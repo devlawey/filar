@@ -27,7 +27,7 @@ Filar is a Rust-based terminal application that integrates an AI agent (LLM) wit
 
 ## Screenshots
 
-> Screenshots coming soon
+![Filar](pics/scr_filar.png)
 
 ---
 
