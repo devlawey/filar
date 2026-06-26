@@ -1,0 +1,22 @@
+[package]
+name = "filar-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Smoke tests that require a real GLM API key (set GLM_API_KEY env var).
+smoke = []
+
+[dependencies]
+filar-core = { workspace = true }
+filar-transport = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

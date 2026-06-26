@@ -1,0 +1,13 @@
+# Cargo configuration for the GNU toolchain on Windows.
+#
+# Copy this file to `.cargo/config.toml` and adjust the paths to match your
+# MinGW installation.  This is needed only if you build with the
+# `x86_64-pc-windows-gnu` target (e.g. when Visual Studio Build Tools are
+# not installed).
+#
+# If you use the `x86_64-pc-windows-msvc` target, you can delete this file
+# entirely — the default linker will be used.
+
+[target.x86_64-pc-windows-gnu]
+linker = "C:\\path\\to\\mingw64\\bin\\x86_64-w64-mingw32-gcc.exe"
+ar = "C:\\path\\to\\mingw64\\bin\\x86_64-w64-mingw32-gcc-ar.exe"

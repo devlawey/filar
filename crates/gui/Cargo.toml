@@ -1,0 +1,14 @@
+[package]
+name = "filar-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+filar-core = { workspace = true }
+eframe = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+keyring = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }

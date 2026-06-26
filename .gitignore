@@ -1,0 +1,20 @@
+/target
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.qoder/
+
+# Cargo config — contains machine-specific linker paths
+# Copy .cargo/config.toml.example to .cargo/config.toml and adjust
+.cargo/config.toml
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db

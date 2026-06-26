@@ -1,0 +1,5 @@
+@echo off
+chcp 65001 >nul
+cd /d c:\dev\warper
+target\debug\warp.exe
+pause

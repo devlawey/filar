@@ -1,0 +1,23 @@
+//! TUI crate: terminal user interface built on `ratatui` + `crossterm`.
+//!
+//! Provides a chat-like interface for the agent:
+//! - Chat history with visually distinct blocks (user, agent, command, error).
+//! - Input field for typing messages.
+//! - Confirmation dialog for command approval ([a]pprove / [d]eny).
+//! - Status bar showing target, confirm mode, and current state.
+//! - Scrollable history.
+
+pub mod app;
+pub mod confirmer;
+pub mod event;
+pub mod runner;
+pub mod terminal;
+pub mod ui;
+
+// Re-export key types.
+pub use app::{App, AppMode};
+pub use confirmer::TuiConfirmer;
+pub use event::AgentEvent;
+pub use runner::{run, TuiConfig};
+pub use terminal::{key_to_bytes, TerminalModel};
+pub use filar_core::ChatBlock;

@@ -1,0 +1,7 @@
+# Normalize line endings: LF in the repo, CRLF on Windows checkout
+* text=auto eol=lf
+
+# Binary files — don't touch line endings
+*.png binary
+*.ico binary
+*.svg binary

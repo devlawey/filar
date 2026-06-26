@@ -1,0 +1,17 @@
+[package]
+name = "filar-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+filar-core = { workspace = true }
+filar-agent = { workspace = true }
+filar-transport = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+alacritty_terminal = { workspace = true }

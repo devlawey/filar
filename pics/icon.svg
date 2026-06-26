@@ -1,0 +1,53 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="256" y1="0" x2="256" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#181B21"/>
+      <stop offset="1" stop-color="#0A0B0E"/>
+    </linearGradient>
+    <linearGradient id="amber" x1="72" y1="256" x2="440" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0"   stop-color="#E8870E"/>
+      <stop offset="0.5" stop-color="#FFCD78"/>
+      <stop offset="1"   stop-color="#E8870E"/>
+    </linearGradient>
+    <radialGradient id="hot" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FFEFCF"/>
+      <stop offset="1" stop-color="#FFC661"/>
+    </radialGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="7" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="softglow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="15"/>
+    </filter>
+  </defs>
+
+  <!-- Tile -->
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)"/>
+  <rect x="16.5" y="16.5" width="479" height="479" rx="111.5" fill="none" stroke="#2A2E37" stroke-width="1"/>
+
+  <!-- Ambient glow under the filament -->
+  <line x1="104" y1="256" x2="408" y2="256" stroke="#F5A623" stroke-width="18"
+        stroke-linecap="round" opacity="0.22" filter="url(#softglow)"/>
+
+  <!-- Filament thread: straight hot wire with a barely-there sag -->
+  <g filter="url(#glow)">
+    <path d="M 104 256 Q 256 272 408 256" stroke="url(#amber)" stroke-width="8"
+          stroke-linecap="round" fill="none"/>
+  </g>
+
+  <!-- Local endpoint (filled node) -->
+  <circle cx="104" cy="256" r="14" fill="url(#hot)" filter="url(#glow)"/>
+  <!-- Remote endpoint (hollow ring) -->
+  <circle cx="408" cy="256" r="15" fill="none" stroke="url(#amber)" stroke-width="7" filter="url(#glow)"/>
+
+  <!-- Terminal prompt sitting on the wire: chevron '>' + cursor block -->
+  <g filter="url(#glow)">
+    <polyline points="196,198 262,256 196,314" fill="none" stroke="url(#amber)"
+              stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="296" y="234" width="44" height="44" rx="9" fill="url(#hot)"/>
+  </g>
+</svg>
