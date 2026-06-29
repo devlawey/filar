@@ -398,6 +398,22 @@ async fn drain_until_marker_with_exit(
                                 // Find the start of the marker line (go back to the previous newline).
                                 let line_start = buf[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
                                 let output = buf[..line_start].to_string();
+                                // Drain any trailing ExtendedData (stderr) that may still
+                                // be buffered on the channel. Without this, late stderr
+                                // from the current command could contaminate the next
+                                // run's result. Best-effort: uses a short timeout since
+                                // in normal operation all stderr arrives before the marker.
+                                loop {
+                                    match tokio::time::timeout(
+                                        Duration::from_millis(50),
+                                        channel.wait(),
+                                    ).await {
+                                        Ok(Some(ChannelMsg::ExtendedData { ref data, ext })) if ext == 1 => {
+                                            stderr_buf.push_str(&String::from_utf8_lossy(data.as_ref()));
+                                        }
+                                        _ => break,
+                                    }
+                                }
                                 return Ok((output, stderr_buf, Some(code)));
                             }
                         }
@@ -549,7 +565,8 @@ mod tests {
         // `ls` on a non-existent path writes to stderr and exits non-zero.
         let result = session.run("ls /nonexistent_path_xyz").await.unwrap();
 
-        assert_ne!(result.exit_code, Some(0), "expected non-zero exit code");
+        let code = result.exit_code.expect("expected command to report an exit code");
+        assert_ne!(code, 0, "expected non-zero exit code");
         assert!(
             !result.stderr.is_empty(),
             "stderr should not be empty for a failing command"
