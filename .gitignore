@@ -15,6 +15,13 @@
 .env.*
 !.env.example
 
+# Temporary instruction files
+FIX_INSTRUCTIONS*
+
+# Archives and documents
+*.zip
+*.pptx
+
 # OS
 .DS_Store
 Thumbs.db
