@@ -12,7 +12,7 @@ use russh::client::{self, Handle, Msg};
 use russh::keys::*;
 use russh::{Channel, ChannelMsg, Disconnect};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use filar_core::{CoreError, Result, SshAuth, SshTarget};
@@ -223,11 +223,11 @@ impl SshSession {
         )
         .await
         {
-            Ok((output, exit_code)) => {
+            Ok((stdout, stderr, exit_code)) => {
                 let duration = start.elapsed();
                 Ok(CommandResult {
-                    stdout: output,
-                    stderr: String::new(),
+                    stdout,
+                    stderr,
                     exit_code,
                     duration,
                 })
@@ -350,6 +350,10 @@ async fn drain_until_marker(
                     return Ok(());
                 }
             }
+            ChannelMsg::ExtendedData { .. } => {
+                // Extended data (e.g. stderr) — drain silently during sync.
+                // Sync markers are sent via stdout, so we don't need to collect this.
+            }
             ChannelMsg::Eof | ChannelMsg::Close => {
                 return Err(CoreError::Other(
                     "channel closed before marker received".into(),
@@ -366,8 +370,9 @@ async fn drain_until_marker_with_exit(
     channel: &mut Channel<Msg>,
     marker_tag: &str,
     timeout: Duration,
-) -> Result<(String, Option<i32>)> {
+) -> Result<(String, String, Option<i32>)> {
     let mut buf = String::new();
+    let mut stderr_buf = String::new();
     let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
@@ -393,11 +398,20 @@ async fn drain_until_marker_with_exit(
                                 // Find the start of the marker line (go back to the previous newline).
                                 let line_start = buf[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
                                 let output = buf[..line_start].to_string();
-                                return Ok((output, Some(code)));
+                                return Ok((output, stderr_buf, Some(code)));
                             }
                         }
                     }
                     // Marker tag found but couldn't parse exit code — keep reading.
+                }
+            }
+            ChannelMsg::ExtendedData { ref data, ext } => {
+                // SSH EXTENDED_DATA with data_type_code 1 = stderr.
+                // Note: stdout/stderr interleaving is lost with separate buffers;
+                // this is acceptable — the agent receives them as independent streams.
+                if ext == 1 {
+                    debug!(len = data.len(), "stderr data received from SSH channel");
+                    stderr_buf.push_str(&String::from_utf8_lossy(data.as_ref()));
                 }
             }
             ChannelMsg::Eof | ChannelMsg::Close => {
@@ -513,6 +527,38 @@ mod tests {
 
         assert_eq!(before.stdout.trim(), after.stdout.trim(),
             "zero-install violated: file count changed");
+
+        session.close().await.unwrap();
+    }
+
+    /// Integration test — verifies stderr capture from a failing command.
+    #[tokio::test]
+    #[ignore = "requires Docker sshd container on port 2222"]
+    async fn ssh_stderr_capture() {
+        let target = SshTarget {
+            name: "test".into(),
+            host: "127.0.0.1".into(),
+            port: 2222,
+            user: "testuser".into(),
+            auth: SshAuth::Password { password: None },
+        };
+        std::env::set_var("SSH_PASSWORD", "testpassword");
+
+        let session = SshSession::connect(&target).await.unwrap();
+
+        // `ls` on a non-existent path writes to stderr and exits non-zero.
+        let result = session.run("ls /nonexistent_path_xyz").await.unwrap();
+
+        assert_ne!(result.exit_code, Some(0), "expected non-zero exit code");
+        assert!(
+            !result.stderr.is_empty(),
+            "stderr should not be empty for a failing command"
+        );
+        assert!(
+            result.stderr.contains("No such file or directory"),
+            "stderr should contain error message, got: {:?}",
+            result.stderr
+        );
 
         session.close().await.unwrap();
     }
