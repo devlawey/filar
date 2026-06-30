@@ -341,6 +341,7 @@ async fn run_app(
                                 auth: filar_core::SshAuth::Password {
                                     password: Some(password),
                                 },
+                                host_key_policy: filar_core::HostKeyPolicy::Tofu,
                             };
                             match filar_transport::SshExecutor::connect(&target).await {
                                 Ok(ssh_exec) => {

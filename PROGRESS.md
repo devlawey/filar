@@ -421,3 +421,40 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
   - `debug!` логирует только kind + length, не raw content (безопасность).
   - Тесты используют `env::var("SSH_PASSWORD").expect(...)` вместо хардкода.
   - Тест обёрнут `timeout(2s, cancel())` для проверки latency самого `cancel()`.
+
+### Issue #4: host key не проверяется, MITM
+- **Файлы:** `crates/core/src/config.rs`, `crates/core/src/lib.rs`,
+  `crates/transport/src/ssh.rs`, `crates/transport/src/interactive.rs`,
+  `crates/tui/src/runner.rs`, `crates/app/src/main.rs`
+- **Проблема:** `check_server_key` всегда возвращал `Ok(true)` — любой MITM
+  проходил незамеченным.
+- **Фикс — TOFU (Trust On First Use):**
+  - Добавлен `HostKeyPolicy` enum в `config.rs`: `Strict`, `Tofu` (default),
+    `AcceptNew`. Сериализация `snake_case`.
+  - Поле `host_key_policy: HostKeyPolicy` добавлено в `SshTarget` с
+    `#[serde(default)]`.
+  - `SshHandler` (ssh.rs) теперь содержит поля: `host`, `port`, `policy`,
+    `known_hosts_path`.
+  - `check_server_key` вычисляет SHA256 fingerprint, проверяет known_hosts.
+    - `Match` → accept.
+    - `Mismatch` → reject (`Ok(false)`).
+    - `New` → зависит от policy: `Strict` reject, `Tofu` accept+save,
+      `AcceptNew` accept без сохранения.
+  - Known_hosts файл: `~/.config/filar/known_hosts`, формат `host:port SHA256:fp`.
+  - Хелперы: `known_hosts_path()`, `parse_known_hosts_contents()`,
+    `parse_known_hosts()`, `append_known_hosts_entry()`, `check_host_key()`.
+  - `interactive.rs` и `runner.rs` обновлены для construction `SshHandler` с
+    полями и `SshTarget` с `host_key_policy`.
+- **Тесты (5 unit):** `known_hosts_parse_contents`, `known_hosts_append_and_read`,
+  `host_key_check_match`, `host_key_check_mismatch`, `host_key_check_new`.
+- **Публичные контракты:** `HostKeyPolicy` добавлен в re-exports `filar-core`.
+  `SshTarget` получил новое поле (backward-incompatible для ручной инициализации,
+  но serde-совместимо через `#[serde(default)]`).
+- Total: 70 tests pass, 0 fail, 5 ignored (Docker).
+- **Review fixes (CodeRabbit PR #10):**
+  - `parse_known_hosts` возвращает `Result` вместо silent empty map. Только
+    `NotFound` → пустая карта (first connection); остальные I/O ошибки →
+    reject (fail closed).
+  - TOFU-путь: если `append_known_hosts_entry` не удался → reject (`Ok(false)`)
+    вместо accept с warning. Ключ должен быть закреплён, иначе подключение
+    не должно проходить.
