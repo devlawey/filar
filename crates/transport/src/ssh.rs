@@ -60,7 +60,18 @@ impl client::Handler for SshHandler {
         let fp_str = fingerprint.to_string();
         let host_port = format!("{}:{}", self.host, self.port);
 
-        let entries = parse_known_hosts(&self.known_hosts_path);
+        let entries = match parse_known_hosts(&self.known_hosts_path) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) => {
+                warn!(
+                    host = %host_port,
+                    error = %e,
+                    "failed to read known_hosts, rejecting host key"
+                );
+                return Ok(false);
+            }
+        };
 
         match check_host_key(&entries, &host_port, &fp_str) {
             HostKeyCheck::Match => {
@@ -83,13 +94,24 @@ impl client::Handler for SshHandler {
                     Ok(false)
                 }
                 HostKeyPolicy::Tofu => {
-                    info!(host = %host_port, "host key added (TOFU)");
-                    if let Err(e) =
-                        append_known_hosts_entry(&self.known_hosts_path, &host_port, &fp_str)
-                    {
-                        warn!(error = %e, "failed to write known_hosts entry");
+                    match append_known_hosts_entry(
+                        &self.known_hosts_path,
+                        &host_port,
+                        &fp_str,
+                    ) {
+                        Ok(()) => {
+                            info!(host = %host_port, "host key added (TOFU)");
+                            Ok(true)
+                        }
+                        Err(e) => {
+                            warn!(
+                                host = %host_port,
+                                error = %e,
+                                "failed to write known_hosts entry, rejecting host key"
+                            );
+                            Ok(false)
+                        }
                     }
-                    Ok(true)
                 }
                 HostKeyPolicy::AcceptNew => {
                     info!(
@@ -538,13 +560,14 @@ fn parse_known_hosts_contents(contents: &str) -> HashMap<String, String> {
     entries
 }
 
-/// Read and parse the known_hosts file. Returns an empty map if the file
-/// doesn't exist or can't be read.
-fn parse_known_hosts(path: &Path) -> HashMap<String, String> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => parse_known_hosts_contents(&contents),
-        Err(_) => HashMap::new(),
-    }
+/// Read and parse the known_hosts file.
+///
+/// Returns `Ok(empty_map)` when the file doesn't exist (first connection).
+/// Returns `Err` for any other I/O error — callers should reject the host key
+/// (fail closed) rather than silently downgrading verification.
+fn parse_known_hosts(path: &Path) -> std::io::Result<HashMap<String, String>> {
+    std::fs::read_to_string(path)
+        .map(|contents| parse_known_hosts_contents(&contents))
 }
 
 /// Append a new entry to the known_hosts file. Creates the file (and parent
@@ -995,7 +1018,7 @@ mod tests {
         append_known_hosts_entry(&path, "host1:22", "SHA256:aaa").unwrap();
         append_known_hosts_entry(&path, "host2:22", "SHA256:bbb").unwrap();
 
-        let entries = parse_known_hosts(&path);
+        let entries = parse_known_hosts(&path).unwrap();
         assert_eq!(
             entries.get("host1:22"),
             Some(&"SHA256:aaa".to_string())

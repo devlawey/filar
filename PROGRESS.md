@@ -451,3 +451,10 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
   `SshTarget` получил новое поле (backward-incompatible для ручной инициализации,
   но serde-совместимо через `#[serde(default)]`).
 - Total: 70 tests pass, 0 fail, 5 ignored (Docker).
+- **Review fixes (CodeRabbit PR #10):**
+  - `parse_known_hosts` возвращает `Result` вместо silent empty map. Только
+    `NotFound` → пустая карта (first connection); остальные I/O ошибки →
+    reject (fail closed).
+  - TOFU-путь: если `append_known_hosts_entry` не удался → reject (`Ok(false)`)
+    вместо accept с warning. Ключ должен быть закреплён, иначе подключение
+    не должно проходить.
