@@ -389,3 +389,35 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
   - SSH: «DOES persist ... carry over» (соответствует персистентному каналу `SshSession`).
 - **Тесты:** добавлены `ssh_prompt_states_persistence` и `local_prompt_states_no_persistence`.
 - **Публичные контракты:** без изменений — `build_system_prompt` сигнатура та же.
+
+### Issue #3: cancel() не может прервать выполняющуюся команду
+- **Файл:** `crates/transport/src/ssh.rs` — `SshSession`, `SshExecutor`
+- **Проблема:** `run()` держал `self.inner.lock().await` всё время выполнения команды
+  (до 120 c). `cancel()` лочил тот же мьютекс → Ctrl-C проходил только после
+  завершения команды. Прерывание зависшей команды фактически не работало.
+- **Фикс — reader-task архитектура:**
+  - На `connect` заспавнен долгоживущий таск, который **единолично владеет**
+    `Channel<Msg>`. Таск в цикле `tokio::select!` читает из канала
+    (`channel.wait()`) и принимает команды из `mpsc` (`cmd_rx`).
+  - `ChannelCmd::Write(Vec<u8>)` — запись в канал; `ChannelCmd::Interrupt` —
+    отправка `\x03` (Ctrl-C).
+  - `ChannelEvent::Data(String)`, `ChannelEvent::Stderr(String)`,
+    `ChannelEvent::Closed` — события наружу через `mpsc::unbounded_channel`.
+  - `SshSession` хранит: `cmd_tx` (отправка команд в таск), `run_lock: Mutex<()>`
+    (сериализация команд), `event_rx: Mutex<UnboundedReceiver>` (чтение событий).
+  - `run()` шлёт payload через `cmd_tx`, читает события из `event_rx` — **не
+    держа** лока, который нужен `cancel()`.
+  - `cancel()` просто шлёт `Interrupt` в `cmd_tx` — мгновенно, без contention.
+- **Тесты:** добавлен интеграционный тест `ssh_cancel_interrupts_long_command`
+  (`#[ignore]`): `sleep 30` прерывается через 1 c, общая длительность < 15 c,
+  последующий `echo ok` возвращает `ok` с exit code 0.
+- **Публичные контракты:** без изменений — `SshSession::run/cancel/close` и
+  `SshExecutor::run/cancel` сигнатуры те же. `SshSessionInner` удалён (внутренняя
+  деталь реализации).
+- **Review fixes (CodeRabbit PR #9):**
+  - Маркер команды дополнен UUID (`req_{id}_{uuid}`) для защиты от коллизий.
+  - Drain stale events перенесён **до** отправки команды (был после — мог
+    терять вывод быстрых команд).
+  - `debug!` логирует только kind + length, не raw content (безопасность).
+  - Тесты используют `env::var("SSH_PASSWORD").expect(...)` вместо хардкода.
+  - Тест обёрнут `timeout(2s, cancel())` для проверки latency самого `cancel()`.
