@@ -234,7 +234,7 @@ impl SshSession {
         let _guard = self.run_lock.lock().await;
 
         let req_id = self.req_counter.fetch_add(1, Ordering::Relaxed);
-        let marker_id = format!("req_{:08x}", req_id);
+        let marker_id = format!("req_{:08x}_{}", req_id, Uuid::new_v4().simple());
         let marker_tag = format!("{}{}", MARKER_PREFIX, marker_id);
 
         // Build the full payload: <command>\n printf marker\n
@@ -245,21 +245,29 @@ impl SshSession {
 
         let start = Instant::now();
 
+        // Lock the event receiver. `cancel()` never touches this mutex.
+        let mut event_rx = self.event_rx.lock().await;
+
+        // Drain any stale events from a previous command BEFORE sending
+        // the new payload — otherwise fast commands' output could be
+        // discarded as "stale".
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(10), event_rx.recv()).await
+        {
+            // Log only metadata — raw output may contain secrets.
+            let (kind, len) = match &event {
+                ChannelEvent::Data(text) => ("stdout", text.len()),
+                ChannelEvent::Stderr(text) => ("stderr", text.len()),
+                ChannelEvent::Closed => ("closed", 0),
+            };
+            debug!(kind, len, "draining stale event");
+        }
+
         // Send the payload to the reader task (which owns the channel).
         self.cmd_tx
             .send(ChannelCmd::Write(payload.into_bytes()))
             .await
             .map_err(|_| CoreError::Other("channel task closed".into()))?;
-
-        // Lock the event receiver. `cancel()` never touches this mutex.
-        let mut event_rx = self.event_rx.lock().await;
-
-        // Drain any stale events from a previous command.
-        while let Ok(Some(event)) =
-            tokio::time::timeout(Duration::from_millis(10), event_rx.recv()).await
-        {
-            debug!(?event, "draining stale event");
-        }
 
         // Read events until we find the marker — without holding any lock
         // that `cancel()` needs.
@@ -622,6 +630,7 @@ mod tests {
 
     /// Integration test — requires a running SSH server.
     /// Start one with: docker run -d -p 2222:22 --name filar-sshd filar-sshd
+    /// Set SSH_PASSWORD env var, e.g. `set SSH_PASSWORD=testpassword`.
     #[tokio::test]
     #[ignore = "requires Docker sshd container on port 2222"]
     async fn ssh_run_basic() {
@@ -632,7 +641,8 @@ mod tests {
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
         };
-        std::env::set_var("SSH_PASSWORD", "testpassword");
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
 
         let session = SshSession::connect(&target).await.unwrap();
         let result = session.run("echo hi").await.unwrap();
@@ -656,7 +666,8 @@ mod tests {
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
         };
-        std::env::set_var("SSH_PASSWORD", "testpassword");
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
 
         let session = SshSession::connect(&target).await.unwrap();
 
@@ -679,7 +690,8 @@ mod tests {
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
         };
-        std::env::set_var("SSH_PASSWORD", "testpassword");
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
 
         let session = SshSession::connect(&target).await.unwrap();
 
@@ -711,7 +723,8 @@ mod tests {
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
         };
-        std::env::set_var("SSH_PASSWORD", "testpassword");
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
 
         let session = SshSession::connect(&target).await.unwrap();
 
@@ -753,7 +766,8 @@ mod tests {
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
         };
-        std::env::set_var("SSH_PASSWORD", "testpassword");
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
 
         let session = Arc::new(SshSession::connect(&target).await.unwrap());
 
@@ -765,7 +779,10 @@ mod tests {
 
         // Give the command a moment to start, then cancel.
         tokio::time::sleep(Duration::from_secs(1)).await;
-        session.cancel().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), session.cancel())
+            .await
+            .expect("cancel() blocked")
+            .unwrap();
 
         // The command should return quickly (well under 30 seconds).
         let start = Instant::now();

@@ -414,3 +414,10 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
 - **Публичные контракты:** без изменений — `SshSession::run/cancel/close` и
   `SshExecutor::run/cancel` сигнатуры те же. `SshSessionInner` удалён (внутренняя
   деталь реализации).
+- **Review fixes (CodeRabbit PR #9):**
+  - Маркер команды дополнен UUID (`req_{id}_{uuid}`) для защиты от коллизий.
+  - Drain stale events перенесён **до** отправки команды (был после — мог
+    терять вывод быстрых команд).
+  - `debug!` логирует только kind + length, не raw content (безопасность).
+  - Тесты используют `env::var("SSH_PASSWORD").expect(...)` вместо хардкода.
+  - Тест обёрнут `timeout(2s, cancel())` для проверки latency самого `cancel()`.
