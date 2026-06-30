@@ -1,5 +1,6 @@
-# Filar
+# Filar. 
 
+**Filar Is a Lightweight Agent for Remotes.**
 **Terminal with AI agent over SSH.**
 
 Filar is a Rust-based terminal application that integrates an AI agent (LLM) with SSH remote execution. The agent can run commands on your local machine or on a remote server via SSH — with user confirmation for every action.
