@@ -61,14 +61,22 @@ fn build_system_prompt(is_local: bool, ssh_info: Option<&str>, is_windows: bool)
         }
     };
 
-    let shell_desc = if is_windows && is_local {
-        "You are running on Windows with PowerShell. \
-         Each command runs in a separate process — shell state (cwd, env) does NOT persist between calls. \
-         Use absolute paths or chain commands with semicolons if needed."
+    let shell_desc = if is_local {
+        if is_windows {
+            "You are running on Windows with PowerShell. \
+             Each command runs in a separate process — shell state (cwd, env) does NOT persist between calls. \
+             Use absolute paths or chain commands with semicolons if needed."
+        } else {
+            "You are running on a POSIX shell. \
+             Each command runs in a separate process — shell state (cwd, env) does NOT persist between calls. \
+             Use absolute paths or chain commands with && or ; if needed."
+        }
     } else {
-        "You are running on a POSIX shell. \
-         Each command runs in a separate process — shell state (cwd, env) does NOT persist between calls. \
-         Use absolute paths or chain commands with && or ; if needed."
+        // SSH: persistent channel — state persists between commands.
+        "You are running on a persistent POSIX shell session over SSH. \
+         Shell state (cwd, env) DOES persist between calls: your `cd`, exported variables \
+         and environment carry over to subsequent commands. Prefer using this (e.g. \
+         `cd /var/log` then `ls`)."
     };
 
     format!(
@@ -624,5 +632,29 @@ mod tests {
         assert!(truncated.starts_with("0123456789"));
         assert!(truncated.contains("truncated"));
         assert!(truncated.contains("16"));
+    }
+
+    #[test]
+    fn ssh_prompt_states_persistence() {
+        // SSH mode: prompt should mention persistence.
+        let prompt = build_system_prompt(false, None, false);
+        assert!(
+            prompt.contains("DOES persist") || prompt.contains("carry over"),
+            "SSH prompt should mention shell state persistence, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("does NOT persist"),
+            "SSH prompt should NOT say state does not persist"
+        );
+    }
+
+    #[test]
+    fn local_prompt_states_no_persistence() {
+        // Local mode: prompt should say state does NOT persist.
+        let prompt = build_system_prompt(true, None, false);
+        assert!(
+            prompt.contains("does NOT persist"),
+            "Local prompt should mention state does NOT persist, got: {prompt}"
+        );
     }
 }

@@ -374,3 +374,18 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
 5. Для отладки иконок: `filar.exe` в Explorer + Свойства → Подробно
 6. Для тестирования SSH: `!ssh user@host` в Normal режиме → Ctrl+P для пароля
 7. Все изменения в коде — на русском языке в комментариях и сообщениях пользователю
+
+---
+
+## 11. Недавние изменения (R1 milestone)
+
+### Issue #2: Системный промпт противоречит killer-фиче
+- **Файл:** `crates/agent/src/agent.rs`, функция `build_system_prompt`
+- **Проблема:** промпт говорил «shell state does NOT persist» для всех режимов,
+  включая SSH, где состояние персистентного канала сохраняется между командами.
+- **Фикс:** `shell_desc` теперь зависит от `is_local`:
+  - Local (Windows/POSIX): «does NOT persist» (соответствует `LocalExecutor` —
+    каждая команда в отдельном процессе).
+  - SSH: «DOES persist ... carry over» (соответствует персистентному каналу `SshSession`).
+- **Тесты:** добавлены `ssh_prompt_states_persistence` и `local_prompt_states_no_persistence`.
+- **Публичные контракты:** без изменений — `build_system_prompt` сигнатура та же.
