@@ -69,6 +69,10 @@ pub struct SshTarget {
     /// Authentication strategy.
     #[serde(default)]
     pub auth: SshAuth,
+
+    /// Host key verification policy (default: TOFU).
+    #[serde(default)]
+    pub host_key_policy: HostKeyPolicy,
 }
 
 fn default_ssh_port() -> u16 {
@@ -93,6 +97,30 @@ pub enum SshAuth {
         #[serde(default)]
         password: Option<String>,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Host key policy
+// ---------------------------------------------------------------------------
+
+/// Host key verification policy for SSH connections.
+///
+/// Controls how the client handles the server's public key:
+/// - [`Strict`](Self::Strict): reject unknown hosts (must be in known_hosts).
+/// - [`Tofu`](Self::Tofu): trust on first use — accept, record, then verify.
+/// - [`AcceptNew`](Self::AcceptNew): accept new keys without recording.
+///
+/// There is **no** "accept everything silently" option.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKeyPolicy {
+    /// Reject unknown hosts — only accept keys already in known_hosts.
+    Strict,
+    /// Trust on first use: accept and record new keys, reject mismatches (default).
+    #[default]
+    Tofu,
+    /// Accept new keys without recording, reject mismatches.
+    AcceptNew,
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +374,30 @@ type = "agent"
         assert_eq!(cfg.confirm_mode, CommandConfirmMode::Allowlist);
         assert_eq!(cfg.ssh_targets.len(), 2);
         assert_eq!(cfg.ssh_target("staging").unwrap().host, "10.0.0.6");
+    }
+
+    #[test]
+    fn parse_host_key_policy() {
+        let toml = r#"
+[llm]
+model = "glm-5.1"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+
+[[ssh_targets]]
+name = "prod"
+host = "10.0.0.5"
+user = "deploy"
+host_key_policy = "strict"
+
+[[ssh_targets]]
+name = "dev"
+host = "10.0.0.6"
+user = "dev"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.ssh_targets[0].host_key_policy, HostKeyPolicy::Strict);
+        // Default is Tofu.
+        assert_eq!(cfg.ssh_targets[1].host_key_policy, HostKeyPolicy::Tofu);
     }
 
     #[test]

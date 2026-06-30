@@ -221,6 +221,7 @@ async fn run() -> anyhow::Result<()> {
                     auth: filar_core::SshAuth::Password {
                         password: if s.password.is_empty() { None } else { Some(s.password) },
                     },
+                    host_key_policy: filar_core::HostKeyPolicy::Tofu,
                 });
 
                 (

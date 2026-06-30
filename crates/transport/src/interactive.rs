@@ -23,7 +23,7 @@ use tracing::info;
 
 use filar_core::{CoreError, Result, SshAuth, SshTarget};
 
-use crate::ssh::{dirs_or_default, SshHandler};
+use crate::ssh::{dirs_or_default, known_hosts_path, SshHandler};
 
 // ---------------------------------------------------------------------------
 // InteractiveTerminal trait
@@ -242,7 +242,13 @@ impl SshInteractive {
         let addr = (target.host.as_str(), target.port);
         info!(host = %target.host, port = target.port, user = %target.user, "connecting interactive SSH");
 
-        let mut session = client::connect(config, addr, SshHandler)
+        let handler = SshHandler {
+            host: target.host.clone(),
+            port: target.port,
+            policy: target.host_key_policy,
+            known_hosts_path: known_hosts_path(),
+        };
+        let mut session = client::connect(config, addr, handler)
             .await
             .map_err(|e| CoreError::Other(format!("SSH connect failed: {e}")))?;
 

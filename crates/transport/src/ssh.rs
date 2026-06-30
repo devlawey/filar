@@ -5,6 +5,8 @@
 //! boundary detection and exit-code extraction. **Zero files are created
 //! on the remote machine.**
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,7 +18,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use filar_core::{CoreError, Result, SshAuth, SshTarget};
+use filar_core::{CoreError, HostKeyPolicy, Result, SshAuth, SshTarget};
 
 use crate::CommandResult;
 
@@ -34,9 +36,18 @@ const MARKER_PREFIX: &str = "__FILAR_";
 
 /// Handler for SSH session events.
 ///
-/// Currently accepts all host keys (with a warning). TODO: verify against
-/// `known_hosts`.
-pub(crate) struct SshHandler;
+/// Implements TOFU (trust on first use) host key verification via a
+/// `known_hosts` file at `~/.config/filar/known_hosts`.
+pub(crate) struct SshHandler {
+    /// Remote host (for known_hosts lookup).
+    pub(crate) host: String,
+    /// Remote port.
+    pub(crate) port: u16,
+    /// Host key verification policy.
+    pub(crate) policy: HostKeyPolicy,
+    /// Path to the known_hosts file.
+    pub(crate) known_hosts_path: PathBuf,
+}
 
 impl client::Handler for SshHandler {
     type Error = russh::Error;
@@ -46,8 +57,49 @@ impl client::Handler for SshHandler {
         server_public_key: &ssh_key::PublicKey,
     ) -> std::result::Result<bool, Self::Error> {
         let fingerprint = server_public_key.fingerprint(ssh_key::HashAlg::Sha256);
-        warn!(%fingerprint, "accepting unverified host key (known_hosts check not yet implemented)");
-        Ok(true)
+        let fp_str = fingerprint.to_string();
+        let host_port = format!("{}:{}", self.host, self.port);
+
+        let entries = parse_known_hosts(&self.known_hosts_path);
+
+        match check_host_key(&entries, &host_port, &fp_str) {
+            HostKeyCheck::Match => {
+                debug!(host = %host_port, "host key verified (matches known_hosts)");
+                Ok(true)
+            }
+            HostKeyCheck::Mismatch => {
+                warn!(
+                    host = %host_port,
+                    "HOST KEY MISMATCH — possible MITM, rejecting"
+                );
+                Ok(false)
+            }
+            HostKeyCheck::New => match self.policy {
+                HostKeyPolicy::Strict => {
+                    warn!(
+                        host = %host_port,
+                        "unknown host key (strict mode — rejecting)"
+                    );
+                    Ok(false)
+                }
+                HostKeyPolicy::Tofu => {
+                    info!(host = %host_port, "host key added (TOFU)");
+                    if let Err(e) =
+                        append_known_hosts_entry(&self.known_hosts_path, &host_port, &fp_str)
+                    {
+                        warn!(error = %e, "failed to write known_hosts entry");
+                    }
+                    Ok(true)
+                }
+                HostKeyPolicy::AcceptNew => {
+                    info!(
+                        host = %host_port,
+                        "host key accepted (accept-new, not recorded)"
+                    );
+                    Ok(true)
+                }
+            },
+        }
     }
 }
 
@@ -118,7 +170,13 @@ impl SshSession {
         let addr = (target.host.as_str(), target.port);
         info!(host = %target.host, port = target.port, user = %target.user, "connecting via SSH");
 
-        let mut session = client::connect(config, addr, SshHandler)
+        let handler = SshHandler {
+            host: target.host.clone(),
+            port: target.port,
+            policy: target.host_key_policy,
+            known_hosts_path: known_hosts_path(),
+        };
+        let mut session = client::connect(config, addr, handler)
             .await
             .map_err(|e| CoreError::Other(format!("SSH connect failed: {e}")))?;
 
@@ -453,6 +511,89 @@ pub(crate) fn dirs_or_default() -> std::path::PathBuf {
     std::path::PathBuf::from(&home).join(".ssh/id_rsa")
 }
 
+/// Default known_hosts path: `~/.config/filar/known_hosts`.
+pub(crate) fn known_hosts_path() -> PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into());
+    PathBuf::from(&home)
+        .join(".config")
+        .join("filar")
+        .join("known_hosts")
+}
+
+/// Parse known_hosts file contents into a `host:port → fingerprint` map.
+fn parse_known_hosts_contents(contents: &str) -> HashMap<String, String> {
+    let mut entries = HashMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.splitn(2, char::is_whitespace);
+        if let (Some(host), Some(fp)) = (parts.next(), parts.next()) {
+            entries.insert(host.trim().to_string(), fp.trim().to_string());
+        }
+    }
+    entries
+}
+
+/// Read and parse the known_hosts file. Returns an empty map if the file
+/// doesn't exist or can't be read.
+fn parse_known_hosts(path: &Path) -> HashMap<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_known_hosts_contents(&contents),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Append a new entry to the known_hosts file. Creates the file (and parent
+/// directories) if it doesn't exist.
+fn append_known_hosts_entry(
+    path: &Path,
+    host_port: &str,
+    fingerprint: &str,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let exists = path.exists();
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if !exists {
+        writeln!(file, "# filar known_hosts — do not edit manually")?;
+    }
+    writeln!(file, "{host_port} {fingerprint}")?;
+    Ok(())
+}
+
+/// Result of comparing a server key against known_hosts.
+#[derive(Debug, PartialEq, Eq)]
+enum HostKeyCheck {
+    /// Key matches the known entry.
+    Match,
+    /// Key doesn't match — possible MITM.
+    Mismatch,
+    /// No entry for this host — first connection.
+    New,
+}
+
+/// Check a fingerprint against known_hosts entries.
+fn check_host_key(
+    entries: &HashMap<String, String>,
+    host_port: &str,
+    fingerprint: &str,
+) -> HostKeyCheck {
+    match entries.get(host_port) {
+        Some(known_fp) if known_fp == fingerprint => HostKeyCheck::Match,
+        Some(_) => HostKeyCheck::Mismatch,
+        None => HostKeyCheck::New,
+    }
+}
+
 /// Read from the channel until `marker` is found in the accumulated output.
 /// Returns the output *before* the marker (discarded for sync).
 ///
@@ -640,6 +781,7 @@ mod tests {
             port: 2222,
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
+            host_key_policy: HostKeyPolicy::Tofu,
         };
         std::env::var("SSH_PASSWORD")
             .expect("set SSH_PASSWORD to run ignored SSH integration tests");
@@ -665,6 +807,7 @@ mod tests {
             port: 2222,
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
+            host_key_policy: HostKeyPolicy::Tofu,
         };
         std::env::var("SSH_PASSWORD")
             .expect("set SSH_PASSWORD to run ignored SSH integration tests");
@@ -689,6 +832,7 @@ mod tests {
             port: 2222,
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
+            host_key_policy: HostKeyPolicy::Tofu,
         };
         std::env::var("SSH_PASSWORD")
             .expect("set SSH_PASSWORD to run ignored SSH integration tests");
@@ -722,6 +866,7 @@ mod tests {
             port: 2222,
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
+            host_key_policy: HostKeyPolicy::Tofu,
         };
         std::env::var("SSH_PASSWORD")
             .expect("set SSH_PASSWORD to run ignored SSH integration tests");
@@ -765,6 +910,7 @@ mod tests {
             port: 2222,
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
+            host_key_policy: HostKeyPolicy::Tofu,
         };
         std::env::var("SSH_PASSWORD")
             .expect("set SSH_PASSWORD to run ignored SSH integration tests");
@@ -818,5 +964,76 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
 
         session.close().await.unwrap();
+    }
+
+    // ── known_hosts unit tests ───────────────────────────────────────
+
+    #[test]
+    fn known_hosts_parse_contents() {
+        let contents = "# filar known_hosts\n127.0.0.1:2222 SHA256:abc123\n10.0.0.5:22 SHA256:def456\n\n# comment line\n";
+        let entries = parse_known_hosts_contents(contents);
+        assert_eq!(
+            entries.get("127.0.0.1:2222"),
+            Some(&"SHA256:abc123".to_string())
+        );
+        assert_eq!(
+            entries.get("10.0.0.5:22"),
+            Some(&"SHA256:def456".to_string())
+        );
+        assert!(entries.get("unknown:22").is_none());
+    }
+
+    #[test]
+    fn known_hosts_append_and_read() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "filar_test_known_hosts_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        append_known_hosts_entry(&path, "host1:22", "SHA256:aaa").unwrap();
+        append_known_hosts_entry(&path, "host2:22", "SHA256:bbb").unwrap();
+
+        let entries = parse_known_hosts(&path);
+        assert_eq!(
+            entries.get("host1:22"),
+            Some(&"SHA256:aaa".to_string())
+        );
+        assert_eq!(
+            entries.get("host2:22"),
+            Some(&"SHA256:bbb".to_string())
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn host_key_check_match() {
+        let mut entries = HashMap::new();
+        entries.insert("127.0.0.1:2222".to_string(), "SHA256:abc".to_string());
+        assert_eq!(
+            check_host_key(&entries, "127.0.0.1:2222", "SHA256:abc"),
+            HostKeyCheck::Match
+        );
+    }
+
+    #[test]
+    fn host_key_check_mismatch() {
+        let mut entries = HashMap::new();
+        entries.insert("127.0.0.1:2222".to_string(), "SHA256:abc".to_string());
+        assert_eq!(
+            check_host_key(&entries, "127.0.0.1:2222", "SHA256:xyz"),
+            HostKeyCheck::Mismatch
+        );
+    }
+
+    #[test]
+    fn host_key_check_new() {
+        let entries: HashMap<String, String> = HashMap::new();
+        assert_eq!(
+            check_host_key(&entries, "127.0.0.1:2222", "SHA256:abc"),
+            HostKeyCheck::New
+        );
     }
 }
