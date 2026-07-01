@@ -94,26 +94,39 @@ fn writes_to_system_path(command: &str) -> bool {
     // Split by shell operators to process each sub-command independently.
     for sub in cleaned.split([';', '|', '&']) {
         let sub = sub.trim();
-        let chars: Vec<char> = sub.chars().collect();
+        // Use char_indices() for byte-safe offsets — sub[...] slicing requires
+        // byte positions, not character positions. Non-ASCII text before '>'
+        // would otherwise cause a panic or incorrect extraction.
+        let indices: Vec<(usize, char)> = sub.char_indices().collect();
         let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '>' {
+        while i < indices.len() {
+            if indices[i].1 == '>' {
                 // Skip second '>' for '>>' append operator.
                 let mut target_start = i + 1;
-                if target_start < chars.len() && chars[target_start] == '>' {
+                if target_start < indices.len() && indices[target_start].1 == '>' {
                     target_start += 1;
                 }
                 // Skip whitespace after redirect operator.
-                while target_start < chars.len() && chars[target_start].is_whitespace() {
+                while target_start < indices.len() && indices[target_start].1.is_whitespace() {
                     target_start += 1;
                 }
                 // Extract the target token (up to next whitespace or end).
                 let mut target_end = target_start;
-                while target_end < chars.len() && !chars[target_end].is_whitespace() {
+                while target_end < indices.len() && !indices[target_end].1.is_whitespace() {
                     target_end += 1;
                 }
                 if target_end > target_start {
-                    let target: String = sub[target_start..target_end].to_string();
+                    // Use byte offsets for slicing.
+                    let byte_start = indices[target_start].0;
+                    let byte_end = if target_end < indices.len() {
+                        indices[target_end].0
+                    } else {
+                        sub.len()
+                    };
+                    let target = &sub[byte_start..byte_end];
+                    // Strip surrounding shell quotes so that
+                    // `echo foo >"/etc/passwd"` is still caught.
+                    let target = target.trim_matches(|c| c == '"' || c == '\'');
                     // /dev/null is a null device, not a real system path write.
                     if target != "/dev/null" {
                         if system_paths.iter().any(|p| target.starts_with(p)) {
@@ -397,6 +410,12 @@ mod tests {
         assert!(writes_to_system_path("dd if=/dev/zero > /dev/sda"));
         // Append to system path.
         assert!(writes_to_system_path("echo bad >> /etc/passwd"));
+        // Quoted redirect targets must still be caught.
+        assert!(writes_to_system_path("echo foo >\"/etc/passwd\""));
+        assert!(writes_to_system_path("echo foo >>'/etc/passwd'"));
+        // Non-ASCII before '>' must not panic (byte-safe indexing).
+        assert!(writes_to_system_path("echo привет > /etc/passwd"));
+        assert!(!writes_to_system_path("echo привет > /tmp/test"));
     }
 
     #[test]

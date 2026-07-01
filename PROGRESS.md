@@ -480,3 +480,12 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
   исключение, `>>` append, system path в read-части, `/dev/sda` device).
 - **Публичные контракты:** без изменений.
 - Total: 70 tests pass, 0 fail, 5 ignored (Docker).
+- **Review fixes (CodeRabbit PR #11):**
+  - `writes_to_system_path` использует `char_indices()` вместо `chars()` для
+    byte-safe offset'ов. Non-ASCII текст перед `>` больше не вызывает panic
+    при слайсинге строки.
+  - Quoted redirect targets: `trim_matches` снимает кавычки (`"`, `'`) с цели
+    редиректа перед проверкой. `echo foo >"/etc/passwd"` теперь корректно
+    распознаётся как запись в системный путь.
+  - Тесты расширены: quoted paths (`"/etc/passwd"`, `'/etc/passwd'`) и
+    non-ASCII перед `>` (`echo привет > /etc/passwd`).
