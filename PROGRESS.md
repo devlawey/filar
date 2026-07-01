@@ -458,3 +458,25 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
   - TOFU-путь: если `append_known_hosts_entry` не удался → reject (`Ok(false)`)
     вместо accept с warning. Ключ должен быть закреплён, иначе подключение
     не должно проходить.
+
+### Issue #5: Косметика и грубые эвристики
+- **Файлы:** `crates/transport/src/ssh.rs`, `crates/agent/src/security.rs`
+- **Часть A — лишняя пустая строка в выводе:**
+  - **Проблема:** printf-маркер использует ведущий `\n` для надёжного детекта
+    начала строки. Этот `\n` попадал в output как лишний хвостовой перевод строки.
+  - **Фикс:** после извлечения `output` из буфера срезаем ровно один хвостовой
+    `\n` через `strip_suffix('\n')` — синтетический от printf, не трогая вывод команды.
+  - **Критерий:** `run("echo hi")` даёт `stdout == "hi\n"` без второго пустого ряда.
+- **Часть B — грубый `writes_to_system_path`:**
+  - **Проблема:** функция проверяла «где-то после `>`» встречается ли системный путь.
+    Ложное срабатывание: `grep x > /tmp/a; cat /etc/passwd` → true (из-за `/etc/`
+    в read-части, а не в redirect).
+  - **Фикс:** переписана — теперь разделяет по `;&|&`, находит каждый `>` или `>>`,
+    извлекает **непосредственно следующий токен** (цель редиректа) и проверяет
+    только его. `/dev/null` исключён (null device, не системный путь).
+  - **Критерий:** `writes_to_system_path("echo foo > /etc/passwd") == true`,
+    `writes_to_system_path("grep x > /tmp/a; cat /etc/passwd") == false`.
+- **Тесты:** `detect_system_redirect` обновлён — 7 кейсов (включая `/dev/null`
+  исключение, `>>` append, system path в read-части, `/dev/sda` device).
+- **Публичные контракты:** без изменений.
+- Total: 70 tests pass, 0 fail, 5 ignored (Docker).
