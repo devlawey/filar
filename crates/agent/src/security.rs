@@ -79,24 +79,68 @@ pub fn is_destructive(command: &str) -> bool {
 }
 
 /// Check whether a command writes to a system path (potential destruction).
+///
+/// Only checks the **immediate target** of each redirect operator (`>` or `>>`),
+/// not system paths that appear elsewhere in the command. This prevents false
+/// positives like `grep x > /tmp/a; cat /etc/passwd` where `/etc/passwd` is a
+/// read target, not a write target.
 fn writes_to_system_path(command: &str) -> bool {
     let lower = command.to_lowercase();
-    // Clean harmless redirects to /dev/null and stderr/stdout duplication.
-    let cleaned = lower
-        .replace("2>/dev/null", "")
-        .replace("1>/dev/null", "")
-        .replace(">/dev/null", "")
-        .replace("&>/dev/null", "")
-        .replace("2>&1", "")
-        .replace("1>&2", "");
+    // Remove non-redirect patterns that contain > (=>, ->, >=).
+    let cleaned = lower.replace("=>", "").replace("->", "").replace(">=", "");
+
     let system_paths = ["/etc/", "/boot/", "/sys/", "/proc/", "/dev/", "/usr/", "/lib/"];
-    // Look for redirect patterns: > /path  or >> /path
-    if let Some(idx) = cleaned.find('>') {
-        let after = &cleaned[idx..];
-        system_paths.iter().any(|p| after.contains(p))
-    } else {
-        false
+
+    // Split by shell operators to process each sub-command independently.
+    for sub in cleaned.split([';', '|', '&']) {
+        let sub = sub.trim();
+        // Use char_indices() for byte-safe offsets — sub[...] slicing requires
+        // byte positions, not character positions. Non-ASCII text before '>'
+        // would otherwise cause a panic or incorrect extraction.
+        let indices: Vec<(usize, char)> = sub.char_indices().collect();
+        let mut i = 0;
+        while i < indices.len() {
+            if indices[i].1 == '>' {
+                // Skip second '>' for '>>' append operator.
+                let mut target_start = i + 1;
+                if target_start < indices.len() && indices[target_start].1 == '>' {
+                    target_start += 1;
+                }
+                // Skip whitespace after redirect operator.
+                while target_start < indices.len() && indices[target_start].1.is_whitespace() {
+                    target_start += 1;
+                }
+                // Extract the target token (up to next whitespace or end).
+                let mut target_end = target_start;
+                while target_end < indices.len() && !indices[target_end].1.is_whitespace() {
+                    target_end += 1;
+                }
+                if target_end > target_start {
+                    // Use byte offsets for slicing.
+                    let byte_start = indices[target_start].0;
+                    let byte_end = if target_end < indices.len() {
+                        indices[target_end].0
+                    } else {
+                        sub.len()
+                    };
+                    let target = &sub[byte_start..byte_end];
+                    // Strip surrounding shell quotes so that
+                    // `echo foo >"/etc/passwd"` is still caught.
+                    let target = target.trim_matches(|c| c == '"' || c == '\'');
+                    // /dev/null is a null device, not a real system path write.
+                    if target != "/dev/null" {
+                        if system_paths.iter().any(|p| target.starts_with(p)) {
+                            return true;
+                        }
+                    }
+                }
+                i = target_end;
+            } else {
+                i += 1;
+            }
+        }
     }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +401,21 @@ mod tests {
         assert!(writes_to_system_path("echo foo > /etc/passwd"));
         assert!(writes_to_system_path("echo bar >> /boot/grub.cfg"));
         assert!(!writes_to_system_path("echo foo > /tmp/test"));
+        // /dev/null is a null device, not a real system path write.
+        assert!(!writes_to_system_path("echo foo > /dev/null"));
+        assert!(!writes_to_system_path("echo foo 2>/dev/null"));
+        // System path in a *read* sub-command must not trigger.
+        assert!(!writes_to_system_path("grep x > /tmp/a; cat /etc/passwd"));
+        // /dev/sda is a real device — should be flagged.
+        assert!(writes_to_system_path("dd if=/dev/zero > /dev/sda"));
+        // Append to system path.
+        assert!(writes_to_system_path("echo bad >> /etc/passwd"));
+        // Quoted redirect targets must still be caught.
+        assert!(writes_to_system_path("echo foo >\"/etc/passwd\""));
+        assert!(writes_to_system_path("echo foo >>'/etc/passwd'"));
+        // Non-ASCII before '>' must not panic (byte-safe indexing).
+        assert!(writes_to_system_path("echo привет > /etc/passwd"));
+        assert!(!writes_to_system_path("echo привет > /tmp/test"));
     }
 
     #[test]

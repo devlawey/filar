@@ -694,6 +694,13 @@ async fn recv_until_marker(
                                 let line_start =
                                     buf[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
                                 let output = buf[..line_start].to_string();
+                                // Strip the synthetic trailing newline added by the
+                                // printf marker's leading '\n'. This removes
+                                // exactly one '\n' — not the command's own output.
+                                let output = output
+                                    .strip_suffix('\n')
+                                    .map(str::to_string)
+                                    .unwrap_or(output);
 
                                 // Drain any trailing stderr that may still be
                                 // in the event pipeline. Without this, late
