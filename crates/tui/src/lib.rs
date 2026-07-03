@@ -21,3 +21,4 @@ pub use event::AgentEvent;
 pub use runner::{run, TuiConfig};
 pub use terminal::{key_to_bytes, TerminalModel};
 pub use filar_core::ChatBlock;
+pub use ui::Theme;

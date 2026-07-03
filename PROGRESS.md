@@ -69,7 +69,7 @@ c:\dev\warper\
 │   │   └── src/{lib,glm,agent,tools,security}.rs
 │   ├── tui/                # ratatui + crossterm TUI + terminal emulator — ГОТОВ
 │   │   ├── Cargo.toml
-│   │   └── src/{lib,app,ui,event,confirmer,runner,terminal}.rs
+│   │   └── src/{lib,app,ui/mod,ui/theme,ui/text,ui/bars,ui/chat,ui/input,event,confirmer,runner,terminal}.rs
 │   ├── gui/                # GUI-лаунчер на eframe + keyring — ГОТОВ
 │   │   ├── Cargo.toml
 │   │   └── src/lib.rs
@@ -506,3 +506,39 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
   вывода команд (`must NOT be translated`).
 - **Публичные контракты:** без изменений — `build_system_prompt` сигнатура та же.
 - Total: 71 tests pass, 0 fail, 5 ignored (Docker).
+
+### Issue #13: TUI — модуль темы и рефакторинг рендера
+- **Файлы:**
+  - `crates/tui/src/ui.rs` → удалён, разбит на модуль `crates/tui/src/ui/`
+  - `crates/tui/src/ui/mod.rs` — `pub fn render()` + layout + `render_interactive()`
+  - `crates/tui/src/ui/theme.rs` — `Theme` struct, `default_dark()`, хелперы стилей
+  - `crates/tui/src/ui/text.rs` — `strip_emoji`, `wrap_text` (перенесены без изменений)
+  - `crates/tui/src/ui/bars.rs` — `render_status_bar`, `render_help_bar`
+  - `crates/tui/src/ui/chat.rs` — `render_chat_history`
+  - `crates/tui/src/ui/input.rs` — `render_input_area` (Normal, Thinking, Confirming, PasswordInput)
+  - `crates/tui/src/app.rs` — добавлено поле `pub theme: Theme`
+  - `crates/tui/src/lib.rs` — реэкспорт `Theme`
+  - `crates/tui/src/runner.rs`, `crates/tui/src/terminal.rs` — pre-existing clippy фиксы
+- **Что сделано:**
+  - Создан `Theme` struct с 10 семантическими токенами (bg, fg, fg_dim, fg_muted,
+    accent, success, warning, danger, surface, selection_bg).
+  - `Theme::default_dark()` — единая точка цветов для всего UI.
+  - Хелперы: `user_style()`, `agent_style()`, `error_style()`, `command_style()`,
+    `muted()`, `dim()`, `fg_style()`, `surface_style()`, `help_bar_style()`,
+    `target_badge_style()`, `mode_badge_style()`, `mode_color()`.
+  - `ui.rs` (440 строк) разбит на 5 модулей по зоне ответственности.
+  - Все `Color::*` литералы — только в `theme.rs` (DoD: ни одного вне).
+  - Экземпляр темы хранится в `App.theme`, рендереры обращаются к `app.theme.*`.
+- **Решение по Magenta:** Interactive и PasswordInput режимы раньше использовали
+  `Color::Magenta`. По дизайн-философии (§2: «один акцентный цвет») они переведены
+  на `accent` (Cyan). Это единственное видимое изменение — зафиксировано в доке
+  `theme.rs` и в тесте `mode_color_mapping`.
+- **Pre-existing clippy фиксы** (не часть issue, но нужны для DoD `cargo clippy -D warnings`):
+  - `app.rs`: `manual_strip` → `strip_prefix`, `collapsible_match` → вложенный паттерн
+  - `runner.rs`: `manual_strip` → `strip_prefix`, `too_many_arguments` → `#[allow]`
+  - `terminal.rs`: `map_or(false,…)` → `is_some_and(…)`, `unnecessary_cast` → убраны
+- **Тесты:** 3 новых в `theme.rs` (colors, mode_color, style_helpers), 5 в `text.rs`
+  (strip_emoji, wrap_text). Total: 24 tui tests pass.
+- **Публичные контракты:** `Theme` реэкспортирован из `filar-tui`. `App` получил
+  новое поле `theme` (backward-incompatible для ручной инициализации, но `App::new()`
+  и `App::with_history()` работают без изменений).

@@ -143,7 +143,7 @@ impl TerminalModel {
                 }
 
                 // Determine if this is the cursor cell.
-                let is_cursor = cursor.map_or(false, |(c, r)| c as usize == col && r as usize == row);
+                let is_cursor = cursor.is_some_and(|(c, r)| c as usize == col && r as usize == row);
 
                 let (fg, bg) = cell_colors(cell, is_cursor);
                 let style = build_style(cell.flags, fg, bg);
@@ -181,7 +181,7 @@ impl TerminalModel {
 
         // Set the cursor position if visible.
         if let Some((col, row)) = cursor {
-            if (col as u16) < area.width && (row as u16) < area.height {
+            if col < area.width && row < area.height {
                 frame.set_cursor_position((area.x + col, area.y + row));
             }
         }
