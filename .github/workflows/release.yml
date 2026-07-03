@@ -1,0 +1,42 @@
+name: Release build (Windows)
+
+# Триггер — ПУБЛИКАЦИЯ релиза через интерфейс GitHub.
+# Флоу: Releases → "Draft a new release" → выбираешь/создаёшь тег (например v0.1.1)
+#       → жмёшь "Generate release notes" (GitHub сам соберёт список из PR)
+#       → "Publish release".
+# Публикация запускает этот workflow: он собирает Windows-бинарник и прикладывает
+# его к тому же релизу как файл для скачивания.
+on:
+  release:
+    types: [published]
+
+# Нужно право записи в содержимое репозитория, чтобы загрузить файл в релиз.
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code (at the release tag)
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --package filar-app
+
+      - name: Package binary with version in the name
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.release.tag_name }}"
+          Copy-Item "target/release/filar.exe" "filar-$tag-windows-x86_64.exe"
+
+      - name: Attach binary to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: filar-*-windows-x86_64.exe
