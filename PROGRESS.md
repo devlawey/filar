@@ -489,3 +489,20 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
     распознаётся как запись в системный путь.
   - Тесты расширены: quoted paths (`"/etc/passwd"`, `'/etc/passwd'`) и
     non-ASCII перед `>` (`echo привет > /etc/passwd`).
+
+### Issue #6: Отвечать на языке исходного запроса
+- **Файл:** `crates/agent/src/agent.rs`, функция `build_system_prompt`
+- **Проблема:** язык ответа жёстко зашит как русский в двух местах промпта:
+  строка `Always respond in Russian` и правило №6 `final answer in Russian`.
+- **Фикс:**
+  - Удалены обе зашитые ссылки на русский.
+  - Вместо `Always respond in Russian` — инструкция зеркалирования: определить
+    язык **первого** запроса пользователя и писать все пояснения, сводки,
+    вопросы и финальный ответ на том же языке. Сырой вывод команд
+    (stdout/stderr) не переводится — только prose агента.
+  - Правило №6: `final answer in the user's language` вместо `in Russian`.
+- **Тест:** `prompt_mirrors_user_language` — проверяет отсутствие `Russian`
+  в промпте, наличие `user's` + `same language`, и оговорку про неперевод
+  вывода команд (`must NOT be translated`).
+- **Публичные контракты:** без изменений — `build_system_prompt` сигнатура та же.
+- Total: 71 tests pass, 0 fail, 5 ignored (Docker).
