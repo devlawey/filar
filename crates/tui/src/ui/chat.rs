@@ -38,6 +38,14 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
     // Compute visible slice from cached lines.
     let total_lines = app.layout_cache.lines.len();
     let visible_height = area.height.saturating_sub(2) as usize; // -2 for border
+
+    // Definitive scroll clamp — the render path knows the exact visible_height
+    // and has just rebuilt the cache, so this is the authoritative clamp.
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    if app.scroll > max_scroll {
+        app.scroll = max_scroll;
+    }
+
     let skip = if total_lines > visible_height {
         total_lines.saturating_sub(visible_height + app.scroll)
     } else {
@@ -61,4 +69,23 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
 
     let paragraph = Paragraph::new(visible_lines).block(block);
     f.render_widget(paragraph, area);
+
+    // "↓ N new" indicator — shown when the user has scrolled up from the bottom.
+    // N is the number of lines below the viewport (= scroll after clamping).
+    if app.scroll > 0 && area.height >= 3 && area.width >= 3 {
+        let indicator = format!("\u{2193} {} new", app.scroll);
+        let indicator_width = indicator.len() as u16;
+        let inner_width = area.width.saturating_sub(2);
+        let indicator_width = indicator_width.min(inner_width);
+        let indicator_area = Rect::new(
+            area.x + area.width.saturating_sub(1 + indicator_width),
+            area.y + area.height.saturating_sub(2),
+            indicator_width,
+            1,
+        );
+        f.render_widget(
+            Paragraph::new(indicator).style(app.theme.muted()),
+            indicator_area,
+        );
+    }
 }

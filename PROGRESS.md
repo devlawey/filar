@@ -589,3 +589,36 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
     `AgentEvent::Error`, `AgentEvent::CommandExecuted` (in-place update),
     `respond_to_confirmation` (via handle_key 'a' in Confirming mode).
   Total: 37 tui tests pass.
+
+### Issue #15: TUI — захват мыши и скролл колесом
+- **Файлы:**
+  - `crates/tui/src/runner.rs` — `EnableMouseCapture`/`DisableMouseCapture` в init/teardown;
+    обработка `Event::Mouse(m)` в event loop
+  - `crates/tui/src/app.rs` — `handle_mouse()`, `clamp_scroll()`; `End` key при пустом
+    вводе сбрасывает scroll; `End` добавлен в Thinking/Confirming; `clamp_scroll()` после PageUp
+  - `crates/tui/src/ui/chat.rs` — definitive scroll clamp в render; индикатор `↓ N new`
+    в правом нижнем углу chat area (тусклый цвет `theme.fg_muted`)
+- **Что сделано:**
+  - Mouse capture включается при старте и выключается при выходе (оба пути,
+    включая ошибочный) — OS text selection работает после закрытия приложения.
+  - `handle_mouse()`: `ScrollUp` → scroll += 3, `ScrollDown` → scroll -= 3;
+    только внутри `chat_area`; игнорируется в Interactive/PasswordInput.
+  - `clamp_scroll()`: clamp к `layout_cache.lines.len().saturating_sub(visible_height)` —
+    нельзя укрутить в пустоту. Вызывается после mouse wheel и PageUp.
+    Дублируется в `render_chat_history` для definitive clamp (точный visible_height).
+  - `End` key: при пустом вводе → scroll = 0 (Normal/Thinking/Confirming);
+    при непустом вводе в Normal → cursor в конец (как раньше).
+  - Индикатор `↓ N new` где N = scroll (после clamp) — количество строк ниже вьюпорта.
+- **Решения:**
+  - `↓` (U+2193) — basic Unicode, рендерится в Windows Terminal и conhost.
+    Glyphs-struct fallback (DESIGN_PHILOSOPHY §7) — отдельная задача, не эта.
+  - `clamp_scroll` использует `chat_area` и `layout_cache.lines` из последнего рендера —
+    best-effort; definitive clamp в render использует точные значения.
+  - Mouse events за пределами `chat_area` игнорируются (не клики по input/help bar).
+- **Тесты:** 11 новых в `app.rs`: scroll up/down, clamp to max/zero, ignored outside
+  chat area, ignored in Interactive, End key (empty/nonempty input, Thinking,
+  Confirming), PageUp clamp. Total: 48 tui tests pass.
+- **Публичные контракты:** `App::handle_mouse()` — новый public метод (для runner).
+  `clamp_scroll()` — приватный. End key в Normal изменил поведение: пустой ввод →
+  scroll reset вместо cursor-to-end (backward-incompatible, но старый behavior
+  остаётся при непустом вводе).

@@ -9,7 +9,7 @@ use std::io::{self, Stdout};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream};
+use crossterm::event::{EnableMouseCapture, DisableMouseCapture, Event, EventStream};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -142,7 +142,7 @@ pub async fn run(
     // Set up terminal.
     enable_raw_mode().map_err(|e| CoreError::Other(format!("failed to enable raw mode: {e}")))?;
     let mut stdout = io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen)
+    crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
         .map_err(|e| CoreError::Other(format!("failed to enter alternate screen: {e}")))?;
 
     let backend = CrosstermBackend::new(stdout);
@@ -153,7 +153,7 @@ pub async fn run(
 
     // Restore terminal.
     disable_raw_mode().ok();
-    crossterm::execute!(io::stdout(), LeaveAlternateScreen).ok();
+    crossterm::execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen).ok();
 
     result
 }
@@ -233,6 +233,10 @@ async fn run_app(
                                 let _ = term.resize(term_cols, term_rows).await;
                             }
                         }
+                        needs_redraw = true;
+                    }
+                    Some(Ok(Event::Mouse(m))) => {
+                        app.handle_mouse(m);
                         needs_redraw = true;
                     }
                     Some(Ok(_)) => {} // ignore other events
