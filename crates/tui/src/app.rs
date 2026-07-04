@@ -9,6 +9,7 @@ use filar_core::{ChatBlock, CommandConfirmMode};
 
 use crate::event::AgentEvent;
 use crate::terminal::{key_to_bytes, TerminalModel};
+use crate::ui::Theme;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -93,6 +94,8 @@ pub struct App {
     pub pending_ssh: Option<(String, String, u16)>,
     /// Pending SSH password entered by the user via Ctrl+P.
     pub pending_ssh_password: Option<String>,
+    /// Colour theme used by the UI renderer.
+    pub theme: Theme,
 }
 
 impl App {
@@ -122,6 +125,7 @@ impl App {
             saved_input: String::new(),
             pending_ssh: None,
             pending_ssh_password: None,
+            theme: Theme::default_dark(),
         }
     }
 
@@ -165,8 +169,8 @@ impl App {
                             self.input_history.push(text.clone());
                         }
                         self.history_pos = None;
-                        if text.starts_with('!') {
-                            let cmd = text[1..].trim().to_string();
+                        if let Some(stripped) = text.strip_prefix('!') {
+                            let cmd = stripped.trim().to_string();
                             if !cmd.is_empty() {
                                 // Check if this is an SSH connection command.
                                 if let Some((user, host, port)) = parse_ssh_command(&cmd) {
@@ -478,19 +482,17 @@ impl App {
             } => {
                 // Try to update the last matching Command block with output.
                 let mut updated = false;
-                if let Some(last) = self.messages.last_mut() {
-                    if let ChatBlock::Command {
-                        command: ref cmd,
-                        output: ref mut o,
-                        approved: ref mut a,
-                        ..
-                    } = last
-                    {
-                        if *cmd == command && o.is_none() {
-                            *o = Some(output.clone());
-                            *a = approved;
-                            updated = true;
-                        }
+                if let Some(ChatBlock::Command {
+                    command: ref cmd,
+                    output: ref mut o,
+                    approved: ref mut a,
+                    ..
+                }) = self.messages.last_mut()
+                {
+                    if *cmd == command && o.is_none() {
+                        *o = Some(output.clone());
+                        *a = approved;
+                        updated = true;
                     }
                 }
                 if !updated {

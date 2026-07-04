@@ -291,9 +291,9 @@ async fn run_app(
 
                 // Check if user sent input — spawn agent or execute shell escape.
                 if let Some(user_input) = app.take_input() {
-                    if user_input.starts_with('!') {
+                    if let Some(stripped) = user_input.strip_prefix('!') {
                         // Shell escape: execute command directly without agent.
-                        let cmd = user_input[1..].trim().to_string();
+                        let cmd = stripped.trim().to_string();
                         if !cmd.is_empty() {
                             let exec = tui_executor.clone();
                             let tx = agent_tx.clone();
@@ -481,6 +481,7 @@ async fn run_app(
 }
 
 /// Spawn the agent in a tokio task to process the user's input.
+#[allow(clippy::too_many_arguments)]
 fn spawn_agent(
     llm: Arc<dyn LlmClient>,
     executor: Arc<dyn CommandExecutor>,
