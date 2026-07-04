@@ -154,6 +154,10 @@ pub struct App {
     pub status_bar_area: Rect,
     /// Help bar area (set during render, for hit-testing).
     pub help_bar_area: Rect,
+    /// Currently selected confirm button: `false` = Deny (safe default), `true` = Approve.
+    pub confirm_selected: bool,
+    /// Button under mouse cursor during hover (`Some(true)` = Approve, `Some(false)` = Deny).
+    pub hovered_button: Option<bool>,
 }
 
 impl App {
@@ -193,6 +197,8 @@ impl App {
             indicator_area: Rect::default(),
             status_bar_area: Rect::default(),
             help_bar_area: Rect::default(),
+            confirm_selected: false,
+            hovered_button: None,
         }
     }
 
@@ -423,8 +429,15 @@ impl App {
                 }
             }
             AppMode::Confirming => match key.code {
-                KeyCode::Enter
-                | KeyCode::Char('a') | KeyCode::Char('y') | KeyCode::Char('e')
+                KeyCode::Enter => {
+                    // Enter activates the selected button (default Deny — safe).
+                    self.respond_to_confirmation(self.confirm_selected);
+                }
+                KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
+                    // Toggle between Approve and Deny.
+                    self.confirm_selected = !self.confirm_selected;
+                }
+                KeyCode::Char('a') | KeyCode::Char('y') | KeyCode::Char('e')
                 | KeyCode::Char('ф') | KeyCode::Char('н') | KeyCode::Char('у') => {
                     self.respond_to_confirmation(true);
                 }
@@ -600,6 +613,9 @@ impl App {
                 HitZone::Input if self.mode == AppMode::Normal => {
                     self.set_cursor_from_click(m.column, m.row);
                 }
+                HitZone::ConfirmButton(approve) => {
+                    self.respond_to_confirmation(approve);
+                }
                 _ => {}
             },
             // --- Drag ---
@@ -612,6 +628,15 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 self.mouse_drag = None;
             }
+            // --- Hover (track which button is under cursor) ---
+            MouseEventKind::Moved => {
+                if let HitZone::ConfirmButton(approve) = zone {
+                    self.hovered_button = Some(approve);
+                    self.confirm_selected = approve;
+                } else {
+                    self.hovered_button = None;
+                }
+            }
             _ => {}
         }
     }
@@ -621,7 +646,18 @@ impl App {
     /// Uses the last-known areas (filled during render).  The caller is
     /// responsible for acting on the result.
     fn hit_test(&self, col: u16, row: u16) -> HitZone {
-        // --- ↓ N new indicator (check first — it overlays the chat area) ---
+        // --- Confirm buttons (check first — modal overlays everything) ---
+        for (rect, approved) in &self.confirm_button_areas {
+            if col >= rect.x
+                && col < rect.x + rect.width
+                && row >= rect.y
+                && row < rect.y + rect.height
+            {
+                return HitZone::ConfirmButton(*approved);
+            }
+        }
+
+        // --- ↓ N new indicator (overlays the chat area) ---
         if self.indicator_area.width > 0
             && col >= self.indicator_area.x
             && col < self.indicator_area.x + self.indicator_area.width
@@ -696,16 +732,7 @@ impl App {
             return HitZone::HelpBar;
         }
 
-        // --- Confirm buttons (future — areas not yet populated) ---
-        for (rect, approved) in &self.confirm_button_areas {
-            if col >= rect.x
-                && col < rect.x + rect.width
-                && row >= rect.y
-                && row < rect.y + rect.height
-            {
-                return HitZone::ConfirmButton(*approved);
-            }
-        }
+        // --- Confirm buttons (checked at top of hit_test — see above) ---
 
         HitZone::Outside
     }
@@ -788,6 +815,8 @@ impl App {
                     respond_to,
                 });
                 self.mode = AppMode::Confirming;
+                // Reset selection to safe default (Deny).
+                self.confirm_selected = false;
             }
             AgentEvent::CommandExecuted {
                 command,
@@ -1596,5 +1625,257 @@ mod tests {
             27,
         ));
         assert_eq!(app.cursor_pos, 0); // no change in Thinking mode
+    }
+
+    // ----- Confirm modal tests (issue #17) -----
+
+    /// Helper: set up an app in Confirming mode with a pending confirmation.
+    fn make_confirm_app(destructive: bool) -> App {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let (_tx, rx) = oneshot::channel::<bool>();
+        // We need the tx to stay alive so respond_to doesn't fail silently;
+        // but for tests we just check mode/message changes.
+        // Use a fresh sender that we drop to simulate a real channel.
+        let (tx, _rx2) = oneshot::channel::<bool>();
+        app.pending_confirm = Some(PendingConfirm {
+            command: "rm -rf /tmp/test".into(),
+            explanation: "cleanup".into(),
+            destructive,
+            respond_to: tx,
+        });
+        app.mode = AppMode::Confirming;
+        app.confirm_selected = false; // safe default
+        app
+    }
+
+    /// Helper: create a key event.
+    fn key_event(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn confirm_selected_defaults_to_deny() {
+        let app = make_confirm_app(false);
+        assert!(!app.confirm_selected, "default should be Deny (false)");
+    }
+
+    #[test]
+    fn tab_toggles_confirm_selected() {
+        let mut app = make_confirm_app(false);
+        assert!(!app.confirm_selected);
+        app.handle_key(key_event(crossterm::event::KeyCode::Tab));
+        assert!(app.confirm_selected, "Tab should toggle to Approve");
+        app.handle_key(key_event(crossterm::event::KeyCode::Tab));
+        assert!(!app.confirm_selected, "Tab should toggle back to Deny");
+    }
+
+    #[test]
+    fn left_arrow_toggles_confirm_selected() {
+        let mut app = make_confirm_app(false);
+        app.handle_key(key_event(crossterm::event::KeyCode::Left));
+        assert!(app.confirm_selected);
+        app.handle_key(key_event(crossterm::event::KeyCode::Left));
+        assert!(!app.confirm_selected);
+    }
+
+    #[test]
+    fn right_arrow_toggles_confirm_selected() {
+        let mut app = make_confirm_app(false);
+        app.handle_key(key_event(crossterm::event::KeyCode::Right));
+        assert!(app.confirm_selected);
+    }
+
+    #[test]
+    fn enter_activates_selected_default_deny() {
+        let mut app = make_confirm_app(false);
+        // Default is Deny → Enter should deny.
+        app.handle_key(key_event(crossterm::event::KeyCode::Enter));
+        assert_eq!(app.mode, AppMode::Thinking);
+        assert!(app.pending_confirm.is_none());
+        // Last message should be a Command with approved=false.
+        if let Some(ChatBlock::Command { approved, .. }) = app.messages.last() {
+            assert!(!*approved, "Enter on default Deny should deny");
+        } else {
+            panic!("expected Command block");
+        }
+    }
+
+    #[test]
+    fn enter_after_tab_activates_approve() {
+        let mut app = make_confirm_app(false);
+        app.handle_key(key_event(crossterm::event::KeyCode::Tab));
+        assert!(app.confirm_selected);
+        app.handle_key(key_event(crossterm::event::KeyCode::Enter));
+        assert_eq!(app.mode, AppMode::Thinking);
+        if let Some(ChatBlock::Command { approved, .. }) = app.messages.last() {
+            assert!(*approved, "Enter after Tab should approve");
+        } else {
+            panic!("expected Command block");
+        }
+    }
+
+    #[test]
+    fn letter_a_approves_directly() {
+        let mut app = make_confirm_app(false);
+        app.handle_key(key_event(crossterm::event::KeyCode::Char('a')));
+        assert_eq!(app.mode, AppMode::Thinking);
+        if let Some(ChatBlock::Command { approved, .. }) = app.messages.last() {
+            assert!(*approved);
+        } else {
+            panic!("expected Command block");
+        }
+    }
+
+    #[test]
+    fn letter_d_denies_directly() {
+        let mut app = make_confirm_app(false);
+        app.handle_key(key_event(crossterm::event::KeyCode::Char('d')));
+        assert_eq!(app.mode, AppMode::Thinking);
+        if let Some(ChatBlock::Command { approved, .. }) = app.messages.last() {
+            assert!(!*approved);
+        } else {
+            panic!("expected Command block");
+        }
+    }
+
+    #[test]
+    fn russian_layout_approve() {
+        let mut app = make_confirm_app(false);
+        // ф = a in ЙЦУКЕН layout
+        app.handle_key(key_event(crossterm::event::KeyCode::Char('ф')));
+        assert_eq!(app.mode, AppMode::Thinking);
+        if let Some(ChatBlock::Command { approved, .. }) = app.messages.last() {
+            assert!(*approved);
+        } else {
+            panic!("expected Command block");
+        }
+    }
+
+    #[test]
+    fn russian_layout_deny() {
+        let mut app = make_confirm_app(false);
+        // в = d in ЙЦУКЕН layout
+        app.handle_key(key_event(crossterm::event::KeyCode::Char('в')));
+        assert_eq!(app.mode, AppMode::Thinking);
+        if let Some(ChatBlock::Command { approved, .. }) = app.messages.last() {
+            assert!(!*approved);
+        } else {
+            panic!("expected Command block");
+        }
+    }
+
+    #[test]
+    fn ctrl_c_denies_and_quits() {
+        let mut app = make_confirm_app(false);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert!(app.should_quit);
+        assert_eq!(app.mode, AppMode::Thinking);
+        if let Some(ChatBlock::Command { approved, .. }) = app.messages.last() {
+            assert!(!*approved, "Ctrl+C should deny");
+        } else {
+            panic!("expected Command block");
+        }
+    }
+
+    #[test]
+    fn confirm_selected_resets_on_new_request() {
+        let mut app = make_confirm_app(false);
+        // Toggle to Approve.
+        app.handle_key(key_event(crossterm::event::KeyCode::Tab));
+        assert!(app.confirm_selected);
+        // Simulate a new confirmation request.
+        let (tx, _rx) = oneshot::channel::<bool>();
+        app.handle_agent_event(AgentEvent::ConfirmationRequest {
+            command: "ls".into(),
+            explanation: "list".into(),
+            destructive: false,
+            respond_to: tx,
+        });
+        assert!(!app.confirm_selected, "new request should reset to Deny");
+    }
+
+    #[test]
+    fn mouse_click_approve_button() {
+        let mut app = make_confirm_app(false);
+        // Simulate button areas (set during render).
+        // Approve button at col 20-34, row 10.
+        app.confirm_button_areas.push((Rect::new(20, 10, 15, 1), true));
+        // Deny button at col 38-50, row 10.
+        app.confirm_button_areas.push((Rect::new(38, 10, 13, 1), false));
+        // Click on Approve.
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            25,
+            10,
+        ));
+        assert_eq!(app.mode, AppMode::Thinking);
+        if let Some(ChatBlock::Command { approved, .. }) = app.messages.last() {
+            assert!(*approved, "clicking Approve should approve");
+        } else {
+            panic!("expected Command block");
+        }
+    }
+
+    #[test]
+    fn mouse_click_deny_button() {
+        let mut app = make_confirm_app(false);
+        app.confirm_button_areas.push((Rect::new(20, 10, 15, 1), true));
+        app.confirm_button_areas.push((Rect::new(38, 10, 13, 1), false));
+        // Click on Deny.
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            42,
+            10,
+        ));
+        assert_eq!(app.mode, AppMode::Thinking);
+        if let Some(ChatBlock::Command { approved, .. }) = app.messages.last() {
+            assert!(!*approved, "clicking Deny should deny");
+        } else {
+            panic!("expected Command block");
+        }
+    }
+
+    #[test]
+    fn mouse_hover_updates_selected() {
+        let mut app = make_confirm_app(false);
+        app.confirm_button_areas.push((Rect::new(20, 10, 15, 1), true));
+        app.confirm_button_areas.push((Rect::new(38, 10, 13, 1), false));
+        // Hover over Approve.
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Moved,
+            25,
+            10,
+        ));
+        assert_eq!(app.hovered_button, Some(true));
+        assert!(app.confirm_selected, "hover on Approve should move selection");
+        // Hover over Deny.
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Moved,
+            42,
+            10,
+        ));
+        assert_eq!(app.hovered_button, Some(false));
+        assert!(!app.confirm_selected);
+        // Hover outside buttons.
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Moved,
+            0,
+            0,
+        ));
+        assert_eq!(app.hovered_button, None);
+    }
+
+    #[test]
+    fn hit_test_confirm_button_overrides_chat() {
+        let mut app = make_hit_test_app();
+        app.mode = AppMode::Confirming;
+        // Place a confirm button over the chat area.
+        app.confirm_button_areas.push((Rect::new(5, 5, 15, 1), true));
+        // Hit-test at a point inside the button — should be ConfirmButton, not Chat.
+        let zone = app.hit_test(7, 5);
+        assert_eq!(zone, HitZone::ConfirmButton(true));
     }
 }

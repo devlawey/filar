@@ -48,7 +48,7 @@ pub(crate) fn render_help_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let help_text = match app.mode {
         AppMode::Normal => " Enter=Send | !=Shell | Ctrl+T=Terminal | Ctrl+P=Password | Ctrl+C=Quit",
         AppMode::Thinking => " Ctrl+C=Quit | PgUp/PgDn=Scroll",
-        AppMode::Confirming => " a/y/e=Approve | d/n=Deny | Ctrl+C=Quit",
+        AppMode::Confirming => " Tab=Switch | Enter=Confirm | a/y=Approve | d/n=Deny | Ctrl+C=Quit",
         AppMode::Interactive => " Ctrl+T=Agent mode | (terminal input is forwarded)",
         AppMode::PasswordInput => " Enter=Send password | Esc=Cancel | Ctrl+C=Cancel",
     };

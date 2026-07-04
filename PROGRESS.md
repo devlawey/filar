@@ -665,3 +665,47 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
   - Fixed `update_scrollbar_drag` divisor: `visible_height` → `visible_height - 1`
     (track span). Old formula prevented thumb from reaching `scroll = 0` at bottom.
     Updated test to assert `scroll == 0` at bottom.
+
+## Issue #17: TUI: модальное подтверждение команд с кликабельными кнопками
+
+PR: #28
+
+**Задача:** Заменить текстовое подтверждение в нижней панели на центрированный
+модальный диалог с кликабельными кнопками Approve / Deny.
+
+**Файлы:**
+- `crates/tui/src/ui/confirm.rs` — НОВЫЙ модуль: рендеринг модального диалога
+  (Block с Rounded borders, Clear под ним, кнопки с hit-test areas)
+- `crates/tui/src/app.rs` — новые поля `confirm_selected` (bool, default false=Deny)
+  и `hovered_button` (Option<bool>); обновлён `handle_key` (Enter → активирует
+  selected, Tab/←/→ → toggle); обновлён `handle_mouse` (click на кнопку →
+  respond, Moved → hover tracking); `hit_test` — confirm buttons проверяются
+  первыми (поверх всего); `confirm_selected` сбрасывается при новом
+  ConfirmationRequest
+- `crates/tui/src/ui/mod.rs` — `mod confirm;`, рендер модала после всех зон
+  если mode == Confirming
+- `crates/tui/src/ui/input.rs` — `render_confirm` показывает приглушённый
+  `waiting for confirmation…` (layout не прыгает); убраны старые импорты
+  `Line`/`Span`
+- `crates/tui/src/ui/bars.rs` — help-bar для Confirming: `Tab=Switch | Enter=Confirm | a/y=Approve | d/n=Deny | Ctrl+C=Quit`
+
+**Решения:**
+- Enter теперь активирует выделенную кнопку (дефолт Deny) — согласованное
+  изменение из DESIGN_PHILOSOPHY §6. Безопаснее, чем безусловный approve.
+- Hover перемещает selection на кнопку под курсором — интуитивный UX.
+- `confirm_button_areas` проверяются в `hit_test` первыми — модал поверх всего.
+- Кнопки: `[ Approve (a) ]` / `[ Deny (d) ]`, inversion (fg↔bg) для выбранной,
+  `theme.surface` bg для невыбранной. 3 пробела между кнопками.
+- Рамка: `BorderType::Rounded`, `danger` для destructive, `warning` иначе.
+- Title: ` Confirm command ` (ASCII-safe, без `⚠`).
+
+**Тесты:** 16 новых в `app.rs`: confirm_selected defaults, Tab/Left/Right toggle,
+  Enter activates selected (default deny, after tab approve), letter hotkeys
+  (a/d, Russian ф/в), Ctrl+C denies+quits, confirm_selected resets on new
+  request, mouse click Approve/Deny, mouse hover updates selected, hit_test
+  confirm button overrides chat. Total: 81 tui tests.
+
+**Публичные контракты:** `App` получил 2 новых поля: `confirm_selected: bool`,
+  `hovered_button: Option<bool>`. Новый модуль `ui::confirm`.
+  `render_confirm` в `input.rs` больше не рисует диалог — только muted placeholder.
+  Help-bar текст для Confirming изменён.
