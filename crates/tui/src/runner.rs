@@ -201,7 +201,7 @@ async fn run_app(
     let mut interactive_term: Option<Arc<dyn InteractiveTerminal>> = None;
 
     // Draw initial UI.
-    terminal.draw(|f| ui::render(f, &app)).ok();
+    terminal.draw(|f| ui::render(f, &mut app)).ok();
 
     let mut prev_mode = app.mode;
     let mut needs_redraw = false;
@@ -274,9 +274,7 @@ async fn run_app(
                             }
                             Err(e) => {
                                 warn!(error = %e, "failed to start interactive terminal");
-                                app.messages.push(ChatBlock::Error(
-                                    format!("Failed to start terminal: {e}")
-                                ));
+                                app.push_error(format!("Failed to start terminal: {e}"));
                             }
                         }
                     }
@@ -438,7 +436,7 @@ async fn run_app(
                     needs_clear = false;
                     prev_mode = app.mode;
                 }
-                terminal.draw(|f| ui::render(f, &app)).ok();
+                terminal.draw(|f| ui::render(f, &mut app)).ok();
                 needs_redraw = false;
             }
         }

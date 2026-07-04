@@ -9,7 +9,10 @@ use ratatui::Frame;
 use crate::app::{App, AppMode};
 
 /// Render the input area or confirmation dialog.
-pub(crate) fn render_input_area(f: &mut Frame, app: &App, area: Rect) {
+pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
+    // Record the input area for future hit-testing (task 3).
+    app.input_area = area;
+
     match app.mode {
         AppMode::Normal => render_normal_input(f, app, area),
         AppMode::Thinking => render_thinking(f, app, area),

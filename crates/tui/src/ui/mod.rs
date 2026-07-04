@@ -21,6 +21,7 @@
 mod bars;
 mod chat;
 mod input;
+pub mod layout_cache;
 mod text;
 pub mod theme;
 
@@ -34,7 +35,7 @@ use ratatui::Frame;
 use crate::app::{App, AppMode};
 
 /// Render the entire UI.
-pub fn render(f: &mut Frame, app: &App) {
+pub fn render(f: &mut Frame, app: &mut App) {
     if app.mode == AppMode::Interactive {
         render_interactive(f, app);
         return;
@@ -57,7 +58,7 @@ pub fn render(f: &mut Frame, app: &App) {
 }
 
 /// Render the interactive terminal mode.
-fn render_interactive(f: &mut Frame, app: &App) {
+fn render_interactive(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

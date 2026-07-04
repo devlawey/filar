@@ -69,7 +69,7 @@ c:\dev\warper\
 │   │   └── src/{lib,glm,agent,tools,security}.rs
 │   ├── tui/                # ratatui + crossterm TUI + terminal emulator — ГОТОВ
 │   │   ├── Cargo.toml
-│   │   └── src/{lib,app,ui/mod,ui/theme,ui/text,ui/bars,ui/chat,ui/input,event,confirmer,runner,terminal}.rs
+│   │   └── src/{lib,app,ui/mod,ui/theme,ui/text,ui/bars,ui/chat,ui/input,ui/layout_cache,event,confirmer,runner,terminal}.rs
 │   ├── gui/                # GUI-лаунчер на eframe + keyring — ГОТОВ
 │   │   ├── Cargo.toml
 │   │   └── src/lib.rs
@@ -545,3 +545,47 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
 - **Review fix (CodeRabbit PR #24):** `ChatBlock::System` — добавлен `strip_emoji`
   для системных сообщений (могут содержать user-controlled текст: target_name,
   SSH user/host). Теперь все варианты `ChatBlock` проходят emoji-фильтрацию.
+
+### Issue #14: TUI — кэширование layout чата (фундамент для мыши)
+- **Файлы:**
+  - `crates/tui/src/ui/layout_cache.rs` — новый модуль: `RenderedLine`, `LineRegion`, `ChatLayoutCache`
+  - `crates/tui/src/ui/chat.rs` — переписан: использует кэш вместо per-frame rebuild
+  - `crates/tui/src/ui/mod.rs` — `render()` и `render_interactive()` принимают `&mut App`
+  - `crates/tui/src/ui/input.rs` — `render_input_area()` принимает `&mut App`, записывает `input_area`
+  - `crates/tui/src/app.rs` — новые поля `layout_cache`, `message_rev`, `chat_area`, `input_area`,
+    `confirm_button_areas`; метод `push_message()`; все `self.messages.push(...)` заменены
+  - `crates/tui/src/runner.rs` — `ui::render(f, &mut app)`; bump `message_rev` в error path
+- **Что сделано:**
+  - `ChatLayoutCache` хранит pre-rendered `Vec<RenderedLine>` с метаданными
+    (`block_index`, `LineRegion`) для будущего hit-testing.
+  - Кэш инвалидируется при: изменении ширины, изменении `messages.len()`, изменении `message_rev`.
+  - `rebuild()` переносит логику построения строк из `chat.rs` (wrapping, emoji strip,
+    output truncation at 30 lines).
+  - `MAX_CACHED_LINES` поднят с 500 до 2000 — кэш делает per-frame cost = slice.
+  - `App::push_message()` — единая точка мутации `messages` + bump `message_rev`.
+    Все `self.messages.push(...)` заменены на `self.push_message(...)`.
+  - In-place update последнего Command блока (CommandExecuted event) — bump `message_rev`
+    для инвалидации кэша.
+  - `app.chat_area` и `app.input_area` заполняются при каждом рендере (для задачи 3).
+- **Решения:**
+  - `push_message()` оставлен приватным — runner bump’ит `message_rev` вручную для
+    единственного `app.messages.push` вне `App` (error path в interactive terminal).
+  - `collapsed: &HashSet<usize>` параметр в `rebuild()` зарезервирован для задачи 6
+    (collapse/expand output) — пока всегда пустой.
+  - `LineRegion::OutputToggle` помечает строку `... (N more lines)` — будущий target
+    для клик-Expand (задача 6).
+- **Тесты:** 6 новых в `layout_cache.rs` (invalidation on width/message/rev,
+  no-rebuild on same params, region correctness, command output + toggle).
+  Total: 30 tui tests pass.
+- **Публичные контракты:** `App` получил 5 новых полей (backward-incompatible для
+  ручной инициализации, но `App::new()` и `App::with_history()` работают без изменений).
+  `ui::render()` сигнатура изменена: `&App` → `&mut App`.
+- **Review fixes (CodeRabbit PR #25):**
+  - Добавлен `pub fn push_error()` — единая точка для внешних (runner) мутаций
+    `messages` с автоматическим bump `message_rev`. Runner больше не делает
+    прямой `app.messages.push(...)` + ручной bump.
+  - Добавлены 7 тестов в `app.rs` на `message_rev`-bumping paths: `push_error`,
+    `enter_interactive`, `exit_interactive`, `AgentEvent::TextResponse`,
+    `AgentEvent::Error`, `AgentEvent::CommandExecuted` (in-place update),
+    `respond_to_confirmation` (via handle_key 'a' in Confirming mode).
+  Total: 37 tui tests pass.
