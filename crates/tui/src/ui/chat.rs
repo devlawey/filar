@@ -74,7 +74,8 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
     // N is the number of lines below the viewport (= scroll after clamping).
     if app.scroll > 0 && area.height >= 3 && area.width >= 3 {
         let indicator = format!("\u{2193} {} new", app.scroll);
-        let indicator_width = indicator.len() as u16;
+        // Use char count, not byte length — `↓` (U+2193) is 3 bytes but 1 column.
+        let indicator_width = indicator.chars().count() as u16;
         let inner_width = area.width.saturating_sub(2);
         let indicator_width = indicator_width.min(inner_width);
         let indicator_area = Rect::new(

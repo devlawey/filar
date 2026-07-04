@@ -622,3 +622,7 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
   `clamp_scroll()` — приватный. End key в Normal изменил поведение: пустой ввод →
   scroll reset вместо cursor-to-end (backward-incompatible, но старый behavior
   остаётся при непустом вводе).
+- **Review fixes (CodeRabbit PR #26):**
+  - Fixed indicator width: `indicator.len()` (bytes) → `indicator.chars().count()`
+    (display columns). `↓` (U+2193) is 3 bytes but 1 terminal column, so byte length
+    overestimated width by 2 and mispositioned the indicator.
