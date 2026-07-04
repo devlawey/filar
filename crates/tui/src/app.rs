@@ -6,9 +6,11 @@
 
 use tokio::sync::oneshot;
 use filar_core::{ChatBlock, CommandConfirmMode};
+use ratatui::layout::Rect;
 
 use crate::event::AgentEvent;
 use crate::terminal::{key_to_bytes, TerminalModel};
+use crate::ui::layout_cache::ChatLayoutCache;
 use crate::ui::Theme;
 
 use std::collections::HashMap;
@@ -96,6 +98,17 @@ pub struct App {
     pub pending_ssh_password: Option<String>,
     /// Colour theme used by the UI renderer.
     pub theme: Theme,
+    /// Cached chat layout — avoids re-wrapping text on every frame.
+    pub layout_cache: ChatLayoutCache,
+    /// Revision counter — bumped on any mutation of `messages` to
+    /// invalidate [`layout_cache`](Self::layout_cache).
+    pub message_rev: u64,
+    /// Actual chat area on screen (filled during render, for hit-testing).
+    pub chat_area: Rect,
+    /// Actual input area on screen (filled during render, for hit-testing).
+    pub input_area: Rect,
+    /// Confirm button areas (filled later, for mouse click detection).
+    pub confirm_button_areas: Vec<(Rect, bool)>,
 }
 
 impl App {
@@ -126,6 +139,11 @@ impl App {
             pending_ssh: None,
             pending_ssh_password: None,
             theme: Theme::default_dark(),
+            layout_cache: ChatLayoutCache::new(),
+            message_rev: 0,
+            chat_area: Rect::default(),
+            input_area: Rect::default(),
+            confirm_button_areas: Vec::new(),
         }
     }
 
@@ -138,11 +156,23 @@ impl App {
         let mut app = Self::new(target_name, confirm_mode);
         if !messages.is_empty() {
             app.messages = messages;
-            app.messages.push(ChatBlock::System(
+            // Bump rev for the wholesale replacement so the cache rebuilds.
+            app.message_rev = app.message_rev.wrapping_add(1);
+            app.push_message(ChatBlock::System(
                 "Session restored — history loaded from disk".into(),
             ));
         }
         app
+    }
+
+    /// Append a message to the history and bump [`message_rev`](Self::message_rev).
+    ///
+    /// All mutations of `messages` must go through this method (or explicitly
+    /// bump `message_rev`) so that [`layout_cache`](Self::layout_cache)
+    /// invalidates correctly.
+    fn push_message(&mut self, msg: ChatBlock) {
+        self.messages.push(msg);
+        self.message_rev = self.message_rev.wrapping_add(1);
     }
 
     /// Handle a terminal keyboard event.
@@ -179,7 +209,7 @@ impl App {
                                         host.clone(),
                                         port,
                                     ));
-                                    self.messages.push(ChatBlock::System(format!(
+                                    self.push_message(ChatBlock::System(format!(
                                         "Connecting to {user}@{host}:{port} via SSH. \
                                          Press Ctrl+P to enter the password."
                                     )));
@@ -189,7 +219,7 @@ impl App {
                                     // Stay in Normal mode — user needs to press Ctrl+P.
                                 } else if is_interactive_command(&cmd) {
                                     // Block interactive commands — they hang the executor.
-                                    self.messages.push(ChatBlock::System(format!(
+                                    self.push_message(ChatBlock::System(format!(
                                         "Interactive command '{cmd}' is not supported in shell escape. \
                                          Use Ctrl+T to enter interactive terminal mode."
                                     )));
@@ -198,7 +228,7 @@ impl App {
                                     self.cursor_pos = 0;
                                 } else {
                                     // Regular shell escape.
-                                    self.messages.push(ChatBlock::Command {
+                                    self.push_message(ChatBlock::Command {
                                         command: cmd,
                                         explanation: "Shell escape (direct)".into(),
                                         output: None,
@@ -213,7 +243,7 @@ impl App {
                                 }
                             }
                         } else {
-                            self.messages.push(ChatBlock::User(text.clone()));
+                            self.push_message(ChatBlock::User(text.clone()));
                             self.scroll = 0;
                             self.input.clear();
                             self.cursor_pos = 0;
@@ -237,7 +267,7 @@ impl App {
                     self.mode = AppMode::PasswordInput;
                     // If there's a pending SSH connection, show a hint.
                     if let Some((user, host, port)) = &self.pending_ssh {
-                        self.messages.push(ChatBlock::System(format!(
+                        self.push_message(ChatBlock::System(format!(
                             "Enter SSH password for {user}@{host}:{port}"
                         )));
                         self.scroll = 0;
@@ -315,7 +345,7 @@ impl App {
                     self.pending_ssh = None;
                     self.pending_ssh_password = None;
                     self.mode = AppMode::Normal;
-                    self.messages.push(ChatBlock::System(
+                    self.push_message(ChatBlock::System(
                         "Cancelled.".into()
                     ));
                     self.scroll = 0;
@@ -388,7 +418,7 @@ impl App {
                                  Use this variable directly in your commands.",
                                 var_name
                             );
-                            self.messages.push(ChatBlock::System(
+                            self.push_message(ChatBlock::System(
                                 format!("Password provided as {} (hidden)", var_name)
                             ));
                             self.scroll = 0;
@@ -442,7 +472,7 @@ impl App {
     fn respond_to_confirmation(&mut self, approved: bool) {
         if let Some(confirm) = self.pending_confirm.take() {
             let _ = confirm.respond_to.send(approved);
-            self.messages.push(ChatBlock::Command {
+            self.push_message(ChatBlock::Command {
                 command: confirm.command,
                 explanation: confirm.explanation,
                 output: None,
@@ -459,7 +489,7 @@ impl App {
                 self.mode = AppMode::Thinking;
             }
             AgentEvent::TextResponse(text) => {
-                self.messages.push(ChatBlock::Agent(text));
+                self.push_message(ChatBlock::Agent(text));
             }
             AgentEvent::ConfirmationRequest {
                 command,
@@ -493,10 +523,12 @@ impl App {
                         *o = Some(output.clone());
                         *a = approved;
                         updated = true;
+                        // Bump rev so the cache rebuilds with updated output.
+                        self.message_rev = self.message_rev.wrapping_add(1);
                     }
                 }
                 if !updated {
-                    self.messages.push(ChatBlock::Command {
+                    self.push_message(ChatBlock::Command {
                         command,
                         explanation: String::new(),
                         output: Some(output),
@@ -506,13 +538,13 @@ impl App {
             }
             AgentEvent::Finished(text) => {
                 if !text.is_empty() {
-                    self.messages.push(ChatBlock::Agent(text));
+                    self.push_message(ChatBlock::Agent(text));
                 }
                 self.mode = AppMode::Normal;
                 self.agent_running = false;
             }
             AgentEvent::Error(err) => {
-                self.messages.push(ChatBlock::Error(err));
+                self.push_message(ChatBlock::Error(err));
                 self.mode = AppMode::Normal;
                 self.agent_running = false;
             }
@@ -543,7 +575,7 @@ impl App {
     pub fn enter_interactive(&mut self, model: TerminalModel) {
         self.terminal = Some(model);
         self.mode = AppMode::Interactive;
-        self.messages.push(ChatBlock::System(
+        self.push_message(ChatBlock::System(
             "Entered interactive terminal mode (Ctrl+T to switch back)".into(),
         ));
     }
@@ -552,7 +584,7 @@ impl App {
     pub fn exit_interactive(&mut self) {
         self.terminal = None;
         self.mode = AppMode::Normal;
-        self.messages.push(ChatBlock::System(
+        self.push_message(ChatBlock::System(
             "Returned to agent mode".into(),
         ));
     }
