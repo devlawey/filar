@@ -108,6 +108,7 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &App, area: Rect) {
                 lines.push(Line::from(""));
             }
             ChatBlock::System(text) => {
+                let text = strip_emoji(text);
                 lines.push(Line::from(vec![
                     Span::styled("- ", app.theme.muted()),
                     Span::styled(text, app.theme.muted()),

@@ -542,3 +542,6 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
 - **Публичные контракты:** `Theme` реэкспортирован из `filar-tui`. `App` получил
   новое поле `theme` (backward-incompatible для ручной инициализации, но `App::new()`
   и `App::with_history()` работают без изменений).
+- **Review fix (CodeRabbit PR #24):** `ChatBlock::System` — добавлен `strip_emoji`
+  для системных сообщений (могут содержать user-controlled текст: target_name,
+  SSH user/host). Теперь все варианты `ChatBlock` проходят emoji-фильтрацию.
