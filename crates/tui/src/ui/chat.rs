@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -70,6 +70,18 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
     let paragraph = Paragraph::new(visible_lines).block(block);
     f.render_widget(paragraph, area);
 
+    // Scrollbar — shown only when content overflows.
+    if total_lines > visible_height {
+        let mut scrollbar_state = ScrollbarState::default()
+            .content_length(total_lines)
+            .viewport_content_length(visible_height)
+            .position(skip);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .thumb_style(app.theme.dim())
+            .track_style(app.theme.muted());
+        f.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+    }
+
     // "↓ N new" indicator — shown when the user has scrolled up from the bottom.
     // N is the number of lines below the viewport (= scroll after clamping).
     if app.scroll > 0 && area.height >= 3 && area.width >= 3 {
@@ -84,9 +96,14 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
             indicator_width,
             1,
         );
+        // Store for click detection in hit_test.
+        app.indicator_area = indicator_area;
         f.render_widget(
             Paragraph::new(indicator).style(app.theme.muted()),
             indicator_area,
         );
+    } else {
+        // Clear indicator area so hit_test doesn't detect a stale indicator.
+        app.indicator_area = Rect::default();
     }
 }

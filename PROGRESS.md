@@ -626,3 +626,38 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
   - Fixed indicator width: `indicator.len()` (bytes) → `indicator.chars().count()`
     (display columns). `↓` (U+2193) is 3 bytes but 1 terminal column, so byte length
     overestimated width by 2 and mispositioned the indicator.
+
+### Issue #16: TUI — скроллбар и hit-testing кликов
+- **Файлы:**
+  - `crates/tui/src/app.rs` — `HitZone` enum, `DragKind` enum, new fields (`mouse_drag`,
+    `indicator_area`, `status_bar_area`, `help_bar_area`); `hit_test()`, `update_scrollbar_drag()`,
+    `set_cursor_from_click()`; `handle_mouse()` полностью переписан для routing всех зон
+  - `crates/tui/src/ui/chat.rs` — scrollbar rendering (`Scrollbar`, `ScrollbarState`);
+    `indicator_area` stored in App for click detection
+  - `crates/tui/src/ui/bars.rs` — `render_status_bar` / `render_help_bar` принимают `&mut App`,
+    store `status_bar_area` / `help_bar_area`
+- **Что сделано:**
+  - **Scrollbar:** `Scrollbar::new(VerticalRight)` с `theme.dim()` thumb и `theme.muted()` track.
+    Показывается только когда `total_lines > visible_height`. Position = `skip` (first visible line).
+  - **Drag по скроллбару:** `Down(Left)` в колонке скроллбара → `mouse_drag = Some(Scrollbar)`,
+    scroll пересчитывается пропорционально row. `Drag(Left)` продолжает обновлять.
+    `Up(Left)` сбрасывает `mouse_drag = None`.
+  - **`hit_test(col, row)`:** приватный метод, routing по зонам: `ScrollIndicator` (first,
+    overlays chat), `Scrollbar`, `Chat { line_idx }`, `ChatEmpty`, `Input`, `StatusBar`,
+    `HelpBar`, `ConfirmButton(bool)`, `Outside`. `line_idx` вычисляется из row, `chat_area`,
+    `scroll` через `layout_cache`.
+  - **Клик по `↓ N new`:** `Down(Left)` в `indicator_area` → `scroll = 0`.
+  - **Клик в input:** `Down(Left)` в `input_area` (Normal mode only) → `cursor_pos` из
+    row/col (reverse of `place_cursor` math: `pos = row * inner_width + col`, clamped).
+- **Решения:**
+  - `ConfirmButton(bool)` в HitZone enum включён для полноты, но `confirm_button_areas`
+    пока не заполняется при рендере — это будущая задача.
+  - Scrollbar рисуется на full `area` (поверх правой рамки) — стандартный паттерн ratatui.
+  - `hit_test` — приватный (тесты в том же модуле имеют доступ).
+  - `DragKind::Selection` зарезервирован для будущего text selection (не эта задача).
+- **Тесты:** 17 новых в `app.rs`: hit_test по всем зонам (Chat, ChatEmpty, Scrollbar,
+  Scrollbar-not-visible, Input, StatusBar, HelpBar, Outside, ScrollIndicator, line_idx
+  with scroll), scrollbar drag (proportional, mouse_up clears), click indicator, click
+  input (cursor set, second row, clamp to end, ignored in Thinking). Total: 65 tui tests.
+- **Публичные контракты:** `HitZone`, `DragKind` — новые public enums. `App` получил 4 новых
+  поля. `render_status_bar` / `render_help_bar` сигнатура: `&App` → `&mut App`.
