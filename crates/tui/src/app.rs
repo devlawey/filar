@@ -36,6 +36,43 @@ pub enum AppMode {
 }
 
 // ---------------------------------------------------------------------------
+// Mouse hit-testing
+// ---------------------------------------------------------------------------
+
+/// Which zone of the UI a mouse click landed on.
+///
+/// Produced by [`App::hit_test`] to route mouse events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitZone {
+    /// Inside the chat content; `line_idx` is the index into `layout_cache.lines`.
+    Chat { line_idx: usize },
+    /// Inside the chat area but below all content (empty space).
+    ChatEmpty,
+    /// On the scrollbar track/thumb.
+    Scrollbar,
+    /// Inside the input field.
+    Input,
+    /// On the status bar (top line).
+    StatusBar,
+    /// On the help bar (bottom line).
+    HelpBar,
+    /// On a confirm dialog button (`true` = approve, `false` = deny).
+    ConfirmButton(bool),
+    /// On the "↓ N new" scroll indicator.
+    ScrollIndicator,
+    /// Outside any interactive zone.
+    Outside,
+}
+
+/// The kind of mouse drag in progress (if any).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragKind {
+    /// Dragging the scrollbar thumb.
+    Scrollbar,
+    // `Selection` (text selection) is reserved for future work.
+}
+
+// ---------------------------------------------------------------------------
 // Pending confirmation
 // ---------------------------------------------------------------------------
 
@@ -109,6 +146,14 @@ pub struct App {
     pub input_area: Rect,
     /// Confirm button areas (filled later, for mouse click detection).
     pub confirm_button_areas: Vec<(Rect, bool)>,
+    /// Current mouse drag operation (if any).
+    pub mouse_drag: Option<DragKind>,
+    /// Area of the "↓ N new" indicator (set during render, for click detection).
+    pub indicator_area: Rect,
+    /// Status bar area (set during render, for hit-testing).
+    pub status_bar_area: Rect,
+    /// Help bar area (set during render, for hit-testing).
+    pub help_bar_area: Rect,
 }
 
 impl App {
@@ -144,6 +189,10 @@ impl App {
             chat_area: Rect::default(),
             input_area: Rect::default(),
             confirm_button_areas: Vec::new(),
+            mouse_drag: None,
+            indicator_area: Rect::default(),
+            status_bar_area: Rect::default(),
+            help_bar_area: Rect::default(),
         }
     }
 
@@ -507,37 +556,200 @@ impl App {
         }
     }
 
-    /// Handle a mouse event (scroll wheel inside the chat area).
+    /// Handle a mouse event (scroll wheel, clicks, drags).
     ///
     /// Active in all modes except `Interactive` and `PasswordInput`.
     pub fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
-        use crossterm::event::MouseEventKind;
+        use crossterm::event::{MouseButton, MouseEventKind};
 
-        // Mouse is only for chat scrolling — ignore in interactive/password modes.
+        // Mouse is not used in interactive/password modes (yet — task 10).
         if self.mode == AppMode::Interactive || self.mode == AppMode::PasswordInput {
             return;
         }
 
-        // Check if the event is inside the chat area (including borders).
-        let inside = m.row >= self.chat_area.y
-            && m.row < self.chat_area.y + self.chat_area.height
-            && m.column >= self.chat_area.x
-            && m.column < self.chat_area.x + self.chat_area.width;
-
-        if !inside {
-            return;
-        }
+        let zone = self.hit_test(m.column, m.row);
 
         match m.kind {
+            // --- Scroll wheel ---
             MouseEventKind::ScrollUp => {
-                self.scroll = self.scroll.saturating_add(3);
-                self.clamp_scroll();
+                if matches!(
+                    zone,
+                    HitZone::Chat { .. } | HitZone::ChatEmpty | HitZone::ScrollIndicator
+                ) {
+                    self.scroll = self.scroll.saturating_add(3);
+                    self.clamp_scroll();
+                }
             }
             MouseEventKind::ScrollDown => {
-                self.scroll = self.scroll.saturating_sub(3);
+                if matches!(
+                    zone,
+                    HitZone::Chat { .. } | HitZone::ChatEmpty | HitZone::ScrollIndicator
+                ) {
+                    self.scroll = self.scroll.saturating_sub(3);
+                }
+            }
+            // --- Left click ---
+            MouseEventKind::Down(MouseButton::Left) => match zone {
+                HitZone::Scrollbar => {
+                    self.mouse_drag = Some(DragKind::Scrollbar);
+                    self.update_scrollbar_drag(m.row);
+                }
+                HitZone::ScrollIndicator => {
+                    self.scroll = 0;
+                }
+                HitZone::Input if self.mode == AppMode::Normal => {
+                    self.set_cursor_from_click(m.column, m.row);
+                }
+                _ => {}
+            },
+            // --- Drag ---
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.mouse_drag == Some(DragKind::Scrollbar) {
+                    self.update_scrollbar_drag(m.row);
+                }
+            }
+            // --- Mouse up ---
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.mouse_drag = None;
             }
             _ => {}
         }
+    }
+
+    /// Determine which UI zone a screen coordinate falls into.
+    ///
+    /// Uses the last-known areas (filled during render).  The caller is
+    /// responsible for acting on the result.
+    fn hit_test(&self, col: u16, row: u16) -> HitZone {
+        // --- ↓ N new indicator (check first — it overlays the chat area) ---
+        if self.indicator_area.width > 0
+            && col >= self.indicator_area.x
+            && col < self.indicator_area.x + self.indicator_area.width
+            && row >= self.indicator_area.y
+            && row < self.indicator_area.y + self.indicator_area.height
+        {
+            return HitZone::ScrollIndicator;
+        }
+
+        // --- Scrollbar (rightmost column of chat area, inside borders) ---
+        let visible_height = self.chat_area.height.saturating_sub(2) as usize;
+        let total_lines = self.layout_cache.lines.len();
+        let scrollbar_visible = total_lines > visible_height;
+        if scrollbar_visible
+            && self.chat_area.width > 0
+            && col == self.chat_area.x + self.chat_area.width - 1
+            && row > self.chat_area.y
+            && row < self.chat_area.y + self.chat_area.height - 1
+        {
+            return HitZone::Scrollbar;
+        }
+
+        // --- Chat content (inside borders, excluding scrollbar column) ---
+        if self.chat_area.width > 2
+            && self.chat_area.height > 2
+            && col > self.chat_area.x
+            && col < self.chat_area.x + self.chat_area.width - 1
+            && row > self.chat_area.y
+            && row < self.chat_area.y + self.chat_area.height - 1
+        {
+            let inner_row = (row - self.chat_area.y - 1) as usize;
+            let skip = if total_lines > visible_height {
+                total_lines.saturating_sub(visible_height + self.scroll)
+            } else {
+                0
+            };
+            let line_idx = skip + inner_row;
+            if line_idx < total_lines {
+                return HitZone::Chat { line_idx };
+            } else {
+                return HitZone::ChatEmpty;
+            }
+        }
+
+        // --- Input field ---
+        if self.input_area.width > 0
+            && col >= self.input_area.x
+            && col < self.input_area.x + self.input_area.width
+            && row >= self.input_area.y
+            && row < self.input_area.y + self.input_area.height
+        {
+            return HitZone::Input;
+        }
+
+        // --- Status bar ---
+        if self.status_bar_area.width > 0
+            && col >= self.status_bar_area.x
+            && col < self.status_bar_area.x + self.status_bar_area.width
+            && row >= self.status_bar_area.y
+            && row < self.status_bar_area.y + self.status_bar_area.height
+        {
+            return HitZone::StatusBar;
+        }
+
+        // --- Help bar ---
+        if self.help_bar_area.width > 0
+            && col >= self.help_bar_area.x
+            && col < self.help_bar_area.x + self.help_bar_area.width
+            && row >= self.help_bar_area.y
+            && row < self.help_bar_area.y + self.help_bar_area.height
+        {
+            return HitZone::HelpBar;
+        }
+
+        // --- Confirm buttons (future — areas not yet populated) ---
+        for (rect, approved) in &self.confirm_button_areas {
+            if col >= rect.x
+                && col < rect.x + rect.width
+                && row >= rect.y
+                && row < rect.y + rect.height
+            {
+                return HitZone::ConfirmButton(*approved);
+            }
+        }
+
+        HitZone::Outside
+    }
+
+    /// Update scroll position from a scrollbar drag at the given row.
+    ///
+    /// Maps the row proportionally: top of track → scroll = max (top of
+    /// content), bottom → scroll = 0 (bottom/latest).
+    fn update_scrollbar_drag(&mut self, row: u16) {
+        if self.chat_area.height == 0 {
+            return;
+        }
+        let visible_height = self.chat_area.height.saturating_sub(2) as usize;
+        let total_lines = self.layout_cache.lines.len();
+        let max_scroll = total_lines.saturating_sub(visible_height);
+        if max_scroll == 0 || visible_height == 0 {
+            return;
+        }
+        let track_top = self.chat_area.y + 1; // inside top border
+        let relative_row = (row.saturating_sub(track_top)) as usize;
+        // Track spans rows 0..=visible_height-1.  Divide by (visible_height - 1)
+        // so the bottom row maps to skip=max_scroll → scroll=0.
+        let track_span = (visible_height - 1).max(1);
+        let skip = relative_row * max_scroll / track_span;
+        self.scroll = max_scroll.saturating_sub(skip).min(max_scroll);
+    }
+
+    /// Set cursor position from a click in the input area.
+    ///
+    /// Reverses the `place_cursor` math: `cursor_pos = row * inner_width + col`.
+    fn set_cursor_from_click(&mut self, col: u16, row: u16) {
+        if self.input_area.width == 0 {
+            return;
+        }
+        let inner_x = self.input_area.x + 1;
+        let inner_y = self.input_area.y + 1;
+        let inner_width = (self.input_area.width.saturating_sub(2)).max(1) as usize;
+
+        let relative_col = (col.saturating_sub(inner_x)) as usize;
+        let relative_row = (row.saturating_sub(inner_y)) as usize;
+
+        let char_count = self.input.chars().count();
+        let pos = relative_row * inner_width + relative_col;
+        self.cursor_pos = pos.min(char_count);
     }
 
     /// Respond to a pending confirmation request.
@@ -1156,5 +1368,233 @@ mod tests {
         }
         // 5 * 5 = 25, clamped to 8
         assert_eq!(app.scroll, 8);
+    }
+
+    // ----- Hit-testing tests (issue #16) -----
+
+    /// Helper: set up an app with a chat area and cached lines for hit-testing.
+    fn make_hit_test_app() -> App {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        // Chat area: x=0, y=1, w=80, h=24 (inner: 78x22)
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        // Input area: x=0, y=26, w=80, h=5 (inner: 78x3)
+        app.input_area = Rect::new(0, 26, 80, 5);
+        // Status bar: y=0, h=1
+        app.status_bar_area = Rect::new(0, 0, 80, 1);
+        // Help bar: y=31, h=1
+        app.help_bar_area = Rect::new(0, 31, 80, 1);
+        // 50 cached lines → scrollbar visible (50 > 22)
+        app.layout_cache.lines = (0..50)
+            .map(|i| crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw(format!("line {i}")),
+                block_index: Some(i),
+                region: crate::ui::layout_cache::LineRegion::Body,
+            })
+            .collect();
+        // scroll = 0 → bottom; skip = 50 - 22 = 28
+        app
+    }
+
+    #[test]
+    fn hit_test_chat_content() {
+        let app = make_hit_test_app();
+        // Click at col=5, row=2 (inside chat, first content row)
+        // skip = 28, inner_row = 0, line_idx = 28
+        let zone = app.hit_test(5, 2);
+        assert_eq!(zone, HitZone::Chat { line_idx: 28 });
+    }
+
+    #[test]
+    fn hit_test_chat_empty_below_content() {
+        let mut app = make_hit_test_app();
+        // Only 5 lines → no overflow, scrollbar hidden.
+        app.layout_cache.lines.truncate(5);
+        app.scroll = 0;
+        // Click at row=20 (inner_row=19), but only 5 lines total → ChatEmpty
+        let zone = app.hit_test(5, 20);
+        assert_eq!(zone, HitZone::ChatEmpty);
+    }
+
+    #[test]
+    fn hit_test_scrollbar() {
+        let app = make_hit_test_app();
+        // Scrollbar = rightmost column of chat area (col=79), inside borders (row 2..23)
+        let zone = app.hit_test(79, 10);
+        assert_eq!(zone, HitZone::Scrollbar);
+    }
+
+    #[test]
+    fn hit_test_scrollbar_not_visible_when_content_fits() {
+        let mut app = make_hit_test_app();
+        // Only 5 lines → fits in visible_height=22, no scrollbar.
+        app.layout_cache.lines.truncate(5);
+        // Click at rightmost column → should be chat border, not scrollbar.
+        // But col=79 is the right border, so it's not inside chat content either.
+        // hit_test returns Outside for border clicks when no scrollbar.
+        let zone = app.hit_test(79, 10);
+        assert_eq!(zone, HitZone::Outside);
+    }
+
+    #[test]
+    fn hit_test_input() {
+        let app = make_hit_test_app();
+        // Click inside the input area.
+        let zone = app.hit_test(5, 27);
+        assert_eq!(zone, HitZone::Input);
+    }
+
+    #[test]
+    fn hit_test_status_bar() {
+        let app = make_hit_test_app();
+        let zone = app.hit_test(5, 0);
+        assert_eq!(zone, HitZone::StatusBar);
+    }
+
+    #[test]
+    fn hit_test_help_bar() {
+        let app = make_hit_test_app();
+        let zone = app.hit_test(5, 31);
+        assert_eq!(zone, HitZone::HelpBar);
+    }
+
+    #[test]
+    fn hit_test_outside() {
+        let app = make_hit_test_app();
+        // Click way outside any area.
+        let zone = app.hit_test(200, 200);
+        assert_eq!(zone, HitZone::Outside);
+    }
+
+    #[test]
+    fn hit_test_scroll_indicator() {
+        let mut app = make_hit_test_app();
+        // Set up a fake indicator area inside the chat area.
+        app.indicator_area = Rect::new(70, 22, 8, 1);
+        let zone = app.hit_test(72, 22);
+        assert_eq!(zone, HitZone::ScrollIndicator);
+    }
+
+    #[test]
+    fn hit_test_line_idx_with_scroll() {
+        let mut app = make_hit_test_app();
+        // scroll=10 → skip = 50 - 22 - 10 = 18
+        app.scroll = 10;
+        // Click at row=2 (inner_row=0) → line_idx = 18
+        let zone = app.hit_test(5, 2);
+        assert_eq!(zone, HitZone::Chat { line_idx: 18 });
+    }
+
+    // ----- Scrollbar drag tests -----
+
+    #[test]
+    fn scrollbar_drag_sets_scroll_proportionally() {
+        let mut app = make_hit_test_app();
+        // visible_height = 22, max_scroll = 50 - 22 = 28
+        // Drag to top of track (row=2, inner_row=0):
+        // skip = 0 * 28 / 22 = 0, scroll = 28 - 0 = 28 (top)
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            79,
+            2,
+        ));
+        assert_eq!(app.scroll, 28);
+        assert_eq!(app.mouse_drag, Some(DragKind::Scrollbar));
+
+        // Drag to bottom of track (row=23, inner_row=21):
+        // track_span = 22 - 1 = 21, skip = 21 * 28 / 21 = 28, scroll = 28 - 28 = 0
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            79,
+            23,
+        ));
+        assert_eq!(app.scroll, 0, "drag to bottom should reach scroll=0");
+    }
+
+    #[test]
+    fn scrollbar_mouse_up_clears_drag() {
+        let mut app = make_hit_test_app();
+        app.mouse_drag = Some(DragKind::Scrollbar);
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            79,
+            10,
+        ));
+        assert_eq!(app.mouse_drag, None);
+    }
+
+    // ----- Click indicator → scroll = 0 -----
+
+    #[test]
+    fn click_indicator_resets_scroll() {
+        let mut app = make_hit_test_app();
+        app.scroll = 15;
+        app.indicator_area = Rect::new(70, 22, 8, 1);
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            72,
+            22,
+        ));
+        assert_eq!(app.scroll, 0);
+    }
+
+    // ----- Click input → cursor_pos -----
+
+    #[test]
+    fn click_input_sets_cursor() {
+        let mut app = make_hit_test_app();
+        app.mode = AppMode::Normal;
+        app.input = "hello world test".into(); // 16 chars
+        // input_area = x=0, y=26, w=80, h=5 → inner_x=1, inner_y=27, inner_width=78
+        // Click at col=3, row=27 → relative_col=2, relative_row=0 → cursor_pos=2
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            3,
+            27,
+        ));
+        assert_eq!(app.cursor_pos, 2);
+    }
+
+    #[test]
+    fn click_input_second_row_sets_cursor() {
+        let mut app = make_hit_test_app();
+        app.mode = AppMode::Normal;
+        // 80 chars → wraps to 2 lines at inner_width=78
+        app.input = "a".repeat(80);
+        // Click at col=1, row=28 (second row of input, relative_row=1)
+        // cursor_pos = 1 * 78 + 0 = 78
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            1,
+            28,
+        ));
+        assert_eq!(app.cursor_pos, 78);
+    }
+
+    #[test]
+    fn click_input_clamps_to_end() {
+        let mut app = make_hit_test_app();
+        app.mode = AppMode::Normal;
+        app.input = "hi".into(); // 2 chars
+        // Click far right → cursor_pos clamped to 2
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            70,
+            27,
+        ));
+        assert_eq!(app.cursor_pos, 2);
+    }
+
+    #[test]
+    fn click_input_ignored_in_thinking_mode() {
+        let mut app = make_hit_test_app();
+        app.mode = AppMode::Thinking;
+        app.input = "hello".into();
+        app.cursor_pos = 0;
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            3,
+            27,
+        ));
+        assert_eq!(app.cursor_pos, 0); // no change in Thinking mode
     }
 }

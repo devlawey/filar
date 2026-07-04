@@ -8,7 +8,7 @@ use ratatui::Frame;
 use crate::app::{App, AppMode};
 
 /// Render the status bar (top line).
-pub(crate) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
+pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let mode_text = match app.mode {
         AppMode::Normal => "NORMAL",
         AppMode::Thinking => "THINKING...",
@@ -16,6 +16,9 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         AppMode::Interactive => "INTERACTIVE",
         AppMode::PasswordInput => "PASSWORD",
     };
+
+    // Store area for hit-testing.
+    app.status_bar_area = area;
 
     let mode_color = app.theme.mode_color(app.mode);
 
@@ -41,7 +44,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Render the help bar (bottom line).
-pub(crate) fn render_help_bar(f: &mut Frame, app: &App, area: Rect) {
+pub(crate) fn render_help_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let help_text = match app.mode {
         AppMode::Normal => " Enter=Send | !=Shell | Ctrl+T=Terminal | Ctrl+P=Password | Ctrl+C=Quit",
         AppMode::Thinking => " Ctrl+C=Quit | PgUp/PgDn=Scroll",
@@ -49,6 +52,9 @@ pub(crate) fn render_help_bar(f: &mut Frame, app: &App, area: Rect) {
         AppMode::Interactive => " Ctrl+T=Agent mode | (terminal input is forwarded)",
         AppMode::PasswordInput => " Enter=Send password | Esc=Cancel | Ctrl+C=Cancel",
     };
+
+    // Store area for hit-testing.
+    app.help_bar_area = area;
 
     let paragraph = Paragraph::new(help_text).style(app.theme.help_bar_style());
     f.render_widget(paragraph, area);
