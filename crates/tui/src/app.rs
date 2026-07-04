@@ -726,8 +726,10 @@ impl App {
         }
         let track_top = self.chat_area.y + 1; // inside top border
         let relative_row = (row.saturating_sub(track_top)) as usize;
-        // Proportional: row 0 → skip=0 (top), row visible_height → skip=max_scroll (bottom).
-        let skip = relative_row * max_scroll / visible_height;
+        // Track spans rows 0..=visible_height-1.  Divide by (visible_height - 1)
+        // so the bottom row maps to skip=max_scroll → scroll=0.
+        let track_span = (visible_height - 1).max(1);
+        let skip = relative_row * max_scroll / track_span;
         self.scroll = max_scroll.saturating_sub(skip).min(max_scroll);
     }
 
@@ -1499,13 +1501,13 @@ mod tests {
         assert_eq!(app.mouse_drag, Some(DragKind::Scrollbar));
 
         // Drag to bottom of track (row=23, inner_row=21):
-        // skip = 21 * 28 / 22 = 26, scroll = 28 - 26 = 2
+        // track_span = 22 - 1 = 21, skip = 21 * 28 / 21 = 28, scroll = 28 - 28 = 0
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
             79,
             23,
         ));
-        assert!(app.scroll <= 3, "scroll near bottom, got {}", app.scroll);
+        assert_eq!(app.scroll, 0, "drag to bottom should reach scroll=0");
     }
 
     #[test]

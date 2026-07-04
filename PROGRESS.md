@@ -661,3 +661,7 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
   input (cursor set, second row, clamp to end, ignored in Thinking). Total: 65 tui tests.
 - **Публичные контракты:** `HitZone`, `DragKind` — новые public enums. `App` получил 4 новых
   поля. `render_status_bar` / `render_help_bar` сигнатура: `&App` → `&mut App`.
+- **Review fixes (CodeRabbit PR #27):**
+  - Fixed `update_scrollbar_drag` divisor: `visible_height` → `visible_height - 1`
+    (track span). Old formula prevented thumb from reaching `scroll = 0` at bottom.
+    Updated test to assert `scroll == 0` at bottom.
