@@ -580,3 +580,12 @@ cargo test -p filar-tui -p filar-agent -p filar-transport
 - **Публичные контракты:** `App` получил 5 новых полей (backward-incompatible для
   ручной инициализации, но `App::new()` и `App::with_history()` работают без изменений).
   `ui::render()` сигнатура изменена: `&App` → `&mut App`.
+- **Review fixes (CodeRabbit PR #25):**
+  - Добавлен `pub fn push_error()` — единая точка для внешних (runner) мутаций
+    `messages` с автоматическим bump `message_rev`. Runner больше не делает
+    прямой `app.messages.push(...)` + ручной bump.
+  - Добавлены 7 тестов в `app.rs` на `message_rev`-bumping paths: `push_error`,
+    `enter_interactive`, `exit_interactive`, `AgentEvent::TextResponse`,
+    `AgentEvent::Error`, `AgentEvent::CommandExecuted` (in-place update),
+    `respond_to_confirmation` (via handle_key 'a' in Confirming mode).
+  Total: 37 tui tests pass.

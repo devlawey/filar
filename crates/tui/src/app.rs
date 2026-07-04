@@ -175,6 +175,13 @@ impl App {
         self.message_rev = self.message_rev.wrapping_add(1);
     }
 
+    /// Append an error message from outside `App` (e.g. runner startup
+    /// failures) while still bumping [`message_rev`](Self::message_rev) so
+    /// the layout cache invalidates correctly.
+    pub fn push_error(&mut self, text: String) {
+        self.push_message(ChatBlock::Error(text));
+    }
+
     /// Handle a terminal keyboard event.
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -767,5 +774,97 @@ mod tests {
         ));
 
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn push_error_bumps_message_rev() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let rev_before = app.message_rev;
+        app.push_error("boom".into());
+        assert!(app.message_rev > rev_before);
+        assert!(matches!(app.messages.last(), Some(ChatBlock::Error(s)) if s == "boom"));
+    }
+
+    #[test]
+    fn enter_interactive_bumps_message_rev() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let rev_before = app.message_rev;
+        let model = crate::terminal::TerminalModel::new(80, 24);
+        app.enter_interactive(model);
+        assert!(app.message_rev > rev_before);
+        assert_eq!(app.mode, AppMode::Interactive);
+    }
+
+    #[test]
+    fn exit_interactive_bumps_message_rev() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let model = crate::terminal::TerminalModel::new(80, 24);
+        app.enter_interactive(model);
+        let rev_before = app.message_rev;
+        app.exit_interactive();
+        assert!(app.message_rev > rev_before);
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn agent_text_response_bumps_message_rev() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let rev_before = app.message_rev;
+        app.handle_agent_event(AgentEvent::TextResponse("hello".into()));
+        assert!(app.message_rev > rev_before);
+    }
+
+    #[test]
+    fn agent_error_bumps_message_rev() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let rev_before = app.message_rev;
+        app.handle_agent_event(AgentEvent::Error("oops".into()));
+        assert!(app.message_rev > rev_before);
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn agent_command_executed_inplace_bumps_message_rev() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        // Push a Command block without output — this is the one that will be
+        // updated in-place by CommandExecuted.
+        app.push_message(ChatBlock::Command {
+            command: "ls".into(),
+            explanation: String::new(),
+            output: None,
+            approved: false,
+        });
+        let rev_before = app.message_rev;
+        app.handle_agent_event(AgentEvent::CommandExecuted {
+            command: "ls".into(),
+            output: "file1\nfile2".into(),
+            approved: true,
+        });
+        assert!(app.message_rev > rev_before, "in-place update must bump rev");
+        // Verify the block was updated in-place, not duplicated.
+        assert_eq!(app.messages.len(), 2); // system + command (updated)
+    }
+
+    #[test]
+    fn confirmation_response_bumps_message_rev() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let (tx, _rx) = oneshot::channel();
+        app.pending_confirm = Some(PendingConfirm {
+            command: "rm -rf /tmp/test".into(),
+            explanation: "cleanup".into(),
+            destructive: false,
+            respond_to: tx,
+        });
+        app.mode = AppMode::Confirming;
+        let rev_before = app.message_rev;
+
+        // Press 'a' to approve.
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        assert!(app.message_rev > rev_before);
+        assert_eq!(app.mode, AppMode::Thinking);
     }
 }

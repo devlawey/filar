@@ -274,10 +274,7 @@ async fn run_app(
                             }
                             Err(e) => {
                                 warn!(error = %e, "failed to start interactive terminal");
-                                app.messages.push(ChatBlock::Error(
-                                    format!("Failed to start terminal: {e}")
-                                ));
-                                app.message_rev = app.message_rev.wrapping_add(1);
+                                app.push_error(format!("Failed to start terminal: {e}"));
                             }
                         }
                     }
