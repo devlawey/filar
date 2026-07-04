@@ -334,10 +334,15 @@ impl App {
                     self.cursor_pos = 0;
                 }
                 KeyCode::End => {
-                    self.cursor_pos = self.input.chars().count();
+                    if self.input.is_empty() {
+                        self.scroll = 0;
+                    } else {
+                        self.cursor_pos = self.input.chars().count();
+                    }
                 }
                 KeyCode::PageUp => {
                     self.scroll = self.scroll.saturating_add(5);
+                    self.clamp_scroll();
                 }
                 KeyCode::PageDown => {
                     self.scroll = self.scroll.saturating_sub(5);
@@ -359,9 +364,13 @@ impl App {
                 }
                 if key.code == KeyCode::PageUp {
                     self.scroll = self.scroll.saturating_add(5);
+                    self.clamp_scroll();
                 }
                 if key.code == KeyCode::PageDown {
                     self.scroll = self.scroll.saturating_sub(5);
+                }
+                if key.code == KeyCode::End {
+                    self.scroll = 0;
                 }
             }
             AppMode::Confirming => match key.code {
@@ -373,6 +382,9 @@ impl App {
                 KeyCode::Char('d') | KeyCode::Char('n')
                 | KeyCode::Char('в') | KeyCode::Char('т') => {
                     self.respond_to_confirmation(false);
+                }
+                KeyCode::End => {
+                    self.scroll = 0;
                 }
                 _ if ctrl_key('c', 'с') => {
                     self.respond_to_confirmation(false);
@@ -472,6 +484,59 @@ impl App {
                 }
                 _ => {}
             },
+        }
+    }
+
+    /// Clamp `scroll` so the user cannot scroll past the content.
+    ///
+    /// Uses the last-known chat area height and cached line count.  Called
+    /// after mouse-wheel and PageUp adjustments, and also during render for
+    /// a definitive clamp.
+    fn clamp_scroll(&mut self) {
+        if self.chat_area.height == 0 {
+            return;
+        }
+        let visible_height = self.chat_area.height.saturating_sub(2) as usize;
+        let max_scroll = self
+            .layout_cache
+            .lines
+            .len()
+            .saturating_sub(visible_height);
+        if self.scroll > max_scroll {
+            self.scroll = max_scroll;
+        }
+    }
+
+    /// Handle a mouse event (scroll wheel inside the chat area).
+    ///
+    /// Active in all modes except `Interactive` and `PasswordInput`.
+    pub fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        use crossterm::event::MouseEventKind;
+
+        // Mouse is only for chat scrolling — ignore in interactive/password modes.
+        if self.mode == AppMode::Interactive || self.mode == AppMode::PasswordInput {
+            return;
+        }
+
+        // Check if the event is inside the chat area (including borders).
+        let inside = m.row >= self.chat_area.y
+            && m.row < self.chat_area.y + self.chat_area.height
+            && m.column >= self.chat_area.x
+            && m.column < self.chat_area.x + self.chat_area.width;
+
+        if !inside {
+            return;
+        }
+
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll = self.scroll.saturating_add(3);
+                self.clamp_scroll();
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll = self.scroll.saturating_sub(3);
+            }
+            _ => {}
         }
     }
 
@@ -866,5 +931,230 @@ mod tests {
 
         assert!(app.message_rev > rev_before);
         assert_eq!(app.mode, AppMode::Thinking);
+    }
+
+    // ----- Mouse / scroll tests (issue #15) -----
+
+    /// Helper: create a mouse scroll event.
+    fn mouse_event(kind: crossterm::event::MouseEventKind, col: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_scroll_up_increases_scroll() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        // Simulate a chat area with content (set chat_area so clamp_scroll works).
+        app.chat_area = Rect::new(0, 1, 80, 24); // y=1, height=24
+        // Fill cache with enough lines so scroll is possible.
+        app.layout_cache.lines = (0..50)
+            .map(|_| crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("test"),
+                block_index: None,
+                region: crate::ui::layout_cache::LineRegion::Spacer,
+            })
+            .collect();
+        // visible_height = 24 - 2 = 22; max_scroll = 50 - 22 = 28
+
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::ScrollUp,
+            10,
+            10,
+        ));
+        assert_eq!(app.scroll, 3);
+    }
+
+    #[test]
+    fn mouse_scroll_down_decreases_scroll() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        app.layout_cache.lines = (0..50)
+            .map(|_| crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("test"),
+                block_index: None,
+                region: crate::ui::layout_cache::LineRegion::Spacer,
+            })
+            .collect();
+        app.scroll = 10;
+
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::ScrollDown,
+            10,
+            10,
+        ));
+        assert_eq!(app.scroll, 7); // 10 - 3 = 7
+    }
+
+    #[test]
+    fn mouse_scroll_down_clamps_to_zero() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        app.layout_cache.lines = (0..50)
+            .map(|_| crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("test"),
+                block_index: None,
+                region: crate::ui::layout_cache::LineRegion::Spacer,
+            })
+            .collect();
+        app.scroll = 2;
+
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::ScrollDown,
+            10,
+            10,
+        ));
+        assert_eq!(app.scroll, 0); // 2 - 3 saturates to 0
+    }
+
+    #[test]
+    fn mouse_scroll_up_clamps_to_max() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        app.layout_cache.lines = (0..30)
+            .map(|_| crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("test"),
+                block_index: None,
+                region: crate::ui::layout_cache::LineRegion::Spacer,
+            })
+            .collect();
+        // visible_height = 22; max_scroll = 30 - 22 = 8
+
+        // Scroll up many times to exceed max.
+        for _ in 0..10 {
+            app.handle_mouse(mouse_event(
+                crossterm::event::MouseEventKind::ScrollUp,
+                10,
+                10,
+            ));
+        }
+        assert_eq!(app.scroll, 8); // clamped to max_scroll
+    }
+
+    #[test]
+    fn mouse_ignored_outside_chat_area() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        app.layout_cache.lines = (0..50)
+            .map(|_| crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("test"),
+                block_index: None,
+                region: crate::ui::layout_cache::LineRegion::Spacer,
+            })
+            .collect();
+
+        // Click outside chat area (row 0 is above chat_area.y=1).
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::ScrollUp,
+            10,
+            0,
+        ));
+        assert_eq!(app.scroll, 0); // no change
+    }
+
+    #[test]
+    fn mouse_ignored_in_interactive_mode() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Interactive;
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        app.layout_cache.lines = (0..50)
+            .map(|_| crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("test"),
+                block_index: None,
+                region: crate::ui::layout_cache::LineRegion::Spacer,
+            })
+            .collect();
+
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::ScrollUp,
+            10,
+            10,
+        ));
+        assert_eq!(app.scroll, 0); // no change in Interactive mode
+    }
+
+    #[test]
+    fn end_key_resets_scroll_when_input_empty() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.scroll = 15;
+        // Input is empty by default.
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::End,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn end_key_moves_cursor_when_input_nonempty() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.input = "hello".into();
+        app.cursor_pos = 0;
+        app.scroll = 15;
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::End,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.cursor_pos, 5); // cursor at end of "hello"
+        assert_eq!(app.scroll, 15); // scroll unchanged
+    }
+
+    #[test]
+    fn end_key_resets_scroll_in_thinking_mode() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Thinking;
+        app.scroll = 20;
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::End,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn end_key_resets_scroll_in_confirming_mode() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let (tx, _rx) = oneshot::channel();
+        app.pending_confirm = Some(PendingConfirm {
+            command: "ls".into(),
+            explanation: "test".into(),
+            destructive: false,
+            respond_to: tx,
+        });
+        app.mode = AppMode::Confirming;
+        app.scroll = 12;
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::End,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.mode, AppMode::Confirming); // still confirming
+    }
+
+    #[test]
+    fn page_up_clamps_scroll() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        app.layout_cache.lines = (0..30)
+            .map(|_| crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("test"),
+                block_index: None,
+                region: crate::ui::layout_cache::LineRegion::Spacer,
+            })
+            .collect();
+        // visible_height = 22; max_scroll = 30 - 22 = 8
+
+        // PageUp many times to exceed max.
+        for _ in 0..5 {
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::PageUp,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        // 5 * 5 = 25, clamped to 8
+        assert_eq!(app.scroll, 8);
     }
 }
