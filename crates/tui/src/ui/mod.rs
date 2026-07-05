@@ -20,6 +20,7 @@
 
 mod bars;
 mod chat;
+mod confirm;
 mod input;
 pub mod layout_cache;
 mod text;
@@ -55,6 +56,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
     chat::render_chat_history(f, app, chunks[1]);
     input::render_input_area(f, app, chunks[2]);
     bars::render_help_bar(f, app, chunks[3]);
+
+    // Render confirmation modal on top of chat if in Confirming mode.
+    if app.mode == AppMode::Confirming {
+        confirm::render_confirm_modal(f, app, app.chat_area);
+    }
 }
 
 /// Render the interactive terminal mode.

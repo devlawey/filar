@@ -2,7 +2,6 @@
 
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
@@ -64,61 +63,20 @@ fn render_thinking(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
-/// Confirmation dialog for command approval.
+/// Confirmation mode: input panel shows a muted placeholder.
+///
+/// The actual confirmation dialog is rendered as a centered modal overlay
+/// (see [`crate::ui::confirm::render_confirm_modal`]).
 fn render_confirm(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Confirm Command")
-        .border_style(
-            Style::default()
-                .fg(app.theme.danger)
-                .add_modifier(Modifier::BOLD),
-        );
+        .title("Input")
+        .border_style(app.theme.muted());
 
-    let mut lines = Vec::new();
-
-    if let Some(confirm) = &app.pending_confirm {
-        if !confirm.explanation.is_empty() {
-            lines.push(Line::from(format!(
-                "  Explanation: {}",
-                confirm.explanation
-            )));
-        }
-        if confirm.destructive {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "  ! WARNING: ",
-                    app.theme.error_style(),
-                ),
-                Span::styled(
-                    "This command may be destructive!",
-                    app.theme.danger_fg(),
-                ),
-            ]));
-        }
-        lines.push(Line::from(format!("  $ {}", confirm.command)));
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled(
-                " [a]",
-                Style::default()
-                    .fg(app.theme.success)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("pprove  "),
-            Span::styled(
-                "[d]",
-                app.theme.error_style(),
-            ),
-            Span::raw("eny  "),
-            Span::styled("Ctrl+C", app.theme.muted()),
-            Span::raw(" to quit"),
-        ]));
-    }
-
-    let paragraph = Paragraph::new(lines)
+    let text = "waiting for confirmation…";
+    let paragraph = Paragraph::new(text)
         .block(block)
-        .wrap(Wrap { trim: false });
+        .style(app.theme.muted());
     f.render_widget(paragraph, area);
 }
 
