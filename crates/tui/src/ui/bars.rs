@@ -10,11 +10,11 @@ use crate::app::{App, AppMode};
 /// Render the status bar (top line).
 pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let mode_text = match app.mode {
-        AppMode::Normal => "NORMAL",
-        AppMode::Thinking => "THINKING...",
-        AppMode::Confirming => "CONFIRM",
-        AppMode::Interactive => "INTERACTIVE",
-        AppMode::PasswordInput => "PASSWORD",
+        AppMode::Normal => "NORMAL".to_string(),
+        AppMode::Thinking => format!("{} thinking", app.spinner_char()),
+        AppMode::Confirming => "CONFIRM".to_string(),
+        AppMode::Interactive => "INTERACTIVE".to_string(),
+        AppMode::PasswordInput => "PASSWORD".to_string(),
     };
 
     // Store area for hit-testing.

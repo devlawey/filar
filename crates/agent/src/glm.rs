@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 use filar_core::{secrets, CoreError, LlmConfig, Result};
 
 use crate::{ChatMessage, ChatRequest, ChatResponse, LlmClient, ToolCall};
+use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -132,6 +133,81 @@ impl LlmClient for GlmClient {
             .map(|e| e.into_core_error())
             .unwrap_or_else(|| CoreError::Other("exhausted retries".into())))
     }
+
+    async fn chat_stream(
+        &self,
+        request: &ChatRequest,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<ChatResponse> {
+        let mut api_request =
+            ApiRequest::from_chat_request(request, &self.model, self.max_tokens);
+        api_request.stream = Some(true);
+        let body = serde_json::to_value(&api_request)
+            .map_err(|e| CoreError::Other(format!("failed to serialize request: {e}")))?;
+
+        debug!(model = %self.model, "sending streaming chat request to GLM API");
+
+        // Retry loop for the initial connection only (not mid-stream).
+        let response = {
+            let mut last_error: Option<ApiError> = None;
+            let mut resp: Option<reqwest::Response> = None;
+            for attempt in 0..=self.max_retries {
+                if attempt > 0 {
+                    let delay = self.backoff_base * 2u32.pow(attempt - 1);
+                    warn!(attempt, delay_ms = delay.as_millis(), "retrying after transient error");
+                    tokio::time::sleep(delay).await;
+                }
+                match self.send_stream_request(&body).await {
+                    Ok(r) => {
+                        resp = Some(r);
+                        break;
+                    }
+                    Err(e) if e.is_retryable() => {
+                        warn!(attempt, error = %e, "transient error, will retry");
+                        last_error = Some(e);
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e.into_core_error());
+                    }
+                }
+            }
+            match resp {
+                Some(r) => r,
+                None => {
+                    return Err(last_error
+                        .map(|e| e.into_core_error())
+                        .unwrap_or_else(|| CoreError::Other("exhausted retries".into())))
+                }
+            }
+        };
+
+        // Parse the SSE stream.
+        use futures::StreamExt;
+        let mut stream = response.bytes_stream();
+        let mut state = SseState::new();
+
+        loop {
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    let deltas = state.process_chunk(&String::from_utf8_lossy(&chunk));
+                    for d in deltas {
+                        on_delta(d);
+                    }
+                }
+                Some(Err(e)) => {
+                    return Err(CoreError::Other(format!("stream error: {e}")));
+                }
+                None => {
+                    debug!("stream ended");
+                    return state.into_response();
+                }
+            }
+            if state.done {
+                return state.into_response();
+            }
+        }
+    }
 }
 
 impl GlmClient {
@@ -139,7 +215,7 @@ impl GlmClient {
     async fn send_request(&self, body: &serde_json::Value) -> std::result::Result<ApiResponse, ApiError> {
         let response = self
             .http
-            .post(&self.endpoint())
+            .post(self.endpoint())
             .bearer_auth(&self.api_key)
             .json(body)
             .send()
@@ -173,6 +249,45 @@ impl GlmClient {
                     ApiError::Parse(format!("{e}. Response body: {preview}"))
                 })?;
             Ok(api_response)
+        } else {
+            let status_code = status.as_u16();
+            let body_text = response.text().await.unwrap_or_default();
+            info!(status_code, body = %body_text, "GLM API returned error status");
+            match status_code {
+                401 | 403 => Err(ApiError::Auth(format!("HTTP {status_code}: {body_text}"))),
+                429 => Err(ApiError::RateLimit(body_text)),
+                500..=599 => Err(ApiError::Server(status_code, body_text)),
+                _ => Err(ApiError::Client(status_code, body_text)),
+            }
+        }
+    }
+
+    /// Send a streaming request — returns the raw HTTP response for SSE parsing.
+    async fn send_stream_request(
+        &self,
+        body: &serde_json::Value,
+    ) -> std::result::Result<reqwest::Response, ApiError> {
+        let response = self
+            .http
+            .post(self.endpoint())
+            .bearer_auth(&self.api_key)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    ApiError::Timeout(self.timeout)
+                } else if e.is_connect() {
+                    ApiError::Connect(e.to_string())
+                } else {
+                    ApiError::Network(e.to_string())
+                }
+            })?;
+
+        let status = response.status();
+        if status.is_success() {
+            debug!(status = %status, "GLM streaming API connection established");
+            Ok(response)
         } else {
             let status_code = status.as_u16();
             let body_text = response.text().await.unwrap_or_default();
@@ -262,6 +377,8 @@ struct ApiRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ApiTool>,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 impl ApiRequest {
@@ -273,6 +390,7 @@ impl ApiRequest {
             messages,
             tools,
             max_tokens,
+            stream: None,
         }
     }
 }
@@ -427,6 +545,153 @@ impl ApiResponse {
         // Otherwise, return the text content.
         let text = choice.message.content.unwrap_or_default();
         Ok(ChatResponse::Text(text))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSE streaming types
+// ---------------------------------------------------------------------------
+
+/// A single SSE event parsed from a `data: {...}` line.
+#[derive(Deserialize)]
+struct SseEvent {
+    #[serde(default)]
+    choices: Vec<SseChoice>,
+}
+
+#[derive(Deserialize)]
+struct SseChoice {
+    delta: SseDelta,
+    #[allow(dead_code)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SseDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<SseToolCallDelta>>,
+}
+
+#[derive(Deserialize)]
+struct SseToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    function: Option<SseToolCallFunctionDelta>,
+}
+
+#[derive(Deserialize)]
+struct SseToolCallFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+/// Accumulated tool call from streaming deltas.
+#[derive(Default)]
+struct StreamToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Stateful SSE parser — accumulates text and tool_calls across chunked data.
+///
+/// Designed for unit-testing: feed it chunked SSE data via [`process_chunk`](Self::process_chunk),
+/// then call [`into_response`](Self::into_response) to get the final [`ChatResponse`].
+struct SseState {
+    buffer: String,
+    full_text: String,
+    tool_calls: BTreeMap<usize, StreamToolCall>,
+    done: bool,
+}
+
+impl SseState {
+    fn new() -> Self {
+        Self {
+            buffer: String::new(),
+            full_text: String::new(),
+            tool_calls: BTreeMap::new(),
+            done: false,
+        }
+    }
+
+    /// Process a chunk of SSE data. Returns new text content deltas.
+    fn process_chunk(&mut self, chunk: &str) -> Vec<String> {
+        let mut new_deltas = Vec::new();
+        self.buffer.push_str(chunk);
+        while let Some(pos) = self.buffer.find('\n') {
+            let line = self.buffer[..pos].trim_end_matches('\r').to_string();
+            self.buffer = self.buffer[pos + 1..].to_string();
+
+            if line.is_empty() {
+                continue;
+            }
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+
+            if data.trim() == "[DONE]" {
+                self.done = true;
+                continue;
+            }
+
+            match serde_json::from_str::<SseEvent>(data) {
+                Ok(event) => {
+                    if let Some(choice) = event.choices.into_iter().next() {
+                        if let Some(content) = choice.delta.content {
+                            if !content.is_empty() {
+                                new_deltas.push(content.clone());
+                                self.full_text.push_str(&content);
+                            }
+                        }
+                        if let Some(tc_deltas) = choice.delta.tool_calls {
+                            for tc in tc_deltas {
+                                let entry =
+                                    self.tool_calls.entry(tc.index).or_default();
+                                if let Some(id) = tc.id {
+                                    entry.id = id;
+                                }
+                                if let Some(func) = tc.function {
+                                    if let Some(name) = func.name {
+                                        entry.name = name;
+                                    }
+                                    if let Some(args) = func.arguments {
+                                        entry.arguments.push_str(&args);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, line = %data, "failed to parse SSE event, skipping");
+                }
+            }
+        }
+        new_deltas
+    }
+
+    /// Build the final [`ChatResponse`] from accumulated state.
+    fn into_response(self) -> Result<ChatResponse> {
+        if !self.tool_calls.is_empty() {
+            let calls: Vec<ToolCall> = self
+                .tool_calls
+                .values()
+                .map(|tc| {
+                    let arguments = serde_json::from_str(&tc.arguments)
+                        .unwrap_or(serde_json::Value::Null);
+                    ToolCall {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        arguments,
+                    }
+                })
+                .collect();
+            Ok(ChatResponse::ToolCalls(calls))
+        } else {
+            Ok(ChatResponse::Text(self.full_text))
+        }
     }
 }
 
@@ -656,5 +921,147 @@ mod tests {
                 println!("Model responded with text instead of tool call: {text}");
             }
         }
+    }
+
+    // ── SSE parser tests ───────────────────────────────────────────────
+
+    #[test]
+    fn sse_parse_text_stream_chunked() {
+        // Simulate SSE data split across chunks at arbitrary byte boundaries.
+        let mut state = SseState::new();
+
+        // Chunk 1: first event, split mid-line.
+        let d1 = state.process_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"Hel");
+        assert!(d1.is_empty(), "no complete line yet");
+
+        // Chunk 2: rest of first event + start of second.
+        let d2 = state.process_chunk(
+            "lo\"}}]}
+
+data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
+
+",
+        );
+        assert_eq!(&d2, &["Hello", " world"]);
+
+        // Chunk 3: [DONE] marker.
+        let d3 = state.process_chunk("data: [DONE]\n\n");
+        assert!(d3.is_empty());
+        assert!(state.done);
+
+        let response = state.into_response().unwrap();
+        match response {
+            ChatResponse::Text(text) => assert_eq!(text, "Hello world"),
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn sse_parse_tool_calls_stream() {
+        let mut state = SseState::new();
+
+        // First chunk: tool call with id + name + start of arguments.
+        let d1 = state.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{\\\"comm\"}}]}}]}\n\n",
+        );
+        assert!(d1.is_empty(), "no text deltas expected");
+
+        // Second chunk: continuation of arguments.
+        let d2 = state.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"and\\\":\\\"ls\\\"}\"}}]}}]}\n\n",
+        );
+        assert!(d2.is_empty());
+
+        // Done.
+        state.process_chunk("data: [DONE]\n\n");
+
+        let response = state.into_response().unwrap();
+        match response {
+            ChatResponse::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call_1");
+                assert_eq!(calls[0].name, "run_command");
+                assert_eq!(calls[0].arguments["command"], "ls");
+            }
+            _ => panic!("expected ToolCalls response"),
+        }
+    }
+
+    #[test]
+    fn sse_parse_multiple_tool_calls() {
+        let mut state = SseState::new();
+
+        state.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{}\"}}]}}]}\n",
+        );
+        state.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c2\",\"function\":{\"name\":\"list_dir\",\"arguments\":\"{}\"}}]}}]}\n",
+        );
+        state.process_chunk("data: [DONE]\n\n");
+
+        let response = state.into_response().unwrap();
+        match response {
+            ChatResponse::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[0].id, "c1");
+                assert_eq!(calls[0].name, "run_command");
+                assert_eq!(calls[1].id, "c2");
+                assert_eq!(calls[1].name, "list_dir");
+            }
+            _ => panic!("expected ToolCalls response"),
+        }
+    }
+
+    #[test]
+    fn sse_parse_text_and_tool_calls() {
+        // Model sends text first, then tool calls.
+        let mut state = SseState::new();
+
+        let d1 = state.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Let me check.\"}}]}\n\n",
+        );
+        assert_eq!(&d1, &["Let me check."]);
+
+        state.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        );
+        state.process_chunk("data: [DONE]\n\n");
+
+        // Final response is ToolCalls (tool_calls take precedence).
+        let response = state.into_response().unwrap();
+        match response {
+            ChatResponse::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "run_command");
+            }
+            _ => panic!("expected ToolCalls response"),
+        }
+    }
+
+    #[test]
+    fn sse_parse_empty_stream() {
+        let state = SseState::new();
+        let response = state.into_response().unwrap();
+        match response {
+            ChatResponse::Text(text) => assert!(text.is_empty()),
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn serialize_stream_request() {
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("Hello")],
+            tools: vec![],
+        };
+        let mut api = ApiRequest::from_chat_request(&req, "glm-4", 4096);
+        api.stream = Some(true);
+        let json = serde_json::to_value(&api).unwrap();
+        assert_eq!(json["stream"], true);
+
+        // Without streaming, stream field should be absent.
+        let api_no_stream = ApiRequest::from_chat_request(&req, "glm-4", 4096);
+        let json_no_stream = serde_json::to_value(&api_no_stream).unwrap();
+        assert!(json_no_stream.get("stream").is_none());
     }
 }

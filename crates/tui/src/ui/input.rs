@@ -50,16 +50,22 @@ fn render_normal_input(f: &mut Frame, app: &App, area: Rect) {
     place_cursor(f, app, area);
 }
 
-/// Thinking mode: agent status.
+/// Thinking mode: disabled input field with spinner.
+///
+/// Replaces the old yellow "Agent is thinking" box with a stable layout:
+/// the same input frame but muted, with a spinner on the left.
 fn render_thinking(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Agent")
-        .border_style(Style::default().fg(app.theme.warning));
-    let text = "Agent is thinking... (Ctrl+C to quit)";
+        .title("Input")
+        .border_style(app.theme.muted());
+
+    let spinner = app.spinner_char();
+    let label = if app.streaming { "writing…" } else { "thinking…" };
+    let text = format!("{spinner} {label}  (Ctrl+C to cancel)");
     let paragraph = Paragraph::new(text)
         .block(block)
-        .style(app.theme.warning_fg());
+        .style(app.theme.muted());
     f.render_widget(paragraph, area);
 }
 

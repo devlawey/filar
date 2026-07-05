@@ -30,6 +30,20 @@ use filar_core::Result;
 pub trait LlmClient: Send + Sync {
     /// Send a chat request and return the model's response.
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse>;
+
+    /// Send a chat request with streaming, calling `on_delta` for each text
+    /// chunk as it arrives. Returns the fully-assembled response.
+    ///
+    /// Default implementation falls back to non-streaming [`chat`][Self::chat].
+    async fn chat_stream(
+        &self,
+        request: &ChatRequest,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<ChatResponse> {
+        // Default: no streaming, just call chat.
+        let _ = on_delta; // suppress unused warning in default impl.
+        self.chat(request).await
+    }
 }
 
 // ---------------------------------------------------------------------------
