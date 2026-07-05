@@ -91,8 +91,8 @@ impl ChatLayoutCache {
 
     /// Rebuild the cache from scratch.
     ///
-    /// `collapsed` contains indices of blocks whose output is collapsed
-    /// (reserved for task 6 — currently always empty).
+    /// `collapsed` contains indices of blocks whose output is collapsed,
+    /// computed by `App::collapsed_set()` from user overrides and defaults.
     pub fn rebuild(
         &mut self,
         messages: &[ChatBlock],
@@ -145,40 +145,83 @@ impl ChatLayoutCache {
                     output,
                     approved,
                 } => {
+                    let is_collapsed = collapsed.contains(&idx);
+
+                    // Status glyph: ✓ for approved, ✗ for denied.
                     let status = if *approved {
-                        Span::styled(" [ok] ", theme.success_fg())
+                        Span::styled("  ✓", theme.success_fg())
                     } else {
-                        Span::styled(" [no] ", theme.danger_fg())
+                        Span::styled("  ✗", theme.danger_fg())
                     };
 
+                    // Arrow indicator: ▸ collapsed, ▾ expanded, spaces if no output.
+                    let arrow = if output.is_some() {
+                        if is_collapsed { "▸ " } else { "▾ " }
+                    } else {
+                        "  "
+                    };
+
+                    // Compact header: `▸ $ command  ✓` / `▾ $ command  ✓`
                     self.push_header(idx, vec![
-                        Span::styled("> ", theme.warning_fg()),
-                        Span::styled("Command", theme.command_style()),
+                        Span::styled(arrow, theme.warning_fg()),
+                        Span::styled("$ ", theme.warning_fg()),
+                        Span::styled(command.clone(), theme.command_style()),
                         status,
                     ]);
 
+                    // Explanation (if any) — shown in both states.
                     if !explanation.is_empty() {
                         for wrapped in wrap_text(&strip_emoji(explanation), output_width) {
                             self.push_output(idx, format!("  | {wrapped}"));
                         }
                     }
-                    for wrapped in wrap_text(&format!("$ {command}"), output_width) {
-                        self.push_output(idx, format!("  | {wrapped}"));
-                    }
 
+                    // Output rendering with collapse/expand.
                     if let Some(out) = output {
-                        for (count, line) in out.lines().enumerate() {
-                            if count >= 30 {
-                                let remaining =
-                                    out.lines().count().saturating_sub(30);
+                        let all_lines: Vec<&str> = out.lines().collect();
+                        let total = all_lines.len();
+
+                        if is_collapsed {
+                            // Collapsed: show first 5 lines + toggle.
+                            for line in all_lines.iter().take(5) {
+                                for wrapped in wrap_text(line, output_width) {
+                                    self.push_output(idx, format!("  | {wrapped}"));
+                                }
+                            }
+                            if total > 5 {
+                                let remaining = total - 5;
                                 self.push_output_toggle(
                                     idx,
-                                    format!("  | ... ({} more lines)", remaining),
+                                    format!(
+                                        "  ▸ … {} more lines — click to expand",
+                                        remaining
+                                    ),
                                 );
-                                break;
                             }
-                            for wrapped in wrap_text(line, output_width) {
-                                self.push_output(idx, format!("  | {wrapped}"));
+                        } else {
+                            // Expanded: show up to 400 lines (safety ceiling).
+                            const MAX_EXPANDED_LINES: usize = 400;
+                            for line in all_lines.iter().take(MAX_EXPANDED_LINES) {
+                                for wrapped in wrap_text(line, output_width) {
+                                    self.push_output(idx, format!("  | {wrapped}"));
+                                }
+                            }
+                            if total > MAX_EXPANDED_LINES {
+                                let remaining = total - MAX_EXPANDED_LINES;
+                                self.push_output(
+                                    idx,
+                                    format!(
+                                        "  … truncated ({} more lines)",
+                                        remaining
+                                    ),
+                                );
+                            }
+                            // Collapse toggle for long output.
+                            if total > 5 {
+                                self.push_output_toggle(
+                                    idx,
+                                    "  ▾ collapse".to_string(),
+                                );
                             }
                         }
                     }
@@ -367,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn command_block_produces_output_and_toggle_regions() {
+    fn command_block_expanded_shows_collapse_toggle() {
         let theme = Theme::default_dark();
         let collapsed = HashSet::new();
         let mut cache = ChatLayoutCache::new();
@@ -381,10 +424,121 @@ mod tests {
         }];
         cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
 
-        // Should have: Header, Output (expl), Output ($ test), Output x30, OutputToggle, Spacer
+        // Expanded: Header, Output (expl), Output x50, OutputToggle (▾ collapse), Spacer.
         let has_toggle = cache.lines.iter().any(|l| l.region == LineRegion::OutputToggle);
-        assert!(has_toggle, "expected an OutputToggle line for truncated output");
+        assert!(has_toggle, "expected a ▾ collapse toggle for expanded long output");
         let has_output = cache.lines.iter().any(|l| l.region == LineRegion::Output);
         assert!(has_output, "expected Output lines");
+
+        // The toggle text should say "collapse", not "more lines".
+        let toggle = cache.lines.iter().find(|l| l.region == LineRegion::OutputToggle).unwrap();
+        let toggle_text = format!("{}", toggle.line);
+        assert!(toggle_text.contains("collapse"), "toggle should say collapse, got: {toggle_text}");
+    }
+
+    #[test]
+    fn command_block_collapsed_shows_5_lines_and_expand_toggle() {
+        let theme = Theme::default_dark();
+        let mut collapsed = HashSet::new();
+        collapsed.insert(0);
+        let mut cache = ChatLayoutCache::new();
+
+        let long_output = (0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let msgs = vec![ChatBlock::Command {
+            command: "test".into(),
+            explanation: "".into(),
+            output: Some(long_output),
+            approved: true,
+        }];
+        cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
+
+        // Collapsed: Header, Output x5, OutputToggle (▸ … 45 more lines), Spacer.
+        let output_count = cache.lines.iter().filter(|l| l.region == LineRegion::Output).count();
+        assert_eq!(output_count, 5, "collapsed block should show exactly 5 output lines");
+
+        let toggle = cache.lines.iter().find(|l| l.region == LineRegion::OutputToggle);
+        assert!(toggle.is_some(), "collapsed block should have a toggle line");
+        let toggle_text = format!("{}", toggle.unwrap().line);
+        assert!(toggle_text.contains("more lines"), "toggle should mention more lines, got: {toggle_text}");
+        assert!(toggle_text.contains("45"), "toggle should say 45 more lines, got: {toggle_text}");
+    }
+
+    #[test]
+    fn command_block_short_output_has_no_toggle() {
+        let theme = Theme::default_dark();
+        let collapsed = HashSet::new();
+        let mut cache = ChatLayoutCache::new();
+
+        let short_output = "line 1\nline 2\nline 3";
+        let msgs = vec![ChatBlock::Command {
+            command: "echo".into(),
+            explanation: "".into(),
+            output: Some(short_output.into()),
+            approved: true,
+        }];
+        cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
+
+        // Short output: Header, Output x3, Spacer — no toggle.
+        let has_toggle = cache.lines.iter().any(|l| l.region == LineRegion::OutputToggle);
+        assert!(!has_toggle, "short output should not have a toggle line");
+    }
+
+    #[test]
+    fn command_block_header_has_arrow_and_status() {
+        let theme = Theme::default_dark();
+        let collapsed = HashSet::new();
+        let mut cache = ChatLayoutCache::new();
+
+        let msgs = vec![
+            ChatBlock::Command {
+                command: "ls".into(),
+                explanation: "".into(),
+                output: Some("file1\nfile2".into()),
+                approved: true,
+            },
+            ChatBlock::Command {
+                command: "rm".into(),
+                explanation: "".into(),
+                output: Some("".into()),
+                approved: false,
+            },
+        ];
+        cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
+
+        // First header: expanded arrow (▾), $ ls, ✓.
+        let header0 = &cache.lines[0];
+        assert_eq!(header0.region, LineRegion::Header);
+        let header0_text = format!("{}", header0.line);
+        assert!(header0_text.contains('▾'), "expanded header should have ▾, got: {header0_text}");
+        assert!(header0_text.contains("ls"), "header should contain command, got: {header0_text}");
+        assert!(header0_text.contains('✓'), "approved header should have ✓, got: {header0_text}");
+
+        // Find the second header (skip first block's lines + spacer).
+        let header1 = cache.lines.iter().find(|l| {
+            l.region == LineRegion::Header && l.block_index == Some(1)
+        }).unwrap();
+        let header1_text = format!("{}", header1.line);
+        assert!(header1_text.contains('✗'), "denied header should have ✗, got: {header1_text}");
+        assert!(header1_text.contains("rm"), "header should contain command, got: {header1_text}");
+    }
+
+    #[test]
+    fn command_block_no_output_has_no_arrow() {
+        let theme = Theme::default_dark();
+        let collapsed = HashSet::new();
+        let mut cache = ChatLayoutCache::new();
+
+        let msgs = vec![ChatBlock::Command {
+            command: "pending".into(),
+            explanation: "".into(),
+            output: None,
+            approved: false,
+        }];
+        cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
+
+        let header = &cache.lines[0];
+        let header_text = format!("{}", header.line);
+        assert!(!header_text.contains('▸') && !header_text.contains('▾'),
+            "no-output block should not have arrow, got: {header_text}");
     }
 }
