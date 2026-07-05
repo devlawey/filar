@@ -824,24 +824,25 @@ impl App {
         }
     }
 
+    /// Compute the default collapse state for a chat block.
+    /// A Command block is collapsed by default if its output has more than 6 lines.
+    fn default_collapsed_for(msg: &ChatBlock) -> bool {
+        matches!(msg, ChatBlock::Command { output: Some(out), .. } if out.lines().count() > 6)
+    }
+
     /// Compute the set of collapsed block indices from `collapsed_overrides`
-    /// and defaults.  A Command block is collapsed by default if its output
-    /// has more than 6 lines; `collapsed_overrides` can force either state.
+    /// and defaults.  `collapsed_overrides` can force either state.
     pub fn collapsed_set(&self) -> HashSet<usize> {
         self.messages
             .iter()
             .enumerate()
-            .filter_map(|(idx, msg)| match msg {
-                ChatBlock::Command { output: Some(out), .. } => {
-                    let line_count = out.lines().count();
-                    let is_collapsed = self
-                        .collapsed_overrides
-                        .get(&idx)
-                        .copied()
-                        .unwrap_or(line_count > 6);
-                    if is_collapsed { Some(idx) } else { None }
-                }
-                _ => None,
+            .filter_map(|(idx, msg)| {
+                let is_collapsed = self
+                    .collapsed_overrides
+                    .get(&idx)
+                    .copied()
+                    .unwrap_or_else(|| Self::default_collapsed_for(msg));
+                if is_collapsed { Some(idx) } else { None }
             })
             .collect()
     }
@@ -854,13 +855,9 @@ impl App {
             .get(&block_idx)
             .copied()
             .unwrap_or_else(|| {
-                if let Some(ChatBlock::Command { output: Some(out), .. }) =
-                    self.messages.get(block_idx)
-                {
-                    out.lines().count() > 6
-                } else {
-                    false
-                }
+                self.messages
+                    .get(block_idx)
+                    .is_some_and(Self::default_collapsed_for)
             });
         self.collapsed_overrides.insert(block_idx, !is_collapsed);
         self.message_rev = self.message_rev.wrapping_add(1);
@@ -2038,5 +2035,116 @@ mod tests {
         assert!(!app.collapsed_set().contains(&0));
         app.collapsed_overrides.insert(0, true);
         assert!(app.collapsed_set().contains(&0));
+    }
+
+    // ---- Mouse click routing tests (issue #18 review) ----
+
+    #[test]
+    fn mouse_click_output_toggle_toggles_collapse() {
+        let mut app = make_command_app(50);
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        app.layout_cache.lines = vec![
+            crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("header"),
+                block_index: Some(0),
+                region: crate::ui::layout_cache::LineRegion::Header,
+            },
+            crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("toggle"),
+                block_index: Some(0),
+                region: crate::ui::layout_cache::LineRegion::OutputToggle,
+            },
+        ];
+        // Click the OutputToggle line (row 3 → line_idx 1).
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            5,
+            3,
+        ));
+        assert!(
+            app.collapsed_overrides.contains_key(&0),
+            "OutputToggle click should toggle collapse"
+        );
+    }
+
+    #[test]
+    fn mouse_click_command_header_with_output_toggles_collapse() {
+        let mut app = make_command_app(50);
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        app.layout_cache.lines = vec![
+            crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("header"),
+                block_index: Some(0),
+                region: crate::ui::layout_cache::LineRegion::Header,
+            },
+        ];
+        // Click the Header line (row 2 → line_idx 0).
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            5,
+            2,
+        ));
+        assert!(
+            app.collapsed_overrides.contains_key(&0),
+            "Header click should toggle collapse for Command with output"
+        );
+    }
+
+    #[test]
+    fn mouse_click_command_header_without_output_no_toggle() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.messages.clear();
+        app.messages.push(ChatBlock::Command {
+            command: "pending".into(),
+            explanation: "".into(),
+            output: None,
+            approved: false,
+        });
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        app.layout_cache.lines = vec![
+            crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("header"),
+                block_index: Some(0),
+                region: crate::ui::layout_cache::LineRegion::Header,
+            },
+        ];
+        // Click the Header line — should NOT toggle (no output).
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            5,
+            2,
+        ));
+        assert!(
+            !app.collapsed_overrides.contains_key(&0),
+            "Header click should not toggle for Command without output"
+        );
+    }
+
+    #[test]
+    fn mouse_click_body_does_not_toggle_collapse() {
+        let mut app = make_command_app(50);
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        app.layout_cache.lines = vec![
+            crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("header"),
+                block_index: Some(0),
+                region: crate::ui::layout_cache::LineRegion::Header,
+            },
+            crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("body"),
+                block_index: Some(0),
+                region: crate::ui::layout_cache::LineRegion::Body,
+            },
+        ];
+        // Click the Body line (row 3 → line_idx 1).
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            5,
+            3,
+        ));
+        assert!(
+            !app.collapsed_overrides.contains_key(&0),
+            "Body click should not toggle collapse"
+        );
     }
 }

@@ -91,8 +91,8 @@ impl ChatLayoutCache {
 
     /// Rebuild the cache from scratch.
     ///
-    /// `collapsed` contains indices of blocks whose output is collapsed
-    /// (reserved for task 6 — currently always empty).
+    /// `collapsed` contains indices of blocks whose output is collapsed,
+    /// computed by `App::collapsed_set()` from user overrides and defaults.
     pub fn rebuild(
         &mut self,
         messages: &[ChatBlock],
@@ -208,7 +208,7 @@ impl ChatLayoutCache {
                             }
                             if total > MAX_EXPANDED_LINES {
                                 let remaining = total - MAX_EXPANDED_LINES;
-                                self.push_output_toggle(
+                                self.push_output(
                                     idx,
                                     format!(
                                         "  … truncated ({} more lines)",

@@ -757,3 +757,14 @@ PR: #28
   `ChatLayoutCache::rebuild()` теперь получает реальные collapsed-данные.
   Заголовок Command блока изменился: `> Command [ok]` → `▾ $ command  ✓`.
   `strip_emoji` whitelist расширен диапазоном 0x2713–0x2717.
+- **Review fixes (CodeRabbit PR #29):**
+  - Truncation marker `… truncated (N more lines)` changed from `OutputToggle`
+    to `Output` region — it's informational, not clickable. Only `▾ collapse`
+    remains as the toggle.
+  - Stale doc comment on `rebuild()` updated: `collapsed` is now populated
+    by `app.collapsed_set()`, not "reserved for task 6".
+  - Extracted `default_collapsed_for()` helper to deduplicate the `> 6 lines`
+    threshold between `collapsed_set()` and `toggle_collapse()`.
+  - Added 4 mouse click routing tests: OutputToggle click toggles, Header click
+    toggles (with output), Header click no-op (without output), Body click
+    no-op. Total: 96 tui tests.
