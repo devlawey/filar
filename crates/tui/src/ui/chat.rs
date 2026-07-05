@@ -1,7 +1,5 @@
 //! Chat history rendering.
 
-use std::collections::HashSet;
-
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
@@ -26,11 +24,12 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
         .layout_cache
         .needs_rebuild(&app.messages, inner_width, app.message_rev)
     {
+        let collapsed = app.collapsed_set();
         app.layout_cache.rebuild(
             &app.messages,
             inner_width,
             &app.theme,
-            &HashSet::new(), // no collapsed blocks yet (task 6)
+            &collapsed,
             app.message_rev,
         );
     }

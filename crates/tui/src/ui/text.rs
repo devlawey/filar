@@ -19,7 +19,8 @@ pub(crate) fn strip_emoji(s: &str) -> String {
             || (0x2200..=0x22FF).contains(&cp)  // Math operators (≠ ≤ ≥ ±)
             || (0x2500..=0x257F).contains(&cp)  // Box drawing (┃ │ ┌ └)
             || (0x2580..=0x259F).contains(&cp)  // Block elements
-            || (0x25A0..=0x25FF).contains(&cp)  // Geometric shapes (▶ ◆ ● ■)
+            || (0x25A0..=0x25FF).contains(&cp)  // Geometric shapes (▶ ◆ ● ■ ▸ ▾)
+            || (0x2713..=0x2717).contains(&cp)  // Dingbats: ✓ ✗ (command status)
             // Everything else (Misc symbols, Dingbats, Emojis, Flags) is stripped
         })
         .collect()

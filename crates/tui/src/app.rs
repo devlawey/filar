@@ -13,7 +13,7 @@ use crate::terminal::{key_to_bytes, TerminalModel};
 use crate::ui::layout_cache::ChatLayoutCache;
 use crate::ui::Theme;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -158,6 +158,9 @@ pub struct App {
     pub confirm_selected: bool,
     /// Button under mouse cursor during hover (`Some(true)` = Approve, `Some(false)` = Deny).
     pub hovered_button: Option<bool>,
+    /// User-set collapse overrides: block index → is_collapsed.
+    /// Blocks not in this map use the default (collapsed if output > 6 lines).
+    pub collapsed_overrides: HashMap<usize, bool>,
 }
 
 impl App {
@@ -199,6 +202,7 @@ impl App {
             help_bar_area: Rect::default(),
             confirm_selected: false,
             hovered_button: None,
+            collapsed_overrides: HashMap::new(),
         }
     }
 
@@ -616,6 +620,30 @@ impl App {
                 HitZone::ConfirmButton(approve) => {
                     self.respond_to_confirmation(approve);
                 }
+                HitZone::Chat { line_idx } => {
+                    // Click on OutputToggle or Command header → toggle collapse.
+                    if let Some(rl) = self.layout_cache.lines.get(line_idx) {
+                        match rl.region {
+                            crate::ui::layout_cache::LineRegion::OutputToggle => {
+                                if let Some(block_idx) = rl.block_index {
+                                    self.toggle_collapse(block_idx);
+                                }
+                            }
+                            crate::ui::layout_cache::LineRegion::Header => {
+                                if let Some(block_idx) = rl.block_index {
+                                    // Only toggle for Command blocks with output.
+                                    if matches!(
+                                        self.messages.get(block_idx),
+                                        Some(ChatBlock::Command { output: Some(_), .. })
+                                    ) {
+                                        self.toggle_collapse(block_idx);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 _ => {}
             },
             // --- Drag ---
@@ -794,6 +822,48 @@ impl App {
             self.confirm_button_areas.clear();
             self.hovered_button = None;
         }
+    }
+
+    /// Compute the set of collapsed block indices from `collapsed_overrides`
+    /// and defaults.  A Command block is collapsed by default if its output
+    /// has more than 6 lines; `collapsed_overrides` can force either state.
+    pub fn collapsed_set(&self) -> HashSet<usize> {
+        self.messages
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, msg)| match msg {
+                ChatBlock::Command { output: Some(out), .. } => {
+                    let line_count = out.lines().count();
+                    let is_collapsed = self
+                        .collapsed_overrides
+                        .get(&idx)
+                        .copied()
+                        .unwrap_or(line_count > 6);
+                    if is_collapsed { Some(idx) } else { None }
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Toggle the collapse state of a command block.
+    /// Bumps `message_rev` so the layout cache rebuilds.
+    fn toggle_collapse(&mut self, block_idx: usize) {
+        let is_collapsed = self
+            .collapsed_overrides
+            .get(&block_idx)
+            .copied()
+            .unwrap_or_else(|| {
+                if let Some(ChatBlock::Command { output: Some(out), .. }) =
+                    self.messages.get(block_idx)
+                {
+                    out.lines().count() > 6
+                } else {
+                    false
+                }
+            });
+        self.collapsed_overrides.insert(block_idx, !is_collapsed);
+        self.message_rev = self.message_rev.wrapping_add(1);
     }
 
     /// Handle an agent event.
@@ -1903,5 +1973,70 @@ mod tests {
             !matches!(zone, HitZone::ConfirmButton(_)),
             "stale button area should not swallow clicks after modal closes"
         );
+    }
+
+    // ---- Collapse / expand tests (issue #18) ----
+
+    fn make_command_app(output_lines: usize) -> App {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.messages.clear();
+        let output = (0..output_lines)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.messages.push(ChatBlock::Command {
+            command: "test".into(),
+            explanation: "".into(),
+            output: Some(output),
+            approved: true,
+        });
+        app
+    }
+
+    #[test]
+    fn collapsed_set_defaults_long_output_collapsed() {
+        let app = make_command_app(50);
+        let collapsed = app.collapsed_set();
+        assert!(collapsed.contains(&0), "50-line output should be collapsed by default");
+    }
+
+    #[test]
+    fn collapsed_set_defaults_short_output_not_collapsed() {
+        let app = make_command_app(3);
+        let collapsed = app.collapsed_set();
+        assert!(!collapsed.contains(&0), "3-line output should not be collapsed by default");
+    }
+
+    #[test]
+    fn collapsed_set_respects_expand_override() {
+        let mut app = make_command_app(50);
+        app.collapsed_overrides.insert(0, false);
+        let collapsed = app.collapsed_set();
+        assert!(!collapsed.contains(&0), "override=false should expand even long output");
+    }
+
+    #[test]
+    fn collapsed_set_respects_collapse_override() {
+        let mut app = make_command_app(3);
+        app.collapsed_overrides.insert(0, true);
+        let collapsed = app.collapsed_set();
+        assert!(collapsed.contains(&0), "override=true should collapse even short output");
+    }
+
+    #[test]
+    fn toggle_collapse_from_default_collapsed_to_expanded() {
+        let mut app = make_command_app(50);
+        assert!(app.collapsed_set().contains(&0));
+        // Simulate toggle via the private method's logic.
+        app.collapsed_overrides.insert(0, false);
+        assert!(!app.collapsed_set().contains(&0));
+    }
+
+    #[test]
+    fn toggle_collapse_from_default_expanded_to_collapsed() {
+        let mut app = make_command_app(3);
+        assert!(!app.collapsed_set().contains(&0));
+        app.collapsed_overrides.insert(0, true);
+        assert!(app.collapsed_set().contains(&0));
     }
 }

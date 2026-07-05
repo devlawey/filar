@@ -717,3 +717,43 @@ PR: #28
     count so `Constraint::Length` doesn't clip long text. Min width 30 → 32.
   - Fixed title color: hardcoded `danger` → `border_color` (warning for
     non-destructive commands).
+
+### Issue #18: Сворачиваемые блоки команд по клику (task 6)
+
+**Ветка:** `feat/18-collapsible-command-blocks`
+
+**Что сделано:**
+- Заменён жёсткий лимит 30 строк на collapse/expand: по умолчанию блоки с
+  выводом > 6 строк свёрнуты до 5 строк + строка-переключатель
+  `▸ … N more lines — click to expand`. Развёрнутые длинные блоки показывают
+  `▾ collapse`. Страховочный потолок: 400 строк (`… truncated`).
+- Компактный заголовок команды: `▸ $ command  ✓` (свёрнут) /
+  `▾ $ command  ✓` (развёрнут). `✓` = success, `✗` = danger для denied.
+  Если вывода нет (`output: None`) — стрелка не показывается.
+  Команда перенесена из отдельной output-строки в заголовок.
+- `collapsed_overrides: HashMap<usize, bool>` в `App` — пользовательские
+  переопределения. Блоки не в map используют дефолт (> 6 строк → свёрнут).
+- Клик по строке `OutputToggle` или по заголовку `Command` (с output)
+  переключает collapse/expand. `message_rev` инкрементируется → кэш
+  перестраивается.
+- `collapsed_set()` в `App` вычисляет множество свёрнутых индексов из
+  overrides + дефолтов, передаётся в `layout_cache.rebuild()`.
+- `strip_emoji`: добавлен диапазон 0x2713–0x2717 (Dingbats: ✓ ✗).
+
+**Файлы:**
+- `crates/tui/src/app.rs` — `collapsed_overrides`, `collapsed_set()`,
+  `toggle_collapse()`, handle_mouse Chat zone (OutputToggle + Header click)
+- `crates/tui/src/ui/layout_cache.rs` — новый заголовок, collapse/expand логика,
+  400-строк потолок
+- `crates/tui/src/ui/chat.rs` — передаёт `app.collapsed_set()` вместо `HashSet::new()`
+- `crates/tui/src/ui/text.rs` — whitelist 0x2713–0x2717
+
+**Тесты:** 10 новых (92 tui total): collapsed_set defaults/overrides (4),
+  toggle collapse (2), layout_cache collapsed shows 5 lines + expand toggle,
+  expanded shows collapse toggle, short output no toggle, header arrow+status,
+  no-output no arrow.
+
+**Публичные контракты:** `App` получил `collapsed_overrides: HashMap<usize, bool>`.
+  `ChatLayoutCache::rebuild()` теперь получает реальные collapsed-данные.
+  Заголовок Command блока изменился: `> Command [ok]` → `▾ $ command  ✓`.
+  `strip_emoji` whitelist расширен диапазоном 0x2713–0x2717.
