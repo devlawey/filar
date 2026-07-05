@@ -48,17 +48,33 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         )));
     }
 
+    let command_text = format!("$ {}", confirm.command);
     lines.push(Line::from(Span::styled(
-        format!("$ {}", confirm.command),
+        command_text.as_str(),
         app.theme.warning_fg(),
     )));
 
     lines.push(Line::from(""));
 
-    let content_lines = lines.len() as u16;
+    // --- Estimate modal dimensions ---
+    // Minimum width 32 so buttons fit inside borders (30 chars + 2 borders).
+    let modal_width = 70u16.min(area.width.saturating_sub(8)).max(32);
+    let inner_width = (modal_width.saturating_sub(2)) as usize; // -2 borders
+
+    // Estimate how many rendered rows each text segment will occupy after
+    // wrapping, so the content area is tall enough to show everything.
+    let explanation_rows = if !confirm.explanation.is_empty() {
+        estimate_wrapped_rows(&confirm.explanation, inner_width)
+    } else {
+        0
+    };
+    let warning_rows = if confirm.destructive { 1 } else { 0 };
+    let command_rows = estimate_wrapped_rows(&command_text, inner_width);
+    let empty_rows = 1; // separator line
+
+    let content_height = (explanation_rows + warning_rows + command_rows + empty_rows) as u16;
     // +2 for borders, +1 for buttons line
-    let modal_height = content_lines + 1 + 2;
-    let modal_width = 70u16.min(area.width.saturating_sub(8)).max(30);
+    let modal_height = content_height + 1 + 2;
 
     // Center within the area.
     let modal_x = area.x + (area.width.saturating_sub(modal_width)) / 2;
@@ -81,7 +97,7 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         .title(Span::styled(
             " Confirm command ",
             Style::default()
-                .fg(app.theme.danger)
+                .fg(border_color)
                 .add_modifier(Modifier::BOLD),
         ))
         .border_style(Style::default().fg(border_color));
@@ -93,7 +109,7 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(content_lines),
+            Constraint::Length(content_height),
             Constraint::Length(1), // buttons line
         ])
         .split(inner);
@@ -167,4 +183,24 @@ fn render_buttons(f: &mut Frame, app: &mut App, area: Rect) {
         Paragraph::new(deny_label).style(deny_style),
         deny_area,
     );
+}
+
+/// Estimate how many terminal rows `text` will occupy after wrapping at
+/// `width` columns.  Uses char count (not byte length) for correctness with
+/// multi-byte glyphs, matching ratatui's `Wrap { trim: false }` behaviour.
+fn estimate_wrapped_rows(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    text.split('\n')
+        .map(|line| {
+            let chars = line.chars().count();
+            if chars == 0 {
+                1
+            } else {
+                chars.div_ceil(width)
+            }
+        })
+        .sum::<usize>()
+        .max(1)
 }

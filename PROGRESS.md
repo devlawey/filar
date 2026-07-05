@@ -709,3 +709,11 @@ PR: #28
   `hovered_button: Option<bool>`. Новый модуль `ui::confirm`.
   `render_confirm` в `input.rs` больше не рисует диалог — только muted placeholder.
   Help-bar текст для Confirming изменён.
+- **Review fixes (CodeRabbit PR #28):**
+  - Fixed stale hit-test state: `respond_to_confirmation` now clears
+    `confirm_button_areas` and `hovered_button` so old button rects don't
+    swallow clicks after modal closes. Added regression test.
+  - Fixed modal sizing: `estimate_wrapped_rows` helper computes wrapped line
+    count so `Constraint::Length` doesn't clip long text. Min width 30 → 32.
+  - Fixed title color: hardcoded `danger` → `border_color` (warning for
+    non-destructive commands).

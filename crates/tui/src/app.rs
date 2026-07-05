@@ -790,6 +790,9 @@ impl App {
                 approved,
             });
             self.mode = AppMode::Thinking;
+            // Clear modal hit-test state so stale button areas don't swallow clicks.
+            self.confirm_button_areas.clear();
+            self.hovered_button = None;
         }
     }
 
@@ -1877,5 +1880,28 @@ mod tests {
         // Hit-test at a point inside the button — should be ConfirmButton, not Chat.
         let zone = app.hit_test(7, 5);
         assert_eq!(zone, HitZone::ConfirmButton(true));
+    }
+
+    #[test]
+    fn confirm_state_cleared_after_response() {
+        let mut app = make_confirm_app(false);
+        // Populate button areas as if rendered.
+        app.confirm_button_areas.push((Rect::new(20, 10, 15, 1), true));
+        app.confirm_button_areas.push((Rect::new(38, 10, 13, 1), false));
+        app.hovered_button = Some(true);
+
+        // Deny via keyboard.
+        app.handle_key(key_event(crossterm::event::KeyCode::Char('d')));
+
+        // After response, modal state should be cleared.
+        assert!(app.confirm_button_areas.is_empty(), "button areas should be cleared");
+        assert_eq!(app.hovered_button, None, "hovered_button should be cleared");
+
+        // Hit-test in the former button area should NOT return ConfirmButton.
+        let zone = app.hit_test(25, 10);
+        assert!(
+            !matches!(zone, HitZone::ConfirmButton(_)),
+            "stale button area should not swallow clicks after modal closes"
+        );
     }
 }
