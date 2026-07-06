@@ -161,6 +161,12 @@ pub struct App {
     /// User-set collapse overrides: block index → is_collapsed.
     /// Blocks not in this map use the default (collapsed if output > 6 lines).
     pub collapsed_overrides: HashMap<usize, bool>,
+    /// Whether the agent is currently streaming a text response.
+    /// When true, `TextDelta` events append to the last `Agent` block.
+    pub streaming: bool,
+    /// Spinner animation tick counter — incremented each render frame
+    /// while in `Thinking` mode.
+    pub tick: u64,
 }
 
 impl App {
@@ -203,6 +209,8 @@ impl App {
             confirm_selected: false,
             hovered_button: None,
             collapsed_overrides: HashMap::new(),
+            streaming: false,
+            tick: 0,
         }
     }
 
@@ -863,11 +871,42 @@ impl App {
         self.message_rev = self.message_rev.wrapping_add(1);
     }
 
+    /// Return the current spinner character based on `tick`.
+    ///
+    /// Uses braille frames in modern terminals (Windows Terminal),
+    /// ASCII fallback (`|/-\`) in conhost.
+    pub fn spinner_char(&self) -> &'static str {
+        static IS_WT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let is_wt = *IS_WT.get_or_init(|| std::env::var("WT_SESSION").is_ok());
+        const BRAILLE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        const ASCII: &[&str] = &["|", "/", "-", "\\"];
+        let frames = if is_wt { BRAILLE } else { ASCII };
+        frames[(self.tick as usize) % frames.len()]
+    }
+
     /// Handle an agent event.
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
+        let mut auto_scroll = true;
         match event {
             AgentEvent::Started | AgentEvent::Thinking => {
                 self.mode = AppMode::Thinking;
+            }
+            AgentEvent::TextDelta(s) => {
+                // Append to the last Agent block if streaming, else create new.
+                if self.streaming {
+                    if let Some(ChatBlock::Agent(ref mut text)) = self.messages.last_mut() {
+                        text.push_str(&s);
+                    } else {
+                        self.push_message(ChatBlock::Agent(s));
+                    }
+                } else {
+                    self.push_message(ChatBlock::Agent(s));
+                    self.streaming = true;
+                }
+                self.message_rev = self.message_rev.wrapping_add(1);
+                // Only auto-scroll if already at bottom.
+                // If the user scrolled up, don’t yank them down.
+                auto_scroll = self.scroll == 0;
             }
             AgentEvent::TextResponse(text) => {
                 self.push_message(ChatBlock::Agent(text));
@@ -878,6 +917,9 @@ impl App {
                 destructive,
                 respond_to,
             } => {
+                // Finalize any streaming text before showing the dialog.
+                self.streaming = false;
+                auto_scroll = self.scroll == 0;
                 self.pending_confirm = Some(PendingConfirm {
                     command: command.clone(),
                     explanation: explanation.clone(),
@@ -893,6 +935,9 @@ impl App {
                 output,
                 approved,
             } => {
+                // Finalize any streaming text before showing command output.
+                self.streaming = false;
+                auto_scroll = self.scroll == 0;
                 // Try to update the last matching Command block with output.
                 let mut updated = false;
                 if let Some(ChatBlock::Command {
@@ -920,13 +965,31 @@ impl App {
                 }
             }
             AgentEvent::Finished(text) => {
-                if !text.is_empty() {
+                // Finalize streaming block with authoritative text.
+                if self.streaming {
+                    if !text.is_empty() {
+                        if let Some(ChatBlock::Agent(ref mut existing)) = self.messages.last_mut() {
+                            *existing = text;
+                            self.message_rev = self.message_rev.wrapping_add(1);
+                        } else {
+                            self.push_message(ChatBlock::Agent(text));
+                        }
+                    }
+                    self.streaming = false;
+                    auto_scroll = self.scroll == 0;
+                } else if !text.is_empty() {
                     self.push_message(ChatBlock::Agent(text));
                 }
                 self.mode = AppMode::Normal;
                 self.agent_running = false;
             }
             AgentEvent::Error(err) => {
+                // If streaming was interrupted, mark it.
+                if self.streaming {
+                    self.push_message(ChatBlock::System("response interrupted".into()));
+                    self.streaming = false;
+                    auto_scroll = self.scroll == 0;
+                }
                 self.push_message(ChatBlock::Error(err));
                 self.mode = AppMode::Normal;
                 self.agent_running = false;
@@ -935,8 +998,10 @@ impl App {
                 // Handled by the runner before reaching here — no-op.
             }
         }
-        // Auto-scroll to bottom on any new content.
-        self.scroll = 0;
+        // Auto-scroll to bottom on new content (unless user scrolled up during streaming).
+        if auto_scroll {
+            self.scroll = 0;
+        }
     }
 
     /// Take the pending user input (called by the runner to send to the agent).
@@ -1702,7 +1767,7 @@ mod tests {
     /// Helper: set up an app in Confirming mode with a pending confirmation.
     fn make_confirm_app(destructive: bool) -> App {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        let (_tx, rx) = oneshot::channel::<bool>();
+        let (_tx, _rx) = oneshot::channel::<bool>();
         // We need the tx to stay alive so respond_to doesn't fail silently;
         // but for tests we just check mode/message changes.
         // Use a fresh sender that we drop to simulate a real channel.
@@ -2146,5 +2211,186 @@ mod tests {
             !app.collapsed_overrides.contains_key(&0),
             "Body click should not toggle collapse"
         );
+    }
+
+    // ── Streaming tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn text_delta_creates_new_agent_block() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.messages.clear();
+        app.mode = AppMode::Thinking;
+
+        app.handle_agent_event(AgentEvent::TextDelta("Hello".into()));
+
+        assert!(app.streaming);
+        assert_eq!(app.messages.len(), 1);
+        match &app.messages[0] {
+            ChatBlock::Agent(text) => assert_eq!(text, "Hello"),
+            _ => panic!("expected Agent block"),
+        }
+    }
+
+    #[test]
+    fn text_delta_appends_when_streaming() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.messages.clear();
+        app.mode = AppMode::Thinking;
+
+        app.handle_agent_event(AgentEvent::TextDelta("Hello".into()));
+        app.handle_agent_event(AgentEvent::TextDelta(" world".into()));
+
+        assert!(app.streaming);
+        assert_eq!(app.messages.len(), 1);
+        match &app.messages[0] {
+            ChatBlock::Agent(text) => assert_eq!(text, "Hello world"),
+            _ => panic!("expected Agent block"),
+        }
+    }
+
+    #[test]
+    fn finished_finalizes_streaming_block() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.messages.clear();
+        app.mode = AppMode::Thinking;
+
+        // Stream some text.
+        app.handle_agent_event(AgentEvent::TextDelta("Partial".into()));
+        app.handle_agent_event(AgentEvent::TextDelta(" response".into()));
+        assert!(app.streaming);
+
+        // Finished replaces with authoritative text.
+        app.handle_agent_event(AgentEvent::Finished(
+            "Partial response — finalized".into(),
+        ));
+
+        assert!(!app.streaming);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.messages.len(), 1);
+        match &app.messages[0] {
+            ChatBlock::Agent(text) => assert_eq!(text, "Partial response — finalized"),
+            _ => panic!("expected Agent block"),
+        }
+    }
+
+    #[test]
+    fn finished_empty_text_keeps_streaming_block() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.messages.clear();
+        app.mode = AppMode::Thinking;
+
+        app.handle_agent_event(AgentEvent::TextDelta("Streamed text".into()));
+        app.handle_agent_event(AgentEvent::Finished(String::new()));
+
+        assert!(!app.streaming);
+        assert_eq!(app.messages.len(), 1);
+        match &app.messages[0] {
+            ChatBlock::Agent(text) => assert_eq!(text, "Streamed text"),
+            _ => panic!("expected Agent block"),
+        }
+    }
+
+    #[test]
+    fn error_during_stream_adds_interrupted_marker() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.messages.clear();
+        app.mode = AppMode::Thinking;
+
+        app.handle_agent_event(AgentEvent::TextDelta("Partial".into()));
+        assert!(app.streaming);
+
+        app.handle_agent_event(AgentEvent::Error("network error".into()));
+
+        assert!(!app.streaming);
+        assert_eq!(app.mode, AppMode::Normal);
+        // Should have: Agent block (partial) + System (interrupted) + Error.
+        assert_eq!(app.messages.len(), 3);
+        assert!(matches!(&app.messages[1], ChatBlock::System(s) if s == "response interrupted"));
+        assert!(matches!(&app.messages[2], ChatBlock::Error(_)));
+    }
+
+    #[test]
+    fn confirmation_request_finalizes_streaming() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.messages.clear();
+        app.mode = AppMode::Thinking;
+
+        app.handle_agent_event(AgentEvent::TextDelta("Let me check...".into()));
+        assert!(app.streaming);
+
+        let (tx, _rx) = oneshot::channel::<bool>();
+        app.handle_agent_event(AgentEvent::ConfirmationRequest {
+            command: "ls".into(),
+            explanation: "list files".into(),
+            destructive: false,
+            respond_to: tx,
+        });
+
+        assert!(!app.streaming);
+        assert_eq!(app.mode, AppMode::Confirming);
+    }
+
+    #[test]
+    fn text_delta_no_autoscroll_when_user_scrolled_up() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.messages.clear();
+        app.mode = AppMode::Thinking;
+        app.scroll = 5; // User scrolled up.
+
+        app.handle_agent_event(AgentEvent::TextDelta("new text".into()));
+
+        // Scroll should NOT be reset to 0 — user is reading history.
+        assert_eq!(app.scroll, 5);
+    }
+
+    #[test]
+    fn text_delta_autoscroll_when_at_bottom() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.messages.clear();
+        app.mode = AppMode::Thinking;
+        app.scroll = 0;
+
+        app.handle_agent_event(AgentEvent::TextDelta("new text".into()));
+
+        // Scroll stays at 0 (bottom).
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn spinner_char_cycles() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let c0 = app.spinner_char();
+        app.tick = app.tick.wrapping_add(1);
+        let c1 = app.spinner_char();
+        app.tick = app.tick.wrapping_add(1);
+        let c2 = app.spinner_char();
+
+        // At least some frames should differ.
+        // (In braille mode all 10 are unique; in ASCII 4 are unique.)
+        assert_ne!(c0, c1, "spinner should advance");
+        assert_ne!(c1, c2, "spinner should advance");
+    }
+
+    #[test]
+    fn streaming_resets_on_new_agent_run() {
+        // After Finished, a new TextDelta should create a new block (not append to old).
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.messages.clear();
+        app.mode = AppMode::Thinking;
+
+        app.handle_agent_event(AgentEvent::TextDelta("First".into()));
+        app.handle_agent_event(AgentEvent::Finished("First".into()));
+        assert!(!app.streaming);
+
+        // New run.
+        app.handle_agent_event(AgentEvent::Thinking);
+        app.handle_agent_event(AgentEvent::TextDelta("Second".into()));
+
+        assert!(app.streaming);
+        assert_eq!(app.messages.len(), 2);
+        match &app.messages[1] {
+            ChatBlock::Agent(text) => assert_eq!(text, "Second"),
+            _ => panic!("expected second Agent block"),
+        }
     }
 }

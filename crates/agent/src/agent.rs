@@ -117,6 +117,8 @@ pub struct Agent {
     max_iterations: usize,
     max_output_chars: usize,
     system_prompt: String,
+    /// Optional callback invoked for each text delta during LLM streaming.
+    on_text_delta: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 /// Builder for [`Agent`].
@@ -128,6 +130,7 @@ pub struct AgentBuilder {
     max_iterations: usize,
     max_output_chars: usize,
     system_prompt: Option<String>,
+    on_text_delta: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 impl AgentBuilder {
@@ -141,6 +144,7 @@ impl AgentBuilder {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             max_output_chars: DEFAULT_MAX_OUTPUT_CHARS,
             system_prompt: None,
+            on_text_delta: None,
         }
     }
 
@@ -186,6 +190,12 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the text-delta callback for LLM streaming.
+    pub fn on_text_delta(mut self, cb: Arc<dyn Fn(String) + Send + Sync>) -> Self {
+        self.on_text_delta = Some(cb);
+        self
+    }
+
     /// Convenience: set the system prompt for local execution.
     pub fn local_mode(self) -> Self {
         self.system_prompt(build_system_prompt(true, None, cfg!(windows)))
@@ -208,6 +218,7 @@ impl AgentBuilder {
             system_prompt: self.system_prompt.unwrap_or_else(||
                 build_system_prompt(false, None, cfg!(windows))
             ),
+            on_text_delta: self.on_text_delta,
         })
     }
 }
@@ -246,7 +257,12 @@ impl Agent {
                 tools: tool_defs.clone(),
             };
 
-            let response = self.llm.chat(&request).await?;
+            // Use streaming if a callback is set, otherwise fall back to non-streaming.
+            let response = if let Some(ref cb) = self.on_text_delta {
+                self.llm.chat_stream(&request, cb.as_ref()).await?
+            } else {
+                self.llm.chat(&request).await?
+            };
 
             match response {
                 ChatResponse::Text(text) => {

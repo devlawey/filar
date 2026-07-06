@@ -15,6 +15,10 @@ pub enum AgentEvent {
     /// The agent is calling the LLM (thinking).
     Thinking,
 
+    /// A text chunk arrived during streaming.
+    /// The UI should append this to the current streaming agent block.
+    TextDelta(String),
+
     /// The agent produced a text response.
     TextResponse(String),
 

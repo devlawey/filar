@@ -339,10 +339,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 ## 8. Тесты
 
-- **51 unit-тест** проходят:
-  - filar-agent: 33 теста (agent loop, tools, security, GLM client)
+- **150 unit-тестов** проходят:
+  - filar-agent: 42 теста (agent loop, tools, security, GLM client, SSE parser)
   - filar-transport: 2 теста (marker format, payload format) + 3 ignored (Docker)
-  - filar-tui: 16 тестов (terminal model, key mapping, app state)
+  - filar-tui: 106 тестов (terminal model, key mapping, app state, layout, streaming)
 - **1 pre-existing failure:** `parse_minimal_config` в filar-core (ожидает `Always`,
   дефолт `Allowlist`) — unrelated к текущим изменениям
 
@@ -768,3 +768,68 @@ PR: #28
   - Added 4 mouse click routing tests: OutputToggle click toggles, Header click
     toggles (with output), Header click no-op (without output), Body click
     no-op. Total: 96 tui tests.
+
+### Issue #19: Agent+TUI — стриминг ответа LLM и спиннер
+
+**Ветка:** `feat/19-llm-streaming-spinner`
+
+**Задача:** SSE-стриминг ответа LLM с поблочным выводом текста в TUI и спиннером
+в Thinking-режиме.
+
+**Что сделано:**
+- **SSE-стриминг в GLM-клиенте** (`crates/agent/src/glm.rs`):
+  - `chat_stream()` — отправляет `"stream": true`, читает `bytes_stream()`,
+    парсит SSE через stateful `SseState` парсер.
+  - `SseState` — аккумулирует `buffer`, `full_text`, `tool_calls` (BTreeMap
+    по `index`), флаг `done`. `process_chunk()` возвращает `Vec<String>`
+    текстовых дельт. `into_response()` собирает финальный `ChatResponse`.
+  - `send_stream_request()` — retry loop для initial connection (5xx/429/network).
+- **LlmClient trait** (`crates/agent/src/lib.rs`):
+  - `chat_stream()` — default метод с fallback на `chat()`.
+  - Callback: `Fn(String)` вместо `Fn(&str)` — обходит HRTB-проблему
+    `async_trait` (десугарит `for<'a> Fn(&'a str)` в конкретный lifetime).
+- **AgentEvent::TextDelta** (`crates/tui/src/event.rs`) — новый вариант.
+- **Agent loop** (`crates/agent/src/agent.rs`):
+  - `on_text_delta: Option<Arc<dyn Fn(String) + Send + Sync>>` — callback.
+  - Если callback установлен — `chat_stream()`, иначе `chat()`.
+- **Runner** (`crates/tui/src/runner.rs`):
+  - Streaming callback: клонирует `tx`, отправляет `TextDelta`.
+  - Spinner tick: `app.tick` инкрементируется каждый render frame в Thinking.
+  - `needs_clear` подавлен для `TextDelta` (анти-мерцание).
+- **App streaming state** (`crates/tui/src/app.rs`):
+  - `streaming: bool`, `tick: u64`, `spinner_char()` (braille `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`
+    в WT_SESSION, ASCII `|/-\` fallback).
+  - `TextDelta`: append к последнему Agent блоку если streaming, иначе новый;
+    auto-scroll только если `scroll == 0`.
+  - `Finished`: заменяет streaming-блок авторитетным текстом.
+  - `Error`: добавляет `System("response interrupted")` если streaming.
+- **Input panel** (`crates/tui/src/ui/input.rs`): disabled frame с muted
+  стилем, спиннер + `writing…` / `thinking…` + `(Ctrl+C to cancel)`.
+- **Status bar** (`crates/tui/src/ui/bars.rs`): `{spinner} thinking`.
+- **strip_emoji** (`crates/tui/src/ui/text.rs`): whitelist 0x2800–0x28FF.
+
+**Решения:**
+- `Fn(String)` вместо `Fn(&str)` — `async_trait` десугарит HRTB в конкретный
+  lifetime, привязанный к async future. Owned `String` решает проблему.
+- `process_chunk` возвращает `Vec<String>` вместо callback — та же причина.
+- Braille спиннер только в Windows Terminal (`WT_SESSION` env).
+- `needs_clear` подавлен для `TextDelta` — prevents мерцание.
+- Auto-scroll только если `scroll == 0` — `↓ N new` индикатор растёт.
+
+**Тесты:**
+- 6 SSE parser tests (chunked text, tool calls, multiple tool calls,
+  text+tool calls, empty stream, stream serialization).
+- 10 streaming tests (append, new block, auto-scroll, reset, spinner,
+  Finished, Error, ConfirmationRequest, CommandExecuted).
+- Total: 42 agent tests + 106 tui tests pass.
+
+**Публичные контракты:**
+- `LlmClient` trait: новый метод `chat_stream()` (default impl).
+- `AgentEvent`: новый вариант `TextDelta(String)`.
+- `Agent`/`AgentBuilder`: новое поле `on_text_delta` + builder method.
+- `App`: новые поля `streaming: bool`, `tick: u64`; метод `spinner_char()`.
+- Callback: `Fn(&str)` → `Fn(String)`.
+
+**Что дальше:**
+- Issue #20: Collapsible command blocks (click-to-expand).
+- Issue #21: Keyboard shortcuts in Thinking mode.

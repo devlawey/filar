@@ -393,9 +393,14 @@ async fn run_app(
                         ssh_info = new_ssh.clone();
                         app.target_name = new_ssh.clone().unwrap_or_else(|| "local".into());
                     }
+                    // TextDelta events don't need a full clear — just a redraw.
+                    // This prevents flickering during streaming.
+                    let is_text_delta = matches!(event, AgentEvent::TextDelta(_));
                     app.handle_agent_event(event);
                     needs_redraw = true;
-                    needs_clear = true;
+                    if !is_text_delta {
+                        needs_clear = true;
+                    }
                 }
             }
 
@@ -434,7 +439,11 @@ async fn run_app(
             }
 
             // Render at most 60fps — batches multiple events into one draw.
-            _ = render_interval.tick(), if needs_redraw => {
+            // Also tick when in Thinking mode so the spinner animates.
+            _ = render_interval.tick(), if needs_redraw || app.mode == AppMode::Thinking => {
+                if app.mode == AppMode::Thinking {
+                    app.tick = app.tick.wrapping_add(1);
+                }
                 if needs_clear || prev_mode != app.mode {
                     terminal.clear().ok();
                     needs_clear = false;
@@ -546,6 +555,14 @@ fn spawn_agent(
         } else {
             builder = builder.ssh_mode(ssh_info.as_deref());
         }
+
+        // Set up streaming callback: send TextDelta events to the TUI.
+        let tx_for_delta = tx.clone();
+        let on_text_delta: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |delta: String| {
+            let _ = tx_for_delta.send(AgentEvent::TextDelta(delta));
+        });
+        builder = builder.on_text_delta(on_text_delta);
+
         let agent = match builder.build() {
             Ok(a) => a,
             Err(e) => {
