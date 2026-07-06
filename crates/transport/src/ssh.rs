@@ -460,7 +460,7 @@ async fn reader_task(
                             break;
                         }
                     }
-                    Some(ChannelMsg::ExtendedData { ref data, ext }) if ext == 1 => {
+                    Some(ChannelMsg::ExtendedData { ref data, ext: 1 }) => {
                         debug!(len = data.len(), "stderr data received from SSH channel");
                         let text = String::from_utf8_lossy(data.as_ref()).to_string();
                         if event_tx.send(ChannelEvent::Stderr(text)).is_err() {
@@ -705,18 +705,14 @@ async fn recv_until_marker(
                                 // Drain any trailing stderr that may still be
                                 // in the event pipeline. Without this, late
                                 // stderr could contaminate the next run's result.
-                                loop {
-                                    match tokio::time::timeout(
+                                while let Ok(Some(ChannelEvent::Stderr(text))) =
+                                    tokio::time::timeout(
                                         Duration::from_millis(50),
                                         event_rx.recv(),
                                     )
                                     .await
-                                    {
-                                        Ok(Some(ChannelEvent::Stderr(text))) => {
-                                            stderr_buf.push_str(&text);
-                                        }
-                                        _ => break,
-                                    }
+                                {
+                                    stderr_buf.push_str(&text);
                                 }
                                 return Ok((output, stderr_buf, Some(code)));
                             }
@@ -975,17 +971,13 @@ mod tests {
         // The result should be either an error (timeout/channel) or a
         // non-zero exit code (SIGINT = 130). A `Some(0)` means the command
         // was NOT interrupted — that's a failure.
-        match result {
-            Ok(Ok(r)) => {
-                assert_ne!(
-                    r.exit_code,
-                    Some(0),
-                    "expected non-zero exit code after cancel, got: {:?}",
-                    r.exit_code
-                );
-            }
-            // Error from run() (timeout) or JoinError — both acceptable.
-            Ok(Err(_)) | Err(_) => {}
+        if let Ok(Ok(r)) = result {
+            assert_ne!(
+                r.exit_code,
+                Some(0),
+                "expected non-zero exit code after cancel, got: {:?}",
+                r.exit_code
+            );
         }
 
         // Verify the shell is still usable after cancel.
@@ -1010,7 +1002,7 @@ mod tests {
             entries.get("10.0.0.5:22"),
             Some(&"SHA256:def456".to_string())
         );
-        assert!(entries.get("unknown:22").is_none());
+        assert!(!entries.contains_key("unknown:22"));
     }
 
     #[test]

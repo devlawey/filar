@@ -72,6 +72,37 @@ pub enum DragKind {
     // `Selection` (text selection) is reserved for future work.
 }
 
+/// An action triggered by clicking a help-bar item.
+///
+/// Each clickable help-bar item stores its `Rect` and associated `HelpAction`
+/// in [`App::helpbar_zones`] during render.  When a click lands on the help
+/// bar, [`App::handle_mouse`] looks up the zone and executes the action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpAction {
+    /// Send the current input (Enter in Normal mode).
+    Send,
+    /// Insert `!` prefix for shell escape.
+    Shell,
+    /// Toggle interactive terminal mode (Ctrl+T).
+    Terminal,
+    /// Enter password input mode (Ctrl+P).
+    Password,
+    /// Quit the application (Ctrl+C) or cancel agent (in Thinking).
+    Quit,
+    /// Switch confirm selection (Tab).
+    Switch,
+    /// Confirm with the selected button (Enter in Confirming).
+    Confirm,
+    /// Approve the command (a/y).
+    Approve,
+    /// Deny the command (d/n).
+    Deny,
+    /// Send password (Enter in PasswordInput).
+    SendPassword,
+    /// Cancel password input (Esc).
+    Cancel,
+}
+
 // ---------------------------------------------------------------------------
 // Pending confirmation
 // ---------------------------------------------------------------------------
@@ -167,6 +198,8 @@ pub struct App {
     /// Spinner animation tick counter — incremented each render frame
     /// while in `Thinking` mode.
     pub tick: u64,
+    /// Clickable help-bar zones: (rect, action) filled during render.
+    pub helpbar_zones: Vec<(Rect, HelpAction)>,
 }
 
 impl App {
@@ -211,6 +244,7 @@ impl App {
             collapsed_overrides: HashMap::new(),
             streaming: false,
             tick: 0,
+            helpbar_zones: Vec::new(),
         }
     }
 
@@ -583,11 +617,29 @@ impl App {
 
     /// Handle a mouse event (scroll wheel, clicks, drags).
     ///
-    /// Active in all modes except `Interactive` and `PasswordInput`.
+    /// Help-bar clicks work in all modes; other mouse events are active in
+    /// all modes except `Interactive` and `PasswordInput`.
     pub fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
 
-        // Mouse is not used in interactive/password modes (yet — task 10).
+        // Help-bar clicks work in ALL modes (including Interactive/Password).
+        if m.kind == MouseEventKind::Down(MouseButton::Left) {
+            if let HitZone::HelpBar = self.hit_test(m.column, m.row) {
+                for (rect, action) in &self.helpbar_zones {
+                    if m.column >= rect.x
+                        && m.column < rect.x + rect.width
+                        && m.row >= rect.y
+                        && m.row < rect.y + rect.height
+                    {
+                        self.execute_help_action(*action);
+                        return;
+                    }
+                }
+                return;
+            }
+        }
+
+        // Other mouse events are not used in interactive/password modes.
         if self.mode == AppMode::Interactive || self.mode == AppMode::PasswordInput {
             return;
         }
@@ -674,6 +726,94 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Execute the action associated with a help-bar click.
+    fn execute_help_action(&mut self, action: HelpAction) {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        match action {
+            HelpAction::Send => {
+                self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+            }
+            HelpAction::Shell => {
+                // Insert `!` prefix if input is empty.
+                if self.mode == AppMode::Normal && self.input.is_empty() {
+                    self.insert_char('!');
+                }
+            }
+            HelpAction::Terminal => {
+                self.toggle_interactive = true;
+            }
+            HelpAction::Password => {
+                if self.mode == AppMode::Normal {
+                    self.input.clear();
+                    self.cursor_pos = 0;
+                    self.mode = AppMode::PasswordInput;
+                    if let Some((user, host, port)) = &self.pending_ssh {
+                        self.push_message(ChatBlock::System(format!(
+                            "Enter SSH password for {user}@{host}:{port}"
+                        )));
+                        self.scroll = 0;
+                    }
+                }
+            }
+            HelpAction::Quit => match self.mode {
+                AppMode::Normal => self.should_quit = true,
+                AppMode::Thinking => {
+                    self.agent_running = false;
+                    self.pending_input = None;
+                    self.pending_ssh = None;
+                    self.pending_ssh_password = None;
+                    self.mode = AppMode::Normal;
+                    self.push_message(ChatBlock::System("Cancelled.".into()));
+                    self.scroll = 0;
+                }
+                AppMode::Confirming => {
+                    self.respond_to_confirmation(false);
+                    self.should_quit = true;
+                }
+                AppMode::Interactive => {
+                    self.toggle_interactive = true;
+                }
+                AppMode::PasswordInput => {
+                    self.input.clear();
+                    self.cursor_pos = 0;
+                    self.mode = AppMode::Normal;
+                }
+            },
+            HelpAction::Switch => {
+                if self.mode == AppMode::Confirming {
+                    self.confirm_selected = !self.confirm_selected;
+                }
+            }
+            HelpAction::Confirm => {
+                if self.mode == AppMode::Confirming {
+                    self.respond_to_confirmation(self.confirm_selected);
+                }
+            }
+            HelpAction::Approve => {
+                if self.mode == AppMode::Confirming {
+                    self.respond_to_confirmation(true);
+                }
+            }
+            HelpAction::Deny => {
+                if self.mode == AppMode::Confirming {
+                    self.respond_to_confirmation(false);
+                }
+            }
+            HelpAction::SendPassword => {
+                if self.mode == AppMode::PasswordInput {
+                    self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+                }
+            }
+            HelpAction::Cancel => {
+                if self.mode == AppMode::PasswordInput {
+                    self.input.clear();
+                    self.cursor_pos = 0;
+                    self.mode = AppMode::Normal;
+                }
+            }
         }
     }
 
@@ -2392,5 +2532,115 @@ mod tests {
             ChatBlock::Agent(text) => assert_eq!(text, "Second"),
             _ => panic!("expected second Agent block"),
         }
+    }
+
+    // --- HelpAction and helpbar_zones tests ---
+
+    #[test]
+    fn helpbar_zones_init_empty() {
+        let app = App::new("test".into(), CommandConfirmMode::Always);
+        assert!(app.helpbar_zones.is_empty());
+    }
+
+    #[test]
+    fn help_action_quit_in_normal_mode() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        assert!(!app.should_quit);
+        app.execute_help_action(HelpAction::Quit);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn help_action_quit_in_thinking_cancels() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Thinking;
+        app.agent_running = true;
+        app.execute_help_action(HelpAction::Quit);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(!app.agent_running);
+    }
+
+    #[test]
+    fn help_action_terminal_toggles() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        assert!(!app.toggle_interactive);
+        app.execute_help_action(HelpAction::Terminal);
+        assert!(app.toggle_interactive);
+    }
+
+    #[test]
+    fn help_action_password_enters_mode() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.execute_help_action(HelpAction::Password);
+        assert_eq!(app.mode, AppMode::PasswordInput);
+    }
+
+    #[test]
+    fn help_action_shell_inserts_bang() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        assert!(app.input.is_empty());
+        app.execute_help_action(HelpAction::Shell);
+        assert_eq!(app.input, "!");
+    }
+
+    #[test]
+    fn help_action_shell_does_not_overwrite_nonempty() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.input = "hello".into();
+        app.execute_help_action(HelpAction::Shell);
+        assert_eq!(app.input, "hello");
+    }
+
+    #[test]
+    fn help_action_approve_denies_in_confirming() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        app.mode = AppMode::Confirming;
+        app.pending_confirm = Some(PendingConfirm {
+            command: "ls".into(),
+            explanation: "list".into(),
+            destructive: false,
+            respond_to: tx,
+        });
+        app.execute_help_action(HelpAction::Approve);
+        assert_eq!(app.mode, AppMode::Thinking);
+        assert!(rx.try_recv().unwrap());
+    }
+
+    #[test]
+    fn help_action_deny_in_confirming() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        app.mode = AppMode::Confirming;
+        app.pending_confirm = Some(PendingConfirm {
+            command: "rm".into(),
+            explanation: "remove".into(),
+            destructive: true,
+            respond_to: tx,
+        });
+        app.execute_help_action(HelpAction::Deny);
+        assert_eq!(app.mode, AppMode::Thinking);
+        assert!(!rx.try_recv().unwrap());
+    }
+
+    #[test]
+    fn help_action_cancel_in_password_mode() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::PasswordInput;
+        app.input = "secret".into();
+        app.execute_help_action(HelpAction::Cancel);
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn help_action_switch_toggles_confirm_selected() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Confirming;
+        assert!(!app.confirm_selected); // default = Deny
+        app.execute_help_action(HelpAction::Switch);
+        assert!(app.confirm_selected);
+        app.execute_help_action(HelpAction::Switch);
+        assert!(!app.confirm_selected);
     }
 }

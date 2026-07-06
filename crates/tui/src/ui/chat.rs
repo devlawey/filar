@@ -2,7 +2,7 @@
 
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -16,8 +16,8 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
     // Record the chat area for future hit-testing (task 3).
     app.chat_area = area;
 
-    // Inner width (without borders) — drives cache invalidation.
-    let inner_width = area.width.saturating_sub(2);
+    // Inner width (no borders) — drives cache invalidation.
+    let inner_width = area.width;
 
     // Rebuild cache if any invalidation key changed.
     if app
@@ -36,7 +36,7 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Compute visible slice from cached lines.
     let total_lines = app.layout_cache.lines.len();
-    let visible_height = area.height.saturating_sub(2) as usize; // -2 for border
+    let visible_height = area.height as usize;
 
     // Definitive scroll clamp — the render path knows the exact visible_height
     // and has just rebuilt the cache, so this is the authoritative clamp.
@@ -61,12 +61,7 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|rl| rl.line.clone())
         .collect();
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Chat")
-        .border_style(app.theme.muted());
-
-    let paragraph = Paragraph::new(visible_lines).block(block);
+    let paragraph = Paragraph::new(visible_lines);
     f.render_widget(paragraph, area);
 
     // Scrollbar — shown only when content overflows.
@@ -87,11 +82,10 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
         let indicator = format!("\u{2193} {} new", app.scroll);
         // Use char count, not byte length — `↓` (U+2193) is 3 bytes but 1 column.
         let indicator_width = indicator.chars().count() as u16;
-        let inner_width = area.width.saturating_sub(2);
         let indicator_width = indicator_width.min(inner_width);
         let indicator_area = Rect::new(
-            area.x + area.width.saturating_sub(1 + indicator_width),
-            area.y + area.height.saturating_sub(2),
+            area.x + area.width.saturating_sub(indicator_width),
+            area.y + area.height.saturating_sub(1),
             indicator_width,
             1,
         );

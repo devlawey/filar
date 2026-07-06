@@ -50,10 +50,7 @@ fn save_secret(username: &str, secret: &str) {
 /// Load a secret from the OS credential store. Returns empty string if not found.
 fn load_secret(username: &str) -> String {
     match keyring::Entry::new(CRED_SERVICE, username) {
-        Ok(entry) => match entry.get_password() {
-            Ok(s) => s,
-            Err(_) => String::new(),
-        },
+        Ok(entry) => entry.get_password().unwrap_or_default(),
         Err(_) => String::new(),
     }
 }

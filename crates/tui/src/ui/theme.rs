@@ -8,6 +8,78 @@
 //! shades of gray — following `docs/DESIGN_PHILOSOPHY.md` §2 (Единая тема).
 
 use ratatui::style::{Color, Modifier, Style};
+use std::sync::OnceLock;
+
+/// Unicode/ASCII glyph set for the TUI.
+///
+/// Modern terminals (Windows Terminal, detected via `WT_SESSION`) get the
+/// full Unicode set; conhost gets ASCII fallbacks so nothing shows as `?`.
+///
+/// See `docs/DESIGN_PHILOSOPHY.md` §7 (Windows-first, деградация — предусмотрена).
+pub struct Glyphs {
+    /// Input prompt: `❯` or `>`.
+    pub prompt: &'static str,
+    /// Vertical gutter for code/output: `│` or `|`.
+    pub gutter: &'static str,
+    /// Horizontal separator: `─` or `-`.
+    pub separator: &'static str,
+    /// Approved command status: `✓` or `[ok]`.
+    pub success: &'static str,
+    /// Denied/failed status: `✗` or `[no]`.
+    pub danger: &'static str,
+    /// System message bullet: `·` or `-`.
+    pub middle_dot: &'static str,
+    /// Collapsed arrow: `▸` or `+`.
+    pub collapse_arrow: &'static str,
+    /// Expanded arrow: `▾` or `-`.
+    pub expand_arrow: &'static str,
+    /// List bullet: `•` or `*`.
+    pub bullet: &'static str,
+    /// Target separator in status bar: `▸` or `>`.
+    pub target_sep: &'static str,
+}
+
+impl Glyphs {
+    /// Unicode glyphs for modern terminals.
+    const UNICODE: Self = Self {
+        prompt: "❯",
+        gutter: "│",
+        separator: "─",
+        success: "✓",
+        danger: "✗",
+        middle_dot: "·",
+        collapse_arrow: "▸",
+        expand_arrow: "▾",
+        bullet: "•",
+        target_sep: "▸",
+    };
+
+    /// ASCII fallback for conhost and legacy terminals.
+    const ASCII: Self = Self {
+        prompt: ">",
+        gutter: "|",
+        separator: "-",
+        success: "[ok]",
+        danger: "[no]",
+        middle_dot: "-",
+        collapse_arrow: "+",
+        expand_arrow: "-",
+        bullet: "*",
+        target_sep: ">",
+    };
+
+    /// Detect terminal capabilities and return the appropriate glyph set.
+    /// Uses `WT_SESSION` env var (cached with `OnceLock`).
+    pub fn detect() -> &'static Self {
+        static IS_WT: OnceLock<bool> = OnceLock::new();
+        let is_wt = *IS_WT.get_or_init(|| std::env::var("WT_SESSION").is_ok());
+        if is_wt {
+            &Self::UNICODE
+        } else {
+            &Self::ASCII
+        }
+    }
+}
 
 /// The colour palette used by every UI element.
 ///
@@ -146,6 +218,26 @@ impl Theme {
             AppMode::Interactive => self.accent,
             AppMode::PasswordInput => self.accent,
         }
+    }
+
+    /// Return the appropriate glyph set for this terminal.
+    pub fn glyphs(&self) -> &'static Glyphs {
+        Glyphs::detect()
+    }
+
+    /// Style for markdown code spans: `fg` on `surface` background.
+    pub fn code_span_style(&self) -> Style {
+        Style::default().fg(self.fg).bg(self.surface)
+    }
+
+    /// Style for markdown bold text: `fg` + bold.
+    pub fn bold_style(&self) -> Style {
+        Style::default().fg(self.fg).add_modifier(Modifier::BOLD)
+    }
+
+    /// Style for markdown headers: `accent` + bold.
+    pub fn header_style(&self) -> Style {
+        Style::default().fg(self.accent).add_modifier(Modifier::BOLD)
     }
 }
 

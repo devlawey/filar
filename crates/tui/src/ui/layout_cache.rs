@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 
 use filar_core::ChatBlock;
 
-use super::text::{strip_emoji, wrap_text};
+use super::text::{render_markdown_line, strip_emoji, wrap_text, MarkdownState};
 use super::theme::Theme;
 
 /// Which part of a [`ChatBlock`] a rendered line belongs to.
@@ -108,14 +108,16 @@ impl ChatLayoutCache {
         let content_width = inner.saturating_sub(2).max(1); // "  " prefix
         let output_width = inner.saturating_sub(4).max(1); // "  | " prefix
 
+        let glyphs = theme.glyphs();
+
         for (idx, msg) in messages.iter().enumerate() {
             let _is_collapsed = collapsed.contains(&idx);
             match msg {
                 ChatBlock::User(text) => {
                     let text = strip_emoji(text);
                     self.push_header(idx, vec![
-                        Span::styled("> ", theme.user_style()),
-                        Span::styled("You", theme.user_style()),
+                        Span::raw("  "),
+                        Span::styled("you", theme.user_style()),
                     ]);
                     for line in text.lines() {
                         for wrapped in wrap_text(line, content_width) {
@@ -128,12 +130,15 @@ impl ChatLayoutCache {
                 ChatBlock::Agent(text) => {
                     let text = strip_emoji(text);
                     self.push_header(idx, vec![
-                        Span::styled("* ", theme.agent_style()),
-                        Span::styled("Agent", theme.agent_style()),
+                        Span::raw("  "),
+                        Span::styled("agent", theme.agent_style()),
                     ]);
+                    let mut md_state = MarkdownState::default();
                     for line in text.lines() {
                         for wrapped in wrap_text(line, content_width) {
-                            self.push_body(idx, format!("  {wrapped}"));
+                            let mut spans = vec![Span::raw("  ")];
+                            spans.extend(render_markdown_line(&wrapped, theme, &mut md_state));
+                            self.push_body_spans(idx, spans);
                         }
                     }
                     self.push_spacer();
@@ -147,45 +152,42 @@ impl ChatLayoutCache {
                 } => {
                     let is_collapsed = collapsed.contains(&idx);
 
-                    // Status glyph: ✓ for approved, ✗ for denied.
+                    // Status glyph from Glyphs.
                     let status = if *approved {
-                        Span::styled("  ✓", theme.success_fg())
+                        Span::styled(format!("  {}", glyphs.success), theme.success_fg())
                     } else {
-                        Span::styled("  ✗", theme.danger_fg())
+                        Span::styled(format!("  {}", glyphs.danger), theme.danger_fg())
                     };
 
-                    // Arrow indicator: ▸ collapsed, ▾ expanded, spaces if no output.
+                    // Arrow indicator from Glyphs.
                     let arrow = if output.is_some() {
-                        if is_collapsed { "▸ " } else { "▾ " }
+                        if is_collapsed { glyphs.collapse_arrow } else { glyphs.expand_arrow }
                     } else {
-                        "  "
+                        " "
                     };
 
-                    // Compact header: `▸ $ command  ✓` / `▾ $ command  ✓`
                     self.push_header(idx, vec![
-                        Span::styled(arrow, theme.warning_fg()),
+                        Span::raw("  "),
+                        Span::styled(format!("{} ", arrow), theme.warning_fg()),
                         Span::styled("$ ", theme.warning_fg()),
                         Span::styled(command.clone(), theme.command_style()),
                         status,
                     ]);
 
-                    // Explanation (if any) — shown in both states.
                     if !explanation.is_empty() {
                         for wrapped in wrap_text(&strip_emoji(explanation), output_width) {
-                            self.push_output(idx, format!("  | {wrapped}"));
+                            self.push_output(idx, format!("  {} {}", glyphs.gutter, wrapped));
                         }
                     }
 
-                    // Output rendering with collapse/expand.
                     if let Some(out) = output {
                         let all_lines: Vec<&str> = out.lines().collect();
                         let total = all_lines.len();
 
                         if is_collapsed {
-                            // Collapsed: show first 5 lines + toggle.
                             for line in all_lines.iter().take(5) {
                                 for wrapped in wrap_text(line, output_width) {
-                                    self.push_output(idx, format!("  | {wrapped}"));
+                                    self.push_output(idx, format!("  {} {}", glyphs.gutter, wrapped));
                                 }
                             }
                             if total > 5 {
@@ -193,34 +195,29 @@ impl ChatLayoutCache {
                                 self.push_output_toggle(
                                     idx,
                                     format!(
-                                        "  ▸ … {} more lines — click to expand",
-                                        remaining
+                                        "  {} ... {} more lines - click to expand",
+                                        glyphs.collapse_arrow, remaining
                                     ),
                                 );
                             }
                         } else {
-                            // Expanded: show up to 400 lines (safety ceiling).
                             const MAX_EXPANDED_LINES: usize = 400;
                             for line in all_lines.iter().take(MAX_EXPANDED_LINES) {
                                 for wrapped in wrap_text(line, output_width) {
-                                    self.push_output(idx, format!("  | {wrapped}"));
+                                    self.push_output(idx, format!("  {} {}", glyphs.gutter, wrapped));
                                 }
                             }
                             if total > MAX_EXPANDED_LINES {
                                 let remaining = total - MAX_EXPANDED_LINES;
                                 self.push_output(
                                     idx,
-                                    format!(
-                                        "  … truncated ({} more lines)",
-                                        remaining
-                                    ),
+                                    format!("  ... truncated ({} more lines)", remaining),
                                 );
                             }
-                            // Collapse toggle for long output.
                             if total > 5 {
                                 self.push_output_toggle(
                                     idx,
-                                    "  ▾ collapse".to_string(),
+                                    format!("  {} collapse", glyphs.expand_arrow),
                                 );
                             }
                         }
@@ -231,21 +228,18 @@ impl ChatLayoutCache {
                 ChatBlock::Error(text) => {
                     let text = strip_emoji(text);
                     self.push_header(idx, vec![
-                        Span::styled("! ", theme.error_style()),
-                        Span::styled("Error", theme.error_style()),
+                        Span::raw("  "),
+                        Span::styled(format!("{} ", glyphs.danger), theme.error_style()),
+                        Span::styled(text, theme.error_style()),
                     ]);
-                    for line in text.lines() {
-                        for wrapped in wrap_text(line, content_width) {
-                            self.push_body(idx, format!("  {wrapped}"));
-                        }
-                    }
                     self.push_spacer();
                 }
 
                 ChatBlock::System(text) => {
                     let text = strip_emoji(text);
                     self.push_header(idx, vec![
-                        Span::styled("- ", theme.muted()),
+                        Span::raw("  "),
+                        Span::styled(format!("{} ", glyphs.middle_dot), theme.muted()),
                         Span::styled(text, theme.muted()),
                     ]);
                     self.push_spacer();
@@ -277,6 +271,14 @@ impl ChatLayoutCache {
     fn push_body(&mut self, idx: usize, text: String) {
         self.lines.push(RenderedLine {
             line: Line::from(text),
+            block_index: Some(idx),
+            region: LineRegion::Body,
+        });
+    }
+
+    fn push_body_spans(&mut self, idx: usize, spans: Vec<Span<'static>>) {
+        self.lines.push(RenderedLine {
+            line: Line::from(spans),
             block_index: Some(idx),
             region: LineRegion::Body,
         });
@@ -505,20 +507,21 @@ mod tests {
         ];
         cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
 
-        // First header: expanded arrow (▾), $ ls, ✓.
+        // First header: expanded arrow, $ ls, success glyph.
+        let glyphs = theme.glyphs();
         let header0 = &cache.lines[0];
         assert_eq!(header0.region, LineRegion::Header);
         let header0_text = format!("{}", header0.line);
-        assert!(header0_text.contains('▾'), "expanded header should have ▾, got: {header0_text}");
+        assert!(header0_text.contains(glyphs.expand_arrow), "expanded header should have expand arrow, got: {header0_text}");
         assert!(header0_text.contains("ls"), "header should contain command, got: {header0_text}");
-        assert!(header0_text.contains('✓'), "approved header should have ✓, got: {header0_text}");
+        assert!(header0_text.contains(glyphs.success), "approved header should have success glyph, got: {header0_text}");
 
         // Find the second header (skip first block's lines + spacer).
         let header1 = cache.lines.iter().find(|l| {
             l.region == LineRegion::Header && l.block_index == Some(1)
         }).unwrap();
         let header1_text = format!("{}", header1.line);
-        assert!(header1_text.contains('✗'), "denied header should have ✗, got: {header1_text}");
+        assert!(header1_text.contains(glyphs.danger), "denied header should have danger glyph, got: {header1_text}");
         assert!(header1_text.contains("rm"), "header should contain command, got: {header1_text}");
     }
 
@@ -538,7 +541,8 @@ mod tests {
 
         let header = &cache.lines[0];
         let header_text = format!("{}", header.line);
-        assert!(!header_text.contains('▸') && !header_text.contains('▾'),
+        let g = theme.glyphs();
+        assert!(!header_text.contains(g.collapse_arrow) && !header_text.contains(g.expand_arrow),
             "no-output block should not have arrow, got: {header_text}");
     }
 }
