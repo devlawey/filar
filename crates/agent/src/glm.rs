@@ -183,16 +183,25 @@ impl LlmClient for GlmClient {
         };
 
         // Parse the SSE stream.
+        // Buffer raw bytes and decode only complete lines to avoid
+        // corrupting multi-byte UTF-8 characters split across chunks.
         use futures::StreamExt;
         let mut stream = response.bytes_stream();
         let mut state = SseState::new();
+        let mut raw_buffer: Vec<u8> = Vec::new();
 
         loop {
             match stream.next().await {
                 Some(Ok(chunk)) => {
-                    let deltas = state.process_chunk(&String::from_utf8_lossy(&chunk));
-                    for d in deltas {
-                        on_delta(d);
+                    raw_buffer.extend_from_slice(&chunk);
+                    while let Some(pos) = raw_buffer.iter().position(|&b| b == b'\n') {
+                        let line: String =
+                            String::from_utf8_lossy(&raw_buffer[..=pos]).into_owned();
+                        raw_buffer = raw_buffer[pos + 1..].to_vec();
+                        let deltas = state.process_chunk(&line);
+                        for d in deltas {
+                            on_delta(d);
+                        }
                     }
                 }
                 Some(Err(e)) => {
@@ -679,8 +688,10 @@ impl SseState {
                 .tool_calls
                 .values()
                 .map(|tc| {
-                    let arguments = serde_json::from_str(&tc.arguments)
-                        .unwrap_or(serde_json::Value::Null);
+                    let arguments = serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
+                        warn!(error = %e, id = %tc.id, name = %tc.name, "failed to parse accumulated tool call arguments");
+                        serde_json::Value::Null
+                    });
                     ToolCall {
                         id: tc.id.clone(),
                         name: tc.name.clone(),

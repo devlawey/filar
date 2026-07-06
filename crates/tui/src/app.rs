@@ -876,13 +876,11 @@ impl App {
     /// Uses braille frames in modern terminals (Windows Terminal),
     /// ASCII fallback (`|/-\`) in conhost.
     pub fn spinner_char(&self) -> &'static str {
+        static IS_WT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let is_wt = *IS_WT.get_or_init(|| std::env::var("WT_SESSION").is_ok());
         const BRAILLE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         const ASCII: &[&str] = &["|", "/", "-", "\\"];
-        let frames = if std::env::var("WT_SESSION").is_ok() {
-            BRAILLE
-        } else {
-            ASCII
-        };
+        let frames = if is_wt { BRAILLE } else { ASCII };
         frames[(self.tick as usize) % frames.len()]
     }
 
@@ -921,6 +919,7 @@ impl App {
             } => {
                 // Finalize any streaming text before showing the dialog.
                 self.streaming = false;
+                auto_scroll = self.scroll == 0;
                 self.pending_confirm = Some(PendingConfirm {
                     command: command.clone(),
                     explanation: explanation.clone(),
@@ -938,6 +937,7 @@ impl App {
             } => {
                 // Finalize any streaming text before showing command output.
                 self.streaming = false;
+                auto_scroll = self.scroll == 0;
                 // Try to update the last matching Command block with output.
                 let mut updated = false;
                 if let Some(ChatBlock::Command {
@@ -976,6 +976,7 @@ impl App {
                         }
                     }
                     self.streaming = false;
+                    auto_scroll = self.scroll == 0;
                 } else if !text.is_empty() {
                     self.push_message(ChatBlock::Agent(text));
                 }
@@ -987,6 +988,7 @@ impl App {
                 if self.streaming {
                     self.push_message(ChatBlock::System("response interrupted".into()));
                     self.streaming = false;
+                    auto_scroll = self.scroll == 0;
                 }
                 self.push_message(ChatBlock::Error(err));
                 self.mode = AppMode::Normal;

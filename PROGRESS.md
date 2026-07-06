@@ -339,7 +339,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 ## 8. Тесты
 
-- **148 unit-тестов** проходят:
+- **150 unit-тестов** проходят:
   - filar-agent: 42 теста (agent loop, tools, security, GLM client, SSE parser)
   - filar-transport: 2 теста (marker format, payload format) + 3 ignored (Docker)
   - filar-tui: 106 тестов (terminal model, key mapping, app state, layout, streaming)
@@ -829,3 +829,7 @@ PR: #28
 - `Agent`/`AgentBuilder`: новое поле `on_text_delta` + builder method.
 - `App`: новые поля `streaming: bool`, `tick: u64`; метод `spinner_char()`.
 - Callback: `Fn(&str)` → `Fn(String)`.
+
+**Что дальше:**
+- Issue #20: Collapsible command blocks (click-to-expand).
+- Issue #21: Keyboard shortcuts in Thinking mode.
