@@ -1091,12 +1091,12 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
 
     #[test]
     fn sse_parse_partial_chunk() {
-        // Partial chunk (no double-newline terminator) should not produce output
-        // until completed.
+        // Partial chunk (no line terminator) should not produce output
+        // until the line is completed by a subsequent chunk.
         let mut state = SseState::new();
-        state.process_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n");
-        // Not yet complete — no response available.
-        state.process_chunk("\n");
+        let d1 = state.process_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"Hi");
+        assert!(d1.is_empty(), "no complete line yet");
+        state.process_chunk("\"}}]}\n\n");
         let response = state.into_response().unwrap();
         match response {
             ChatResponse::Text(text) => assert_eq!(text, "Hi"),

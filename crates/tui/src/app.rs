@@ -3815,9 +3815,17 @@ mod tests {
         app.input_area = Rect::new(0, 6, 40, 1);
         app.status_bar_area = Rect::new(0, 0, 40, 1);
         app.help_bar_area = Rect::new(0, 7, 40, 1);
-        // Click in chat area
+        // Populate chat lines so hit_test exercises the Chat branch, not ChatEmpty.
+        app.layout_cache.lines = (0..3)
+            .map(|i| crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw(format!("line {i}")),
+                block_index: Some(i),
+                region: crate::ui::layout_cache::LineRegion::Body,
+            })
+            .collect();
+        // Click in chat area — should hit a real Chat zone, not ChatEmpty.
         let zone = app.hit_test(5, 3);
-        assert!(matches!(zone, HitZone::ChatEmpty | HitZone::Chat { .. }));
+        assert!(matches!(zone, HitZone::Chat { .. }));
         // Click in input area
         let zone = app.hit_test(5, 6);
         assert!(matches!(zone, HitZone::Input));

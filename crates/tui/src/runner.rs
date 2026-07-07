@@ -142,9 +142,11 @@ pub async fn run(
     // Set up terminal.
     enable_raw_mode().map_err(|e| CoreError::Other(format!("failed to enable raw mode: {e}")))?;
     let mut stdout = io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen).map_err(|e| {
-        CoreError::Other(format!("failed to enter alternate screen: {e}"))
-    })?;
+    if let Err(e) = crossterm::execute!(stdout, EnterAlternateScreen) {
+        // Restore terminal state before returning the error.
+        disable_raw_mode().ok();
+        return Err(CoreError::Other(format!("failed to enter alternate screen: {e}")));
+    }
     // Mouse capture is optional — degrade gracefully if unsupported.
     if let Err(e) = crossterm::execute!(io::stdout(), EnableMouseCapture) {
         warn!(error = %e, "mouse capture not available — mouse support disabled");
