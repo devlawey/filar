@@ -40,6 +40,7 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
         ],
         AppMode::Interactive => vec![
             HelpItem { key: "ctrl+t", desc: "agent mode", action: Some(HelpAction::Terminal) },
+            HelpItem { key: "wheel", desc: "scroll", action: None },
         ],
         AppMode::PasswordInput => vec![
             HelpItem { key: "enter", desc: "send password", action: Some(HelpAction::SendPassword) },
