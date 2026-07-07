@@ -60,6 +60,9 @@ eframe = { version = "0.29", default-features = false, features = ["glow", "defa
 # OS credential storage (Windows Credential Manager, macOS Keychain, Linux Secret Service)
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }
 
+# Clipboard
+arboard = "3"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

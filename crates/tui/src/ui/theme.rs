@@ -131,7 +131,7 @@ pub struct Theme {
     pub danger: Color,
     /// Background of "raised" elements (status bar, help bar).
     pub surface: Color,
-    /// Background for mouse text selection (reserved for future use).
+    /// Background for mouse text selection.
     pub selection_bg: Color,
 }
 

@@ -103,6 +103,15 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     }
     spans.push(Span::styled(confirm_text, app.theme.muted()));
 
+    // Toast notification (e.g. "copied") — shown right-aligned after confirm_mode.
+    if let Some(toast) = app.toast_text() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("\u{00b7} {}", toast),
+            app.theme.success_fg(),
+        ));
+    }
+
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line);
     f.render_widget(paragraph, area);

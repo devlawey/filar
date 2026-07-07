@@ -914,3 +914,73 @@ PR: #28
 - `App::execute_help_action()` — приватный метод.
 - `Glyphs` struct — предсуществовал в theme.rs.
 - `render_markdown_line` сигнатура: `(&str, &Theme, &mut MarkdownState) -> Vec<Span>`.
+
+---
+
+## Issue #21: Выделение текста мышью и копирование в буфер
+
+**Задача:** Вернуть нативное выделение текста в mouse-capture TUI. Drag мышью
+выделяет текст, отпускание копирует в системный буфер. Двойной клик — слово,
+тройной — строка. Выделение переживает скролл, сбрасывается при новых сообщениях.
+
+**Что сделано:**
+
+### 1. Зависимость arboard
+- Добавлена `arboard = "3"` в workspace dependencies и `crates/tui/Cargo.toml`.
+- Кроссплатформенный clipboard (Windows поддерживается из коробки).
+
+### 2. Selection struct
+- `Selection { anchor_line, anchor_col, head_line, head_col }` — координаты
+  в пространстве `layout_cache.lines` (не экрана), переживает скролл.
+- `normalised()` → `((start_line, start_col), (end_line, end_col))` —
+  отсортированные пары для рендера/копирования.
+- `is_empty()` — true если anchor == head.
+- `DragKind::Selection` — новый вариант для отслеживания состояния drag.
+
+### 3. Mouse events
+- **Down(Left)** в чате (не toggle/header): старт выделения. Отслеживание
+  двойного/тройного клика (< 400 ms, та же позиция).
+- **Drag(Left)**: обновление `head` + автоскролл у верхней/нижней кромки.
+- **Up(Left)**: copy-on-select — вызов `arboard::Clipboard::set_text()`,
+  тост `· copied` на 1.5 сек. Если выделение пусто — очищается.
+
+### 4. Двойной / тройной клик
+- Double click → `select_word()`: максимальный run непробельных символов.
+- Triple click → `select_line()`: вся строка целиком.
+- Счётчик кликов зацикливается: 1 → 2 → 3 → 1.
+
+### 5. Рендер выделения
+- `apply_selection()` в `chat.rs`: проходит по spans видимых линий, разбивает
+  на «до / выделено / после», накладывает `theme.selection_bg` на выбранный
+  диапазон колонок. Поддерживает multi-line selection.
+
+### 6. Toast уведомление
+- `toast: Option<(String, Instant)>` в `App`.
+- `toast_text()` — возвращает текст, если тост ещё активен.
+- Рендерится в status-bar (`bars.rs`) после confirm_mode: `· copied` цветом
+  `success_fg`.
+
+### 7. Сброс выделения
+- `push_message()` очищает `selection` — новые сообщения инвалидируют индексы.
+
+**Файлы:**
+- `Cargo.toml` — arboard workspace dependency
+- `crates/tui/Cargo.toml` — arboard dependency
+- `crates/tui/src/app.rs` — Selection struct, DragKind::Selection, handle_mouse
+  обновлён, screen_to_line_col, line_text, selected_text, copy_selection_to_clipboard,
+  select_word, select_line, toast_text, 20 новых тестов
+- `crates/tui/src/ui/chat.rs` — apply_selection для рендера selection_bg
+- `crates/tui/src/ui/bars.rs` — toast в status-bar
+- `crates/tui/src/ui/theme.rs` — комментарий selection_bg обновлён
+
+**Тесты:** 20 новых (145 tui total): selection normalised (forward/backward),
+  is_empty, selected_text (single/multi/empty), select_word (middle/start),
+  select_line, screen_to_line_col (map/exclude scrollbar/outside),
+  mouse_down_starts_selection, mouse_drag_updates_head, mouse_up_clears_drag,
+  push_message_clears_selection, toast (none/active/expired).
+
+**Публичные контракты:**
+- `Selection` struct — новый public type.
+- `DragKind::Selection` — новый вариант.
+- `App`: новые поля `selection: Option<Selection>`, `toast: Option<(String, Instant)>`.
+- `App::toast_text()` — новый public метод.
