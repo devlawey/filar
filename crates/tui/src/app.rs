@@ -200,6 +200,10 @@ pub struct App {
     pub tick: u64,
     /// Clickable help-bar zones: (rect, action) filled during render.
     pub helpbar_zones: Vec<(Rect, HelpAction)>,
+    /// Input scroll offset (set during render when input exceeds 5 lines).
+    /// Used by [`set_cursor_from_click`](Self::set_cursor_from_click) to map
+    /// clicks back to the correct cursor position in a scrolled input.
+    pub input_scroll_offset: usize,
 }
 
 impl App {
@@ -245,6 +249,7 @@ impl App {
             streaming: false,
             tick: 0,
             helpbar_zones: Vec::new(),
+            input_scroll_offset: 0,
         }
     }
 
@@ -604,7 +609,8 @@ impl App {
         if self.chat_area.height == 0 {
             return;
         }
-        let visible_height = self.chat_area.height.saturating_sub(2) as usize;
+        // Borderless layout: full height is the visible height.
+        let visible_height = self.chat_area.height as usize;
         let max_scroll = self
             .layout_cache
             .lines
@@ -843,28 +849,28 @@ impl App {
             return HitZone::ScrollIndicator;
         }
 
-        // --- Scrollbar (rightmost column of chat area, inside borders) ---
-        let visible_height = self.chat_area.height.saturating_sub(2) as usize;
+        // --- Scrollbar (rightmost column of chat area, borderless) ---
+        let visible_height = self.chat_area.height as usize;
         let total_lines = self.layout_cache.lines.len();
         let scrollbar_visible = total_lines > visible_height;
         if scrollbar_visible
             && self.chat_area.width > 0
             && col == self.chat_area.x + self.chat_area.width - 1
-            && row > self.chat_area.y
-            && row < self.chat_area.y + self.chat_area.height - 1
+            && row >= self.chat_area.y
+            && row < self.chat_area.y + self.chat_area.height
         {
             return HitZone::Scrollbar;
         }
 
-        // --- Chat content (inside borders, excluding scrollbar column) ---
-        if self.chat_area.width > 2
-            && self.chat_area.height > 2
-            && col > self.chat_area.x
+        // --- Chat content (borderless, excluding scrollbar column) ---
+        if self.chat_area.width > 1
+            && self.chat_area.height > 0
+            && col >= self.chat_area.x
             && col < self.chat_area.x + self.chat_area.width - 1
-            && row > self.chat_area.y
-            && row < self.chat_area.y + self.chat_area.height - 1
+            && row >= self.chat_area.y
+            && row < self.chat_area.y + self.chat_area.height
         {
-            let inner_row = (row - self.chat_area.y - 1) as usize;
+            let inner_row = (row - self.chat_area.y) as usize;
             let skip = if total_lines > visible_height {
                 total_lines.saturating_sub(visible_height + self.scroll)
             } else {
@@ -921,13 +927,14 @@ impl App {
         if self.chat_area.height == 0 {
             return;
         }
-        let visible_height = self.chat_area.height.saturating_sub(2) as usize;
+        // Borderless layout: full height is the visible height.
+        let visible_height = self.chat_area.height as usize;
         let total_lines = self.layout_cache.lines.len();
         let max_scroll = total_lines.saturating_sub(visible_height);
         if max_scroll == 0 || visible_height == 0 {
             return;
         }
-        let track_top = self.chat_area.y + 1; // inside top border
+        let track_top = self.chat_area.y; // borderless — no top border
         let relative_row = (row.saturating_sub(track_top)) as usize;
         // Track spans rows 0..=visible_height-1.  Divide by (visible_height - 1)
         // so the bottom row maps to skip=max_scroll → scroll=0.
@@ -938,20 +945,22 @@ impl App {
 
     /// Set cursor position from a click in the input area.
     ///
-    /// Reverses the `place_cursor` math: `cursor_pos = row * inner_width + col`.
+    /// Reverses the `place_cursor` math: `cursor_pos = (row + scroll_offset) * inner_width + col`.
+    /// Uses borderless geometry (prompt occupies columns 0..1, no top border).
     fn set_cursor_from_click(&mut self, col: u16, row: u16) {
         if self.input_area.width == 0 {
             return;
         }
-        let inner_x = self.input_area.x + 1;
-        let inner_y = self.input_area.y + 1;
-        let inner_width = (self.input_area.width.saturating_sub(2)).max(1) as usize;
+        let prompt_width: u16 = 2; // prompt char + space
+        let inner_x = self.input_area.x + prompt_width;
+        let inner_y = self.input_area.y; // borderless — no top border
+        let inner_width = (self.input_area.width.saturating_sub(prompt_width)).max(1) as usize;
 
         let relative_col = (col.saturating_sub(inner_x)) as usize;
         let relative_row = (row.saturating_sub(inner_y)) as usize;
 
         let char_count = self.input.chars().count();
-        let pos = relative_row * inner_width + relative_col;
+        let pos = (relative_row + self.input_scroll_offset) * inner_width + relative_col;
         self.cursor_pos = pos.min(char_count);
     }
 
@@ -1537,7 +1546,7 @@ mod tests {
                 region: crate::ui::layout_cache::LineRegion::Spacer,
             })
             .collect();
-        // visible_height = 22; max_scroll = 30 - 22 = 8
+        // visible_height = 24 (borderless); max_scroll = 30 - 24 = 6
 
         // Scroll up many times to exceed max.
         for _ in 0..10 {
@@ -1547,7 +1556,7 @@ mod tests {
                 10,
             ));
         }
-        assert_eq!(app.scroll, 8); // clamped to max_scroll
+        assert_eq!(app.scroll, 6); // clamped to max_scroll
     }
 
     #[test]
@@ -1661,7 +1670,7 @@ mod tests {
                 region: crate::ui::layout_cache::LineRegion::Spacer,
             })
             .collect();
-        // visible_height = 22; max_scroll = 30 - 22 = 8
+        // visible_height = 24 (borderless); max_scroll = 30 - 24 = 6
 
         // PageUp many times to exceed max.
         for _ in 0..5 {
@@ -1670,8 +1679,8 @@ mod tests {
                 crossterm::event::KeyModifiers::NONE,
             ));
         }
-        // 5 * 5 = 25, clamped to 8
-        assert_eq!(app.scroll, 8);
+        // 5 * 5 = 25, clamped to 6
+        assert_eq!(app.scroll, 6);
     }
 
     // ----- Hit-testing tests (issue #16) -----
@@ -1679,15 +1688,15 @@ mod tests {
     /// Helper: set up an app with a chat area and cached lines for hit-testing.
     fn make_hit_test_app() -> App {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        // Chat area: x=0, y=1, w=80, h=24 (inner: 78x22)
+        // Chat area: x=0, y=1, w=80, h=24 (borderless: full 80x24 is visible)
         app.chat_area = Rect::new(0, 1, 80, 24);
-        // Input area: x=0, y=26, w=80, h=5 (inner: 78x3)
+        // Input area: x=0, y=26, w=80, h=5 (borderless: prompt at col 0-1)
         app.input_area = Rect::new(0, 26, 80, 5);
         // Status bar: y=0, h=1
         app.status_bar_area = Rect::new(0, 0, 80, 1);
         // Help bar: y=31, h=1
         app.help_bar_area = Rect::new(0, 31, 80, 1);
-        // 50 cached lines → scrollbar visible (50 > 22)
+        // 50 cached lines → scrollbar visible (50 > 24)
         app.layout_cache.lines = (0..50)
             .map(|i| crate::ui::layout_cache::RenderedLine {
                 line: ratatui::text::Line::raw(format!("line {i}")),
@@ -1695,17 +1704,17 @@ mod tests {
                 region: crate::ui::layout_cache::LineRegion::Body,
             })
             .collect();
-        // scroll = 0 → bottom; skip = 50 - 22 = 28
+        // scroll = 0 → bottom; skip = 50 - 24 = 26
         app
     }
 
     #[test]
     fn hit_test_chat_content() {
         let app = make_hit_test_app();
-        // Click at col=5, row=2 (inside chat, first content row)
-        // skip = 28, inner_row = 0, line_idx = 28
-        let zone = app.hit_test(5, 2);
-        assert_eq!(zone, HitZone::Chat { line_idx: 28 });
+        // Click at col=5, row=1 (first content row, borderless)
+        // skip = 26, inner_row = 0, line_idx = 26
+        let zone = app.hit_test(5, 1);
+        assert_eq!(zone, HitZone::Chat { line_idx: 26 });
     }
 
     #[test]
@@ -1722,7 +1731,7 @@ mod tests {
     #[test]
     fn hit_test_scrollbar() {
         let app = make_hit_test_app();
-        // Scrollbar = rightmost column of chat area (col=79), inside borders (row 2..23)
+        // Scrollbar = rightmost column of chat area (col=79), borderless (row 1..24)
         let zone = app.hit_test(79, 10);
         assert_eq!(zone, HitZone::Scrollbar);
     }
@@ -1730,11 +1739,10 @@ mod tests {
     #[test]
     fn hit_test_scrollbar_not_visible_when_content_fits() {
         let mut app = make_hit_test_app();
-        // Only 5 lines → fits in visible_height=22, no scrollbar.
+        // Only 5 lines → fits in visible_height=24, no scrollbar.
         app.layout_cache.lines.truncate(5);
-        // Click at rightmost column → should be chat border, not scrollbar.
-        // But col=79 is the right border, so it's not inside chat content either.
-        // hit_test returns Outside for border clicks when no scrollbar.
+        // Click at rightmost column → scrollbar not visible, col=79 excluded
+        // from chat content → Outside.
         let zone = app.hit_test(79, 10);
         assert_eq!(zone, HitZone::Outside);
     }
@@ -1781,11 +1789,11 @@ mod tests {
     #[test]
     fn hit_test_line_idx_with_scroll() {
         let mut app = make_hit_test_app();
-        // scroll=10 → skip = 50 - 22 - 10 = 18
+        // scroll=10 → skip = 50 - 24 - 10 = 16
         app.scroll = 10;
-        // Click at row=2 (inner_row=0) → line_idx = 18
-        let zone = app.hit_test(5, 2);
-        assert_eq!(zone, HitZone::Chat { line_idx: 18 });
+        // Click at row=1 (inner_row=0) → line_idx = 16
+        let zone = app.hit_test(5, 1);
+        assert_eq!(zone, HitZone::Chat { line_idx: 16 });
     }
 
     // ----- Scrollbar drag tests -----
@@ -1793,23 +1801,23 @@ mod tests {
     #[test]
     fn scrollbar_drag_sets_scroll_proportionally() {
         let mut app = make_hit_test_app();
-        // visible_height = 22, max_scroll = 50 - 22 = 28
-        // Drag to top of track (row=2, inner_row=0):
-        // skip = 0 * 28 / 22 = 0, scroll = 28 - 0 = 28 (top)
+        // visible_height = 24, max_scroll = 50 - 24 = 26
+        // Drag to top of track (row=1, relative_row=0):
+        // skip = 0 * 26 / 23 = 0, scroll = 26 - 0 = 26 (top)
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             79,
-            2,
+            1,
         ));
-        assert_eq!(app.scroll, 28);
+        assert_eq!(app.scroll, 26);
         assert_eq!(app.mouse_drag, Some(DragKind::Scrollbar));
 
-        // Drag to bottom of track (row=23, inner_row=21):
-        // track_span = 22 - 1 = 21, skip = 21 * 28 / 21 = 28, scroll = 28 - 28 = 0
+        // Drag to bottom of track (row=24, relative_row=23):
+        // track_span = 24 - 1 = 23, skip = 23 * 26 / 23 = 26, scroll = 26 - 26 = 0
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
             79,
-            23,
+            24,
         ));
         assert_eq!(app.scroll, 0, "drag to bottom should reach scroll=0");
     }
@@ -1848,12 +1856,13 @@ mod tests {
         let mut app = make_hit_test_app();
         app.mode = AppMode::Normal;
         app.input = "hello world test".into(); // 16 chars
-        // input_area = x=0, y=26, w=80, h=5 → inner_x=1, inner_y=27, inner_width=78
-        // Click at col=3, row=27 → relative_col=2, relative_row=0 → cursor_pos=2
+        // input_area = x=0, y=26, w=80, h=5 (borderless: prompt at col 0-1)
+        // inner_x=2, inner_y=26, inner_width=78
+        // Click at col=4, row=26 → relative_col=2, relative_row=0 → cursor_pos=2
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            3,
-            27,
+            4,
+            26,
         ));
         assert_eq!(app.cursor_pos, 2);
     }
@@ -1864,12 +1873,12 @@ mod tests {
         app.mode = AppMode::Normal;
         // 80 chars → wraps to 2 lines at inner_width=78
         app.input = "a".repeat(80);
-        // Click at col=1, row=28 (second row of input, relative_row=1)
+        // Click at col=2, row=27 (second row of input, relative_row=1)
         // cursor_pos = 1 * 78 + 0 = 78
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            1,
-            28,
+            2,
+            27,
         ));
         assert_eq!(app.cursor_pos, 78);
     }
@@ -1883,7 +1892,7 @@ mod tests {
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             70,
-            27,
+            26,
         ));
         assert_eq!(app.cursor_pos, 2);
     }
@@ -1896,8 +1905,8 @@ mod tests {
         app.cursor_pos = 0;
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            3,
-            27,
+            4,
+            26,
         ));
         assert_eq!(app.cursor_pos, 0); // no change in Thinking mode
     }
@@ -2260,11 +2269,11 @@ mod tests {
                 region: crate::ui::layout_cache::LineRegion::OutputToggle,
             },
         ];
-        // Click the OutputToggle line (row 3 → line_idx 1).
+        // Click the OutputToggle line (row 2 → inner_row=1 → line_idx 1, borderless).
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             5,
-            3,
+            2,
         ));
         assert!(
             app.collapsed_overrides.contains_key(&0),
@@ -2283,11 +2292,11 @@ mod tests {
                 region: crate::ui::layout_cache::LineRegion::Header,
             },
         ];
-        // Click the Header line (row 2 → line_idx 0).
+        // Click the Header line (row 1 → inner_row=0 → line_idx 0, borderless).
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             5,
-            2,
+            1,
         ));
         assert!(
             app.collapsed_overrides.contains_key(&0),

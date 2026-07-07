@@ -171,8 +171,8 @@ pub fn render_markdown_line(
             }
         }
 
-        // Bold toggle: **
-        if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
+        // Bold toggle: ** (skip while inside a code span — code content is literal)
+        if !in_code && i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
             if in_bold {
                 // Closing ** — toggle off.
                 if !current.is_empty() {
@@ -316,5 +316,24 @@ mod tests {
         // First span is the bullet, second is the content
         let combined: String = spans.iter().map(|s| s.content.to_string()).collect();
         assert!(combined.contains("item"), "list item content: {:?}", spans);
+    }
+
+    #[test]
+    fn md_bold_inside_code_span_is_literal() {
+        // `a**b` should render as a single code span with literal content "a**b",
+        // NOT split into code/bold segments.
+        let spans = md_spans("`a**b`");
+        // The code span content should contain the literal `**` characters.
+        assert!(
+            spans.iter().any(|s| s == "a**b"),
+            "`a**b` should be a single code span with literal **: {:?}",
+            spans
+        );
+        // There should NOT be a separate "b" span (which would indicate bold splitting).
+        assert!(
+            !spans.iter().any(|s| s == "b"),
+            "`a**b` should not split on ** inside code span: {:?}",
+            spans
+        );
     }
 }

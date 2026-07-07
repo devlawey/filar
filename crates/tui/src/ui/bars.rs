@@ -82,9 +82,6 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         AppMode::PasswordInput => Some("password".to_string()),
     };
 
-    // Compute mode_len before moving mode_text.
-    let mode_len = mode_text.as_ref().map(|m| m.chars().count() + 3).unwrap_or(0);
-
     if let Some(mt) = mode_text {
         let mode_color = app.theme.mode_color(app.mode);
         spans.push(Span::raw("   "));
@@ -93,9 +90,12 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Right-align confirm_mode.
     let confirm_text = format!(" {:?}", app.confirm_mode);
+    // left_len already includes mode-badge spans (pushed above), so we
+    // must NOT add mode_len again — that would double-count and break
+    // the right-alignment in non-Normal modes.
     let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     let right_len = confirm_text.chars().count();
-    let total = left_len + mode_len + right_len;
+    let total = left_len + right_len;
     let available = area.width as usize;
     if total < available {
         let padding = available - total;

@@ -28,7 +28,7 @@ pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
 ///
 /// Supports multi-line growth: the input area grows up to 5 lines as the user
 /// types, with internal scrolling to keep the cursor visible.
-fn render_normal_input(f: &mut Frame, app: &App, area: Rect) {
+fn render_normal_input(f: &mut Frame, app: &mut App, area: Rect) {
     let glyphs = app.theme.glyphs();
 
     // Shell-escape: input starts with `!` -> prompt `$ ` in warning.
@@ -47,6 +47,7 @@ fn render_normal_input(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("enter your message...", app.theme.muted()),
         ]);
         f.render_widget(Paragraph::new(line), area);
+        app.input_scroll_offset = 0;
     } else {
         // Wrap input to terminal width and render multiple lines.
         let prompt_width: usize = 2; // prompt char + space
@@ -61,6 +62,9 @@ fn render_normal_input(f: &mut Frame, app: &App, area: Rect) {
         } else {
             0
         };
+
+        // Store scroll_offset so set_cursor_from_click can reverse the mapping.
+        app.input_scroll_offset = scroll_offset;
 
         let lines: Vec<Line> = wrapped
             .iter()
@@ -86,7 +90,7 @@ fn render_normal_input(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Place cursor after prompt + current position.
-    place_cursor(f, app, area, 2); // 2 = prompt char + space
+    place_cursor(f, app, area, 2, app.input_scroll_offset); // 2 = prompt char + space
 }
 
 /// Thinking mode: spinner + muted label.
@@ -112,7 +116,7 @@ fn render_confirm(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Password input mode: masked input with prompt.
-fn render_password_input(f: &mut Frame, app: &App, area: Rect) {
+fn render_password_input(f: &mut Frame, app: &mut App, area: Rect) {
     let glyphs = app.theme.glyphs();
     let prompt = format!("{} ", glyphs.prompt);
 
@@ -133,17 +137,20 @@ fn render_password_input(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Place cursor after prompt.
-    place_cursor(f, app, area, 2);
+    app.input_scroll_offset = 0;
+    place_cursor(f, app, area, 2, 0);
 }
 
 /// Place the cursor at the correct position within the input area.
 ///
 /// `prompt_width` is the number of columns the prompt occupies (e.g. 2 for `> `).
-fn place_cursor(f: &mut Frame, app: &App, area: Rect, prompt_width: u16) {
+/// `scroll_offset` is the number of wrapped lines scrolled out of view (0 when
+/// input fits in the visible area).
+fn place_cursor(f: &mut Frame, app: &App, area: Rect, prompt_width: u16, scroll_offset: usize) {
     let cursor_pos = app.cursor_pos as u16;
     let inner_width = area.width.saturating_sub(prompt_width).max(1);
     let cursor_col = cursor_pos % inner_width;
-    let cursor_row = cursor_pos / inner_width;
+    let cursor_row = (cursor_pos / inner_width).saturating_sub(scroll_offset as u16);
     let cursor_x = area.x + prompt_width + cursor_col;
     let cursor_y = area.y + cursor_row.min(area.height.saturating_sub(1));
     f.set_cursor_position((cursor_x, cursor_y));

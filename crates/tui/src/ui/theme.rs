@@ -69,11 +69,37 @@ impl Glyphs {
     };
 
     /// Detect terminal capabilities and return the appropriate glyph set.
-    /// Uses `WT_SESSION` env var (cached with `OnceLock`).
+    ///
+    /// Heuristic (cached with `OnceLock`):
+    /// - `WT_SESSION` → Windows Terminal (Unicode)
+    /// - `TERM_PROGRAM` set (vscode, iTerm, Apple_Terminal, ghostty, WezTerm) → Unicode
+    /// - `COLORTERM=truecolor` → modern terminal (Unicode)
+    /// - Non-Windows platform → Unicode (modern Linux/macOS terminals support it)
+    /// - Fallback on Windows without any of the above → ASCII (conhost)
     pub fn detect() -> &'static Self {
-        static IS_WT: OnceLock<bool> = OnceLock::new();
-        let is_wt = *IS_WT.get_or_init(|| std::env::var("WT_SESSION").is_ok());
-        if is_wt {
+        static UNICODE_OK: OnceLock<bool> = OnceLock::new();
+        let unicode_ok = *UNICODE_OK.get_or_init(|| {
+            // Windows Terminal
+            if std::env::var("WT_SESSION").is_ok() {
+                return true;
+            }
+            // Known modern terminals via TERM_PROGRAM
+            if let Ok(tp) = std::env::var("TERM_PROGRAM") {
+                if matches!(
+                    tp.as_str(),
+                    "vscode" | "iTerm.app" | "Apple_Terminal" | "ghostty" | "WezTerm" | "hyper"
+                ) {
+                    return true;
+                }
+            }
+            // Truecolour support implies Unicode capability
+            if std::env::var("COLORTERM").is_ok_and(|v| v == "truecolor") {
+                return true;
+            }
+            // Non-Windows: assume Unicode (modern Linux/macOS terminals)
+            !cfg!(windows)
+        });
+        if unicode_ok {
             &Self::UNICODE
         } else {
             &Self::ASCII
