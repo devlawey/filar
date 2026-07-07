@@ -3760,4 +3760,66 @@ mod tests {
         // No pending term input — scroll was internal.
         assert!(app.pending_term_input.is_none());
     }
+
+    // --- Scroll clamp edge cases ---
+
+    #[test]
+    fn clamp_scroll_zero_when_content_fits() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        app.layout_cache.lines = (0..10)
+            .map(|_| crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("test"),
+                block_index: None,
+                region: crate::ui::layout_cache::LineRegion::Spacer,
+            })
+            .collect();
+        // 10 lines fit in 24 → max_scroll = 0
+        app.scroll = 5;
+        app.clamp_scroll();
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn clamp_scroll_zero_height_no_panic() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.chat_area = Rect::new(0, 0, 80, 0); // height = 0
+        app.scroll = 10;
+        app.clamp_scroll(); // should not panic
+        assert_eq!(app.scroll, 10); // early return, scroll unchanged
+    }
+
+    #[test]
+    fn clamp_scroll_exact_fit() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        app.layout_cache.lines = (0..24)
+            .map(|_| crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("test"),
+                block_index: None,
+                region: crate::ui::layout_cache::LineRegion::Spacer,
+            })
+            .collect();
+        // 24 lines in 24 height → max_scroll = 0
+        app.scroll = 3;
+        app.clamp_scroll();
+        assert_eq!(app.scroll, 0);
+    }
+
+    // --- Hit test small terminal ---
+
+    #[test]
+    fn hit_test_tiny_terminal() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.chat_area = Rect::new(0, 1, 40, 5);
+        app.input_area = Rect::new(0, 6, 40, 1);
+        app.status_bar_area = Rect::new(0, 0, 40, 1);
+        app.help_bar_area = Rect::new(0, 7, 40, 1);
+        // Click in chat area
+        let zone = app.hit_test(5, 3);
+        assert!(matches!(zone, HitZone::ChatEmpty | HitZone::Chat { .. }));
+        // Click in input area
+        let zone = app.hit_test(5, 6);
+        assert!(matches!(zone, HitZone::Input));
+    }
 }

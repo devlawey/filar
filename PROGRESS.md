@@ -1049,3 +1049,63 @@ PR: #28
 - Колесо скроллит историю в интерактивном режиме.
 - В `htop`/`mc` по SSH клики и колесо доходят до приложения.
 - В `less` колесо листает (трансляция в стрелки).
+
+---
+
+## Issue #23: Полировка, устойчивость, документация, релиз 0.2.0
+
+**Задача:** Финальная полировка TUI — стабильность layout, деградация без мыши,
+обновление help-бара, документации и версии.
+
+### Что сделано
+
+1. **Стабильность layout** — убран `needs_clear` на non-TextDelta agent-события.
+   Полный `terminal.clear()` теперь выполняется только при смене режима
+   (`prev_mode != app.mode`). Редизайн (borderless layout) не оставляет
+   артефактов, мерцание устранено.
+
+2. **Деградация без мыши** — `EnableMouseCapture` теперь выполняется отдельно
+   от `EnterAlternateScreen`. Ошибка mouse capture логируется `warn!` и не
+   прерывает работу. Приложение работает без мыши (клавиатурные эквиваленты
+   для всех действий).
+
+3. **Help-бар обновлён** — Normal mode: добавлены `wheel scroll`, `click expand`,
+   `drag copy`. Thinking mode: `pgup/pgdn` заменён на `wheel scroll`.
+
+4. **Тесты** — добавлены:
+   - Scroll clamp: zero when content fits, zero height no panic, exact fit.
+   - Hit test: tiny terminal (40×5).
+   - Markdown-lite: empty string, only markers, multiple code spans.
+   - SSE parser: malformed data line, partial chunk.
+
+5. **Документация:**
+   - `README.md`: добавлены Mouse Support и Streaming Responses в Features;
+     обновлена таблица Keyboard Shortcuts (Ctrl+T, mouse wheel/click/drag).
+   - `USER_GUIDE.md`: добавлен раздел 4.2 «Управление мышью» с таблицей
+     действий; обновлены горячие клавиши (Enter = confirm selected button,
+     Tab, Ctrl+P); нумерация разделов сдвинута.
+
+6. **Версия** — поднята до `0.2.0` в `workspace.package`.
+
+### Изменённые файлы
+
+- `crates/tui/src/runner.rs` — убран `needs_clear`, раздельный EnableMouseCapture
+- `crates/tui/src/ui/bars.rs` — обновлены help-items для Normal и Thinking
+- `crates/tui/src/app.rs` — 4 новых теста (scroll clamp + hit_test tiny)
+- `crates/tui/src/ui/text.rs` — 3 новых теста (markdown-lite edge cases)
+- `crates/agent/src/glm.rs` — 2 новых теста (SSE malformed + partial)
+- `README.md` — Features + Keyboard Shortcuts обновлены
+- `USER_GUIDE.md` — раздел «Мышь» + обновлённые хоткеи
+- `Cargo.toml` — версия 0.2.0
+- `PROGRESS.md` — этот раздел
+
+**Тесты:** 9 новых (4 scroll clamp/hit_test + 3 markdown + 2 SSE).
+
+**Публичные контракты:** без изменений.
+
+**DoD (требует ручной проверки):**
+- Smoke-тест: запуск → агент → стриминг → подтверждение кликом → разворот
+  кликом → выделение/копия → Ctrl+T → скролл колесом → Ctrl+T → Ctrl+C →
+  сессия сохранена.
+- Ресайз 40×10 — нет паник.
+- Запуск без mouse capture — работает.
