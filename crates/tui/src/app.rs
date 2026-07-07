@@ -15,6 +15,8 @@ use crate::ui::Theme;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // App mode
@@ -69,7 +71,41 @@ pub enum HitZone {
 pub enum DragKind {
     /// Dragging the scrollbar thumb.
     Scrollbar,
-    // `Selection` (text selection) is reserved for future work.
+    /// Dragging to select text in the chat area.
+    Selection,
+}
+
+/// A text selection in the chat area.
+///
+/// Coordinates are in `layout_cache.lines` index space (not screen space),
+/// so the selection survives scrolling.  `anchor` is where the mouse went
+/// down; `head` tracks the current drag position.  Normalised order is
+/// computed at render/copy time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    /// Line index where the selection started.
+    pub anchor_line: usize,
+    /// Column (char offset within the rendered line) where the selection started.
+    pub anchor_col: usize,
+    /// Line index of the current selection head (follows the mouse).
+    pub head_line: usize,
+    /// Column of the current selection head.
+    pub head_col: usize,
+}
+
+impl Selection {
+    /// Return `(start, end)` as normalised `(line, col)` pairs where
+    /// `start <= end` lexicographically.
+    pub fn normalised(&self) -> ((usize, usize), (usize, usize)) {
+        let a = (self.anchor_line, self.anchor_col);
+        let h = (self.head_line, self.head_col);
+        if a <= h { (a, h) } else { (h, a) }
+    }
+
+    /// Whether the selection is empty (anchor == head).
+    pub fn is_empty(&self) -> bool {
+        self.anchor_line == self.head_line && self.anchor_col == self.head_col
+    }
 }
 
 /// An action triggered by clicking a help-bar item.
@@ -204,6 +240,18 @@ pub struct App {
     /// Used by [`set_cursor_from_click`](Self::set_cursor_from_click) to map
     /// clicks back to the correct cursor position in a scrolled input.
     pub input_scroll_offset: usize,
+    /// Current text selection in the chat area (if any).
+    /// Coordinates are in `layout_cache.lines` index space.
+    pub selection: Option<Selection>,
+    /// Toast notification: `(text, expiry)`.  Shown in the status bar area
+    /// until `expiry` is reached.
+    pub toast: Option<(String, Instant)>,
+    /// Timestamp of the last mouse-down in the chat area (for double/triple click).
+    last_click_time: Option<Instant>,
+    /// Position of the last mouse-down in the chat area (for double/triple click).
+    last_click_pos: Option<(usize, usize)>,
+    /// Current click count (1=single, 2=double, 3=triple).
+    click_count: u8,
 }
 
 impl App {
@@ -250,6 +298,11 @@ impl App {
             tick: 0,
             helpbar_zones: Vec::new(),
             input_scroll_offset: 0,
+            selection: None,
+            toast: None,
+            last_click_time: None,
+            last_click_pos: None,
+            click_count: 0,
         }
     }
 
@@ -279,6 +332,8 @@ impl App {
     fn push_message(&mut self, msg: ChatBlock) {
         self.messages.push(msg);
         self.message_rev = self.message_rev.wrapping_add(1);
+        // New message invalidates line indices — clear any active selection.
+        self.selection = None;
     }
 
     /// Append an error message from outside `App` (e.g. runner startup
@@ -688,12 +743,15 @@ impl App {
                 }
                 HitZone::Chat { line_idx } => {
                     // Click on OutputToggle or Command header → toggle collapse.
+                    // For non-collapsing headers (User, Agent, etc.), fall through
+                    // to the text-selection path so users can select header text.
                     if let Some(rl) = self.layout_cache.lines.get(line_idx) {
                         match rl.region {
                             crate::ui::layout_cache::LineRegion::OutputToggle => {
                                 if let Some(block_idx) = rl.block_index {
                                     self.toggle_collapse(block_idx);
                                 }
+                                return;
                             }
                             crate::ui::layout_cache::LineRegion::Header => {
                                 if let Some(block_idx) = rl.block_index {
@@ -703,10 +761,46 @@ impl App {
                                         Some(ChatBlock::Command { output: Some(_), .. })
                                     ) {
                                         self.toggle_collapse(block_idx);
+                                        return;
                                     }
                                 }
+                                // Non-collapsing header — fall through to selection.
                             }
                             _ => {}
+                        }
+                    }
+                    // --- Text selection ---
+                    let char_col = (m.column.saturating_sub(self.chat_area.x)) as usize;
+                    // Detect double/triple click (< 400 ms, same position).
+                    let now = Instant::now();
+                    let is_repeat = self.last_click_time.is_some_and(|t| now.duration_since(t) < Duration::from_millis(400))
+                        && self.last_click_pos == Some((line_idx, char_col));
+                    if is_repeat {
+                        self.click_count = (self.click_count % 3) + 1;
+                    } else {
+                        self.click_count = 1;
+                    }
+                    self.last_click_time = Some(now);
+                    self.last_click_pos = Some((line_idx, char_col));
+
+                    match self.click_count {
+                        2 => {
+                            // Double click — select word.
+                            self.select_word(line_idx, char_col);
+                            self.mouse_drag = Some(DragKind::Selection);
+                        }
+                        3 => {
+                            // Triple click — select line.
+                            self.select_line(line_idx);
+                            self.mouse_drag = Some(DragKind::Selection);
+                        }
+                        _ => {
+                            // Single click — start char selection.
+                            self.selection = Some(Selection {
+                                anchor_line: line_idx, anchor_col: char_col,
+                                head_line: line_idx, head_col: char_col,
+                            });
+                            self.mouse_drag = Some(DragKind::Selection);
                         }
                     }
                 }
@@ -716,10 +810,39 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.mouse_drag == Some(DragKind::Scrollbar) {
                     self.update_scrollbar_drag(m.row);
+                } else if self.mouse_drag == Some(DragKind::Selection) {
+                    // Update selection head to current mouse position.
+                    if let Some((line_idx, char_col)) = self.screen_to_line_col(m.column, m.row) {
+                        if let Some(sel) = &mut self.selection {
+                            sel.head_line = line_idx;
+                            sel.head_col = char_col;
+                        }
+                    }
+                    // Auto-scroll when dragging near the top or bottom edge.
+                    if self.chat_area.height > 0 {
+                        let edge = m.row;
+                        let top = self.chat_area.y;
+                        let bottom = self.chat_area.y + self.chat_area.height - 1;
+                        if edge <= top {
+                            self.scroll = self.scroll.saturating_add(1);
+                            self.clamp_scroll();
+                        } else if edge >= bottom {
+                            self.scroll = self.scroll.saturating_sub(1);
+                        }
+                    }
                 }
             }
             // --- Mouse up ---
             MouseEventKind::Up(MouseButton::Left) => {
+                if self.mouse_drag == Some(DragKind::Selection) {
+                    // If selection is empty (click without drag), clear it.
+                    if self.selection.as_ref().is_some_and(|s| s.is_empty()) {
+                        self.selection = None;
+                    } else {
+                        // Copy on select (non-empty selection).
+                        self.copy_selection_to_clipboard();
+                    }
+                }
                 self.mouse_drag = None;
             }
             // --- Hover (track which button is under cursor) ---
@@ -962,6 +1085,160 @@ impl App {
         let char_count = self.input.chars().count();
         let pos = (relative_row + self.input_scroll_offset) * inner_width + relative_col;
         self.cursor_pos = pos.min(char_count);
+    }
+
+    /// Convert a screen `(col, row)` to `(line_idx, char_col)` in layout-cache
+    /// space.  Returns `None` if the coordinate is outside the chat content.
+    ///
+    /// `line_idx` is the absolute index into `layout_cache.lines`.
+    /// `char_col` is the character offset within that line (0-based).
+    fn screen_to_line_col(&self, col: u16, row: u16) -> Option<(usize, usize)> {
+        if self.chat_area.width <= 1 || self.chat_area.height == 0 {
+            return None;
+        }
+        // Exclude scrollbar column (rightmost).
+        if col >= self.chat_area.x + self.chat_area.width - 1 {
+            return None;
+        }
+        if col < self.chat_area.x || row < self.chat_area.y || row >= self.chat_area.y + self.chat_area.height {
+            return None;
+        }
+        let visible_height = self.chat_area.height as usize;
+        let total_lines = self.layout_cache.lines.len();
+        let skip = if total_lines > visible_height {
+            total_lines.saturating_sub(visible_height + self.scroll)
+        } else {
+            0
+        };
+        let inner_row = (row - self.chat_area.y) as usize;
+        let line_idx = skip + inner_row;
+        if line_idx >= total_lines {
+            return None;
+        }
+        let char_col = (col - self.chat_area.x) as usize;
+        Some((line_idx, char_col))
+    }
+
+    /// Extract the plain-text content of a rendered line.
+    ///
+    /// Concatenates all span contents — stripping style information — to
+    /// produce the raw text needed for clipboard copy.
+    fn line_text(&self, line_idx: usize) -> String {
+        self.layout_cache
+            .lines
+            .get(line_idx)
+            .map(|rl| {
+                rl.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Extract the selected text from `layout_cache.lines`.
+    ///
+    /// For the start and end lines, only the portion within the selection
+    /// column range is included.  Middle lines are included in full.
+    fn selected_text(&self) -> Option<String> {
+        let sel = self.selection.as_ref()?;
+        if sel.is_empty() {
+            return None;
+        }
+        let ((start_line, start_col), (end_line, end_col)) = sel.normalised();
+        let mut result = String::new();
+        for line_idx in start_line..=end_line {
+            let text = self.line_text(line_idx);
+            if line_idx == start_line && line_idx == end_line {
+                // Single-line selection
+                let s = start_col.min(text.chars().count());
+                let e = end_col.min(text.chars().count());
+                result.push_str(&text.chars().skip(s).take(e.saturating_sub(s)).collect::<String>());
+            } else if line_idx == start_line {
+                let s = start_col.min(text.chars().count());
+                result.push_str(&text.chars().skip(s).collect::<String>());
+            } else if line_idx == end_line {
+                let e = end_col.min(text.chars().count());
+                result.push_str(&text.chars().take(e).collect::<String>());
+            } else {
+                result.push_str(&text);
+            }
+            if line_idx < end_line {
+                result.push('\n');
+            }
+        }
+        if result.is_empty() { None } else { Some(result) }
+    }
+
+    /// Copy the current selection to the system clipboard.
+    /// On success, shows a "copied" toast for ~1.5 seconds.
+    fn copy_selection_to_clipboard(&mut self) {
+        if let Some(text) = self.selected_text() {
+            match arboard::Clipboard::new() {
+                Ok(mut cb) => {
+                    if cb.set_text(&text).is_ok() {
+                        self.toast = Some((
+                            "copied".to_string(),
+                            Instant::now() + Duration::from_millis(1500),
+                        ));
+                    }
+                }
+                Err(_) => {
+                    // Clipboard not available — silently ignore.
+                    // Selection still works visually.
+                }
+            }
+        }
+    }
+
+    /// Select a word at the given line and column.
+    ///
+    /// A "word" is a maximal run of non-whitespace characters.
+    fn select_word(&mut self, line_idx: usize, col: usize) {
+        let text = self.line_text(line_idx);
+        let char_count = text.chars().count();
+        if char_count == 0 {
+            self.selection = Some(Selection {
+                anchor_line: line_idx, anchor_col: 0,
+                head_line: line_idx, head_col: 0,
+            });
+            return;
+        }
+        let col = col.min(char_count);
+        let chars: Vec<char> = text.chars().collect();
+        // Find word boundaries.
+        let is_word_char = |c: char| !c.is_whitespace();
+        // If cursor is on whitespace, select the whitespace run.
+        let target_is_word = is_word_char(chars[col.min(char_count - 1)]);
+        let mut start = col;
+        while start > 0 && is_word_char(chars[start - 1]) == target_is_word {
+            start -= 1;
+        }
+        let mut end = col;
+        while end < char_count && is_word_char(chars[end]) == target_is_word {
+            end += 1;
+        }
+        self.selection = Some(Selection {
+            anchor_line: line_idx, anchor_col: start,
+            head_line: line_idx, head_col: end,
+        });
+    }
+
+    /// Select an entire line.
+    fn select_line(&mut self, line_idx: usize) {
+        let char_count = self.line_text(line_idx).chars().count();
+        self.selection = Some(Selection {
+            anchor_line: line_idx, anchor_col: 0,
+            head_line: line_idx, head_col: char_count,
+        });
+    }
+
+    /// Whether the toast is still active (not expired).
+    pub fn toast_text(&self) -> Option<&str> {
+        self.toast.as_ref().and_then(|(text, expiry)| {
+            if *expiry > Instant::now() { Some(text.as_str()) } else { None }
+        })
     }
 
     /// Respond to a pending confirmation request.
@@ -2651,5 +2928,275 @@ mod tests {
         assert!(app.confirm_selected);
         app.execute_help_action(HelpAction::Switch);
         assert!(!app.confirm_selected);
+    }
+
+    // ----- Text selection tests (issue #21) -----
+
+    #[test]
+    fn selection_normalised_forward() {
+        let sel = Selection {
+            anchor_line: 5, anchor_col: 3,
+            head_line: 10, head_col: 7,
+        };
+        let ((sl, sc), (el, ec)) = sel.normalised();
+        assert_eq!((sl, sc), (5, 3));
+        assert_eq!((el, ec), (10, 7));
+    }
+
+    #[test]
+    fn selection_normalised_backward() {
+        let sel = Selection {
+            anchor_line: 10, anchor_col: 7,
+            head_line: 5, head_col: 3,
+        };
+        let ((sl, sc), (el, ec)) = sel.normalised();
+        assert_eq!((sl, sc), (5, 3));
+        assert_eq!((el, ec), (10, 7));
+    }
+
+    #[test]
+    fn selection_is_empty_when_anchor_equals_head() {
+        let sel = Selection {
+            anchor_line: 5, anchor_col: 3,
+            head_line: 5, head_col: 3,
+        };
+        assert!(sel.is_empty());
+    }
+
+    #[test]
+    fn selection_not_empty_when_different_line() {
+        let sel = Selection {
+            anchor_line: 5, anchor_col: 0,
+            head_line: 6, head_col: 0,
+        };
+        assert!(!sel.is_empty());
+    }
+
+    #[test]
+    fn selected_text_single_line() {
+        let mut app = make_hit_test_app();
+        // Line 26 = "line 26" — 7 chars
+        app.selection = Some(Selection {
+            anchor_line: 26, anchor_col: 0,
+            head_line: 26, head_col: 4,
+        });
+        assert_eq!(app.selected_text().unwrap(), "line");
+    }
+
+    #[test]
+    fn selected_text_multi_line() {
+        let mut app = make_hit_test_app();
+        // Lines 26-28: "line 26", "line 27", "line 28"
+        app.selection = Some(Selection {
+            anchor_line: 26, anchor_col: 5,
+            head_line: 28, head_col: 2,
+        });
+        // From line 26 col 5: "26"
+        // Full line 27: "line 27"
+        // Line 28 cols 0-2: "li"
+        assert_eq!(app.selected_text().unwrap(), "26\nline 27\nli");
+    }
+
+    #[test]
+    fn selected_text_empty_returns_none() {
+        let mut app = make_hit_test_app();
+        app.selection = Some(Selection {
+            anchor_line: 26, anchor_col: 3,
+            head_line: 26, head_col: 3,
+        });
+        assert!(app.selected_text().is_none());
+    }
+
+    #[test]
+    fn select_word_picks_non_whitespace_run() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.layout_cache.lines = vec![
+            crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("hello world test"),
+                block_index: Some(0),
+                region: crate::ui::layout_cache::LineRegion::Body,
+            }
+        ];
+        // Click on "world" at col 6 (the 'w')
+        app.select_word(0, 6);
+        let sel = app.selection.unwrap();
+        assert_eq!(sel.anchor_col, 6);
+        assert_eq!(sel.head_col, 11); // "world" = cols 6..11
+    }
+
+    #[test]
+    fn select_word_at_start_of_line() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.layout_cache.lines = vec![
+            crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("hello world"),
+                block_index: Some(0),
+                region: crate::ui::layout_cache::LineRegion::Body,
+            }
+        ];
+        // Click at col 0
+        app.select_word(0, 0);
+        let sel = app.selection.unwrap();
+        assert_eq!(sel.anchor_col, 0);
+        assert_eq!(sel.head_col, 5); // "hello"
+    }
+
+    #[test]
+    fn select_line_selects_entire_line() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.layout_cache.lines = vec![
+            crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("hello world"),
+                block_index: Some(0),
+                region: crate::ui::layout_cache::LineRegion::Body,
+            }
+        ];
+        app.select_line(0);
+        let sel = app.selection.unwrap();
+        assert_eq!(sel.anchor_col, 0);
+        assert_eq!(sel.head_col, 11); // entire line
+    }
+
+    #[test]
+    fn screen_to_line_col_maps_correctly() {
+        let app = make_hit_test_app();
+        // chat_area: x=0, y=1, w=80, h=24
+        // 50 lines, scroll=0 → skip = 26
+        // Click at col=5, row=1 → line_idx=26, char_col=5
+        let (line_idx, char_col) = app.screen_to_line_col(5, 1).unwrap();
+        assert_eq!(line_idx, 26);
+        assert_eq!(char_col, 5);
+    }
+
+    #[test]
+    fn screen_to_line_col_excludes_scrollbar() {
+        let app = make_hit_test_app();
+        // col=79 is the scrollbar column → None
+        assert!(app.screen_to_line_col(79, 10).is_none());
+    }
+
+    #[test]
+    fn screen_to_line_col_returns_none_outside() {
+        let app = make_hit_test_app();
+        assert!(app.screen_to_line_col(200, 200).is_none());
+    }
+
+    #[test]
+    fn mouse_down_in_chat_starts_selection() {
+        let mut app = make_hit_test_app();
+        // Click at col=5, row=1 → line 26, col 5
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 5,
+            row: 1,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        assert!(app.selection.is_some());
+        assert_eq!(app.mouse_drag, Some(DragKind::Selection));
+        let sel = app.selection.unwrap();
+        assert_eq!(sel.anchor_line, 26);
+        assert_eq!(sel.anchor_col, 5);
+        assert_eq!(sel.head_line, 26);
+        assert_eq!(sel.head_col, 5);
+    }
+
+    #[test]
+    fn mouse_drag_updates_selection_head() {
+        let mut app = make_hit_test_app();
+        // Down at col=0, row=1 → line 26, col 0
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 1,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        // Drag to col=4, row=2 → line 27, col 4
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 4,
+            row: 2,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        let sel = app.selection.unwrap();
+        assert_eq!(sel.anchor_line, 26);
+        assert_eq!(sel.anchor_col, 0);
+        assert_eq!(sel.head_line, 27);
+        assert_eq!(sel.head_col, 4);
+    }
+
+    #[test]
+    fn mouse_up_clears_drag() {
+        let mut app = make_hit_test_app();
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 1,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 1,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        assert_eq!(app.mouse_drag, None);
+        // Empty selection should be cleared on mouse-up.
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn push_message_clears_selection() {
+        let mut app = make_hit_test_app();
+        app.selection = Some(Selection {
+            anchor_line: 26, anchor_col: 0,
+            head_line: 26, head_col: 4,
+        });
+        app.push_message(ChatBlock::User("new message".into()));
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn toast_text_none_when_no_toast() {
+        let app = App::new("test".into(), CommandConfirmMode::Always);
+        assert!(app.toast_text().is_none());
+    }
+
+    #[test]
+    fn toast_text_shown_when_active() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.toast = Some(("copied".to_string(), Instant::now() + Duration::from_secs(10)));
+        assert_eq!(app.toast_text().unwrap(), "copied");
+    }
+
+    #[test]
+    fn toast_text_expired_returns_none() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.toast = Some(("copied".to_string(), Instant::now() - Duration::from_secs(1)));
+        assert!(app.toast_text().is_none());
+    }
+
+    #[test]
+    fn header_click_non_collapsing_starts_selection() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        // A Header line for a User message (not a collapsible Command).
+        app.layout_cache.lines = vec![
+            crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("  you"),
+                block_index: Some(0),
+                region: crate::ui::layout_cache::LineRegion::Header,
+            },
+        ];
+        app.messages = vec![ChatBlock::User("test".into())];
+        // Click at col=3, row=1 (on the "you" header text)
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 3,
+            row: 1,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        // Should fall through to selection, not return early.
+        assert!(app.selection.is_some());
+        assert_eq!(app.mouse_drag, Some(DragKind::Selection));
     }
 }

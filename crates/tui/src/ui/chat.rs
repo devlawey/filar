@@ -1,7 +1,8 @@
 //! Chat history rendering.
 
 use ratatui::layout::Rect;
-use ratatui::text::Line;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 
@@ -52,13 +53,20 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let skip = skip.min(total_lines);
 
+    // Build visible lines, applying selection highlighting if active.
+    let sel = app.selection;
+    let selection_style = Style::default().bg(app.theme.selection_bg);
     let visible_lines: Vec<Line> = app
         .layout_cache
         .lines
         .iter()
+        .enumerate()
         .skip(skip)
         .take(visible_height)
-        .map(|rl| rl.line.clone())
+        .map(|(line_idx, rl)| {
+            let line = rl.line.clone();
+            apply_selection(line, line_idx, sel, selection_style)
+        })
         .collect();
 
     let paragraph = Paragraph::new(visible_lines);
@@ -99,4 +107,67 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
         // Clear indicator area so hit_test doesn't detect a stale indicator.
         app.indicator_area = Rect::default();
     }
+}
+
+/// Apply selection background to a rendered line.
+///
+/// If the line is within the selection range, the relevant character columns
+/// get `selection_bg` as their background colour.  This works by rebuilding
+/// the line's spans: each original span is split at selection boundaries.
+fn apply_selection(
+    line: Line<'static>,
+    line_idx: usize,
+    sel: Option<crate::app::Selection>,
+    sel_style: Style,
+) -> Line<'static> {
+    let Some(sel) = sel else { return line };
+    if sel.is_empty() {
+        return line;
+    }
+    let ((start_line, start_col), (end_line, end_col)) = sel.normalised();
+    // Is this line within the selection range at all?
+    if line_idx < start_line || line_idx > end_line {
+        return line;
+    }
+    // Compute the column range for this specific line.
+    let col_start = if line_idx == start_line { start_col } else { 0 };
+    let col_end = if line_idx == end_line { end_col } else { usize::MAX };
+
+    // Walk through the line's spans, splitting them at selection boundaries.
+    let mut new_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_col = 0usize;
+    for span in &line.spans {
+        let span_len = span.content.chars().count();
+        let span_end = current_col + span_len;
+        // Compute intersection [col_start, col_end) with [current_col, span_end)
+        let intersect_start = col_start.max(current_col);
+        let intersect_end = col_end.min(span_end);
+        if intersect_start >= intersect_end {
+            // No intersection — keep span as-is.
+            new_spans.push(span.clone());
+        } else {
+            // Split into up to 3 parts: before, selected, after.
+            let chars: Vec<char> = span.content.chars().collect();
+            // Before selection
+            if intersect_start > current_col {
+                let before: String = chars[..intersect_start - current_col].iter().collect();
+                new_spans.push(Span::styled(before, span.style));
+            }
+            // Selected portion
+            let selected: String = chars[intersect_start - current_col..intersect_end - current_col]
+                .iter()
+                .collect();
+            new_spans.push(Span::styled(
+                selected,
+                span.style.patch(sel_style),
+            ));
+            // After selection
+            if intersect_end < span_end {
+                let after: String = chars[intersect_end - current_col..].iter().collect();
+                new_spans.push(Span::styled(after, span.style));
+            }
+        }
+        current_col = span_end;
+    }
+    Line::from(new_spans)
 }
