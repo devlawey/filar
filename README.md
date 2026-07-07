@@ -17,6 +17,8 @@ Filar is a Rust-based terminal application that integrates an AI agent (LLM) wit
 - **SSH Remote Execution** — agent manages remote machines via SSH, zero-install (no files left on the remote)
 - **Local Mode** — run commands on your own machine via PowerShell
 - **TUI Interface** — built with [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm)
+- **Mouse Support** — scroll wheel, click-to-expand command blocks, drag-to-select and copy text
+- **Streaming Responses** — real-time streaming of LLM responses with spinner animation
 - **GUI Launcher** — built with [egui](https://github.com/emilk/egui), for easy SSH profile and API key configuration
 - **Command Confirmation** — every command requires user approval before execution
 - **Shell Escape** — type `!command` for direct shell access without the agent
@@ -135,11 +137,15 @@ Type `!` followed by a command to run it directly (bypassing the agent):
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Send message / Confirm |
+| `Enter` | Send message / Confirm selected button |
 | `Ctrl+C` | Cancel agent (in Thinking mode) / Quit (in Normal mode) |
+| `Ctrl+T` | Toggle interactive terminal mode |
 | `Ctrl+P` | Enter password input mode (masked) |
 | `Up/Down` | Browse input history |
 | `!command` | Shell escape (direct execution) |
+| `Mouse wheel` | Scroll chat history / terminal scrollback |
+| `Click` | Expand/collapse command output blocks |
+| `Drag` | Select text and copy to clipboard |
 
 ### SSH Connection
 

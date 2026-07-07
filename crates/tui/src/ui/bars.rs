@@ -25,11 +25,14 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
             HelpItem { key: "!", desc: "shell", action: Some(HelpAction::Shell) },
             HelpItem { key: "^T", desc: "terminal", action: Some(HelpAction::Terminal) },
             HelpItem { key: "^P", desc: "password", action: Some(HelpAction::Password) },
+            HelpItem { key: "wheel", desc: "scroll", action: None },
+            HelpItem { key: "click", desc: "expand", action: None },
+            HelpItem { key: "drag", desc: "copy", action: None },
             HelpItem { key: "^C", desc: "quit", action: Some(HelpAction::Quit) },
         ],
         AppMode::Thinking => vec![
             HelpItem { key: "ctrl+c", desc: "quit", action: Some(HelpAction::Quit) },
-            HelpItem { key: "pgup/pgdn", desc: "scroll", action: None },
+            HelpItem { key: "wheel", desc: "scroll", action: None },
         ],
         AppMode::Confirming => vec![
             HelpItem { key: "tab", desc: "switch", action: Some(HelpAction::Switch) },

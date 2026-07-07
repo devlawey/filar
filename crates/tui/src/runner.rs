@@ -142,8 +142,15 @@ pub async fn run(
     // Set up terminal.
     enable_raw_mode().map_err(|e| CoreError::Other(format!("failed to enable raw mode: {e}")))?;
     let mut stdout = io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .map_err(|e| CoreError::Other(format!("failed to enter alternate screen: {e}")))?;
+    if let Err(e) = crossterm::execute!(stdout, EnterAlternateScreen) {
+        // Restore terminal state before returning the error.
+        disable_raw_mode().ok();
+        return Err(CoreError::Other(format!("failed to enter alternate screen: {e}")));
+    }
+    // Mouse capture is optional — degrade gracefully if unsupported.
+    if let Err(e) = crossterm::execute!(io::stdout(), EnableMouseCapture) {
+        warn!(error = %e, "mouse capture not available — mouse support disabled");
+    }
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)
@@ -205,7 +212,6 @@ async fn run_app(
 
     let mut prev_mode = app.mode;
     let mut needs_redraw = false;
-    let mut needs_clear = false; // Full clear to prevent overlap during rapid updates.
     let mut render_interval = tokio::time::interval(Duration::from_millis(16));
     render_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -393,14 +399,11 @@ async fn run_app(
                         ssh_info = new_ssh.clone();
                         app.target_name = new_ssh.clone().unwrap_or_else(|| "local".into());
                     }
-                    // TextDelta events don't need a full clear — just a redraw.
-                    // This prevents flickering during streaming.
-                    let is_text_delta = matches!(event, AgentEvent::TextDelta(_));
+                    // All agent events just need a redraw — the borderless
+                    // layout handles transitions cleanly without full clear.
+                    // Full clear is only needed on mode change (see below).
                     app.handle_agent_event(event);
                     needs_redraw = true;
-                    if !is_text_delta {
-                        needs_clear = true;
-                    }
                 }
             }
 
@@ -444,9 +447,8 @@ async fn run_app(
                 if app.mode == AppMode::Thinking {
                     app.tick = app.tick.wrapping_add(1);
                 }
-                if needs_clear || prev_mode != app.mode {
+                if prev_mode != app.mode {
                     terminal.clear().ok();
-                    needs_clear = false;
                     prev_mode = app.mode;
                 }
                 terminal.draw(|f| ui::render(f, &mut app)).ok();

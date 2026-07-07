@@ -1075,4 +1075,32 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         let json_no_stream = serde_json::to_value(&api_no_stream).unwrap();
         assert!(json_no_stream.get("stream").is_none());
     }
+
+    #[test]
+    fn sse_parse_malformed_data_line() {
+        // Malformed JSON in data line should be skipped gracefully.
+        let mut state = SseState::new();
+        state.process_chunk("data: not-json\n\n");
+        state.process_chunk("data: [DONE]\n\n");
+        let response = state.into_response().unwrap();
+        match response {
+            ChatResponse::Text(text) => assert!(text.is_empty()),
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn sse_parse_partial_chunk() {
+        // Partial chunk (no line terminator) should not produce output
+        // until the line is completed by a subsequent chunk.
+        let mut state = SseState::new();
+        let d1 = state.process_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"Hi");
+        assert!(d1.is_empty(), "no complete line yet");
+        state.process_chunk("\"}}]}\n\n");
+        let response = state.into_response().unwrap();
+        match response {
+            ChatResponse::Text(text) => assert_eq!(text, "Hi"),
+            _ => panic!("expected Text response"),
+        }
+    }
 }

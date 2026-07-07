@@ -336,4 +336,24 @@ mod tests {
             spans
         );
     }
+
+    #[test]
+    fn md_empty_string() {
+        let spans = md_spans("");
+        assert!(spans.is_empty() || spans == vec![""]);
+    }
+
+    #[test]
+    fn md_only_markers() {
+        // Just `**` with nothing between should be literal text.
+        let spans = md_spans("**");
+        assert!(!spans.is_empty());
+    }
+
+    #[test]
+    fn md_multiple_code_spans() {
+        let spans = md_spans("`foo` and `bar`");
+        assert!(spans.iter().any(|s| s == "foo"));
+        assert!(spans.iter().any(|s| s == "bar"));
+    }
 }
