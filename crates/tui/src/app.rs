@@ -743,6 +743,8 @@ impl App {
                 }
                 HitZone::Chat { line_idx } => {
                     // Click on OutputToggle or Command header → toggle collapse.
+                    // For non-collapsing headers (User, Agent, etc.), fall through
+                    // to the text-selection path so users can select header text.
                     if let Some(rl) = self.layout_cache.lines.get(line_idx) {
                         match rl.region {
                             crate::ui::layout_cache::LineRegion::OutputToggle => {
@@ -759,9 +761,10 @@ impl App {
                                         Some(ChatBlock::Command { output: Some(_), .. })
                                     ) {
                                         self.toggle_collapse(block_idx);
+                                        return;
                                     }
                                 }
-                                return;
+                                // Non-collapsing header — fall through to selection.
                             }
                             _ => {}
                         }
@@ -3170,5 +3173,30 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.toast = Some(("copied".to_string(), Instant::now() - Duration::from_secs(1)));
         assert!(app.toast_text().is_none());
+    }
+
+    #[test]
+    fn header_click_non_collapsing_starts_selection() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.chat_area = Rect::new(0, 1, 80, 24);
+        // A Header line for a User message (not a collapsible Command).
+        app.layout_cache.lines = vec![
+            crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("  you"),
+                block_index: Some(0),
+                region: crate::ui::layout_cache::LineRegion::Header,
+            },
+        ];
+        app.messages = vec![ChatBlock::User("test".into())];
+        // Click at col=3, row=1 (on the "you" header text)
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 3,
+            row: 1,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        // Should fall through to selection, not return early.
+        assert!(app.selection.is_some());
+        assert_eq!(app.mouse_drag, Some(DragKind::Selection));
     }
 }

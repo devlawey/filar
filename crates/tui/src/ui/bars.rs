@@ -107,7 +107,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(toast) = app.toast_text() {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            format!("\u{00b7} {}", toast),
+            format!("{} {}", glyphs.middle_dot, toast),
             app.theme.success_fg(),
         ));
     }
