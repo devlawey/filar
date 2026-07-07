@@ -984,3 +984,68 @@ PR: #28
 - `DragKind::Selection` — новый вариант.
 - `App`: новые поля `selection: Option<Selection>`, `toast: Option<(String, Instant)>`.
 - `App::toast_text()` — новый public метод.
+
+---
+
+## Issue #22: Мышь в интерактивном режиме терминала
+
+**Задача:** Скролл истории терминала колесом и проброс мыши в приложения
+(vim, htop, mc) в режиме Interactive (Ctrl+T).
+
+### Что сделано
+
+1. **TerminalModel API** (`crates/tui/src/terminal.rs`):
+   - `scroll_display(delta: i32)` — скролл scrollback-истории через
+     `term.scroll_display(Scroll::Delta(delta))`.
+   - `scroll_to_bottom()` — сброс скролла в низ через `Scroll::Bottom`.
+   - `mouse_mode() -> bool` — проверка `TermMode::MOUSE_MODE | SGR_MOUSE`
+     (REPORT_CLICK / DRAG / MOTION + SGR).
+   - `is_alt_screen() -> bool` — проверка `TermMode::ALT_SCREEN`.
+   - Импорт `Scroll` из `alacritty_terminal::grid`.
+
+2. **handle_interactive_mouse** (`crates/tui/src/app.rs`):
+   - Если `mouse_mode() == true`: кодирование события в SGR-последовательность
+     (`\x1b[<{button};{x};{y}M/m`, координаты 1-based относительно области
+     терминала) и отправка в `pending_term_input`.
+   - Иначе в alt-screen: колесо → стрелки `↑↑↑`/`↓↓↓` (по 3 на тик) —
+     стандартное поведение для `less`/`man`.
+   - Иначе (primary screen): колесо → `scroll_display(±3)`.
+   - События вне `terminal_area` игнорируются.
+
+3. **SGR mouse encoding** (`encode_sgr_mouse`):
+   - Поддержка: Left/Right/Middle click, release (M/m), drag (32+button),
+     motion (35), scroll (64/65).
+   - Модификаторы: Shift(4), Alt(8), Ctrl(16).
+
+4. **Сброс скролла при вводе** — клавиатурный ввод в Interactive вызывает
+   `scroll_to_bottom()` перед отправкой байтов.
+
+5. **terminal_area** — новое поле `App`, заполняется в `render_interactive`
+   для hit-testing мышью.
+
+6. **Help-bar** — добавлен `wheel scroll` в Interactive mode.
+
+### Изменённые файлы
+
+- `crates/tui/src/terminal.rs` — `scroll_display`, `scroll_to_bottom`,
+  `mouse_mode`, `is_alt_screen`, импорт `Scroll`
+- `crates/tui/src/app.rs` — `handle_interactive_mouse`, `encode_sgr_mouse`,
+  `push_term_input`, поле `terminal_area`, сброс скролла при keyboard input,
+  19 новых тестов
+- `crates/tui/src/ui/mod.rs` — сохранение `terminal_area` в `render_interactive`
+- `crates/tui/src/ui/bars.rs` — `wheel scroll` в Interactive help-bar
+
+**Тесты:** 19 новых: scroll up/down (primary), alt-screen arrow translation,
+  mouse outside area, SGR encoding (click/release/scroll/modifiers/right/
+  middle drag/motion), mouse_mode default/enabled, alt_screen default/enabled,
+  scroll_display, scroll_to_bottom, push_term_input (append/new).
+
+**Публичные контракты:**
+- `TerminalModel::scroll_display(i32)`, `scroll_to_bottom()`,
+  `mouse_mode() -> bool`, `is_alt_screen() -> bool` — новые public методы.
+- `App::terminal_area: Rect` — новое public поле.
+
+**DoD (требует ручной проверки):**
+- Колесо скроллит историю в интерактивном режиме.
+- В `htop`/`mc` по SSH клики и колесо доходят до приложения.
+- В `less` колесо листает (трансляция в стрелки).

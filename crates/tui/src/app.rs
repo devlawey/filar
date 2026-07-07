@@ -209,6 +209,8 @@ pub struct App {
     pub message_rev: u64,
     /// Actual chat area on screen (filled during render, for hit-testing).
     pub chat_area: Rect,
+    /// Terminal grid area in interactive mode (filled during render).
+    pub terminal_area: Rect,
     /// Actual input area on screen (filled during render, for hit-testing).
     pub input_area: Rect,
     /// Confirm button areas (filled later, for mouse click detection).
@@ -285,6 +287,7 @@ impl App {
             layout_cache: ChatLayoutCache::new(),
             message_rev: 0,
             chat_area: Rect::default(),
+            terminal_area: Rect::default(),
             input_area: Rect::default(),
             confirm_button_areas: Vec::new(),
             mouse_drag: None,
@@ -574,6 +577,10 @@ impl App {
                 // Convert the key event to terminal input bytes.
                 let bytes = key_to_bytes(key);
                 if !bytes.is_empty() {
+                    // Reset scrollback to bottom on keyboard input.
+                    if let Some(t) = self.terminal.as_mut() {
+                        t.scroll_to_bottom();
+                    }
                     // Append to pending input (multiple keys may arrive per loop iteration).
                     match &mut self.pending_term_input {
                         Some(existing) => existing.extend_from_slice(&bytes),
@@ -700,8 +707,14 @@ impl App {
             }
         }
 
-        // Other mouse events are not used in interactive/password modes.
-        if self.mode == AppMode::Interactive || self.mode == AppMode::PasswordInput {
+        // Mouse events in Interactive mode are handled separately.
+        if self.mode == AppMode::Interactive {
+            self.handle_interactive_mouse(m);
+            return;
+        }
+
+        // No mouse events in PasswordInput mode.
+        if self.mode == AppMode::PasswordInput {
             return;
         }
 
@@ -855,6 +868,82 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Handle a mouse event in Interactive terminal mode.
+    ///
+    /// If the terminal application has requested mouse events (SGR mode),
+    /// all mouse events are encoded as SGR sequences and forwarded to the
+    /// terminal input.  Otherwise, the scroll wheel either scrolls the
+    /// scrollback history (primary screen) or translates to arrow keys
+    /// (alternate screen, e.g. `less`, `man`).
+    fn handle_interactive_mouse(&mut self, m: crossterm::event::MouseEvent) {
+        use crossterm::event::MouseEventKind;
+
+        // Ignore events outside the terminal area.
+        let area = self.terminal_area;
+        if m.column < area.x
+            || m.column >= area.x + area.width
+            || m.row < area.y
+            || m.row >= area.y + area.height
+        {
+            return;
+        }
+
+        // 1-based coordinates relative to the terminal area (SGR convention).
+        let x = (m.column - area.x + 1) as usize;
+        let y = (m.row - area.y + 1) as usize;
+
+        let mouse_mode = self.terminal.as_ref().is_some_and(|t| t.mouse_mode());
+        let sgr_mouse = self.terminal.as_ref().is_some_and(|t| t.sgr_mouse());
+        let alt_screen = self.terminal.as_ref().is_some_and(|t| t.is_alt_screen());
+
+        if mouse_mode {
+            // Forward mouse events to the terminal.
+            if sgr_mouse {
+                // SGR encoding: \x1b[<{button};{x};{y}M/m
+                if let Some(seq) = encode_sgr_mouse(&m, x, y) {
+                    self.push_term_input(&seq);
+                }
+            } else {
+                // Legacy encoding: \x1b[M followed by 3 bytes (button+32, x+32, y+32).
+                // Coordinates are clamped to 255 (max for legacy format).
+                if let Some(seq) = encode_legacy_mouse(&m, x, y) {
+                    self.push_term_input(&seq);
+                }
+            }
+            return;
+        }
+
+        // No mouse mode — handle scroll wheel only.
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                if alt_screen {
+                    // Translate wheel to arrow keys (3 per tick).
+                    let arrows = b"\x1b[A\x1b[A\x1b[A";
+                    self.push_term_input(arrows);
+                } else if let Some(t) = self.terminal.as_mut() {
+                    t.scroll_display(3);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if alt_screen {
+                    let arrows = b"\x1b[B\x1b[B\x1b[B";
+                    self.push_term_input(arrows);
+                } else if let Some(t) = self.terminal.as_mut() {
+                    t.scroll_display(-3);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Append bytes to the pending terminal input buffer.
+    fn push_term_input(&mut self, bytes: &[u8]) {
+        match &mut self.pending_term_input {
+            Some(existing) => existing.extend_from_slice(bytes),
+            None => self.pending_term_input = Some(bytes.to_vec()),
         }
     }
 
@@ -1595,6 +1684,97 @@ fn is_interactive_command(cmd: &str) -> bool {
         | "bash" | "sh" | "zsh" | "fish" | "dash"
         | "su" | "sudo"  // sudo can be interactive (e.g. sudo -i)
     )
+}
+
+// ---------------------------------------------------------------------------
+// SGR mouse encoding for interactive terminal mode
+// ---------------------------------------------------------------------------
+
+/// Encode a crossterm mouse event as an SGR mouse sequence.
+///
+/// Returns `None` for event types that don't have a standard SGR encoding.
+///
+/// Format: `\x1b[<{button};{x};{y}M` for press/motion, `\x1b[<{button};{x};{y}m`
+/// for release.  Coordinates are 1-based.
+fn encode_sgr_mouse(m: &crossterm::event::MouseEvent, x: usize, y: usize) -> Option<Vec<u8>> {
+    use crossterm::event::{MouseButton, MouseEventKind, KeyModifiers};
+
+    // Base button code.
+    let (button, is_release) = match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => (0, false),
+        MouseEventKind::Down(MouseButton::Right) => (2, false),
+        MouseEventKind::Down(MouseButton::Middle) => (1, false),
+        MouseEventKind::Up(MouseButton::Left) => (0, true),
+        MouseEventKind::Up(MouseButton::Right) => (2, true),
+        MouseEventKind::Up(MouseButton::Middle) => (1, true),
+        MouseEventKind::Drag(MouseButton::Left) => (32, false),
+        MouseEventKind::Drag(MouseButton::Right) => (34, false),
+        MouseEventKind::Drag(MouseButton::Middle) => (33, false),
+        MouseEventKind::Moved => (35, false),
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        _ => return None,
+    };
+
+    // Add modifier flags.
+    let mut code = button;
+    if m.modifiers.contains(KeyModifiers::SHIFT) {
+        code |= 4;
+    }
+    if m.modifiers.contains(KeyModifiers::ALT) {
+        code |= 8;
+    }
+    if m.modifiers.contains(KeyModifiers::CONTROL) {
+        code |= 16;
+    }
+
+    let suffix = if is_release { b'm' } else { b'M' };
+    Some(format!("\x1b[<{code};{x};{y}").into_bytes())
+        .map(|mut v| { v.push(suffix); v })
+}
+
+/// Encode a crossterm mouse event using the legacy (pre-SGR) encoding.
+///
+/// Format: `\x1b[M` followed by 3 bytes: `(button_code + 32)`,
+/// `(x + 32)`, `(y + 32)`.  Coordinates are 1-based and clamped to 255.
+///
+/// Returns `None` for event types that don't have a standard encoding.
+fn encode_legacy_mouse(m: &crossterm::event::MouseEvent, x: usize, y: usize) -> Option<Vec<u8>> {
+    use crossterm::event::{MouseButton, MouseEventKind, KeyModifiers};
+
+    // Base button code (same as SGR for the low bits).
+    let button = match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => 0,
+        MouseEventKind::Down(MouseButton::Right) => 2,
+        MouseEventKind::Down(MouseButton::Middle) => 1,
+        MouseEventKind::Up(_) => 3, // Release is button 3 in legacy mode.
+        MouseEventKind::Drag(MouseButton::Left) => 32,
+        MouseEventKind::Drag(MouseButton::Right) => 34,
+        MouseEventKind::Drag(MouseButton::Middle) => 33,
+        MouseEventKind::Moved => 35,
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        _ => return None,
+    };
+
+    // Add modifier flags.
+    let mut code = button;
+    if m.modifiers.contains(KeyModifiers::SHIFT) {
+        code |= 4;
+    }
+    if m.modifiers.contains(KeyModifiers::ALT) {
+        code |= 8;
+    }
+    if m.modifiers.contains(KeyModifiers::CONTROL) {
+        code |= 16;
+    }
+
+    // Clamp coordinates to legacy max (255 - 32 = 223 usable).
+    let bx = (code + 32).min(255) as u8;
+    let sx = ((x - 1) + 32).min(255) as u8;
+    let sy = ((y - 1) + 32).min(255) as u8;
+
+    Some(vec![0x1b, b'[', b'M', bx, sx, sy])
 }
 
 #[cfg(test)]
@@ -3198,5 +3378,386 @@ mod tests {
         // Should fall through to selection, not return early.
         assert!(app.selection.is_some());
         assert_eq!(app.mouse_drag, Some(DragKind::Selection));
+    }
+
+    // --- Interactive mouse tests ---
+
+    fn make_interactive_app() -> App {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Interactive;
+        app.terminal = Some(TerminalModel::new(80, 24));
+        app.terminal_area = Rect::new(0, 2, 80, 20);
+        app
+    }
+
+    #[test]
+    fn interactive_scroll_up_primary_screen() {
+        let mut app = make_interactive_app();
+        // Feed enough lines to create scrollback history.
+        if let Some(t) = app.terminal.as_mut() {
+            for _ in 0..30 {
+                t.feed(b"line\n");
+            }
+        }
+        // Scroll up — should scroll through scrollback.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        // No pending term input — scroll is internal.
+        assert!(app.pending_term_input.is_none());
+    }
+
+    #[test]
+    fn interactive_scroll_down_primary_screen() {
+        let mut app = make_interactive_app();
+        if let Some(t) = app.terminal.as_mut() {
+            for _ in 0..30 {
+                t.feed(b"line\n");
+            }
+            t.scroll_display(10);
+        }
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 10,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        assert!(app.pending_term_input.is_none());
+    }
+
+    #[test]
+    fn interactive_scroll_alt_screen_translates_to_arrows() {
+        let mut app = make_interactive_app();
+        // Enter alt screen mode via ESC sequence.
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed(b"\x1b[?1049h");
+        }
+        assert!(app.terminal.as_ref().unwrap().is_alt_screen());
+        // Scroll up → should produce arrow key bytes.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        let input = app.take_term_input().unwrap();
+        assert_eq!(input, b"\x1b[A\x1b[A\x1b[A");
+
+        // Scroll down → should produce down arrow bytes.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 10,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        let input = app.take_term_input().unwrap();
+        assert_eq!(input, b"\x1b[B\x1b[B\x1b[B");
+    }
+
+    #[test]
+    fn interactive_mouse_outside_area_ignored() {
+        let mut app = make_interactive_app();
+        // Click below terminal area (row 23 > 2+20=22).
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 10,
+            row: 23,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        assert!(app.pending_term_input.is_none());
+    }
+
+    #[test]
+    fn interactive_sgr_mouse_mode_forwarded() {
+        let mut app = make_interactive_app();
+        // Enable SGR mouse mode via ESC sequence.
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed(b"\x1b[?1006h\x1b[?1002h"); // SGR + REPORT_CLICK
+        }
+        assert!(app.terminal.as_ref().unwrap().mouse_mode());
+
+        // Left click at (col=10, row=5) → SGR: x=11, y=4 (1-based).
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 10,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        let input = app.take_term_input().unwrap();
+        // SGR format: \x1b[<0;11;4M
+        assert_eq!(input, b"\x1b[<0;11;4M");
+    }
+
+    #[test]
+    fn interactive_sgr_mouse_release() {
+        let mut app = make_interactive_app();
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed(b"\x1b[?1006h\x1b[?1002h");
+        }
+        // Left button release at (col=20, row=10) → x=21, y=9.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 20,
+            row: 10,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        let input = app.take_term_input().unwrap();
+        // Release uses lowercase 'm'.
+        assert_eq!(input, b"\x1b[<0;21;9m");
+    }
+
+    #[test]
+    fn interactive_sgr_mouse_scroll() {
+        let mut app = make_interactive_app();
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed(b"\x1b[?1006h\x1b[?1002h");
+        }
+        // Scroll up → button code 64.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 15,
+            row: 7,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        let input = app.take_term_input().unwrap();
+        // x=16, y=6.
+        assert_eq!(input, b"\x1b[<64;16;6M");
+    }
+
+    #[test]
+    fn interactive_sgr_mouse_with_modifiers() {
+        let mut app = make_interactive_app();
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed(b"\x1b[?1006h\x1b[?1002h");
+        }
+        // Ctrl+Shift+Left click at (col=5, row=3) → x=6, y=2.
+        // code = 0 + 4 (shift) + 16 (ctrl) = 20.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: crossterm::event::KeyModifiers::SHIFT | crossterm::event::KeyModifiers::CONTROL,
+        });
+        let input = app.take_term_input().unwrap();
+        assert_eq!(input, b"\x1b[<20;6;2M");
+    }
+
+    #[test]
+    fn encode_sgr_mouse_right_click() {
+        let m = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        let result = encode_sgr_mouse(&m, 5, 3).unwrap();
+        assert_eq!(result, b"\x1b[<2;5;3M");
+    }
+
+    #[test]
+    fn encode_sgr_mouse_middle_drag() {
+        let m = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Middle),
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        let result = encode_sgr_mouse(&m, 10, 10).unwrap();
+        assert_eq!(result, b"\x1b[<33;10;10M");
+    }
+
+    #[test]
+    fn encode_sgr_mouse_motion_no_button() {
+        let m = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        let result = encode_sgr_mouse(&m, 1, 1).unwrap();
+        assert_eq!(result, b"\x1b[<35;1;1M");
+    }
+
+    // --- TerminalModel new methods tests ---
+
+    #[test]
+    fn terminal_model_mouse_mode_default_off() {
+        let model = TerminalModel::new(80, 24);
+        assert!(!model.mouse_mode());
+    }
+
+    #[test]
+    fn terminal_model_mouse_mode_sgr_enabled() {
+        let mut model = TerminalModel::new(80, 24);
+        // Enable SGR mouse + click reporting.
+        model.feed(b"\x1b[?1006h\x1b[?1002h");
+        assert!(model.mouse_mode());
+        assert!(model.sgr_mouse());
+    }
+
+    #[test]
+    fn terminal_model_mouse_mode_sgr_only_not_tracking() {
+        let mut model = TerminalModel::new(80, 24);
+        // Enable SGR encoding only — no tracking mode.
+        model.feed(b"\x1b[?1006h");
+        assert!(!model.mouse_mode()); // SGR alone is not tracking.
+        assert!(model.sgr_mouse());
+    }
+
+    #[test]
+    fn terminal_model_mouse_mode_legacy_tracking() {
+        let mut model = TerminalModel::new(80, 24);
+        // Enable click tracking without SGR.
+        model.feed(b"\x1b[?1000h");
+        assert!(model.mouse_mode());
+        assert!(!model.sgr_mouse());
+    }
+
+    #[test]
+    fn terminal_model_alt_screen_default_off() {
+        let model = TerminalModel::new(80, 24);
+        assert!(!model.is_alt_screen());
+    }
+
+    #[test]
+    fn terminal_model_alt_screen_enabled() {
+        let mut model = TerminalModel::new(80, 24);
+        model.feed(b"\x1b[?1049h");
+        assert!(model.is_alt_screen());
+    }
+
+    #[test]
+    fn terminal_model_scroll_display_up() {
+        let mut model = TerminalModel::new(80, 5);
+        for _ in 0..20 {
+            model.feed(b"line\n");
+        }
+        model.scroll_display(3);
+        // Should not panic — display offset changed.
+        // We can't directly read display_offset from the public API,
+        // but the method should complete successfully.
+    }
+
+    #[test]
+    fn terminal_model_scroll_to_bottom() {
+        let mut model = TerminalModel::new(80, 5);
+        for _ in 0..20 {
+            model.feed(b"line\n");
+        }
+        model.scroll_display(5);
+        model.scroll_to_bottom();
+        // Should not panic.
+    }
+
+    #[test]
+    fn push_term_input_appends() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.push_term_input(b"abc");
+        app.push_term_input(b"def");
+        let input = app.take_term_input().unwrap();
+        assert_eq!(input, b"abcdef");
+    }
+
+    #[test]
+    fn push_term_input_new_buffer() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.push_term_input(b"hello");
+        assert_eq!(app.take_term_input().unwrap(), b"hello");
+        assert!(app.take_term_input().is_none());
+    }
+
+    // --- Legacy mouse encoding tests ---
+
+    #[test]
+    fn interactive_legacy_mouse_forwarded() {
+        let mut app = make_interactive_app();
+        // Enable click tracking WITHOUT SGR (legacy mode 1000).
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed(b"\x1b[?1000h");
+        }
+        assert!(app.terminal.as_ref().unwrap().mouse_mode());
+        assert!(!app.terminal.as_ref().unwrap().sgr_mouse());
+
+        // Left click at (col=10, row=5) → x=11, y=4 (1-based).
+        // Legacy: \x1b[M + (0+32), (10+32), (3+32) = \x1b[M \x20 \x2a \x23
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 10,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        let input = app.take_term_input().unwrap();
+        // button=0+32=32, x=(11-1)+32=42, y=(4-1)+32=35
+        assert_eq!(input, vec![0x1b, b'[', b'M', 32, 42, 35]);
+    }
+
+    #[test]
+    fn interactive_legacy_mouse_release() {
+        let mut app = make_interactive_app();
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed(b"\x1b[?1000h");
+        }
+        // Release → button 3 in legacy mode.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        let input = app.take_term_input().unwrap();
+        // button=3+32=35, x=(6-1)+32=37, y=(2-1)+32=33
+        assert_eq!(input, vec![0x1b, b'[', b'M', 35, 37, 33]);
+    }
+
+    #[test]
+    fn encode_legacy_mouse_right_click() {
+        let m = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        // x=5, y=3 → x byte = 4+32=36, y byte = 2+32=34
+        let result = encode_legacy_mouse(&m, 5, 3).unwrap();
+        // button=2+32=34
+        assert_eq!(result, vec![0x1b, b'[', b'M', 34, 36, 34]);
+    }
+
+    #[test]
+    fn encode_legacy_mouse_scroll() {
+        let m = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        // x=1, y=1 → x byte = 0+32=32, y byte = 0+32=32
+        let result = encode_legacy_mouse(&m, 1, 1).unwrap();
+        // button=64+32=96
+        assert_eq!(result, vec![0x1b, b'[', b'M', 96, 32, 32]);
+    }
+
+    #[test]
+    fn sgr_only_without_tracking_uses_scrollback() {
+        let mut app = make_interactive_app();
+        // Enable SGR encoding only — no tracking mode.
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed(b"\x1b[?1006h");
+        }
+        assert!(!app.terminal.as_ref().unwrap().mouse_mode());
+        assert!(app.terminal.as_ref().unwrap().sgr_mouse());
+
+        // Scroll up → should NOT be forwarded as SGR, should use scrollback.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        // No pending term input — scroll was internal.
+        assert!(app.pending_term_input.is_none());
     }
 }

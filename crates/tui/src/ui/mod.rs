@@ -104,6 +104,9 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
     bars::render_status_bar(f, app, chunks[0]);
     bars::render_separator(f, app, chunks[1]);
 
+    // Store terminal area for mouse hit-testing in interactive mode.
+    app.terminal_area = chunks[2];
+
     // Render the terminal model grid.
     if let Some(ref term) = app.terminal {
         term.render(f, chunks[2]);

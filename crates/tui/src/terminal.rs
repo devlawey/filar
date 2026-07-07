@@ -7,7 +7,7 @@
 //! terminal input bytes via [`key_to_bytes`].
 
 use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
@@ -106,6 +106,46 @@ impl TerminalModel {
         let col = point.column.0.min(u16::MAX as usize) as u16;
         let row = point.line.0.max(0) as u16;
         Some((col, row))
+    }
+
+    /// Scroll the terminal display by `delta` lines (negative = up).
+    ///
+    /// This scrolls through the scrollback history without sending input
+    /// to the PTY/SSH channel.
+    pub fn scroll_display(&mut self, delta: i32) {
+        self.term.scroll_display(Scroll::Delta(delta));
+    }
+
+    /// Reset scrollback to the bottom (latest output).
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Check whether the application in the terminal has requested mouse
+    /// tracking (click, drag, or motion mode).
+    ///
+    /// This checks `MOUSE_MODE` only (REPORT_CLICK | MOTION | DRAG), not
+    /// `SGR_MOUSE`, which is an encoding flag rather than a tracking flag.
+    pub fn mouse_mode(&self) -> bool {
+        self.term.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Check whether the application has requested SGR mouse encoding (1006).
+    ///
+    /// When `true`, mouse events should be encoded as SGR sequences
+    /// (`\x1b[<{button};{x};{y}M/m`).  When `false` but `mouse_mode()` is
+    /// `true`, legacy encoding (`\x1b[M{b}{x}{y}`) should be used instead.
+    pub fn sgr_mouse(&self) -> bool {
+        self.term.mode().contains(TermMode::SGR_MOUSE)
+    }
+
+    /// Check whether the terminal is in alternate screen mode.
+    ///
+    /// In alt-screen (used by `less`, `vim`, `htop`, etc.) scrollback
+    /// scrolling doesn't apply — the wheel should be translated to arrow
+    /// keys instead.
+    pub fn is_alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
     /// Render the terminal grid to a ratatui frame.
