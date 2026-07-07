@@ -896,12 +896,22 @@ impl App {
         let y = (m.row - area.y + 1) as usize;
 
         let mouse_mode = self.terminal.as_ref().is_some_and(|t| t.mouse_mode());
+        let sgr_mouse = self.terminal.as_ref().is_some_and(|t| t.sgr_mouse());
         let alt_screen = self.terminal.as_ref().is_some_and(|t| t.is_alt_screen());
 
         if mouse_mode {
-            // Forward mouse events as SGR sequences to the terminal.
-            if let Some(seq) = encode_sgr_mouse(&m, x, y) {
-                self.push_term_input(&seq);
+            // Forward mouse events to the terminal.
+            if sgr_mouse {
+                // SGR encoding: \x1b[<{button};{x};{y}M/m
+                if let Some(seq) = encode_sgr_mouse(&m, x, y) {
+                    self.push_term_input(&seq);
+                }
+            } else {
+                // Legacy encoding: \x1b[M followed by 3 bytes (button+32, x+32, y+32).
+                // Coordinates are clamped to 255 (max for legacy format).
+                if let Some(seq) = encode_legacy_mouse(&m, x, y) {
+                    self.push_term_input(&seq);
+                }
             }
             return;
         }
@@ -1721,6 +1731,50 @@ fn encode_sgr_mouse(m: &crossterm::event::MouseEvent, x: usize, y: usize) -> Opt
     let suffix = if is_release { b'm' } else { b'M' };
     Some(format!("\x1b[<{code};{x};{y}").into_bytes())
         .map(|mut v| { v.push(suffix); v })
+}
+
+/// Encode a crossterm mouse event using the legacy (pre-SGR) encoding.
+///
+/// Format: `\x1b[M` followed by 3 bytes: `(button_code + 32)`,
+/// `(x + 32)`, `(y + 32)`.  Coordinates are 1-based and clamped to 255.
+///
+/// Returns `None` for event types that don't have a standard encoding.
+fn encode_legacy_mouse(m: &crossterm::event::MouseEvent, x: usize, y: usize) -> Option<Vec<u8>> {
+    use crossterm::event::{MouseButton, MouseEventKind, KeyModifiers};
+
+    // Base button code (same as SGR for the low bits).
+    let button = match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => 0,
+        MouseEventKind::Down(MouseButton::Right) => 2,
+        MouseEventKind::Down(MouseButton::Middle) => 1,
+        MouseEventKind::Up(_) => 3, // Release is button 3 in legacy mode.
+        MouseEventKind::Drag(MouseButton::Left) => 32,
+        MouseEventKind::Drag(MouseButton::Right) => 34,
+        MouseEventKind::Drag(MouseButton::Middle) => 33,
+        MouseEventKind::Moved => 35,
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        _ => return None,
+    };
+
+    // Add modifier flags.
+    let mut code = button;
+    if m.modifiers.contains(KeyModifiers::SHIFT) {
+        code |= 4;
+    }
+    if m.modifiers.contains(KeyModifiers::ALT) {
+        code |= 8;
+    }
+    if m.modifiers.contains(KeyModifiers::CONTROL) {
+        code |= 16;
+    }
+
+    // Clamp coordinates to legacy max (255 - 32 = 223 usable).
+    let bx = (code + 32).min(255) as u8;
+    let sx = ((x - 1) + 32).min(255) as u8;
+    let sy = ((y - 1) + 32).min(255) as u8;
+
+    Some(vec![0x1b, b'[', b'M', bx, sx, sy])
 }
 
 #[cfg(test)]
@@ -3541,6 +3595,25 @@ mod tests {
         // Enable SGR mouse + click reporting.
         model.feed(b"\x1b[?1006h\x1b[?1002h");
         assert!(model.mouse_mode());
+        assert!(model.sgr_mouse());
+    }
+
+    #[test]
+    fn terminal_model_mouse_mode_sgr_only_not_tracking() {
+        let mut model = TerminalModel::new(80, 24);
+        // Enable SGR encoding only — no tracking mode.
+        model.feed(b"\x1b[?1006h");
+        assert!(!model.mouse_mode()); // SGR alone is not tracking.
+        assert!(model.sgr_mouse());
+    }
+
+    #[test]
+    fn terminal_model_mouse_mode_legacy_tracking() {
+        let mut model = TerminalModel::new(80, 24);
+        // Enable click tracking without SGR.
+        model.feed(b"\x1b[?1000h");
+        assert!(model.mouse_mode());
+        assert!(!model.sgr_mouse());
     }
 
     #[test]
@@ -3594,5 +3667,97 @@ mod tests {
         app.push_term_input(b"hello");
         assert_eq!(app.take_term_input().unwrap(), b"hello");
         assert!(app.take_term_input().is_none());
+    }
+
+    // --- Legacy mouse encoding tests ---
+
+    #[test]
+    fn interactive_legacy_mouse_forwarded() {
+        let mut app = make_interactive_app();
+        // Enable click tracking WITHOUT SGR (legacy mode 1000).
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed(b"\x1b[?1000h");
+        }
+        assert!(app.terminal.as_ref().unwrap().mouse_mode());
+        assert!(!app.terminal.as_ref().unwrap().sgr_mouse());
+
+        // Left click at (col=10, row=5) → x=11, y=4 (1-based).
+        // Legacy: \x1b[M + (0+32), (10+32), (3+32) = \x1b[M \x20 \x2a \x23
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 10,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        let input = app.take_term_input().unwrap();
+        // button=0+32=32, x=(11-1)+32=42, y=(4-1)+32=35
+        assert_eq!(input, vec![0x1b, b'[', b'M', 32, 42, 35]);
+    }
+
+    #[test]
+    fn interactive_legacy_mouse_release() {
+        let mut app = make_interactive_app();
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed(b"\x1b[?1000h");
+        }
+        // Release → button 3 in legacy mode.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        let input = app.take_term_input().unwrap();
+        // button=3+32=35, x=(6-1)+32=37, y=(2-1)+32=33
+        assert_eq!(input, vec![0x1b, b'[', b'M', 35, 37, 33]);
+    }
+
+    #[test]
+    fn encode_legacy_mouse_right_click() {
+        let m = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        // x=5, y=3 → x byte = 4+32=36, y byte = 2+32=34
+        let result = encode_legacy_mouse(&m, 5, 3).unwrap();
+        // button=2+32=34
+        assert_eq!(result, vec![0x1b, b'[', b'M', 34, 36, 34]);
+    }
+
+    #[test]
+    fn encode_legacy_mouse_scroll() {
+        let m = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        // x=1, y=1 → x byte = 0+32=32, y byte = 0+32=32
+        let result = encode_legacy_mouse(&m, 1, 1).unwrap();
+        // button=64+32=96
+        assert_eq!(result, vec![0x1b, b'[', b'M', 96, 32, 32]);
+    }
+
+    #[test]
+    fn sgr_only_without_tracking_uses_scrollback() {
+        let mut app = make_interactive_app();
+        // Enable SGR encoding only — no tracking mode.
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed(b"\x1b[?1006h");
+        }
+        assert!(!app.terminal.as_ref().unwrap().mouse_mode());
+        assert!(app.terminal.as_ref().unwrap().sgr_mouse());
+
+        // Scroll up → should NOT be forwarded as SGR, should use scrollback.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        // No pending term input — scroll was internal.
+        assert!(app.pending_term_input.is_none());
     }
 }

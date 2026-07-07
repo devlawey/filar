@@ -122,12 +122,21 @@ impl TerminalModel {
     }
 
     /// Check whether the application in the terminal has requested mouse
-    /// events (SGR, click, drag, or motion mode).
+    /// tracking (click, drag, or motion mode).
     ///
-    /// When this returns `true`, mouse events should be encoded as SGR
-    /// sequences and forwarded to the terminal input.
+    /// This checks `MOUSE_MODE` only (REPORT_CLICK | MOTION | DRAG), not
+    /// `SGR_MOUSE`, which is an encoding flag rather than a tracking flag.
     pub fn mouse_mode(&self) -> bool {
-        self.term.mode().intersects(TermMode::MOUSE_MODE | TermMode::SGR_MOUSE)
+        self.term.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Check whether the application has requested SGR mouse encoding (1006).
+    ///
+    /// When `true`, mouse events should be encoded as SGR sequences
+    /// (`\x1b[<{button};{x};{y}M/m`).  When `false` but `mouse_mode()` is
+    /// `true`, legacy encoding (`\x1b[M{b}{x}{y}`) should be used instead.
+    pub fn sgr_mouse(&self) -> bool {
+        self.term.mode().contains(TermMode::SGR_MOUSE)
     }
 
     /// Check whether the terminal is in alternate screen mode.
