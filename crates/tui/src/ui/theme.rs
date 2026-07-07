@@ -8,6 +8,104 @@
 //! shades of gray — following `docs/DESIGN_PHILOSOPHY.md` §2 (Единая тема).
 
 use ratatui::style::{Color, Modifier, Style};
+use std::sync::OnceLock;
+
+/// Unicode/ASCII glyph set for the TUI.
+///
+/// Modern terminals (Windows Terminal, detected via `WT_SESSION`) get the
+/// full Unicode set; conhost gets ASCII fallbacks so nothing shows as `?`.
+///
+/// See `docs/DESIGN_PHILOSOPHY.md` §7 (Windows-first, деградация — предусмотрена).
+pub struct Glyphs {
+    /// Input prompt: `❯` or `>`.
+    pub prompt: &'static str,
+    /// Vertical gutter for code/output: `│` or `|`.
+    pub gutter: &'static str,
+    /// Horizontal separator: `─` or `-`.
+    pub separator: &'static str,
+    /// Approved command status: `✓` or `[ok]`.
+    pub success: &'static str,
+    /// Denied/failed status: `✗` or `[no]`.
+    pub danger: &'static str,
+    /// System message bullet: `·` or `-`.
+    pub middle_dot: &'static str,
+    /// Collapsed arrow: `▸` or `+`.
+    pub collapse_arrow: &'static str,
+    /// Expanded arrow: `▾` or `-`.
+    pub expand_arrow: &'static str,
+    /// List bullet: `•` or `*`.
+    pub bullet: &'static str,
+    /// Target separator in status bar: `▸` or `>`.
+    pub target_sep: &'static str,
+}
+
+impl Glyphs {
+    /// Unicode glyphs for modern terminals.
+    const UNICODE: Self = Self {
+        prompt: "❯",
+        gutter: "│",
+        separator: "─",
+        success: "✓",
+        danger: "✗",
+        middle_dot: "·",
+        collapse_arrow: "▸",
+        expand_arrow: "▾",
+        bullet: "•",
+        target_sep: "▸",
+    };
+
+    /// ASCII fallback for conhost and legacy terminals.
+    const ASCII: Self = Self {
+        prompt: ">",
+        gutter: "|",
+        separator: "-",
+        success: "[ok]",
+        danger: "[no]",
+        middle_dot: "-",
+        collapse_arrow: "+",
+        expand_arrow: "-",
+        bullet: "*",
+        target_sep: ">",
+    };
+
+    /// Detect terminal capabilities and return the appropriate glyph set.
+    ///
+    /// Heuristic (cached with `OnceLock`):
+    /// - `WT_SESSION` → Windows Terminal (Unicode)
+    /// - `TERM_PROGRAM` set (vscode, iTerm, Apple_Terminal, ghostty, WezTerm) → Unicode
+    /// - `COLORTERM=truecolor` → modern terminal (Unicode)
+    /// - Non-Windows platform → Unicode (modern Linux/macOS terminals support it)
+    /// - Fallback on Windows without any of the above → ASCII (conhost)
+    pub fn detect() -> &'static Self {
+        static UNICODE_OK: OnceLock<bool> = OnceLock::new();
+        let unicode_ok = *UNICODE_OK.get_or_init(|| {
+            // Windows Terminal
+            if std::env::var("WT_SESSION").is_ok() {
+                return true;
+            }
+            // Known modern terminals via TERM_PROGRAM
+            if let Ok(tp) = std::env::var("TERM_PROGRAM") {
+                if matches!(
+                    tp.as_str(),
+                    "vscode" | "iTerm.app" | "Apple_Terminal" | "ghostty" | "WezTerm" | "hyper"
+                ) {
+                    return true;
+                }
+            }
+            // Truecolour support implies Unicode capability
+            if std::env::var("COLORTERM").is_ok_and(|v| v == "truecolor") {
+                return true;
+            }
+            // Non-Windows: assume Unicode (modern Linux/macOS terminals)
+            !cfg!(windows)
+        });
+        if unicode_ok {
+            &Self::UNICODE
+        } else {
+            &Self::ASCII
+        }
+    }
+}
 
 /// The colour palette used by every UI element.
 ///
@@ -146,6 +244,26 @@ impl Theme {
             AppMode::Interactive => self.accent,
             AppMode::PasswordInput => self.accent,
         }
+    }
+
+    /// Return the appropriate glyph set for this terminal.
+    pub fn glyphs(&self) -> &'static Glyphs {
+        Glyphs::detect()
+    }
+
+    /// Style for markdown code spans: `fg` on `surface` background.
+    pub fn code_span_style(&self) -> Style {
+        Style::default().fg(self.fg).bg(self.surface)
+    }
+
+    /// Style for markdown bold text: `fg` + bold.
+    pub fn bold_style(&self) -> Style {
+        Style::default().fg(self.fg).add_modifier(Modifier::BOLD)
+    }
+
+    /// Style for markdown headers: `accent` + bold.
+    pub fn header_style(&self) -> Style {
+        Style::default().fg(self.accent).add_modifier(Modifier::BOLD)
     }
 }
 

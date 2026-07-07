@@ -831,5 +831,86 @@ PR: #28
 - Callback: `Fn(&str)` → `Fn(String)`.
 
 **Что дальше:**
-- Issue #20: Collapsible command blocks (click-to-expand).
 - Issue #21: Keyboard shortcuts in Thinking mode.
+
+### Issue #20: TUI — визуальный редизайн, markdown-lite, help-bar клики
+
+**Ветка:** `feat/20-visual-redesign-markdown-lite`
+
+**Задача:** Убрать «коробочность», сделать воздух и акценты. Markdown-lite для
+сообщений агента. Кликабельный help-бар. Многострочный ввод.
+
+**Что сделано:**
+
+#### 1. Главный layout — без рамок
+- **Статус-бар** (`bars.rs`): без сплошной заливки `DarkGray`. Слева `filar ▸ {target}`
+  (accent на имени таргета), режим по центру/справа (словом + цветом), `confirm_mode`
+  тускло справа. Разделитель `─` цветом `fg_muted`.
+- **Help-бар** (`bars.rs`): без заливки фоном. Клавиши — `fg_dim`, описания — `fg_muted`,
+  разделение тремя пробелами.
+- **Роль-заголовки** (`layout_cache.rs`): строчные `you` / `agent` (bold + цвет роли).
+  Тело — `fg` с отступом 2 пробела.
+- **Блок команды**: заголовок из задачи 6 (✓/✗, ▸/▾). Строки вывода — gutter `│`
+  цветом `fg_muted`.
+- **System**: `· text` (`fg_muted`). **Error**: `✗ text` (`danger`).
+- **Поле ввода** (`input.rs`): без рамки. Промпт `❯` (accent; ASCII `>`).
+  Плейсхолдер `enter your message...` (`fg_muted`). При вводе `!` — промпт `$` и
+  цвет `warning`.
+
+#### 2. Help-бар с кликабельными зонами
+- **`HelpAction` enum** (`app.rs`): Send, Shell, Terminal, Password, Quit, Switch,
+  Confirm, Approve, Deny, SendPassword, Cancel.
+- **`helpbar_zones: Vec<(Rect, HelpAction)>`** в `App` — заполняется при рендере
+  help-бара (`bars.rs`).
+- **Обработка кликов** (`handle_mouse`): клик по help-бару работает во ВСЕХ режимах
+  (включая Interactive/PasswordInput). Метод `execute_help_action()` выполняет
+  действие, соответствующее клавиатурному эквиваленту.
+
+#### 3. Markdown-lite для сообщений Agent
+- **`render_markdown_line()`** (`text.rs`): inline-парсинг `` `code spans` ``,
+  `**bold**`, `# headers`, `- list markers`. Fenced-блоки через `MarkdownState`.
+- **Незакрытые маркеры** — рендерятся как обычный текст (проверка наличия
+  закрывающего маркера перед переключением состояния).
+- **Стили** (`theme.rs`): `code_span_style()` (fg на surface), `bold_style()`
+  (fg + bold), `header_style()` (accent + bold).
+
+#### 4. Glyphs и ASCII-фоллбэки
+- **`Glyphs` struct** (`theme.rs`): prompt, gutter, separator, success, danger,
+  middle_dot, collapse_arrow, expand_arrow, bullet, target_sep.
+- Детект по `WT_SESSION` env → Unicode; иначе ASCII.
+
+#### 5. Многострочный рост поля ввода
+- **`input_height()`** (`mod.rs`): вычисляет высоту поля ввода от wrap текста,
+  до 5 строк максимум.
+- **`render_normal_input()`** (`input.rs`): wraps input, рендерит каждую строку.
+  Промпт только на первой строке, последующие — с отступом. Внутренний скролл
+  к курсору при превышении 5 строк.
+
+#### 6. Предсуществующие clippy-фиксы
+- `filar-gui/src/lib.rs`: `match → unwrap_or_default()`.
+- `filar-transport/src/ssh.rs`: redundant guard → pattern match, `loop → while let`,
+  `match → if let`, `get().is_none() → !contains_key()`.
+- `filar-agent/src/security.rs`: collapsible `if`, identical branches merged.
+
+**Файлы:**
+- `crates/tui/src/ui/bars.rs` — полный редизайн status/help баров + helpbar_zones
+- `crates/tui/src/ui/input.rs` — многострочный ввод
+- `crates/tui/src/ui/mod.rs` — динамическая высота input area
+- `crates/tui/src/ui/text.rs` — markdown-lite с незакрытыми маркерами
+- `crates/tui/src/ui/theme.rs` — Glyphs struct (предсуществовал, дополнен)
+- `crates/tui/src/ui/layout_cache.rs` — unused import fix
+- `crates/tui/src/app.rs` — HelpAction enum, helpbar_zones, execute_help_action
+- `crates/gui/src/lib.rs` — clippy fix
+- `crates/transport/src/ssh.rs` — clippy fixes
+- `crates/agent/src/security.rs` — clippy fixes
+
+**Тесты:** 11 новых (124 tui total): helpbar_zones init, HelpAction quit/terminal/
+  password/shell/approve/deny/cancel/switch. Markdown tests: code span, bold,
+  mixed, unclosed marker, unclosed bold, header, list marker.
+
+**Публичные контракты:**
+- `HelpAction` enum — новый public type.
+- `App`: новое поле `helpbar_zones: Vec<(Rect, HelpAction)>`.
+- `App::execute_help_action()` — приватный метод.
+- `Glyphs` struct — предсуществовал в theme.rs.
+- `render_markdown_line` сигнатура: `(&str, &Theme, &mut MarkdownState) -> Vec<Span>`.

@@ -128,10 +128,8 @@ fn writes_to_system_path(command: &str) -> bool {
                     // `echo foo >"/etc/passwd"` is still caught.
                     let target = target.trim_matches(|c| c == '"' || c == '\'');
                     // /dev/null is a null device, not a real system path write.
-                    if target != "/dev/null" {
-                        if system_paths.iter().any(|p| target.starts_with(p)) {
-                            return true;
-                        }
+                    if target != "/dev/null" && system_paths.iter().any(|p| target.starts_with(p)) {
+                        return true;
                     }
                 }
                 i = target_end;
@@ -273,8 +271,6 @@ pub fn check_command(command: &str, mode: CommandConfirmMode) -> ConfirmDecision
         CommandConfirmMode::Allowlist => {
             if is_readonly(command) && !destructive {
                 ConfirmDecision::AutoApproved
-            } else if destructive {
-                ConfirmDecision::NeedsConfirmation
             } else {
                 ConfirmDecision::NeedsConfirmation
             }
