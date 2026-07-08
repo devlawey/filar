@@ -1189,4 +1189,44 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
             _ => panic!("expected Text response"),
         }
     }
+
+    #[test]
+    fn sse_raw_buffer_flush_on_stream_end() {
+        // Simulate the chat_stream None-branch logic: raw_buffer has
+        // leftover bytes without a trailing newline.  The flush path
+        // should decode, process, and emit the final delta.
+        let mut state = SseState::new();
+        let mut raw_buffer: Vec<u8> =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"end\"}}]}".to_vec();
+
+        // Normal processing loop — no newline found, nothing processed.
+        let mut collected_deltas: Vec<String> = Vec::new();
+        while let Some(pos) = raw_buffer.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&raw_buffer[..=pos]).into_owned();
+            raw_buffer = raw_buffer[pos + 1..].to_vec();
+            for d in state.process_chunk(&line) {
+                collected_deltas.push(d);
+            }
+        }
+        assert!(collected_deltas.is_empty(), "no complete line yet");
+
+        // Stream ended — flush raw_buffer (same logic as chat_stream).
+        if !raw_buffer.is_empty() {
+            let leftover = String::from_utf8_lossy(&raw_buffer).into_owned();
+            for d in state.process_chunk(&format!("{}\n", leftover)) {
+                collected_deltas.push(d);
+            }
+        }
+        // Flush SseState buffer.
+        for d in state.flush() {
+            collected_deltas.push(d);
+        }
+
+        assert_eq!(&collected_deltas, &["end".to_string()]);
+        let response = state.into_response().unwrap();
+        match response {
+            ChatResponse::Text(text) => assert_eq!(text, "end"),
+            _ => panic!("expected Text response"),
+        }
+    }
 }
