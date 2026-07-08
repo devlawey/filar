@@ -1109,3 +1109,32 @@ PR: #28
   сессия сохранена.
 - Ресайз 40×10 — нет паник.
 - Запуск без mouse capture — работает.
+
+---
+
+## 25. Issue #40: TUI panic-hook — восстановление терминала при панике
+
+**Milestone:** Engine v0.3.0. **Ветка:** `fix/40-panic-hook-terminal-restore`.
+
+**Что сделано:**
+- Добавлен `PanicHookGuard` — RAII-структура в `runner.rs`, устанавливающая
+  panic-hook ДО `enable_raw_mode()`. Хук восстанавливает терминал (DisableMouseCapture,
+  LeaveAlternateScreen, disable_raw_mode) ПЕРЕД печатью паники — текст виден и
+  выделяется мышью.
+- Hook снимается через `drop(_hook_guard)` ДО штатного teardown (для чистоты,
+  чтобы избежать двойного DisableMouseCapture). На error-path снимается
+  автоматически через Drop.
+- Штатный путь выхода (Ctrl+C) не изменился.
+
+**Изменённые файлы:**
+- `crates/tui/src/runner.rs` — `PanicHookGuard` + установка в `run()`
+
+**Тесты:** без изменений (242 passed, 0 failed, 5 ignored). Поведение проверяется
+  ручным тестом (panic в debug-сборке → терминал восстановлен).
+
+**Публичные контракты:** без изменений (`PanicHookGuard` — private).
+
+**DoD (требует ручной проверки):**
+- В debug-сборке вызвать панику внутри event loop → терминал в нормальном
+  состоянии, текст паники читаемо и выделяется мышью.
+- Штатный выход (Ctrl+C) работает как раньше.
