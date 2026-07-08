@@ -17,6 +17,7 @@
 
 # Temporary instruction files
 FIX_INSTRUCTIONS*
+_seeds/
 
 # Archives and documents
 *.zip
