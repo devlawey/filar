@@ -1170,3 +1170,28 @@ PR: #28
 
 **DoD:** наведение мыши не влияет на действие Enter; дефолт Deny сохраняется
   до явного действия пользователя.
+
+---
+
+## Issue #42: SSE — не терять хвост потока без завершающего перевода строки
+
+**Задача:** При завершении потока (`stream.next() == None`) остатки `raw_buffer`
+и `SseState.buffer` молча выбрасывались. Если сервер закрыл соединение без
+завершающего `\n` — терялась финальная дельта или `[DONE]`.
+
+**Решение:**
+- В `chat_stream` ветка `None`: если `raw_buffer` непуст — декодировать остаток,
+  прогнать через `state.process_chunk(&(leftover + "\n"))`, эмитнуть дельты.
+- `SseState::flush()`: новый метод, обрабатывающий незавершённую строку в
+  `self.buffer` как полную (добавляет `\n` и вызывает `process_chunk`).
+- Вызывается после flush `raw_buffer` и до `into_response()`.
+
+**Изменённые файлы:**
+- `crates/agent/src/glm.rs` — `flush()` + flush в `chat_stream` + 3 теста
+
+**Тесты:** 246 passed, 0 failed, 5 ignored.
+  - `sse_flush_partial_line_without_newline` — дельта "end" не теряется
+  - `sse_flush_done_without_newline` — `[DONE]` без `\n` обрабатывается
+  - `sse_flush_empty_buffer_noop` — пустой хвост не меняет поведение
+
+**Публичные контракты:** без изменений (`SseState` — private).
