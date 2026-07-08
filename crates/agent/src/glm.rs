@@ -209,6 +209,21 @@ impl LlmClient for GlmClient {
                 }
                 None => {
                     debug!("stream ended");
+                    // Flush raw_buffer: if there's leftover data without a
+                    // trailing newline, process it as a final line.
+                    if !raw_buffer.is_empty() {
+                        let leftover = String::from_utf8_lossy(&raw_buffer).into_owned();
+                        let deltas = state.process_chunk(&format!("{}\n", leftover));
+                        for d in deltas {
+                            on_delta(d);
+                        }
+                    }
+                    // Flush SseState buffer: process any remaining partial
+                    // line that was not terminated by a newline.
+                    let deltas = state.flush();
+                    for d in deltas {
+                        on_delta(d);
+                    }
                     return state.into_response();
                 }
             }
@@ -681,6 +696,19 @@ impl SseState {
         new_deltas
     }
 
+    /// Flush any remaining buffered data as a final SSE line.
+    ///
+    /// Called when the stream ends without a trailing newline.  If the buffer
+    /// contains a partial `data:` line, it is processed as if a newline were
+    /// appended.  Returns any text deltas produced.
+    fn flush(&mut self) -> Vec<String> {
+        if self.buffer.is_empty() {
+            return Vec::new();
+        }
+        // Append a newline so `process_chunk` can handle the trailing line.
+        self.process_chunk("\n")
+    }
+
     /// Build the final [`ChatResponse`] from accumulated state.
     fn into_response(self) -> Result<ChatResponse> {
         if !self.tool_calls.is_empty() {
@@ -1100,6 +1128,64 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         let response = state.into_response().unwrap();
         match response {
             ChatResponse::Text(text) => assert_eq!(text, "Hi"),
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn sse_flush_partial_line_without_newline() {
+        // Stream ends with a data line that has no trailing newline.
+        // flush() should recover the final delta.
+        let mut state = SseState::new();
+        // First event complete.
+        let d1 = state.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+        );
+        assert_eq!(&d1, &["Hello".to_string()]);
+        // Second event — no trailing newline.
+        let d2 = state.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"end\"}}]}",
+        );
+        assert!(d2.is_empty(), "no complete line yet");
+        // flush should process the remaining buffer.
+        let d3 = state.flush();
+        assert_eq!(&d3, &["end".to_string()]);
+        let response = state.into_response().unwrap();
+        match response {
+            ChatResponse::Text(text) => assert_eq!(text, "Helloend"),
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn sse_flush_done_without_newline() {
+        // Stream ends with `data: [DONE]` but no trailing newline.
+        let mut state = SseState::new();
+        state.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+        );
+        // [DONE] without newline.
+        state.process_chunk("data: [DONE]");
+        assert!(!state.done, "done should not be set until line is processed");
+        let deltas = state.flush();
+        assert!(deltas.is_empty(), "[DONE] produces no text deltas");
+        assert!(state.done, "flush should set done flag");
+        let response = state.into_response().unwrap();
+        match response {
+            ChatResponse::Text(text) => assert_eq!(text, "ok"),
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn sse_flush_empty_buffer_noop() {
+        // Flushing an empty buffer should be a no-op.
+        let mut state = SseState::new();
+        let deltas = state.flush();
+        assert!(deltas.is_empty());
+        let response = state.into_response().unwrap();
+        match response {
+            ChatResponse::Text(text) => assert!(text.is_empty()),
             _ => panic!("expected Text response"),
         }
     }
