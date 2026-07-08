@@ -859,10 +859,12 @@ impl App {
                 self.mouse_drag = None;
             }
             // --- Hover (track which button is under cursor) ---
+            // NOTE: hover only updates visual highlighting — it must NOT
+            // change confirm_selected, so the Enter safety-default (Deny)
+            // is preserved until the user explicitly toggles via keyboard.
             MouseEventKind::Moved => {
                 if let HitZone::ConfirmButton(approve) = zone {
                     self.hovered_button = Some(approve);
-                    self.confirm_selected = approve;
                 } else {
                     self.hovered_button = None;
                 }
@@ -2580,19 +2582,19 @@ mod tests {
     }
 
     #[test]
-    fn mouse_hover_updates_selected() {
+    fn mouse_hover_does_not_change_confirm_selected() {
         let mut app = make_confirm_app(false);
         app.confirm_button_areas.push((Rect::new(20, 10, 15, 1), true));
         app.confirm_button_areas.push((Rect::new(38, 10, 13, 1), false));
-        // Hover over Approve.
+        // Hover over Approve — hovered_button updates but confirm_selected stays Deny.
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Moved,
             25,
             10,
         ));
         assert_eq!(app.hovered_button, Some(true));
-        assert!(app.confirm_selected, "hover on Approve should move selection");
-        // Hover over Deny.
+        assert!(!app.confirm_selected, "hover must NOT change confirm_selected");
+        // Hover over Deny — hovered_button updates, confirm_selected unchanged.
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Moved,
             42,
@@ -2600,13 +2602,42 @@ mod tests {
         ));
         assert_eq!(app.hovered_button, Some(false));
         assert!(!app.confirm_selected);
-        // Hover outside buttons.
+        // Hover outside buttons — hovered_button clears.
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Moved,
             0,
             0,
         ));
         assert_eq!(app.hovered_button, None);
+        assert!(!app.confirm_selected);
+    }
+
+    #[test]
+    fn repeated_hover_does_not_change_confirm_selected() {
+        let mut app = make_confirm_app(false);
+        app.confirm_button_areas.push((Rect::new(20, 10, 15, 1), true));
+        app.confirm_button_areas.push((Rect::new(38, 10, 13, 1), false));
+        // Multiple hovers over Approve — confirm_selected must remain false.
+        for _ in 0..3 {
+            app.handle_mouse(mouse_event(
+                crossterm::event::MouseEventKind::Moved,
+                25,
+                10,
+            ));
+            assert!(!app.confirm_selected);
+        }
+        // Hover over Deny, then back over Approve — still must remain false.
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Moved,
+            42,
+            10,
+        ));
+        app.handle_mouse(mouse_event(
+            crossterm::event::MouseEventKind::Moved,
+            25,
+            10,
+        ));
+        assert!(!app.confirm_selected, "hover must never change confirm_selected");
     }
 
     #[test]

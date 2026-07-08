@@ -9,7 +9,9 @@
 //!
 //! The selected button (default: Deny — safe) is highlighted with inverted
 //! colours.  Tab / ← / → toggle the selection; Enter activates it.
-//! Mouse clicks on a button activate it directly; hover moves the selection.
+//! Mouse clicks on a button activate it directly; hover highlights the button
+//! (underline) without changing the selection — Enter always activates the
+//! keyboard-selected button, preserving the safety default.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -24,8 +26,9 @@ use crate::app::App;
 /// Stores button rectangles in [`App::confirm_button_areas`] for hit-testing.
 pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     // Clear previous button areas (populated during this render).
+    // NOTE: hovered_button is NOT cleared here — it is transient state set by
+    // mouse Moved events and must persist across renders for hover styling.
     app.confirm_button_areas.clear();
-    app.hovered_button = None;
 
     let Some(confirm) = &app.pending_confirm else {
         return;
@@ -147,24 +150,40 @@ fn render_buttons(f: &mut Frame, app: &mut App, area: Rect) {
     app.confirm_button_areas.push((approve_area, true));
     app.confirm_button_areas.push((deny_area, false));
 
-    // Styles: selected button gets inverted colours (fg↔bg), unselected gets
-    // surface background with coloured text.
-    let approve_style = if app.confirm_selected {
+    // Styles: selected button (active for Enter) gets inverted colours
+    // (fg↔bg) + BOLD.  Hovered-but-not-selected button gets UNDERLINED to
+    // visually distinguish hover from selection.  Unselected, unhovered
+    // buttons get surface background with coloured text.
+    let approve_selected = app.confirm_selected;
+    let approve_hovered = app.hovered_button == Some(true);
+    let approve_style = if approve_selected {
         Style::default()
             .fg(app.theme.surface)
             .bg(app.theme.success)
             .add_modifier(Modifier::BOLD)
+    } else if approve_hovered {
+        Style::default()
+            .fg(app.theme.success)
+            .bg(app.theme.surface)
+            .add_modifier(Modifier::UNDERLINED)
     } else {
         Style::default()
             .fg(app.theme.success)
             .bg(app.theme.surface)
     };
 
-    let deny_style = if !app.confirm_selected {
+    let deny_selected = !app.confirm_selected;
+    let deny_hovered = app.hovered_button == Some(false);
+    let deny_style = if deny_selected {
         Style::default()
             .fg(app.theme.surface)
             .bg(app.theme.danger)
             .add_modifier(Modifier::BOLD)
+    } else if deny_hovered {
+        Style::default()
+            .fg(app.theme.danger)
+            .bg(app.theme.surface)
+            .add_modifier(Modifier::UNDERLINED)
     } else {
         Style::default()
             .fg(app.theme.danger)
