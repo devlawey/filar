@@ -117,6 +117,49 @@ impl CommandExecutor for TuiExecutor {
 }
 
 // ---------------------------------------------------------------------------
+// Panic hook guard
+// ---------------------------------------------------------------------------
+
+/// RAII guard that restores the default panic hook when dropped.
+///
+/// Installs a custom panic hook that restores the terminal state
+/// (disables raw mode, leaves alternate screen, disables mouse capture)
+/// *before* printing the panic message. This ensures the user can read
+/// the panic text and select it with the mouse even if a panic occurs
+/// inside the event loop or rendering code.
+///
+/// When the guard is dropped (either after normal teardown or on early
+/// return), the original panic hook is restored via `take_hook()`, so
+/// code running after the TUI is unaffected.
+struct PanicHookGuard;
+
+impl PanicHookGuard {
+    /// Install the terminal-restoring panic hook and return a guard.
+    fn install() -> Self {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Restore terminal state BEFORE printing the panic message
+            // so the user can read it and select the text.
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::DisableMouseCapture,
+                crossterm::terminal::LeaveAlternateScreen
+            );
+            let _ = crossterm::terminal::disable_raw_mode();
+            default_hook(info);
+        }));
+        Self
+    }
+}
+
+impl Drop for PanicHookGuard {
+    fn drop(&mut self) {
+        // Restore the original panic hook.
+        let _ = std::panic::take_hook();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
 
@@ -139,6 +182,11 @@ pub async fn run(
     executor: Arc<dyn CommandExecutor>,
     config: TuiConfig,
 ) -> Result<()> {
+    // Install panic hook to restore terminal state on panic.
+    // The hook is automatically uninstalled when _hook_guard is dropped
+    // (on normal return, early error, or panic).
+    let _hook_guard = PanicHookGuard::install();
+
     // Set up terminal.
     enable_raw_mode().map_err(|e| CoreError::Other(format!("failed to enable raw mode: {e}")))?;
     let mut stdout = io::stdout();
@@ -157,6 +205,12 @@ pub async fn run(
         .map_err(|e| CoreError::Other(format!("failed to create terminal: {e}")))?;
 
     let result = run_app(&mut terminal, llm, executor, config).await;
+
+    // Restore the original panic hook before terminal teardown.
+    // The custom hook is no longer needed — teardown uses .ok() and
+    // cannot panic. Removing the hook here avoids a redundant double
+    // DisableMouseCapture if the default hook fires during teardown.
+    drop(_hook_guard);
 
     // Restore terminal.
     disable_raw_mode().ok();
