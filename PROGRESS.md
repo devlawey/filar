@@ -1138,3 +1138,35 @@ PR: #28
 - В debug-сборке вызвать панику внутри event loop → терминал в нормальном
   состоянии, текст паники читаемо и выделяется мышью.
 - Штатный выход (Ctrl+C) работает как раньше.
+
+---
+
+## Issue #41: TUI: hover не должен менять действие Enter в диалоге подтверждения
+
+**Задача:** Наведение мыши на кнопку подтверждения не должно менять
+`confirm_selected` — safety-дефолт «Enter = Deny» должен сохраняться до
+явного действия пользователя (Tab/←/→ или клик).
+
+**Решение:**
+- В `app.rs::handle_mouse` ветка `Moved`: удалена строка
+  `self.confirm_selected = approve`. Hover обновляет только `hovered_button`
+  (визуальная подсветка).
+- В `ui/confirm.rs::render_buttons`: добавлена визуальная дифференциация —
+  selected (активная для Enter) = инверсия + BOLD, hovered = UNDERLINED,
+  обычная = plain. Убрано преждевременное `hovered_button = None` в начале
+  рендера (состояние hover должно сохраняться между кадрами).
+- Тесты: `mouse_hover_updates_selected` → переименован в
+  `mouse_hover_does_not_change_confirm_selected` (assert: hover не меняет
+  `confirm_selected`); добавлен `repeated_hover_does_not_change_confirm_selected`
+  (многократный hover не меняет выбор).
+
+**Изменённые файлы:**
+- `crates/tui/src/app.rs` — фикс `Moved` + тесты
+- `crates/tui/src/ui/confirm.rs` — hover styling + doc-comment
+
+**Тесты:** 243 passed, 0 failed, 5 ignored.
+
+**Публичные контракты:** без изменений.
+
+**DoD:** наведение мыши не влияет на действие Enter; дефолт Deny сохраняется
+  до явного действия пользователя.
