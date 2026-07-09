@@ -14,4 +14,5 @@ pub mod session;
 pub use chat::ChatBlock;
 pub use config::{Config, SshTarget, SshAuth, LlmConfig, LlmProfile, CommandConfirmMode, TimeoutConfig, HostKeyPolicy};
 pub use error::{CoreError, Result};
+pub use secrets::{EnvSecretProvider, SecretProvider, StaticSecretProvider};
 pub use session::{Session, SessionMeta, SessionStore};

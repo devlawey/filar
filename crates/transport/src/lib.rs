@@ -9,6 +9,7 @@
 
 pub mod interactive;
 pub mod local;
+pub mod secret;
 pub mod ssh;
 
 use std::time::Duration;
@@ -19,6 +20,7 @@ use filar_core::Result;
 // Re-export key types.
 pub use interactive::{InteractiveTerminal, LocalInteractive, SshInteractive};
 pub use local::LocalExecutor;
+pub use secret::SecretSubstitutingExecutor;
 pub use ssh::{SshExecutor, SshSession};
 
 /// Result of executing a command.

@@ -17,7 +17,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use filar_core::{secrets, CoreError, LlmConfig, Result};
+use filar_core::{secrets, CoreError, LlmConfig, Result, SecretProvider};
 
 use crate::{ChatMessage, ChatRequest, ChatResponse, LlmClient, ToolCall};
 use std::collections::BTreeMap;
@@ -54,6 +54,22 @@ impl GlmClient {
     /// The API key is read from the `GLM_API_KEY` environment variable.
     pub fn new(config: &LlmConfig, timeout: Duration) -> Result<Self> {
         Self::new_with_key(config, timeout, &secrets::glm_api_key()?)
+    }
+
+    /// Create a new `GlmClient` using a [`SecretProvider`] to retrieve the
+    /// API key.  The `key_name` is the logical name passed to the provider
+    /// (e.g. `"GLM_API_KEY"` or a profile-specific env var name).
+    ///
+    /// This is the preferred constructor for engine consumers (bots, mobile,
+    /// GUI-launched sessions) — it avoids direct `std::env::var` calls.
+    pub fn new_with_provider(
+        config: &LlmConfig,
+        timeout: Duration,
+        key_name: &str,
+        provider: &dyn SecretProvider,
+    ) -> Result<Self> {
+        let api_key = provider.get(key_name)?;
+        Self::new_with_key(config, timeout, &api_key)
     }
 
     /// Create a new `GlmClient` with an explicit API key (useful for testing).

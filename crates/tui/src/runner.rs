@@ -4,9 +4,8 @@
 //! (keyboard) and agent events (from the agent task). The agent runs in a
 //! separate tokio task, and communication happens via channels.
 
-use std::collections::HashMap;
 use std::io::{self, Stdout};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{EnableMouseCapture, DisableMouseCapture, Event, EventStream};
@@ -18,7 +17,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use filar_agent::{AgentBuilder, CommandConfirmer, LlmClient};
-use filar_core::{CommandConfirmMode, CoreError, Result};
+use filar_core::{CommandConfirmMode, CoreError, Result, SecretProvider};
 use filar_transport::{CommandExecutor, InteractiveTerminal, LocalInteractive, SshInteractive};
 use tokio_util::sync::CancellationToken;
 
@@ -30,20 +29,17 @@ use crate::ui;
 use filar_core::ChatBlock;
 
 // ---------------------------------------------------------------------------
-// TuiExecutor — wraps an executor and emits events
+// TuiExecutor — wraps an executor for runtime swapping
 // ---------------------------------------------------------------------------
 
-/// A [`CommandExecutor`] wrapper that handles secret substitution and
-/// output sanitization.
+/// A [`CommandExecutor`] wrapper whose inner executor is swappable at runtime.
 ///
-/// The inner executor is swappable at runtime, allowing the transport
-/// to switch from local to SSH (or vice versa) without restarting the app.
-/// Command execution events are emitted by the agent via `EventSink`, not
-/// by this wrapper.
+/// This allows the transport to switch from local to SSH (or vice versa)
+/// without restarting the app. Secret substitution and output sanitisation
+/// are handled by [`SecretSubstitutingExecutor`] in the engine, which wraps
+/// this executor during `AgentBuilder::build()`.
 struct TuiExecutor {
     inner: Arc<tokio::sync::RwLock<Arc<dyn CommandExecutor>>>,
-    /// Shared secret variables for command substitution.
-    secrets: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl TuiExecutor {
@@ -57,40 +53,8 @@ impl TuiExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for TuiExecutor {
     async fn run(&self, command: &str) -> Result<filar_transport::CommandResult> {
-        // Substitute secret variables ($FILAR_SECRET_N) with actual values
-        // before executing the command.
-        let actual_command = {
-            let mut cmd = command.to_string();
-            if let Ok(secrets) = self.secrets.lock() {
-                for (var, value) in secrets.iter() {
-                    if !value.is_empty() {
-                        cmd = cmd.replace(var, value);
-                    }
-                }
-            }
-            cmd
-        };
-
-        let mut result = {
-            let executor = self.inner.read().await.clone();
-            executor.run(&actual_command).await?
-        };
-
-        // Sanitize output — replace any secret value with its variable name
-        // so the LLM never sees the actual password in command output.
-        {
-            let secrets = self.secrets.lock();
-            if let Ok(secrets) = secrets {
-                for (var, value) in secrets.iter() {
-                    if !value.is_empty() {
-                        result.stdout = result.stdout.replace(value, var);
-                        result.stderr = result.stderr.replace(value, var);
-                    }
-                }
-            }
-        }
-
-        Ok(result)
+        let executor = self.inner.read().await.clone();
+        executor.run(command).await
     }
 
     async fn cancel(&self) -> Result<()> {
@@ -157,6 +121,10 @@ pub struct TuiConfig {
     pub ssh_target: Option<filar_core::SshTarget>,
     /// Whether commands execute on the local machine (true) or over SSH (false).
     pub is_local: bool,
+    /// Secret provider for command substitution and output sanitisation.
+    /// Shared between the TUI (for dynamic `$FILAR_SECRET_N` insertion) and
+    /// the agent (via `SecretSubstitutingExecutor`).
+    pub secret_provider: Arc<dyn SecretProvider>,
 }
 
 /// Run the TUI with the given LLM client, executor, and configuration.
@@ -229,12 +197,9 @@ async fn run_app(
     let mut is_local = config.is_local;
 
     // Create the TUI confirmer and executor wrappers.
-    // Share secrets between App and TuiExecutor for secure variable substitution.
-    let shared_secrets = app.secrets.clone();
     let confirmer = Arc::new(TuiConfirmer::new(agent_tx.clone()));
     let tui_executor = Arc::new(TuiExecutor {
         inner: Arc::new(tokio::sync::RwLock::new(executor)),
-        secrets: shared_secrets,
     });
 
     // Crossterm event stream for async keyboard input.
@@ -401,6 +366,7 @@ async fn run_app(
                             is_local,
                             ssh_info.clone(),
                             cancel_token,
+                            config.secret_provider.clone(),
                         );
                     }
                 }
@@ -581,6 +547,7 @@ fn spawn_agent(
     is_local: bool,
     ssh_info: Option<String>,
     cancellation: CancellationToken,
+    secret_provider: Arc<dyn SecretProvider>,
 ) {
     let tx = event_tx.clone();
 
@@ -636,7 +603,8 @@ fn spawn_agent(
             .confirmer(confirmer)
             .confirm_mode(confirm_mode)
             .event_sink(sink)
-            .cancellation(cancellation);
+            .cancellation(cancellation)
+            .secret_provider(secret_provider);
         if is_local {
             builder = builder.local_mode();
         } else {

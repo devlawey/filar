@@ -6,7 +6,7 @@
 
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use filar_core::{ChatBlock, CommandConfirmMode};
+use filar_core::{ChatBlock, CommandConfirmMode, StaticSecretProvider};
 use ratatui::layout::Rect;
 
 use crate::event::TuiEvent;
@@ -15,7 +15,7 @@ use crate::ui::layout_cache::ChatLayoutCache;
 use crate::ui::Theme;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 use std::time::Duration;
 
@@ -186,9 +186,9 @@ pub struct App {
     pending_term_input: Option<Vec<u8>>,
     /// Flag: user pressed Ctrl+T to toggle between agent and interactive modes.
     pub toggle_interactive: bool,
-    /// Shared secret variables: $FILAR_SECRET_N → actual value.
+    /// Shared secret provider: $FILAR_SECRET_N → actual value.
     /// Used to substitute secrets in commands without exposing them to the LLM.
-    pub secrets: Arc<Mutex<HashMap<String, String>>>,
+    pub secrets: Arc<StaticSecretProvider>,
     /// Counter for the next secret variable name.
     pub secret_counter: usize,
     /// History of all user inputs (for Up/Down navigation).
@@ -285,7 +285,7 @@ impl App {
             terminal: None,
             pending_term_input: None,
             toggle_interactive: false,
-            secrets: Arc::new(Mutex::new(HashMap::new())),
+            secrets: Arc::new(StaticSecretProvider::new()),
             secret_counter: 0,
             input_history: Vec::new(),
             history_pos: None,
@@ -620,9 +620,7 @@ impl App {
                             // Regular secret variable — never sent to the LLM.
                             self.secret_counter += 1;
                             let var_name = format!("$FILAR_SECRET_{}", self.secret_counter);
-                            if let Ok(mut secrets) = self.secrets.lock() {
-                                secrets.insert(var_name.clone(), password);
-                            }
+                            self.secrets.insert(var_name.clone(), password);
                             let agent_msg = format!(
                                 "Password provided as secret variable {}. \
                                  Use this variable directly in your commands.",

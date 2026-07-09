@@ -63,6 +63,9 @@ keyring = { version = "3", default-features = false, features = ["apple-native",
 # Clipboard
 arboard = "3"
 
+# Secret zeroization
+zeroize = { version = "1", features = ["derive"] }
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
