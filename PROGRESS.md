@@ -1276,3 +1276,39 @@ PR: #28
   через `ConfirmationRequest`). Новое поле `App::pending_proposal`.
 - **Double terminal event в shell escape**: `Finished` больше не эмитится после
   `Error` — только один терминальный event на запуск.
+
+---
+
+## Issue #44: Engine 0.2 — стриминг в LlmClient (сверка и закрытие)
+
+**Задача:** Сверить, что стриминг в `LlmClient` полностью реализован, и закрыть
+issue. Если чего-то не хватает — дополнить.
+
+**Результат:** Все 3 шага уже реализованы в предыдущих задачах (#43, SSE flush).
+Добавлен недостающий DoD-тест.
+
+**Сверка по шагам:**
+1. ✅ `LlmClient::chat_stream` с дефолтной реализацией-фолббэком через `chat()`
+   — `crates/agent/src/lib.rs:40-48`
+2. ✅ `GlmClient` реализует SSE-стриминг (`"stream": true`, парсинг `data:`-строк
+   с буферизацией разрывов чанков, аккумуляция tool_calls по index, `[DONE]`)
+   — `crates/agent/src/glm.rs:137-230`
+3. ✅ `Agent::run` использует `chat_stream`, пробрасывая дельты в
+   `AgentEvent::TextDelta` через sink — `crates/agent/src/agent.rs:307-319`
+
+**Сверка по DoD:**
+- ✅ Unit-тест SSE-парсера (разрыв посреди `data:`, tool_calls по кускам) —
+  11 тестов в `glm.rs`, включая `sse_parse_text_stream_chunked`,
+  `sse_parse_tool_calls_stream`, `sse_parse_partial_chunk`
+- ✅ **Добавлен** `event_sink_streaming_text_delta` — мок-LLM со стримом
+  (`MockStreamingLlm`) → sink получает TextDelta до Finished.
+  Последовательность: Started → TextDelta×3 → Finished.
+- ✅ Нестримящие реализации `LlmClient` продолжают работать (фоллбэк) —
+  `MockLlm` реализует только `chat()`, все тесты проходят.
+
+**Изменённые файлы:**
+- `crates/agent/src/agent.rs` — `MockStreamingLlm` + тест `event_sink_streaming_text_delta`
+
+**Тесты:** 250 passed, 0 failed, 5 ignored.
+
+**Публичные контракты:** без изменений (сверка существующей реализации).
