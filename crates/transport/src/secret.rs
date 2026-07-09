@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use filar_core::{Result, SecretProvider};
+use filar_core::{CoreError, Result, SecretProvider};
 
 use crate::CommandExecutor;
 
@@ -43,8 +43,20 @@ impl SecretSubstitutingExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for SecretSubstitutingExecutor {
     async fn run(&self, command: &str) -> Result<crate::CommandResult> {
-        // Substitute secret placeholders with actual values.
-        let names = self.provider.secret_names();
+        // Only substitute $-prefixed secret names (e.g. $FILAR_SECRET_N).
+        // This prevents non-command secrets (like the LLM API key, which is
+        // stored without a $ prefix) from being injected into shell commands.
+        let mut names: Vec<String> = self
+            .provider
+            .secret_names()
+            .into_iter()
+            .filter(|n| n.starts_with('$'))
+            .collect();
+        // Sort by descending length to prevent substring collisions:
+        // $FILAR_SECRET_1 is a substring of $FILAR_SECRET_10, so the longer
+        // name must be processed first.
+        names.sort_unstable_by_key(|n| std::cmp::Reverse(n.len()));
+
         let actual_command = {
             let mut cmd = command.to_string();
             for name in &names {
@@ -57,7 +69,23 @@ impl CommandExecutor for SecretSubstitutingExecutor {
             cmd
         };
 
-        let mut result = self.inner.run(&actual_command).await?;
+        // Capture the result so we can sanitise the error path too —
+        // error messages may embed the substituted command with real secrets.
+        let run_result = self.inner.run(&actual_command).await;
+        let mut result = match run_result {
+            Ok(r) => r,
+            Err(e) => {
+                let mut msg = e.to_string();
+                for name in &names {
+                    if let Ok(value) = self.provider.get(name) {
+                        if !value.is_empty() {
+                            msg = msg.replace(&value, name);
+                        }
+                    }
+                }
+                return Err(CoreError::Other(msg));
+            }
+        };
 
         // Sanitise output — replace any secret value with its placeholder.
         for name in &names {
@@ -211,6 +239,97 @@ mod tests {
 
         assert_eq!(*mock.last_command.lock().unwrap(), "echo alice and bob");
         assert_eq!(result.stdout, "$FILAR_SECRET_1 and $FILAR_SECRET_2 are here");
+    }
+
+    /// A mock executor that always returns an error containing the
+    /// command it received (simulating a shell error that embeds the
+    /// command line).
+    struct FailingMockExecutor {
+        last_command: Mutex<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandExecutor for FailingMockExecutor {
+        async fn run(&self, command: &str) -> Result<crate::CommandResult> {
+            *self.last_command.lock().unwrap() = command.to_string();
+            Err(filar_core::CoreError::Other(format!(
+                "command failed: {command}"
+            )))
+        }
+        async fn cancel(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn error_path_is_sanitised() {
+        let provider = Arc::new(StaticSecretProvider::new());
+        provider.insert("$FILAR_SECRET_1", "s3cr3t");
+        let provider_trait: Arc<dyn SecretProvider> = provider;
+
+        let mock = Arc::new(FailingMockExecutor {
+            last_command: Mutex::new(String::new()),
+        });
+        let exec = SecretSubstitutingExecutor::new(mock, provider_trait);
+
+        let result = exec.run("echo $FILAR_SECRET_1").await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("s3cr3t"),
+            "secret leaked in error: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("$FILAR_SECRET_1"),
+            "placeholder missing in error: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn substring_collision_with_10_plus_secrets() {
+        let provider = Arc::new(StaticSecretProvider::new());
+        provider.insert("$FILAR_SECRET_1", "one");
+        provider.insert("$FILAR_SECRET_10", "ten");
+        let provider_trait: Arc<dyn SecretProvider> = provider;
+
+        let mock = Arc::new(MockExecutor::new("one and ten"));
+        let exec = SecretSubstitutingExecutor::new(mock.clone(), provider_trait);
+
+        let result = exec
+            .run("echo $FILAR_SECRET_1 and $FILAR_SECRET_10")
+            .await
+            .unwrap();
+
+        // Both secrets should be correctly substituted in the command.
+        assert_eq!(
+            *mock.last_command.lock().unwrap(),
+            "echo one and ten"
+        );
+        // Both should be correctly masked in the output.
+        assert_eq!(
+            result.stdout,
+            "$FILAR_SECRET_1 and $FILAR_SECRET_10"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_key_not_substituted() {
+        let provider = Arc::new(StaticSecretProvider::new());
+        provider.insert("GLM_API_KEY", "sk-1234567890");
+        provider.insert("$FILAR_SECRET_1", "runtime-secret");
+        let provider_trait: Arc<dyn SecretProvider> = provider;
+
+        let mock = Arc::new(MockExecutor::new(""));
+        let exec = SecretSubstitutingExecutor::new(mock.clone(), provider_trait);
+
+        let _ = exec.run("echo GLM_API_KEY").await.unwrap();
+
+        // GLM_API_KEY is NOT substituted because it lacks the $ prefix.
+        assert_eq!(
+            *mock.last_command.lock().unwrap(),
+            "echo GLM_API_KEY"
+        );
     }
 
     #[tokio::test]

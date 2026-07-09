@@ -17,8 +17,10 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use filar_agent::{AgentBuilder, CommandConfirmer, LlmClient};
-use filar_core::{CommandConfirmMode, CoreError, Result, SecretProvider};
-use filar_transport::{CommandExecutor, InteractiveTerminal, LocalInteractive, SshInteractive};
+use filar_core::{CommandConfirmMode, CoreError, Result, SecretProvider, StaticSecretProvider};
+use filar_transport::{
+    CommandExecutor, InteractiveTerminal, LocalInteractive, SecretSubstitutingExecutor, SshInteractive,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::app::{App, AppMode};
@@ -122,9 +124,9 @@ pub struct TuiConfig {
     /// Whether commands execute on the local machine (true) or over SSH (false).
     pub is_local: bool,
     /// Secret provider for command substitution and output sanitisation.
-    /// Shared between the TUI (for dynamic `$FILAR_SECRET_N` insertion) and
-    /// the agent (via `SecretSubstitutingExecutor`).
-    pub secret_provider: Arc<dyn SecretProvider>,
+    /// Shared between the TUI (for dynamic `$FILAR_SECRET_N` insertion via
+    /// Ctrl+P) and the agent (via `SecretSubstitutingExecutor`).
+    pub secret_provider: Arc<StaticSecretProvider>,
 }
 
 /// Run the TUI with the given LLM client, executor, and configuration.
@@ -186,6 +188,10 @@ async fn run_app(
             std::mem::take(&mut config.initial_messages),
         )
     };
+    // Wire the App to the same StaticSecretProvider instance used by the
+    // agent's SecretSubstitutingExecutor, so Ctrl+P inserts are visible to
+    // command substitution and output sanitisation.
+    app.secrets = config.secret_provider.clone();
 
     // Channel for agent → UI events.
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<TuiEvent>();
@@ -305,9 +311,17 @@ async fn run_app(
                         let cmd = stripped.trim().to_string();
                         if !cmd.is_empty() {
                             let exec = tui_executor.clone();
+                            let provider = config.secret_provider.clone();
                             let tx = agent_tx.clone();
                             tokio::spawn(async move {
-                                let succeeded = match exec.run(&cmd).await {
+                                // Wrap with SecretSubstitutingExecutor so that
+                                // $FILAR_SECRET_N placeholders are substituted
+                                // and output is sanitised — same as agent path.
+                                let wrapped = SecretSubstitutingExecutor::new(
+                                    exec as Arc<dyn CommandExecutor>,
+                                    provider as Arc<dyn SecretProvider>,
+                                );
+                                let succeeded = match wrapped.run(&cmd).await {
                                     Ok(result) => {
                                         // Build display output from CommandResult.
                                         let mut output = result.stdout.clone();

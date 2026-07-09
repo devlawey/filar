@@ -1424,7 +1424,7 @@ issue. Если чего-то не хватает — дополнить.
   `spawn_agent` принимает `secret_provider`
 - `crates/tui/src/app.rs` — `Arc<StaticSecretProvider>` вместо `Arc<Mutex<HashMap>>`
 
-**Тесты:** 269 passed, 0 failed, 5 ignored.
+**Тесты:** 274 passed, 0 failed, 5 ignored.
 
 **Публичные контракты:**
 - `filar_core::SecretProvider` — новый трейт (`get`, `secret_names`).
@@ -1432,4 +1432,15 @@ issue. Если чего-то не хватает — дополнить.
 - `filar_transport::SecretSubstitutingExecutor` — новый `CommandExecutor` wrapper.
 - `filar_agent::glm::GlmClient::new_with_provider` — новый конструктор.
 - `filar_agent::AgentBuilder::secret_provider` — новый builder method.
-- `filar_tui::TuiConfig` — новое поле `secret_provider: Arc<dyn SecretProvider>`.
+- `filar_tui::TuiConfig` — новое поле `secret_provider: Arc<StaticSecretProvider>`.
+
+**Review fixes (PR #54, CodeRabbit):**
+- `StaticSecretProvider::insert()` — zeroize старого значения при перезаписи.
+- `StaticSecretProvider::remove()` — возврат `bool` вместо `Option<String>`, zeroize внутри.
+- `SecretSubstitutingExecutor::run()` — фильтр только `$`-префиксных имён (API key не подставляется).
+- `SecretSubstitutingExecutor::run()` — sort по убыванию длины (защита от substring collision `$FILAR_SECRET_1` vs `_10`).
+- `SecretSubstitutingExecutor::run()` — санитизация error path (маскировка секрета в сообщении об ошибке).
+- `runner.rs` — `app.secrets = config.secret_provider.clone()` (общий экземпляр провайдера).
+- `runner.rs` — shell-escape `!cmd` обёрнут в `SecretSubstitutingExecutor`.
+- `TuiConfig.secret_provider` — тип изменён с `Arc<dyn SecretProvider>` на `Arc<StaticSecretProvider>`.
+- Добавлены 3 теста: error sanitization, substring collision, API key exclusion.

@@ -120,15 +120,33 @@ impl StaticSecretProvider {
     }
 
     /// Insert or replace a secret. Visible to all clones.
+    ///
+    /// If a secret with the same name already exists, the old value is
+    /// zeroized before being dropped.
     pub fn insert(&self, name: impl Into<String>, value: impl Into<String>) {
         if let Ok(mut secrets) = self.secrets.write() {
-            secrets.insert(name.into(), value.into());
+            if let Some(mut old) = secrets.insert(name.into(), value.into()) {
+                old.zeroize();
+            }
         }
     }
 
-    /// Remove a secret. Returns the previous value if it existed.
-    pub fn remove(&self, name: &str) -> Option<String> {
-        self.secrets.write().ok()?.remove(name)
+    /// Remove a secret. Returns `true` if the secret existed.
+    ///
+    /// The removed value is zeroized internally — it is never returned to
+    /// the caller in plaintext.
+    pub fn remove(&self, name: &str) -> bool {
+        if let Some(mut value) = self
+            .secrets
+            .write()
+            .ok()
+            .and_then(|mut s| s.remove(name))
+        {
+            value.zeroize();
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -268,8 +286,10 @@ mod tests {
     fn static_provider_remove() {
         let provider = StaticSecretProvider::new();
         provider.insert("SECRET", "value");
-        assert_eq!(provider.remove("SECRET"), Some("value".into()));
+        assert!(provider.remove("SECRET"));
         assert!(provider.get("SECRET").is_err());
+        // Removing again returns false.
+        assert!(!provider.remove("SECRET"));
     }
 
     #[test]
