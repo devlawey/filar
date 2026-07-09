@@ -48,9 +48,7 @@ jobs:
 
       - name: Check engine without `local` feature
         run: |
-          cargo check -p filar-core
-          cargo check -p filar-transport --no-default-features
-          cargo check -p filar-agent
+          cargo check --workspace --exclude filar-tui --exclude filar-app --exclude filar-gui --no-default-features
 
   android:
     name: Engine check (aarch64-linux-android)
@@ -72,6 +70,4 @@ jobs:
 
       - name: Check engine for Android (no `local` feature)
         run: |
-          cargo ndk -t arm64-v8a check -p filar-core
-          cargo ndk -t arm64-v8a check -p filar-transport --no-default-features
-          cargo ndk -t arm64-v8a check -p filar-agent
+          cargo ndk -t arm64-v8a check --workspace --exclude filar-tui --exclude filar-app --exclude filar-gui --no-default-features
