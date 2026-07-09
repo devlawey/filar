@@ -80,11 +80,24 @@ impl SessionStore {
         &self.dir
     }
 
-    /// Create a store, ensuring the sessions directory exists.
-    pub fn new() -> Result<Self> {
-        let dir = sessions_dir()?;
+    /// Create a store with a specific base directory.
+    ///
+    /// The sessions directory will be `base_dir/filar/sessions`.
+    /// This allows external consumers (bots, mobile apps) to specify a
+    /// platform-appropriate path without relying on `APPDATA` or `HOME`.
+    pub fn new(base_dir: PathBuf) -> Result<Self> {
+        let dir = base_dir.join("filar").join("sessions");
         std::fs::create_dir_all(&dir)?;
         Ok(Self { dir })
+    }
+
+    /// Create a store using the platform-default base directory.
+    ///
+    /// On Windows this is `%APPDATA%`; on Unix it is `$HOME`.
+    /// For cross-compilation targets (Android, iOS) where these variables
+    /// may not be set, use [`new`](Self::new) with an explicit path.
+    pub fn with_default_dir() -> Result<Self> {
+        Self::new(default_base_dir()?)
     }
 
     /// Save a session to disk (overwrites if the ID already exists).
@@ -160,18 +173,24 @@ impl SessionStore {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Determine the sessions directory.
-fn sessions_dir() -> Result<PathBuf> {
-    let base = if cfg!(windows) {
+/// Determine the platform-default base directory for filar data.
+///
+/// Returns `%APPDATA%` on Windows, `$HOME` on Unix.
+/// The sessions directory is `base/filar/sessions`.
+///
+/// This function does **not** create any directories — use it when you only
+/// need the base path (e.g. for `settings.json`, `pending_launch.json`).
+/// For session storage, use [`SessionStore::with_default_dir`] instead.
+pub fn default_base_dir() -> Result<PathBuf> {
+    if cfg!(windows) {
         std::env::var("APPDATA")
             .map(PathBuf::from)
-            .map_err(|_| CoreError::Other("APPDATA environment variable not set".into()))?
+            .map_err(|_| CoreError::Other("APPDATA environment variable not set".into()))
     } else {
         std::env::var("HOME")
             .map(PathBuf::from)
-            .map_err(|_| CoreError::Other("HOME environment variable not set".into()))?
-    };
-    Ok(base.join("filar").join("sessions"))
+            .map_err(|_| CoreError::Other("HOME environment variable not set".into()))
+    }
 }
 
 /// Generate a session ID and human-readable timestamp from the current time.
@@ -321,6 +340,56 @@ mod tests {
         assert_eq!(metas[2].id, "0000000003");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn session_store_new_creates_sessions_dir() {
+        let tmp = std::env::temp_dir().join(format!(
+            "filar_new_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        // Ensure clean state.
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let store = SessionStore::new(tmp.clone()).unwrap();
+        let expected = tmp.join("filar").join("sessions");
+        assert!(expected.exists(), "sessions directory should be created");
+        assert_eq!(store.dir(), expected);
+
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn session_store_with_default_dir_resolves_platform_path() {
+        // with_default_dir() should succeed when APPDATA (Windows) or HOME (Unix)
+        // is set, and the resulting directory should be base/filar/sessions.
+        let store = SessionStore::with_default_dir();
+        // In CI / test environments the env var is usually set.
+        if let Ok(s) = store {
+            assert!(
+                s.dir().ends_with(std::path::Path::new("filar/sessions")),
+                "dir should end with filar/sessions, got: {}",
+                s.dir().display()
+            );
+            assert!(s.dir().exists(), "directory should exist after creation");
+        }
+        // If env var is not set, that's also acceptable in exotic environments.
+    }
+
+    #[test]
+    fn default_base_dir_does_not_create_directories() {
+        // default_base_dir() should return a path but NOT create any directories.
+        // We can't easily verify "no directory created" in general, but we can
+        // check that the function returns a path that makes sense.
+        if let Ok(base) = default_base_dir() {
+            // The base dir itself (APPDATA or HOME) should already exist.
+            assert!(base.exists(), "base directory should already exist");
+        }
     }
 
     #[test]

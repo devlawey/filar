@@ -11,9 +11,11 @@
 //! - [`SshInteractive`] — connects via SSH, requests a PTY + shell, and
 //!   provides raw read/write/resize over the channel.
 
+#[cfg(feature = "local")]
 use std::io::{Read, Write};
 use std::sync::Arc;
 
+#[cfg(feature = "local")]
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use russh::client::{self, Handle, Msg};
 use russh::keys::*;
@@ -54,13 +56,14 @@ pub trait InteractiveTerminal: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// LocalInteractive — local PTY
+// LocalInteractive — local PTY (feature-gated: requires `local`)
 // ---------------------------------------------------------------------------
 
 /// [`InteractiveTerminal`] backed by a local PTY via `portable-pty`.
 ///
 /// Spawns a shell (`sh` on Unix, `cmd.exe` on Windows) in a pseudo-terminal
 /// and provides raw read/write/resize access.
+#[cfg(feature = "local")]
 pub struct LocalInteractive {
     /// Receiver for output bytes (fed by a reader thread).
     rx: Arc<Mutex<mpsc::UnboundedReceiver<Vec<u8>>>>,
@@ -73,6 +76,7 @@ pub struct LocalInteractive {
     child: Arc<std::sync::Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
 }
 
+#[cfg(feature = "local")]
 impl LocalInteractive {
     /// Create a new local interactive terminal with default shell and size.
     pub async fn new() -> Result<Self> {
@@ -161,6 +165,7 @@ impl LocalInteractive {
 }
 
 #[async_trait::async_trait]
+#[cfg(feature = "local")]
 impl InteractiveTerminal for LocalInteractive {
     async fn read_output(&self) -> Result<Option<Vec<u8>>> {
         let mut rx = self.rx.lock().await;
@@ -405,10 +410,10 @@ async fn authenticate(session: &mut Handle<SshHandler>, target: &SshTarget) -> R
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "local"))]
     use super::*;
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "local"))]
     #[tokio::test]
     #[ignore = "requires sh on Unix"]
     async fn local_interactive_echo() {

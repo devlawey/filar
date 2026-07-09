@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 filar-core = { workspace = true }
-filar-transport = { workspace = true }
+filar-transport = { workspace = true, features = ["local"] }
 filar-agent = { workspace = true }
 filar-tui = { workspace = true }
 filar-gui = { workspace = true }

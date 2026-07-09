@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 
 use filar_agent::glm::GlmClient;
 use filar_agent::LlmClient;
-use filar_core::{secrets, Config, SessionStore, StaticSecretProvider};
+use filar_core::{secrets, default_base_dir, Config, SessionStore, StaticSecretProvider};
 use filar_transport::{LocalExecutor, SshExecutor};
 use filar_tui::TuiConfig;
 
@@ -105,9 +105,9 @@ async fn run() -> anyhow::Result<()> {
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Determine log directory.
-    let log_dir = SessionStore::new()
+    let log_dir = default_base_dir()
         .ok()
-        .and_then(|s| s.dir().parent().map(|p| p.to_path_buf()))
+        .map(|base| base.join("filar"))
         .unwrap_or_else(|| {
             // Fallback: current directory.
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -302,7 +302,7 @@ async fn run() -> anyhow::Result<()> {
     // ── Load session if specified ──────────────────────────────────────
     let initial_messages = if let Some(ref sid) = session_id {
         info!(session_id = %sid, "loading session");
-        match SessionStore::new() {
+        match SessionStore::with_default_dir() {
             Ok(store) => match store.load(sid) {
                 Ok(Some(session)) => {
                     info!(messages = session.messages.len(), "session loaded");

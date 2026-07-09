@@ -1444,3 +1444,75 @@ issue. Если чего-то не хватает — дополнить.
 - `runner.rs` — shell-escape `!cmd` обёрнут в `SecretSubstitutingExecutor`.
 - `TuiConfig.secret_provider` — тип изменён с `Arc<dyn SecretProvider>` на `Arc<StaticSecretProvider>`.
 - Добавлены 3 теста: error sanitization, substring collision, API key exclusion.
+
+### Issue #47: Кросс-компиляция, feature local, CI, тег engine-v0.3.0 (Engine 0.5)
+
+**Задача:** подготовить движок (core+transport+agent) к кросс-компиляции под
+Linux/Android. Вынести `portable-pty` за feature `local`. Сделать
+`SessionStore` параметризуемым. CI-матрица. Гайд потребителя.
+
+**Что сделано:**
+
+1. **`filar-transport` feature `local`** — `portable-pty` стал optional,
+   `default = ["local"]`. Модули `local.rs` и `LocalInteractive` в
+   `interactive.rs` gated за `#[cfg(feature = "local")]`. SSH (`ssh.rs`,
+   `russh`) — безусловный. Импорты `std::io::{Read, Write}` также gated.
+2. **`filar-tui`/`filar-app`** — включают `features = ["local"]` явно в
+   `Cargo.toml`.
+3. **`SessionStore::new(base_dir: PathBuf)`** — принимает базовую директорию
+   как параметр. `SessionStore::with_default_dir()` — фабрика с текущей
+   платформенной логикой (`APPDATA`/`HOME`). Все 6 вызовов обновлены.
+4. **`docs/ENGINE_API.md`** — гайд потребителя: таблица крейтов, таблица фич,
+   пример `Cargo.toml` с git-tag зависимостью, ~30-строчный пример кода,
+   пример `SessionStore`.
+5. **`.github/workflows/engine-targets.yml`** — CI-матрица: `cargo check`
+   под `x86_64-unknown-linux-gnu` и `aarch64-linux-android` (через
+   `cargo-ndk`) с `--no-default-features` для transport.
+6. **`README.md`** — секция «Using filar as a Library» со ссылкой на
+   `docs/ENGINE_API.md`.
+
+**Изменённые файлы:**
+- `crates/transport/Cargo.toml` — `[features]` section, `portable-pty` optional
+- `crates/transport/src/lib.rs` — `#[cfg(feature = "local")]` gating
+- `crates/transport/src/interactive.rs` — `#[cfg(feature = "local")]` на `LocalInteractive`, импортах
+- `crates/tui/Cargo.toml` — `features = ["local"]`
+- `crates/app/Cargo.toml` — `features = ["local"]`
+- `crates/core/src/session.rs` — `new(base_dir)` + `with_default_dir()`
+- `crates/tui/src/runner.rs` — `with_default_dir()`
+- `crates/app/src/main.rs` — `with_default_dir()` (2 вызова)
+- `crates/gui/src/lib.rs` — `with_default_dir()` (3 вызова)
+- `docs/ENGINE_API.md` — новый файл
+- `.github/workflows/engine-targets.yml` — новый файл
+- `README.md` — секция «Using filar as a Library»
+
+**Тесты:** 277 passed, 0 failed, 5 ignored. `cargo check -p filar-transport
+--no-default-features` — чисто. `cargo check -p filar-agent` — чисто (без `local`).
+`cargo clippy --workspace` — чисто.
+
+**Публичные контракты:**
+- `filar_transport` features: `default = ["local"]`, `local = ["dep:portable-pty"]`.
+- `filar_core::SessionStore::new(base_dir: PathBuf)` — новый сигнатур (был `new()`).
+- `filar_core::SessionStore::with_default_dir()` — новый метод (текущая логика).
+- `filar_core::default_base_dir()` — публичная функция (была приватной).
+- `filar_transport::LocalExecutor`, `filar_transport::LocalInteractive` — gated за `local`.
+
+**Review fixes (PR #55, CodeRabbit):**
+- `engine-targets.yml`: `persist-credentials: false` на обоих `actions/checkout` (artipacked).
+- `engine-targets.yml`: `permissions: contents: read` (least-privilege).
+- `engine-targets.yml`: `timeout-minutes: 15` на обоих джобах.
+- `engine-targets.yml`: `cargo install cargo-ndk --version 4 --locked` (пин версии).
+- `Cargo.toml` (workspace): `filar-transport` `default-features = false` — `filar-agent`
+  больше не тянет `local` (CI действительно проверяет no-`local` путь).
+- `session.rs`: `default_base_dir()` стала `pub` — вызовцы в gui/app получают
+  base path без побочного создания директории `filar/sessions`.
+- `gui/src/lib.rs`: `pending_launch_path()` и `Settings::path()` — используют
+  `default_base_dir()` вместо `SessionStore::with_default_dir()` + `.dir().parent()`.
+- `app/src/main.rs`: `log_dir` — использует `default_base_dir()` вместо
+  `SessionStore::with_default_dir()` + `.dir().parent()`.
+- 3 новых теста: `session_store_new_creates_sessions_dir`,
+  `session_store_with_default_dir_resolves_platform_path`,
+  `default_base_dir_does_not_create_directories`.
+
+**Не вошло в скоуп:**
+- `aarch64-apple-ios` target — отложен (требует macOS в CI; CI покрывает linux + android).
+- Тег `engine-v0.3.0` — создаётся после мержа PR (отдельная операция релиза).

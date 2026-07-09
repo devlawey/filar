@@ -34,6 +34,15 @@ Filar is a Rust-based terminal application that integrates an AI agent (LLM) wit
 
 ---
 
+## Using filar as a Library
+
+filar's engine crates (`filar-core`, `filar-transport`, `filar-agent`) can be
+used as dependencies in external projects — Telegram bots, mobile apps, or
+any SSH-based agent frontend. See [`docs/ENGINE_API.md`](docs/ENGINE_API.md)
+for a consumer guide with Cargo.toml example and a minimal code sample.
+
+---
+
 ## Getting Started
 
 ### Prerequisites

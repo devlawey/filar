@@ -1,4 +1,4 @@
-//! Transport crate: abstraction over command execution (local PTY + SSH).
+//! Transport crate: abstraction over command execution (SSH + optional local).
 //!
 //! This crate provides:
 //! - [`CommandExecutor`] — a trait abstracting command execution so the agent
@@ -6,8 +6,10 @@
 //! - [`SshExecutor`] — SSH implementation using a persistent shell channel
 //!   with marker-based boundary detection (Stage 2).
 //! - [`LocalExecutor`] — local PTY implementation using `portable-pty` (Stage 3).
+//!   Only available with the `local` feature (enabled by default).
 
 pub mod interactive;
+#[cfg(feature = "local")]
 pub mod local;
 pub mod secret;
 pub mod ssh;
@@ -18,7 +20,10 @@ use tokio::sync::mpsc;
 use filar_core::Result;
 
 // Re-export key types.
-pub use interactive::{InteractiveTerminal, LocalInteractive, SshInteractive};
+#[cfg(feature = "local")]
+pub use interactive::LocalInteractive;
+pub use interactive::{InteractiveTerminal, SshInteractive};
+#[cfg(feature = "local")]
 pub use local::LocalExecutor;
 pub use secret::SecretSubstitutingExecutor;
 pub use ssh::{SshExecutor, SshSession};

@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Local PTY executor and interactive terminal (portable-pty).
+# Enabled by default for TUI/desktop; disabled for bot/mobile (SSH-only).
+default = ["local"]
+local = ["dep:portable-pty"]
+
 [dependencies]
 filar-core = { workspace = true }
 tokio = { workspace = true }
@@ -12,7 +18,7 @@ tracing = { workspace = true }
 russh = { workspace = true }
 ssh-key = { workspace = true }
 uuid = { workspace = true }
-portable-pty = { workspace = true }
+portable-pty = { workspace = true, optional = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }

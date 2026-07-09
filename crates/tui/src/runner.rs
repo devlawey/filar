@@ -530,7 +530,7 @@ async fn run_app(
         llm_profile: config.llm_profile.clone(),
         messages: app.messages.clone(),
     };
-    match filar_core::SessionStore::new() {
+    match filar_core::SessionStore::with_default_dir() {
         Ok(store) => {
             if let Err(e) = store.save(&session) {
                 eprintln!("\nFailed to save session: {e}");

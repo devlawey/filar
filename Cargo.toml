@@ -73,7 +73,7 @@ tracing-appender = "0.2"
 
 # Internal crates
 filar-core = { path = "crates/core" }
-filar-transport = { path = "crates/transport" }
+filar-transport = { path = "crates/transport", default-features = false }
 filar-agent = { path = "crates/agent" }
 filar-tui = { path = "crates/tui" }
 filar-gui = { path = "crates/gui" }
