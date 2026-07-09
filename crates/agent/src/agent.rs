@@ -15,9 +15,10 @@ use filar_core::{CommandConfirmMode, CoreError, Result};
 use filar_transport::CommandExecutor;
 
 use crate::{
+    events::{AgentEvent, EventSink},
     security::{self, CommandConfirmer, ConfirmDecision},
     tools::{self},
-    ChatMessage, ChatRequest, ChatResponse, LlmClient, MessageRole, ToolCall,
+    ChatMessage, ChatRequest, LlmClient, ToolCall,
 };
 
 // ---------------------------------------------------------------------------
@@ -119,6 +120,8 @@ pub struct Agent {
     system_prompt: String,
     /// Optional callback invoked for each text delta during LLM streaming.
     on_text_delta: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    /// Optional event sink for emitting AgentEvents to frontends.
+    event_sink: Option<EventSink>,
 }
 
 /// Builder for [`Agent`].
@@ -131,6 +134,7 @@ pub struct AgentBuilder {
     max_output_chars: usize,
     system_prompt: Option<String>,
     on_text_delta: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    event_sink: Option<EventSink>,
 }
 
 impl AgentBuilder {
@@ -145,6 +149,7 @@ impl AgentBuilder {
             max_output_chars: DEFAULT_MAX_OUTPUT_CHARS,
             system_prompt: None,
             on_text_delta: None,
+            event_sink: None,
         }
     }
 
@@ -196,6 +201,17 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the event sink for emitting [`AgentEvent`]s to a frontend.
+    ///
+    /// If set, the agent emits events at key points in the processing loop:
+    /// [`AgentEvent::Started`], [`AgentEvent::TextDelta`],
+    /// [`AgentEvent::CommandProposed`], [`AgentEvent::CommandFinished`],
+    /// [`AgentEvent::Finished`], and [`AgentEvent::Error`].
+    pub fn event_sink(mut self, sink: EventSink) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
     /// Convenience: set the system prompt for local execution.
     pub fn local_mode(self) -> Self {
         self.system_prompt(build_system_prompt(true, None, cfg!(windows)))
@@ -219,6 +235,7 @@ impl AgentBuilder {
                 build_system_prompt(false, None, cfg!(windows))
             ),
             on_text_delta: self.on_text_delta,
+            event_sink: self.event_sink,
         })
     }
 }
@@ -235,11 +252,39 @@ impl Agent {
         AgentBuilder::new()
     }
 
+    /// Emit an event to the sink (if set).
+    fn emit(&self, event: AgentEvent) {
+        if let Some(ref sink) = self.event_sink {
+            sink(event);
+        }
+    }
+
     /// Run the agent loop with a user prompt and optional conversation history.
     ///
     /// Returns the final text response from the LLM, or an error if the
     /// loop exceeds the maximum iterations or encounters a failure.
+    ///
+    /// Events emitted via the [`EventSink`] (if set):
+    /// [`AgentEvent::Started`] → [`AgentEvent::TextDelta`] (streaming) →
+    /// [`AgentEvent::CommandProposed`] / [`AgentEvent::CommandFinished`] (tool calls) →
+    /// [`AgentEvent::Finished`] (success) or [`AgentEvent::Error`] (failure).
     pub async fn run(&self, user_prompt: &str, history: &[ChatMessage]) -> Result<String> {
+        self.emit(AgentEvent::Started);
+        match self.run_loop(user_prompt, history).await {
+            Ok(text) => {
+                self.emit(AgentEvent::Finished(text.clone()));
+                Ok(text)
+            }
+            Err(e) => {
+                self.emit(AgentEvent::Error(e.to_string()));
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner agent loop — does NOT emit `Started`/`Finished`/`Error` events.
+    /// The caller ([`run`](Self::run)) wraps this to emit those events.
+    async fn run_loop(&self, user_prompt: &str, history: &[ChatMessage]) -> Result<String> {
         // Build initial message history: system prompt + prior context + new user message.
         let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(&self.system_prompt)];
         messages.extend_from_slice(history);
@@ -257,36 +302,44 @@ impl Agent {
                 tools: tool_defs.clone(),
             };
 
-            // Use streaming if a callback is set, otherwise fall back to non-streaming.
-            let response = if let Some(ref cb) = self.on_text_delta {
-                self.llm.chat_stream(&request, cb.as_ref()).await?
+            // Use streaming if either callback is set, otherwise fall back to non-streaming.
+            // Both on_text_delta and event_sink can fire simultaneously.
+            let response = if self.on_text_delta.is_some() || self.event_sink.is_some() {
+                let cb = self.on_text_delta.clone();
+                let sink = self.event_sink.clone();
+                self.llm
+                    .chat_stream(&request, &move |delta: String| {
+                        if let Some(ref cb) = cb {
+                            cb(delta.clone());
+                        }
+                        if let Some(ref sink) = sink {
+                            sink(AgentEvent::TextDelta(delta));
+                        }
+                    })
+                    .await?
             } else {
                 self.llm.chat(&request).await?
             };
 
-            match response {
-                ChatResponse::Text(text) => {
-                    info!(iteration, "agent produced final text response");
-                    return Ok(text);
-                }
-                ChatResponse::ToolCalls(tool_calls) => {
-                    info!(iteration, count = tool_calls.len(), "LLM requested tool calls");
+            if response.has_tool_calls() {
+                let tool_calls = response.tool_calls.clone();
+                info!(iteration, count = tool_calls.len(), "LLM requested tool calls");
 
-                    // Add the assistant message with tool calls to history.
-                    let assistant_msg = ChatMessage {
-                        role: MessageRole::Assistant,
-                        content: String::new(),
-                        tool_calls: tool_calls.clone(),
-                        tool_call_id: None,
-                    };
-                    messages.push(assistant_msg);
+                // Add the assistant message with tool calls (and any preamble text) to history.
+                let assistant_msg = ChatMessage::assistant_with_tools(
+                    &response.text,
+                    tool_calls.clone(),
+                );
+                messages.push(assistant_msg);
 
-                    // Process each tool call.
-                    for tc in &tool_calls {
-                        let result = self.process_tool_call(tc).await?;
-                        messages.push(result);
-                    }
+                // Process each tool call.
+                for tc in &tool_calls {
+                    let result = self.process_tool_call(tc).await?;
+                    messages.push(result);
                 }
+            } else {
+                info!(iteration, "agent produced final text response");
+                return Ok(response.text);
             }
         }
 
@@ -300,6 +353,9 @@ impl Agent {
 
     /// Process a single tool call: parse, confirm, execute, and return the
     /// tool result message.
+    ///
+    /// Emits [`AgentEvent::CommandProposed`] before confirmation and
+    /// [`AgentEvent::CommandFinished`] after execution (or denial).
     async fn process_tool_call(&self, tc: &ToolCall) -> Result<ChatMessage> {
         // Parse the tool call.
         let parsed = match tools::parse_tool_call(&tc.id, &tc.name, &tc.arguments) {
@@ -324,9 +380,19 @@ impl Agent {
 
         let destructive = security::is_destructive(&parsed.command);
 
+        // Emit CommandProposed before any confirmation logic.
+        self.emit(AgentEvent::CommandProposed {
+            command: parsed.command.clone(),
+            explanation: parsed.explanation.clone(),
+            destructive,
+        });
+
         match decision {
             ConfirmDecision::Blocked(reason) => {
                 warn!(command = %parsed.command, reason = %reason, "command blocked by security");
+                // No CommandFinished event for blocked commands: blocked is not a
+                // user denial, and the TUI should not show a command block for it.
+                // The block reason is sent back to the LLM as tool context.
                 return Ok(ChatMessage::tool(
                     &tc.id,
                     format!("Error: command blocked by security policy: {reason}"),
@@ -343,6 +409,11 @@ impl Agent {
 
                 if !approved {
                     info!(command = %parsed.command, "command denied by user");
+                    self.emit(AgentEvent::CommandFinished {
+                        command: parsed.command.clone(),
+                        output: String::new(),
+                        denied: true,
+                    });
                     return Ok(ChatMessage::tool(
                         &tc.id,
                         "Command denied by user. Try a different approach.".to_string(),
@@ -357,6 +428,11 @@ impl Agent {
             Ok(o) => o,
             Err(e) => {
                 warn!(command = %parsed.command, error = %e, "tool execution failed");
+                self.emit(AgentEvent::CommandFinished {
+                    command: parsed.command.clone(),
+                    output: format!("Error: {e}"),
+                    denied: false,
+                });
                 return Ok(ChatMessage::tool(
                     &tc.id,
                     format!("Error executing command: {e}"),
@@ -366,6 +442,12 @@ impl Agent {
 
         // Truncate output if too long.
         let truncated = self.truncate_output(&output);
+
+        self.emit(AgentEvent::CommandFinished {
+            command: parsed.command.clone(),
+            output: truncated.clone(),
+            denied: false,
+        });
 
         Ok(ChatMessage::tool(&tc.id, truncated))
     }
@@ -392,6 +474,7 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ChatResponse;
     use filar_transport::CommandResult;
     use std::time::Duration;
 
@@ -420,7 +503,7 @@ mod tests {
             if idx < self.responses.len() {
                 Ok(self.responses[idx].clone())
             } else {
-                Ok(ChatResponse::Text("No more responses.".into()))
+                Ok(ChatResponse::text("No more responses."))
             }
         }
     }
@@ -465,7 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_text_response() {
-        let llm = Arc::new(MockLlm::new(vec![ChatResponse::Text("Hello!".into())]));
+        let llm = Arc::new(MockLlm::new(vec![ChatResponse::text("Hello!")]));
         let executor = Arc::new(MockExecutor {
             last_command: std::sync::Mutex::new(String::new()),
         });
@@ -485,7 +568,7 @@ mod tests {
     #[tokio::test]
     async fn agent_tool_call_then_text() {
         // First response: tool call. Second response: text.
-        let tool_call = ChatResponse::ToolCalls(vec![ToolCall {
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
             id: "call_1".into(),
             name: "run_command".into(),
             arguments: serde_json::json!({
@@ -496,7 +579,7 @@ mod tests {
 
         let llm = Arc::new(MockLlm::new(vec![
             tool_call,
-            ChatResponse::Text("Done! The output was: output of: echo hello".into()),
+            ChatResponse::text("Done! The output was: output of: echo hello"),
         ]));
 
         let executor = Arc::new(MockExecutor {
@@ -518,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_tool_call_denied() {
-        let tool_call = ChatResponse::ToolCalls(vec![ToolCall {
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
             id: "call_1".into(),
             name: "run_command".into(),
             arguments: serde_json::json!({
@@ -529,7 +612,7 @@ mod tests {
 
         let llm = Arc::new(MockLlm::new(vec![
             tool_call,
-            ChatResponse::Text("Okay, I won't delete anything.".into()),
+            ChatResponse::text("Okay, I won't delete anything."),
         ]));
 
         let executor = Arc::new(MockExecutor {
@@ -552,7 +635,7 @@ mod tests {
     #[tokio::test]
     async fn agent_tool_call_auto_approved() {
         // In Allowlist mode, read-only commands are auto-approved (no confirmer call).
-        let tool_call = ChatResponse::ToolCalls(vec![ToolCall {
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
             id: "call_1".into(),
             name: "run_command".into(),
             arguments: serde_json::json!({
@@ -563,7 +646,7 @@ mod tests {
 
         let llm = Arc::new(MockLlm::new(vec![
             tool_call,
-            ChatResponse::Text("Files listed.".into()),
+            ChatResponse::text("Files listed."),
         ]));
 
         let executor = Arc::new(MockExecutor {
@@ -587,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn agent_max_iterations() {
         // Always return a tool call — never produce text.
-        let tool_call = ChatResponse::ToolCalls(vec![ToolCall {
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
             id: "call_1".into(),
             name: "run_command".into(),
             arguments: serde_json::json!({
@@ -697,5 +780,112 @@ mod tests {
             prompt.contains("must NOT be translated"),
             "Prompt should state that command output is not translated, got: {prompt}"
         );
+    }
+
+    // ── Event sink tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn event_sink_sequence_tool_call() {
+        // DoD test: mock-LLM with one tool call → sink receives
+        // Started → CommandProposed → CommandFinished → Finished.
+        use std::sync::Mutex;
+
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "echo hello",
+                "explanation": "Print hello"
+            }),
+        }]);
+
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call,
+            ChatResponse::text("Done!"),
+        ]));
+
+        let executor = Arc::new(MockExecutor {
+            last_command: Mutex::new(String::new()),
+        });
+        let confirmer = Arc::new(MockConfirmer { approve: true });
+
+        // Collect events via an EventSink.
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let sink: EventSink = Arc::new(move |event: AgentEvent| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let agent = Agent::builder()
+            .llm(llm)
+            .executor(executor)
+            .confirmer(confirmer)
+            .confirm_mode(CommandConfirmMode::Never)
+            .event_sink(sink)
+            .build()
+            .unwrap();
+
+        let result = agent.run("say hello", &[]).await.unwrap();
+        assert_eq!(result, "Done!");
+
+        let received = events.lock().unwrap();
+        assert_eq!(received.len(), 4, "expected 4 events, got {received:?}");
+
+        // Verify the event sequence.
+        assert!(matches!(&received[0], AgentEvent::Started), "first event should be Started, got {:?}", received[0]);
+        assert!(matches!(&received[1], AgentEvent::CommandProposed { command, .. } if command == "echo hello"),
+            "second event should be CommandProposed, got {:?}", received[1]);
+        assert!(matches!(&received[2], AgentEvent::CommandFinished { command, denied, .. } if command == "echo hello" && !denied),
+            "third event should be CommandFinished (not denied), got {:?}", received[2]);
+        assert!(matches!(&received[3], AgentEvent::Finished(text) if text == "Done!"),
+            "fourth event should be Finished, got {:?}", received[3]);
+    }
+
+    #[tokio::test]
+    async fn event_sink_denied_command() {
+        // When a command is denied, sink should receive CommandFinished with denied=true.
+        use std::sync::Mutex;
+
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "rm -rf /tmp",
+                "explanation": "Delete temp files"
+            }),
+        }]);
+
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call,
+            ChatResponse::text("Okay, I won't delete anything."),
+        ]));
+
+        let executor = Arc::new(MockExecutor {
+            last_command: Mutex::new(String::new()),
+        });
+        let confirmer = Arc::new(MockConfirmer { approve: false }); // Deny!
+
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let sink: EventSink = Arc::new(move |event: AgentEvent| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let agent = Agent::builder()
+            .llm(llm)
+            .executor(executor)
+            .confirmer(confirmer)
+            .confirm_mode(CommandConfirmMode::Always)
+            .event_sink(sink)
+            .build()
+            .unwrap();
+
+        let _ = agent.run("delete temp files", &[]).await.unwrap();
+
+        let received = events.lock().unwrap();
+        // Started → CommandProposed → CommandFinished(denied=true) → Finished
+        assert_eq!(received.len(), 4, "expected 4 events, got {received:?}");
+        assert!(matches!(&received[2], AgentEvent::CommandFinished { denied: true, .. }),
+            "third event should be CommandFinished with denied=true, got {:?}", received[2]);
     }
 }

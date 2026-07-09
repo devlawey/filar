@@ -1195,3 +1195,84 @@ PR: #28
   - `sse_flush_empty_buffer_noop` — пустой хвост не меняет поведение
 
 **Публичные контракты:** без изменений (`SseState` — private).
+
+---
+
+## Issue #43: Engine 0.1 — публичные события агента (AgentEvent + sink)
+
+**Задача:** Создать UI-агностический `AgentEvent` enum + `EventSink` в `filar-agent`,
+эмитить события во всех ключевых точках `Agent::run`. TUI должен использовать
+`filar_agent::AgentEvent` без собственной копии. Дополнительно: `ChatResponse`
+изменён с enum (Text XOR ToolCalls) на struct (text + tool_calls) чтобы
+сохранять preamble-текст в истории при наличии tool calls.
+
+**Решение:**
+
+### Часть A: AgentEvent + EventSink
+- **`crates/agent/src/events.rs`** (новый): `AgentEvent` enum (`#[non_exhaustive]`)
+  с вариантами: `Started`, `TextDelta(String)`, `CommandProposed { command, explanation,
+  destructive }`, `CommandFinished { command, output, denied }`, `Finished(String)`,
+  `Error(String)`. `EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>`.
+- **`crates/agent/src/lib.rs`**: модуль `events` публичный, реэкспорт `AgentEvent` + `EventSink`.
+- **`crates/agent/src/agent.rs`**: `AgentBuilder::event_sink(sink)` — опциональный sink.
+  `run()` рефакторен в `run()` + `run_loop()`: внешний `run()` эмитит `Started` →
+  `run_loop()` → `Finished`/`Error`. `process_tool_call()` эмитит `CommandProposed`
+  перед подтверждением и `CommandFinished` для всех исходов (blocked/denied/error/success).
+- **TUI:** `event.rs` — старый `AgentEvent` enum заменён на `TuiEvent` с вариантами:
+  `Agent(filar_agent::AgentEvent)`, `Thinking`, `ConfirmationRequest { ... }`,
+  `TransportChanged { ... }`. `runner.rs::spawn_agent` — `EventSink` форвардит
+  `AgentEvent` → `TuiEvent::Agent(...)`. `TuiExecutor` лишён `event_tx` — события
+  команд идут через sink. `app.rs::handle_agent_event` — match на `TuiEvent::Agent`
+  с вложенным match на `filar_agent::AgentEvent`.
+
+### Часть B: ChatResponse → struct
+- **`crates/agent/src/lib.rs`**: `ChatResponse` — struct с `text: String` и
+  `tool_calls: Vec<ToolCall>` (оба поля всегда присутствуют). Конструкторы
+  `text()` и `tool_calls(text, calls)`, метод `has_tool_calls()`.
+- **`crates/agent/src/glm.rs`**: `try_into_chat_response()` и `into_response()`
+  собирают оба поля. Тесты обновлены.
+
+**Решения дизайна:**
+- `run()`/`run_loop()` split — гарантирует ровно один `Finished`/`Error` на всех
+  путях (включая max-iterations).
+- `CommandFinished { denied: true }` — TUI handler пропускает update command block
+  для denied команд, сохраняя старое поведение (блок уже добавлен в `ConfirmationRequest`).
+- Shell escape (`!cmd`) — runner строит `CommandFinished` вручную из `CommandResult`,
+  т.к. агент не запущен.
+
+**Изменённые файлы:**
+- `crates/agent/src/events.rs` — новый: `AgentEvent` + `EventSink`
+- `crates/agent/src/lib.rs` — `ChatResponse` struct, модуль `events`
+- `crates/agent/src/glm.rs` — обновлён под struct API
+- `crates/agent/src/agent.rs` — `event_sink()`, `run()`/`run_loop()`, emit, 2 теста
+- `crates/tui/src/event.rs` — `TuiEvent` (замена `AgentEvent`)
+- `crates/tui/src/runner.rs` — `EventSink` bridge, `TuiExecutor` без `event_tx`
+- `crates/tui/src/app.rs` — `handle_agent_event` на `TuiEvent`
+- `crates/tui/src/confirmer.rs` — `TuiEvent` вместо `AgentEvent`
+- `crates/tui/src/lib.rs` — реэкспорт `TuiEvent`
+
+**Тесты:** 249 passed, 0 failed, 5 ignored.
+  - `event_sink_sequence_tool_call` (DoD): mock LLM с одним tool call → sink получает
+    Started → CommandProposed → CommandFinished → Finished
+  - `event_sink_denied_command`: CommandFinished с `denied: true`
+
+**Публичные контракты:**
+- NEW: `filar_agent::AgentEvent` (enum, `#[non_exhaustive]`), `filar_agent::EventSink` (type alias)
+- NEW: `AgentBuilder::event_sink(sink: EventSink) -> Self`
+- CHANGED: `filar_agent::ChatResponse` — enum → struct (`text` + `tool_calls`)
+- CHANGED: `filar_tui::event::TuiEvent` (was `AgentEvent`) — wrapping `filar_agent::AgentEvent`
+- REMOVED: дубликаты TUI event-вариантов (Started, TextDelta, CommandExecuted, Finished, Error)
+
+### Review fixes (PR #51, CodeRabbit)
+
+- **TextDelta через оба хука**: `on_text_delta` и `event_sink` теперь работают
+  одновременно — раньше `on_text_delta` полностью перекрывал sink.
+- **Blocked ≠ denied**: для `ConfirmDecision::Blocked` больше не эмитится
+  `CommandFinished` — blocked не является user denial, и TUI не должен показывать
+  блок команды. Причина блокировки отправляется только в LLM как tool context.
+- **println! в smoke-тестах**: удалены отладочные `println!` (AGENTS.md).
+- **CommandProposed explanation**: TUI теперь сохраняет metadata из `CommandProposed`
+  и использует её в `CommandFinished` для auto-approved команд (которые не прошли
+  через `ConfirmationRequest`). Новое поле `App::pending_proposal`.
+- **Double terminal event в shell escape**: `Finished` больше не эмитится после
+  `Error` — только один терминальный event на запуск.

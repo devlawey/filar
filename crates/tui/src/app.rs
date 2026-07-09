@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 use filar_core::{ChatBlock, CommandConfirmMode};
 use ratatui::layout::Rect;
 
-use crate::event::AgentEvent;
+use crate::event::TuiEvent;
 use crate::terminal::{key_to_bytes, TerminalModel};
 use crate::ui::layout_cache::ChatLayoutCache;
 use crate::ui::Theme;
@@ -233,6 +233,11 @@ pub struct App {
     /// Whether the agent is currently streaming a text response.
     /// When true, `TextDelta` events append to the last `Agent` block.
     pub streaming: bool,
+    /// Pending command proposal metadata from `CommandProposed`:
+    /// `(command, explanation)`. Used to preserve the explanation when
+    /// `CommandFinished` arrives for auto-approved commands (which never
+    /// triggered a `ConfirmationRequest` dialog).
+    pub pending_proposal: Option<(String, String)>,
     /// Spinner animation tick counter — incremented each render frame
     /// while in `Thinking` mode.
     pub tick: u64,
@@ -298,6 +303,7 @@ impl App {
             hovered_button: None,
             collapsed_overrides: HashMap::new(),
             streaming: false,
+            pending_proposal: None,
             tick: 0,
             helpbar_zones: Vec::new(),
             input_scroll_offset: 0,
@@ -1401,34 +1407,117 @@ impl App {
         frames[(self.tick as usize) % frames.len()]
     }
 
-    /// Handle an agent event.
-    pub fn handle_agent_event(&mut self, event: AgentEvent) {
+    /// Handle a TUI event (forwarded agent event or TUI-specific event).
+    pub fn handle_agent_event(&mut self, event: TuiEvent) {
         let mut auto_scroll = true;
         match event {
-            AgentEvent::Started | AgentEvent::Thinking => {
-                self.mode = AppMode::Thinking;
-            }
-            AgentEvent::TextDelta(s) => {
-                // Append to the last Agent block if streaming, else create new.
-                if self.streaming {
-                    if let Some(ChatBlock::Agent(ref mut text)) = self.messages.last_mut() {
-                        text.push_str(&s);
+            TuiEvent::Agent(agent_event) => match agent_event {
+                filar_agent::AgentEvent::Started => {
+                    self.mode = AppMode::Thinking;
+                }
+                filar_agent::AgentEvent::TextDelta(s) => {
+                    // Append to the last Agent block if streaming, else create new.
+                    if self.streaming {
+                        if let Some(ChatBlock::Agent(ref mut text)) = self.messages.last_mut() {
+                            text.push_str(&s);
+                        } else {
+                            self.push_message(ChatBlock::Agent(s));
+                        }
                     } else {
                         self.push_message(ChatBlock::Agent(s));
+                        self.streaming = true;
                     }
-                } else {
-                    self.push_message(ChatBlock::Agent(s));
-                    self.streaming = true;
+                    self.message_rev = self.message_rev.wrapping_add(1);
+                    // Only auto-scroll if already at bottom.
+                    // If the user scrolled up, don’t yank them down.
+                    auto_scroll = self.scroll == 0;
                 }
-                self.message_rev = self.message_rev.wrapping_add(1);
-                // Only auto-scroll if already at bottom.
-                // If the user scrolled up, don’t yank them down.
-                auto_scroll = self.scroll == 0;
+                filar_agent::AgentEvent::CommandProposed { command, explanation, .. } => {
+                    // Store proposal metadata so CommandFinished can preserve
+                    // the explanation for auto-approved commands (which never
+                    // go through ConfirmationRequest).
+                    self.pending_proposal = Some((command, explanation));
+                }
+                filar_agent::AgentEvent::CommandFinished { command, output, denied } => {
+                    if !denied {
+                        // Finalize any streaming text before showing command output.
+                        self.streaming = false;
+                        auto_scroll = self.scroll == 0;
+                        // Retrieve stored explanation from CommandProposed (if any).
+                        let explanation = self
+                            .pending_proposal
+                            .as_ref()
+                            .filter(|(cmd, _)| *cmd == command)
+                            .map(|(_, expl)| expl.clone())
+                            .unwrap_or_default();
+                        // Try to update the last matching Command block with output.
+                        let mut updated = false;
+                        if let Some(ChatBlock::Command {
+                            command: ref cmd,
+                            output: ref mut o,
+                            approved: ref mut a,
+                            ..
+                        }) = self.messages.last_mut()
+                        {
+                            if *cmd == command && o.is_none() {
+                                *o = Some(output.clone());
+                                *a = true;
+                                updated = true;
+                                // Bump rev so the cache rebuilds with updated output.
+                                self.message_rev = self.message_rev.wrapping_add(1);
+                            }
+                        }
+                        if !updated {
+                            self.push_message(ChatBlock::Command {
+                                command,
+                                explanation,
+                                output: Some(output),
+                                approved: true,
+                            });
+                        }
+                    }
+                    // Clear the pending proposal regardless — the command is done.
+                    self.pending_proposal = None;
+                    // For denied commands, the command block was already pushed
+                    // by respond_to_confirmation (if confirmation was needed).
+                    // For blocked commands, no block is shown — matching old behavior.
+                }
+                filar_agent::AgentEvent::Finished(text) => {
+                    // Finalize streaming block with authoritative text.
+                    if self.streaming {
+                        if !text.is_empty() {
+                            if let Some(ChatBlock::Agent(ref mut existing)) = self.messages.last_mut() {
+                                *existing = text;
+                                self.message_rev = self.message_rev.wrapping_add(1);
+                            } else {
+                                self.push_message(ChatBlock::Agent(text));
+                            }
+                        }
+                        self.streaming = false;
+                        auto_scroll = self.scroll == 0;
+                    } else if !text.is_empty() {
+                        self.push_message(ChatBlock::Agent(text));
+                    }
+                    self.mode = AppMode::Normal;
+                    self.agent_running = false;
+                }
+                filar_agent::AgentEvent::Error(err) => {
+                    // If streaming was interrupted, mark it.
+                    if self.streaming {
+                        self.push_message(ChatBlock::System("response interrupted".into()));
+                        self.streaming = false;
+                        auto_scroll = self.scroll == 0;
+                    }
+                    self.push_message(ChatBlock::Error(err));
+                    self.mode = AppMode::Normal;
+                    self.agent_running = false;
+                }
+                _ => {} // non_exhaustive: ignore unknown agent events
             }
-            AgentEvent::TextResponse(text) => {
-                self.push_message(ChatBlock::Agent(text));
+            TuiEvent::Thinking => {
+                self.mode = AppMode::Thinking;
             }
-            AgentEvent::ConfirmationRequest {
+            TuiEvent::ConfirmationRequest {
                 command,
                 explanation,
                 destructive,
@@ -1447,71 +1536,7 @@ impl App {
                 // Reset selection to safe default (Deny).
                 self.confirm_selected = false;
             }
-            AgentEvent::CommandExecuted {
-                command,
-                output,
-                approved,
-            } => {
-                // Finalize any streaming text before showing command output.
-                self.streaming = false;
-                auto_scroll = self.scroll == 0;
-                // Try to update the last matching Command block with output.
-                let mut updated = false;
-                if let Some(ChatBlock::Command {
-                    command: ref cmd,
-                    output: ref mut o,
-                    approved: ref mut a,
-                    ..
-                }) = self.messages.last_mut()
-                {
-                    if *cmd == command && o.is_none() {
-                        *o = Some(output.clone());
-                        *a = approved;
-                        updated = true;
-                        // Bump rev so the cache rebuilds with updated output.
-                        self.message_rev = self.message_rev.wrapping_add(1);
-                    }
-                }
-                if !updated {
-                    self.push_message(ChatBlock::Command {
-                        command,
-                        explanation: String::new(),
-                        output: Some(output),
-                        approved,
-                    });
-                }
-            }
-            AgentEvent::Finished(text) => {
-                // Finalize streaming block with authoritative text.
-                if self.streaming {
-                    if !text.is_empty() {
-                        if let Some(ChatBlock::Agent(ref mut existing)) = self.messages.last_mut() {
-                            *existing = text;
-                            self.message_rev = self.message_rev.wrapping_add(1);
-                        } else {
-                            self.push_message(ChatBlock::Agent(text));
-                        }
-                    }
-                    self.streaming = false;
-                    auto_scroll = self.scroll == 0;
-                } else if !text.is_empty() {
-                    self.push_message(ChatBlock::Agent(text));
-                }
-                self.mode = AppMode::Normal;
-                self.agent_running = false;
-            }
-            AgentEvent::Error(err) => {
-                // If streaming was interrupted, mark it.
-                if self.streaming {
-                    self.push_message(ChatBlock::System("response interrupted".into()));
-                    self.streaming = false;
-                    auto_scroll = self.scroll == 0;
-                }
-                self.push_message(ChatBlock::Error(err));
-                self.mode = AppMode::Normal;
-                self.agent_running = false;
-            }
-            AgentEvent::TransportChanged { .. } => {
+            TuiEvent::TransportChanged { .. } => {
                 // Handled by the runner before reaching here — no-op.
             }
         }
@@ -1859,7 +1884,7 @@ mod tests {
     fn agent_text_response_bumps_message_rev() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let rev_before = app.message_rev;
-        app.handle_agent_event(AgentEvent::TextResponse("hello".into()));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::Finished("hello".into())));
         assert!(app.message_rev > rev_before);
     }
 
@@ -1867,7 +1892,7 @@ mod tests {
     fn agent_error_bumps_message_rev() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let rev_before = app.message_rev;
-        app.handle_agent_event(AgentEvent::Error("oops".into()));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::Error("oops".into())));
         assert!(app.message_rev > rev_before);
         assert_eq!(app.mode, AppMode::Normal);
     }
@@ -1884,11 +1909,11 @@ mod tests {
             approved: false,
         });
         let rev_before = app.message_rev;
-        app.handle_agent_event(AgentEvent::CommandExecuted {
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::CommandFinished {
             command: "ls".into(),
             output: "file1\nfile2".into(),
-            approved: true,
-        });
+            denied: false,
+        }));
         assert!(app.message_rev > rev_before, "in-place update must bump rev");
         // Verify the block was updated in-place, not duplicated.
         assert_eq!(app.messages.len(), 2); // system + command (updated)
@@ -2531,7 +2556,7 @@ mod tests {
         assert!(app.confirm_selected);
         // Simulate a new confirmation request.
         let (tx, _rx) = oneshot::channel::<bool>();
-        app.handle_agent_event(AgentEvent::ConfirmationRequest {
+        app.handle_agent_event(TuiEvent::ConfirmationRequest {
             command: "ls".into(),
             explanation: "list".into(),
             destructive: false,
@@ -2858,7 +2883,7 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(AgentEvent::TextDelta("Hello".into()));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("Hello".into())));
 
         assert!(app.streaming);
         assert_eq!(app.messages.len(), 1);
@@ -2874,8 +2899,8 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(AgentEvent::TextDelta("Hello".into()));
-        app.handle_agent_event(AgentEvent::TextDelta(" world".into()));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("Hello".into())));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta(" world".into())));
 
         assert!(app.streaming);
         assert_eq!(app.messages.len(), 1);
@@ -2892,14 +2917,14 @@ mod tests {
         app.mode = AppMode::Thinking;
 
         // Stream some text.
-        app.handle_agent_event(AgentEvent::TextDelta("Partial".into()));
-        app.handle_agent_event(AgentEvent::TextDelta(" response".into()));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("Partial".into())));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta(" response".into())));
         assert!(app.streaming);
 
         // Finished replaces with authoritative text.
-        app.handle_agent_event(AgentEvent::Finished(
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::Finished(
             "Partial response — finalized".into(),
-        ));
+        )));
 
         assert!(!app.streaming);
         assert_eq!(app.mode, AppMode::Normal);
@@ -2916,8 +2941,8 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(AgentEvent::TextDelta("Streamed text".into()));
-        app.handle_agent_event(AgentEvent::Finished(String::new()));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("Streamed text".into())));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::Finished(String::new())));
 
         assert!(!app.streaming);
         assert_eq!(app.messages.len(), 1);
@@ -2933,10 +2958,10 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(AgentEvent::TextDelta("Partial".into()));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("Partial".into())));
         assert!(app.streaming);
 
-        app.handle_agent_event(AgentEvent::Error("network error".into()));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::Error("network error".into())));
 
         assert!(!app.streaming);
         assert_eq!(app.mode, AppMode::Normal);
@@ -2952,11 +2977,11 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(AgentEvent::TextDelta("Let me check...".into()));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("Let me check...".into())));
         assert!(app.streaming);
 
         let (tx, _rx) = oneshot::channel::<bool>();
-        app.handle_agent_event(AgentEvent::ConfirmationRequest {
+        app.handle_agent_event(TuiEvent::ConfirmationRequest {
             command: "ls".into(),
             explanation: "list files".into(),
             destructive: false,
@@ -2974,7 +2999,7 @@ mod tests {
         app.mode = AppMode::Thinking;
         app.scroll = 5; // User scrolled up.
 
-        app.handle_agent_event(AgentEvent::TextDelta("new text".into()));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("new text".into())));
 
         // Scroll should NOT be reset to 0 — user is reading history.
         assert_eq!(app.scroll, 5);
@@ -2987,7 +3012,7 @@ mod tests {
         app.mode = AppMode::Thinking;
         app.scroll = 0;
 
-        app.handle_agent_event(AgentEvent::TextDelta("new text".into()));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("new text".into())));
 
         // Scroll stays at 0 (bottom).
         assert_eq!(app.scroll, 0);
@@ -3015,13 +3040,13 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(AgentEvent::TextDelta("First".into()));
-        app.handle_agent_event(AgentEvent::Finished("First".into()));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("First".into())));
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::Finished("First".into())));
         assert!(!app.streaming);
 
         // New run.
-        app.handle_agent_event(AgentEvent::Thinking);
-        app.handle_agent_event(AgentEvent::TextDelta("Second".into()));
+        app.handle_agent_event(TuiEvent::Thinking);
+        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("Second".into())));
 
         assert!(app.streaming);
         assert_eq!(app.messages.len(), 2);
