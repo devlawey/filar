@@ -233,6 +233,11 @@ pub struct App {
     /// Whether the agent is currently streaming a text response.
     /// When true, `TextDelta` events append to the last `Agent` block.
     pub streaming: bool,
+    /// Pending command proposal metadata from `CommandProposed`:
+    /// `(command, explanation)`. Used to preserve the explanation when
+    /// `CommandFinished` arrives for auto-approved commands (which never
+    /// triggered a `ConfirmationRequest` dialog).
+    pub pending_proposal: Option<(String, String)>,
     /// Spinner animation tick counter — incremented each render frame
     /// while in `Thinking` mode.
     pub tick: u64,
@@ -298,6 +303,7 @@ impl App {
             hovered_button: None,
             collapsed_overrides: HashMap::new(),
             streaming: false,
+            pending_proposal: None,
             tick: 0,
             helpbar_zones: Vec::new(),
             input_scroll_offset: 0,
@@ -1426,15 +1432,24 @@ impl App {
                     // If the user scrolled up, don’t yank them down.
                     auto_scroll = self.scroll == 0;
                 }
-                filar_agent::AgentEvent::CommandProposed { .. } => {
-                    // Informational — the TUI shows commands via
-                    // ConfirmationRequest or CommandFinished. No action needed.
+                filar_agent::AgentEvent::CommandProposed { command, explanation, .. } => {
+                    // Store proposal metadata so CommandFinished can preserve
+                    // the explanation for auto-approved commands (which never
+                    // go through ConfirmationRequest).
+                    self.pending_proposal = Some((command, explanation));
                 }
                 filar_agent::AgentEvent::CommandFinished { command, output, denied } => {
                     if !denied {
                         // Finalize any streaming text before showing command output.
                         self.streaming = false;
                         auto_scroll = self.scroll == 0;
+                        // Retrieve stored explanation from CommandProposed (if any).
+                        let explanation = self
+                            .pending_proposal
+                            .as_ref()
+                            .filter(|(cmd, _)| *cmd == command)
+                            .map(|(_, expl)| expl.clone())
+                            .unwrap_or_default();
                         // Try to update the last matching Command block with output.
                         let mut updated = false;
                         if let Some(ChatBlock::Command {
@@ -1455,12 +1470,14 @@ impl App {
                         if !updated {
                             self.push_message(ChatBlock::Command {
                                 command,
-                                explanation: String::new(),
+                                explanation,
                                 output: Some(output),
                                 approved: true,
                             });
                         }
                     }
+                    // Clear the pending proposal regardless — the command is done.
+                    self.pending_proposal = None;
                     // For denied commands, the command block was already pushed
                     // by respond_to_confirmation (if confirmation was needed).
                     // For blocked commands, no block is shown — matching old behavior.

@@ -341,7 +341,7 @@ async fn run_app(
                             let exec = tui_executor.clone();
                             let tx = agent_tx.clone();
                             tokio::spawn(async move {
-                                match exec.run(&cmd).await {
+                                let succeeded = match exec.run(&cmd).await {
                                     Ok(result) => {
                                         // Build display output from CommandResult.
                                         let mut output = result.stdout.clone();
@@ -361,6 +361,7 @@ async fn run_app(
                                                 denied: false,
                                             }
                                         ));
+                                        true
                                     }
                                     Err(e) => {
                                         let _ = tx.send(TuiEvent::Agent(
@@ -368,12 +369,16 @@ async fn run_app(
                                                 format!("Shell command failed: {e}")
                                             )
                                         ));
+                                        false
                                     }
+                                };
+                                // Signal completion only on success — Error is
+                                // already a terminal event for the TUI handler.
+                                if succeeded {
+                                    let _ = tx.send(TuiEvent::Agent(
+                                        filar_agent::AgentEvent::Finished(String::new())
+                                    ));
                                 }
-                                // Signal completion to return to Normal mode.
-                                let _ = tx.send(TuiEvent::Agent(
-                                    filar_agent::AgentEvent::Finished(String::new())
-                                ));
                             });
                         } else {
                             // Empty command after ! — just return to normal.

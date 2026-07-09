@@ -905,7 +905,6 @@ mod tests {
         let response = client.chat(&request).await.expect("chat request failed");
         assert!(!response.has_tool_calls(), "expected Text response, got ToolCalls");
         assert!(!response.text.is_empty(), "response text should not be empty");
-        println!("Smoke test text response: {}", response.text);
     }
 
     #[cfg(feature = "smoke")]
@@ -943,10 +942,6 @@ mod tests {
         let response = client.chat(&request).await.expect("chat request failed");
         if response.has_tool_calls() {
             assert!(!response.tool_calls.is_empty(), "expected at least one tool call");
-            println!("Smoke test tool call: {} → {}", response.tool_calls[0].name, response.tool_calls[0].arguments);
-        } else {
-            // Some models may answer in text instead of calling a tool.
-            println!("Model responded with text instead of tool call: {}", response.text);
         }
     }
 

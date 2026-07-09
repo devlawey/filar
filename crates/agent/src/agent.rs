@@ -302,16 +302,19 @@ impl Agent {
                 tools: tool_defs.clone(),
             };
 
-            // Use streaming if a callback is set, otherwise fall back to non-streaming.
-            // If an event sink is set, wrap it as the on_delta callback so that
-            // TextDelta events are emitted during streaming.
-            let response = if let Some(ref cb) = self.on_text_delta {
-                self.llm.chat_stream(&request, cb.as_ref()).await?
-            } else if let Some(ref sink) = self.event_sink {
-                let sink_clone = sink.clone();
+            // Use streaming if either callback is set, otherwise fall back to non-streaming.
+            // Both on_text_delta and event_sink can fire simultaneously.
+            let response = if self.on_text_delta.is_some() || self.event_sink.is_some() {
+                let cb = self.on_text_delta.clone();
+                let sink = self.event_sink.clone();
                 self.llm
                     .chat_stream(&request, &move |delta: String| {
-                        sink_clone(AgentEvent::TextDelta(delta));
+                        if let Some(ref cb) = cb {
+                            cb(delta.clone());
+                        }
+                        if let Some(ref sink) = sink {
+                            sink(AgentEvent::TextDelta(delta));
+                        }
                     })
                     .await?
             } else {
@@ -387,11 +390,9 @@ impl Agent {
         match decision {
             ConfirmDecision::Blocked(reason) => {
                 warn!(command = %parsed.command, reason = %reason, "command blocked by security");
-                self.emit(AgentEvent::CommandFinished {
-                    command: parsed.command.clone(),
-                    output: format!("blocked by security policy: {reason}"),
-                    denied: true,
-                });
+                // No CommandFinished event for blocked commands: blocked is not a
+                // user denial, and the TUI should not show a command block for it.
+                // The block reason is sent back to the LLM as tool context.
                 return Ok(ChatMessage::tool(
                     &tc.id,
                     format!("Error: command blocked by security policy: {reason}"),

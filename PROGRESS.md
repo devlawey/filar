@@ -1262,3 +1262,17 @@ PR: #28
 - CHANGED: `filar_agent::ChatResponse` — enum → struct (`text` + `tool_calls`)
 - CHANGED: `filar_tui::event::TuiEvent` (was `AgentEvent`) — wrapping `filar_agent::AgentEvent`
 - REMOVED: дубликаты TUI event-вариантов (Started, TextDelta, CommandExecuted, Finished, Error)
+
+### Review fixes (PR #51, CodeRabbit)
+
+- **TextDelta через оба хука**: `on_text_delta` и `event_sink` теперь работают
+  одновременно — раньше `on_text_delta` полностью перекрывал sink.
+- **Blocked ≠ denied**: для `ConfirmDecision::Blocked` больше не эмитится
+  `CommandFinished` — blocked не является user denial, и TUI не должен показывать
+  блок команды. Причина блокировки отправляется только в LLM как tool context.
+- **println! в smoke-тестах**: удалены отладочные `println!` (AGENTS.md).
+- **CommandProposed explanation**: TUI теперь сохраняет metadata из `CommandProposed`
+  и использует её в `CommandFinished` для auto-approved команд (которые не прошли
+  через `ConfirmationRequest`). Новое поле `App::pending_proposal`.
+- **Double terminal event в shell escape**: `Finished` больше не эмитится после
+  `Error` — только один терминальный event на запуск.
