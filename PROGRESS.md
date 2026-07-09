@@ -1312,3 +1312,72 @@ issue. Если чего-то не хватает — дополнить.
 **Тесты:** 250 passed, 0 failed, 5 ignored.
 
 **Публичные контракты:** без изменений (сверка существующей реализации).
+
+---
+
+## Issue #45: Engine 0.3 — отмена и таймауты (CancellationToken в Agent::run)
+
+**Задача:** Добавить возможность отмены выполняющегося агента через
+`CancellationToken`, а также таймауты на подтверждение команды и выполнение
+команды.
+
+**Решение:**
+
+### 1. CancellationToken в Agent
+- `AgentBuilder::cancellation(token: CancellationToken)` — устанавливает токен.
+- `with_cancellation()` — свободная функция, оборачивающая future в
+  `tokio::select!` с `token.cancelled()`. Возвращает `Err("cancelled")`.
+- `Agent::run()` при ошибке проверяет `is_cancelled()` и эмитит
+  `AgentEvent::Cancelled` вместо `AgentEvent::Error`.
+- LLM-запросы (`chat`, `chat_stream`), подтверждение команды и выполнение
+  команды — все обёрнуты в `with_cancellation`.
+- При отмене во время выполнения команды вызывается `executor.cancel()`.
+
+### 2. AgentEvent::Cancelled
+- Новый вариант в `AgentEvent` (terminal event, `#[non_exhaustive]`).
+
+### 3. confirm_timeout(Duration)
+- `AgentBuilder::confirm_timeout(duration)` — таймаут на подтверждение.
+- При таймауте: `CommandFinished { denied: true, output: "Confirmation timed out" }`,
+  команда считается denied, агент продолжает работу.
+
+### 4. command_timeout(Duration)
+- `AgentBuilder::command_timeout(duration)` — таймаут на выполнение.
+- При таймауте: `executor.cancel()`, `CommandFinished { output: "Command timed out" }`,
+  агент продолжает работу.
+
+### 5. TUI integration
+- `App.cancellation: Option<CancellationToken>` — хранит токен текущего запуска.
+- `spawn_agent` создаёт токен, сохраняет в `App`, передаёт в `AgentBuilder`.
+- Ctrl+C в Thinking mode: `token.cancel()` + немедленный возврат в Normal mode.
+- `AgentEvent::Cancelled`: очищает токен, финализирует состояние.
+
+### DoD-тесты
+- `cancellation_emits_cancelled_event` — HangingLlm + CancellationToken →
+  Started → Cancelled.
+- `confirm_timeout_treats_as_denied` — HangingConfirmer + confirm_timeout(100ms) →
+  CommandFinished { denied: true, "timed out" } → агент продолжает → Finished.
+
+**Изменённые файлы:**
+- `crates/agent/Cargo.toml` — `tokio-util` dependency
+- `crates/agent/src/events.rs` — `Cancelled` variant
+- `crates/agent/src/agent.rs` — поля, builder methods, `with_cancellation`,
+  `run()`/`run_loop()` cancellation, `process_tool_call()` timeouts, 2 DoD-теста
+- `crates/tui/Cargo.toml` — `tokio-util` dependency
+- `crates/tui/src/app.rs` — `cancellation` field, Ctrl+C handler, `Cancelled` handler
+- `crates/tui/src/runner.rs` — `spawn_agent` принимает `CancellationToken`
+
+**Тесты:** 253 passed, 0 failed, 5 ignored.
+
+**Публичные контракты:**
+- `AgentEvent` — новый вариант `Cancelled` (non-breaking, `#[non_exhaustive]`).
+- `AgentBuilder` — новые методы: `cancellation()`, `confirm_timeout()`, `command_timeout()`.
+
+### Review fixes (PR #53, CodeRabbit)
+
+- **Stale confirmation dialog на таймауте**: при `confirm_timeout` TUI оставался в
+  `Confirming` mode с зависшим диалогом. Добавлена очистка `pending_confirm` и возврат
+  в `Normal` при получении `CommandFinished { denied: true }` в `Confirming` mode.
+- **Тест на `command_timeout`**: добавлен `command_timeout_cancels_executor` —
+  `HangingExecutor` + `command_timeout(100ms)` → `executor.cancel()` вызывается,
+  `CommandFinished` содержит "timed out", агент продолжает работу.

@@ -5,6 +5,7 @@
 //! and agent events (from the agent task).
 
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use filar_core::{ChatBlock, CommandConfirmMode};
 use ratatui::layout::Rect;
 
@@ -232,6 +233,9 @@ pub struct App {
     pub collapsed_overrides: HashMap<usize, bool>,
     /// Whether the agent is currently streaming a text response.
     /// When true, `TextDelta` events append to the last `Agent` block.
+    /// Cancellation token for the currently running agent task.
+    /// Set when the agent is spawned, triggered by Ctrl+C in Thinking mode.
+    pub cancellation: Option<CancellationToken>,
     pub streaming: bool,
     /// Pending command proposal metadata from `CommandProposed`:
     /// `(command, explanation)`. Used to preserve the explanation when
@@ -302,6 +306,7 @@ impl App {
             confirm_selected: false,
             hovered_button: None,
             collapsed_overrides: HashMap::new(),
+            cancellation: None,
             streaming: false,
             pending_proposal: None,
             tick: 0,
@@ -521,6 +526,11 @@ impl App {
             },
             AppMode::Thinking => {
                 if ctrl_key('c', 'с') {
+                    // Trigger cancellation token to stop the agent task.
+                    if let Some(ref token) = self.cancellation {
+                        token.cancel();
+                    }
+                    self.cancellation = None;
                     // Cancel the running command and return to Normal mode.
                     self.agent_running = false;
                     self.pending_input = None;
@@ -987,6 +997,11 @@ impl App {
             HelpAction::Quit => match self.mode {
                 AppMode::Normal => self.should_quit = true,
                 AppMode::Thinking => {
+                    // Trigger cancellation token to stop the agent task.
+                    if let Some(ref token) = self.cancellation {
+                        token.cancel();
+                    }
+                    self.cancellation = None;
                     self.agent_running = false;
                     self.pending_input = None;
                     self.pending_ssh = None;
@@ -1481,6 +1496,14 @@ impl App {
                     // For denied commands, the command block was already pushed
                     // by respond_to_confirmation (if confirmation was needed).
                     // For blocked commands, no block is shown — matching old behavior.
+                    //
+                    // However, if a confirmation *timed out*, the TUI is still in
+                    // Confirming mode with a stale pending_confirm. Clear it so the
+                    // user isn't stuck in a dead dialog.
+                    if denied && self.mode == AppMode::Confirming {
+                        self.pending_confirm = None;
+                        self.mode = AppMode::Normal;
+                    }
                 }
                 filar_agent::AgentEvent::Finished(text) => {
                     // Finalize streaming block with authoritative text.
@@ -1511,6 +1534,21 @@ impl App {
                     self.push_message(ChatBlock::Error(err));
                     self.mode = AppMode::Normal;
                     self.agent_running = false;
+                }
+                filar_agent::AgentEvent::Cancelled => {
+                    // Agent was cancelled via CancellationToken.
+                    // If Ctrl+C already did cleanup (agent_running == false),
+                    // this just clears the token. Otherwise, do full cleanup.
+                    self.cancellation = None;
+                    if self.agent_running {
+                        if self.streaming {
+                            self.push_message(ChatBlock::System("response interrupted".into()));
+                            self.streaming = false;
+                            auto_scroll = self.scroll == 0;
+                        }
+                        self.mode = AppMode::Normal;
+                        self.agent_running = false;
+                    }
                 }
                 _ => {} // non_exhaustive: ignore unknown agent events
             }

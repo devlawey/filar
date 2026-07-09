@@ -1247,6 +1247,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -1322,6 +1323,7 @@ dependencies = [
  "futures",
  "ratatui",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

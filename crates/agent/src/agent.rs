@@ -8,7 +8,9 @@
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use filar_core::{CommandConfirmMode, CoreError, Result};
@@ -122,6 +124,12 @@ pub struct Agent {
     on_text_delta: Option<Arc<dyn Fn(String) + Send + Sync>>,
     /// Optional event sink for emitting AgentEvents to frontends.
     event_sink: Option<EventSink>,
+    /// Optional cancellation token for user-initiated cancellation.
+    cancellation: Option<CancellationToken>,
+    /// Optional timeout for command confirmation.
+    confirm_timeout: Option<Duration>,
+    /// Optional timeout for command execution.
+    command_timeout: Option<Duration>,
 }
 
 /// Builder for [`Agent`].
@@ -135,6 +143,9 @@ pub struct AgentBuilder {
     system_prompt: Option<String>,
     on_text_delta: Option<Arc<dyn Fn(String) + Send + Sync>>,
     event_sink: Option<EventSink>,
+    cancellation: Option<CancellationToken>,
+    confirm_timeout: Option<Duration>,
+    command_timeout: Option<Duration>,
 }
 
 impl AgentBuilder {
@@ -150,6 +161,9 @@ impl AgentBuilder {
             system_prompt: None,
             on_text_delta: None,
             event_sink: None,
+            cancellation: None,
+            confirm_timeout: None,
+            command_timeout: None,
         }
     }
 
@@ -206,9 +220,40 @@ impl AgentBuilder {
     /// If set, the agent emits events at key points in the processing loop:
     /// [`AgentEvent::Started`], [`AgentEvent::TextDelta`],
     /// [`AgentEvent::CommandProposed`], [`AgentEvent::CommandFinished`],
-    /// [`AgentEvent::Finished`], and [`AgentEvent::Error`].
+    /// [`AgentEvent::Finished`], [`AgentEvent::Error`], and
+    /// [`AgentEvent::Cancelled`].
     pub fn event_sink(mut self, sink: EventSink) -> Self {
         self.event_sink = Some(sink);
+        self
+    }
+
+    /// Set a cancellation token for user-initiated cancellation.
+    ///
+    /// When the token is cancelled, the agent loop aborts at the next
+    /// `tokio::select!` checkpoint (LLM request or command execution) and
+    /// emits [`AgentEvent::Cancelled`]. If not set, the agent runs to
+    /// completion (TUI behavior — eternal wait).
+    pub fn cancellation(mut self, token: CancellationToken) -> Self {
+        self.cancellation = Some(token);
+        self
+    }
+
+    /// Set a timeout for command confirmation.
+    ///
+    /// If the confirmer does not respond within `duration`, the command is
+    /// treated as denied. Default: no timeout (eternal wait — TUI behavior).
+    pub fn confirm_timeout(mut self, duration: Duration) -> Self {
+        self.confirm_timeout = Some(duration);
+        self
+    }
+
+    /// Set a timeout for command execution.
+    ///
+    /// If the command does not complete within `duration`, it is aborted and
+    /// a timeout error is returned to the LLM. Default: no timeout (current
+    /// behavior — relies on transport-level timeouts).
+    pub fn command_timeout(mut self, duration: Duration) -> Self {
+        self.command_timeout = Some(duration);
         self
     }
 
@@ -236,6 +281,9 @@ impl AgentBuilder {
             ),
             on_text_delta: self.on_text_delta,
             event_sink: self.event_sink,
+            cancellation: self.cancellation,
+            confirm_timeout: self.confirm_timeout,
+            command_timeout: self.command_timeout,
         })
     }
 }
@@ -243,6 +291,28 @@ impl AgentBuilder {
 impl Default for AgentBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Run a future with cancellation support.
+///
+/// If a cancellation token is set, wraps the future in `tokio::select!`
+/// with `token.cancelled()`. Returns `Err("cancelled")` if cancelled.
+async fn with_cancellation<F, T>(
+    cancellation: Option<&CancellationToken>,
+    future: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match cancellation {
+        Some(token) => {
+            tokio::select! {
+                result = future => result,
+                _ = token.cancelled() => Err(CoreError::Other("cancelled".into())),
+            }
+        }
+        None => future.await,
     }
 }
 
@@ -256,6 +326,14 @@ impl Agent {
     fn emit(&self, event: AgentEvent) {
         if let Some(ref sink) = self.event_sink {
             sink(event);
+        }
+    }
+
+    /// Check whether the cancellation token has been triggered.
+    fn is_cancelled(&self) -> bool {
+        match &self.cancellation {
+            Some(token) => token.is_cancelled(),
+            None => false,
         }
     }
 
@@ -276,7 +354,11 @@ impl Agent {
                 Ok(text)
             }
             Err(e) => {
-                self.emit(AgentEvent::Error(e.to_string()));
+                if self.is_cancelled() {
+                    self.emit(AgentEvent::Cancelled);
+                } else {
+                    self.emit(AgentEvent::Error(e.to_string()));
+                }
                 Err(e)
             }
         }
@@ -307,18 +389,17 @@ impl Agent {
             let response = if self.on_text_delta.is_some() || self.event_sink.is_some() {
                 let cb = self.on_text_delta.clone();
                 let sink = self.event_sink.clone();
-                self.llm
-                    .chat_stream(&request, &move |delta: String| {
-                        if let Some(ref cb) = cb {
-                            cb(delta.clone());
-                        }
-                        if let Some(ref sink) = sink {
-                            sink(AgentEvent::TextDelta(delta));
-                        }
-                    })
-                    .await?
+                let callback = move |delta: String| {
+                    if let Some(ref cb) = cb {
+                        cb(delta.clone());
+                    }
+                    if let Some(ref sink) = sink {
+                        sink(AgentEvent::TextDelta(delta));
+                    }
+                };
+                with_cancellation(self.cancellation.as_ref(), self.llm.chat_stream(&request, &callback)).await?
             } else {
-                self.llm.chat(&request).await?
+                with_cancellation(self.cancellation.as_ref(), self.llm.chat(&request)).await?
             };
 
             if response.has_tool_calls() {
@@ -402,10 +483,28 @@ impl Agent {
                 info!(command = %parsed.command, "command auto-approved");
             }
             ConfirmDecision::NeedsConfirmation => {
-                let approved = self
+                let confirm_fut = self
                     .confirmer
-                    .confirm(&parsed.command, &parsed.explanation, destructive)
-                    .await?;
+                    .confirm(&parsed.command, &parsed.explanation, destructive);
+                let approved = if let Some(ct) = self.confirm_timeout {
+                    match tokio::time::timeout(ct, with_cancellation(self.cancellation.as_ref(), confirm_fut)).await {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            info!(command = %parsed.command, "confirmation timed out");
+                            self.emit(AgentEvent::CommandFinished {
+                                command: parsed.command.clone(),
+                                output: "Confirmation timed out".to_string(),
+                                denied: true,
+                            });
+                            return Ok(ChatMessage::tool(
+                                &tc.id,
+                                "Command confirmation timed out. Treating as denied.".to_string(),
+                            ));
+                        }
+                    }
+                } else {
+                    with_cancellation(self.cancellation.as_ref(), confirm_fut).await?
+                };
 
                 if !approved {
                     info!(command = %parsed.command, "command denied by user");
@@ -423,20 +522,58 @@ impl Agent {
             }
         }
 
-        // Execute the tool.
-        let output = match tools::execute_tool_call(&parsed, self.executor.as_ref()).await {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(command = %parsed.command, error = %e, "tool execution failed");
-                self.emit(AgentEvent::CommandFinished {
-                    command: parsed.command.clone(),
-                    output: format!("Error: {e}"),
-                    denied: false,
-                });
-                return Ok(ChatMessage::tool(
-                    &tc.id,
-                    format!("Error executing command: {e}"),
-                ));
+        // Execute the tool, with optional cancellation and command timeout.
+        let exec_fut = tools::execute_tool_call(&parsed, self.executor.as_ref());
+        let output = if let Some(ct) = self.command_timeout {
+            match tokio::time::timeout(ct, with_cancellation(self.cancellation.as_ref(), exec_fut)).await {
+                Ok(Ok(o)) => o,
+                Ok(Err(e)) if e.to_string() == "cancelled" => {
+                    // Cancellation — kill the running command.
+                    let _ = self.executor.cancel().await;
+                    return Err(e);
+                }
+                Ok(Err(e)) => {
+                    warn!(command = %parsed.command, error = %e, "tool execution failed");
+                    self.emit(AgentEvent::CommandFinished {
+                        command: parsed.command.clone(),
+                        output: format!("Error: {e}"),
+                        denied: false,
+                    });
+                    return Ok(ChatMessage::tool(
+                        &tc.id,
+                        format!("Error executing command: {e}"),
+                    ));
+                }
+                Err(_) => {
+                    warn!(command = %parsed.command, "command timed out");
+                    let _ = self.executor.cancel().await;
+                    self.emit(AgentEvent::CommandFinished {
+                        command: parsed.command.clone(),
+                        output: "Command timed out".to_string(),
+                        denied: false,
+                    });
+                    return Ok(ChatMessage::tool(&tc.id, "Command timed out.".to_string()));
+                }
+            }
+        } else {
+            match with_cancellation(self.cancellation.as_ref(), exec_fut).await {
+                Ok(o) => o,
+                Err(e) if e.to_string() == "cancelled" => {
+                    let _ = self.executor.cancel().await;
+                    return Err(e);
+                }
+                Err(e) => {
+                    warn!(command = %parsed.command, error = %e, "tool execution failed");
+                    self.emit(AgentEvent::CommandFinished {
+                        command: parsed.command.clone(),
+                        output: format!("Error: {e}"),
+                        denied: false,
+                    });
+                    return Ok(ChatMessage::tool(
+                        &tc.id,
+                        format!("Error executing command: {e}"),
+                    ));
+                }
             }
         };
 
@@ -964,5 +1101,209 @@ mod tests {
             "fourth event should be TextDelta, got {:?}", received[3]);
         assert!(matches!(&received[4], AgentEvent::Finished(text) if text == "Hello world!"),
             "last event should be Finished, got {:?}", received[4]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_emits_cancelled_event() {
+        // DoD test: agent with CancellationToken — triggering it mid-run
+        // emits Started → Cancelled and returns an error.
+        use std::sync::Mutex;
+
+        // Mock LLM that hangs forever — simulates a long LLM request.
+        struct HangingLlm;
+        #[async_trait::async_trait]
+        impl LlmClient for HangingLlm {
+            async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse> {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+
+        let llm = Arc::new(HangingLlm);
+        let executor = Arc::new(MockExecutor {
+            last_command: Mutex::new(String::new()),
+        });
+        let confirmer = Arc::new(MockConfirmer { approve: true });
+
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let sink: EventSink = Arc::new(move |event: AgentEvent| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let token = CancellationToken::new();
+        let token_clone = token.clone();
+
+        let agent = Agent::builder()
+            .llm(llm)
+            .executor(executor)
+            .confirmer(confirmer)
+            .event_sink(sink)
+            .cancellation(token)
+            .build()
+            .unwrap();
+
+        // Spawn the agent run in a task.
+        let handle = tokio::spawn(async move {
+            agent.run("test", &[]).await
+        });
+
+        // Give the agent a moment to start, then cancel.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        token_clone.cancel();
+
+        // The agent should return an error (cancelled).
+        let result = handle.await.unwrap();
+        assert!(result.is_err(), "agent should return error on cancellation");
+
+        let received = events.lock().unwrap();
+        // Expected: Started → Cancelled
+        assert_eq!(received.len(), 2, "expected 2 events, got {received:?}");
+        assert!(matches!(&received[0], AgentEvent::Started),
+            "first event should be Started, got {:?}", received[0]);
+        assert!(matches!(&received[1], AgentEvent::Cancelled),
+            "second event should be Cancelled, got {:?}", received[1]);
+    }
+
+    #[tokio::test]
+    async fn confirm_timeout_treats_as_denied() {
+        // DoD test: agent with confirm_timeout — confirmer that never
+        // responds → timeout fires, command treated as denied.
+        use std::sync::Mutex;
+
+        // Confirmer that hangs forever — never responds.
+        struct HangingConfirmer;
+        #[async_trait::async_trait]
+        impl CommandConfirmer for HangingConfirmer {
+            async fn confirm(&self, _: &str, _: &str, _: bool) -> Result<bool> {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "echo hello",
+                "explanation": "Print hello"
+            }),
+        }]);
+
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call,
+            ChatResponse::text("Done!"),
+        ]));
+
+        let executor = Arc::new(MockExecutor {
+            last_command: Mutex::new(String::new()),
+        });
+        let confirmer = Arc::new(HangingConfirmer);
+
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let sink: EventSink = Arc::new(move |event: AgentEvent| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let agent = Agent::builder()
+            .llm(llm)
+            .executor(executor)
+            .confirmer(confirmer)
+            .confirm_mode(CommandConfirmMode::Always)
+            .event_sink(sink)
+            .confirm_timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+
+        let result = agent.run("say hello", &[]).await.unwrap();
+        assert_eq!(result, "Done!");
+
+        let received = events.lock().unwrap();
+        // Expected: Started → CommandProposed → CommandFinished(denied=true, "timed out") → Finished
+        assert!(received.len() >= 3, "expected at least 3 events, got {received:?}");
+        assert!(matches!(&received[0], AgentEvent::Started),
+            "first event should be Started, got {:?}", received[0]);
+        assert!(matches!(&received[1], AgentEvent::CommandProposed { .. }),
+            "second event should be CommandProposed, got {:?}", received[1]);
+        assert!(matches!(&received[2], AgentEvent::CommandFinished { denied: true, output, .. } if output.contains("timed out")),
+            "third event should be CommandFinished with denied=true and timeout message, got {:?}", received[2]);
+    }
+
+    #[tokio::test]
+    async fn command_timeout_cancels_executor() {
+        // DoD test: agent with command_timeout — executor that hangs forever
+        // → timeout fires, executor.cancel() is called, agent continues.
+        use std::sync::Mutex;
+
+        /// Executor that hangs forever in `run()` and tracks `cancel()` calls.
+        struct HangingExecutor {
+            cancel_count: Mutex<usize>,
+        }
+
+        #[async_trait::async_trait]
+        impl CommandExecutor for HangingExecutor {
+            async fn run(&self, _command: &str) -> Result<CommandResult> {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+
+            async fn cancel(&self) -> Result<()> {
+                *self.cancel_count.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "sleep 999",
+                "explanation": "Long sleep"
+            }),
+        }]);
+
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call,
+            ChatResponse::text("Done!"),
+        ]));
+
+        let executor = Arc::new(HangingExecutor {
+            cancel_count: Mutex::new(0),
+        });
+        let confirmer = Arc::new(MockConfirmer { approve: true });
+
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let sink: EventSink = Arc::new(move |event: AgentEvent| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let agent = Agent::builder()
+            .llm(llm)
+            .executor(executor.clone())
+            .confirmer(confirmer)
+            .confirm_mode(CommandConfirmMode::Never)
+            .event_sink(sink)
+            .command_timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+
+        let result = agent.run("run sleep", &[]).await.unwrap();
+        assert_eq!(result, "Done!");
+
+        // executor.cancel() must have been called on timeout.
+        let cancel_count = *executor.cancel_count.lock().unwrap();
+        assert_eq!(cancel_count, 1, "executor.cancel() should be called once on timeout");
+
+        let received = events.lock().unwrap();
+        // Expected: Started → CommandProposed → CommandFinished(output="Command timed out") → Finished
+        assert!(received.len() >= 3, "expected at least 3 events, got {received:?}");
+        assert!(matches!(&received[0], AgentEvent::Started),
+            "first event should be Started, got {:?}", received[0]);
+        assert!(matches!(&received[1], AgentEvent::CommandProposed { .. }),
+            "second event should be CommandProposed, got {:?}", received[1]);
+        assert!(matches!(&received[2], AgentEvent::CommandFinished { denied: false, output, .. } if output.contains("timed out")),
+            "third event should be CommandFinished with timeout message, got {:?}", received[2]);
     }
 }

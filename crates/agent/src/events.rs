@@ -54,6 +54,13 @@ pub enum AgentEvent {
 
     /// The agent encountered an error (network, LLM, transport).
     Error(String),
+
+    /// The agent was cancelled by the user via a `CancellationToken`.
+    ///
+    /// This is a terminal event — no further events will be emitted after it.
+    /// The chat history remains consistent: any partial response or tool result
+    /// produced before cancellation is preserved.
+    Cancelled,
 }
 
 /// A callback for delivering [`AgentEvent`]s to a frontend.

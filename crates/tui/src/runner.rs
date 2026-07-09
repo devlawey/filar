@@ -20,6 +20,7 @@ use tracing::{error, info, warn};
 use filar_agent::{AgentBuilder, CommandConfirmer, LlmClient};
 use filar_core::{CommandConfirmMode, CoreError, Result};
 use filar_transport::{CommandExecutor, InteractiveTerminal, LocalInteractive, SshInteractive};
+use tokio_util::sync::CancellationToken;
 
 use crate::app::{App, AppMode};
 use crate::confirmer::TuiConfirmer;
@@ -386,6 +387,9 @@ async fn run_app(
                             app.agent_running = false;
                         }
                     } else {
+                        // Create a cancellation token for this agent run.
+                        let cancel_token = CancellationToken::new();
+                        app.cancellation = Some(cancel_token.clone());
                         spawn_agent(
                             llm.clone(),
                             tui_executor.clone(),
@@ -396,6 +400,7 @@ async fn run_app(
                             agent_tx.clone(),
                             is_local,
                             ssh_info.clone(),
+                            cancel_token,
                         );
                     }
                 }
@@ -575,6 +580,7 @@ fn spawn_agent(
     event_tx: mpsc::UnboundedSender<TuiEvent>,
     is_local: bool,
     ssh_info: Option<String>,
+    cancellation: CancellationToken,
 ) {
     let tx = event_tx.clone();
 
@@ -629,7 +635,8 @@ fn spawn_agent(
             .executor(executor)
             .confirmer(confirmer)
             .confirm_mode(confirm_mode)
-            .event_sink(sink);
+            .event_sink(sink)
+            .cancellation(cancellation);
         if is_local {
             builder = builder.local_mode();
         } else {
