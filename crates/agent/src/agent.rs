@@ -1229,4 +1229,81 @@ mod tests {
         assert!(matches!(&received[2], AgentEvent::CommandFinished { denied: true, output, .. } if output.contains("timed out")),
             "third event should be CommandFinished with denied=true and timeout message, got {:?}", received[2]);
     }
+
+    #[tokio::test]
+    async fn command_timeout_cancels_executor() {
+        // DoD test: agent with command_timeout — executor that hangs forever
+        // → timeout fires, executor.cancel() is called, agent continues.
+        use std::sync::Mutex;
+
+        /// Executor that hangs forever in `run()` and tracks `cancel()` calls.
+        struct HangingExecutor {
+            cancel_count: Mutex<usize>,
+        }
+
+        #[async_trait::async_trait]
+        impl CommandExecutor for HangingExecutor {
+            async fn run(&self, _command: &str) -> Result<CommandResult> {
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+
+            async fn cancel(&self) -> Result<()> {
+                *self.cancel_count.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "sleep 999",
+                "explanation": "Long sleep"
+            }),
+        }]);
+
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call,
+            ChatResponse::text("Done!"),
+        ]));
+
+        let executor = Arc::new(HangingExecutor {
+            cancel_count: Mutex::new(0),
+        });
+        let confirmer = Arc::new(MockConfirmer { approve: true });
+
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let sink: EventSink = Arc::new(move |event: AgentEvent| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let agent = Agent::builder()
+            .llm(llm)
+            .executor(executor.clone())
+            .confirmer(confirmer)
+            .confirm_mode(CommandConfirmMode::Never)
+            .event_sink(sink)
+            .command_timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+
+        let result = agent.run("run sleep", &[]).await.unwrap();
+        assert_eq!(result, "Done!");
+
+        // executor.cancel() must have been called on timeout.
+        let cancel_count = *executor.cancel_count.lock().unwrap();
+        assert_eq!(cancel_count, 1, "executor.cancel() should be called once on timeout");
+
+        let received = events.lock().unwrap();
+        // Expected: Started → CommandProposed → CommandFinished(output="Command timed out") → Finished
+        assert!(received.len() >= 3, "expected at least 3 events, got {received:?}");
+        assert!(matches!(&received[0], AgentEvent::Started),
+            "first event should be Started, got {:?}", received[0]);
+        assert!(matches!(&received[1], AgentEvent::CommandProposed { .. }),
+            "second event should be CommandProposed, got {:?}", received[1]);
+        assert!(matches!(&received[2], AgentEvent::CommandFinished { denied: false, output, .. } if output.contains("timed out")),
+            "third event should be CommandFinished with timeout message, got {:?}", received[2]);
+    }
 }

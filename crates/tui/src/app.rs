@@ -1496,6 +1496,14 @@ impl App {
                     // For denied commands, the command block was already pushed
                     // by respond_to_confirmation (if confirmation was needed).
                     // For blocked commands, no block is shown — matching old behavior.
+                    //
+                    // However, if a confirmation *timed out*, the TUI is still in
+                    // Confirming mode with a stale pending_confirm. Clear it so the
+                    // user isn't stuck in a dead dialog.
+                    if denied && self.mode == AppMode::Confirming {
+                        self.pending_confirm = None;
+                        self.mode = AppMode::Normal;
+                    }
                 }
                 filar_agent::AgentEvent::Finished(text) => {
                     // Finalize streaming block with authoritative text.

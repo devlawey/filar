@@ -1367,8 +1367,17 @@ issue. Если чего-то не хватает — дополнить.
 - `crates/tui/src/app.rs` — `cancellation` field, Ctrl+C handler, `Cancelled` handler
 - `crates/tui/src/runner.rs` — `spawn_agent` принимает `CancellationToken`
 
-**Тесты:** 252 passed, 0 failed, 5 ignored.
+**Тесты:** 253 passed, 0 failed, 5 ignored.
 
 **Публичные контракты:**
 - `AgentEvent` — новый вариант `Cancelled` (non-breaking, `#[non_exhaustive]`).
 - `AgentBuilder` — новые методы: `cancellation()`, `confirm_timeout()`, `command_timeout()`.
+
+### Review fixes (PR #53, CodeRabbit)
+
+- **Stale confirmation dialog на таймауте**: при `confirm_timeout` TUI оставался в
+  `Confirming` mode с зависшим диалогом. Добавлена очистка `pending_confirm` и возврат
+  в `Normal` при получении `CommandFinished { denied: true }` в `Confirming` mode.
+- **Тест на `command_timeout`**: добавлен `command_timeout_cancels_executor` —
+  `HangingExecutor` + `command_timeout(100ms)` → `executor.cancel()` вызывается,
+  `CommandFinished` содержит "timed out", агент продолжает работу.
