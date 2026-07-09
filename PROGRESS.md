@@ -1381,3 +1381,66 @@ issue. Если чего-то не хватает — дополнить.
 - **Тест на `command_timeout`**: добавлен `command_timeout_cancels_executor` —
   `HangingExecutor` + `command_timeout(100ms)` → `executor.cancel()` вызывается,
   `CommandFinished` содержит "timed out", агент продолжает работу.
+
+### Issue #46: SecretProvider — секреты не только из env (Engine 0.4)
+
+**Задача:** вынести чтение секретов за пределы `std::env::var`, подготовив движок
+к внешним фронтендам (бот, мобилка). Перенести подстановку `$FILAR_SECRET_N`
+и санитизацию вывода из TUI в движок.
+
+**Что сделано:**
+
+1. **`filar-core::secrets`** — добавлен трейт `SecretProvider` с методами `get(name)`
+   и `secret_names()`. Две реализации:
+   - `EnvSecretProvider` — читает из `std::env` (дефолт для TUI/десктопа).
+   - `StaticSecretProvider` — in-memory `HashMap` через `Arc<RwLock<…>>`,
+     mutable, zeroize на drop (последний клон).
+2. **`filar-transport::secret::SecretSubstitutingExecutor`** — обёртка над
+   `CommandExecutor`: подстановка `$FILAR_SECRET_N` перед выполнением, маскирование
+   значений в stdout/stderr после.
+3. **`filar-agent::glm::GlmClient::new_with_provider`** — получает API-ключ через
+   `SecretProvider`, без прямого `std::env::var`.
+4. **`AgentBuilder::secret_provider()`** — принимает `Arc<dyn SecretProvider>`,
+   в `build()` оборачивает executor в `SecretSubstitutingExecutor`.
+5. **`main.rs`** — создаёт `StaticSecretProvider`, загружает API-ключ,
+   передаёт в TUI через `TuiConfig.secret_provider`.
+6. **TUI runner** — `TuiExecutor` упрощён (только swapping), подстановка/санитизация
+   теперь в `SecretSubstitutingExecutor` (движок).
+7. **`App`** — `secrets` заменён с `Arc<Mutex<HashMap>>` на `Arc<StaticSecretProvider>`.
+8. **`zeroize` crate** добавлен в workspace + `filar-core`.
+
+**Изменённые файлы:**
+- `Cargo.toml` — `zeroize` dependency
+- `crates/core/Cargo.toml` — `zeroize` dependency
+- `crates/core/src/secrets.rs` — `SecretProvider` trait, `EnvSecretProvider`,
+  `StaticSecretProvider`, 11 тестов
+- `crates/core/src/lib.rs` — re-export `SecretProvider`, `EnvSecretProvider`, `StaticSecretProvider`
+- `crates/transport/src/secret.rs` — новый файл: `SecretSubstitutingExecutor` + 5 тестов
+- `crates/transport/src/lib.rs` — модуль + re-export `SecretSubstitutingExecutor`
+- `crates/agent/src/glm.rs` — `new_with_provider()` конструктор
+- `crates/agent/src/agent.rs` — `secret_provider` field + builder method + `build()` wrapping
+- `crates/app/src/main.rs` — `StaticSecretProvider` creation + `GlmClient::new_with_provider`
+- `crates/tui/src/runner.rs` — `TuiConfig.secret_provider`, `TuiExecutor` упрощён,
+  `spawn_agent` принимает `secret_provider`
+- `crates/tui/src/app.rs` — `Arc<StaticSecretProvider>` вместо `Arc<Mutex<HashMap>>`
+
+**Тесты:** 274 passed, 0 failed, 5 ignored.
+
+**Публичные контракты:**
+- `filar_core::SecretProvider` — новый трейт (`get`, `secret_names`).
+- `filar_core::EnvSecretProvider`, `filar_core::StaticSecretProvider` — новые типы.
+- `filar_transport::SecretSubstitutingExecutor` — новый `CommandExecutor` wrapper.
+- `filar_agent::glm::GlmClient::new_with_provider` — новый конструктор.
+- `filar_agent::AgentBuilder::secret_provider` — новый builder method.
+- `filar_tui::TuiConfig` — новое поле `secret_provider: Arc<StaticSecretProvider>`.
+
+**Review fixes (PR #54, CodeRabbit):**
+- `StaticSecretProvider::insert()` — zeroize старого значения при перезаписи.
+- `StaticSecretProvider::remove()` — возврат `bool` вместо `Option<String>`, zeroize внутри.
+- `SecretSubstitutingExecutor::run()` — фильтр только `$`-префиксных имён (API key не подставляется).
+- `SecretSubstitutingExecutor::run()` — sort по убыванию длины (защита от substring collision `$FILAR_SECRET_1` vs `_10`).
+- `SecretSubstitutingExecutor::run()` — санитизация error path (маскировка секрета в сообщении об ошибке).
+- `runner.rs` — `app.secrets = config.secret_provider.clone()` (общий экземпляр провайдера).
+- `runner.rs` — shell-escape `!cmd` обёрнут в `SecretSubstitutingExecutor`.
+- `TuiConfig.secret_provider` — тип изменён с `Arc<dyn SecretProvider>` на `Arc<StaticSecretProvider>`.
+- Добавлены 3 теста: error sanitization, substring collision, API key exclusion.

@@ -13,8 +13,8 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use filar_core::{CommandConfirmMode, CoreError, Result};
-use filar_transport::CommandExecutor;
+use filar_core::{CommandConfirmMode, CoreError, Result, SecretProvider};
+use filar_transport::{CommandExecutor, SecretSubstitutingExecutor};
 
 use crate::{
     events::{AgentEvent, EventSink},
@@ -130,6 +130,11 @@ pub struct Agent {
     confirm_timeout: Option<Duration>,
     /// Optional timeout for command execution.
     command_timeout: Option<Duration>,
+    /// Optional secret provider (stored for potential future use).
+    /// The executor is already wrapped in `SecretSubstitutingExecutor`
+    /// during `build()` if this is set.
+    #[allow(dead_code)]
+    secret_provider: Option<Arc<dyn SecretProvider>>,
 }
 
 /// Builder for [`Agent`].
@@ -146,6 +151,7 @@ pub struct AgentBuilder {
     cancellation: Option<CancellationToken>,
     confirm_timeout: Option<Duration>,
     command_timeout: Option<Duration>,
+    secret_provider: Option<Arc<dyn SecretProvider>>,
 }
 
 impl AgentBuilder {
@@ -164,6 +170,7 @@ impl AgentBuilder {
             cancellation: None,
             confirm_timeout: None,
             command_timeout: None,
+            secret_provider: None,
         }
     }
 
@@ -257,6 +264,17 @@ impl AgentBuilder {
         self
     }
 
+    /// Set a secret provider for command substitution and output sanitisation.
+    ///
+    /// When set, the executor is wrapped in [`SecretSubstitutingExecutor`] during
+    /// [`build`](Self::build). `$FILAR_SECRET_N` placeholders in commands are
+    /// replaced with actual values from the provider before execution, and
+    /// secret values in command output are masked back to placeholders.
+    pub fn secret_provider(mut self, provider: Arc<dyn SecretProvider>) -> Self {
+        self.secret_provider = Some(provider);
+        self
+    }
+
     /// Convenience: set the system prompt for local execution.
     pub fn local_mode(self) -> Self {
         self.system_prompt(build_system_prompt(true, None, cfg!(windows)))
@@ -269,9 +287,16 @@ impl AgentBuilder {
 
     /// Build the agent.
     pub fn build(self) -> Result<Agent> {
+        let executor = self.executor.ok_or_else(|| CoreError::Other("executor not set".into()))?;
+        // Wrap the executor in SecretSubstitutingExecutor if a provider is set.
+        let secret_provider = self.secret_provider;
+        let executor: Arc<dyn CommandExecutor> = match &secret_provider {
+            Some(provider) => Arc::new(SecretSubstitutingExecutor::new(executor, provider.clone())),
+            None => executor,
+        };
         Ok(Agent {
             llm: self.llm.ok_or_else(|| CoreError::Other("LLM client not set".into()))?,
-            executor: self.executor.ok_or_else(|| CoreError::Other("executor not set".into()))?,
+            executor,
             confirmer: self.confirmer.ok_or_else(|| CoreError::Other("confirmer not set".into()))?,
             confirm_mode: self.confirm_mode,
             max_iterations: self.max_iterations,
@@ -284,6 +309,7 @@ impl AgentBuilder {
             cancellation: self.cancellation,
             confirm_timeout: self.confirm_timeout,
             command_timeout: self.command_timeout,
+            secret_provider,
         })
     }
 }

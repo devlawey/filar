@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 
 use filar_agent::glm::GlmClient;
 use filar_agent::LlmClient;
-use filar_core::{secrets, Config, SessionStore};
+use filar_core::{secrets, Config, SessionStore, StaticSecretProvider};
 use filar_transport::{LocalExecutor, SshExecutor};
 use filar_tui::TuiConfig;
 
@@ -264,10 +264,17 @@ async fn run() -> anyhow::Result<()> {
         anyhow::bail!("API key is required. Enter it in the GUI launcher or set the GLM_API_KEY environment variable.");
     }
 
-    let llm: Arc<dyn LlmClient> = Arc::new(GlmClient::new_with_key(
+    // ── Create SecretProvider ──────────────────────────────────────────
+    // The StaticSecretProvider holds the API key and will also hold dynamic
+    // $FILAR_SECRET_N variables added at runtime (via Ctrl+P in the TUI).
+    let secret_provider = Arc::new(StaticSecretProvider::new());
+    secret_provider.insert(secrets::env_vars::GLM_API_KEY, &api_key);
+
+    let llm: Arc<dyn LlmClient> = Arc::new(GlmClient::new_with_provider(
         &llm_config,
         Duration::from_secs(config.timeouts.llm_secs),
-        &api_key,
+        secrets::env_vars::GLM_API_KEY,
+        &*secret_provider,
     )?);
 
     info!(model = %llm_config.model, "LLM client initialised");
@@ -327,6 +334,7 @@ async fn run() -> anyhow::Result<()> {
         initial_messages,
         ssh_target: ssh_target.clone(),
         is_local: ssh_target.is_none(),
+        secret_provider,
     };
 
     info!("launching TUI");
