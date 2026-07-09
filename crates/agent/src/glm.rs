@@ -562,13 +562,16 @@ impl ApiResponse {
                         }
                     })
                     .collect();
-                return Ok(ChatResponse::ToolCalls(parsed));
+                return Ok(ChatResponse::tool_calls(
+                    choice.message.content.unwrap_or_default(),
+                    parsed,
+                ));
             }
         }
 
         // Otherwise, return the text content.
         let text = choice.message.content.unwrap_or_default();
-        Ok(ChatResponse::Text(text))
+        Ok(ChatResponse::text(text))
     }
 }
 
@@ -727,9 +730,9 @@ impl SseState {
                     }
                 })
                 .collect();
-            Ok(ChatResponse::ToolCalls(calls))
+            Ok(ChatResponse::tool_calls(self.full_text, calls))
         } else {
-            Ok(ChatResponse::Text(self.full_text))
+            Ok(ChatResponse::text(self.full_text))
         }
     }
 }
@@ -805,10 +808,8 @@ mod tests {
         });
         let resp: ApiResponse = serde_json::from_value(raw).unwrap();
         let result = resp.try_into_chat_response().unwrap();
-        match result {
-            ChatResponse::Text(text) => assert_eq!(text, "Hello! How can I help?"),
-            _ => panic!("expected Text response"),
-        }
+        assert!(!result.has_tool_calls(), "expected Text response");
+        assert_eq!(result.text, "Hello! How can I help?");
     }
 
     #[test]
@@ -832,15 +833,12 @@ mod tests {
         });
         let resp: ApiResponse = serde_json::from_value(raw).unwrap();
         let result = resp.try_into_chat_response().unwrap();
-        match result {
-            ChatResponse::ToolCalls(calls) => {
-                assert_eq!(calls.len(), 1);
-                assert_eq!(calls[0].id, "call_abc123");
-                assert_eq!(calls[0].name, "run_command");
-                assert_eq!(calls[0].arguments["command"], "ls -la");
-            }
-            _ => panic!("expected ToolCalls response"),
-        }
+        assert!(result.has_tool_calls(), "expected ToolCalls response");
+        let calls = &result.tool_calls;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_abc123");
+        assert_eq!(calls[0].name, "run_command");
+        assert_eq!(calls[0].arguments["command"], "ls -la");
     }
 
     #[test]
@@ -868,14 +866,11 @@ mod tests {
         });
         let resp: ApiResponse = serde_json::from_value(raw).unwrap();
         let result = resp.try_into_chat_response().unwrap();
-        match result {
-            ChatResponse::ToolCalls(calls) => {
-                assert_eq!(calls.len(), 2);
-                assert_eq!(calls[0].name, "list_dir");
-                assert_eq!(calls[1].name, "run_command");
-            }
-            _ => panic!("expected ToolCalls response"),
-        }
+        assert!(result.has_tool_calls(), "expected ToolCalls response");
+        let calls = &result.tool_calls;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "list_dir");
+        assert_eq!(calls[1].name, "run_command");
     }
 
     #[test]
@@ -908,13 +903,9 @@ mod tests {
         };
 
         let response = client.chat(&request).await.expect("chat request failed");
-        match response {
-            ChatResponse::Text(text) => {
-                assert!(!text.is_empty(), "response text should not be empty");
-                println!("Smoke test text response: {text}");
-            }
-            _ => panic!("expected Text response, got ToolCalls"),
-        }
+        assert!(!response.has_tool_calls(), "expected Text response, got ToolCalls");
+        assert!(!response.text.is_empty(), "response text should not be empty");
+        println!("Smoke test text response: {}", response.text);
     }
 
     #[cfg(feature = "smoke")]
@@ -950,15 +941,12 @@ mod tests {
         };
 
         let response = client.chat(&request).await.expect("chat request failed");
-        match response {
-            ChatResponse::ToolCalls(calls) => {
-                assert!(!calls.is_empty(), "expected at least one tool call");
-                println!("Smoke test tool call: {} → {}", calls[0].name, calls[0].arguments);
-            }
-            ChatResponse::Text(text) => {
-                // Some models may answer in text instead of calling a tool.
-                println!("Model responded with text instead of tool call: {text}");
-            }
+        if response.has_tool_calls() {
+            assert!(!response.tool_calls.is_empty(), "expected at least one tool call");
+            println!("Smoke test tool call: {} → {}", response.tool_calls[0].name, response.tool_calls[0].arguments);
+        } else {
+            // Some models may answer in text instead of calling a tool.
+            println!("Model responded with text instead of tool call: {}", response.text);
         }
     }
 
@@ -989,10 +977,8 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         assert!(state.done);
 
         let response = state.into_response().unwrap();
-        match response {
-            ChatResponse::Text(text) => assert_eq!(text, "Hello world"),
-            _ => panic!("expected Text response"),
-        }
+        assert!(!response.has_tool_calls(), "expected Text response");
+        assert_eq!(response.text, "Hello world");
     }
 
     #[test]
@@ -1015,15 +1001,12 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         state.process_chunk("data: [DONE]\n\n");
 
         let response = state.into_response().unwrap();
-        match response {
-            ChatResponse::ToolCalls(calls) => {
-                assert_eq!(calls.len(), 1);
-                assert_eq!(calls[0].id, "call_1");
-                assert_eq!(calls[0].name, "run_command");
-                assert_eq!(calls[0].arguments["command"], "ls");
-            }
-            _ => panic!("expected ToolCalls response"),
-        }
+        assert!(response.has_tool_calls(), "expected ToolCalls response");
+        let calls = &response.tool_calls;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "run_command");
+        assert_eq!(calls[0].arguments["command"], "ls");
     }
 
     #[test]
@@ -1039,16 +1022,13 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         state.process_chunk("data: [DONE]\n\n");
 
         let response = state.into_response().unwrap();
-        match response {
-            ChatResponse::ToolCalls(calls) => {
-                assert_eq!(calls.len(), 2);
-                assert_eq!(calls[0].id, "c1");
-                assert_eq!(calls[0].name, "run_command");
-                assert_eq!(calls[1].id, "c2");
-                assert_eq!(calls[1].name, "list_dir");
-            }
-            _ => panic!("expected ToolCalls response"),
-        }
+        assert!(response.has_tool_calls(), "expected ToolCalls response");
+        let calls = &response.tool_calls;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].name, "run_command");
+        assert_eq!(calls[1].id, "c2");
+        assert_eq!(calls[1].name, "list_dir");
     }
 
     #[test]
@@ -1066,25 +1046,22 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         );
         state.process_chunk("data: [DONE]\n\n");
 
-        // Final response is ToolCalls (tool_calls take precedence).
+        // Final response has tool_calls (tool_calls take precedence).
         let response = state.into_response().unwrap();
-        match response {
-            ChatResponse::ToolCalls(calls) => {
-                assert_eq!(calls.len(), 1);
-                assert_eq!(calls[0].name, "run_command");
-            }
-            _ => panic!("expected ToolCalls response"),
-        }
+        assert!(response.has_tool_calls(), "expected ToolCalls response");
+        let calls = &response.tool_calls;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "run_command");
+        // The text preamble should be preserved.
+        assert_eq!(response.text, "Let me check.");
     }
 
     #[test]
     fn sse_parse_empty_stream() {
         let state = SseState::new();
         let response = state.into_response().unwrap();
-        match response {
-            ChatResponse::Text(text) => assert!(text.is_empty()),
-            _ => panic!("expected Text response"),
-        }
+        assert!(!response.has_tool_calls(), "expected Text response");
+        assert!(response.text.is_empty());
     }
 
     #[test]
@@ -1111,10 +1088,8 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         state.process_chunk("data: not-json\n\n");
         state.process_chunk("data: [DONE]\n\n");
         let response = state.into_response().unwrap();
-        match response {
-            ChatResponse::Text(text) => assert!(text.is_empty()),
-            _ => panic!("expected Text response"),
-        }
+        assert!(!response.has_tool_calls(), "expected Text response");
+        assert!(response.text.is_empty());
     }
 
     #[test]
@@ -1126,10 +1101,8 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         assert!(d1.is_empty(), "no complete line yet");
         state.process_chunk("\"}}]}\n\n");
         let response = state.into_response().unwrap();
-        match response {
-            ChatResponse::Text(text) => assert_eq!(text, "Hi"),
-            _ => panic!("expected Text response"),
-        }
+        assert!(!response.has_tool_calls(), "expected Text response");
+        assert_eq!(response.text, "Hi");
     }
 
     #[test]
@@ -1151,10 +1124,8 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         let d3 = state.flush();
         assert_eq!(&d3, &["end".to_string()]);
         let response = state.into_response().unwrap();
-        match response {
-            ChatResponse::Text(text) => assert_eq!(text, "Helloend"),
-            _ => panic!("expected Text response"),
-        }
+        assert!(!response.has_tool_calls(), "expected Text response");
+        assert_eq!(response.text, "Helloend");
     }
 
     #[test]
@@ -1171,10 +1142,8 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         assert!(deltas.is_empty(), "[DONE] produces no text deltas");
         assert!(state.done, "flush should set done flag");
         let response = state.into_response().unwrap();
-        match response {
-            ChatResponse::Text(text) => assert_eq!(text, "ok"),
-            _ => panic!("expected Text response"),
-        }
+        assert!(!response.has_tool_calls(), "expected Text response");
+        assert_eq!(response.text, "ok");
     }
 
     #[test]
@@ -1184,10 +1153,8 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         let deltas = state.flush();
         assert!(deltas.is_empty());
         let response = state.into_response().unwrap();
-        match response {
-            ChatResponse::Text(text) => assert!(text.is_empty()),
-            _ => panic!("expected Text response"),
-        }
+        assert!(!response.has_tool_calls(), "expected Text response");
+        assert!(response.text.is_empty());
     }
 
     #[test]
@@ -1224,9 +1191,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
 
         assert_eq!(&collected_deltas, &["end".to_string()]);
         let response = state.into_response().unwrap();
-        match response {
-            ChatResponse::Text(text) => assert_eq!(text, "end"),
-            _ => panic!("expected Text response"),
-        }
+        assert!(!response.has_tool_calls(), "expected Text response");
+        assert_eq!(response.text, "end");
     }
 }

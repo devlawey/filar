@@ -23,7 +23,7 @@ use filar_transport::{CommandExecutor, InteractiveTerminal, LocalInteractive, Ss
 
 use crate::app::{App, AppMode};
 use crate::confirmer::TuiConfirmer;
-use crate::event::AgentEvent;
+use crate::event::TuiEvent;
 use crate::terminal::TerminalModel;
 use crate::ui;
 use filar_core::ChatBlock;
@@ -32,14 +32,15 @@ use filar_core::ChatBlock;
 // TuiExecutor — wraps an executor and emits events
 // ---------------------------------------------------------------------------
 
-/// A [`CommandExecutor`] wrapper that sends [`AgentEvent::CommandExecuted`]
-/// events to the TUI whenever a command is executed.
+/// A [`CommandExecutor`] wrapper that handles secret substitution and
+/// output sanitization.
 ///
 /// The inner executor is swappable at runtime, allowing the transport
 /// to switch from local to SSH (or vice versa) without restarting the app.
+/// Command execution events are emitted by the agent via `EventSink`, not
+/// by this wrapper.
 struct TuiExecutor {
     inner: Arc<tokio::sync::RwLock<Arc<dyn CommandExecutor>>>,
-    event_tx: mpsc::UnboundedSender<AgentEvent>,
     /// Shared secret variables for command substitution.
     secrets: Arc<Mutex<HashMap<String, String>>>,
 }
@@ -87,25 +88,6 @@ impl CommandExecutor for TuiExecutor {
                 }
             }
         }
-
-        // Build output string for the UI (also sanitized).
-        let mut output = result.stdout.clone();
-        if !result.stderr.is_empty() {
-            output.push_str("\n[stderr] ");
-            output.push_str(&result.stderr);
-        }
-        if let Some(code) = result.exit_code {
-            if code != 0 {
-                output.push_str(&format!("\n[exit code: {code}]"));
-            }
-        }
-
-        // Display the ORIGINAL command (with $FILAR_SECRET_N) in the UI.
-        let _ = self.event_tx.send(AgentEvent::CommandExecuted {
-            command: command.to_string(),
-            output,
-            approved: true,
-        });
 
         Ok(result)
     }
@@ -237,7 +219,7 @@ async fn run_app(
     };
 
     // Channel for agent → UI events.
-    let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<TuiEvent>();
 
     // Build SSH info string for the system prompt (e.g. "user@host:port").
     let mut ssh_info = config.ssh_target.as_ref().map(|t| {
@@ -251,7 +233,6 @@ async fn run_app(
     let confirmer = Arc::new(TuiConfirmer::new(agent_tx.clone()));
     let tui_executor = Arc::new(TuiExecutor {
         inner: Arc::new(tokio::sync::RwLock::new(executor)),
-        event_tx: agent_tx.clone(),
         secrets: shared_secrets,
     });
 
@@ -360,13 +341,39 @@ async fn run_app(
                             let exec = tui_executor.clone();
                             let tx = agent_tx.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = exec.run(&cmd).await {
-                                    let _ = tx.send(AgentEvent::Error(
-                                        format!("Shell command failed: {e}")
-                                    ));
+                                match exec.run(&cmd).await {
+                                    Ok(result) => {
+                                        // Build display output from CommandResult.
+                                        let mut output = result.stdout.clone();
+                                        if !result.stderr.is_empty() {
+                                            output.push_str("\n[stderr] ");
+                                            output.push_str(&result.stderr);
+                                        }
+                                        if let Some(code) = result.exit_code {
+                                            if code != 0 {
+                                                output.push_str(&format!("\n[exit code: {code}]"));
+                                            }
+                                        }
+                                        let _ = tx.send(TuiEvent::Agent(
+                                            filar_agent::AgentEvent::CommandFinished {
+                                                command: cmd.clone(),
+                                                output,
+                                                denied: false,
+                                            }
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(TuiEvent::Agent(
+                                            filar_agent::AgentEvent::Error(
+                                                format!("Shell command failed: {e}")
+                                            )
+                                        ));
+                                    }
                                 }
                                 // Signal completion to return to Normal mode.
-                                let _ = tx.send(AgentEvent::Finished(String::new()));
+                                let _ = tx.send(TuiEvent::Agent(
+                                    filar_agent::AgentEvent::Finished(String::new())
+                                ));
                             });
                         } else {
                             // Empty command after ! — just return to normal.
@@ -394,7 +401,7 @@ async fn run_app(
                         let tx = agent_tx.clone();
                         let exec_clone = tui_executor.clone();
                         tokio::spawn(async move {
-                            let _ = tx.send(AgentEvent::Thinking);
+                            let _ = tx.send(TuiEvent::Thinking);
                             let target = filar_core::SshTarget {
                                 name: "dynamic".into(),
                                 host: host.clone(),
@@ -414,19 +421,23 @@ async fn run_app(
                                         .await;
                                     // Notify runner to update system prompt info.
                                     let new_ssh_info = format!("{user}@{host}:{port}");
-                                    let _ = tx.send(AgentEvent::TransportChanged {
+                                    let _ = tx.send(TuiEvent::TransportChanged {
                                         is_local: false,
                                         ssh_info: Some(new_ssh_info),
                                     });
-                                    let _ = tx.send(AgentEvent::Finished(format!(
-                                        "Connected to {user}@{host}:{port} via SSH. \
-                                         You are now operating on the remote machine."
-                                    )));
+                                    let _ = tx.send(TuiEvent::Agent(
+                                        filar_agent::AgentEvent::Finished(format!(
+                                            "Connected to {user}@{host}:{port} via SSH. \
+                                             You are now operating on the remote machine."
+                                        ))
+                                    ));
                                 }
                                 Err(e) => {
-                                    let _ = tx.send(AgentEvent::Error(format!(
-                                        "SSH connection failed: {e}"
-                                    )));
+                                    let _ = tx.send(TuiEvent::Agent(
+                                        filar_agent::AgentEvent::Error(format!(
+                                            "SSH connection failed: {e}"
+                                        ))
+                                    ));
                                 }
                             }
                         });
@@ -441,14 +452,14 @@ async fn run_app(
             // Agent event (only when not in interactive mode).
             maybe_agent_event = async {
                 if in_interactive {
-                    std::future::pending::<Option<AgentEvent>>().await
+                    std::future::pending::<Option<TuiEvent>>().await
                 } else {
                     agent_rx.recv().await
                 }
             } => {
                 if let Some(event) = maybe_agent_event {
                     // Intercept TransportChanged to update system prompt info.
-                    if let AgentEvent::TransportChanged { is_local: new_local, ssh_info: new_ssh } = &event {
+                    if let TuiEvent::TransportChanged { is_local: new_local, ssh_info: new_ssh } = &event {
                         is_local = *new_local;
                         ssh_info = new_ssh.clone();
                         app.target_name = new_ssh.clone().unwrap_or_else(|| "local".into());
@@ -556,16 +567,15 @@ fn spawn_agent(
     confirm_mode: CommandConfirmMode,
     user_input: String,
     chat_history: Vec<ChatBlock>,
-    event_tx: mpsc::UnboundedSender<AgentEvent>,
+    event_tx: mpsc::UnboundedSender<TuiEvent>,
     is_local: bool,
     ssh_info: Option<String>,
 ) {
     let tx = event_tx.clone();
 
     tokio::spawn(async move {
-        // Notify UI that the agent started.
-        let _ = tx.send(AgentEvent::Started);
-        let _ = tx.send(AgentEvent::Thinking);
+        // TUI-specific: show spinner before the first text delta arrives.
+        let _ = tx.send(TuiEvent::Thinking);
 
         // Convert chat history (ChatBlock) to LLM messages (ChatMessage).
         // Only User and Agent blocks are included — command blocks and system
@@ -600,41 +610,41 @@ fn spawn_agent(
             })
             .collect();
 
+        // Set up EventSink: forward agent events to the TUI channel.
+        // The agent emits Started, TextDelta, CommandProposed, CommandFinished,
+        // Finished, and Error via this sink.
+        let tx_for_sink = tx.clone();
+        let sink: filar_agent::EventSink = Arc::new(move |event: filar_agent::AgentEvent| {
+            let _ = tx_for_sink.send(TuiEvent::Agent(event));
+        });
+
         // Build the agent with appropriate system prompt.
         let mut builder = AgentBuilder::new()
             .llm(llm)
             .executor(executor)
             .confirmer(confirmer)
-            .confirm_mode(confirm_mode);
+            .confirm_mode(confirm_mode)
+            .event_sink(sink);
         if is_local {
             builder = builder.local_mode();
         } else {
             builder = builder.ssh_mode(ssh_info.as_deref());
         }
 
-        // Set up streaming callback: send TextDelta events to the TUI.
-        let tx_for_delta = tx.clone();
-        let on_text_delta: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |delta: String| {
-            let _ = tx_for_delta.send(AgentEvent::TextDelta(delta));
-        });
-        builder = builder.on_text_delta(on_text_delta);
-
         let agent = match builder.build() {
             Ok(a) => a,
             Err(e) => {
-                let _ = tx.send(AgentEvent::Error(e.to_string()));
+                let _ = tx.send(TuiEvent::Agent(
+                    filar_agent::AgentEvent::Error(e.to_string())
+                ));
                 return;
             }
         };
 
-        // Run the agent loop.
-        match agent.run(&user_input, &history).await {
-            Ok(result) => {
-                let _ = tx.send(AgentEvent::Finished(result));
-            }
-            Err(e) => {
-                let _ = tx.send(AgentEvent::Error(e.to_string()));
-            }
-        }
+        // Run the agent loop. All events (Started, TextDelta, CommandProposed,
+        // CommandFinished, Finished, Error) are emitted via the EventSink.
+        // The run() wrapper emits Finished on Ok and Error on Err, so we
+        // don't need to send them again here.
+        let _ = agent.run(&user_input, &history).await;
     });
 }

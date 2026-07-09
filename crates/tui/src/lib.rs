@@ -17,7 +17,7 @@ pub mod ui;
 // Re-export key types.
 pub use app::{App, AppMode};
 pub use confirmer::TuiConfirmer;
-pub use event::AgentEvent;
+pub use event::TuiEvent;
 pub use runner::{run, TuiConfig};
 pub use terminal::{key_to_bytes, TerminalModel};
 pub use filar_core::ChatBlock;

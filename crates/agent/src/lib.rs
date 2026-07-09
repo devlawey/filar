@@ -7,12 +7,14 @@
 //! - Security layer: confirmation, destructive command detection (Stage 5).
 
 pub mod agent;
+pub mod events;
 pub mod glm;
 pub mod security;
 pub mod tools;
 
 // Re-export key types for convenience.
 pub use agent::{Agent, AgentBuilder};
+pub use events::{AgentEvent, EventSink};
 pub use security::{CliConfirmer, CommandConfirmer, ConfirmDecision};
 pub use tools::{tool_definitions, ToolKind};
 
@@ -162,13 +164,41 @@ pub struct ToolDef {
     pub parameters: serde_json::Value,
 }
 
-/// The model's response — either text or one or more tool calls.
+/// The model's response, containing both text and optional tool calls.
+///
+/// Both fields are always present — `text` may be empty when the model only
+/// requests tool calls, and `tool_calls` is empty for a plain text response.
+/// This ensures the streaming preamble is preserved in conversation history
+/// even when the model follows it with tool calls.
 #[derive(Debug, Clone)]
-pub enum ChatResponse {
-    /// The model produced a text response.
-    Text(String),
-    /// The model wants to call one or more tools.
-    ToolCalls(Vec<ToolCall>),
+pub struct ChatResponse {
+    /// Text content of the response (may be empty for pure tool calls).
+    pub text: String,
+    /// Tool calls requested by the model (empty for a final text response).
+    pub tool_calls: Vec<ToolCall>,
+}
+
+impl ChatResponse {
+    /// Create a text-only response.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// Create a tool-call response with optional preamble text.
+    pub fn tool_calls(text: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            text: text.into(),
+            tool_calls,
+        }
+    }
+
+    /// Returns `true` if the response contains tool calls.
+    pub fn has_tool_calls(&self) -> bool {
+        !self.tool_calls.is_empty()
+    }
 }
 
 // Re-export async_trait.

@@ -10,16 +10,16 @@ use tracing::debug;
 use filar_agent::CommandConfirmer;
 use filar_core::{CoreError, Result};
 
-use crate::event::AgentEvent;
+use crate::event::TuiEvent;
 
 /// A [`CommandConfirmer`] that delegates to the TUI via channels.
 pub struct TuiConfirmer {
-    event_tx: mpsc::UnboundedSender<AgentEvent>,
+    event_tx: mpsc::UnboundedSender<TuiEvent>,
 }
 
 impl TuiConfirmer {
     /// Create a new TUI confirmer that sends events to the given channel.
-    pub fn new(event_tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
+    pub fn new(event_tx: mpsc::UnboundedSender<TuiEvent>) -> Self {
         Self { event_tx }
     }
 }
@@ -37,7 +37,7 @@ impl CommandConfirmer for TuiConfirmer {
         let (respond_tx, respond_rx) = oneshot::channel();
 
         self.event_tx
-            .send(AgentEvent::ConfirmationRequest {
+            .send(TuiEvent::ConfirmationRequest {
                 command: command.to_string(),
                 explanation: explanation.to_string(),
                 destructive,
