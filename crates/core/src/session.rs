@@ -80,11 +80,24 @@ impl SessionStore {
         &self.dir
     }
 
-    /// Create a store, ensuring the sessions directory exists.
-    pub fn new() -> Result<Self> {
-        let dir = sessions_dir()?;
+    /// Create a store with a specific base directory.
+    ///
+    /// The sessions directory will be `base_dir/filar/sessions`.
+    /// This allows external consumers (bots, mobile apps) to specify a
+    /// platform-appropriate path without relying on `APPDATA` or `HOME`.
+    pub fn new(base_dir: PathBuf) -> Result<Self> {
+        let dir = base_dir.join("filar").join("sessions");
         std::fs::create_dir_all(&dir)?;
         Ok(Self { dir })
+    }
+
+    /// Create a store using the platform-default base directory.
+    ///
+    /// On Windows this is `%APPDATA%`; on Unix it is `$HOME`.
+    /// For cross-compilation targets (Android, iOS) where these variables
+    /// may not be set, use [`new`](Self::new) with an explicit path.
+    pub fn with_default_dir() -> Result<Self> {
+        Self::new(default_base_dir()?)
     }
 
     /// Save a session to disk (overwrites if the ID already exists).
@@ -160,18 +173,20 @@ impl SessionStore {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Determine the sessions directory.
-fn sessions_dir() -> Result<PathBuf> {
-    let base = if cfg!(windows) {
+/// Determine the platform-default base directory for filar data.
+///
+/// Returns `%APPDATA%` on Windows, `$HOME` on Unix.
+/// The sessions directory is `base/filar/sessions`.
+fn default_base_dir() -> Result<PathBuf> {
+    if cfg!(windows) {
         std::env::var("APPDATA")
             .map(PathBuf::from)
-            .map_err(|_| CoreError::Other("APPDATA environment variable not set".into()))?
+            .map_err(|_| CoreError::Other("APPDATA environment variable not set".into()))
     } else {
         std::env::var("HOME")
             .map(PathBuf::from)
-            .map_err(|_| CoreError::Other("HOME environment variable not set".into()))?
-    };
-    Ok(base.join("filar").join("sessions"))
+            .map_err(|_| CoreError::Other("HOME environment variable not set".into()))
+    }
 }
 
 /// Generate a session ID and human-readable timestamp from the current time.

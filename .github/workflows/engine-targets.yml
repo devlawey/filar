@@ -1,0 +1,68 @@
+name: Engine cross-compilation
+
+# Verifies that the engine crates (filar-core, filar-transport, filar-agent)
+# compile without the `local` feature on Linux and Android targets.
+# This ensures bots and mobile apps can use the engine via SSH-only.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/core/**'
+      - 'crates/transport/**'
+      - 'crates/agent/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/engine-targets.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/core/**'
+      - 'crates/transport/**'
+      - 'crates/agent/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/engine-targets.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Engine check (x86_64-linux-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check engine without `local` feature
+        run: |
+          cargo check -p filar-core
+          cargo check -p filar-transport --no-default-features
+          cargo check -p filar-agent
+
+  android:
+    name: Engine check (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Check engine for Android (no `local` feature)
+        run: |
+          cargo ndk -t arm64-v8a check -p filar-core
+          cargo ndk -t arm64-v8a check -p filar-transport --no-default-features
+          cargo ndk -t arm64-v8a check -p filar-agent

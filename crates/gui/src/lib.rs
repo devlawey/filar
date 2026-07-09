@@ -107,7 +107,7 @@ pub struct SshConnection {
 // ---------------------------------------------------------------------------
 
 fn pending_launch_path() -> Option<std::path::PathBuf> {
-    let dir = filar_core::session::SessionStore::new()
+    let dir = filar_core::session::SessionStore::with_default_dir()
         .ok()
         .map(|s| s.dir().to_path_buf())?;
     Some(dir.parent()?.join("pending_launch.json"))
@@ -160,7 +160,7 @@ struct Settings {
 
 impl Settings {
     fn path() -> Option<std::path::PathBuf> {
-        let dir = filar_core::session::SessionStore::new()
+        let dir = filar_core::session::SessionStore::with_default_dir()
             .ok()
             .map(|s| s.dir().to_path_buf())?;
         Some(dir.parent()?.join("settings.json"))
@@ -440,7 +440,7 @@ impl eframe::App for LauncherApp {
 // ---------------------------------------------------------------------------
 
 pub fn run_launcher(config: &Config) {
-    let sessions = SessionStore::new()
+    let sessions = SessionStore::with_default_dir()
         .ok()
         .and_then(|s| s.list().ok())
         .unwrap_or_default();

@@ -105,7 +105,7 @@ async fn run() -> anyhow::Result<()> {
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Determine log directory.
-    let log_dir = SessionStore::new()
+    let log_dir = SessionStore::with_default_dir()
         .ok()
         .and_then(|s| s.dir().parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| {
@@ -302,7 +302,7 @@ async fn run() -> anyhow::Result<()> {
     // ── Load session if specified ──────────────────────────────────────
     let initial_messages = if let Some(ref sid) = session_id {
         info!(session_id = %sid, "loading session");
-        match SessionStore::new() {
+        match SessionStore::with_default_dir() {
             Ok(store) => match store.load(sid) {
                 Ok(Some(session)) => {
                     info!(messages = session.messages.len(), "session loaded");
