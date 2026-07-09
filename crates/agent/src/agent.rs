@@ -508,6 +508,35 @@ mod tests {
         }
     }
 
+    // ── Mock streaming LLM client ─────────────────────────────────────
+
+    /// Mock LLM that implements `chat_stream` — calls `on_delta` for each
+    /// text chunk before returning the assembled response.
+    struct MockStreamingLlm {
+        /// Text chunks to emit via `on_delta`.
+        deltas: Vec<String>,
+        /// Final response to return from `chat_stream` / `chat`.
+        final_response: ChatResponse,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for MockStreamingLlm {
+        async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse> {
+            Ok(self.final_response.clone())
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &ChatRequest,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<ChatResponse> {
+            for d in &self.deltas {
+                on_delta(d.clone());
+            }
+            Ok(self.final_response.clone())
+        }
+    }
+
     // ── Mock executor ────────────────────────────────────────────────────
 
     struct MockExecutor {
@@ -887,5 +916,53 @@ mod tests {
         assert_eq!(received.len(), 4, "expected 4 events, got {received:?}");
         assert!(matches!(&received[2], AgentEvent::CommandFinished { denied: true, .. }),
             "third event should be CommandFinished with denied=true, got {:?}", received[2]);
+    }
+
+    #[tokio::test]
+    async fn event_sink_streaming_text_delta() {
+        // DoD 2: Mock-LLM with streaming → sink receives TextDelta before Finished.
+        use std::sync::Mutex;
+
+        let llm = Arc::new(MockStreamingLlm {
+            deltas: vec!["Hello".into(), " world".into(), "!".into()],
+            final_response: ChatResponse::text("Hello world!"),
+        });
+
+        let executor = Arc::new(MockExecutor {
+            last_command: Mutex::new(String::new()),
+        });
+        let confirmer = Arc::new(MockConfirmer { approve: true });
+
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let sink: EventSink = Arc::new(move |event: AgentEvent| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let agent = Agent::builder()
+            .llm(llm)
+            .executor(executor)
+            .confirmer(confirmer)
+            .confirm_mode(CommandConfirmMode::Never)
+            .event_sink(sink)
+            .build()
+            .unwrap();
+
+        let result = agent.run("say hello", &[]).await.unwrap();
+        assert_eq!(result, "Hello world!");
+
+        let received = events.lock().unwrap();
+        // Expected: Started → TextDelta("Hello") → TextDelta(" world") → TextDelta("!") → Finished
+        assert_eq!(received.len(), 5, "expected 5 events, got {received:?}");
+        assert!(matches!(&received[0], AgentEvent::Started),
+            "first event should be Started, got {:?}", received[0]);
+        assert!(matches!(&received[1], AgentEvent::TextDelta(s) if s == "Hello"),
+            "second event should be TextDelta, got {:?}", received[1]);
+        assert!(matches!(&received[2], AgentEvent::TextDelta(s) if s == " world"),
+            "third event should be TextDelta, got {:?}", received[2]);
+        assert!(matches!(&received[3], AgentEvent::TextDelta(s) if s == "!"),
+            "fourth event should be TextDelta, got {:?}", received[3]);
+        assert!(matches!(&received[4], AgentEvent::Finished(text) if text == "Hello world!"),
+            "last event should be Finished, got {:?}", received[4]);
     }
 }
