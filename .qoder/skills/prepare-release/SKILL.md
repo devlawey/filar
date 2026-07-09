@@ -55,7 +55,7 @@ $token = ($credOutput | Select-String "password=(.+)" ).Matches.Groups[1].Value
 
 # 3. Прочитать файл как UTF-8 и отправить запрос
 $bodyText = [System.IO.File]::ReadAllText("c:\dev\warper\release_body.txt", [System.Text.Encoding]::UTF8)
-$bodyObj = @{ body = $bodyText; draft = $true; tag_name = "vX.Y.Z"; target_commitish = "main"; generate_release_notes = $true } | ConvertTo-Json -Depth 5
+$bodyObj = @{ body = $bodyText; draft = $true; tag_name = "vX.Y.Z"; name = "Filar vX.Y.Z"; target_commitish = "main"; generate_release_notes = $true } | ConvertTo-Json -Depth 5
 $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($bodyObj)
 $response = Invoke-RestMethod -Uri "https://api.github.com/repos/devlawey/filar/releases" `
   -Method Post `
@@ -75,7 +75,7 @@ git push origin vX.Y.Z
 # 2. Опубликовать релиз через API
 $credOutput = "protocol=https`nhost=github.com`n`n" | git credential fill 2>&1
 $token = ($credOutput | Select-String "password=(.+)" ).Matches.Groups[1].Value
-$bodyObj = @{ draft = $false; tag_name = "vX.Y.Z" } | ConvertTo-Json
+$bodyObj = @{ draft = $false; tag_name = "vX.Y.Z"; name = "Filar vX.Y.Z" } | ConvertTo-Json
 $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($bodyObj)
 $response = Invoke-RestMethod -Uri "https://api.github.com/repos/devlawey/filar/releases/$RELEASE_ID" `
   -Method Patch `
@@ -130,8 +130,10 @@ $runs = Invoke-RestMethod -Uri "https://api.github.com/repos/devlawey/filar/acti
    - Переключись на `main`, подтяни изменения (`git checkout main; git pull origin main`).
    - Удали локальную ветку `chore/release-X.Y.Z`.
    - Создай draft-релиз через GitHub API (см. рецепт выше):
-     - `tag_name: "vX.Y.Z"`, `target_commitish: "main"`, `draft: true`,
-       `generate_release_notes: true`.
+     - `tag_name: "vX.Y.Z"`, `name: "Filar vX.Y.Z"`, `target_commitish: "main"`,
+       `draft: true`, `generate_release_notes: true`.
+     - **Конвенция именования:** `name` = `Filar vX.Y.Z` (например `Filar v0.3.0`),
+       не просто `vX.Y.Z` — так показывается на главной странице репозитория.
      - Заметки (body) запиши в файл через Write tool (UTF-8!), прочитай через
        `[System.IO.File]::ReadAllText(..., [System.Text.Encoding]::UTF8)` и отправь
        как `[System.Text.Encoding]::UTF8.GetBytes(json)` — иначе кириллица сломается.
@@ -145,7 +147,16 @@ $runs = Invoke-RestMethod -Uri "https://api.github.com/repos/devlawey/filar/acti
 6. **После подтверждения пользователя — опубликуй релиз:**
    - Создай тег локально: `git tag vX.Y.Z` (на текущем HEAD `main`).
    - Пушь тег: `git push origin vX.Y.Z`.
-   - Опубликуй релиз через API (PATCH `draft: false` + `tag_name: "vX.Y.Z"`).
+   - Опубликуй релиз через API (PATCH `draft: false` + `tag_name: "vX.Y.Z"` +
+     `name: "Filar vX.Y.Z"`).
+   - **Проверь, что не создался дубликат-релиз** (`untagged-...`). Если на странице
+     релизов появился мусорный `untagged-...` релиз — удали его через API (DELETE
+     `/releases/{id}`), а его assets (бинарник) перенеси на правильный релиз.
+     Также удали мусорный тег `untagged-...` (локально и на remote).
+   - **Проверь имя бинарника.** Workflow называет файл `filar-{tag_name}-windows-x86_64.exe`.
+     Если tag_name был `untagged-...`, переименуй asset через API
+     (PATCH `/releases/assets/{id}` с `name: "filar-vX.Y.Z-windows-x86_64.exe"`).
+     Также удали старые бинарники от предыдущих релизов, если они случайно прикрепились.
    - Проверь, что workflow `release.yml` запустился (через API `actions/runs`).
    - Дай пользователю ссылки: на релиз и на workflow run.
    - Подсказать, что статус сборки виден во вкладке Actions.
