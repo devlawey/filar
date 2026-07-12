@@ -99,15 +99,17 @@ async fn main() {
 
 async fn run() -> anyhow::Result<()> {
     // ── Logging ────────────────────────────────────────────────────────
-    // While the TUI is active the tracing subscriber must NOT write to the
-    // terminal — any line would be painted over the ratatui interface. So the
-    // only terminal-facing sink is removed: logs go to a rolling file, and
-    // WARN/ERROR records are mirrored into the chat as `System` blocks via a
-    // channel the TUI runner polls. Startup/teardown errors reach the terminal
-    // through explicit `eprintln!` (before raw mode / after teardown), which is
-    // fine.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    // Logs always go to a rolling file. The *second* sink depends on the mode:
+    //
+    // - TUI path (default): the terminal is owned by the ratatui interface, so
+    //   the subscriber must NOT write to it. Instead, WARN/ERROR records are
+    //   mirrored into the chat as `System` blocks via a channel the runner
+    //   polls. Startup/teardown errors still reach the terminal through
+    //   explicit `eprintln!` (before raw mode / after teardown).
+    // - `--gui-only` subprocess: there is no TUI here, so terminal output is
+    //   fine and useful — this path keeps the stderr layer unchanged.
+    let make_filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Log directory: base/filar/logs (same base as SessionStore).
     let log_dir = default_base_dir()
@@ -120,8 +122,15 @@ async fn run() -> anyhow::Result<()> {
                 .join("logs")
         });
 
-    // Create the log directory if it doesn't exist.
-    let _ = std::fs::create_dir_all(&log_dir);
+    // Create the log directory if it doesn't exist. Logging is best-effort, so
+    // a failure here degrades gracefully (file sink may be inert) rather than
+    // aborting startup — but it must not be swallowed silently.
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!(
+            "warning: could not create log directory {}: {e}",
+            log_dir.display()
+        );
+    }
 
     // File appender (daily rotation), non-blocking writer.
     let file_appender = tracing_appender::rolling::daily(&log_dir, "filar.log");
@@ -130,14 +139,27 @@ async fn run() -> anyhow::Result<()> {
         .with_writer(file_writer)
         .with_ansi(false); // No ANSI colours in the log file.
 
-    // Chat mirror layer for WARN/ERROR — the receiver is handed to the TUI.
-    let (chat_log_layer, log_rx) = filar_tui::chat_log_layer();
-
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(file_layer)
-        .with(chat_log_layer)
-        .init();
+    // Peek at `--gui-only` before parsing args in full: the subscriber is
+    // global and installed once, so we must pick the right second sink now.
+    let gui_only = std::env::args().any(|a| a == "--gui-only");
+    let mut log_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>> = None;
+    if gui_only {
+        let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+        tracing_subscriber::registry()
+            .with(make_filter())
+            .with(file_layer)
+            .with(stderr_layer)
+            .init();
+    } else {
+        // Chat mirror layer for WARN/ERROR — the receiver is handed to the TUI.
+        let (chat_log_layer, rx) = filar_tui::chat_log_layer();
+        log_rx = Some(rx);
+        tracing_subscriber::registry()
+            .with(make_filter())
+            .with(file_layer)
+            .with(chat_log_layer)
+            .init();
+    }
 
     // Keep the guard alive for the entire program.
     let _guard = guard;
@@ -341,7 +363,7 @@ async fn run() -> anyhow::Result<()> {
         ssh_target: ssh_target.clone(),
         is_local: ssh_target.is_none(),
         secret_provider,
-        log_rx: Some(log_rx),
+        log_rx,
     };
 
     info!("launching TUI");

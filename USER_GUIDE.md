@@ -1,4 +1,4 @@
-# Warp — Пользовательская инструкция
+# Filar — Пользовательская инструкция
 
 > Терминал с AI-агентом поверх SSH. Агент выполняет команды на локальной или
 > удалённой машине, запрашивая подтверждение перед каждой операцией.
@@ -9,7 +9,7 @@
 
 ### 1.1. Запуск (самый простой способ)
 
-1. Откройте Проводник, перейдите в `c:\dev\warper`
+1. Откройте Проводник, перейдите в `c:\dev\filar`
 2. Дважды кликните файл **`run.bat`**
 3. Откроется GUI-окно — введите модель, URL и API-ключ прямо в интерфейсе
 4. Нажмите **Launch**
@@ -17,8 +17,8 @@
 ### 1.2. Запуск через PowerShell
 
 ```powershell
-cd c:\dev\warper
-.\target\debug\warp.exe
+cd c:\dev\filar
+.\target\debug\filar.exe
 ```
 
 Откроется GUI-лаунчер. Без аргументов — всегда GUI.
@@ -28,24 +28,24 @@ cd c:\dev\warper
 ```powershell
 # Локальная машина (требуется GLM_API_KEY в env)
 $env:GLM_API_KEY = "ваш-ключ"
-.\target\debug\warp.exe --target local
+.\target\debug\filar.exe --target local
 
 # SSH-таргет + конкретный LLM-профиль
-.\target\debug\warp.exe --target test-docker --llm glm
+.\target\debug\filar.exe --target test-docker --llm glm
 
 # Восстановить предыдущую сессию
-.\target\debug\warp.exe --target local --session 1718900000
+.\target\debug\filar.exe --target local --session 1718900000
 ```
 
 ### 1.4. Сборка из исходников
 
 ```powershell
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:USERPROFILE\mingw\mingw64\bin;$env:PATH"
-cd c:\dev\warper
+cd c:\dev\filar
 cargo build
 ```
 
-Бинарник: `target\debug\warp.exe`
+Бинарник: `target\debug\filar.exe`
 
 ---
 
@@ -129,11 +129,11 @@ $env:SSH_PASSWORD = "пароль-ssh"
 
 ## 3. GUI-лаунчер
 
-При запуске без аргументов открывается окно "Warp — Launcher":
+При запуске без аргументов открывается окно "Filar — Launcher":
 
 ```
 ┌──────────────────────────────────────────┐
-│  Warp                                     │
+│  Filar                                    │
 │  Terminal with an AI agent over SSH       │
 │──────────────────────────────────────────│
 │  Recent sessions:                         │
@@ -278,8 +278,8 @@ Explanation:         Updating package lists to check available versions
 
 ### 6.2. Хранилище
 
-- **Windows:** `%APPDATA%\warp\sessions\`
-- **Unix:** `~/.warp/sessions/`
+- **Windows:** `%APPDATA%\filar\sessions\`
+- **Unix:** `~/.filar/sessions/`
 
 Формат: JSON-файлы (`<id>.json`). Хранится не более **10 последних** сессий
 (старые удаляются автоматически).
@@ -290,7 +290,7 @@ Explanation:         Updating package lists to check available versions
 
 **Через CLI:**
 ```powershell
-.\target\release\warp.exe --target local --session 1718900000
+.\target\release\filar.exe --target local --session 1718900000
 ```
 
 При восстановлении загружается вся история чата. В начале добавляется
@@ -331,7 +331,7 @@ $env:RUST_LOG = "debug"
 ## 8. CLI-аргументы
 
 ```
-Usage: warp [--target <name>] [--llm <profile>] [--session <id>]
+Usage: filar [--target <name>] [--llm <profile>] [--session <id>]
 
 Options:
   --target <name>   Подключиться к таргету ('local' или имя SSH-таргета из конфига)
@@ -346,16 +346,16 @@ Options:
 
 ```powershell
 # Локальная работа, LLM по умолчанию
-warp --target local
+filar --target local
 
 # SSH на сервер, DeepSeek
-warp --target my-server --llm deepseek
+filar --target my-server --llm deepseek
 
 # Восстановить сессию на локальной машине
-warp --target local --session 1718900000
+filar --target local --session 1718900000
 
 # Только GUI (без аргументов)
-warp
+filar
 ```
 
 ---
@@ -364,7 +364,7 @@ warp
 
 ### Сценарий 1: Диагностика через агента
 
-1. Запустите: `warp --target my-server`
+1. Запустите: `filar --target my-server`
 2. Введите: "Найди, какой процесс слушает порт 8080, и покажи его рабочую директорию"
 3. Агент предложит: `sudo lsof -i :8080` → подтвердите (a)
 4. Агент предложит: `ls -la /proc/<pid>/cwd` → подтвердите (a)
@@ -372,7 +372,7 @@ warp
 
 ### Сценарий 2: Быстрый фикс через терминал
 
-1. Запустите: `warp --target local`
+1. Запустите: `filar --target local`
 2. Нажмите `Ctrl+T` — переключитесь в терминал
 3. Выполните нужные команды вручную
 4. Нажмите `Ctrl+T` — вернитесь к агенту
@@ -380,7 +380,7 @@ warp
 
 ### Сценарий 3: Восстановление вчерашней сессии
 
-1. Запустите без аргументов: `warp`
+1. Запустите без аргументов: `filar`
 2. В GUI выберите вчерашнюю сессию из списка
 3. Нажмите Launch — история загрузится
 4. Продолжите диалог: "А теперь проверь логи за сегодня"
@@ -391,7 +391,7 @@ warp
 
 ### "failed to load config"
 - Проверьте, что `config.toml` существует в рабочей директории
-- Или укажите путь: `$env:WARP_CONFIG = "C:\path\to\config.toml"`
+- Или укажите путь: `$env:FILAR_CONFIG = "C:\path\to\config.toml"`
 
 ### "API key is required"
 - В GUI-режиме: введите ключ в поле "API key" и нажмите Launch
@@ -399,7 +399,7 @@ warp
 
 ### "SSH target 'xxx' not found"
 - Проверьте имя таргета в `config.toml` (поле `name` в `[[ssh_targets]]`)
-- Список доступных таргетов: `warp --help`
+- Список доступных таргетов: `filar --help`
 
 ### SSH-подключение не удаётся
 - **Пароль:** установите `$env:SSH_PASSWORD`
@@ -411,7 +411,7 @@ warp
 - Минимальный размер окна: ~80×24
 
 ### Сессии не сохраняются
-- Проверьте права на запись в `%APPDATA%\warp\sessions\`
+- Проверьте права на запись в `%APPDATA%\filar\sessions\`
 - Создайте директорию вручную при необходимости
 
 ---
@@ -446,5 +446,5 @@ warp
 - [ ] CLI: `--target local` — локальный executor
 - [ ] CLI: `--llm <profile>` — выбор LLM-профиля
 - [ ] SSH: подключение к тестовому серверу (если доступен)
-- [ ] Сессии: сохранение в `%APPDATA%\warp\sessions\`
+- [ ] Сессии: сохранение в `%APPDATA%\filar\sessions\`
 - [ ] Сессии: не более 10 файлов (prune работает)

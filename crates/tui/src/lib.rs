@@ -10,6 +10,7 @@
 pub mod app;
 pub mod confirmer;
 pub mod event;
+/// Tracing layer that mirrors WARN/ERROR log records into the chat.
 pub mod log_layer;
 pub mod runner;
 pub mod terminal;

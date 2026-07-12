@@ -369,25 +369,33 @@ impl App {
     /// than the chat area, and consecutive identical lines collapse into a
     /// single block with a `… xN` counter instead of repeating.
     pub fn push_system_log(&mut self, line: String) {
-        // Clamp to one line no wider than the chat area (fallback width before
-        // the first render). Keeps a burst of a long log line from reflowing
-        // the whole chat.
+        // Chat width for clamping (fallback before the first render).
         let width = if self.chat_area.width > 0 {
             self.chat_area.width as usize
         } else {
             120
         };
-        let mut text: String = line.replace(['\n', '\r'], " ");
-        if text.chars().count() > width {
-            let keep = width.saturating_sub(1).max(1);
-            text = text.chars().take(keep).collect::<String>() + "…";
-        }
+        // Clamp to a single line no wider than the chat area. Keeps a burst of
+        // a long log line from reflowing the whole chat.
+        let clamp = |s: &str| -> String {
+            if s.chars().count() > width {
+                let keep = width.saturating_sub(1).max(1);
+                s.chars().take(keep).collect::<String>() + "…"
+            } else {
+                s.to_string()
+            }
+        };
 
-        // Collapse a run of identical lines into `… xN`.
-        if self.last_log_text.as_deref() == Some(text.as_str()) {
+        // Dedup key is the *full* normalized line (untruncated), so distinct
+        // long messages that merely share a prefix don't collapse together.
+        let normalized: String = line.replace(['\n', '\r'], " ");
+
+        // Collapse a run of identical lines into `… xN`. The rendered string —
+        // suffix included — is clamped to the chat width.
+        if self.last_log_text.as_deref() == Some(normalized.as_str()) {
             if let Some(ChatBlock::System(s)) = self.messages.last_mut() {
                 self.last_log_count += 1;
-                *s = format!("{text} … x{}", self.last_log_count);
+                *s = clamp(&format!("{normalized} … x{}", self.last_log_count));
                 self.message_rev = self.message_rev.wrapping_add(1);
                 self.selection = None;
                 return;
@@ -395,8 +403,8 @@ impl App {
         }
 
         // `push_message` resets `last_log_text`, so set the run state after it.
-        self.push_message(ChatBlock::System(text.clone()));
-        self.last_log_text = Some(text);
+        self.push_message(ChatBlock::System(clamp(&normalized)));
+        self.last_log_text = Some(normalized);
         self.last_log_count = 1;
     }
 
@@ -1974,6 +1982,56 @@ mod tests {
         // Two distinct System blocks; the second collapsed the repeat.
         assert!(matches!(&app.messages[app.messages.len() - 2], ChatBlock::System(s) if s == "first"));
         assert!(matches!(app.messages.last(), Some(ChatBlock::System(s)) if s == "second … x2"));
+    }
+
+    #[test]
+    fn push_system_log_dedup_key_is_full_line_not_truncated() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        // Narrow chat so both lines clamp to the same rendered text, but their
+        // full forms differ only past the clamp point.
+        app.chat_area.width = 10;
+        let before = app.messages.len();
+
+        app.push_system_log("abcdefghij1".into());
+        app.push_system_log("abcdefghij2".into());
+
+        // Distinct full lines → two separate blocks, NOT collapsed into "… x2".
+        assert_eq!(app.messages.len(), before + 2);
+        for m in &app.messages[before..] {
+            match m {
+                ChatBlock::System(s) => {
+                    assert!(!s.contains(" x2"), "distinct lines must not dedup: {s}");
+                    assert!(s.chars().count() <= 10, "clamped to width: {s}");
+                }
+                other => panic!("expected System, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn push_system_log_repeat_clamps_suffix_within_width() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.chat_area.width = 8;
+        let before = app.messages.len();
+
+        for _ in 0..5 {
+            app.push_system_log("hello".into());
+        }
+
+        // Same full line collapses into a single block…
+        assert_eq!(app.messages.len(), before + 1);
+        // …and the rendered text (including the "… xN" suffix) stays within
+        // the chat width.
+        match app.messages.last() {
+            Some(ChatBlock::System(s)) => {
+                assert!(
+                    s.chars().count() <= 8,
+                    "final rendered string must be clamped to width: {s} ({} chars)",
+                    s.chars().count()
+                );
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
     }
 
     #[test]
