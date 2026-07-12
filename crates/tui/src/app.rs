@@ -263,6 +263,14 @@ pub struct App {
     last_click_pos: Option<(usize, usize)>,
     /// Current click count (1=single, 2=double, 3=triple).
     click_count: u8,
+    /// Base text of the last forwarded log line (see [`push_system_log`]).
+    /// Used to collapse consecutive identical log lines into `… xN` instead of
+    /// spamming the chat. `None` once any non-log message breaks the run.
+    ///
+    /// [`push_system_log`]: Self::push_system_log
+    last_log_text: Option<String>,
+    /// Count of consecutive identical forwarded log lines (for `… xN`).
+    last_log_count: usize,
 }
 
 impl App {
@@ -317,6 +325,8 @@ impl App {
             last_click_time: None,
             last_click_pos: None,
             click_count: 0,
+            last_log_text: None,
+            last_log_count: 0,
         }
     }
 
@@ -348,6 +358,54 @@ impl App {
         self.message_rev = self.message_rev.wrapping_add(1);
         // New message invalidates line indices — clear any active selection.
         self.selection = None;
+        // Any non-log message breaks a run of identical forwarded log lines.
+        self.last_log_text = None;
+    }
+
+    /// Push a WARN/ERROR log line (from [`crate::log_layer`]) into the chat as
+    /// a `System` block.
+    ///
+    /// Keeps the chat readable: the line is clamped to a single line no wider
+    /// than the chat area, and consecutive identical lines collapse into a
+    /// single block with a `… xN` counter instead of repeating.
+    pub fn push_system_log(&mut self, line: String) {
+        // Chat width for clamping (fallback before the first render).
+        let width = if self.chat_area.width > 0 {
+            self.chat_area.width as usize
+        } else {
+            120
+        };
+        // Clamp to a single line no wider than the chat area. Keeps a burst of
+        // a long log line from reflowing the whole chat.
+        let clamp = |s: &str| -> String {
+            if s.chars().count() > width {
+                let keep = width.saturating_sub(1).max(1);
+                s.chars().take(keep).collect::<String>() + "…"
+            } else {
+                s.to_string()
+            }
+        };
+
+        // Dedup key is the *full* normalized line (untruncated), so distinct
+        // long messages that merely share a prefix don't collapse together.
+        let normalized: String = line.replace(['\n', '\r'], " ");
+
+        // Collapse a run of identical lines into `… xN`. The rendered string —
+        // suffix included — is clamped to the chat width.
+        if self.last_log_text.as_deref() == Some(normalized.as_str()) {
+            if let Some(ChatBlock::System(s)) = self.messages.last_mut() {
+                self.last_log_count += 1;
+                *s = clamp(&format!("{normalized} … x{}", self.last_log_count));
+                self.message_rev = self.message_rev.wrapping_add(1);
+                self.selection = None;
+                return;
+            }
+        }
+
+        // `push_message` resets `last_log_text`, so set the run state after it.
+        self.push_message(ChatBlock::System(clamp(&normalized)));
+        self.last_log_text = Some(normalized);
+        self.last_log_count = 1;
     }
 
     /// Append an error message from outside `App` (e.g. runner startup
@@ -1893,6 +1951,87 @@ mod tests {
         app.push_error("boom".into());
         assert!(app.message_rev > rev_before);
         assert!(matches!(app.messages.last(), Some(ChatBlock::Error(s)) if s == "boom"));
+    }
+
+    #[test]
+    fn push_system_log_dedups_consecutive_lines() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let before = app.messages.len();
+
+        app.push_system_log("ssh: reader: channel closed".into());
+        app.push_system_log("ssh: reader: channel closed".into());
+        app.push_system_log("ssh: reader: channel closed".into());
+
+        // Only one block added; it carries the "… x3" counter.
+        assert_eq!(app.messages.len(), before + 1);
+        assert!(
+            matches!(app.messages.last(), Some(ChatBlock::System(s)) if s == "ssh: reader: channel closed … x3"),
+            "got: {:?}",
+            app.messages.last()
+        );
+    }
+
+    #[test]
+    fn push_system_log_new_line_breaks_dedup_run() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+
+        app.push_system_log("first".into());
+        app.push_system_log("second".into());
+        app.push_system_log("second".into());
+
+        // Two distinct System blocks; the second collapsed the repeat.
+        assert!(matches!(&app.messages[app.messages.len() - 2], ChatBlock::System(s) if s == "first"));
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(s)) if s == "second … x2"));
+    }
+
+    #[test]
+    fn push_system_log_dedup_key_is_full_line_not_truncated() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        // Narrow chat so both lines clamp to the same rendered text, but their
+        // full forms differ only past the clamp point.
+        app.chat_area.width = 10;
+        let before = app.messages.len();
+
+        app.push_system_log("abcdefghij1".into());
+        app.push_system_log("abcdefghij2".into());
+
+        // Distinct full lines → two separate blocks, NOT collapsed into "… x2".
+        assert_eq!(app.messages.len(), before + 2);
+        for m in &app.messages[before..] {
+            match m {
+                ChatBlock::System(s) => {
+                    assert!(!s.contains(" x2"), "distinct lines must not dedup: {s}");
+                    assert!(s.chars().count() <= 10, "clamped to width: {s}");
+                }
+                other => panic!("expected System, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn push_system_log_repeat_clamps_suffix_within_width() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.chat_area.width = 8;
+        let before = app.messages.len();
+
+        for _ in 0..5 {
+            app.push_system_log("hello".into());
+        }
+
+        // Same full line collapses into a single block…
+        assert_eq!(app.messages.len(), before + 1);
+        // …and the rendered text (including the "… xN" suffix) stays within
+        // the chat width.
+        match app.messages.last() {
+            Some(ChatBlock::System(s)) => {
+                assert!(
+                    s.chars().count() <= 8,
+                    "final rendered string must be clamped to width: {s} ({} chars)",
+                    s.chars().count()
+                );
+            }
+            other => panic!("expected System, got {other:?}"),
+        }
     }
 
     #[test]

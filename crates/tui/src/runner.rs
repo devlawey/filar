@@ -127,6 +127,11 @@ pub struct TuiConfig {
     /// Shared between the TUI (for dynamic `$FILAR_SECRET_N` insertion via
     /// Ctrl+P) and the agent (via `SecretSubstitutingExecutor`).
     pub secret_provider: Arc<StaticSecretProvider>,
+    /// Receiver for WARN/ERROR log lines forwarded from the tracing subscriber
+    /// (see [`crate::log_layer`]). The runner polls it and shows each line as a
+    /// `System` block, so important logs surface in the chat instead of being
+    /// painted over the interface. `None` disables the feature (e.g. in tests).
+    pub log_rx: Option<mpsc::UnboundedReceiver<String>>,
 }
 
 /// Run the TUI with the given LLM client, executor, and configuration.
@@ -195,6 +200,9 @@ async fn run_app(
 
     // Channel for agent → UI events.
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<TuiEvent>();
+
+    // Receiver for WARN/ERROR log lines mirrored into the chat.
+    let mut log_rx = config.log_rx.take();
 
     // Build SSH info string for the system prompt (e.g. "user@host:port").
     let mut ssh_info = config.ssh_target.as_ref().map(|t| {
@@ -462,6 +470,17 @@ async fn run_app(
                 }
             }
 
+            // WARN/ERROR log line forwarded from the tracing subscriber.
+            // Polled in every mode so disconnects during interactive sessions
+            // still surface once the user returns to the chat. `recv_log_line`
+            // disables further polling once the channel closes.
+            maybe_log = recv_log_line(&mut log_rx) => {
+                if let Some(line) = maybe_log {
+                    app.push_system_log(line);
+                    needs_redraw = true;
+                }
+            }
+
             // Terminal output (only when in interactive mode).
             maybe_output = async move {
                 match term_for_read {
@@ -546,6 +565,25 @@ async fn run_app(
 
     info!("TUI session ended");
     Ok(())
+}
+
+/// Await the next forwarded log line from the optional receiver.
+///
+/// Returns the next line, or `None` when the channel has closed. On closure it
+/// also sets `log_rx` to `None` so the caller's `select!` branch stops polling
+/// — otherwise a closed [`mpsc::UnboundedReceiver`] would resolve immediately
+/// forever and spin the event loop at 100% CPU. When `log_rx` is already
+/// `None`, this future stays pending (the branch is effectively disabled).
+async fn recv_log_line(log_rx: &mut Option<mpsc::UnboundedReceiver<String>>) -> Option<String> {
+    let line = match log_rx.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending::<Option<String>>().await,
+    };
+    if line.is_none() {
+        // Channel closed: disable further polling.
+        *log_rx = None;
+    }
+    line
 }
 
 /// Spawn the agent in a tokio task to process the user's input.
@@ -641,4 +679,33 @@ fn spawn_agent(
         // don't need to send them again here.
         let _ = agent.run(&user_input, &history).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recv_log_line_returns_sent_line_and_keeps_channel() {
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let mut log_rx = Some(rx);
+        tx.send("warn: boom".to_string()).unwrap();
+
+        let line = recv_log_line(&mut log_rx).await;
+        assert_eq!(line.as_deref(), Some("warn: boom"));
+        // Channel still open (sender alive) — polling stays enabled.
+        assert!(log_rx.is_some());
+    }
+
+    #[tokio::test]
+    async fn recv_log_line_disables_polling_when_channel_closes() {
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let mut log_rx = Some(rx);
+        drop(tx); // Close the channel.
+
+        let line = recv_log_line(&mut log_rx).await;
+        assert!(line.is_none());
+        // Closed channel must disable further polling to avoid a busy-loop.
+        assert!(log_rx.is_none());
+    }
 }
