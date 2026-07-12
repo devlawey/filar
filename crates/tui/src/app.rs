@@ -263,6 +263,14 @@ pub struct App {
     last_click_pos: Option<(usize, usize)>,
     /// Current click count (1=single, 2=double, 3=triple).
     click_count: u8,
+    /// Base text of the last forwarded log line (see [`push_system_log`]).
+    /// Used to collapse consecutive identical log lines into `… xN` instead of
+    /// spamming the chat. `None` once any non-log message breaks the run.
+    ///
+    /// [`push_system_log`]: Self::push_system_log
+    last_log_text: Option<String>,
+    /// Count of consecutive identical forwarded log lines (for `… xN`).
+    last_log_count: usize,
 }
 
 impl App {
@@ -317,6 +325,8 @@ impl App {
             last_click_time: None,
             last_click_pos: None,
             click_count: 0,
+            last_log_text: None,
+            last_log_count: 0,
         }
     }
 
@@ -348,6 +358,46 @@ impl App {
         self.message_rev = self.message_rev.wrapping_add(1);
         // New message invalidates line indices — clear any active selection.
         self.selection = None;
+        // Any non-log message breaks a run of identical forwarded log lines.
+        self.last_log_text = None;
+    }
+
+    /// Push a WARN/ERROR log line (from [`crate::log_layer`]) into the chat as
+    /// a `System` block.
+    ///
+    /// Keeps the chat readable: the line is clamped to a single line no wider
+    /// than the chat area, and consecutive identical lines collapse into a
+    /// single block with a `… xN` counter instead of repeating.
+    pub fn push_system_log(&mut self, line: String) {
+        // Clamp to one line no wider than the chat area (fallback width before
+        // the first render). Keeps a burst of a long log line from reflowing
+        // the whole chat.
+        let width = if self.chat_area.width > 0 {
+            self.chat_area.width as usize
+        } else {
+            120
+        };
+        let mut text: String = line.replace(['\n', '\r'], " ");
+        if text.chars().count() > width {
+            let keep = width.saturating_sub(1).max(1);
+            text = text.chars().take(keep).collect::<String>() + "…";
+        }
+
+        // Collapse a run of identical lines into `… xN`.
+        if self.last_log_text.as_deref() == Some(text.as_str()) {
+            if let Some(ChatBlock::System(s)) = self.messages.last_mut() {
+                self.last_log_count += 1;
+                *s = format!("{text} … x{}", self.last_log_count);
+                self.message_rev = self.message_rev.wrapping_add(1);
+                self.selection = None;
+                return;
+            }
+        }
+
+        // `push_message` resets `last_log_text`, so set the run state after it.
+        self.push_message(ChatBlock::System(text.clone()));
+        self.last_log_text = Some(text);
+        self.last_log_count = 1;
     }
 
     /// Append an error message from outside `App` (e.g. runner startup
@@ -1893,6 +1943,37 @@ mod tests {
         app.push_error("boom".into());
         assert!(app.message_rev > rev_before);
         assert!(matches!(app.messages.last(), Some(ChatBlock::Error(s)) if s == "boom"));
+    }
+
+    #[test]
+    fn push_system_log_dedups_consecutive_lines() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let before = app.messages.len();
+
+        app.push_system_log("ssh: reader: channel closed".into());
+        app.push_system_log("ssh: reader: channel closed".into());
+        app.push_system_log("ssh: reader: channel closed".into());
+
+        // Only one block added; it carries the "… x3" counter.
+        assert_eq!(app.messages.len(), before + 1);
+        assert!(
+            matches!(app.messages.last(), Some(ChatBlock::System(s)) if s == "ssh: reader: channel closed … x3"),
+            "got: {:?}",
+            app.messages.last()
+        );
+    }
+
+    #[test]
+    fn push_system_log_new_line_breaks_dedup_run() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+
+        app.push_system_log("first".into());
+        app.push_system_log("second".into());
+        app.push_system_log("second".into());
+
+        // Two distinct System blocks; the second collapsed the repeat.
+        assert!(matches!(&app.messages[app.messages.len() - 2], ChatBlock::System(s) if s == "first"));
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(s)) if s == "second … x2"));
     }
 
     #[test]

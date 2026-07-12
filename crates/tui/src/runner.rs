@@ -127,6 +127,11 @@ pub struct TuiConfig {
     /// Shared between the TUI (for dynamic `$FILAR_SECRET_N` insertion via
     /// Ctrl+P) and the agent (via `SecretSubstitutingExecutor`).
     pub secret_provider: Arc<StaticSecretProvider>,
+    /// Receiver for WARN/ERROR log lines forwarded from the tracing subscriber
+    /// (see [`crate::log_layer`]). The runner polls it and shows each line as a
+    /// `System` block, so important logs surface in the chat instead of being
+    /// painted over the interface. `None` disables the feature (e.g. in tests).
+    pub log_rx: Option<mpsc::UnboundedReceiver<String>>,
 }
 
 /// Run the TUI with the given LLM client, executor, and configuration.
@@ -195,6 +200,9 @@ async fn run_app(
 
     // Channel for agent → UI events.
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<TuiEvent>();
+
+    // Receiver for WARN/ERROR log lines mirrored into the chat.
+    let mut log_rx = config.log_rx.take();
 
     // Build SSH info string for the system prompt (e.g. "user@host:port").
     let mut ssh_info = config.ssh_target.as_ref().map(|t| {
@@ -458,6 +466,21 @@ async fn run_app(
                     // layout handles transitions cleanly without full clear.
                     // Full clear is only needed on mode change (see below).
                     app.handle_agent_event(event);
+                    needs_redraw = true;
+                }
+            }
+
+            // WARN/ERROR log line forwarded from the tracing subscriber.
+            // Polled in every mode so disconnects during interactive sessions
+            // still surface once the user returns to the chat.
+            maybe_log = async {
+                match log_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending::<Option<String>>().await,
+                }
+            } => {
+                if let Some(line) = maybe_log {
+                    app.push_system_log(line);
                     needs_redraw = true;
                 }
             }

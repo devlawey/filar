@@ -10,6 +10,7 @@
 pub mod app;
 pub mod confirmer;
 pub mod event;
+pub mod log_layer;
 pub mod runner;
 pub mod terminal;
 pub mod ui;
@@ -18,6 +19,7 @@ pub mod ui;
 pub use app::{App, AppMode};
 pub use confirmer::TuiConfirmer;
 pub use event::TuiEvent;
+pub use log_layer::{chat_log_layer, ChatLogLayer};
 pub use runner::{run, TuiConfig};
 pub use terminal::{key_to_bytes, TerminalModel};
 pub use filar_core::ChatBlock;

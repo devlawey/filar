@@ -99,38 +99,44 @@ async fn main() {
 
 async fn run() -> anyhow::Result<()> {
     // ── Logging ────────────────────────────────────────────────────────
-    // Set up dual logging: stderr (for CLI mode) + file (for TUI mode).
-    // The file is at %APPDATA%/filar/filar.log on Windows.
+    // While the TUI is active the tracing subscriber must NOT write to the
+    // terminal — any line would be painted over the ratatui interface. So the
+    // only terminal-facing sink is removed: logs go to a rolling file, and
+    // WARN/ERROR records are mirrored into the chat as `System` blocks via a
+    // channel the TUI runner polls. Startup/teardown errors reach the terminal
+    // through explicit `eprintln!` (before raw mode / after teardown), which is
+    // fine.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // Determine log directory.
+    // Log directory: base/filar/logs (same base as SessionStore).
     let log_dir = default_base_dir()
         .ok()
-        .map(|base| base.join("filar"))
+        .map(|base| base.join("filar").join("logs"))
         .unwrap_or_else(|| {
-            // Fallback: current directory.
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            // Fallback: ./logs in the current directory.
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("logs")
         });
 
     // Create the log directory if it doesn't exist.
     let _ = std::fs::create_dir_all(&log_dir);
 
-    // Set up file appender (daily rotation).
+    // File appender (daily rotation), non-blocking writer.
     let file_appender = tracing_appender::rolling::daily(&log_dir, "filar.log");
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
-
-    // Build subscriber with both stderr and file layers.
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr);
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(file_writer)
-        .with_ansi(false); // No ANSI colors in log file.
+        .with_ansi(false); // No ANSI colours in the log file.
+
+    // Chat mirror layer for WARN/ERROR — the receiver is handed to the TUI.
+    let (chat_log_layer, log_rx) = filar_tui::chat_log_layer();
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(stderr_layer)
         .with(file_layer)
+        .with(chat_log_layer)
         .init();
 
     // Keep the guard alive for the entire program.
@@ -335,6 +341,7 @@ async fn run() -> anyhow::Result<()> {
         ssh_target: ssh_target.clone(),
         is_local: ssh_target.is_none(),
         secret_provider,
+        log_rx: Some(log_rx),
     };
 
     info!("launching TUI");
