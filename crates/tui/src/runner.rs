@@ -516,8 +516,21 @@ async fn run_app(
             }
 
             // Render at most 60fps — batches multiple events into one draw.
-            // Also tick when in Thinking mode so the spinner animates.
-            _ = render_interval.tick(), if needs_redraw || app.mode == AppMode::Thinking => {
+            // Also tick when in Thinking mode so the spinner animates, and while
+            // a toast is pending so it disappears on its own timer (~1.5s)
+            // without requiring further input.
+            //
+            // NB: the guard tests `app.toast.is_some()` (the field), not
+            // `toast_text()` (which already applies the expiry). Gating on
+            // `toast_text()` — as the issue text literally suggests — would stop
+            // ticking the instant the toast expires, so the frame that *erases*
+            // the toast would never be drawn and it would linger until the next
+            // input. Instead we keep ticking while the field is set, and drop the
+            // expired toast right after the erasing draw below; the next tick's
+            // guard is then false and ticking stops (CPU idle stays at zero).
+            _ = render_interval.tick(), if needs_redraw
+                || app.mode == AppMode::Thinking
+                || app.toast.is_some() => {
                 if app.mode == AppMode::Thinking {
                     app.tick = app.tick.wrapping_add(1);
                 }
@@ -527,6 +540,11 @@ async fn run_app(
                 }
                 terminal.draw(|f| ui::render(f, &mut app)).ok();
                 needs_redraw = false;
+                // Clear an expired toast so the next tick's guard goes false and
+                // ticking stops after this erasing frame.
+                if app.toast_text().is_none() {
+                    app.toast = None;
+                }
             }
         }
 
