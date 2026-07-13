@@ -20,6 +20,14 @@ pub enum CoreError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The remote connection or channel was lost *before* the command was
+    /// dispatched onto the wire. This variant is the signal that an automatic,
+    /// safe retry (e.g. one silent SSH reconnect) is permitted — no side effect
+    /// has happened remotely yet. Failures that occur *after* a command may have
+    /// started executing must NOT use this variant.
+    #[error("connection lost: {0}")]
+    ConnectionLost(String),
+
     /// Generic error for cases that don't fit a more specific variant.
     #[error("{0}")]
     Other(String),

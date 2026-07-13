@@ -7,14 +7,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use russh::client::{self, Handle, Msg};
 use russh::keys::*;
 use russh::{Channel, ChannelMsg, Disconnect};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -29,6 +29,47 @@ use crate::CommandResult;
 /// Unique prefix for marker lines. Chosen to be extremely unlikely to appear
 /// in normal command output.
 const MARKER_PREFIX: &str = "__FILAR_";
+
+/// Default keepalive interval — send a keepalive if nothing is received from
+/// the server for this long. Chosen well below typical NAT/idle-connection
+/// timeouts so a resting session never dies.
+const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Default number of unanswered keepalives before the connection is considered
+/// dead. `20s * 3 ≈ 60s` grace before russh tears the session down.
+const DEFAULT_KEEPALIVE_MAX: usize = 3;
+
+// ---------------------------------------------------------------------------
+// Transport config
+// ---------------------------------------------------------------------------
+
+/// Tunables for the SSH transport.
+///
+/// Defaults keep an idle session alive effectively indefinitely (as long as
+/// the network is up) and enable a single silent reconnect+retry when a command
+/// is issued on a connection that died while resting.
+#[derive(Debug, Clone)]
+pub struct SshTransportConfig {
+    /// Send a keepalive if nothing is received from the server for this long.
+    /// `None` disables keepalive entirely.
+    pub keepalive_interval: Option<Duration>,
+    /// Number of unanswered keepalives after which the connection is closed.
+    pub keepalive_max: usize,
+    /// When `true`, a command that fails because the connection was lost
+    /// *before dispatch* triggers one silent reconnect and a single retry.
+    /// A command that may already have executed is never auto-retried.
+    pub auto_reconnect: bool,
+}
+
+impl Default for SshTransportConfig {
+    fn default() -> Self {
+        Self {
+            keepalive_interval: Some(DEFAULT_KEEPALIVE_INTERVAL),
+            keepalive_max: DEFAULT_KEEPALIVE_MAX,
+            auto_reconnect: true,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SSH client handler
@@ -178,14 +219,33 @@ pub struct SshSession {
     session: Mutex<Handle<SshHandler>>,
     /// Monotonic counter for request IDs.
     req_counter: AtomicU64,
+    /// Set to `true` when teardown is intentional (`close()` or being replaced
+    /// on reconnect). The reader task reads this to decide whether a channel
+    /// closure is expected (INFO) or unexpected (WARN).
+    shutdown: Arc<AtomicBool>,
 }
 
 impl SshSession {
+    /// Connect to an SSH target with the default transport config.
+    pub async fn connect(target: &SshTarget) -> Result<Self> {
+        Self::connect_with_config(target, &SshTransportConfig::default()).await
+    }
+
     /// Connect to an SSH target, authenticate, open a shell channel, and
     /// synchronise the initial output.
-    pub async fn connect(target: &SshTarget) -> Result<Self> {
+    ///
+    /// `cfg` controls keepalive; keepalive is what keeps an idle session from
+    /// being reaped by the server/NAT after a few minutes of no traffic.
+    pub async fn connect_with_config(
+        target: &SshTarget,
+        cfg: &SshTransportConfig,
+    ) -> Result<Self> {
         let config = Arc::new(client::Config {
+            // Keep the inactivity guard well above the keepalive interval so a
+            // healthy session (keepalives answered) never trips it.
             inactivity_timeout: Some(Duration::from_secs(300)),
+            keepalive_interval: cfg.keepalive_interval,
+            keepalive_max: cfg.keepalive_max,
             ..<_>::default()
         });
 
@@ -288,7 +348,8 @@ impl SshSession {
         let (cmd_tx, cmd_rx) = mpsc::channel::<ChannelCmd>(16);
         let (event_tx, event_rx) = mpsc::unbounded_channel::<ChannelEvent>();
 
-        tokio::spawn(reader_task(channel, cmd_rx, event_tx));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        tokio::spawn(reader_task(channel, cmd_rx, event_tx, shutdown.clone()));
 
         info!("SSH shell channel ready and synchronised");
 
@@ -298,6 +359,7 @@ impl SshSession {
             event_rx: Mutex::new(event_rx),
             session: Mutex::new(session),
             req_counter: AtomicU64::new(0),
+            shutdown,
         })
     }
 
@@ -344,10 +406,16 @@ impl SshSession {
         }
 
         // Send the payload to the reader task (which owns the channel).
+        //
+        // A failure here means the reader task is already gone (the channel
+        // died — typically an idle session reaped by the server/NAT). Crucially,
+        // the command bytes have NOT reached the wire yet, so this is the one
+        // point where an automatic reconnect+retry is safe — signalled via the
+        // dedicated `ConnectionLost` variant.
         self.cmd_tx
             .send(ChannelCmd::Write(payload.into_bytes()))
             .await
-            .map_err(|_| CoreError::Other("channel task closed".into()))?;
+            .map_err(|_| CoreError::ConnectionLost("ssh channel task closed".into()))?;
 
         // Read events until we find the marker — without holding any lock
         // that `cancel()` needs.
@@ -397,8 +465,18 @@ impl SshSession {
         Ok(())
     }
 
+    /// Mark this session as intentionally shutting down.
+    ///
+    /// Signals the reader task that an imminent channel closure is expected, so
+    /// it logs at INFO rather than WARN. Used both by [`close`](Self::close) and
+    /// when the session is replaced during a reconnect.
+    pub(crate) fn mark_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
     /// Disconnect the SSH session.
     pub async fn close(&self) -> Result<()> {
+        self.mark_shutdown();
         let session = self.session.lock().await;
         let _ = session
             .disconnect(Disconnect::ByApplication, "", "English")
@@ -420,6 +498,7 @@ async fn reader_task(
     mut channel: Channel<Msg>,
     mut cmd_rx: mpsc::Receiver<ChannelCmd>,
     event_tx: mpsc::UnboundedSender<ChannelEvent>,
+    shutdown: Arc<AtomicBool>,
 ) {
     debug!("SSH reader task started");
     loop {
@@ -472,7 +551,15 @@ async fn reader_task(
                         // Other extended data — ignore.
                     }
                     Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                        warn!("reader: channel closed (EOF/Close/None)");
+                        // Expected closure (we are tearing the session down) is
+                        // routine — log at INFO. An unexpected closure (idle
+                        // reap, network drop) is worth a WARN and, via the chat
+                        // log mirror, is surfaced to the user.
+                        if shutdown.load(Ordering::Relaxed) {
+                            info!("reader: channel closed (shutdown)");
+                        } else {
+                            warn!("reader: channel closed unexpectedly (EOF/Close/None)");
+                        }
                         let _ = event_tx.send(ChannelEvent::Closed);
                         break;
                     }
@@ -489,31 +576,96 @@ async fn reader_task(
 // ---------------------------------------------------------------------------
 
 /// [`CommandExecutor`] implementation backed by an SSH session.
+///
+/// The session lives behind an [`RwLock`] so it can be swapped out on
+/// reconnect without disturbing in-flight readers. `run()`/`cancel()` take a
+/// *read* guard (they run concurrently — `cancel()` must work while `run()` is
+/// awaiting), while a reconnect briefly takes the *write* guard to install a
+/// fresh session.
 pub struct SshExecutor {
-    session: SshSession,
+    session: RwLock<SshSession>,
+    /// Target + credentials, retained so a dropped connection can be re-dialled
+    /// with the same parameters. Held in memory only (never logged).
+    target: SshTarget,
+    config: SshTransportConfig,
 }
 
 impl SshExecutor {
-    /// Create a new SSH executor by connecting to the given target.
+    /// Create a new SSH executor by connecting to the given target with the
+    /// default transport config.
     pub async fn connect(target: &SshTarget) -> Result<Self> {
-        let session = SshSession::connect(target).await?;
-        Ok(Self { session })
+        Self::connect_with_config(target, SshTransportConfig::default()).await
+    }
+
+    /// Create a new SSH executor with an explicit transport config.
+    pub async fn connect_with_config(
+        target: &SshTarget,
+        config: SshTransportConfig,
+    ) -> Result<Self> {
+        let session = SshSession::connect_with_config(target, &config).await?;
+        Ok(Self {
+            session: RwLock::new(session),
+            target: target.clone(),
+            config,
+        })
     }
 
     /// Close the underlying session.
     pub async fn close(&self) -> Result<()> {
-        self.session.close().await
+        self.session.read().await.close().await
     }
 }
 
 #[async_trait::async_trait]
 impl crate::CommandExecutor for SshExecutor {
     async fn run(&self, command: &str) -> Result<CommandResult> {
-        self.session.run(command).await
+        // First attempt on the current session.
+        let first = { self.session.read().await.run(command).await };
+
+        // Reconnect only when the connection was lost *before* the command was
+        // dispatched (the `ConnectionLost` variant). A command that may have
+        // started executing surfaces as a different error and is never retried
+        // automatically — this preserves the "no silent re-execution" invariant.
+        let should_reconnect =
+            self.config.auto_reconnect && matches!(first, Err(CoreError::ConnectionLost(_)));
+        if !should_reconnect {
+            return first;
+        }
+
+        info!("ssh connection lost before dispatch — attempting one silent reconnect");
+
+        // Install a fresh session under the write guard, then drop the guard
+        // before retrying so `cancel()` can still proceed during the retry.
+        {
+            let mut guard = self.session.write().await;
+            match SshSession::connect_with_config(&self.target, &self.config).await {
+                Ok(fresh) => {
+                    let old = std::mem::replace(&mut *guard, fresh);
+                    // The old session is already dead here; mark it so its
+                    // reader task (if any lingers) treats closure as expected.
+                    old.mark_shutdown();
+                }
+                Err(reconnect_err) => {
+                    warn!(error = %reconnect_err, "ssh reconnect failed");
+                    // Return the original connection-lost error, not the
+                    // reconnect failure — the user's command never ran.
+                    return first;
+                }
+            }
+        }
+
+        // Surfaced to the chat via the WARN→System log mirror (issue #57).
+        warn!(
+            "reconnected to {}:{}",
+            self.target.host, self.target.port
+        );
+
+        // Single retry on the fresh session.
+        self.session.read().await.run(command).await
     }
 
     async fn cancel(&self) -> Result<()> {
-        self.session.cancel().await
+        self.session.read().await.cancel().await
     }
 }
 
@@ -1057,5 +1209,125 @@ mod tests {
             check_host_key(&entries, "127.0.0.1:2222", "SHA256:abc"),
             HostKeyCheck::New
         );
+    }
+
+    // ── transport config ─────────────────────────────────────────────
+
+    #[test]
+    fn transport_config_defaults() {
+        let cfg = SshTransportConfig::default();
+        assert_eq!(cfg.keepalive_interval, Some(Duration::from_secs(20)));
+        assert_eq!(cfg.keepalive_max, 3);
+        assert!(cfg.auto_reconnect);
+    }
+
+    #[test]
+    fn connection_lost_is_classified() {
+        // Pre-dispatch failures use the typed variant so the executor knows a
+        // silent retry is safe; `is_connection_lost` recognises it.
+        let e = CoreError::ConnectionLost("ssh channel task closed".into());
+        assert!(crate::is_connection_lost(&e));
+        assert!(matches!(e, CoreError::ConnectionLost(_)));
+    }
+
+    // ── reconnect integration tests (require Docker sshd) ────────────
+    //
+    // These drive `SshExecutor` against a real container and toggle it with
+    // `docker stop`/`docker start`. The container name defaults to
+    // `filar-sshd` and can be overridden with `FILAR_TEST_SSHD_CONTAINER`.
+
+    #[cfg(test)]
+    fn test_target() -> SshTarget {
+        SshTarget {
+            name: "test".into(),
+            host: "127.0.0.1".into(),
+            port: 2222,
+            user: "testuser".into(),
+            auth: SshAuth::Password { password: None },
+            host_key_policy: HostKeyPolicy::Tofu,
+        }
+    }
+
+    #[cfg(test)]
+    fn docker(args: &[&str]) {
+        let container = std::env::var("FILAR_TEST_SSHD_CONTAINER")
+            .unwrap_or_else(|_| "filar-sshd".to_string());
+        let mut full = Vec::with_capacity(args.len() + 1);
+        full.extend_from_slice(args);
+        full.push(container.as_str());
+        let status = std::process::Command::new("docker")
+            .args(&full)
+            .status()
+            .expect("failed to invoke docker");
+        assert!(status.success(), "docker {args:?} failed");
+    }
+
+    /// Killing the container between commands yields a clear error on the next
+    /// command; restarting it and issuing another command reconnects silently
+    /// and succeeds. Verifies the `reconnected` notice is emitted (visible in
+    /// logs / chat via the WARN→System mirror — checked manually).
+    #[tokio::test]
+    #[ignore = "requires Docker sshd container on port 2222"]
+    async fn ssh_reconnect_after_container_restart() {
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
+
+        use crate::CommandExecutor;
+        let exec = SshExecutor::connect(&test_target()).await.unwrap();
+
+        // Baseline: works.
+        let r = exec.run("echo alive").await.unwrap();
+        assert_eq!(r.stdout.trim(), "alive");
+
+        // Kill the container — the session dies.
+        docker(&["stop"]);
+        // Give russh a moment to notice the dropped socket so the next command
+        // hits the pre-dispatch (ConnectionLost) path. Auto-reconnect will try
+        // once, fail (container down), and surface a clear error.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let down = exec.run("echo nope").await;
+        assert!(down.is_err(), "expected an error while container is down");
+
+        // Bring it back and let sshd come up.
+        docker(&["start"]);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Next command should reconnect silently and succeed.
+        let r = exec.run("echo back").await.unwrap();
+        assert_eq!(r.stdout.trim(), "back");
+
+        exec.close().await.unwrap();
+    }
+
+    /// A command that has already been dispatched must never be auto-retried.
+    /// Killing the container *while* a long command runs surfaces an error
+    /// rather than silently re-running it after reconnect.
+    #[tokio::test]
+    #[ignore = "requires Docker sshd container on port 2222"]
+    async fn ssh_dispatched_command_not_retried() {
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
+
+        use crate::CommandExecutor;
+        let exec = Arc::new(SshExecutor::connect(&test_target()).await.unwrap());
+
+        let exec2 = exec.clone();
+        let handle = tokio::spawn(async move {
+            // Long-running command: it is dispatched before the container dies.
+            exec2.run("sleep 30 && echo done").await
+        });
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        docker(&["restart"]);
+
+        let result = handle.await.unwrap();
+        // The dispatched command must error out (channel closed after dispatch),
+        // NOT silently reconnect and re-run `sleep 30 && echo done`.
+        assert!(
+            result.is_err() || result.as_ref().unwrap().exit_code != Some(0),
+            "dispatched command should not have completed successfully after reconnect: {result:?}"
+        );
+
+        exec.close().await.unwrap();
     }
 }

@@ -83,7 +83,13 @@ impl CommandExecutor for SecretSubstitutingExecutor {
                         }
                     }
                 }
-                return Err(CoreError::Other(msg));
+                // Preserve the error's classification through sanitisation —
+                // `ConnectionLost` must survive so the transport's reconnect
+                // logic (and `is_connection_lost`) still recognises it.
+                return Err(match e {
+                    CoreError::ConnectionLost(_) => CoreError::ConnectionLost(msg),
+                    _ => CoreError::Other(msg),
+                });
             }
         };
 
