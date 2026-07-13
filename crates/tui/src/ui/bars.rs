@@ -92,28 +92,38 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         spans.push(Span::styled(mt, app.theme.mode_badge_style(mode_color)));
     }
 
-    // Right-align confirm_mode.
+    // Right side: `confirm_mode`, then an optional toast (e.g. "· copied")
+    // pinned to the far right. Space for the toast is reserved *before* the
+    // padding is computed — otherwise the padding fills the whole line and the
+    // toast, pushed afterwards, starts at column == width and gets clipped by
+    // ratatui (the original bug: the toast was never visible).
     let confirm_text = format!(" {:?}", app.confirm_mode);
     // left_len already includes mode-badge spans (pushed above), so we
     // must NOT add mode_len again — that would double-count and break
     // the right-alignment in non-Normal modes.
     let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     let right_len = confirm_text.chars().count();
-    let total = left_len + right_len;
+
+    // Owned copy drops the borrow on `app` immediately. The rendered toast is
+    // a 2-space gap + `· <text>`.
+    let toast_span_text = app
+        .toast_text()
+        .map(|t| format!("  {} {}", glyphs.middle_dot, t));
+    let toast_len = toast_span_text
+        .as_ref()
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
+
     let available = area.width as usize;
-    if total < available {
-        let padding = available - total;
+    // Toast has priority over padding on a narrow terminal (saturating — no
+    // panic, toast may be clipped by ratatui if the line is too short).
+    let padding = available.saturating_sub(left_len + right_len + toast_len);
+    if padding > 0 {
         spans.push(Span::raw(" ".repeat(padding)));
     }
     spans.push(Span::styled(confirm_text, app.theme.muted()));
-
-    // Toast notification (e.g. "copied") — shown right-aligned after confirm_mode.
-    if let Some(toast) = app.toast_text() {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            format!("{} {}", glyphs.middle_dot, toast),
-            app.theme.success_fg(),
-        ));
+    if let Some(text) = toast_span_text {
+        spans.push(Span::styled(text, app.theme.success_fg()));
     }
 
     let line = Line::from(spans);
@@ -182,4 +192,70 @@ pub(crate) fn render_help_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line);
     f.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use filar_core::CommandConfirmMode;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::time::{Duration, Instant};
+
+    /// Render the status bar into a `width`×1 test buffer and return the visible
+    /// text of the single row.
+    fn render_status_row(app: &mut App, width: u16) -> String {
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_status_bar(f, app, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..width).map(|x| buffer[(x, 0)].symbol()).collect()
+    }
+
+    #[test]
+    fn active_toast_is_visible_in_status_bar() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.toast = Some((
+            "copied".to_string(),
+            Instant::now() + Duration::from_secs(10),
+        ));
+        let row = render_status_row(&mut app, 80);
+        assert!(
+            row.contains("copied"),
+            "active toast should be visible, got: {row:?}"
+        );
+    }
+
+    #[test]
+    fn expired_toast_is_absent_from_status_bar() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.toast = Some((
+            "copied".to_string(),
+            Instant::now() - Duration::from_secs(1),
+        ));
+        let row = render_status_row(&mut app, 80);
+        assert!(
+            !row.contains("copied"),
+            "expired toast must not be rendered, got: {row:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_terminal_does_not_panic_with_toast() {
+        // 20 columns: left text + confirm_mode already exceed the width, so the
+        // toast is clipped — but rendering must not panic (saturating padding).
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.toast = Some((
+            "copied".to_string(),
+            Instant::now() + Duration::from_secs(10),
+        ));
+        let row = render_status_row(&mut app, 20);
+        assert_eq!(row.chars().count(), 20, "row must fill exactly 20 columns");
+    }
 }
