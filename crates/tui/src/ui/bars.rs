@@ -197,7 +197,7 @@ pub(crate) fn render_help_bar(f: &mut Frame, app: &mut App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::app::{App, AppMode};
     use filar_core::CommandConfirmMode;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -229,6 +229,25 @@ mod tests {
         assert!(
             row.contains("copied"),
             "active toast should be visible, got: {row:?}"
+        );
+    }
+
+    #[test]
+    fn active_toast_visible_alongside_mode_badge() {
+        // Guards the double-counting bug flagged near `left_len`: a mode badge
+        // (non-Normal mode) is already included in `left_len`, so the toast must
+        // still fit and render. Without the reserve-before-padding fix — or if
+        // `mode_len` were added twice — the toast would be pushed off-screen.
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Confirming;
+        app.toast = Some((
+            "copied".to_string(),
+            Instant::now() + Duration::from_secs(10),
+        ));
+        let row = render_status_row(&mut app, 80);
+        assert!(
+            row.contains("copied"),
+            "toast should remain visible alongside a mode badge, got: {row:?}"
         );
     }
 
