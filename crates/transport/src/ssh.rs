@@ -737,14 +737,15 @@ pub(crate) fn resolve_ssh_password(
 ) -> Result<String> {
     match password {
         Some(p) => Ok(p.clone()),
-        None => secrets.get("SSH_PASSWORD").map_err(|_| {
-            CoreError::Secret(
-                "no SSH password available: set it explicitly via \
-                 SshAuth::Password { password: Some(..) }, or provide it through \
+        None => secrets.get("SSH_PASSWORD").map_err(|e| {
+            // Keep the provider's underlying cause (e.g. a custom provider's
+            // network/permission failure) instead of discarding it.
+            CoreError::Secret(format!(
+                "no SSH password available ({e}): set it explicitly via \
+                 SshAuth::Password {{ password: Some(..) }}, or provide it through \
                  your SecretProvider under the name \"SSH_PASSWORD\" (the default \
                  EnvSecretProvider reads the SSH_PASSWORD environment variable)"
-                    .into(),
-            )
+            ))
         }),
     }
 }
