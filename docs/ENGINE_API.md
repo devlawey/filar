@@ -113,6 +113,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## SSH credentials (password auth)
+
+For `SshAuth::Password`, the SSH password is resolved in this order:
+
+1. **Explicit password on the target** — `SshAuth::Password { password: Some(..) }`.
+   Recommended for bots, mobile, and other embeddings that already hold the
+   credential.
+2. **Your `SecretProvider`** — if the password is `None`, the transport looks up
+   the logical name `"SSH_PASSWORD"` via the provider you pass to
+   `SshExecutor::connect_with_provider` (or `SshInteractive::connect_with_provider`).
+
+The transport itself **never reads environment variables** for the password. The
+`SSH_PASSWORD` env-var fallback is simply the behaviour of the default
+`EnvSecretProvider`, which is what the convenience constructors
+(`SshExecutor::connect`, `SshInteractive::connect`) use — so TUI/desktop keep
+reading `SSH_PASSWORD` from the environment, while external consumers whose env is
+not a secret source are not trapped by it.
+
+```rust,no_run
+use std::sync::Arc;
+use filar_core::{SshTarget, SshAuth, HostKeyPolicy, StaticSecretProvider};
+use filar_transport::{SshExecutor, SshTransportConfig};
+
+# async fn example(target: SshTarget) -> Result<(), Box<dyn std::error::Error>> {
+// Option A — inject the password explicitly on the target.
+let target_a = SshTarget {
+    auth: SshAuth::Password { password: Some("s3cret".into()) },
+    ..target.clone()
+};
+let exec_a = SshExecutor::connect(&target_a).await?;
+
+// Option B — supply it through your own SecretProvider under "SSH_PASSWORD".
+let secrets = Arc::new(StaticSecretProvider::new());
+secrets.insert("SSH_PASSWORD", "s3cret");
+let target_b = SshTarget { auth: SshAuth::Password { password: None }, ..target };
+let exec_b =
+    SshExecutor::connect_with_provider(&target_b, SshTransportConfig::default(), secrets).await?;
+# let _ = (exec_a, exec_b);
+# Ok(())
+# }
+```
+
 ## SessionStore
 
 `SessionStore::new(base_dir)` accepts an explicit base directory, making it

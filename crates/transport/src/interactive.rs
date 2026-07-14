@@ -23,9 +23,9 @@ use russh::{ChannelMsg, ChannelWriteHalf, Disconnect};
 use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 
-use filar_core::{CoreError, Result, SshAuth, SshTarget};
+use filar_core::{CoreError, EnvSecretProvider, Result, SecretProvider, SshAuth, SshTarget};
 
-use crate::ssh::{dirs_or_default, known_hosts_path, SshHandler};
+use crate::ssh::{dirs_or_default, known_hosts_path, resolve_ssh_password, SshHandler};
 
 // ---------------------------------------------------------------------------
 // InteractiveTerminal trait
@@ -228,16 +228,35 @@ pub struct SshInteractive {
 impl SshInteractive {
     /// Connect to an SSH target, request a PTY + shell, and return an
     /// interactive terminal.
+    ///
+    /// Secrets are resolved through the default [`EnvSecretProvider`]
+    /// (`SSH_PASSWORD` env var), preserving TUI/desktop behaviour.
     pub async fn connect(target: &SshTarget, cols: u16, rows: u16) -> Result<Self> {
         Self::connect_with_term(target, cols, rows, "xterm-256color").await
     }
 
-    /// Connect with a specific terminal type string.
+    /// Connect with a specific terminal type string, resolving secrets through
+    /// the default [`EnvSecretProvider`].
     pub async fn connect_with_term(
         target: &SshTarget,
         cols: u16,
         rows: u16,
         term: &str,
+    ) -> Result<Self> {
+        Self::connect_with_provider(target, cols, rows, term, &EnvSecretProvider::new()).await
+    }
+
+    /// Connect with a specific terminal type string and secret provider.
+    ///
+    /// External consumers that don't use environment variables can inject the
+    /// SSH password via their own [`SecretProvider`] (`"SSH_PASSWORD"`) or set
+    /// it explicitly on the target.
+    pub async fn connect_with_provider(
+        target: &SshTarget,
+        cols: u16,
+        rows: u16,
+        term: &str,
+        secrets: &dyn SecretProvider,
     ) -> Result<Self> {
         let config = Arc::new(client::Config {
             inactivity_timeout: Some(std::time::Duration::from_secs(300)),
@@ -258,7 +277,7 @@ impl SshInteractive {
             .map_err(|e| CoreError::Other(format!("SSH connect failed: {e}")))?;
 
         // ── Authenticate ───────────────────────────────────────────────
-        authenticate(&mut session, target).await?;
+        authenticate(&mut session, target, secrets).await?;
 
         // ── Open channel and request PTY + shell ───────────────────────
         let channel = session
@@ -354,7 +373,14 @@ impl InteractiveTerminal for SshInteractive {
 // ---------------------------------------------------------------------------
 
 /// Authenticate an SSH session using the target's configured auth method.
-async fn authenticate(session: &mut Handle<SshHandler>, target: &SshTarget) -> Result<()> {
+///
+/// `secrets` supplies the SSH password (`"SSH_PASSWORD"`) for password auth when
+/// no explicit password is set on the target — no direct env reads here.
+async fn authenticate(
+    session: &mut Handle<SshHandler>,
+    target: &SshTarget,
+    secrets: &dyn SecretProvider,
+) -> Result<()> {
     match &target.auth {
         SshAuth::Key { path } => {
             let key_path = path.clone().unwrap_or_else(dirs_or_default);
@@ -381,11 +407,7 @@ async fn authenticate(session: &mut Handle<SshHandler>, target: &SshTarget) -> R
             info!("SSH authenticated via key");
         }
         SshAuth::Password { password } => {
-            let password = password.clone()
-                .or_else(|| std::env::var("SSH_PASSWORD").ok())
-                .ok_or_else(|| {
-                    CoreError::Secret("no password provided (set SSH_PASSWORD env var or enter in GUI)".into())
-                })?;
+            let password = resolve_ssh_password(password, secrets)?;
 
             let auth_res = session
                 .authenticate_password(&target.user, &password)
