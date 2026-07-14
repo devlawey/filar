@@ -40,6 +40,7 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
             HelpItem { key: "enter", desc: "confirm", action: Some(HelpAction::Confirm) },
             HelpItem { key: "a/y", desc: "approve", action: Some(HelpAction::Approve) },
             HelpItem { key: "d/n", desc: "deny", action: Some(HelpAction::Deny) },
+            HelpItem { key: "^Z", desc: "deny", action: Some(HelpAction::CancelWork) },
             HelpItem { key: "^Q", desc: "quit", action: Some(HelpAction::Quit) },
         ],
         AppMode::Interactive => vec![

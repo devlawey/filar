@@ -2036,6 +2036,30 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_q_and_z_are_forwarded_in_interactive() {
+        // In Interactive the global hotkey gate is bypassed: ^Q/^Z must reach
+        // the PTY as raw control bytes (Ctrl+Q=0x11, Ctrl+Z=0x1A), NOT trigger
+        // quit()/cancel_work(). Only Ctrl+T leaves interactive mode.
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Interactive;
+
+        app.handle_key(ctrl_key('q'));
+        assert!(!app.should_quit, "^Q must not quit in Interactive");
+        assert_eq!(app.mode, AppMode::Interactive);
+
+        app.handle_key(ctrl_key('z'));
+        assert_eq!(app.mode, AppMode::Interactive, "^Z must not cancel in Interactive");
+        assert!(!app.should_quit);
+
+        let bytes = app
+            .pending_term_input
+            .clone()
+            .expect("keys should be forwarded to the PTY");
+        assert!(bytes.contains(&0x11), "Ctrl+Q should forward 0x11, got {bytes:?}");
+        assert!(bytes.contains(&0x1a), "Ctrl+Z should forward 0x1A, got {bytes:?}");
+    }
+
+    #[test]
     fn push_error_bumps_message_rev() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let rev_before = app.message_rev;
