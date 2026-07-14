@@ -18,7 +18,9 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use filar_core::{CoreError, HostKeyPolicy, Result, SshAuth, SshTarget};
+use filar_core::{
+    CoreError, EnvSecretProvider, HostKeyPolicy, Result, SecretProvider, SshAuth, SshTarget,
+};
 
 use crate::CommandResult;
 
@@ -227,8 +229,22 @@ pub struct SshSession {
 
 impl SshSession {
     /// Connect to an SSH target with the default transport config.
+    ///
+    /// Secrets (the SSH password for `SshAuth::Password`) are resolved through
+    /// the default [`EnvSecretProvider`], preserving the `SSH_PASSWORD` env-var
+    /// behaviour for TUI/desktop. External consumers that don't use env should
+    /// call [`SshSession::connect_with_config_and_provider`].
     pub async fn connect(target: &SshTarget) -> Result<Self> {
         Self::connect_with_config(target, &SshTransportConfig::default()).await
+    }
+
+    /// Connect with an explicit transport config, resolving secrets through the
+    /// default [`EnvSecretProvider`].
+    pub async fn connect_with_config(
+        target: &SshTarget,
+        cfg: &SshTransportConfig,
+    ) -> Result<Self> {
+        Self::connect_with_config_and_provider(target, cfg, &EnvSecretProvider::new()).await
     }
 
     /// Connect to an SSH target, authenticate, open a shell channel, and
@@ -236,9 +252,14 @@ impl SshSession {
     ///
     /// `cfg` controls keepalive; keepalive is what keeps an idle session from
     /// being reaped by the server/NAT after a few minutes of no traffic.
-    pub async fn connect_with_config(
+    ///
+    /// `secrets` supplies the SSH password for `SshAuth::Password` (looked up as
+    /// `"SSH_PASSWORD"`) when no explicit password is set on the target. This is
+    /// the single point where the password is obtained — no direct env reads.
+    pub async fn connect_with_config_and_provider(
         target: &SshTarget,
         cfg: &SshTransportConfig,
+        secrets: &dyn SecretProvider,
     ) -> Result<Self> {
         let config = Arc::new(client::Config {
             // Keep the inactivity guard well above the keepalive interval so a
@@ -294,9 +315,7 @@ impl SshSession {
             }
 
             SshAuth::Password { password } => {
-                let password = password.clone()
-                    .or_else(|| std::env::var("SSH_PASSWORD").ok())
-                    .ok_or_else(|| CoreError::Secret("no password provided (set SSH_PASSWORD env var or enter in GUI)".into()))?;
+                let password = resolve_ssh_password(password, secrets)?;
 
                 let auth_res = session
                     .authenticate_password(&target.user, &password)
@@ -588,25 +607,48 @@ pub struct SshExecutor {
     /// with the same parameters. Held in memory only (never logged).
     target: SshTarget,
     config: SshTransportConfig,
+    /// Secret provider used to resolve the SSH password on connect and on every
+    /// auto-reconnect. Retained so re-dialling uses the same credential source.
+    secrets: Arc<dyn SecretProvider>,
 }
 
 impl SshExecutor {
     /// Create a new SSH executor by connecting to the given target with the
-    /// default transport config.
+    /// default transport config, resolving secrets through the default
+    /// [`EnvSecretProvider`] (preserves TUI/desktop `SSH_PASSWORD` env-var
+    /// behaviour).
     pub async fn connect(target: &SshTarget) -> Result<Self> {
         Self::connect_with_config(target, SshTransportConfig::default()).await
     }
 
-    /// Create a new SSH executor with an explicit transport config.
+    /// Create a new SSH executor with an explicit transport config, resolving
+    /// secrets through the default [`EnvSecretProvider`].
     pub async fn connect_with_config(
         target: &SshTarget,
         config: SshTransportConfig,
     ) -> Result<Self> {
-        let session = SshSession::connect_with_config(target, &config).await?;
+        Self::connect_with_provider(target, config, Arc::new(EnvSecretProvider::new())).await
+    }
+
+    /// Create a new SSH executor with an explicit transport config and secret
+    /// provider.
+    ///
+    /// External consumers (bots, mobile, FFI) that don't use environment
+    /// variables should pass their own [`SecretProvider`] holding `SSH_PASSWORD`
+    /// (or set the password explicitly on the target). The provider is retained
+    /// and reused for every silent reconnect.
+    pub async fn connect_with_provider(
+        target: &SshTarget,
+        config: SshTransportConfig,
+        secrets: Arc<dyn SecretProvider>,
+    ) -> Result<Self> {
+        let session =
+            SshSession::connect_with_config_and_provider(target, &config, &*secrets).await?;
         Ok(Self {
             session: RwLock::new(session),
             target: target.clone(),
             config,
+            secrets,
         })
     }
 
@@ -638,7 +680,13 @@ impl crate::CommandExecutor for SshExecutor {
         // before retrying so `cancel()` can still proceed during the retry.
         {
             let mut guard = self.session.write().await;
-            match SshSession::connect_with_config(&self.target, &self.config).await {
+            match SshSession::connect_with_config_and_provider(
+                &self.target,
+                &self.config,
+                &*self.secrets,
+            )
+            .await
+            {
                 Ok(fresh) => {
                     let old = std::mem::replace(&mut *guard, fresh);
                     // The old session is already dead here; mark it so its
@@ -672,6 +720,35 @@ impl crate::CommandExecutor for SshExecutor {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve the SSH password for `SshAuth::Password`.
+///
+/// Resolution order:
+/// 1. An explicit password set on the target (`SshAuth::Password { password:
+///    Some(..) }`) always wins — useful for bots/FFI that inject credentials
+///    directly.
+/// 2. Otherwise the secret is fetched from the [`SecretProvider`] under the
+///    logical name `"SSH_PASSWORD"`. The default [`EnvSecretProvider`] maps this
+///    to the `SSH_PASSWORD` environment variable, so TUI/desktop behaviour is
+///    unchanged; env is never read directly by the transport.
+pub(crate) fn resolve_ssh_password(
+    password: &Option<String>,
+    secrets: &dyn SecretProvider,
+) -> Result<String> {
+    match password {
+        Some(p) => Ok(p.clone()),
+        None => secrets.get("SSH_PASSWORD").map_err(|e| {
+            // Keep the provider's underlying cause (e.g. a custom provider's
+            // network/permission failure) instead of discarding it.
+            CoreError::Secret(format!(
+                "no SSH password available ({e}): set it explicitly via \
+                 SshAuth::Password {{ password: Some(..) }}, or provide it through \
+                 your SecretProvider under the name \"SSH_PASSWORD\" (the default \
+                 EnvSecretProvider reads the SSH_PASSWORD environment variable)"
+            ))
+        }),
+    }
+}
 
 /// Default SSH key path: `~/.ssh/id_ed25519` (falls back to `id_rsa`).
 pub(crate) fn dirs_or_default() -> std::path::PathBuf {
@@ -1228,6 +1305,39 @@ mod tests {
         let e = CoreError::ConnectionLost("ssh channel task closed".into());
         assert!(crate::is_connection_lost(&e));
         assert!(matches!(e, CoreError::ConnectionLost(_)));
+    }
+
+    // ── SSH password resolution (issue #61) ──────────────────────────
+
+    #[test]
+    fn ssh_password_from_provider_without_env() {
+        // A caller-supplied provider (bot/FFI/tests) resolves SSH_PASSWORD
+        // without touching the environment — the transport never reads env.
+        let provider = filar_core::StaticSecretProvider::new();
+        provider.insert("SSH_PASSWORD", "s3cret");
+        let pw = resolve_ssh_password(&None, &provider).unwrap();
+        assert_eq!(pw, "s3cret");
+    }
+
+    #[test]
+    fn ssh_password_explicit_wins_over_provider() {
+        // An explicit password on the target takes precedence over the provider.
+        let provider = filar_core::StaticSecretProvider::new();
+        provider.insert("SSH_PASSWORD", "from-provider");
+        let pw = resolve_ssh_password(&Some("explicit".into()), &provider).unwrap();
+        assert_eq!(pw, "explicit");
+    }
+
+    #[test]
+    fn ssh_password_missing_mentions_provider_and_explicit() {
+        // Error text must guide external consumers: mention both the explicit
+        // password path and the SecretProvider.
+        let provider = filar_core::StaticSecretProvider::new();
+        let err = resolve_ssh_password(&None, &provider).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("SshAuth::Password"), "should mention explicit password: {msg}");
+        assert!(msg.contains("SecretProvider"), "should mention the provider: {msg}");
+        assert!(msg.contains("SSH_PASSWORD"), "should mention the secret name: {msg}");
     }
 
     // ── reconnect integration tests (require Docker sshd) ────────────

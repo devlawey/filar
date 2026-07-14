@@ -1731,3 +1731,51 @@ help-actions `Quit`/`CancelWork`. `cargo test --workspace` (tui 202) и
 - `app.rs`: добавлен регресс-тест `ctrl_q_and_z_are_forwarded_in_interactive` —
   проверяет, что в Interactive `^Q`/`^Z` уходят в PTY байтами (0x11/0x1A) и не
   вызывают `quit()`/`cancel_work()`. Итого tui — 203 теста, clippy зелёный.
+
+## Issue #61: Transport — SSH_PASSWORD в обход SecretProvider (milestone v0.3.1)
+
+**Мотивация:** фоллбэк `std::env::var("SSH_PASSWORD")` в `ssh.rs`/`interactive.rs`
+был единственным секретом, читаемым напрямую из env в обход `SecretProvider`.
+Нарушал границу движка (DoD задачи 0.4) и был западнёй для внешних потребителей
+(бот/мобилка), у которых env — не источник секретов.
+
+**Что сделано (`crates/transport/src/ssh.rs`, `interactive.rs`):**
+- Новый хелпер `resolve_ssh_password(password, secrets)` (в `ssh.rs`,
+  `pub(crate)`) — единственная точка получения SSH-пароля: явный
+  `SshAuth::Password { password: Some(..) }` имеет приоритет, иначе
+  `secrets.get("SSH_PASSWORD")`. Прямых `env::var` для пароля в транспорте больше
+  нет. Текст ошибки при отсутствии упоминает и явную передачу, и провайдера, и
+  имя `SSH_PASSWORD`.
+- `ssh.rs`: добавлен `SshSession::connect_with_config_and_provider(target, cfg,
+  &dyn SecretProvider)`; старые `connect`/`connect_with_config` сохранены и теперь
+  делегируют в него с `EnvSecretProvider` (поведение TUI/десктопа не меняется).
+- `SshExecutor`: новое поле `secrets: Arc<dyn SecretProvider>` + конструктор
+  `connect_with_provider(target, config, secrets)`. Провайдер переиспользуется
+  при тихом авто-реконнекте. `connect`/`connect_with_config` дефолтят на
+  `EnvSecretProvider`.
+- `interactive.rs`: `authenticate` принимает `&dyn SecretProvider`; добавлен
+  `SshInteractive::connect_with_provider(..)`; `connect`/`connect_with_term`
+  дефолтят на `EnvSecretProvider`.
+
+**Публичные контракты:** добавлены (не ломающие) методы
+`SshSession::connect_with_config_and_provider`, `SshExecutor::connect_with_provider`,
+`SshInteractive::connect_with_provider`. Старые сигнатуры сохранены. Трейты
+`CommandExecutor`/`LlmClient` без изменений.
+
+**Документация:** `docs/ENGINE_API.md` — новый раздел «SSH credentials (password
+auth)»: порядок разрешения пароля (явный → провайдер `SSH_PASSWORD`), транспорт
+не читает env сам, env-фоллбэк = поведение `EnvSecretProvider`; пример с обоими
+вариантами.
+
+**Тесты:** `ssh_password_from_provider_without_env` (StaticSecretProvider отдаёт
+пароль без env), `ssh_password_explicit_wins_over_provider`,
+`ssh_password_missing_mentions_provider_and_explicit`. `cargo build/test/clippy
+--workspace` — зелёные (transport 24, всего workspace без падений). Grep:
+`env::var` для секретов в engine-коде вне `EnvSecretProvider` не осталось
+(HOME/USERPROFILE/WT_SESSION — не секреты; чтение `SSH_PASSWORD` осталось только
+в `#[ignore]` docker-тестах как гвард запуска).
+
+**Дальше:** осталась ручная проверка (реальный вход по паролю из TUI и
+`#[ignore]` docker-sshd тесты, включая тихий реконнект с переиспользованием
+провайдера). Отдельных доработок по задаче не планируется — после мёржа
+milestone v0.3.1 продолжается следующими issue.
