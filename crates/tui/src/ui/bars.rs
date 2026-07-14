@@ -28,10 +28,11 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
             HelpItem { key: "wheel", desc: "scroll", action: None },
             HelpItem { key: "click", desc: "expand", action: None },
             HelpItem { key: "drag", desc: "copy", action: None },
-            HelpItem { key: "^C", desc: "quit", action: Some(HelpAction::Quit) },
+            HelpItem { key: "^Q", desc: "quit", action: Some(HelpAction::Quit) },
         ],
         AppMode::Thinking => vec![
-            HelpItem { key: "ctrl+c", desc: "quit", action: Some(HelpAction::Quit) },
+            HelpItem { key: "^Z", desc: "cancel", action: Some(HelpAction::CancelWork) },
+            HelpItem { key: "^Q", desc: "quit", action: Some(HelpAction::Quit) },
             HelpItem { key: "wheel", desc: "scroll", action: None },
         ],
         AppMode::Confirming => vec![
@@ -39,7 +40,8 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
             HelpItem { key: "enter", desc: "confirm", action: Some(HelpAction::Confirm) },
             HelpItem { key: "a/y", desc: "approve", action: Some(HelpAction::Approve) },
             HelpItem { key: "d/n", desc: "deny", action: Some(HelpAction::Deny) },
-            HelpItem { key: "ctrl+c", desc: "quit", action: Some(HelpAction::Quit) },
+            HelpItem { key: "^Z", desc: "deny", action: Some(HelpAction::CancelWork) },
+            HelpItem { key: "^Q", desc: "quit", action: Some(HelpAction::Quit) },
         ],
         AppMode::Interactive => vec![
             HelpItem { key: "ctrl+t", desc: "agent mode", action: Some(HelpAction::Terminal) },
@@ -48,7 +50,7 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
         AppMode::PasswordInput => vec![
             HelpItem { key: "enter", desc: "send password", action: Some(HelpAction::SendPassword) },
             HelpItem { key: "esc", desc: "cancel", action: Some(HelpAction::Cancel) },
-            HelpItem { key: "ctrl+c", desc: "cancel", action: Some(HelpAction::Cancel) },
+            HelpItem { key: "^Q", desc: "quit", action: Some(HelpAction::Quit) },
         ],
     }
 }

@@ -124,8 +124,12 @@ pub enum HelpAction {
     Terminal,
     /// Enter password input mode (Ctrl+P).
     Password,
-    /// Quit the application (Ctrl+C) or cancel agent (in Thinking).
+    /// Quit the application (Ctrl+Q). In Confirming denies first; in Thinking
+    /// cancels the running agent; then shuts down gracefully.
     Quit,
+    /// Cancel the current work (Ctrl+Z): stop the agent in Thinking or deny in
+    /// Confirming, without quitting.
+    CancelWork,
     /// Switch confirm selection (Tab).
     Switch,
     /// Confirm with the selected button (Enter in Confirming).
@@ -416,6 +420,55 @@ impl App {
     }
 
     /// Handle a terminal keyboard event.
+    /// Quit the application gracefully (Ctrl+Q) from any non-Interactive mode.
+    ///
+    /// Mirrors the old Ctrl+C quit: a pending confirmation is denied first
+    /// (Confirming) and a running agent is cancelled (Thinking) so shutdown is
+    /// clean, then `should_quit` triggers teardown + session save in the runner.
+    fn quit(&mut self) {
+        match self.mode {
+            AppMode::Confirming => {
+                self.respond_to_confirmation(false);
+            }
+            AppMode::Thinking => {
+                if let Some(ref token) = self.cancellation {
+                    token.cancel();
+                }
+                self.cancellation = None;
+            }
+            _ => {}
+        }
+        self.should_quit = true;
+    }
+
+    /// Cancel the current work (Ctrl+Z) without quitting.
+    ///
+    /// - Thinking: cancel the running agent (token → `Cancelled` event, partial
+    ///   answer stays) and return to Normal.
+    /// - Confirming: deny the pending command (stay in the app).
+    /// - Other modes: no-op.
+    fn cancel_work(&mut self) {
+        match self.mode {
+            AppMode::Thinking => {
+                if let Some(ref token) = self.cancellation {
+                    token.cancel();
+                }
+                self.cancellation = None;
+                self.agent_running = false;
+                self.pending_input = None;
+                self.pending_ssh = None;
+                self.pending_ssh_password = None;
+                self.mode = AppMode::Normal;
+                self.push_message(ChatBlock::System("Cancelled.".into()));
+                self.scroll = 0;
+            }
+            AppMode::Confirming => {
+                self.respond_to_confirmation(false);
+            }
+            _ => {}
+        }
+    }
+
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -426,8 +479,26 @@ impl App {
                 && key.code == KeyCode::Char(c)
         };
         // Map English Ctrl shortcuts to both English and Russian layout chars.
-        // Russian equivalents (ЙЦУКЕН): T=е, C=с, A=ф, D=в, Y=н, N=т, P=з, Esc=Esc
+        // Russian equivalents (ЙЦУКЕН): T=е, C=с, A=ф, D=в, Y=н, N=т, P=з,
+        // Q=й, Z=я, Esc=Esc
         let ctrl_key = |en: char, ru: char| is_ctrl(en) || is_ctrl(ru);
+
+        // Global control hotkeys — active in every mode EXCEPT Interactive, where
+        // all keys (including ^Q/^Z/^C) are forwarded to the remote PTY.
+        //
+        // Ctrl+C is intentionally NOT bound anywhere: users strongly associate it
+        // with "copy", so an accidental press must do nothing. Quit is ^Q, cancel
+        // is ^Z (both with Russian-layout equivalents Й/Я).
+        if self.mode != AppMode::Interactive {
+            if ctrl_key('q', 'й') {
+                self.quit();
+                return;
+            }
+            if ctrl_key('z', 'я') {
+                self.cancel_work();
+                return;
+            }
+        }
 
         match self.mode {
             AppMode::Normal => match key.code {
@@ -496,9 +567,6 @@ impl App {
                 _ if ctrl_key('t', 'е') => {
                     // Toggle to interactive terminal mode.
                     self.toggle_interactive = true;
-                }
-                _ if ctrl_key('c', 'с') => {
-                    self.should_quit = true;
                 }
                 _ if ctrl_key('p', 'з') => {
                     // Enter secure password input mode.
@@ -583,23 +651,6 @@ impl App {
                 _ => {}
             },
             AppMode::Thinking => {
-                if ctrl_key('c', 'с') {
-                    // Trigger cancellation token to stop the agent task.
-                    if let Some(ref token) = self.cancellation {
-                        token.cancel();
-                    }
-                    self.cancellation = None;
-                    // Cancel the running command and return to Normal mode.
-                    self.agent_running = false;
-                    self.pending_input = None;
-                    self.pending_ssh = None;
-                    self.pending_ssh_password = None;
-                    self.mode = AppMode::Normal;
-                    self.push_message(ChatBlock::System(
-                        "Cancelled.".into()
-                    ));
-                    self.scroll = 0;
-                }
                 if key.code == KeyCode::PageUp {
                     self.scroll = self.scroll.saturating_add(5);
                     self.clamp_scroll();
@@ -631,20 +682,12 @@ impl App {
                 KeyCode::End => {
                     self.scroll = 0;
                 }
-                _ if ctrl_key('c', 'с') => {
-                    self.respond_to_confirmation(false);
-                    self.should_quit = true;
-                }
                 _ => {}
             },
             AppMode::Interactive => {
-                // Ctrl+T toggles back to agent mode.
+                // Ctrl+T toggles back to agent mode. Every other key — including
+                // ^C/^Q/^Z — is forwarded to the remote PTY unchanged.
                 if ctrl_key('t', 'е') {
-                    self.toggle_interactive = true;
-                    return;
-                }
-                // Ctrl+C also exits interactive mode.
-                if ctrl_key('c', 'с') {
                     self.toggle_interactive = true;
                     return;
                 }
@@ -698,11 +741,6 @@ impl App {
                 }
                 KeyCode::Esc => {
                     // Cancel — go back to normal input.
-                    self.input.clear();
-                    self.cursor_pos = 0;
-                    self.mode = AppMode::Normal;
-                }
-                _ if ctrl_key('c', 'с') => {
                     self.input.clear();
                     self.cursor_pos = 0;
                     self.mode = AppMode::Normal;
@@ -1050,35 +1088,17 @@ impl App {
                     }
                 }
             }
-            HelpAction::Quit => match self.mode {
-                AppMode::Normal => self.should_quit = true,
-                AppMode::Thinking => {
-                    // Trigger cancellation token to stop the agent task.
-                    if let Some(ref token) = self.cancellation {
-                        token.cancel();
-                    }
-                    self.cancellation = None;
-                    self.agent_running = false;
-                    self.pending_input = None;
-                    self.pending_ssh = None;
-                    self.pending_ssh_password = None;
-                    self.mode = AppMode::Normal;
-                    self.push_message(ChatBlock::System("Cancelled.".into()));
-                    self.scroll = 0;
-                }
-                AppMode::Confirming => {
-                    self.respond_to_confirmation(false);
-                    self.should_quit = true;
-                }
-                AppMode::Interactive => {
+            HelpAction::Quit => {
+                if self.mode == AppMode::Interactive {
+                    // No quit from interactive — Ctrl+T returns to agent mode.
                     self.toggle_interactive = true;
+                } else {
+                    self.quit();
                 }
-                AppMode::PasswordInput => {
-                    self.input.clear();
-                    self.cursor_pos = 0;
-                    self.mode = AppMode::Normal;
-                }
-            },
+            }
+            HelpAction::CancelWork => {
+                self.cancel_work();
+            }
             HelpAction::Switch => {
                 if self.mode == AppMode::Confirming {
                     self.confirm_selected = !self.confirm_selected;
@@ -1932,16 +1952,111 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn app_ctrl_c_quits() {
-        let mut app = App::new("test".into(), CommandConfirmMode::Always);
-
-        app.handle_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('c'),
+    fn ctrl_key(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(c),
             crossterm::event::KeyModifiers::CONTROL,
-        ));
+        )
+    }
 
+    #[test]
+    fn ctrl_c_is_noop_in_normal() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.handle_key(ctrl_key('c'));
+        assert!(!app.should_quit, "Ctrl+C must do nothing (users use it to copy)");
+        // Russian layout equivalent (с) is likewise a no-op.
+        app.handle_key(ctrl_key('с'));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_q_quits_in_normal() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.handle_key(ctrl_key('q'));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_q_russian_layout_quits() {
+        // й = q in ЙЦУКЕН layout.
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.handle_key(ctrl_key('й'));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_z_is_noop_in_normal() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.handle_key(ctrl_key('z'));
+        assert!(!app.should_quit);
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn ctrl_z_cancels_in_thinking() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Thinking;
+        app.agent_running = true;
+        app.handle_key(ctrl_key('z'));
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(!app.agent_running);
+        assert!(!app.should_quit, "Ctrl+Z cancels, it must not quit");
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(s)) if s == "Cancelled."));
+    }
+
+    #[test]
+    fn ctrl_z_russian_layout_cancels_in_thinking() {
+        // я = z in ЙЦУКЕН layout.
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Thinking;
+        app.agent_running = true;
+        app.handle_key(ctrl_key('я'));
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(!app.agent_running);
+    }
+
+    #[test]
+    fn ctrl_c_is_noop_in_thinking() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Thinking;
+        app.agent_running = true;
+        app.handle_key(ctrl_key('c'));
+        assert_eq!(app.mode, AppMode::Thinking);
+        assert!(app.agent_running);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_q_quits_in_thinking() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Thinking;
+        app.agent_running = true;
+        app.handle_key(ctrl_key('q'));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_q_and_z_are_forwarded_in_interactive() {
+        // In Interactive the global hotkey gate is bypassed: ^Q/^Z must reach
+        // the PTY as raw control bytes (Ctrl+Q=0x11, Ctrl+Z=0x1A), NOT trigger
+        // quit()/cancel_work(). Only Ctrl+T leaves interactive mode.
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Interactive;
+
+        app.handle_key(ctrl_key('q'));
+        assert!(!app.should_quit, "^Q must not quit in Interactive");
+        assert_eq!(app.mode, AppMode::Interactive);
+
+        app.handle_key(ctrl_key('z'));
+        assert_eq!(app.mode, AppMode::Interactive, "^Z must not cancel in Interactive");
+        assert!(!app.should_quit);
+
+        let bytes = app
+            .pending_term_input
+            .clone()
+            .expect("keys should be forwarded to the PTY");
+        assert!(bytes.contains(&0x11), "Ctrl+Q should forward 0x11, got {bytes:?}");
+        assert!(bytes.contains(&0x1a), "Ctrl+Z should forward 0x1A, got {bytes:?}");
     }
 
     #[test]
@@ -2708,16 +2823,34 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_denies_and_quits() {
+    fn ctrl_c_is_noop_in_confirming() {
         let mut app = make_confirm_app(false);
-        app.handle_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('c'),
-            crossterm::event::KeyModifiers::CONTROL,
-        ));
+        app.handle_key(ctrl_key('c'));
+        assert!(!app.should_quit, "Ctrl+C must do nothing in Confirming");
+        assert_eq!(app.mode, AppMode::Confirming, "should stay awaiting a choice");
+    }
+
+    #[test]
+    fn ctrl_q_denies_and_quits_in_confirming() {
+        let mut app = make_confirm_app(false);
+        app.handle_key(ctrl_key('q'));
         assert!(app.should_quit);
         assert_eq!(app.mode, AppMode::Thinking);
         if let Some(ChatBlock::Command { approved, .. }) = app.messages.last() {
-            assert!(!*approved, "Ctrl+C should deny");
+            assert!(!*approved, "Ctrl+Q should deny the pending command");
+        } else {
+            panic!("expected Command block");
+        }
+    }
+
+    #[test]
+    fn ctrl_z_denies_without_quit_in_confirming() {
+        let mut app = make_confirm_app(false);
+        app.handle_key(ctrl_key('z'));
+        assert!(!app.should_quit, "Ctrl+Z denies but must not quit");
+        assert_eq!(app.mode, AppMode::Thinking);
+        if let Some(ChatBlock::Command { approved, .. }) = app.messages.last() {
+            assert!(!*approved, "Ctrl+Z should deny the pending command");
         } else {
             panic!("expected Command block");
         }
@@ -3248,13 +3381,23 @@ mod tests {
     }
 
     #[test]
-    fn help_action_quit_in_thinking_cancels() {
+    fn help_action_quit_in_thinking_quits() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.mode = AppMode::Thinking;
         app.agent_running = true;
         app.execute_help_action(HelpAction::Quit);
+        assert!(app.should_quit, "Quit action should quit, even in Thinking");
+    }
+
+    #[test]
+    fn help_action_cancelwork_in_thinking_cancels() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Thinking;
+        app.agent_running = true;
+        app.execute_help_action(HelpAction::CancelWork);
         assert_eq!(app.mode, AppMode::Normal);
         assert!(!app.agent_running);
+        assert!(!app.should_quit);
     }
 
     #[test]

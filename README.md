@@ -147,7 +147,9 @@ Type `!` followed by a command to run it directly (bypassing the agent):
 | Key | Action |
 |-----|--------|
 | `Enter` | Send message / Confirm selected button |
-| `Ctrl+C` | Cancel agent (in Thinking mode) / Quit (in Normal mode) |
+| `Ctrl+Q` | Quit the app (denies a pending command first in Confirming) |
+| `Ctrl+Z` | Cancel: stop the agent (Thinking) / deny the command (Confirming) |
+| `Ctrl+C` | Nothing — left free so it can be used to copy the selection |
 | `Ctrl+T` | Toggle interactive terminal mode |
 | `Ctrl+P` | Enter password input mode (masked) |
 | `Up/Down` | Browse input history |
@@ -155,6 +157,10 @@ Type `!` followed by a command to run it directly (bypassing the agent):
 | `Mouse wheel` | Scroll chat history / terminal scrollback |
 | `Click` | Expand/collapse command output blocks |
 | `Drag` | Select text and copy to clipboard |
+
+Shortcuts also work on the Russian ЙЦУКЕН layout (`Ctrl+Й`/`Ctrl+Я`/`Ctrl+Е`/`Ctrl+З`).
+In the interactive terminal all keys — including `Ctrl+C/Q/Z` — are forwarded to the
+remote program; leave it with `Ctrl+T`.
 
 ### SSH Connection
 
