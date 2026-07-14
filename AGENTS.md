@@ -88,7 +88,10 @@ PR, меняющий поведение или публичный контрак
 ## Git и ветки
 
 - **Запрещён прямой push в `main`** и force-push в `main`. Все изменения идут через
-  Pull Request.
+  Pull Request. **Единственное исключение:** релизный version-bump-коммит
+  (`chore(release): bump version to X.Y.Z`), который скилл `prepare-release`
+  пушит прямо в `main` без PR и без пауз. Force-push в `main` запрещён всегда, без
+  исключений.
 - Одна задача (issue) — одна ветка — один PR. Не смешивай несвязанные правки.
 - Имя ветки: `fix/<номер-issue>-<краткий-слаг>` (или `feat/`, `refactor/` по характеру).
 - Сообщения коммитов — в стиле Conventional Commits: `<type>(<scope>): <описание>`.
