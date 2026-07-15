@@ -86,9 +86,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 5. Build the agent.
+    // 5. Build the agent. `OpenAiCompatClient` speaks the OpenAI-compatible
+    //    chat/completions protocol (default endpoint: GLM). The deprecated
+    //    `GlmClient` alias still works for existing consumers.
     let agent = AgentBuilder::new()
-        .llm(Arc::new(filar_agent::GlmClient::new_with_provider(
+        .llm(Arc::new(filar_agent::OpenAiCompatClient::new_with_provider(
             &filar_core::LlmConfig {
                 api_base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
                 model: "glm-4-flash".into(),
@@ -223,3 +225,51 @@ let config = LlmConfig {
     extra_body: Some(serde_json::json!({ "thinking": { "type": "disabled" } })),
 };
 ```
+
+## Using a local or third-party OpenAI-compatible model
+
+`OpenAiCompatClient` is provider-agnostic: point `api_base_url` at any
+OpenAI-compatible endpoint and supply the API key it expects. No code changes
+are needed — only the config.
+
+A local model served by [Ollama](https://ollama.com/) or LM Studio exposes an
+OpenAI-compatible API at `http://localhost:11434/v1` (Ollama) or
+`http://localhost:1234/v1` (LM Studio). Local servers usually do not check the
+key, but filar requires a non-empty value — pass any placeholder:
+
+```toml
+[llm]
+model = "llama3.1"
+api_base_url = "http://localhost:11434/v1"
+max_tokens = 4096
+temperature = 0.3
+```
+
+```rust
+use filar_core::LlmConfig;
+
+let config = LlmConfig {
+    model: "llama3.1".into(),
+    api_base_url: "http://localhost:11434/v1".into(),
+    max_tokens: 4096,
+    temperature: Some(0.3),
+    ..Default::default()
+};
+// key: any non-empty placeholder for a local server
+```
+
+### Choosing the API key environment variable
+
+By default the key is read from `GLM_API_KEY`. A profile can override this with
+`key_env` so each provider uses its own variable:
+
+```toml
+[[llm_profiles]]
+name = "local"
+model = "llama3.1"
+api_base_url = "http://localhost:11434/v1"
+key_env = "OLLAMA_KEY"          # any name; value just needs to be non-empty
+temperature = 0.3
+```
+
+Select it at launch with `--llm local` (or `Config::select_llm(Some("local"))`).

@@ -13,7 +13,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
-use filar_agent::glm::GlmClient;
+use filar_agent::OpenAiCompatClient;
 use filar_agent::LlmClient;
 use filar_core::{secrets, default_base_dir, Config, SessionStore, StaticSecretProvider};
 use filar_transport::{LocalExecutor, SshExecutor};
@@ -327,7 +327,7 @@ async fn run() -> anyhow::Result<()> {
     let secret_provider = Arc::new(StaticSecretProvider::new());
     secret_provider.insert(secrets::env_vars::GLM_API_KEY, &api_key);
 
-    let llm: Arc<dyn LlmClient> = Arc::new(GlmClient::new_with_provider(
+    let llm: Arc<dyn LlmClient> = Arc::new(OpenAiCompatClient::new_with_provider(
         &llm_config,
         Duration::from_secs(config.timeouts.llm_secs),
         secrets::env_vars::GLM_API_KEY,
