@@ -176,7 +176,7 @@ For desktop platforms, use `SessionStore::with_default_dir()` which reads
 |-------|------|-------|---------|
 | `temperature` | `Option<f32>` | [0.0, 2.0] | `None` (provider default) |
 | `top_p` | `Option<f32>` | (0.0, 1.0] | `None` (provider default) |
-| `extra_body` | `Option<serde_json::Value>` | any JSON object | `None` |
+| `extra_body` | `Option<serde_json::Value>` | JSON object; non-objects are ignored | `None` |
 
 All fields default to `None` — without them, the request body is byte-for-byte
 identical to previous versions (backward compatible).
@@ -184,8 +184,9 @@ identical to previous versions (backward compatible).
 ### extra_body merge rules
 
 `extra_body` is merged into the JSON request body **after** serializing the base
-fields. Protected keys (`model`, `messages`, `tools`, `stream`) are **silently
-ignored** with a `warn!` log — they cannot be overridden via `extra_body`. All
+fields. Only JSON objects are merged; non-object values are ignored with a
+`warn!` log. Protected keys (`model`, `messages`, `tools`, `stream`) are also
+ignored with a `warn!` log and cannot be overridden via `extra_body`. All
 other keys (including `max_tokens`, `temperature`, `top_p`) are inserted or
 overridden.
 

@@ -146,7 +146,7 @@ pub struct LlmConfig {
     /// Arbitrary extra fields merged into the JSON request body.
     ///
     /// Keys `model`, `messages`, `tools`, `stream` are protected and
-    /// silently ignored if present in `extra_body`.
+    /// ignored (with a warning) if present in `extra_body`.
     #[serde(default)]
     pub extra_body: Option<serde_json::Value>,
 }
@@ -178,7 +178,7 @@ impl LlmConfig {
             }
         }
         if let Some(p) = self.top_p {
-            if p <= 0.0 || p > 1.0 {
+            if !(p > 0.0 && p <= 1.0) {
                 return Err(CoreError::Config(format!(
                     "top_p must be in (0.0, 1.0], got {p}"
                 )));
@@ -589,5 +589,27 @@ options = { num_ctx = 8192 }
         let (llm_cfg, _) = cfg.select_llm(Some("local")).unwrap();
         assert_eq!(llm_cfg.temperature, Some(0.2));
         assert!(llm_cfg.extra_body.is_some());
+    }
+
+    #[test]
+    fn config_load_rejects_out_of_range_temperature() {
+        let toml = r#"
+[llm]
+model = "glm-5.1"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+temperature = 5.0
+"#;
+        let tmp = std::env::temp_dir().join(format!(
+            "filar_config_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&tmp, toml).unwrap();
+        let result = Config::load(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(result.is_err(), "Config::load should reject temperature=5.0");
     }
 }
