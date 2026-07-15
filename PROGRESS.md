@@ -1828,3 +1828,34 @@ milestone v0.3.1 продолжается следующими issue.
 `release.yml`, сборка Windows-бинаря), затем тег движка `engine-v0.3.1` на том же
 коммите (milestone затрагивал core/transport → точка зависимости для внешних
 потребителей).
+
+---
+
+## Issue #70: LLM — настраиваемые параметры запроса (milestone v0.4.0)
+
+**Что сделано:**
+- `LlmConfig` и `LlmProfile` дополнены опциональными `temperature` (`Option<f32>`,
+  [0.0, 2.0]), `top_p` (`Option<f32>`, (0.0, 1.0]) и `extra_body`
+  (`Option<serde_json::Value>`). Все дефолты — `None`, поведение байт-в-байт как
+  раньше (golden-тест).
+- `LlmConfig::validate()` — проверка диапазонов; вызывается в `Config::load()`
+  для `[llm]` и каждого профиля.
+- `ApiRequest` в `glm.rs`: `temperature`/`top_p` как `Option<f32>` со
+  `skip_serializing_if`. `extra_body` мержится в JSON-тело после сериализации через
+  `merge_extra_body()`. Защищённые ключи (`model`, `messages`, `tools`, `stream`)
+  игнорируются с `warn!`.
+- `GlmClient` хранит `temperature`, `top_p`, `extra_body` из конфига и передаёт
+  в `ApiRequest` + мержит в `chat()` и `chat_stream()`.
+- GUI-лаунчер: поля Temperature (singleline) и Extra body JSON (multiline) с
+  валидацией перед запуском. Сохраняются в `settings.json`.
+- `main.rs`: парсинг `temperature` и `extra_body` из `LaunchConfig` в `LlmConfig`.
+- `docs/ENGINE_API.md`: раздел «LLM request parameters» с таблицей, правилами
+  мержа, примерами для GLM/OpenAI/Ollama.
+- Тесты: 6 в `config.rs` (парсинг, валидация, профили), 6 в `glm.rs` (golden,
+  temperature/top_p, merge, protected keys, override, non-object).
+
+**Публичные контракты:**
+- `filar_core::LlmConfig`: новые поля `temperature`, `top_p`, `extra_body`.
+- `filar_core::LlmProfile`: те же новые поля.
+- `filar_core::LlmConfig::validate() -> Result<()>` — новый метод.
+- Тип `extra_body`: `Option<serde_json::Value>` (зафиксирован в PROGRESS.md).

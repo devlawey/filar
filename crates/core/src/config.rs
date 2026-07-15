@@ -137,6 +137,18 @@ pub struct LlmConfig {
     /// Maximum number of tokens to generate in a single response.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// Sampling temperature (0.0–2.0). `None` = provider default.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Nucleus sampling probability (0.0–1.0, exclusive of 0). `None` = provider default.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Arbitrary extra fields merged into the JSON request body.
+    ///
+    /// Keys `model`, `messages`, `tools`, `stream` are protected and
+    /// silently ignored if present in `extra_body`.
+    #[serde(default)]
+    pub extra_body: Option<serde_json::Value>,
 }
 
 impl Default for LlmConfig {
@@ -145,7 +157,34 @@ impl Default for LlmConfig {
             model: "glm-5.1".to_string(),
             api_base_url: "https://open.bigmodel.cn/api/paas/v4".to_string(),
             max_tokens: default_max_tokens(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
         }
+    }
+}
+
+impl LlmConfig {
+    /// Validate parameter ranges.
+    ///
+    /// Returns an error if `temperature` or `top_p` are outside their
+    /// valid ranges.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(t) = self.temperature {
+            if !(0.0..=2.0).contains(&t) {
+                return Err(CoreError::Config(format!(
+                    "temperature must be in [0.0, 2.0], got {t}"
+                )));
+            }
+        }
+        if let Some(p) = self.top_p {
+            if p <= 0.0 || p > 1.0 {
+                return Err(CoreError::Config(format!(
+                    "top_p must be in (0.0, 1.0], got {p}"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -176,6 +215,15 @@ pub struct LlmProfile {
     /// (default: `"GLM_API_KEY"`).
     #[serde(default = "default_glm_key_env")]
     pub key_env: String,
+    /// Sampling temperature (0.0–2.0). `None` = provider default.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Nucleus sampling probability (0.0–1.0, exclusive of 0). `None` = provider default.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Arbitrary extra fields merged into the JSON request body.
+    #[serde(default)]
+    pub extra_body: Option<serde_json::Value>,
 }
 
 fn default_glm_key_env() -> String {
@@ -188,6 +236,9 @@ impl From<&LlmProfile> for LlmConfig {
             model: p.model.clone(),
             api_base_url: p.api_base_url.clone(),
             max_tokens: p.max_tokens,
+            temperature: p.temperature,
+            top_p: p.top_p,
+            extra_body: p.extra_body.clone(),
         }
     }
 }
@@ -268,6 +319,11 @@ impl Config {
                 path.display()
             ))
         })?;
+        // Validate LLM parameter ranges.
+        cfg.llm.validate()?;
+        for p in &cfg.llm_profiles {
+            LlmConfig::from(p).validate()?;
+        }
         Ok(cfg)
     }
 
@@ -442,5 +498,96 @@ api_base_url = "https://open.bigmodel.cn/api/paas/v4"
 
         // Profile names list.
         assert_eq!(cfg.llm_profile_names(), vec!["default", "deepseek", "glm"]);
+    }
+
+    #[test]
+    fn parse_config_with_temperature() {
+        let toml = r#"
+[llm]
+model = "glm-5.1"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+temperature = 0.3
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.llm.temperature, Some(0.3));
+        assert_eq!(cfg.llm.top_p, None);
+        assert_eq!(cfg.llm.extra_body, None);
+    }
+
+    #[test]
+    fn parse_config_with_extra_body() {
+        let toml = r#"
+[llm]
+model = "glm-5.1"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+temperature = 0.5
+top_p = 0.9
+[llm.extra_body]
+thinking = { type = "disabled" }
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.llm.temperature, Some(0.5));
+        assert_eq!(cfg.llm.top_p, Some(0.9));
+        assert!(cfg.llm.extra_body.is_some());
+        assert_eq!(cfg.llm.extra_body.as_ref().unwrap()["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn validate_temperature_out_of_range() {
+        let cfg = LlmConfig {
+            model: "test".into(),
+            api_base_url: "http://localhost".into(),
+            max_tokens: 4096,
+            temperature: Some(3.0),
+            top_p: None,
+            extra_body: None,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_top_p_zero() {
+        let cfg = LlmConfig {
+            model: "test".into(),
+            api_base_url: "http://localhost".into(),
+            max_tokens: 4096,
+            temperature: None,
+            top_p: Some(0.0),
+            extra_body: None,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_valid_params() {
+        let cfg = LlmConfig {
+            model: "test".into(),
+            api_base_url: "http://localhost".into(),
+            max_tokens: 4096,
+            temperature: Some(1.5),
+            top_p: Some(0.7),
+            extra_body: None,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn profile_carries_params() {
+        let toml = r#"
+[llm]
+model = "glm-5.1"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+[[llm_profiles]]
+name = "local"
+model = "llama3"
+api_base_url = "http://localhost:11434/v1"
+temperature = 0.2
+[llm_profiles.extra_body]
+options = { num_ctx = 8192 }
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let (llm_cfg, _) = cfg.select_llm(Some("local")).unwrap();
+        assert_eq!(llm_cfg.temperature, Some(0.2));
+        assert!(llm_cfg.extra_body.is_some());
     }
 }

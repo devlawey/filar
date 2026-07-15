@@ -167,3 +167,58 @@ let store = SessionStore::new(std::path::PathBuf::from("/data/data/com.example.a
 
 For desktop platforms, use `SessionStore::with_default_dir()` which reads
 `APPDATA` (Windows) or `HOME` (Unix).
+
+## LLM request parameters
+
+`LlmConfig` supports optional parameters that are sent in the API request body:
+
+| Field | Type | Range | Default |
+|-------|------|-------|---------|
+| `temperature` | `Option<f32>` | [0.0, 2.0] | `None` (provider default) |
+| `top_p` | `Option<f32>` | (0.0, 1.0] | `None` (provider default) |
+| `extra_body` | `Option<serde_json::Value>` | any JSON object | `None` |
+
+All fields default to `None` — without them, the request body is byte-for-byte
+identical to previous versions (backward compatible).
+
+### extra_body merge rules
+
+`extra_body` is merged into the JSON request body **after** serializing the base
+fields. Protected keys (`model`, `messages`, `tools`, `stream`) are **silently
+ignored** with a `warn!` log — they cannot be overridden via `extra_body`. All
+other keys (including `max_tokens`, `temperature`, `top_p`) are inserted or
+overridden.
+
+### Config example
+
+```toml
+[llm]
+model = "glm-5.2"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+max_tokens = 4096
+temperature = 0.3
+top_p = 0.9
+[llm.extra_body]
+thinking = { type = "disabled" }
+```
+
+### Provider-specific examples
+
+- **GLM** (`thinking`): `{ "thinking": { "type": "disabled" } }`
+- **OpenAI-compatible** (`reasoning_effort`): `{ "reasoning_effort": "low" }`
+- **Ollama** (`options.num_ctx`): `{ "options": { "num_ctx": 8192 } }`
+
+### Code example
+
+```rust
+use filar_core::LlmConfig;
+
+let config = LlmConfig {
+    model: "glm-5.2".into(),
+    api_base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
+    max_tokens: 4096,
+    temperature: Some(0.3),
+    top_p: None,
+    extra_body: Some(serde_json::json!({ "thinking": { "type": "disabled" } })),
+};
+```
