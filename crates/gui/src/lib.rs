@@ -396,10 +396,13 @@ impl eframe::App for LauncherApp {
                     // Validate temperature and extra_body before launching.
                     self.validation_error.clear();
                     if !self.temperature.trim().is_empty()
-                        && self.temperature.trim().parse::<f32>().is_err()
+                        && !matches!(
+                            self.temperature.trim().parse::<f32>(),
+                            Ok(t) if t.is_finite() && (0.0..=2.0).contains(&t)
+                        )
                     {
                         self.validation_error = format!(
-                            "Invalid temperature: '{}'. Expected a number like 0.3.",
+                            "Invalid temperature: '{}'. Expected a number in [0.0, 2.0].",
                             self.temperature
                         );
                     }

@@ -1859,3 +1859,6 @@ milestone v0.3.1 продолжается следующими issue.
 - `filar_core::LlmProfile`: те же новые поля.
 - `filar_core::LlmConfig::validate() -> Result<()>` — новый метод.
 - Тип `extra_body`: `Option<serde_json::Value>` (зафиксирован в PROGRESS.md).
+
+**Дальше:** issue #71 (GlmClient → OpenAiCompatClient) — переименование клиента,
+зависит от этого PR (обе правят `glm.rs`).

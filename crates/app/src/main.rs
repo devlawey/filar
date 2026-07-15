@@ -267,6 +267,7 @@ async fn run() -> anyhow::Result<()> {
                     top_p: None,
                     extra_body,
                 };
+                llm_config.validate().map_err(|e| anyhow::anyhow!(e))?;
 
                 // Build SshTarget if the user selected SSH in the GUI.
                 let ssh_target = launch.ssh.map(|s| filar_core::SshTarget {
