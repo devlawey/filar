@@ -31,48 +31,57 @@ eval/
   separately, e.g. the portable Windows zip). promptfoo itself is **not**
   committed: run it via `npx`. Verified with Node 24 + promptfoo 0.121.x.
 
-## Environment variables (no secrets in the repo)
+## Environment variable (no secrets in the repo)
 
-Providers read keys and URLs **only** from the environment (methodology §6).
-Set at least the ones for the provider(s) you want to run:
-
-| Variable          | Used by          | Example                                    |
-|-------------------|------------------|--------------------------------------------|
-| `EVAL_GLM_URL`    | GLM cloud        | `https://open.bigmodel.cn/api/paas/v4`     |
-| `EVAL_GLM_KEY`    | GLM cloud        | your GLM API key                           |
-| `EVAL_LOCAL_URL`  | Ollama (local)   | `http://localhost:11434/v1`                |
-| `EVAL_LOCAL_KEY`  | Ollama (local)   | any non-empty string (e.g. `ollama`)       |
-| `EVAL_THIRD_URL`  | 3rd provider     | your endpoint                              |
-| `EVAL_THIRD_KEY`  | 3rd provider     | your key                                   |
-
-The third provider in `promptfooconfig.yaml` is a **template** — set the
-`EVAL_THIRD_*` vars or remove that block before running.
-
-PowerShell example:
+Models are accessed via [OpenRouter](https://openrouter.ai/). The API key is
+read automatically from the `OPENROUTER_API_KEY` environment variable — it is
+**never** committed (methodology §6). Set it once (User scope — persists across
+shells and reboots):
 
 ```powershell
-$env:EVAL_GLM_URL = "https://open.bigmodel.cn/api/paas/v4"
-$env:EVAL_GLM_KEY = "your-key"
+[Environment]::SetEnvironmentVariable("OPENROUTER_API_KEY", "sk-or-v1-...", "User")
 ```
+
+Open a new shell afterwards (or use `$env:OPENROUTER_API_KEY = "sk-or-v1-..."`
+for the current session only).
 
 ## Running
 
 ```bash
-# run all configured providers against all tests
+# run all configured models against all smoke tests (writes eval/results.json)
 npx promptfoo@latest eval -c eval/promptfooconfig.yaml
 
-# run a single provider (by 1-based index or label)
-npx promptfoo@latest eval -c eval/promptfooconfig.yaml -p 1
-
-# open the local web report (table: tests × providers, PASS/FAIL, latency)
+# open the local web report (table: tests × models, PASS/FAIL, latency, cost)
 npx promptfoo@latest view
 
 # export a shareable report
 npx promptfoo@latest eval -c eval/promptfooconfig.yaml -o results.html
 ```
 
-Run outputs (`results.*`, `.promptfoo/`) are gitignored — only config,
-prompts, asserts and datasets are committed.
+To run fewer models, comment out their `- id: openrouter:...` block in
+`promptfooconfig.yaml`. Run outputs (`results.*`, `.promptfoo/`) are gitignored.
+
+## Models (changing them)
+
+The three models live in the `providers:` list of `promptfooconfig.yaml`:
+
+```yaml
+providers:
+  - id: openrouter:z-ai/glm-5.2
+  - id: openrouter:qwen/qwen3.6-35b-a3b
+  - id: openrouter:meta-llama/llama-3.1-8b-instruct
+```
+
+- The id is `openrouter:<slug>`, where `<slug>` is the model's OpenRouter ID
+  (find it on https://openrouter.ai/models, e.g. `openai/gpt-5.4`).
+- To swap/add/remove a model, edit these `id:` lines (and the `label:`).
+- The tool schema is attached to every provider via the `&filar_tools` /
+  `*filar_tools` YAML anchor — you do **not** repeat it per model.
+- `tool_choice` is unset (= `auto`), matching filar's production behaviour: the
+  model decides whether to call `run_command`. Set `tool_choice: "required"` on
+  a provider to force a tool call (useful to confirm a model *can* call tools);
+  do not use `required` for the safety-inversion cases — it would force a call
+  even when the model should refuse.
 
 ## Asserts
 
@@ -113,14 +122,16 @@ user turn `{{question}}` from each test case.
 
 ## Deviations from the methodology (conscious)
 
-- **No LiteLLM gateway.** filar has no gateway, so providers are listed
-  directly with per-provider `apiBaseUrl` (methodology assumes a gateway with
-  aliases).
-- **No cost tracking.** Without a gateway, per-request spend is unavailable;
-  the report covers quality, latency and failure rate only. Cost is discussed
-  separately from eval (methodology §8.2, §11).
+- **OpenRouter as the router.** filar has no LiteLLM gateway; models are
+  reached through OpenRouter (`openrouter:<slug>` providers) — a comparable
+  single-endpoint router. The key is read from `OPENROUTER_API_KEY`.
+- **Cost is available.** OpenRouter returns per-request usage and cost, so the
+  promptfoo report includes cost (unlike the earlier no-gateway note).
 - **Tool call, not text.** Asserts inspect tool-call structure (filar
   adaptation called out in the issue).
+- **Tools live in `config.tools`.** promptfoo's OpenRouter provider does not
+  forward the top-level `tools` key, so the schema is attached to each
+  provider's `config.tools` via the `&filar_tools` YAML anchor.
 
 ## Dataset ownership
 

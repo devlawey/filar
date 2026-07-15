@@ -9,8 +9,10 @@ prompts:
 
 # Tool schema mirrors crates/agent/src/tools.rs::tool_definitions(). It is a
 # manual mirror (single-source sharing from Rust would need an export step);
-# the asserts target the stable tool name `run_command`.
-tools:
+# the asserts target the stable tool name `run_command`. The schema is defined
+# once here (anchor &filar_tools) and attached to each provider's `config.tools`
+# — promptfoo's OpenRouter/OpenAI provider sends `config.tools` to the API.
+tools: &filar_tools
   - type: function
     function:
       name: run_command
@@ -48,34 +50,32 @@ tools:
             description: "Absolute or relative path to the directory."
         required: ["path"]
 
-# Providers — keys and URLs ONLY from env (methodology §6). No values here.
-# filar has no LiteLLM gateway, so providers are listed directly (deviation
-# from the methodology, noted in README.md). Cost tracking is unavailable.
+# Providers — three models via OpenRouter. The key is read automatically from
+# the OPENROUTER_API_KEY environment variable (methodology §6: no secrets in
+# the repo). To change/add models, edit the `id:` lines below — the model id
+# is the OpenRouter slug (see https://openrouter.ai/models).
 providers:
-  - id: openai:chat:glm-4-flash
-    label: GLM cloud (glm-4-flash)
+  - id: openrouter:z-ai/glm-5.2
+    label: GLM-5.2 (OpenRouter)
     config:
-      apiBaseUrl: ${EVAL_GLM_URL}
-      apiKey: ${EVAL_GLM_KEY}
       temperature: 0
       max_tokens: 1024
       timeoutMs: 300000
-  - id: openai:chat:llama3.1
-    label: Ollama local (llama3.1)
+      tools: *filar_tools
+  - id: openrouter:qwen/qwen3.6-35b-a3b
+    label: Qwen3.6-35B-A3B (OpenRouter)
     config:
-      apiBaseUrl: ${EVAL_LOCAL_URL}
-      apiKey: ${EVAL_LOCAL_KEY}
       temperature: 0
       max_tokens: 1024
       timeoutMs: 300000
-  - id: openai:chat:MODEL
-    label: Third provider (template — set EVAL_THIRD_* or remove)
+      tools: *filar_tools
+  - id: openrouter:meta-llama/llama-3.1-8b-instruct
+    label: Llama-3.1-8B-Instruct (OpenRouter)
     config:
-      apiBaseUrl: ${EVAL_THIRD_URL}
-      apiKey: ${EVAL_THIRD_KEY}
       temperature: 0
       max_tokens: 1024
       timeoutMs: 300000
+      tools: *filar_tools
 
 # Smoke cases (3) — temporary, prove the harness + asserts work end-to-end.
 # The full dataset is added in a separate issue (#73).
