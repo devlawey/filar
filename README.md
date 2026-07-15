@@ -13,7 +13,7 @@ Filar is a Rust-based terminal application that integrates an AI agent (LLM) wit
 
 ## Features
 
-- **AI Agent** — powered by GLM (OpenAI-compatible API), with tool calling support
+- **AI Agent** — powered by any OpenAI-compatible LLM (default: GLM), with tool calling support
 - **SSH Remote Execution** — agent manages remote machines via SSH, zero-install (no files left on the remote)
 - **Local Mode** — run commands on your own machine via PowerShell
 - **TUI Interface** — built with [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm)
@@ -116,6 +116,55 @@ filar --session <session-id>
 
 ---
 
+## Choosing an LLM
+
+Filar works with **any OpenAI-compatible** `chat/completions` endpoint — the
+agent client is not GLM-specific. You switch providers by changing only the
+config (`model`, `api_base_url`, and the API key env var).
+
+The default profile points at the GLM cloud (`open.bigmodel.cn`,
+`GLM_API_KEY`). To use a local model (Ollama / LM Studio) or another cloud
+provider, point `api_base_url` at its OpenAI-compatible base URL and supply
+the key its API expects (local servers usually accept any non-empty string):
+
+```toml
+[llm]
+model = "llama3.1"
+api_base_url = "http://localhost:11434/v1"
+max_tokens = 4096
+temperature = 0.3          # local models benefit from lower temperature
+```
+
+### Verified providers
+
+| Provider | Endpoint | Tool calling | Streaming | Notes |
+|----------|----------|--------------|-----------|-------|
+| GLM cloud | `https://open.bigmodel.cn/api/paas/v4` | verified | verified | Default profile; key via `GLM_API_KEY`. |
+| Ollama (local) | `http://localhost:11434/v1` | pending manual check | pending manual check | OpenAI-compatible; set a non-empty key. |
+
+> The table lists only what has been checked by hand. Add rows as more
+> providers are verified (including via the eval tasks of milestone v0.4.0).
+
+### Provider differences to be aware of
+
+These are known OpenAI-compatibility quirks that may surface in filar's request
+cycle. They are **not** patched with hacks in the client; they are documented
+here, and critical ones get separate issues.
+
+- **Streaming `tool_calls` deltas** — filar accumulates streamed tool-call
+  fragments keyed by the `index` field (per the OpenAI streaming spec). GLM
+  follows this. If a provider streams tool calls without a stable `index`,
+  accumulation may mis-order; verify per provider.
+- **Non-empty `content` on assistant tool-call messages** — filar always
+  serializes a `content` string (possibly empty) on assistant messages that
+  carry `tool_calls`. Some servers reject an empty/`null` `content` in that
+  case; if so, file an issue rather than special-casing the client.
+- **Empty `tools` array** — filar omits `tools` entirely when empty
+  (`skip_serializing_if = "Vec::is_empty"`), confirmed by tests. Servers that
+  reject a present-but-empty `tools` array are therefore unaffected.
+
+---
+
 ## Usage
 
 ### Agent Mode
@@ -177,7 +226,7 @@ filar/
 ├── crates/
 │   ├── core/        # Config, errors, secrets, chat, sessions
 │   ├── transport/   # CommandExecutor trait: SSH + Local implementations
-│   ├── agent/       # LLM client (GLM), agent loop, tools, security
+│   ├── agent/       # LLM client (OpenAI-compatible), agent loop, tools, security
 │   ├── tui/         # Terminal UI (ratatui + crossterm + alacritty_terminal)
 │   ├── gui/         # GUI launcher (egui + keyring)
 │   └── app/         # Binary: ties everything together
@@ -205,7 +254,7 @@ cargo test
 
 62 unit tests covering:
 - Agent loop (text response, tool calls, max iterations)
-- GLM client (serialization, deserialization)
+- OpenAI-compatible client (serialization, deserialization)
 - Security (destructive command detection, confirm modes)
 - Tools (parsing, shell quoting)
 - TUI (terminal model, key mapping, app state)

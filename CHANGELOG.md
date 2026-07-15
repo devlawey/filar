@@ -11,6 +11,18 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Changed
+
+- Renamed the LLM client `GlmClient` → `OpenAiCompatClient` (module `glm` →
+  `openai_compat`); filar works with any OpenAI-compatible endpoint, not just
+  GLM. `GlmClient` stays as a deprecated re-export alias for back-compat (#71).
+
+### Added
+
+- README "Choosing an LLM" section with a verified-providers table and
+  OpenAI-compatibility notes; `docs/ENGINE_API.md` local-model example and
+  `key_env` override note (#71).
+
 ## [0.3.1] - 2026-07-14
 
 ### Added

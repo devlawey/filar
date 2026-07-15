@@ -1,22 +1,33 @@
 //! Agent crate: LLM client, agent loop, and tools.
 //!
 //! This crate houses:
-//! - The [`LlmClient`] trait and its `GlmClient` implementation (Stage 4).
+//! - The [`LlmClient`] trait and its `OpenAiCompatClient` implementation (Stage 4).
 //! - The agent loop that orchestrates LLM ↔ tool execution (Stage 5).
 //! - Tool definitions (`run_command`, `read_file`, `list_dir`) (Stage 5).
 //! - Security layer: confirmation, destructive command detection (Stage 5).
 
 pub mod agent;
 pub mod events;
-pub mod glm;
+pub mod openai_compat;
 pub mod security;
 pub mod tools;
 
 // Re-export key types for convenience.
 pub use agent::{Agent, AgentBuilder};
 pub use events::{AgentEvent, EventSink};
+pub use openai_compat::OpenAiCompatClient;
 pub use security::{CliConfirmer, CommandConfirmer, ConfirmDecision};
 pub use tools::{tool_definitions, ToolKind};
+
+/// Deprecated alias for [`OpenAiCompatClient`].
+///
+/// `GlmClient` was renamed to `OpenAiCompatClient` because the client is not
+/// GLM-specific — it speaks the standard OpenAI-compatible `chat/completions`
+/// protocol and works with any such endpoint (default: GLM). The alias is kept
+/// temporarily so external engine consumers (bots, mobile) keep compiling; it
+/// will be removed at the next major engine tag.
+#[deprecated(note = "renamed to OpenAiCompatClient")]
+pub use openai_compat::OpenAiCompatClient as GlmClient;
 
 use filar_core::Result;
 
@@ -26,8 +37,9 @@ use filar_core::Result;
 
 /// Trait abstracting an LLM backend.
 ///
-/// The primary implementation is [`glm::GlmClient`] targeting the GLM API.
-/// The trait allows swapping models without touching the agent loop.
+/// The primary implementation is [`openai_compat::OpenAiCompatClient`] targeting
+/// any OpenAI-compatible API (default: GLM). The trait allows swapping models
+/// without touching the agent loop.
 #[async_trait::async_trait]
 pub trait LlmClient: Send + Sync {
     /// Send a chat request and return the model's response.

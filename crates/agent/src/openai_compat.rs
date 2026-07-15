@@ -1,13 +1,17 @@
-//! GLM LLM client — OpenAI-compatible `chat/completions` API.
+//! OpenAI-compatible LLM client — `chat/completions` API.
 //!
-//! Implements [`crate::LlmClient`] using `reqwest` to talk to the GLM
-//! platform (e.g. `open.bigmodel.cn`). The API is OpenAI-compatible, so the
-//! request/response shapes mirror the standard `chat/completions` format with
-//! tool/function calling support.
+//! Implements [`crate::LlmClient`] using `reqwest` to talk to any
+//! OpenAI-compatible endpoint (default: the GLM platform, e.g.
+//! `open.bigmodel.cn`). The request/response shapes mirror the standard
+//! `chat/completions` format with tool/function calling support, so any
+//! provider implementing that protocol (GLM cloud, Ollama / LM Studio at
+//! `http://localhost:11434/v1`, DeepSeek, OpenAI, …) works by changing only
+//! the config.
 //!
 //! # Features
 //! - Configurable model, base URL, and max tokens (from [`filar_core::LlmConfig`]).
-//! - API key read from the `GLM_API_KEY` environment variable.
+//! - API key read from the `GLM_API_KEY` environment variable by default
+//!   (overridable per profile via `filar_core::LlmProfile::key_env`).
 //! - Retries with exponential backoff on transient failures (5xx, 429, network).
 //! - Request timeout.
 //! - Tool calling (function calling) support.
@@ -33,11 +37,12 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_BACKOFF_BASE: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
-// GlmClient
+// OpenAiCompatClient
 // ---------------------------------------------------------------------------
 
-/// [`LlmClient`] implementation backed by the GLM (OpenAI-compatible) API.
-pub struct GlmClient {
+/// [`LlmClient`] implementation backed by an OpenAI-compatible
+/// `chat/completions` API (default endpoint: GLM).
+pub struct OpenAiCompatClient {
     http: reqwest::Client,
     api_base_url: String,
     model: String,
@@ -51,15 +56,15 @@ pub struct GlmClient {
     extra_body: Option<serde_json::Value>,
 }
 
-impl GlmClient {
-    /// Create a new `GlmClient` from the given LLM config.
+impl OpenAiCompatClient {
+    /// Create a new `OpenAiCompatClient` from the given LLM config.
     ///
     /// The API key is read from the `GLM_API_KEY` environment variable.
     pub fn new(config: &LlmConfig, timeout: Duration) -> Result<Self> {
         Self::new_with_key(config, timeout, &secrets::glm_api_key()?)
     }
 
-    /// Create a new `GlmClient` using a [`SecretProvider`] to retrieve the
+    /// Create a new `OpenAiCompatClient` using a [`SecretProvider`] to retrieve the
     /// API key.  The `key_name` is the logical name passed to the provider
     /// (e.g. `"GLM_API_KEY"` or a profile-specific env var name).
     ///
@@ -75,7 +80,7 @@ impl GlmClient {
         Self::new_with_key(config, timeout, &api_key)
     }
 
-    /// Create a new `GlmClient` with an explicit API key (useful for testing).
+    /// Create a new `OpenAiCompatClient` with an explicit API key (useful for testing).
     pub fn new_with_key(config: &LlmConfig, timeout: Duration, api_key: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(timeout)
@@ -118,7 +123,7 @@ impl GlmClient {
 }
 
 #[async_trait::async_trait]
-impl LlmClient for GlmClient {
+impl LlmClient for OpenAiCompatClient {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
         let api_request = ApiRequest::from_chat_request(
             request,
@@ -133,7 +138,7 @@ impl LlmClient for GlmClient {
             merge_extra_body(&mut body, extra);
         }
 
-        debug!(model = %self.model, "sending chat request to GLM API");
+        debug!(model = %self.model, "sending chat request to OpenAI-compatible API");
 
         // Retry loop with exponential backoff.
         let mut last_error: Option<ApiError> = None;
@@ -146,7 +151,7 @@ impl LlmClient for GlmClient {
 
             match self.send_request(&body).await {
                 Ok(response) => {
-                    debug!("GLM API request succeeded");
+                    debug!("OpenAI-compatible API request succeeded");
                     return response.try_into_chat_response();
                 }
                 Err(e) if e.is_retryable() => {
@@ -184,7 +189,7 @@ impl LlmClient for GlmClient {
             merge_extra_body(&mut body, extra);
         }
 
-        debug!(model = %self.model, "sending streaming chat request to GLM API");
+        debug!(model = %self.model, "sending streaming chat request to OpenAI-compatible API");
 
         // Retry loop for the initial connection only (not mid-stream).
         let response = {
@@ -273,7 +278,7 @@ impl LlmClient for GlmClient {
     }
 }
 
-impl GlmClient {
+impl OpenAiCompatClient {
     /// Send a single request to the API and return the raw response.
     async fn send_request(&self, body: &serde_json::Value) -> std::result::Result<ApiResponse, ApiError> {
         let response = self
@@ -300,7 +305,7 @@ impl GlmClient {
             // This way if parsing fails, we can include the actual response
             // body in the error message for debugging.
             let body_text = response.text().await.unwrap_or_default();
-            debug!(status = %status, body_len = body_text.len(), "GLM API success response");
+            debug!(status = %status, body_len = body_text.len(), "OpenAI-compatible API success response");
             let api_response: ApiResponse = serde_json::from_str(&body_text)
                 .map_err(|e| {
                     let preview = if body_text.len() > 500 {
@@ -315,7 +320,7 @@ impl GlmClient {
         } else {
             let status_code = status.as_u16();
             let body_text = response.text().await.unwrap_or_default();
-            info!(status_code, body = %body_text, "GLM API returned error status");
+            info!(status_code, body = %body_text, "OpenAI-compatible API returned error status");
             match status_code {
                 401 | 403 => Err(ApiError::Auth(format!("HTTP {status_code}: {body_text}"))),
                 429 => Err(ApiError::RateLimit(body_text)),
@@ -354,7 +359,7 @@ impl GlmClient {
         } else {
             let status_code = status.as_u16();
             let body_text = response.text().await.unwrap_or_default();
-            info!(status_code, body = %body_text, "GLM API returned error status");
+            info!(status_code, body = %body_text, "OpenAI-compatible API returned error status");
             match status_code {
                 401 | 403 => Err(ApiError::Auth(format!("HTTP {status_code}: {body_text}"))),
                 429 => Err(ApiError::RateLimit(body_text)),
@@ -973,7 +978,7 @@ mod tests {
             max_tokens: 256,
             ..Default::default()
         };
-        let client = GlmClient::new_with_key(&config, Duration::from_secs(60), &api_key).unwrap();
+        let client = OpenAiCompatClient::new_with_key(&config, Duration::from_secs(60), &api_key).unwrap();
 
         let request = ChatRequest {
             messages: vec![
@@ -998,7 +1003,7 @@ mod tests {
             max_tokens: 256,
             ..Default::default()
         };
-        let client = GlmClient::new_with_key(&config, Duration::from_secs(60), &api_key).unwrap();
+        let client = OpenAiCompatClient::new_with_key(&config, Duration::from_secs(60), &api_key).unwrap();
 
         let request = ChatRequest {
             messages: vec![
@@ -1364,5 +1369,24 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         let extra = serde_json::json!(42);
         merge_extra_body(&mut body, &extra);
         assert_eq!(body["model"], "glm-5.1");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn glm_client_alias_still_compiles() {
+        // The deprecated `GlmClient` alias (re-exported in `lib.rs`) must
+        // resolve to the same type as `OpenAiCompatClient`, so existing engine
+        // consumers (bots, mobile) keep compiling until the next major engine
+        // tag removes the alias.
+        fn assert_same_type(_: &OpenAiCompatClient) {}
+        let config = LlmConfig {
+            model: "glm-5.1".into(),
+            api_base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let client = crate::GlmClient::new_with_key(&config, Duration::from_secs(1), "dummy-key")
+            .unwrap();
+        assert_same_type(&client);
     }
 }

@@ -1862,3 +1862,43 @@ milestone v0.3.1 продолжается следующими issue.
 
 **Дальше:** issue #71 (GlmClient → OpenAiCompatClient) — переименование клиента,
 зависит от этого PR (обе правят `glm.rs`).
+
+---
+
+## Issue #71: GlmClient → OpenAiCompatClient — любой OpenAI-compatible endpoint (milestone v0.4.0)
+
+**Что сделано:**
+- Файл `crates/agent/src/glm.rs` → `openai_compat.rs` (git rename), структура
+  `GlmClient` → `OpenAiCompatClient` (включая `impl LlmClient` и `impl`-блоки,
+  smoke-тесты). Тело запроса и поведение не изменились.
+- В `lib.rs`: `pub mod openai_compat;`, `pub use OpenAiCompatClient;` и
+  deprecated-алиас `pub use OpenAiCompatClient as GlmClient;`
+  (`#[deprecated(note = "renamed to OpenAiCompatClient")]`) — обратная
+  совместимость для внешних потребителей движка до следующего мажорного тега.
+- `app/main.rs` переведён на `OpenAiCompatClient` (чтобы не триггерить
+  deprecation-warning под `-D warnings`).
+- Rustdoc/комментарии/логи: формулировки «the GLM API» → «OpenAI-compatible API
+  (default: GLM)». Дефолты конфига (GLM, `GLM_API_KEY`) сохранены; в доке указано
+  переопределение env-ключа через `LlmProfile::key_env`.
+- `README.md`: раздел «Choosing an LLM» с таблицей проверенных провайдеров
+  (GLM cloud — verified, Ollama — pending manual check) и заметками о
+  совместимости (стриминг tool_calls по `index`, непустой `content` при
+  tool_calls, пустой `tools` массив уже опускается — подтверждено тестом).
+- `docs/ENGINE_API.md`: пример переименован на `OpenAiCompatClient` (с пометкой
+  про deprecated-алиас), добавлен раздел про локальную/стороннюю модель
+  (`api_base_url = http://localhost:11434/v1`, ключ-заглушка) и `key_env`.
+- Тесты: добавлен `glm_client_alias_still_compiles` (`#[allow(deprecated)]`) —
+  доказывает, что `crate::GlmClient` и `OpenAiCompatClient` — один тип; golden-
+  тест на тело запроса остался зелёным.
+
+**Публичные контракты:**
+- `filar_agent::openai_compat::OpenAiCompatClient` — новое имя клиента (was
+  `filar_agent::glm::GlmClient`).
+- `filar_agent::GlmClient` — deprecated re-export-алиас (временно).
+- Модуль `filar_agent::glm` переименован в `filar_agent::openai_compat`.
+
+**Ручная проверка:** Ollama-эндпоинт не проверялся в этом PR (нет локального
+сервера) — отмечен в таблице как pending manual check.
+
+**Дальше:** issue #72–#74 (eval-каркас, датасет, CI smoke) — оставшиеся задачи
+milestone v0.4.0.
