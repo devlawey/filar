@@ -234,10 +234,38 @@ async fn run() -> anyhow::Result<()> {
 
         match launch {
             Some(launch) => {
+                let temperature = if launch.temperature.trim().is_empty() {
+                    None
+                } else {
+                    match launch.temperature.trim().parse::<f32>() {
+                        Ok(t) => Some(t),
+                        Err(_) => {
+                            anyhow::bail!(
+                                "Invalid temperature value: '{}'. Expected a number like 0.3.",
+                                launch.temperature
+                            );
+                        }
+                    }
+                };
+                let extra_body = if launch.extra_body.trim().is_empty() {
+                    None
+                } else {
+                    match serde_json::from_str(&launch.extra_body) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            anyhow::bail!(
+                                "Invalid extra body JSON: {e}"
+                            );
+                        }
+                    }
+                };
                 let llm_config = filar_core::LlmConfig {
                     model: launch.model,
                     api_base_url: launch.api_base_url,
                     max_tokens: config.llm.max_tokens,
+                    temperature,
+                    top_p: None,
+                    extra_body,
                 };
 
                 // Build SshTarget if the user selected SSH in the GUI.

@@ -91,6 +91,12 @@ pub struct LaunchConfig {
     pub api_key: String,
     /// Session ID to restore, if the user picked a previous session.
     pub session_id: Option<String>,
+    /// Temperature as text (empty = provider default).
+    #[serde(default)]
+    pub temperature: String,
+    /// Extra body JSON as text (empty = none).
+    #[serde(default)]
+    pub extra_body: String,
 }
 
 /// SSH connection details from the GUI.
@@ -154,6 +160,10 @@ struct Settings {
     ssh_profiles: Vec<SshProfile>,
     #[serde(default)]
     last_ssh: usize,
+    #[serde(default)]
+    temperature: String,
+    #[serde(default)]
+    extra_body: String,
 }
 
 impl Settings {
@@ -240,6 +250,9 @@ struct LauncherApp {
     api_base_url: String,
     api_key: String,
     ssh_slots: Vec<SshSlot>,
+    temperature: String,
+    extra_body: String,
+    validation_error: String,
 }
 
 impl eframe::App for LauncherApp {
@@ -354,6 +367,24 @@ impl eframe::App for LauncherApp {
                     .hint_text("saved in OS credential store"),
             );
 
+            ui.label("Temperature:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.temperature)
+                    .hint_text("empty = default (e.g. 0.3)"),
+            );
+
+            ui.label("Extra body (JSON):");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.extra_body)
+                    .hint_text("e.g. {\"thinking\": {\"type\": \"disabled\"}}")
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY),
+            );
+
+            if !self.validation_error.is_empty() {
+                ui.colored_label(egui::Color32::RED, &self.validation_error);
+            }
+
             ui.separator();
 
             // ── Buttons ─────────────────────────────────────────────────
@@ -362,6 +393,26 @@ impl eframe::App for LauncherApp {
                 let cancel = ui.button("Cancel").clicked();
 
                 if launch {
+                    // Validate temperature and extra_body before launching.
+                    self.validation_error.clear();
+                    if !self.temperature.trim().is_empty()
+                        && self.temperature.trim().parse::<f32>().is_err()
+                    {
+                        self.validation_error = format!(
+                            "Invalid temperature: '{}'. Expected a number like 0.3.",
+                            self.temperature
+                        );
+                    }
+                    if self.validation_error.is_empty()
+                        && !self.extra_body.trim().is_empty()
+                        && serde_json::from_str::<serde_json::Value>(&self.extra_body).is_err()
+                    {
+                        self.validation_error = "Invalid extra body JSON.".to_string();
+                    }
+                    if !self.validation_error.is_empty() {
+                        return;
+                    }
+
                     let target = if self.target_mode == 0 {
                         "local".to_string()
                     } else {
@@ -394,6 +445,8 @@ impl eframe::App for LauncherApp {
                         } else {
                             0
                         },
+                        temperature: self.temperature.clone(),
+                        extra_body: self.extra_body.clone(),
                     };
                     settings.save();
 
@@ -418,6 +471,8 @@ impl eframe::App for LauncherApp {
                         api_base_url: self.api_base_url.clone(),
                         api_key: self.api_key.clone(),
                         session_id,
+                        temperature: self.temperature.clone(),
+                        extra_body: self.extra_body.clone(),
                     };
                     save_pending_launch(&cfg);
                     std::process::exit(0);
@@ -475,6 +530,9 @@ pub fn run_launcher(config: &Config) {
         },
         api_key,
         ssh_slots,
+        temperature: settings.temperature,
+        extra_body: settings.extra_body,
+        validation_error: String::new(),
     };
 
     let options = eframe::NativeOptions {

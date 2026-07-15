@@ -46,6 +46,9 @@ pub struct GlmClient {
     timeout: Duration,
     max_retries: u32,
     backoff_base: Duration,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    extra_body: Option<serde_json::Value>,
 }
 
 impl GlmClient {
@@ -88,6 +91,9 @@ impl GlmClient {
             timeout,
             max_retries: DEFAULT_MAX_RETRIES,
             backoff_base: DEFAULT_BACKOFF_BASE,
+            temperature: config.temperature,
+            top_p: config.top_p,
+            extra_body: config.extra_body.clone(),
         })
     }
 
@@ -114,9 +120,18 @@ impl GlmClient {
 #[async_trait::async_trait]
 impl LlmClient for GlmClient {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
-        let api_request = ApiRequest::from_chat_request(request, &self.model, self.max_tokens);
-        let body = serde_json::to_value(&api_request)
+        let api_request = ApiRequest::from_chat_request(
+            request,
+            &self.model,
+            self.max_tokens,
+            self.temperature,
+            self.top_p,
+        );
+        let mut body = serde_json::to_value(&api_request)
             .map_err(|e| CoreError::Other(format!("failed to serialize request: {e}")))?;
+        if let Some(ref extra) = self.extra_body {
+            merge_extra_body(&mut body, extra);
+        }
 
         debug!(model = %self.model, "sending chat request to GLM API");
 
@@ -155,11 +170,19 @@ impl LlmClient for GlmClient {
         request: &ChatRequest,
         on_delta: &(dyn Fn(String) + Send + Sync),
     ) -> Result<ChatResponse> {
-        let mut api_request =
-            ApiRequest::from_chat_request(request, &self.model, self.max_tokens);
+        let mut api_request = ApiRequest::from_chat_request(
+            request,
+            &self.model,
+            self.max_tokens,
+            self.temperature,
+            self.top_p,
+        );
         api_request.stream = Some(true);
-        let body = serde_json::to_value(&api_request)
+        let mut body = serde_json::to_value(&api_request)
             .map_err(|e| CoreError::Other(format!("failed to serialize request: {e}")))?;
+        if let Some(ref extra) = self.extra_body {
+            merge_extra_body(&mut body, extra);
+        }
 
         debug!(model = %self.model, "sending streaming chat request to GLM API");
 
@@ -419,10 +442,20 @@ struct ApiRequest {
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
 }
 
 impl ApiRequest {
-    fn from_chat_request(req: &ChatRequest, model: &str, max_tokens: u32) -> Self {
+    fn from_chat_request(
+        req: &ChatRequest,
+        model: &str,
+        max_tokens: u32,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+    ) -> Self {
         let messages = req.messages.iter().map(ApiMessage::from).collect();
         let tools = req.tools.iter().map(ApiTool::from).collect();
         Self {
@@ -431,7 +464,35 @@ impl ApiRequest {
             tools,
             max_tokens,
             stream: None,
+            temperature,
+            top_p,
         }
+    }
+}
+
+/// Keys that `extra_body` is not allowed to override.
+const PROTECTED_KEYS: &[&str] = &["model", "messages", "tools", "stream"];
+
+/// Merge `extra_body` into the serialized JSON request body.
+///
+/// Protected keys (`model`, `messages`, `tools`, `stream`) are silently
+/// ignored with a `warn!` log. All other keys from `extra_body` are
+/// inserted into (or override) the body.
+fn merge_extra_body(body: &mut serde_json::Value, extra: &serde_json::Value) {
+    let Some(extra_map) = extra.as_object() else {
+        warn!("extra_body is not a JSON object, ignoring");
+        return;
+    };
+    let Some(body_map) = body.as_object_mut() else {
+        warn!("request body is not a JSON object, cannot merge extra_body");
+        return;
+    };
+    for (key, value) in extra_map {
+        if PROTECTED_KEYS.contains(&key.as_str()) {
+            warn!(key = %key, "extra_body key is protected, ignoring");
+            continue;
+        }
+        body_map.insert(key.clone(), value.clone());
     }
 }
 
@@ -771,7 +832,7 @@ mod tests {
             ],
             tools: vec![],
         };
-        let api = ApiRequest::from_chat_request(&req, "glm-5.1", 4096);
+        let api = ApiRequest::from_chat_request(&req, "glm-5.1", 4096, None, None);
         let json = serde_json::to_value(&api).unwrap();
 
         assert_eq!(json["model"], "glm-5.1");
@@ -782,6 +843,9 @@ mod tests {
         assert_eq!(json["messages"][1]["content"], "Hello");
         // No tools → "tools" key should be absent.
         assert!(json.get("tools").is_none());
+        // No temperature/top_p → absent.
+        assert!(json.get("temperature").is_none());
+        assert!(json.get("top_p").is_none());
     }
 
     #[test]
@@ -800,7 +864,7 @@ mod tests {
                 }),
             }],
         };
-        let api = ApiRequest::from_chat_request(&req, "glm-5.1", 4096);
+        let api = ApiRequest::from_chat_request(&req, "glm-5.1", 4096, None, None);
         let json = serde_json::to_value(&api).unwrap();
 
         assert_eq!(json["tools"][0]["type"], "function");
@@ -907,6 +971,7 @@ mod tests {
             model: "glm-4-flash".into(),
             api_base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
             max_tokens: 256,
+            ..Default::default()
         };
         let client = GlmClient::new_with_key(&config, Duration::from_secs(60), &api_key).unwrap();
 
@@ -931,6 +996,7 @@ mod tests {
             model: "glm-4-flash".into(),
             api_base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
             max_tokens: 256,
+            ..Default::default()
         };
         let client = GlmClient::new_with_key(&config, Duration::from_secs(60), &api_key).unwrap();
 
@@ -1081,13 +1147,13 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
             messages: vec![ChatMessage::user("Hello")],
             tools: vec![],
         };
-        let mut api = ApiRequest::from_chat_request(&req, "glm-4", 4096);
+        let mut api = ApiRequest::from_chat_request(&req, "glm-4", 4096, None, None);
         api.stream = Some(true);
         let json = serde_json::to_value(&api).unwrap();
         assert_eq!(json["stream"], true);
 
         // Without streaming, stream field should be absent.
-        let api_no_stream = ApiRequest::from_chat_request(&req, "glm-4", 4096);
+        let api_no_stream = ApiRequest::from_chat_request(&req, "glm-4", 4096, None, None);
         let json_no_stream = serde_json::to_value(&api_no_stream).unwrap();
         assert!(json_no_stream.get("stream").is_none());
     }
@@ -1204,5 +1270,99 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         let response = state.into_response().unwrap();
         assert!(!response.has_tool_calls(), "expected Text response");
         assert_eq!(response.text, "end");
+    }
+
+    // ── LLM parameter tests ────────────────────────────────────────────
+
+    #[test]
+    fn golden_no_params_unchanged() {
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("Hello")],
+            tools: vec![],
+        };
+        let api = ApiRequest::from_chat_request(&req, "glm-5.1", 4096, None, None);
+        let json = serde_json::to_value(&api).unwrap();
+        // Body should NOT contain temperature or top_p.
+        assert!(json.get("temperature").is_none());
+        assert!(json.get("top_p").is_none());
+        // Core fields present.
+        assert_eq!(json["model"], "glm-5.1");
+        assert_eq!(json["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn with_temperature_and_top_p() {
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("Hello")],
+            tools: vec![],
+        };
+        let api = ApiRequest::from_chat_request(&req, "glm-5.1", 4096, Some(0.5), Some(0.25));
+        let json = serde_json::to_value(&api).unwrap();
+        assert_eq!(json["temperature"].as_f64().unwrap(), 0.5);
+        assert_eq!(json["top_p"].as_f64().unwrap(), 0.25);
+    }
+
+    #[test]
+    fn extra_body_merges_into_request() {
+        let mut body = serde_json::json!({
+            "model": "glm-5.1",
+            "messages": [],
+            "max_tokens": 4096
+        });
+        let extra = serde_json::json!({
+            "thinking": { "type": "disabled" },
+            "reasoning_effort": "low"
+        });
+        merge_extra_body(&mut body, &extra);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["reasoning_effort"], "low");
+        // Original fields intact.
+        assert_eq!(body["model"], "glm-5.1");
+        assert_eq!(body["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn extra_body_protected_keys_ignored() {
+        let mut body = serde_json::json!({
+            "model": "glm-5.1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [],
+            "stream": false,
+            "max_tokens": 4096
+        });
+        let extra = serde_json::json!({
+            "model": "hacked",
+            "messages": [],
+            "tools": [{"type": "function"}],
+            "stream": true,
+            "temperature": 0.5
+        });
+        merge_extra_body(&mut body, &extra);
+        // Protected keys unchanged.
+        assert_eq!(body["model"], "glm-5.1");
+        assert_eq!(body["messages"][0]["content"], "hi");
+        assert!(body["tools"].as_array().unwrap().is_empty());
+        assert_eq!(body["stream"], false);
+        // Non-protected key allowed.
+        assert_eq!(body["temperature"], 0.5);
+    }
+
+    #[test]
+    fn extra_body_overrides_max_tokens() {
+        let mut body = serde_json::json!({
+            "model": "glm-5.1",
+            "max_tokens": 4096
+        });
+        let extra = serde_json::json!({ "max_tokens": 8192 });
+        merge_extra_body(&mut body, &extra);
+        assert_eq!(body["max_tokens"], 8192);
+    }
+
+    #[test]
+    fn extra_body_non_object_ignored() {
+        let mut body = serde_json::json!({ "model": "glm-5.1" });
+        let extra = serde_json::json!(42);
+        merge_extra_body(&mut body, &extra);
+        assert_eq!(body["model"], "glm-5.1");
     }
 }
