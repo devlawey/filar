@@ -22,6 +22,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - README "Choosing an LLM" section with a verified-providers table and
   OpenAI-compatibility notes; `docs/ENGINE_API.md` local-model example and
   `key_env` override note (#71).
+- `eval/` harness (promptfoo config, synced agent system prompt, tool-call
+  asserts, smoke cases) for comparing LLMs on filar tasks (#72).
 
 ## [0.3.1] - 2026-07-14
 

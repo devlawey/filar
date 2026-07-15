@@ -1332,4 +1332,23 @@ mod tests {
         assert!(matches!(&received[2], AgentEvent::CommandFinished { denied: false, output, .. } if output.contains("timed out")),
             "third event should be CommandFinished with timeout message, got {:?}", received[2]);
     }
+
+    #[test]
+    fn system_prompt_matches_eval_snapshot() {
+        // The eval harness (eval/prompts/agent-system.txt) must test filar's
+        // real system prompt. This snapshot is the canonical SSH/POSIX remote
+        // variant — filar's primary scenario (build_system_prompt(false, None,
+        // false)). If the prompt in code changes, update the eval snapshot to
+        // match; this test fails on drift.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../eval/prompts/agent-system.txt");
+        let snapshot = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        let expected = build_system_prompt(false, None, false);
+        assert_eq!(
+            snapshot.trim_end(),
+            expected.trim_end(),
+            "eval/prompts/agent-system.txt is out of sync with build_system_prompt(false, None, false)"
+        );
+    }
 }

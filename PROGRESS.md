@@ -1902,3 +1902,50 @@ milestone v0.3.1 продолжается следующими issue.
 
 **Дальше:** issue #72–#74 (eval-каркас, датасет, CI smoke) — оставшиеся задачи
 milestone v0.4.0.
+
+---
+
+## Issue #72: eval-каркас + promptfoo-конфиг с проверками tool calling (milestone v0.4.0)
+
+**Что сделано:**
+- Создан `eval/` (методика — `docs/eval-methodology.md`): `promptfooconfig.yaml`,
+  `prompts/agent-system.txt`, `asserts.js`, `asserts.test.js`, `README.md`,
+  `datasets/.gitkeep` (датасет — отдельная issue #73), `eval/.gitignore`.
+- `prompts/agent-system.txt` — snapshot боевого системного промпта filar,
+  канонический вариант `build_system_prompt(false, None, false)` (SSH/POSIX
+  remote — основной сценарий filar). Способ синхронизации выбран «snapshot +
+  Rust-тест»: `system_prompt_matches_eval_snapshot` в `agent.rs` читает файл и
+  сравнивает с кодом (`trim_end`), падает при рассинхроне. Вариант «вынести
+  промпт в общий файл» отвергнут — промпт собирается динамически по контексту
+  (local/SSH/windows), единый файл потребовал бы шаблонизации.
+- `promptfooconfig.yaml`: 3 провайдера — GLM cloud, локальная Ollama, шаблон
+  третьего; ключи/URL **только из env** (`EVAL_GLM_URL`/`EVAL_GLM_KEY`,
+  `EVAL_LOCAL_URL`/`EVAL_LOCAL_KEY`, `EVAL_THIRD_*`), значений в конфиге нет
+  (методика §6). `tools` вручную зеркалит `tool_definitions()` из
+  `tools.rs` (run_command/read_file/list_dir). Промпт — chat: system из файла +
+  user `{{question}}`.
+- `asserts.js` — три filar-специфичных проверки: `toolCalled` (вызван ли
+  `run_command`; проза вместо вызова = FAIL), `commandMatches` (regex по
+  аргументу `command`, гибко: `df` и `df -h` оба PASS; pattern из `vars`),
+  `refusesDestructive` (safety-инверсия: деструктив без уточнения = FAIL).
+  Толерантны к строковому output и к OpenAI-compatible response-shapes.
+- `asserts.test.js` — plain-Node юнит-тесты ассертов (DoD: проза → FAIL,
+  корректный tool call → PASS, safety-инверсия).
+- 3 smoke-кейса в конфиге (место на диске → df; загрузка → ps|top|uptime;
+  деструктив → safety-инверсия). Полный датасет — #73.
+- `eval/.gitignore`: `.promptfoo/`, `results.*` (коммитятся только конфиг,
+  промпт, asserts, датасеты, README).
+- Отклонения от методики зафиксированы в `eval/README.md`: нет LiteLLM-шлюза
+  (провайдеры напрямую), недоступен учёт стоимости.
+
+**Публичные контракты:** без изменений (eval — отдельный слой; добавлен только
+тест `system_prompt_matches_eval_snapshot` в `filar-agent`).
+
+**Ручная проверка / ограничения:** Node не установлен в окружении, поэтому
+`npx promptfoo@latest eval` и `node eval/asserts.test.js` прогнать не удалось —
+требуют Node 18+ (отмечено в README/PR). Проверено: `cargo test --workspace`
+зелёный (включая sync-тест), `cargo clippy -p filar-agent -- -D warnings` чист.
+`#[ignore]`-тесты docker-sshd не запускались.
+
+**Дальше:** issue #73 (стартовый датасет 30 кейсов) и #74 (CI smoke) —
+оставшиеся задачи milestone v0.4.0.

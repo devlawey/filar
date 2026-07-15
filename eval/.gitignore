@@ -1,0 +1,4 @@
+# promptfoo local cache + run outputs are NOT committed (methodology §10).
+# Only config, prompts, asserts, datasets and this README are tracked.
+.promptfoo/
+results.*
