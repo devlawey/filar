@@ -12,7 +12,7 @@ equality.
 
 ## Layout
 
-```
+```text
 eval/
 ├── promptfooconfig.yaml   # providers, tools, smoke tests
 ├── prompts/

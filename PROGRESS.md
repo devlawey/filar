@@ -1944,6 +1944,10 @@ milestone v0.4.0.
 - Отклонения от методики зафиксированы в `eval/README.md`: вместо LiteLLM-шлюза —
   OpenRouter (единственный эндпоинт-роутер), стоимость доступна (OpenRouter
   возвращает usage/cost).
+- По ревью PR #77: отформатирован боевой системный промпт в `build_system_prompt`
+  (`agent.rs`) — правила разделены переносами строк (ранее склеены через
+  `\`-continuations: `language.Rules:1.`). Snapshot `agent-system.txt`
+  перегенерирован, sync-тест `system_prompt_matches_eval_snapshot` зелёный.
 
 **Публичные контракты:** без изменений (eval — отдельный слой; добавлен только
 тест `system_prompt_matches_eval_snapshot` в `filar-agent`).
