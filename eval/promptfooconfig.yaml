@@ -2,13 +2,10 @@ description: "filar agent eval — tool-calling on filar tasks (milestone v0.4.0
 
 # Prompt under test = filar's real agent system prompt (SSH/POSIX remote
 # variant), synced with crates/agent/src/agent.rs via the
-# `system_prompt_matches_eval_snapshot` Rust test. The user turn comes from
-# each test case's {{question}} var.
+# `system_prompt_matches_eval_snapshot` Rust test. agent-chat.json is a chat
+# prompt: system message loaded from agent-system.txt + user {{question}}.
 prompts:
-  - role: system
-    content: file://prompts/agent-system.txt
-  - role: user
-    content: "{{question}}"
+  - file://prompts/agent-chat.json
 
 # Tool schema mirrors crates/agent/src/tools.rs::tool_definitions(). It is a
 # manual mirror (single-source sharing from Rust would need an export step);

@@ -16,7 +16,8 @@ equality.
 eval/
 ├── promptfooconfig.yaml   # providers, tools, smoke tests
 ├── prompts/
-│   └── agent-system.txt   # filar's real agent system prompt (synced with code)
+│   ├── agent-system.txt   # filar's real agent system prompt (synced with code)
+│   └── agent-chat.json    # chat prompt: system (file:// agent-system.txt) + user {{question}}
 ├── asserts.js             # filar-specific assert helpers
 ├── asserts.test.js        # plain-Node unit tests for asserts.js
 ├── datasets/              # starter dataset — added in #73
@@ -27,7 +28,8 @@ eval/
 ## Prerequisites
 
 - **Node.js 18+** (not bundled with the filar dev environment — install
-  separately). promptfoo itself is **not** committed: run it via `npx`.
+  separately, e.g. the portable Windows zip). promptfoo itself is **not**
+  committed: run it via `npx`. Verified with Node 24 + promptfoo 0.121.x.
 
 ## Environment variables (no secrets in the repo)
 
@@ -104,6 +106,10 @@ call => PASS, and the safety-inversion behaviour.
 `crates/agent/src/agent.rs`). Drift is caught by the Rust test
 `system_prompt_matches_eval_snapshot` (runs in `cargo test --workspace`): if
 the prompt in code changes, update the snapshot to match.
+
+`promptfooconfig.yaml` uses `prompts/agent-chat.json` — a chat prompt that
+loads the system message from `agent-system.txt` (via `file://`) and adds the
+user turn `{{question}}` from each test case.
 
 ## Deviations from the methodology (conscious)
 
