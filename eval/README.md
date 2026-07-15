@@ -49,7 +49,7 @@ for the current session only).
 
 ```bash
 # run all configured models against the 30-case dataset (writes eval/results.json)
-npx promptfoo@latest eval -c eval/promptfooconfig.yaml
+npx promptfoo@latest eval -c eval/promptfooconfig.yaml -o eval/results.json
 
 # open the local web report (table: tests × models, PASS/FAIL, latency, cost)
 npx promptfoo@latest view
