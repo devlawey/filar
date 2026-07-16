@@ -1,0 +1,103 @@
+name: Eval smoke
+
+# Regression smoke for filar's agent eval (methodology §10): runs a 10-case
+# subset against one baseline model whenever the system prompt / agent loop /
+# dataset changes, and on manual dispatch. Skips (does not fail) on forks or
+# repos without the OPENROUTER_API_KEY secret.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'eval/prompts/**'
+      - 'crates/agent/src/**'
+      - 'eval/datasets/**'
+      - 'eval/promptfooconfig.yaml'
+      - 'eval/asserts.js'
+      - '.github/workflows/eval-smoke.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  # Secrets cannot be referenced in a job-level `if` (actionlint: the "secrets"
+  # context is not allowed there), so a tiny gate job evaluates the secret in its
+  # env and exports a boolean. The smoke job then runs only when the secret is
+  # present — on forks / repos without it, smoke is skipped, not failed.
+  check-secret:
+    name: Check for OPENROUTER_API_KEY
+    runs-on: ubuntu-latest
+    outputs:
+      has_secret: ${{ steps.check.outputs.has_secret }}
+    steps:
+      - id: check
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [ -n "$OPENROUTER_API_KEY" ]; then
+            echo "has_secret=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_secret=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  smoke:
+    name: eval smoke (10 cases, GLM-5.2)
+    needs: check-secret
+    if: needs.check-secret.outputs.has_secret == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install promptfoo
+        # Pinned to the version the smoke set was validated against; bump and
+        # re-validate locally before changing.
+        run: npm install -g promptfoo@0.121.19
+
+      # Low temperature (0) is set in promptfooconfig.yaml for reproducibility.
+      - name: Run smoke subset
+        id: run1
+        continue-on-error: true
+        run: |
+          promptfoo eval -c eval/promptfooconfig.yaml \
+            --filter-metadata smoke=true \
+            --filter-providers 'glm-5.2' \
+            --no-cache \
+            -o eval/results.json
+
+      - name: Check pass rate (≥ 90%)
+        id: check1
+        if: always()
+        continue-on-error: true
+        run: node eval/scripts/smoke-check.js eval/results.json 90
+
+      # One automatic retry of the failed cases (LLMs are non-deterministic);
+      # if the retry is still red, the job fails.
+      - name: Retry failed cases once (flakiness)
+        if: steps.check1.outcome == 'failure'
+        run: |
+          promptfoo eval -c eval/promptfooconfig.yaml \
+            --filter-failing eval/results.json \
+            --filter-providers 'glm-5.2' \
+            --no-cache \
+            -o eval/results.retry.json
+          node eval/scripts/smoke-check.js eval/results.retry.json 100
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-smoke-report
+          path: |
+            eval/results.json
+            eval/results.retry.json
+          if-no-files-found: ignore
