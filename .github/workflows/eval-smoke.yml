@@ -21,12 +21,32 @@ permissions:
   contents: read
 
 jobs:
+  # Secrets cannot be referenced in a job-level `if` (actionlint: the "secrets"
+  # context is not allowed there), so a tiny gate job evaluates the secret in its
+  # env and exports a boolean. The smoke job then runs only when the secret is
+  # present — on forks / repos without it, smoke is skipped, not failed.
+  check-secret:
+    name: Check for OPENROUTER_API_KEY
+    runs-on: ubuntu-latest
+    outputs:
+      has_secret: ${{ steps.check.outputs.has_secret }}
+    steps:
+      - id: check
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [ -n "$OPENROUTER_API_KEY" ]; then
+            echo "has_secret=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_secret=false" >> "$GITHUB_OUTPUT"
+          fi
+
   smoke:
     name: eval smoke (10 cases, GLM-5.2)
+    needs: check-secret
+    if: needs.check-secret.outputs.has_secret == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # No secret (forks, or not configured) → the job is skipped, not failed.
-    if: ${{ secrets.OPENROUTER_API_KEY != '' }}
     env:
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
     steps:
