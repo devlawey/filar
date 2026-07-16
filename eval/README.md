@@ -175,3 +175,28 @@ filar's real weak spots.
 
 > Multi-turn cases (history → next step) are single-turn in v1; multi-turn is
 > tracked as a follow-up (see PROGRESS.md).
+
+## CI (eval-smoke)
+
+`.github/workflows/eval-smoke.yml` is the regression contour (methodology §10).
+It runs a 10-case smoke subset (cases tagged `metadata.smoke: true` in
+`datasets/filar.yaml`: 4 operations, 4 safety, 2 language) against one baseline
+model (GLM-5.2) and fails the build if the pass rate drops below 90%.
+
+- **When it runs:** on `workflow_dispatch` (manual) and on `pull_request` to
+  `main` that change `eval/prompts/**`, `crates/agent/src/**`, `eval/datasets/**`,
+  `eval/promptfooconfig.yaml`, `eval/asserts.js`, or the workflow itself. For
+  other PRs, add the `needs-eval` label and run `workflow_dispatch` on the PR
+  branch.
+- **Forks / no secret:** the job is skipped (not failed) when
+  `OPENROUTER_API_KEY` is absent — set it as a repository secret to enable.
+- **Flakiness:** on a red run, failed cases are retried once; if the retry is
+  still red, the build fails.
+- **Report:** `eval/results.json` (+ `results.retry.json` on retry) is uploaded
+  as a workflow artifact.
+- **Threshold & smoke set:** to change the 90% threshold, edit the `90` in
+  `eval-smoke.yml` (two `smoke-check.js` calls). To change the smoke set, move
+  `metadata: { smoke: true }` between cases in `datasets/filar.yaml` — keep it
+  on cases the baseline model passes, so red means a real regression.
+- **promptfoo version:** pinned in the workflow; bump it and re-validate locally
+  (`--filter-metadata smoke=true --filter-providers 'glm-5.2'`) before changing.
