@@ -1237,7 +1237,7 @@ checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
 name = "filar-agent"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "filar-core",
@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "filar-app"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "filar-agent",
@@ -1271,7 +1271,7 @@ dependencies = [
 
 [[package]]
 name = "filar-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "filar-gui"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "filar-core",
@@ -1296,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "filar-transport"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "filar-tui"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "alacritty_terminal",
  "arboard",

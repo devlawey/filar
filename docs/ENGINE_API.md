@@ -27,22 +27,22 @@ working example.
 Bots and mobile apps that only need SSH should disable default features:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v0.3.1", default-features = false }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v0.4.0", default-features = false }
 ```
 
 Desktop apps (TUI/GUI) should keep `local` enabled:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v0.3.1" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v0.4.0" }
 ```
 
 ## Cargo.toml example
 
 ```toml
 [dependencies]
-filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v0.3.1" }
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v0.3.1", default-features = false }
-filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v0.3.1" }
+filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v0.4.0" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v0.4.0", default-features = false }
+filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v0.4.0" }
 
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"

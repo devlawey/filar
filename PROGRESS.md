@@ -2058,3 +2058,23 @@ v0.4.0; multi-turn-кейсы — отдельная issue.
 **Milestone v0.4.0 завершён** (#70 параметры, #71 переименование клиента, #72
 каркас eval, #73 датасет, #74 CI smoke). Открытый follow-up: multi-turn-кейсы для
 eval (отдельная issue).
+
+---
+
+## Релиз v0.4.0 (2026-07-16)
+
+**Подготовка:** preflight зелёный (`cargo build --workspace`, `cargo test --workspace`
+— 0 failed; 7 `#[ignore]` docker-sshd пропущены). Бамп `workspace.package.version`
+0.3.1 → 0.4.0 в `Cargo.toml`, `Cargo.lock` перегенерирован. `CHANGELOG.md`:
+`## [Unreleased]` → `## [0.4.0] - 2026-07-16` (+ пропущенные #70/#73/#74), новая
+пустая `## [Unreleased]`, ссылки обновлены. `docs/ENGINE_API.md`: примеры зависимостей
+`engine-v0.3.1` → `engine-v0.4.0` (движок менялся: #70, #71 трогали `crates/core`/`crates/agent`).
+Bump-коммит `chore(release): bump version to 0.4.0` запушен прямо в `main` (исключение
+для релизного бампа).
+
+**Публичные контракты движка (engine-v0.4.0):** `filar_core::LlmConfig`/`LlmProfile` —
+новые поля `temperature`/`top_p`/`extra_body` (#70); `filar_agent::openai_compat::OpenAiCompatClient`
+(был `glm::GlmClient`) + deprecated-алиас `GlmClient` (#71). Обратно совместимо (additive).
+
+**Релиз:** тег `v0.4.0` + GitHub Release `Filar v0.4.0` (`generate_release_notes: true`,
+windows-бинарник собирает `release.yml`). Тег движка `engine-v0.4.0` на том же коммите.

@@ -11,6 +11,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-16
+
+Milestone v0.4.0 — flexibility of LLM choice and measurability of its quality on
+filar's own tasks.
+
 ### Changed
 
 - Renamed the LLM client `GlmClient` → `OpenAiCompatClient` (module `glm` →
@@ -21,11 +26,17 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Configurable LLM request parameters — `temperature`, `top_p`, and `extra_body`
+  on `LlmConfig`/`LlmProfile` (with validation and GUI launcher fields) (#70).
 - README "Choosing an LLM" section with a verified-providers table and
   OpenAI-compatibility notes; `docs/ENGINE_API.md` local-model example and
   `key_env` override note (#71).
 - `eval/` harness (promptfoo config, synced agent system prompt, tool-call
-  asserts, smoke cases) for comparing LLMs on filar tasks (#72).
+  asserts) for comparing LLMs on filar tasks (#72).
+- Starter eval dataset — 30 anonymised cases (operations / safety / language)
+  with a three-model comparison report (#73).
+- `eval-smoke` CI regression workflow — a 10-case subset, ≥90% threshold with one
+  retry, triggered on prompt/agent/dataset changes (#74).
 
 ## [0.3.1] - 2026-07-14
 
@@ -105,6 +116,7 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/devlawey/filar/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/devlawey/filar/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/devlawey/filar/releases/tag/v0.3.0
