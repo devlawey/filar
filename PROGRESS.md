@@ -2224,3 +2224,23 @@ rubric-only). Пересобрать smoke-набор до ~12 кейсов.
 `node eval/asserts.test.js` — 15 asserts passed. `node -e "require('./eval/scripts/run-eval.js')"` —
 скрипт загружается без синтаксических ошибок. Полный прогон с ретраями —
 ручная проверка (требует `OPENROUTER_API_KEY`, `npx`, promptfoo).
+
+**Правки по ревью (PR #88, devlawey):**
+- `eval/promptfooconfig.yaml`: `maxConcurrency`/`delay` вынесены из `config:` на
+  уровень провайдера (внутри `config:` OpenRouter-клиент игнорировал их).
+- `eval/scripts/run-eval.js`: полный rewrite:
+  - Бинарник promptfoo — через `PROMPTFOO_BIN` env (дефолт `npx promptfoo`,
+    CI передаёт `promptfoo` для использования закреплённой версии).
+  - Ретрай теперь фильтрует `results.json` до error-only перед `--filter-failing`,
+    assertion failures не ретраятся.
+  - Результаты ретраев мержатся с результатами первого прогона (keep passing,
+    overlay retried), а не перезаписываются.
+  - `--smoke` exit 1 если results отсутствуют, 0 если прогон ok.
+  - Пользовательский `-o` фильтруется из extraArgs (скрипт сам управляет
+    выходным файлом).
+  - Комментарий про exit-код исправлен.
+- `.github/workflows/eval-smoke.yml`: `PROMPTFOO_BIN: promptfoo` — использует
+  глобально установленную закреплённую версию.
+- `eval/README.md`: диапазон стоимости приведён к единому ($0.10–$2.00),
+  добавлена заметка про удвоение нагрузки от судьи и рекомендация снизить
+  `maxConcurrency` до 2 для больших прогонов.

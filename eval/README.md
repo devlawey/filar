@@ -78,6 +78,12 @@ buckets B and C.
 | Per-provider `maxConcurrency` | 1 | `:free` models only (HY3, Nemotron) |
 | Per-provider `delay` | 3000 ms | `:free` models only |
 
+> **Note on judge load:** every rubric case in buckets B and C triggers a second
+> API call to the judge model, roughly doubling the load for those cases. The
+> global `maxConcurrency: 4` covers paid models + judge calls together; for
+> very large runs (all 10 models with many rubric cases), consider lowering it
+> to 2.
+
 ### Free model limits
 
 OpenRouter `:free` models are **rate-limited to ~20 requests/minute** with
@@ -100,9 +106,10 @@ Use `--smoke` to skip retries (CI mode — fails immediately on low pass rate).
 ### Cost estimate
 
 OpenRouter pricing varies widely. A full 10-model × 50-case run costs roughly
-**$0.10–$1.50** depending on model mix. The judge (`mistralai/mistral-large`)
-adds ~$0.05 per run. `:free` models have zero cost. Budget ~$2 for a complete
-rerun.
+**$0.10–$2.00** depending on model mix (free models cost $0; frontier models
+like GPT-5.6-SOL are the most expensive). The judge (`mistralai/mistral-large`)
+adds ~$0.05 per run. Budget ~$2 for a complete rerun, ~$3 if you also pay for
+a frontier model judge call on every B/C case.
 
 ## Models (changing them)
 

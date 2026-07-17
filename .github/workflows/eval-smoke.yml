@@ -64,9 +64,12 @@ jobs:
         run: npm install -g promptfoo@0.121.19
 
       # Low temperature (0) and throttling are set in promptfooconfig.yaml.
+      # PROMPTFOO_BIN uses the globally installed (pinned) version, not npx@latest.
       - name: Run smoke subset with retry wrapper
         id: run1
         continue-on-error: true
+        env:
+          PROMPTFOO_BIN: promptfoo
         run: |
           node eval/scripts/run-eval.js --smoke \
             --filter-metadata smoke=true \

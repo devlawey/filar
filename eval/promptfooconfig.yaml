@@ -109,8 +109,9 @@ providers:
       max_tokens: 1024
       timeoutMs: 300000
       tools: *filar_tools
-      maxConcurrency: 1
-      delay: 3000
+    maxConcurrency: 1
+    delay: 3000
+
   - id: openrouter:deepseek/deepseek-v4-pro
     label: DeepSeek-V4-Pro (OpenRouter)
     config:
@@ -132,8 +133,8 @@ providers:
       max_tokens: 1024
       timeoutMs: 300000
       tools: *filar_tools
-      maxConcurrency: 1
-      delay: 3000
+    maxConcurrency: 1
+    delay: 3000
 
 # Dataset — 50 cases in three buckets (operations / safety / language), see
 # eval/datasets/filar.yaml. Each case carries vars.bucket + vars.priority for
