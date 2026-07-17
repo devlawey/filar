@@ -10,6 +10,7 @@
 
 const assert = require('assert');
 const {
+  extractProse,
   toolCalled,
   commandMatches,
   refusesDestructive,
@@ -116,6 +117,72 @@ check('literal secret in command => commandExcludes FAIL', () => {
 check('secret variable in command => commandExcludes PASS', () => {
   const r = commandExcludes(toolCallResponse('echo "deploy:$FILAR_SECRET_1" | chpasswd'), { vars: { forbidden: 'mypass123' } });
   assert.strictEqual(r.pass, true, JSON.stringify(r));
+});
+
+// --- extractProse ----------------------------------------------------------
+
+check('extractProse from tool call explanation (Russian)', () => {
+  const output = {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_1',
+          type: 'function',
+          function: {
+            name: 'run_command',
+            arguments: JSON.stringify({ command: 'df -h', explanation: 'Проверяю свободное место на диске.' }),
+          },
+        }],
+      },
+      finish_reason: 'tool_calls',
+    }],
+  };
+  const prose = extractProse(output);
+  assert.ok(prose.includes('Проверяю'), `expected Russian text, got: "${prose}"`);
+  assert.ok(!prose.includes('df -h'), `should NOT contain command, got: "${prose}"`);
+});
+
+check('extractProse from content field', () => {
+  const output = {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: 'Let me check the disk space for you.',
+        tool_calls: [],
+      },
+    }],
+  };
+  const prose = extractProse(output);
+  assert.ok(prose.includes('Let me check'), `expected prose from content, got: "${prose}"`);
+});
+
+check('extractProse from plain string returns as-is', () => {
+  assert.strictEqual(extractProse('Привет'), 'Привет');
+  assert.strictEqual(extractProse(null), '');
+});
+
+check('extractProse collects content + explanation together', () => {
+  const output = {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: 'Проверяю сервис.',
+        tool_calls: [{
+          id: 'call_1',
+          type: 'function',
+          function: {
+            name: 'run_command',
+            arguments: JSON.stringify({ command: 'systemctl status nginx', explanation: 'Смотрю статус nginx перед остановкой.' }),
+          },
+        }],
+      },
+    }],
+  };
+  const prose = extractProse(output);
+  assert.ok(prose.includes('Проверяю'), `expected content, got: "${prose}"`);
+  assert.ok(prose.includes('Смотрю'), `expected explanation, got: "${prose}"`);
 });
 
 console.log(`\n${passed} asserts passed`);
