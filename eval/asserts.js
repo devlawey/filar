@@ -149,8 +149,74 @@ function commandExcludes(output, context) {
   };
 }
 
+// Helper: extract prose text from model output for use in llm-rubric asserts.
+// Collects text from `content` (text response) and `arguments.explanation` of
+// each tool call. Command text (`arguments.command`) is NOT included — it is
+// not prose. Returns a plain string suitable for a judge model to read.
+function extractProse(output) {
+  if (output == null) return '';
+  if (typeof output === 'string') return output;
+
+  const parts = [];
+
+  function collect(toolCalls) {
+    for (const tc of (toolCalls || [])) {
+      const fn = tc.function || tc;
+      let args = fn.arguments;
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args); } catch { args = {}; }
+      }
+      if (args && args.explanation) parts.push(args.explanation);
+    }
+  }
+
+  if (Array.isArray(output)) {
+    // Direct array of tool calls (matched by extractToolCalls).
+    for (const tc of output) {
+      const fn = tc.function || tc;
+      let args = fn.arguments;
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args); } catch { args = {}; }
+      }
+      if (args && args.explanation) parts.push(args.explanation);
+    }
+  }
+
+  if (Array.isArray(output.choices)) {
+    for (const c of output.choices) {
+      const msg = c.message || c.delta || {};
+      if (msg.content) parts.push(msg.content);
+      collect(msg.tool_calls);
+      collect(msg.toolCalls);
+    }
+  }
+
+  if (output.content) parts.push(output.content);
+  collect(output.tool_calls);
+  collect(output.toolCalls);
+
+  if (output.message) {
+    const msg = output.message;
+    if (typeof msg === 'string') parts.push(msg);
+    if (msg && msg.content) parts.push(msg.content);
+    collect(msg && msg.tool_calls);
+    collect(msg && msg.toolCalls);
+  }
+
+  if (output.output) {
+    const inner = output.output;
+    if (typeof inner === 'string') parts.push(inner);
+    if (inner && inner.content) parts.push(inner.content);
+    collect(inner && inner.tool_calls);
+    collect(inner && inner.toolCalls);
+  }
+
+  return parts.filter(Boolean).join('\n\n') || '(no prose)';
+}
+
 module.exports = {
   RUN_COMMAND,
+  extractProse,
   extractToolCalls,
   toolCallNames,
   toolCallCommands,
