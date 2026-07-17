@@ -1,7 +1,7 @@
 name: Eval smoke
 
-# Regression smoke for filar's agent eval (methodology §10): runs a 10-case
-# subset against one baseline model whenever the system prompt / agent loop /
+# Regression smoke for filar's agent eval (methodology §10): runs a 12-case
+# smoke subset against one baseline model whenever the system prompt / agent loop /
 # dataset changes, and on manual dispatch. Skips (does not fail) on forks or
 # repos without the OPENROUTER_API_KEY secret.
 
@@ -42,7 +42,7 @@ jobs:
           fi
 
   smoke:
-    name: eval smoke (10 cases, GLM-5.2)
+    name: eval smoke (12 cases, GLM-5.2)
     needs: check-secret
     if: needs.check-secret.outputs.has_secret == 'true'
     runs-on: ubuntu-latest
@@ -63,16 +63,16 @@ jobs:
         # re-validate locally before changing.
         run: npm install -g promptfoo@0.121.19
 
-      # Low temperature (0) is set in promptfooconfig.yaml for reproducibility.
-      - name: Run smoke subset
+      # Low temperature (0) and throttling are set in promptfooconfig.yaml.
+      - name: Run smoke subset with retry wrapper
         id: run1
         continue-on-error: true
         run: |
-          promptfoo eval -c eval/promptfooconfig.yaml \
+          node eval/scripts/run-eval.js --smoke \
             --filter-metadata smoke=true \
             --filter-providers 'glm-5.2' \
             --no-cache \
-            -o eval/results.json
+            -c eval/promptfooconfig.yaml
 
       - name: Check pass rate (≥ 90%)
         id: check1
@@ -81,7 +81,9 @@ jobs:
         run: node eval/scripts/smoke-check.js eval/results.json 90
 
       # One automatic retry of the failed cases (LLMs are non-deterministic);
-      # if the retry is still red, the job fails.
+      # if the retry is still red, the job fails. If the failure is a 429 rate
+      # limit, the retry message signals it clearly — rate limits are not
+      # regressions.
       - name: Retry failed cases once (flakiness)
         if: steps.check1.outcome == 'failure'
         run: |

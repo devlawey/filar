@@ -2182,3 +2182,45 @@ rubric-only). Пересобрать smoke-набор до ~12 кейсов.
 **Тесты:** `cargo test -p filar-agent -p filar-core` — 96 passed, 0 failed.
 `node eval/asserts.test.js` — 15 asserts passed. Контрольный прогон на двух
 моделях (фронтир + якорь) — ручная проверка (требует `OPENROUTER_API_KEY`).
+
+---
+
+## Issue #85: Eval — троттлинг и ретраи на 429
+
+**Проблема:** при полном прогоне (10 моделей × 50 кейсов + вызовы судьи)
+несколько моделей получали 429 Too Many Requests от OpenRouter:
+- Параллелизм promptfoo по умолчанию бил в rate limit провайдера;
+- Бесплатные модели (`:free`) жёстко лимитированы (~20 req/min + суточные
+  лимиты);
+- Вызовы судьи удваивают нагрузку на рубричных кейсах.
+
+**Что сделано:**
+- `eval/promptfooconfig.yaml`:
+  - Глобальный `maxConcurrency: 4` — умеренный параллелизм для платных моделей.
+  - Per-provider throttling для `:free` моделей (HY3, Nemotron):
+    `maxConcurrency: 1`, `delay: 3000` (3с между запросами).
+  - Комментарии обновлены: dataset 50, milestone v0.4.1.
+- `eval/scripts/run-eval.js` — новый скрипт-обёртка над `promptfoo eval`:
+  - После первого прогона парсит `results.json`, находит кейсы с API-ошибками
+    (429, timeout) — НЕ assertion failures.
+  - Ретраит с экспоненциальной задержкой: 30с / 60с / 120с, макс. 3 попытки.
+  - Флаг `--smoke` для CI — короткое замыкание без ретраев.
+  - Подсказка при первом ретрае: про лимиты :free моделей и раздельный прогон.
+- `eval/README.md`: новый раздел «Limits and cost» — таблица throttling,
+  лимиты :free моделей, описание run-eval.js, оценка стоимости ($0.10–$2).
+  Обновлена секция «Running» — примеры с run-eval.js wrapper'ом. Обновлена
+  CI-секция (12 smoke-кейсов вместо 10).
+- `.github/workflows/eval-smoke.yml`:
+  - Smoke-прогон через `node eval/scripts/run-eval.js --smoke` (throttling
+    из конфига применяется автоматически).
+  - Название джобы и комментарии обновлены (12 cases).
+  - Ретрай флаков (существующий) сохранён — 429 не маскируется, job падает
+    с внятным сообщением если rate limit исчерпал все попытки.
+
+**Публичные контракты:** без изменений (eval — отдельный слой; Rust-код
+не тронут).
+
+**Тесты:** `cargo test -p filar-agent -p filar-core` — 96 passed, 0 failed.
+`node eval/asserts.test.js` — 15 asserts passed. `node -e "require('./eval/scripts/run-eval.js')"` —
+скрипт загружается без синтаксических ошибок. Полный прогон с ретраями —
+ручная проверка (требует `OPENROUTER_API_KEY`, `npx`, promptfoo).

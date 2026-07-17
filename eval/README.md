@@ -48,18 +48,61 @@ for the current session only).
 ## Running
 
 ```bash
-# run all configured models against the 30-case dataset (writes eval/results.json)
+# full run with retry-on-429 wrapper (recommended):
+node eval/scripts/run-eval.js -c eval/promptfooconfig.yaml
+
+# without retries (faster, but 429 errors will remain as errors):
 npx promptfoo@latest eval -c eval/promptfooconfig.yaml -o eval/results.json
 
 # open the local web report (table: tests × models, PASS/FAIL, latency, cost)
 npx promptfoo@latest view
 
-# export a shareable report
-npx promptfoo@latest eval -c eval/promptfooconfig.yaml -o results.html
+# smoke subset (CI-compatible, no retries):
+node eval/scripts/run-eval.js --smoke --filter-metadata smoke=true -c eval/promptfooconfig.yaml
 ```
 
 To run fewer models, comment out their `- id: openrouter:...` block in
 `promptfooconfig.yaml`. Run outputs (`results.*`, `.promptfoo/`) are gitignored.
+
+## Limits and cost
+
+A full run (50 cases × 10 models + judge calls) makes **~500+ API requests**.
+Judge calls for `llm-rubric` asserts roughly double the per-model load for
+buckets B and C.
+
+### Throttling (`promptfooconfig.yaml`)
+
+| Setting | Value | Applies to |
+|---|---|---|
+| `maxConcurrency` | 4 (global) | All paid models |
+| Per-provider `maxConcurrency` | 1 | `:free` models only (HY3, Nemotron) |
+| Per-provider `delay` | 3000 ms | `:free` models only |
+
+### Free model limits
+
+OpenRouter `:free` models are **rate-limited to ~20 requests/minute** with
+additional daily caps. On a full run, a `:free` model hits the daily limit
+after ~2 minutes. If you need consistent results for free models:
+
+- Run them separately: comment out all but one `:free` model, then repeat.
+- Use `--filter-providers 'hy3'` to run a single model.
+- Increase per-provider `delay` to 10000 for very tight limits.
+
+### Retry wrapper (`eval/scripts/run-eval.js`)
+
+If a full run produces 429/timeout errors, the retry wrapper:
+1. Identifies cases that failed with API errors (not assertion failures).
+2. Retries failed cases with `--filter-failing` after 30s / 60s / 120s delays.
+3. Max 3 retry attempts; assertion failures are never retried.
+
+Use `--smoke` to skip retries (CI mode — fails immediately on low pass rate).
+
+### Cost estimate
+
+OpenRouter pricing varies widely. A full 10-model × 50-case run costs roughly
+**$0.10–$1.50** depending on model mix. The judge (`mistralai/mistral-large`)
+adds ~$0.05 per run. `:free` models have zero cost. Budget ~$2 for a complete
+rerun.
 
 ## Models (changing them)
 
@@ -217,9 +260,12 @@ filar's real weak spots.
 ## CI (eval-smoke)
 
 `.github/workflows/eval-smoke.yml` is the regression contour (methodology §10).
-It runs a 10-case smoke subset (cases tagged `metadata.smoke: true` in
-`datasets/filar.yaml`: 4 operations, 4 safety, 2 language) against one baseline
+It runs a 12-case smoke subset (cases tagged `metadata.smoke: true` in
+`datasets/filar.yaml`: 5 operations, 4 safety, 3 language) against one baseline
 model (GLM-5.2) and fails the build if the pass rate drops below 90%.
+Throttling settings from `promptfooconfig.yaml` are applied automatically.
+The run is wrapped via `node eval/scripts/run-eval.js --smoke` which skips
+retries (429s in CI are handled by the flakiness retry step, not the wrapper).
 
 - **When it runs:** on `workflow_dispatch` (manual) and on `pull_request` to
   `main` that change `eval/prompts/**`, `crates/agent/src/**`, `eval/datasets/**`,
