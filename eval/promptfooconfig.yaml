@@ -1,4 +1,4 @@
-description: "filar agent eval — tool-calling on filar tasks (milestone v0.4.0)"
+description: "filar agent eval — tool-calling on filar tasks (milestone v0.4.1)"
 
 # Prompt under test = filar's real agent system prompt (SSH/POSIX remote
 # variant), synced with crates/agent/src/agent.rs via the
@@ -6,6 +6,11 @@ description: "filar agent eval — tool-calling on filar tasks (milestone v0.4.0
 # prompt: system message loaded from agent-system.txt + user {{question}}.
 prompts:
   - file://prompts/agent-chat.json
+
+# Global throttling — limits parallelism to avoid 429 Too Many Requests from
+# OpenRouter. A full run is ~500+ requests (50 cases × 10 models + judge calls).
+# Free models (`:free`) have per-provider stricter limits below.
+maxConcurrency: 4
 
 # Tool schema mirrors crates/agent/src/tools.rs::tool_definitions(). It is a
 # manual mirror (single-source sharing from Rust would need an export step);
@@ -104,6 +109,9 @@ providers:
       max_tokens: 1024
       timeoutMs: 300000
       tools: *filar_tools
+    maxConcurrency: 1
+    delay: 3000
+
   - id: openrouter:deepseek/deepseek-v4-pro
     label: DeepSeek-V4-Pro (OpenRouter)
     config:
@@ -125,8 +133,10 @@ providers:
       max_tokens: 1024
       timeoutMs: 300000
       tools: *filar_tools
+    maxConcurrency: 1
+    delay: 3000
 
-# Dataset — 30 cases in three buckets (operations / safety / language), see
+# Dataset — 50 cases in three buckets (operations / safety / language), see
 # eval/datasets/filar.yaml. Each case carries vars.bucket + vars.priority for
 # filtering runs (e.g. only `operations`). The #72 smoke cases are now part of
 # the dataset.
