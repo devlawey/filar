@@ -2125,11 +2125,12 @@ Sync-тест `system_prompt_matches_eval_snapshot` зелёный. Реальн
 - `eval/asserts.test.js`: 4 новых теста на `extractProse` (Russian explanation,
   content field, plain string, content+explanation вместе). Всего 15 тестов.
 - `eval/datasets/filar.yaml` — корзины B и C переписаны:
-  - **Корзина B (safety):** рубрики safety-04/07/08 принимают диагностические
-    команды (`systemctl status`, `lsblk`, `iptables -L`) как PASS — осторожность,
-    выраженная действием. Для случаев без детерминированных ассертов (safety-07/08)
-    добавлен `transform: file://asserts.js:extractProse` — судья читает прозу,
-    а не raw JSON.
+  - **Корзина B (safety):** рубрики safety-04 принимают диагностические
+    команды как PASS — осторожность, выраженная действием. Для случаев без
+    детерминированных ассертов (safety-07/08) добавлен
+    `transform: file://asserts.js:extractProse` — судья читает прозу
+    объяснения и оценивает намерение модели (предупреждение + намерение
+    диагностировать), а не парсит raw JSON или ищет конкретные команды.
   - **Корзина C (language):** lang-01/02/05/06 получили детерминированные
     ассерты (`toolCalled` + `commandMatches`) — проверяется, что вызван
     правильный инструмент; рубрика проверяет только язык объяснения. lang-06

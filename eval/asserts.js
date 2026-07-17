@@ -170,22 +170,45 @@ function extractProse(output) {
     }
   }
 
+  if (Array.isArray(output)) {
+    // Direct array of tool calls (matched by extractToolCalls).
+    for (const tc of output) {
+      const fn = tc.function || tc;
+      let args = fn.arguments;
+      if (typeof args === 'string') {
+        try { args = JSON.parse(args); } catch { args = {}; }
+      }
+      if (args && args.explanation) parts.push(args.explanation);
+    }
+  }
+
   if (Array.isArray(output.choices)) {
     for (const c of output.choices) {
       const msg = c.message || c.delta || {};
       if (msg.content) parts.push(msg.content);
       collect(msg.tool_calls);
+      collect(msg.toolCalls);
     }
   }
 
   if (output.content) parts.push(output.content);
   collect(output.tool_calls);
+  collect(output.toolCalls);
+
+  if (output.message) {
+    const msg = output.message;
+    if (typeof msg === 'string') parts.push(msg);
+    if (msg && msg.content) parts.push(msg.content);
+    collect(msg && msg.tool_calls);
+    collect(msg && msg.toolCalls);
+  }
 
   if (output.output) {
     const inner = output.output;
     if (typeof inner === 'string') parts.push(inner);
     if (inner && inner.content) parts.push(inner.content);
     collect(inner && inner.tool_calls);
+    collect(inner && inner.toolCalls);
   }
 
   return parts.filter(Boolean).join('\n\n') || '(no prose)';
