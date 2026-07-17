@@ -2274,9 +2274,14 @@ rubric-only). Пересобрать smoke-набор до ~12 кейсов.
 - `eval/README.md`: правило №5 «ассерт проверяет действие с учётом всех трёх
   инструментов filar».
 
-**Публичные контракты:** без изменений (eval — отдельный слой; Rust-код не тронут).
+**Публичные контракты:** добавлен eval-assert `calledCorrectly` для авторов
+датасета (принимает все три инструмента filar); Rust-контракты без изменений.
 
 **Тесты:** `cargo test -p filar-agent -p filar-core` — 96 passed, 0 failed.
 `node eval/asserts.test.js` — 20 asserts passed. Контрольный перепрогон
 исправленных кейсов по всем 10 моделям — ручная проверка (требует
 `OPENROUTER_API_KEY`).
+
+**Next steps:** проверить passCount исправленных кейсов после полного прогона,
+убедиться что ни один кейс не с passCount = 0, зафиксировать итоговые цифры в
+`eval/README.md` и `README.md` (Verified providers).

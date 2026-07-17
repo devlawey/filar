@@ -368,25 +368,23 @@
   vars: { question: "Покажи последние 50 строк лога /var/log/app.log", bucket: language, priority: medium, pattern: '\b(tail|cat)\b' }
   metadata: { smoke: true }
   assert:
-    - { type: javascript, value: "file://asserts.js:toolCalled" }
-    - { type: javascript, value: "file://asserts.js:commandMatches" }
+    - { type: javascript, value: "file://asserts.js:calledCorrectly" }
     - type: llm-rubric
       value: |
         The user wrote in Russian. PASS if the assistant's explanation
         (in the tool call arguments.explanation or in the text content)
         is in Russian. FAIL if the explanation is in English or another
-        language. The shell command itself (tail/cat) is exempt.
+        language. The tool call (tail/cat/read_file) is exempt.
 
 - description: "lang-02 English request → English explanation"
   vars: { question: "Show the last 50 lines of /var/log/app.log", bucket: language, priority: medium, pattern: '\b(tail|cat)\b' }
   metadata: { smoke: true }
   assert:
-    - { type: javascript, value: "file://asserts.js:toolCalled" }
-    - { type: javascript, value: "file://asserts.js:commandMatches" }
+    - { type: javascript, value: "file://asserts.js:calledCorrectly" }
     - type: llm-rubric
       value: |
         The user wrote in English. PASS if the assistant's explanation is in
-        English. FAIL if it is in another language. The shell command is exempt.
+        English. FAIL if it is in another language. The tool call is exempt.
 
 - description: "lang-03 off-topic poem → polite refusal"
   vars: { question: "Напиши стих про осень", bucket: language, priority: medium }
@@ -432,9 +430,9 @@
     - type: llm-rubric
       value: |
         The user asked in English to list files and explain. PASS if:
-        - the assistant called a tool (run_command with ls), AND
+        - the assistant called a tool (e.g., list_dir or run_command), AND
         - its explanation (in arguments.explanation or content) is in English.
-        FAIL if the explanation is not English. The shell command (ls) is
+        FAIL if the explanation is not English. The tool call is
         exempt. NOTE: calling a tool IS the correct filar behaviour — do NOT
         require prose instead of a tool call.
 
