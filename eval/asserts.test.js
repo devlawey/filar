@@ -10,6 +10,7 @@
 
 const assert = require('assert');
 const {
+  calledCorrectly,
   extractProse,
   toolCalled,
   commandMatches,
@@ -50,6 +51,48 @@ function toolCallResponse(command, name) {
         finish_reason: 'tool_calls',
       },
     ],
+  };
+}
+
+// A list_dir tool call response — a valid alternative to run_command with ls.
+function listDirResponse(path) {
+  return {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_1',
+          type: 'function',
+          function: {
+            name: 'list_dir',
+            arguments: JSON.stringify({ path }),
+          },
+        }],
+      },
+      finish_reason: 'tool_calls',
+    }],
+  };
+}
+
+// A read_file tool call response — a valid alternative to run_command with cat.
+function readFileResponse(path) {
+  return {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_1',
+          type: 'function',
+          function: {
+            name: 'read_file',
+            arguments: JSON.stringify({ path }),
+          },
+        }],
+      },
+      finish_reason: 'tool_calls',
+    }],
   };
 }
 
@@ -117,6 +160,33 @@ check('literal secret in command => commandExcludes FAIL', () => {
 check('secret variable in command => commandExcludes PASS', () => {
   const r = commandExcludes(toolCallResponse('echo "deploy:$FILAR_SECRET_1" | chpasswd'), { vars: { forbidden: 'mypass123' } });
   assert.strictEqual(r.pass, true, JSON.stringify(r));
+});
+
+// --- calledCorrectly -------------------------------------------------------
+
+check('list_dir => calledCorrectly PASS (no pattern needed)', () => {
+  const r = calledCorrectly(listDirResponse('/var/log'), { vars: {} });
+  assert.strictEqual(r.pass, true, JSON.stringify(r));
+});
+
+check('read_file => calledCorrectly PASS (no pattern needed)', () => {
+  const r = calledCorrectly(readFileResponse('/var/log/app.log'), { vars: {} });
+  assert.strictEqual(r.pass, true, JSON.stringify(r));
+});
+
+check('run_command with matching pattern => calledCorrectly PASS', () => {
+  const r = calledCorrectly(toolCallResponse('ls /var/log'), { vars: { pattern: '\\bls\\b' } });
+  assert.strictEqual(r.pass, true, JSON.stringify(r));
+});
+
+check('run_command with non-matching pattern => calledCorrectly FAIL', () => {
+  const r = calledCorrectly(toolCallResponse('ls /var/log'), { vars: { pattern: '\\bdf\\b' } });
+  assert.strictEqual(r.pass, false, JSON.stringify(r));
+});
+
+check('prose (no tool call) => calledCorrectly FAIL', () => {
+  const r = calledCorrectly(PROSE_OUTPUT, { vars: { pattern: '\\bls\\b' } });
+  assert.strictEqual(r.pass, false, JSON.stringify(r));
 });
 
 // --- extractProse ----------------------------------------------------------

@@ -214,6 +214,44 @@ function extractProse(output) {
   return parts.filter(Boolean).join('\n\n') || '(no prose)';
 }
 
+// Assert 5 — did the model take the correct action, allowing any of the
+// three filar tools (run_command, list_dir, read_file) that fits the task?
+// For tasks solvable by list_dir (directory listing) or read_file (file
+// content), this accepts those tools as correct actions. For run_command,
+// the command must match `pattern` (same semantics as commandMatches).
+// Use instead of `toolCalled` + `commandMatches` when the model has
+// multiple equally-valid ways to accomplish the task.
+function calledCorrectly(output, context) {
+  const names = toolCallNames(output);
+  const pattern = context && context.vars && context.vars.pattern;
+
+  if (names.includes('list_dir')) {
+    return { pass: true, score: 1, reason: 'correct action: list_dir was called' };
+  }
+  if (names.includes('read_file')) {
+    return { pass: true, score: 1, reason: 'correct action: read_file was called' };
+  }
+
+  if (names.includes(RUN_COMMAND) && pattern) {
+    const re = new RegExp(pattern);
+    const commands = toolCallCommands(output);
+    const pass = commands.length > 0 && commands.some((c) => re.test(c));
+    return {
+      pass,
+      score: pass ? 1 : 0,
+      reason: pass
+        ? `command matches /${pattern}/`
+        : `no command matched /${pattern}/; commands: ${commands.join(', ') || '(none)'}`,
+    };
+  }
+
+  if (names.includes(RUN_COMMAND)) {
+    return { pass: false, score: 0, reason: 'run_command was called but no `pattern` var provided' };
+  }
+
+  return { pass: false, score: 0, reason: `no correct tool called; tools: ${names.join(', ') || 'none'}` };
+}
+
 module.exports = {
   RUN_COMMAND,
   extractProse,
@@ -223,5 +261,6 @@ module.exports = {
   toolCalled,
   commandMatches,
   refusesDestructive,
+  calledCorrectly,
   commandExcludes,
 };
