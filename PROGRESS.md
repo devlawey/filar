@@ -2147,3 +2147,38 @@ Sync-тест `system_prompt_matches_eval_snapshot` зелёный. Реальн
 **Тесты:** `cargo test -p filar-agent -p filar-core` — 96 passed, 0 failed.
 `node eval/asserts.test.js` — 15 asserts passed. Контрольный прогон на двух
 моделях (фронтир + якорь) — ручная проверка (требует `OPENROUTER_API_KEY`).
+
+---
+
+## Issue #84: Eval — расширить датасет до 50 кейсов
+
+**Задача:** после починки рубрик (issue #83) дополнить датасет 20 новыми
+кейсами: 10 в operations, 7 в safety, 3 в language. Все новые кейсы пишутся
+по исправленным правилам (диагностика = осторожность; extractProse для
+rubric-only). Пересобрать smoke-набор до ~12 кейсов.
+
+**Что сделано:**
+- `eval/datasets/filar.yaml` — 20 новых кейсов (50 total):
+  - **Bucket A (25, было 15):** ops-16 раздел /var, ops-17 топ-5 больших
+    файлов, ops-18 логи за период, ops-19 SMART, ops-20 systemd list-units,
+    ops-21 память, ops-22 зомби-процессы, ops-23 DNS, ops-24 NTP,
+    ops-25 cron/timers. Все с `toolCalled` + `commandMatches`.
+  - **Bucket B (15, было 8):** safety-09 удаление по маске, safety-10 chmod
+    777 /etc, safety-11 kill -9, safety-12 правка fstab, safety-13 apt
+    upgrade -y, safety-14 очистка таблицы БД, safety-15 смена IP (риск
+    потери SSH — filar-специфичный сценарий). Все с `refusesDestructive` +
+    `llm-rubric`; safety-15 — rubric-only с `extractProse`.
+  - **Bucket C (10, было 7):** lang-08 смешанный язык (русский + англ.
+    термины), lang-09 prompt injection, lang-10 интерпретация вывода команды
+    + следующий шаг.
+- **Smoke-набор пересобран:** 12 кейсов (5A + 4B + 3C вместо 4+4+2).
+  Добавлены ops-21 (память) и safety-09 (удаление по маске). Порог CI 90%
+  остаётся — 11/12 = 91.7% > 90%.
+- Новые кейсы обезличены (example.com, 10.0.0.5, /opt/app_data, deploy).
+
+**Публичные контракты:** без изменений (eval — отдельный слой; Rust-код
+не тронут).
+
+**Тесты:** `cargo test -p filar-agent -p filar-core` — 96 passed, 0 failed.
+`node eval/asserts.test.js` — 15 asserts passed. Контрольный прогон на двух
+моделях (фронтир + якорь) — ручная проверка (требует `OPENROUTER_API_KEY`).
