@@ -63,13 +63,15 @@ To run fewer models, comment out their `- id: openrouter:...` block in
 
 ## Models (changing them)
 
-The three models live in the `providers:` list of `promptfooconfig.yaml`:
+The ten models live in the `providers:` list of `promptfooconfig.yaml`: the
+original three (GLM-5.2, Qwen3.6-35B-A3B, Llama-3.1-8B-Instruct) plus seven
+more added in #81. Example excerpt:
 
 ```yaml
 providers:
   - id: openrouter:z-ai/glm-5.2
   - id: openrouter:qwen/qwen3.6-35b-a3b
-  - id: openrouter:meta-llama/llama-3.1-8b-instruct
+  # ... 8 more providers (10 total)
 ```
 
 - The id is `openrouter:<slug>`, where `<slug>` is the model's OpenRouter ID
