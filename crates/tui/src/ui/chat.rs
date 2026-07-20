@@ -74,7 +74,7 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Scrollbar — shown only when content overflows.
     if total_lines > visible_height {
-        let scroll_len = total_lines.saturating_sub(visible_height);
+        let scroll_len = scrollbar_content_len(total_lines, visible_height);
         let mut scrollbar_state = ScrollbarState::default()
             .content_length(scroll_len)
             .viewport_content_length(visible_height)
@@ -171,4 +171,15 @@ fn apply_selection(
         current_col = span_end;
     }
     Line::from(new_spans)
+}
+
+/// Helper: compute the scrollbar track length (scrollable positions).
+/// `content_length` in ratatui `ScrollbarState` is the number of scrollable
+/// positions, NOT the total number of lines. When `total_lines` is the full
+/// content height and `visible_height` is the viewport, the scrollbar track
+/// represents `total_lines − visible_height` positions.
+///
+/// Extracted for testability — the rendering path and tests share this formula.
+pub(crate) fn scrollbar_content_len(total_lines: usize, visible_height: usize) -> usize {
+    total_lines.saturating_sub(visible_height)
 }

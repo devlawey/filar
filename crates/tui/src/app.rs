@@ -4180,11 +4180,10 @@ mod tests {
         assert_eq!(app.scroll, 0);
     }
 
-    /// At scroll = 0 (bottom) the scrollbar `content_length` must equal
-    /// `total_lines.saturating_sub(visible_height)` so the thumb reaches the
-    /// end of the track. Using `total_lines` as content_length (the bug) would
-    /// leave the thumb ~quarter short because position max is `total_lines - height`
-    /// but content_length is `total_lines` — the thumb never reaches 100%.
+    /// At scroll = 0 (bottom) the scrollbar thumb must reach the end of the
+    /// track. `ui::chat::scrollbar_content_len` is the production helper used
+    /// by `render_chat_history`; calling it directly verifies that the formula
+    /// matches the skip-at-bottom invariant.
     #[test]
     fn scrollbar_content_length_at_bottom() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
@@ -4197,17 +4196,45 @@ mod tests {
                 region: crate::ui::layout_cache::LineRegion::Spacer,
             })
             .collect();
-        // Scroll to the bottom.
-        app.scroll = 0;
         let visible_height = app.chat_area.height as usize;
         let total_lines = app.layout_cache.lines.len();
-        let content_length = total_lines.saturating_sub(visible_height);
-        assert_eq!(content_length, 26, "max_scroll = total_lines - height");
-        // scroll = 0 means we're at the bottom; the skip offset from start
-        // should equal content_length (i.e. the thumb position equals total
-        // scrollable positions, positioning it at the end of the track).
+
+        // Production helper — the same function render_chat_history calls.
+        let content_len = crate::ui::scrollbar_content_len(total_lines, visible_height);
+        assert_eq!(content_len, 26);
+
+        // At scroll = 0 (bottom), the skip equals content_len — thumb at end.
+        app.scroll = 0;
         let skip = total_lines.saturating_sub(visible_height + app.scroll);
-        assert_eq!(skip, content_length, "at bottom, skip should equal content_length");
+        assert_eq!(skip, content_len, "at bottom, skip should match scrollbar content_length");
+
+        // Edge: content fits in viewport → content_len = 0, scrollbar hidden.
+        app.layout_cache.lines = (0..10)
+            .map(|_| crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("test"),
+                block_index: None,
+                region: crate::ui::layout_cache::LineRegion::Spacer,
+            })
+            .collect();
+        let short = crate::ui::scrollbar_content_len(
+            app.layout_cache.lines.len(),
+            visible_height,
+        );
+        assert_eq!(short, 0, "content fits → no scrollable positions");
+
+        // Edge: content exactly equals viewport → content_len = 0.
+        app.layout_cache.lines = (0..visible_height)
+            .map(|_| crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("test"),
+                block_index: None,
+                region: crate::ui::layout_cache::LineRegion::Spacer,
+            })
+            .collect();
+        let exact = crate::ui::scrollbar_content_len(
+            app.layout_cache.lines.len(),
+            visible_height,
+        );
+        assert_eq!(exact, 0, "exact fit → no scrollable positions");
     }
 
     // --- Hit test small terminal ---
