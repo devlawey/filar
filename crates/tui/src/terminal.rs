@@ -148,6 +148,17 @@ impl TerminalModel {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
+    /// Current scrollback offset — 0 at the bottom (latest output), increasing
+    /// as the user scrolls up through history.
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    /// Total number of lines in the grid (screen lines + scrollback history).
+    pub fn total_grid_lines(&self) -> usize {
+        self.term.grid().total_lines()
+    }
+
     /// Render the terminal grid to a ratatui frame.
     ///
     /// Each cell is rendered as a character with its foreground/background

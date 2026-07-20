@@ -32,7 +32,7 @@ pub use theme::Theme;
 
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::Style;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 
 use crate::app::{App, AppMode};
@@ -112,6 +112,26 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
     // Render the terminal model grid.
     if let Some(ref term) = app.terminal {
         term.render(f, chunks[2]);
+
+        // Scrollbar for scrollback — shown on the right edge of the
+        // terminal area when there's history to scroll through.
+        let grid_total = term.total_grid_lines();
+        let grid_visible = term.rows() as usize;
+        let scroll_len = chat::scrollbar_content_len(grid_total, grid_visible);
+        if scroll_len > 0 {
+            let offset = term.display_offset();
+            // display_offset = 0 at bottom (latest output), but ratatui
+            // position 0 = top of track. Invert: top-of-history offset
+            // maps to position 0, bottom maps to position = scroll_len.
+            let mut state = ScrollbarState::default()
+                .content_length(scroll_len)
+                .viewport_content_length(grid_visible)
+                .position(scroll_len.saturating_sub(offset));
+            let sb = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .thumb_style(app.theme.dim())
+                .track_style(app.theme.muted());
+            f.render_stateful_widget(sb, chunks[2], &mut state);
+        }
     } else {
         let block = Block::default()
             .borders(Borders::ALL)

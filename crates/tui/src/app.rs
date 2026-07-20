@@ -691,6 +691,23 @@ impl App {
                     self.toggle_interactive = true;
                     return;
                 }
+                // PgUp/PgDn — scroll through terminal history (scrollback)
+                // when in primary screen. In alt-screen (vim/htop/less)
+                // these keys are forwarded to the PTY so the remote
+                // application receives them — matching mouse wheel logic.
+                if key.code == KeyCode::PageUp || key.code == KeyCode::PageDown {
+                    if let Some(t) = self.terminal.as_mut() {
+                        if !t.is_alt_screen() {
+                            let rows = t.rows() as i32;
+                            if key.code == KeyCode::PageUp {
+                                t.scroll_display(rows.max(1));
+                            } else {
+                                t.scroll_display(-rows.max(1));
+                            }
+                            return;
+                        }
+                    }
+                }
                 // Convert the key event to terminal input bytes.
                 let bytes = key_to_bytes(key);
                 if !bytes.is_empty() {
@@ -4009,10 +4026,9 @@ mod tests {
         for _ in 0..20 {
             model.feed(b"line\n");
         }
+        assert_eq!(model.display_offset(), 0);
         model.scroll_display(3);
-        // Should not panic — display offset changed.
-        // We can't directly read display_offset from the public API,
-        // but the method should complete successfully.
+        assert_eq!(model.display_offset(), 3);
     }
 
     #[test]
@@ -4022,8 +4038,57 @@ mod tests {
             model.feed(b"line\n");
         }
         model.scroll_display(5);
+        assert_eq!(model.display_offset(), 5);
         model.scroll_to_bottom();
-        // Should not panic.
+        assert_eq!(model.display_offset(), 0);
+    }
+
+    /// PgUp in interactive mode scrolls history up, NOT forwarded to PTY.
+    #[test]
+    fn interactive_pgup_scrolls_scrollback() {
+        let mut app = make_interactive_app();
+        if let Some(t) = app.terminal.as_mut() {
+            for _ in 0..50 {
+                t.feed(b"line\n");
+            }
+        }
+        let rows = app.terminal.as_ref().unwrap().rows() as usize;
+        // Scroll to bottom first.
+        app.terminal.as_mut().unwrap().scroll_to_bottom();
+        // Press PgUp.
+        app.handle_key(crossterm::event::KeyEvent {
+            code: crossterm::event::KeyCode::PageUp,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        });
+        let offset = app.terminal.as_ref().unwrap().display_offset();
+        assert_eq!(offset, rows, "PgUp should scroll one screen up");
+
+        // PgUp was NOT forwarded to PTY (no pending input).
+        assert!(app.take_term_input().is_none(), "PgUp should not be forwarded to PTY");
+    }
+
+    /// PgDn in interactive mode scrolls history down.
+    #[test]
+    fn interactive_pgdn_scrolls_scrollback() {
+        let mut app = make_interactive_app();
+        if let Some(t) = app.terminal.as_mut() {
+            for _ in 0..30 {
+                t.feed(b"line\n");
+            }
+        }
+        // Scroll up first.
+        app.terminal.as_mut().unwrap().scroll_display(10);
+        // Press PgDn.
+        app.handle_key(crossterm::event::KeyEvent {
+            code: crossterm::event::KeyCode::PageDown,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        });
+        let offset = app.terminal.as_ref().unwrap().display_offset();
+        assert!(offset < 10, "PgDn should decrease the scroll offset");
     }
 
     #[test]
