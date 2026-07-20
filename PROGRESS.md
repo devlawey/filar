@@ -2379,3 +2379,42 @@ ScrollbarState::default().content_length(scroll_len)
 **Публичные контракты:** без изменений (внутренняя визуализация TUI).
 
 **Тесты:** `cargo test -p filar-tui` — 204 passed, 0 failed.
+
+---
+
+## Issue #95: TUI — скролл истории в интерактивном режиме
+
+**Проблема:** в interactive после большого вывода (`dmesg`) PgUp/PgDn не
+реагировали, скроллбара не было. PgUp/PgDn уходили в PTY как сырые байты,
+вместо того чтобы листать scrollback.
+
+**Решение:**
+- `crates/tui/src/terminal.rs`: `TerminalModel::display_offset()` и
+  `total_grid_lines()` — получение текущего смещения и общего числа строк
+  (screen + history). `scroll_display()`, `scroll_to_bottom()`, `mouse_mode()`,
+  `is_alt_screen()` уже были — scrollback API уже существовал в модели, не
+  был проброшен в UI.
+- `crates/tui/src/app.rs`:
+  - PgUp/PgDn в интерактивном режиме теперь перехватываются ДО конвертации
+    в PTY-байты: PgUp → `scroll_display(+rows)`, PgDn →
+    `scroll_display(-rows)`. В PTY НЕ форвардятся.
+  - Колесо мыши (scroll up/down → `scroll_display(±3)`) уже работало,
+    логика не менялась.
+- `crates/tui/src/ui/mod.rs`: в `render_interactive()` добавлен скроллбар
+  справа от терминала при наличии scrollback-истории. Контент-длина =
+  `total_grid_lines − screen_rows` (та же формула `scrollbar_content_len`
+  из #94). Позиция = `display_offset`. При alt-screen (vim/htop) скроллбар
+  не рисуется.
+
+**Тесты:** добавлены `interactive_pgup_scrolls_scrollback`,
+`interactive_pgdn_scrolls_scrollback`, обновлён `terminal_model_scroll_display_up`
+(теперь проверяет `display_offset`), `terminal_model_scroll_to_bottom`
+(проверяет возврат в 0).
+
+**Публичные контракты:** `TerminalModel::display_offset()` и
+`total_grid_lines()` — новые pub-методы для UI-слоя.
+
+**Тесты:** `cargo test -p filar-tui` — 206 passed, 0 failed.
+Ручная проверка на Windows Terminal + SSH — требуется (PgUp/PgDn, колесо,
+скроллбар в `dmesg`/`journalctl`, ввод сбрасывает к низу, в htop/vim колесо
+уходит в приложение).
