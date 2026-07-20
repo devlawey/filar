@@ -120,10 +120,13 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
         let scroll_len = chat::scrollbar_content_len(grid_total, grid_visible);
         if scroll_len > 0 {
             let offset = term.display_offset();
+            // display_offset = 0 at bottom (latest output), but ratatui
+            // position 0 = top of track. Invert: top-of-history offset
+            // maps to position 0, bottom maps to position = scroll_len.
             let mut state = ScrollbarState::default()
                 .content_length(scroll_len)
                 .viewport_content_length(grid_visible)
-                .position(offset);
+                .position(scroll_len.saturating_sub(offset));
             let sb = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .thumb_style(app.theme.dim())
                 .track_style(app.theme.muted());

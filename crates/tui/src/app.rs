@@ -691,21 +691,22 @@ impl App {
                     self.toggle_interactive = true;
                     return;
                 }
-                // PgUp/PgDn — scroll through terminal history (scrollback).
-                // Not forwarded to PTY; the remote app never sees these.
-                if key.code == KeyCode::PageUp {
+                // PgUp/PgDn — scroll through terminal history (scrollback)
+                // when in primary screen. In alt-screen (vim/htop/less)
+                // these keys are forwarded to the PTY so the remote
+                // application receives them — matching mouse wheel logic.
+                if key.code == KeyCode::PageUp || key.code == KeyCode::PageDown {
                     if let Some(t) = self.terminal.as_mut() {
-                        let rows = t.rows() as i32;
-                        t.scroll_display(rows.max(1));
+                        if !t.is_alt_screen() {
+                            let rows = t.rows() as i32;
+                            if key.code == KeyCode::PageUp {
+                                t.scroll_display(rows.max(1));
+                            } else {
+                                t.scroll_display(-rows.max(1));
+                            }
+                            return;
+                        }
                     }
-                    return;
-                }
-                if key.code == KeyCode::PageDown {
-                    if let Some(t) = self.terminal.as_mut() {
-                        let rows = t.rows() as i32;
-                        t.scroll_display(-rows.max(1));
-                    }
-                    return;
                 }
                 // Convert the key event to terminal input bytes.
                 let bytes = key_to_bytes(key);
