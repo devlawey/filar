@@ -2318,3 +2318,35 @@ rubric-only). Пересобрать smoke-набор до ~12 кейсов.
 **Тесты:** `cargo test -p filar-agent -p filar-core` — 96 passed, 0 failed.
 `node eval/asserts.test.js` — 20 asserts passed. Точечный перепрогон 5 кейсов +
 финальный полный прогон без кэша — ручная проверка (требует `OPENROUTER_API_KEY`).
+
+---
+
+## Issue #93: TUI — интерактивный режим не перерисовывается (select! starvation)
+
+**Проблема:** в interactive-режиме (Ctrl+T → SSH) вывод не появлялся без нажатия
+клавиш или resize. Причина: `crates/tui/src/runner.rs`, в главном `tokio::select!`
+ветка `read_output().await` стояла выше ветки `render_interval.tick()` — при потоке
+вывода read_output резолвился непрерывно и голодил рендер. `needs_redraw = true`
+выполнялось, но `terminal.draw` не вызывался.
+
+**Решение (принудительный кадр вне состязания веток):**
+- Добавлен трекинг `last_draw: Instant`.
+- В существующей ветке `render_interval.tick()` — `last_draw = Instant::now()`.
+- **После `select!`** добавлен принудительный кадр: если `needs_redraw` и с прошлого
+  draw прошло ≥16 мс — рисовать вне состязания. Ветка `render_interval.tick()`
+  сохраняется для батчинга <16 мс (60fps в Normal/Thinking), принудительный кадр —
+  fallback для starvation-сценария.
+- Первый кадр после `enter_interactive()`: `needs_redraw` выставляется в обработчике
+  Ctrl+T, следующий pass через select! принудительно рисует.
+
+**Ctrl+= / Ctrl+- (зум шрифта):** проверено — на Windows Terminal зум-комбинации
+перехватываются эмулятором терминала ДО crossterm (raw mode не мешает). В коде
+добавлен комментарий с объяснением. `terminal.rs::ctrl_key()` не маппит `=`/`-` —
+в interactive они не форвардятся в PTY.
+
+**Публичные контракты:** без изменений. Логика цикла событий и рендера — внутренняя
+реализация TUI.
+
+**Тесты:** `cargo test -p filar-tui` — 203 passed, 0 failed. `cargo build --workspace`
+зелёный. Ручная проверка на Windows Terminal + SSH — требуется (interactive вывод
+должен появляться сразу, без нажатий).
