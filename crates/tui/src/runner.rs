@@ -575,6 +575,9 @@ async fn run_app(
         // The render tick above still batches updates (< 16 ms intervals),
         // so 60 fps batching in Normal/Thinking is preserved.
         if needs_redraw && last_draw.elapsed() >= Duration::from_millis(16) {
+            if app.mode == AppMode::Thinking {
+                app.tick = app.tick.wrapping_add(1);
+            }
             if prev_mode != app.mode {
                 terminal.clear().ok();
                 prev_mode = app.mode;
@@ -582,6 +585,9 @@ async fn run_app(
             terminal.draw(|f| ui::render(f, &mut app)).ok();
             needs_redraw = false;
             last_draw = Instant::now();
+            // Prevent the normal render tick from firing immediately on
+            // the next iteration — the frame we just drew is current.
+            render_interval.reset();
             if app.toast_text().is_none() {
                 app.toast = None;
             }
