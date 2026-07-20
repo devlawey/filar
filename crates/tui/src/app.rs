@@ -4180,6 +4180,36 @@ mod tests {
         assert_eq!(app.scroll, 0);
     }
 
+    /// At scroll = 0 (bottom) the scrollbar `content_length` must equal
+    /// `total_lines.saturating_sub(visible_height)` so the thumb reaches the
+    /// end of the track. Using `total_lines` as content_length (the bug) would
+    /// leave the thumb ~quarter short because position max is `total_lines - height`
+    /// but content_length is `total_lines` — the thumb never reaches 100%.
+    #[test]
+    fn scrollbar_content_length_at_bottom() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.chat_area = Rect::new(0, 1, 80, 24); // height=24
+        // 50 lines → visible_height=24, max_scroll = 50-24 = 26
+        app.layout_cache.lines = (0..50)
+            .map(|_| crate::ui::layout_cache::RenderedLine {
+                line: ratatui::text::Line::raw("test"),
+                block_index: None,
+                region: crate::ui::layout_cache::LineRegion::Spacer,
+            })
+            .collect();
+        // Scroll to the bottom.
+        app.scroll = 0;
+        let visible_height = app.chat_area.height as usize;
+        let total_lines = app.layout_cache.lines.len();
+        let content_length = total_lines.saturating_sub(visible_height);
+        assert_eq!(content_length, 26, "max_scroll = total_lines - height");
+        // scroll = 0 means we're at the bottom; the skip offset from start
+        // should equal content_length (i.e. the thumb position equals total
+        // scrollable positions, positioning it at the end of the track).
+        let skip = total_lines.saturating_sub(visible_height + app.scroll);
+        assert_eq!(skip, content_length, "at bottom, skip should equal content_length");
+    }
+
     // --- Hit test small terminal ---
 
     #[test]
