@@ -15,6 +15,7 @@ use crate::ui::layout_cache::ChatLayoutCache;
 use crate::ui::Theme;
 
 use std::collections::{HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Instant;
 use std::time::Duration;
@@ -162,6 +163,32 @@ pub struct PendingConfirm {
 
 /// The main application state.
 pub struct App {
+    /// All open sessions (tabs). The first session is created on startup.
+    pub sessions: Vec<Session>,
+    /// Index of the currently active session in `sessions`.
+    pub active: usize,
+    /// Command confirmation mode.
+    pub confirm_mode: CommandConfirmMode,
+    /// Set to true when the user wants to quit.
+    pub should_quit: bool,
+    /// Shared secret provider: $FILAR_SECRET_N → actual value.
+    pub secrets: Arc<StaticSecretProvider>,
+    /// Pending SSH connection: (user, host, port) parsed from `!ssh user@host`.
+    pub pending_ssh: Option<(String, String, u16)>,
+    /// Pending SSH password entered by the user via Ctrl+P.
+    pub pending_ssh_password: Option<String>,
+    /// Colour theme used by the UI renderer.
+    pub theme: Theme,
+    /// Status bar area (set during render, for hit-testing).
+    pub status_bar_area: Rect,
+    /// Help bar area (set during render, for hit-testing).
+    pub help_bar_area: Rect,
+}
+
+/// Per-tab session state — everything that is independent per open tab.
+pub struct Session {
+    /// Display name shown on the tab label.
+    pub target_name: String,
     /// Chat history blocks.
     pub messages: Vec<ChatBlock>,
     /// Current input text.
@@ -172,16 +199,10 @@ pub struct App {
     pub mode: AppMode,
     /// Scroll offset: 0 = bottom (latest), positive = scrolled up.
     pub scroll: usize,
-    /// Current target name (for the status bar).
-    pub target_name: String,
-    /// Command confirmation mode.
-    pub confirm_mode: CommandConfirmMode,
     /// Pending confirmation request (when mode == Confirming).
     pub pending_confirm: Option<PendingConfirm>,
     /// Whether the agent task is currently running.
     pub agent_running: bool,
-    /// Set to true when the user wants to quit.
-    pub should_quit: bool,
     /// Pending user input to be sent to the agent.
     pending_input: Option<String>,
     /// Interactive terminal model (when in interactive mode).
@@ -190,9 +211,6 @@ pub struct App {
     pending_term_input: Option<Vec<u8>>,
     /// Flag: user pressed Ctrl+T to toggle between agent and interactive modes.
     pub toggle_interactive: bool,
-    /// Shared secret provider: $FILAR_SECRET_N → actual value.
-    /// Used to substitute secrets in commands without exposing them to the LLM.
-    pub secrets: Arc<StaticSecretProvider>,
     /// Counter for the next secret variable name.
     pub secret_counter: usize,
     /// History of all user inputs (for Up/Down navigation).
@@ -201,16 +219,9 @@ pub struct App {
     history_pos: Option<usize>,
     /// Saved input when user starts browsing history.
     saved_input: String,
-    /// Pending SSH connection: (user, host, port) parsed from `!ssh user@host`.
-    pub pending_ssh: Option<(String, String, u16)>,
-    /// Pending SSH password entered by the user via Ctrl+P.
-    pub pending_ssh_password: Option<String>,
-    /// Colour theme used by the UI renderer.
-    pub theme: Theme,
     /// Cached chat layout — avoids re-wrapping text on every frame.
     pub layout_cache: ChatLayoutCache,
-    /// Revision counter — bumped on any mutation of `messages` to
-    /// invalidate [`layout_cache`](Self::layout_cache).
+    /// Revision counter — bumped on any mutation of `messages`.
     pub message_rev: u64,
     /// Actual chat area on screen (filled during render, for hit-testing).
     pub chat_area: Rect,
@@ -220,91 +231,149 @@ pub struct App {
     pub input_area: Rect,
     /// Confirm button areas (filled later, for mouse click detection).
     pub confirm_button_areas: Vec<(Rect, bool)>,
-    /// Current mouse drag operation (if any).
-    pub mouse_drag: Option<DragKind>,
-    /// Area of the "↓ N new" indicator (set during render, for click detection).
-    pub indicator_area: Rect,
-    /// Status bar area (set during render, for hit-testing).
-    pub status_bar_area: Rect,
-    /// Help bar area (set during render, for hit-testing).
-    pub help_bar_area: Rect,
-    /// Currently selected confirm button: `false` = Deny (safe default), `true` = Approve.
-    pub confirm_selected: bool,
-    /// Button under mouse cursor during hover (`Some(true)` = Approve, `Some(false)` = Deny).
-    pub hovered_button: Option<bool>,
-    /// User-set collapse overrides: block index → is_collapsed.
-    /// Blocks not in this map use the default (collapsed if output > 6 lines).
-    pub collapsed_overrides: HashMap<usize, bool>,
     /// Whether the agent is currently streaming a text response.
-    /// When true, `TextDelta` events append to the last `Agent` block.
-    /// Cancellation token for the currently running agent task.
-    /// Set when the agent is spawned, triggered by Ctrl+C in Thinking mode.
-    pub cancellation: Option<CancellationToken>,
     pub streaming: bool,
-    /// Pending command proposal metadata from `CommandProposed`:
-    /// `(command, explanation)`. Used to preserve the explanation when
-    /// `CommandFinished` arrives for auto-approved commands (which never
-    /// triggered a `ConfirmationRequest` dialog).
+    /// Pending command proposal metadata from `CommandProposed`.
     pub pending_proposal: Option<(String, String)>,
-    /// Spinner animation tick counter — incremented each render frame
-    /// while in `Thinking` mode.
+    /// Spinner animation tick counter — incremented each render frame.
     pub tick: u64,
     /// Clickable help-bar zones: (rect, action) filled during render.
     pub helpbar_zones: Vec<(Rect, HelpAction)>,
     /// Input scroll offset (set during render when input exceeds 5 lines).
-    /// Used by [`set_cursor_from_click`](Self::set_cursor_from_click) to map
-    /// clicks back to the correct cursor position in a scrolled input.
     pub input_scroll_offset: usize,
     /// Current text selection in the chat area (if any).
-    /// Coordinates are in `layout_cache.lines` index space.
     pub selection: Option<Selection>,
-    /// Toast notification: `(text, expiry)`.  Shown in the status bar area
-    /// until `expiry` is reached.
+    /// Toast notification: `(text, expiry)`.
     pub toast: Option<(String, Instant)>,
-    /// Timestamp of the last mouse-down in the chat area (for double/triple click).
+    /// Current mouse drag operation (if any).
+    pub mouse_drag: Option<DragKind>,
+    /// Area of the "↓ N new" indicator (set during render, for click detection).
+    pub indicator_area: Rect,
+    /// Currently selected confirm button: `false` = Deny (safe default), `true` = Approve.
+    pub confirm_selected: bool,
+    /// Button under mouse cursor during hover.
+    pub hovered_button: Option<bool>,
+    /// User-set collapse overrides: block index → is_collapsed.
+    pub collapsed_overrides: HashMap<usize, bool>,
+    /// Cancellation token for the currently running agent task.
+    pub cancellation: Option<CancellationToken>,
+    /// Timestamp of the last mouse-down in the chat area.
     last_click_time: Option<Instant>,
-    /// Position of the last mouse-down in the chat area (for double/triple click).
+    /// Position of the last mouse-down in the chat area.
     last_click_pos: Option<(usize, usize)>,
     /// Current click count (1=single, 2=double, 3=triple).
     click_count: u8,
-    /// Base text of the last forwarded log line (see [`push_system_log`]).
-    /// Used to collapse consecutive identical log lines into `… xN` instead of
-    /// spamming the chat. `None` once any non-log message breaks the run.
-    ///
-    /// [`push_system_log`]: Self::push_system_log
+    /// Base text of the last forwarded log line (for dedup).
     last_log_text: Option<String>,
     /// Count of consecutive identical forwarded log lines (for `… xN`).
     last_log_count: usize,
 }
 
 impl App {
+    /// Get a reference to the active session.
+    pub fn active_session(&self) -> &Session {
+        &self.sessions[self.active]
+    }
+    /// Get a mutable reference to the active session.
+    pub fn active_session_mut(&mut self) -> &mut Session {
+        &mut self.sessions[self.active]
+    }
+
     /// Create a new app with the given target name and confirmation mode.
     pub fn new(target_name: String, confirm_mode: CommandConfirmMode) -> Self {
+        let session = Session::new(target_name, confirm_mode);
         Self {
+            sessions: vec![session],
+            active: 0,
+            confirm_mode,
+            should_quit: false,
+            secrets: Arc::new(StaticSecretProvider::new()),
+            pending_ssh: None,
+            pending_ssh_password: None,
+            theme: Theme::default_dark(),
+            status_bar_area: Rect::default(),
+            help_bar_area: Rect::default(),
+        }
+    }
+
+    /// Create a new session tab in local mode, inheriting target_name display.
+    pub fn new_tab(&mut self) {
+        let name = format!("local-{}", self.sessions.len() + 1);
+        let session = Session::new(name, self.confirm_mode);
+        self.sessions.push(session);
+        self.active = self.sessions.len() - 1;
+    }
+
+    /// Close the active tab. If it's the last tab, set should_quit.
+    pub fn close_tab(&mut self) {
+        if self.sessions.len() <= 1 {
+            self.should_quit = true;
+            return;
+        }
+        self.sessions.remove(self.active);
+        if self.active >= self.sessions.len() {
+            self.active = self.sessions.len() - 1;
+        }
+    }
+
+    /// Switch to the previous tab (wraps around).
+    pub fn prev_tab(&mut self) {
+        if self.active == 0 {
+            self.active = self.sessions.len() - 1;
+        } else {
+            self.active -= 1;
+        }
+    }
+
+    /// Switch to the next tab (wraps around).
+    pub fn next_tab(&mut self) {
+        self.active = (self.active + 1) % self.sessions.len();
+    }
+
+    /// Switch to tab at index (1-based from user, clamped).
+    pub fn switch_to_tab(&mut self, index: usize) {
+        let idx = index.saturating_sub(1).min(self.sessions.len().saturating_sub(1));
+        self.active = idx;
+    }
+}
+
+// App delegates per-session field access to the active session via Deref.
+// This avoids touching ~300+ field references in the existing code while
+// enabling multi-session support through self.sessions + self.active.
+impl Deref for App {
+    type Target = Session;
+    fn deref(&self) -> &Self::Target {
+        &self.sessions[self.active]
+    }
+}
+impl DerefMut for App {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.sessions[self.active]
+    }
+}
+
+impl Session {
+    pub fn new(target_name: String, confirm_mode: CommandConfirmMode) -> Self {
+        let name = target_name.clone();
+        Self {
+            target_name,
             messages: vec![ChatBlock::System(format!(
-                "Connected to: {target_name} | Mode: {confirm_mode:?}"
+                "Connected to: {name} | Mode: {confirm_mode:?}"
             ))],
             input: String::new(),
             cursor_pos: 0,
             mode: AppMode::Normal,
             scroll: 0,
-            target_name,
-            confirm_mode,
             pending_confirm: None,
             agent_running: false,
-            should_quit: false,
             pending_input: None,
             terminal: None,
             pending_term_input: None,
             toggle_interactive: false,
-            secrets: Arc::new(StaticSecretProvider::new()),
             secret_counter: 0,
             input_history: Vec::new(),
             history_pos: None,
             saved_input: String::new(),
-            pending_ssh: None,
-            pending_ssh_password: None,
-            theme: Theme::default_dark(),
             layout_cache: ChatLayoutCache::new(),
             message_rev: 0,
             chat_area: Rect::default(),
@@ -313,8 +382,6 @@ impl App {
             confirm_button_areas: Vec::new(),
             mouse_drag: None,
             indicator_area: Rect::default(),
-            status_bar_area: Rect::default(),
-            help_bar_area: Rect::default(),
             confirm_selected: false,
             hovered_button: None,
             collapsed_overrides: HashMap::new(),
@@ -333,7 +400,9 @@ impl App {
             last_log_count: 0,
         }
     }
+}
 
+impl App {
     /// Create a new app with pre-loaded chat history (for session restore).
     pub fn with_history(
         target_name: String,
@@ -397,9 +466,10 @@ impl App {
         // Collapse a run of identical lines into `… xN`. The rendered string —
         // suffix included — is clamped to the chat width.
         if self.last_log_text.as_deref() == Some(normalized.as_str()) {
+            self.last_log_count += 1;
+            let count = self.last_log_count;
             if let Some(ChatBlock::System(s)) = self.messages.last_mut() {
-                self.last_log_count += 1;
-                *s = clamp(&format!("{normalized} … x{}", self.last_log_count));
+                *s = clamp(&format!("{normalized} … x{count}"));
                 self.message_rev = self.message_rev.wrapping_add(1);
                 self.selection = None;
                 return;
@@ -497,6 +567,45 @@ impl App {
             if ctrl_key('z', 'я') {
                 self.cancel_work();
                 return;
+            }
+            // Tab navigation — active in all non-Interactive modes.
+            if ctrl_key('n', 'т') {
+                self.new_tab();
+                return;
+            }
+            if ctrl_key('w', 'ц') {
+                // Ctrl+W closes the active tab (if > 1; last tab quits).
+                self.close_tab();
+                return;
+            }
+            if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::CONTROL) {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.prev_tab();
+                } else {
+                    self.next_tab();
+                }
+                return;
+            }
+            // Ctrl+PageDown / Ctrl+PageUp — alternative tab switching.
+            if key.code == KeyCode::PageDown
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                self.next_tab();
+                return;
+            }
+            if key.code == KeyCode::PageUp
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                self.prev_tab();
+                return;
+            }
+            // Ctrl+1..9 — direct tab switch.
+            if let KeyCode::Char(c) = key.code {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && c >= '1' && c <= '9' {
+                    let idx = (c as u8 - b'1') as usize + 1;
+                    self.switch_to_tab(idx);
+                    return;
+                }
             }
         }
 
