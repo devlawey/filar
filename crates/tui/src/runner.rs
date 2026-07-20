@@ -6,7 +6,7 @@
 
 use std::io::{self, Stdout};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{EnableMouseCapture, DisableMouseCapture, Event, EventStream};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -229,6 +229,11 @@ async fn run_app(
     let mut needs_redraw = false;
     let mut render_interval = tokio::time::interval(Duration::from_millis(16));
     render_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Track last draw time for forced-frame logic below. The render tick
+    // branch in select! can be starved by continuous output (interactive SSH
+    // PTY); we draw at the end of the iteration body if a frame is pending
+    // and a frame deadline has passed, avoiding competition with read_output.
+    let mut last_draw = Instant::now();
 
     loop {
         let in_interactive = app.mode == AppMode::Interactive;
@@ -240,6 +245,13 @@ async fn run_app(
             maybe_event = events.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => {
+                        // Note: Ctrl+= / Ctrl+- (terminal font zoom) are NOT
+                        // consumed by filar. On Windows Terminal these are
+                        // intercepted by the terminal emulator before crossterm
+                        // sees them in raw mode; zoom works regardless. In
+                        // interactive mode, they are not forwarded to the PTY
+                        // because ctrl_key() only maps a-z and a few special
+                        // chars (see crates/tui/src/terminal.rs:486-492).
                         app.handle_key(key);
                         needs_redraw = true;
                     }
@@ -540,6 +552,7 @@ async fn run_app(
                 }
                 terminal.draw(|f| ui::render(f, &mut app)).ok();
                 needs_redraw = false;
+                last_draw = Instant::now();
                 // Clear an expired toast so the next tick's guard goes false and
                 // ticking stops after this erasing frame.
                 if app.toast_text().is_none() {
@@ -550,6 +563,28 @@ async fn run_app(
 
         if app.should_quit {
             break;
+        }
+
+        // Force a draw after the iteration if a frame is pending and the
+        // frame deadline (16 ms) has passed, regardless of which select!
+        // branch was chosen. This decouples redraw from branch competition:
+        // continuous output from an SSH interactive PTY starves the render
+        // tick because read_output always resolves first; without this
+        // fallback draw the screen would only update on key/resize events.
+        //
+        // The render tick above still batches updates (< 16 ms intervals),
+        // so 60 fps batching in Normal/Thinking is preserved.
+        if needs_redraw && last_draw.elapsed() >= Duration::from_millis(16) {
+            if prev_mode != app.mode {
+                terminal.clear().ok();
+                prev_mode = app.mode;
+            }
+            terminal.draw(|f| ui::render(f, &mut app)).ok();
+            needs_redraw = false;
+            last_draw = Instant::now();
+            if app.toast_text().is_none() {
+                app.toast = None;
+            }
         }
     }
 
