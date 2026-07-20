@@ -2350,3 +2350,32 @@ rubric-only). Пересобрать smoke-набор до ~12 кейсов.
 **Тесты:** `cargo test -p filar-tui` — 203 passed, 0 failed. `cargo build --workspace`
 зелёный. Ручная проверка на Windows Terminal + SSH — требуется (interactive вывод
 должен появляться сразу, без нажатий).
+
+---
+
+## Issue #94: TUI — скроллбар не доходит до низа (content_length)
+
+**Проблема:** при полностью пролистанном тексте ползунок скроллбара не доходил
+до низа — оставался зазор ~четверть трека. Причина: в `ui/chat.rs` `ScrollbarState`
+получал `content_length(total_lines)` — полное число строк, тогда как в ratatui
+`content_length` = число **прокручиваемых позиций** = `total − viewport_height`.
+
+При 100 строках и 20 видимых: `content_length = 100` вместо `80`, позиция макс =
+`80`, ползунок = `20/100 = 20%` трека → никогда не доходил до 100%.
+
+**Решение:** одна строка в `ui/chat.rs:78`:
+```rust
+let scroll_len = total_lines.saturating_sub(visible_height);
+ScrollbarState::default().content_length(scroll_len)
+```
+Все остальные расчёты (`clamp_scroll`, `update_scrollbar_drag`, `skip`) уже
+использовали корректную формулу `saturating_sub`; баг был только в визуальном
+виджете.
+
+**Тесты:** добавлен `scrollbar_content_length_at_bottom` — проверяет что при
+`scroll = 0` (нижнее положение) `skip == total_lines.saturating_sub(visible_height)`,
+т.е. позиция ползунка совпадает с концом контента.
+
+**Публичные контракты:** без изменений (внутренняя визуализация TUI).
+
+**Тесты:** `cargo test -p filar-tui` — 204 passed, 0 failed.

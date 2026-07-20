@@ -22,6 +22,8 @@ mod bars;
 mod chat;
 mod confirm;
 mod input;
+#[allow(unused_imports)]
+pub(crate) use chat::scrollbar_content_len;
 pub mod layout_cache;
 mod text;
 pub mod theme;
