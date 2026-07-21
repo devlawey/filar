@@ -260,250 +260,261 @@ struct LauncherApp {
     validation_error: String,
 }
 
-impl eframe::App for LauncherApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.heading("Filar");
-            ui.label("Terminal with an AI agent over SSH");
-            ui.separator();
+/// Apply the dark theme, matching the TUI accent palette:
+/// muted dark background, one accent colour (used for buttons and highlights),
+/// readable grey scale for secondary text.
+fn configure_theme(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    // Accent — a teal/cyan that matches the TUI's mode colours.
+    let accent = egui::Color32::from_rgb(0x3d, 0xb3, 0xb3);
+    visuals.override_text_color = Some(egui::Color32::from_gray(0xe0));
+    visuals.widgets.noninteractive.bg_fill = egui::Color32::from_gray(0x22);
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(0x2a);
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_gray(0x38);
+    visuals.widgets.active.bg_fill = accent;
+    visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_gray(0xc0);
+    visuals.selection.bg_fill = accent.linear_multiply(0.3);
+    ctx.set_visuals(visuals);
+}
 
-            // ── Session list ────────────────────────────────────────────
-            ui.label("Recent sessions:");
-            if self.sessions.is_empty() {
-                ui.label("  (no saved sessions yet)");
-            } else {
-                let new_selected = self.selected_session.is_none();
-                if ui
-                    .selectable_label(new_selected, "  + Start new session")
-                    .clicked()
-                {
-                    self.selected_session = None;
-                }
-
-                egui::ScrollArea::vertical()
-                    .max_height(100.0)
-                    .show(ui, |ui| {
-                        for (i, session) in self.sessions.iter().enumerate() {
-                            let selected = self.selected_session == Some(i);
-                            let text = format!(
-                                "  {} | {} | {}",
-                                session.timestamp, session.target, session.preview
-                            );
-                            if ui.selectable_label(selected, &text).clicked() {
-                                self.selected_session = Some(i);
-                            }
-                        }
-                    });
-            }
-
-            ui.separator();
-
-            // ── Target selector ─────────────────────────────────────────
-            ui.horizontal(|ui| {
-                ui.label("Target:");
-                ui.radio_value(&mut self.target_mode, 0, "Local");
-                for i in 1..=SSH_SLOTS {
-                    let alias = self.ssh_slots[i - 1].alias.trim();
-                    let label = if alias.is_empty() {
-                        format!("SSH{i}")
-                    } else if alias.chars().count() > 32 {
-                        format!("{}…", alias.chars().take(31).collect::<String>())
-                    } else {
-                        alias.to_string()
-                    };
-                    ui.radio_value(&mut self.target_mode, i, label);
+impl LauncherApp {
+    fn render_session_list(&mut self, ui: &mut egui::Ui) {
+        ui.label("Recent sessions:");
+        if self.sessions.is_empty() {
+            ui.label("  (no saved sessions yet)");
+            return;
+        }
+        let new_selected = self.selected_session.is_none();
+        if ui
+            .selectable_label(new_selected, "  + Start new session")
+            .clicked()
+        {
+            self.selected_session = None;
+        }
+        egui::ScrollArea::vertical()
+            .max_height(100.0)
+            .show(ui, |ui| {
+                for (i, session) in self.sessions.iter().enumerate() {
+                    let selected = self.selected_session == Some(i);
+                    let text = format!(
+                        "  {} | {} | {}",
+                        session.timestamp, session.target, session.preview
+                    );
+                    if ui.selectable_label(selected, &text).clicked() {
+                        self.selected_session = Some(i);
+                    }
                 }
             });
+    }
 
-            // ── SSH fields ──────────────────────────────────────────────
-            if self.target_mode > 0 {
-                let idx = self.target_mode - 1;
-                let slot = &mut self.ssh_slots[idx];
-                egui::Grid::new("ssh_grid")
-                    .num_columns(2)
-                    .spacing([10.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("Host:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut slot.host)
-                                .hint_text("192.168.1.100"),
-                        );
-                        ui.end_row();
-
-                        ui.label("Port:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut slot.port)
-                                .hint_text("22"),
-                        );
-                        ui.end_row();
-
-                        ui.label("User:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut slot.user)
-                                .hint_text("root"),
-                        );
-                        ui.end_row();
-
-                        ui.label("Alias:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut slot.alias)
-                                .hint_text("deploy")
-                                .desired_width(120.0),
-                        );
-                        ui.end_row();
-
-                        ui.label("Password:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut slot.password)
-                                .password(true)
-                                .hint_text(""),
-                        );
-                        ui.end_row();
-                    });
-                ui.checkbox(&mut slot.save_password, "Save password (encrypted in OS credential store)");
+    fn render_target_selector(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Target:");
+            ui.radio_value(&mut self.target_mode, 0, "Local");
+            for i in 1..=SSH_SLOTS {
+                let alias = self.ssh_slots[i - 1].alias.trim();
+                let label = if alias.is_empty() {
+                    format!("SSH{i}")
+                } else if alias.chars().count() > 32 {
+                    format!("{}…", alias.chars().take(31).collect::<String>())
+                } else {
+                    alias.to_string()
+                };
+                ui.radio_value(&mut self.target_mode, i, label);
             }
+        });
+    }
 
-            ui.separator();
+    fn render_ssh_fields(&mut self, ui: &mut egui::Ui) {
+        if self.target_mode == 0 {
+            return;
+        }
+        let idx = self.target_mode - 1;
+        let slot = &mut self.ssh_slots[idx];
+        egui::Grid::new("ssh_grid")
+            .num_columns(2)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Host:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut slot.host)
+                        .hint_text("192.168.1.100"),
+                );
+                ui.end_row();
+                ui.label("Port:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut slot.port)
+                        .hint_text("22"),
+                );
+                ui.end_row();
+                ui.label("User:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut slot.user)
+                        .hint_text("root"),
+                );
+                ui.end_row();
+                ui.label("Alias:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut slot.alias)
+                        .hint_text("deploy")
+                        .desired_width(120.0),
+                );
+                ui.end_row();
+                ui.label("Password:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut slot.password)
+                        .password(true)
+                        .hint_text(""),
+                );
+                ui.end_row();
+            });
+        ui.checkbox(&mut slot.save_password, "Save password (encrypted in OS credential store)");
+    }
 
-            // ── LLM settings ────────────────────────────────────────────
-            ui.heading("LLM");
+    fn render_llm_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("LLM");
+        ui.label("Model:");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.model)
+                .hint_text("e.g. glm-5.1"),
+        );
+        ui.label("API base URL:");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.api_base_url)
+                .hint_text("e.g. https://openrouter.ai/api/v1"),
+        );
+        ui.label("API key:");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.api_key)
+                .password(true)
+                .hint_text("saved in OS credential store"),
+        );
+        ui.label("Temperature:");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.temperature)
+                .hint_text("empty = default (e.g. 0.3)"),
+        );
+        ui.label("Extra body (JSON):");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.extra_body)
+                .hint_text("e.g. {\"thinking\": {\"type\": \"disabled\"}}")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        );
+    }
 
-            ui.label("Model:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.model)
-                    .hint_text("e.g. glm-5.1"),
+    fn do_launch(&mut self) {
+        self.validation_error.clear();
+        if !self.temperature.trim().is_empty()
+            && !matches!(
+                self.temperature.trim().parse::<f32>(),
+                Ok(t) if t.is_finite() && (0.0..=2.0).contains(&t)
+            )
+        {
+            self.validation_error = format!(
+                "Invalid temperature: '{}'. Expected a number in [0.0, 2.0].",
+                self.temperature
             );
-
-            ui.label("API base URL:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.api_base_url)
-                    .hint_text("e.g. https://openrouter.ai/api/v1"),
-            );
-
-            ui.label("API key:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.api_key)
-                    .password(true)
-                    .hint_text("saved in OS credential store"),
-            );
-
-            ui.label("Temperature:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.temperature)
-                    .hint_text("empty = default (e.g. 0.3)"),
-            );
-
-            ui.label("Extra body (JSON):");
-            ui.add(
-                egui::TextEdit::multiline(&mut self.extra_body)
-                    .hint_text("e.g. {\"thinking\": {\"type\": \"disabled\"}}")
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY),
-            );
-
-            if !self.validation_error.is_empty() {
-                ui.colored_label(egui::Color32::RED, &self.validation_error);
+        }
+        if self.validation_error.is_empty()
+            && !self.extra_body.trim().is_empty()
+            && serde_json::from_str::<serde_json::Value>(&self.extra_body).is_err()
+        {
+            self.validation_error = "Invalid extra body JSON.".to_string();
+        }
+        if !self.validation_error.is_empty() {
+            return;
+        }
+        let target = if self.target_mode == 0 {
+            "local"
+        } else {
+            "ssh"
+        };
+        let ssh = if self.target_mode > 0 {
+            let slot = &self.ssh_slots[self.target_mode - 1];
+            Some(SshConnection {
+                host: slot.host.clone(),
+                port: slot.port.parse().unwrap_or(22),
+                user: slot.user.clone(),
+                password: slot.password.clone(),
+            })
+        } else {
+            None
+        };
+        let settings = Settings {
+            model: self.model.clone(),
+            api_base_url: self.api_base_url.clone(),
+            ssh_profiles: self.ssh_slots.iter().map(|s| s.to_profile()).collect(),
+            last_ssh: if self.target_mode > 0 {
+                self.target_mode - 1
+            } else {
+                0
+            },
+            temperature: self.temperature.clone(),
+            extra_body: self.extra_body.clone(),
+        };
+        settings.save();
+        save_secret(api_key_cred_name(), &self.api_key);
+        for (i, slot) in self.ssh_slots.iter().enumerate() {
+            if slot.save_password && !slot.password.is_empty() {
+                save_secret(&ssh_cred_name(i), &slot.password);
+            } else {
+                delete_secret(&ssh_cred_name(i));
             }
+        }
+        let session_id = self.selected_session.map(|i| self.sessions[i].id.clone());
+        let cfg = LaunchConfig {
+            target: target.to_string(),
+            ssh,
+            model: self.model.clone(),
+            api_base_url: self.api_base_url.clone(),
+            api_key: self.api_key.clone(),
+            session_id,
+            temperature: self.temperature.clone(),
+            extra_body: self.extra_body.clone(),
+        };
+        save_pending_launch(&cfg);
+        std::process::exit(0);
+    }
+}
 
-            ui.separator();
+impl eframe::App for LauncherApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Dark theme matching the TUI accent palette.
+        configure_theme(ctx);
 
-            // ── Buttons ─────────────────────────────────────────────────
-            ui.horizontal(|ui| {
-                let launch = ui.button("Launch").clicked();
-                let cancel = ui.button("Cancel").clicked();
-
-                if launch {
-                    // Validate temperature and extra_body before launching.
-                    self.validation_error.clear();
-                    if !self.temperature.trim().is_empty()
-                        && !matches!(
-                            self.temperature.trim().parse::<f32>(),
-                            Ok(t) if t.is_finite() && (0.0..=2.0).contains(&t)
-                        )
-                    {
-                        self.validation_error = format!(
-                            "Invalid temperature: '{}'. Expected a number in [0.0, 2.0].",
-                            self.temperature
-                        );
+        // Fixed bottom panel: Launch/Cancel always visible, regardless of
+        // window height. The rest of the content scrolls above it.
+        egui::TopBottomPanel::bottom("bottom_buttons")
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Launch").clicked() {
+                        self.do_launch();
                     }
-                    if self.validation_error.is_empty()
-                        && !self.extra_body.trim().is_empty()
-                        && serde_json::from_str::<serde_json::Value>(&self.extra_body).is_err()
-                    {
-                        self.validation_error = "Invalid extra body JSON.".to_string();
+                    if ui.button("Cancel").clicked() {
+                        std::process::exit(0);
                     }
-                    if !self.validation_error.is_empty() {
-                        return;
-                    }
+                });
+            });
 
-                    let target = if self.target_mode == 0 {
-                        "local".to_string()
-                    } else {
-                        "ssh".to_string()
-                    };
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.heading("Filar");
+                ui.label("Terminal with an AI agent over SSH");
+                ui.separator();
 
-                    let ssh = if self.target_mode > 0 {
-                        let slot = &self.ssh_slots[self.target_mode - 1];
-                        Some(SshConnection {
-                            host: slot.host.clone(),
-                            port: slot.port.parse().unwrap_or(22),
-                            user: slot.user.clone(),
-                            password: slot.password.clone(),
-                        })
-                    } else {
-                        None
-                    };
+                self.render_session_list(ui);
+                ui.separator();
+                self.render_target_selector(ui);
+                ui.separator();
+                self.render_ssh_fields(ui);
+                ui.separator();
+                self.render_llm_settings(ui);
 
-                    // Save non-sensitive settings to settings.json.
-                    let settings = Settings {
-                        model: self.model.clone(),
-                        api_base_url: self.api_base_url.clone(),
-                        ssh_profiles: self
-                            .ssh_slots
-                            .iter()
-                            .map(|s| s.to_profile())
-                            .collect(),
-                        last_ssh: if self.target_mode > 0 {
-                            self.target_mode - 1
-                        } else {
-                            0
-                        },
-                        temperature: self.temperature.clone(),
-                        extra_body: self.extra_body.clone(),
-                    };
-                    settings.save();
-
-                    // Save API key to OS credential store (always).
-                    save_secret(api_key_cred_name(), &self.api_key);
-
-                    // Save/delete SSH passwords based on checkbox state.
-                    for (i, slot) in self.ssh_slots.iter().enumerate() {
-                        if slot.save_password && !slot.password.is_empty() {
-                            save_secret(&ssh_cred_name(i), &slot.password);
-                        } else {
-                            delete_secret(&ssh_cred_name(i));
-                        }
-                    }
-
-                    let session_id =
-                        self.selected_session.map(|i| self.sessions[i].id.clone());
-                    let cfg = LaunchConfig {
-                        target,
-                        ssh,
-                        model: self.model.clone(),
-                        api_base_url: self.api_base_url.clone(),
-                        api_key: self.api_key.clone(),
-                        session_id,
-                        temperature: self.temperature.clone(),
-                        extra_body: self.extra_body.clone(),
-                    };
-                    save_pending_launch(&cfg);
-                    std::process::exit(0);
-                }
-
-                if cancel {
-                    std::process::exit(0);
+                if !self.validation_error.is_empty() {
+                    ui.colored_label(egui::Color32::RED, &self.validation_error);
                 }
             });
         });
@@ -562,6 +573,7 @@ pub fn run_launcher(config: &Config) {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([460.0, 620.0])
+            .with_min_inner_size([440.0, 300.0])
             .with_title("Filar — Launcher")
             .with_icon(std::sync::Arc::new(load_icon())),
         ..Default::default()
