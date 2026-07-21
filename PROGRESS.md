@@ -2549,3 +2549,20 @@ local с тем же LLM-доступом; переход в SSH внутри в
 
 **Тесты:** `cargo test -p filar-tui` — 206 passed. `cargo build --workspace`
 зелёный. Ручная проверка GUI — требуется (тёмная тема, кнопки видны на ноутбуке).
+
+---
+
+## Релиз v0.5.0 (подготовка)
+
+**Дата:** 2026-07-21. **Milestone:** v0.5.0 (6/6 issues, все смерджены).
+
+**Что вошло:**
+- #93 (#99): fix select! starvation — принудительный кадр после итерации
+- #94 (#100): fix скроллбар — content_length = total − viewport
+- #95 (#101): feat interactive scrollback — PgUp/PgDn, скроллбар терминала
+- #96 (#102): feat вкладки сессий — Session struct, Deref, Ctrl+N/W/Tab/1..9
+- #103 (#104): feat мультиплексирование — SessionId, per-session dispatch, индикаторы
+- #97 (#105): feat лаунчер — поле alias для SSH-таргетов
+- #98 (#106): feat лаунчер — тёмная тема, fixed bottom-panel layout
+
+**Engine:** не менялся (core/transport/agent не тронуты). Тег engine-v0.5.0 НЕ ставится.

@@ -11,6 +11,33 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-21
+
+Milestone v0.5.0 — hotfix интерактивного режима (select! starvation, скроллбар,
+scrollback) и доработки UX (вкладки сессий, алиасы SSH-таргетов, тёмная тема
+лаунчера).
+
+### Added
+
+- Session tabs: `Ctrl+N` — новая вкладка (local), `Ctrl+W` — закрыть,
+  `Ctrl+Tab`/`Ctrl+1..9` — переключение. Tab bar над status bar. Session struct
+  с Deref-паттерном для обратной совместимости (#96).
+- SessionId и per-session диспетчеризация событий агента. Activity-индикаторы
+  на ярлыках вкладок (`●` — агент работает, `?` — ожидание подтверждения,
+  `○` — новые сообщения) (#103).
+- Interactive scrollback: PgUp/PgDn и колесо мыши листают историю терминала.
+  Скроллбар с корректной математикой (#93, #95).
+- Scrollbar position fix: content_length = total − viewport, ползунок доходит
+  до низа (#94).
+- Launcher: поле alias для SSH-таргетов, сохранение в settings.json (#97).
+- Launcher: тёмная тема (accent #3db3b3) и фиксированные кнопки Launch/Cancel
+  (TopBottomPanel::bottom + ScrollArea) (#98).
+
+### Fixed
+
+- Interactive режим не перерисовывался: read_output голодил рендер в select!.
+  Добавлен принудительный кадр после итерации цикла (#93).
+
 ## [0.4.0] - 2026-07-16
 
 Milestone v0.4.0 — flexibility of LLM choice and measurability of its quality on
@@ -116,7 +143,9 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/devlawey/filar/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/devlawey/filar/compare/v0.3.0...v0.4.0
 [0.4.0]: https://github.com/devlawey/filar/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/devlawey/filar/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/devlawey/filar/releases/tag/v0.3.0
