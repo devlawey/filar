@@ -492,10 +492,13 @@ impl eframe::App for LauncherApp {
                     if ui.button("Launch").clicked() {
                         self.do_launch();
                     }
-                    if ui.button("Cancel").clicked() {
-                        std::process::exit(0);
-                    }
-                });
+                if ui.button("Cancel").clicked() {
+                    std::process::exit(0);
+                }
+            });
+            if !self.validation_error.is_empty() {
+                ui.colored_label(egui::Color32::RED, &self.validation_error);
+            }
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -512,10 +515,6 @@ impl eframe::App for LauncherApp {
                 self.render_ssh_fields(ui);
                 ui.separator();
                 self.render_llm_settings(ui);
-
-                if !self.validation_error.is_empty() {
-                    ui.colored_label(egui::Color32::RED, &self.validation_error);
-                }
             });
         });
     }
