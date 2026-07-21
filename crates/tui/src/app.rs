@@ -16,6 +16,7 @@ use crate::ui::Theme;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use std::time::Duration;
@@ -185,8 +186,26 @@ pub struct App {
     pub help_bar_area: Rect,
 }
 
+/// Stable identifier for a session tab. Assigned once on creation, never
+/// reused. Events carry this id so they can be dispatched to the originating
+/// session even when the active tab changes or intermediate tabs close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionId(u64);
+
+/// Global counter for unique SessionIds. Atomic so it can be incremented
+/// from any context (runner, UI) without locking.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+impl SessionId {
+    fn next() -> Self {
+        SessionId(NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// Per-tab session state — everything that is independent per open tab.
 pub struct Session {
+    /// Stable session identifier (never reused).
+    pub id: SessionId,
     /// Display name shown on the tab label.
     pub target_name: String,
     /// Chat history blocks.
@@ -267,6 +286,12 @@ pub struct Session {
     last_log_text: Option<String>,
     /// Count of consecutive identical forwarded log lines (for `… xN`).
     last_log_count: usize,
+    /// True when the agent is running in this session (even if not active).
+    pub background_activity: bool,
+    /// True when new output arrived since the user last viewed this tab.
+    pub has_new: bool,
+    /// True when a confirmation is pending (agent is waiting for user input).
+    pub awaiting_confirmation: bool,
 }
 
 impl App {
@@ -323,22 +348,35 @@ impl App {
 
     /// Switch to the previous tab (wraps around).
     pub fn prev_tab(&mut self) {
-        if self.active == 0 {
-            self.active = self.sessions.len() - 1;
+        let prev = if self.active == 0 {
+            self.sessions.len() - 1
         } else {
-            self.active -= 1;
-        }
+            self.active - 1
+        };
+        self.sessions[prev].has_new = false;
+        self.active = prev;
     }
 
     /// Switch to the next tab (wraps around).
     pub fn next_tab(&mut self) {
-        self.active = (self.active + 1) % self.sessions.len();
+        let next = (self.active + 1) % self.sessions.len();
+        self.sessions[next].has_new = false;
+        self.active = next;
     }
 
     /// Switch to tab at index (1-based from user, clamped).
     pub fn switch_to_tab(&mut self, index: usize) {
         let idx = index.saturating_sub(1).min(self.sessions.len().saturating_sub(1));
+        if idx != self.active {
+            // Clear "has new" flag on the tab being switched to.
+            self.sessions[idx].has_new = false;
+        }
         self.active = idx;
+    }
+
+    /// Find the index of a session by its stable id.
+    pub fn find_session_idx(&self, id: SessionId) -> Option<usize> {
+        self.sessions.iter().position(|s| s.id == id)
     }
 }
 
@@ -361,6 +399,7 @@ impl Session {
     pub fn new(target_name: String, confirm_mode: CommandConfirmMode) -> Self {
         let name = target_name.clone();
         Self {
+            id: SessionId::next(),
             target_name,
             messages: vec![ChatBlock::System(format!(
                 "Connected to: {name} | Mode: {confirm_mode:?}"
@@ -403,6 +442,9 @@ impl Session {
             click_count: 0,
             last_log_text: None,
             last_log_count: 0,
+            background_activity: false,
+            has_new: false,
+            awaiting_confirmation: false,
         }
     }
 }
@@ -662,7 +704,7 @@ impl App {
                                         explanation: "Shell escape (direct)".into(),
                                         output: None,
                                         approved: true,
-                                    });
+        });
                                     self.scroll = 0;
                                     self.input.clear();
                                     self.cursor_pos = 0;
@@ -1635,14 +1677,34 @@ impl App {
 
     /// Handle a TUI event (forwarded agent event or TUI-specific event).
     pub fn handle_agent_event(&mut self, event: TuiEvent) {
+        let sid = match &event {
+            TuiEvent::Agent { session_id, .. } => *session_id,
+            TuiEvent::Thinking => self.sessions[self.active].id,
+            TuiEvent::ConfirmationRequest { .. } => self.sessions[self.active].id,
+            TuiEvent::TransportChanged { .. } => self.sessions[self.active].id,
+        };
+
+        // Dispatch to the originating session. Save the active index so we can
+        // restore it after applying the event to a non-active tab.
+        let orig_active = self.active;
+        let is_background = self.sessions[orig_active].id != sid;
+
+        if let Some(idx) = self.find_session_idx(sid) {
+            self.active = idx;
+        } else {
+            // Session closed while event was in flight — discard.
+            tracing::debug!(?sid, "discarding event for closed session");
+            return;
+        }
+
         let mut auto_scroll = true;
         match event {
-            TuiEvent::Agent(agent_event) => match agent_event {
+            TuiEvent::Agent { event: agent_event, .. } => match agent_event {
                 filar_agent::AgentEvent::Started => {
                     self.mode = AppMode::Thinking;
+                    self.active_session_mut().background_activity = true;
                 }
                 filar_agent::AgentEvent::TextDelta(s) => {
-                    // Append to the last Agent block if streaming, else create new.
                     if self.streaming {
                         if let Some(ChatBlock::Agent(ref mut text)) = self.messages.last_mut() {
                             text.push_str(&s);
@@ -1654,29 +1716,21 @@ impl App {
                         self.streaming = true;
                     }
                     self.message_rev = self.message_rev.wrapping_add(1);
-                    // Only auto-scroll if already at bottom.
-                    // If the user scrolled up, don’t yank them down.
                     auto_scroll = self.scroll == 0;
                 }
                 filar_agent::AgentEvent::CommandProposed { command, explanation, .. } => {
-                    // Store proposal metadata so CommandFinished can preserve
-                    // the explanation for auto-approved commands (which never
-                    // go through ConfirmationRequest).
                     self.pending_proposal = Some((command, explanation));
                 }
                 filar_agent::AgentEvent::CommandFinished { command, output, denied } => {
                     if !denied {
-                        // Finalize any streaming text before showing command output.
                         self.streaming = false;
                         auto_scroll = self.scroll == 0;
-                        // Retrieve stored explanation from CommandProposed (if any).
                         let explanation = self
                             .pending_proposal
                             .as_ref()
                             .filter(|(cmd, _)| *cmd == command)
                             .map(|(_, expl)| expl.clone())
                             .unwrap_or_default();
-                        // Try to update the last matching Command block with output.
                         let mut updated = false;
                         if let Some(ChatBlock::Command {
                             command: ref cmd,
@@ -1689,35 +1743,24 @@ impl App {
                                 *o = Some(output.clone());
                                 *a = true;
                                 updated = true;
-                                // Bump rev so the cache rebuilds with updated output.
                                 self.message_rev = self.message_rev.wrapping_add(1);
                             }
                         }
                         if !updated {
                             self.push_message(ChatBlock::Command {
-                                command,
+                                command: command.clone(),
                                 explanation,
-                                output: Some(output),
+                                output: Some(output.clone()),
                                 approved: true,
                             });
                         }
+                    } else {
+                        self.push_message(ChatBlock::System(format!("Denied: {command}")));
+                        auto_scroll = self.scroll == 0;
                     }
-                    // Clear the pending proposal regardless — the command is done.
                     self.pending_proposal = None;
-                    // For denied commands, the command block was already pushed
-                    // by respond_to_confirmation (if confirmation was needed).
-                    // For blocked commands, no block is shown — matching old behavior.
-                    //
-                    // However, if a confirmation *timed out*, the TUI is still in
-                    // Confirming mode with a stale pending_confirm. Clear it so the
-                    // user isn't stuck in a dead dialog.
-                    if denied && self.mode == AppMode::Confirming {
-                        self.pending_confirm = None;
-                        self.mode = AppMode::Normal;
-                    }
                 }
                 filar_agent::AgentEvent::Finished(text) => {
-                    // Finalize streaming block with authoritative text.
                     if self.streaming {
                         if !text.is_empty() {
                             if let Some(ChatBlock::Agent(ref mut existing)) = self.messages.last_mut() {
@@ -1734,9 +1777,10 @@ impl App {
                     }
                     self.mode = AppMode::Normal;
                     self.agent_running = false;
+                    self.cancellation = None;
+                    self.active_session_mut().background_activity = false;
                 }
                 filar_agent::AgentEvent::Error(err) => {
-                    // If streaming was interrupted, mark it.
                     if self.streaming {
                         self.push_message(ChatBlock::System("response interrupted".into()));
                         self.streaming = false;
@@ -1745,24 +1789,11 @@ impl App {
                     self.push_message(ChatBlock::Error(err));
                     self.mode = AppMode::Normal;
                     self.agent_running = false;
-                }
-                filar_agent::AgentEvent::Cancelled => {
-                    // Agent was cancelled via CancellationToken.
-                    // If Ctrl+C already did cleanup (agent_running == false),
-                    // this just clears the token. Otherwise, do full cleanup.
                     self.cancellation = None;
-                    if self.agent_running {
-                        if self.streaming {
-                            self.push_message(ChatBlock::System("response interrupted".into()));
-                            self.streaming = false;
-                            auto_scroll = self.scroll == 0;
-                        }
-                        self.mode = AppMode::Normal;
-                        self.agent_running = false;
-                    }
+                    self.active_session_mut().background_activity = false;
                 }
-                _ => {} // non_exhaustive: ignore unknown agent events
-            }
+                _ => {}
+            },
             TuiEvent::Thinking => {
                 self.mode = AppMode::Thinking;
             }
@@ -1793,6 +1824,18 @@ impl App {
         if auto_scroll {
             self.scroll = 0;
         }
+        // Mark background session as having new content if event went to non-active tab.
+        if is_background {
+            self.active_session_mut().has_new = true;
+        }
+        // Track awaiting confirmation.
+        if self.mode == AppMode::Confirming {
+            self.active_session_mut().awaiting_confirmation = true;
+        } else {
+            self.active_session_mut().awaiting_confirmation = false;
+        }
+        // Restore the original active tab.
+        self.active = orig_active;
     }
 
     /// Take the pending user input (called by the runner to send to the agent).
@@ -2309,7 +2352,7 @@ mod tests {
     fn agent_text_response_bumps_message_rev() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let rev_before = app.message_rev;
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::Finished("hello".into())));
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::Finished("hello".into()) });
         assert!(app.message_rev > rev_before);
     }
 
@@ -2317,7 +2360,7 @@ mod tests {
     fn agent_error_bumps_message_rev() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let rev_before = app.message_rev;
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::Error("oops".into())));
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::Error("oops".into()) });
         assert!(app.message_rev > rev_before);
         assert_eq!(app.mode, AppMode::Normal);
     }
@@ -2334,11 +2377,11 @@ mod tests {
             approved: false,
         });
         let rev_before = app.message_rev;
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::CommandFinished {
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::CommandFinished {
             command: "ls".into(),
             output: "file1\nfile2".into(),
             denied: false,
-        }));
+        }});
         assert!(app.message_rev > rev_before, "in-place update must bump rev");
         // Verify the block was updated in-place, not duplicated.
         assert_eq!(app.messages.len(), 2); // system + command (updated)
@@ -3326,7 +3369,7 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("Hello".into())));
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("Hello".into()) });
 
         assert!(app.streaming);
         assert_eq!(app.messages.len(), 1);
@@ -3342,8 +3385,8 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("Hello".into())));
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta(" world".into())));
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("Hello".into()) });
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta(" world".into()) });
 
         assert!(app.streaming);
         assert_eq!(app.messages.len(), 1);
@@ -3360,14 +3403,14 @@ mod tests {
         app.mode = AppMode::Thinking;
 
         // Stream some text.
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("Partial".into())));
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta(" response".into())));
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("Partial".into()) });
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta(" response".into()) });
         assert!(app.streaming);
 
         // Finished replaces with authoritative text.
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::Finished(
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::Finished(
             "Partial response — finalized".into(),
-        )));
+        )});
 
         assert!(!app.streaming);
         assert_eq!(app.mode, AppMode::Normal);
@@ -3384,8 +3427,8 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("Streamed text".into())));
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::Finished(String::new())));
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("Streamed text".into()) });
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::Finished(String::new()) });
 
         assert!(!app.streaming);
         assert_eq!(app.messages.len(), 1);
@@ -3401,10 +3444,10 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("Partial".into())));
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("Partial".into()) });
         assert!(app.streaming);
 
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::Error("network error".into())));
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::Error("network error".into()) });
 
         assert!(!app.streaming);
         assert_eq!(app.mode, AppMode::Normal);
@@ -3420,7 +3463,7 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("Let me check...".into())));
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("Let me check...".into()) });
         assert!(app.streaming);
 
         let (tx, _rx) = oneshot::channel::<bool>();
@@ -3442,7 +3485,7 @@ mod tests {
         app.mode = AppMode::Thinking;
         app.scroll = 5; // User scrolled up.
 
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("new text".into())));
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("new text".into()) });
 
         // Scroll should NOT be reset to 0 — user is reading history.
         assert_eq!(app.scroll, 5);
@@ -3455,7 +3498,7 @@ mod tests {
         app.mode = AppMode::Thinking;
         app.scroll = 0;
 
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("new text".into())));
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("new text".into()) });
 
         // Scroll stays at 0 (bottom).
         assert_eq!(app.scroll, 0);
@@ -3483,13 +3526,13 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("First".into())));
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::Finished("First".into())));
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("First".into()) });
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::Finished("First".into()) });
         assert!(!app.streaming);
 
         // New run.
         app.handle_agent_event(TuiEvent::Thinking);
-        app.handle_agent_event(TuiEvent::Agent(filar_agent::AgentEvent::TextDelta("Second".into())));
+        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("Second".into()) });
 
         assert!(app.streaming);
         assert_eq!(app.messages.len(), 2);

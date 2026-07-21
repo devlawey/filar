@@ -2461,3 +2461,43 @@ local с тем же LLM-доступом; переход в SSH внутри в
 **Тесты:** `cargo test -p filar-tui` — 206 passed, 0 failed. `cargo build --workspace`
 зелёный. Ручная проверка на Windows — требуется (Ctrl+N, переключение, закрытие,
 вкладки в interactive).
+
+---
+
+## Issue #103: TUI — мультиплексирование сессий (SessionId + диспетчеризация событий по сессиям)
+
+**Проблема:** #96 добавила UI-каркас вкладок, но runner.rs обрабатывал события
+только активной сессии. Агент, запущенный в вкладке A, «вставал» при переключении
+на B; TuiEvent::Agent не нёс идентификатора сессии (отмечено CodeRabbit в #102).
+
+**Решение:**
+- `crates/tui/src/app.rs`:
+  - `SessionId(u64)` — стабильный идентификатор (глобальный атомарный счётчик,
+    не переиспользуется). `Session::id` заполняется при создании.
+  - `Session.background_activity: bool`, `has_new: bool`, `awaiting_confirmation: bool` —
+    флаги фоновой активности для индикации на ярлыке.
+  - `App::find_session_idx()` — поиск сессии по SessionId (не по индексу Vec).
+  - `handle_agent_event()` — извлекает `session_id` из события, переключает
+    `self.active` на целевую сессию, применяет мутации, восстанавливает `active`.
+    Фоновые события (неактивная вкладка) — устанавливают `has_new = true`.
+    `background_activity` снимается на `Finished`/`Error`.
+  - Переключение вкладок (`next_tab/prev_tab/switch_to_tab`) — сбрасывает `has_new`.
+- `crates/tui/src/event.rs`: `TuiEvent::Agent { session_id: SessionId, event: AgentEvent }`
+  вместо `TuiEvent::Agent(AgentEvent)`.
+- `crates/tui/src/runner.rs`: все отправки `TuiEvent::Agent` передают `session_id`
+  (захватывается из `app.sessions[app.active].id` перед spawn). `spawn_agent()`
+  принимает `sid: SessionId`.
+- `crates/tui/src/ui/mod.rs`: `render_tab_bar()` — маркеры активности:
+  `●` (full bullet) = агент работает, `?` = ожидание подтверждения,
+  `○` (open bullet) = есть новые сообщения.
+
+**Что НЕ сделано (anti-scope / follow-up):**
+- PTY фоновых сессий: interactive в неактивной вкладке не читается из PTY
+  (требует per-session tasks — отдельная задача).
+- Per-session event channel (agent/terminal всё ещё шлют в общий `agent_tx`).
+
+**Публичные контракты:** `SessionId`, `Session::id`, `TuiEvent::Agent { session_id, event }`,
+`App::find_session_idx()`. `BackgroundActivity/has_new/awaiting_confirmation` — pub-поля Session.
+
+**Тесты:** `cargo test -p filar-tui` — 206 passed, 0 failed. `cargo build --workspace`
+зелёный. Ручная проверка на Windows — требуется (агент в фоне, индикаторы вкладок).

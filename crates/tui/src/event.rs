@@ -6,7 +6,10 @@
 //! while TUI-specific events (confirmation requests, transport changes) are
 //! sent directly by TUI components.
 
+use filar_agent::AgentEvent;
 use tokio::sync::oneshot;
+
+use crate::app::SessionId;
 
 /// Events sent to the TUI.
 ///
@@ -16,7 +19,10 @@ use tokio::sync::oneshot;
 #[derive(Debug)]
 pub enum TuiEvent {
     /// Forwarded agent event (from the `EventSink`).
-    Agent(filar_agent::AgentEvent),
+    Agent {
+        session_id: SessionId,
+        event: AgentEvent,
+    },
 
     /// The agent is calling the LLM (thinking). TUI-specific: drives the spinner.
     Thinking,

@@ -23,7 +23,7 @@ use filar_transport::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::app::{App, AppMode};
+use crate::app::{App, AppMode, SessionId};
 use crate::confirmer::TuiConfirmer;
 use crate::event::TuiEvent;
 use crate::terminal::TerminalModel;
@@ -332,18 +332,15 @@ async fn run_app(
                         if !cmd.is_empty() {
                             let exec = tui_executor.clone();
                             let provider = config.secret_provider.clone();
+                            let sid = app.sessions[app.active].id;
                             let tx = agent_tx.clone();
                             tokio::spawn(async move {
-                                // Wrap with SecretSubstitutingExecutor so that
-                                // $FILAR_SECRET_N placeholders are substituted
-                                // and output is sanitised — same as agent path.
                                 let wrapped = SecretSubstitutingExecutor::new(
                                     exec as Arc<dyn CommandExecutor>,
                                     provider as Arc<dyn SecretProvider>,
                                 );
                                 let succeeded = match wrapped.run(&cmd).await {
                                     Ok(result) => {
-                                        // Build display output from CommandResult.
                                         let mut output = result.stdout.clone();
                                         if !result.stderr.is_empty() {
                                             output.push_str("\n[stderr] ");
@@ -354,30 +351,31 @@ async fn run_app(
                                                 output.push_str(&format!("\n[exit code: {code}]"));
                                             }
                                         }
-                                        let _ = tx.send(TuiEvent::Agent(
-                                            filar_agent::AgentEvent::CommandFinished {
+                                        let _ = tx.send(TuiEvent::Agent {
+                                            session_id: sid,
+                                            event: filar_agent::AgentEvent::CommandFinished {
                                                 command: cmd.clone(),
                                                 output,
                                                 denied: false,
                                             }
-                                        ));
+                                        });
                                         true
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(TuiEvent::Agent(
-                                            filar_agent::AgentEvent::Error(
+                                        let _ = tx.send(TuiEvent::Agent {
+                                            session_id: sid,
+                                            event: filar_agent::AgentEvent::Error(
                                                 format!("Shell command failed: {e}")
                                             )
-                                        ));
+                                        });
                                         false
                                     }
                                 };
-                                // Signal completion only on success — Error is
-                                // already a terminal event for the TUI handler.
                                 if succeeded {
-                                    let _ = tx.send(TuiEvent::Agent(
-                                        filar_agent::AgentEvent::Finished(String::new())
-                                    ));
+                                    let _ = tx.send(TuiEvent::Agent {
+                                        session_id: sid,
+                                        event: filar_agent::AgentEvent::Finished(String::new())
+                                    });
                                 }
                             });
                         } else {
@@ -401,6 +399,7 @@ async fn run_app(
                             ssh_info.clone(),
                             cancel_token,
                             config.secret_provider.clone(),
+                            app.sessions[app.active].id,
                         );
                     }
                 }
@@ -408,6 +407,7 @@ async fn run_app(
                 // Check if user entered an SSH password — perform connection.
                 if let Some(password) = app.pending_ssh_password.take() {
                     if let Some((user, host, port)) = app.pending_ssh.take() {
+                        let sid = app.sessions[app.active].id;
                         let tx = agent_tx.clone();
                         let exec_clone = tui_executor.clone();
                         tokio::spawn(async move {
@@ -435,19 +435,21 @@ async fn run_app(
                                         is_local: false,
                                         ssh_info: Some(new_ssh_info),
                                     });
-                                    let _ = tx.send(TuiEvent::Agent(
-                                        filar_agent::AgentEvent::Finished(format!(
+                                    let _ = tx.send(TuiEvent::Agent {
+                                        session_id: sid,
+                                        event: filar_agent::AgentEvent::Finished(format!(
                                             "Connected to {user}@{host}:{port} via SSH. \
                                              You are now operating on the remote machine."
                                         ))
-                                    ));
+                                    });
                                 }
                                 Err(e) => {
-                                    let _ = tx.send(TuiEvent::Agent(
-                                        filar_agent::AgentEvent::Error(format!(
+                                    let _ = tx.send(TuiEvent::Agent {
+                                        session_id: sid,
+                                        event: filar_agent::AgentEvent::Error(format!(
                                             "SSH connection failed: {e}"
                                         ))
-                                    ));
+                                    });
                                 }
                             }
                         });
@@ -659,17 +661,13 @@ fn spawn_agent(
     ssh_info: Option<String>,
     cancellation: CancellationToken,
     secret_provider: Arc<dyn SecretProvider>,
+    sid: SessionId,
 ) {
     let tx = event_tx.clone();
 
     tokio::spawn(async move {
-        // TUI-specific: show spinner before the first text delta arrives.
         let _ = tx.send(TuiEvent::Thinking);
 
-        // Convert chat history (ChatBlock) to LLM messages (ChatMessage).
-        // Only User and Agent blocks are included — command blocks and system
-        // messages are omitted because they can't be faithfully reconstructed
-        // without tool call IDs.
         let history: Vec<filar_agent::ChatMessage> = chat_history
             .iter()
             .filter_map(|block| match block {
@@ -681,8 +679,6 @@ fn spawn_agent(
                     approved,
                     ..
                 } => {
-                    // Include command context as an assistant message so the
-                    // LLM remembers what it ran and what the result was.
                     let output_text = output.as_deref().unwrap_or(
                         if *approved { "(no output)" } else { "(denied by user)" },
                     );
@@ -699,12 +695,12 @@ fn spawn_agent(
             })
             .collect();
 
-        // Set up EventSink: forward agent events to the TUI channel.
-        // The agent emits Started, TextDelta, CommandProposed, CommandFinished,
-        // Finished, and Error via this sink.
         let tx_for_sink = tx.clone();
         let sink: filar_agent::EventSink = Arc::new(move |event: filar_agent::AgentEvent| {
-            let _ = tx_for_sink.send(TuiEvent::Agent(event));
+            let _ = tx_for_sink.send(TuiEvent::Agent {
+                session_id: sid,
+                event,
+            });
         });
 
         // Build the agent with appropriate system prompt.
@@ -725,9 +721,10 @@ fn spawn_agent(
         let agent = match builder.build() {
             Ok(a) => a,
             Err(e) => {
-                let _ = tx.send(TuiEvent::Agent(
-                    filar_agent::AgentEvent::Error(e.to_string())
-                ));
+                let _ = tx.send(TuiEvent::Agent {
+                    session_id: sid,
+                    event: filar_agent::AgentEvent::Error(e.to_string()),
+                });
                 return;
             }
         };

@@ -163,12 +163,28 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
 /// open session. Only called when `sessions.len() > 1`.
 fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
     let active = app.active;
-    let mut spans: Vec<Span> = Vec::with_capacity(app.sessions.len() * 3);
+    let mut spans: Vec<Span> = Vec::with_capacity(app.sessions.len() * 4);
     for (i, s) in app.sessions.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw(" "));
         }
-        let label = format!("{}. {}", i + 1, s.target_name);
+        // Activity marker: spinner char for agent running, dot for new output,
+        // question mark for pending confirmation.
+        let marker = if i != active {
+            if s.awaiting_confirmation {
+                "? "
+            } else if s.background_activity {
+                // Use a fullwidth bullet to avoid layout jitter between states.
+                "\u{25cf} "
+            } else if s.has_new {
+                "\u{25cb} "
+            } else {
+                ""
+            }
+        } else {
+            ""
+        };
+        let label = format!("{}{}. {}", marker, i + 1, s.target_name);
         let style = if i == active {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
