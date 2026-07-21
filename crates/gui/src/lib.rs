@@ -240,7 +240,7 @@ impl SshSlot {
             host: self.host.clone(),
             port: self.port.clone(),
             user: self.user.clone(),
-            alias: self.alias.clone(),
+            alias: self.alias.trim().chars().take(32).collect(),
             save_password: self.save_password,
         }
     }
@@ -304,10 +304,13 @@ impl eframe::App for LauncherApp {
                 ui.label("Target:");
                 ui.radio_value(&mut self.target_mode, 0, "Local");
                 for i in 1..=SSH_SLOTS {
-                    let label = if self.ssh_slots[i - 1].alias.is_empty() {
+                    let alias = self.ssh_slots[i - 1].alias.trim();
+                    let label = if alias.is_empty() {
                         format!("SSH{i}")
+                    } else if alias.chars().count() > 32 {
+                        format!("{}…", alias.chars().take(31).collect::<String>())
                     } else {
-                        self.ssh_slots[i - 1].alias.clone()
+                        alias.to_string()
                     };
                     ui.radio_value(&mut self.target_mode, i, label);
                 }
