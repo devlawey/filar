@@ -1679,7 +1679,7 @@ impl App {
     pub fn handle_agent_event(&mut self, event: TuiEvent) {
         let sid = match &event {
             TuiEvent::Agent { session_id, .. } => *session_id,
-            TuiEvent::Thinking => return, // Thinking events are UI-only, no session data.
+            TuiEvent::Thinking => self.sessions[self.active].id,
             TuiEvent::ConfirmationRequest { .. } => self.sessions[self.active].id,
             TuiEvent::TransportChanged { .. } => self.sessions[self.active].id,
         };
