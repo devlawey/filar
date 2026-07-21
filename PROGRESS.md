@@ -2452,7 +2452,7 @@ local с тем же LLM-доступом; переход в SSH внутри в
 для удовлетворения borrow checker'а (Rust не видит split borrows через Deref).
 
 **Публичные контракты:** `Session` struct + `Deref impl` + `App::sessions`,
-`App::active`, `App::new_tab/clse_tab/next_tab/prev_tab/switch_to_tab`. UI-контракты:
+`App::active`, `App::new_tab/close_tab/next_tab/prev_tab/switch_to_tab`. UI-контракты:
 `render_tab_bar()`.
 
 **Anti-scope (НЕ сделано):** drag-reorder, переименование, отсоединение в окно,

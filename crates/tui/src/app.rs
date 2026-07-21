@@ -310,6 +310,11 @@ impl App {
             self.should_quit = true;
             return;
         }
+        // Cancel the agent task for the tab being closed so leftover
+        // events don't land on the next active session.
+        if let Some(ref token) = self.sessions[self.active].cancellation {
+            token.cancel();
+        }
         self.sessions.remove(self.active);
         if self.active >= self.sessions.len() {
             self.active = self.sessions.len() - 1;
@@ -586,6 +591,10 @@ impl App {
                 }
                 return;
             }
+            if key.code == KeyCode::BackTab {
+                self.prev_tab();
+                return;
+            }
             // Ctrl+PageDown / Ctrl+PageUp — alternative tab switching.
             if key.code == KeyCode::PageDown
                 && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -601,7 +610,7 @@ impl App {
             }
             // Ctrl+1..9 — direct tab switch.
             if let KeyCode::Char(c) = key.code {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && c >= '1' && c <= '9' {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && ('1'..='9').contains(&c) {
                     let idx = (c as u8 - b'1') as usize + 1;
                     self.switch_to_tab(idx);
                     return;
