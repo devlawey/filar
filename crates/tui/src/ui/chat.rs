@@ -26,12 +26,16 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
         .needs_rebuild(&app.messages, inner_width, app.message_rev)
     {
         let collapsed = app.collapsed_set();
-        app.layout_cache.rebuild(
-            &app.messages,
+        // Get a local mutable reference to the active session so Rust's
+        // split-borrow analysis sees distinct field borrows instead of
+        // clashing through DerefMut.
+        let s = &mut app.sessions[app.active];
+        s.layout_cache.rebuild(
+            &s.messages,
             inner_width,
             &app.theme,
             &collapsed,
-            app.message_rev,
+            s.message_rev,
         );
     }
 

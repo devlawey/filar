@@ -2418,3 +2418,46 @@ ScrollbarState::default().content_length(scroll_len)
 Ручная проверка на Windows Terminal + SSH — требуется (PgUp/PgDn, колесо,
 скроллбар в `dmesg`/`journalctl`, ввод сбрасывает к низу, в htop/vim колесо
 уходит в приложение).
+
+---
+
+## Issue #96: TUI — вкладки сессий
+
+**Задача:** добавить вкладки с независимыми рабочими контекстами. Новая вкладка —
+local с тем же LLM-доступом; переход в SSH внутри вкладки командой; переключение
+и закрытие хоткеями и мышью.
+
+**Решение:**
+- `crates/tui/src/app.rs`: выделен per-tab `Session`-struct (target_name, messages,
+  mode, scroll, terminal, layout_cache, cancellation, и всё остальное per-session).
+  `App` → `Vec<Session>` + `active: usize` + общие поля (secrets, confirm_mode,
+  theme, pending_ssh). Реализован `Deref<Target = Session>` для `App` — все
+  существующие методы работают без изменений (доступ к per-session полям делегируется
+  активной сессии). Добавлены хоткеи:
+  - `Ctrl+N` — новая вкладка (local, наследует confirm_mode)
+  - `Ctrl+W` — закрыть активную (последняя → quit)
+  - `Ctrl+Tab`/`Ctrl+Shift+Tab`, `Ctrl+PageDown/Up` — переключение
+  - `Ctrl+1..9` — прямой выбор
+- `crates/tui/src/ui/mod.rs`: tab bar — тонкая полоса над status bar (только при
+  sessions.len() > 1). Активная вкладка reversed, остальные dim. Формат: `N. target`.
+  Одна вкладка — layout идентичен старому.
+- `crates/tui/src/ui/bars.rs`: `^N tab` в help bar (Normal mode).
+- `crates/tui/src/ui/chat.rs`: обход Deref-ограничения borrow checker'а — split
+  borrow через явный `&mut app.sessions[app.active]`.
+
+**Архитектурное решение (Deref):** вместо механической замены ~300+ ссылок на поля
+в 20+ методах использован `Deref<Target = Session>` для `App`. Все существующие
+методы продолжают работать через `self.field`, прозрачно делегируясь активной сессии.
+Недостаток: некоторые места ввода-вывода требуют явного `&mut app.sessions[app.active]`
+для удовлетворения borrow checker'а (Rust не видит split borrows через Deref).
+
+**Публичные контракты:** `Session` struct + `Deref impl` + `App::sessions`,
+`App::active`, `App::new_tab/close_tab/next_tab/prev_tab/switch_to_tab`. UI-контракты:
+`render_tab_bar()`.
+
+**Anti-scope (НЕ сделано):** drag-reorder, переименование, отсоединение в окно,
+раздельные LLM-профили на вкладку, фоновая индикация активности на ярлыке.
+
+**Тесты:** `cargo test -p filar-tui` — 206 passed, 0 failed. `cargo build --workspace`
+зелёный. Ручная проверка на Windows — требуется (Ctrl+N, переключение, закрытие,
+вкладки в interactive).

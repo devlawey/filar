@@ -30,8 +30,9 @@ pub mod theme;
 
 pub use theme::Theme;
 
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::Style;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 
@@ -62,27 +63,40 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
 
     let in_height = input_height(app, f.area().width);
+    let has_tabs = app.sessions.len() > 1;
+
+    // Layout: optional tab bar (1 line) above the status bar.
+    let mut constraints = vec![];
+    if has_tabs {
+        constraints.push(Constraint::Length(1)); // tab bar
+    }
+    constraints.extend_from_slice(&[
+        Constraint::Length(1),       // status bar
+        Constraint::Length(1),       // separator
+        Constraint::Min(8),          // chat history
+        Constraint::Length(1),       // separator
+        Constraint::Length(in_height), // input
+        Constraint::Length(1),       // separator
+        Constraint::Length(1),       // help bar
+    ]);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),       // status bar
-            Constraint::Length(1),       // separator
-            Constraint::Min(8),          // chat history
-            Constraint::Length(1),       // separator
-            Constraint::Length(in_height), // input
-            Constraint::Length(1),       // separator
-            Constraint::Length(1),       // help bar
-        ])
+        .constraints(constraints)
         .split(f.area());
 
-    bars::render_status_bar(f, app, chunks[0]);
-    bars::render_separator(f, app, chunks[1]);
-    chat::render_chat_history(f, app, chunks[2]);
-    bars::render_separator(f, app, chunks[3]);
-    input::render_input_area(f, app, chunks[4]);
-    bars::render_separator(f, app, chunks[5]);
-    bars::render_help_bar(f, app, chunks[6]);
+    let mut idx = 0usize;
+    if has_tabs {
+        render_tab_bar(f, app, chunks[0]);
+        idx += 1;
+    }
+    bars::render_status_bar(f, app, chunks[idx]);
+    bars::render_separator(f, app, chunks[idx + 1]);
+    chat::render_chat_history(f, app, chunks[idx + 2]);
+    bars::render_separator(f, app, chunks[idx + 3]);
+    input::render_input_area(f, app, chunks[idx + 4]);
+    bars::render_separator(f, app, chunks[idx + 5]);
+    bars::render_help_bar(f, app, chunks[idx + 6]);
 
     // Render confirmation modal on top of chat if in Confirming mode.
     if app.mode == AppMode::Confirming {
@@ -143,4 +157,26 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
 
     bars::render_separator(f, app, chunks[3]);
     bars::render_help_bar(f, app, chunks[4]);
+}
+
+/// Render the tab bar — thin strip above the status bar showing each
+/// open session. Only called when `sessions.len() > 1`.
+fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
+    let active = app.active;
+    let mut spans: Vec<Span> = Vec::with_capacity(app.sessions.len() * 3);
+    for (i, s) in app.sessions.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let label = format!("{}. {}", i + 1, s.target_name);
+        let style = if i == active {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        spans.push(Span::styled(label, style));
+    }
+    let line = Line::from(spans);
+    let paragraph = Paragraph::new(line);
+    f.render_widget(paragraph, area);
 }
