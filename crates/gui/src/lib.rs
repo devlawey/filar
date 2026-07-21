@@ -145,8 +145,10 @@ struct SshProfile {
     host: String,
     port: String,
     user: String,
+    /// Optional alias shown in the target selector instead of `SSHn`.
+    #[serde(default)]
+    alias: String,
     /// Whether the user checked "Save password" for this slot.
-    /// The actual password is in the OS credential store, not in this file.
     #[serde(default)]
     save_password: bool,
 }
@@ -207,6 +209,7 @@ struct SshSlot {
     host: String,
     port: String,
     user: String,
+    alias: String,
     password: String,
     save_password: bool,
 }
@@ -226,6 +229,7 @@ impl SshSlot {
                 p.port.clone()
             },
             user: p.user.clone(),
+            alias: p.alias.clone(),
             password,
             save_password: p.save_password,
         }
@@ -236,6 +240,7 @@ impl SshSlot {
             host: self.host.clone(),
             port: self.port.clone(),
             user: self.user.clone(),
+            alias: self.alias.clone(),
             save_password: self.save_password,
         }
     }
@@ -299,7 +304,12 @@ impl eframe::App for LauncherApp {
                 ui.label("Target:");
                 ui.radio_value(&mut self.target_mode, 0, "Local");
                 for i in 1..=SSH_SLOTS {
-                    ui.radio_value(&mut self.target_mode, i, format!("SSH{i}"));
+                    let label = if self.ssh_slots[i - 1].alias.is_empty() {
+                        format!("SSH{i}")
+                    } else {
+                        self.ssh_slots[i - 1].alias.clone()
+                    };
+                    ui.radio_value(&mut self.target_mode, i, label);
                 }
             });
 
@@ -329,6 +339,14 @@ impl eframe::App for LauncherApp {
                         ui.add(
                             egui::TextEdit::singleline(&mut slot.user)
                                 .hint_text("root"),
+                        );
+                        ui.end_row();
+
+                        ui.label("Alias:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut slot.alias)
+                                .hint_text("deploy")
+                                .desired_width(120.0),
                         );
                         ui.end_row();
 

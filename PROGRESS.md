@@ -2501,3 +2501,25 @@ local с тем же LLM-доступом; переход в SSH внутри в
 
 **Тесты:** `cargo test -p filar-tui` — 206 passed, 0 failed. `cargo build --workspace`
 зелёный. Ручная проверка на Windows — требуется (агент в фоне, индикаторы вкладок).
+
+---
+
+## Issue #97: Лаунчер — поле alias для SSH-таргетов
+
+**Задача:** добавить поле «alias» в настройки каждого SSH-таргета лаунчера.
+Отображать alias на radio-кнопке вместо `SSHn`. Сохраняется как остальные поля
+(save_password, host, port, user) в `settings.json`.
+
+**Решение:**
+- `crates/gui/src/lib.rs`:
+  - `SshProfile::alias: String` — сохраняется в `settings.json` (`#[serde(default)]`).
+  - `SshSlot::alias: String` — runtime-поле для egui-UI.
+  - `from_profile/to_profile` — копируют alias.
+  - Radio-кнопка: если `alias` непустой — показывает alias, иначе `SSH{i}` (как раньше).
+  - Форма SSH: поле `Alias` (hint_text `"deploy"`, desired_width 120).
+
+**Публичные контракты:** `SshProfile::alias` (новое поле, serde(default), обратная
+совместимость — старые конфиги без `alias` не ломаются).
+
+**Тесты:** `cargo build --workspace` зелёный, `cargo test --workspace` — все тесты
+зелёные (agent 62, core 34, transport 24, tui 206). Ручная проверка GUI — требуется.
