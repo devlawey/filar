@@ -20,8 +20,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   ignoring `display_offset`, so wheel/PgUp scrolling had no visible effect
   ([#108](https://github.com/devlawey/filar/issues/108)).
 - Tab navigation was dead in interactive terminal mode; `Ctrl+Tab`/`Ctrl+Shift+Tab`/
-  `Ctrl+PageUp`/`Ctrl+PageDown` now switch tabs (leaving the terminal first) when
-  more than one tab is open
+  `BackTab`/`Ctrl+PageUp`/`Ctrl+PageDown` now switch tabs (leaving the terminal
+  first) when more than one tab is open
   ([#109](https://github.com/devlawey/filar/issues/109)).
 
 ## [0.5.0] - 2026-07-21

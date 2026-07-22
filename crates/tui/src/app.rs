@@ -887,7 +887,12 @@ impl App {
                 // when in primary screen. In alt-screen (vim/htop/less)
                 // these keys are forwarded to the PTY so the remote
                 // application receives them — matching mouse wheel logic.
-                if key.code == KeyCode::PageUp || key.code == KeyCode::PageDown {
+                // Ctrl+PageUp/Ctrl+PageDown are NOT intercepted here: with
+                // a single session they pass to the PTY, with multiple
+                // sessions the tab-switch gate above consumes them.
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && (key.code == KeyCode::PageUp || key.code == KeyCode::PageDown)
+                {
                     if let Some(t) = self.terminal.as_mut() {
                         if !t.is_alt_screen() {
                             let rows = t.rows() as i32;
