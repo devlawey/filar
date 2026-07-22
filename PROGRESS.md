@@ -2627,3 +2627,16 @@ local с тем же LLM-доступом; переход в SSH внутри в
 
 **Тесты:** `cargo test -p filar-tui` — 210 passed (208 + 2 новых).
 **Следующие шаги:** нет.
+
+---
+
+## Релиз v0.5.1 (подготовка)
+
+**Дата:** 2026-07-22. **Milestone:** Filar v0.5.1 (3/3 issues, все смерджены).
+
+**Что вошло:**
+- #107 (#110): fix interactive PTY grid — 4 chrome lines instead of 2
+- #108 (#111): fix scrollback render — apply display_offset in TerminalModel::render
+- #109 (#112): fix tab switch in interactive — exit-on-switch when >1 tab
+
+**Engine:** не менялся (core/transport/agent не тронуты). Тег engine-v0.5.1 НЕ ставится.
