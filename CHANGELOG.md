@@ -11,6 +11,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- Interactive terminal PTY/grid was sized 2 rows too tall (chrome = 4 lines, not 2),
+  hiding the shell prompt below the viewport until the window was maximized (#107).
+
 ## [0.5.0] - 2026-07-21
 
 Milestone v0.5.0 — hotfix интерактивного режима (select! starvation, скроллбар,

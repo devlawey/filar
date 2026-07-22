@@ -18,6 +18,16 @@
 //! All colours come from [`Theme`] — no `Color::*` literals exist outside
 //! `theme.rs`.
 
+/// Number of lines occupied by interactive-mode "chrome"
+/// (status bar + separator + separator + help bar).
+pub const INTERACTIVE_CHROME_LINES: u16 = 4;
+
+/// Returns the number of grid rows available for the interactive terminal,
+/// given the total terminal height.
+pub fn interactive_grid_rows(total_height: u16) -> u16 {
+    total_height.saturating_sub(INTERACTIVE_CHROME_LINES)
+}
+
 mod bars;
 mod chat;
 mod confirm;
@@ -195,4 +205,16 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line);
     f.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_grid_reserves_four_chrome_lines() {
+        assert_eq!(interactive_grid_rows(30), 26);
+        assert_eq!(interactive_grid_rows(4), 0);
+        assert_eq!(interactive_grid_rows(3), 0); // saturating
+    }
 }

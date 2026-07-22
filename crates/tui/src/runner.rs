@@ -258,7 +258,7 @@ async fn run_app(
                     Some(Ok(Event::Resize(cols, rows))) => {
                         if in_interactive {
                             let term_cols = cols;
-                            let term_rows = rows.saturating_sub(2); // status + help bar
+                            let term_rows = ui::interactive_grid_rows(rows);
                             if let Some(model) = &mut app.terminal {
                                 model.resize(term_cols, term_rows);
                             }
@@ -292,7 +292,7 @@ async fn run_app(
                         // Enter interactive mode.
                         let size = terminal.size().unwrap_or_default();
                         let cols = size.width;
-                        let rows = size.height.saturating_sub(2);
+                        let rows = ui::interactive_grid_rows(size.height);
                         let term_result: Result<Arc<dyn InteractiveTerminal>> =
                             if let Some(ref target) = config.ssh_target {
                                 SshInteractive::connect(target, cols, rows)
