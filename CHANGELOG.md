@@ -14,7 +14,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 ### Fixed
 
 - Interactive terminal PTY/grid was sized 2 rows too tall (chrome = 4 lines, not 2),
-  hiding the shell prompt below the viewport until the window was maximized (#107).
+  hiding the shell prompt below the viewport until the window was maximized
+  ([#107](https://github.com/devlawey/filar/issues/107)).
 
 ## [0.5.0] - 2026-07-21
 
