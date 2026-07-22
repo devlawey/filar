@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- Interactive scrollbar now responds to mouse drag; it was previously only
+  controllable via PgUp/PgDn keys
+  ([#119](https://github.com/devlawey/filar/issues/119)).
+
 ## [0.5.1] - 2026-07-22
 
 ### Fixed

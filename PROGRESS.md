@@ -2640,3 +2640,25 @@ local с тем же LLM-доступом; переход в SSH внутри в
 - #109 (#112): fix tab switch in interactive — exit-on-switch when >1 tab
 
 **Engine:** не менялся (core/transport/agent не тронуты). Тег engine-v0.5.1 НЕ ставится.
+
+---
+
+## Issue #119: bug(tui) — скроллбар интерактивного режима не реагирует на мышь
+
+**Проблема:** скроллбар терминала визуально отображался, но не реагировал на
+перетаскивание мышью — только PgUp/PgDn. Mouse-события на правой колонке
+терминальной области уходили на обработку как терминальные события (PTY),
+а не как drag скроллбара.
+
+**Решение:**
+- `crates/tui/src/app.rs`, `handle_interactive_mouse`: перед форвардингом в PTY
+  проверяется колонка скроллбара (`terminal_area.x + width - 1`). События на ней
+  перехватываются: Down → начать drag, Drag → `terminal_scrollbar_drag()`,
+  Up → завершить, Scroll → проброс на существующую ветку колеса.
+- Новый метод `terminal_scrollbar_drag(row)`: маппит строку в `display_offset`
+  через обратное преобразование `position = scroll_len − offset` (та же логика,
+  что в `render_interactive`).
+
+**Публичные контракты:** `terminal_scrollbar_drag` — приватный метод, без изменений.
+
+**Тесты:** `cargo test -p filar-tui` — 210 passed.
