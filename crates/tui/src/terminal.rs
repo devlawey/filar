@@ -110,6 +110,11 @@ impl TerminalModel {
 
     /// Scroll the terminal display by `delta` lines (negative = up).
     ///
+    /// Scroll the terminal display by `delta` lines.
+    ///
+    /// Positive `delta` scrolls **up** into scrollback (shows older history).
+    /// Negative `delta` scrolls **down** toward the current live output.
+    /// PgUp passes `+rows`, PgDn passes `-rows`; the mouse wheel passes `±3`.
     /// This scrolls through the scrollback history without sending input
     /// to the PTY/SSH channel.
     pub fn scroll_display(&mut self, delta: i32) {
@@ -636,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn render_shows_scrollback_when_scrolled_up() {
+    fn render_shows_scrollback_when_scrolled_up() -> Result<(), String> {
         use ratatui::{backend::TestBackend, Terminal};
         let mut model = TerminalModel::new(20, 4);
         for i in 0..8 {
@@ -644,15 +649,19 @@ mod tests {
         }
         let area = ratatui::layout::Rect::new(0, 0, 20, 4);
 
-        let mut term = Terminal::new(TestBackend::new(20, 4)).unwrap();
-        term.draw(|f| model.render(f, area)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(20, 4))
+            .map_err(|e| format!("create test terminal: {e:?}"))?;
+        term.draw(|f| model.render(f, area))
+            .map_err(|e| format!("render live view: {e:?}"))?;
         let bottom = format!("{:?}", term.backend().buffer());
 
         model.scroll_display(4);
-        term.draw(|f| model.render(f, area)).unwrap();
+        term.draw(|f| model.render(f, area))
+            .map_err(|e| format!("render scrollback view: {e:?}"))?;
         let scrolled = format!("{:?}", term.backend().buffer());
 
         assert_ne!(bottom, scrolled, "scrollback view must differ from live view");
         assert!(scrolled.contains("line3"), "scrollback should show earlier lines; got: {scrolled}");
+        Ok(())
     }
 }
