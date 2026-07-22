@@ -2566,3 +2566,23 @@ local с тем же LLM-доступом; переход в SSH внутри в
 - #98 (#106): feat лаунчер — тёмная тема, fixed bottom-panel layout
 
 **Engine:** не менялся (core/transport/agent не тронуты). Тег engine-v0.5.0 НЕ ставится.
+
+---
+
+## Issue #107: fix(tui) — интерактивный терминал на 2 строки выше видимой области
+
+**Проблема:** после v0.5.0 строка приглашения шелла в интерактивном режиме
+пряталась под экран при обычной высоте окна. `render_interactive` резервирует
+4 строки хрома (status + separator + separator + help), но PTY/модель
+создавались с `H − 2` — забыты два разделителя.
+
+**Решение:**
+- `crates/tui/src/ui/mod.rs`: константа `INTERACTIVE_CHROME_LINES = 4` и
+  хелпер `interactive_grid_rows(total_height) → total_height.saturating_sub(4)`.
+- `crates/tui/src/runner.rs`: `saturating_sub(2)` → `interactive_grid_rows(size.height)`
+  в обоих местах (вход в режим и ресайз).
+- `crates/tui/src/ui/mod.rs`: юнит-тест `interactive_grid_reserves_four_chrome_lines`.
+
+**Публичные контракты:** `INTERACTIVE_CHROME_LINES`, `interactive_grid_rows` (новые pub).
+
+**Тесты:** `cargo test -p filar-tui` — 207 passed (206 + 1 новый). `cargo build --workspace` зелёный.
