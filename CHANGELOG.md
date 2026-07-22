@@ -16,6 +16,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Interactive terminal PTY/grid was sized 2 rows too tall (chrome = 4 lines, not 2),
   hiding the shell prompt below the viewport until the window was maximized
   ([#107](https://github.com/devlawey/filar/issues/107)).
+- Interactive scrollback did not render: the grid was drawn from the live screen
+  ignoring `display_offset`, so wheel/PgUp scrolling had no visible effect
+  ([#108](https://github.com/devlawey/filar/issues/108)).
 
 ## [0.5.0] - 2026-07-21
 

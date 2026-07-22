@@ -2586,3 +2586,23 @@ local с тем же LLM-доступом; переход в SSH внутри в
 **Публичные контракты:** `INTERACTIVE_CHROME_LINES`, `interactive_grid_rows` (новые pub).
 
 **Тесты:** `cargo test -p filar-tui` — 207 passed (206 + 1 новый). `cargo build --workspace` зелёный.
+
+---
+
+## Issue #108: fix(tui) — scrollback интерактивного терминала не рендерится
+
+**Проблема:** колесо/PgUp меняли `display_offset`, но `TerminalModel::render`
+игнорировал offset — грид всегда отрисовывался с `Line(0)`, показывая живой
+экран вместо истории.
+
+**Решение:**
+- `crates/tui/src/terminal.rs`: `render` применяет `display_offset` при
+  индексации грида: `grid[Line(row - offset)]`. Курсор скрывается при
+  `offset > 0` (иначе «залипает» инвертированный знак в истории).
+- Юнит-тест `render_shows_scrollback_when_scrolled_up` через `TestBackend`:
+  накопить scrollback, сравнить рендеры при offset=0 и offset=4.
+
+**Публичные контракты:** без изменений (внутренний рендер TerminalModel).
+
+**Тесты:** `cargo test -p filar-tui` — 208 passed (207 + 1 новый).
+**Следующие шаги:** нет.

@@ -110,6 +110,11 @@ impl TerminalModel {
 
     /// Scroll the terminal display by `delta` lines (negative = up).
     ///
+    /// Scroll the terminal display by `delta` lines.
+    ///
+    /// Positive `delta` scrolls **up** into scrollback (shows older history).
+    /// Negative `delta` scrolls **down** toward the current live output.
+    /// PgUp passes `+rows`, PgDn passes `-rows`; the mouse wheel passes `±3`.
     /// This scrolls through the scrollback history without sending input
     /// to the PTY/SSH channel.
     pub fn scroll_display(&mut self, delta: i32) {
@@ -169,8 +174,17 @@ impl TerminalModel {
         let num_cols = grid.columns();
         let num_lines = grid.screen_lines();
 
-        // Cursor position for inversion.
-        let cursor = self.cursor_position();
+        // Apply scrollback offset: a positive display_offset means the user
+        // has scrolled up into history. Line(row - offset) indexes lines above
+        // the live screen (negative Line goes into scrollback via compute_index).
+        let offset = grid.display_offset() as i32;
+
+        // Cursor position for inversion — only visible at the bottom (offset == 0).
+        let cursor = if offset == 0 {
+            self.cursor_position()
+        } else {
+            None
+        };
 
         // Determine how many lines fit in the area.
         let max_rows = (area.height as usize).min(num_lines);
@@ -179,7 +193,7 @@ impl TerminalModel {
         let mut lines: Vec<RatLine> = Vec::with_capacity(max_rows);
 
         for row in 0..max_rows {
-            let grid_row = &grid[Line(row as i32)];
+            let grid_row = &grid[Line(row as i32 - offset)];
             let mut spans: Vec<Span> = Vec::new();
             let mut current_text = String::new();
             let mut current_style = Style::default();
@@ -624,5 +638,30 @@ mod tests {
         // Index 255 = lightest grayscale.
         let c = map_indexed_color(255);
         assert_eq!(c, Color::Rgb(238, 238, 238));
+    }
+
+    #[test]
+    fn render_shows_scrollback_when_scrolled_up() -> Result<(), String> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut model = TerminalModel::new(20, 4);
+        for i in 0..8 {
+            model.feed(format!("line{i}\r\n").as_bytes());
+        }
+        let area = ratatui::layout::Rect::new(0, 0, 20, 4);
+
+        let mut term = Terminal::new(TestBackend::new(20, 4))
+            .map_err(|e| format!("create test terminal: {e:?}"))?;
+        term.draw(|f| model.render(f, area))
+            .map_err(|e| format!("render live view: {e:?}"))?;
+        let bottom = format!("{:?}", term.backend().buffer());
+
+        model.scroll_display(4);
+        term.draw(|f| model.render(f, area))
+            .map_err(|e| format!("render scrollback view: {e:?}"))?;
+        let scrolled = format!("{:?}", term.backend().buffer());
+
+        assert_ne!(bottom, scrolled, "scrollback view must differ from live view");
+        assert!(scrolled.contains("line3"), "scrollback should show earlier lines; got: {scrolled}");
+        Ok(())
     }
 }
