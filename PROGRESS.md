@@ -2606,3 +2606,24 @@ local с тем же LLM-доступом; переход в SSH внутри в
 
 **Тесты:** `cargo test -p filar-tui` — 208 passed (207 + 1 новый).
 **Следующие шаги:** нет.
+
+---
+
+## Issue #109: fix(tui) — переключение вкладок в интерактивном режиме
+
+**Проблема:** в `AppMode::Interactive` вся навигация по вкладкам отключена
+гейтом `if self.mode != AppMode::Interactive`. `Ctrl+Tab`/`Ctrl+PgUp` уходили в PTY.
+
+**Решение:**
+- `crates/tui/src/app.rs`, ветка `AppMode::Interactive` в `handle_key`:
+  перед конвертацией в байты PTY перехватываются `Ctrl+Tab`/`Ctrl+Shift+Tab`/
+  `BackTab`/`Ctrl+PageUp`/`Ctrl+PageDown` — только при `sessions.len() > 1`.
+  Переключение вкладки + `self.toggle_interactive = true` (выход из терминала).
+  Одна вкладка → клавиши уходят в PTY (не перехватываются).
+- Юнит-тесты: `interactive_ctrl_tab_switches_and_exits`,
+  `interactive_plain_key_still_goes_to_pty`.
+
+**Публичные контракты:** без изменений (внутренний обработчик клавиш).
+
+**Тесты:** `cargo test -p filar-tui` — 210 passed (208 + 2 новых).
+**Следующие шаги:** нет.

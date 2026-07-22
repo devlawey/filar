@@ -851,11 +851,48 @@ impl App {
                     self.toggle_interactive = true;
                     return;
                 }
+                // Tab navigation when multiple tabs are open: switch tab and
+                // exit interactive mode (global PTY, not per-session). Single
+                // tab → let keys fall through to PTY unchanged.
+                if self.sessions.len() > 1 {
+                    let switch = match (key.code, key.modifiers) {
+                        (KeyCode::Tab, m) if m.contains(KeyModifiers::CONTROL) => {
+                            if m.contains(KeyModifiers::SHIFT) {
+                                self.prev_tab();
+                            } else {
+                                self.next_tab();
+                            }
+                            true
+                        }
+                        (KeyCode::BackTab, _) => {
+                            self.prev_tab();
+                            true
+                        }
+                        (KeyCode::PageDown, m) if m.contains(KeyModifiers::CONTROL) => {
+                            self.next_tab();
+                            true
+                        }
+                        (KeyCode::PageUp, m) if m.contains(KeyModifiers::CONTROL) => {
+                            self.prev_tab();
+                            true
+                        }
+                        _ => false,
+                    };
+                    if switch {
+                        self.toggle_interactive = true;
+                        return;
+                    }
+                }
                 // PgUp/PgDn — scroll through terminal history (scrollback)
                 // when in primary screen. In alt-screen (vim/htop/less)
                 // these keys are forwarded to the PTY so the remote
                 // application receives them — matching mouse wheel logic.
-                if key.code == KeyCode::PageUp || key.code == KeyCode::PageDown {
+                // Ctrl+PageUp/Ctrl+PageDown are NOT intercepted here: with
+                // a single session they pass to the PTY, with multiple
+                // sessions the tab-switch gate above consumes them.
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && (key.code == KeyCode::PageUp || key.code == KeyCode::PageDown)
+                {
                     if let Some(t) = self.terminal.as_mut() {
                         if !t.is_alt_screen() {
                             let rows = t.rows() as i32;
@@ -4486,5 +4523,36 @@ mod tests {
         // Click in input area
         let zone = app.hit_test(5, 6);
         assert!(matches!(zone, HitZone::Input));
+    }
+
+    #[test]
+    fn interactive_ctrl_tab_switches_and_exits() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        app.new_tab(); // now 2 sessions, active = 1
+        let model = crate::terminal::TerminalModel::new(80, 24);
+        app.enter_interactive(model);
+        let before = app.active;
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
+
+        assert_ne!(app.active, before, "Ctrl+Tab must switch tab");
+        assert!(app.take_toggle_interactive(), "Ctrl+Tab must request interactive exit");
+        assert!(app.take_term_input().is_none(), "Ctrl+Tab must not be forwarded to PTY");
+    }
+
+    #[test]
+    fn interactive_plain_key_still_goes_to_pty() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        app.new_tab();
+        let model = crate::terminal::TerminalModel::new(80, 24);
+        app.enter_interactive(model);
+        let before = app.active;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        assert_eq!(app.active, before, "plain key must not switch tab");
+        assert_eq!(app.take_term_input().as_deref(), Some(&b"a"[..]));
     }
 }
