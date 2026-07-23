@@ -1207,8 +1207,45 @@ impl App {
     fn handle_interactive_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::MouseEventKind;
 
-        // Ignore events outside the terminal area.
         let area = self.terminal_area;
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        // Detect scrollbar column: rightmost column of the terminal area.
+        // Mouse events on the scrollbar are intercepted before forwarding to PTY.
+        let scrollbar_col = area.x + area.width - 1;
+        let on_scrollbar = m.column == scrollbar_col
+            && m.row >= area.y
+            && m.row < area.y + area.height;
+
+        let dragging_scrollbar = self.mouse_drag == Some(DragKind::Scrollbar);
+        if on_scrollbar || dragging_scrollbar {
+            match m.kind {
+                MouseEventKind::Down(_) if on_scrollbar => {
+                    self.mouse_drag = Some(DragKind::Scrollbar);
+                    self.terminal_scrollbar_drag(m.row);
+                    return;
+                }
+                MouseEventKind::Drag(_) if dragging_scrollbar => {
+                    self.terminal_scrollbar_drag(m.row);
+                    return;
+                }
+                MouseEventKind::Up(_) if dragging_scrollbar => {
+                    self.mouse_drag = None;
+                    return;
+                }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    // Wheel on scrollbar: handle as scroll (fall through to
+                    // the scroll-wheel branch below, which already works).
+                }
+                _ => return,
+            }
+        }
+
+        // --- rest of existing handler (outside terminal area, mouse mode, wheel) ---
+
+        // Ignore events outside the terminal area (scrollbar already handled above).
         if m.column < area.x
             || m.column >= area.x + area.width
             || m.row < area.y
@@ -1466,6 +1503,35 @@ impl App {
         let track_span = (visible_height - 1).max(1);
         let skip = relative_row * max_scroll / track_span;
         self.scroll = max_scroll.saturating_sub(skip).min(max_scroll);
+    }
+
+    /// Map a mouse row on the interactive terminal scrollbar to a
+    /// display_offset delta and apply it. The scrollbar is rendered with
+    /// position = scroll_len - offset (bottom-up), so the mapping inverts:
+    /// relative_row → position → offset = scroll_len - position → delta.
+    fn terminal_scrollbar_drag(&mut self, row: u16) {
+        let area = self.terminal_area;
+        if area.height < 2 {
+            return;
+        }
+        let Some(ref mut t) = self.terminal else { return };
+        let visible_height = (area.height as usize).min(t.rows() as usize);
+        if visible_height < 2 {
+            return;
+        }
+        let total_lines = t.total_grid_lines();
+        let scroll_len = total_lines.saturating_sub(visible_height);
+        if scroll_len == 0 {
+            return;
+        }
+        let track_top = area.y;
+        let track_span = visible_height - 1;
+        let relative_row = (row.saturating_sub(track_top) as usize).min(track_span);
+        let position = relative_row * scroll_len / track_span;
+        let desired_offset = (scroll_len - position) as i32;
+        let current = t.display_offset() as i32;
+        let delta = desired_offset - current;
+        t.scroll_display(delta);
     }
 
     /// Set cursor position from a click in the input area.
