@@ -190,7 +190,7 @@ pub struct App {
 /// reused. Events carry this id so they can be dispatched to the originating
 /// session even when the active tab changes or intermediate tabs close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SessionId(u64);
+pub struct SessionId(pub(crate) u64);
 
 /// Global counter for unique SessionIds. Atomic so it can be incremented
 /// from any context (runner, UI) without locking.

@@ -17,6 +17,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   (internal refactor, no behavior change) preparing per-tab persistent terminals
   ([#113](https://github.com/devlawey/filar/issues/113)).
 
+### Added
+
+- Per-terminal reader tasks feed a tagged channel so every interactive backend
+  (including background tabs) is drained and routed to its own session model
+  ([#114](https://github.com/devlawey/filar/issues/114)).
+
 ### Fixed
 
 - Interactive scrollbar now responds to mouse drag; it was previously only

@@ -28,6 +28,57 @@ use crate::confirmer::TuiConfirmer;
 use crate::event::TuiEvent;
 use crate::terminal::TerminalModel;
 use crate::ui;
+
+/// Chunk emitted by a per-backend reader task via the tagged channel.
+enum TermChunk {
+    /// Output bytes to feed into the terminal model.
+    Bytes(Vec<u8>),
+    /// Terminal session ended (shell exited).
+    Eof,
+    /// I/O error reading from the backend.
+    Err(filar_core::CoreError),
+}
+
+/// Outcome of routing a terminal chunk to its session.
+#[derive(Debug)]
+enum RouteOutcome {
+    /// Chunk fed to the target session's terminal model (and/or marked).
+    Fed,
+    /// EOF – terminal ended, caller should teardown backend.
+    Eof,
+    /// Error – caller should teardown backend.
+    Error(filar_core::CoreError),
+    /// Session not found (tab already closed), chunk discarded.
+    Ignored,
+}
+
+/// Route a terminal chunk to the correct session by SessionId.
+///
+/// - `Bytes` are fed into the target session's `terminal` model.
+///   If the target is not the active session, `has_new` is set to true.
+/// - `Eof`/`Err` return the respective outcome without modifying the model.
+/// - If the session is not found (tab closed), the chunk is silently ignored.
+fn route_term_chunk(app: &mut App, sid: SessionId, chunk: TermChunk) -> RouteOutcome {
+    let active_id = app.sessions[app.active].id;
+    let Some(session) = app.sessions.iter_mut().find(|s| s.id == sid) else {
+        return RouteOutcome::Ignored;
+    };
+    let is_background = active_id != sid;
+
+    match chunk {
+        TermChunk::Bytes(bytes) => {
+            if let Some(ref mut model) = session.terminal {
+                model.feed(&bytes);
+            }
+            if is_background {
+                session.has_new = true;
+            }
+            RouteOutcome::Fed
+        }
+        TermChunk::Eof => RouteOutcome::Eof,
+        TermChunk::Err(e) => RouteOutcome::Error(e),
+    }
+}
 use filar_core::ChatBlock;
 
 // ---------------------------------------------------------------------------
@@ -220,10 +271,17 @@ async fn run_app(
     let mut events = EventStream::new();
 
     // Interactive terminal backends — one per session, keyed by SessionId.
+    // Each entry holds the backend Arc and its reader task JoinHandle for
+    // lifecycle management.
     let mut interactive_backends: std::collections::HashMap<
         crate::app::SessionId,
-        Arc<dyn InteractiveTerminal>,
+        (Arc<dyn InteractiveTerminal>, tokio::task::JoinHandle<()>),
     > = std::collections::HashMap::new();
+
+    // Tagged channel: reader tasks push (SessionId, TermChunk); the event
+    // loop receives and routes to the correct session model.
+    let (term_tx, mut term_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(crate::app::SessionId, TermChunk)>();
 
     // Draw initial UI.
     terminal.draw(|f| ui::render(f, &mut app)).ok();
@@ -241,17 +299,6 @@ async fn run_app(
 
     loop {
         let in_interactive = app.mode == AppMode::Interactive;
-        // Clone the Arc for the read future (avoids borrowing backends map).
-        // The read sid is captured alongside the Arc so the read result can
-        // be dispatched to the correct session even if the active tab changes.
-        let read_pair: Option<(crate::app::SessionId, Arc<dyn InteractiveTerminal>)> =
-            if in_interactive {
-                let sid = app.sessions[app.active].id;
-                interactive_backends.get(&sid).map(|term| (sid, term.clone()))
-            } else {
-                None
-            };
-        let term_for_read = read_pair.as_ref().map(|(_, t)| t.clone());
 
         tokio::select! {
             // Terminal keyboard / resize event.
@@ -276,7 +323,7 @@ async fn run_app(
                             if let Some(model) = &mut app.terminal {
                                 model.resize(term_cols, term_rows);
                             }
-                            if let Some(ref term) = interactive_backends.get(&resize_sid) {
+                            if let Some((ref term, _)) = interactive_backends.get(&resize_sid) {
                                 let _ = term.resize(term_cols, term_rows).await;
                             }
                         }
@@ -297,9 +344,9 @@ async fn run_app(
                 if app.take_toggle_interactive() {
                     let toggle_sid = app.sessions[app.active].id;
                     if in_interactive {
-                        // Exit interactive mode.
-                        if let Some(term) = interactive_backends.remove(&toggle_sid) {
-                            let _ = term.close().await;
+                        // Exit interactive mode — abort reader, close backend.
+                        if let Some((_, handle)) = interactive_backends.remove(&toggle_sid) {
+                            handle.abort();
                         }
                         app.exit_interactive();
                     } else if !app.agent_running {
@@ -320,7 +367,30 @@ async fn run_app(
                         match term_result {
                             Ok(term) => {
                                 let model = TerminalModel::new(cols, rows);
-                                interactive_backends.insert(toggle_sid, term);
+                                let term_for_read = term.clone();
+                                let sid = toggle_sid;
+                                let tx = term_tx.clone();
+                                let handle = tokio::spawn(async move {
+                                    loop {
+                                        match term_for_read.read_output().await {
+                                            Ok(Some(b)) => {
+                                                if tx.send((sid, TermChunk::Bytes(b))).is_err()
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                            Ok(None) => {
+                                                let _ = tx.send((sid, TermChunk::Eof));
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send((sid, TermChunk::Err(e)));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+                                interactive_backends.insert(toggle_sid, (term, handle));
                                 app.enter_interactive(model);
                             }
                             Err(e) => {
@@ -334,7 +404,7 @@ async fn run_app(
                 // Forward terminal input bytes to the backend.
                 if let Some(bytes) = app.take_term_input() {
                     let write_sid = app.sessions[app.active].id;
-                    if let Some(ref term) = interactive_backends.get(&write_sid) {
+                    if let Some((ref term, _)) = interactive_backends.get(&write_sid) {
                         let _ = term.write_input(&bytes).await;
                     }
                 }
@@ -510,41 +580,26 @@ async fn run_app(
                 }
             }
 
-            // Terminal output (only when in interactive mode).
-            maybe_output = async move {
-                match term_for_read {
-                    Some(term) => term.read_output().await,
-                    None => std::future::pending::<
-                        std::result::Result<Option<Vec<u8>>, filar_core::CoreError>
-                    >().await,
-                }
-            } => {
-                let read_sid = read_pair.as_ref().map(|(sid, _)| *sid);
-                match maybe_output {
-                    Ok(Some(bytes)) => {
-                        if let Some(model) = &mut app.terminal {
-                            model.feed(&bytes);
-                        }
-                        needs_redraw = true;
-                    }
-                    Ok(None) => {
-                        // Terminal EOF (shell exited) — auto-exit interactive mode.
-                        if let Some(sid) = read_sid {
-                            if let Some(term) = interactive_backends.remove(&sid) {
-                                let _ = term.close().await;
+            // Terminal output from reader tasks (all sessions — including
+            // background tabs). Each chunk carries its own SessionId so
+            // routing works correctly regardless of the active tab.
+            maybe_chunk = term_rx.recv() => {
+                if let Some((sid, chunk)) = maybe_chunk {
+                    let outcome = route_term_chunk(&mut app, sid, chunk);
+                    match outcome {
+                        RouteOutcome::Eof | RouteOutcome::Error(_) => {
+                            if let Some((_, handle)) = interactive_backends.remove(&sid) {
+                                handle.abort();
+                            }
+                            if app.sessions[app.active].id == sid
+                                && app.mode == AppMode::Interactive
+                            {
+                                app.exit_interactive();
                             }
                         }
-                        app.exit_interactive();
-                        needs_redraw = true;
+                        _ => {}
                     }
-                    Err(e) => {
-                        error!(error = %e, "terminal read error");
-                        if let Some(sid) = read_sid {
-                            interactive_backends.remove(&sid);
-                        }
-                        app.exit_interactive();
-                        needs_redraw = true;
-                    }
+                    needs_redraw = true;
                 }
             }
 
@@ -620,9 +675,9 @@ async fn run_app(
         }
     }
 
-    // Clean up interactive terminals — close all remaining backends.
-    for (_, term) in interactive_backends.drain() {
-        let _ = term.close().await;
+    // Clean up interactive terminals — abort reader tasks.
+    for (_, (_, handle)) in interactive_backends.drain() {
+        handle.abort();
     }
 
     // Save session to disk for future restore.
@@ -787,5 +842,45 @@ mod tests {
         assert!(line.is_none());
         // Closed channel must disable further polling to avoid a busy-loop.
         assert!(log_rx.is_none());
+    }
+
+    #[test]
+    fn route_feeds_correct_session_and_marks_background() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        app.new_tab(); // active = 1
+        let sid0 = app.sessions[0].id;
+        app.sessions[0].terminal =
+            Some(crate::terminal::TerminalModel::new(80, 24));
+
+        let outcome = route_term_chunk(
+            &mut app,
+            sid0,
+            TermChunk::Bytes(b"hi".to_vec()),
+        );
+        assert!(matches!(outcome, RouteOutcome::Fed));
+        assert!(app.sessions[0].has_new, "background tab must be marked");
+    }
+
+    #[test]
+    fn route_ignores_closed_session() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        let outcome = route_term_chunk(
+            &mut app,
+            crate::app::SessionId(9999),
+            TermChunk::Bytes(b"ghost".to_vec()),
+        );
+        assert!(matches!(outcome, RouteOutcome::Ignored));
+    }
+
+    #[test]
+    fn route_eof_returns_eof_outcome() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+
+        let outcome = route_term_chunk(&mut app, sid, TermChunk::Eof);
+        assert!(matches!(outcome, RouteOutcome::Eof));
     }
 }
