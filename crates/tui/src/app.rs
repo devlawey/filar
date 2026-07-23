@@ -851,6 +851,19 @@ impl App {
                     self.toggle_interactive = true;
                     return;
                 }
+                // Ctrl+N — new tab (local). Intercepted always: the new tab
+                // starts in agent mode, the current terminal stays alive in
+                // the background. No toggle_interactive — old PTY untouched.
+                if ctrl_key('n', 'т') {
+                    self.new_tab();
+                    return;
+                }
+                // Ctrl+W — close the active tab. Last tab quits. Intercepted
+                // always: the terminal is torn down inside close_tab.
+                if ctrl_key('w', 'ц') {
+                    self.close_tab();
+                    return;
+                }
                 // Tab navigation when multiple tabs are open: switch tab and
                 // exit interactive mode (global PTY, not per-session). Single
                 // tab → let keys fall through to PTY unchanged.
@@ -4620,5 +4633,37 @@ mod tests {
 
         assert_eq!(app.active, before, "plain key must not switch tab");
         assert_eq!(app.take_term_input().as_deref(), Some(&b"a"[..]));
+    }
+
+    #[test]
+    fn interactive_ctrl_n_creates_new_tab_without_exiting() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        let model = crate::terminal::TerminalModel::new(80, 24);
+        app.enter_interactive(model);
+        assert_eq!(app.sessions.len(), 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.sessions.len(), 2, "Ctrl+N must create a new tab");
+        assert!(!app.take_toggle_interactive(), "Ctrl+N must NOT request interactive teardown");
+        assert!(app.take_term_input().is_none(), "Ctrl+N must not be forwarded to PTY");
+        // Old tab's terminal still alive in background.
+        assert_eq!(app.sessions[0].mode, AppMode::Interactive);
+        assert!(app.sessions[0].terminal.is_some(), "old tab terminal must persist");
+    }
+
+    #[test]
+    fn interactive_ctrl_w_closes_tab() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        app.new_tab(); // 2 sessions, active = 1
+        let model = crate::terminal::TerminalModel::new(80, 24);
+        app.enter_interactive(model);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.sessions.len(), 1, "Ctrl+W must close the active tab");
+        assert!(app.take_term_input().is_none(), "Ctrl+W must not be forwarded to PTY");
     }
 }

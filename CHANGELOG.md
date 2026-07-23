@@ -19,6 +19,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Fixed visual artifacts (stale text, status-bar fragments) when switching between
   session tabs, especially from interactive to agent views and after Ctrl+Z
   ([#120](https://github.com/devlawey/filar/issues/120)).
+- `Ctrl+N` (new tab) and `Ctrl+W` (close tab) now work from interactive terminal
+  mode; previously they were forwarded to the PTY and ignored
+  ([#121](https://github.com/devlawey/filar/issues/121)).
 
 ## [0.5.1] - 2026-07-22
 
