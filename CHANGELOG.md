@@ -16,6 +16,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Interactive scrollbar now responds to mouse drag; it was previously only
   controllable via PgUp/PgDn keys
   ([#119](https://github.com/devlawey/filar/issues/119)).
+- Fixed visual artifacts (stale text, status-bar fragments) when switching between
+  session tabs, especially from interactive to agent views and after Ctrl+Z
+  ([#120](https://github.com/devlawey/filar/issues/120)).
 
 ## [0.5.1] - 2026-07-22
 
