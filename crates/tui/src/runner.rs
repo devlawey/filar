@@ -226,6 +226,7 @@ async fn run_app(
     terminal.draw(|f| ui::render(f, &mut app)).ok();
 
     let mut prev_mode = app.mode;
+    let mut prev_active = app.active;
     let mut needs_redraw = false;
     let mut render_interval = tokio::time::interval(Duration::from_millis(16));
     render_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -545,12 +546,16 @@ async fn run_app(
             _ = render_interval.tick(), if needs_redraw
                 || app.mode == AppMode::Thinking
                 || app.toast.is_some() => {
+                let tab_changed = prev_active != app.active;
                 if app.mode == AppMode::Thinking {
                     app.tick = app.tick.wrapping_add(1);
                 }
-                if prev_mode != app.mode {
+                if prev_mode != app.mode || tab_changed {
                     terminal.clear().ok();
                     prev_mode = app.mode;
+                }
+                if tab_changed {
+                    prev_active = app.active;
                 }
                 terminal.draw(|f| ui::render(f, &mut app)).ok();
                 needs_redraw = false;
@@ -580,9 +585,10 @@ async fn run_app(
             if app.mode == AppMode::Thinking {
                 app.tick = app.tick.wrapping_add(1);
             }
-            if prev_mode != app.mode {
+            if prev_mode != app.mode || prev_active != app.active {
                 terminal.clear().ok();
                 prev_mode = app.mode;
+                prev_active = app.active;
             }
             terminal.draw(|f| ui::render(f, &mut app)).ok();
             needs_redraw = false;
