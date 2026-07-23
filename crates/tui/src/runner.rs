@@ -330,8 +330,10 @@ async fn run_app(
                         // Resize all session models — even background tabs.
                         resize_all_models(&mut app, term_cols, term_rows);
                         // Resize all live backends.
-                        for (_, (ref term, _)) in interactive_backends.iter() {
-                            let _ = term.resize(term_cols, term_rows).await;
+                        for (sid, (ref term, _)) in interactive_backends.iter() {
+                            if let Err(e) = term.resize(term_cols, term_rows).await {
+                                warn!(error = %e, sid = ?sid, "terminal resize failed");
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -960,7 +962,7 @@ mod tests {
         }
         resize_all_models(&mut app, 100, 30);
         for s in &app.sessions {
-            let t = s.terminal.as_ref().unwrap();
+            let t = s.terminal.as_ref().expect("terminal model must be set");
             assert_eq!(t.rows(), 30);
             assert_eq!(t.cols(), 100);
         }
