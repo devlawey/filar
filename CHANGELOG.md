@@ -36,8 +36,6 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   clears on switch; docs updated for persistent per-tab terminals
   ([#118](https://github.com/devlawey/filar/issues/118)).
 
-### Added
-
 - Per-terminal reader tasks feed a tagged channel so every interactive backend
   (including background tabs) is drained and routed to its own session model
   ([#114](https://github.com/devlawey/filar/issues/114)).
