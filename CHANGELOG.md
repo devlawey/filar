@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Changed
+
+- Interactive terminal backends are now stored per `SessionId` in the runner
+  (internal refactor, no behavior change) preparing per-tab persistent terminals
+  ([#113](https://github.com/devlawey/filar/issues/113)).
+
 ### Fixed
 
 - Interactive scrollbar now responds to mouse drag; it was previously only

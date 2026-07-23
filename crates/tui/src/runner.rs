@@ -219,8 +219,11 @@ async fn run_app(
     // Crossterm event stream for async keyboard input.
     let mut events = EventStream::new();
 
-    // Interactive terminal backend (set when entering interactive mode).
-    let mut interactive_term: Option<Arc<dyn InteractiveTerminal>> = None;
+    // Interactive terminal backends — one per session, keyed by SessionId.
+    let mut interactive_backends: std::collections::HashMap<
+        crate::app::SessionId,
+        Arc<dyn InteractiveTerminal>,
+    > = std::collections::HashMap::new();
 
     // Draw initial UI.
     terminal.draw(|f| ui::render(f, &mut app)).ok();
@@ -238,8 +241,9 @@ async fn run_app(
 
     loop {
         let in_interactive = app.mode == AppMode::Interactive;
-        // Clone the Arc for the read future (avoids borrowing interactive_term).
-        let term_for_read = interactive_term.clone();
+        // Clone the Arc for the read future (avoids borrowing backends map).
+        let active_sid = app.sessions[app.active].id;
+        let term_for_read = interactive_backends.get(&active_sid).cloned();
 
         tokio::select! {
             // Terminal keyboard / resize event.
@@ -263,7 +267,7 @@ async fn run_app(
                             if let Some(model) = &mut app.terminal {
                                 model.resize(term_cols, term_rows);
                             }
-                            if let Some(ref term) = interactive_term {
+                            if let Some(ref term) = interactive_backends.get(&active_sid) {
                                 let _ = term.resize(term_cols, term_rows).await;
                             }
                         }
@@ -284,10 +288,9 @@ async fn run_app(
                 if app.take_toggle_interactive() {
                     if in_interactive {
                         // Exit interactive mode.
-                        if let Some(ref term) = interactive_term {
+                        if let Some(term) = interactive_backends.remove(&active_sid) {
                             let _ = term.close().await;
                         }
-                        interactive_term = None;
                         app.exit_interactive();
                     } else if !app.agent_running {
                         // Enter interactive mode.
@@ -307,7 +310,8 @@ async fn run_app(
                         match term_result {
                             Ok(term) => {
                                 let model = TerminalModel::new(cols, rows);
-                                interactive_term = Some(term);
+                                interactive_backends
+                                    .insert(active_sid, term);
                                 app.enter_interactive(model);
                             }
                             Err(e) => {
@@ -320,7 +324,7 @@ async fn run_app(
 
                 // Forward terminal input bytes to the backend.
                 if let Some(bytes) = app.take_term_input() {
-                    if let Some(ref term) = interactive_term {
+                    if let Some(ref term) = interactive_backends.get(&active_sid) {
                         let _ = term.write_input(&bytes).await;
                     }
                 }
@@ -514,16 +518,15 @@ async fn run_app(
                     }
                     Ok(None) => {
                         // Terminal EOF (shell exited) — auto-exit interactive mode.
-                        if let Some(ref term) = interactive_term {
+                        if let Some(term) = interactive_backends.remove(&active_sid) {
                             let _ = term.close().await;
                         }
-                        interactive_term = None;
                         app.exit_interactive();
                         needs_redraw = true;
                     }
                     Err(e) => {
                         error!(error = %e, "terminal read error");
-                        interactive_term = None;
+                        interactive_backends.remove(&active_sid);
                         app.exit_interactive();
                         needs_redraw = true;
                     }
@@ -602,8 +605,8 @@ async fn run_app(
         }
     }
 
-    // Clean up interactive terminal if still open.
-    if let Some(ref term) = interactive_term {
+    // Clean up interactive terminals — close all remaining backends.
+    for (_, term) in interactive_backends.drain() {
         let _ = term.close().await;
     }
 
