@@ -2743,3 +2743,33 @@ Normal→Normal).
 closed session ignore, EOF outcome).
 
 **Тесты:** `cargo test -p filar-tui` — 215 passed (212 + 3 новых).
+
+---
+
+## Issue #115: feat(tui) — персистентное переключение вкладок
+
+**Проблема:** в 0.5.1 переключение вкладок в интерактивном режиме убивало PTY
+(exit-on-switch). Нужно оставлять терминал живым — как оставлял.
+
+**Решение:**
+- `app.rs`:
+  - Ctrl+T в Interactive → `hide_interactive_view()` (прячет вид, PTY жив).
+  - Ctrl+T в Normal с живым терминалом → `show_interactive_view()`.
+  - Ctrl+T в Normal без терминала → `toggle_interactive = true` (runner создаст).
+  - Ctrl+Tab/Ctrl+PgUp/Ctrl+PgDn в Interactive → переключение вкладки **без**
+    `toggle_interactive` (терминал остаётся в фоне).
+  - `hide_interactive_view()`: mode = Normal, terminal сохраняется.
+  - `show_interactive_view()`: mode = Interactive, если terminal.is_some().
+  - `exit_interactive()` НЕ трогался — полный teardown через runner/tab close.
+- `runner.rs`:
+  - При `take_toggle_interactive()`: если бэкенд уже существует для сессии,
+    просто `show_interactive_view()`. Новый создаётся только если бэкенда нет.
+
+**Тесты:** `interactive_ctrl_tab_switches_without_exiting` (был `_and_exits`),
+`hide_view_keeps_terminal_alive`, `show_view_restores_interactive`,
+`ctrl_t_in_normal_shows_hidden_terminal`.
+
+**Публичные контракты:** `hide_interactive_view()`, `show_interactive_view()` —
+новые pub-методы App.
+
+**Тесты:** `cargo test -p filar-tui` — 218 passed (215 + 3 новых).

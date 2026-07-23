@@ -359,6 +359,9 @@ async fn run_app(
                             handle.abort();
                         }
                         app.exit_interactive();
+                    } else if interactive_backends.contains_key(&toggle_sid) {
+                        // Session already has a live backend — just show its view.
+                        app.show_interactive_view();
                     } else if !app.agent_running {
                         // Enter interactive mode.
                         let size = terminal.size().unwrap_or_default();

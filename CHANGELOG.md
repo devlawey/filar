@@ -23,6 +23,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   (including background tabs) is drained and routed to its own session model
   ([#114](https://github.com/devlawey/filar/issues/114)).
 
+### Changed
+
+- Interactive terminals are now persistent per tab: switching tabs no longer
+  closes the terminal, and Ctrl+T toggles the view without killing the PTY
+  (supersedes the 0.5.1 exit-on-switch behavior)
+  ([#115](https://github.com/devlawey/filar/issues/115)).
+
 ### Fixed
 
 - Interactive scrollbar now responds to mouse drag; it was previously only
