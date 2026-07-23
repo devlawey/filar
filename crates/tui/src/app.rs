@@ -4764,4 +4764,15 @@ mod tests {
         let closed = app.take_closed_ids();
         assert!(closed.contains(&sid), "close_tab must signal SessionId for teardown");
     }
+
+    #[test]
+    fn switching_to_tab_clears_new_output_marker() {
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        app.new_tab(); // active = 1
+        app.sessions[0].has_new = true; // simulate background terminal output
+        app.switch_to_tab(1); // switch to tab 0 (1-based index)
+        assert!(!app.sessions[0].has_new, "marker must clear on view");
+        // Tab 0 is now active; tab 1's marker unchanged.
+        assert!(!app.sessions[1].has_new);
+    }
 }
