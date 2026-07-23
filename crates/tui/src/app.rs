@@ -184,6 +184,9 @@ pub struct App {
     pub status_bar_area: Rect,
     /// Help bar area (set during render, for hit-testing).
     pub help_bar_area: Rect,
+    /// SessionIds of recently closed tabs — consumed by runner to teardown
+    /// corresponding interactive backends.
+    pub closed_ids: Vec<SessionId>,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -318,6 +321,7 @@ impl App {
             theme: Theme::default_dark(),
             status_bar_area: Rect::default(),
             help_bar_area: Rect::default(),
+            closed_ids: Vec::new(),
         }
     }
 
@@ -330,11 +334,14 @@ impl App {
     }
 
     /// Close the active tab. If it's the last tab, set should_quit.
+    /// Pushes the closed session's SessionId into `closed_ids` so the
+    /// runner can teardown its interactive backend (PTY/reader task).
     pub fn close_tab(&mut self) {
         if self.sessions.len() <= 1 {
             self.should_quit = true;
             return;
         }
+        let sid = self.sessions[self.active].id;
         // Cancel the agent task for the tab being closed so leftover
         // events don't land on the next active session.
         if let Some(ref token) = self.sessions[self.active].cancellation {
@@ -344,6 +351,12 @@ impl App {
         if self.active >= self.sessions.len() {
             self.active = self.sessions.len() - 1;
         }
+        self.closed_ids.push(sid);
+    }
+
+    /// Take and clear the list of closed session IDs (for runner to process).
+    pub fn take_closed_ids(&mut self) -> Vec<SessionId> {
+        std::mem::take(&mut self.closed_ids)
     }
 
     /// Switch to the previous tab (wraps around).
@@ -4740,5 +4753,15 @@ mod tests {
         assert_eq!(app.sessions[0].mode, AppMode::Interactive);
         assert!(app.sessions[1].terminal.is_some());
         assert_eq!(app.sessions[1].mode, AppMode::Interactive);
+    }
+
+    #[test]
+    fn closing_tab_signals_backend_teardown() {
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        app.new_tab(); // active = 1
+        let sid = app.sessions[app.active].id;
+        app.close_tab();
+        let closed = app.take_closed_ids();
+        assert!(closed.contains(&sid), "close_tab must signal SessionId for teardown");
     }
 }

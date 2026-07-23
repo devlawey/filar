@@ -21,6 +21,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   (supersedes the 0.5.1 exit-on-switch behavior)
   ([#115](https://github.com/devlawey/filar/issues/115)).
 
+### Fixed
+
+- Per-tab interactive terminals are torn down on tab close and app exit, and
+  background EOF/errors retire a tab's terminal without disturbing the active
+  tab ([#116](https://github.com/devlawey/filar/issues/116)).
+
 ### Added
 
 - Per-terminal reader tasks feed a tagged channel so every interactive backend

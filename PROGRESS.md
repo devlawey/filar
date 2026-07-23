@@ -2774,3 +2774,27 @@ closed session ignore, EOF outcome).
 
 **Тесты:** `cargo test -p filar-tui` — 218 passed (215 + 3 новых).
 **Следующие шаги:** ручная проверка на Windows Terminal (терминал переживает переключение вкладок, Ctrl+T тумблит вид).
+
+---
+
+## Issue #116: feat(tui) — жизненный цикл терминалов
+
+**Проблема:** close_tab (Ctrl+W) не закрывал бэкенд интерактивного терминала —
+только отменял агента. PTY/reader-задача висели до финальной очистки.
+
+**Решение:**
+- `app.rs`: `close_tab()` теперь кладёт `SessionId` закрытой вкладки в
+  `closed_ids: Vec<SessionId>`. `take_closed_ids()` — drain для runner'а.
+- `runner.rs`: после каждой итерации event-loop дренируются `take_closed_ids()`,
+  для каждого закрытого id — `interactive_backends.remove()` + `close()` +
+  `handle.abort()`.
+- Финальная очистка (уже была из #114) закрывает оставшиеся бэкенды.
+- Background EOF/Err (из #115 fix) чистит `session.terminal = None` для
+  неактивных сессий, не переключая активную.
+
+**Тесты:** новый тест `closing_tab_signals_backend_teardown` (проверяет
+`take_closed_ids()`).
+
+**Публичные контракты:** `App::closed_ids`, `App::take_closed_ids()`.
+
+**Тесты:** `cargo test -p filar-tui` — 220 passed (219 + 1 новый).
