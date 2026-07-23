@@ -59,6 +59,9 @@ enum RouteOutcome {
 /// - `Eof`/`Err` return the respective outcome without modifying the model.
 /// - If the session is not found (tab closed), the chunk is silently ignored.
 fn route_term_chunk(app: &mut App, sid: SessionId, chunk: TermChunk) -> RouteOutcome {
+    if app.sessions.is_empty() {
+        return RouteOutcome::Ignored;
+    }
     let active_id = app.sessions[app.active].id;
     let Some(session) = app.sessions.iter_mut().find(|s| s.id == sid) else {
         return RouteOutcome::Ignored;
@@ -280,8 +283,11 @@ async fn run_app(
 
     // Tagged channel: reader tasks push (SessionId, TermChunk); the event
     // loop receives and routes to the correct session model.
-    let (term_tx, mut term_rx) =
+    let (term_tx, term_rx) =
         tokio::sync::mpsc::unbounded_channel::<(crate::app::SessionId, TermChunk)>();
+    // Store in Option so we can disable polling when the channel closes
+    // (same pattern as log_rx), avoiding a busy-loop.
+    let mut term_rx_opt: Option<tokio::sync::mpsc::UnboundedReceiver<_>> = Some(term_rx);
 
     // Draw initial UI.
     terminal.draw(|f| ui::render(f, &mut app)).ok();
@@ -344,8 +350,9 @@ async fn run_app(
                 if app.take_toggle_interactive() {
                     let toggle_sid = app.sessions[app.active].id;
                     if in_interactive {
-                        // Exit interactive mode — abort reader, close backend.
-                        if let Some((_, handle)) = interactive_backends.remove(&toggle_sid) {
+                        // Exit interactive mode — close backend, abort reader.
+                        if let Some((term, handle)) = interactive_backends.remove(&toggle_sid) {
+                            let _ = term.close().await;
                             handle.abort();
                         }
                         app.exit_interactive();
@@ -583,12 +590,27 @@ async fn run_app(
             // Terminal output from reader tasks (all sessions — including
             // background tabs). Each chunk carries its own SessionId so
             // routing works correctly regardless of the active tab.
-            maybe_chunk = term_rx.recv() => {
+            // When the channel closes (all senders dropped), switch to
+            // pending to avoid a busy-loop — same pattern as recv_log_line.
+            maybe_chunk = recv_term_chunk(&mut term_rx_opt) => {
                 if let Some((sid, chunk)) = maybe_chunk {
                     let outcome = route_term_chunk(&mut app, sid, chunk);
                     match outcome {
-                        RouteOutcome::Eof | RouteOutcome::Error(_) => {
-                            if let Some((_, handle)) = interactive_backends.remove(&sid) {
+                        RouteOutcome::Eof => {
+                            if let Some((term, handle)) = interactive_backends.remove(&sid) {
+                                let _ = term.close().await;
+                                handle.abort();
+                            }
+                            if app.sessions[app.active].id == sid
+                                && app.mode == AppMode::Interactive
+                            {
+                                app.exit_interactive();
+                            }
+                        }
+                        RouteOutcome::Error(e) => {
+                            error!(error = %e, "terminal read error, sid={sid:?}");
+                            if let Some((term, handle)) = interactive_backends.remove(&sid) {
+                                let _ = term.close().await;
                                 handle.abort();
                             }
                             if app.sessions[app.active].id == sid
@@ -675,8 +697,9 @@ async fn run_app(
         }
     }
 
-    // Clean up interactive terminals — abort reader tasks.
-    for (_, (_, handle)) in interactive_backends.drain() {
+    // Clean up interactive terminals — close all remaining backends, abort readers.
+    for (_, (term, handle)) in interactive_backends.drain() {
+        let _ = term.close().await;
         handle.abort();
     }
 
@@ -724,6 +747,21 @@ async fn recv_log_line(log_rx: &mut Option<mpsc::UnboundedReceiver<String>>) -> 
         *log_rx = None;
     }
     line
+}
+
+/// Receive a terminal chunk from the tagged channel, disabling polling
+/// when the channel closes to avoid a busy-loop (same pattern as `recv_log_line`).
+async fn recv_term_chunk(
+    rx_opt: &mut Option<mpsc::UnboundedReceiver<(SessionId, TermChunk)>>,
+) -> Option<(SessionId, TermChunk)> {
+    let chunk = match rx_opt.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending::<Option<(SessionId, TermChunk)>>().await,
+    };
+    if chunk.is_none() {
+        *rx_opt = None;
+    }
+    chunk
 }
 
 /// Spawn the agent in a tokio task to process the user's input.
