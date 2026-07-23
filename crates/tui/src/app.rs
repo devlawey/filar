@@ -4648,6 +4648,9 @@ mod tests {
         assert_eq!(app.sessions.len(), 2, "Ctrl+N must create a new tab");
         assert!(!app.take_toggle_interactive(), "Ctrl+N must NOT request interactive teardown");
         assert!(app.take_term_input().is_none(), "Ctrl+N must not be forwarded to PTY");
+        // Old tab's terminal still alive in background.
+        assert_eq!(app.sessions[0].mode, AppMode::Interactive);
+        assert!(app.sessions[0].terminal.is_some(), "old tab terminal must persist");
     }
 
     #[test]
