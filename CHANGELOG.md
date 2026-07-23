@@ -32,6 +32,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Background terminal output marks its tab with a new-output indicator that
+  clears on switch; docs updated for persistent per-tab terminals
+  ([#118](https://github.com/devlawey/filar/issues/118)).
+
 - Per-terminal reader tasks feed a tagged channel so every interactive backend
   (including background tabs) is drained and routed to its own session model
   ([#114](https://github.com/devlawey/filar/issues/114)).

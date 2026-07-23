@@ -199,7 +199,10 @@ Type `!` followed by a command to run it directly (bypassing the agent):
 | `Ctrl+Q` | Quit the app (denies a pending command first in Confirming) |
 | `Ctrl+Z` | Cancel: stop the agent (Thinking) / deny the command (Confirming) |
 | `Ctrl+C` | Nothing — left free so it can be used to copy the selection |
-| `Ctrl+T` | Toggle interactive terminal mode |
+| `Ctrl+T` | Toggle interactive terminal view (persistent per tab since v0.6.0) |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Switch session tab (works in interactive too) |
+| `Ctrl+N` | New local session tab |
+| `Ctrl+W` | Close active session tab |
 | `Ctrl+P` | Enter password input mode (masked) |
 | `Up/Down` | Browse input history |
 | `!command` | Shell escape (direct execution) |
@@ -208,8 +211,16 @@ Type `!` followed by a command to run it directly (bypassing the agent):
 | `Drag` | Select text and copy to clipboard |
 
 Shortcuts also work on the Russian ЙЦУКЕН layout (`Ctrl+Й`/`Ctrl+Я`/`Ctrl+Е`/`Ctrl+З`).
-In the interactive terminal all keys — including `Ctrl+C/Q/Z` — are forwarded to the
-remote program; leave it with `Ctrl+T`.
+
+**Interactive terminal:** since v0.6.0, each tab has its own persistent terminal.
+`Ctrl+T` toggles the view without killing the PTY — background processes keep running.
+`Ctrl+Tab`/`Ctrl+N`/`Ctrl+W` work from within interactive mode. Switch to another
+tab while a command runs, come back later — everything is as you left it.
+Closing a tab closes its terminal. The tab bar shows activity indicators:
+`●` = agent running, `?` = awaiting confirmation, `○` = new output in background.
+
+All other keys in interactive mode — including `Ctrl+C/Q/Z` — are forwarded
+to the remote program; use `Ctrl+T` to return to agent mode.
 
 ### SSH Connection
 
