@@ -2684,3 +2684,22 @@ Normal→Normal).
 
 **Тесты:** `cargo test -p filar-tui` — 210 passed.
 **Следующие шаги:** ручная проверка на Windows Terminal (артефакты при переключении вкладок после Ctrl+Z).
+
+---
+
+## Issue #121: bug(tui) — Ctrl+N не работает в интерактивном режиме
+
+**Проблема:** в интерактивном терминальном режиме `Ctrl+N` и `Ctrl+W` уходили
+в PTY (блокированы гейтом `mode != Interactive` в глобальных хоткеях).
+
+**Решение:**
+- `crates/tui/src/app.rs`, `AppMode::Interactive` в `handle_key`: перед
+  конвертацией в байты PTY перехватываются `Ctrl+N` (`new_tab()`) и
+  `Ctrl+W` (`close_tab()`). Без `toggle_interactive` — старая терминальная
+  вкладка остаётся живой. Перехват всегда (даже при одной вкладке для Ctrl+N).
+- Юнит-тесты: `interactive_ctrl_n_creates_new_tab_without_exiting`,
+  `interactive_ctrl_w_closes_tab`.
+
+**Публичные контракты:** без изменений (внутренний обработчик клавиш).
+
+**Тесты:** `cargo test -p filar-tui` — 212 passed (210 + 2 новых).
