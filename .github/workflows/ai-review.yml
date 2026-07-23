@@ -31,10 +31,6 @@ permissions:
   contents: read
   pull-requests: write
 
-concurrency:
-  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
-  cancel-in-progress: true
-
 env:
   # Фолбэк, если переменная репозитория AI_REVIEW_MODEL не задана.
   # Актуальный список слагов: https://openrouter.ai/models
@@ -51,6 +47,12 @@ jobs:
        github.event.issue.pull_request != null &&
        startsWith(github.event.comment.body, '/ai-review') &&
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    # ВАЖНО: concurrency именно на уровне job, а не воркфлоу.
+    # На уровне воркфлоу он гасил бы и пустые прогоны, порождённые
+    # комментариями ботов (CodeRabbit), а те отменяли бы настоящее ревью.
+    concurrency:
+      group: ai-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -108,9 +110,23 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
+
+      # На самом первом PR (который эти файлы и добавляет) в базовой ветке
+      # ревьюера ещё нет — checkout базы его не найдёт. Вместо непонятного
+      # креша даём внятную пометку и зелёный прогон.
+      - name: Проверить наличие ревьюера в базовой ветке
+        id: guard
+        run: |
+          if [ -f .github/ai-review/review.mjs ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::AI-ревьюер ещё не влит в базовую ветку — пропускаю. Смержи этот PR, и со следующего он заработает."
+          fi
 
       - name: Ревью
+        if: steps.guard.outputs.ok == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
