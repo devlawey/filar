@@ -1219,20 +1219,19 @@ impl App {
             && m.row >= area.y
             && m.row < area.y + area.height;
 
-        if on_scrollbar {
+        let dragging_scrollbar = self.mouse_drag == Some(DragKind::Scrollbar);
+        if on_scrollbar || dragging_scrollbar {
             match m.kind {
-                MouseEventKind::Down(_) => {
+                MouseEventKind::Down(_) if on_scrollbar => {
                     self.mouse_drag = Some(DragKind::Scrollbar);
                     self.terminal_scrollbar_drag(m.row);
                     return;
                 }
-                MouseEventKind::Drag(_) => {
-                    if self.mouse_drag == Some(DragKind::Scrollbar) {
-                        self.terminal_scrollbar_drag(m.row);
-                    }
+                MouseEventKind::Drag(_) if dragging_scrollbar => {
+                    self.terminal_scrollbar_drag(m.row);
                     return;
                 }
-                MouseEventKind::Up(_) => {
+                MouseEventKind::Up(_) if dragging_scrollbar => {
                     self.mouse_drag = None;
                     return;
                 }
@@ -1517,14 +1516,17 @@ impl App {
         }
         let Some(ref mut t) = self.terminal else { return };
         let visible_height = (area.height as usize).min(t.rows() as usize);
+        if visible_height < 2 {
+            return;
+        }
         let total_lines = t.total_grid_lines();
         let scroll_len = total_lines.saturating_sub(visible_height);
         if scroll_len == 0 {
             return;
         }
         let track_top = area.y;
-        let relative_row = (row.saturating_sub(track_top)) as usize;
-        let track_span = (visible_height - 1).max(1);
+        let track_span = visible_height - 1;
+        let relative_row = (row.saturating_sub(track_top) as usize).min(track_span);
         let position = relative_row * scroll_len / track_span;
         let desired_offset = (scroll_len - position) as i32;
         let current = t.display_offset() as i32;
