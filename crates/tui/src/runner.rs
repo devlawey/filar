@@ -325,16 +325,13 @@ async fn run_app(
                         needs_redraw = true;
                     }
                     Some(Ok(Event::Resize(cols, rows))) => {
-                        if in_interactive {
-                            let resize_sid = app.sessions[app.active].id;
-                            let term_cols = cols;
-                            let term_rows = ui::interactive_grid_rows(rows);
-                            if let Some(model) = &mut app.terminal {
-                                model.resize(term_cols, term_rows);
-                            }
-                            if let Some((ref term, _)) = interactive_backends.get(&resize_sid) {
-                                let _ = term.resize(term_cols, term_rows).await;
-                            }
+                        let term_cols = cols;
+                        let term_rows = ui::interactive_grid_rows(rows);
+                        // Resize all session models — even background tabs.
+                        resize_all_models(&mut app, term_cols, term_rows);
+                        // Resize all live backends.
+                        for (_, (ref term, _)) in interactive_backends.iter() {
+                            let _ = term.resize(term_cols, term_rows).await;
                         }
                         needs_redraw = true;
                     }
@@ -786,6 +783,15 @@ async fn recv_term_chunk(
     chunk
 }
 
+/// Resize every session's terminal model — both active and background tabs.
+pub fn resize_all_models(app: &mut App, cols: u16, rows: u16) {
+    for session in app.sessions.iter_mut() {
+        if let Some(ref mut model) = session.terminal {
+            model.resize(cols, rows);
+        }
+    }
+}
+
 /// Spawn the agent in a tokio task to process the user's input.
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent(
@@ -942,5 +948,21 @@ mod tests {
 
         let outcome = route_term_chunk(&mut app, sid, TermChunk::Eof);
         assert!(matches!(outcome, RouteOutcome::Eof));
+    }
+
+    #[test]
+    fn resize_applies_to_all_session_models() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        app.new_tab();
+        for s in app.sessions.iter_mut() {
+            s.terminal = Some(crate::terminal::TerminalModel::new(80, 24));
+        }
+        resize_all_models(&mut app, 100, 30);
+        for s in &app.sessions {
+            let t = s.terminal.as_ref().unwrap();
+            assert_eq!(t.rows(), 30);
+            assert_eq!(t.cols(), 100);
+        }
     }
 }

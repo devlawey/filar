@@ -26,6 +26,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Per-tab interactive terminals are torn down on tab close and app exit, and
   background EOF/errors retire a tab's terminal without disturbing the active
   tab ([#116](https://github.com/devlawey/filar/issues/116)).
+- Window resize now propagates to every live per-tab terminal (model and backend),
+  not just the active one, so background terminals stay correctly sized
+  ([#117](https://github.com/devlawey/filar/issues/117)).
 
 ### Added
 
