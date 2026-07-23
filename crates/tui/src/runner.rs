@@ -607,6 +607,10 @@ async fn run_app(
                                 let _ = term.close().await;
                                 handle.abort();
                             }
+                            // Clear the terminal model for the dying session.
+                            if let Some(s) = app.sessions.iter_mut().find(|s| s.id == sid) {
+                                s.terminal = None;
+                            }
                             if app.sessions.get(app.active).map(|s| s.id) == Some(sid)
                                 && app.mode == AppMode::Interactive
                             {
@@ -618,6 +622,9 @@ async fn run_app(
                             if let Some((term, handle)) = interactive_backends.remove(&sid) {
                                 let _ = term.close().await;
                                 handle.abort();
+                            }
+                            if let Some(s) = app.sessions.iter_mut().find(|s| s.id == sid) {
+                                s.terminal = None;
                             }
                             if app.sessions.get(app.active).map(|s| s.id) == Some(sid)
                                 && app.mode == AppMode::Interactive

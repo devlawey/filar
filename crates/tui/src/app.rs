@@ -870,9 +870,9 @@ impl App {
                     self.close_tab();
                     return;
                 }
-                // Tab navigation when multiple tabs are open: switch tab and
-                // exit interactive mode (global PTY, not per-session). Single
-                // tab → let keys fall through to PTY unchanged.
+                // Tab navigation when multiple tabs are open: switch the active
+                // tab while preserving per-tab terminal state. PTY stays alive
+                // in the background — no teardown, no toggle_interactive.
                 if self.sessions.len() > 1 {
                     let switch = match (key.code, key.modifiers) {
                         (KeyCode::Tab, m) if m.contains(KeyModifiers::CONTROL) => {
@@ -1359,8 +1359,8 @@ impl App {
             }
             HelpAction::Quit => {
                 if self.mode == AppMode::Interactive {
-                    // No quit from interactive — Ctrl+T returns to agent mode.
-                    self.toggle_interactive = true;
+                    // Hide terminal view without killing PTY (persistent tabs).
+                    self.hide_interactive_view();
                 } else {
                     self.quit();
                 }
@@ -4705,7 +4705,7 @@ mod tests {
     }
 
     #[test]
-    fn cyttrl_t_in_normal_shows_hidden_terminal() {
+    fn ctrl_t_in_normal_shows_hidden_terminal() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = App::new("t0".into(), CommandConfirmMode::Always);
         app.enter_interactive(crate::terminal::TerminalModel::new(80, 24));
@@ -4715,5 +4715,30 @@ mod tests {
 
         assert_eq!(app.mode, AppMode::Interactive, "Ctrl+T must show hidden terminal");
         assert!(!app.take_toggle_interactive(), "must not request runner teardown");
+    }
+
+    #[test]
+    fn each_tab_preserves_its_own_terminal() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        app.new_tab(); // active = 1 (t1)
+
+        // Give each tab a distinct terminal model.
+        let _t0 = app.sessions[0].id;
+        let _t1 = app.sessions[1].id;
+        app.sessions[0].terminal = Some(crate::terminal::TerminalModel::new(80, 20));
+        app.sessions[1].terminal = Some(crate::terminal::TerminalModel::new(80, 24));
+        app.sessions[0].mode = AppMode::Interactive;
+        app.sessions[1].mode = AppMode::Interactive;
+
+        // Switch to tab 0.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        assert_eq!(app.active, 0);
+
+        // Verify tab 0's terminal is intact, tab 1's also alive.
+        assert!(app.sessions[0].terminal.is_some());
+        assert_eq!(app.sessions[0].mode, AppMode::Interactive);
+        assert!(app.sessions[1].terminal.is_some());
+        assert_eq!(app.sessions[1].mode, AppMode::Interactive);
     }
 }

@@ -16,19 +16,16 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Interactive terminal backends are now stored per `SessionId` in the runner
   (internal refactor, no behavior change) preparing per-tab persistent terminals
   ([#113](https://github.com/devlawey/filar/issues/113)).
+- Interactive terminals are now persistent per tab: switching tabs no longer
+  closes the terminal, and Ctrl+T toggles the view without killing the PTY
+  (supersedes the 0.5.1 exit-on-switch behavior)
+  ([#115](https://github.com/devlawey/filar/issues/115)).
 
 ### Added
 
 - Per-terminal reader tasks feed a tagged channel so every interactive backend
   (including background tabs) is drained and routed to its own session model
   ([#114](https://github.com/devlawey/filar/issues/114)).
-
-### Changed
-
-- Interactive terminals are now persistent per tab: switching tabs no longer
-  closes the terminal, and Ctrl+T toggles the view without killing the PTY
-  (supersedes the 0.5.1 exit-on-switch behavior)
-  ([#115](https://github.com/devlawey/filar/issues/115)).
 
 ### Fixed
 

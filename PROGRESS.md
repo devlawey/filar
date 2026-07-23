@@ -2773,3 +2773,4 @@ closed session ignore, EOF outcome).
 новые pub-методы App.
 
 **Тесты:** `cargo test -p filar-tui` — 218 passed (215 + 3 новых).
+**Следующие шаги:** ручная проверка на Windows Terminal (терминал переживает переключение вкладок, Ctrl+T тумблит вид).
