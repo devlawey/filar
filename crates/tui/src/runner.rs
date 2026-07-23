@@ -242,8 +242,16 @@ async fn run_app(
     loop {
         let in_interactive = app.mode == AppMode::Interactive;
         // Clone the Arc for the read future (avoids borrowing backends map).
-        let active_sid = app.sessions[app.active].id;
-        let term_for_read = interactive_backends.get(&active_sid).cloned();
+        // The read sid is captured alongside the Arc so the read result can
+        // be dispatched to the correct session even if the active tab changes.
+        let read_pair: Option<(crate::app::SessionId, Arc<dyn InteractiveTerminal>)> =
+            if in_interactive {
+                let sid = app.sessions[app.active].id;
+                interactive_backends.get(&sid).map(|term| (sid, term.clone()))
+            } else {
+                None
+            };
+        let term_for_read = read_pair.as_ref().map(|(_, t)| t.clone());
 
         tokio::select! {
             // Terminal keyboard / resize event.
@@ -262,12 +270,13 @@ async fn run_app(
                     }
                     Some(Ok(Event::Resize(cols, rows))) => {
                         if in_interactive {
+                            let resize_sid = app.sessions[app.active].id;
                             let term_cols = cols;
                             let term_rows = ui::interactive_grid_rows(rows);
                             if let Some(model) = &mut app.terminal {
                                 model.resize(term_cols, term_rows);
                             }
-                            if let Some(ref term) = interactive_backends.get(&active_sid) {
+                            if let Some(ref term) = interactive_backends.get(&resize_sid) {
                                 let _ = term.resize(term_cols, term_rows).await;
                             }
                         }
@@ -286,9 +295,10 @@ async fn run_app(
 
                 // Handle mode toggle (Ctrl+T).
                 if app.take_toggle_interactive() {
+                    let toggle_sid = app.sessions[app.active].id;
                     if in_interactive {
                         // Exit interactive mode.
-                        if let Some(term) = interactive_backends.remove(&active_sid) {
+                        if let Some(term) = interactive_backends.remove(&toggle_sid) {
                             let _ = term.close().await;
                         }
                         app.exit_interactive();
@@ -310,8 +320,7 @@ async fn run_app(
                         match term_result {
                             Ok(term) => {
                                 let model = TerminalModel::new(cols, rows);
-                                interactive_backends
-                                    .insert(active_sid, term);
+                                interactive_backends.insert(toggle_sid, term);
                                 app.enter_interactive(model);
                             }
                             Err(e) => {
@@ -324,7 +333,8 @@ async fn run_app(
 
                 // Forward terminal input bytes to the backend.
                 if let Some(bytes) = app.take_term_input() {
-                    if let Some(ref term) = interactive_backends.get(&active_sid) {
+                    let write_sid = app.sessions[app.active].id;
+                    if let Some(ref term) = interactive_backends.get(&write_sid) {
                         let _ = term.write_input(&bytes).await;
                     }
                 }
@@ -509,6 +519,7 @@ async fn run_app(
                     >().await,
                 }
             } => {
+                let read_sid = read_pair.as_ref().map(|(sid, _)| *sid);
                 match maybe_output {
                     Ok(Some(bytes)) => {
                         if let Some(model) = &mut app.terminal {
@@ -518,15 +529,19 @@ async fn run_app(
                     }
                     Ok(None) => {
                         // Terminal EOF (shell exited) — auto-exit interactive mode.
-                        if let Some(term) = interactive_backends.remove(&active_sid) {
-                            let _ = term.close().await;
+                        if let Some(sid) = read_sid {
+                            if let Some(term) = interactive_backends.remove(&sid) {
+                                let _ = term.close().await;
+                            }
                         }
                         app.exit_interactive();
                         needs_redraw = true;
                     }
                     Err(e) => {
                         error!(error = %e, "terminal read error");
-                        interactive_backends.remove(&active_sid);
+                        if let Some(sid) = read_sid {
+                            interactive_backends.remove(&sid);
+                        }
                         app.exit_interactive();
                         needs_redraw = true;
                     }
