@@ -2846,3 +2846,19 @@ closed session ignore, EOF outcome).
 **Публичные контракты:** без новых (только тест + документация).
 
 **Тесты:** `cargo test -p filar-tui` — 222 passed (221 + 1 новый).
+
+---
+
+## Релиз v0.6.0 (подготовка)
+
+**Дата:** 2026-07-23. **Milestone:** Filar v0.6.0 (6/6 issues, все смерджены).
+
+**Что вошло:**
+- #113 (#127): refactor — бэкенды по SessionId в HashMap
+- #114 (#128): feat — насос вывода (reader-задачи + tagged channel + route_term_chunk)
+- #115 (#129): feat — персистентные per-tab терминалы (hide/show_interactive_view)
+- #116 (#130): feat — жизненный цикл терминалов (close_tab → closed_ids → runner teardown)
+- #117 (#131): fix — ресайз всех терминалов (resize_all_models + все бэкенды)
+- #118 (#132): feat — маркеры активности + документация
+
+**Engine:** не менялся (core/transport/agent не тронуты). Тег engine-v0.6.0 НЕ ставится.
