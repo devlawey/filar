@@ -1,0 +1,126 @@
+name: AI PR Review
+
+# Свой аналог CodeRabbit на OpenRouter.
+#
+# Триггеры:
+#   • pull_request  — авто-ревью при открытии и на каждый новый пуш в PR
+#   • issue_comment — команда `/ai-review [model-slug]` в комментарии к PR
+#   • workflow_dispatch — ручной запуск с выбором PR и модели
+#
+# Требуется секрет OPENROUTER_API_KEY.
+# Модель по умолчанию — из переменной репозитория AI_REVIEW_MODEL (Settings →
+# Secrets and variables → Actions → Variables). Если не задана, берётся DEFAULT_MODEL ниже.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Номер PR'
+        required: true
+        type: string
+      model:
+        description: 'OpenRouter model slug (пусто = значение по умолчанию)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+  cancel-in-progress: true
+
+env:
+  # Фолбэк, если переменная репозитория AI_REVIEW_MODEL не задана.
+  # Актуальный список слагов: https://openrouter.ai/models
+  DEFAULT_MODEL: 'anthropic/claude-sonnet-5'
+
+jobs:
+  review:
+    # Пропускаем черновики и чужие комментарии; команду принимаем только от
+    # владельца/участников репозитория.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       startsWith(github.event.comment.body, '/ai-review') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Определить PR, модель и базовый коммит
+        id: cfg
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          INPUT_PR: ${{ inputs.pr }}
+          INPUT_MODEL: ${{ inputs.model }}
+          VAR_MODEL: ${{ vars.AI_REVIEW_MODEL }}
+          PR_EVENT_NUMBER: ${{ github.event.pull_request.number }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          # --- номер PR ---
+          case "$EVENT" in
+            pull_request)   PR="$PR_EVENT_NUMBER" ;;
+            issue_comment)  PR="$ISSUE_NUMBER" ;;
+            workflow_dispatch) PR="$INPUT_PR" ;;
+          esac
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+
+          # --- модель: dispatch input > аргумент команды > переменная репо > дефолт ---
+          MODEL=""
+          if [ -n "${INPUT_MODEL:-}" ]; then
+            MODEL="$INPUT_MODEL"
+          elif [ "$EVENT" = "issue_comment" ]; then
+            # "/ai-review anthropic/claude-sonnet-5" → второй токен
+            MODEL="$(printf '%s' "$COMMENT_BODY" | head -n1 | awk '{print $2}')"
+          fi
+          [ -z "$MODEL" ] && MODEL="${VAR_MODEL:-}"
+          [ -z "$MODEL" ] && MODEL="${DEFAULT_MODEL}"
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "Ревью PR #$PR моделью $MODEL"
+
+          # --- базовый коммит: код воркфлоу и правила берём из базы, не из PR ---
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "ref=$PR_BASE_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ github.event.repository.default_branch }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ВАЖНО: чекаутим БАЗУ, а не голову PR. Скрипт, промпт и AGENTS.md должны
+      # быть доверенными — иначе PR мог бы подменить инструкции ревьюеру.
+      - name: Checkout (base)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.cfg.outputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Ревью
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.cfg.outputs.pr }}
+          MODEL: ${{ steps.cfg.outputs.model }}
+          # Инкрементальный режим: ревьюить только новое с прошлого AI-ревью.
+          INCREMENTAL: ${{ vars.AI_REVIEW_INCREMENTAL || 'true' }}
+          MAX_DIFF_CHARS: ${{ vars.AI_REVIEW_MAX_DIFF_CHARS || '120000' }}
+          MAX_FILE_CHARS: ${{ vars.AI_REVIEW_MAX_FILE_CHARS || '25000' }}
+          MAX_COMMENTS: ${{ vars.AI_REVIEW_MAX_COMMENTS || '25' }}
+          TEMPERATURE: ${{ vars.AI_REVIEW_TEMPERATURE || '0.1' }}
+        run: node .github/ai-review/review.mjs
