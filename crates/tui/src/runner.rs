@@ -62,7 +62,10 @@ fn route_term_chunk(app: &mut App, sid: SessionId, chunk: TermChunk) -> RouteOut
     if app.sessions.is_empty() {
         return RouteOutcome::Ignored;
     }
-    let active_id = app.sessions[app.active].id;
+    let Some(current) = app.sessions.get(app.active) else {
+        return RouteOutcome::Ignored;
+    };
+    let active_id = current.id;
     let Some(session) = app.sessions.iter_mut().find(|s| s.id == sid) else {
         return RouteOutcome::Ignored;
     };
@@ -601,7 +604,7 @@ async fn run_app(
                                 let _ = term.close().await;
                                 handle.abort();
                             }
-                            if app.sessions[app.active].id == sid
+                            if app.sessions.get(app.active).map(|s| s.id) == Some(sid)
                                 && app.mode == AppMode::Interactive
                             {
                                 app.exit_interactive();
@@ -613,7 +616,7 @@ async fn run_app(
                                 let _ = term.close().await;
                                 handle.abort();
                             }
-                            if app.sessions[app.active].id == sid
+                            if app.sessions.get(app.active).map(|s| s.id) == Some(sid)
                                 && app.mode == AppMode::Interactive
                             {
                                 app.exit_interactive();
