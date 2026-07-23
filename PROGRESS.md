@@ -2703,3 +2703,20 @@ Normal→Normal).
 **Публичные контракты:** без изменений (внутренний обработчик клавиш).
 
 **Тесты:** `cargo test -p filar-tui` — 212 passed (210 + 2 новых).
+
+---
+
+## Issue #113: refactor(tui) — хранилище интерактивных бэкендов по SessionId
+
+**Проблема:** бэкенд интерактивного терминала хранился в единственной переменной
+`Option<Arc<dyn InteractiveTerminal>>` — не масштабируется на per-session.
+
+**Решение:**
+- `crates/tui/src/runner.rs`: замена на `HashMap<SessionId, Arc<dyn InteractiveTerminal>>`.
+  Все операции (создание, чтение, ресайз, close, финальная очистка) работают через
+  `active_sid = app.sessions[app.active].id`. Поведение идентично 0.5.1.
+- Финальная очистка: `drain()` всех бэкендов.
+
+**Публичные контракты:** без изменений (внутренний рефактор runner).
+
+**Тесты:** `cargo test -p filar-tui` — 212 passed, 0 failed.
