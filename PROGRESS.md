@@ -2798,3 +2798,22 @@ closed session ignore, EOF outcome).
 **Публичные контракты:** `App::closed_ids`, `App::take_closed_ids()`.
 
 **Тесты:** `cargo test -p filar-tui` — 220 passed (219 + 1 новый).
+
+---
+
+## Issue #117: fix(tui) — ресайз окна применяется ко всем живым терминалам
+
+**Проблема:** ресайз окна применялся только к активной сессии (модель + бэкенд).
+Фоновые терминалы не ресайзились — после разворота на весь экран и обратно
+«съезжал» prompt.
+
+**Решение:**
+- `crates/tui/src/runner.rs`: `Event::Resize` больше не под гейтом `in_interactive`.
+  `resize_all_models()` — применяет `model.resize()` ко ВСЕМ сессиям, у которых
+  есть модель. Все бэкенды в `interactive_backends` получают `term.resize()`.
+- `resize_all_models()` — вынесена как `pub fn` для тестирования.
+
+**Тесты:** `resize_applies_to_all_session_models` — 2 сессии с моделями, ресайз
+применяется к обеим.
+
+**Тесты:** `cargo test -p filar-tui` — 221 passed (220 + 1 новый).
