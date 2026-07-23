@@ -2720,3 +2720,26 @@ Normal→Normal).
 **Публичные контракты:** без изменений (внутренний рефактор runner).
 
 **Тесты:** `cargo test -p filar-tui` — 212 passed, 0 failed.
+
+---
+
+## Issue #114: feat(tui) — насос вывода терминалов (reader-задачи + тегированный канал)
+
+**Проблема:** вывод читался inline в `select!` из одного активного бэкенда.
+При нескольких живых терминалах (issue-3) фоновые PTY не читались.
+
+**Решение:**
+- `crates/tui/src/runner.rs`:
+  - `TermChunk` (Bytes/Eof/Err) и `RouteOutcome` (Fed/Eof/Error/Ignored) enum'ы.
+  - Канал `(term_tx, term_rx)` для `(SessionId, TermChunk)`.
+  - При создании бэкенда спавнится reader-задача (tokio::spawn), шлёт чанки
+    в канал. Бэкенд хранится как `(Arc<dyn InteractiveTerminal>, JoinHandle<()>)`.
+  - Ветка `select!` читает из `term_rx.recv()` вместо `read_output()`.
+  - `route_term_chunk()` — чистая функция роутинга: Bytes → feed в модель +
+    `has_new` для фоновых, Eof/Err → outcome для caller'а, Unknown sid → Ignored.
+  - Закрытие бэкенда: `handle.abort()`. Финальная очистка — abort всех reader'ов.
+
+**Тесты:** 3 новых юнит-теста для `route_term_chunk` (background marking,
+closed session ignore, EOF outcome).
+
+**Тесты:** `cargo test -p filar-tui` — 215 passed (212 + 3 новых).
