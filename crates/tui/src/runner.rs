@@ -554,7 +554,16 @@ async fn run_app(
                     }
                 }
 
-                if app.should_quit {
+        // Teardown backends for tabs closed via Ctrl+W / close_tab.
+        // App only signals the SessionId; runner executes the async close.
+        for sid in app.take_closed_ids() {
+            if let Some((term, handle)) = interactive_backends.remove(&sid) {
+                let _ = term.close().await;
+                handle.abort();
+            }
+        }
+
+        if app.should_quit {
                     break;
                 }
             }
