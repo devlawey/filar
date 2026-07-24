@@ -17,6 +17,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   reconnects only its own tab instead of swapping the connection for every tab; the
   interactive terminal now opens on the tab's current host
   ([#140](https://github.com/devlawey/filar/issues/140)).
+- Session tab labels now show the tab's actual target (`user@host`) instead of always
+  reading `local-N`
+  ([#141](https://github.com/devlawey/filar/issues/141)).
 
 ## [0.6.0] - 2026-07-23
 
