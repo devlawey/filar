@@ -123,6 +123,22 @@ impl CommandExecutor for TuiExecutor {
 }
 
 // ---------------------------------------------------------------------------
+// Per-session executor storage
+// ---------------------------------------------------------------------------
+
+/// Entry in the per-session executor map.
+///
+/// Each session tab has its own executor so that `!ssh` only reconnects
+/// the tab that issued it, and `Ctrl+T` opens a PTY on the tab's host.
+struct ExecutorEntry {
+    executor: Arc<TuiExecutor>,
+    /// SSH target stored so Ctrl+T can open an interactive terminal on the
+    /// same host. `None` for local sessions. Shared via `Arc<RwLock>` so the
+    /// `!ssh` spawned task can write it alongside swapping the executor.
+    ssh_target: Arc<tokio::sync::RwLock<Option<filar_core::SshTarget>>>,
+}
+
+// ---------------------------------------------------------------------------
 // Panic hook guard
 // ---------------------------------------------------------------------------
 
@@ -261,17 +277,31 @@ async fn run_app(
     // Receiver for WARN/ERROR log lines mirrored into the chat.
     let mut log_rx = config.log_rx.take();
 
-    // Build SSH info string for the system prompt (e.g. "user@host:port").
-    let mut ssh_info = config.ssh_target.as_ref().map(|t| {
-        format!("{}@{}:{}", t.user, t.host, t.port)
-    });
-    let mut is_local = config.is_local;
-
-    // Create the TUI confirmer and executor wrappers.
+    // Create the TUI confirmer.
     let confirmer = Arc::new(TuiConfirmer::new(agent_tx.clone()));
-    let tui_executor = Arc::new(TuiExecutor {
+
+    // Per-session executors. The initial executor (from main.rs) is stored
+    // for the start-up session; new tabs get a LocalExecutor created on demand.
+    let initial_tui = Arc::new(TuiExecutor {
         inner: Arc::new(tokio::sync::RwLock::new(executor)),
     });
+    let initial_sid = app.sessions[0].id;
+    let mut executors: std::collections::HashMap<
+        crate::app::SessionId,
+        ExecutorEntry,
+    > = std::collections::HashMap::new();
+    executors.insert(
+        initial_sid,
+        ExecutorEntry {
+            executor: initial_tui,
+            ssh_target: Arc::new(tokio::sync::RwLock::new(config.ssh_target.clone())),
+        },
+    );
+    // Set initial ssh_info on the first session.
+    if let Some(ref target) = config.ssh_target {
+        app.sessions[0].ssh_info =
+            Some(format!("{}@{}:{}", target.user, target.host, target.port));
+    }
 
     // Crossterm event stream for async keyboard input.
     let mut events = EventStream::new();
@@ -366,8 +396,15 @@ async fn run_app(
                         let size = terminal.size().unwrap_or_default();
                         let cols = size.width;
                         let rows = ui::interactive_grid_rows(size.height);
+                        // Use the tab's own SSH target, not the global config.
+                        let ssh_guard = executors.get(&toggle_sid)
+                            .map(|e| e.ssh_target.clone());
+                        let ssh_target = match ssh_guard {
+                            Some(g) => g.read().await.clone(),
+                            None => None,
+                        };
                         let term_result: Result<Arc<dyn InteractiveTerminal>> =
-                            if let Some(ref target) = config.ssh_target {
+                            if let Some(ref target) = ssh_target {
                                 SshInteractive::connect(target, cols, rows)
                                     .await
                                     .map(|t| Arc::new(t) as Arc<dyn InteractiveTerminal>)
@@ -427,13 +464,20 @@ async fn run_app(
                         // Shell escape: execute command directly without agent.
                         let cmd = stripped.trim().to_string();
                         if !cmd.is_empty() {
-                            let exec = tui_executor.clone();
+                            let sid = app.sessions[app.active].id;
+                            let exec = match executors.get(&sid) {
+                                Some(e) => e.executor.clone() as Arc<dyn CommandExecutor>,
+                                None => {
+                                    app.push_error("Tab executor not ready yet".into());
+                                    continue;
+                                }
+                            };
                             let provider = config.secret_provider.clone();
                             let sid = app.sessions[app.active].id;
                             let tx = agent_tx.clone();
                             tokio::spawn(async move {
                                 let wrapped = SecretSubstitutingExecutor::new(
-                                    exec as Arc<dyn CommandExecutor>,
+                                    exec,
                                     provider as Arc<dyn SecretProvider>,
                                 );
                                 let succeeded = match wrapped.run(&cmd).await {
@@ -481,22 +525,33 @@ async fn run_app(
                             app.agent_running = false;
                         }
                     } else {
+                        let sid = app.sessions[app.active].id;
+                        let (agent_exec, is_local, ssh_info) = match executors.get(&sid) {
+                            Some(e) => {
+                                let info = app.sessions[app.active].ssh_info.clone();
+                                (e.executor.clone() as Arc<dyn CommandExecutor>, info.is_none(), info)
+                            }
+                            None => {
+                                app.push_error("Tab executor not ready yet".into());
+                                continue;
+                            }
+                        };
                         // Create a cancellation token for this agent run.
                         let cancel_token = CancellationToken::new();
                         app.cancellation = Some(cancel_token.clone());
                         spawn_agent(
                             llm.clone(),
-                            tui_executor.clone(),
+                            agent_exec,
                             confirmer.clone(),
                             config.confirm_mode,
                             user_input,
                             app.messages.clone(),
                             agent_tx.clone(),
                             is_local,
-                            ssh_info.clone(),
+                            ssh_info,
                             cancel_token,
                             config.secret_provider.clone(),
-                            app.sessions[app.active].id,
+                            sid,
                         );
                     }
                 }
@@ -506,7 +561,8 @@ async fn run_app(
                     if let Some((user, host, port)) = app.pending_ssh.take() {
                         let sid = app.sessions[app.active].id;
                         let tx = agent_tx.clone();
-                        let exec_clone = tui_executor.clone();
+                        let exec_entry = executors.get(&sid)
+                            .map(|e| (e.executor.clone(), e.ssh_target.clone()));
                         tokio::spawn(async move {
                             let _ = tx.send(TuiEvent::Thinking);
                             let target = filar_core::SshTarget {
@@ -519,16 +575,21 @@ async fn run_app(
                                 },
                                 host_key_policy: filar_core::HostKeyPolicy::Tofu,
                             };
+                            let new_ssh_info = format!("{user}@{host}:{port}");
                             match filar_transport::SshExecutor::connect(&target).await {
                                 Ok(ssh_exec) => {
-                                    // Swap the executor to SSH.
-                                    exec_clone
-                                        .swap_executor(Arc::new(ssh_exec)
+                                    // Swap the executor for this session only.
+                                    if let Some((ref exec, ref st)) = exec_entry {
+                                        exec.swap_executor(Arc::new(ssh_exec)
                                             as Arc<dyn CommandExecutor>)
-                                        .await;
-                                    // Notify runner to update system prompt info.
-                                    let new_ssh_info = format!("{user}@{host}:{port}");
+                                            .await;
+                                        // Store the SshTarget so Ctrl+T can open a PTY
+                                        // on the same host for this tab.
+                                        *st.write().await = Some(target.clone());
+                                    }
+                                    // Notify runner to update per-session info.
                                     let _ = tx.send(TuiEvent::TransportChanged {
+                                        session_id: sid,
                                         is_local: false,
                                         ssh_info: Some(new_ssh_info),
                                     });
@@ -560,6 +621,35 @@ async fn run_app(
                 let _ = term.close().await;
                 handle.abort();
             }
+            // Release the tab's executor so SSH connections don't leak.
+            executors.remove(&sid);
+        }
+
+        // Create local executors for new tabs signalled via new_tab().
+        for sid in app.take_pending_local_executors() {
+            match filar_transport::LocalExecutor::new().await {
+                Ok(local) => {
+                    executors.insert(
+                        sid,
+                        ExecutorEntry {
+                            executor: Arc::new(TuiExecutor {
+                                inner: Arc::new(tokio::sync::RwLock::new(Arc::new(local))),
+                            }),
+                            ssh_target: Arc::new(tokio::sync::RwLock::new(None)),
+                        },
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to create local executor for sid={sid:?}");
+                    if let Some(s) = app.sessions.iter_mut().find(|s| s.id == sid) {
+                        s.ssh_info = None;
+                    }
+                    app.push_error(format!(
+                        "Failed to create local executor for new tab: {e}"
+                    ));
+                    app.pending_local_executors.push(sid);
+                }
+            }
         }
 
         if app.should_quit {
@@ -576,11 +666,16 @@ async fn run_app(
                 }
             } => {
                 if let Some(event) = maybe_agent_event {
-                    // Intercept TransportChanged to update system prompt info.
-                    if let TuiEvent::TransportChanged { is_local: new_local, ssh_info: new_ssh } = &event {
-                        is_local = *new_local;
-                        ssh_info = new_ssh.clone();
-                        app.target_name = new_ssh.clone().unwrap_or_else(|| "local".into());
+                    // Intercept TransportChanged to update per-session info.
+                    if let TuiEvent::TransportChanged { session_id, ref ssh_info, .. } = &event {
+                        if let Some(idx) = app.find_session_idx(*session_id) {
+                            app.sessions[idx].ssh_info = ssh_info.clone();
+                            // Also update display name for the tab label.
+                            app.sessions[idx].target_name =
+                                ssh_info.clone().unwrap_or_else(|| {
+                                    format!("local-{}", idx + 1)
+                                });
+                        }
                     }
                     // All agent events just need a redraw — the borderless
                     // layout handles transitions cleanly without full clear.

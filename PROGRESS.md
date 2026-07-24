@@ -2849,6 +2849,72 @@ closed session ignore, EOF outcome).
 
 ---
 
+## Issue #140: fix(tui) — per-session executor, Ctrl+N always local, !ssh scoped to tab
+
+**Milestone:** Filar v0.6.1. **Ветка:** `fix/140-per-session-executor`.
+
+**Проблема:** executor был один на всё приложение — все вкладки делили одно
+SSH-соединение. `!ssh` переподключал ВСЕ вкладки, `Ctrl+N` создавал вкладку на
+том же транспорте, а подпись `local-N` всегда врала.
+
+**Решение:**
+
+1. **Per-session executors** (`runner.rs`):
+   - `HashMap<SessionId, ExecutorEntry>` вместо единственного `Arc<TuiExecutor>`.
+   - `ExecutorEntry { executor, ssh_target }` — хранение цели для `Ctrl+T`.
+   - `ssh_target: Arc<RwLock<Option<SshTarget>>>` — разделяемый между event loop
+     и `!ssh`-таском для записи цели подключения.
+   - Стартовый executor (из `main.rs`) кладётся для первой сессии; новые вкладки
+     получают `LocalExecutor` через сигнал `pending_local_executors`.
+
+2. **`App::new_tab()`** (`app.rs`):
+   - Сигналит runner о необходимости `LocalExecutor` через `pending_local_executors`.
+   - Новая вкладка всегда локальная (`ssh_info: None`), не наследует SSH-состояние
+     другой сессии.
+
+3. **`Ctrl+N` создаёт `LocalExecutor`** (`runner.rs`):
+   - `take_pending_local_executors()` — runner асинхронно создаёт `LocalExecutor`,
+     оборачивает в `TuiExecutor` и кладёт в `executors`.
+   - До готовности executor'а ввод показывает ошибку "not ready yet" без паники.
+
+4. **`!ssh` действует только на свою вкладку** (`runner.rs`):
+   - `swap_executor` вызывается на executor'е конкретного `SessionId`.
+   - `ssh_target` сохраняется в `ExecutorEntry` для последующего `Ctrl+T`.
+   - `TransportChanged` несёт `session_id` — runner обновляет `Session::ssh_info`.
+
+5. **`Ctrl+T` — по цели вкладки** (`runner.rs`):
+   - Читает `ExecutorEntry::ssh_target` вместо `config.ssh_target`.
+   - Стартовый конфиг — только для первой вкладки.
+
+6. **Закрытие вкладки освобождает executor** (`runner.rs`):
+   - `executors.remove(&sid)` в обработчике `take_closed_ids()`.
+
+7. **`TransportChanged` — посессионно** (`event.rs`, `runner.rs`):
+   - Поле `session_id: SessionId` добавлено в `TuiEvent::TransportChanged`.
+   - Runner обновляет `Session::ssh_info` конкретной сессии вместо глобальных
+     переменных `is_local`/`ssh_info`.
+
+**Изменённые файлы:**
+- `crates/tui/src/app.rs` — `Session::ssh_info`, `App::pending_local_executors`,
+  `take_pending_local_executors()`, `new_tab()` сигналит runner
+- `crates/tui/src/event.rs` — `TransportChanged { session_id, ... }`
+- `crates/tui/src/runner.rs` — `ExecutorEntry`, `executors: HashMap<SessionId, ExecutorEntry>`,
+  `pending_local_executors` обработчик, per-session shell escape / spawn_agent / !ssh / Ctrl+T /
+  close_tab, TransportChanged interceptor
+
+**Тесты:** 5 новых (227 total): `new_tab_signals_pending_local_executor`,
+`new_tab_session_defaults_to_local_ssh_info`, `new_tab_does_not_inherit_ssh_state`,
+`take_pending_local_executors_clears_list`, `transport_changed_carries_session_id`.
+`cargo test --workspace` — 227 tui + 62 agent + 34 core + 24 transport = все зелёные.
+
+**Публичные контракты:**
+- `TuiEvent::TransportChanged` — новое поле `session_id: SessionId`.
+- `App` — новое поле `pending_local_executors: Vec<SessionId>`, метод `take_pending_local_executors()`.
+- `Session` — новое поле `ssh_info: Option<String>`.
+- `ExecutorEntry` — новый приватный тип в `runner.rs`.
+
+---
+
 ## Релиз v0.6.0 (подготовка)
 
 **Дата:** 2026-07-23. **Milestone:** Filar v0.6.0 (6/6 issues, все смерджены).

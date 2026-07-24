@@ -39,9 +39,32 @@ pub enum TuiEvent {
     },
 
     /// The transport was switched (e.g. from local to SSH).
-    /// The runner uses this to update the system prompt for future agent calls.
+    /// The runner uses this to update per-session connection info.
     TransportChanged {
+        session_id: SessionId,
         is_local: bool,
         ssh_info: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_changed_carries_session_id() {
+        let sid = SessionId(42);
+        let event = TuiEvent::TransportChanged {
+            session_id: sid,
+            is_local: false,
+            ssh_info: Some("root@10.0.0.5:22".into()),
+        };
+        if let TuiEvent::TransportChanged { session_id, is_local, ref ssh_info } = event {
+            assert_eq!(session_id, SessionId(42));
+            assert!(!is_local);
+            assert_eq!(ssh_info.as_deref(), Some("root@10.0.0.5:22"));
+        } else {
+            panic!("expected TransportChanged");
+        }
+    }
 }
