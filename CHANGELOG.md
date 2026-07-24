@@ -11,6 +11,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- Command executors are now per session: a new tab always starts local, and `!ssh`
+  reconnects only its own tab instead of swapping the connection for every tab; the
+  interactive terminal now opens on the tab's current host
+  ([#140](https://github.com/devlawey/filar/issues/140)).
+
 ## [0.6.0] - 2026-07-23
 
 ### Changed

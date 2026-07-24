@@ -187,6 +187,10 @@ pub struct App {
     /// SessionIds of recently closed tabs — consumed by runner to teardown
     /// corresponding interactive backends.
     pub closed_ids: Vec<SessionId>,
+    /// SessionIds of new tabs awaiting a local executor from the runner.
+    /// App signals the runner here; runner creates the executor asynchronously
+    /// and stores it in its per-session map.
+    pub pending_local_executors: Vec<SessionId>,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -295,6 +299,9 @@ pub struct Session {
     pub has_new: bool,
     /// True when a confirmation is pending (agent is waiting for user input).
     pub awaiting_confirmation: bool,
+    /// SSH connection info for this tab (e.g. "user@host:port"). None = local.
+    /// Set when `!ssh` succeeds for this tab. Used for display and system prompt.
+    pub ssh_info: Option<String>,
 }
 
 impl App {
@@ -322,13 +329,17 @@ impl App {
             status_bar_area: Rect::default(),
             help_bar_area: Rect::default(),
             closed_ids: Vec::new(),
+            pending_local_executors: Vec::new(),
         }
     }
 
     /// Create a new session tab in local mode, inheriting target_name display.
+    /// Signals the runner to create a new LocalExecutor for this tab via
+    /// [`pending_local_executors`](Self::pending_local_executors).
     pub fn new_tab(&mut self) {
         let name = format!("local-{}", self.sessions.len() + 1);
         let session = Session::new(name, self.confirm_mode);
+        self.pending_local_executors.push(session.id);
         self.sessions.push(session);
         self.active = self.sessions.len() - 1;
     }
@@ -357,6 +368,11 @@ impl App {
     /// Take and clear the list of closed session IDs (for runner to process).
     pub fn take_closed_ids(&mut self) -> Vec<SessionId> {
         std::mem::take(&mut self.closed_ids)
+    }
+
+    /// Take and clear the list of sessions awaiting a local executor (for runner to process).
+    pub fn take_pending_local_executors(&mut self) -> Vec<SessionId> {
+        std::mem::take(&mut self.pending_local_executors)
     }
 
     /// Switch to the previous tab (wraps around).
@@ -458,6 +474,7 @@ impl Session {
             background_activity: false,
             has_new: false,
             awaiting_confirmation: false,
+            ssh_info: None,
         }
     }
 }
@@ -4776,5 +4793,65 @@ mod tests {
         assert_eq!(app.active, 0, "should switch to tab 0");
         assert!(!app.sessions[0].has_new, "marker must clear on target tab");
         assert!(app.sessions[1].has_new, "marker on old active tab must survive");
+    }
+
+    // ── Per-session executor tests ─────────────────────────────────────
+
+    #[test]
+    fn new_tab_signals_pending_local_executor() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let initial_sid = app.sessions[0].id;
+        // The initial tab is NOT in pending_local_executors.
+        assert!(
+            !app.pending_local_executors.contains(&initial_sid),
+            "initial tab must not request a local executor (it already has one)"
+        );
+        app.new_tab();
+        let new_sid = app.sessions[1].id;
+        assert!(
+            app.pending_local_executors.contains(&new_sid),
+            "new_tab must signal runner to create a LocalExecutor"
+        );
+        let pending = app.take_pending_local_executors();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0], new_sid);
+        assert!(app.pending_local_executors.is_empty());
+    }
+
+    #[test]
+    fn new_tab_session_defaults_to_local_ssh_info() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.new_tab();
+        assert!(
+            app.sessions[0].ssh_info.is_none(),
+            "initial session ssh_info should be None (local)"
+        );
+        assert!(
+            app.sessions[1].ssh_info.is_none(),
+            "new tab ssh_info must be None (always starts local)"
+        );
+    }
+
+    #[test]
+    fn new_tab_does_not_inherit_ssh_state() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        // Simulate session 0 getting SSH info.
+        app.sessions[0].ssh_info = Some("root@10.0.0.5:22".into());
+        app.new_tab();
+        assert!(
+            app.sessions[1].ssh_info.is_none(),
+            "new tab must not inherit SSH info from another tab"
+        );
+    }
+
+    #[test]
+    fn take_pending_local_executors_clears_list() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.new_tab();
+        app.new_tab();
+        assert_eq!(app.pending_local_executors.len(), 2);
+        let taken = app.take_pending_local_executors();
+        assert_eq!(taken.len(), 2);
+        assert!(app.pending_local_executors.is_empty());
     }
 }
