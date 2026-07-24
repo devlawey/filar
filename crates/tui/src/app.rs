@@ -710,6 +710,11 @@ impl App {
                                         host.clone(),
                                         port,
                                     ));
+                                    // Update session ssh_info immediately so
+                                    // spawn_agent sees the correct is_local/ssh_info
+                                    // even before TransportChanged arrives.
+                                    self.ssh_info =
+                                        Some(format!("{user}@{host}:{port}"));
                                     self.push_message(ChatBlock::System(format!(
                                         "Connecting to {user}@{host}:{port} via SSH. \
                                          Press Ctrl+P to enter the password."

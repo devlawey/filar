@@ -397,8 +397,12 @@ async fn run_app(
                         let cols = size.width;
                         let rows = ui::interactive_grid_rows(size.height);
                         // Use the tab's own SSH target, not the global config.
-                        let ssh_target = executors.get(&toggle_sid)
-                            .and_then(|e| e.ssh_target.blocking_read().clone());
+                        let ssh_guard = executors.get(&toggle_sid)
+                            .map(|e| e.ssh_target.clone());
+                        let ssh_target = match ssh_guard {
+                            Some(g) => g.read().await.clone(),
+                            None => None,
+                        };
                         let term_result: Result<Arc<dyn InteractiveTerminal>> =
                             if let Some(ref target) = ssh_target {
                                 SshInteractive::connect(target, cols, rows)
@@ -581,7 +585,7 @@ async fn run_app(
                                             .await;
                                         // Store the SshTarget so Ctrl+T can open a PTY
                                         // on the same host for this tab.
-                                        *st.blocking_write() = Some(target.clone());
+                                        *st.write().await = Some(target.clone());
                                     }
                                     // Notify runner to update per-session info.
                                     let _ = tx.send(TuiEvent::TransportChanged {
@@ -640,6 +644,10 @@ async fn run_app(
                     if let Some(s) = app.sessions.iter_mut().find(|s| s.id == sid) {
                         s.ssh_info = None;
                     }
+                    app.push_error(format!(
+                        "Failed to create local executor for new tab: {e}"
+                    ));
+                    app.pending_local_executors.push(sid);
                 }
             }
         }
