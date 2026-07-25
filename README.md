@@ -22,7 +22,7 @@ Filar is a Rust-based terminal application that integrates an AI agent (LLM) wit
 - **GUI Launcher** — built with [egui](https://github.com/emilk/egui), for easy SSH profile and API key configuration
 - **Command Confirmation** — every command requires user approval before execution
 - **Shell Escape** — type `!command` for direct shell access without the agent
-- **Session Persistence** — save and restore chat sessions
+- **Session Persistence** — save and restore chat sessions, including agent input history (Up/Down recalls prompts from previous sessions)
 - **Secure Credential Storage** — API keys and SSH passwords stored in OS Credential Manager (not in plain text files)
 - **Interactive Terminal** — full terminal emulation via [alacritty_terminal](https://github.com/alacritty/alacritty)
 
@@ -195,16 +195,17 @@ Type `!` followed by a command to run it directly (bypassing the agent):
 
 | Key | Action |
 |-----|--------|
+| `F1` | Show full help overlay (all shortcuts and commands grouped by section) |
 | `Enter` | Send message / Confirm selected button |
 | `Ctrl+Q` | Quit the app (denies a pending command first in Confirming) |
 | `Ctrl+Z` | Cancel: stop the agent (Thinking) / deny the command (Confirming) |
 | `Ctrl+C` | Nothing — left free so it can be used to copy the selection |
-| `Ctrl+T` | Toggle interactive terminal view (persistent per tab since v0.6.0) |
+| `Ctrl+T` | Toggle interactive terminal (opens on the current tab's host — local or SSH) |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Switch session tab (works in interactive too) |
-| `Ctrl+N` | New local session tab |
+| `Ctrl+N` | New local session tab (always local, never inherits another tab's SSH) |
 | `Ctrl+W` | Close active session tab |
 | `Ctrl+P` | Enter password input mode (masked) |
-| `Up/Down` | Browse input history |
+| `Up/Down` | Browse agent input history (persisted across sessions since v0.6.1) |
 | `!command` | Shell escape (direct execution) |
 | `Mouse wheel` | Scroll chat history / terminal scrollback |
 | `Click` | Expand/collapse command output blocks |
@@ -214,6 +215,9 @@ Shortcuts also work on the Russian ЙЦУКЕН layout (`Ctrl+Й`/`Ctrl+Я`/`Ctr
 
 **Interactive terminal:** since v0.6.0, each tab has its own persistent terminal.
 `Ctrl+T` toggles the view without killing the PTY — background processes keep running.
+The terminal opens on the **current tab's host** (local for a local tab, SSH host for a
+tab connected via `!ssh`). Tab labels reflect the actual target: `local-N` for local tabs,
+`user@host` for SSH tabs.
 `Ctrl+Tab`/`Ctrl+N`/`Ctrl+W` work from within interactive mode. Switch to another
 tab while a command runs, come back later — everything is as you left it.
 Closing a tab closes its terminal. The tab bar shows activity indicators:
@@ -226,7 +230,9 @@ to the remote program; use `Ctrl+T` to return to agent mode.
 
 From the GUI: select an SSH profile and click Launch.
 
-From the TUI: type `!ssh user@host` in Normal mode, then press `Ctrl+P` to enter the password.
+From the TUI: type `!ssh user@host` in Normal mode, then press `Ctrl+P` to enter the
+password. The connection applies **only to the current tab** — other tabs keep their
+existing connections. Each tab can be connected to a different host, or stay local.
 
 ---
 
@@ -249,7 +255,7 @@ filar/
 
 ### Key Design Decisions
 
-- **Swappable Executor** — `CommandExecutor` trait allows switching between Local and SSH at runtime
+- **Swappable Executor** — `CommandExecutor` trait allows switching between Local and SSH at runtime; since v0.6.1, each tab has its own executor, so `!ssh` reconnects only the current tab
 - **Zero-Install SSH** — no files are left on the remote machine; all commands are injected via the SSH channel
 - **Secure by Default** — all commands require confirmation; destructive commands are detected and blocked
 - **Dynamic System Prompt** — the agent's system prompt adapts to local/SSH context and OS/shell type
