@@ -16,6 +16,9 @@ use crate::error::{CoreError, Result};
 /// Maximum number of sessions to retain on disk.
 pub const MAX_SESSIONS: usize = 10;
 
+/// Maximum number of input history entries to persist per session.
+pub const MAX_INPUT_HISTORY: usize = 200;
+
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
@@ -33,6 +36,10 @@ pub struct Session {
     pub llm_profile: String,
     /// Chat history blocks.
     pub messages: Vec<ChatBlock>,
+    /// History of user prompts in agent mode (for Up/Down navigation).
+    /// Limited to [`MAX_INPUT_HISTORY`] entries when saved.
+    #[serde(default)]
+    pub input_history: Vec<String>,
 }
 
 /// Lightweight metadata for listing sessions without loading full messages.
@@ -252,6 +259,7 @@ mod tests {
                 ChatBlock::User("find port 8080".into()),
                 ChatBlock::Agent("running lsof".into()),
             ],
+            input_history: vec![],
         };
         let meta = SessionMeta::from(&session);
         assert_eq!(meta.id, "123");
@@ -267,6 +275,7 @@ mod tests {
             target: "t".into(),
             llm_profile: "t".into(),
             messages: vec![],
+            input_history: vec![],
         };
         let meta = SessionMeta::from(&session);
         assert!(meta.preview.is_empty());
@@ -291,6 +300,7 @@ mod tests {
                 ChatBlock::User("hello".into()),
                 ChatBlock::Agent("world".into()),
             ],
+            input_history: vec!["ls -la".into(), "find port".into()],
         };
 
         store.save(&session).unwrap();
@@ -327,6 +337,7 @@ mod tests {
                 target: "t".into(),
                 llm_profile: "t".into(),
                 messages: vec![ChatBlock::User(format!("msg{i}"))],
+                input_history: vec![],
             };
             store.save(&session).unwrap();
         }
@@ -410,5 +421,52 @@ mod tests {
         // Let me just verify the epoch is correct and the function doesn't panic.
         let (y, _m, _d, _h, _mi, _s) = unix_to_ymdhms(1_782_045_045);
         assert_eq!(y, 2026);
+    }
+
+    // ── input_history tests ────────────────────────────────────────────
+
+    #[test]
+    fn input_history_serialize_roundtrip() {
+        let session = Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "t".into(),
+            llm_profile: "t".into(),
+            messages: vec![],
+            input_history: vec!["ls".into(), "find port 8080".into()],
+        };
+        let json = serde_json::to_string_pretty(&session).unwrap();
+        assert!(json.contains("input_history"), "JSON must contain input_history");
+        assert!(json.contains("find port 8080"), "must contain history entries");
+        let loaded: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.input_history.len(), 2);
+        assert_eq!(loaded.input_history[0], "ls");
+        assert_eq!(loaded.input_history[1], "find port 8080");
+    }
+
+    #[test]
+    fn input_history_backward_compat_no_field() {
+        // JSON from a session saved by the old version — no input_history field.
+        let json = r#"{
+            "id":"123",
+            "timestamp":"2026-01-01 00:00:00",
+            "target":"test",
+            "llm_profile":"glm",
+            "messages":[{"User":"hello"},{"Agent":"world"}]
+        }"#;
+        let session: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(session.id, "123");
+        assert!(session.input_history.is_empty(), "missing field → default empty");
+    }
+
+    #[test]
+    fn truncate_input_history_keeps_last_entries() {
+        use super::MAX_INPUT_HISTORY;
+        let mut history: Vec<String> = (0..250).map(|i| format!("entry{i}")).collect();
+        assert!(history.len() > MAX_INPUT_HISTORY);
+        history = history.split_off(history.len() - MAX_INPUT_HISTORY);
+        assert_eq!(history.len(), MAX_INPUT_HISTORY);
+        assert_eq!(history[0], "entry50"); // first kept
+        assert_eq!(history.last().unwrap(), "entry249"); // last kept
     }
 }

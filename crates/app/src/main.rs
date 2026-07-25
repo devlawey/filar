@@ -357,30 +357,30 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // ── Load session if specified ──────────────────────────────────────
-    let initial_messages = if let Some(ref sid) = session_id {
+    let (initial_messages, initial_input_history) = if let Some(ref sid) = session_id {
         info!(session_id = %sid, "loading session");
         match SessionStore::with_default_dir() {
             Ok(store) => match store.load(sid) {
                 Ok(Some(session)) => {
                     info!(messages = session.messages.len(), "session loaded");
-                    session.messages
+                    (session.messages, session.input_history)
                 }
                 Ok(None) => {
                     warn!(session_id = %sid, "session not found");
-                    vec![]
+                    (vec![], vec![])
                 }
                 Err(e) => {
                     warn!(error = %e, "failed to load session");
-                    vec![]
+                    (vec![], vec![])
                 }
             },
             Err(e) => {
                 warn!(error = %e, "failed to initialise session store");
-                vec![]
+                (vec![], vec![])
             }
         }
     } else {
-        vec![]
+        (vec![], vec![])
     };
 
     // ── Launch TUI ─────────────────────────────────────────────────────
@@ -389,6 +389,7 @@ async fn run() -> anyhow::Result<()> {
         confirm_mode: config.confirm_mode,
         llm_profile: target_name,
         initial_messages,
+        initial_input_history,
         ssh_target: ssh_target.clone(),
         is_local: ssh_target.is_none(),
         secret_provider,

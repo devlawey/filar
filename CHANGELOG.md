@@ -16,6 +16,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Help overlay listing every shortcut and command, opened with `F1` (Ctrl+H tested
   and found indistinguishable from Backspace on Windows Terminal)
   ([#142](https://github.com/devlawey/filar/issues/142)).
+- Agent-mode input history is now saved with the session and restored on reopen, so
+  Up/Down recalls previous prompts
+  ([#143](https://github.com/devlawey/filar/issues/143)).
 
 ### Fixed
 
