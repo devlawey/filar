@@ -3036,6 +3036,25 @@ help-строка для текущего режима.
 
 ---
 
+## Issue #151: fix(tui) — scrollable help overlay
+
+**Milestone:** Filar v0.6.2. **Ветка:** `fix/151-help-overlay-scroll`.
+
+**Проблема:** оверлей F1 не прокручивался — содержимое обрезалось по высоте, PgUp/PgDn не работали.
+
+**Решение:**
+- `App::help_scroll: u16` — смещение прокрутки, сбрасывается в 0 при открытии.
+- `handle_key` в режиме оверлея: PgDn/↓ +1, PgUp/↑ −1 (saturating), Home→0, End→MAX.
+- `render_help_overlay`: клэмп `scroll = min(help_scroll, total_lines - visible)`,
+  `Paragraph::scroll((scroll, 0))`, индикатор `"N/M"` в заголовке.
+
+**Файлы:** `crates/tui/src/app.rs`, `crates/tui/src/ui/help.rs`.
+
+**Тесты:** 7 новых (248 total): открытие сбрасывает scroll, PgDn/PgUp меняют, saturation at 0,
+Home reset, arrow keys, clamp формула.
+
+---
+
 ## Релиз v0.6.1 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.1 (5/5 issue, все смерджены).

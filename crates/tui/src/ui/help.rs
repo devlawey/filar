@@ -220,12 +220,6 @@ pub(crate) fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
     // Clear the area behind the overlay.
     f.render_widget(Clear, overlay_area);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.theme.accent))
-        .title(" Help (F1 or Esc to close) ")
-        .style(Style::default().bg(app.theme.bg));
-
     let mut lines: Vec<Line> = Vec::new();
     let mut current_section: Option<&str> = None;
 
@@ -264,8 +258,32 @@ pub(crate) fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
         lines.push(line);
     }
 
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.accent))
+        .style(Style::default().bg(app.theme.bg));
+    let inner_area = inner.inner(overlay_area);
+    let visible = inner_area.height.saturating_sub(1) as usize; // one row for margins
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(visible);
+    let scroll = (app.help_scroll as usize).min(max_scroll) as u16;
+
+    // Title with scroll indicator if content overflows.
+    let title = if total > visible {
+        format!(
+            " Help (F1/Esc close, {}/{}, PgUp/PgDn scroll) ",
+            scroll.saturating_add(inner_area.height.saturating_sub(1)),
+            total
+        )
+    } else {
+        " Help (F1 or Esc to close) ".into()
+    };
+
+    let block = inner.title(title);
+
     let paragraph = Paragraph::new(lines)
         .block(block)
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
 
     f.render_widget(paragraph, overlay_area);

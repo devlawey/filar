@@ -193,6 +193,8 @@ pub struct App {
     pub pending_local_executors: Vec<SessionId>,
     /// Whether the help overlay is currently visible.
     pub help_overlay_visible: bool,
+    /// Scroll offset (in lines) for the help overlay.
+    pub help_scroll: u16,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -333,6 +335,7 @@ impl App {
             closed_ids: Vec::new(),
             pending_local_executors: Vec::new(),
             help_overlay_visible: false,
+            help_scroll: 0,
         }
     }
 
@@ -642,9 +645,12 @@ impl App {
         }
     }
 
-    /// Toggle the help overlay on/off.
+    /// Toggle the help overlay on/off. Resets scroll to top when opening.
     pub fn toggle_help_overlay(&mut self) {
         self.help_overlay_visible = !self.help_overlay_visible;
+        if self.help_overlay_visible {
+            self.help_scroll = 0;
+        }
     }
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
@@ -657,11 +663,20 @@ impl App {
             return;
         }
 
-        // When the help overlay is visible, only Esc and F1 are processed;
-        // all other keys are consumed so they don't affect the UI behind it.
+        // When the help overlay is visible, only navigation and close keys
+        // are processed; all other keys are consumed.
         if self.help_overlay_visible {
-            if key.code == KeyCode::Esc {
-                self.help_overlay_visible = false;
+            match key.code {
+                KeyCode::Esc => self.help_overlay_visible = false,
+                KeyCode::PageDown | KeyCode::Down => {
+                    self.help_scroll = self.help_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp | KeyCode::Up => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                }
+                KeyCode::Home => self.help_scroll = 0,
+                KeyCode::End => self.help_scroll = u16::MAX,
+                _ => {}
             }
             return;
         }
@@ -5023,5 +5038,98 @@ mod tests {
         };
         app.handle_mouse(m);
         // No assertion needed other than no panic — mouse event is consumed.
+    }
+
+    #[test]
+    fn help_overlay_opening_resets_scroll_to_zero() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.help_scroll = 5;
+        app.toggle_help_overlay();
+        assert!(app.help_overlay_visible);
+        assert_eq!(app.help_scroll, 0, "opening overlay must reset scroll");
+    }
+
+    #[test]
+    fn help_overlay_pgdn_increases_scroll() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.help_overlay_visible = true;
+        let pgdn = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageDown,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        app.handle_key(pgdn);
+        assert_eq!(app.help_scroll, 1);
+        app.handle_key(pgdn);
+        assert_eq!(app.help_scroll, 2);
+    }
+
+    #[test]
+    fn help_overlay_pgup_decreases_scroll() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.help_overlay_visible = true;
+        app.help_scroll = 5;
+        let pgup = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageUp,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        app.handle_key(pgup);
+        assert_eq!(app.help_scroll, 4);
+    }
+
+    #[test]
+    fn help_overlay_scroll_saturates_at_zero() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.help_overlay_visible = true;
+        app.help_scroll = 1;
+        let pgup = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageUp,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        app.handle_key(pgup);
+        app.handle_key(pgup);
+        assert_eq!(app.help_scroll, 0, "scroll must saturate at 0");
+    }
+
+    #[test]
+    fn help_overlay_home_resets_scroll() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.help_overlay_visible = true;
+        app.help_scroll = 10;
+        let home = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Home,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        app.handle_key(home);
+        assert_eq!(app.help_scroll, 0);
+    }
+
+    #[test]
+    fn help_overlay_arrow_keys_scroll() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.help_overlay_visible = true;
+        let down = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        app.handle_key(down);
+        assert_eq!(app.help_scroll, 1);
+        let up = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        app.handle_key(up);
+        assert_eq!(app.help_scroll, 0);
+    }
+
+    #[test]
+    fn help_overlay_scroll_clamp_formula() {
+        let clamp = |scroll: usize, total: usize, visible: usize| -> usize {
+            let max = total.saturating_sub(visible);
+            scroll.min(max)
+        };
+        assert_eq!(clamp(0, 30, 20), 0);
+        assert_eq!(clamp(5, 30, 20), 5);
+        assert_eq!(clamp(15, 30, 20), 10, "15 clamped to max 10");
+        assert_eq!(clamp(0, 10, 20), 0, "total < visible, max = 0");
     }
 }
