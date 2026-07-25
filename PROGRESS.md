@@ -3055,6 +3055,20 @@ Home reset, arrow keys, clamp формула.
 
 ---
 
+## Issue #152: fix(tui) — close-tab shortcut visible in bottom hint bar
+
+**Milestone:** Filar v0.6.2. **Ветка:** `fix/152-close-tab-hint`.
+
+**Проблема:** `^W` (закрытие вкладки) был только в F1-оверлее, не в нижней строке подсказок.
+
+**Решение:** добавлен `HelpItem { key: "^W", desc: "close" }` в `help_items(AppMode::Normal)` рядом с `^N`. Thinking и Confirming не затронуты (бары минимальны).
+
+**Файлы:** `crates/tui/src/ui/bars.rs`.
+
+**Тесты:** 1 новый (249 total): `normal_mode_help_includes_close_tab`.
+
+---
+
 ## Релиз v0.6.1 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.1 (5/5 issue, все смерджены).

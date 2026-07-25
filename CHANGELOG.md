@@ -16,6 +16,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - The F1 help overlay is now scrollable (PgUp/PgDn/arrows) instead of clipping entries
   that don't fit a small terminal window
   ([#151](https://github.com/devlawey/filar/issues/151)).
+- The close-tab shortcut (^W) is now shown in the bottom hint bar, not only in the F1
+  overlay ([#152](https://github.com/devlawey/filar/issues/152)).
 
 ## [0.6.1] - 2026-07-25
 
