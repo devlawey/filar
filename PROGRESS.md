@@ -2975,6 +2975,46 @@ help-строка для текущего режима.
 
 ---
 
+## Issue #143: feat(core,tui) — persist agent input history with session
+
+**Milestone:** Filar v0.6.1. **Ветка:** `feat/143-persist-input-history`.
+
+**Проблема:** история ввода агента жила только в памяти, при перезапуске терялась.
+`↑`/`↓` в восстановленной сессии показывали пустой список.
+
+**Решение:**
+- **Персистентная модель** (`crates/core/src/session.rs`): поле `input_history: Vec<String>`
+  с `#[serde(default)]` — обратная совместимость со старыми файлами.
+  Константа `MAX_INPUT_HISTORY = 200`.
+- **Сохранение** (`runner.rs`): при выходе обрезает историю до последних 200 записей
+  и кладёт в `filar_core::Session`.
+- **Восстановление** (`app.rs`, `runner.rs`, `main.rs`): `App::with_history` принимает
+  `input_history`, `TuiConfig` несёт `initial_input_history`, `main.rs` загружает
+  поле из файла сессии.
+- **Безопасность:** пароли в историю не попадают — ввод через `Ctrl+P` обрабатывается
+  отдельно от `Enter` в Normal-режиме, где пополняется `input_history`.
+- **Дубликаты:** сохранено существующее правило (не добавлять одинаковый ввод подряд).
+
+**Файлы:**
+- `crates/core/src/session.rs` — поле `input_history` + `MAX_INPUT_HISTORY`
+- `crates/tui/src/app.rs` — `Session::input_history()`, `App::with_history(input_history)`
+- `crates/tui/src/runner.rs` — `TuiConfig.initial_input_history`, сохранение с обрезкой
+- `crates/app/src/main.rs` — загрузка `input_history` из файла сессии
+
+**Тесты:** 3 новых в core (37 total): round-trip сериализации, загрузка JSON без поля
+(обратная совместимость), обрезка по MAX_INPUT_HISTORY. 241 tui — без регрессии.
+7 ignored (Docker sshd).
+
+**Публичные контракты:**
+- `filar_core::Session` — новое поле `input_history: Vec<String>` с `#[serde(default)]`.
+- `filar_core::session::MAX_INPUT_HISTORY` — новая константа.
+- `filar_tui::TuiConfig` — новое поле `initial_input_history: Vec<String>`.
+- `filar_tui::Session::input_history()` — новый public метод.
+
+**Дальнейшие шаги:** нет. Функциональность завершена.
+
+---
+
 ## Релиз v0.6.0 (подготовка)
 
 **Дата:** 2026-07-23. **Milestone:** Filar v0.6.0 (6/6 issues, все смерджены).

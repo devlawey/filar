@@ -191,6 +191,8 @@ pub struct TuiConfig {
     pub confirm_mode: CommandConfirmMode,
     pub llm_profile: String,
     pub initial_messages: Vec<ChatBlock>,
+    /// Initial agent input history (for session restore).
+    pub initial_input_history: Vec<String>,
     /// SSH target for interactive terminal mode (Ctrl+T).
     /// If `None`, the agent runs in local mode.
     pub ssh_target: Option<filar_core::SshTarget>,
@@ -257,13 +259,16 @@ async fn run_app(
     executor: Arc<dyn CommandExecutor>,
     mut config: TuiConfig,
 ) -> Result<()> {
-    let mut app = if config.initial_messages.is_empty() {
+    let mut app = if config.initial_messages.is_empty()
+        && config.initial_input_history.is_empty()
+    {
         App::new(config.target_name.clone(), config.confirm_mode)
     } else {
         App::with_history(
             config.target_name.clone(),
             config.confirm_mode,
             std::mem::take(&mut config.initial_messages),
+            std::mem::take(&mut config.initial_input_history),
         )
     };
     // Wire the App to the same StaticSecretProvider instance used by the
@@ -821,13 +826,15 @@ async fn run_app(
 
     // Save session to disk for future restore.
     let (id, timestamp) = filar_core::session::now_session_id();
-    let session = filar_core::Session {
+    let mut session = filar_core::Session {
         id,
         timestamp,
         target: config.target_name.clone(),
         llm_profile: config.llm_profile.clone(),
         messages: app.messages.clone(),
+        input_history: app.input_history().to_vec(),
     };
+    session.truncate_history();
     match filar_core::SessionStore::with_default_dir() {
         Ok(store) => {
             if let Err(e) = store.save(&session) {

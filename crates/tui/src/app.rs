@@ -495,6 +495,11 @@ impl Session {
             None => self.target_name.clone(),
         }
     }
+
+    /// Reference to the input history (for persistence).
+    pub fn input_history(&self) -> &[String] {
+        &self.input_history
+    }
 }
 
 impl App {
@@ -503,16 +508,19 @@ impl App {
         target_name: String,
         confirm_mode: CommandConfirmMode,
         messages: Vec<ChatBlock>,
+        input_history: Vec<String>,
     ) -> Self {
         let mut app = Self::new(target_name, confirm_mode);
         if !messages.is_empty() {
             app.messages = messages;
-            // Bump rev for the wholesale replacement so the cache rebuilds.
             app.message_rev = app.message_rev.wrapping_add(1);
             app.push_message(ChatBlock::System(
                 "Session restored — history loaded from disk".into(),
             ));
         }
+        // Restore agent input history so Up/Down recalls previous prompts.
+        app.input_history = input_history;
+        app.history_pos = None; // Start not in browsing mode.
         app
     }
 
