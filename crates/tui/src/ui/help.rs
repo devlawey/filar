@@ -263,7 +263,7 @@ pub(crate) fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(app.theme.accent))
         .style(Style::default().bg(app.theme.bg));
     let inner_area = inner.inner(overlay_area);
-    let visible = inner_area.height.saturating_sub(1) as usize; // one row for margins
+    let visible = inner_area.height as usize;
     let total = lines.len();
     let max_scroll = total.saturating_sub(visible);
     let scroll = (app.help_scroll as usize).min(max_scroll) as u16;
@@ -272,7 +272,7 @@ pub(crate) fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
     let title = if total > visible {
         format!(
             " Help (F1/Esc close, {}/{}, PgUp/PgDn scroll) ",
-            scroll.saturating_add(inner_area.height.saturating_sub(1)),
+            scroll.saturating_add(1),
             total
         )
     } else {
