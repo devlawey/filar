@@ -2915,6 +2915,30 @@ SSH-соединение. `!ssh` переподключал ВСЕ вкладк�
 
 ---
 
+## Issue #141: fix(tui) — tab label shows real connection target
+
+**Milestone:** Filar v0.6.1. **Ветка:** `fix/141-tab-label-target`.
+
+**Проблема:** подпись вкладки всегда `local-N`, даже после `!ssh user@host`.
+
+**Решение:**
+- `Session::tab_label(index)` — форматирует ярлык из `ssh_info`:
+  `None` → `local-N`, `Some("user@host:22")` → `user@host`, нестандартный порт сохраняется.
+- `render_tab_bar` использует `s.tab_label(i)` вместо `s.target_name`.
+- Статус-бар уже показывает актуальную цель через `app.target_name` (Deref из #140).
+- Маркеры активности (`?`, `●`, `○`) не затронуты.
+
+**Файлы:** `crates/tui/src/app.rs` (метод `tab_label`), `crates/tui/src/ui/mod.rs` (render_tab_bar).
+
+**Тесты:** 4 новых (231 total):
+`tab_label_local_shows_local_n`, `tab_label_ssh_strips_default_port`,
+`tab_label_ssh_keeps_nonstandard_port`, `tab_label_ssh_no_port_shows_as_is`.
+
+**Публичные контракты:**
+- `Session::tab_label(index: usize) -> String` — новый public метод.
+
+---
+
 ## Релиз v0.6.0 (подготовка)
 
 **Дата:** 2026-07-23. **Milestone:** Filar v0.6.0 (6/6 issues, все смерджены).

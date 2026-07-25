@@ -477,6 +477,21 @@ impl Session {
             ssh_info: None,
         }
     }
+
+    /// Format the tab label: `local-N` for local sessions, `user@host` for
+    /// remote (port omitted when it is 22).
+    pub fn tab_label(&self, _index: usize) -> String {
+        match &self.ssh_info {
+            Some(info) => {
+                if let Some(host) = info.strip_suffix(":22") {
+                    host.to_string()
+                } else {
+                    info.clone()
+                }
+            }
+            None => self.target_name.clone(),
+        }
+    }
 }
 
 impl App {
@@ -4858,5 +4873,38 @@ mod tests {
         let taken = app.take_pending_local_executors();
         assert_eq!(taken.len(), 2);
         assert!(app.pending_local_executors.is_empty());
+    }
+
+    // ── Tab label tests ────────────────────────────────────────────────
+
+    #[test]
+    fn tab_label_local_shows_target_name() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        // Session 0: target_name is the initial config name.
+        assert_eq!(app.sessions[0].tab_label(0), "local");
+        app.new_tab();
+        // Session 1: target_name = "local-2" (set by new_tab).
+        assert_eq!(app.sessions[1].tab_label(1), "local-2");
+    }
+
+    #[test]
+    fn tab_label_ssh_strips_default_port() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.sessions[0].ssh_info = Some("root@10.0.0.5:22".into());
+        assert_eq!(app.sessions[0].tab_label(0), "root@10.0.0.5");
+    }
+
+    #[test]
+    fn tab_label_ssh_keeps_nonstandard_port() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.sessions[0].ssh_info = Some("root@10.0.0.5:2222".into());
+        assert_eq!(app.sessions[0].tab_label(0), "root@10.0.0.5:2222");
+    }
+
+    #[test]
+    fn tab_label_ssh_no_port_shows_as_is() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.sessions[0].ssh_info = Some("admin@devbox".into());
+        assert_eq!(app.sessions[0].tab_label(0), "admin@devbox");
     }
 }

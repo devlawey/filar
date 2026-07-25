@@ -194,7 +194,7 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
         } else {
             ""
         };
-        let label = format!("{}{}. {}", marker, i + 1, s.target_name);
+        let label = format!("{}{}. {}", marker, i + 1, s.tab_label(i));
         let style = if i == active {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
