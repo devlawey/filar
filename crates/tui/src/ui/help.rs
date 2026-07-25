@@ -165,6 +165,15 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
         },
         // ── Input ─────────────────────────────────────────────────────
         HelpEntry {
+            key: "^V",
+            desc: "Paste from clipboard",
+            section: "Input",
+            available: |m| matches!(
+                m,
+                AppMode::Normal | AppMode::Confirming | AppMode::PasswordInput
+            ),
+        },
+        HelpEntry {
             key: "!cmd",
             desc: "Run shell command directly",
             section: "Input",

@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Clipboard paste now works via Ctrl+V and bracketed paste in agent input, interactive
+  terminal, and password prompt
+  ([#153](https://github.com/devlawey/filar/issues/153)).
+
 ### Fixed
 
 - The F1 help overlay is now scrollable (PgUp/PgDn/arrows) instead of clipping entries
