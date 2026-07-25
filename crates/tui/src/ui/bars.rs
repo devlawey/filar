@@ -36,7 +36,6 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
             HelpItem { key: "^Z", desc: "cancel", action: Some(HelpAction::CancelWork) },
             HelpItem { key: "^Q", desc: "quit", action: Some(HelpAction::Quit) },
             HelpItem { key: "wheel", desc: "scroll", action: None },
-            HelpItem { key: "wheel", desc: "scroll", action: None },
         ],
         AppMode::Confirming => vec![
             HelpItem { key: "tab", desc: "switch", action: Some(HelpAction::Switch) },
