@@ -655,7 +655,11 @@ impl App {
     pub fn paste_text(&mut self, text: &str) {
         match self.mode {
             AppMode::Normal | AppMode::Confirming => {
-                let clean: String = text.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+                let clean: String = text
+                    .chars()
+                    .filter(|c| *c != '\r')
+                    .map(|c| if c == '\n' { ' ' } else { c })
+                    .collect();
                 if clean.is_empty() {
                     return;
                 }
