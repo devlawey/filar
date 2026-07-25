@@ -480,7 +480,7 @@ impl Session {
 
     /// Format the tab label: `local-N` for local sessions, `user@host` for
     /// remote (port omitted when it is 22).
-    pub fn tab_label(&self, index: usize) -> String {
+    pub fn tab_label(&self, _index: usize) -> String {
         match &self.ssh_info {
             Some(info) => {
                 if let Some(host) = info.strip_suffix(":22") {
@@ -489,7 +489,7 @@ impl Session {
                     info.clone()
                 }
             }
-            None => format!("local-{}", index + 1),
+            None => self.target_name.clone(),
         }
     }
 }
@@ -4878,12 +4878,12 @@ mod tests {
     // ── Tab label tests ────────────────────────────────────────────────
 
     #[test]
-    fn tab_label_local_shows_local_n() {
-        let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        // Session 0: index 0 → local-1
-        assert_eq!(app.sessions[0].tab_label(0), "local-1");
+    fn tab_label_local_shows_target_name() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        // Session 0: target_name is the initial config name.
+        assert_eq!(app.sessions[0].tab_label(0), "local");
         app.new_tab();
-        // Session 1: index 1 → local-2
+        // Session 1: target_name = "local-2" (set by new_tab).
         assert_eq!(app.sessions[1].tab_label(1), "local-2");
     }
 
