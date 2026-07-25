@@ -3036,6 +3036,22 @@ help-строка для текущего режима.
 
 ---
 
+## Релиз v0.6.1 (подготовка)
+
+**Дата:** 2026-07-25. **Milestone:** Filar v0.6.1 (5/5 issue, все смерджены).
+
+**Что вошло:**
+- #140 (#145): fix — per-session executor, Ctrl+N always local, !ssh scoped to tab
+- #141 (#146): fix — tab label shows real connection target from ssh_info
+- #142 (#147): feat — F1 help overlay with full command registry
+- #143 (#148): feat — persist agent input history with session
+- #144 (#149): docs — README actualization for v0.6.1
+
+**Engine:** менялись core (input_history), transport (TransportChanged session_id),
+agent (session_id). Тег `engine-v0.6.1` ставится.
+
+---
+
 ## Релиз v0.6.0 (подготовка)
 
 **Дата:** 2026-07-23. **Milestone:** Filar v0.6.0 (6/6 issues, все смерджены).
