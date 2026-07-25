@@ -642,8 +642,9 @@ impl App {
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
 
-        // F1 toggles the help overlay in ANY mode (including Interactive).
-        if key.code == KeyCode::F(1) {
+        // F1 toggles the help overlay — except in PasswordInput where
+        // the overlay would steal Esc from the password-cancel flow.
+        if key.code == KeyCode::F(1) && self.mode != AppMode::PasswordInput {
             self.toggle_help_overlay();
             return;
         }

@@ -250,7 +250,7 @@ pub(crate) fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
             app.theme.muted()
         };
         let desc_style = if available {
-            Style::default()
+            app.theme.fg_style()
         } else {
             app.theme.muted()
         };
