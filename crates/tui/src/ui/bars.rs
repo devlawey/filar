@@ -26,6 +26,7 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
             HelpItem { key: "^T", desc: "terminal", action: Some(HelpAction::Terminal) },
             HelpItem { key: "^P", desc: "password", action: Some(HelpAction::Password) },
             HelpItem { key: "^N", desc: "tab", action: None },
+            HelpItem { key: "^W", desc: "close", action: None },
             HelpItem { key: "wheel", desc: "scroll", action: None },
             HelpItem { key: "click", desc: "expand", action: None },
             HelpItem { key: "drag", desc: "copy", action: None },
@@ -279,5 +280,14 @@ mod tests {
         ));
         let row = render_status_row(&mut app, 20);
         assert_eq!(row.chars().count(), 20, "row must fill exactly 20 columns");
+    }
+
+    #[test]
+    fn normal_mode_help_includes_close_tab() {
+        let items = help_items(AppMode::Normal);
+        let has_w = items.iter().any(|i| i.key == "^W" && i.desc == "close");
+        assert!(has_w, "Normal mode help must include ^W close");
+        let has_n = items.iter().any(|i| i.key == "^N");
+        assert!(has_n, "Normal mode help must include ^N (existing check)");
     }
 }
