@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Help overlay listing every shortcut and command, opened with `F1` (Ctrl+H tested
+  and found indistinguishable from Backspace on Windows Terminal)
+  ([#142](https://github.com/devlawey/filar/issues/142)).
+
 ### Fixed
 
 - Command executors are now per session: a new tab always starts local, and `!ssh`

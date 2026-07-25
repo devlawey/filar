@@ -2939,6 +2939,42 @@ SSH-соединение. `!ssh` переподключал ВСЕ вкладк�
 
 ---
 
+## Issue #142: feat(tui) — F1 help overlay
+
+**Milestone:** Filar v0.6.1. **Ветка:** `feat/142-help-overlay`.
+
+**Проблема:** пользователь не видит полный список возможностей — только узкая
+help-строка для текущего режима.
+
+**Решение:**
+- **Реестр команд** (`ui/help.rs`): `help_registry()` — 24 записи в 7 разделах
+  (Help, Modes, Tabs, Agent, Scrolling, Copy, Input, Exit). Каждая с функцией
+  `available(mode) -> bool`. Единый источник для нижней help-строки и оверлея.
+- **Оверлей** — модальное окно поверх всего UI. Секции с заголовками (accent+bold),
+  доступные пункты обычным стилем, недоступные — muted.
+- **Открытие:** `F1` (во всех режимах, включая Interactive).
+- **Закрытие:** `Esc`, повторный `F1`.
+- **Блокировка ввода:** пока оверлей открыт, клавиши и мышь в приложение не проходят.
+- **Ctrl+H:** проверен эмпирически в Windows Terminal — неотличим от Backspace,
+  приходит как `KeyCode::Backspace`. Поэтому основная привязка — только `F1`.
+
+**Файлы:**
+- `crates/tui/src/ui/help.rs` — новый модуль (реестр + рендер)
+- `crates/tui/src/ui/mod.rs` — `mod help`, вызов render_help_overlay
+- `crates/tui/src/app.rs` — `help_overlay_visible`, `toggle_help_overlay()`,
+  перехват F1 и блокировка ввода в handle_key/handle_mouse
+
+**Тесты:** 10 новых (241 total):
+реестр непустой, ключевые секции, доступность по режимам (Normal/Interactive),
+открытие/закрытие F1/Esc, блокировка клавиш/мыши.
+
+**Публичные контракты:**
+- `App` — новое поле `help_overlay_visible: bool`.
+- `App::toggle_help_overlay()` — новый public метод.
+- `ui::help::help_registry()` — pub(crate), доступен для тестов.
+
+---
+
 ## Релиз v0.6.0 (подготовка)
 
 **Дата:** 2026-07-23. **Milestone:** Filar v0.6.0 (6/6 issues, все смерджены).
