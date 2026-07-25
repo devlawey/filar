@@ -8,7 +8,7 @@ use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{EnableMouseCapture, DisableMouseCapture, Event, EventStream};
+use crossterm::event::{EnableBracketedPaste, DisableBracketedPaste, EnableMouseCapture, DisableMouseCapture, Event, EventStream};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -164,6 +164,7 @@ impl PanicHookGuard {
             // so the user can read it and select the text.
             let _ = crossterm::execute!(
                 std::io::stdout(),
+                crossterm::event::DisableBracketedPaste,
                 crossterm::event::DisableMouseCapture,
                 crossterm::terminal::LeaveAlternateScreen
             );
@@ -232,6 +233,10 @@ pub async fn run(
     if let Err(e) = crossterm::execute!(io::stdout(), EnableMouseCapture) {
         warn!(error = %e, "mouse capture not available — mouse support disabled");
     }
+    // Bracketed paste enables Event::Paste for pasting from the system clipboard.
+    if let Err(e) = crossterm::execute!(io::stdout(), EnableBracketedPaste) {
+        warn!(error = %e, "bracketed paste not supported");
+    }
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)
@@ -247,7 +252,7 @@ pub async fn run(
 
     // Restore terminal.
     disable_raw_mode().ok();
-    crossterm::execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen).ok();
+    crossterm::execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen).ok();
 
     result
 }
@@ -374,6 +379,17 @@ async fn run_app(
                     }
                     Some(Ok(Event::Mouse(m))) => {
                         app.handle_mouse(m);
+                        needs_redraw = true;
+                    }
+                    Some(Ok(Event::Paste(text))) => {
+                        // Bracketed paste: forward to app's paste handler,
+                        // which dispatches by mode (normal/confirm/password).
+                        // In Interactive mode, paste manually writes to PTY.
+                        if app.mode == AppMode::Interactive {
+                            app.push_term_input(text.as_bytes());
+                        } else {
+                            app.paste_text(&text);
+                        }
                         needs_redraw = true;
                     }
                     Some(Ok(_)) => {} // ignore other events

@@ -645,6 +645,37 @@ impl App {
         }
     }
 
+    /// Paste `text` from the clipboard into the current mode's input.
+    ///
+    /// - *Normal / Confirming*: insert at cursor position, update [`cursor_pos`].
+    ///   Multi-line text has `\n` replaced with space (single-line input field).
+    /// - *PasswordInput*: insert masked — same path as typed password characters,
+    ///   without logging or entering input history.
+    /// - Other modes (Interactive, Thinking): no-op — handled elsewhere.
+    pub fn paste_text(&mut self, text: &str) {
+        match self.mode {
+            AppMode::Normal | AppMode::Confirming => {
+                let clean: String = text
+                    .chars()
+                    .filter(|c| *c != '\r')
+                    .map(|c| if c == '\n' { ' ' } else { c })
+                    .collect();
+                if clean.is_empty() {
+                    return;
+                }
+                let pos = self.cursor_pos.min(self.input.len());
+                self.input.insert_str(pos, &clean);
+                self.cursor_pos = pos + clean.len();
+            }
+            AppMode::PasswordInput => {
+                // Same as typing: masked, never logged, never in history.
+                let clean: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+                self.input.push_str(&clean);
+            }
+            _ => {}
+        }
+    }
+
     /// Toggle the help overlay on/off. Resets scroll to top when opening.
     pub fn toggle_help_overlay(&mut self) {
         self.help_overlay_visible = !self.help_overlay_visible;
@@ -689,8 +720,24 @@ impl App {
         };
         // Map English Ctrl shortcuts to both English and Russian layout chars.
         // Russian equivalents (ЙЦУКЕН): T=е, C=с, A=ф, D=в, Y=н, N=т, P=з,
-        // Q=й, Z=я, Esc=Esc
+        // Q=й, Z=я, W=ц, V=м
         let ctrl_key = |en: char, ru: char| is_ctrl(en) || is_ctrl(ru);
+
+        // Ctrl+V — paste from clipboard. Active in Normal, Confirming, and
+        // PasswordInput modes. In Interactive mode, bracketed paste (Event::Paste)
+        // handles insertion; in Thinking mode, the agent is running — no paste.
+        if ctrl_key('v', 'м')
+            && matches!(self.mode, AppMode::Normal | AppMode::Confirming | AppMode::PasswordInput)
+        {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                if let Ok(text) = clipboard.get_text() {
+                    if !text.is_empty() {
+                        self.paste_text(&text);
+                    }
+                }
+            }
+            return;
+        }
 
         // Global control hotkeys — active in every mode EXCEPT Interactive, where
         // all keys (including ^Q/^Z/^C) are forwarded to the remote PTY.
@@ -1423,7 +1470,7 @@ impl App {
     }
 
     /// Append bytes to the pending terminal input buffer.
-    fn push_term_input(&mut self, bytes: &[u8]) {
+    pub(crate) fn push_term_input(&mut self, bytes: &[u8]) {
         match &mut self.pending_term_input {
             Some(existing) => existing.extend_from_slice(bytes),
             None => self.pending_term_input = Some(bytes.to_vec()),
@@ -5131,5 +5178,51 @@ mod tests {
         assert_eq!(clamp(5, 30, 20), 5);
         assert_eq!(clamp(15, 30, 20), 10, "15 clamped to max 10");
         assert_eq!(clamp(0, 10, 20), 0, "total < visible, max = 0");
+    }
+
+    // ── Paste tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn paste_inserts_at_cursor_in_normal_mode() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.input = "hello".into();
+        app.cursor_pos = 2; // between 'e' and 'l'
+        app.paste_text("XYZ");
+        assert_eq!(app.input, "heXYZllo");
+        assert_eq!(app.cursor_pos, 5); // moved after inserted text
+    }
+
+    #[test]
+    fn paste_replaces_newlines_with_space() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.paste_text("line1\nline2");
+        assert_eq!(app.input, "line1 line2");
+    }
+
+    #[test]
+    fn paste_empty_string_is_noop() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.input = "hello".into();
+        app.paste_text("");
+        assert_eq!(app.input, "hello");
+    }
+
+    #[test]
+    fn paste_in_password_mode_does_not_enter_history() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::PasswordInput;
+        assert!(app.input_history().is_empty());
+        app.paste_text("s3cret");
+        assert!(!app.input.is_empty(), "input should receive pasted text");
+        assert!(app.input_history().is_empty(), "history must NOT contain password");
+    }
+
+    #[test]
+    fn paste_in_thinking_mode_is_noop() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Thinking;
+        app.input = "before".into();
+        app.paste_text("pasted");
+        assert_eq!(app.input, "before", "paste must be no-op in Thinking mode");
     }
 }

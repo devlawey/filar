@@ -3069,6 +3069,36 @@ Home reset, arrow keys, clamp формула.
 
 ---
 
+## Issue #153: feat(tui) — clipboard paste (Ctrl+V + bracketed paste)
+
+**Milestone:** Filar v0.6.2. **Ветка:** `feat/153-clipboard-paste`.
+
+**Проблема:** вставка из буфера не работала нигде: ни в поле ввода, ни в терминале, ни в парольном режиме.
+
+**Решение:**
+- **Bracketed paste:** `EnableBracketedPaste` в setup, `DisableBracketedPaste` в cleanup
+  (включая panic-хук). `Event::Paste` обрабатывается в цикле событий: направляет текст
+  в `App::paste_text()` или в PTY (`push_term_input`) для интерактивного режима.
+- **Ctrl+V:** привязан в `handle_key` (с русским эквивалентом ЙЦУКЕН: `Ctrl+М` для `м`
+  вместо латинского `v`). Читает буфер через `arboard::Clipboard::get_text()` и вызывает
+  `paste_text()`. Работает в Normal, Confirming, PasswordInput; в Thinking — no-op;
+  в Interactive — не перехватывается (bracketed paste покрывает).
+- **`App::paste_text()`:** единый метод вставки по режимам: Normal/Confirming — вставка в
+  позицию курсора (многострочный → замена `\n` на пробел); PasswordInput — вставка в
+  маскированное поле (не попадает в историю/логи); остальные — no-op.
+- **Реестр помощи:** запись `^V Paste from clipboard` добавлена в раздел Input.
+
+**Файлы:** `crates/tui/src/app.rs`, `crates/tui/src/runner.rs`, `crates/tui/src/ui/help.rs`.
+
+**Тесты:** 5 новых (254 total): paste в позицию курсора, замена `\n`, пустая строка no-op,
+PasswordInput не логируется, Thinking no-op.
+
+**Решение по интерактивному режиму:** Ctrl+V НЕ перехватывается в Interactive — bracketed
+paste (`Event::Paste`) естественно доставляет текст в PTY. Это соответствует поведению
+`Ctrl+C` (не перехвачен, оставлен терминалу).
+
+---
+
 ## Релиз v0.6.1 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.1 (5/5 issue, все смерджены).
