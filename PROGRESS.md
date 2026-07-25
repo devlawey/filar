@@ -3113,6 +3113,20 @@ paste (`Event::Paste`) естественно доставляет текст в
 
 ---
 
+## Релиз v0.6.2 (подготовка)
+
+**Дата:** 2026-07-25. **Milestone:** Filar v0.6.2 (4/4 issue, все смерджены).
+
+**Что вошло:**
+- #151 (#155): fix — scrollable help overlay
+- #152 (#156): fix — ^W close-tab in bottom hint bar
+- #153 (#157): feat — clipboard paste (Ctrl+V + bracketed paste)
+- #154 (#158): fix — redraw after Ctrl+T toggle
+
+**Engine:** не менялся (только tui). Тег engine НЕ ставится.
+
+---
+
 ## Релиз v0.6.1 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.1 (5/5 issue, все смерджены).

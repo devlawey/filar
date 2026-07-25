@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-07-25
+
 ### Added
 
 - Clipboard paste now works via Ctrl+V and bracketed paste in agent input, interactive
@@ -244,7 +246,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/devlawey/filar/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/devlawey/filar/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/devlawey/filar/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/devlawey/filar/compare/v0.5.0...v0.5.1
