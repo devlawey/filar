@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- The F1 help overlay is now scrollable (PgUp/PgDn/arrows) instead of clipping entries
+  that don't fit a small terminal window
+  ([#151](https://github.com/devlawey/filar/issues/151)).
+
 ## [0.6.1] - 2026-07-25
 
 ### Added
