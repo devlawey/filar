@@ -191,6 +191,8 @@ pub struct App {
     /// App signals the runner here; runner creates the executor asynchronously
     /// and stores it in its per-session map.
     pub pending_local_executors: Vec<SessionId>,
+    /// Whether the help overlay is currently visible.
+    pub help_overlay_visible: bool,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -330,6 +332,7 @@ impl App {
             help_bar_area: Rect::default(),
             closed_ids: Vec::new(),
             pending_local_executors: Vec::new(),
+            help_overlay_visible: false,
         }
     }
 
@@ -631,8 +634,29 @@ impl App {
         }
     }
 
+    /// Toggle the help overlay on/off.
+    pub fn toggle_help_overlay(&mut self) {
+        self.help_overlay_visible = !self.help_overlay_visible;
+    }
+
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
+
+        // F1 toggles the help overlay — except in PasswordInput where
+        // the overlay would steal Esc from the password-cancel flow.
+        if key.code == KeyCode::F(1) && self.mode != AppMode::PasswordInput {
+            self.toggle_help_overlay();
+            return;
+        }
+
+        // When the help overlay is visible, only Esc and F1 are processed;
+        // all other keys are consumed so they don't affect the UI behind it.
+        if self.help_overlay_visible {
+            if key.code == KeyCode::Esc {
+                self.help_overlay_visible = false;
+            }
+            return;
+        }
 
         // Helper: check if key is Ctrl+<english_char>, considering Russian layout.
         // On Russian ЙЦУКЕН layout, physical keys produce different characters.
@@ -1081,6 +1105,11 @@ impl App {
     /// all modes except `Interactive` and `PasswordInput`.
     pub fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+
+        // When the help overlay is visible, consume all mouse events.
+        if self.help_overlay_visible {
+            return;
+        }
 
         // Help-bar clicks work in ALL modes (including Interactive/Password).
         if m.kind == MouseEventKind::Down(MouseButton::Left) {
@@ -4906,5 +4935,85 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.sessions[0].ssh_info = Some("admin@devbox".into());
         assert_eq!(app.sessions[0].tab_label(0), "admin@devbox");
+    }
+
+    // ── Help overlay tests ────────────────────────────────────────────
+
+    #[test]
+    fn help_overlay_defaults_to_hidden() {
+        let app = App::new("test".into(), CommandConfirmMode::Always);
+        assert!(!app.help_overlay_visible);
+    }
+
+    #[test]
+    fn toggle_help_overlay_flips_visibility() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.toggle_help_overlay();
+        assert!(app.help_overlay_visible);
+        app.toggle_help_overlay();
+        assert!(!app.help_overlay_visible);
+    }
+
+    #[test]
+    fn f1_toggles_help_overlay() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let f1 = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(1),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        app.handle_key(f1);
+        assert!(app.help_overlay_visible, "F1 must open help overlay");
+        app.handle_key(f1);
+        assert!(!app.help_overlay_visible, "F1 must close help overlay");
+    }
+
+    #[test]
+    fn esc_closes_help_overlay() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let f1 = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(1),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        app.handle_key(f1);
+        assert!(app.help_overlay_visible);
+        let esc = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        app.handle_key(esc);
+        assert!(!app.help_overlay_visible, "Esc must close help overlay");
+    }
+
+    #[test]
+    fn help_overlay_blocks_other_keys() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let f1 = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(1),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        app.handle_key(f1);
+        assert!(app.help_overlay_visible);
+        // Type a character — should NOT reach the input field.
+        let a = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        app.handle_key(a);
+        assert!(app.input.is_empty(), "input must stay empty when overlay is open");
+    }
+
+    #[test]
+    fn help_overlay_blocks_mouse() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.help_overlay_visible = true;
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let m = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        app.handle_mouse(m);
+        // No assertion needed other than no panic — mouse event is consumed.
     }
 }

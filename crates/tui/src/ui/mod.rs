@@ -31,6 +31,7 @@ pub fn interactive_grid_rows(total_height: u16) -> u16 {
 mod bars;
 mod chat;
 mod confirm;
+mod help;
 mod input;
 #[allow(unused_imports)]
 pub(crate) use chat::scrollbar_content_len;
@@ -112,6 +113,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.mode == AppMode::Confirming {
         confirm::render_confirm_modal(f, app, app.chat_area);
     }
+
+    // Render help overlay on top of everything if active.
+    if app.help_overlay_visible {
+        let full = f.area();
+        help::render_help_overlay(f, app, full);
+    }
 }
 
 /// Render the interactive terminal mode.
@@ -167,6 +174,12 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
 
     bars::render_separator(f, app, chunks[3]);
     bars::render_help_bar(f, app, chunks[4]);
+
+    // Render help overlay on top of everything if active.
+    if app.help_overlay_visible {
+        let full = f.area();
+        help::render_help_overlay(f, app, full);
+    }
 }
 
 /// Render the tab bar — thin strip above the status bar showing each
