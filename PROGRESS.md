@@ -3015,6 +3015,27 @@ help-строка для текущего режима.
 
 ---
 
+## Issue #144: docs — README actualization for v0.6.1
+
+**Milestone:** Filar v0.6.1. **Ветка:** `docs/144-readme-v0-6-1`.
+
+**Проблема:** README устарел — не отражал per-tab executor, per-tab !ssh, подписи
+вкладок, help overlay и персистентную историю ввода.
+
+**Решение:** правки только в README.md. Код не тронут.
+- Таблица шорткатов: добавлен `F1` (help overlay), уточнены `Ctrl+T` (per-tab host),
+  `Ctrl+N` (always local), `Up/Down` (persisted history).
+- Секция SSH: `!ssh` действует только на текущую вкладку.
+- Интерактивный терминал: открывается на хосте вкладки; подписи вкладок отражают цель.
+- Features: Session Persistence дополнена упоминанием истории ввода.
+- Key Design: Swappable Executor — per-tab с v0.6.1.
+
+**Файлы:** `README.md`.
+
+**Тесты:** не требуются (только документация).
+
+---
+
 ## Релиз v0.6.0 (подготовка)
 
 **Дата:** 2026-07-23. **Milestone:** Filar v0.6.0 (6/6 issues, все смерджены).

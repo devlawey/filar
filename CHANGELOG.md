@@ -20,6 +20,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   Up/Down recalls previous prompts
   ([#143](https://github.com/devlawey/filar/issues/143)).
 
+### Changed
+
+- README updated for v0.6.1: per-tab connections, `!ssh` scope, help overlay, persisted
+  agent input history ([#144](https://github.com/devlawey/filar/issues/144)).
+
 ### Fixed
 
 - Command executors are now per session: a new tab always starts local, and `!ssh`
