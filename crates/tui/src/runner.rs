@@ -262,12 +262,11 @@ async fn run_app(
     let mut app = if config.initial_messages.is_empty() {
         App::new(config.target_name.clone(), config.confirm_mode)
     } else {
-        let history = std::mem::take(&mut config.initial_input_history);
         App::with_history(
             config.target_name.clone(),
             config.confirm_mode,
-            std::mem::take(&mut config.initial_messages),
-            history,
+            config.initial_messages,
+            config.initial_input_history,
         )
     };
     // Wire the App to the same StaticSecretProvider instance used by the
@@ -825,20 +824,15 @@ async fn run_app(
 
     // Save session to disk for future restore.
     let (id, timestamp) = filar_core::session::now_session_id();
-    let mut history: Vec<String> = app.input_history().to_vec();
-    let max_history = filar_core::session::MAX_INPUT_HISTORY;
-    if history.len() > max_history {
-        // Keep the most recent entries.
-        history = history.split_off(history.len() - max_history);
-    }
-    let session = filar_core::Session {
+    let mut session = filar_core::Session {
         id,
         timestamp,
         target: config.target_name.clone(),
         llm_profile: config.llm_profile.clone(),
         messages: app.messages.clone(),
-        input_history: history,
+        input_history: app.input_history().to_vec(),
     };
+    session.truncate_history();
     match filar_core::SessionStore::with_default_dir() {
         Ok(store) => {
             if let Err(e) = store.save(&session) {

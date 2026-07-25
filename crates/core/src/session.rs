@@ -73,6 +73,22 @@ impl From<&Session> for SessionMeta {
 }
 
 // ---------------------------------------------------------------------------
+// Session methods
+// ---------------------------------------------------------------------------
+
+impl Session {
+    /// Truncate `input_history` to at most [`MAX_INPUT_HISTORY`] entries,
+    /// keeping the most recent.
+    pub fn truncate_history(&mut self) {
+        let max = MAX_INPUT_HISTORY;
+        if self.input_history.len() > max {
+            let excess = self.input_history.len() - max;
+            self.input_history.drain(0..excess);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SessionStore
 // ---------------------------------------------------------------------------
 
@@ -461,12 +477,18 @@ mod tests {
 
     #[test]
     fn truncate_input_history_keeps_last_entries() {
-        use super::MAX_INPUT_HISTORY;
-        let mut history: Vec<String> = (0..250).map(|i| format!("entry{i}")).collect();
-        assert!(history.len() > MAX_INPUT_HISTORY);
-        history = history.split_off(history.len() - MAX_INPUT_HISTORY);
-        assert_eq!(history.len(), MAX_INPUT_HISTORY);
-        assert_eq!(history[0], "entry50"); // first kept
-        assert_eq!(history.last().unwrap(), "entry249"); // last kept
+        let mut session = Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "t".into(),
+            llm_profile: "t".into(),
+            messages: vec![],
+            input_history: (0..250).map(|i| format!("entry{i}")).collect(),
+        };
+        assert!(session.input_history.len() > MAX_INPUT_HISTORY);
+        session.truncate_history();
+        assert_eq!(session.input_history.len(), MAX_INPUT_HISTORY);
+        assert_eq!(session.input_history[0], "entry50");
+        assert_eq!(session.input_history.last().unwrap(), "entry249");
     }
 }
