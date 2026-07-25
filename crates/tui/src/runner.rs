@@ -259,14 +259,16 @@ async fn run_app(
     executor: Arc<dyn CommandExecutor>,
     mut config: TuiConfig,
 ) -> Result<()> {
-    let mut app = if config.initial_messages.is_empty() {
+    let mut app = if config.initial_messages.is_empty()
+        && config.initial_input_history.is_empty()
+    {
         App::new(config.target_name.clone(), config.confirm_mode)
     } else {
         App::with_history(
             config.target_name.clone(),
             config.confirm_mode,
-            config.initial_messages,
-            config.initial_input_history,
+            std::mem::take(&mut config.initial_messages),
+            std::mem::take(&mut config.initial_input_history),
         )
     };
     // Wire the App to the same StaticSecretProvider instance used by the

@@ -3011,6 +3011,8 @@ help-строка для текущего режима.
 - `filar_tui::TuiConfig` — новое поле `initial_input_history: Vec<String>`.
 - `filar_tui::Session::input_history()` — новый public метод.
 
+**Дальнейшие шаги:** нет. Функциональность завершена.
+
 ---
 
 ## Релиз v0.6.0 (подготовка)

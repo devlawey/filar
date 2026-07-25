@@ -324,6 +324,7 @@ mod tests {
         assert_eq!(loaded.id, "999");
         assert_eq!(loaded.target, "test");
         assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.input_history, session.input_history);
 
         let metas = store.list().unwrap();
         assert_eq!(metas.len(), 1);
