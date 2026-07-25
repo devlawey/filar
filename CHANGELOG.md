@@ -24,6 +24,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   ([#151](https://github.com/devlawey/filar/issues/151)).
 - The close-tab shortcut (^W) is now shown in the bottom hint bar, not only in the F1
   overlay ([#152](https://github.com/devlawey/filar/issues/152)).
+- Toggling the interactive view with Ctrl+T now redraws immediately instead of leaving a
+  stale frame until the next event
+  ([#154](https://github.com/devlawey/filar/issues/154)).
 
 ## [0.6.1] - 2026-07-25
 

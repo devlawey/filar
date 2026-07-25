@@ -575,6 +575,9 @@ async fn run_app(
                             sid,
                         );
                     }
+
+                    // Ctrl+T changes what's on screen — force immediate redraw.
+                    needs_redraw = true;
                 }
 
                 // Check if user entered an SSH password — perform connection.

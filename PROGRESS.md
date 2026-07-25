@@ -3099,6 +3099,20 @@ paste (`Event::Paste`) естественно доставляет текст в
 
 ---
 
+## Issue #154: fix(tui) — redraw after Ctrl+T toggle
+
+**Milestone:** Filar v0.6.2. **Ветка:** `fix/154-redraw-after-toggle`.
+
+**Проблема:** после Ctrl+T экран не обновлялся — кадр залипал до следующего события.
+
+**Решение:** `needs_redraw = true` внутри блока toggle после всех веток (enter/exit/show).
+
+**Файлы:** `crates/tui/src/runner.rs` (+1 строка).
+
+**Тесты:** 254 зелёных, перерисовка — ручная проверка.
+
+---
+
 ## Релиз v0.6.1 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.1 (5/5 issue, все смерджены).
