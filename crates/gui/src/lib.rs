@@ -250,7 +250,13 @@ fn save_config_toml(settings: &Settings) {
 
     // Load existing config to preserve non-LLM sections.
     let mut config: filar_core::Config = if path.exists() {
-        filar_core::Config::load(&path).unwrap_or_default()
+        match filar_core::Config::load(&path) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "config.toml exists but is invalid, not overwriting");
+                return;
+            }
+        }
     } else {
         filar_core::Config::default()
     };
@@ -267,7 +273,10 @@ fn save_config_toml(settings: &Settings) {
         config.llm.extra_body = serde_json::from_str(&settings.extra_body).ok();
     }
 
-    let _ = std::fs::create_dir_all(&app_dir);
+    if let Err(e) = std::fs::create_dir_all(&app_dir) {
+        tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");
+        return;
+    }
     match toml::to_string_pretty(&config) {
         Ok(data) => {
             if let Err(e) = std::fs::write(&path, &data) {
@@ -770,6 +779,32 @@ mod tests {
         let loaded: Settings = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(loaded.model, "test-model");
         assert_eq!(loaded.temperature, "0.5");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_save_preserves_existing_sections() {
+        let dir = std::env::temp_dir().join(format!("filar_test_cfg_{}", std::process::id()));
+        let app_dir = dir.join("filar");
+        let path = app_dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Write a config with non-LLM sections that must survive.
+        let existing = "[llm]\nmodel = \"old\"\napi_base_url = \"https://old.example.com\"\n\n[[ssh_targets]]\nname = \"dev\"\nhost = \"10.0.0.1\"\nuser = \"root\"\nauth = { type = \"agent\" }\n";
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(&path, existing).unwrap();
+
+        // Simulate what save_config_toml does after loading the config.
+        let mut config: filar_core::Config = filar_core::Config::load(&path).unwrap();
+        config.llm.model = "new".into();
+        let saved = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&path, &saved).unwrap();
+
+        let result = std::fs::read_to_string(&path).unwrap();
+        assert!(result.contains("model = \"new\""), "model must be updated");
+        assert!(result.contains("[[ssh_targets]]"), "ssh_targets must survive");
+        assert!(result.contains("dev"), "ssh target name must survive");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

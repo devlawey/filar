@@ -650,4 +650,21 @@ temperature = 5.0
         let _ = std::fs::remove_file(&tmp);
         assert!(result.is_err(), "Config::load should reject temperature=5.0");
     }
+
+    #[test]
+    fn load_default_prefers_filar_config_env() {
+        // Write a minimal config to a temp file and set FILAR_CONFIG env.
+        let dir = std::env::temp_dir().join(format!("filar_cfg_test_{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "[llm]\nmodel = \"env-model\"\napi_base_url = \"https://test.example.com\"\n").unwrap();
+
+        std::env::set_var("FILAR_CONFIG", path.to_str().unwrap());
+        let cfg = Config::load_default().unwrap();
+        assert_eq!(cfg.llm.model, "env-model", "FILAR_CONFIG must take priority");
+
+        std::env::remove_var("FILAR_CONFIG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
