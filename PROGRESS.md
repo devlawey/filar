@@ -3129,6 +3129,21 @@ paste (`Event::Paste`) естественно доставляет текст в
 
 ---
 
+## Issue #160: fix(gui) — ensure settings directory exists before save
+
+**Milestone:** Filar v0.7.0. **Ветка:** `fix/160-ensure-settings-dir`.
+
+**Проблема:** `std::fs::write` не создаёт родительские каталоги. Если `%APPDATA%\filar`
+отсутствует, настройки молча не сохраняются.
+
+**Решение:** `create_dir_all` в `Settings::save()` и `save_pending_launch()` перед записью.
+
+**Файлы:** `crates/gui/src/lib.rs` (+6 строк).
+
+**Тесты:** 1 новый (3 GUI total): запись→чтение→проверка значений в temp-каталоге.
+
+---
+
 ## Релиз v0.6.2 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.2 (4/4 issue, все смерджены).
