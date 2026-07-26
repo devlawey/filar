@@ -213,6 +213,86 @@ pub fn api_key(env_var: &str) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// KeyringSecretProvider
+// ---------------------------------------------------------------------------
+
+/// [`SecretProvider`] backed by the OS credential store (via `keyring`).
+///
+/// Secret names are used directly as the credential entry username; the service
+/// name is always `"filar"`.
+///
+/// On platforms without a credential store, `get()` returns
+/// [`CoreError::Secret`] and `secret_names()` returns an empty list.
+/// The provider never panics on keyring errors.
+///
+/// # Examples
+///
+/// ```no_run
+/// use filar_core::secrets::{KeyringSecretProvider, SecretProvider};
+/// let keyring = KeyringSecretProvider::new();
+/// // This reads the credential stored under "api_key" in the "filar" service.
+/// if let Ok(api_key) = keyring.get("api_key") {
+///     println!("API key loaded from OS credential store");
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct KeyringSecretProvider;
+
+impl KeyringSecretProvider {
+    /// Create a new `KeyringSecretProvider`.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for KeyringSecretProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SecretProvider for KeyringSecretProvider {
+    fn get(&self, name: &str) -> Result<String> {
+        let entry = keyring::Entry::new("filar", name)
+            .map_err(|e| CoreError::Secret(format!("keyring entry error: {e}")))?;
+        entry
+            .get_password()
+            .map_err(|e| CoreError::Secret(format!("keyring get failed for {name}: {e}")))
+    }
+
+    fn secret_names(&self) -> Vec<String> {
+        // Keyring doesn't support listing entries — return empty.
+        Vec::new()
+    }
+}
+
+/// Save a secret to the OS credential store.
+///
+/// `username` is the logical name (e.g. `"api_key"`, `"ssh0"`). An empty
+/// secret deletes the entry rather than storing an empty string.
+pub fn save_secret_to_keyring(username: &str, secret: &str) {
+    if secret.is_empty() {
+        delete_secret_from_keyring(username);
+        return;
+    }
+    match keyring::Entry::new("filar", username) {
+        Ok(entry) => {
+            if let Err(e) = entry.set_password(secret) {
+                tracing::warn!(error = %e, "failed to save secret to credential store");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to create credential entry"),
+    }
+}
+
+/// Delete a secret from the OS credential store.
+pub fn delete_secret_from_keyring(username: &str) {
+    if let Ok(entry) = keyring::Entry::new("filar", username) {
+        let _ = entry.delete_credential();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

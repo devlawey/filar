@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 
 use filar_agent::OpenAiCompatClient;
 use filar_agent::LlmClient;
-use filar_core::{secrets, default_base_dir, Config, SessionStore, StaticSecretProvider};
+use filar_core::{secrets, default_base_dir, Config, SecretProvider, SessionStore, StaticSecretProvider};
 use filar_transport::{LocalExecutor, SshExecutor};
 use filar_tui::TuiConfig;
 
@@ -270,22 +270,42 @@ async fn run() -> anyhow::Result<()> {
                 llm_config.validate().map_err(|e| anyhow::anyhow!(e))?;
 
                 // Build SshTarget if the user selected SSH in the GUI.
-                let ssh_target = launch.ssh.map(|s| filar_core::SshTarget {
-                    name: "gui-ssh".to_string(),
-                    host: s.host,
-                    port: s.port,
-                    user: s.user,
-                    auth: filar_core::SshAuth::Password {
-                        password: if s.password.is_empty() { None } else { Some(s.password) },
-                    },
-                    host_key_policy: filar_core::HostKeyPolicy::Tofu,
+                // Read password from OS credential store if not passed in
+                // (since the struct now excludes secrets from serialization).
+                let ssh_target = launch.ssh.map(|s| {
+                    let password = if s.password.is_empty() {
+                        let cred = filar_core::secrets::KeyringSecretProvider::new();
+                        let name = format!("ssh{}", s.slot);
+                        cred.get(&name).ok()
+                    } else {
+                        Some(s.password)
+                    };
+                    filar_core::SshTarget {
+                        name: "gui-ssh".to_string(),
+                        host: s.host,
+                        port: s.port,
+                        user: s.user,
+                        auth: filar_core::SshAuth::Password {
+                            password,
+                        },
+                        host_key_policy: filar_core::HostKeyPolicy::Tofu,
+                    }
                 });
+
+                // Read API key from OS credential store if not passed in
+                // (serde(skip) excludes it from serialization).
+                let api_key = if launch.api_key.is_empty() {
+                    let cred = filar_core::secrets::KeyringSecretProvider::new();
+                    cred.get("api_key").unwrap_or_default()
+                } else {
+                    launch.api_key
+                };
 
                 (
                     launch.target,
                     launch.session_id,
                     llm_config,
-                    launch.api_key,
+                    api_key,
                     ssh_target,
                 )
             }
