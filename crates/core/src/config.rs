@@ -345,7 +345,7 @@ impl Config {
         }
         // 2. App-data directory (unified config location).
         if let Ok(base) = crate::default_base_dir() {
-            let app_config = base.join("config.toml");
+            let app_config = base.join("filar").join("config.toml");
             if app_config.exists() {
                 tracing::info!(path = %app_config.display(), "loading config from app-data dir");
                 return Self::load(&app_config);
@@ -358,11 +358,12 @@ impl Config {
         }
         // 4. Next to the executable.
         if let Ok(exe) = std::env::current_exe() {
-            let exe_dir = exe.parent().unwrap_or(std::path::Path::new("."));
-            let exe_config = exe_dir.join("config.toml");
-            if exe_config.exists() {
-                tracing::info!(path = %exe_config.display(), "loading config from exe directory");
-                return Self::load(&exe_config);
+            if let Some(exe_dir) = exe.parent() {
+                let exe_config = exe_dir.join("config.toml");
+                if exe_config.exists() {
+                    tracing::info!(path = %exe_config.display(), "loading config from exe directory");
+                    return Self::load(&exe_config);
+                }
             }
         }
         tracing::info!("no config.toml found, using built-in defaults");

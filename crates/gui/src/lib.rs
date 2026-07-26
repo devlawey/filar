@@ -230,32 +230,53 @@ impl Settings {
     }
 }
 
-/// Write `[llm]` settings to `config.toml` in the app-data directory
-/// so `filar-tui` invoked without the GUI launcher still picks them up.
+/// Write `[llm]` settings to `config.toml` in `%APPDATA%\filar\`
+/// so `filar-tui` invoked without the GUI launcher picks them up.
+///
+/// If a config.toml already exists, only the `[llm]` section is updated;
+/// other sections (SSH targets, profiles, etc.) are preserved.
 fn save_config_toml(settings: &Settings) {
     let base = match filar_core::default_base_dir() {
         Ok(b) => b,
         Err(_) => return,
     };
-    let path = base.join("config.toml");
-    // Only write if LLM fields are non-empty (don't overwrite a
-    // user-edited config.toml with an empty one).
-    if settings.model.is_empty() && settings.api_base_url.is_empty() {
+    let app_dir = base.join("filar");
+    let path = app_dir.join("config.toml");
+
+    // Only save if the model field is non-empty.
+    if settings.model.is_empty() {
         return;
     }
-    let _ = std::fs::create_dir_all(base);
-    let mut content = format!(
-        "[llm]\nmodel = \"{}\"\napi_base_url = \"{}\"\n",
-        settings.model, settings.api_base_url
-    );
+
+    // Load existing config to preserve non-LLM sections.
+    let mut config: filar_core::Config = if path.exists() {
+        filar_core::Config::load(&path).unwrap_or_default()
+    } else {
+        filar_core::Config::default()
+    };
+
+    // Update LLM section from GUI settings.
+    config.llm.model = settings.model.clone();
+    if !settings.api_base_url.is_empty() {
+        config.llm.api_base_url = settings.api_base_url.clone();
+    }
     if !settings.temperature.is_empty() {
-        content.push_str(&format!("temperature = \"{}\"\n", settings.temperature));
+        config.llm.temperature = settings.temperature.parse().ok();
     }
     if !settings.extra_body.is_empty() {
-        content.push_str(&format!("extra_body = \"{}\"\n", settings.extra_body));
+        config.llm.extra_body = serde_json::from_str(&settings.extra_body).ok();
     }
-    if let Err(e) = std::fs::write(&path, &content) {
-        tracing::warn!(path = %path.display(), error = %e, "failed to save config.toml");
+
+    let _ = std::fs::create_dir_all(&app_dir);
+    match toml::to_string_pretty(&config) {
+        Ok(data) => {
+            if let Err(e) = std::fs::write(&path, &data) {
+                tracing::warn!(path = %path.display(), error = %e, "failed to save config.toml");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialize config.toml");
+        }
     }
 }
 
