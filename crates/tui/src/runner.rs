@@ -203,6 +203,12 @@ pub struct TuiConfig {
     /// Shared between the TUI (for dynamic `$FILAR_SECRET_N` insertion via
     /// Ctrl+P) and the agent (via `SecretSubstitutingExecutor`).
     pub secret_provider: Arc<StaticSecretProvider>,
+    /// All configured LLM profiles loaded from config.
+    pub profiles: Vec<filar_core::LlmProfile>,
+    /// Name of the default (startup) profile.
+    pub default_profile_name: String,
+    /// Factory for creating per-session LLM clients from profiles.
+    pub llm_factory: Arc<dyn Fn(&filar_core::LlmProfile, &StaticSecretProvider) -> std::result::Result<Arc<dyn LlmClient>, CoreError> + Send + Sync>,
     /// Receiver for WARN/ERROR log lines forwarded from the tracing subscriber
     /// (see [`crate::log_layer`]). The runner polls it and shows each line as a
     /// `System` block, so important logs surface in the chat instead of being
@@ -212,7 +218,7 @@ pub struct TuiConfig {
 
 /// Run the TUI with the given LLM client, executor, and configuration.
 pub async fn run(
-    llm: Arc<dyn LlmClient>,
+    _llm: Arc<dyn LlmClient>,
     executor: Arc<dyn CommandExecutor>,
     config: TuiConfig,
 ) -> Result<()> {
@@ -242,7 +248,7 @@ pub async fn run(
     let mut terminal = Terminal::new(backend)
         .map_err(|e| CoreError::Other(format!("failed to create terminal: {e}")))?;
 
-    let result = run_app(&mut terminal, llm, executor, config).await;
+    let result = run_app(&mut terminal, _llm, executor, config).await;
 
     // Restore the original panic hook before terminal teardown.
     // The custom hook is no longer needed — teardown uses .ok() and
@@ -260,7 +266,7 @@ pub async fn run(
 /// The main application loop.
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    llm: Arc<dyn LlmClient>,
+    _llm: Arc<dyn LlmClient>,
     executor: Arc<dyn CommandExecutor>,
     mut config: TuiConfig,
 ) -> Result<()> {
@@ -276,6 +282,9 @@ async fn run_app(
             std::mem::take(&mut config.initial_input_history),
         )
     };
+    // Load available LLM profiles and default profile name.
+    app.profiles = std::mem::take(&mut config.profiles);
+    app.default_profile_name = std::mem::take(&mut config.default_profile_name);
     // Wire the App to the same StaticSecretProvider instance used by the
     // agent's SecretSubstitutingExecutor, so Ctrl+P inserts are visible to
     // command substitution and output sanitisation.
@@ -560,8 +569,30 @@ async fn run_app(
                         // Create a cancellation token for this agent run.
                         let cancel_token = CancellationToken::new();
                         app.cancellation = Some(cancel_token.clone());
+                        // Resolve the LLM client for this session's profile.
+                        let session_llm = {
+                            let profile_name = app.sessions[app.active]
+                                .llm_profile
+                                .as_deref()
+                                .unwrap_or(&app.default_profile_name);
+                            let profile = app.profiles.iter()
+                                .find(|p| p.name == profile_name);
+                            match profile {
+                                Some(p) => match (config.llm_factory)(p, &config.secret_provider) {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        app.push_error(format!("Failed to create LLM client: {e}"));
+                                        continue;
+                                    }
+                                },
+                                None => {
+                                    app.push_error(format!("Profile '{profile_name}' not found"));
+                                    continue;
+                                }
+                            }
+                        };
                         spawn_agent(
-                            llm.clone(),
+                            session_llm,
                             agent_exec,
                             confirmer.clone(),
                             config.confirm_mode,
