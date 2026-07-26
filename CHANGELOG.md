@@ -16,6 +16,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - GUI launcher now has a Models tab with add/delete profile management; each profile
   stores its API key in the OS credential store independently
   ([#162](https://github.com/devlawey/filar/issues/162)).
+- Ctrl+L now cycles through LLM profiles per tab; each session can use a different
+  model without affecting other tabs
+  ([#163](https://github.com/devlawey/filar/issues/163)).
 
 ### Fixed
 

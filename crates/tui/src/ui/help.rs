@@ -165,6 +165,13 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
         },
         // ── Input ─────────────────────────────────────────────────────
         HelpEntry {
+            key: "^L",
+            desc: "Cycle LLM profile for this tab",
+            section: "Agent",
+            available: |m| m == AppMode::Normal,
+        },
+        // ── Input ─────────────────────────────────────────────────────
+        HelpEntry {
             key: "^V",
             desc: "Paste from clipboard",
             section: "Input",

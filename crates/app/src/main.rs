@@ -388,6 +388,9 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // ── Launch TUI ─────────────────────────────────────────────────────
+    let default_profile_name = config.llm_profiles.first()
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| "default".into());
     let tui_config = TuiConfig {
         target_name: target_name.clone(),
         confirm_mode: config.confirm_mode,
@@ -396,8 +399,21 @@ async fn run() -> anyhow::Result<()> {
         initial_input_history,
         ssh_target: ssh_target.clone(),
         is_local: ssh_target.is_none(),
-        secret_provider,
+        secret_provider: secret_provider.clone(),
         log_rx,
+        profiles: config.llm_profiles.clone(),
+        default_profile_name,
+        llm_factory: Arc::new(move |profile: &filar_core::LlmProfile, sp: &filar_core::StaticSecretProvider| {
+            let key = sp.get(&profile.key_env).unwrap_or_default();
+            let key = if key.is_empty() { std::env::var(&profile.key_env).unwrap_or_default() } else { key };
+            let llm_config: filar_core::LlmConfig = profile.into();
+            Ok(Arc::new(OpenAiCompatClient::new_with_provider(
+                &llm_config,
+                Duration::from_secs(300),
+                &key,
+                sp as &dyn filar_core::SecretProvider,
+            ).map_err(|e| filar_core::CoreError::Other(format!("LLM client error: {e}")))?))
+        }),
     };
 
     info!("launching TUI");

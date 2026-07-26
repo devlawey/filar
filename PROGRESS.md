@@ -3185,6 +3185,26 @@ paste (`Event::Paste`) естественно доставляет текст в
 
 ---
 
+## Issue #163: feat(tui) — per-session LLM profile with Ctrl+L
+
+**Milestone:** Filar v0.7.0. **Ветка:** `feat/163-per-session-llm-profile`.
+
+**Проблема:** одна модель на всё приложение. Нельзя было иметь разные модели в разных вкладках.
+
+**Решение:**
+- `Session::llm_profile: Option<String>` — выбранный профиль (None = default).
+- `App::profiles: Vec<LlmProfile>`, `default_profile_name` — загружаются из config.
+- `Ctrl+L` в Normal циклически переключает профили (Ctrl+Д на ЙЦУКЕН).
+- `TuiConfig::llm_factory` — фабрика клиентов LLM (closure из main.rs).
+- При `spawn_agent` строится новый `Arc<dyn LlmClient>` через factory для профиля сессии.
+- `help_registry`: запись `^L Cycle LLM profile`.
+
+**Файлы:** `tui/src/app.rs`, `tui/src/runner.rs`, `tui/src/ui/help.rs`, `app/src/main.rs`.
+
+**Тесты:** 420 pass, без регрессии.
+
+---
+
 ## Релиз v0.6.2 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.2 (4/4 issue, все смерджены).

@@ -195,6 +195,10 @@ pub struct App {
     pub help_overlay_visible: bool,
     /// Scroll offset (in lines) for the help overlay.
     pub help_scroll: u16,
+    /// Available LLM profiles (from config).
+    pub profiles: Vec<filar_core::LlmProfile>,
+    /// Default profile name when session doesn't specify one.
+    pub default_profile_name: String,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -306,6 +310,8 @@ pub struct Session {
     /// SSH connection info for this tab (e.g. "user@host:port"). None = local.
     /// Set when `!ssh` succeeds for this tab. Used for display and system prompt.
     pub ssh_info: Option<String>,
+    /// LLM profile selected via Ctrl+L. None = use App default.
+    pub llm_profile: Option<String>,
 }
 
 impl App {
@@ -336,6 +342,8 @@ impl App {
             pending_local_executors: Vec::new(),
             help_overlay_visible: false,
             help_scroll: 0,
+            profiles: Vec::new(),
+            default_profile_name: String::new(),
         }
     }
 
@@ -481,6 +489,7 @@ impl Session {
             has_new: false,
             awaiting_confirmation: false,
             ssh_info: None,
+            llm_profile: None,
         }
     }
 
@@ -736,6 +745,23 @@ impl App {
                     }
                 }
             }
+            return;
+        }
+
+        // Ctrl+L — cycle LLM profiles for this session.
+        if ctrl_key('l', 'д')
+            && self.mode == AppMode::Normal
+            && !self.profiles.is_empty()
+        {
+            let current = self.llm_profile.as_deref();
+            let idx = self.profiles.iter()
+                .position(|p| Some(p.name.as_str()) == current)
+                .map_or(self.profiles.len().saturating_sub(1), |i| (i + 1) % self.profiles.len());
+            self.llm_profile = Some(self.profiles[idx].name.clone());
+            self.push_message(ChatBlock::System(format!(
+                "Switched to LLM profile: {}",
+                self.profiles[idx].name
+            )));
             return;
         }
 
