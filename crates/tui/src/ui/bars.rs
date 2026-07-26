@@ -96,6 +96,15 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         spans.push(Span::styled(mt, app.theme.mode_badge_style(mode_color)));
     }
 
+    // Token counter — right-aligned.
+    if app.tokens_in > 0 || app.tokens_out > 0 {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            format!("toks: {}↑ {}↓", app.tokens_in, app.tokens_out),
+            app.theme.muted(),
+        ));
+    }
+
     // Right side: `confirm_mode`, then an optional toast (e.g. "· copied")
     // pinned to the far right. Space for the toast is reserved *before* the
     // padding is computed — otherwise the padding fills the whole line and the

@@ -312,6 +312,10 @@ pub struct Session {
     pub ssh_info: Option<String>,
     /// LLM profile selected via Ctrl+L. None = use App default.
     pub llm_profile: Option<String>,
+    /// Cumulative input tokens consumed by this session.
+    pub tokens_in: u64,
+    /// Cumulative output tokens generated for this session.
+    pub tokens_out: u64,
 }
 
 impl App {
@@ -490,6 +494,8 @@ impl Session {
             awaiting_confirmation: false,
             ssh_info: None,
             llm_profile: None,
+            tokens_in: 0,
+            tokens_out: 0,
         }
     }
 
@@ -891,6 +897,7 @@ impl App {
                             }
                         } else {
                             self.push_message(ChatBlock::User(text.clone()));
+                            self.tokens_in += (text.len() as u64).div_ceil(4);
                             self.scroll = 0;
                             self.input.clear();
                             self.cursor_pos = 0;
@@ -2063,6 +2070,7 @@ impl App {
                     self.pending_proposal = None;
                 }
                 filar_agent::AgentEvent::Finished(text) => {
+                    let text_len = text.len();
                     if self.streaming {
                         if !text.is_empty() {
                             if let Some(ChatBlock::Agent(ref mut existing)) = self.messages.last_mut() {
@@ -2080,6 +2088,7 @@ impl App {
                     self.mode = AppMode::Normal;
                     self.agent_running = false;
                     self.cancellation = None;
+                    self.tokens_out += (text_len as u64).div_ceil(4);
                     self.active_session_mut().background_activity = false;
                 }
                 filar_agent::AgentEvent::Error(err) => {

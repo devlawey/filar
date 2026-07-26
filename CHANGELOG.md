@@ -19,6 +19,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Ctrl+L now cycles through LLM profiles per tab; each session can use a different
   model without affecting other tabs
   ([#163](https://github.com/devlawey/filar/issues/163)).
+- Token usage counter shown in the status bar (estimated ~4 chars/token) per session
+  ([#164](https://github.com/devlawey/filar/issues/164)).
 
 ### Fixed
 
