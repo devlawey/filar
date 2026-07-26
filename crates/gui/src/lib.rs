@@ -554,7 +554,7 @@ impl LauncherApp {
     }
 
     fn save_profiles(&mut self) {
-        let p = &self.profiles[self.selected_profile];
+        let Some(p) = self.profiles.get(self.selected_profile) else { return };
         Settings {
             model: p.model.clone(), api_base_url: p.api_base_url.clone(),
             ssh_profiles: self.ssh_slots.iter().map(|s| s.to_profile()).collect(),
