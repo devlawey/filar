@@ -3113,6 +3113,22 @@ paste (`Event::Paste`) естественно доставляет текст в
 
 ---
 
+## Issue #159: fix(security) — secrets out of pending_launch.json
+
+**Milestone:** Filar v0.7.0. **Ветка:** `fix/159-secrets-out-of-pending-launch`.
+
+**Проблема:** `LaunchConfig` сериализовался целиком с `api_key`/`ssh.password` в
+`pending_launch.json`. При падении файл с секретами оставался на диске.
+
+**Решение:** `#[serde(skip)]` на полях-секретах, `KeyringSecretProvider` в `core`,
+`main.rs` читает ключи из OS credential store, старые файлы удаляются.
+
+**Файлы:** `core/Cargo.toml`, `core/secrets.rs`, `gui/lib.rs`, `app/main.rs`.
+
+**Тесты:** 2 GUI + 1 doc-test = 411 total (2 skipped docker).
+
+---
+
 ## Релиз v0.6.2 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.2 (4/4 issue, все смерджены).

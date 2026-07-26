@@ -77,6 +77,9 @@ fn ssh_cred_name(slot: usize) -> String {
 // ---------------------------------------------------------------------------
 
 /// The user's choices from the launcher GUI.
+///
+/// Secrets (API key, SSH passwords) are NOT serialized — they go through
+/// the OS credential store. See `filar_core::secrets::KeyringSecretProvider`.
 #[derive(Serialize, Deserialize)]
 pub struct LaunchConfig {
     /// `"local"` or `"ssh"`.
@@ -87,7 +90,8 @@ pub struct LaunchConfig {
     pub model: String,
     /// API base URL.
     pub api_base_url: String,
-    /// API key entered by the user.
+    /// API key entered by the user — NEVER written to disk.
+    #[serde(skip, default)]
     pub api_key: String,
     /// Session ID to restore, if the user picked a previous session.
     pub session_id: Option<String>,
@@ -100,12 +104,20 @@ pub struct LaunchConfig {
 }
 
 /// SSH connection details from the GUI.
+///
+/// The password is NEVER serialized — it goes through the OS credential store.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SshConnection {
     pub host: String,
     pub port: u16,
     pub user: String,
+    /// Password — NEVER written to disk.
+    #[serde(skip, default)]
     pub password: String,
+    /// Slot index for saving/loading the password from the OS credential store.
+    /// Not a secret — must be persisted so resume picks the correct keyring entry.
+    #[serde(default)]
+    pub slot: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +143,16 @@ pub fn load_pending_launch() -> Option<LaunchConfig> {
         return None;
     }
     let data = std::fs::read_to_string(&p).ok()?;
+
+    // Check for old-format files that still contain plaintext secrets.
+    // Users upgrading from 0.6.x may have these on disk; delete them
+    // and return None so the GUI re-launches with the new clean format.
+    if data.contains("\"api_key\":") || data.contains("\"password\":") {
+        let _ = std::fs::remove_file(&p);
+        tracing::info!("deleted old-format pending_launch.json with plaintext secrets");
+        return None;
+    }
+
     let _ = std::fs::remove_file(&p);
     serde_json::from_str(&data).ok()
 }
@@ -303,8 +325,7 @@ impl LauncherApp {
                     if ui.selectable_label(selected, &text).clicked() {
                         self.selected_session = Some(i);
                     }
-                }
-            });
+            }});
     }
 
     fn render_target_selector(&mut self, ui: &mut egui::Ui) {
@@ -437,6 +458,7 @@ impl LauncherApp {
                 port: slot.port.parse().unwrap_or(22),
                 user: slot.user.clone(),
                 password: slot.password.clone(),
+                slot: self.target_mode.saturating_sub(1),
             })
         } else {
             None
@@ -603,5 +625,67 @@ fn load_icon() -> egui::IconData {
         rgba: img.into_raw(),
         width,
         height,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_config_serialization_excludes_secrets() {
+        let cfg = LaunchConfig {
+            target: "ssh".into(),
+            ssh: Some(SshConnection {
+                host: "10.0.0.5".into(),
+                port: 22,
+                user: "root".into(),
+                password: "supersecret".into(),
+                slot: 0,
+            }),
+            model: "glm".into(),
+            api_base_url: "https://api.example.com".into(),
+            api_key: "sk-test-key-12345".into(),
+            session_id: None,
+            temperature: String::new(),
+            extra_body: String::new(),
+        };
+        let json = serde_json::to_string_pretty(&cfg).unwrap();
+        assert!(!json.contains("supersecret"));
+        assert!(!json.contains("sk-test-key-12345"));
+        assert!(json.contains("10.0.0.5"));
+        assert!(json.contains("glm"));
+        // Round-trip: non-secret fields survive serialize→deserialize.
+        let loaded: LaunchConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.target, "ssh");
+        assert_eq!(loaded.model, "glm");
+        assert!(loaded.ssh.is_some());
+        assert_eq!(loaded.ssh.as_ref().unwrap().slot, 0);
+        // Secrets must be absent after deserialization (serde(skip) → default).
+        assert!(loaded.api_key.is_empty());
+        assert!(loaded.ssh.as_ref().unwrap().password.is_empty());
+    }
+
+    #[test]
+    fn ssh_connection_serialization_excludes_password() {
+        let conn = SshConnection {
+            host: "host".into(),
+            port: 22,
+            user: "admin".into(),
+            password: "p@ssw0rd".into(),
+            slot: 2,
+        };
+        let json = serde_json::to_string(&conn).unwrap();
+        assert!(!json.contains("p@ssw0rd"));
+        assert!(json.contains("host"));
+        // Round-trip: non-secret fields survive, secret doesn't.
+        let loaded: SshConnection = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.host, "host");
+        assert_eq!(loaded.slot, 2);
+        assert!(loaded.password.is_empty());
     }
 }

@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- API keys and SSH passwords are no longer written in plain text to
+  `pending_launch.json`; secrets are read from the OS credential store instead
+  ([#159](https://github.com/devlawey/filar/issues/159)).
+
 ## [0.6.2] - 2026-07-25
 
 ### Added
