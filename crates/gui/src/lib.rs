@@ -230,6 +230,35 @@ impl Settings {
     }
 }
 
+/// Write `[llm]` settings to `config.toml` in the app-data directory
+/// so `filar-tui` invoked without the GUI launcher still picks them up.
+fn save_config_toml(settings: &Settings) {
+    let base = match filar_core::default_base_dir() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let path = base.join("config.toml");
+    // Only write if LLM fields are non-empty (don't overwrite a
+    // user-edited config.toml with an empty one).
+    if settings.model.is_empty() && settings.api_base_url.is_empty() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(base);
+    let mut content = format!(
+        "[llm]\nmodel = \"{}\"\napi_base_url = \"{}\"\n",
+        settings.model, settings.api_base_url
+    );
+    if !settings.temperature.is_empty() {
+        content.push_str(&format!("temperature = \"{}\"\n", settings.temperature));
+    }
+    if !settings.extra_body.is_empty() {
+        content.push_str(&format!("extra_body = \"{}\"\n", settings.extra_body));
+    }
+    if let Err(e) = std::fs::write(&path, &content) {
+        tracing::warn!(path = %path.display(), error = %e, "failed to save config.toml");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LauncherApp
 // ---------------------------------------------------------------------------
@@ -483,6 +512,9 @@ impl LauncherApp {
             extra_body: self.extra_body.clone(),
         };
         settings.save();
+        // Also persist LLM settings to config.toml in the app-data directory
+        // so `filar-tui` (invoked without the GUI launcher) picks them up.
+        save_config_toml(&settings);
         save_secret(api_key_cred_name(), &self.api_key);
         for (i, slot) in self.ssh_slots.iter().enumerate() {
             if slot.save_password && !slot.password.is_empty() {

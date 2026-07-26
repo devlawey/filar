@@ -3144,6 +3144,26 @@ paste (`Event::Paste`) естественно доставляет текст в
 
 ---
 
+## Issue #161: feat(core,app,gui) — unified config.toml location
+
+**Milestone:** Filar v0.7.0. **Ветка:** `feat/161-unified-config-location`.
+
+**Проблема:** `config.toml` искался в CWD, не в `%APPDATA%\filar\`. При запуске из
+Загрузок/рабочего стола конфиг не находился.
+
+**Решение:**
+- `Config::load_default()`: `FILAR_CONFIG` → `%APPDATA%\filar\config.toml` → CWD →
+  exe dir → defaults.
+- `main.rs` упрощён до `Config::load_default()` (27 строк → 1 строка).
+- `save_config_toml()` в GUI: при сохранении настроек лаунчер пишет `[llm]` секцию
+  в `%APPDATA%\filar\config.toml`.
+
+**Файлы:** `core/src/config.rs`, `app/src/main.rs`, `gui/src/lib.rs`.
+
+**Тесты:** 413 pass, без регрессии.
+
+---
+
 ## Релиз v0.6.2 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.2 (4/4 issue, все смерджены).

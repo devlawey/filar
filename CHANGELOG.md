@@ -19,6 +19,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - `Settings::save` and `save_pending_launch` now create their parent directory before
   writing, preventing silent data loss when `%APPDATA%\filar` doesn't exist
   ([#160](https://github.com/devlawey/filar/issues/160)).
+- `config.toml` is now searched in `%APPDATA%\filar\` first (unified config location),
+  then CWD, then next to the executable
+  ([#161](https://github.com/devlawey/filar/issues/161)).
 
 ## [0.6.2] - 2026-07-25
 

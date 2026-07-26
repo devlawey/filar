@@ -327,9 +327,46 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Convenience: load from `config.toml` in the current directory.
+    /// Convenience: load from `config.toml`.
+    ///
+    /// Search order:
+    /// 1. `FILAR_CONFIG` environment variable (explicit path)
+    /// 2. `%APPDATA%\filar\config.toml` (platform app-data directory)
+    /// 3. `config.toml` in the current working directory
+    /// 4. `config.toml` next to the executable
+    ///
+    /// Falls back to built-in defaults if no file is found anywhere.
     pub fn load_default() -> Result<Self> {
-        Self::load("config.toml")
+        // 1. FILAR_CONFIG env var.
+        if let Ok(explicit) = std::env::var("FILAR_CONFIG") {
+            let p = std::path::PathBuf::from(explicit);
+            tracing::info!(path = %p.display(), "loading config from FILAR_CONFIG");
+            return Self::load(&p);
+        }
+        // 2. App-data directory (unified config location).
+        if let Ok(base) = crate::default_base_dir() {
+            let app_config = base.join("config.toml");
+            if app_config.exists() {
+                tracing::info!(path = %app_config.display(), "loading config from app-data dir");
+                return Self::load(&app_config);
+            }
+        }
+        // 3. Current working directory.
+        if std::path::Path::new("config.toml").exists() {
+            tracing::info!("loading config.toml from current directory");
+            return Self::load("config.toml");
+        }
+        // 4. Next to the executable.
+        if let Ok(exe) = std::env::current_exe() {
+            let exe_dir = exe.parent().unwrap_or(std::path::Path::new("."));
+            let exe_config = exe_dir.join("config.toml");
+            if exe_config.exists() {
+                tracing::info!(path = %exe_config.display(), "loading config from exe directory");
+                return Self::load(&exe_config);
+            }
+        }
+        tracing::info!("no config.toml found, using built-in defaults");
+        Ok(Self::default())
     }
 
     /// Look up an SSH target by name.
