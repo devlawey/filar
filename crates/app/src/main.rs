@@ -274,12 +274,12 @@ async fn run() -> anyhow::Result<()> {
                     }
                 });
 
-                // Read API key from OS credential store if not passed in
-                // (serde(skip) excludes it from serialization).
+                // Read API key from OS credential store using the profile's key_env.
                 let api_key = if launch.api_key.is_empty() {
                     let cred = filar_core::secrets::KeyringSecretProvider::new();
-                    cred.get("api_key")
-                        .inspect_err(|e| tracing::warn!(error = %e, "failed to read API key from OS credential store"))
+                    let key_name = if launch.key_env.is_empty() { "GLM_API_KEY".to_string() } else { launch.key_env.clone() };
+                    cred.get(&key_name)
+                        .inspect_err(|e| tracing::warn!(error = %e, %key_name, "failed to read API key from OS credential store"))
                         .unwrap_or_default()
                 } else {
                     launch.api_key

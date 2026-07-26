@@ -67,6 +67,11 @@ fn api_key_cred_name() -> &'static str {
     "api_key"
 }
 
+/// Try to load the API key for a profile from the OS credential store.
+fn load_secret_for_profile(profile: &filar_core::LlmProfile) -> String {
+    load_secret(&profile.key_env)
+}
+
 /// Credential key for SSH slot N (0-based).
 fn ssh_cred_name(slot: usize) -> String {
     format!("ssh{slot}")
@@ -101,6 +106,16 @@ pub struct LaunchConfig {
     /// Extra body JSON as text (empty = none).
     #[serde(default)]
     pub extra_body: String,
+    /// Selected profile name (if using the Models tab).
+    #[serde(default)]
+    pub selected_profile: Option<String>,
+    /// Env var / credential name for the API key.
+    #[serde(default = "default_glm_key_env_gui")]
+    pub key_env: String,
+}
+
+fn default_glm_key_env_gui() -> String {
+    "GLM_API_KEY".to_string()
 }
 
 /// SSH connection details from the GUI.
@@ -191,6 +206,12 @@ struct Settings {
     temperature: String,
     #[serde(default)]
     extra_body: String,
+    /// Named LLM profiles (for Models tab).
+    #[serde(default)]
+    profiles: Vec<filar_core::LlmProfile>,
+    /// Index of the default (last-selected) profile.
+    #[serde(default)]
+    selected_profile: usize,
 }
 
 impl Settings {
@@ -243,8 +264,8 @@ fn save_config_toml(settings: &Settings) {
     let app_dir = base.join("filar");
     let path = app_dir.join("config.toml");
 
-    // Only save if the model field is non-empty.
-    if settings.model.is_empty() {
+    // Only save if there's something to write.
+    if settings.model.is_empty() && settings.profiles.is_empty() {
         return;
     }
 
@@ -261,7 +282,7 @@ fn save_config_toml(settings: &Settings) {
         filar_core::Config::default()
     };
 
-    // Update LLM section from GUI settings.
+    // Update primary LLM section (backward compat) and profiles.
     config.llm.model = settings.model.clone();
     if !settings.api_base_url.is_empty() {
         config.llm.api_base_url = settings.api_base_url.clone();
@@ -271,6 +292,10 @@ fn save_config_toml(settings: &Settings) {
     }
     if !settings.extra_body.is_empty() {
         config.llm.extra_body = serde_json::from_str(&settings.extra_body).ok();
+    }
+    // Whenever profiles are defined, write them to config.toml.
+    if !settings.profiles.is_empty() {
+        config.llm_profiles = settings.profiles.clone();
     }
 
     if let Err(e) = std::fs::create_dir_all(&app_dir) {
@@ -337,15 +362,25 @@ impl SshSlot {
 struct LauncherApp {
     sessions: Vec<SessionMeta>,
     selected_session: Option<usize>,
-    /// 0 = local, 1..=5 = SSH1..SSH5
     target_mode: usize,
+    ssh_slots: Vec<SshSlot>,
+    /// All configured profiles.
+    profiles: Vec<LlmProfileData>,
+    /// Currently selected profile index.
+    selected_profile: usize,
+    validation_error: String,
+}
+
+/// Local copy of an LLM profile for GUI editing.
+#[derive(Clone)]
+struct LlmProfileData {
+    name: String,
     model: String,
     api_base_url: String,
+    key_env: String,
     api_key: String,
-    ssh_slots: Vec<SshSlot>,
     temperature: String,
     extra_body: String,
-    validation_error: String,
 }
 
 /// Apply the dark theme, matching the TUI accent palette:
@@ -459,110 +494,113 @@ impl LauncherApp {
     }
 
     fn render_llm_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("LLM");
-        ui.label("Model:");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.model)
-                .hint_text("e.g. glm-5.1"),
-        );
-        ui.label("API base URL:");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.api_base_url)
-                .hint_text("e.g. https://openrouter.ai/api/v1"),
-        );
-        ui.label("API key:");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.api_key)
-                .password(true)
-                .hint_text("saved in OS credential store"),
-        );
-        ui.label("Temperature:");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.temperature)
-                .hint_text("empty = default (e.g. 0.3)"),
-        );
+        ui.heading("Models");
+        let profile_names: Vec<String> = self.profiles.iter().map(|p| p.name.clone()).collect();
+        if profile_names.is_empty() {
+            ui.label("No profiles defined. Click Add to create one.");
+            if ui.button("Add Profile").clicked() {
+                self.profiles.push(LlmProfileData {
+                    name: "default".into(), model: String::new(),
+                    api_base_url: String::new(), key_env: "GLM_API_KEY".into(),
+                    api_key: String::new(), temperature: String::new(),
+                    extra_body: String::new(),
+                });
+                self.selected_profile = 0;
+            }
+            return;
+        }
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_label("Profile")
+                .selected_text(&profile_names[self.selected_profile])
+                .show_ui(ui, |ui| {
+                    for (i, name) in profile_names.iter().enumerate() {
+                        if ui.selectable_label(i == self.selected_profile, name).clicked() {
+                            self.selected_profile = i;
+                        }
+                    }
+                });
+            if ui.button("+").on_hover_text("Add profile").clicked() {
+                self.profiles.push(LlmProfileData {
+                    name: format!("profile-{}", self.profiles.len() + 1),
+                    model: String::new(), api_base_url: String::new(),
+                    key_env: "GLM_API_KEY".into(), api_key: String::new(),
+                    temperature: String::new(), extra_body: String::new(),
+                });
+                self.selected_profile = self.profiles.len() - 1;
+            }
+            if self.profiles.len() > 1 && ui.button("X").on_hover_text("Delete profile").clicked() {
+                self.profiles.remove(self.selected_profile);
+                self.selected_profile = self.selected_profile.min(self.profiles.len().saturating_sub(1));
+            }
+        });
+        let p = &mut self.profiles[self.selected_profile];
+        ui.horizontal(|ui| { ui.label("Name:"); ui.text_edit_singleline(&mut p.name); });
+        ui.horizontal(|ui| { ui.label("Model:"); ui.text_edit_singleline(&mut p.model); });
+        ui.horizontal(|ui| { ui.label("API URL:"); ui.text_edit_singleline(&mut p.api_base_url); });
+        ui.horizontal(|ui| {
+            ui.label("API key:");
+            ui.add(egui::TextEdit::singleline(&mut p.api_key).password(true).hint_text("saved in OS credential store"));
+        });
+        ui.horizontal(|ui| { ui.label("Key env:"); ui.text_edit_singleline(&mut p.key_env); });
+        ui.horizontal(|ui| { ui.label("Temp:"); ui.text_edit_singleline(&mut p.temperature); });
         ui.label("Extra body (JSON):");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.extra_body)
-                .hint_text("e.g. {\"thinking\": {\"type\": \"disabled\"}}")
-                .desired_rows(2)
-                .desired_width(f32::INFINITY),
-        );
+        ui.add(egui::TextEdit::multiline(&mut p.extra_body)
+            .hint_text("e.g. {\"thinking\":{\"type\":\"disabled\"}}")
+            .desired_rows(2).desired_width(f32::INFINITY));
     }
 
     fn do_launch(&mut self) {
         self.validation_error.clear();
-        if !self.temperature.trim().is_empty()
-            && !matches!(
-                self.temperature.trim().parse::<f32>(),
-                Ok(t) if t.is_finite() && (0.0..=2.0).contains(&t)
-            )
+        let p = &self.profiles[self.selected_profile];
+        if !p.temperature.trim().is_empty()
+            && !matches!(p.temperature.trim().parse::<f32>(), Ok(t) if t.is_finite() && (0.0..=2.0).contains(&t))
         {
-            self.validation_error = format!(
-                "Invalid temperature: '{}'. Expected a number in [0.0, 2.0].",
-                self.temperature
-            );
+            self.validation_error = format!("Invalid temperature: '{}'. Expected [0.0, 2.0].", p.temperature);
         }
         if self.validation_error.is_empty()
-            && !self.extra_body.trim().is_empty()
-            && serde_json::from_str::<serde_json::Value>(&self.extra_body).is_err()
+            && !p.extra_body.trim().is_empty()
+            && serde_json::from_str::<serde_json::Value>(&p.extra_body).is_err()
         {
             self.validation_error = "Invalid extra body JSON.".to_string();
         }
         if !self.validation_error.is_empty() {
             return;
         }
-        let target = if self.target_mode == 0 {
-            "local"
-        } else {
-            "ssh"
-        };
+        let target = if self.target_mode == 0 { "local" } else { "ssh" };
         let ssh = if self.target_mode > 0 {
             let slot = &self.ssh_slots[self.target_mode - 1];
-            Some(SshConnection {
-                host: slot.host.clone(),
-                port: slot.port.parse().unwrap_or(22),
-                user: slot.user.clone(),
-                password: slot.password.clone(),
-                slot: self.target_mode.saturating_sub(1),
-            })
-        } else {
-            None
-        };
+            Some(SshConnection { host: slot.host.clone(), port: slot.port.parse().unwrap_or(22), user: slot.user.clone(), password: slot.password.clone(), slot: self.target_mode.saturating_sub(1) })
+        } else { None };
+
         let settings = Settings {
-            model: self.model.clone(),
-            api_base_url: self.api_base_url.clone(),
+            model: p.model.clone(), api_base_url: p.api_base_url.clone(),
             ssh_profiles: self.ssh_slots.iter().map(|s| s.to_profile()).collect(),
-            last_ssh: if self.target_mode > 0 {
-                self.target_mode - 1
-            } else {
-                0
-            },
-            temperature: self.temperature.clone(),
-            extra_body: self.extra_body.clone(),
+            last_ssh: if self.target_mode > 0 { self.target_mode - 1 } else { 0 },
+            temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
+            profiles: self.profiles.iter().map(|d| filar_core::LlmProfile {
+                name: d.name.clone(), model: d.model.clone(), api_base_url: d.api_base_url.clone(),
+                key_env: d.key_env.clone(), max_tokens: 4096,
+                temperature: d.temperature.trim().parse().ok(),
+                top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
+            }).collect(),
+            selected_profile: self.selected_profile,
         };
         settings.save();
-        // Also persist LLM settings to config.toml in the app-data directory
-        // so `filar-tui` (invoked without the GUI launcher) picks them up.
         save_config_toml(&settings);
-        save_secret(api_key_cred_name(), &self.api_key);
+        for prof in &self.profiles {
+            if !prof.api_key.is_empty() { save_secret(&prof.key_env, &prof.api_key); }
+        }
         for (i, slot) in self.ssh_slots.iter().enumerate() {
-            if slot.save_password && !slot.password.is_empty() {
-                save_secret(&ssh_cred_name(i), &slot.password);
-            } else {
-                delete_secret(&ssh_cred_name(i));
-            }
+            if slot.save_password && !slot.password.is_empty() { save_secret(&ssh_cred_name(i), &slot.password); }
+            else { delete_secret(&ssh_cred_name(i)); }
         }
         let session_id = self.selected_session.map(|i| self.sessions[i].id.clone());
         let cfg = LaunchConfig {
-            target: target.to_string(),
-            ssh,
-            model: self.model.clone(),
-            api_base_url: self.api_base_url.clone(),
-            api_key: self.api_key.clone(),
-            session_id,
-            temperature: self.temperature.clone(),
-            extra_body: self.extra_body.clone(),
+            target: target.to_string(), ssh,
+            model: p.model.clone(), api_base_url: p.api_base_url.clone(),
+            api_key: p.api_key.clone(), session_id,
+            temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
+            selected_profile: Some(p.name.clone()), key_env: p.key_env.clone(),
         };
         save_pending_launch(&cfg);
         std::process::exit(0);
@@ -632,8 +670,40 @@ pub fn run_launcher(config: &Config) {
         .map(|(i, p)| SshSlot::from_profile(p, i))
         .collect();
 
-    // Load API key from credential store.
-    let api_key = load_secret(api_key_cred_name());
+    // Build profile list. Migrate old flat settings into a default profile
+    // on first upgrade, preserving existing api_key.
+    let mut profiles: Vec<LlmProfileData> = settings
+        .profiles
+        .iter()
+        .map(|p| LlmProfileData {
+            name: p.name.clone(),
+            model: p.model.clone(),
+            api_base_url: p.api_base_url.clone(),
+            key_env: p.key_env.clone(),
+            api_key: load_secret_for_profile(p),
+            temperature: p.temperature.map(|t| t.to_string()).unwrap_or_default(),
+            extra_body: p.extra_body
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+        })
+        .collect();
+
+    // If no profiles exist, create a default from flat fields / config.
+    if profiles.is_empty() {
+        let api_key = load_secret(api_key_cred_name());
+        profiles.push(LlmProfileData {
+            name: "default".into(),
+            model: if settings.model.is_empty() { config.llm.model.clone() } else { settings.model.clone() },
+            api_base_url: if settings.api_base_url.is_empty() { config.llm.api_base_url.clone() } else { settings.api_base_url.clone() },
+            key_env: "GLM_API_KEY".into(),
+            api_key,
+            temperature: settings.temperature.clone(),
+            extra_body: settings.extra_body.clone(),
+        });
+    }
+
+    let selected_profile = settings.selected_profile.min(profiles.len().saturating_sub(1));
 
     let app = LauncherApp {
         sessions,
@@ -643,20 +713,9 @@ pub fn run_launcher(config: &Config) {
         } else {
             0
         },
-        model: if settings.model.is_empty() {
-            config.llm.model.clone()
-        } else {
-            settings.model
-        },
-        api_base_url: if settings.api_base_url.is_empty() {
-            config.llm.api_base_url.clone()
-        } else {
-            settings.api_base_url
-        },
-        api_key,
         ssh_slots,
-        temperature: settings.temperature,
-        extra_body: settings.extra_body,
+        profiles,
+        selected_profile,
         validation_error: String::new(),
     };
 
@@ -722,6 +781,8 @@ mod tests {
             session_id: None,
             temperature: String::new(),
             extra_body: String::new(),
+            selected_profile: None,
+            key_env: "GLM_API_KEY".into(),
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(!json.contains("supersecret"));
@@ -773,6 +834,8 @@ mod tests {
             model: "test-model".into(), api_base_url: "https://example.com".into(),
             ssh_profiles: vec![], last_ssh: 0, temperature: "0.5".into(),
             extra_body: String::new(),
+            profiles: vec![],
+            selected_profile: 0,
         };
         std::fs::write(&file, serde_json::to_string_pretty(&s).unwrap()).unwrap();
 

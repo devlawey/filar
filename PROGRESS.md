@@ -3164,6 +3164,27 @@ paste (`Event::Paste`) естественно доставляет текст в
 
 ---
 
+## Issue #162: feat(gui,core) — Models tab with profile management
+
+**Milestone:** Filar v0.7.0. **Ветка:** `feat/162-launcher-model-profiles`.
+
+**Проблема:** лаунчер имел только один набор LLM-полей, нельзя было переключаться между моделями без ручной правки полей.
+
+**Решение:**
+- `Settings.profiles: Vec<LlmProfile>` + `selected_profile` — персистентное хранение профилей.
+- `LauncherApp` — профильный UI: combobox выбора, кнопки +/×, поля ввода для выделенного профиля.
+- `do_launch`: каждый профиль сохраняет API-ключ в keyring под своим `key_env` именем.
+- `LaunchConfig`: новые поля `selected_profile: Option<String>`, `key_env: String`.
+- `main.rs`: ключ читается из keyring по `key_env` (а не жёстко `"api_key"`).
+- `save_config_toml`: пишет `[llm_profiles]` в дополнение к `[llm]`.
+- Миграция: при первом запуске старые плоские поля создают один профиль `"default"`.
+
+**Файлы:** `gui/src/lib.rs` (основной), `app/src/main.rs` (+4 строки).
+
+**Тесты:** 416 pass, без регрессии.
+
+---
+
 ## Релиз v0.6.2 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.2 (4/4 issue, все смерджены).

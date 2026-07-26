@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- GUI launcher now has a Models tab with add/delete profile management; each profile
+  stores its API key in the OS credential store independently
+  ([#162](https://github.com/devlawey/filar/issues/162)).
+
 ### Fixed
 
 - API keys and SSH passwords are no longer written in plain text to
