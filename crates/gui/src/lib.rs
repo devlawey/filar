@@ -506,6 +506,7 @@ impl LauncherApp {
                     extra_body: String::new(),
                 });
                 self.selected_profile = 0;
+                self.save_profiles();
             }
             return;
         }
@@ -523,14 +524,17 @@ impl LauncherApp {
                 self.profiles.push(LlmProfileData {
                     name: format!("profile-{}", self.profiles.len() + 1),
                     model: String::new(), api_base_url: String::new(),
-                    key_env: "GLM_API_KEY".into(), api_key: String::new(),
-                    temperature: String::new(), extra_body: String::new(),
+                    key_env: format!("api_key_profile-{}", self.profiles.len() + 1),
+                    api_key: String::new(), temperature: String::new(),
+                    extra_body: String::new(),
                 });
                 self.selected_profile = self.profiles.len() - 1;
+                self.save_profiles();
             }
             if self.profiles.len() > 1 && ui.button("X").on_hover_text("Delete profile").clicked() {
                 self.profiles.remove(self.selected_profile);
                 self.selected_profile = self.selected_profile.min(self.profiles.len().saturating_sub(1));
+                self.save_profiles();
             }
         });
         let p = &mut self.profiles[self.selected_profile];
@@ -549,9 +553,29 @@ impl LauncherApp {
             .desired_rows(2).desired_width(f32::INFINITY));
     }
 
+    fn save_profiles(&mut self) {
+        let p = &self.profiles[self.selected_profile];
+        Settings {
+            model: p.model.clone(), api_base_url: p.api_base_url.clone(),
+            ssh_profiles: self.ssh_slots.iter().map(|s| s.to_profile()).collect(),
+            last_ssh: if self.target_mode > 0 { self.target_mode - 1 } else { 0 },
+            temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
+            profiles: self.profiles.iter().map(|d| filar_core::LlmProfile {
+                name: d.name.clone(), model: d.model.clone(), api_base_url: d.api_base_url.clone(),
+                key_env: d.key_env.clone(), max_tokens: 4096,
+                temperature: d.temperature.trim().parse().ok(),
+                top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
+            }).collect(),
+            selected_profile: self.selected_profile,
+        }.save();
+    }
+
     fn do_launch(&mut self) {
         self.validation_error.clear();
-        let p = &self.profiles[self.selected_profile];
+        let Some(p) = self.profiles.get(self.selected_profile) else {
+            self.validation_error = "No profile selected".to_string();
+            return;
+        };
         if !p.temperature.trim().is_empty()
             && !matches!(p.temperature.trim().parse::<f32>(), Ok(t) if t.is_finite() && (0.0..=2.0).contains(&t))
         {
@@ -696,7 +720,7 @@ pub fn run_launcher(config: &Config) {
             name: "default".into(),
             model: if settings.model.is_empty() { config.llm.model.clone() } else { settings.model.clone() },
             api_base_url: if settings.api_base_url.is_empty() { config.llm.api_base_url.clone() } else { settings.api_base_url.clone() },
-            key_env: "GLM_API_KEY".into(),
+            key_env: api_key_cred_name().to_string(),
             api_key,
             temperature: settings.temperature.clone(),
             extra_body: settings.extra_body.clone(),
