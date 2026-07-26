@@ -554,12 +554,14 @@ impl LauncherApp {
     }
 
     fn save_profiles(&mut self) {
-        let Some(p) = self.profiles.get(self.selected_profile) else { return };
+        let p = self.profiles.get(self.selected_profile);
         Settings {
-            model: p.model.clone(), api_base_url: p.api_base_url.clone(),
+            model: p.map_or_else(String::new, |x| x.model.clone()),
+            api_base_url: p.map_or_else(String::new, |x| x.api_base_url.clone()),
             ssh_profiles: self.ssh_slots.iter().map(|s| s.to_profile()).collect(),
             last_ssh: if self.target_mode > 0 { self.target_mode - 1 } else { 0 },
-            temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
+            temperature: p.map_or_else(String::new, |x| x.temperature.clone()),
+            extra_body: p.map_or_else(String::new, |x| x.extra_body.clone()),
             profiles: self.profiles.iter().map(|d| filar_core::LlmProfile {
                 name: d.name.clone(), model: d.model.clone(), api_base_url: d.api_base_url.clone(),
                 key_env: d.key_env.clone(), max_tokens: 4096,
