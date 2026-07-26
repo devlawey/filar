@@ -115,7 +115,8 @@ pub struct SshConnection {
     #[serde(skip, default)]
     pub password: String,
     /// Slot index for saving/loading the password from the OS credential store.
-    #[serde(skip, default)]
+    /// Not a secret — must be persisted so resume picks the correct keyring entry.
+    #[serde(default)]
     pub slot: usize,
 }
 
@@ -658,6 +659,15 @@ mod tests {
         assert!(!json.contains("sk-test-key-12345"));
         assert!(json.contains("10.0.0.5"));
         assert!(json.contains("glm"));
+        // Round-trip: non-secret fields survive serialize→deserialize.
+        let loaded: LaunchConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.target, "ssh");
+        assert_eq!(loaded.model, "glm");
+        assert!(loaded.ssh.is_some());
+        assert_eq!(loaded.ssh.as_ref().unwrap().slot, 0);
+        // Secrets must be absent after deserialization (serde(skip) → default).
+        assert!(loaded.api_key.is_empty());
+        assert!(loaded.ssh.as_ref().unwrap().password.is_empty());
     }
 
     #[test]
@@ -672,5 +682,10 @@ mod tests {
         let json = serde_json::to_string(&conn).unwrap();
         assert!(!json.contains("p@ssw0rd"));
         assert!(json.contains("host"));
+        // Round-trip: non-secret fields survive, secret doesn't.
+        let loaded: SshConnection = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.host, "host");
+        assert_eq!(loaded.slot, 2);
+        assert!(loaded.password.is_empty());
     }
 }

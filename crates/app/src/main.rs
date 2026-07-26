@@ -276,7 +276,9 @@ async fn run() -> anyhow::Result<()> {
                     let password = if s.password.is_empty() {
                         let cred = filar_core::secrets::KeyringSecretProvider::new();
                         let name = format!("ssh{}", s.slot);
-                        cred.get(&name).ok()
+                        cred.get(&name)
+                            .inspect_err(|e| tracing::debug!(error = %e, %name, "no saved SSH password in keyring"))
+                            .ok()
                     } else {
                         Some(s.password)
                     };
@@ -296,7 +298,9 @@ async fn run() -> anyhow::Result<()> {
                 // (serde(skip) excludes it from serialization).
                 let api_key = if launch.api_key.is_empty() {
                     let cred = filar_core::secrets::KeyringSecretProvider::new();
-                    cred.get("api_key").unwrap_or_default()
+                    cred.get("api_key")
+                        .inspect_err(|e| tracing::warn!(error = %e, "failed to read API key from OS credential store"))
+                        .unwrap_or_default()
                 } else {
                     launch.api_key
                 };
