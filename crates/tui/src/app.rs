@@ -754,9 +754,15 @@ impl App {
             && !self.profiles.is_empty()
         {
             let current = self.llm_profile.as_deref();
-            let idx = self.profiles.iter()
+            let idx = match self.profiles.iter()
                 .position(|p| Some(p.name.as_str()) == current)
-                .map_or(self.profiles.len().saturating_sub(1), |i| (i + 1) % self.profiles.len());
+            {
+                Some(i) => (i + 1) % self.profiles.len(),
+                // First Ctrl+L: start from the default profile, not the last one.
+                None => self.profiles.iter()
+                    .position(|p| p.name == self.default_profile_name)
+                    .unwrap_or(0),
+            };
             self.llm_profile = Some(self.profiles[idx].name.clone());
             self.push_message(ChatBlock::System(format!(
                 "Switched to LLM profile: {}",
@@ -5250,5 +5256,28 @@ mod tests {
         app.input = "before".into();
         app.paste_text("pasted");
         assert_eq!(app.input, "before", "paste must be no-op in Thinking mode");
+    }
+
+    #[test]
+    fn ctrl_l_cycles_llm_profiles() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.profiles = vec![
+            filar_core::LlmProfile { name: "glm".into(), model: "g".into(), api_base_url: "u".into(), max_tokens: 4096, key_env: "k1".into(), temperature: None, top_p: None, extra_body: None },
+            filar_core::LlmProfile { name: "ds".into(), model: "d".into(), api_base_url: "u".into(), max_tokens: 4096, key_env: "k2".into(), temperature: None, top_p: None, extra_body: None },
+        ];
+        app.default_profile_name = "glm".into();
+
+        // First Ctrl+L with None profile → jumps to default.
+        let ctrl_l = crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('l'), crossterm::event::KeyModifiers::CONTROL);
+        app.handle_key(ctrl_l);
+        assert_eq!(app.llm_profile.as_deref(), Some("glm"));
+
+        // Second → next profile.
+        app.handle_key(ctrl_l);
+        assert_eq!(app.llm_profile.as_deref(), Some("ds"));
+
+        // Third → wrap to first.
+        app.handle_key(ctrl_l);
+        assert_eq!(app.llm_profile.as_deref(), Some("glm"));
     }
 }

@@ -574,8 +574,8 @@ async fn run_app(
                             let profile_name = app.sessions[app.active]
                                 .llm_profile
                                 .as_deref()
-                                .unwrap_or(&config.default_profile_name);
-                            let profile = config.profiles.iter()
+                                .unwrap_or(&app.default_profile_name);
+                            let profile = app.profiles.iter()
                                 .find(|p| p.name == profile_name);
                             match profile {
                                 Some(p) => match (config.llm_factory)(p, &config.secret_provider) {

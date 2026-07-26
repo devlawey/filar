@@ -406,6 +406,11 @@ async fn run() -> anyhow::Result<()> {
         llm_factory: Arc::new(move |profile: &filar_core::LlmProfile, sp: &filar_core::StaticSecretProvider| {
             let key = sp.get(&profile.key_env).unwrap_or_default();
             let key = if key.is_empty() { std::env::var(&profile.key_env).unwrap_or_default() } else { key };
+            if key.is_empty() {
+                return Err(filar_core::CoreError::Secret(
+                    format!("no API key found for profile {} (checked credential store '{}' and env)", profile.name, profile.key_env)
+                ));
+            }
             let llm_config: filar_core::LlmConfig = profile.into();
             Ok(Arc::new(OpenAiCompatClient::new_with_provider(
                 &llm_config,
