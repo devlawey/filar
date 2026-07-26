@@ -327,9 +327,47 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Convenience: load from `config.toml` in the current directory.
+    /// Convenience: load from `config.toml`.
+    ///
+    /// Search order:
+    /// 1. `FILAR_CONFIG` environment variable (explicit path)
+    /// 2. `%APPDATA%\filar\config.toml` (platform app-data directory)
+    /// 3. `config.toml` in the current working directory
+    /// 4. `config.toml` next to the executable
+    ///
+    /// Falls back to built-in defaults if no file is found anywhere.
     pub fn load_default() -> Result<Self> {
-        Self::load("config.toml")
+        // 1. FILAR_CONFIG env var.
+        if let Ok(explicit) = std::env::var("FILAR_CONFIG") {
+            let p = std::path::PathBuf::from(explicit);
+            tracing::info!(path = %p.display(), "loading config from FILAR_CONFIG");
+            return Self::load(&p);
+        }
+        // 2. App-data directory (unified config location).
+        if let Ok(base) = crate::default_base_dir() {
+            let app_config = base.join("filar").join("config.toml");
+            if app_config.exists() {
+                tracing::info!(path = %app_config.display(), "loading config from app-data dir");
+                return Self::load(&app_config);
+            }
+        }
+        // 3. Current working directory.
+        if std::path::Path::new("config.toml").exists() {
+            tracing::info!("loading config.toml from current directory");
+            return Self::load("config.toml");
+        }
+        // 4. Next to the executable.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                let exe_config = exe_dir.join("config.toml");
+                if exe_config.exists() {
+                    tracing::info!(path = %exe_config.display(), "loading config from exe directory");
+                    return Self::load(&exe_config);
+                }
+            }
+        }
+        tracing::info!("no config.toml found, using built-in defaults");
+        Ok(Self::default())
     }
 
     /// Look up an SSH target by name.
@@ -611,5 +649,35 @@ temperature = 5.0
         let result = Config::load(&tmp);
         let _ = std::fs::remove_file(&tmp);
         assert!(result.is_err(), "Config::load should reject temperature=5.0");
+    }
+
+    #[test]
+    fn load_default_prefers_filar_config_env() {
+        let dir = std::env::temp_dir().join(format!("filar_cfg_test_{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "[llm]\nmodel = \"env-model\"\napi_base_url = \"https://test.example.com\"\n").unwrap();
+
+        // Guard structs for cleanup.
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        struct EnvGuard { key: &'static str, old: Option<String> }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.old {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+
+        let _dir_guard = DirGuard(dir);
+        let old_val = std::env::var("FILAR_CONFIG").ok();
+        std::env::set_var("FILAR_CONFIG", path.to_str().unwrap());
+        let _env_guard = EnvGuard { key: "FILAR_CONFIG", old: old_val };
+
+        let cfg = Config::load_default().unwrap();
+        assert_eq!(cfg.llm.model, "env-model", "FILAR_CONFIG must take priority");
     }
 }

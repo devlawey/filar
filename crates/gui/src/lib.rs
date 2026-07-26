@@ -230,6 +230,65 @@ impl Settings {
     }
 }
 
+/// Write `[llm]` settings to `config.toml` in `%APPDATA%\filar\`
+/// so `filar-tui` invoked without the GUI launcher picks them up.
+///
+/// If a config.toml already exists, only the `[llm]` section is updated;
+/// other sections (SSH targets, profiles, etc.) are preserved.
+fn save_config_toml(settings: &Settings) {
+    let base = match filar_core::default_base_dir() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let app_dir = base.join("filar");
+    let path = app_dir.join("config.toml");
+
+    // Only save if the model field is non-empty.
+    if settings.model.is_empty() {
+        return;
+    }
+
+    // Load existing config to preserve non-LLM sections.
+    let mut config: filar_core::Config = if path.exists() {
+        match filar_core::Config::load(&path) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "config.toml exists but is invalid, not overwriting");
+                return;
+            }
+        }
+    } else {
+        filar_core::Config::default()
+    };
+
+    // Update LLM section from GUI settings.
+    config.llm.model = settings.model.clone();
+    if !settings.api_base_url.is_empty() {
+        config.llm.api_base_url = settings.api_base_url.clone();
+    }
+    if !settings.temperature.is_empty() {
+        config.llm.temperature = settings.temperature.parse().ok();
+    }
+    if !settings.extra_body.is_empty() {
+        config.llm.extra_body = serde_json::from_str(&settings.extra_body).ok();
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&app_dir) {
+        tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");
+        return;
+    }
+    match toml::to_string_pretty(&config) {
+        Ok(data) => {
+            if let Err(e) = std::fs::write(&path, &data) {
+                tracing::warn!(path = %path.display(), error = %e, "failed to save config.toml");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialize config.toml");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LauncherApp
 // ---------------------------------------------------------------------------
@@ -483,6 +542,9 @@ impl LauncherApp {
             extra_body: self.extra_body.clone(),
         };
         settings.save();
+        // Also persist LLM settings to config.toml in the app-data directory
+        // so `filar-tui` (invoked without the GUI launcher) picks them up.
+        save_config_toml(&settings);
         save_secret(api_key_cred_name(), &self.api_key);
         for (i, slot) in self.ssh_slots.iter().enumerate() {
             if slot.save_password && !slot.password.is_empty() {
@@ -717,6 +779,32 @@ mod tests {
         let loaded: Settings = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(loaded.model, "test-model");
         assert_eq!(loaded.temperature, "0.5");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_save_preserves_existing_sections() {
+        let dir = std::env::temp_dir().join(format!("filar_test_cfg_{}", std::process::id()));
+        let app_dir = dir.join("filar");
+        let path = app_dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Write a config with non-LLM sections that must survive.
+        let existing = "[llm]\nmodel = \"old\"\napi_base_url = \"https://old.example.com\"\n\n[[ssh_targets]]\nname = \"dev\"\nhost = \"10.0.0.1\"\nuser = \"root\"\nauth = { type = \"agent\" }\n";
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(&path, existing).unwrap();
+
+        // Simulate what save_config_toml does after loading the config.
+        let mut config: filar_core::Config = filar_core::Config::load(&path).unwrap();
+        config.llm.model = "new".into();
+        let saved = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&path, &saved).unwrap();
+
+        let result = std::fs::read_to_string(&path).unwrap();
+        assert!(result.contains("model = \"new\""), "model must be updated");
+        assert!(result.contains("[[ssh_targets]]"), "ssh_targets must survive");
+        assert!(result.contains("dev"), "ssh target name must survive");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

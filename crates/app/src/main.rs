@@ -167,28 +167,8 @@ async fn run() -> anyhow::Result<()> {
     info!(log_dir = %log_dir.display(), "filar starting up");
 
     // ── Config ─────────────────────────────────────────────────────────
-    // Try: FILAR_CONFIG env var → current dir → exe dir → built-in defaults.
-    let config = if let Ok(path) = std::env::var("FILAR_CONFIG") {
-        let path = PathBuf::from(path);
-        info!(path = %path.display(), "loading configuration from FILAR_CONFIG");
-        Config::load(&path).map_err(|e| anyhow::anyhow!(e))?
-    } else if std::path::Path::new("config.toml").exists() {
-        info!("loading config.toml from current directory");
-        Config::load("config.toml").map_err(|e| anyhow::anyhow!(e))?
-    } else if let Ok(exe) = std::env::current_exe() {
-        let exe_dir = exe.parent().unwrap_or(std::path::Path::new("."));
-        let path = exe_dir.join("config.toml");
-        if path.exists() {
-            info!(path = %path.display(), "loading config from exe directory");
-            Config::load(&path).map_err(|e| anyhow::anyhow!(e))?
-        } else {
-            info!("no config.toml found, using built-in defaults");
-            Config::default()
-        }
-    } else {
-        info!("no config.toml found, using built-in defaults");
-        Config::default()
-    };
+    // FILAR_CONFIG env var → appdata → CWD → exe dir → built-in defaults.
+    let config = Config::load_default().map_err(|e| anyhow::anyhow!(e))?;
 
     info!(
         model = %config.llm.model,
