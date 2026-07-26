@@ -697,29 +697,24 @@ mod tests {
     }
 
     #[test]
-    fn settings_save_creates_directory() {
-        let dir = std::env::temp_dir().join(format!("filar_test_settings_{}", std::process::id()));
-        // Ensure clean start.
+    fn settings_save_pattern_preserves_data() {
+        // Test the internal pattern: create_dir_all before write,
+        // then write→read round-trip verifying data integrity.
+        let dir = std::env::temp_dir().join(format!("filar_test_save_{}", std::process::id()));
+        let file = dir.join("filar").join("settings.json");
         let _ = std::fs::remove_dir_all(&dir);
-        let settings_path = dir.join("filar").join("settings.json");
 
-        // Patch path() for test — we can't mock a private method, so write directly.
-        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
-        let settings = Settings {
-            model: "test-model".into(),
-            api_base_url: "https://example.com".into(),
-            ssh_profiles: vec![],
-            last_ssh: 0,
-            temperature: "0.5".into(),
+        assert!(!file.parent().unwrap().exists());
+        // Replicate what Settings::save does: create_dir_all + write.
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let s = Settings {
+            model: "test-model".into(), api_base_url: "https://example.com".into(),
+            ssh_profiles: vec![], last_ssh: 0, temperature: "0.5".into(),
             extra_body: String::new(),
         };
-        let data = serde_json::to_string_pretty(&settings).unwrap();
-        std::fs::write(&settings_path, &data).unwrap();
+        std::fs::write(&file, serde_json::to_string_pretty(&s).unwrap()).unwrap();
 
-        // Read back — file must survive.
-        let loaded: Settings = serde_json::from_str(
-            &std::fs::read_to_string(&settings_path).unwrap()
-        ).unwrap();
+        let loaded: Settings = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(loaded.model, "test-model");
         assert_eq!(loaded.temperature, "0.5");
 
