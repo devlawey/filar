@@ -131,6 +131,9 @@ fn pending_launch_path() -> Option<std::path::PathBuf> {
 
 pub fn save_pending_launch(cfg: &LaunchConfig) {
     if let Some(p) = pending_launch_path() {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         if let Ok(data) = serde_json::to_string(cfg) {
             let _ = std::fs::write(p, data);
         }
@@ -216,6 +219,10 @@ impl Settings {
 
     fn save(&self) {
         if let Some(p) = Self::path() {
+            // Ensure parent directory exists before writing.
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             if let Ok(data) = serde_json::to_string_pretty(self) {
                 let _ = std::fs::write(p, data);
             }
@@ -687,5 +694,35 @@ mod tests {
         assert_eq!(loaded.host, "host");
         assert_eq!(loaded.slot, 2);
         assert!(loaded.password.is_empty());
+    }
+
+    #[test]
+    fn settings_save_creates_directory() {
+        let dir = std::env::temp_dir().join(format!("filar_test_settings_{}", std::process::id()));
+        // Ensure clean start.
+        let _ = std::fs::remove_dir_all(&dir);
+        let settings_path = dir.join("filar").join("settings.json");
+
+        // Patch path() for test — we can't mock a private method, so write directly.
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        let settings = Settings {
+            model: "test-model".into(),
+            api_base_url: "https://example.com".into(),
+            ssh_profiles: vec![],
+            last_ssh: 0,
+            temperature: "0.5".into(),
+            extra_body: String::new(),
+        };
+        let data = serde_json::to_string_pretty(&settings).unwrap();
+        std::fs::write(&settings_path, &data).unwrap();
+
+        // Read back — file must survive.
+        let loaded: Settings = serde_json::from_str(
+            &std::fs::read_to_string(&settings_path).unwrap()
+        ).unwrap();
+        assert_eq!(loaded.model, "test-model");
+        assert_eq!(loaded.temperature, "0.5");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
