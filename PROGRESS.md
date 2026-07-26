@@ -3205,6 +3205,27 @@ paste (`Event::Paste`) естественно доставляет текст в
 
 ---
 
+## Issue #164: feat(agent,tui) — token usage counter per session
+
+**Milestone:** Filar v0.7.0. **Ветка:** `feat/164-token-usage-counter`.
+
+**Проблема:** пользователь не видит расход токенов.
+
+**Решение (v1 — оценочное):**
+- `Session::tokens_in: u64`, `tokens_out: u64` — накопительный счётчик.
+- При Enter: `tokens_in += input.len().div_ceil(4)` (~4 chars/token).
+- При `AgentEvent::Finished`: `tokens_out += text.len().div_ceil(4)`.
+- Статус-бар: `toks: N↑ M↓` (muted стиль) справа от режима.
+
+**Файлы:** `tui/src/app.rs` (+8 строк), `tui/src/ui/bars.rs` (+8 строк).
+
+**Тесты:** 255 pass, без регрессии.
+
+**Вне скоупа:** точный подсчёт из API-ответа (usage.prompt_tokens/completion_tokens) —
+требует сквозного пайплайна через провайдер → ChatResponse → AgentEvent → TuiEvent.
+
+---
+
 ## Релиз v0.6.2 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.2 (4/4 issue, все смерджены).

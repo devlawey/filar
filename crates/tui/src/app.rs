@@ -312,6 +312,10 @@ pub struct Session {
     pub ssh_info: Option<String>,
     /// LLM profile selected via Ctrl+L. None = use App default.
     pub llm_profile: Option<String>,
+    /// Cumulative input tokens consumed by this session.
+    pub tokens_in: u64,
+    /// Cumulative output tokens generated for this session.
+    pub tokens_out: u64,
 }
 
 impl App {
@@ -490,6 +494,8 @@ impl Session {
             awaiting_confirmation: false,
             ssh_info: None,
             llm_profile: None,
+            tokens_in: 0,
+            tokens_out: 0,
         }
     }
 
@@ -891,6 +897,7 @@ impl App {
                             }
                         } else {
                             self.push_message(ChatBlock::User(text.clone()));
+                            self.tokens_in += (text.chars().count() as u64).div_ceil(4);
                             self.scroll = 0;
                             self.input.clear();
                             self.cursor_pos = 0;
@@ -2063,6 +2070,7 @@ impl App {
                     self.pending_proposal = None;
                 }
                 filar_agent::AgentEvent::Finished(text) => {
+                    let text_len = text.chars().count();
                     if self.streaming {
                         if !text.is_empty() {
                             if let Some(ChatBlock::Agent(ref mut existing)) = self.messages.last_mut() {
@@ -2080,6 +2088,7 @@ impl App {
                     self.mode = AppMode::Normal;
                     self.agent_running = false;
                     self.cancellation = None;
+                    self.tokens_out += (text_len as u64).div_ceil(4);
                     self.active_session_mut().background_activity = false;
                 }
                 filar_agent::AgentEvent::Error(err) => {
@@ -5279,5 +5288,35 @@ mod tests {
         // Third → wrap to first.
         app.handle_key(ctrl_l);
         assert_eq!(app.llm_profile.as_deref(), Some("glm"));
+    }
+
+    #[test]
+    fn token_counter_increments_on_enter() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.input = "hello world".into();
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        // "hello world" = 11 chars → ceil(11/4) = 3
+        assert_eq!(app.tokens_in, 3);
+        assert_eq!(app.tokens_out, 0);
+    }
+
+    #[test]
+    fn token_counter_is_per_session() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.new_tab(); // active = 1, new session gets index 1
+        app.switch_to_tab(1); // back to session 0 (1-based index for tab 1)
+        assert_eq!(app.active, 0);
+        // Session 0: add tokens
+        app.input = "abcd".into();
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.sessions[0].tokens_in, 1); // "abcd" = 4 chars → 1 token
+        // Session 1 must still be at zero.
+        assert_eq!(app.sessions[1].tokens_in, 0);
     }
 }
