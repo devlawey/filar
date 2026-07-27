@@ -282,7 +282,7 @@ async fn run_app(
     let default_for_restore = std::mem::take(&mut config.default_profile_name);
     let has_history = !config.initial_messages.is_empty()
         || !config.initial_input_history.is_empty()
-        || config.initial_llm_profile.is_some()
+        || config.initial_llm_profile.as_ref().is_some_and(|p| !p.is_empty())
         || config.initial_tokens_in > 0
         || config.initial_tokens_out > 0;
     let mut app = if has_history {
