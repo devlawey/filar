@@ -28,8 +28,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Changed
 
-- `config.toml` search order: CWD before app-data (local `./config.toml` overrides
-  `%APPDATA%\filar\`); README updated with all 0.7.0 features
+- `config.toml` search order: CWD before app-data (local `./config.toml` now
+  overrides `%APPDATA%\filar\`)
+  ([#175](https://github.com/devlawey/filar/issues/175)).
+- README updated with all 0.7.0 features: Models tab, Ctrl+L, token counter,
+  config priority, key storage
   ([#175](https://github.com/devlawey/filar/issues/175)).
 
 ### Added
