@@ -530,6 +530,11 @@ impl App {
         confirm_mode: CommandConfirmMode,
         messages: Vec<ChatBlock>,
         input_history: Vec<String>,
+        llm_profile: Option<String>,
+        tokens_in: u64,
+        tokens_out: u64,
+        profiles: &[filar_core::LlmProfile],
+        default_profile_name: &str,
     ) -> Self {
         let mut app = Self::new(target_name, confirm_mode);
         if !messages.is_empty() {
@@ -539,9 +544,24 @@ impl App {
                 "Session restored — history loaded from disk".into(),
             ));
         }
-        // Restore agent input history so Up/Down recalls previous prompts.
         app.input_history = input_history;
-        app.history_pos = None; // Start not in browsing mode.
+        app.history_pos = None;
+        let default_name = if default_profile_name.is_empty() { "default" } else { default_profile_name };
+        if let Some(profile) = llm_profile {
+            if profile.is_empty() {
+                // Old session (pre-0.7.0 fix): silently fall back to default.
+                app.llm_profile = Some(default_name.to_string());
+            } else if profiles.iter().any(|p| p.name == profile) {
+                app.llm_profile = Some(profile);
+            } else {
+                app.llm_profile = Some(default_name.to_string());
+                app.push_message(ChatBlock::System(format!(
+                    "Profile '{}' not found — using '{}'", profile, default_name
+                )));
+            }
+        }
+        app.tokens_in = tokens_in;
+        app.tokens_out = tokens_out;
         app
     }
 

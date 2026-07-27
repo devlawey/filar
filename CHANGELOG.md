@@ -23,6 +23,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Token counter now uses real API usage data instead of character-length estimation,
   and shows `—` when the provider doesn't report usage
   ([#173](https://github.com/devlawey/filar/issues/173)).
+- Session persistence now saves and restores the selected LLM profile and accumulated
+  token counters ([#174](https://github.com/devlawey/filar/issues/174)).
 
 ### Added
 

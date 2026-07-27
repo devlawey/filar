@@ -361,30 +361,33 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // ── Load session if specified ──────────────────────────────────────
-    let (initial_messages, initial_input_history) = if let Some(ref sid) = session_id {
+    let (initial_messages, initial_input_history, initial_llm_profile, initial_tokens_in, initial_tokens_out) =
+        if let Some(ref sid) = session_id {
         info!(session_id = %sid, "loading session");
         match SessionStore::with_default_dir() {
             Ok(store) => match store.load(sid) {
                 Ok(Some(session)) => {
                     info!(messages = session.messages.len(), "session loaded");
-                    (session.messages, session.input_history)
+                    (session.messages, session.input_history,
+                     session.llm_profile,
+                     session.tokens_in, session.tokens_out)
                 }
                 Ok(None) => {
                     warn!(session_id = %sid, "session not found");
-                    (vec![], vec![])
+                    (vec![], vec![], None, 0, 0)
                 }
                 Err(e) => {
                     warn!(error = %e, "failed to load session");
-                    (vec![], vec![])
+                    (vec![], vec![], None, 0, 0)
                 }
             },
             Err(e) => {
                 warn!(error = %e, "failed to initialise session store");
-                (vec![], vec![])
+                (vec![], vec![], None, 0, 0)
             }
         }
     } else {
-        (vec![], vec![])
+        (vec![], vec![], None, 0, 0)
     };
 
     // ── Launch TUI ─────────────────────────────────────────────────────
@@ -395,9 +398,12 @@ async fn run() -> anyhow::Result<()> {
     let tui_config = TuiConfig {
         target_name: target_name.clone(),
         confirm_mode: config.confirm_mode,
-        llm_profile: target_name,
+        llm_profile: default_profile_name.clone(),
         initial_messages,
         initial_input_history,
+        initial_llm_profile,
+        initial_tokens_in,
+        initial_tokens_out,
         ssh_target: ssh_target.clone(),
         is_local: ssh_target.is_none(),
         secret_provider: secret_provider.clone(),
