@@ -209,6 +209,8 @@ pub struct TuiConfig {
     pub default_profile_name: String,
     /// Factory for creating per-session LLM clients from profiles.
     pub llm_factory: Arc<dyn Fn(&filar_core::LlmProfile, &StaticSecretProvider) -> std::result::Result<Arc<dyn LlmClient>, CoreError> + Send + Sync>,
+    /// For validating a profile's API key at Ctrl+L time without building a client.
+    pub key_checker: Arc<dyn Fn(&filar_core::LlmProfile) -> Option<String> + Send + Sync>,
     /// Receiver for WARN/ERROR log lines forwarded from the tracing subscriber
     /// (see [`crate::log_layer`]). The runner polls it and shows each line as a
     /// `System` block, so important logs surface in the chat instead of being
@@ -285,6 +287,7 @@ async fn run_app(
     // Load available LLM profiles and default profile name.
     app.profiles = std::mem::take(&mut config.profiles);
     app.default_profile_name = std::mem::take(&mut config.default_profile_name);
+    app.key_checker = Some(config.key_checker.clone());
     // Wire the App to the same StaticSecretProvider instance used by the
     // agent's SecretSubstitutingExecutor, so Ctrl+P inserts are visible to
     // command substitution and output sanitisation.
