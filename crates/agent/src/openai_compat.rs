@@ -688,6 +688,8 @@ impl ApiResponse {
 struct SseEvent {
     #[serde(default)]
     choices: Vec<SseChoice>,
+    #[serde(default)]
+    usage: Option<ApiUsage>,
 }
 
 #[derive(Deserialize)]
@@ -735,6 +737,7 @@ struct SseState {
     full_text: String,
     tool_calls: BTreeMap<usize, StreamToolCall>,
     done: bool,
+    streamed_usage: Option<ApiUsage>,
 }
 
 impl SseState {
@@ -744,6 +747,7 @@ impl SseState {
             full_text: String::new(),
             tool_calls: BTreeMap::new(),
             done: false,
+            streamed_usage: None,
         }
     }
 
@@ -769,6 +773,9 @@ impl SseState {
 
             match serde_json::from_str::<SseEvent>(data) {
                 Ok(event) => {
+                    if let Some(u) = event.usage {
+                        self.streamed_usage = Some(u);
+                    }
                     if let Some(choice) = event.choices.into_iter().next() {
                         if let Some(content) = choice.delta.content {
                             if !content.is_empty() {
@@ -818,26 +825,26 @@ impl SseState {
 
     /// Build the final [`ChatResponse`] from accumulated state.
     fn into_response(self) -> Result<ChatResponse> {
-        if !self.tool_calls.is_empty() {
-            let calls: Vec<ToolCall> = self
-                .tool_calls
-                .values()
-                .map(|tc| {
-                    let arguments = serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
-                        warn!(error = %e, id = %tc.id, name = %tc.name, "failed to parse accumulated tool call arguments");
-                        serde_json::Value::Null
-                    });
-                    ToolCall {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        arguments,
-                    }
-                })
-                .collect();
-            Ok(ChatResponse::tool_calls(self.full_text, calls))
+        let mut resp = if !self.tool_calls.is_empty() {
+            let calls: Vec<ToolCall> = self.tool_calls.values().map(|tc| {
+                let arguments = serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
+                    warn!(error = %e, id = %tc.id, name = %tc.name, "failed to parse accumulated tool call arguments");
+                    serde_json::Value::Null
+                });
+                ToolCall { id: tc.id.clone(), name: tc.name.clone(), arguments }
+            }).collect();
+            ChatResponse::tool_calls(self.full_text, calls)
         } else {
-            Ok(ChatResponse::text(self.full_text))
+            ChatResponse::text(self.full_text)
+        };
+        if let Some(u) = self.streamed_usage {
+            resp = resp.with_usage(crate::TokenUsage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+            });
         }
+        Ok(resp)
     }
 }
 

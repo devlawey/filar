@@ -2016,7 +2016,7 @@ impl App {
 
         let mut auto_scroll = true;
         match event {
-            TuiEvent::Agent { event: agent_event, .. } => match agent_event {
+            TuiEvent::Agent { session_id, event: agent_event } => match agent_event {
                 filar_agent::AgentEvent::Started => {
                     self.mode = AppMode::Thinking;
                     self.active_session_mut().background_activity = true;
@@ -2098,8 +2098,10 @@ impl App {
                     self.active_session_mut().background_activity = false;
                 }
                 filar_agent::AgentEvent::TokenUsage { tokens_in, tokens_out } => {
-                    self.tokens_in += tokens_in;
-                    self.tokens_out += tokens_out;
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        s.tokens_in += tokens_in;
+                        s.tokens_out += tokens_out;
+                    }
                 }
                 filar_agent::AgentEvent::Error(err) => {
                     if self.streaming {
