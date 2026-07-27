@@ -72,7 +72,8 @@ For CLI usage, create `config.toml`. The file is searched in this order:
 
 1. `FILAR_CONFIG` environment variable (explicit path)
 2. `./config.toml` in the current working directory (local override for development)
-3. `%APPDATA%\filar\config.toml` (shared system-wide config, written by GUI launcher)
+3. `%APPDATA%\filar\config.toml` (per-user app-data directory, written by GUI launcher;
+   `~/.local/share/filar` on Linux, `~/Library/Application Support/filar` on macOS)
 4. `config.toml` next to the executable
 
 ```toml

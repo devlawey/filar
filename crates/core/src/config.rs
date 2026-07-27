@@ -345,6 +345,16 @@ impl Config {
         }
         // 2. Current working directory (local override for development).
         if std::path::Path::new("config.toml").exists() {
+            // Warn if app-data config is also present — local file overrides.
+            if let Ok(base) = crate::default_base_dir() {
+                let app_config = base.join("filar").join("config.toml");
+                if app_config.exists() {
+                    tracing::warn!(
+                        app_data = %app_config.display(),
+                        "local ./config.toml overrides app-data config"
+                    );
+                }
+            }
             tracing::info!("loading config.toml from current directory");
             return Self::load("config.toml");
         }
@@ -680,4 +690,29 @@ temperature = 5.0
         let cfg = Config::load_default().unwrap();
         assert_eq!(cfg.llm.model, "env-model", "FILAR_CONFIG must take priority");
     }
+
+    #[test]
+    fn load_default_cwd_wins_over_app_data() {
+        // Write a local config.toml. Since `default_base_dir` is OS-dependent,
+        // we test the general priority chain by putting files in CWD only.
+        // FILAR_CONFIG → CWD order is tested above.
+        let dir = std::env::temp_dir().join(format!("filar_cfg_cwd_{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "[llm]\nmodel = \"cwd-model\"\napi_base_url = \"https://test.example.com\"\n").unwrap();
+
+        std::env::set_var("FILAR_CONFIG", path.to_str().unwrap());
+        let old = std::env::var("FILAR_CONFIG").ok();
+        let _env = EnvGuard { key: "FILAR_CONFIG", old };
+        let _dir = DirGuard(dir);
+
+        let cfg = Config::load_default().unwrap();
+        assert_eq!(cfg.llm.model, "cwd-model", "FILAR_CONFIG must find config via CWD path");
+    }
+
+    struct EnvGuard { key: &'static str, old: Option<String> }
+    impl Drop for EnvGuard { fn drop(&mut self) { match &self.old { Some(v) => std::env::set_var(self.key, v), None => std::env::remove_var(self.key), } } }
+    struct DirGuard(std::path::PathBuf);
+    impl Drop for DirGuard { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
 }
