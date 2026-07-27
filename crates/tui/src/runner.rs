@@ -194,6 +194,12 @@ pub struct TuiConfig {
     pub initial_messages: Vec<ChatBlock>,
     /// Initial agent input history (for session restore).
     pub initial_input_history: Vec<String>,
+    /// LLM profile restored from a previous session.
+    pub initial_llm_profile: Option<String>,
+    /// Input token count restored from a previous session.
+    pub initial_tokens_in: u64,
+    /// Output token count restored from a previous session.
+    pub initial_tokens_out: u64,
     /// SSH target for interactive terminal mode (Ctrl+T).
     /// If `None`, the agent runs in local mode.
     pub ssh_target: Option<filar_core::SshTarget>,
@@ -282,6 +288,9 @@ async fn run_app(
             config.confirm_mode,
             std::mem::take(&mut config.initial_messages),
             std::mem::take(&mut config.initial_input_history),
+            std::mem::take(&mut config.initial_llm_profile),
+            config.initial_tokens_in,
+            config.initial_tokens_out,
         )
     };
     // Load available LLM profiles and default profile name.
@@ -883,9 +892,11 @@ async fn run_app(
         id,
         timestamp,
         target: config.target_name.clone(),
-        llm_profile: config.llm_profile.clone(),
+        llm_profile: app.llm_profile.clone().unwrap_or_else(|| config.default_profile_name.clone()),
         messages: app.messages.clone(),
         input_history: app.input_history().to_vec(),
+        tokens_in: app.tokens_in,
+        tokens_out: app.tokens_out,
     };
     session.truncate_history();
     match filar_core::SessionStore::with_default_dir() {

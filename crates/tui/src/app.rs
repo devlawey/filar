@@ -530,6 +530,9 @@ impl App {
         confirm_mode: CommandConfirmMode,
         messages: Vec<ChatBlock>,
         input_history: Vec<String>,
+        llm_profile: Option<String>,
+        tokens_in: u64,
+        tokens_out: u64,
     ) -> Self {
         let mut app = Self::new(target_name, confirm_mode);
         if !messages.is_empty() {
@@ -541,7 +544,19 @@ impl App {
         }
         // Restore agent input history so Up/Down recalls previous prompts.
         app.input_history = input_history;
-        app.history_pos = None; // Start not in browsing mode.
+        app.history_pos = None;
+        // Restore LLM profile and token counters from previous session.
+        if let Some(profile) = llm_profile {
+            if app.profiles.iter().any(|p| p.name == profile) {
+                app.llm_profile = Some(profile);
+            } else {
+                app.push_message(ChatBlock::System(format!(
+                    "Profile '{}' not found — using default", profile
+                )));
+            }
+        }
+        app.tokens_in = tokens_in;
+        app.tokens_out = tokens_out;
         app
     }
 

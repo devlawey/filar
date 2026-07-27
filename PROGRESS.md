@@ -3293,6 +3293,32 @@ Credential Manager.
 
 ---
 
+## Issue #174: fix(core,tui,app) — сохранение профиля и токенов с сессией
+
+**Milestone:** Filar v0.7.0. **Ветка:** `fix/174-session-profile-tokens`.
+
+**Проблема:** `llm_profile` = `target_name`, Ctrl+L не сохранялся, токены не персистились.
+
+**Решение:**
+- `filar_core::Session`: поля `tokens_in: u64, tokens_out: u64` с `#[serde(default)]`.
+- `main.rs`: `llm_profile = default_profile_name` (а не `target_name`).
+- `runner.rs` save: профиль + токены из активной сессии.
+- `runner.rs`/`app.rs` restore: `with_history` принимает `llm_profile, tokens_in, tokens_out`.
+  При отсутствии профиля — откат на default с сообщением.
+- `main.rs` загрузка: `session.llm_profile`, `session.tokens_in/out` из файла сессии.
+
+**Файлы:** `core/src/session.rs`, `app/src/main.rs`, `tui/src/app.rs`, `tui/src/runner.rs`.
+
+**Тесты:** 2 новых core (40 total): `tokens_in_out_roundtrip`, `tokens_in_out_backward_compat`.
+257 tui pass.
+
+**Публичные контракты:**
+- `filar_core::Session` — `tokens_in`, `tokens_out` (аддитивные с `#[serde(default)]`).
+- `App::with_history` — 3 новых параметра.
+- `TuiConfig` — 3 новых поля.
+
+---
+
 ## Релиз v0.6.2 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.2 (4/4 issue, все смерджены).

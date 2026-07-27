@@ -1,4 +1,4 @@
-//! Session persistence: save and restore chat histories.
+﻿//! Session persistence: save and restore chat histories.
 //!
 //! Sessions are stored as JSON files in a per-user directory:
 //! - Windows: `%APPDATA%/filar/sessions/<id>.json`
@@ -40,6 +40,12 @@ pub struct Session {
     /// Limited to [`MAX_INPUT_HISTORY`] entries when saved.
     #[serde(default)]
     pub input_history: Vec<String>,
+    /// Cumulative input tokens (from API usage data).
+    #[serde(default)]
+    pub tokens_in: u64,
+    /// Cumulative output tokens (from API usage data).
+    #[serde(default)]
+    pub tokens_out: u64,
 }
 
 /// Lightweight metadata for listing sessions without loading full messages.
@@ -276,6 +282,8 @@ mod tests {
                 ChatBlock::Agent("running lsof".into()),
             ],
             input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
         };
         let meta = SessionMeta::from(&session);
         assert_eq!(meta.id, "123");
@@ -292,6 +300,8 @@ mod tests {
             llm_profile: "t".into(),
             messages: vec![],
             input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
         };
         let meta = SessionMeta::from(&session);
         assert!(meta.preview.is_empty());
@@ -317,6 +327,8 @@ mod tests {
                 ChatBlock::Agent("world".into()),
             ],
             input_history: vec!["ls -la".into(), "find port".into()],
+            tokens_in: 0,
+            tokens_out: 0,
         };
 
         store.save(&session).unwrap();
@@ -355,6 +367,8 @@ mod tests {
                 llm_profile: "t".into(),
                 messages: vec![ChatBlock::User(format!("msg{i}"))],
                 input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
             };
             store.save(&session).unwrap();
         }
@@ -427,15 +441,30 @@ mod tests {
     }
 
     #[test]
+    fn tokens_in_out_roundtrip() {
+        let s = Session {
+            id: "1".into(), timestamp: "t".into(), target: "t".into(),
+            llm_profile: "glm".into(), messages: vec![], input_history: vec![],
+            tokens_in: 150, tokens_out: 300,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("tokens_in"), "must serialize tokens_in");
+        assert!(json.contains("150"), "must serialize value");
+        let loaded: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.tokens_in, 150);
+        assert_eq!(loaded.tokens_out, 300);
+    }
+
+    #[test]
+    fn tokens_in_out_backward_compat() {
+        let json = r#"{"id":"1","timestamp":"x","target":"x","llm_profile":"x","messages":[],"input_history":[]}"#;
+        let loaded: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.tokens_in, 0, "missing field → default 0");
+        assert_eq!(loaded.tokens_out, 0);
+    }
+
+    #[test]
     fn unix_to_ymdhms_known_date() {
-        // 2026-06-21 12:30:45 UTC
-        // Unix timestamp: calculate from known reference
-        // 2026-01-01 00:00:00 = 1767225600
-        // + 31 days (Jan) + 28 days (Feb) + 31 (Mar) + 30 (Apr) + 31 (May) + 20 days (Jun 1-20)
-        // = 171 days * 86400 = 14774400
-        // + 12.5h = 45045
-        // Total ≈ 1767225600 + 14774400 + 45045 = 1782045045
-        // Let me just verify the epoch is correct and the function doesn't panic.
         let (y, _m, _d, _h, _mi, _s) = unix_to_ymdhms(1_782_045_045);
         assert_eq!(y, 2026);
     }
@@ -451,6 +480,8 @@ mod tests {
             llm_profile: "t".into(),
             messages: vec![],
             input_history: vec!["ls".into(), "find port 8080".into()],
+            tokens_in: 0,
+            tokens_out: 0,
         };
         let json = serde_json::to_string_pretty(&session).unwrap();
         assert!(json.contains("input_history"), "JSON must contain input_history");
@@ -485,6 +516,8 @@ mod tests {
             llm_profile: "t".into(),
             messages: vec![],
             input_history: (0..250).map(|i| format!("entry{i}")).collect(),
+            tokens_in: 0,
+            tokens_out: 0,
         };
         assert!(session.input_history.len() > MAX_INPUT_HISTORY);
         session.truncate_history();
