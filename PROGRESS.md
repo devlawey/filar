@@ -3266,6 +3266,33 @@ Credential Manager.
 
 ---
 
+## Issue #173: fix(agent,tui) — real token usage from API
+
+**Milestone:** Filar v0.7.0. **Ветка:** `fix/173-real-token-usage`.
+
+**Проблема:** chars/4 оценка не учитывает системный промпт, историю, схемы инструментов
+и промежуточные итерации. Цифра занижена в разы.
+
+**Решение:**
+- `ApiResponse::usage` — парсинг `prompt_tokens/completion_tokens/total_tokens`.
+- `ChatResponse::usage: Option<TokenUsage>` — аддитивное поле, `ChatResponse::text/tool_calls` получают `None`.
+- `AgentEvent::TokenUsage { tokens_in, tokens_out }` — на каждое обращение к модели.
+- В `agent_main` emit TokenUsage после получения response.
+- TUI: `app.rs` — удалена chars/4, прибавление из `TokenUsage`.
+- Статус-бар: при отсутствии данных `toks: —`.
+
+**Файлы:** `agent/src/lib.rs`, `agent/src/events.rs`, `agent/src/openai_compat.rs`,
+`agent/src/agent.rs`, `tui/src/app.rs`, `tui/src/ui/bars.rs`.
+
+**Тесты:** `deserialize_response_with_usage`, `deserialize_response_without_usage` (2 новых).
+257 tui pass. Токен-тесты переписаны под API-usage.
+
+**Публичные контракты:**
+- `ChatResponse.usage: Option<TokenUsage>` — новое аддитивное поле.
+- `AgentEvent::TokenUsage` — новый non-exhaustive вариант.
+
+---
+
 ## Релиз v0.6.2 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.2 (4/4 issue, все смерджены).

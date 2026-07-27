@@ -96,11 +96,16 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         spans.push(Span::styled(mt, app.theme.mode_badge_style(mode_color)));
     }
 
-    // Token counter — right-aligned.
+    // Token counter. Uses real API usage data; shows — when no data yet.
+    spans.push(Span::raw("   "));
     if app.tokens_in > 0 || app.tokens_out > 0 {
-        spans.push(Span::raw("   "));
         spans.push(Span::styled(
             format!("toks: {}↑ {}↓", app.tokens_in, app.tokens_out),
+            app.theme.muted(),
+        ));
+    } else {
+        spans.push(Span::styled(
+            "toks: —",
             app.theme.muted(),
         ));
     }

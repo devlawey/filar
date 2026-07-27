@@ -420,6 +420,14 @@ impl Agent {
                 with_cancellation(self.cancellation.as_ref(), self.llm.chat(&request)).await?
             };
 
+            // Emit token usage if the provider reported it.
+            if let Some(ref u) = response.usage {
+                self.emit(AgentEvent::TokenUsage {
+                    tokens_in: u.prompt_tokens.unwrap_or(0),
+                    tokens_out: u.completion_tokens.unwrap_or(0),
+                });
+            }
+
             if response.has_tool_calls() {
                 let tool_calls = response.tool_calls.clone();
                 info!(iteration, count = tool_calls.len(), "LLM requested tool calls");

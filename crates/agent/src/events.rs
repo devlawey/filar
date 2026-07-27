@@ -52,6 +52,14 @@ pub enum AgentEvent {
     /// The agent finished and produced a final answer.
     Finished(String),
 
+    /// Token usage reported by the LLM provider for the current exchange.
+    /// Each call to the model produces one of these events (intermediate
+    /// tool-call iterations each get their own).
+    TokenUsage {
+        tokens_in: u64,
+        tokens_out: u64,
+    },
+
     /// The agent encountered an error (network, LLM, transport).
     Error(String),
 
