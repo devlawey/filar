@@ -3238,6 +3238,12 @@ paste (`Event::Paste`) естественно доставляет текст в
 
 **Тесты:** 3 новых (424 total).
 
+**Публичные контракты:**
+- `TuiConfig` — новое поле `key_checker: Arc<dyn Fn(&LlmProfile) -> Option<String>>`.
+- `App` — новое поле `key_checker: Option<Arc<dyn Fn(&LlmProfile) -> Option<String>>>`.
+
+**Дальнейшие шаги:** добавлены в issue #172 (уникальность ключей).
+
 ---
 
 ## Релиз v0.6.2 (подготовка)

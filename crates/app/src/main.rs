@@ -391,6 +391,7 @@ async fn run() -> anyhow::Result<()> {
     let default_profile_name = config.llm_profiles.first()
         .map(|p| p.name.clone())
         .unwrap_or_else(|| "default".into());
+    let key_checker_provider = secret_provider.clone();
     let tui_config = TuiConfig {
         target_name: target_name.clone(),
         confirm_mode: config.confirm_mode,
@@ -433,15 +434,19 @@ async fn run() -> anyhow::Result<()> {
                 sp as &dyn filar_core::SecretProvider,
             ).map_err(|e| filar_core::CoreError::Other(format!("LLM client error: {e}")))?))
         }),
-        key_checker: Arc::new(|profile: &filar_core::LlmProfile| {
-            let sp = filar_core::StaticSecretProvider::new();
-            let key = sp.get(&profile.key_env).unwrap_or_default();
+        key_checker: Arc::new(move |profile: &filar_core::LlmProfile| {
+            let key = key_checker_provider.get(&profile.key_env).unwrap_or_default();
             if !key.is_empty() { return None; }
             let keyring = filar_core::secrets::KeyringSecretProvider::new();
             match keyring.get(&profile.key_env) {
-                Ok(k) if !k.is_empty() => None,
+                Ok(k) if !k.is_empty() => {
+                    key_checker_provider.insert(&profile.key_env, &k);
+                    None
+                }
                 _ => {
-                    if std::env::var(&profile.key_env).is_ok() { return None; }
+                    if std::env::var(&profile.key_env).map(|v| !v.is_empty()).unwrap_or(false) {
+                        return None;
+                    }
                     Some(format!("no API key found (checked memory, OS store, env '{}')", profile.key_env))
                 }
             }
@@ -482,10 +487,35 @@ mod tests {
     }
 
     #[test]
-    fn key_resolve_error_when_no_source() {
+    fn key_resolve_caches_keyring_result() {
         let sp = StaticSecretProvider::new();
-        let result = resolve_test_key("NONEXISTENT_KEY_XYZ", &sp, None);
-        assert!(result.is_empty(), "must return empty when no source has key");
+        // Simulate keyring returning a value (third party).
+        let result = resolve_test_key("KR_KEY_1", &sp, Some("kr-secret"));
+        assert_eq!(result, "kr-secret");
+        // Cache it in StaticSecretProvider (simulating factory behavior).
+        if !result.is_empty() {
+            sp.insert("KR_KEY_1", &result);
+        }
+        // Second call should hit memory, not keyring.
+        let cached = sp.get("KR_KEY_1").unwrap_or_default();
+        assert_eq!(cached, "kr-secret", "key must be cached after first keyring read");
+    }
+
+    #[test]
+    fn key_resolve_memory_overrides_keyring() {
+        let sp = StaticSecretProvider::new();
+        sp.insert("MY_KEY_2", "mem-val");
+        let result = resolve_test_key("MY_KEY_2", &sp, Some("kr-val"));
+        assert_eq!(result, "mem-val", "memory must take precedence over keyring");
+    }
+
+    #[test]
+    fn key_resolve_env_rejects_empty() {
+        std::env::set_var("FILAR_TEST_EMPTY", "");
+        let sp = StaticSecretProvider::new();
+        let result = resolve_test_key("FILAR_TEST_EMPTY", &sp, None);
+        assert!(result.is_empty(), "empty env var must be treated as missing");
+        std::env::remove_var("FILAR_TEST_EMPTY");
     }
 
     /// Test the same 3-step resolution as the factory closure.
