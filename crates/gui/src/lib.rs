@@ -72,9 +72,51 @@ fn load_secret_for_profile(profile: &filar_core::LlmProfile) -> String {
     load_secret(&profile.key_env)
 }
 
+/// Generate a unique profile name with the given prefix.
+/// Finds the first free number (profile-1, profile-2, ...) not already in use.
+fn unique_profile_name(existing: &[LlmProfileData], prefix: &str) -> String {
+    let mut n = 1;
+    loop {
+        let candidate = format!("{prefix}-{n}");
+        if !existing.iter().any(|p| p.name == candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Credential key for SSH slot N (0-based).
 fn ssh_cred_name(slot: usize) -> String {
     format!("ssh{slot}")
+}
+
+/// Migration: fix duplicate profile names and key_env entries in a loaded list.
+fn deduplicate_profiles(profiles: &mut Vec<LlmProfileData>) {
+    let mut seen_names = std::collections::BTreeSet::new();
+    for p in profiles.iter_mut() {
+        let mut name = p.name.clone();
+        while seen_names.contains(&name) {
+            name = format!("{}_dup", p.name);
+        }
+        if name != p.name {
+            tracing::warn!(old = %p.name, new = %name, "deduplicated colliding profile name on load");
+            p.name = name;
+        }
+        seen_names.insert(p.name.clone());
+    }
+    // Fix key_env collisions: ensure each profile has a unique key_env.
+    let mut seen_envs = std::collections::BTreeSet::new();
+    for p in profiles.iter_mut() {
+        let mut env = p.key_env.clone();
+        while seen_envs.contains(&env) {
+            env = format!("api_key_{env}");
+        }
+        if env != p.key_env {
+            tracing::warn!(old = %p.key_env, new = %env, profile = %p.name, "deduplicated colliding key_env on load");
+            p.key_env = env;
+        }
+        seen_envs.insert(p.key_env.clone());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -521,10 +563,11 @@ impl LauncherApp {
                     }
                 });
             if ui.button("+").on_hover_text("Add profile").clicked() {
+                let name = unique_profile_name(&self.profiles, "profile");
+                let key_env = format!("api_key_{name}");
                 self.profiles.push(LlmProfileData {
-                    name: format!("profile-{}", self.profiles.len() + 1),
+                    name, key_env,
                     model: String::new(), api_base_url: String::new(),
-                    key_env: format!("api_key_profile-{}", self.profiles.len() + 1),
                     api_key: String::new(), temperature: String::new(),
                     extra_body: String::new(),
                 });
@@ -532,6 +575,8 @@ impl LauncherApp {
                 self.save_profiles();
             }
             if self.profiles.len() > 1 && ui.button("X").on_hover_text("Delete profile").clicked() {
+                let removed = &self.profiles[self.selected_profile];
+                delete_secret(&removed.key_env);
                 self.profiles.remove(self.selected_profile);
                 self.selected_profile = self.selected_profile.min(self.profiles.len().saturating_sub(1));
                 self.save_profiles();
@@ -578,6 +623,17 @@ impl LauncherApp {
             self.validation_error = "No profile selected".to_string();
             return;
         };
+        // Validate unique names and non-empty name.
+        if p.name.trim().is_empty() {
+            self.validation_error = "Profile name must not be empty.".to_string();
+            return;
+        }
+        for (i, other) in self.profiles.iter().enumerate() {
+            if i != self.selected_profile && other.name == p.name {
+                self.validation_error = format!("Duplicate profile name: \"{}\". Names must be unique.", p.name);
+                return;
+            }
+        }
         if !p.temperature.trim().is_empty()
             && !matches!(p.temperature.trim().parse::<f32>(), Ok(t) if t.is_finite() && (0.0..=2.0).contains(&t))
         {
@@ -728,6 +784,9 @@ pub fn run_launcher(config: &Config) {
             extra_body: settings.extra_body.clone(),
         });
     }
+
+    // Repair any collisions that survived from v0.7.0 pre-fix code.
+    deduplicate_profiles(&mut profiles);
 
     let selected_profile = settings.selected_profile.min(profiles.len().saturating_sub(1));
 
@@ -896,5 +955,32 @@ mod tests {
         assert!(result.contains("dev"), "ssh target name must survive");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_profile_name_fills_gaps() {
+        let existing = vec![
+            LlmProfileData { name: "profile-1".into(), model: String::new(), api_base_url: String::new(), key_env: String::new(), api_key: String::new(), temperature: String::new(), extra_body: String::new() },
+            LlmProfileData { name: "profile-3".into(), model: String::new(), api_base_url: String::new(), key_env: String::new(), api_key: String::new(), temperature: String::new(), extra_body: String::new() },
+        ];
+        let name = unique_profile_name(&existing, "profile");
+        assert_eq!(name, "profile-2", "must find first free number, not len+1");
+    }
+
+    #[test]
+    fn unique_profile_name_first_free() {
+        let existing = vec![] as Vec<LlmProfileData>;
+        let name = unique_profile_name(&existing, "profile");
+        assert_eq!(name, "profile-1");
+    }
+
+    #[test]
+    fn deduplicate_profiles_renames_collisions() {
+        let mut profiles = vec![
+            LlmProfileData { name: "dup".into(), model: String::new(), api_base_url: String::new(), key_env: "k1".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new() },
+            LlmProfileData { name: "dup".into(), model: String::new(), api_base_url: String::new(), key_env: "k2".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new() },
+        ];
+        deduplicate_profiles(&mut profiles);
+        assert_ne!(profiles[0].name, profiles[1].name, "names must differ after dedup");
     }
 }

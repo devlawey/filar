@@ -16,6 +16,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Switching LLM profiles with Ctrl+L now resolves the profile's API key from the OS
   credential store, not just the in-memory key of the launched profile
   ([#171](https://github.com/devlawey/filar/issues/171)).
+- Profile names and credential entries are now unique: deleting a profile no longer
+  leaves its API key in the OS credential store, and adding a profile after a deletion
+  no longer collides with an existing one
+  ([#172](https://github.com/devlawey/filar/issues/172)).
 
 ### Added
 
