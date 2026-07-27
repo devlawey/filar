@@ -96,7 +96,7 @@ fn deduplicate_profiles(profiles: &mut Vec<LlmProfileData>) {
     for p in profiles.iter_mut() {
         let mut name = p.name.clone();
         while seen_names.contains(&name) {
-            name = format!("{}_dup", p.name);
+            name = format!("{name}_dup");
         }
         if name != p.name {
             tracing::warn!(old = %p.name, new = %name, "deduplicated colliding profile name on load");
@@ -786,7 +786,33 @@ pub fn run_launcher(config: &Config) {
     }
 
     // Repair any collisions that survived from v0.7.0 pre-fix code.
+    let profiles_before = profiles
+        .iter()
+        .map(|p| (p.name.clone(), p.key_env.clone()))
+        .collect::<Vec<_>>();
     deduplicate_profiles(&mut profiles);
+    let profiles_after: Vec<_> = profiles
+        .iter()
+        .map(|p| (p.name.clone(), p.key_env.clone()))
+        .collect();
+    if profiles_before != profiles_after {
+        // Persist the repaired config immediately so the migration survives.
+        Settings {
+            model: settings.model.clone(),
+            api_base_url: settings.api_base_url.clone(),
+            ssh_profiles: settings.ssh_profiles.clone(),
+            last_ssh: settings.last_ssh,
+            temperature: settings.temperature.clone(),
+            extra_body: settings.extra_body.clone(),
+            profiles: profiles.iter().map(|d| filar_core::LlmProfile {
+                name: d.name.clone(), model: d.model.clone(), api_base_url: d.api_base_url.clone(),
+                key_env: d.key_env.clone(), max_tokens: 4096,
+                temperature: d.temperature.trim().parse().ok(),
+                top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
+            }).collect(),
+            selected_profile: settings.selected_profile.min(profiles.len().saturating_sub(1)),
+        }.save();
+    }
 
     let selected_profile = settings.selected_profile.min(profiles.len().saturating_sub(1));
 
@@ -982,5 +1008,18 @@ mod tests {
         ];
         deduplicate_profiles(&mut profiles);
         assert_ne!(profiles[0].name, profiles[1].name, "names must differ after dedup");
+    }
+
+    #[test]
+    fn deduplicate_three_identical_names_completes() {
+        let mut profiles = vec![
+            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k1".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new() },
+            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k2".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new() },
+            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k3".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new() },
+        ];
+        deduplicate_profiles(&mut profiles);
+        assert_ne!(profiles[0].name, profiles[1].name);
+        assert_ne!(profiles[1].name, profiles[2].name);
+        assert_ne!(profiles[0].name, profiles[2].name, "all three must be unique after dedup");
     }
 }
