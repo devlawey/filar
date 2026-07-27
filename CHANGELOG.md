@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- Switching LLM profiles with Ctrl+L now resolves the profile's API key from the OS
+  credential store, not just the in-memory key of the launched profile
+  ([#171](https://github.com/devlawey/filar/issues/171)).
+
 ### Added
 
 - GUI launcher now has a Models tab with add/delete profile management; each profile

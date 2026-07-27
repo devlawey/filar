@@ -199,6 +199,8 @@ pub struct App {
     pub profiles: Vec<filar_core::LlmProfile>,
     /// Default profile name when session doesn't specify one.
     pub default_profile_name: String,
+    /// Validate that a profile's API key is available (None = ok, Some = error msg).
+    pub key_checker: Option<Arc<dyn Fn(&filar_core::LlmProfile) -> Option<String> + Send + Sync>>,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -348,6 +350,7 @@ impl App {
             help_scroll: 0,
             profiles: Vec::new(),
             default_profile_name: String::new(),
+            key_checker: None,
         }
     }
 
@@ -770,10 +773,16 @@ impl App {
                     .unwrap_or(0),
             };
             self.llm_profile = Some(self.profiles[idx].name.clone());
-            self.push_message(ChatBlock::System(format!(
-                "Switched to LLM profile: {}",
-                self.profiles[idx].name
-            )));
+            let switched_name = self.profiles[idx].name.clone();
+            let msg = if let Some(ref checker) = self.key_checker {
+                match checker(&self.profiles[idx]) {
+                    None => format!("Switched to LLM profile: {}", switched_name),
+                    Some(err) => format!("Switched to profile: {}. ⚠️ {}", switched_name, err),
+                }
+            } else {
+                format!("Switched to LLM profile: {}", switched_name)
+            };
+            self.push_message(ChatBlock::System(msg));
             return;
         }
 

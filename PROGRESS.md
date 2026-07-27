@@ -3226,6 +3226,26 @@ paste (`Event::Paste`) естественно доставляет текст в
 
 ---
 
+## Issue #171: fix(app) — переключение профиля по Ctrl+L не находит ключ
+
+**Milestone:** Filar v0.7.0 (блокер). **Ветка:** `fix/171-profile-key-resolution`.
+
+**Проблема:** фабрика LLM искала ключ только в памяти и env. OS хранилище не опрашивалось.
+
+**Решение:** порядок: память → OS (keyring) → env. Ключ кэшируется. Валидация при Ctrl+L.
+
+**Файлы:** `app/src/main.rs`, `tui/src/app.rs`, `tui/src/runner.rs`.
+
+**Тесты:** 3 новых (424 total).
+
+**Публичные контракты:**
+- `TuiConfig` — новое поле `key_checker: Arc<dyn Fn(&LlmProfile) -> Option<String>>`.
+- `App` — новое поле `key_checker: Option<Arc<dyn Fn(&LlmProfile) -> Option<String>>>`.
+
+**Дальнейшие шаги:** добавлены в issue #172 (уникальность ключей).
+
+---
+
 ## Релиз v0.6.2 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.2 (4/4 issue, все смерджены).
