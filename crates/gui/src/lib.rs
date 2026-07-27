@@ -812,6 +812,7 @@ pub fn run_launcher(config: &Config) {
             }).collect(),
             selected_profile: settings.selected_profile.min(profiles.len().saturating_sub(1)),
         }.save();
+        tracing::info!("persisted deduplicated profile config on startup");
     }
 
     let selected_profile = settings.selected_profile.min(profiles.len().saturating_sub(1));
