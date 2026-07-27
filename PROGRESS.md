@@ -3336,6 +3336,28 @@ Credential Manager.
 
 ---
 
+## Релиз v0.7.0 (подготовка)
+
+**Дата:** 2026-07-27. **Milestone:** Filar v0.7.0 (5/5 issue, все смерджены).
+
+**Что вошло:**
+- #159 (#165): fix — secrets out of pending_launch.json
+- #160 (#166): fix — settings directory creation
+- #161 (#167): feat — unified config.toml location
+- #162 (#168): feat — Models tab in launcher
+- #163 (#169): feat — per-session LLM profile with Ctrl+L
+- #164 (#170): feat — token usage counter
+- #171 (#176): fix — profile key resolution from OS store
+- #172 (#177): fix — unique profile names/keys
+- #173 (#178): fix — real API usage data for tokens
+- #174 (#179): fix — profile and tokens persist with session
+- #175 (#180): docs — README 0.7.0 + config priority
+
+**Engine:** менялись core (Session fields, KeyringSecretProvider), agent (TokenUsage event,
+ChatResponse), transport (SshConnection). Тег `engine-v0.7.0` ставится.
+
+---
+
 ## Релиз v0.6.2 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.2 (4/4 issue, все смерджены).

@@ -703,7 +703,7 @@ temperature = 5.0
         std::fs::write(&path, "[llm]\nmodel = \"cwd-model\"\napi_base_url = \"https://test.example.com\"\n").unwrap();
 
         let old = std::env::var("FILAR_CONFIG").ok();
-        std::env::set_var("FILAR_CONFIG", &path.to_string_lossy());
+        std::env::set_var("FILAR_CONFIG", path.as_os_str());
         let _env = EnvGuard { key: "FILAR_CONFIG", old };
         let _dir = DirGuard(dir);
 
