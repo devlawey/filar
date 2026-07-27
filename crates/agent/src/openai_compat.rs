@@ -591,6 +591,18 @@ struct ApiToolCallFunction {
 #[derive(Deserialize)]
 struct ApiResponse {
     choices: Vec<ApiChoice>,
+    #[serde(default)]
+    usage: Option<ApiUsage>,
+}
+
+#[derive(Deserialize, Default)]
+struct ApiUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    total_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -629,6 +641,12 @@ impl ApiResponse {
             .next()
             .ok_or_else(|| CoreError::Other("API returned no choices".into()))?;
 
+        let usage = self.usage.map(|u| crate::TokenUsage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+        });
+
         // If the model returned tool calls, parse them.
         if let Some(tool_calls) = choice.message.tool_calls {
             if !tool_calls.is_empty() {
@@ -644,16 +662,20 @@ impl ApiResponse {
                         }
                     })
                     .collect();
-                return Ok(ChatResponse::tool_calls(
+                let mut resp = ChatResponse::tool_calls(
                     choice.message.content.unwrap_or_default(),
                     parsed,
-                ));
+                );
+                if let Some(u) = usage { resp = resp.with_usage(u); }
+                return Ok(resp);
             }
         }
 
         // Otherwise, return the text content.
         let text = choice.message.content.unwrap_or_default();
-        Ok(ChatResponse::text(text))
+        let mut resp = ChatResponse::text(text);
+        if let Some(u) = usage { resp = resp.with_usage(u); }
+        Ok(resp)
     }
 }
 
@@ -666,6 +688,8 @@ impl ApiResponse {
 struct SseEvent {
     #[serde(default)]
     choices: Vec<SseChoice>,
+    #[serde(default)]
+    usage: Option<ApiUsage>,
 }
 
 #[derive(Deserialize)]
@@ -713,6 +737,7 @@ struct SseState {
     full_text: String,
     tool_calls: BTreeMap<usize, StreamToolCall>,
     done: bool,
+    streamed_usage: Option<ApiUsage>,
 }
 
 impl SseState {
@@ -722,6 +747,7 @@ impl SseState {
             full_text: String::new(),
             tool_calls: BTreeMap::new(),
             done: false,
+            streamed_usage: None,
         }
     }
 
@@ -747,6 +773,9 @@ impl SseState {
 
             match serde_json::from_str::<SseEvent>(data) {
                 Ok(event) => {
+                    if let Some(u) = event.usage {
+                        self.streamed_usage = Some(u);
+                    }
                     if let Some(choice) = event.choices.into_iter().next() {
                         if let Some(content) = choice.delta.content {
                             if !content.is_empty() {
@@ -796,26 +825,26 @@ impl SseState {
 
     /// Build the final [`ChatResponse`] from accumulated state.
     fn into_response(self) -> Result<ChatResponse> {
-        if !self.tool_calls.is_empty() {
-            let calls: Vec<ToolCall> = self
-                .tool_calls
-                .values()
-                .map(|tc| {
-                    let arguments = serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
-                        warn!(error = %e, id = %tc.id, name = %tc.name, "failed to parse accumulated tool call arguments");
-                        serde_json::Value::Null
-                    });
-                    ToolCall {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        arguments,
-                    }
-                })
-                .collect();
-            Ok(ChatResponse::tool_calls(self.full_text, calls))
+        let mut resp = if !self.tool_calls.is_empty() {
+            let calls: Vec<ToolCall> = self.tool_calls.values().map(|tc| {
+                let arguments = serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
+                    warn!(error = %e, id = %tc.id, name = %tc.name, "failed to parse accumulated tool call arguments");
+                    serde_json::Value::Null
+                });
+                ToolCall { id: tc.id.clone(), name: tc.name.clone(), arguments }
+            }).collect();
+            ChatResponse::tool_calls(self.full_text, calls)
         } else {
-            Ok(ChatResponse::text(self.full_text))
+            ChatResponse::text(self.full_text)
+        };
+        if let Some(u) = self.streamed_usage {
+            resp = resp.with_usage(crate::TokenUsage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+            });
         }
+        Ok(resp)
     }
 }
 
@@ -1388,5 +1417,22 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         let client = crate::GlmClient::new_with_key(&config, Duration::from_secs(1), "dummy-key")
             .unwrap();
         assert_same_type(&client);
+    }
+
+    #[test]
+    fn deserialize_response_with_usage() {
+        let json = r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+        let resp: ApiResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(10));
+        assert_eq!(usage.completion_tokens, Some(5));
+        assert_eq!(usage.total_tokens, Some(15));
+    }
+
+    #[test]
+    fn deserialize_response_without_usage() {
+        let json = r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#;
+        let resp: ApiResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.usage.is_none(), "usage must be None when absent");
     }
 }

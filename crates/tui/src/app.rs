@@ -906,7 +906,6 @@ impl App {
                             }
                         } else {
                             self.push_message(ChatBlock::User(text.clone()));
-                            self.tokens_in += (text.chars().count() as u64).div_ceil(4);
                             self.scroll = 0;
                             self.input.clear();
                             self.cursor_pos = 0;
@@ -2017,7 +2016,7 @@ impl App {
 
         let mut auto_scroll = true;
         match event {
-            TuiEvent::Agent { event: agent_event, .. } => match agent_event {
+            TuiEvent::Agent { session_id, event: agent_event } => match agent_event {
                 filar_agent::AgentEvent::Started => {
                     self.mode = AppMode::Thinking;
                     self.active_session_mut().background_activity = true;
@@ -2079,7 +2078,6 @@ impl App {
                     self.pending_proposal = None;
                 }
                 filar_agent::AgentEvent::Finished(text) => {
-                    let text_len = text.chars().count();
                     if self.streaming {
                         if !text.is_empty() {
                             if let Some(ChatBlock::Agent(ref mut existing)) = self.messages.last_mut() {
@@ -2097,8 +2095,13 @@ impl App {
                     self.mode = AppMode::Normal;
                     self.agent_running = false;
                     self.cancellation = None;
-                    self.tokens_out += (text_len as u64).div_ceil(4);
                     self.active_session_mut().background_activity = false;
+                }
+                filar_agent::AgentEvent::TokenUsage { tokens_in, tokens_out } => {
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        s.tokens_in += tokens_in;
+                        s.tokens_out += tokens_out;
+                    }
                 }
                 filar_agent::AgentEvent::Error(err) => {
                     if self.streaming {
@@ -2111,6 +2114,8 @@ impl App {
                     self.agent_running = false;
                     self.cancellation = None;
                     self.active_session_mut().background_activity = false;
+                }
+                filar_agent::AgentEvent::Cancelled => {
                 }
                 _ => {}
             },
@@ -5301,30 +5306,31 @@ mod tests {
 
     #[test]
     fn token_counter_increments_on_enter() {
+        // Enter no longer counts tokens — token counters come from
+        // real API usage (AgentEvent::TokenUsage).
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.input = "hello world".into();
         app.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Enter,
             crossterm::event::KeyModifiers::NONE,
         ));
-        // "hello world" = 11 chars → ceil(11/4) = 3
-        assert_eq!(app.tokens_in, 3);
+        assert_eq!(app.tokens_in, 0, "tokens_in unchanged until API returns usage");
         assert_eq!(app.tokens_out, 0);
     }
 
     #[test]
     fn token_counter_is_per_session() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.new_tab(); // active = 1, new session gets index 1
-        app.switch_to_tab(1); // back to session 0 (1-based index for tab 1)
+        // Token counters are updated via AgentEvent::TokenUsage only.
+        // Simulate receiving usage for session 0.
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TokenUsage { tokens_in: 10, tokens_out: 20 },
+        });
+        assert_eq!(app.sessions[0].tokens_in, 10);
+        app.new_tab();
+        app.switch_to_tab(1); // back to session 0
         assert_eq!(app.active, 0);
-        // Session 0: add tokens
-        app.input = "abcd".into();
-        app.handle_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        assert_eq!(app.sessions[0].tokens_in, 1); // "abcd" = 4 chars → 1 token
         // Session 1 must still be at zero.
         assert_eq!(app.sessions[1].tokens_in, 0);
     }

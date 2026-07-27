@@ -20,6 +20,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   leaves its API key in the OS credential store, and adding a profile after a deletion
   no longer collides with an existing one
   ([#172](https://github.com/devlawey/filar/issues/172)).
+- Token counter now uses real API usage data instead of character-length estimation,
+  and shows `—` when the provider doesn't report usage
+  ([#173](https://github.com/devlawey/filar/issues/173)).
 
 ### Added
 
@@ -29,8 +32,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Ctrl+L now cycles through LLM profiles per tab; each session can use a different
   model without affecting other tabs
   ([#163](https://github.com/devlawey/filar/issues/163)).
-- Token usage counter shown in the status bar (estimated ~4 chars/token) per session
-  ([#164](https://github.com/devlawey/filar/issues/164)).
+- Token usage counter now uses real API response data (`usage.prompt_tokens` /
+  `completion_tokens`) instead of character-length estimation
+  ([#173](https://github.com/devlawey/filar/issues/173)).
 
 ### Fixed
 

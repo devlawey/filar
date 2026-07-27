@@ -176,6 +176,14 @@ pub struct ToolDef {
     pub parameters: serde_json::Value,
 }
 
+/// Token usage from the API response.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
 /// The model's response, containing both text and optional tool calls.
 ///
 /// Both fields are always present — `text` may be empty when the model only
@@ -188,6 +196,8 @@ pub struct ChatResponse {
     pub text: String,
     /// Tool calls requested by the model (empty for a final text response).
     pub tool_calls: Vec<ToolCall>,
+    /// Token usage reported by the provider, if available.
+    pub usage: Option<TokenUsage>,
 }
 
 impl ChatResponse {
@@ -196,6 +206,7 @@ impl ChatResponse {
         Self {
             text: text.into(),
             tool_calls: Vec::new(),
+            usage: None,
         }
     }
 
@@ -204,12 +215,19 @@ impl ChatResponse {
         Self {
             text: text.into(),
             tool_calls,
+            usage: None,
         }
     }
 
     /// Returns `true` if the response contains tool calls.
     pub fn has_tool_calls(&self) -> bool {
         !self.tool_calls.is_empty()
+    }
+
+    /// Attach token usage data. Chainable.
+    pub fn with_usage(mut self, usage: TokenUsage) -> Self {
+        self.usage = Some(usage);
+        self
     }
 }
 
