@@ -33,7 +33,8 @@ pub struct Session {
     /// Target name that was connected to.
     pub target: String,
     /// LLM profile name that was used.
-    pub llm_profile: String,
+    #[serde(default)]
+    pub llm_profile: Option<String>,
     /// Chat history blocks.
     pub messages: Vec<ChatBlock>,
     /// History of user prompts in agent mode (for Up/Down navigation).
@@ -72,7 +73,7 @@ impl From<&Session> for SessionMeta {
             id: s.id.clone(),
             timestamp: s.timestamp.clone(),
             target: s.target.clone(),
-            llm_profile: s.llm_profile.clone(),
+            llm_profile: s.llm_profile.clone().unwrap_or_default(),
             preview,
         }
     }
@@ -275,7 +276,7 @@ mod tests {
             id: "123".into(),
             timestamp: "2026-06-21 12:00:00".into(),
             target: "local".into(),
-            llm_profile: "default".into(),
+            llm_profile: Some("default".into()),
             messages: vec![
                 ChatBlock::System("connected".into()),
                 ChatBlock::User("find port 8080".into()),
@@ -297,7 +298,7 @@ mod tests {
             id: "1".into(),
             timestamp: "t".into(),
             target: "t".into(),
-            llm_profile: "t".into(),
+            llm_profile: Some("t".into()),
             messages: vec![],
             input_history: vec![],
             tokens_in: 0,
@@ -321,7 +322,7 @@ mod tests {
             id: "999".into(),
             timestamp: "2026-01-01 00:00:00".into(),
             target: "test".into(),
-            llm_profile: "glm".into(),
+            llm_profile: Some("glm".into()),
             messages: vec![
                 ChatBlock::User("hello".into()),
                 ChatBlock::Agent("world".into()),
@@ -364,7 +365,7 @@ mod tests {
                 id: format!("{i:010}"),
                 timestamp: format!("t{i}"),
                 target: "t".into(),
-                llm_profile: "t".into(),
+                llm_profile: Some("t".into()),
                 messages: vec![ChatBlock::User(format!("msg{i}"))],
                 input_history: vec![],
             tokens_in: 0,
@@ -444,7 +445,7 @@ mod tests {
     fn tokens_in_out_roundtrip() {
         let s = Session {
             id: "1".into(), timestamp: "t".into(), target: "t".into(),
-            llm_profile: "glm".into(), messages: vec![], input_history: vec![],
+            llm_profile: Some("glm".into()), messages: vec![], input_history: vec![],
             tokens_in: 150, tokens_out: 300,
         };
         let json = serde_json::to_string(&s).unwrap();
@@ -477,7 +478,7 @@ mod tests {
             id: "1".into(),
             timestamp: "t".into(),
             target: "t".into(),
-            llm_profile: "t".into(),
+            llm_profile: Some("t".into()),
             messages: vec![],
             input_history: vec!["ls".into(), "find port 8080".into()],
             tokens_in: 0,
@@ -513,7 +514,7 @@ mod tests {
             id: "1".into(),
             timestamp: "t".into(),
             target: "t".into(),
-            llm_profile: "t".into(),
+            llm_profile: Some("t".into()),
             messages: vec![],
             input_history: (0..250).map(|i| format!("entry{i}")).collect(),
             tokens_in: 0,

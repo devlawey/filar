@@ -278,12 +278,17 @@ async fn run_app(
     executor: Arc<dyn CommandExecutor>,
     mut config: TuiConfig,
 ) -> Result<()> {
+    let profiles_for_restore = std::mem::take(&mut config.profiles);
+    let default_for_restore = std::mem::take(&mut config.default_profile_name);
     let mut app = if config.initial_messages.is_empty()
         && config.initial_input_history.is_empty()
     {
-        App::new(config.target_name.clone(), config.confirm_mode)
+        let mut a = App::new(config.target_name.clone(), config.confirm_mode);
+        a.profiles = profiles_for_restore;
+        a.default_profile_name = default_for_restore;
+        a
     } else {
-        App::with_history(
+        let mut a = App::with_history(
             config.target_name.clone(),
             config.confirm_mode,
             std::mem::take(&mut config.initial_messages),
@@ -291,11 +296,14 @@ async fn run_app(
             std::mem::take(&mut config.initial_llm_profile),
             config.initial_tokens_in,
             config.initial_tokens_out,
-        )
+            &profiles_for_restore,
+            &default_for_restore,
+        );
+        a.profiles = profiles_for_restore;
+        a.default_profile_name = default_for_restore;
+        a
     };
     // Load available LLM profiles and default profile name.
-    app.profiles = std::mem::take(&mut config.profiles);
-    app.default_profile_name = std::mem::take(&mut config.default_profile_name);
     app.key_checker = Some(config.key_checker.clone());
     // Wire the App to the same StaticSecretProvider instance used by the
     // agent's SecretSubstitutingExecutor, so Ctrl+P inserts are visible to
@@ -892,7 +900,7 @@ async fn run_app(
         id,
         timestamp,
         target: config.target_name.clone(),
-        llm_profile: app.llm_profile.clone().unwrap_or_else(|| config.default_profile_name.clone()),
+        llm_profile: app.llm_profile.clone(),
         messages: app.messages.clone(),
         input_history: app.input_history().to_vec(),
         tokens_in: app.tokens_in,

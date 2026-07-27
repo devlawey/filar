@@ -369,7 +369,7 @@ async fn run() -> anyhow::Result<()> {
                 Ok(Some(session)) => {
                     info!(messages = session.messages.len(), "session loaded");
                     (session.messages, session.input_history,
-                     Some(session.llm_profile),
+                     session.llm_profile,
                      session.tokens_in, session.tokens_out)
                 }
                 Ok(None) => {

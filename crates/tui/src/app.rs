@@ -533,6 +533,8 @@ impl App {
         llm_profile: Option<String>,
         tokens_in: u64,
         tokens_out: u64,
+        profiles: &[filar_core::LlmProfile],
+        default_profile_name: &str,
     ) -> Self {
         let mut app = Self::new(target_name, confirm_mode);
         if !messages.is_empty() {
@@ -542,16 +544,16 @@ impl App {
                 "Session restored — history loaded from disk".into(),
             ));
         }
-        // Restore agent input history so Up/Down recalls previous prompts.
         app.input_history = input_history;
         app.history_pos = None;
-        // Restore LLM profile and token counters from previous session.
         if let Some(profile) = llm_profile {
-            if app.profiles.iter().any(|p| p.name == profile) {
+            if profile.is_empty() {
+                // Old session (pre-0.7.0 fix) with empty llm_profile: silent fallback.
+            } else if profiles.iter().any(|p| p.name == profile) {
                 app.llm_profile = Some(profile);
             } else {
                 app.push_message(ChatBlock::System(format!(
-                    "Profile '{}' not found — using default", profile
+                    "Profile '{}' not found — using '{}'", profile, default_profile_name
                 )));
             }
         }
