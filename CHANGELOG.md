@@ -26,6 +26,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Session persistence now saves and restores the selected LLM profile and accumulated
   token counters ([#174](https://github.com/devlawey/filar/issues/174)).
 
+### Changed
+
+- `config.toml` search order: CWD before app-data (local `./config.toml` overrides
+  `%APPDATA%\filar\`); README updated with all 0.7.0 features
+  ([#175](https://github.com/devlawey/filar/issues/175)).
+
 ### Added
 
 - GUI launcher now has a Models tab with add/delete profile management; each profile

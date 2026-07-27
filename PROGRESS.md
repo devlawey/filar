@@ -3319,6 +3319,23 @@ Credential Manager.
 
 ---
 
+## Issue #175: docs(readme) — README 0.7.0 + config.toml priority swap
+
+**Milestone:** Filar v0.7.0. **Ветка:** `docs/175-readme-0-7-0`.
+
+**Решение:**
+- Порядок `config.toml`: `FILAR_CONFIG` → CWD (локальный override) → app-data → exe dir.
+- README: вкладка Models, Ctrl+L, Ctrl+V, токены, хранение ключей, приоритет конфига,
+  пример `llm_profiles`.
+
+**Файлы:** `README.md`, `crates/core/src/config.rs`.
+
+**Тесты:** 408 pass, без регрессии.
+
+**Принятое решение:** вариант (б) — CWD выше app-data, «локальный файл переопределяет».
+
+---
+
 ## Релиз v0.6.2 (подготовка)
 
 **Дата:** 2026-07-25. **Milestone:** Filar v0.6.2 (4/4 issue, все смерджены).

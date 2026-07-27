@@ -19,11 +19,13 @@ Filar is a Rust-based terminal application that integrates an AI agent (LLM) wit
 - **TUI Interface** — built with [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm)
 - **Mouse Support** — scroll wheel, click-to-expand command blocks, drag-to-select and copy text
 - **Streaming Responses** — real-time streaming of LLM responses with spinner animation
-- **GUI Launcher** — built with [egui](https://github.com/emilk/egui), for easy SSH profile and API key configuration
+- **GUI Launcher** — built with [egui](https://github.com/emilk/egui), with a **Models tab** for managing multiple LLM profiles (each with its own API key, saved in OS Credential Manager)
+- **Multi-Model Support** — `Ctrl+L` cycles through LLM profiles per tab; different tabs can use different models simultaneously
 - **Command Confirmation** — every command requires user approval before execution
 - **Shell Escape** — type `!command` for direct shell access without the agent
 - **Session Persistence** — save and restore chat sessions, including agent input history (Up/Down recalls prompts from previous sessions)
 - **Secure Credential Storage** — API keys and SSH passwords stored in OS Credential Manager (not in plain text files)
+- **Token Usage Counter** — real API usage data shown in the status bar per session (`toks: N↑ M↓`)
 - **Interactive Terminal** — full terminal emulation via [alacritty_terminal](https://github.com/alacritty/alacritty)
 
 ---
@@ -65,7 +67,13 @@ The executable will be at `target\release\filar.exe`.
 
 ### Configuration (optional)
 
-Filar works without a config file — the GUI launcher handles everything. For CLI usage, create `config.toml`:
+Filar works without a config file — the GUI launcher handles everything.
+For CLI usage, create `config.toml`. The file is searched in this order:
+
+1. `FILAR_CONFIG` environment variable (explicit path)
+2. `./config.toml` in the current working directory (local override for development)
+3. `%APPDATA%\filar\config.toml` (shared system-wide config, written by GUI launcher)
+4. `config.toml` next to the executable
 
 ```toml
 confirm_mode = "allowlist"
@@ -90,6 +98,32 @@ user = "admin"
 [ssh_targets.auth]
 type = "password"
 ```
+
+#### Multiple LLM Profiles (since v0.7.0)
+
+```toml
+# Define any number of profiles with independent API keys.
+[[llm_profiles]]
+name = "glm-5.2"
+model = "glm-5.2"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+max_tokens = 4096
+
+[[llm_profiles]]
+name = "deepseek"
+model = "deepseek-chat"
+api_base_url = "https://api.deepseek.com/v1"
+max_tokens = 8192
+
+[[llm_profiles]]
+name = "local-llama"
+model = "llama3.1"
+api_base_url = "http://localhost:11434/v1"
+max_tokens = 4096
+```
+
+API keys are stored in the OS credential store (Windows Credential Manager)
+and are **never** written to `config.toml`, `settings.json`, or log files.
 
 ### Run
 
@@ -204,6 +238,8 @@ Type `!` followed by a command to run it directly (bypassing the agent):
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Switch session tab (works in interactive too) |
 | `Ctrl+N` | New local session tab (always local, never inherits another tab's SSH) |
 | `Ctrl+W` | Close active session tab |
+| `Ctrl+L` | Cycle LLM profile for this tab (different model per tab) |
+| `Ctrl+V` | Paste from system clipboard (also via bracketed paste) |
 | `Ctrl+P` | Enter password input mode (masked) |
 | `Up/Down` | Browse agent input history (persisted across sessions since v0.6.1) |
 | `!command` | Shell escape (direct execution) |

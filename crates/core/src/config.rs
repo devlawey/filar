@@ -331,8 +331,8 @@ impl Config {
     ///
     /// Search order:
     /// 1. `FILAR_CONFIG` environment variable (explicit path)
-    /// 2. `%APPDATA%\filar\config.toml` (platform app-data directory)
-    /// 3. `config.toml` in the current working directory
+    /// 2. `config.toml` in the current working directory (override for development)
+    /// 3. `%APPDATA%\filar\config.toml` (shared system-wide config)
     /// 4. `config.toml` next to the executable
     ///
     /// Falls back to built-in defaults if no file is found anywhere.
@@ -343,18 +343,18 @@ impl Config {
             tracing::info!(path = %p.display(), "loading config from FILAR_CONFIG");
             return Self::load(&p);
         }
-        // 2. App-data directory (unified config location).
+        // 2. Current working directory (local override for development).
+        if std::path::Path::new("config.toml").exists() {
+            tracing::info!("loading config.toml from current directory");
+            return Self::load("config.toml");
+        }
+        // 3. App-data directory (unified config location).
         if let Ok(base) = crate::default_base_dir() {
             let app_config = base.join("filar").join("config.toml");
             if app_config.exists() {
                 tracing::info!(path = %app_config.display(), "loading config from app-data dir");
                 return Self::load(&app_config);
             }
-        }
-        // 3. Current working directory.
-        if std::path::Path::new("config.toml").exists() {
-            tracing::info!("loading config.toml from current directory");
-            return Self::load("config.toml");
         }
         // 4. Next to the executable.
         if let Ok(exe) = std::env::current_exe() {
