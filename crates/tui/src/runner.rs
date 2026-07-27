@@ -280,14 +280,12 @@ async fn run_app(
 ) -> Result<()> {
     let profiles_for_restore = std::mem::take(&mut config.profiles);
     let default_for_restore = std::mem::take(&mut config.default_profile_name);
-    let mut app = if config.initial_messages.is_empty()
-        && config.initial_input_history.is_empty()
-    {
-        let mut a = App::new(config.target_name.clone(), config.confirm_mode);
-        a.profiles = profiles_for_restore;
-        a.default_profile_name = default_for_restore;
-        a
-    } else {
+    let has_history = !config.initial_messages.is_empty()
+        || !config.initial_input_history.is_empty()
+        || config.initial_llm_profile.is_some()
+        || config.initial_tokens_in > 0
+        || config.initial_tokens_out > 0;
+    let mut app = if has_history {
         let mut a = App::with_history(
             config.target_name.clone(),
             config.confirm_mode,
@@ -299,6 +297,11 @@ async fn run_app(
             &profiles_for_restore,
             &default_for_restore,
         );
+        a.profiles = profiles_for_restore;
+        a.default_profile_name = default_for_restore;
+        a
+    } else {
+        let mut a = App::new(config.target_name.clone(), config.confirm_mode);
         a.profiles = profiles_for_restore;
         a.default_profile_name = default_for_restore;
         a
