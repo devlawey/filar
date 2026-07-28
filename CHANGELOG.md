@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- LLM client construction passed the resolved API key where a secret *name* was
+  expected, so every agent request failed and the key value was shown in the error
+  message ([#183](https://github.com/devlawey/filar/issues/183)).
+
 ### Changed
 
 - Engine API consistency: `SessionMeta.llm_profile` now matches `Session.llm_profile`

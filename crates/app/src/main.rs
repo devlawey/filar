@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 
 use filar_agent::OpenAiCompatClient;
 use filar_agent::LlmClient;
-use filar_core::{secrets, default_base_dir, Config, SecretProvider, SessionStore, StaticSecretProvider};
+use filar_core::{secrets, default_base_dir, Config, CoreError, SecretProvider, SessionStore, StaticSecretProvider};
 use filar_transport::{LocalExecutor, SshExecutor};
 use filar_tui::TuiConfig;
 
@@ -75,6 +75,53 @@ fn parse_args() -> Args {
         }
     }
     args
+}
+
+// ---------------------------------------------------------------------------
+// LLM client factory
+// ---------------------------------------------------------------------------
+
+/// Build an `OpenAiCompatClient` from an LLM profile and secret provider.
+///
+/// Key resolution order: in-memory `StaticSecretProvider` → OS credential store
+/// (keyring) → environment variable. On first keyring hit, the key is cached in
+/// `sp` to avoid repeated OS credential store calls.
+///
+/// This is a free function (not an inline closure) so that it can be
+/// unit-tested independently from `main`.
+pub fn build_llm_client_from_profile(
+    profile: &filar_core::LlmProfile,
+    sp: &filar_core::StaticSecretProvider,
+    llm_timeout_secs: u64,
+) -> std::result::Result<Arc<dyn LlmClient>, CoreError> {
+    let key = sp.get(&profile.key_env).unwrap_or_default();
+    let key = if key.is_empty() {
+        let keyring = filar_core::KeyringSecretProvider::new();
+        let kr_key = keyring.get(&profile.key_env).ok().unwrap_or_default();
+        if !kr_key.is_empty() {
+            sp.insert(&profile.key_env, &kr_key);
+            kr_key
+        } else {
+            std::env::var(&profile.key_env).unwrap_or_default()
+        }
+    } else {
+        key
+    };
+    if key.is_empty() {
+        return Err(filar_core::CoreError::Secret(format!(
+            "no API key found for profile {}",
+            profile.name
+        )));
+    }
+    let llm_config: filar_core::LlmConfig = profile.into();
+    Ok(Arc::new(
+        OpenAiCompatClient::new_with_key(
+            &llm_config,
+            Duration::from_secs(llm_timeout_secs),
+            &key,
+        )
+        .map_err(|e| filar_core::CoreError::Other(format!("LLM client error: {e}")))?,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -410,36 +457,12 @@ async fn run() -> anyhow::Result<()> {
         log_rx,
         profiles: config.llm_profiles.clone(),
         default_profile_name,
-        llm_factory: Arc::new(move |profile: &filar_core::LlmProfile, sp: &filar_core::StaticSecretProvider| {
-            // Resolve API key: in-memory cache → OS credential store → env.
-            let key = sp.get(&profile.key_env).unwrap_or_default();
-            let mut checked = "in-memory secret provider, ";
-            let key = if key.is_empty() {
-                checked = "in-memory provider, OS credential store, ";
-                let keyring = filar_core::KeyringSecretProvider::new();
-                let kr_key = keyring.get(&profile.key_env).ok().unwrap_or_default();
-                if !kr_key.is_empty() {
-                    // Cache for subsequent calls so we don't hit keyring again.
-                    sp.insert(&profile.key_env, &kr_key);
-                    kr_key
-                } else {
-                    checked = "in-memory provider, OS credential store, env var, ";
-                    std::env::var(&profile.key_env).unwrap_or_default()
-                }
-            } else { key };
-            if key.is_empty() {
-                return Err(filar_core::CoreError::Secret(
-                    format!("no API key found for profile {} (checked: {})", profile.name, checked.trim_end_matches(", "))
-                ));
-            }
-            let llm_config: filar_core::LlmConfig = profile.into();
-            Ok(Arc::new(OpenAiCompatClient::new_with_provider(
-                &llm_config,
-                Duration::from_secs(300),
-                &key,
-                sp as &dyn filar_core::SecretProvider,
-            ).map_err(|e| filar_core::CoreError::Other(format!("LLM client error: {e}")))?))
-        }),
+        llm_factory: {
+            let llm_timeout_secs = config.timeouts.llm_secs;
+            Arc::new(move |profile: &filar_core::LlmProfile, sp: &filar_core::StaticSecretProvider| {
+                build_llm_client_from_profile(profile, sp, llm_timeout_secs)
+            })
+        },
         key_checker: Arc::new(move |profile: &filar_core::LlmProfile| {
             let key = key_checker_provider.get(&profile.key_env).unwrap_or_default();
             if !key.is_empty() { return None; }
@@ -473,7 +496,11 @@ async fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use filar_core::{SecretProvider, StaticSecretProvider};
+    use filar_core::{LlmProfile, SecretProvider, StaticSecretProvider};
+
+    use super::build_llm_client_from_profile;
+
+    // ── Key resolution tests ────────────────────────────────────────────
 
     #[test]
     fn key_resolve_prefers_in_memory() {
@@ -495,14 +522,11 @@ mod tests {
     #[test]
     fn key_resolve_caches_keyring_result() {
         let sp = StaticSecretProvider::new();
-        // Simulate keyring returning a value (third party).
         let result = resolve_test_key("KR_KEY_1", &sp, Some("kr-secret"));
         assert_eq!(result, "kr-secret");
-        // Cache it in StaticSecretProvider (simulating factory behavior).
         if !result.is_empty() {
             sp.insert("KR_KEY_1", &result);
         }
-        // Second call should hit memory, not keyring.
         let cached = sp.get("KR_KEY_1").unwrap_or_default();
         assert_eq!(cached, "kr-secret", "key must be cached after first keyring read");
     }
@@ -524,17 +548,91 @@ mod tests {
         std::env::remove_var("FILAR_TEST_EMPTY");
     }
 
-    /// Test the same 3-step resolution as the factory closure.
     fn resolve_test_key(
         key_env: &str,
         sp: &StaticSecretProvider,
         keyring_value: Option<&str>,
     ) -> String {
         let key = sp.get(key_env).unwrap_or_default();
-        if !key.is_empty() { return key; }
+        if !key.is_empty() {
+            return key;
+        }
         if let Some(v) = keyring_value {
-            if !v.is_empty() { return v.to_string(); }
+            if !v.is_empty() {
+                return v.to_string();
+            }
         }
         std::env::var(key_env).unwrap_or_default()
+    }
+
+    // ── Factory regression tests (#183) ─────────────────────────────────
+
+    #[test]
+    fn factory_with_valid_key_returns_ok() {
+        let key_value = "sk-fake-key-for-testing-12345";
+        let sp = StaticSecretProvider::new();
+        sp.insert("TEST_KEY_ENV", key_value);
+        let profile = LlmProfile {
+            name: "test-profile".into(),
+            model: "test-model".into(),
+            api_base_url: "https://example.com/api".into(),
+            max_tokens: 1024,
+            key_env: "TEST_KEY_ENV".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+        };
+        let result = build_llm_client_from_profile(&profile, &sp, 60);
+        assert!(result.is_ok(), "factory must succeed with a valid key");
+    }
+
+    #[test]
+    fn factory_with_missing_key_returns_err() {
+        let sp = StaticSecretProvider::new();
+        let profile = LlmProfile {
+            name: "no-key-profile".into(),
+            model: "test-model".into(),
+            api_base_url: "https://example.com/api".into(),
+            max_tokens: 1024,
+            key_env: "NONEXISTENT_KEY".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+        };
+        let result = build_llm_client_from_profile(&profile, &sp, 60);
+        assert!(result.is_err(), "factory must fail when no key is available");
+    }
+
+    #[test]
+    fn factory_error_does_not_contain_key_value() {
+        let key_value = "sk-or-v1-super-secret-key-that-must-not-leak";
+        let sp = StaticSecretProvider::new();
+        let profile = LlmProfile {
+            name: "leak-test-profile".into(),
+            model: "test-model".into(),
+            api_base_url: "https://example.com/api".into(),
+            max_tokens: 1024,
+            key_env: "LEAK_TEST_KEY".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+        };
+        // Test 1: key is absent → error must NOT contain the test value.
+        let result = build_llm_client_from_profile(&profile, &sp, 60);
+        if let Err(ref e) = result {
+            let msg = format!("{e}");
+            assert!(
+                !msg.contains(key_value),
+                "error must NOT contain the key value '{key_value}', but got: {msg}"
+            );
+            assert!(
+                msg.contains("no API key found"),
+                "error must mention that the key is missing, got: {msg}"
+            );
+        }
+        // Test 2: insert the key → factory must succeed (no error to check).
+        sp.insert("LEAK_TEST_KEY", key_value);
+        let result2 = build_llm_client_from_profile(&profile, &sp, 60);
+        assert!(result2.is_ok(), "factory must succeed after inserting key");
     }
 }

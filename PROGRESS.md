@@ -3355,6 +3355,39 @@ Credential Manager.
 
 ---
 
+## Issue #183: fix(app) — в клиент передаётся значение ключа вместо имени секрета
+
+**Milestone:** Filar v0.7.1 (блокер). **Ветка:** `fix/183-llm-factory-key-name`.
+
+**Проблема:** в замыкании `llm_factory` (`main.rs`) разрешённое значение API-ключа
+передавалось в `OpenAiCompatClient::new_with_provider()` как имя секрета. Провайдер
+искал секрет с именем `sk-or-v1-…`, не находил, ошибка с ключом в тексте попадала в UI.
+Фича «профили LLM» не работала ни разу в 0.7.0.
+
+**Решение:**
+1. Замена `new_with_provider(&llm_config, timeout, &key, sp)` →
+   `new_with_key(&llm_config, timeout, &key)`. `new_with_key` принимает значение ключа,
+   а не его имя.
+2. Таймаут из конфига (`config.timeouts.llm_secs`, по умолчанию 60) вместо зашитого `300`.
+3. Замыкание-фабрика вынесено в свободную функцию `build_llm_client_from_profile()` для
+   юнит-тестирования.
+4. Тесты: `factory_with_valid_key_returns_ok` (ключ в StaticSecretProvider → Ok),
+   `factory_with_missing_key_returns_err` (нет ключа → Err),
+   `factory_error_does_not_contain_key_value` (проверка, что значение ключа не попало
+   в сообщение об ошибке).
+
+**Изменённые файлы:**
+- `crates/app/src/main.rs` — функция `build_llm_client_from_profile`, обновлённое
+  замыкание `llm_factory`, 3 новых теста
+
+**Публичные контракты:** без изменений (свободная функция в бинарном крейте — не
+публичный API).
+
+**DoD (требует ручной проверки):** сборка бинарника, запуск: 2 профиля, запрос →
+ответ; Ctrl+L → запрос → ответ; неверный ключ → ошибка без значения.
+
+---
+
 ## Релиз v0.7.0 (подготовка)
 
 **Дата:** 2026-07-27. **Milestone:** Filar v0.7.0 (5/5 issue, все смерджены).
