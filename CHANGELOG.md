@@ -22,9 +22,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Changed
 
-- Engine API consistency: `SessionMeta.llm_profile` now matches `Session.llm_profile`
-  (`Option<String>`), and `KeyringSecretProvider` is re-exported alongside the other
-  secret providers ([#181](https://github.com/devlawey/filar/issues/181)).
+- Contributor docs now require a manual smoke run of the built binary before closing
+  user-facing issues, with a checklist in `docs/SMOKE.md`
+  ([#185](https://github.com/devlawey/filar/issues/185)).
 
 ## [0.7.0] - 2026-07-27
 
