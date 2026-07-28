@@ -110,7 +110,7 @@ pub fn build_llm_client_from_profile(
     if key.is_empty() {
         return Err(filar_core::CoreError::Secret(format!(
             "no API key found for profile {}",
-            filar_core::redact(&profile.name)
+            profile.name
         )));
     }
     let llm_config: filar_core::LlmConfig = profile.into();

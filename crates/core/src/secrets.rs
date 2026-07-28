@@ -212,7 +212,7 @@ impl Drop for StaticSecretProvider {
 /// ```
 pub fn redact(s: &str) -> String {
     let prefix: String = s.chars().take(4).collect();
-    let len = s.len();
+    let len = s.chars().count();
     format!("{prefix}… (len {len})")
 }
 
