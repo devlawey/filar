@@ -120,7 +120,7 @@ pub fn build_llm_client_from_profile(
             Duration::from_secs(llm_timeout_secs),
             &key,
         )
-        .inspect_err(|e| warn!(error = %e, "LLM client construction failed"))
+        .inspect_err(|_| warn!("LLM client construction failed"))
         .map_err(|_| filar_core::CoreError::Other("failed to construct LLM client".into()))?,
     ))
 }
