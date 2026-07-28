@@ -13,8 +13,43 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [0.7.0] - 2026-07-27
 
+### Added
+
+- GUI launcher now has a Models tab with add/delete profile management; each profile
+  stores its API key in the OS credential store independently
+  ([#162](https://github.com/devlawey/filar/issues/162)).
+- Ctrl+L now cycles through LLM profiles per tab; each session can use a different
+  model without affecting other tabs
+  ([#163](https://github.com/devlawey/filar/issues/163)).
+- Clipboard paste now works via Ctrl+V and bracketed paste in agent input, interactive
+  terminal, and password prompt
+  ([#153](https://github.com/devlawey/filar/issues/153)).
+- Token usage counter shown in the status bar (v1: character-length estimation) per
+  session ([#164](https://github.com/devlawey/filar/issues/164)).
+- `config.toml` is now searched in `%APPDATA%\filar\` first (unified config location),
+  then CWD, then next to the executable
+  ([#161](https://github.com/devlawey/filar/issues/161)).
+
+### Changed
+
+- `config.toml` search order: CWD before app-data (local `./config.toml` now
+  overrides `%APPDATA%\filar\`)
+  ([#175](https://github.com/devlawey/filar/issues/175)).
+- README updated with all 0.7.0 features: Models tab, Ctrl+L, token counter,
+  config priority, key storage
+  ([#175](https://github.com/devlawey/filar/issues/175)).
+- Engine API: `SessionMeta.llm_profile` now matches `Session.llm_profile`
+  (`Option<String>`), and `KeyringSecretProvider` is re-exported alongside the
+  other secret providers ([#181](https://github.com/devlawey/filar/issues/181)).
+
 ### Fixed
 
+- API keys and SSH passwords are no longer written in plain text to
+  `pending_launch.json`; secrets are read from the OS credential store instead
+  ([#159](https://github.com/devlawey/filar/issues/159)).
+- `Settings::save` and `save_pending_launch` now create their parent directory before
+  writing, preventing silent data loss when `%APPDATA%\filar` doesn't exist
+  ([#160](https://github.com/devlawey/filar/issues/160)).
 - Switching LLM profiles with Ctrl+L now resolves the profile's API key from the OS
   credential store, not just the in-memory key of the launched profile
   ([#171](https://github.com/devlawey/filar/issues/171)).
@@ -27,39 +62,6 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   ([#173](https://github.com/devlawey/filar/issues/173)).
 - Session persistence now saves and restores the selected LLM profile and accumulated
   token counters ([#174](https://github.com/devlawey/filar/issues/174)).
-
-### Changed
-
-- `config.toml` search order: CWD before app-data (local `./config.toml` now
-  overrides `%APPDATA%\filar\`)
-  ([#175](https://github.com/devlawey/filar/issues/175)).
-- README updated with all 0.7.0 features: Models tab, Ctrl+L, token counter,
-  config priority, key storage
-  ([#175](https://github.com/devlawey/filar/issues/175)).
-
-### Added
-
-- GUI launcher now has a Models tab with add/delete profile management; each profile
-  stores its API key in the OS credential store independently
-  ([#162](https://github.com/devlawey/filar/issues/162)).
-- Ctrl+L now cycles through LLM profiles per tab; each session can use a different
-  model without affecting other tabs
-  ([#163](https://github.com/devlawey/filar/issues/163)).
-- Token usage counter now uses real API response data (`usage.prompt_tokens` /
-  `completion_tokens`) instead of character-length estimation
-  ([#173](https://github.com/devlawey/filar/issues/173)).
-
-### Fixed
-
-- API keys and SSH passwords are no longer written in plain text to
-  `pending_launch.json`; secrets are read from the OS credential store instead
-  ([#159](https://github.com/devlawey/filar/issues/159)).
-- `Settings::save` and `save_pending_launch` now create their parent directory before
-  writing, preventing silent data loss when `%APPDATA%\filar` doesn't exist
-  ([#160](https://github.com/devlawey/filar/issues/160)).
-- `config.toml` is now searched in `%APPDATA%\filar\` first (unified config location),
-  then CWD, then next to the executable
-  ([#161](https://github.com/devlawey/filar/issues/161)).
 
 ## [0.6.2] - 2026-07-25
 
@@ -118,15 +120,6 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   (supersedes the 0.5.1 exit-on-switch behavior)
   ([#115](https://github.com/devlawey/filar/issues/115)).
 
-### Fixed
-
-- Per-tab interactive terminals are torn down on tab close and app exit, and
-  background EOF/errors retire a tab's terminal without disturbing the active
-  tab ([#116](https://github.com/devlawey/filar/issues/116)).
-- Window resize now propagates to every live per-tab terminal (model and backend),
-  not just the active one, so background terminals stay correctly sized
-  ([#117](https://github.com/devlawey/filar/issues/117)).
-
 ### Added
 
 - Background terminal output marks its tab with a new-output indicator that
@@ -139,6 +132,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- Per-tab interactive terminals are torn down on tab close and app exit, and
+  background EOF/errors retire a tab's terminal without disturbing the active
+  tab ([#116](https://github.com/devlawey/filar/issues/116)).
+- Window resize now propagates to every live per-tab terminal (model and backend),
+  not just the active one, so background terminals stay correctly sized
+  ([#117](https://github.com/devlawey/filar/issues/117)).
 - Interactive scrollbar now responds to mouse drag; it was previously only
   controllable via PgUp/PgDn keys
   ([#119](https://github.com/devlawey/filar/issues/119)).

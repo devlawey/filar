@@ -55,7 +55,7 @@ pub struct SessionMeta {
     pub id: String,
     pub timestamp: String,
     pub target: String,
-    pub llm_profile: String,
+    pub llm_profile: Option<String>,
     /// Preview of the first user message (or system message).
     pub preview: String,
 }
@@ -73,7 +73,7 @@ impl From<&Session> for SessionMeta {
             id: s.id.clone(),
             timestamp: s.timestamp.clone(),
             target: s.target.clone(),
-            llm_profile: s.llm_profile.clone().unwrap_or_default(),
+            llm_profile: s.llm_profile.clone(),
             preview,
         }
     }

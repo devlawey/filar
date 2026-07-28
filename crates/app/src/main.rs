@@ -1,4 +1,4 @@
-//! `filar` — terminal with an AI agent over SSH.
+﻿//! `filar` — terminal with an AI agent over SSH.
 //!
 //! Entry point: initialise logging, load configuration, then either launch the
 //! GUI launcher (no CLI args) or go straight to the TUI (with `--target`,
@@ -254,7 +254,7 @@ async fn run() -> anyhow::Result<()> {
                 // (since the struct now excludes secrets from serialization).
                 let ssh_target = launch.ssh.map(|s| {
                     let password = if s.password.is_empty() {
-                        let cred = filar_core::secrets::KeyringSecretProvider::new();
+                        let cred = filar_core::KeyringSecretProvider::new();
                         let name = format!("ssh{}", s.slot);
                         cred.get(&name)
                             .inspect_err(|e| tracing::debug!(error = %e, %name, "no saved SSH password in keyring"))
@@ -276,7 +276,7 @@ async fn run() -> anyhow::Result<()> {
 
                 // Read API key from OS credential store using the profile's key_env.
                 let api_key = if launch.api_key.is_empty() {
-                    let cred = filar_core::secrets::KeyringSecretProvider::new();
+                    let cred = filar_core::KeyringSecretProvider::new();
                     let key_name = if launch.key_env.is_empty() { "api_key".to_string() } else { launch.key_env.clone() };
                     cred.get(&key_name)
                         .inspect_err(|e| tracing::warn!(error = %e, %key_name, "failed to read API key from OS credential store"))
@@ -416,7 +416,7 @@ async fn run() -> anyhow::Result<()> {
             let mut checked = "in-memory secret provider, ";
             let key = if key.is_empty() {
                 checked = "in-memory provider, OS credential store, ";
-                let keyring = filar_core::secrets::KeyringSecretProvider::new();
+                let keyring = filar_core::KeyringSecretProvider::new();
                 let kr_key = keyring.get(&profile.key_env).ok().unwrap_or_default();
                 if !kr_key.is_empty() {
                     // Cache for subsequent calls so we don't hit keyring again.
@@ -443,7 +443,7 @@ async fn run() -> anyhow::Result<()> {
         key_checker: Arc::new(move |profile: &filar_core::LlmProfile| {
             let key = key_checker_provider.get(&profile.key_env).unwrap_or_default();
             if !key.is_empty() { return None; }
-            let keyring = filar_core::secrets::KeyringSecretProvider::new();
+            let keyring = filar_core::KeyringSecretProvider::new();
             match keyring.get(&profile.key_env) {
                 Ok(k) if !k.is_empty() => {
                     key_checker_provider.insert(&profile.key_env, &k);
