@@ -3336,6 +3336,25 @@ Credential Manager.
 
 ---
 
+## Issue #181: chore(core,docs) — API consistency + CHANGELOG cleanup
+
+**Milestone:** Filar v0.7.1. **Ветка:** `chore/181-api-consistency`.
+
+**Решение:**
+- `SessionMeta.llm_profile` → `Option<String>` (согласован с `Session`).
+- `KeyringSecretProvider` ре-экспортирован из `filar_core`.
+- `main.rs` использует короткий путь `filar_core::KeyringSecretProvider`.
+- CHANGELOG 0.7.0 и 0.6.0: дубликаты `### Fixed` слиты, порядок разделов исправлен.
+- Задокументирована смена типа `llm_profile` в CHANGELOG.
+
+**Файлы:** `crates/core/src/session.rs`, `crates/core/src/lib.rs`, `crates/app/src/main.rs`, `CHANGELOG.md`.
+
+**Тесты:** 410 pass, без регрессии. Поведение приложения не меняется.
+
+**Дальнейшие шаги:** нет. Задача завершена.
+
+---
+
 ## Релиз v0.7.0 (подготовка)
 
 **Дата:** 2026-07-27. **Milestone:** Filar v0.7.0 (5/5 issue, все смерджены).
