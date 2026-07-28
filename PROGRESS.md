@@ -3347,9 +3347,11 @@ Credential Manager.
 - CHANGELOG 0.7.0 и 0.6.0: дубликаты `### Fixed` слиты, порядок разделов исправлен.
 - Задокументирована смена типа `llm_profile` в CHANGELOG.
 
-**Файлы:** `core/src/session.rs`, `core/src/lib.rs`, `app/src/main.rs`, `CHANGELOG.md`.
+**Файлы:** `crates/core/src/session.rs`, `crates/core/src/lib.rs`, `crates/app/src/main.rs`, `CHANGELOG.md`.
 
 **Тесты:** 410 pass, без регрессии. Поведение приложения не меняется.
+
+**Дальнейшие шаги:** нет. Задача завершена.
 
 ---
 
