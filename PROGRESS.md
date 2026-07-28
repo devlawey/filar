@@ -3388,6 +3388,40 @@ Credential Manager.
 
 ---
 
+## Issue #184: fix(core,security) — имя секрета не должно попадать в текст ошибки
+
+**Milestone:** Filar v0.7.1 (блокер). **Ветка:** `fix/184-redact-secret-names`.
+
+**Проблема:** `EnvSecretProvider::get` и `StaticSecretProvider::get` подставляли
+искомое имя напрямую в `.ok_or_else(|| CoreError::Secret(format!("{name} not set or empty")))`.
+Если в позицию имени попадёт значение ключа (как в #183: `new_with_provider(&key_value, ...)`),
+ключ окажется в тексте ошибки на экране. Канал утечки был открыт по построению.
+
+**Решение:**
+1. Хелпер `redact(s: &str) -> String` в `filar_core::secrets`: первые 4 символа + `… (len N)`.
+   Диагностируемость сохраняется (видно префикс и длину), значение в сообщение не попадает.
+2. Применён в трёх провайдерах: `EnvSecretProvider::get`, `StaticSecretProvider::get`,
+   `KeyringSecretProvider::get` — все три места подстановки `{name}` и `{name}: {e}`.
+3. Применён в `main.rs::build_llm_client_from_profile` для `profile.name`.
+4. Аудит остальных `CoreError::Secret` — в `transport/ssh.rs` имя не подставляется
+   (оборачивается `{e}` из провайдера), безопасно.
+5. Тесты: `redact_normal_name_keeps_prefix_and_shows_length`, `redact_short_name`,
+   `error_message_does_not_contain_secret_value` (ключ `sk-or-v1-...` не попадает в ошибку),
+   `env_provider_redacted_on_missing_secret`, `static_provider_redacted_on_missing_secret`.
+
+**Изменённые файлы:**
+- `crates/core/src/secrets.rs` — `redact()` + применение в 3 провайдерах + 5 тестов
+- `crates/core/src/lib.rs` — ре-экспорт `redact`
+- `crates/app/src/main.rs` — `redact(&profile.name)`
+
+**Публичные контракты:** `filar_core::secrets::redact(s: &str) -> String` — новая
+публичная функция (экспортируется из `filar_core`).
+
+**DoD (требует ручной проверки):** запуск бинарника с несуществующим именем секрета
+в профиле → осмысленная ошибка без секретных данных.
+
+---
+
 ## Релиз v0.7.0 (подготовка)
 
 **Дата:** 2026-07-27. **Milestone:** Filar v0.7.0 (5/5 issue, все смерджены).
