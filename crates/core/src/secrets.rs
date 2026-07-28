@@ -75,7 +75,7 @@ impl SecretProvider for EnvSecretProvider {
         std::env::var(env_name)
             .ok()
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| CoreError::Secret(format!("{name} not set or empty")))
+            .ok_or_else(|| CoreError::Secret(format!("{} not set or empty", redact(name))))
     }
 
     fn secret_names(&self) -> Vec<String> {
@@ -166,7 +166,7 @@ impl SecretProvider for StaticSecretProvider {
             .get(name)
             .filter(|v| !v.is_empty())
             .cloned()
-            .ok_or_else(|| CoreError::Secret(format!("{name} not set or empty")))
+            .ok_or_else(|| CoreError::Secret(format!("{} not set or empty", redact(name))))
     }
 
     fn secret_names(&self) -> Vec<String> {
@@ -190,6 +190,30 @@ impl Drop for StaticSecretProvider {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Redaction helper
+// ---------------------------------------------------------------------------
+
+/// Redact a potentially sensitive string for use in error messages.
+///
+/// Shows the first 4 characters and the total length, e.g. `"glm_… (len 11)"`.
+/// Preserves diagnostics (you can tell which secret is missing) while ensuring
+/// that a full secret value cannot appear in user-facing text even if passed by
+/// mistake in place of a secret name.
+///
+/// # Examples
+///
+/// ```
+/// use filar_core::secrets::redact;
+/// assert_eq!(redact("GLM_API_KEY"), "GLM_… (len 11)".to_string());
+/// assert_eq!(redact("sk-or-v1-abc123def456"), "sk-o… (len 21)".to_string());
+/// ```
+pub fn redact(s: &str) -> String {
+    let prefix: String = s.chars().take(4).collect();
+    let len = s.len();
+    format!("{prefix}… (len {len})")
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +281,7 @@ impl SecretProvider for KeyringSecretProvider {
             .map_err(|e| CoreError::Secret(format!("keyring entry error: {e}")))?;
         entry
             .get_password()
-            .map_err(|e| CoreError::Secret(format!("keyring get failed for {name}: {e}")))
+            .map_err(|e| CoreError::Secret(format!("keyring get failed for {}: {e}", redact(name))))
     }
 
     fn secret_names(&self) -> Vec<String> {
@@ -410,5 +434,59 @@ mod tests {
         assert!(names.contains(&"$FILAR_SECRET_TEST_B".to_string()));
         std::env::remove_var("FILAR_SECRET_TEST_A");
         std::env::remove_var("FILAR_SECRET_TEST_B");
+    }
+
+    // ── Redaction tests (#184) ─────────────────────────────────────────
+
+    #[test]
+    fn redact_normal_name_keeps_prefix_and_shows_length() {
+        let result = redact("GLM_API_KEY");
+        assert_eq!(result, "GLM_… (len 11)");
+    }
+
+    #[test]
+    fn redact_short_name_shows_all_chars() {
+        let result = redact("ab");
+        assert_eq!(result, "ab… (len 2)");
+    }
+
+    #[test]
+    fn error_message_does_not_contain_secret_value() {
+        let key_value = "sk-or-v1-1234567890abcdef1234567890abcdef";
+        let provider = StaticSecretProvider::new();
+        // Mistakenly pass the key value as if it were the name.
+        let err = provider.get(key_value).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains(key_value),
+            "error must NOT contain the full key value '{key_value}', got: {msg}"
+        );
+        // The redacted form (prefix + length) should be present.
+        assert!(
+            msg.contains("sk-o"),
+            "error must contain the redacted prefix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn env_provider_redacted_on_missing_secret() {
+        let name = "sk-or-v1-leaked-key-12345678";
+        let provider = EnvSecretProvider::new();
+        let err = provider.get(name).unwrap_err();
+        let msg = format!("{err}");
+        let expected_prefix = redact(name);
+        assert!(!msg.contains(name));
+        assert!(msg.contains(&expected_prefix));
+    }
+
+    #[test]
+    fn static_provider_redacted_on_missing_secret() {
+        let name = "another-secret-key-that-could-leak";
+        let provider = StaticSecretProvider::new();
+        let err = provider.get(name).unwrap_err();
+        let msg = format!("{err}");
+        let expected_prefix = redact(name);
+        assert!(!msg.contains(name));
+        assert!(msg.contains(&expected_prefix));
     }
 }
