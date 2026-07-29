@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- The profile selected in the launcher is now actually used: sessions no longer always
+  start on the first profile in `config.toml`, and the first `Ctrl+L` press no longer
+  goes to waste ([#194](https://github.com/devlawey/filar/issues/194)).
+
 ## [0.7.2] - 2026-07-29
 
 ### Fixed

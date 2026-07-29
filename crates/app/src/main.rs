@@ -229,6 +229,7 @@ async fn run() -> anyhow::Result<()> {
 
     // ── Parse CLI args ─────────────────────────────────────────────────
     let args = parse_args();
+    let cli_llm_name = args.llm.clone();
 
     // ── GUI-only mode (subprocess) ──────────────────────────────────
     if args.gui_only {
@@ -240,7 +241,7 @@ async fn run() -> anyhow::Result<()> {
     // ── Determine launch parameters ──────────────────────────────────
     // When no CLI args, check for pending launch from a previous GUI
     // session, or spawn the GUI as a subprocess.
-    let (target_name, session_id, llm_config, api_key, ssh_target) = if args.is_empty() {
+    let (target_name, session_id, llm_config, api_key, ssh_target, gui_selected_profile) = if args.is_empty() {
         // Check if the GUI subprocess already saved a launch config.
         let launch = filar_gui::load_pending_launch().or_else(|| {
             // Spawn GUI subprocess.
@@ -340,6 +341,7 @@ async fn run() -> anyhow::Result<()> {
                     llm_config,
                     api_key,
                     ssh_target,
+                    launch.selected_profile,
                 )
             }
             None => {
@@ -366,7 +368,7 @@ async fn run() -> anyhow::Result<()> {
             None
         };
 
-        (target, args.session, llm_config, key, ssh_target)
+        (target, args.session, llm_config, key, ssh_target, None)
     };
 
     // Validate API key.
@@ -457,9 +459,21 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // ── Launch TUI ─────────────────────────────────────────────────────
-    let default_profile_name = config.llm_profiles.first()
-        .map(|p| p.name.clone())
-        .unwrap_or_else(|| "default".into());
+    let default_profile_name = {
+        let cli_profile = cli_llm_name.as_deref().filter(|n| *n != "default");
+        let first_in_config = config.llm_profiles.first()
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "default".into());
+        let candidate = cli_profile
+            .or(gui_selected_profile.as_deref())
+            .unwrap_or(&first_in_config);
+        if config.llm_profiles.iter().any(|p| p.name == candidate) {
+            candidate.to_string()
+        } else {
+            warn!(candidate, "selected startup profile not found, falling back to first in config");
+            first_in_config
+        }
+    };
     let key_checker_provider = secret_provider.clone();
     let tui_config = TuiConfig {
         target_name: target_name.clone(),
