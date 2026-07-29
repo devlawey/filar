@@ -11,6 +11,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- The bottom hint bar now shows `F1`, so the full command reference is discoverable
+  without reading the README ([#191](https://github.com/devlawey/filar/issues/191)).
+
 ### Added
 
 - Session cost is now taken from OpenRouter's per-request `usage.cost`, tokens are tracked
