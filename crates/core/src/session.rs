@@ -195,23 +195,7 @@ impl SessionStore {
                         Ok(session) => metas.push(SessionMeta::from(&session)),
                         Err(e) => {
                             tracing::warn!(path = %path.display(), error = %e, "skipping unparseable session file");
-    #[test]
-    fn session_backward_compat_without_new_fields() {
-        let old_json = r#"{
-            "id":"1","timestamp":"t","target":"t",
-            "messages":[],
-            "input_history":[],
-            "tokens_in":100,
-            "tokens_out":200
-        }"#;
-        let s: Session = serde_json::from_str(old_json).unwrap();
-        assert_eq!(s.tokens_in, 100);
-        assert_eq!(s.tokens_out, 200);
-        assert_eq!(s.cost_usd, None);
-        assert!(s.per_profile.is_empty());
-        assert_eq!(s.last_served_model, None);
-    }
-}
+                        }
                     }
                 }
                 Err(e) => {
@@ -585,5 +569,22 @@ mod tests {
         assert_eq!(session.input_history.len(), MAX_INPUT_HISTORY);
         assert_eq!(session.input_history[0], "entry50");
         assert_eq!(session.input_history.last().unwrap(), "entry249");
+    }
+
+    #[test]
+    fn session_backward_compat_without_new_fields() {
+        let old_json = r#"{
+            "id":"1","timestamp":"t","target":"t",
+            "messages":[],
+            "input_history":[],
+            "tokens_in":100,
+            "tokens_out":200
+        }"#;
+        let s: Session = serde_json::from_str(old_json).unwrap();
+        assert_eq!(s.tokens_in, 100);
+        assert_eq!(s.tokens_out, 200);
+        assert_eq!(s.cost_usd, None);
+        assert!(s.per_profile.is_empty());
+        assert_eq!(s.last_served_model, None);
     }
 }

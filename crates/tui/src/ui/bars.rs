@@ -120,7 +120,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(ref model) = app.last_served_model {
         spans.push(Span::raw(" "));
         let model_display: String = if model.len() > 24 {
-            model.chars().take(21).chain("…".chars()).collect()
+            model.chars().take(23).chain("…".chars()).collect()
         } else {
             model.clone()
         };
