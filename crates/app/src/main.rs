@@ -4,6 +4,7 @@
 //! GUI launcher (no CLI args) or go straight to the TUI (with `--target`,
 //! `--llm`, `--session` args).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -409,7 +410,9 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // ── Load session if specified ──────────────────────────────────────
-    let (initial_messages, initial_input_history, initial_llm_profile, initial_tokens_in, initial_tokens_out) =
+    let (initial_messages, initial_input_history, initial_llm_profile,
+         initial_tokens_in, initial_tokens_out,
+         initial_cost_usd, initial_per_profile, initial_last_served_model) =
         if let Some(ref sid) = session_id {
         info!(session_id = %sid, "loading session");
         match SessionStore::with_default_dir() {
@@ -418,24 +421,27 @@ async fn run() -> anyhow::Result<()> {
                     info!(messages = session.messages.len(), "session loaded");
                     (session.messages, session.input_history,
                      session.llm_profile,
-                     session.tokens_in, session.tokens_out)
+                     session.tokens_in, session.tokens_out,
+                     session.cost_usd,
+                     session.per_profile,
+                     session.last_served_model)
                 }
                 Ok(None) => {
                     warn!(session_id = %sid, "session not found");
-                    (vec![], vec![], None, 0, 0)
+                    (vec![], vec![], None, 0, 0, None, HashMap::new(), None)
                 }
                 Err(e) => {
                     warn!(error = %e, "failed to load session");
-                    (vec![], vec![], None, 0, 0)
+                    (vec![], vec![], None, 0, 0, None, HashMap::new(), None)
                 }
             },
             Err(e) => {
                 warn!(error = %e, "failed to initialise session store");
-                (vec![], vec![], None, 0, 0)
+                (vec![], vec![], None, 0, 0, None, HashMap::new(), None)
             }
         }
     } else {
-        (vec![], vec![], None, 0, 0)
+        (vec![], vec![], None, 0, 0, None, HashMap::new(), None)
     };
 
     // ── Launch TUI ─────────────────────────────────────────────────────
@@ -452,6 +458,9 @@ async fn run() -> anyhow::Result<()> {
         initial_llm_profile,
         initial_tokens_in,
         initial_tokens_out,
+        initial_cost_usd,
+        initial_per_profile,
+        initial_last_served_model,
         ssh_target: ssh_target.clone(),
         is_local: ssh_target.is_none(),
         secret_provider: secret_provider.clone(),

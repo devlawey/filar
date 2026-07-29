@@ -182,6 +182,9 @@ pub struct TokenUsage {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    /// Cost in USD as reported by the provider (OpenRouter `usage.cost`).
+    /// `None` when the provider doesn't report cost.
+    pub cost: Option<f64>,
 }
 
 /// The model's response, containing both text and optional tool calls.
@@ -198,6 +201,9 @@ pub struct ChatResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Token usage reported by the provider, if available.
     pub usage: Option<TokenUsage>,
+    /// The actually served model slug, if reported by the provider.
+    /// May differ from the requested model (e.g. OpenRouter routing).
+    pub model: Option<String>,
 }
 
 impl ChatResponse {
@@ -207,6 +213,7 @@ impl ChatResponse {
             text: text.into(),
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
         }
     }
 
@@ -216,6 +223,7 @@ impl ChatResponse {
             text: text.into(),
             tool_calls,
             usage: None,
+            model: None,
         }
     }
 
@@ -227,6 +235,12 @@ impl ChatResponse {
     /// Attach token usage data. Chainable.
     pub fn with_usage(mut self, usage: TokenUsage) -> Self {
         self.usage = Some(usage);
+        self
+    }
+
+    /// Attach the actually served model slug. Chainable.
+    pub fn with_model(mut self, model: String) -> Self {
+        self.model = Some(model);
         self
     }
 }

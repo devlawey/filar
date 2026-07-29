@@ -4,6 +4,7 @@
 //! (keyboard) and agent events (from the agent task). The agent runs in a
 //! separate tokio task, and communication happens via channels.
 
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -200,6 +201,12 @@ pub struct TuiConfig {
     pub initial_tokens_in: u64,
     /// Output token count restored from a previous session.
     pub initial_tokens_out: u64,
+    /// Cumulative cost in USD restored from a previous session.
+    pub initial_cost_usd: Option<f64>,
+    /// Per-profile token breakdown restored from a previous session.
+    pub initial_per_profile: HashMap<String, filar_core::ProfileUsage>,
+    /// Last served model restored from a previous session.
+    pub initial_last_served_model: Option<String>,
     /// SSH target for interactive terminal mode (Ctrl+T).
     /// If `None`, the agent runs in local mode.
     pub ssh_target: Option<filar_core::SshTarget>,
@@ -294,6 +301,9 @@ async fn run_app(
             std::mem::take(&mut config.initial_llm_profile),
             config.initial_tokens_in,
             config.initial_tokens_out,
+            config.initial_cost_usd,
+            config.initial_per_profile,
+            config.initial_last_served_model,
             &profiles_for_restore,
             &default_for_restore,
         );
@@ -908,6 +918,9 @@ async fn run_app(
         input_history: app.input_history().to_vec(),
         tokens_in: app.tokens_in,
         tokens_out: app.tokens_out,
+        cost_usd: app.cost_usd,
+        per_profile: app.per_profile.clone(),
+        last_served_model: app.last_served_model.clone(),
     };
     session.truncate_history();
     match filar_core::SessionStore::with_default_dir() {

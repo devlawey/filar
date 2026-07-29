@@ -15,4 +15,4 @@ pub use chat::ChatBlock;
 pub use config::{Config, SshTarget, SshAuth, LlmConfig, LlmProfile, CommandConfirmMode, TimeoutConfig, HostKeyPolicy};
 pub use error::{CoreError, Result};
 pub use secrets::{EnvSecretProvider, KeyringSecretProvider, SecretProvider, StaticSecretProvider, redact};
-pub use session::{default_base_dir, Session, SessionMeta, SessionStore};
+pub use session::{default_base_dir, ProfileUsage, Session, SessionMeta, SessionStore};

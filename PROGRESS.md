@@ -3526,3 +3526,59 @@ agent (session_id). Тег `engine-v0.6.1` ставится.
 - #118 (#132): feat — маркеры активности + документация
 
 **Engine:** не менялся (core/transport/agent не тронуты). Тег engine-v0.6.0 НЕ ставится.
+
+---
+
+## Issue #190: feat(agent,tui) — стоимость запросов из OpenRouter, токены по профилям, фактическая модель
+
+**Milestone:** Filar v0.7.2. **Ветка:** `feat/190-openrouter-cost-per-profile`.
+
+**Мотивация:** счётчик `toks: N↑ M↓` копил токены всех моделей одной кучей. После `Ctrl+L`
+токены разных моделей (с разной ценой) смешивались. Деньги не показывались вообще,
+хотя OpenRouter возвращает точную `usage.cost` автоматически.
+
+**Решение:**
+
+1. **Парсинг ответа** (`openai_compat.rs`): `ApiUsage.cost: Option<f64>`,
+   `ApiResponse.model: Option<String>`. Все поля с `#[serde(default)]`.
+   SSE-парсер тоже получает `model` из `SseEvent`.
+
+2. **Проброс**: `TokenUsage.cost`, `ChatResponse.model` + `with_model()`,
+   `AgentEvent::TokenUsage { cost, model }`.
+
+3. **Накопление в сессии** (`filar_core::Session`):
+   - `cost_usd: Option<f64>` — суммарная стоимость
+   - `per_profile: HashMap<String, ProfileUsage>` — разбивка токенов
+   - `last_served_model: Option<String>` — фактический слаг
+   - `ProfileUsage { tokens_in, tokens_out }` — новый public struct из `filar_core`
+
+4. **Статус-бар** (`bars.rs`): после `toks:` показывается `$0.0412` (зелёным)
+   и слаг модели (диммированным, до 24 символов).
+
+5. **Тесты**: разбор JSON с cost/model и без; cost-less → всё None; SSE с model;
+   накопление стоимости + разделение по профилям; обратная совместимость
+   (старый JSON без новых полей → загружается с defaults).
+
+**Изменённые файлы:**
+- `crates/agent/src/openai_compat.rs` — ApiResponse, ApiUsage, SseEvent, SseState, tests
+- `crates/agent/src/lib.rs` — TokenUsage, ChatResponse
+- `crates/agent/src/events.rs` — AgentEvent::TokenUsage
+- `crates/agent/src/agent.rs` — emit
+- `crates/core/src/session.rs` — Session fields, ProfileUsage, test
+- `crates/core/src/lib.rs` — re-export ProfileUsage
+- `crates/tui/src/app.rs` — Session fields, handler, test
+- `crates/tui/src/ui/bars.rs` — render_status_bar
+- `crates/tui/src/runner.rs` — TuiConfig, save/load, App::with_history
+- `crates/app/src/main.rs` — load/send new fields
+
+**Публичные контракты:**
+- `filar_core::ProfileUsage` — новый struct (аддитивно)
+- `filar_core::Session` — 3 новых поля с `#[serde(default)]`
+- `filar_agent::TokenUsage.cost` — новое поле
+- `filar_agent::ChatResponse.model` — новое поле
+- `filar_agent::AgentEvent::TokenUsage` — 2 новых поля
+
+**DoD (требует ручной проверки):** сборка бинарника, запуск с ключом OpenRouter,
+несколько запросов → стоимость ненулевая, слаг модели виден; `Ctrl+L` на второй
+профиль → стоимость суммируется, токены разделены; сохранить/открыть сессию →
+данные на месте; старый файл сессии открывается без ошибок.

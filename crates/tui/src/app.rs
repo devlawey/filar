@@ -318,6 +318,12 @@ pub struct Session {
     pub tokens_in: u64,
     /// Cumulative output tokens generated for this session.
     pub tokens_out: u64,
+    /// Cumulative cost in USD. Summed across all profiles.
+    pub cost_usd: Option<f64>,
+    /// Per-profile token consumption. Keyed by profile name.
+    pub per_profile: HashMap<String, filar_core::ProfileUsage>,
+    /// The last actually served model slug reported by the provider.
+    pub last_served_model: Option<String>,
 }
 
 impl App {
@@ -499,6 +505,9 @@ impl Session {
             llm_profile: None,
             tokens_in: 0,
             tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
         }
     }
 
@@ -533,6 +542,9 @@ impl App {
         llm_profile: Option<String>,
         tokens_in: u64,
         tokens_out: u64,
+        cost_usd: Option<f64>,
+        per_profile: HashMap<String, filar_core::ProfileUsage>,
+        last_served_model: Option<String>,
         profiles: &[filar_core::LlmProfile],
         default_profile_name: &str,
     ) -> Self {
@@ -546,6 +558,14 @@ impl App {
         }
         app.input_history = input_history;
         app.history_pos = None;
+        {
+            let s = app.active_session_mut();
+            s.tokens_in = tokens_in;
+            s.tokens_out = tokens_out;
+            s.cost_usd = cost_usd;
+            s.per_profile = per_profile;
+            s.last_served_model = last_served_model;
+        }
         let default_name = if default_profile_name.is_empty() { "default" } else { default_profile_name };
         if let Some(profile) = llm_profile {
             if profile.is_empty() {
@@ -2117,10 +2137,21 @@ impl App {
                     self.cancellation = None;
                     self.active_session_mut().background_activity = false;
                 }
-                filar_agent::AgentEvent::TokenUsage { tokens_in, tokens_out } => {
+                filar_agent::AgentEvent::TokenUsage { tokens_in, tokens_out, cost, model } => {
                     if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                         s.tokens_in += tokens_in;
                         s.tokens_out += tokens_out;
+                        if let Some(c) = cost {
+                            let total = s.cost_usd.unwrap_or(0.0) + c;
+                            s.cost_usd = Some((total * 10000.0).round() / 10000.0);
+                        }
+                        let active_profile = s.llm_profile.clone().unwrap_or_else(|| "default".into());
+                        let pu = s.per_profile.entry(active_profile).or_default();
+                        pu.tokens_in += tokens_in;
+                        pu.tokens_out += tokens_out;
+                        if let Some(m) = model {
+                            s.last_served_model = Some(m);
+                        }
                     }
                 }
                 filar_agent::AgentEvent::Error(err) => {
@@ -5345,7 +5376,7 @@ mod tests {
         // Simulate receiving usage for session 0.
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
-            event: filar_agent::AgentEvent::TokenUsage { tokens_in: 10, tokens_out: 20 },
+            event: filar_agent::AgentEvent::TokenUsage { tokens_in: 10, tokens_out: 20, cost: None, model: None },
         });
         assert_eq!(app.sessions[0].tokens_in, 10);
         app.new_tab();
@@ -5353,5 +5384,33 @@ mod tests {
         assert_eq!(app.active, 0);
         // Session 1 must still be at zero.
         assert_eq!(app.sessions[1].tokens_in, 0);
+    }
+
+    #[test]
+    fn cost_accumulates_across_profile_switches() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.active_session_mut().llm_profile = Some("glm".into());
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TokenUsage {
+                tokens_in: 100, tokens_out: 200, cost: Some(0.0015), model: None,
+            },
+        });
+        assert_eq!(app.sessions[0].tokens_in, 100);
+        assert!((app.sessions[0].cost_usd.unwrap() - 0.0015).abs() < 0.0001);
+        assert_eq!(app.sessions[0].per_profile["glm"].tokens_in, 100);
+        assert_eq!(app.sessions[0].per_profile["glm"].tokens_out, 200);
+        app.active_session_mut().llm_profile = Some("deepseek".into());
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TokenUsage {
+                tokens_in: 50, tokens_out: 100, cost: Some(0.0030), model: Some("cohere/command-r".into()),
+            },
+        });
+        assert_eq!(app.sessions[0].tokens_in, 150);
+        assert!((app.sessions[0].cost_usd.unwrap() - 0.0045).abs() < 0.0001);
+        assert_eq!(app.sessions[0].per_profile["glm"].tokens_in, 100);
+        assert_eq!(app.sessions[0].per_profile["deepseek"].tokens_in, 50);
+        assert_eq!(app.sessions[0].last_served_model.as_deref(), Some("cohere/command-r"));
     }
 }

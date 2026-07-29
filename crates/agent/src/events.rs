@@ -58,6 +58,10 @@ pub enum AgentEvent {
     TokenUsage {
         tokens_in: u64,
         tokens_out: u64,
+        /// Cost in USD (e.g. 0.0412). None when provider doesn't report.
+        cost: Option<f64>,
+        /// The actually served model slug. None when not reported.
+        model: Option<String>,
     },
 
     /// The agent encountered an error (network, LLM, transport).

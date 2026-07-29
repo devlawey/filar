@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Session cost is now taken from OpenRouter's per-request `usage.cost`, tokens are tracked
+  per LLM profile, and the actually served model slug is shown in the status bar
+  ([#190](https://github.com/devlawey/filar/issues/190)).
+
 ## [0.7.1] - 2026-07-28
 
 ### Fixed
