@@ -425,6 +425,8 @@ impl Agent {
                 self.emit(AgentEvent::TokenUsage {
                     tokens_in: u.prompt_tokens.unwrap_or(0),
                     tokens_out: u.completion_tokens.unwrap_or(0),
+                    cost: u.cost,
+                    model: response.model.clone(),
                 });
             }
 

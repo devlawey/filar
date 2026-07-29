@@ -593,6 +593,8 @@ struct ApiResponse {
     choices: Vec<ApiChoice>,
     #[serde(default)]
     usage: Option<ApiUsage>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -603,6 +605,11 @@ struct ApiUsage {
     completion_tokens: Option<u64>,
     #[serde(default)]
     total_tokens: Option<u64>,
+    #[serde(default)]
+    cost: Option<f64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    cost_details: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -645,7 +652,10 @@ impl ApiResponse {
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
             total_tokens: u.total_tokens,
+            cost: u.cost,
         });
+
+        let model = self.model;
 
         // If the model returned tool calls, parse them.
         if let Some(tool_calls) = choice.message.tool_calls {
@@ -667,6 +677,7 @@ impl ApiResponse {
                     parsed,
                 );
                 if let Some(u) = usage { resp = resp.with_usage(u); }
+                if let Some(m) = model { resp = resp.with_model(m); }
                 return Ok(resp);
             }
         }
@@ -675,6 +686,7 @@ impl ApiResponse {
         let text = choice.message.content.unwrap_or_default();
         let mut resp = ChatResponse::text(text);
         if let Some(u) = usage { resp = resp.with_usage(u); }
+        if let Some(m) = model { resp = resp.with_model(m); }
         Ok(resp)
     }
 }
@@ -690,6 +702,8 @@ struct SseEvent {
     choices: Vec<SseChoice>,
     #[serde(default)]
     usage: Option<ApiUsage>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -738,6 +752,7 @@ struct SseState {
     tool_calls: BTreeMap<usize, StreamToolCall>,
     done: bool,
     streamed_usage: Option<ApiUsage>,
+    streamed_model: Option<String>,
 }
 
 impl SseState {
@@ -748,6 +763,7 @@ impl SseState {
             tool_calls: BTreeMap::new(),
             done: false,
             streamed_usage: None,
+            streamed_model: None,
         }
     }
 
@@ -775,6 +791,9 @@ impl SseState {
                 Ok(event) => {
                     if let Some(u) = event.usage {
                         self.streamed_usage = Some(u);
+                    }
+                    if let Some(m) = event.model {
+                        self.streamed_model = Some(m);
                     }
                     if let Some(choice) = event.choices.into_iter().next() {
                         if let Some(content) = choice.delta.content {
@@ -842,7 +861,11 @@ impl SseState {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
+                cost: u.cost,
             });
+        }
+        if let Some(m) = self.streamed_model {
+            resp = resp.with_model(m);
         }
         Ok(resp)
     }
@@ -1434,5 +1457,45 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         let json = r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#;
         let resp: ApiResponse = serde_json::from_str(json).unwrap();
         assert!(resp.usage.is_none(), "usage must be None when absent");
+    }
+
+    #[test]
+    fn deserialize_response_with_cost_and_model() {
+        let json = r#"{
+            "model": "openai/gpt-4o-mini",
+            "choices": [{"message": {"role": "assistant", "content": "hello"}}],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "total_tokens": 30,
+                "cost": 0.00015
+            }
+        }"#;
+        let resp: ApiResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.model.as_deref(), Some("openai/gpt-4o-mini"));
+        assert_eq!(resp.usage.as_ref().and_then(|u| u.cost), Some(0.00015));
+        let chat = resp.try_into_chat_response().unwrap();
+        assert_eq!(chat.model.as_deref(), Some("openai/gpt-4o-mini"));
+        let u = chat.usage.unwrap();
+        assert_eq!(u.cost, Some(0.00015));
+    }
+
+    #[test]
+    fn deserialize_response_without_cost_or_model() {
+        let json = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+        let resp: ApiResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.model.is_none());
+        let chat = resp.try_into_chat_response().unwrap();
+        assert!(chat.model.is_none());
+        assert!(chat.usage.is_none());
+    }
+
+    #[test]
+    fn sse_parse_model_from_stream() {
+        let mut state = SseState::new();
+        state.process_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"model\":\"cohere/command-r\"}\n");
+        state.process_chunk("data: [DONE]\n");
+        let resp = state.into_response().unwrap();
+        assert_eq!(resp.model.as_deref(), Some("cohere/command-r"));
     }
 }

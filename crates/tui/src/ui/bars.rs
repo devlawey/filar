@@ -97,6 +97,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // Token counter. Uses real API usage data; shows — when no data yet.
+    // Cost in USD (if available) and served model slug are shown after tokens.
     spans.push(Span::raw("   "));
     if app.tokens_in > 0 || app.tokens_out > 0 {
         spans.push(Span::styled(
@@ -108,6 +109,22 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
             "toks: —",
             app.theme.muted(),
         ));
+    }
+    if let Some(cost) = app.cost_usd {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("${:.4}", cost),
+            app.theme.success_fg(),
+        ));
+    }
+    if let Some(ref model) = app.last_served_model {
+        spans.push(Span::raw(" "));
+        let model_display: String = if model.len() > 24 {
+            model.chars().take(23).chain("…".chars()).collect()
+        } else {
+            model.clone()
+        };
+        spans.push(Span::styled(model_display, app.theme.dim()));
     }
 
     // Right side: `confirm_mode`, then an optional toast (e.g. "· copied")

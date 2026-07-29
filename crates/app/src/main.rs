@@ -4,6 +4,7 @@
 //! GUI launcher (no CLI args) or go straight to the TUI (with `--target`,
 //! `--llm`, `--session` args).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +16,7 @@ use tracing_subscriber::EnvFilter;
 
 use filar_agent::OpenAiCompatClient;
 use filar_agent::LlmClient;
-use filar_core::{secrets, default_base_dir, Config, CoreError, SecretProvider, SessionStore, StaticSecretProvider};
+use filar_core::{secrets, default_base_dir, ChatBlock, Config, CoreError, SecretProvider, SessionStore, StaticSecretProvider};
 use filar_transport::{LocalExecutor, SshExecutor};
 use filar_tui::TuiConfig;
 
@@ -409,33 +410,50 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // ── Load session if specified ──────────────────────────────────────
-    let (initial_messages, initial_input_history, initial_llm_profile, initial_tokens_in, initial_tokens_out) =
-        if let Some(ref sid) = session_id {
+    #[derive(Default)]
+    struct LoadedSession {
+        messages: Vec<ChatBlock>,
+        input_history: Vec<String>,
+        llm_profile: Option<String>,
+        tokens_in: u64,
+        tokens_out: u64,
+        cost_usd: Option<f64>,
+        per_profile: HashMap<String, filar_core::ProfileUsage>,
+        last_served_model: Option<String>,
+    }
+    let loaded = if let Some(ref sid) = session_id {
         info!(session_id = %sid, "loading session");
         match SessionStore::with_default_dir() {
             Ok(store) => match store.load(sid) {
                 Ok(Some(session)) => {
                     info!(messages = session.messages.len(), "session loaded");
-                    (session.messages, session.input_history,
-                     session.llm_profile,
-                     session.tokens_in, session.tokens_out)
+                    LoadedSession {
+                        messages: session.messages,
+                        input_history: session.input_history,
+                        llm_profile: session.llm_profile,
+                        tokens_in: session.tokens_in,
+                        tokens_out: session.tokens_out,
+                        cost_usd: session.cost_usd,
+                        per_profile: session.per_profile,
+                        last_served_model: session.last_served_model,
+                    }
                 }
                 Ok(None) => {
                     warn!(session_id = %sid, "session not found");
-                    (vec![], vec![], None, 0, 0)
+                    LoadedSession::default()
                 }
                 Err(e) => {
                     warn!(error = %e, "failed to load session");
-                    (vec![], vec![], None, 0, 0)
+                    LoadedSession::default()
                 }
             },
             Err(e) => {
                 warn!(error = %e, "failed to initialise session store");
-                (vec![], vec![], None, 0, 0)
+                LoadedSession::default()
             }
         }
     } else {
-        (vec![], vec![], None, 0, 0)
+        LoadedSession::default()
     };
 
     // ── Launch TUI ─────────────────────────────────────────────────────
@@ -447,11 +465,14 @@ async fn run() -> anyhow::Result<()> {
         target_name: target_name.clone(),
         confirm_mode: config.confirm_mode,
         llm_profile: default_profile_name.clone(),
-        initial_messages,
-        initial_input_history,
-        initial_llm_profile,
-        initial_tokens_in,
-        initial_tokens_out,
+        initial_messages: loaded.messages,
+        initial_input_history: loaded.input_history,
+        initial_llm_profile: loaded.llm_profile,
+        initial_tokens_in: loaded.tokens_in,
+        initial_tokens_out: loaded.tokens_out,
+        initial_cost_usd: loaded.cost_usd,
+        initial_per_profile: loaded.per_profile,
+        initial_last_served_model: loaded.last_served_model,
         ssh_target: ssh_target.clone(),
         is_local: ssh_target.is_none(),
         secret_provider: secret_provider.clone(),
