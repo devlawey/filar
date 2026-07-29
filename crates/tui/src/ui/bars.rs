@@ -22,6 +22,7 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
     match mode {
         AppMode::Normal => vec![
             HelpItem { key: "enter", desc: "send", action: Some(HelpAction::Send) },
+            HelpItem { key: "F1", desc: "help", action: None },
             HelpItem { key: "!", desc: "shell", action: Some(HelpAction::Shell) },
             HelpItem { key: "^T", desc: "terminal", action: Some(HelpAction::Terminal) },
             HelpItem { key: "^P", desc: "password", action: Some(HelpAction::Password) },
@@ -33,6 +34,7 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
             HelpItem { key: "^Q", desc: "quit", action: Some(HelpAction::Quit) },
         ],
         AppMode::Thinking => vec![
+            HelpItem { key: "F1", desc: "help", action: None },
             HelpItem { key: "^Z", desc: "cancel", action: Some(HelpAction::CancelWork) },
             HelpItem { key: "^Q", desc: "quit", action: Some(HelpAction::Quit) },
             HelpItem { key: "wheel", desc: "scroll", action: None },
@@ -320,5 +322,14 @@ mod tests {
         assert!(has_w, "Normal mode help must include ^W close");
         let has_n = items.iter().any(|i| i.key == "^N");
         assert!(has_n, "Normal mode help must include ^N (existing check)");
+        let has_f1 = items.iter().any(|i| i.key == "F1" && i.desc == "help");
+        assert!(has_f1, "Normal mode help must include F1 help");
+    }
+
+    #[test]
+    fn thinking_mode_help_includes_f1() {
+        let items = help_items(AppMode::Thinking);
+        let has_f1 = items.iter().any(|i| i.key == "F1" && i.desc == "help");
+        assert!(has_f1, "Thinking mode help must include F1 help");
     }
 }
