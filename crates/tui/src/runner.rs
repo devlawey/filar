@@ -314,6 +314,9 @@ async fn run_app(
         let mut a = App::new(config.target_name.clone(), config.confirm_mode);
         a.profiles = profiles_for_restore;
         a.default_profile_name = default_for_restore;
+        if let Some(s) = a.sessions.first_mut() {
+            s.llm_profile = Some(config.llm_profile.clone());
+        }
         a
     };
     // Load available LLM profiles and default profile name.
