@@ -79,6 +79,38 @@ fn parse_args() -> Args {
 }
 
 // ---------------------------------------------------------------------------
+// Startup profile resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve which LLM profile to use at startup.
+///
+/// Priority: CLI `--llm` flag > GUI launcher selection > first profile in config.
+/// If the resolved profile doesn't exist in `profiles` (deleted/renamed), falls
+/// back to the first available profile with a warning.
+///
+/// This is a free function so it can be unit-tested independently of `main`.
+pub fn resolve_startup_profile(
+    profiles: &[filar_core::LlmProfile],
+    cli_llm: Option<&str>,
+    gui_selected: Option<&str>,
+) -> String {
+    let first_in_config = profiles
+        .first()
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| "default".into());
+    let cli_profile = cli_llm.filter(|n| *n != "default");
+    let candidate = cli_profile
+        .or(gui_selected)
+        .unwrap_or(&first_in_config);
+    if profiles.iter().any(|p| p.name == candidate) {
+        candidate.to_string()
+    } else {
+        warn!(candidate = %candidate, "selected startup profile not found, falling back to first in config");
+        first_in_config
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LLM client factory
 // ---------------------------------------------------------------------------
 
@@ -352,8 +384,12 @@ async fn run() -> anyhow::Result<()> {
     } else {
         // CLI mode — use config profiles and env vars.
         let target = args.target.unwrap_or_else(|| "local".into());
-        let llm_name = args.llm.unwrap_or_else(|| "default".into());
-        let profile_ref = if llm_name == "default" { None } else { Some(llm_name.as_str()) };
+        let startup_profile = resolve_startup_profile(&config.llm_profiles, args.llm.as_deref(), None);
+        let profile_ref = if startup_profile == config.llm_profiles.first().map(|p| &p.name).cloned().unwrap_or_default() {
+            None
+        } else {
+            Some(startup_profile.as_str())
+        };
         let (llm_config, key_env) = config
             .select_llm(profile_ref)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -459,21 +495,8 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // ── Launch TUI ─────────────────────────────────────────────────────
-    let default_profile_name = {
-        let cli_profile = cli_llm_name.as_deref().filter(|n| *n != "default");
-        let first_in_config = config.llm_profiles.first()
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| "default".into());
-        let candidate = cli_profile
-            .or(gui_selected_profile.as_deref())
-            .unwrap_or(&first_in_config);
-        if config.llm_profiles.iter().any(|p| p.name == candidate) {
-            candidate.to_string()
-        } else {
-            warn!(candidate, "selected startup profile not found, falling back to first in config");
-            first_in_config
-        }
-    };
+    let default_profile_name =
+        resolve_startup_profile(&config.llm_profiles, cli_llm_name.as_deref(), gui_selected_profile.as_deref());
     let key_checker_provider = secret_provider.clone();
     let tui_config = TuiConfig {
         target_name: target_name.clone(),
@@ -670,5 +693,64 @@ mod tests {
         sp.insert("LEAK_TEST_KEY", key_value);
         let result2 = build_llm_client_from_profile(&profile, &sp, 60);
         assert!(result2.is_ok(), "factory must succeed after inserting key");
+    }
+
+    // ── Startup profile tests (#194) ───────────────────────────────────
+
+    use super::resolve_startup_profile;
+
+    fn make_profile(name: &str) -> LlmProfile {
+        LlmProfile {
+            name: name.into(),
+            model: name.into(),
+            api_base_url: String::new(),
+            max_tokens: 1024,
+            key_env: String::new(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+        }
+    }
+
+    #[test]
+    fn startup_profile_uses_first_in_config_when_no_cli_or_gui() {
+        let profiles = vec![make_profile("glm"), make_profile("deepseek")];
+        let result = resolve_startup_profile(&profiles, None, None);
+        assert_eq!(result, "glm");
+    }
+
+    #[test]
+    fn startup_profile_uses_cli_over_gui() {
+        let profiles = vec![make_profile("glm"), make_profile("deepseek")];
+        let result = resolve_startup_profile(&profiles, Some("deepseek"), Some("glm"));
+        assert_eq!(result, "deepseek");
+    }
+
+    #[test]
+    fn startup_profile_uses_gui_when_no_cli() {
+        let profiles = vec![make_profile("glm"), make_profile("deepseek")];
+        let result = resolve_startup_profile(&profiles, None, Some("deepseek"));
+        assert_eq!(result, "deepseek");
+    }
+
+    #[test]
+    fn startup_profile_ignores_cli_default() {
+        let profiles = vec![make_profile("glm"), make_profile("deepseek")];
+        let result = resolve_startup_profile(&profiles, Some("default"), Some("deepseek"));
+        assert_eq!(result, "deepseek");
+    }
+
+    #[test]
+    fn startup_profile_falls_back_when_not_found() {
+        let profiles = vec![make_profile("glm")];
+        let result = resolve_startup_profile(&profiles, Some("deleted_profile"), None);
+        assert_eq!(result, "glm");
+    }
+
+    #[test]
+    fn startup_profile_empty_profiles_returns_default() {
+        let profiles: Vec<LlmProfile> = vec![];
+        let result = resolve_startup_profile(&profiles, None, None);
+        assert_eq!(result, "default");
     }
 }
