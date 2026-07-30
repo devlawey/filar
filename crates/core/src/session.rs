@@ -597,4 +597,30 @@ mod tests {
         assert!(s.per_profile.is_empty());
         assert_eq!(s.last_served_model, None);
     }
+
+    #[test]
+    fn model_per_profile_survives_roundtrip() {
+        let mut session = Session {
+            id: "1".into(), timestamp: "t".into(), target: "t".into(),
+            llm_profile: None, messages: vec![], input_history: vec![],
+            tokens_in: 0, tokens_out: 0,
+            cost_usd: None, per_profile: HashMap::new(), last_served_model: None,
+            model_per_profile: HashMap::new(),
+        };
+        session.model_per_profile.insert("glm".into(), "openai/gpt-4o-mini".into());
+        let json = serde_json::to_string(&session).unwrap();
+        let restored: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.model_per_profile.get("glm").map(|s| s.as_str()), Some("openai/gpt-4o-mini"));
+    }
+
+    #[test]
+    fn model_per_profile_is_empty_for_old_json() {
+        let old_json = r#"{
+            "id":"1","timestamp":"t","target":"t",
+            "messages":[], "input_history":[],
+            "tokens_in":0, "tokens_out":0
+        }"#;
+        let s: Session = serde_json::from_str(old_json).unwrap();
+        assert!(s.model_per_profile.is_empty());
+    }
 }

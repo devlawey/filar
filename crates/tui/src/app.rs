@@ -326,6 +326,10 @@ pub struct Session {
     pub last_served_model: Option<String>,
     /// Actually served model slug per profile. Keyed by profile name.
     pub model_per_profile: HashMap<String, String>,
+    /// LLM profile active at the moment the last request was sent.
+    /// Used to attribute the response to the correct profile even if the
+    /// user pressed Ctrl+L before the response arrived.
+    pub pending_llm_profile: Option<String>,
 }
 
 impl App {
@@ -511,6 +515,7 @@ impl Session {
             per_profile: HashMap::new(),
             last_served_model: None,
             model_per_profile: HashMap::new(),
+            pending_llm_profile: None,
         }
     }
 
@@ -947,6 +952,7 @@ impl App {
                                     self.mode = AppMode::Thinking;
                                     self.agent_running = true;
                                     self.pending_input = Some(text);
+                                    self.active_session_mut().pending_llm_profile = self.llm_profile.clone();
                                 }
                             }
                         } else {
@@ -1204,6 +1210,7 @@ impl App {
                             self.mode = AppMode::Thinking;
                             self.agent_running = true;
                             self.pending_input = Some(agent_msg);
+                            self.active_session_mut().pending_llm_profile = self.llm_profile.clone();
                         }
                     }
                 }
@@ -2150,13 +2157,13 @@ impl App {
                             let total = s.cost_usd.unwrap_or(0.0) + c;
                             s.cost_usd = Some((total * 10000.0).round() / 10000.0);
                         }
-                        let active_profile = s.llm_profile.clone().unwrap_or_else(|| "default".into());
-                        let pu = s.per_profile.entry(active_profile.clone()).or_default();
+                        let profile_key = s.pending_llm_profile.clone().unwrap_or_else(|| "default".into());
+                        let pu = s.per_profile.entry(profile_key.clone()).or_default();
                         pu.tokens_in += tokens_in;
                         pu.tokens_out += tokens_out;
                         if let Some(m) = model {
                             s.last_served_model = Some(m.clone());
-                            s.model_per_profile.insert(active_profile, m);
+                            s.model_per_profile.insert(profile_key, m);
                         }
                     }
                 }
@@ -5396,6 +5403,7 @@ mod tests {
     fn cost_accumulates_across_profile_switches() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.active_session_mut().llm_profile = Some("glm".into());
+        app.active_session_mut().pending_llm_profile = Some("glm".into());
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
             event: filar_agent::AgentEvent::TokenUsage {
@@ -5407,6 +5415,7 @@ mod tests {
         assert_eq!(app.sessions[0].per_profile["glm"].tokens_in, 100);
         assert_eq!(app.sessions[0].per_profile["glm"].tokens_out, 200);
         app.active_session_mut().llm_profile = Some("deepseek".into());
+        app.active_session_mut().pending_llm_profile = Some("deepseek".into());
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
             event: filar_agent::AgentEvent::TokenUsage {

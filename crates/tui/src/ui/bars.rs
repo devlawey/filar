@@ -100,17 +100,22 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Token counter — per-profile breakdown from per_profile, not total.
     // Cost — total session sum. Model slug follows active profile.
-    let active = app.llm_profile.clone().unwrap_or_else(|| "default".into());
+    let active = app.llm_profile.clone().unwrap_or_else(|| app.default_profile_name.clone());
     let profile_usage = app.per_profile.get(&active);
     let served = app.model_per_profile.get(&active);
     spans.push(Span::raw("   "));
-    let has_data = profile_usage.map_or(false, |u| u.tokens_in > 0 || u.tokens_out > 0);
-    if has_data {
-        let pu = profile_usage.unwrap();
-        spans.push(Span::styled(
-            format!("toks: {}↑ {}↓", pu.tokens_in, pu.tokens_out),
-            app.theme.muted(),
-        ));
+    if let Some(pu) = profile_usage {
+        if pu.tokens_in > 0 || pu.tokens_out > 0 {
+            spans.push(Span::styled(
+                format!("toks: {}↑ {}↓", pu.tokens_in, pu.tokens_out),
+                app.theme.muted(),
+            ));
+        } else {
+            spans.push(Span::styled(
+                "toks: —",
+                app.theme.muted(),
+            ));
+        }
     } else {
         spans.push(Span::styled(
             "toks: —",
@@ -400,5 +405,40 @@ mod tests {
         app.active_session_mut().llm_profile = Some("glm".into());
         let row = render_status_row(&mut app, 120);
         assert!(row.contains("toks: —"), "zero tokens must show dash, got: {row}");
+    }
+
+    #[test]
+    fn profile_switch_restores_correct_status_bar_data() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.profiles = vec![
+            filar_core::LlmProfile {
+                name: "glm".into(), model: "z-ai/glm-5.2".into(), api_base_url: "".into(),
+                max_tokens: 1024, key_env: "K".into(),
+                temperature: None, top_p: None, extra_body: None,
+            },
+            filar_core::LlmProfile {
+                name: "ds".into(), model: "deepseek-v3".into(), api_base_url: "".into(),
+                max_tokens: 1024, key_env: "K".into(),
+                temperature: None, top_p: None, extra_body: None,
+            },
+        ];
+        // Profile A: has served model and tokens
+        app.active_session_mut().per_profile.insert("glm".into(), filar_core::ProfileUsage {
+            tokens_in: 100, tokens_out: 50,
+        });
+        app.active_session_mut().model_per_profile.insert("glm".into(), "openai/gpt-4o".into());
+        app.active_session_mut().llm_profile = Some("glm".into());
+        let row_a = render_status_row(&mut app, 120);
+        assert!(row_a.contains("100↑ 50↓") && row_a.contains("openai/gpt-4o"),
+            "profile A must show its data, got: {row_a}");
+        // Switch to B (no data yet)
+        app.llm_profile = Some("ds".into());
+        let row_b = render_status_row(&mut app, 120);
+        assert!(row_b.contains("~deepseek-v3"), "profile B must show ~configured model, got: {row_b}");
+        assert!(!row_b.contains("openai/gpt-4o"), "must not show A's model, got: {row_b}");
+        // Switch back to A
+        app.llm_profile = Some("glm".into());
+        let row_a2 = render_status_row(&mut app, 120);
+        assert!(row_a2.contains("openai/gpt-4o"), "back to A must restore A's model, got: {row_a2}");
     }
 }
