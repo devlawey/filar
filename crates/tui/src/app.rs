@@ -2157,7 +2157,7 @@ impl App {
                             let total = s.cost_usd.unwrap_or(0.0) + c;
                             s.cost_usd = Some((total * 10000.0).round() / 10000.0);
                         }
-                        let profile_key = s.pending_llm_profile.clone().unwrap_or_else(|| "default".into());
+                        let profile_key = s.pending_llm_profile.clone().unwrap_or_else(|| self.default_profile_name.clone());
                         let pu = s.per_profile.entry(profile_key.clone()).or_default();
                         pu.tokens_in += tokens_in;
                         pu.tokens_out += tokens_out;
