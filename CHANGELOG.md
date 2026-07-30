@@ -16,6 +16,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - The profile selected in the launcher is now actually used: sessions no longer always
   start on the first profile in `config.toml`, and the first `Ctrl+L` press no longer
   goes to waste ([#194](https://github.com/devlawey/filar/issues/194)).
+- The status bar now follows the active LLM profile: the model slug and token usage
+  update immediately on `Ctrl+L` instead of lagging until the next response
+  ([#195](https://github.com/devlawey/filar/issues/195)).
 
 ## [0.7.2] - 2026-07-29
 

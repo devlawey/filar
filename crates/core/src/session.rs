@@ -72,6 +72,10 @@ pub struct Session {
     /// The last actually served model slug reported by the provider.
     #[serde(default)]
     pub last_served_model: Option<String>,
+    /// Actually served model slug per profile (overrides `last_served_model`).
+    /// Keyed by profile name. `#[serde(default)]` for backward compat.
+    #[serde(default)]
+    pub model_per_profile: HashMap<String, String>,
 }
 
 /// Lightweight metadata for listing sessions without loading full messages.
@@ -313,6 +317,7 @@ mod tests {
             cost_usd: None,
             per_profile: HashMap::new(),
             last_served_model: None,
+            model_per_profile: HashMap::new(),
         };
         let meta = SessionMeta::from(&session);
         assert_eq!(meta.id, "123");
@@ -334,6 +339,7 @@ mod tests {
             cost_usd: None,
             per_profile: HashMap::new(),
             last_served_model: None,
+            model_per_profile: HashMap::new(),
         };
         let meta = SessionMeta::from(&session);
         assert!(meta.preview.is_empty());
@@ -364,6 +370,7 @@ mod tests {
             cost_usd: None,
             per_profile: HashMap::new(),
             last_served_model: None,
+            model_per_profile: HashMap::new(),
         };
 
         store.save(&session).unwrap();
@@ -407,6 +414,7 @@ mod tests {
             cost_usd: None,
             per_profile: HashMap::new(),
             last_served_model: None,
+            model_per_profile: HashMap::new(),
             };
             store.save(&session).unwrap();
         }
@@ -484,7 +492,7 @@ mod tests {
             id: "1".into(), timestamp: "t".into(), target: "t".into(),
             llm_profile: Some("glm".into()), messages: vec![], input_history: vec![],
             tokens_in: 150, tokens_out: 300,
-            cost_usd: None, per_profile: HashMap::new(), last_served_model: None,
+            cost_usd: None, per_profile: HashMap::new(), last_served_model: None, model_per_profile: HashMap::new(),
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("tokens_in"), "must serialize tokens_in");
@@ -524,6 +532,7 @@ mod tests {
             cost_usd: None,
             per_profile: HashMap::new(),
             last_served_model: None,
+            model_per_profile: HashMap::new(),
         };
         let json = serde_json::to_string_pretty(&session).unwrap();
         assert!(json.contains("input_history"), "JSON must contain input_history");
@@ -563,6 +572,7 @@ mod tests {
             cost_usd: None,
             per_profile: HashMap::new(),
             last_served_model: None,
+            model_per_profile: HashMap::new(),
         };
         assert!(session.input_history.len() > MAX_INPUT_HISTORY);
         session.truncate_history();

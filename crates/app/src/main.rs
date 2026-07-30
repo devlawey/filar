@@ -458,6 +458,7 @@ async fn run() -> anyhow::Result<()> {
         cost_usd: Option<f64>,
         per_profile: HashMap<String, filar_core::ProfileUsage>,
         last_served_model: Option<String>,
+        model_per_profile: HashMap<String, String>,
     }
     let loaded = if let Some(ref sid) = session_id {
         info!(session_id = %sid, "loading session");
@@ -474,6 +475,7 @@ async fn run() -> anyhow::Result<()> {
                         cost_usd: session.cost_usd,
                         per_profile: session.per_profile,
                         last_served_model: session.last_served_model,
+                        model_per_profile: session.model_per_profile,
                     }
                 }
                 Ok(None) => {
@@ -510,6 +512,7 @@ async fn run() -> anyhow::Result<()> {
         initial_cost_usd: loaded.cost_usd,
         initial_per_profile: loaded.per_profile,
         initial_last_served_model: loaded.last_served_model,
+        initial_model_per_profile: loaded.model_per_profile,
         ssh_target: ssh_target.clone(),
         is_local: ssh_target.is_none(),
         secret_provider: secret_provider.clone(),

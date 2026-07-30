@@ -207,6 +207,8 @@ pub struct TuiConfig {
     pub initial_per_profile: HashMap<String, filar_core::ProfileUsage>,
     /// Last served model restored from a previous session.
     pub initial_last_served_model: Option<String>,
+    /// Per-profile served model map restored from a previous session.
+    pub initial_model_per_profile: HashMap<String, String>,
     /// SSH target for interactive terminal mode (Ctrl+T).
     /// If `None`, the agent runs in local mode.
     pub ssh_target: Option<filar_core::SshTarget>,
@@ -304,6 +306,7 @@ async fn run_app(
             config.initial_cost_usd,
             config.initial_per_profile,
             config.initial_last_served_model,
+            std::mem::take(&mut config.initial_model_per_profile),
             &profiles_for_restore,
             &default_for_restore,
         );
@@ -924,6 +927,7 @@ async fn run_app(
         cost_usd: app.cost_usd,
         per_profile: app.per_profile.clone(),
         last_served_model: app.last_served_model.clone(),
+        model_per_profile: app.model_per_profile.clone(),
     };
     session.truncate_history();
     match filar_core::SessionStore::with_default_dir() {

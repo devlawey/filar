@@ -324,6 +324,8 @@ pub struct Session {
     pub per_profile: HashMap<String, filar_core::ProfileUsage>,
     /// The last actually served model slug reported by the provider.
     pub last_served_model: Option<String>,
+    /// Actually served model slug per profile. Keyed by profile name.
+    pub model_per_profile: HashMap<String, String>,
 }
 
 impl App {
@@ -508,6 +510,7 @@ impl Session {
             cost_usd: None,
             per_profile: HashMap::new(),
             last_served_model: None,
+            model_per_profile: HashMap::new(),
         }
     }
 
@@ -545,6 +548,7 @@ impl App {
         cost_usd: Option<f64>,
         per_profile: HashMap<String, filar_core::ProfileUsage>,
         last_served_model: Option<String>,
+        model_per_profile: HashMap<String, String>,
         profiles: &[filar_core::LlmProfile],
         default_profile_name: &str,
     ) -> Self {
@@ -565,6 +569,7 @@ impl App {
             s.cost_usd = cost_usd;
             s.per_profile = per_profile;
             s.last_served_model = last_served_model;
+            s.model_per_profile = model_per_profile;
         }
         let default_name = if default_profile_name.is_empty() { "default" } else { default_profile_name };
         if let Some(profile) = llm_profile {
@@ -2146,11 +2151,12 @@ impl App {
                             s.cost_usd = Some((total * 10000.0).round() / 10000.0);
                         }
                         let active_profile = s.llm_profile.clone().unwrap_or_else(|| "default".into());
-                        let pu = s.per_profile.entry(active_profile).or_default();
+                        let pu = s.per_profile.entry(active_profile.clone()).or_default();
                         pu.tokens_in += tokens_in;
                         pu.tokens_out += tokens_out;
                         if let Some(m) = model {
-                            s.last_served_model = Some(m);
+                            s.last_served_model = Some(m.clone());
+                            s.model_per_profile.insert(active_profile, m);
                         }
                     }
                 }

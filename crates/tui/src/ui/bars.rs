@@ -98,12 +98,17 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         spans.push(Span::styled(mt, app.theme.mode_badge_style(mode_color)));
     }
 
-    // Token counter. Uses real API usage data; shows — when no data yet.
-    // Cost in USD (if available) and served model slug are shown after tokens.
+    // Token counter — per-profile breakdown from per_profile, not total.
+    // Cost — total session sum. Model slug follows active profile.
+    let active = app.llm_profile.clone().unwrap_or_else(|| "default".into());
+    let profile_usage = app.per_profile.get(&active);
+    let served = app.model_per_profile.get(&active);
     spans.push(Span::raw("   "));
-    if app.tokens_in > 0 || app.tokens_out > 0 {
+    let has_data = profile_usage.map_or(false, |u| u.tokens_in > 0 || u.tokens_out > 0);
+    if has_data {
+        let pu = profile_usage.unwrap();
         spans.push(Span::styled(
-            format!("toks: {}↑ {}↓", app.tokens_in, app.tokens_out),
+            format!("toks: {}↑ {}↓", pu.tokens_in, pu.tokens_out),
             app.theme.muted(),
         ));
     } else {
@@ -119,15 +124,23 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
             app.theme.success_fg(),
         ));
     }
-    if let Some(ref model) = app.last_served_model {
-        spans.push(Span::raw(" "));
-        let model_display: String = if model.len() > 24 {
-            model.chars().take(23).chain("…".chars()).collect()
-        } else {
-            model.clone()
-        };
-        spans.push(Span::styled(model_display, app.theme.dim()));
-    }
+    // Model: per-profile served model if known, else configured model with ~ prefix.
+    let model_display = if let Some(sm) = served {
+        sm.to_string()
+    } else {
+        let configured = app.profiles.iter()
+            .find(|p| p.name == active)
+            .map(|p| format!("~{}", p.model))
+            .unwrap_or_else(|| "~?".into());
+        configured
+    };
+    spans.push(Span::raw(" "));
+    let truncated: String = if model_display.len() > 24 {
+        model_display.chars().take(23).chain("…".chars()).collect()
+    } else {
+        model_display
+    };
+    spans.push(Span::styled(truncated, app.theme.dim()));
 
     // Right side: `confirm_mode`, then an optional toast (e.g. "· copied")
     // pinned to the far right. Space for the toast is reserved *before* the
@@ -331,5 +344,61 @@ mod tests {
         let items = help_items(AppMode::Thinking);
         let has_f1 = items.iter().any(|i| i.key == "F1" && i.desc == "help");
         assert!(has_f1, "Thinking mode help must include F1 help");
+    }
+
+    #[test]
+    fn status_bar_shows_configured_model_with_tilde_when_no_response() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.profiles = vec![
+            filar_core::LlmProfile {
+                name: "glm".into(), model: "z-ai/glm-5.2".into(), api_base_url: "".into(),
+                max_tokens: 1024, key_env: "K".into(),
+                temperature: None, top_p: None, extra_body: None,
+            },
+        ];
+        app.active_session_mut().llm_profile = Some("glm".into());
+        let row = render_status_row(&mut app, 120);
+        assert!(row.contains("~z-ai/glm-5.2"), "unconfirmed model must have ~ prefix, got: {row}");
+    }
+
+    #[test]
+    fn status_bar_shows_served_model_without_tilde_after_response() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.profiles = vec![
+            filar_core::LlmProfile {
+                name: "glm".into(), model: "z-ai/glm-5.2".into(), api_base_url: "".into(),
+                max_tokens: 1024, key_env: "K".into(),
+                temperature: None, top_p: None, extra_body: None,
+            },
+        ];
+        app.active_session_mut().llm_profile = Some("glm".into());
+        app.active_session_mut().model_per_profile.insert("glm".into(), "openai/gpt-4o-mini".into());
+        let row = render_status_row(&mut app, 120);
+        assert!(row.contains("openai/gpt-4o-mini"), "served model must appear without ~, got: {row}");
+        assert!(!row.contains("~openai"), "served model must NOT have ~, got: {row}");
+    }
+
+    #[test]
+    fn status_bar_shows_per_profile_tokens_not_total() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.active_session_mut().tokens_in = 999;
+        app.active_session_mut().tokens_out = 999;
+        app.active_session_mut().per_profile.insert("glm".into(), filar_core::ProfileUsage {
+            tokens_in: 50, tokens_out: 30,
+        });
+        app.active_session_mut().llm_profile = Some("glm".into());
+        let row = render_status_row(&mut app, 120);
+        assert!(row.contains("50↑ 30↓"), "must show per-profile tokens, got: {row}");
+    }
+
+    #[test]
+    fn status_bar_shows_dash_when_no_profile_data() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.active_session_mut().per_profile.insert("glm".into(), filar_core::ProfileUsage {
+            tokens_in: 0, tokens_out: 0,
+        });
+        app.active_session_mut().llm_profile = Some("glm".into());
+        let row = render_status_row(&mut app, 120);
+        assert!(row.contains("toks: —"), "zero tokens must show dash, got: {row}");
     }
 }
