@@ -212,6 +212,8 @@ pub struct App {
     pub ctrl_o_cancel: Option<tokio_util::sync::CancellationToken>,
     /// Pending Ctrl+O target that needs a password before connecting.
     pub ctrl_o_pending_target: Option<filar_core::SshTarget>,
+    /// Session ID of the tab that initiated a password-needed connection.
+    pub ctrl_o_pending_session_id: Option<SessionId>,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -379,6 +381,7 @@ impl App {
             ctrl_o_needs_connect: false,
             ctrl_o_cancel: None,
             ctrl_o_pending_target: None,
+            ctrl_o_pending_session_id: None,
         }
     }
 
@@ -1288,9 +1291,10 @@ impl App {
                     }
                 }
                 KeyCode::Esc => {
-                    // Cancel — go back to normal input.
                     self.input.clear();
                     self.cursor_pos = 0;
+                    self.ctrl_o_pending_target = None;
+                    self.ctrl_o_pending_session_id = None;
                     self.mode = AppMode::Normal;
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2285,10 +2289,9 @@ impl App {
             TuiEvent::TransportChanged { .. } => {
                 // Handled by the runner before reaching here — no-op.
             }
-            TuiEvent::PasswordNeeded { target, .. } => {
-                // Ctrl+O selected a password target — switch to password entry.
-                self.pending_ssh = Some((target.user.clone(), target.host.clone(), target.port));
+            TuiEvent::PasswordNeeded { session_id, target } => {
                 self.ctrl_o_pending_target = Some(target);
+                self.ctrl_o_pending_session_id = Some(session_id);
                 self.mode = AppMode::PasswordInput;
                 self.agent_running = false;
             }
@@ -5661,8 +5664,8 @@ mod tests {
             session_id: app.sessions[0].id,
             target: target.clone(),
         });
-        assert!(app.pending_ssh.is_some(), "pending_ssh must be set");
         assert!(app.ctrl_o_pending_target.is_some(), "pending ctrl+o target must be set");
+        assert!(app.ctrl_o_pending_session_id.is_some(), "pending session id must be set");
         assert_eq!(app.mode, AppMode::PasswordInput);
     }
 

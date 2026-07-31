@@ -719,12 +719,18 @@ async fn run_app(
             // If we have a pending password entry target, use it directly.
             if let (Some(mut target), Some(password)) = (app.ctrl_o_pending_target.take(), app.pending_ssh_password.take()) {
                 target.auth = filar_core::SshAuth::Password { password: Some(password) };
-                let sid = app.sessions[app.active].id;
+                let sid = app.ctrl_o_pending_session_id.take().unwrap_or(app.sessions[app.active].id);
                 let exec_entry = executors.get(&sid)
                     .map(|e| (e.executor.clone(), e.ssh_target.clone()));
                 let tx = agent_tx.clone();
                 let alias = target.name.clone();
+                let token = CancellationToken::new();
+                app.ctrl_o_cancel = Some(token.clone());
                 tokio::spawn(async move {
+                    tokio::select! {
+                        _ = token.cancelled() => return,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                    }
                     let new_info = format!("{}@{}:{}", target.user, target.host, target.port);
                     match filar_transport::SshExecutor::connect(&target).await {
                         Ok(ssh_exec) => {
@@ -740,10 +746,10 @@ async fn run_app(
                                 event: filar_agent::AgentEvent::Finished(format!("Connected to {} (password)", alias)),
                             });
                         }
-                        Err(e) => {
+                        Err(_) => {
                             let _ = tx.send(TuiEvent::Agent {
                                 session_id: sid,
-                                event: filar_agent::AgentEvent::Error(format!("SSH connection failed: {e}")),
+                                event: filar_agent::AgentEvent::Error("SSH connection failed — authentication error".into()),
                             });
                         }
                     }
@@ -809,7 +815,6 @@ async fn run_app(
                                 return;
                             }
                         }
-                        let target = t.clone();
                         let new_info = format!("{}@{}:{}", target.user, target.host, target.port);
                         match filar_transport::SshExecutor::connect(&target).await {
                             Ok(ssh_exec) => {
