@@ -10,6 +10,7 @@ use filar_core::{ChatBlock, CommandConfirmMode, StaticSecretProvider};
 use ratatui::layout::Rect;
 
 use crate::event::TuiEvent;
+use tracing::warn;
 use crate::terminal::{key_to_bytes, TerminalModel};
 use crate::ui::layout_cache::ChatLayoutCache;
 use crate::ui::Theme;
@@ -595,6 +596,21 @@ impl App {
         app
     }
 
+    /// Record that an agent request is about to be sent and capture the active
+    /// LLM profile so that the response's token usage and served model are
+    /// attributed to the correct profile, even if the user switches profiles
+    /// before the response arrives.
+    fn begin_agent_request(&mut self, input: String) {
+        let profile = self
+            .llm_profile
+            .clone()
+            .unwrap_or_else(|| self.default_profile_name.clone());
+        self.mode = AppMode::Thinking;
+        self.agent_running = true;
+        self.pending_input = Some(input);
+        self.active_session_mut().pending_llm_profile = Some(profile);
+    }
+
     /// Append a message to the history and bump [`message_rev`](Self::message_rev).
     ///
     /// All mutations of `messages` must go through this method (or explicitly
@@ -949,10 +965,7 @@ impl App {
                                     self.scroll = 0;
                                     self.input.clear();
                                     self.cursor_pos = 0;
-                                    self.mode = AppMode::Thinking;
-                                    self.agent_running = true;
-                                    self.pending_input = Some(text);
-                                    self.active_session_mut().pending_llm_profile = self.llm_profile.clone();
+                                    self.begin_agent_request(text);
                                 }
                             }
                         } else {
@@ -960,9 +973,7 @@ impl App {
                             self.scroll = 0;
                             self.input.clear();
                             self.cursor_pos = 0;
-                            self.mode = AppMode::Thinking;
-                            self.agent_running = true;
-                            self.pending_input = Some(text);
+                            self.begin_agent_request(text);
                         }
                     }
                 }
@@ -1207,10 +1218,7 @@ impl App {
                             self.scroll = 0;
                             self.input.clear();
                             self.cursor_pos = 0;
-                            self.mode = AppMode::Thinking;
-                            self.agent_running = true;
-                            self.pending_input = Some(agent_msg);
-                            self.active_session_mut().pending_llm_profile = self.llm_profile.clone();
+                            self.begin_agent_request(agent_msg);
                         }
                     }
                 }
@@ -2157,7 +2165,10 @@ impl App {
                             let total = s.cost_usd.unwrap_or(0.0) + c;
                             s.cost_usd = Some((total * 10000.0).round() / 10000.0);
                         }
-                        let profile_key = s.pending_llm_profile.clone().unwrap_or_else(|| self.default_profile_name.clone());
+                        let profile_key = s.pending_llm_profile.clone().unwrap_or_else(|| {
+                            warn!("pending_llm_profile is None — usage attributed to default profile");
+                            self.default_profile_name.clone()
+                        });
                         let pu = s.per_profile.entry(profile_key.clone()).or_default();
                         pu.tokens_in += tokens_in;
                         pu.tokens_out += tokens_out;
@@ -5385,8 +5396,6 @@ mod tests {
     #[test]
     fn token_counter_is_per_session() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        // Token counters are updated via AgentEvent::TokenUsage only.
-        // Simulate receiving usage for session 0.
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
             event: filar_agent::AgentEvent::TokenUsage { tokens_in: 10, tokens_out: 20, cost: None, model: None },
@@ -5427,5 +5436,73 @@ mod tests {
         assert_eq!(app.sessions[0].per_profile["glm"].tokens_in, 100);
         assert_eq!(app.sessions[0].per_profile["deepseek"].tokens_in, 50);
         assert_eq!(app.sessions[0].last_served_model.as_deref(), Some("cohere/command-r"));
+    }
+
+    #[test]
+    fn begin_agent_request_sets_pending_llm_profile() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.profiles = vec![
+            filar_core::LlmProfile {
+                name: "glm".into(), model: "glm".into(), api_base_url: "".into(),
+                max_tokens: 1024, key_env: "K".into(),
+                temperature: None, top_p: None, extra_body: None,
+            },
+        ];
+        app.llm_profile = Some("glm".into());
+        app.begin_agent_request("hello".into());
+        assert_eq!(app.active_session().pending_llm_profile.as_deref(), Some("glm"));
+        assert!(app.agent_running);
+        assert_eq!(app.mode, AppMode::Thinking);
+    }
+
+    #[test]
+    fn token_usage_attributed_to_send_time_profile_not_current() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.profiles = vec![
+            filar_core::LlmProfile {
+                name: "glm".into(), model: "glm".into(), api_base_url: "".into(),
+                max_tokens: 1024, key_env: "K".into(),
+                temperature: None, top_p: None, extra_body: None,
+            },
+            filar_core::LlmProfile {
+                name: "ds".into(), model: "ds".into(), api_base_url: "".into(),
+                max_tokens: 1024, key_env: "K".into(),
+                temperature: None, top_p: None, extra_body: None,
+            },
+        ];
+        // Send time: profile = glm, so pending = glm.
+        app.llm_profile = Some("glm".into());
+        app.begin_agent_request("hello".into());
+        // Ctrl+L to ds BEFORE response arrives — active profile changes.
+        app.llm_profile = Some("ds".into());
+        // TokenUsage must attribute to glm (pending), not ds (current).
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TokenUsage {
+                tokens_in: 10, tokens_out: 20, cost: None, model: Some("served-glm".into()),
+            },
+        });
+        assert_eq!(app.sessions[0].per_profile["glm"].tokens_in, 10);
+        assert_eq!(app.sessions[0].per_profile["glm"].tokens_out, 20);
+        assert_eq!(app.sessions[0].model_per_profile["glm"], "served-glm");
+        // ds profile must NOT have received the usage.
+        let ds_usage = app.sessions[0].per_profile.get("ds");
+        assert!(ds_usage.map_or(true, |u| u.tokens_in == 0 && u.tokens_out == 0),
+            "ds profile must not have usage attributed to it");
+    }
+
+    #[test]
+    fn token_usage_without_pending_falls_back_to_default_not_panic() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.default_profile_name = "fallback-profile".into();
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TokenUsage {
+                tokens_in: 10, tokens_out: 20, cost: None, model: None,
+            },
+        });
+        let pu = app.sessions[0].per_profile.get("fallback-profile").unwrap();
+        assert_eq!(pu.tokens_in, 10);
+        assert_eq!(pu.tokens_out, 20);
     }
 }

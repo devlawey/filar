@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- Token usage and the served model slug were attributed to the startup profile
+  instead of the active one, because ordinary message sends did not record the
+  pending profile ([#198](https://github.com/devlawey/filar/issues/198)).
+
 ## [0.7.3] - 2026-07-30
 
 ### Fixed

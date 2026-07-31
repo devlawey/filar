@@ -3560,6 +3560,42 @@ ChatResponse), transport (SshConnection). Тег `engine-v0.7.0` ставитс�
 
 ---
 
+## Issue #198: fix(tui) — расход и слаг приписываются не тому профилю (pending_llm_profile на обычной отправке)
+
+**Milestone:** Filar v0.7.4 (блокер). **Ветка:** `fix/198-pending-profile-on-send`.
+
+**Симптом:** после `Ctrl+L` на `default`, запрос на `default` — токены не растут,
+слаг не появляется. При возврате на `DeepSeek` показывается чужой слаг `glm`.
+
+**Первопричина:** `pending_llm_profile` выставлялся на 2 из 3 путей отправки
+(shell escape и ввод пароля), но НЕ на основном пути — обычной отправке сообщения.
+На нём оставался `None`, и `unwrap_or_else(|| default_profile_name)` молча
+приписывал расход и модель профилю запуска, а не активному.
+
+**Решение:**
+1. Добавлена пропущенная строка — `begin_agent_request()` теперь вызывается на всех
+   трёх путях.
+2. Все 3 пути сведены в единый метод `App::begin_agent_request(input: String)`,
+   который атомарно выставляет `mode`, `agent_running`, `pending_input` и
+   `pending_llm_profile`.
+3. Молчаливый `unwrap_or_else(|| default_profile_name)` заменён на `debug_assert!`
+   + `warn!` — None теперь виден в логах, а не тонет.
+4. Тесты: `begin_agent_request` выставляет профиль; после переключения расход идёт
+   в корзину профиля на момент отправки, а не текущего.
+
+**Изменённые файлы:**
+- `crates/tui/src/app.rs` — `begin_agent_request()`, 3 вызова, `debug_assert!`, 2 теста
+
+**Публичные контракты:** `App::begin_agent_request(String)` — новый приватный метод
+(не публичный API).
+
+**DoD (требует ручной проверки):** повторить сценарий из issue: запуск DeepSeek →
+запрос (deepseek); Ctrl+L → default (~glm, —); запрос на default (**токены растут**,
+слаг glm без ~); Ctrl+L → DeepSeek (deepseek, не glm). Shell escape и пароль
+атрибутируются верно. Ретроактивно сессии не тронуты.
+
+---
+
 ## Релиз v0.7.1 (подготовка)
 
 **Дата:** 2026-07-28. **Milestone:** Filar v0.7.1 (3/3 issue, все смерджены).
