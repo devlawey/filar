@@ -746,10 +746,10 @@ async fn run_app(
                                 event: filar_agent::AgentEvent::Finished(format!("Connected to {} (password)", alias)),
                             });
                         }
-                        Err(_) => {
+                        Err(e) => {
                             let _ = tx.send(TuiEvent::Agent {
                                 session_id: sid,
-                                event: filar_agent::AgentEvent::Error("SSH connection failed — authentication error".into()),
+                                event: filar_agent::AgentEvent::Error(format!("SSH connection failed: {e}")),
                             });
                         }
                     }
