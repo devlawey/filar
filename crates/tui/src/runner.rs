@@ -690,6 +690,7 @@ async fn run_app(
                                         session_id: sid,
                                         is_local: false,
                                         ssh_info: Some(new_ssh_info),
+                                        alias: None,
                                     });
                                     let _ = tx.send(TuiEvent::Agent {
                                         session_id: sid,
@@ -746,7 +747,7 @@ async fn run_app(
                             *st.write().await = None;
                         }
                         let _ = tx.send(TuiEvent::TransportChanged {
-                            session_id: sid, is_local: true, ssh_info: None,
+                            session_id: sid, is_local: true, ssh_info: None, alias: Some("local".into()),
                         });
                         return;
                     }
@@ -770,7 +771,7 @@ async fn run_app(
                                 }
                                 let alias = t.name.clone();
                                 let _ = tx.send(TuiEvent::TransportChanged {
-                                    session_id: sid, is_local: false, ssh_info: Some(new_info),
+                                    session_id: sid, is_local: false, ssh_info: Some(new_info), alias: Some(alias.clone()),
                                 });
                                 let _ = tx.send(TuiEvent::Agent {
                                     session_id: sid,
@@ -842,13 +843,14 @@ async fn run_app(
             } => {
                 if let Some(event) = maybe_agent_event {
                     // Intercept TransportChanged to update per-session info.
-                    if let TuiEvent::TransportChanged { session_id, ref ssh_info, .. } = &event {
+                    if let TuiEvent::TransportChanged { session_id, ref ssh_info, ref alias, .. } = &event {
                         if let Some(idx) = app.find_session_idx(*session_id) {
                             app.sessions[idx].ssh_info = ssh_info.clone();
-                            // Also update display name for the tab label.
                             app.sessions[idx].target_name =
-                                ssh_info.clone().unwrap_or_else(|| {
-                                    format!("local-{}", idx + 1)
+                                alias.clone().unwrap_or_else(|| {
+                                    ssh_info.clone().unwrap_or_else(|| {
+                                        format!("local-{}", idx + 1)
+                                    })
                                 });
                         }
                     }

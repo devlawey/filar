@@ -639,7 +639,10 @@ impl App {
                     self.ssh_targets.iter()
                         .position(|t| format!("{}@{}:{}", t.user, t.host, t.port) == *info)
                         .map(|i| i + 1) // index 0 = local, targets start at 1
-                        .unwrap_or(0)
+                        .unwrap_or_else(|| {
+                            warn!("active SSH target not found in config — starting Ctrl+O cycle from local");
+                            0
+                        })
                 } else {
                     0 // local — no SSH info yet.
                 }
@@ -5608,5 +5611,26 @@ mod tests {
         app.ctrl_o_cancel = Some(token.clone());
         app.cycle_ssh_target();
         assert!(token.is_cancelled(), "previous connection attempt must be cancelled");
+    }
+
+    #[test]
+    fn ctrl_o_per_tab_independent() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![make_ssh_target("srv-a"), make_ssh_target("srv-b")];
+        // Tab 0: cycle once to land on first target.
+        app.cycle_ssh_target();
+        let tab0_name = app.target_name.clone();
+        // Create tab 1 and switch (set active directly — switch_to_tab subtracts 1).
+        app.new_tab();
+        app.active = 1;
+        app.cycle_ssh_target(); // first press on fresh tab 1
+        let tab1_name = app.target_name.clone();
+        // Switch back to tab 0 — its target_name must be unchanged.
+        app.active = 0;
+        assert_eq!(app.target_name, tab0_name, "tab 0 target_name unchanged after tab 1 cycle");
+        // Tab 1's target_name must be different and not local.
+        app.active = 1;
+        assert_eq!(app.target_name, tab1_name, "tab 1 target_name unchanged after switch");
+        assert!(!tab1_name.starts_with("~local"), "tab 1 should have cycled to a target");
     }
 }

@@ -44,6 +44,9 @@ pub enum TuiEvent {
         session_id: SessionId,
         is_local: bool,
         ssh_info: Option<String>,
+        /// Optional alias to use for the status bar target_name.
+        /// When set, overrides the ssh_info-derived name.
+        alias: Option<String>,
     },
 }
 
@@ -58,8 +61,9 @@ mod tests {
             session_id: sid,
             is_local: false,
             ssh_info: Some("root@10.0.0.5:22".into()),
+            alias: None,
         };
-        if let TuiEvent::TransportChanged { session_id, is_local, ref ssh_info } = event {
+        if let TuiEvent::TransportChanged { session_id, is_local, ref ssh_info, .. } = event {
             assert_eq!(session_id, SessionId(42));
             assert!(!is_local);
             assert_eq!(ssh_info.as_deref(), Some("root@10.0.0.5:22"));
