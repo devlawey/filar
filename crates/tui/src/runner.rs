@@ -716,6 +716,41 @@ async fn run_app(
         // ── Ctrl+O delayed host connection ─────────────────────────
         if app.ctrl_o_needs_connect {
             app.ctrl_o_needs_connect = false;
+            // If we have a pending password entry target, use it directly.
+            if let (Some(mut target), Some(password)) = (app.ctrl_o_pending_target.take(), app.pending_ssh_password.take()) {
+                target.auth = filar_core::SshAuth::Password { password: Some(password) };
+                let sid = app.sessions[app.active].id;
+                let exec_entry = executors.get(&sid)
+                    .map(|e| (e.executor.clone(), e.ssh_target.clone()));
+                let tx = agent_tx.clone();
+                let alias = target.name.clone();
+                tokio::spawn(async move {
+                    let new_info = format!("{}@{}:{}", target.user, target.host, target.port);
+                    match filar_transport::SshExecutor::connect(&target).await {
+                        Ok(ssh_exec) => {
+                            if let Some((ref exec, ref st)) = exec_entry {
+                                exec.swap_executor(Arc::new(ssh_exec) as Arc<dyn CommandExecutor>).await;
+                                *st.write().await = Some(target);
+                            }
+                            let _ = tx.send(TuiEvent::TransportChanged {
+                                session_id: sid, is_local: false, ssh_info: Some(new_info), alias: Some(alias.clone()),
+                            });
+                            let _ = tx.send(TuiEvent::Agent {
+                                session_id: sid,
+                                event: filar_agent::AgentEvent::Finished(format!("Connected to {} (password)", alias)),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(TuiEvent::Agent {
+                                session_id: sid,
+                                event: filar_agent::AgentEvent::Error(format!("SSH connection failed: {e}")),
+                            });
+                        }
+                    }
+                });
+                continue;
+            }
+            app.ctrl_o_needs_connect = false;
             let token = CancellationToken::new();
             app.ctrl_o_cancel = Some(token.clone());
             let selection = app.ctrl_o_selection;
@@ -752,14 +787,27 @@ async fn run_app(
                         return;
                     }
                     if let Some(t) = targets.get(idx - 1) {
-                        if matches!(t.auth, filar_core::SshAuth::Password { .. }) {
-                            let _ = tx.send(TuiEvent::Agent {
-                                session_id: sid,
-                                event: filar_agent::AgentEvent::Error(format!(
-                                    "Target '{}' requires a password. Ctrl+O is not yet supported for password targets. Use !ssh for this host.", t.name
-                                )),
-                            });
-                            return;
+                        let mut target = t.clone();
+                        // Resolve password for Password-auth targets.
+                        if let filar_core::SshAuth::Password { ref password } = target.auth {
+                            let keyring_name = format!("ssh_target:{}", target.name);
+                            let resolved = password.clone()
+                                .or_else(|| {
+                                    let kr = filar_core::KeyringSecretProvider::new();
+                                    kr.get(&keyring_name).ok().filter(|v| !v.is_empty())
+                                })
+                                .or_else(|| std::env::var("SSH_PASSWORD").ok().filter(|v| !v.is_empty()));
+                            if let Some(pw) = resolved {
+                                if password.is_some() {
+                                    warn!(target = %target.name, "password in config.toml for SSH target — consider moving to OS credential store");
+                                }
+                                target.auth = filar_core::SshAuth::Password { password: Some(pw) };
+                            } else {
+                                let _ = tx.send(TuiEvent::PasswordNeeded {
+                                    session_id: sid, target: target.clone(),
+                                });
+                                return;
+                            }
                         }
                         let target = t.clone();
                         let new_info = format!("{}@{}:{}", target.user, target.host, target.port);

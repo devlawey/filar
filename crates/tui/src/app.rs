@@ -210,6 +210,8 @@ pub struct App {
     pub ctrl_o_needs_connect: bool,
     /// Cancellation token for an in-flight Ctrl+O connection attempt.
     pub ctrl_o_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Pending Ctrl+O target that needs a password before connecting.
+    pub ctrl_o_pending_target: Option<filar_core::SshTarget>,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -376,6 +378,7 @@ impl App {
             ctrl_o_selection: None,
             ctrl_o_needs_connect: false,
             ctrl_o_cancel: None,
+            ctrl_o_pending_target: None,
         }
     }
 
@@ -1252,14 +1255,18 @@ impl App {
                 KeyCode::Enter => {
                     let password = self.input.clone();
                     if !password.is_empty() {
-                        // Check if this password is for an SSH connection.
-                        if self.pending_ssh.is_some() {
-                            // SSH password — store for runner to pick up.
+                        if self.pending_ssh.is_some() || self.ctrl_o_pending_target.is_some() {
                             self.pending_ssh_password = Some(password);
                             self.input.clear();
                             self.cursor_pos = 0;
-                            self.mode = AppMode::Thinking;
-                            self.agent_running = true;
+                            if self.ctrl_o_pending_target.is_some() {
+                                // Ctrl+O password entry — trigger delayed connect.
+                                self.ctrl_o_needs_connect = true;
+                                self.mode = AppMode::Normal;
+                            } else {
+                                self.mode = AppMode::Thinking;
+                                self.agent_running = true;
+                            }
                         } else {
                             // Regular secret variable — never sent to the LLM.
                             self.secret_counter += 1;
@@ -2117,6 +2124,7 @@ impl App {
             TuiEvent::Thinking => self.sessions[self.active].id,
             TuiEvent::ConfirmationRequest { .. } => self.sessions[self.active].id,
             TuiEvent::TransportChanged { .. } => self.sessions[self.active].id,
+            TuiEvent::PasswordNeeded { session_id, .. } => *session_id,
         };
 
         // Dispatch to the originating session. Save the active index so we can
@@ -2276,6 +2284,13 @@ impl App {
             }
             TuiEvent::TransportChanged { .. } => {
                 // Handled by the runner before reaching here — no-op.
+            }
+            TuiEvent::PasswordNeeded { target, .. } => {
+                // Ctrl+O selected a password target — switch to password entry.
+                self.pending_ssh = Some((target.user.clone(), target.host.clone(), target.port));
+                self.ctrl_o_pending_target = Some(target);
+                self.mode = AppMode::PasswordInput;
+                self.agent_running = false;
             }
         }
         // Auto-scroll to bottom on new content (unless user scrolled up during streaming).
@@ -5632,5 +5647,40 @@ mod tests {
         app.active = 1;
         assert_eq!(app.target_name, tab1_name, "tab 1 target_name unchanged after switch");
         assert!(!tab1_name.starts_with("~local"), "tab 1 should have cycled to a target");
+    }
+
+    #[test]
+    fn password_needed_sets_pending_and_switches_mode() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let target = filar_core::SshTarget {
+            name: "srv".into(), host: "h".into(), port: 22, user: "u".into(),
+            auth: filar_core::SshAuth::Password { password: None },
+            host_key_policy: filar_core::HostKeyPolicy::Tofu,
+        };
+        app.handle_agent_event(TuiEvent::PasswordNeeded {
+            session_id: app.sessions[0].id,
+            target: target.clone(),
+        });
+        assert!(app.pending_ssh.is_some(), "pending_ssh must be set");
+        assert!(app.ctrl_o_pending_target.is_some(), "pending ctrl+o target must be set");
+        assert_eq!(app.mode, AppMode::PasswordInput);
+    }
+
+    #[test]
+    fn password_entry_for_ctrl_o_retriggers_connect() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ctrl_o_pending_target = Some(filar_core::SshTarget {
+            name: "srv".into(), host: "h".into(), port: 22, user: "u".into(),
+            auth: filar_core::SshAuth::Password { password: None },
+            host_key_policy: filar_core::HostKeyPolicy::Tofu,
+        });
+        app.mode = AppMode::PasswordInput;
+        app.input = "test-pw".to_string();
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.pending_ssh_password.is_some());
+        assert!(app.ctrl_o_needs_connect, "ctrl_o_needs_connect must be set for runner");
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.ctrl_o_pending_target.is_some(), "pending target consumed by runner, not app");
     }
 }
