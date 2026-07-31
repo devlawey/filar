@@ -48,6 +48,14 @@ pub enum TuiEvent {
         /// When set, overrides the ssh_info-derived name.
         alias: Option<String>,
     },
+
+    /// Ctrl+O encountered a password target with no cached password.
+    /// The UI must switch to password entry mode.
+    PasswordNeeded {
+        session_id: SessionId,
+        /// The target the user wants to connect to.
+        target: filar_core::SshTarget,
+    },
 }
 
 #[cfg(test)]

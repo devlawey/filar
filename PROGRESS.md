@@ -3623,6 +3623,41 @@ ChatResponse), transport (SshConnection). Тег `engine-v0.7.0` ставитс�
 
 ---
 
+## Issue #201: feat(app,tui,gui) — парольные цели при Ctrl+O
+
+**Milestone:** Filar v0.8.0. **Ветка:** `feat/201-password-targets`.
+
+**Цель:** довести `Ctrl+O` до полного набора целей — `SshAuth::Password`.
+
+**Первопричина:** в #200 парольные цели намеренно отклонялись с сообщением.
+
+**Решение:**
+1. Порядок разрешения пароля (runner.rs): явный в конфиге (с warn! в лог) →
+   `ssh_target:<name>` в OS keyring → `SSH_PASSWORD` env → `PasswordNeeded`.
+2. `TuiEvent::PasswordNeeded { session_id, target }` — переключает UI в режим
+   ввода пароля (как `Ctrl+P`), сохраняет цель в `ctrl_o_pending_target`.
+3. После ввода пароля → `ctrl_o_needs_connect = true`, `pending_ssh_password = Some(...)`.
+4. Runner подхватывает пароль + цель и выполняет подключение.
+5. Пароли из конфига логируются с предупреждением (но не в тексте ошибок).
+6. Тесты: `password_needed` выставляет pending state; пароль retriggers connect.
+
+**Вне текущего скоупа:**
+- Сохранение пароля в keyring после успешного коннекта (отдельно).
+- Раздел целей в лаунчере (отдельно).
+
+**Изменённые файлы:**
+- `crates/tui/src/event.rs` — `PasswordNeeded` variant
+- `crates/tui/src/app.rs` — `ctrl_o_pending_target`, handler, 2 теста
+- `crates/tui/src/runner.rs` — password resolution + re-trigger connect
+
+**Публичные контракты:** `TuiEvent::PasswordNeeded` — новый variant (аддитивно).
+
+**DoD (требует ручной проверки):** цель с паролем в keyring → без вопросов;
+`SSH_PASSWORD` → работает; без пароля → запрос → подключение; пароля нет в
+config.toml и логах. Прогон невозможен без SSH-целей.
+
+---
+
 ## Релиз v0.7.4 (подготовка)
 
 **Дата:** 2026-07-31. **Milestone:** Filar v0.7.4 (1/1 issue, смерджен).

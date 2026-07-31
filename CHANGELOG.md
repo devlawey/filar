@@ -16,6 +16,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - `Ctrl+O` cycles through SSH targets defined in `config.toml` (plus `local`),
   showing the target alias in the status bar and reconnecting only the active tab
   ([#200](https://github.com/devlawey/filar/issues/200)).
+- SSH targets using password authentication are now supported by `Ctrl+O`, with
+  the password resolved from the OS credential store, environment, or an
+  interactive prompt ([#201](https://github.com/devlawey/filar/issues/201)).
 
 ## [0.7.4] - 2026-07-31
 
