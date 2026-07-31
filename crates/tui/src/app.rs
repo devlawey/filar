@@ -601,10 +601,14 @@ impl App {
     /// attributed to the correct profile, even if the user switches profiles
     /// before the response arrives.
     fn begin_agent_request(&mut self, input: String) {
+        let profile = self
+            .llm_profile
+            .clone()
+            .unwrap_or_else(|| self.default_profile_name.clone());
         self.mode = AppMode::Thinking;
         self.agent_running = true;
         self.pending_input = Some(input);
-        self.active_session_mut().pending_llm_profile = self.llm_profile.clone();
+        self.active_session_mut().pending_llm_profile = Some(profile);
     }
 
     /// Append a message to the history and bump [`message_rev`](Self::message_rev).
@@ -2162,8 +2166,7 @@ impl App {
                             s.cost_usd = Some((total * 10000.0).round() / 10000.0);
                         }
                         let profile_key = s.pending_llm_profile.clone().unwrap_or_else(|| {
-                            debug_assert!(false, "pending_llm_profile was None — begin_agent_request was not called");
-                            warn!("pending_llm_profile was None — usage attributed to default");
+                            warn!("pending_llm_profile is None — usage attributed to default profile");
                             self.default_profile_name.clone()
                         });
                         let pu = s.per_profile.entry(profile_key.clone()).or_default();
@@ -5393,7 +5396,6 @@ mod tests {
     #[test]
     fn token_counter_is_per_session() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.active_session_mut().pending_llm_profile = Some("test-profile".into());
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
             event: filar_agent::AgentEvent::TokenUsage { tokens_in: 10, tokens_out: 20, cost: None, model: None },
@@ -5487,5 +5489,20 @@ mod tests {
         let ds_usage = app.sessions[0].per_profile.get("ds");
         assert!(ds_usage.map_or(true, |u| u.tokens_in == 0 && u.tokens_out == 0),
             "ds profile must not have usage attributed to it");
+    }
+
+    #[test]
+    fn token_usage_without_pending_falls_back_to_default_not_panic() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.default_profile_name = "fallback-profile".into();
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TokenUsage {
+                tokens_in: 10, tokens_out: 20, cost: None, model: None,
+            },
+        });
+        let pu = app.sessions[0].per_profile.get("fallback-profile").unwrap();
+        assert_eq!(pu.tokens_in, 10);
+        assert_eq!(pu.tokens_out, 20);
     }
 }
