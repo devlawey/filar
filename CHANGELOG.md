@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- `Ctrl+O` cycles through SSH targets defined in `config.toml` (plus `local`),
+  showing the target alias in the status bar and reconnecting only the active tab
+  ([#200](https://github.com/devlawey/filar/issues/200)).
+
 ## [0.7.4] - 2026-07-31
 
 ### Fixed
