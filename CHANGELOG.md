@@ -20,6 +20,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   the password resolved from the OS credential store, environment, or an
   interactive prompt ([#201](https://github.com/devlawey/filar/issues/201)).
 
+### Changed
+
+- `^O` now appears in the hint bar and F1 reference, and the README covers
+  `[[ssh_targets]]`, host cycling, and password storage
+  ([#202](https://github.com/devlawey/filar/issues/202)).
+
 ## [0.7.4] - 2026-07-31
 
 ### Fixed

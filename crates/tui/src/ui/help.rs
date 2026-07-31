@@ -193,6 +193,12 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
             available: |m| m == AppMode::Normal,
         },
         HelpEntry {
+            key: "^O",
+            desc: "Cycle through configured SSH targets (local + [[ssh_targets]])",
+            section: "Input",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
             key: "Up / Down",
             desc: "Browse input history",
             section: "Input",

@@ -3658,6 +3658,30 @@ config.toml и логах. Прогон невозможен без SSH-целе
 
 ---
 
+## Issue #202: docs(tui) — показать ^O в подсказках и описать переключение хостов в README
+
+**Milestone:** Filar v0.8.0. **Ветка:** `docs/202-ctrl-o-discoverability`.
+
+**Цель:** новая горячая клавиша бесполезна, если о ней не знают.
+
+**Решение:**
+1. `help_items` в `bars.rs` — `^O host` в Normal режиме.
+2. `help_registry` в `help.rs` — `^O` в секции Input («Cycle through configured SSH targets»).
+3. README — раздел SSH Connection дополнен описанием `Ctrl+O` и `[[ssh_targets]]`,
+   таблица клавиш дополнена.
+4. `SMOKE.md` — добавлен пункт про `Ctrl+O`.
+5. Тест: `normal_mode_help_includes_ctrl_o`.
+
+**Изменённые файлы:**
+- `crates/tui/src/ui/bars.rs` — `help_items` + тест
+- `crates/tui/src/ui/help.rs` — `help_registry`
+- `README.md` — SSH Connection + таблица
+- `docs/SMOKE.md` — строка
+
+**DoD:** `^O` в нижней строке и F1; README соответствует коду; SMOKE дополнен.
+
+---
+
 ## Релиз v0.7.4 (подготовка)
 
 **Дата:** 2026-07-31. **Milestone:** Filar v0.7.4 (1/1 issue, смерджен).
