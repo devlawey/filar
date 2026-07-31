@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-01
+
 ### Added
 
 - `Ctrl+O` cycles through SSH targets defined in `config.toml` (plus `local`),
@@ -362,7 +364,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v0.7.4...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/devlawey/filar/compare/v0.7.4...v0.8.0
 [0.7.4]: https://github.com/devlawey/filar/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/devlawey/filar/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/devlawey/filar/compare/v0.7.1...v0.7.2
