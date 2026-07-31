@@ -629,7 +629,22 @@ impl App {
     fn cycle_ssh_target(&mut self) {
         if self.ssh_targets.is_empty() { return; }
         let list_size = 1 + self.ssh_targets.len();
-        let current = self.ctrl_o_selection.unwrap_or(0);
+        let current = match self.ctrl_o_selection {
+            Some(pos) => pos,
+            None => {
+                // First Ctrl+O press: derive position from the currently
+                // active SSH target so that cycling starts from where the
+                // user actually is, not from local unconditionally.
+                if let Some(ref info) = self.ssh_info {
+                    self.ssh_targets.iter()
+                        .position(|t| format!("{}@{}:{}", t.user, t.host, t.port) == *info)
+                        .map(|i| i + 1) // index 0 = local, targets start at 1
+                        .unwrap_or(0)
+                } else {
+                    0 // local — no SSH info yet.
+                }
+            }
+        };
         let next = (current + 1) % list_size;
         self.ctrl_o_selection = Some(next);
 
