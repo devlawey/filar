@@ -226,6 +226,8 @@ pub struct TuiConfig {
     pub llm_factory: Arc<dyn Fn(&filar_core::LlmProfile, &StaticSecretProvider) -> std::result::Result<Arc<dyn LlmClient>, CoreError> + Send + Sync>,
     /// For validating a profile's API key at Ctrl+L time without building a client.
     pub key_checker: Arc<dyn Fn(&filar_core::LlmProfile) -> Option<String> + Send + Sync>,
+    /// Named SSH targets from config for Ctrl+O cycling.
+    pub ssh_targets: Vec<filar_core::SshTarget>,
     /// Receiver for WARN/ERROR log lines forwarded from the tracing subscriber
     /// (see [`crate::log_layer`]). The runner polls it and shows each line as a
     /// `System` block, so important logs surface in the chat instead of being
@@ -312,11 +314,13 @@ async fn run_app(
         );
         a.profiles = profiles_for_restore;
         a.default_profile_name = default_for_restore;
+        a.ssh_targets = config.ssh_targets.clone();
         a
     } else {
         let mut a = App::new(config.target_name.clone(), config.confirm_mode);
         a.profiles = profiles_for_restore;
         a.default_profile_name = default_for_restore;
+        a.ssh_targets = config.ssh_targets.clone();
         if let Some(s) = a.sessions.first_mut() {
             s.llm_profile = Some(config.llm_profile.clone());
         }
@@ -707,6 +711,83 @@ async fn run_app(
                         });
                     }
                 }
+
+        // ── Ctrl+O delayed host connection ─────────────────────────
+        if app.ctrl_o_needs_connect {
+            app.ctrl_o_needs_connect = false;
+            let token = CancellationToken::new();
+            app.ctrl_o_cancel = Some(token.clone());
+            let selection = app.ctrl_o_selection;
+            let targets = app.ssh_targets.clone();
+            let sid = app.sessions[app.active].id;
+            let exec_entry = executors.get(&sid)
+                .map(|e| (e.executor.clone(), e.ssh_target.clone()));
+            let tx = agent_tx.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = token.cancelled() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                }
+                if let Some(idx) = selection {
+                    if idx == 0 {
+                        // Switch to local.
+                        let local_exec = match filar_transport::LocalExecutor::new().await {
+                            Ok(exec) => exec,
+                            Err(e) => {
+                                let _ = tx.send(TuiEvent::Agent {
+                                    session_id: sid,
+                                    event: filar_agent::AgentEvent::Error(format!("Failed to create local executor: {e}")),
+                                });
+                                return;
+                            }
+                        };
+                        if let Some((ref exec, ref st)) = exec_entry {
+                            exec.swap_executor(Arc::new(local_exec) as Arc<dyn CommandExecutor>).await;
+                            *st.write().await = None;
+                        }
+                        let _ = tx.send(TuiEvent::TransportChanged {
+                            session_id: sid, is_local: true, ssh_info: None,
+                        });
+                        return;
+                    }
+                    if let Some(t) = targets.get(idx - 1) {
+                        if matches!(t.auth, filar_core::SshAuth::Password { .. }) {
+                            let _ = tx.send(TuiEvent::Agent {
+                                session_id: sid,
+                                event: filar_agent::AgentEvent::Error(format!(
+                                    "Target '{}' requires a password. Ctrl+O is not yet supported for password targets. Use !ssh for this host.", t.name
+                                )),
+                            });
+                            return;
+                        }
+                        let target = t.clone();
+                        let new_info = format!("{}@{}:{}", target.user, target.host, target.port);
+                        match filar_transport::SshExecutor::connect(&target).await {
+                            Ok(ssh_exec) => {
+                                if let Some((ref exec, ref st)) = exec_entry {
+                                    exec.swap_executor(Arc::new(ssh_exec) as Arc<dyn CommandExecutor>).await;
+                                    *st.write().await = Some(target);
+                                }
+                                let alias = t.name.clone();
+                                let _ = tx.send(TuiEvent::TransportChanged {
+                                    session_id: sid, is_local: false, ssh_info: Some(new_info),
+                                });
+                                let _ = tx.send(TuiEvent::Agent {
+                                    session_id: sid,
+                                    event: filar_agent::AgentEvent::Finished(format!("Connected to {}", alias)),
+                                });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(TuiEvent::Agent {
+                                    session_id: sid,
+                                    event: filar_agent::AgentEvent::Error(format!("SSH connection failed: {e}")),
+                                });
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         // Teardown backends for tabs closed via Ctrl+W / close_tab.
         // App only signals the SessionId; runner executes the async close.

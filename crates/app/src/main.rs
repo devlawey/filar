@@ -542,6 +542,7 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }),
+        ssh_targets: config.ssh_targets.clone(),
     };
 
     info!("launching TUI");

@@ -202,6 +202,14 @@ pub struct App {
     pub default_profile_name: String,
     /// Validate that a profile's API key is available (None = ok, Some = error msg).
     pub key_checker: Option<Arc<dyn Fn(&filar_core::LlmProfile) -> Option<String> + Send + Sync>>,
+    /// Named SSH targets from config, for Ctrl+O cycling.
+    pub ssh_targets: Vec<filar_core::SshTarget>,
+    /// Current position in the Ctrl+O cycle. None = not yet selected.
+    pub ctrl_o_selection: Option<usize>,
+    /// Whether a delayed Ctrl+O connection is pending (runner picks this up).
+    pub ctrl_o_needs_connect: bool,
+    /// Cancellation token for an in-flight Ctrl+O connection attempt.
+    pub ctrl_o_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -364,6 +372,10 @@ impl App {
             profiles: Vec::new(),
             default_profile_name: String::new(),
             key_checker: None,
+            ssh_targets: Vec::new(),
+            ctrl_o_selection: None,
+            ctrl_o_needs_connect: false,
+            ctrl_o_cancel: None,
         }
     }
 
@@ -611,6 +623,28 @@ impl App {
         self.active_session_mut().pending_llm_profile = Some(profile);
     }
 
+    /// Advance to the next SSH target (`local` → named targets → `local`) and
+    /// schedule a delayed connection. The alias is shown immediately with a `~`
+    /// prefix until the connection succeeds.
+    fn cycle_ssh_target(&mut self) {
+        if self.ssh_targets.is_empty() { return; }
+        let list_size = 1 + self.ssh_targets.len();
+        let current = self.ctrl_o_selection.unwrap_or(0);
+        let next = (current + 1) % list_size;
+        self.ctrl_o_selection = Some(next);
+
+        let alias = if next == 0 {
+            "~local".to_string()
+        } else {
+            format!("~{}", self.ssh_targets[next - 1].name)
+        };
+        self.target_name = alias;
+        self.ctrl_o_needs_connect = true;
+        if let Some(tok) = self.ctrl_o_cancel.take() {
+            tok.cancel();
+        }
+    }
+
     /// Append a message to the history and bump [`message_rev`](Self::message_rev).
     ///
     /// All mutations of `messages` must go through this method (or explicitly
@@ -849,6 +883,12 @@ impl App {
                 format!("Switched to LLM profile: {}", switched_name)
             };
             self.push_message(ChatBlock::System(msg));
+            return;
+        }
+
+        // Ctrl+O — cycle SSH targets (local + named targets from config).
+        if ctrl_key('o', 'щ') && self.mode == AppMode::Normal {
+            self.cycle_ssh_target();
             return;
         }
 
@@ -5504,5 +5544,54 @@ mod tests {
         let pu = app.sessions[0].per_profile.get("fallback-profile").unwrap();
         assert_eq!(pu.tokens_in, 10);
         assert_eq!(pu.tokens_out, 20);
+    }
+
+    // ── Ctrl+O host cycling tests (#200) ──────────────────────────────
+
+    fn make_ssh_target(name: &str) -> filar_core::SshTarget {
+        filar_core::SshTarget {
+            name: name.into(), host: "host".into(), port: 22, user: "user".into(),
+            auth: filar_core::SshAuth::Agent,
+            host_key_policy: filar_core::HostKeyPolicy::Tofu,
+        }
+    }
+
+    #[test]
+    fn ctrl_o_cycles_local_to_targets_and_back() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![make_ssh_target("srv-a"), make_ssh_target("srv-b")];
+        // First press: local → srv-a.
+        app.cycle_ssh_target();
+        assert_eq!(app.target_name, "~srv-a");
+        assert!(app.ctrl_o_needs_connect);
+        // Second press: srv-a → srv-b.
+        app.cycle_ssh_target();
+        assert_eq!(app.target_name, "~srv-b");
+        // Third press: srv-b → local.
+        app.cycle_ssh_target();
+        assert_eq!(app.target_name, "~local");
+        // Fourth press: local → srv-a (wrap around).
+        app.cycle_ssh_target();
+        assert_eq!(app.target_name, "~srv-a");
+    }
+
+    #[test]
+    fn ctrl_o_noop_when_no_targets() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![];
+        let before = app.target_name.clone();
+        app.cycle_ssh_target();
+        assert_eq!(app.target_name, before);
+        assert!(!app.ctrl_o_needs_connect);
+    }
+
+    #[test]
+    fn ctrl_o_cancels_previous_token() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![make_ssh_target("srv-a")];
+        let token = tokio_util::sync::CancellationToken::new();
+        app.ctrl_o_cancel = Some(token.clone());
+        app.cycle_ssh_target();
+        assert!(token.is_cancelled(), "previous connection attempt must be cancelled");
     }
 }
