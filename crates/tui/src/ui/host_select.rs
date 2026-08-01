@@ -32,6 +32,68 @@ pub(crate) fn render_host_select(f: &mut Frame, app: &App, area: Rect) {
     // Build list items.
     let mut items: Vec<ListItem> = Vec::new();
 
+    if app.ssh_targets.is_empty() {
+        // Diagnostic: inform the user why only local is shown.
+        let msg = Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "No [[ssh_targets]] found in config.toml.",
+                app.theme.warning_fg(),
+            ),
+        ]);
+        items.push(ListItem::new(msg));
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "Add targets like:",
+                app.theme.muted(),
+            ),
+        ])));
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "  [[ssh_targets]]",
+                app.theme.dim(),
+            ),
+        ])));
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "  name = \"my-server\"",
+                app.theme.dim(),
+            ),
+        ])));
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "  host = \"...\"",
+                app.theme.dim(),
+            ),
+        ])));
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "  user = \"root\"",
+                app.theme.dim(),
+            ),
+        ])));
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "  [ssh_targets.auth]",
+                app.theme.dim(),
+            ),
+        ])));
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "  type = \"agent\"",
+                app.theme.dim(),
+            ),
+        ])));
+        items.push(ListItem::new("")); // blank line
+    }
+
     // Item 0: local
     let local_marker = if app.ssh_info.is_none() { " \u{25cf}" } else { "  " };
     let cursor = if app.host_select_index == 0 { "\u{25b6}" } else { " " };

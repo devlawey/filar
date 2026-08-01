@@ -635,12 +635,12 @@ impl App {
         self.active_session_mut().pending_llm_profile = Some(profile);
     }
 
-    /// Advance to the next SSH target (`local` → named targets → `local`) and
-    /// schedule a delayed connection. The alias is shown immediately with a `~`
-    /// prefix until the connection succeeds.
     /// Open the host-selection overlay. The cursor starts on the currently
     /// active SSH target (or `local` if not connected via SSH).
     fn open_host_select(&mut self) {
+        if self.ssh_targets.is_empty() {
+            self.push_message(ChatBlock::System("No [[ssh_targets]] configured. Add targets in config.toml, then restart filar.\nSyntax: [[ssh_targets]] + name/host/user + [ssh_targets.auth] type = \"agent\"".into()));
+        }
         let list_size = 1 + self.ssh_targets.len();
         // Derive current position from the active SSH target.
         let current = if let Some(ref info) = self.ssh_info {
