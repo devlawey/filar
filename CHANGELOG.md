@@ -11,6 +11,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Changed
+
+- `Ctrl+O` now opens a visual host-selection overlay instead of cycling targets
+  instantly. The overlay lists `local` plus all `[[ssh_targets]]` with navigation
+  via arrow keys, `Enter` to select, and `Esc` to cancel
+  ([#206](https://github.com/devlawey/filar/issues/206)).
+
 ## [0.8.0] - 2026-08-01
 
 ### Added
