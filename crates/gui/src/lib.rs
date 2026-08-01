@@ -398,12 +398,8 @@ fn save_config_toml(settings: &Settings) {
         config.llm_profiles = settings.profiles.clone();
     }
 
-    // Sync launcher SSH profiles to [[ssh_targets]] (only if at least one
-    // profile is non-empty — prevents accidentally clearing targets when
-    // the GUI is opened with all SSH slots empty).
-    if settings.ssh_profiles.iter().any(|p| !p.host.is_empty()) {
-        config.ssh_targets = merge_ssh_targets(&config.ssh_targets, &settings.ssh_profiles);
-    }
+    // Sync launcher SSH profiles to [[ssh_targets]].
+    config.ssh_targets = merge_ssh_targets(&config.ssh_targets, &settings.ssh_profiles);
 
     if let Err(e) = std::fs::create_dir_all(&app_dir) {
         tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");
