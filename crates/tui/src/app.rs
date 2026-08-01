@@ -665,7 +665,10 @@ impl App {
         let alias = if idx == 0 {
             "~local".to_string()
         } else {
-            format!("~{}", self.ssh_targets.get(idx - 1).expect("host_select_index out of range").name)
+            match self.ssh_targets.get(idx - 1) {
+                Some(t) => format!("~{}", t.name),
+                None => return, // index out of range — shouldn't happen, safe no-op
+            }
         };
         self.target_name = alias;
         self.ctrl_o_needs_connect = true;
