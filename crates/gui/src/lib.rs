@@ -293,11 +293,57 @@ impl Settings {
     }
 }
 
-/// Write `[llm]` settings to `config.toml` in `%APPDATA%\filar\`
-/// so `filar-tui` invoked without the GUI launcher picks them up.
+// ---------------------------------------------------------------------------
+// SSH target merge
+// ---------------------------------------------------------------------------
+
+/// Merge launcher SSH profiles into the existing `[[ssh_targets]]` list.
 ///
-/// If a config.toml already exists, only the `[llm]` section is updated;
-/// other sections (SSH targets, profiles, etc.) are preserved.
+/// Launcher-created targets are identified by name `"SSH{n}"` (1..5) or by
+/// their `alias`. Non-empty profiles become `SshTarget` entries; empty slots
+/// are skipped. Manually-added targets (not matching `"SSH{n}"`) are preserved.
+///
+/// This is a free function so it can be unit-tested independently of
+/// `save_config_toml`.
+fn merge_ssh_targets(
+    existing: &[filar_core::SshTarget],
+    profiles: &[SshProfile],
+) -> Vec<filar_core::SshTarget> {
+    let launcher_names: std::collections::HashSet<String> = (1..=SSH_SLOTS)
+        .map(|i| format!("SSH{}", i))
+        .collect();
+    let mut merged: Vec<filar_core::SshTarget> = existing
+        .iter()
+        .filter(|t| !launcher_names.contains(&t.name))
+        .cloned()
+        .collect();
+    for (i, profile) in profiles.iter().enumerate() {
+        if profile.host.is_empty() { continue; }
+        let name = if profile.alias.is_empty() {
+            format!("SSH{}", i + 1)
+        } else {
+            profile.alias.clone()
+        };
+        let port: u16 = profile.port.parse().unwrap_or(22);
+        merged.push(filar_core::SshTarget {
+            name,
+            host: profile.host.clone(),
+            port,
+            user: profile.user.clone(),
+            auth: filar_core::SshAuth::Agent,
+            host_key_policy: filar_core::HostKeyPolicy::Tofu,
+        });
+    }
+    merged
+}
+
+/// Write `[llm]` and `[[ssh_targets]]` settings to `config.toml` in
+/// `%APPDATA%\filar\` so `filar-tui` invoked without the GUI launcher picks
+/// them up.
+///
+/// If a `config.toml` already exists, only the `[llm]` and `[[ssh_targets]]`
+/// sections are updated; manually-added `[[llm_profiles]]` and `[[ssh_targets]]`
+/// (not matching launcher slot names) are preserved.
 fn save_config_toml(settings: &Settings) {
     let base = match filar_core::default_base_dir() {
         Ok(b) => b,
@@ -306,8 +352,7 @@ fn save_config_toml(settings: &Settings) {
     let app_dir = base.join("filar");
     let path = app_dir.join("config.toml");
 
-    // Only save if there's something to write.
-    if settings.model.is_empty() && settings.profiles.is_empty() {
+    if settings.model.is_empty() && settings.profiles.is_empty() && settings.ssh_profiles.iter().all(|p| p.host.is_empty()) {
         return;
     }
 
@@ -339,6 +384,9 @@ fn save_config_toml(settings: &Settings) {
     if !settings.profiles.is_empty() {
         config.llm_profiles = settings.profiles.clone();
     }
+
+    // Sync launcher SSH profiles to [[ssh_targets]].
+    config.ssh_targets = merge_ssh_targets(&config.ssh_targets, &settings.ssh_profiles);
 
     if let Err(e) = std::fs::create_dir_all(&app_dir) {
         tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");
@@ -982,6 +1030,44 @@ mod tests {
         assert!(result.contains("dev"), "ssh target name must survive");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_save_writes_launcher_ssh_profiles() {
+        let existing: Vec<filar_core::SshTarget> = vec![];
+        let profiles = vec![
+            SshProfile { host: "10.0.0.1".into(), port: "2222".into(), user: "admin".into(), alias: String::new(), save_password: false },
+            SshProfile { host: "10.0.0.2".into(), port: "22".into(), user: "root".into(), alias: "prod-web".into(), save_password: true },
+            SshProfile::default(), // empty slot — skipped
+            SshProfile::default(),
+            SshProfile::default(),
+        ];
+        let result = merge_ssh_targets(&existing, &profiles);
+        assert_eq!(result.len(), 2, "only non-empty profiles become targets");
+        assert_eq!(result[0].name, "SSH1", "no alias → uses slot name");
+        assert_eq!(result[0].host, "10.0.0.1");
+        assert_eq!(result[0].port, 2222);
+        assert_eq!(result[1].name, "prod-web", "alias overrides slot name");
+        assert_eq!(result[1].host, "10.0.0.2");
+        assert_eq!(result[1].port, 22);
+    }
+
+    #[test]
+    fn merge_preserves_manual_targets() {
+        let existing = vec![
+            filar_core::SshTarget {
+                name: "my-server".into(), host: "192.168.1.1".into(), port: 22, user: "root".into(),
+                auth: filar_core::SshAuth::Agent, host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            },
+        ];
+        let profiles = vec![
+            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: String::new(), save_password: false },
+            SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
+        ];
+        let result = merge_ssh_targets(&existing, &profiles);
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().any(|t| t.name == "my-server"), "manual target must survive");
+        assert!(result.iter().any(|t| t.name == "SSH1"), "launcher target must be added");
     }
 
     #[test]
