@@ -336,7 +336,11 @@ fn merge_ssh_targets(
         };
         if seen.contains(&name) { continue; }
         seen.insert(name.clone());
-        let port: u16 = profile.port.parse().unwrap_or(22);
+        let port: u16 = profile.port.parse().unwrap_or_else(|_| {
+            tracing::warn!(port = %profile.port, slot = i + 1, "invalid SSH port — using 22");
+            22
+        });
+        let port = if port == 0 { 22 } else { port };
         merged.push(filar_core::SshTarget {
             name,
             host: profile.host.clone(),
@@ -394,8 +398,12 @@ fn save_config_toml(settings: &Settings) {
         config.llm_profiles = settings.profiles.clone();
     }
 
-    // Sync launcher SSH profiles to [[ssh_targets]].
-    config.ssh_targets = merge_ssh_targets(&config.ssh_targets, &settings.ssh_profiles);
+    // Sync launcher SSH profiles to [[ssh_targets]] (only if at least one
+    // profile is non-empty — prevents accidentally clearing targets when
+    // the GUI is opened with all SSH slots empty).
+    if settings.ssh_profiles.iter().any(|p| !p.host.is_empty()) {
+        config.ssh_targets = merge_ssh_targets(&config.ssh_targets, &settings.ssh_profiles);
+    }
 
     if let Err(e) = std::fs::create_dir_all(&app_dir) {
         tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");
@@ -1080,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_removes_old_alias_when_alias_changes() {
+    fn merge_adds_new_target_when_alias_changes_old_survives_as_manual() {
         let existing = vec![filar_core::SshTarget {
             name: "prod-web".into(), host: "10.0.0.1".into(), port: 22, user: "admin".into(),
             auth: filar_core::SshAuth::Agent, host_key_policy: filar_core::HostKeyPolicy::Tofu,
