@@ -3682,6 +3682,39 @@ config.toml и логах. Прогон невозможен без SSH-целе
 
 ---
 
+## Issue #206: feat(tui) — оверлей выбора SSH-хоста по Ctrl+O
+
+**Milestone:** Filar v0.8.1. **Ветка:** `feat/206-host-select-overlay`.
+
+**Симптом:** мгновенный цикл `Ctrl+O` не срабатывал (вероятно, `ssh_targets` не доходили
+до `App`). UX цикла также неудобен — нет визуального списка.
+
+**Решение:**
+1. `AppMode::HostSelect` — новый режим. `host_select_visible: bool`,
+   `host_select_index: usize` на `App`.
+2. `Ctrl+O` → `open_host_select()`: открывает оверлей, курсор на текущем хосте.
+3. Навигация: `↑`/`↓` (или `k`/`j`) — перемещение, без зацикливания.
+4. `Enter` → `select_host()`: закрывает оверлей, выставляет `ctrl_o_selection`,
+   `target_name` с `~`, `ctrl_o_needs_connect = true`, отменяет предыдущий токен.
+5. `Esc` — отмена без изменений.
+6. Рендеринг (`ui/host_select.rs`): центрированный блок, список `local` + цели,
+   маркеры `▶` (курсор) и `●` (текущий хост), тип аутентификации `[Agent]/[Key]/[Password]`.
+7. `cycle_ssh_target()` удалён, заменён на `open_host_select()` + `select_host()`.
+8. Оверлей рендерится поверх обоих режимов (Normal + Interactive).
+
+**Изменённые файлы:**
+- `crates/tui/src/app.rs` — AppMode, поля, open_host_select, select_host, handler, 7 тестов
+- `crates/tui/src/ui/host_select.rs` — новый файл, рендеринг оверлея
+- `crates/tui/src/ui/mod.rs` — модуль + рендеринг в обоих путях
+- `crates/tui/src/ui/bars.rs` — HostSelect в match
+- `crates/tui/src/ui/input.rs` — HostSelect в match
+- `crates/tui/src/ui/theme.rs` — HostSelect в match
+
+**DoD:** `Ctrl+O` → оверлей с списком; `↑↓` навигация; `Enter` → подключение;
+`Esc` → отмена; пустой список → `local` + оверлей.
+
+---
+
 ## Релиз v0.8.0 (подготовка)
 
 **Дата:** 2026-08-01. **Milestone:** Filar v0.8.0 (3/3 issue, все смерджены).

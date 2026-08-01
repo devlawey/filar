@@ -39,6 +39,8 @@ pub enum AppMode {
     Interactive,
     /// Secure password input mode — input is masked with asterisks.
     PasswordInput,
+    /// Host selection overlay — user picks an SSH target from a list.
+    HostSelect,
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +216,10 @@ pub struct App {
     pub ctrl_o_pending_target: Option<filar_core::SshTarget>,
     /// Session ID of the tab that initiated a password-needed connection.
     pub ctrl_o_pending_session_id: Option<SessionId>,
+    /// Whether the host-selection overlay is visible.
+    pub host_select_visible: bool,
+    /// Cursor position in the host-selection overlay.
+    pub host_select_index: usize,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -382,6 +388,8 @@ impl App {
             ctrl_o_cancel: None,
             ctrl_o_pending_target: None,
             ctrl_o_pending_session_id: None,
+            host_select_visible: false,
+            host_select_index: 0,
         }
     }
 
@@ -632,35 +640,34 @@ impl App {
     /// Advance to the next SSH target (`local` → named targets → `local`) and
     /// schedule a delayed connection. The alias is shown immediately with a `~`
     /// prefix until the connection succeeds.
-    fn cycle_ssh_target(&mut self) {
-        if self.ssh_targets.is_empty() { return; }
+    /// Open the host-selection overlay. The cursor starts on the currently
+    /// active SSH target (or `local` if not connected via SSH).
+    fn open_host_select(&mut self) {
         let list_size = 1 + self.ssh_targets.len();
-        let current = match self.ctrl_o_selection {
-            Some(pos) => pos,
-            None => {
-                // First Ctrl+O press: derive position from the currently
-                // active SSH target so that cycling starts from where the
-                // user actually is, not from local unconditionally.
-                if let Some(ref info) = self.ssh_info {
-                    self.ssh_targets.iter()
-                        .position(|t| format!("{}@{}:{}", t.user, t.host, t.port) == *info)
-                        .map(|i| i + 1) // index 0 = local, targets start at 1
-                        .unwrap_or_else(|| {
-                            warn!("active SSH target not found in config — starting Ctrl+O cycle from local");
-                            0
-                        })
-                } else {
-                    0 // local — no SSH info yet.
-                }
-            }
+        // Derive current position from the active SSH target.
+        let current = if let Some(ref info) = self.ssh_info {
+            self.ssh_targets.iter()
+                .position(|t| format!("{}@{}:{}", t.user, t.host, t.port) == *info)
+                .map(|i| i + 1)
+                .unwrap_or(0)
+        } else {
+            0
         };
-        let next = (current + 1) % list_size;
-        self.ctrl_o_selection = Some(next);
+        self.host_select_index = current.min(list_size.saturating_sub(1));
+        self.host_select_visible = true;
+    }
 
-        let alias = if next == 0 {
+    /// Confirm the host selection from the overlay: close it and trigger
+    /// a delayed connection to the chosen target.
+    fn select_host(&mut self) {
+        let idx = self.host_select_index;
+        self.host_select_visible = false;
+        self.ctrl_o_selection = Some(idx);
+
+        let alias = if idx == 0 {
             "~local".to_string()
         } else {
-            format!("~{}", self.ssh_targets[next - 1].name)
+            format!("~{}", self.ssh_targets.get(idx - 1).map(|t| t.name.as_str()).unwrap_or("?"))
         };
         self.target_name = alias;
         self.ctrl_o_needs_connect = true;
@@ -910,9 +917,33 @@ impl App {
             return;
         }
 
-        // Ctrl+O — cycle SSH targets (local + named targets from config).
+        // Ctrl+O — open host selection overlay.
         if ctrl_key('o', 'щ') && self.mode == AppMode::Normal {
-            self.cycle_ssh_target();
+            self.open_host_select();
+            return;
+        }
+
+        // When the host-selection overlay is visible, only navigation and
+        // select/cancel keys are processed; all other keys are consumed.
+        if self.host_select_visible {
+            let list_size = 1 + self.ssh_targets.len();
+            match key.code {
+                KeyCode::Esc => {
+                    self.host_select_visible = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.host_select_index = self.host_select_index.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.host_select_index + 1 < list_size {
+                        self.host_select_index += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    self.select_host();
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -977,7 +1008,7 @@ impl App {
         }
 
         match self.mode {
-            AppMode::Normal => match key.code {
+            AppMode::Normal | AppMode::HostSelect => match key.code {
                 KeyCode::Enter => {
                     let text = self.input.trim().to_string();
                     if !text.is_empty() {
@@ -5582,7 +5613,7 @@ mod tests {
         assert_eq!(pu.tokens_out, 20);
     }
 
-    // ── Ctrl+O host cycling tests (#200) ──────────────────────────────
+    // ── Ctrl+O host selection overlay tests (#206) ────────────────────
 
     fn make_ssh_target(name: &str) -> filar_core::SshTarget {
         filar_core::SshTarget {
@@ -5593,63 +5624,107 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_o_cycles_local_to_targets_and_back() {
+    fn ctrl_o_opens_host_select_overlay() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.ssh_targets = vec![make_ssh_target("srv-a"), make_ssh_target("srv-b")];
-        // First press: local → srv-a.
-        app.cycle_ssh_target();
-        assert_eq!(app.target_name, "~srv-a");
-        assert!(app.ctrl_o_needs_connect);
-        // Second press: srv-a → srv-b.
-        app.cycle_ssh_target();
-        assert_eq!(app.target_name, "~srv-b");
-        // Third press: srv-b → local.
-        app.cycle_ssh_target();
-        assert_eq!(app.target_name, "~local");
-        // Fourth press: local → srv-a (wrap around).
-        app.cycle_ssh_target();
-        assert_eq!(app.target_name, "~srv-a");
+        app.open_host_select();
+        assert!(app.host_select_visible);
+        // Cursor starts at 0 (local) since no SSH connection active.
+        assert_eq!(app.host_select_index, 0);
     }
 
     #[test]
-    fn ctrl_o_noop_when_no_targets() {
+    fn host_select_navigate_down_then_up() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.ssh_targets = vec![];
-        let before = app.target_name.clone();
-        app.cycle_ssh_target();
-        assert_eq!(app.target_name, before);
-        assert!(!app.ctrl_o_needs_connect);
+        app.ssh_targets = vec![make_ssh_target("srv-a"), make_ssh_target("srv-b")];
+        app.open_host_select();
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        // Down → srv-a.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.host_select_index, 1);
+        // Down → srv-b.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.host_select_index, 2);
+        // Down → stays at last (no wrap).
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.host_select_index, 2);
+        // Up → srv-a.
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.host_select_index, 1);
+        // Up → local.
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.host_select_index, 0);
+        // Up → stays at 0 (no wrap).
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.host_select_index, 0);
     }
 
     #[test]
-    fn ctrl_o_cancels_previous_token() {
+    fn host_select_enter_triggers_connect() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![make_ssh_target("srv-a")];
+        app.open_host_select();
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        // Navigate to srv-a.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        // Enter → select.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.host_select_visible, "overlay must close on Enter");
+        assert_eq!(app.target_name, "~srv-a");
+        assert!(app.ctrl_o_needs_connect, "connect must be triggered");
+        assert_eq!(app.ctrl_o_selection, Some(1));
+    }
+
+    #[test]
+    fn host_select_esc_cancels() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![make_ssh_target("srv-a")];
+        let before = app.target_name.clone();
+        app.open_host_select();
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.host_select_visible, "overlay must close on Esc");
+        assert_eq!(app.target_name, before, "target_name must be unchanged on cancel");
+        assert!(!app.ctrl_o_needs_connect, "no connect on cancel");
+    }
+
+    #[test]
+    fn host_select_enter_local_selects_local() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![make_ssh_target("srv-a")];
+        app.open_host_select();
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        // Stay at index 0 (local) and press Enter.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.target_name, "~local");
+        assert!(app.ctrl_o_needs_connect);
+        assert_eq!(app.ctrl_o_selection, Some(0));
+    }
+
+    #[test]
+    fn host_select_cancels_previous_token_on_select() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.ssh_targets = vec![make_ssh_target("srv-a")];
         let token = tokio_util::sync::CancellationToken::new();
         app.ctrl_o_cancel = Some(token.clone());
-        app.cycle_ssh_target();
-        assert!(token.is_cancelled(), "previous connection attempt must be cancelled");
+        app.open_host_select();
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(token.is_cancelled(), "previous token must be cancelled on select");
     }
 
     #[test]
-    fn ctrl_o_per_tab_independent() {
+    fn host_select_empty_targets_shows_local() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.ssh_targets = vec![make_ssh_target("srv-a"), make_ssh_target("srv-b")];
-        // Tab 0: cycle once to land on first target.
-        app.cycle_ssh_target();
-        let tab0_name = app.target_name.clone();
-        // Create tab 1 and switch (set active directly — switch_to_tab subtracts 1).
-        app.new_tab();
-        app.active = 1;
-        app.cycle_ssh_target(); // first press on fresh tab 1
-        let tab1_name = app.target_name.clone();
-        // Switch back to tab 0 — its target_name must be unchanged.
-        app.active = 0;
-        assert_eq!(app.target_name, tab0_name, "tab 0 target_name unchanged after tab 1 cycle");
-        // Tab 1's target_name must be different and not local.
-        app.active = 1;
-        assert_eq!(app.target_name, tab1_name, "tab 1 target_name unchanged after switch");
-        assert!(!tab1_name.starts_with("~local"), "tab 1 should have cycled to a target");
+        app.ssh_targets = vec![];
+        app.open_host_select();
+        assert!(app.host_select_visible);
+        assert_eq!(app.host_select_index, 0);
+        // Select local.
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.target_name, "~local");
     }
 
     #[test]
