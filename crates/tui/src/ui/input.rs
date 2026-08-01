@@ -14,7 +14,7 @@ pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
     app.input_area = area;
 
     match app.mode {
-        AppMode::Normal | AppMode::HostSelect => render_normal_input(f, app, area),
+        AppMode::Normal => render_normal_input(f, app, area),
         AppMode::Thinking => render_thinking(f, app, area),
         AppMode::Confirming => render_confirm(f, app, area),
         AppMode::Interactive => {

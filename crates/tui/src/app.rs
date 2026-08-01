@@ -39,8 +39,6 @@ pub enum AppMode {
     Interactive,
     /// Secure password input mode — input is masked with asterisks.
     PasswordInput,
-    /// Host selection overlay — user picks an SSH target from a list.
-    HostSelect,
 }
 
 // ---------------------------------------------------------------------------
@@ -204,9 +202,9 @@ pub struct App {
     pub default_profile_name: String,
     /// Validate that a profile's API key is available (None = ok, Some = error msg).
     pub key_checker: Option<Arc<dyn Fn(&filar_core::LlmProfile) -> Option<String> + Send + Sync>>,
-    /// Named SSH targets from config, for Ctrl+O cycling.
+    /// Named SSH targets from config, selectable via the Ctrl+O overlay.
     pub ssh_targets: Vec<filar_core::SshTarget>,
-    /// Current position in the Ctrl+O cycle. None = not yet selected.
+    /// Index of the last selection made in the Ctrl+O host-selection overlay.
     pub ctrl_o_selection: Option<usize>,
     /// Whether a delayed Ctrl+O connection is pending (runner picks this up).
     pub ctrl_o_needs_connect: bool,
@@ -667,7 +665,7 @@ impl App {
         let alias = if idx == 0 {
             "~local".to_string()
         } else {
-            format!("~{}", self.ssh_targets.get(idx - 1).map(|t| t.name.as_str()).unwrap_or("?"))
+            format!("~{}", self.ssh_targets.get(idx - 1).expect("host_select_index out of range").name)
         };
         self.target_name = alias;
         self.ctrl_o_needs_connect = true;
@@ -918,7 +916,7 @@ impl App {
         }
 
         // Ctrl+O — open host selection overlay.
-        if ctrl_key('o', 'щ') && self.mode == AppMode::Normal {
+        if ctrl_key('o', 'щ') && self.mode == AppMode::Normal && !self.host_select_visible {
             self.open_host_select();
             return;
         }
@@ -1008,7 +1006,7 @@ impl App {
         }
 
         match self.mode {
-            AppMode::Normal | AppMode::HostSelect => match key.code {
+            AppMode::Normal => match key.code {
                 KeyCode::Enter => {
                     let text = self.input.trim().to_string();
                     if !text.is_empty() {
@@ -1385,6 +1383,11 @@ impl App {
 
         // When the help overlay is visible, consume all mouse events.
         if self.help_overlay_visible {
+            return;
+        }
+
+        // When the host-selection overlay is visible, consume all mouse events.
+        if self.host_select_visible {
             return;
         }
 

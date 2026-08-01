@@ -20,7 +20,7 @@ struct HelpItem {
 /// Return the help-bar items for the current mode.
 fn help_items(mode: AppMode) -> Vec<HelpItem> {
     match mode {
-        AppMode::Normal | AppMode::HostSelect => vec![
+        AppMode::Normal => vec![
             HelpItem { key: "enter", desc: "send", action: Some(HelpAction::Send) },
             HelpItem { key: "F1", desc: "help", action: None },
             HelpItem { key: "!", desc: "shell", action: Some(HelpAction::Shell) },
@@ -83,7 +83,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Mode indicator — only shown for non-Normal modes.
     let mode_text = match app.mode {
-        AppMode::Normal | AppMode::HostSelect => None,
+        AppMode::Normal => None,
         AppMode::Thinking => {
             let spinner = app.spinner_char();
             Some(format!("{spinner} thinking"))

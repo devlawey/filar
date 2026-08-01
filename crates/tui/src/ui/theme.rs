@@ -238,7 +238,7 @@ impl Theme {
     pub fn mode_color(&self, mode: crate::app::AppMode) -> Color {
         use crate::app::AppMode;
         match mode {
-            AppMode::Normal | AppMode::HostSelect => self.success,
+            AppMode::Normal => self.success,
             AppMode::Thinking => self.warning,
             AppMode::Confirming => self.danger,
             AppMode::Interactive => self.accent,
