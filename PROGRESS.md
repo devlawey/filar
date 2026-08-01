@@ -3715,6 +3715,21 @@ config.toml и логах. Прогон невозможен без SSH-целе
 
 ---
 
+## Issue #207: docs(tui) — обновить описание Ctrl+O под оверлей
+
+**Milestone:** Filar v0.8.1. **Ветка:** `docs/207-ctrl-o-overlay-docs`.
+
+**Решение:**
+1. F1 реестр: «Cycle through configured SSH targets» → «Open host selection overlay»
+2. Хинт-бар: `^O host` → `^O hosts`
+3. README: раздел SSH Connection — описание оверлея с навигацией, таблица клавиш
+4. SMOKE.md: шаги `Ctrl+O` → оверлей → `↑↓` → `Enter` → `Esc`
+5. Тест обновлён: `host` → `hosts`
+
+**DoD:** F1 и хинт-бар соответствуют оверлею; README и SMOKE описывают навигацию.
+
+---
+
 ## Релиз v0.8.0 (подготовка)
 
 **Дата:** 2026-08-01. **Milestone:** Filar v0.8.0 (3/3 issue, все смерджены).

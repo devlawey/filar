@@ -25,7 +25,7 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
             HelpItem { key: "F1", desc: "help", action: None },
             HelpItem { key: "!", desc: "shell", action: Some(HelpAction::Shell) },
             HelpItem { key: "^T", desc: "terminal", action: Some(HelpAction::Terminal) },
-            HelpItem { key: "^O", desc: "host", action: None },
+            HelpItem { key: "^O", desc: "hosts", action: None },
             HelpItem { key: "^P", desc: "password", action: Some(HelpAction::Password) },
             HelpItem { key: "^N", desc: "tab", action: None },
             HelpItem { key: "^W", desc: "close", action: None },
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn normal_mode_help_includes_ctrl_o() {
         let items = help_items(AppMode::Normal);
-        let has_o = items.iter().any(|i| i.key == "^O" && i.desc == "host");
-        assert!(has_o, "Normal mode help must include ^O host");
+        let has_o = items.iter().any(|i| i.key == "^O" && i.desc == "hosts");
+        assert!(has_o, "Normal mode help must include ^O hosts");
     }
 }

@@ -18,6 +18,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   via arrow keys, `Enter` to select, and `Esc` to cancel
   ([#206](https://github.com/devlawey/filar/issues/206)).
 
+### Changed
+
+- `^O` hint bar and F1 reference now describe the host-selection overlay; README
+  and SMOKE.md updated to match
+  ([#207](https://github.com/devlawey/filar/issues/207)).
+
 ## [0.8.0] - 2026-08-01
 
 ### Added

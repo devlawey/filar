@@ -240,7 +240,7 @@ Type `!` followed by a command to run it directly (bypassing the agent):
 | `Ctrl+N` | New local session tab (always local, never inherits another tab's SSH) |
 | `Ctrl+W` | Close active session tab |
 | `Ctrl+L` | Cycle LLM profile for this tab (different model per tab) |
-| `Ctrl+O` | Cycle SSH host for this tab through local + configured `[[ssh_targets]]` |
+| `Ctrl+O` | Open host-selection overlay (local + configured `[[ssh_targets]]`) |
 | `Ctrl+V` | Paste from system clipboard (also via bracketed paste) |
 | `Ctrl+P` | Enter password input mode (masked) |
 | `Up/Down` | Browse agent input history (persisted across sessions since v0.6.1) |
@@ -271,9 +271,10 @@ From the GUI: select an SSH profile and click Launch.
 From the TUI: 
 - Type `!ssh user@host` for one-off connections to hosts not in the configuration, 
   then press `Ctrl+P` to enter the password.
-- Use `Ctrl+O` to cycle through configured `[[ssh_targets]]` (including `local`). 
-  The target alias is shown in the status bar. Each press schedules a connection to 
-  the next target in order; rapid presses only connect to the final target.
+- Use `Ctrl+O` to open a host-selection overlay listing `local` plus all configured
+  `[[ssh_targets]]`. Navigate with `↑`/`↓`, press `Enter` to connect to the selected
+  host, or `Esc` to cancel. The target alias is shown in the status bar with a `~`
+  prefix until the connection succeeds.
 - The connection applies **only to the current tab** — other tabs keep their
   existing connections. Each tab can be connected to a different host, or stay local.
 - When using `[[ssh_targets]]`, SSH passwords are stored in the OS credential store 
