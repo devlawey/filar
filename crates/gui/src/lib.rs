@@ -85,9 +85,21 @@ fn unique_profile_name(existing: &[LlmProfileData], prefix: &str) -> String {
     }
 }
 
-/// Credential key for SSH slot N (0-based).
-fn ssh_cred_name(slot: usize) -> String {
-    format!("ssh{slot}")
+/// Credential key for SSH slot N. Uses the same naming convention as
+/// the TUI runner: `ssh_target:{name}` where name is the alias (or
+/// `SSH{slot+1}` if no alias is set).
+///
+/// **Contract:** the `name` produced here MUST match the `target.name`
+/// field in `build_ssh_targets_from_profiles`, because the runner looks
+/// up the password under `format!("ssh_target:{}", target.name)`.
+/// Both functions use `SSH{slot+1}` as the fallback for empty alias.
+fn ssh_cred_name(slot: usize, alias: &str) -> String {
+    let name = if alias.is_empty() {
+        format!("SSH{}", slot + 1)
+    } else {
+        alias.to_string()
+    };
+    format!("ssh_target:{name}")
 }
 
 /// Migration: fix duplicate profile names and key_env entries in a loaded list.
@@ -421,7 +433,7 @@ struct SshSlot {
 impl SshSlot {
     fn from_profile(p: &SshProfile, slot_idx: usize) -> Self {
         let password = if p.save_password {
-            load_secret(&ssh_cred_name(slot_idx))
+            load_secret(&ssh_cred_name(slot_idx, &p.alias))
         } else {
             String::new()
         };
@@ -722,8 +734,8 @@ impl LauncherApp {
             if !prof.api_key.is_empty() { save_secret(&prof.key_env, &prof.api_key); }
         }
         for (i, slot) in self.ssh_slots.iter().enumerate() {
-            if slot.save_password && !slot.password.is_empty() { save_secret(&ssh_cred_name(i), &slot.password); }
-            else { delete_secret(&ssh_cred_name(i)); }
+            if slot.save_password && !slot.password.is_empty() { save_secret(&ssh_cred_name(i, &slot.alias), &slot.password); }
+            else { delete_secret(&ssh_cred_name(i, &slot.alias)); }
         }
         let session_id = self.selected_session.map(|i| self.sessions[i].id.clone());
         let cfg = LaunchConfig {
@@ -1137,6 +1149,24 @@ mod tests {
         assert_ne!(profiles[0].name, profiles[1].name);
         assert_ne!(profiles[1].name, profiles[2].name);
         assert_ne!(profiles[0].name, profiles[2].name, "all three must be unique after dedup");
+    }
+
+    #[test]
+    fn ssh_cred_name_empty_alias_uses_slot() {
+        assert_eq!(ssh_cred_name(0, ""), "ssh_target:SSH1");
+        assert_eq!(ssh_cred_name(4, ""), "ssh_target:SSH5");
+    }
+
+    #[test]
+    fn ssh_cred_name_nonempty_alias_uses_alias() {
+        assert_eq!(ssh_cred_name(0, "VPS DE"), "ssh_target:VPS DE");
+        assert_eq!(ssh_cred_name(2, "prod-web"), "ssh_target:prod-web");
+    }
+
+    #[test]
+    fn ssh_cred_name_special_chars_preserved() {
+        assert_eq!(ssh_cred_name(0, "my server!"), "ssh_target:my server!");
+        assert_eq!(ssh_cred_name(1, "сервер"), "ssh_target:сервер");
     }
 }
 

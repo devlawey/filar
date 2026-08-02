@@ -3873,6 +3873,20 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 
 ---
 
+## Issue #226: fix(gui) — ключ keyring не совпадает между лаунчером и runner
+
+**Milestone:** Filar v0.8.5. **Ветка:** `fix/226-keyring-key-mismatch`.
+
+**Симптом:** пароль сохранён в лаунчере, но Ctrl+O запрашивает его заново.
+
+**Решение:** `ssh_cred_name(slot, alias)` теперь генерирует `ssh_target:{name}`
+(где name = alias или `SSH{slot+1}`), что совпадает с ключом в runner.rs
+(`format!("ssh_target:{}", target.name)`).
+
+**DoD:** сохранить пароль в лаунчере → Ctrl+O → подключение без запроса.
+
+---
+
 ## Релиз v0.8.4 (подготовка)
 
 **Дата:** 2026-08-02. **Milestone:** Filar v0.8.4 (3/3 issue, все смерджены).
