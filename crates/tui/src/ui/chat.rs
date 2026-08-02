@@ -3,7 +3,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -75,7 +75,7 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Clear the chat area before rendering to prevent stale lines from
     // surviving when the layout changes (e.g. expand/collapse blocks).
-    f.render_widget(Block::default(), area);
+    f.render_widget(Clear, area);
 
     let paragraph = Paragraph::new(visible_lines);
     f.render_widget(paragraph, area);
