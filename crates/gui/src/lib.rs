@@ -88,6 +88,11 @@ fn unique_profile_name(existing: &[LlmProfileData], prefix: &str) -> String {
 /// Credential key for SSH slot N. Uses the same naming convention as
 /// the TUI runner: `ssh_target:{name}` where name is the alias (or
 /// `SSH{slot+1}` if no alias is set).
+///
+/// **Contract:** the `name` produced here MUST match the `target.name`
+/// field in `build_ssh_targets_from_profiles`, because the runner looks
+/// up the password under `format!("ssh_target:{}", target.name)`.
+/// Both functions use `SSH{slot+1}` as the fallback for empty alias.
 fn ssh_cred_name(slot: usize, alias: &str) -> String {
     let name = if alias.is_empty() {
         format!("SSH{}", slot + 1)
@@ -1144,6 +1149,24 @@ mod tests {
         assert_ne!(profiles[0].name, profiles[1].name);
         assert_ne!(profiles[1].name, profiles[2].name);
         assert_ne!(profiles[0].name, profiles[2].name, "all three must be unique after dedup");
+    }
+
+    #[test]
+    fn ssh_cred_name_empty_alias_uses_slot() {
+        assert_eq!(ssh_cred_name(0, ""), "ssh_target:SSH1");
+        assert_eq!(ssh_cred_name(4, ""), "ssh_target:SSH5");
+    }
+
+    #[test]
+    fn ssh_cred_name_nonempty_alias_uses_alias() {
+        assert_eq!(ssh_cred_name(0, "VPS DE"), "ssh_target:VPS DE");
+        assert_eq!(ssh_cred_name(2, "prod-web"), "ssh_target:prod-web");
+    }
+
+    #[test]
+    fn ssh_cred_name_special_chars_preserved() {
+        assert_eq!(ssh_cred_name(0, "my server!"), "ssh_target:my server!");
+        assert_eq!(ssh_cred_name(1, "сервер"), "ssh_target:сервер");
     }
 }
 
