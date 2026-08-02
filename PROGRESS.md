@@ -3845,6 +3845,20 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 
 ---
 
+## Issue #220: fix(gui,core) — правильный тип аутентификации в зависимости от `save_password`
+
+**Milestone:** Filar v0.8.5. **Ветка:** `fix/220-password-auth`.
+
+**Симптом:** лаунчер подключается по паролю, но Ctrl+O — ошибка «publickey rejected».
+
+**Решение:** `build_ssh_targets_from_profiles` выбирает auth по `profile.save_password`:
+- `true` → `SshAuth::Password { password: None }` (резолвится через keyring в runner.rs)
+- `false` → `SshAuth::Key { path: None }`
+
+**DoD:** профиль с паролем → Ctrl+O подключается по паролю.
+
+---
+
 ## Релиз v0.8.4 (подготовка)
 
 **Дата:** 2026-08-02. **Milestone:** Filar v0.8.4 (3/3 issue, все смерджены).

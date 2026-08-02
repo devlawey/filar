@@ -331,7 +331,10 @@ fn build_ssh_targets_from_profiles(profiles: &[SshProfile]) -> Vec<filar_core::S
             host: profile.host.clone(),
             port,
             user: profile.user.clone(),
-            auth: filar_core::SshAuth::Key { path: None },
+            auth: match profile.save_password {
+                true => filar_core::SshAuth::Password { password: None },
+                false => filar_core::SshAuth::Key { path: None },
+            },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
         });
     }
@@ -1047,6 +1050,9 @@ mod tests {
         assert_eq!(result[1].name, "prod-web", "alias overrides slot name");
         assert_eq!(result[1].host, "10.0.0.2");
         assert_eq!(result[1].port, 22);
+        // Auth type follows save_password flag from the profile.
+        assert!(matches!(result[0].auth, filar_core::SshAuth::Key { .. }), "save_password=false → Key auth");
+        assert!(matches!(result[1].auth, filar_core::SshAuth::Password { .. }), "save_password=true → Password auth");
     }
 
     #[test]
