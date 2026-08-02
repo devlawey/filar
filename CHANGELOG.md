@@ -19,6 +19,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Ctrl+O targets now use the correct authentication type: password-based
   authentication when `save_password` is set in the launcher, key-based
   otherwise ([#220](https://github.com/devlawey/filar/issues/220)).
+- The status bar no longer shows "Connected to: local" after a failed
+  `Ctrl+O` connection — error is in the chat, not the transport label
+  ([#221](https://github.com/devlawey/filar/issues/221)).
 
 ## [0.8.4] - 2026-08-02
 
