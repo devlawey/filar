@@ -49,3 +49,21 @@ Mapped via `ctrl_key(en, ru)` helper in `crates/tui/src/app.rs`.
 
 - `arboard::Clipboard::get_text()` — synchronous on Windows/macOS, may require
   `spawn_blocking` on Linux/X11 (discussion in PR review of #153).
+
+## Command output encoding (Windows)
+
+| Platform | Default console code page | filar behaviour |
+|----------|--------------------------|-----------------|
+| Windows  | CP866 or CP1251 (locale-dependent) | `chcp 65001` prepended to every PowerShell command |
+| Unix     | UTF-8                    | No conversion needed |
+
+> PowerShell on Windows uses the system locale code page (CP866 for Russian,
+> CP1252 for Western) for console output by default. `chcp 65001` changes the
+> **console active code page** to UTF-8, which affects how child processes
+> encode their stdout/stderr. This does not change PowerShell's internal
+> `[Console]::OutputEncoding` or `$OutputEncoding` settings — but since
+> `LocalExecutor` reads raw stdout bytes via `tokio::process::Command` (not
+> through the PowerShell pipeline), the console code page is what matters.
+> `String::from_utf8_lossy` then decodes the bytes correctly (#228).
+
+

@@ -59,13 +59,9 @@ impl crate::CommandExecutor for LocalExecutor {
         // Build the command based on platform.
         #[cfg(windows)]
         let mut cmd = {
+            let full = build_shell_command(command);
             let mut c = tokio::process::Command::new("powershell");
-            c.args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                command,
-            ]);
+            c.args(["-NoProfile", "-NonInteractive", "-Command", &full]);
             c
         };
         #[cfg(unix)]
@@ -131,5 +127,50 @@ impl crate::CommandExecutor for LocalExecutor {
     async fn cancel(&self) -> Result<()> {
         self.cancel_notify.notify_one();
         Ok(())
+    }
+}
+
+/// Build the shell command string for the current platform.
+///
+/// On Windows, prepends `chcp 65001 > $null;` to set the console code page
+/// to UTF-8 so that non-ASCII output (filenames, text) is decoded correctly
+/// by `String::from_utf8_lossy`.
+fn build_shell_command(command: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("chcp 65001 > $null; {command}")
+    }
+    #[cfg(not(windows))]
+    {
+        command.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_shell_command_contains_user_command() {
+        let result = build_shell_command("echo hello");
+        assert!(result.contains("echo hello"), "must contain the original command");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn build_shell_command_windows_has_chcp() {
+        let result = build_shell_command("dir");
+        assert!(
+            result.starts_with("chcp 65001 > $null; "),
+            "Windows command must start with chcp 65001 prefix, got: {result}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn build_shell_command_unix_no_chcp() {
+        let result = build_shell_command("ls");
+        assert_eq!(result, "ls");
+        assert!(!result.contains("chcp"));
     }
 }
