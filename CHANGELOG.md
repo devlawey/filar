@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-08-02
+
 ### Fixed
 
 - `merge_ssh_targets` now properly removes stale launcher targets by host match
@@ -396,7 +398,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v0.8.4...HEAD
+[0.8.4]: https://github.com/devlawey/filar/compare/v0.8.2...v0.8.4
 [0.8.2]: https://github.com/devlawey/filar/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/devlawey/filar/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/devlawey/filar/compare/v0.7.4...v0.8.0
