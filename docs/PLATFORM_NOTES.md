@@ -49,3 +49,17 @@ Mapped via `ctrl_key(en, ru)` helper in `crates/tui/src/app.rs`.
 
 - `arboard::Clipboard::get_text()` — synchronous on Windows/macOS, may require
   `spawn_blocking` on Linux/X11 (discussion in PR review of #153).
+
+## Command output encoding (Windows)
+
+| Platform | Default console code page | filar behaviour |
+|----------|--------------------------|-----------------|
+| Windows  | CP866 or CP1251 (locale-dependent) | `chcp 65001` (UTF-8) prepended to every PowerShell command |
+| Unix     | UTF-8                    | No conversion needed |
+
+> PowerShell on Windows uses the system locale code page (CP866 for Russian,
+> CP1252 for Western) for stdout/stderr by default. Rust's `String::from_utf8_lossy`
+> then produces mojibake for non-ASCII characters. The fix: `LocalExecutor`
+> prepends `chcp 65001 > $null;` to every command on Windows, forcing UTF-8
+> output before the user's command runs (#228).
+

@@ -11,6 +11,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- Russian characters in local command output on Windows are no longer
+  displayed as question marks — `chcp 65001` (UTF-8) is now prepended to
+  every PowerShell command
+  ([#228](https://github.com/devlawey/filar/issues/228)).
+
 ## [0.8.5] - 2026-08-02
 
 ### Fixed

@@ -64,7 +64,10 @@ impl crate::CommandExecutor for LocalExecutor {
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                command,
+                // Set UTF-8 code page so that command output (filenames, text)
+                // is decoded correctly by String::from_utf8_lossy below.
+                // Without this, PowerShell uses CP1251/CP866 on Russian Windows.
+                &format!("chcp 65001 > $null; {command}"),
             ]);
             c
         };
