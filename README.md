@@ -281,17 +281,28 @@ From the TUI:
   (never in `config.toml`). For key-based auth and SSH agent, no password is needed.
 - SSH profiles configured in the **GUI launcher** are automatically synced to 
   `[[ssh_targets]]` in `config.toml` on every Launch. You can also add targets 
-  manually:**
+  manually:
 
 ```toml
 [[ssh_targets]]
 name = "my-server"
 host = "192.168.1.100"
 port = 22
-user = "root"
+  user = "root"
 
 [ssh_targets.auth]
 type = "agent"
+```
+
+**Launcher-generated targets** use the alias (or `SSH1`–`SSH5` if no alias is set):
+
+```toml
+[[ssh_targets]]
+name = "SSH1"
+host = "10.0.0.5"
+port = 22
+user = "admin"
+auth = { type = "agent" }
 ```
 
 ---
