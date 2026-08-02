@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-08-02
+
 ### Fixed
 
 - SSH profiles configured in the GUI launcher are now synced to
@@ -387,7 +389,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/devlawey/filar/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/devlawey/filar/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/devlawey/filar/compare/v0.7.4...v0.8.0
 [0.7.4]: https://github.com/devlawey/filar/compare/v0.7.3...v0.7.4
