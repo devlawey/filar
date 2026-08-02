@@ -356,7 +356,7 @@ fn merge_ssh_targets(
             host: profile.host.clone(),
             port,
             user: profile.user.clone(),
-            auth: filar_core::SshAuth::Agent,
+            auth: filar_core::SshAuth::Key { path: None },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
         });
     }
@@ -1178,3 +1178,4 @@ mod tests {
         assert_ne!(profiles[0].name, profiles[2].name, "all three must be unique after dedup");
     }
 }
+

@@ -3800,6 +3800,22 @@ TUI: `Ctrl+O` видит цель. Удалить профиль → цель и
 
 ---
 
+## Issue #215: fix(gui,tui) — Key auth вместо Agent для Ctrl+O
+
+**Milestone:** Filar v0.8.4. **Ветка:** `fix/215-key-auth-instead-of-agent`.
+
+**Симптом:** выбор `VPS DE` → `Enter` → ошибка «SSH agent authentication not yet implemented».
+
+**Первопричина:** `merge_ssh_targets` хардкодил `SshAuth::Agent`. Filar не поддерживает
+SSH agent — только `SshAuth::Key` (файл приватного ключа) и `SshAuth::Password`.
+
+**Решение:** `SshAuth::Agent` → `SshAuth::Key { path: None }`. При `key_path == None`
+SSH-коннектор использует `~/.ssh/id_rsa` по умолчанию.
+
+**DoD:** выбор хоста → Enter → подключение по ключу работает; `Ctrl+T` на хосте.
+
+---
+
 ## Релиз v0.8.2 (подготовка)
 
 **Дата:** 2026-08-02. **Milestone:** Filar v0.8.2 (2/2 issue, все смерджены).
