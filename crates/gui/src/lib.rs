@@ -309,10 +309,7 @@ fn merge_ssh_targets(
     existing: &[filar_core::SshTarget],
     profiles: &[SshProfile],
 ) -> Vec<filar_core::SshTarget> {
-    // Names that are owned by the launcher: slot names (SSH1..SSH5) plus
-    // any current non-empty alias values. Removing by both slot name and
-    // current alias handles alias changes — the old alias target is removed
-    // when the user changes the alias in the GUI.
+    // Names owned by the launcher: slot names plus current aliases.
     let mut launcher_names: std::collections::HashSet<String> = (1..=SSH_SLOTS)
         .map(|i| format!("SSH{}", i))
         .collect();
@@ -321,11 +318,24 @@ fn merge_ssh_targets(
             launcher_names.insert(profile.alias.clone());
         }
     }
+    // Start with targets that are NOT launcher-named.
     let mut merged: Vec<filar_core::SshTarget> = existing
         .iter()
         .filter(|t| !launcher_names.contains(&t.name))
         .cloned()
         .collect();
+    // Remove stale launcher targets by host+port+user match. If an
+    // existing manual-looking target (e.g. "prod-web") has the same
+    // host/port/user as a current profile, it is a leftover from a
+    // previous alias — remove it.
+    merged.retain(|t| {
+        !profiles.iter().any(|p| {
+            if p.host.is_empty() { return false; }
+            let port: u16 = p.port.parse().unwrap_or(22);
+            let port = if port == 0 { 22 } else { port };
+            t.host == p.host && t.port == port && t.user == p.user
+        })
+    });
     let mut seen: std::collections::HashSet<String> = merged.iter().map(|t| t.name.clone()).collect();
     for (i, profile) in profiles.iter().enumerate() {
         if profile.host.is_empty() { continue; }
@@ -1095,9 +1105,25 @@ mod tests {
         ];
         let result = merge_ssh_targets(&existing, &profiles);
         assert!(result.iter().any(|t| t.name == "prod-api"), "new alias target must be added");
-        // Old alias survives as a manual target (user can clean up manually).
-        assert!(result.iter().any(|t| t.name == "prod-web"), "old alias target survives as manual");
-        assert_eq!(result.len(), 2);
+        assert!(result.iter().all(|t| t.name != "prod-web"), "old alias target with matching host must be removed");
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn merge_removes_old_target_by_host_match_even_when_alias_unchanged() {
+        let existing = vec![filar_core::SshTarget {
+            name: "stale-ss1".into(), host: "10.0.0.1".into(), port: 22, user: "admin".into(),
+            auth: filar_core::SshAuth::Agent, host_key_policy: filar_core::HostKeyPolicy::Tofu,
+        }];
+        // Profile with no alias — uses slot name SSH1. Old stale target
+        // with same host/port/user but different name must be removed.
+        let profiles = vec![
+            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: String::new(), save_password: false },
+            SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
+        ];
+        let result = merge_ssh_targets(&existing, &profiles);
+        assert_eq!(result.len(), 1, "only SSH1 must remain, stale target removed");
+        assert_eq!(result[0].name, "SSH1");
     }
 
     #[test]

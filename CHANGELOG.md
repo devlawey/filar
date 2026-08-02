@@ -11,6 +11,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- `merge_ssh_targets` now properly removes stale launcher targets by host match
+  and no longer duplicates slot names when an alias is set, eliminating leftover
+  targets like `prod-web` and `SSH1` from the `Ctrl+O` overlay
+  ([#214](https://github.com/devlawey/filar/issues/214)).
+
 ## [0.8.2] - 2026-08-02
 
 ### Fixed
