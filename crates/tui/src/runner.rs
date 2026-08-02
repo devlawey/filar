@@ -724,9 +724,6 @@ async fn run_app(
                     .map(|e| (e.executor.clone(), e.ssh_target.clone()));
                 let tx = agent_tx.clone();
                 let alias = target.name.clone();
-                let prev_target_name = app.sessions.iter()
-                    .find(|s| s.id == sid)
-                    .map(|s| s.target_name.clone());
                 let token = CancellationToken::new();
                 app.ctrl_o_cancel = Some(token.clone());
                 tokio::spawn(async move {
@@ -754,11 +751,6 @@ async fn run_app(
                                 session_id: sid,
                                 event: filar_agent::AgentEvent::Error(format!("SSH connection failed: {e}")),
                             });
-                            if let Some(ref prev) = prev_target_name {
-                                let _ = tx.send(TuiEvent::TransportChanged {
-                                    session_id: sid, is_local: false, ssh_info: None, alias: Some(prev.clone()),
-                                });
-                            }
                         }
                     }
                 });
@@ -773,12 +765,6 @@ async fn run_app(
             let exec_entry = executors.get(&sid)
                 .map(|e| (e.executor.clone(), e.ssh_target.clone()));
             let tx = agent_tx.clone();
-            // Snapshot current target_name before the connection attempt so
-            // we can restore it on failure — otherwise the ~alias set by
-            // select_host would persist after the error.
-            let prev_target_name = app.sessions.iter()
-                .find(|s| s.id == sid)
-                .map(|s| s.target_name.clone());
             tokio::spawn(async move {
                 tokio::select! {
                     _ = token.cancelled() => return,
@@ -850,12 +836,6 @@ async fn run_app(
                                     session_id: sid,
                                     event: filar_agent::AgentEvent::Error(format!("SSH connection failed: {e}")),
                                 });
-                                // Restore target_name so the ~alias doesn't persist.
-                                if let Some(ref prev) = prev_target_name {
-                                    let _ = tx.send(TuiEvent::TransportChanged {
-                                        session_id: sid, is_local: false, ssh_info: None, alias: Some(prev.clone()),
-                                    });
-                                }
                             }
                         }
                     }
