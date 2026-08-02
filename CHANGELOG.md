@@ -16,6 +16,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - SSH profiles configured in the GUI launcher are now synced to
   `[[ssh_targets]]` in `config.toml`, so `Ctrl+O` sees them
   ([#210](https://github.com/devlawey/filar/issues/210)).
+- README and SMOKE.md now document the launcher → `config.toml` synchronisation
+  flow for SSH targets ([#211](https://github.com/devlawey/filar/issues/211)).
 
 ## [0.8.1] - 2026-08-01
 
