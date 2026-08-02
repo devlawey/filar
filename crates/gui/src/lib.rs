@@ -1061,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_adds_new_target_when_alias_changes_old_survives_as_manual() {
+    fn build_removes_old_target_when_alias_changes() {
         let profiles = vec![
             SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: "prod-api".into(), save_password: false },
             SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
@@ -1073,7 +1073,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_removes_old_target_by_host_match_even_when_alias_unchanged() {
+    fn build_removes_old_target_by_host_match() {
         // Profile with no alias — uses slot name SSH1. Old stale target
         // with same host/port/user but different name must be removed.
         let profiles = vec![
@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_clears_when_all_profiles_empty() {
+    fn build_clears_when_all_profiles_empty() {
         // All profiles cleared (empty).
         let profiles = vec![SshProfile::default(); SSH_SLOTS];
         let result = build_ssh_targets_from_profiles(&profiles);
