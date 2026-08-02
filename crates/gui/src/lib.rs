@@ -332,6 +332,7 @@ fn merge_ssh_targets(
         !profiles.iter().any(|p| {
             if p.host.is_empty() { return false; }
             let port: u16 = p.port.parse().unwrap_or(22);
+            let port = if port == 0 { 22 } else { port };
             t.host == p.host && t.port == port && t.user == p.user
         })
     });
