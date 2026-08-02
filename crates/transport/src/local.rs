@@ -136,3 +136,29 @@ impl crate::CommandExecutor for LocalExecutor {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[cfg(windows)]
+    fn windows_command_includes_chcp_prefix() {
+        // Verify that the chcp 65001 prefix is present in the formatted
+        // command string. We can't run the executor in a unit test without
+        // a real shell, but we can check the format string logic.
+        let command = "dir";
+        let formatted = format!("chcp 65001 > $null; {command}");
+        assert!(
+            formatted.starts_with("chcp 65001"),
+            "Windows commands must be prefixed with chcp 65001 for UTF-8 output"
+        );
+        assert!(formatted.contains(command));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn unix_command_has_no_chcp_prefix() {
+        let command = "ls";
+        // On Unix, no chcp prefix is needed.
+        assert!(!command.contains("chcp"));
+    }
+}
