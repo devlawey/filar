@@ -16,6 +16,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Launcher-generated `[[ssh_targets]]` now replace ALL previous targets on every
   save, eliminating stale entries like `prod-web` with old addresses
   ([#222](https://github.com/devlawey/filar/issues/222)).
+- Ctrl+O targets now use the correct authentication type: password-based
+  authentication when `save_password` is set in the launcher, key-based
+  otherwise ([#220](https://github.com/devlawey/filar/issues/220)).
 
 ## [0.8.4] - 2026-08-02
 
