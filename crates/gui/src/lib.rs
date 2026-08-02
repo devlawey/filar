@@ -305,38 +305,13 @@ impl Settings {
 ///
 /// This is a free function so it can be unit-tested independently of
 /// `save_config_toml`.
-fn merge_ssh_targets(
-    existing: &[filar_core::SshTarget],
-    profiles: &[SshProfile],
-) -> Vec<filar_core::SshTarget> {
-    // Names owned by the launcher: slot names plus current aliases.
-    let mut launcher_names: std::collections::HashSet<String> = (1..=SSH_SLOTS)
-        .map(|i| format!("SSH{}", i))
-        .collect();
-    for profile in profiles {
-        if !profile.alias.is_empty() {
-            launcher_names.insert(profile.alias.clone());
-        }
-    }
-    // Start with targets that are NOT launcher-named.
-    let mut merged: Vec<filar_core::SshTarget> = existing
-        .iter()
-        .filter(|t| !launcher_names.contains(&t.name))
-        .cloned()
-        .collect();
-    // Remove stale launcher targets by host+port+user match. If an
-    // existing manual-looking target (e.g. "prod-web") has the same
-    // host/port/user as a current profile, it is a leftover from a
-    // previous alias — remove it.
-    merged.retain(|t| {
-        !profiles.iter().any(|p| {
-            if p.host.is_empty() { return false; }
-            let port: u16 = p.port.parse().unwrap_or(22);
-            let port = if port == 0 { 22 } else { port };
-            t.host == p.host && t.port == port && t.user == p.user
-        })
-    });
-    let mut seen: std::collections::HashSet<String> = merged.iter().map(|t| t.name.clone()).collect();
+/// Build `[[ssh_targets]]` from launcher SSH profiles — full rewrite.
+///
+/// Replaces ALL previous targets; no merge, no stale entries survive.
+/// Each non-empty profile produces one `SshTarget`; empty slots are skipped.
+fn build_ssh_targets_from_profiles(profiles: &[SshProfile]) -> Vec<filar_core::SshTarget> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut targets: Vec<filar_core::SshTarget> = Vec::new();
     for (i, profile) in profiles.iter().enumerate() {
         if profile.host.is_empty() { continue; }
         let name = if profile.alias.is_empty() {
@@ -351,7 +326,7 @@ fn merge_ssh_targets(
             22
         });
         let port = if port == 0 { 22 } else { port };
-        merged.push(filar_core::SshTarget {
+        targets.push(filar_core::SshTarget {
             name,
             host: profile.host.clone(),
             port,
@@ -360,7 +335,7 @@ fn merge_ssh_targets(
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
         });
     }
-    merged
+    targets
 }
 
 /// Write `[llm]` and `[[ssh_targets]]` settings to `config.toml` in
@@ -409,7 +384,7 @@ fn save_config_toml(settings: &Settings) {
     }
 
     // Sync launcher SSH profiles to [[ssh_targets]].
-    config.ssh_targets = merge_ssh_targets(&config.ssh_targets, &settings.ssh_profiles);
+    config.ssh_targets = build_ssh_targets_from_profiles(&settings.ssh_profiles);
 
     if let Err(e) = std::fs::create_dir_all(&app_dir) {
         tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");
@@ -1057,7 +1032,6 @@ mod tests {
 
     #[test]
     fn config_save_writes_launcher_ssh_profiles() {
-        let existing: Vec<filar_core::SshTarget> = vec![];
         let profiles = vec![
             SshProfile { host: "10.0.0.1".into(), port: "2222".into(), user: "admin".into(), alias: String::new(), save_password: false },
             SshProfile { host: "10.0.0.2".into(), port: "22".into(), user: "root".into(), alias: "prod-web".into(), save_password: true },
@@ -1065,7 +1039,7 @@ mod tests {
             SshProfile::default(),
             SshProfile::default(),
         ];
-        let result = merge_ssh_targets(&existing, &profiles);
+        let result = build_ssh_targets_from_profiles(&profiles);
         assert_eq!(result.len(), 2, "only non-empty profiles become targets");
         assert_eq!(result[0].name, "SSH1", "no alias → uses slot name");
         assert_eq!(result[0].host, "10.0.0.1");
@@ -1076,34 +1050,23 @@ mod tests {
     }
 
     #[test]
-    fn merge_preserves_manual_targets() {
-        let existing = vec![
-            filar_core::SshTarget {
-                name: "my-server".into(), host: "192.168.1.1".into(), port: 22, user: "root".into(),
-                auth: filar_core::SshAuth::Agent, host_key_policy: filar_core::HostKeyPolicy::Tofu,
-            },
-        ];
+    fn build_rewrites_all_targets_no_preservation() {
         let profiles = vec![
             SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: String::new(), save_password: false },
             SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
         ];
-        let result = merge_ssh_targets(&existing, &profiles);
-        assert_eq!(result.len(), 2);
-        assert!(result.iter().any(|t| t.name == "my-server"), "manual target must survive");
-        assert!(result.iter().any(|t| t.name == "SSH1"), "launcher target must be added");
+        let result = build_ssh_targets_from_profiles(&profiles);
+        assert_eq!(result.len(), 1, "full rewrite only produces current profiles");
+        assert_eq!(result[0].name, "SSH1");
     }
 
     #[test]
     fn merge_adds_new_target_when_alias_changes_old_survives_as_manual() {
-        let existing = vec![filar_core::SshTarget {
-            name: "prod-web".into(), host: "10.0.0.1".into(), port: 22, user: "admin".into(),
-            auth: filar_core::SshAuth::Agent, host_key_policy: filar_core::HostKeyPolicy::Tofu,
-        }];
         let profiles = vec![
             SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: "prod-api".into(), save_password: false },
             SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
         ];
-        let result = merge_ssh_targets(&existing, &profiles);
+        let result = build_ssh_targets_from_profiles(&profiles);
         assert!(result.iter().any(|t| t.name == "prod-api"), "new alias target must be added");
         assert!(result.iter().all(|t| t.name != "prod-web"), "old alias target with matching host must be removed");
         assert_eq!(result.len(), 1);
@@ -1111,30 +1074,22 @@ mod tests {
 
     #[test]
     fn merge_removes_old_target_by_host_match_even_when_alias_unchanged() {
-        let existing = vec![filar_core::SshTarget {
-            name: "stale-ss1".into(), host: "10.0.0.1".into(), port: 22, user: "admin".into(),
-            auth: filar_core::SshAuth::Agent, host_key_policy: filar_core::HostKeyPolicy::Tofu,
-        }];
         // Profile with no alias — uses slot name SSH1. Old stale target
         // with same host/port/user but different name must be removed.
         let profiles = vec![
             SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: String::new(), save_password: false },
             SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
         ];
-        let result = merge_ssh_targets(&existing, &profiles);
+        let result = build_ssh_targets_from_profiles(&profiles);
         assert_eq!(result.len(), 1, "only SSH1 must remain, stale target removed");
         assert_eq!(result[0].name, "SSH1");
     }
 
     #[test]
     fn merge_clears_when_all_profiles_empty() {
-        let existing = vec![filar_core::SshTarget {
-            name: "SSH1".into(), host: "10.0.0.1".into(), port: 22, user: "admin".into(),
-            auth: filar_core::SshAuth::Agent, host_key_policy: filar_core::HostKeyPolicy::Tofu,
-        }];
         // All profiles cleared (empty).
         let profiles = vec![SshProfile::default(); SSH_SLOTS];
-        let result = merge_ssh_targets(&existing, &profiles);
+        let result = build_ssh_targets_from_profiles(&profiles);
         assert!(result.is_empty(), "all launcher targets must be removed when slots are cleared");
     }
 
@@ -1178,4 +1133,8 @@ mod tests {
         assert_ne!(profiles[0].name, profiles[2].name, "all three must be unique after dedup");
     }
 }
+
+
+
+
 

@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- Launcher-generated `[[ssh_targets]]` now replace ALL previous targets on every
+  save, eliminating stale entries like `prod-web` with old addresses
+  ([#222](https://github.com/devlawey/filar/issues/222)).
+
 ## [0.8.4] - 2026-08-02
 
 ### Fixed
