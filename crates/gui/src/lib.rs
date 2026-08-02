@@ -85,9 +85,16 @@ fn unique_profile_name(existing: &[LlmProfileData], prefix: &str) -> String {
     }
 }
 
-/// Credential key for SSH slot N (0-based).
-fn ssh_cred_name(slot: usize) -> String {
-    format!("ssh{slot}")
+/// Credential key for SSH slot N. Uses the same naming convention as
+/// the TUI runner: `ssh_target:{name}` where name is the alias (or
+/// `SSH{slot+1}` if no alias is set).
+fn ssh_cred_name(slot: usize, alias: &str) -> String {
+    let name = if alias.is_empty() {
+        format!("SSH{}", slot + 1)
+    } else {
+        alias.to_string()
+    };
+    format!("ssh_target:{name}")
 }
 
 /// Migration: fix duplicate profile names and key_env entries in a loaded list.
@@ -421,7 +428,7 @@ struct SshSlot {
 impl SshSlot {
     fn from_profile(p: &SshProfile, slot_idx: usize) -> Self {
         let password = if p.save_password {
-            load_secret(&ssh_cred_name(slot_idx))
+            load_secret(&ssh_cred_name(slot_idx, &p.alias))
         } else {
             String::new()
         };
@@ -722,8 +729,8 @@ impl LauncherApp {
             if !prof.api_key.is_empty() { save_secret(&prof.key_env, &prof.api_key); }
         }
         for (i, slot) in self.ssh_slots.iter().enumerate() {
-            if slot.save_password && !slot.password.is_empty() { save_secret(&ssh_cred_name(i), &slot.password); }
-            else { delete_secret(&ssh_cred_name(i)); }
+            if slot.save_password && !slot.password.is_empty() { save_secret(&ssh_cred_name(i, &slot.alias), &slot.password); }
+            else { delete_secret(&ssh_cred_name(i, &slot.alias)); }
         }
         let session_id = self.selected_session.map(|i| self.sessions[i].id.clone());
         let cfg = LaunchConfig {

@@ -22,6 +22,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - The status bar no longer shows "Connected to: local" after a failed
   `Ctrl+O` connection — error is in the chat, not the transport label
   ([#221](https://github.com/devlawey/filar/issues/221)).
+- SSH password keyring key now matches between the launcher and the TUI
+  runner, so saved passwords are found on `Ctrl+O` without re-prompting
+  ([#226](https://github.com/devlawey/filar/issues/226)).
 
 ## [0.8.4] - 2026-08-02
 
