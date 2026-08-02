@@ -3777,6 +3777,18 @@ mod tests {
         assert!(app.collapsed_set().contains(&0));
     }
 
+    #[test]
+    fn toggle_collapse_increments_message_rev() {
+        let mut app = make_command_app(50);
+        let rev_before = app.message_rev;
+        app.toggle_collapse(0);
+        assert_ne!(app.message_rev, rev_before, "message_rev must change on toggle_collapse");
+        // Toggle back — rev must change again.
+        let rev_after = app.message_rev;
+        app.toggle_collapse(0);
+        assert_ne!(app.message_rev, rev_after, "message_rev must change on second toggle");
+    }
+
     // ---- Mouse click routing tests (issue #18 review) ----
 
     #[test]

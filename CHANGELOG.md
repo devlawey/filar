@@ -17,6 +17,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   displayed as question marks — `chcp 65001` (UTF-8) is now prepended to
   every PowerShell command
   ([#228](https://github.com/devlawey/filar/issues/228)).
+- Visual artifacts when expanding/collapsing command blocks in chat are
+  fixed — the chat area is now cleared before re-rendering
+  ([#228](https://github.com/devlawey/filar/issues/228)).
 
 ## [0.8.5] - 2026-08-02
 
