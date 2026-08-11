@@ -339,10 +339,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 ## 8. Тесты
 
-- **150 unit-тестов** проходят:
-  - filar-agent: 42 теста (agent loop, tools, security, GLM client, SSE parser)
-  - filar-transport: 2 теста (marker format, payload format) + 3 ignored (Docker)
-  - filar-tui: 106 тестов (terminal model, key mapping, app state, layout, streaming)
+- **529 unit-тестов** проходят (включая doc-тесты):
+  - filar-agent: 67 тестов
+  - filar-app: 14 тестов
+  - filar-core: 49 тестов + 2 doc-теста
+  - filar-gui: 16 тестов
+  - filar-transport: 26 тестов (7 ignored — требуют Docker sshd)
+  - filar-tui: 278 тестов
 - **1 pre-existing failure:** `parse_minimal_config` в filar-core (ожидает `Always`,
   дефолт `Allowlist`) — unrelated к текущим изменениям
 
@@ -3924,6 +3927,26 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 **Публичные контракты:** без изменений.
 
 **Следующий шаг:** smoke-тест expand/collapse блоков в чате.
+
+---
+
+## Текущая работа: 0.9.0 milestone
+
+**Дата:** 2026-08-11. **Milestone:** Filar v0.9.0 (в работе, 1/4 issue).
+
+**Сделано:**
+- #232: feat — инфраструктура оверлея сохранения сессии и Ctrl+S binding:
+  - Поля `save_overlay_visible: bool`, `save_progress: u8`, `save_error: Option<String>` в `App`
+  - Ctrl+S в Normal mode открывает оверлей; Ctrl+ы (русская раскладка) тоже работает
+  - ESC закрывает оверлей сохранения
+  - Модуль `ui/save_overlay` и stub-функция `render_save_overlay()`
+  - Вызов рендера оверлея в `render()` и `render_interactive()` (поверх всего)
+  - Запись `^S` в help-баре Normal mode
+
+**Публичные контракты:** `App` — новые публичные поля `save_overlay_visible`, `save_progress`, `save_error`.
+Новый модуль `crates/tui/src/ui/save_overlay.rs`.
+
+**Engine:** не менялся (только tui). Тег engine НЕ ставится.
 
 ---
 

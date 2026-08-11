@@ -26,6 +26,7 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
             HelpItem { key: "!", desc: "shell", action: Some(HelpAction::Shell) },
             HelpItem { key: "^T", desc: "terminal", action: Some(HelpAction::Terminal) },
             HelpItem { key: "^O", desc: "hosts", action: None },
+            HelpItem { key: "^S", desc: "save", action: None },
             HelpItem { key: "^P", desc: "password", action: Some(HelpAction::Password) },
             HelpItem { key: "^N", desc: "tab", action: None },
             HelpItem { key: "^W", desc: "close", action: None },

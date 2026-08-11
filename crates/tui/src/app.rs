@@ -218,6 +218,12 @@ pub struct App {
     pub host_select_visible: bool,
     /// Cursor position in the host-selection overlay.
     pub host_select_index: usize,
+    /// Whether the session-save progress overlay is visible (Ctrl+S).
+    pub save_overlay_visible: bool,
+    /// Save progress percentage (0-100).
+    pub save_progress: u8,
+    /// Error message if the last save failed.
+    pub save_error: Option<String>,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -388,6 +394,9 @@ impl App {
             ctrl_o_pending_session_id: None,
             host_select_visible: false,
             host_select_index: 0,
+            save_overlay_visible: false,
+            save_progress: 0,
+            save_error: None,
         }
     }
 
@@ -921,6 +930,23 @@ impl App {
         // Ctrl+O — open host selection overlay.
         if ctrl_key('o', 'щ') && self.mode == AppMode::Normal && !self.host_select_visible {
             self.open_host_select();
+            return;
+        }
+
+        // Ctrl+S — save current session as Markdown.
+        if ctrl_key('s', 'ы') && self.mode == AppMode::Normal {
+            self.save_overlay_visible = true;
+            self.save_progress = 0;
+            self.save_error = None;
+            return;
+        }
+
+        // When the save overlay is visible, only ESC is processed for closing.
+        if self.save_overlay_visible {
+            match key.code {
+                KeyCode::Esc => self.save_overlay_visible = false,
+                _ => {}
+            }
             return;
         }
 
