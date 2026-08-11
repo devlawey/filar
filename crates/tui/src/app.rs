@@ -699,11 +699,17 @@ fn messages_to_markdown(messages: &[ChatBlock], session_name: &str, ssh_info: &O
                 md.push_str(&format!("**$ {command}**\n"));
                 if let Some(out) = output {
                     let max_ticks = out
-                        .split(|ch| ch != '`')
-                        .map(str::len)
-                        .max()
-                        .unwrap_or(0);
-                    let fence = "`".repeat((max_ticks + 1).max(3));
+                        .chars()
+                        .fold((0usize, 0usize), |(max, cur), ch| {
+                            if ch == '`' {
+                                let cur = cur + 1;
+                                (max.max(cur), cur)
+                            } else {
+                                (max, 0)
+                            }
+                        })
+                        .0;
+                    let fence = "`".repeat((max_ticks + 1).max(3_usize));
                     md.push_str(&fence);
                     md.push('\n');
                     md.push_str(out);
@@ -1044,6 +1050,10 @@ impl App {
 
     /// Called by the runner when a save completes (success or error).
     /// Resets the in-flight guard so a new save can be started.
+    ///
+    /// TODO(#235): runner must re-show the overlay (`save_overlay_visible = true`)
+    /// when Done/Error arrives, so the user sees the result even if they pressed
+    /// Esc while the task was still running.
     pub fn finish_save(&mut self) {
         self.save_in_flight = false;
     }
