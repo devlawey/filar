@@ -17,10 +17,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   in the working directory. Russian layout (Ctrl+ы) also supported.
   A progress overlay shows during the save, and a toast confirms completion.
   (`save_in_flight` guard prevents concurrent saves.)
-  ([#232](https://github.com/devlawey/filar/issues/232),
-   [#233](https://github.com/devlawey/filar/issues/233),
-   [#234](https://github.com/devlawey/filar/issues/234),
-   [#235](https://github.com/devlawey/filar/issues/235)).
+   ([#232](https://github.com/devlawey/filar/issues/232),
+    [#233](https://github.com/devlawey/filar/issues/233),
+    [#234](https://github.com/devlawey/filar/issues/234),
+    [#235](https://github.com/devlawey/filar/issues/235)).
+- Smooth progress animation during session save: the progress bar now
+  shows intermediate states (0% → 50% → 100%) with brief pauses,
+  instead of jumping instantly to completion.
+  ([#240](https://github.com/devlawey/filar/issues/240)).
 
 ## [0.8.6] - 2026-08-02
 

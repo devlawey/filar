@@ -3931,7 +3931,7 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 
 ## Текущая работа: 0.9.0 milestone
 
-**Дата:** 2026-08-11. **Milestone:** Filar v0.9.0 (завершён, 4/4 issue).
+**Дата:** 2026-08-11. **Milestone:** Filar v0.9.0 (5 issue, 4 закрыто, #240 в работе).
 
 **Сделано:**
 - #232: feat — инфраструктура оверлея сохранения сессии и Ctrl+S binding:
@@ -3955,6 +3955,9 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
   - `unbounded_channel<SaveProgress>` в `run_app()`
   - `app.save_tx = Some(save_tx)` — канал активен
   - `try_recv()` в event loop — Started→0%, Writing→50%, Done→100%+toast+system_log, Error→ошибка
+- #240: feat — плавная анимация прогресса сохранения:
+  - 150ms задержка после Started (показывает 0%)
+  - 400ms задержка после Writing (показывает 50%) перед записью файла
 
 **Публичные контракты:** `App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `finish_save()`.
 Тип `SaveProgress`. Модуль `crates/tui/src/ui/save_overlay.rs`.
