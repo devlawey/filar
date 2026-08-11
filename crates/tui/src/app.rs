@@ -1029,10 +1029,16 @@ impl App {
         tokio::spawn(async move {
             tx.send(SaveProgress::Started).ok();
 
+            // Small delay so the overlay has time to render the 0% state.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
             let filename = generate_save_filename(&session_name, &ssh_info);
             let md_content = messages_to_markdown(&messages, &session_name, &ssh_info);
 
             tx.send(SaveProgress::Writing).ok();
+
+            // Let the progress bar sit at 50% before jumping to 100%.
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let filepath = cwd.join(&filename);
