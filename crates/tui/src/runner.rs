@@ -442,6 +442,9 @@ async fn run_app(
                     match p {
                         SaveProgress::Done(filename) => {
                             app.save_progress = 100;
+                            if !app.save_overlay_visible {
+                                app.save_overlay_visible = true;
+                            }
                             let msg = format!("Saved to {filename}");
                             app.toast = Some((msg, Instant::now() + Duration::from_secs(3)));
                             app.push_system_log(format!("Session saved to {filename}"));
@@ -449,7 +452,13 @@ async fn run_app(
                         }
                         SaveProgress::Error(err) => {
                             app.save_error = Some(err);
+                            if !app.save_overlay_visible {
+                                app.save_overlay_visible = true;
+                            }
                             app.finish_save();
+                        }
+                        SaveProgress::Writing => {
+                            app.save_progress = 50;
                         }
                         _ => {}
                     }
