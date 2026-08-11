@@ -404,8 +404,59 @@ async fn run_app(
 
     loop {
         let in_interactive = app.mode == AppMode::Interactive;
-
         tokio::select! {
+            biased;
+
+            // Save progress updates (Ctrl+S, #235). Must be inside the
+            // select so the progress bar updates even when the user is idle.
+            Some(progress) = save_rx.recv() => {
+                match progress {
+                    SaveProgress::Started => {
+                        app.save_progress = 0;
+                        app.save_error = None;
+                    }
+                    SaveProgress::Writing => {
+                        app.save_progress = 50;
+                    }
+                    SaveProgress::Done(filename) => {
+                        app.save_progress = 100;
+                        if !app.save_overlay_visible {
+                            app.save_overlay_visible = true;
+                        }
+                        app.finish_save();
+                        let msg = format!("Saved to {filename}");
+                        app.toast = Some((msg, Instant::now() + Duration::from_secs(3)));
+                        app.push_system_log(format!("Session saved to {filename}"));
+                    }
+                    SaveProgress::Error(err) => {
+                        app.save_error = Some(err.clone());
+                        app.save_progress = 0;
+                        if !app.save_overlay_visible {
+                            app.save_overlay_visible = true;
+                        }
+                        app.finish_save();
+                    }
+                }
+                // Drain any remaining messages delivered during this iteration.
+                while let Ok(p) = save_rx.try_recv() {
+                    match p {
+                        SaveProgress::Done(filename) => {
+                            app.save_progress = 100;
+                            let msg = format!("Saved to {filename}");
+                            app.toast = Some((msg, Instant::now() + Duration::from_secs(3)));
+                            app.push_system_log(format!("Session saved to {filename}"));
+                            app.finish_save();
+                        }
+                        SaveProgress::Error(err) => {
+                            app.save_error = Some(err);
+                            app.finish_save();
+                        }
+                        _ => {}
+                    }
+                }
+                needs_redraw = true;
+            }
+
             // Terminal keyboard / resize event.
             maybe_event = events.next() => {
                 match maybe_event {
@@ -1011,38 +1062,6 @@ async fn run_app(
                     app.toast = None;
                 }
             }
-        }
-
-        // Process session-save progress updates (non-blocking, #235).
-        while let Ok(progress) = save_rx.try_recv() {
-            match progress {
-                SaveProgress::Started => {
-                    app.save_progress = 0;
-                    app.save_error = None;
-                }
-                SaveProgress::Writing => {
-                    app.save_progress = 50;
-                }
-                SaveProgress::Done(filename) => {
-                    app.save_progress = 100;
-                    if !app.save_overlay_visible {
-                        app.save_overlay_visible = true;
-                    }
-                    app.finish_save();
-                    let msg = format!("Saved to {filename}");
-                    app.toast = Some((msg, Instant::now() + Duration::from_secs(3)));
-                    app.push_system_log(format!("Session saved to {filename}"));
-                }
-                SaveProgress::Error(err) => {
-                    app.save_error = Some(err.clone());
-                    app.save_progress = 0;
-                    if !app.save_overlay_visible {
-                        app.save_overlay_visible = true;
-                    }
-                    app.finish_save();
-                }
-            }
-            needs_redraw = true;
         }
 
         if app.should_quit {
