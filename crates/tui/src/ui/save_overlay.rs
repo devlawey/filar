@@ -61,7 +61,7 @@ pub(crate) fn render_save_overlay(f: &mut Frame, app: &App, area: Rect) {
         .block(Block::default())
         .gauge_style(app.theme.success_fg())
         .style(Style::default().fg(app.theme.fg_dim))
-        .ratio(f64::from(progress) / 100.0);
+        .ratio((f64::from(progress) / 100.0).clamp(0.0, 1.0));
     f.render_widget(gauge, bar_area);
 
     // Row 3: status text.
@@ -78,16 +78,81 @@ pub(crate) fn render_save_overlay(f: &mut Frame, app: &App, area: Rect) {
         status_area,
     );
 
-    // Last row: footer hint.
+    // Last row inside border: footer hint.
     let footer = " Esc to close ";
     let footer_area = Rect::new(
-        overlay_area.x,
-        overlay_area.y + overlay_area.height.saturating_sub(1),
-        overlay_area.width,
+        inner.x,
+        inner.y + inner.height.saturating_sub(1),
+        inner.width,
         1,
     );
     f.render_widget(
         Paragraph::new(Span::styled(footer, app.theme.muted())),
         footer_area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use filar_core::CommandConfirmMode;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Render the save overlay into a test buffer and return all visible text.
+    fn render_save_text(app: &App) -> String {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_save_overlay(f, app, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..24 {
+            for x in 0..80 {
+                text.push(buffer[(x, y)].symbol().chars().next().unwrap_or(' '));
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn overlay_shows_saving_when_progress_zero() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.save_overlay_visible = true;
+        app.save_progress = 0;
+        let text = render_save_text(&app);
+        assert!(text.contains("Saving..."), "must show Saving... when progress=0");
+    }
+
+    #[test]
+    fn overlay_does_not_panic_on_progress_overflow() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.save_overlay_visible = true;
+        app.save_progress = 200;
+        let text = render_save_text(&app);
+        assert!(!text.trim().is_empty(), "overlay must render without panic");
+    }
+
+    #[test]
+    fn overlay_renders_done_when_complete_no_error() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.save_overlay_visible = true;
+        app.save_progress = 100;
+        let text = render_save_text(&app);
+        assert!(text.contains("Done!"), "must show Done! when complete");
+    }
+
+    #[test]
+    fn overlay_renders_error_when_save_error_set() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.save_overlay_visible = true;
+        app.save_error = Some("disk full".into());
+        let text = render_save_text(&app);
+        assert!(text.contains("Error: disk full"), "must show error message");
+    }
 }
