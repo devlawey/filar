@@ -13,17 +13,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
-- Session-save overlay infrastructure and Ctrl+S shortcut. The overlay
-  appears when Ctrl+S is pressed (Russian Ctrl+ы also works) and can be
-  dismissed with Esc. Actual file export is not yet included.
-  ([#232](https://github.com/devlawey/filar/issues/232)).
-- Session-save progress overlay with progress bar and status display.
-  Shows saving progress, success, or error state in a centred modal.
-  ([#233](https://github.com/devlawey/filar/issues/233)).
-- Session-to-Markdown export and async file save. Messages are converted
-  to Markdown, saved to the working directory with a slug+timestamp
-  filename, and progress is reported via the save overlay.
-  ([#234](https://github.com/devlawey/filar/issues/234)).
+- Ctrl+S session export: saves the current chat session as a Markdown file
+  in the working directory. Russian layout (Ctrl+ы) also supported.
+  A progress overlay shows during the save, and a toast confirms completion.
+  (`save_in_flight` guard prevents concurrent saves.)
+  ([#232](https://github.com/devlawey/filar/issues/232),
+   [#233](https://github.com/devlawey/filar/issues/233),
+   [#234](https://github.com/devlawey/filar/issues/234),
+   [#235](https://github.com/devlawey/filar/issues/235)).
 
 ## [0.8.6] - 2026-08-02
 
