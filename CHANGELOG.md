@@ -17,6 +17,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   appears when Ctrl+S is pressed (Russian Ctrl+ы also works) and can be
   dismissed with Esc. Actual file export is not yet included.
   ([#232](https://github.com/devlawey/filar/issues/232)).
+- Session-save progress overlay with progress bar and status display.
+  Shows saving progress, success, or error state in a centred modal.
+  ([#233](https://github.com/devlawey/filar/issues/233)).
 
 ## [0.8.6] - 2026-08-02
 
