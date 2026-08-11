@@ -224,6 +224,8 @@ pub struct App {
     pub save_progress: u8,
     /// Error message if the last save failed.
     pub save_error: Option<String>,
+    /// Whether an async save task is currently in flight.
+    pub save_in_flight: bool,
     /// Channel sender for save progress events. Set by the runner (#235).
     pub save_tx: Option<tokio::sync::mpsc::UnboundedSender<SaveProgress>>,
 }
@@ -399,6 +401,7 @@ impl App {
             save_overlay_visible: false,
             save_progress: 0,
             save_error: None,
+            save_in_flight: false,
             save_tx: None,
         }
     }
@@ -695,16 +698,19 @@ fn messages_to_markdown(messages: &[ChatBlock], session_name: &str, ssh_info: &O
             ChatBlock::Command { command, output, .. } => {
                 md.push_str(&format!("**$ {command}**\n"));
                 if let Some(out) = output {
-                    // Use a 4-backtick fence when the output itself contains ```.
-                    let contains_fence = out.contains("```");
-                    let fence = if contains_fence { "````" } else { "```" };
-                    md.push_str(fence);
+                    let max_ticks = out
+                        .split(|ch| ch != '`')
+                        .map(str::len)
+                        .max()
+                        .unwrap_or(0);
+                    let fence = "`".repeat((max_ticks + 1).max(3));
+                    md.push_str(&fence);
                     md.push('\n');
                     md.push_str(out);
                     if !out.ends_with('\n') {
                         md.push('\n');
                     }
-                    md.push_str(fence);
+                    md.push_str(&fence);
                     md.push('\n');
                 }
                 md.push('\n');
@@ -994,11 +1000,13 @@ impl App {
     /// Spawns a background task that converts messages to Markdown and writes
     /// the file asynchronously. Progress is reported via `self.save_tx`.
     pub fn start_save(&mut self) {
-        // Guard against concurrent saves.
-        if self.save_overlay_visible {
+        // Guard against concurrent saves — separate from overlay visibility
+        // so that Esc can hide the overlay while the task completes.
+        if self.save_in_flight {
             return;
         }
 
+        self.save_in_flight = true;
         self.save_overlay_visible = true;
         self.save_progress = 0;
         self.save_error = None;
@@ -1032,6 +1040,12 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Called by the runner when a save completes (success or error).
+    /// Resets the in-flight guard so a new save can be started.
+    pub fn finish_save(&mut self) {
+        self.save_in_flight = false;
     }
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
@@ -6134,5 +6148,15 @@ mod tests {
         assert!(app.save_overlay_visible, "start_save must open overlay");
         assert_eq!(app.save_progress, 0, "save_progress must reset");
         assert!(app.save_error.is_none(), "save_error must clear");
+        assert!(app.save_in_flight, "save_in_flight must be set");
+        // Second call must be blocked by save_in_flight guard.
+        app.save_overlay_visible = false;
+        app.save_progress = 99;
+        app.start_save();
+        assert!(!app.save_overlay_visible, "second start_save must be no-op");
+        assert_eq!(app.save_progress, 99, "state must not reset on blocked call");
+        // finish_save must allow a new save.
+        app.finish_save();
+        assert!(!app.save_in_flight, "finish_save must clear the flag");
     }
 }
