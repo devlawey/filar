@@ -34,6 +34,7 @@ mod confirm;
 mod help;
 mod host_select;
 mod input;
+mod save_overlay;
 #[allow(unused_imports)]
 pub(crate) use chat::scrollbar_content_len;
 pub mod layout_cache;
@@ -126,6 +127,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
         let full = f.area();
         host_select::render_host_select(f, app, full);
     }
+
+    // Render session-save progress overlay on top of everything if active.
+    if app.save_overlay_visible {
+        let full = f.area();
+        save_overlay::render_save_overlay(f, app, full);
+    }
 }
 
 /// Render the interactive terminal mode.
@@ -192,6 +199,12 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
     if app.host_select_visible {
         let full = f.area();
         host_select::render_host_select(f, app, full);
+    }
+
+    // Render session-save progress overlay on top of everything if active.
+    if app.save_overlay_visible {
+        let full = f.area();
+        save_overlay::render_save_overlay(f, app, full);
     }
 }
 

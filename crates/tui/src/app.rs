@@ -218,6 +218,12 @@ pub struct App {
     pub host_select_visible: bool,
     /// Cursor position in the host-selection overlay.
     pub host_select_index: usize,
+    /// Whether the session-save progress overlay is visible (Ctrl+S).
+    pub save_overlay_visible: bool,
+    /// Save progress percentage (0-100).
+    pub save_progress: u8,
+    /// Error message if the last save failed.
+    pub save_error: Option<String>,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -388,6 +394,9 @@ impl App {
             ctrl_o_pending_session_id: None,
             host_select_visible: false,
             host_select_index: 0,
+            save_overlay_visible: false,
+            save_progress: 0,
+            save_error: None,
         }
     }
 
@@ -837,6 +846,27 @@ impl App {
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        // Helper: check if key is Ctrl+<english_char>, considering Russian layout.
+        // On Russian ЙЦУКЕН layout, physical keys produce different characters.
+        let is_ctrl = |c: char| {
+            key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char(c)
+        };
+        // Map English Ctrl shortcuts to both English and Russian layout chars.
+        // Russian equivalents (ЙЦУКЕН): T=е, C=с, A=ф, D=в, Y=н, N=т, P=з,
+        // Q=й, Z=я, W=ц, V=м
+        let ctrl_key = |en: char, ru: char| is_ctrl(en) || is_ctrl(ru);
+
+        // When the save overlay is visible, only ESC is processed for closing —
+        // all other keys (including F1, Ctrl+S, global hotkeys) are consumed.
+        if self.save_overlay_visible {
+            match key.code {
+                KeyCode::Esc => self.save_overlay_visible = false,
+                _ => {}
+            }
+            return;
+        }
+
         // F1 toggles the help overlay — except in PasswordInput where
         // the overlay would steal Esc from the password-cancel flow.
         if key.code == KeyCode::F(1) && self.mode != AppMode::PasswordInput {
@@ -861,17 +891,6 @@ impl App {
             }
             return;
         }
-
-        // Helper: check if key is Ctrl+<english_char>, considering Russian layout.
-        // On Russian ЙЦУКЕН layout, physical keys produce different characters.
-        let is_ctrl = |c: char| {
-            key.modifiers.contains(KeyModifiers::CONTROL)
-                && key.code == KeyCode::Char(c)
-        };
-        // Map English Ctrl shortcuts to both English and Russian layout chars.
-        // Russian equivalents (ЙЦУКЕН): T=е, C=с, A=ф, D=в, Y=н, N=т, P=з,
-        // Q=й, Z=я, W=ц, V=м
-        let ctrl_key = |en: char, ru: char| is_ctrl(en) || is_ctrl(ru);
 
         // Ctrl+V — paste from clipboard. Active in Normal, Confirming, and
         // PasswordInput modes. In Interactive mode, bracketed paste (Event::Paste)
@@ -945,6 +964,14 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        // Ctrl+S — save current session as Markdown.
+        if ctrl_key('s', 'ы') && self.mode == AppMode::Normal {
+            self.save_overlay_visible = true;
+            self.save_progress = 0;
+            self.save_error = None;
             return;
         }
 
@@ -5778,5 +5805,81 @@ mod tests {
         assert!(app.ctrl_o_needs_connect, "ctrl_o_needs_connect must be set for runner");
         assert_eq!(app.mode, AppMode::Normal);
         assert!(app.ctrl_o_pending_target.is_some(), "pending target consumed by runner, not app");
+    }
+
+    // ── Ctrl+S save session overlay tests (#232) ─────────────────────
+
+    #[test]
+    fn ctrl_s_opens_save_overlay() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.save_overlay_visible, "Ctrl+S must open save overlay");
+        assert_eq!(app.save_progress, 0, "save_progress must reset to 0");
+        assert!(app.save_error.is_none(), "save_error must be cleared");
+    }
+
+    #[test]
+    fn ctrl_s_russian_layout_opens_save_overlay() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::Char('ы'), KeyModifiers::CONTROL));
+        assert!(app.save_overlay_visible, "Ctrl+ы must open save overlay");
+    }
+
+    #[test]
+    fn esc_closes_save_overlay() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.save_overlay_visible);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.save_overlay_visible, "Esc must close save overlay");
+    }
+
+    #[test]
+    fn keys_blocked_when_save_overlay_visible() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.save_overlay_visible = true;
+        app.save_progress = 50;
+        // Any non-Esc key must be ignored and not reset progress.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.save_overlay_visible, "overlay must stay visible on non-Esc key");
+        assert_eq!(app.save_progress, 50, "progress must not reset on non-Esc key");
+        // Esc must close.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.save_overlay_visible);
+    }
+
+    #[test]
+    fn repeated_ctrl_s_while_save_overlay_visible_does_not_reset() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.save_overlay_visible = true;
+        app.save_progress = 75;
+        // Second Ctrl+S must be blocked by the guard, not reset state.
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.save_overlay_visible, "overlay must stay visible");
+        assert_eq!(app.save_progress, 75, "progress must not reset on repeated Ctrl+S");
+    }
+
+    #[test]
+    fn ctrl_s_clears_save_error() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.save_error = Some("previous error".into());
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.save_error.is_none(), "save_error must be cleared on open");
+    }
+
+    #[test]
+    fn ctrl_s_respects_mode() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        // Ctrl+S in Thinking mode must be a no-op.
+        app.mode = AppMode::Thinking;
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(!app.save_overlay_visible, "Ctrl+S must not open overlay in Thinking mode");
     }
 }

@@ -11,6 +11,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Session-save overlay infrastructure and Ctrl+S shortcut. The overlay
+  appears when Ctrl+S is pressed (Russian Ctrl+ы also works) and can be
+  dismissed with Esc. Actual file export is not yet included.
+  ([#232](https://github.com/devlawey/filar/issues/232)).
+
 ## [0.8.6] - 2026-08-02
 
 ### Fixed
