@@ -3931,7 +3931,7 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 
 ## Текущая работа: 0.9.0 milestone
 
-**Дата:** 2026-08-11. **Milestone:** Filar v0.9.0 (в работе, 3/4 issue).
+**Дата:** 2026-08-11. **Milestone:** Filar v0.9.0 (завершён, 4/4 issue).
 
 **Сделано:**
 - #232: feat — инфраструктура оверлея сохранения сессии и Ctrl+S binding:
@@ -3950,10 +3950,14 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
   - `messages_to_markdown()` — все типы ChatBlock в Markdown
   - `generate_save_filename()` — slug + UTC timestamp, избегает перезаписи (-N суффикс)
   - `SaveProgress` enum и `App::start_save()` — spawn tokio::task с прогрессом
-  - Поле `App::save_tx` (пока None, wiring в #235)
+  - Поле `App::save_tx` и `save_in_flight` guard
+- #235: feat — интеграция канала сохранения в runner:
+  - `unbounded_channel<SaveProgress>` в `run_app()`
+  - `app.save_tx = Some(save_tx)` — канал активен
+  - `try_recv()` в event loop — Started→0%, Writing→50%, Done→100%+toast+system_log, Error→ошибка
 
-**Публичные контракты:** `App` — новые поля `save_overlay_visible`, `save_progress`, `save_error`, `save_tx`.
-Новый тип `SaveProgress`. Новый модуль `crates/tui/src/ui/save_overlay.rs`.
+**Публичные контракты:** `App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `finish_save()`.
+Тип `SaveProgress`. Модуль `crates/tui/src/ui/save_overlay.rs`.
 
 **Engine:** не менялся (только tui). Тег engine НЕ ставится.
 

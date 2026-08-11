@@ -24,7 +24,7 @@ use filar_transport::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::app::{App, AppMode, SessionId};
+use crate::app::{App, AppMode, SaveProgress, SessionId};
 use crate::confirmer::TuiConfirmer;
 use crate::event::TuiEvent;
 use crate::terminal::TerminalModel;
@@ -336,6 +336,10 @@ async fn run_app(
     // Channel for agent → UI events.
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<TuiEvent>();
 
+    // Channel for session-save progress (Ctrl+S, #234/#235).
+    let (save_tx, mut save_rx) = tokio::sync::mpsc::unbounded_channel::<SaveProgress>();
+    app.save_tx = Some(save_tx);
+
     // Receiver for WARN/ERROR log lines mirrored into the chat.
     let mut log_rx = config.log_rx.take();
 
@@ -400,8 +404,69 @@ async fn run_app(
 
     loop {
         let in_interactive = app.mode == AppMode::Interactive;
-
         tokio::select! {
+            biased;
+
+            // Save progress updates (Ctrl+S, #235). Must be inside the
+            // select so the progress bar updates even when the user is idle.
+            Some(progress) = save_rx.recv() => {
+                match progress {
+                    SaveProgress::Started => {
+                        app.save_progress = 0;
+                        app.save_error = None;
+                    }
+                    SaveProgress::Writing => {
+                        app.save_progress = 50;
+                    }
+                    SaveProgress::Done(filename) => {
+                        app.save_progress = 100;
+                        if !app.save_overlay_visible {
+                            app.save_overlay_visible = true;
+                        }
+                        app.finish_save();
+                        let msg = format!("Saved to {filename}");
+                        app.toast = Some((msg, Instant::now() + Duration::from_secs(3)));
+                        app.push_system_log(format!("Session saved to {filename}"));
+                    }
+                    SaveProgress::Error(err) => {
+                        app.save_error = Some(err.clone());
+                        app.save_progress = 0;
+                        if !app.save_overlay_visible {
+                            app.save_overlay_visible = true;
+                        }
+                        app.finish_save();
+                    }
+                }
+                // Drain any remaining messages delivered during this iteration.
+                while let Ok(p) = save_rx.try_recv() {
+                    match p {
+                        SaveProgress::Done(filename) => {
+                            app.save_progress = 100;
+                            if !app.save_overlay_visible {
+                                app.save_overlay_visible = true;
+                            }
+                            let msg = format!("Saved to {filename}");
+                            app.toast = Some((msg, Instant::now() + Duration::from_secs(3)));
+                            app.push_system_log(format!("Session saved to {filename}"));
+                            app.finish_save();
+                        }
+                        SaveProgress::Error(err) => {
+                            app.save_error = Some(err);
+                            app.save_progress = 0;
+                            if !app.save_overlay_visible {
+                                app.save_overlay_visible = true;
+                            }
+                            app.finish_save();
+                        }
+                        SaveProgress::Writing => {
+                            app.save_progress = 50;
+                        }
+                        _ => {}
+                    }
+                }
+                needs_redraw = true;
+            }
+
             // Terminal keyboard / resize event.
             maybe_event = events.next() => {
                 match maybe_event {
