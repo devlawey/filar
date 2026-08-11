@@ -647,12 +647,20 @@ fn generate_save_filename(session_name: &str, ssh_info: &Option<String>) -> Stri
     // Avoid overwriting: append -1, -2, … if file already exists.
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     if cwd.join(&name).exists() {
-        for n in 1u32.. {
+        for n in 1u32..1000 {
             let alt = format!("{slug}.{ts}-{n}.md");
             if !cwd.join(&alt).exists() {
                 name = alt;
                 break;
             }
+        }
+        // Extreme edge-case: all 999 suffixes taken → append nanos.
+        if cwd.join(&name).exists() {
+            let ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos();
+            name = format!("{slug}.{ts}-{ns}.md");
         }
     }
     name
@@ -687,12 +695,17 @@ fn messages_to_markdown(messages: &[ChatBlock], session_name: &str, ssh_info: &O
             ChatBlock::Command { command, output, .. } => {
                 md.push_str(&format!("**$ {command}**\n"));
                 if let Some(out) = output {
-                    md.push_str("```\n");
+                    // Use a 4-backtick fence when the output itself contains ```.
+                    let contains_fence = out.contains("```");
+                    let fence = if contains_fence { "````" } else { "```" };
+                    md.push_str(fence);
+                    md.push('\n');
                     md.push_str(out);
                     if !out.ends_with('\n') {
                         md.push('\n');
                     }
-                    md.push_str("```\n");
+                    md.push_str(fence);
+                    md.push('\n');
                 }
                 md.push('\n');
             }
@@ -981,6 +994,11 @@ impl App {
     /// Spawns a background task that converts messages to Markdown and writes
     /// the file asynchronously. Progress is reported via `self.save_tx`.
     pub fn start_save(&mut self) {
+        // Guard against concurrent saves.
+        if self.save_overlay_visible {
+            return;
+        }
+
         self.save_overlay_visible = true;
         self.save_progress = 0;
         self.save_error = None;
