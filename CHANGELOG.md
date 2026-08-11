@@ -11,6 +11,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Ctrl+S shortcut saves the current session as a Markdown file in the working
+  directory. A progress overlay appears during the save. Russian layout
+  (Ctrl+ы) is also supported.
+  ([#232](https://github.com/devlawey/filar/issues/232)).
+
 ## [0.8.6] - 2026-08-02
 
 ### Fixed

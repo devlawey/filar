@@ -450,4 +450,11 @@ mod tests {
         let has_o = items.iter().any(|i| i.key == "^O" && i.desc == "hosts");
         assert!(has_o, "Normal mode help must include ^O hosts");
     }
+
+    #[test]
+    fn normal_mode_help_includes_ctrl_s() {
+        let items = help_items(AppMode::Normal);
+        let has_s = items.iter().any(|i| i.key == "^S" && i.desc == "save");
+        assert!(has_s, "Normal mode help must include ^S save");
+    }
 }

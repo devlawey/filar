@@ -5,6 +5,7 @@ use ratatui::Frame;
 
 use crate::app::App;
 
-pub(crate) fn render_save_overlay(_f: &mut Frame, _app: &App, _area: Rect) {
-    // Stub — real rendering implemented in issue #233.
-}
+/// Render the session-save progress overlay.
+///
+/// Currently a stub — real rendering with progress bar implemented in issue #233.
+pub(crate) fn render_save_overlay(_f: &mut Frame, _app: &App, _area: Rect) {}

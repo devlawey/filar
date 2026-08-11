@@ -339,15 +339,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 ## 8. Тесты
 
-- **529 unit-тестов** проходят (включая doc-тесты):
+- **452 unit-тестов** проходят (включая doc-тесты):
   - filar-agent: 67 тестов
   - filar-app: 14 тестов
   - filar-core: 49 тестов + 2 doc-теста
   - filar-gui: 16 тестов
   - filar-transport: 26 тестов (7 ignored — требуют Docker sshd)
   - filar-tui: 278 тестов
-- **1 pre-existing failure:** `parse_minimal_config` в filar-core (ожидает `Always`,
-  дефолт `Allowlist`) — unrelated к текущим изменениям
+- **0 failures**, 7 ignored (Docker)
 
 ```powershell
 cd c:\dev\warper
