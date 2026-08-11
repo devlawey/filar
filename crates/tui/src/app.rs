@@ -224,6 +224,10 @@ pub struct App {
     pub save_progress: u8,
     /// Error message if the last save failed.
     pub save_error: Option<String>,
+    /// Whether an async save task is currently in flight.
+    pub save_in_flight: bool,
+    /// Channel sender for save progress events. Set by the runner (#235).
+    pub save_tx: Option<tokio::sync::mpsc::UnboundedSender<SaveProgress>>,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -397,6 +401,8 @@ impl App {
             save_overlay_visible: false,
             save_progress: 0,
             save_error: None,
+            save_in_flight: false,
+            save_tx: None,
         }
     }
 
@@ -572,6 +578,158 @@ impl Session {
     pub fn input_history(&self) -> &[String] {
         &self.input_history
     }
+}
+
+// ── Session-save helpers (Ctrl+S, #234) ──────────────────────────────
+
+/// Progress event sent from the background save task to the runner.
+#[derive(Debug)]
+pub enum SaveProgress {
+    Started,
+    Writing,
+    Done(String),   // display filename
+    Error(String),  // error message
+}
+
+/// Convert a Unix timestamp (seconds) to broken-down UTC time.
+/// Minimal implementation — avoids pulling in `chrono`.
+fn unix_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = (rem / 3600) as u32;
+    let min = ((rem % 3600) / 60) as u32;
+    let sec = (rem % 60) as u32;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if m <= 2 { y + 1 } else { y } as u32;
+
+    (year, m, d, hour, min, sec)
+}
+
+/// Current UTC timestamp formatted as `YYYY-MM-DD.HHMMSS`.
+fn format_now_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (year, month, day, hour, min, sec) = unix_to_ymdhms(secs);
+    format!("{year:04}-{month:02}-{day:02}.{hour:02}{min:02}{sec:02}")
+}
+
+/// Slugify a string for use in a filename:
+/// replace non-alphanumeric (except `._-`) with `-`, limit length to 80.
+fn slugify(s: &str) -> String {
+    let mut result = String::new();
+    let mut prev_dash = false;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
+            result.push(ch);
+            prev_dash = ch == '-';
+        } else if !prev_dash {
+            result.push('-');
+            prev_dash = true;
+        }
+    }
+    result.trim_matches('-').chars().take(80).collect()
+}
+
+/// Generate a save filename: `{slug}.{date}.{time}.md`
+fn generate_save_filename(session_name: &str, ssh_info: &Option<String>) -> String {
+    let base = ssh_info.as_deref().unwrap_or(session_name);
+    let slug = slugify(base);
+    let ts = format_now_utc();
+    let mut name = format!("{slug}.{ts}.md");
+    // Avoid overwriting: append -1, -2, … if file already exists.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    if cwd.join(&name).exists() {
+        for n in 1u32..1000 {
+            let alt = format!("{slug}.{ts}-{n}.md");
+            if !cwd.join(&alt).exists() {
+                name = alt;
+                break;
+            }
+        }
+        // Extreme edge-case: all 999 suffixes taken → append nanos.
+        if cwd.join(&name).exists() {
+            let ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos();
+            name = format!("{slug}.{ts}-{ns}.md");
+        }
+    }
+    name
+}
+
+/// Convert a list of [`ChatBlock`] messages into a Markdown string.
+fn messages_to_markdown(messages: &[ChatBlock], session_name: &str, ssh_info: &Option<String>) -> String {
+    let mut md = String::new();
+    md.push_str(&format!("# Session: {session_name}\n\n"));
+    let ts = {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let (y, mo, d, h, mi, s) = unix_to_ymdhms(secs);
+        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+    };
+    md.push_str(&format!("Date: {ts}\n"));
+    if let Some(ref info) = ssh_info {
+        md.push_str(&format!("Target: {info}\n"));
+    }
+    md.push_str("\n---\n\n");
+
+    for block in messages {
+        match block {
+            ChatBlock::User(s) => {
+                md.push_str(&format!("**You:** {s}\n\n"));
+            }
+            ChatBlock::Agent(s) => {
+                md.push_str(&format!("**Agent:** {s}\n\n"));
+            }
+            ChatBlock::Command { command, output, .. } => {
+                md.push_str(&format!("**$ {command}**\n"));
+                if let Some(out) = output {
+                    let max_ticks = out
+                        .chars()
+                        .fold((0usize, 0usize), |(max, cur), ch| {
+                            if ch == '`' {
+                                let cur = cur + 1;
+                                (max.max(cur), cur)
+                            } else {
+                                (max, 0)
+                            }
+                        })
+                        .0;
+                    let fence = "`".repeat((max_ticks + 1).max(3_usize));
+                    md.push_str(&fence);
+                    md.push('\n');
+                    md.push_str(out);
+                    if !out.ends_with('\n') {
+                        md.push('\n');
+                    }
+                    md.push_str(&fence);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+            ChatBlock::Error(s) => {
+                md.push_str(&format!("**Error:** {s}\n\n"));
+            }
+            ChatBlock::System(s) => {
+                md.push_str(&format!("*{s}*\n\n"));
+            }
+        }
+    }
+    md
 }
 
 impl App {
@@ -843,6 +1001,63 @@ impl App {
         }
     }
 
+    /// Start saving the current session as a Markdown file.
+    ///
+    /// Spawns a background task that converts messages to Markdown and writes
+    /// the file asynchronously. Progress is reported via `self.save_tx`.
+    pub fn start_save(&mut self) {
+        // Guard against concurrent saves — separate from overlay visibility
+        // so that Esc can hide the overlay while the task completes.
+        if self.save_in_flight {
+            return;
+        }
+
+        self.save_in_flight = true;
+        self.save_overlay_visible = true;
+        self.save_progress = 0;
+        self.save_error = None;
+
+        let Some(ref tx) = self.save_tx else {
+            return;
+        };
+
+        let session_name = self.sessions[self.active].target_name.clone();
+        let ssh_info = self.sessions[self.active].ssh_info.clone();
+        let messages = self.sessions[self.active].messages.clone();
+        let tx = tx.clone();
+
+        tokio::spawn(async move {
+            tx.send(SaveProgress::Started).ok();
+
+            let filename = generate_save_filename(&session_name, &ssh_info);
+            let md_content = messages_to_markdown(&messages, &session_name, &ssh_info);
+
+            tx.send(SaveProgress::Writing).ok();
+
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let filepath = cwd.join(&filename);
+
+            match tokio::fs::write(&filepath, &md_content).await {
+                Ok(_) => {
+                    tx.send(SaveProgress::Done(filename)).ok();
+                }
+                Err(e) => {
+                    tx.send(SaveProgress::Error(format!("Failed to write file: {e}"))).ok();
+                }
+            }
+        });
+    }
+
+    /// Called by the runner when a save completes (success or error).
+    /// Resets the in-flight guard so a new save can be started.
+    ///
+    /// TODO(#235): runner must re-show the overlay (`save_overlay_visible = true`)
+    /// when Done/Error arrives, so the user sees the result even if they pressed
+    /// Esc while the task was still running.
+    pub fn finish_save(&mut self) {
+        self.save_in_flight = false;
+    }
+
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -969,9 +1184,7 @@ impl App {
 
         // Ctrl+S — save current session as Markdown.
         if ctrl_key('s', 'ы') && self.mode == AppMode::Normal {
-            self.save_overlay_visible = true;
-            self.save_progress = 0;
-            self.save_error = None;
+            self.start_save();
             return;
         }
 
@@ -5881,5 +6094,79 @@ mod tests {
         app.mode = AppMode::Thinking;
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(!app.save_overlay_visible, "Ctrl+S must not open overlay in Thinking mode");
+    }
+
+    // ── Session-save export helpers (#234) ────────────────────────────
+
+    #[test]
+    fn slugify_replaces_special_chars() {
+        let s = slugify("user@host:22");
+        assert_eq!(s, "user-host-22", "slug must replace @ and : with dashes");
+    }
+
+    #[test]
+    fn slugify_collapses_consecutive_nonalphanum() {
+        let s = slugify("a@#b");
+        assert_eq!(s, "a-b", "consecutive special chars must collapse to one dash");
+    }
+
+    #[test]
+    fn slugify_limits_length() {
+        let s = "a".repeat(100);
+        let slug = slugify(&s);
+        assert!(slug.len() <= 80, "slug must be at most 80 chars");
+    }
+
+    #[test]
+    fn generate_save_filename_has_correct_format() {
+        let name = generate_save_filename("my-server", &Some("root@10.0.0.5:22".into()));
+        assert!(
+            name.starts_with("root-10.0.0.5-22.") && name.ends_with(".md"),
+            "expected slug.date.time.md format, got: {name}"
+        );
+        assert!(!name.contains(' '), "filename must not contain spaces");
+    }
+
+    #[test]
+    fn messages_to_markdown_covers_all_block_types() {
+        let blocks = vec![
+            ChatBlock::User("hello".into()),
+            ChatBlock::Agent("hi".into()),
+            ChatBlock::Command {
+                command: "ls".into(),
+                explanation: "list".into(),
+                output: Some("f.txt".into()),
+                approved: true,
+            },
+            ChatBlock::Error("fail".into()),
+            ChatBlock::System("started".into()),
+        ];
+        let md = messages_to_markdown(&blocks, "test", &Some("u@h:22".into()));
+        assert!(md.contains("**You:** hello"), "must render User block");
+        assert!(md.contains("**Agent:** hi"), "must render Agent block");
+        assert!(md.contains("**$ ls**"), "must render Command block");
+        assert!(md.contains("f.txt"), "must render command output");
+        assert!(md.contains("**Error:** fail"), "must render Error block");
+        assert!(md.contains("*started*"), "must render System block");
+    }
+
+    #[test]
+    fn start_save_sets_overlay_without_tx() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.save_tx = None;
+        app.start_save();
+        assert!(app.save_overlay_visible, "start_save must open overlay");
+        assert_eq!(app.save_progress, 0, "save_progress must reset");
+        assert!(app.save_error.is_none(), "save_error must clear");
+        assert!(app.save_in_flight, "save_in_flight must be set");
+        // Second call must be blocked by save_in_flight guard.
+        app.save_overlay_visible = false;
+        app.save_progress = 99;
+        app.start_save();
+        assert!(!app.save_overlay_visible, "second start_save must be no-op");
+        assert_eq!(app.save_progress, 99, "state must not reset on blocked call");
+        // finish_save must allow a new save.
+        app.finish_save();
+        assert!(!app.save_in_flight, "finish_save must clear the flag");
     }
 }

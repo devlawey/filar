@@ -20,6 +20,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Session-save progress overlay with progress bar and status display.
   Shows saving progress, success, or error state in a centred modal.
   ([#233](https://github.com/devlawey/filar/issues/233)).
+- Session-to-Markdown export and async file save. Messages are converted
+  to Markdown, saved to the working directory with a slug+timestamp
+  filename, and progress is reported via the save overlay.
+  ([#234](https://github.com/devlawey/filar/issues/234)).
 
 ## [0.8.6] - 2026-08-02
 
