@@ -452,6 +452,7 @@ async fn run_app(
                         }
                         SaveProgress::Error(err) => {
                             app.save_error = Some(err);
+                            app.save_progress = 0;
                             if !app.save_overlay_visible {
                                 app.save_overlay_visible = true;
                             }
