@@ -339,13 +339,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 ## 8. Тесты
 
-- **460 unit-тестов** проходят (включая doc-тесты):
+- **470 unit-тестов** проходят (включая doc-тесты):
   - filar-agent: 67 тестов
   - filar-app: 14 тестов
   - filar-core: 49 тестов + 2 doc-теста
   - filar-gui: 16 тестов
   - filar-transport: 26 тестов (7 ignored — требуют Docker sshd)
-  - filar-tui: 286 тестов
+  - filar-tui: 296 тестов
 - **0 failures**, 7 ignored (Docker)
 
 ```powershell
@@ -3931,7 +3931,7 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 
 ## Текущая работа: 0.9.0 milestone
 
-**Дата:** 2026-08-11. **Milestone:** Filar v0.9.0 (в работе, 2/4 issue).
+**Дата:** 2026-08-11. **Milestone:** Filar v0.9.0 (в работе, 3/4 issue).
 
 **Сделано:**
 - #232: feat — инфраструктура оверлея сохранения сессии и Ctrl+S binding:
@@ -3946,9 +3946,14 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
   - Процент сохранения и `Gauge` (ratatui) — цвет заполнения `success_fg`
   - Статусная строка: "Saving..." / "Done!" / "Error: ..."
   - Футер "Esc to close"
+- #234: feat — Markdown-экспорт и асинхронная запись файла:
+  - `messages_to_markdown()` — все типы ChatBlock в Markdown
+  - `generate_save_filename()` — slug + UTC timestamp, избегает перезаписи (-N суффикс)
+  - `SaveProgress` enum и `App::start_save()` — spawn tokio::task с прогрессом
+  - Поле `App::save_tx` (пока None, wiring в #235)
 
-**Публичные контракты:** `App` — новые публичные поля `save_overlay_visible`, `save_progress`, `save_error`.
-Новый модуль `crates/tui/src/ui/save_overlay.rs`.
+**Публичные контракты:** `App` — новые поля `save_overlay_visible`, `save_progress`, `save_error`, `save_tx`.
+Новый тип `SaveProgress`. Новый модуль `crates/tui/src/ui/save_overlay.rs`.
 
 **Engine:** не менялся (только tui). Тег engine НЕ ставится.
 
