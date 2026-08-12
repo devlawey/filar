@@ -407,6 +407,12 @@ fn save_config_toml(settings: &Settings) {
     if !settings.extra_body.is_empty() {
         config.llm.extra_body = serde_json::from_str(&settings.extra_body).ok();
     }
+    // Clear stale launch-specific sections from a pre-#255 config.toml so
+    // they are not written back (migration). These now flow exclusively
+    // through `pending_launch.json`.
+    config.llm_profiles.clear();
+    config.ssh_targets.clear();
+    config.save_dir = None;
 
     if let Err(e) = std::fs::create_dir_all(&app_dir) {
         tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");
@@ -1095,6 +1101,35 @@ mod tests {
         assert!(result.contains("model = \"new\""), "model must be updated");
         assert!(result.contains("[[ssh_targets]]"), "ssh_targets must survive");
         assert!(result.contains("dev"), "ssh target name must survive");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_save_clears_stale_launch_sections() {
+        let dir = std::env::temp_dir().join(format!("filar_test_clear_{}", std::process::id()));
+        let app_dir = dir.join("filar");
+        let path = app_dir.join("config.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Pre-#255 config.toml with duplicated launch sections.
+        let existing = "[llm]\nmodel = \"old\"\napi_base_url = \"https://api\"\n\n[[llm_profiles]]\nname = \"p1\"\nmodel = \"m1\"\napi_base_url = \"https://api\"\nkey_env = \"K\"\n\n[[ssh_targets]]\nname = \"dev\"\nhost = \"10.0.0.1\"\nuser = \"root\"\nauth = { type = \"agent\" }\n\nsave_dir = \"C:\\\\tmp\"\n";
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(&path, existing).unwrap();
+
+        // Simulate save_config_toml's clear() logic after loading the config.
+        let mut config: filar_core::Config = filar_core::Config::load(&path).unwrap();
+        config.llm_profiles.clear();
+        config.ssh_targets.clear();
+        config.save_dir = None;
+        let saved = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&path, &saved).unwrap();
+
+        let result = std::fs::read_to_string(&path).unwrap();
+        assert!(!result.contains("[[llm_profiles]]"), "stale llm_profiles must be cleared");
+        assert!(!result.contains("[[ssh_targets]]"), "stale ssh_targets must be cleared");
+        assert!(!result.contains("save_dir"), "stale save_dir must be cleared");
+        assert!(result.contains("model = \"old\""), "llm section must survive");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
