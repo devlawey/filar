@@ -233,6 +233,8 @@ pub struct TuiConfig {
     /// `System` block, so important logs surface in the chat instead of being
     /// painted over the interface. `None` disables the feature (e.g. in tests).
     pub log_rx: Option<mpsc::UnboundedReceiver<String>>,
+    /// Directory where Ctrl+S session exports are written (`None` = CWD).
+    pub save_dir: Option<std::path::PathBuf>,
 }
 
 /// Run the TUI with the given LLM client, executor, and configuration.
@@ -315,12 +317,14 @@ async fn run_app(
         a.profiles = profiles_for_restore;
         a.default_profile_name = default_for_restore;
         a.ssh_targets = config.ssh_targets.clone();
+        a.save_dir = config.save_dir.clone();
         a
     } else {
         let mut a = App::new(config.target_name.clone(), config.confirm_mode);
         a.profiles = profiles_for_restore;
         a.default_profile_name = default_for_restore;
         a.ssh_targets = config.ssh_targets.clone();
+        a.save_dir = config.save_dir.clone();
         if let Some(s) = a.sessions.first_mut() {
             s.llm_profile = Some(config.llm_profile.clone());
         }

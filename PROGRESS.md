@@ -3931,7 +3931,7 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 
 ## Текущая работа: 0.9.0 milestone
 
-**Дата:** 2026-08-12. **Milestone:** Filar v0.9.0 (10 issue, 5 закрыто, #242 в работе).
+**Дата:** 2026-08-12. **Milestone:** Filar v0.9.0 (10 issue, 9 закрыто, #247 в работе).
 
 **Сделано:**
 - #232: feat — инфраструктура оверлея сохранения сессии и Ctrl+S binding
@@ -3951,9 +3951,13 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
   - PowerShell spawn'ится с `CREATE_NO_WINDOW` (0x08000000) — не трогает консоль TUI
   - UTF-8 сохраняется; `2>&1` из #243 остаётся
   - ⚠️ Требует Windows smoke-теста (не-ASCII stdout/stderr)
+- #247: feat — настраиваемая папка сохранения `save_dir`:
+  - `Config::save_dir: Option<PathBuf>` (core) → `TuiConfig` → `App`
+  - `start_save()`/`generate_save_filename()` пишут в `save_dir`, иначе CWD
+  - GUI-лаунчер: поле "Save directory" + Browse (rfd) + Reset
 
-**Публичные контракты:** `App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `finish_save()`.
-Тип `SaveProgress`. Модуль `crates/tui/src/ui/save_overlay.rs`.
+**Публичные контракты:** `App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `save_dir`, `finish_save()`.
+`Config::save_dir`. Тип `SaveProgress`. Модуль `crates/tui/src/ui/save_overlay.rs`.
 
 **Engine:** не менялся (только tui). Тег engine НЕ ставится.
 

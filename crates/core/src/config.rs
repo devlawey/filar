@@ -36,6 +36,11 @@ pub struct Config {
     /// Command confirmation policy.
     #[serde(default)]
     pub confirm_mode: CommandConfirmMode,
+
+    /// Directory where Ctrl+S session exports (`.md`) are written.
+    /// `None` means the process working directory at startup.
+    #[serde(default)]
+    pub save_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -46,6 +51,7 @@ impl Default for Config {
             llm_profiles: Vec::new(),
             timeouts: TimeoutConfig::default(),
             confirm_mode: CommandConfirmMode::Allowlist,
+            save_dir: None,
         }
     }
 }

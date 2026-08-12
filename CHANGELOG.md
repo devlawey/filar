@@ -25,6 +25,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   shows intermediate states (0% → 50% → 100%) with brief pauses,
   instead of jumping instantly to completion.
   ([#240](https://github.com/devlawey/filar/issues/240)).
+- Configurable save directory for session exports: `save_dir` in
+  `config.toml` sets where Ctrl+S writes `.md` files (default: working
+  directory). The GUI launcher gained a "Save directory" field with a
+  Browse folder picker.
+  ([#247](https://github.com/devlawey/filar/issues/247)).
 
 ### Fixed
 
