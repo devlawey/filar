@@ -1051,6 +1051,40 @@ mod tests {
     }
 
     #[test]
+    fn launch_config_serialization_omits_password_key() {
+        // Regression: SshAuth::Password { password: None } must NOT emit a
+        // `"password":` key, otherwise load_pending_launch() mistakes the file
+        // for an old-format plaintext-secret payload and deletes it (#258).
+        let cfg = LaunchConfig {
+            target: "ssh".into(),
+            ssh: None,
+            model: "glm".into(),
+            api_base_url: "https://api.example.com".into(),
+            api_key: String::new(),
+            session_id: None,
+            temperature: String::new(),
+            extra_body: String::new(),
+            selected_profile: None,
+            key_env: "GLM_API_KEY".into(),
+            save_dir: None,
+            profiles: vec![],
+            ssh_targets: vec![filar_core::SshTarget {
+                name: "srv".into(),
+                host: "10.0.0.1".into(),
+                port: 22,
+                user: "root".into(),
+                auth: filar_core::SshAuth::Password { password: None },
+                host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            }],
+        };
+        let json = serde_json::to_string_pretty(&cfg).unwrap();
+        assert!(!json.contains("\"password\":"), "must not emit password key when None, got: {json}");
+        assert!(json.contains("10.0.0.1"), "ssh target must survive");
+        // And the secret-detection heuristic in load_pending_launch must not trip.
+        assert!(!json.contains("\"api_key\":"), "must not emit api_key");
+    }
+
+    #[test]
     fn settings_save_pattern_preserves_data() {
         // Test the internal pattern: create_dir_all before write,
         // then write→read round-trip verifying data integrity.

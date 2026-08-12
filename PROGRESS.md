@@ -3931,7 +3931,7 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 
 ## Текущая работа: 0.9.0 milestone
 
-**Дата:** 2026-08-12. **Milestone:** Filar v0.9.0 (12/12 issue закрыты; Windows smoke-тест #253/#246 — ожидает ручной проверки).
+**Дата:** 2026-08-12. **Milestone:** Filar v0.9.0 (12/12 issue закрыты + #258 регрессия; Windows smoke-тест #253/#246 — ожидает ручной проверки).
 
 **Сделано:**
 - #232: feat — инфраструктура оверлея сохранения сессии и Ctrl+S binding
@@ -3963,6 +3963,9 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
   - `chcp 65001` (неэффективен для piped-вывода — .NET кеширует кодировку при старте) заменён на `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()`
   - `CREATE_NO_WINDOW` убран; `2>&1` из #243 остаётся
   - Не трогает консольную кодовую страницу → нет смены шрифта/resize (#246)
+- #258: fix — `SshAuth::Password` с `password: None` не сериализует ключ `"password"`:
+  - Регрессия #255: `LaunchConfig.ssh_targets` эмитил `"password": null` → `load_pending_launch` удалял pending_launch.json → TUI не стартовал
+  - Фикс: `#[serde(skip_serializing_if = "Option::is_none")]` на `password`; regression-тест добавлен
 
 **Публичные контракты:** `LaunchConfig` — новые поля `save_dir`, `profiles`, `ssh_targets`.
 `App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `save_dir`, `finish_save()`.
