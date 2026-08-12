@@ -407,10 +407,11 @@ fn save_config_toml(settings: &Settings) {
     if !settings.extra_body.is_empty() {
         config.llm.extra_body = serde_json::from_str(&settings.extra_body).ok();
     }
-    // NOTE: launch-specific sections (llm_profiles, ssh_targets, save_dir) are
-    // intentionally left untouched. The GUI no longer writes them (#255) — it
-    // passes them via `pending_launch.json` — but must NOT clear them either,
-    // because direct-TUI launches still read them from config.toml as fallback.
+    // The primary `[llm]` section above is the ONLY section the GUI still
+    // writes to config.toml (backward-compat). Launch-specific sections
+    // (llm_profiles, ssh_targets, save_dir) are intentionally left untouched:
+    // the GUI passes them via `pending_launch.json` (#255) and must NOT clear
+    // them, because direct-TUI launches read them from config.toml as fallback.
 
     if let Err(e) = std::fs::create_dir_all(&app_dir) {
         tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");

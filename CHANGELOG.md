@@ -34,10 +34,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 ### Changed
 
 - Session-save directory, LLM profiles and SSH targets are now passed from
-  the GUI launcher to the TUI via `pending_launch.json` instead of being
-  written into `config.toml`. The primary `[llm]` section and any manually
-  configured profiles/targets/save_dir remain in `config.toml` as a fallback
-  for direct (non-GUI) TUI launches.
+  the GUI launcher to the TUI via `pending_launch.json`. The GUI no longer
+  writes these launch-specific sections to `config.toml`; they remain only
+  as a fallback for direct (non-GUI) TUI launches.
   ([#255](https://github.com/devlawey/filar/issues/255)).
 
 ### Fixed
