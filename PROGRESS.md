@@ -3947,9 +3947,10 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
   - `bars.rs`: `Clear` перед `render_status_bar` и `render_separator`
   - `input.rs`: `Clear` перед `render_thinking`
   - Убирает жёлтый артефакт от mode-бейджа Thinking
-- #246: fix — замена `chcp 65001` на `[Console]::OutputEncoding`:
-  - Не вызывает `SetConsoleOutputCP` → нет смены шрифта консоли → нет resize
-  - UTF-8 сохраняется для stdout/stderr; `2>&1` из #243 остаётся
+- #246: fix — изоляция `chcp 65001` через `CREATE_NO_WINDOW`:
+  - PowerShell spawn'ится с `CREATE_NO_WINDOW` (0x08000000) → своя скрытая консоль
+  - `chcp 65001` не трогает консоль родительского TUI → нет смены шрифта/resize
+  - UTF-8 сохраняется; `2>&1` из #243 остаётся
 
 **Публичные контракты:** `App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `finish_save()`.
 Тип `SaveProgress`. Модуль `crates/tui/src/ui/save_overlay.rs`.

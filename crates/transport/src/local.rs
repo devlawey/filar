@@ -59,10 +59,16 @@ impl crate::CommandExecutor for LocalExecutor {
         // Build the command based on platform.
         #[cfg(windows)]
         let mut cmd = {
+            use std::os::windows::process::CommandExt;
+
             let full = build_shell_command(command);
-            let mut c = tokio::process::Command::new("powershell");
+            let mut c = std::process::Command::new("powershell");
             c.args(["-NoProfile", "-NonInteractive", "-Command", &full]);
-            c
+            // CREATE_NO_WINDOW: give the child its own hidden console so that
+            // `chcp 65001` does not change the parent TUI's console code page
+            // (which could trigger font switch / resize events).
+            c.creation_flags(0x0800_0000);
+            tokio::process::Command::from(c)
         };
         #[cfg(unix)]
         let mut cmd = {
@@ -132,15 +138,15 @@ impl crate::CommandExecutor for LocalExecutor {
 
 /// Build the shell command string for the current platform.
 ///
-/// On Windows, uses `[Console]::OutputEncoding` to set the output stream
-/// encoding to UTF-8 (without calling `SetConsoleOutputCP`, which can trigger
-/// console font switches and resize events on some Windows configurations).
-/// Appends `2>&1` to redirect stderr through stdout so that PowerShell error
-/// messages are also decoded correctly by `String::from_utf8_lossy`.
+/// On Windows, prepends `chcp 65001 > $null;` to set the console code page
+/// to UTF-8 and appends `2>&1` to redirect stderr through stdout so that
+/// PowerShell error messages are also decoded correctly by
+/// `String::from_utf8_lossy`. The child process runs with `CREATE_NO_WINDOW`
+/// so `chcp` affects only its own hidden console, not the parent TUI console.
 fn build_shell_command(command: &str) -> String {
     #[cfg(windows)]
     {
-        format!("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); {command} 2>&1")
+        format!("chcp 65001 > $null; {command} 2>&1")
     }
     #[cfg(not(windows))]
     {
@@ -160,11 +166,11 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn build_shell_command_windows_has_output_encoding() {
+    fn build_shell_command_windows_has_chcp() {
         let result = build_shell_command("dir");
         assert!(
-            result.starts_with("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); "),
-            "Windows command must start with OutputEncoding prefix, got: {result}"
+            result.starts_with("chcp 65001 > $null; "),
+            "Windows command must start with chcp 65001 prefix, got: {result}"
         );
     }
 
@@ -173,17 +179,16 @@ mod tests {
     fn build_shell_command_windows_has_stderr_redirect() {
         let result = build_shell_command("dir");
         assert!(
-            result.starts_with("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); ")
-                && result.ends_with(" 2>&1"),
-            "Windows command must have OutputEncoding prefix and 2>&1 suffix, got: {result}"
+            result.starts_with("chcp 65001 > $null; ") && result.ends_with(" 2>&1"),
+            "Windows command must have chcp prefix and 2>&1 suffix, got: {result}"
         );
     }
 
     #[test]
     #[cfg(not(windows))]
-    fn build_shell_command_unix_no_prefix() {
+    fn build_shell_command_unix_no_chcp() {
         let result = build_shell_command("ls");
         assert_eq!(result, "ls");
-        assert!(!result.contains("OutputEncoding"));
+        assert!(!result.contains("chcp"));
     }
 }
