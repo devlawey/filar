@@ -266,6 +266,9 @@ struct Settings {
     /// Index of the default (last-selected) profile.
     #[serde(default)]
     selected_profile: usize,
+    /// Directory for Ctrl+S session exports (`None` = CWD).
+    #[serde(default)]
+    save_dir: Option<std::path::PathBuf>,
 }
 
 impl Settings {
@@ -401,6 +404,9 @@ fn save_config_toml(settings: &Settings) {
     // Sync launcher SSH profiles to [[ssh_targets]].
     config.ssh_targets = build_ssh_targets_from_profiles(&settings.ssh_profiles);
 
+    // Save directory for Ctrl+S session exports.
+    config.save_dir = settings.save_dir.clone();
+
     if let Err(e) = std::fs::create_dir_all(&app_dir) {
         tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");
         return;
@@ -472,6 +478,8 @@ struct LauncherApp {
     /// Currently selected profile index.
     selected_profile: usize,
     validation_error: String,
+    /// Directory for Ctrl+S session exports (`None` = CWD).
+    save_dir: Option<std::path::PathBuf>,
 }
 
 /// Local copy of an LLM profile for GUI editing.
@@ -659,6 +667,30 @@ impl LauncherApp {
             .desired_rows(2).desired_width(f32::INFINITY));
     }
 
+    /// Folder picker for the Ctrl+S session export directory.
+    fn render_save_dir_field(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Save directory:");
+            let mut display = match &self.save_dir {
+                Some(p) => p.display().to_string(),
+                None => "CWD (where filar was launched)".to_string(),
+            };
+            ui.add(
+                egui::TextEdit::singleline(&mut display)
+                    .desired_width(240.0)
+                    .interactive(false),
+            );
+            if ui.button("Browse…").clicked() {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.save_dir = Some(dir);
+                }
+            }
+            if self.save_dir.is_some() && ui.button("Reset").clicked() {
+                self.save_dir = None;
+            }
+        });
+    }
+
     fn save_profiles(&mut self) {
         let p = self.profiles.get(self.selected_profile);
         Settings {
@@ -675,6 +707,7 @@ impl LauncherApp {
                 top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
             }).collect(),
             selected_profile: self.selected_profile,
+            save_dir: self.save_dir.clone(),
         }.save();
     }
 
@@ -727,6 +760,7 @@ impl LauncherApp {
                 top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
             }).collect(),
             selected_profile: self.selected_profile,
+            save_dir: self.save_dir.clone(),
         };
         settings.save();
         save_config_toml(&settings);
@@ -787,6 +821,8 @@ impl eframe::App for LauncherApp {
                 self.render_ssh_fields(ui);
                 ui.separator();
                 self.render_llm_settings(ui);
+                ui.separator();
+                self.render_save_dir_field(ui);
             });
         });
     }
@@ -872,6 +908,7 @@ pub fn run_launcher(config: &Config) {
                 top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
             }).collect(),
             selected_profile: settings.selected_profile.min(profiles.len().saturating_sub(1)),
+            save_dir: settings.save_dir.clone(),
         }.save();
         tracing::info!("persisted deduplicated profile config on startup");
     }
@@ -890,6 +927,7 @@ pub fn run_launcher(config: &Config) {
         profiles,
         selected_profile,
         validation_error: String::new(),
+        save_dir: settings.save_dir.clone(),
     };
 
     let options = eframe::NativeOptions {
@@ -1009,6 +1047,7 @@ mod tests {
             extra_body: String::new(),
             profiles: vec![],
             selected_profile: 0,
+            save_dir: None,
         };
         std::fs::write(&file, serde_json::to_string_pretty(&s).unwrap()).unwrap();
 

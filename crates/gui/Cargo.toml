@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 filar-core = { workspace = true }
 eframe = { workspace = true }
+rfd = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

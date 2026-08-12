@@ -228,6 +228,8 @@ pub struct App {
     pub save_in_flight: bool,
     /// Channel sender for save progress events. Set by the runner (#235).
     pub save_tx: Option<tokio::sync::mpsc::UnboundedSender<SaveProgress>>,
+    /// Directory where Ctrl+S session exports are written (`None` = CWD).
+    pub save_dir: Option<std::path::PathBuf>,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -403,6 +405,7 @@ impl App {
             save_error: None,
             save_in_flight: false,
             save_tx: None,
+            save_dir: None,
         }
     }
 
@@ -641,24 +644,28 @@ fn slugify(s: &str) -> String {
     result.trim_matches('-').chars().take(80).collect()
 }
 
-/// Generate a save filename: `{slug}.{date}.{time}.md`
-fn generate_save_filename(session_name: &str, ssh_info: &Option<String>) -> String {
+/// Generate a save filename: `{slug}.{date}.{time}.md`, avoiding collisions
+/// within `base_dir`.
+fn generate_save_filename(
+    session_name: &str,
+    ssh_info: &Option<String>,
+    base_dir: &std::path::Path,
+) -> String {
     let base = ssh_info.as_deref().unwrap_or(session_name);
     let slug = slugify(base);
     let ts = format_now_utc();
     let mut name = format!("{slug}.{ts}.md");
     // Avoid overwriting: append -1, -2, … if file already exists.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    if cwd.join(&name).exists() {
+    if base_dir.join(&name).exists() {
         for n in 1u32..1000 {
             let alt = format!("{slug}.{ts}-{n}.md");
-            if !cwd.join(&alt).exists() {
+            if !base_dir.join(&alt).exists() {
                 name = alt;
                 break;
             }
         }
         // Extreme edge-case: all 999 suffixes taken → append nanos.
-        if cwd.join(&name).exists() {
+        if base_dir.join(&name).exists() {
             let ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1025,6 +1032,11 @@ impl App {
         let ssh_info = self.sessions[self.active].ssh_info.clone();
         let messages = self.sessions[self.active].messages.clone();
         let tx = tx.clone();
+        // Resolve the export directory: configured `save_dir`, else CWD.
+        let base_dir = self
+            .save_dir
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
 
         tokio::spawn(async move {
             tx.send(SaveProgress::Started).ok();
@@ -1032,7 +1044,7 @@ impl App {
             // Small delay so the overlay has time to render the 0% state.
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-            let filename = generate_save_filename(&session_name, &ssh_info);
+            let filename = generate_save_filename(&session_name, &ssh_info, &base_dir);
             let md_content = messages_to_markdown(&messages, &session_name, &ssh_info);
 
             tx.send(SaveProgress::Writing).ok();
@@ -1040,8 +1052,7 @@ impl App {
             // Let the progress bar sit at 50% before jumping to 100%.
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let filepath = cwd.join(&filename);
+            let filepath = base_dir.join(&filename);
 
             match tokio::fs::write(&filepath, &md_content).await {
                 Ok(_) => {
@@ -6125,7 +6136,11 @@ mod tests {
 
     #[test]
     fn generate_save_filename_has_correct_format() {
-        let name = generate_save_filename("my-server", &Some("root@10.0.0.5:22".into()));
+        let name = generate_save_filename(
+            "my-server",
+            &Some("root@10.0.0.5:22".into()),
+            std::path::Path::new("."),
+        );
         assert!(
             name.starts_with("root-10.0.0.5-22.") && name.ends_with(".md"),
             "expected slug.date.time.md format, got: {name}"
