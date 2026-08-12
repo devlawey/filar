@@ -3931,7 +3931,7 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 
 ## Текущая работа: 0.9.0 milestone
 
-**Дата:** 2026-08-12. **Milestone:** Filar v0.9.0 (12 issue, 11 закрыто, #253 открыт).
+**Дата:** 2026-08-12. **Milestone:** Filar v0.9.0 (12 issue, 12 закрыто — milestone завершён).
 
 **Сделано:**
 - #232: feat — инфраструктура оверлея сохранения сессии и Ctrl+S binding
@@ -3959,6 +3959,10 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
   - `LaunchConfig` получил `save_dir`, `profiles`, `ssh_targets` (передаются через `pending_launch.json`)
   - `main.rs`: `tui_config` собирается из `launch`, а не из устаревшего `config`
   - `save_config_toml()` больше НЕ пишет `llm_profiles`/`ssh_targets`/`save_dir` (но и НЕ чистит их — fallback для direct-TUI); первичная секция `[llm]` остаётся
+- #253: fix — UTF-8 вывод PowerShell через `[Console]::OutputEncoding`:
+  - `chcp 65001` (неэффективен для piped-вывода — .NET кеширует кодировку при старте) заменён на `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()`
+  - `CREATE_NO_WINDOW` убран; `2>&1` из #243 остаётся
+  - Не трогает консольную кодовую страницу → нет смены шрифта/resize (#246)
 
 **Публичные контракты:** `LaunchConfig` — новые поля `save_dir`, `profiles`, `ssh_targets`.
 `App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `save_dir`, `finish_save()`.
