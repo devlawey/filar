@@ -54,22 +54,25 @@ Mapped via `ctrl_key(en, ru)` helper in `crates/tui/src/app.rs`.
 
 | Platform | Default console code page | filar behaviour |
 |----------|--------------------------|-----------------|
-| Windows  | CP866 or CP1251 (locale-dependent) | `chcp 65001` prepended + child spawned with `CREATE_NO_WINDOW` |
+| Windows  | OEM console CP (e.g. CP866, CP437/CP850) or ANSI CP (CP1251/CP1252), host-config-dependent | `[Console]::OutputEncoding = UTF8` prepended + `2>&1` stderr redirect |
 | Unix     | UTF-8                    | No conversion needed |
 
-> PowerShell on Windows uses the system locale code page (CP866 for Russian,
-> CP1252 for Western) for console output by default. `chcp 65001` changes the
-> **console active code page** to UTF-8, which affects how child processes
-> encode their stdout/stderr. The child PowerShell process is spawned with the
-> `CREATE_NO_WINDOW` flag, which runs it without a visible console window; the
-> intent is that `chcp 65001` then does **not** touch the parent TUI's console
-> (avoiding font switches and resize events on some Windows configurations,
-> #246). `2>&1` appends to redirect stderr through stdout so PowerShell error
-> messages are also decoded correctly (#243). `String::from_utf8_lossy` then
-> decodes the bytes (#228).
+> PowerShell on Windows encodes its own console output using the active code
+> page: OEM pages (CP866 for Russian locales, CP437/CP850 for Western) for
+> legacy 8-bit console APIs, or ANSI pages (CP1251/CP1252) for the .NET text
+> layer — which one applies depends on host configuration and locale.
+> `chcp 65001` (via `SetConsoleOutputCP`) is **ineffective for piped output**:
+> .NET caches the console encoding at startup and ignores later `chcp` calls.
+> Instead, filar sets `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()`,
+> which directly changes the .NET property PowerShell uses to encode its own
+> output (cmdlet output, error messages) to UTF-8. This does **not** touch the
+> console active code page, so it avoids font-switch/resize events on the
+> parent console (#246). `2>&1` redirects stderr through stdout so PowerShell
+> error messages are also decoded correctly (#243). `String::from_utf8_lossy`
+> then decodes the bytes (#228).
 >
-> **Note:** exact behaviour of `CREATE_NO_WINDOW` (private windowless console
-> vs. inheritance) depends on the Windows version; final verification of
-> non-ASCII native stdout/stderr is pending a Windows smoke test (#246).
+> **Note:** this covers PowerShell's *own* output. Native programs writing raw
+> bytes to the pipe in the OEM code page may still be mis-decoded; that is a
+> separate, harder problem and is not handled here.
 
 

@@ -47,6 +47,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Fixed visual artifact in Thinking mode where the mode badge yellow
   background would bleed into adjacent cells during spinner animation
   ([#245](https://github.com/devlawey/filar/issues/245)).
+- PowerShell output (including Russian error messages) on Windows now
+  encodes as UTF-8 via `[Console]::OutputEncoding`, replacing the
+  ineffective `chcp 65001` (which .NET ignores for piped output)
+  ([#253](https://github.com/devlawey/filar/issues/253)).
 
 ## [0.8.6] - 2026-08-02
 
