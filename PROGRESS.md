@@ -3931,7 +3931,7 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 
 ## Текущая работа: 0.9.0 milestone
 
-**Дата:** 2026-08-12. **Milestone:** Filar v0.9.0 (10 issue, 9 закрыто, #247 в работе).
+**Дата:** 2026-08-12. **Milestone:** Filar v0.9.0 (12 issue, 11 закрыто, #253 открыт).
 
 **Сделано:**
 - #232: feat — инфраструктура оверлея сохранения сессии и Ctrl+S binding
@@ -3955,8 +3955,13 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
   - `Config::save_dir: Option<PathBuf>` (core) → `TuiConfig` → `App`
   - `start_save()`/`generate_save_filename()` пишут в `save_dir`, иначе CWD
   - GUI-лаунчер: поле "Save directory" + Browse (rfd) + Reset
+- #255: refactor — устранение дублирования конфигурации:
+  - `LaunchConfig` получил `save_dir`, `profiles`, `ssh_targets` (передаются через `pending_launch.json`)
+  - `main.rs`: `tui_config` собирается из `launch`, а не из устаревшего `config`
+  - `save_config_toml()` больше НЕ пишет `llm_profiles`/`ssh_targets`/`save_dir` (но и НЕ чистит их — fallback для direct-TUI); первичная секция `[llm]` остаётся
 
-**Публичные контракты:** `App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `save_dir`, `finish_save()`.
+**Публичные контракты:** `LaunchConfig` — новые поля `save_dir`, `profiles`, `ssh_targets`.
+`App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `save_dir`, `finish_save()`.
 `Config::save_dir`. Тип `SaveProgress`. Модуль `crates/tui/src/ui/save_overlay.rs`.
 
 **Engine:** не менялся (только tui). Тег engine НЕ ставится.

@@ -31,6 +31,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   Browse folder picker.
   ([#247](https://github.com/devlawey/filar/issues/247)).
 
+### Changed
+
+- Session-save directory, LLM profiles and SSH targets are now passed from
+  the GUI launcher to the TUI via `pending_launch.json`. The GUI no longer
+  writes these launch-specific sections to `config.toml`; they remain only
+  as a fallback for direct (non-GUI) TUI launches.
+  ([#255](https://github.com/devlawey/filar/issues/255)).
+
 ### Fixed
 
 - PowerShell error output (stderr) on Windows now displays correctly in
