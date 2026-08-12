@@ -54,20 +54,22 @@ Mapped via `ctrl_key(en, ru)` helper in `crates/tui/src/app.rs`.
 
 | Platform | Default console code page | filar behaviour |
 |----------|--------------------------|-----------------|
-| Windows  | CP866 or CP1251 (locale-dependent) | `[Console]::OutputEncoding = UTF8` prepended + `2>&1` stderr redirect |
+| Windows  | OEM console CP (e.g. CP866, CP437/CP850) or ANSI CP (CP1251/CP1252), host-config-dependent | `[Console]::OutputEncoding = UTF8` prepended + `2>&1` stderr redirect |
 | Unix     | UTF-8                    | No conversion needed |
 
-> PowerShell on Windows uses the system locale code page (CP866 for Russian,
-> CP1252 for Western) for console output by default. `chcp 65001` (via
-> `SetConsoleOutputCP`) is **ineffective for piped output**: .NET caches the
-> console encoding at startup and ignores later `chcp` calls. Instead, filar
-> sets `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()`, which
-> directly changes the .NET property PowerShell uses to encode its own output
-> (cmdlet output, error messages) to UTF-8. This does **not** touch the console
-> active code page, so it avoids font-switch/resize events on the parent
-> console (#246). `2>&1` redirects stderr through stdout so PowerShell error
-> messages are also decoded correctly (#243). `String::from_utf8_lossy` then
-> decodes the bytes (#228).
+> PowerShell on Windows encodes its own console output using the active code
+> page: OEM pages (CP866 for Russian locales, CP437/CP850 for Western) for
+> legacy 8-bit console APIs, or ANSI pages (CP1251/CP1252) for the .NET text
+> layer — which one applies depends on host configuration and locale.
+> `chcp 65001` (via `SetConsoleOutputCP`) is **ineffective for piped output**:
+> .NET caches the console encoding at startup and ignores later `chcp` calls.
+> Instead, filar sets `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()`,
+> which directly changes the .NET property PowerShell uses to encode its own
+> output (cmdlet output, error messages) to UTF-8. This does **not** touch the
+> console active code page, so it avoids font-switch/resize events on the
+> parent console (#246). `2>&1` redirects stderr through stdout so PowerShell
+> error messages are also decoded correctly (#243). `String::from_utf8_lossy`
+> then decodes the bytes (#228).
 >
 > **Note:** this covers PowerShell's *own* output. Native programs writing raw
 > bytes to the pipe in the OEM code page may still be mis-decoded; that is a
