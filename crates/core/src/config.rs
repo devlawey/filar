@@ -100,7 +100,7 @@ pub enum SshAuth {
     /// Password-based authentication.
     Password {
         /// Password (optional — falls back to `SSH_PASSWORD` env var).
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         password: Option<String>,
     },
 }
