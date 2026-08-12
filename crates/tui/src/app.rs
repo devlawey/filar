@@ -645,8 +645,8 @@ fn slugify(s: &str) -> String {
 }
 
 /// Generate a save filename: `{slug}.{date}.{time}.md`, avoiding collisions
-/// within `base_dir`.
-fn generate_save_filename(
+/// within `base_dir`. Async because existence checks are non-blocking I/O.
+async fn generate_save_filename(
     session_name: &str,
     ssh_info: &Option<String>,
     base_dir: &std::path::Path,
@@ -656,16 +656,16 @@ fn generate_save_filename(
     let ts = format_now_utc();
     let mut name = format!("{slug}.{ts}.md");
     // Avoid overwriting: append -1, -2, … if file already exists.
-    if base_dir.join(&name).exists() {
+    if tokio::fs::try_exists(base_dir.join(&name)).await.unwrap_or(false) {
         for n in 1u32..1000 {
             let alt = format!("{slug}.{ts}-{n}.md");
-            if !base_dir.join(&alt).exists() {
+            if !tokio::fs::try_exists(base_dir.join(&alt)).await.unwrap_or(false) {
                 name = alt;
                 break;
             }
         }
         // Extreme edge-case: all 999 suffixes taken → append nanos.
-        if base_dir.join(&name).exists() {
+        if tokio::fs::try_exists(base_dir.join(&name)).await.unwrap_or(false) {
             let ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1044,7 +1044,7 @@ impl App {
             // Small delay so the overlay has time to render the 0% state.
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-            let filename = generate_save_filename(&session_name, &ssh_info, &base_dir);
+            let filename = generate_save_filename(&session_name, &ssh_info, &base_dir).await;
             let md_content = messages_to_markdown(&messages, &session_name, &ssh_info);
 
             tx.send(SaveProgress::Writing).ok();
@@ -6134,13 +6134,14 @@ mod tests {
         assert!(slug.len() <= 80, "slug must be at most 80 chars");
     }
 
-    #[test]
-    fn generate_save_filename_has_correct_format() {
+    #[tokio::test]
+    async fn generate_save_filename_has_correct_format() {
         let name = generate_save_filename(
             "my-server",
             &Some("root@10.0.0.5:22".into()),
             std::path::Path::new("."),
-        );
+        )
+        .await;
         assert!(
             name.starts_with("root-10.0.0.5-22.") && name.ends_with(".md"),
             "expected slug.date.time.md format, got: {name}"
