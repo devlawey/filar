@@ -2,7 +2,7 @@
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, AppMode};
@@ -103,6 +103,7 @@ fn render_thinking(f: &mut Frame, app: &App, area: Rect) {
         Span::raw("  "),
         Span::styled("(ctrl+c to cancel)", app.theme.muted()),
     ]);
+    f.render_widget(Clear, area);
     f.render_widget(Paragraph::new(line), area);
 }
 

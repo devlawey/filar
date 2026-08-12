@@ -5,7 +5,7 @@
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, AppMode, HelpAction};
@@ -185,6 +185,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     let line = Line::from(spans);
     let paragraph = Paragraph::new(line);
+    f.render_widget(Clear, area);
     f.render_widget(paragraph, area);
 }
 
@@ -193,6 +194,7 @@ pub(crate) fn render_separator(f: &mut Frame, app: &App, area: Rect) {
     let glyphs = app.theme.glyphs();
     let sep: String = std::iter::repeat_n(glyphs.separator, area.width as usize).collect();
     let paragraph = Paragraph::new(sep).style(app.theme.muted());
+    f.render_widget(Clear, area);
     f.render_widget(paragraph, area);
 }
 

@@ -3943,6 +3943,10 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 - #243: fix — PowerShell error stream encoding:
   - `2>&1` в `build_shell_command` (crates/transport/src/local.rs)
   - stderr PowerShell (ошибки на русском) проходит через UTF-8 stdout
+- #245: fix — Clear widget before status bar / separator / thinking input:
+  - `bars.rs`: `Clear` перед `render_status_bar` и `render_separator`
+  - `input.rs`: `Clear` перед `render_thinking`
+  - Убирает жёлтый артефакт от mode-бейджа Thinking
 
 **Публичные контракты:** `App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `finish_save()`.
 Тип `SaveProgress`. Модуль `crates/tui/src/ui/save_overlay.rs`.
