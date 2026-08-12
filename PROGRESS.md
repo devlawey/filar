@@ -3931,33 +3931,15 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 
 ## Текущая работа: 0.9.0 milestone
 
-**Дата:** 2026-08-11. **Milestone:** Filar v0.9.0 (5 issue, 4 закрыто, #240 в работе).
+**Дата:** 2026-08-12. **Milestone:** Filar v0.9.0 (10 issue, 5 закрыто, #242 в работе).
 
 **Сделано:**
-- #232: feat — инфраструктура оверлея сохранения сессии и Ctrl+S binding:
-  - Поля `save_overlay_visible: bool`, `save_progress: u8`, `save_error: Option<String>` в `App`
-  - Ctrl+S в Normal mode открывает оверлей; Ctrl+ы (русская раскладка) тоже работает
-  - ESC закрывает оверлей сохранения
-  - Модуль `ui/save_overlay` и stub-функция `render_save_overlay()`
-  - Вызов рендера оверлея в `render()` и `render_interactive()` (поверх всего)
-  - Запись `^S` в help-баре Normal mode
-- #233: feat — рендеринг оверлея сохранения с прогресс-баром:
-  - Центрированный модал (50×8) с рамкой (accent)
-  - Процент сохранения и `Gauge` (ratatui) — цвет заполнения `success_fg`
-  - Статусная строка: "Saving..." / "Done!" / "Error: ..."
-  - Футер "Esc to close"
-- #234: feat — Markdown-экспорт и асинхронная запись файла:
-  - `messages_to_markdown()` — все типы ChatBlock в Markdown
-  - `generate_save_filename()` — slug + UTC timestamp, избегает перезаписи (-N суффикс)
-  - `SaveProgress` enum и `App::start_save()` — spawn tokio::task с прогрессом
-  - Поле `App::save_tx` и `save_in_flight` guard
-- #235: feat — интеграция канала сохранения в runner:
-  - `unbounded_channel<SaveProgress>` в `run_app()`
-  - `app.save_tx = Some(save_tx)` — канал активен
-  - `try_recv()` в event loop — Started→0%, Writing→50%, Done→100%+toast+system_log, Error→ошибка
-- #240: feat — плавная анимация прогресса сохранения:
-  - 150ms задержка после Started (показывает 0%)
-  - 400ms задержка после Writing (показывает 50%) перед записью файла
+- #232: feat — инфраструктура оверлея сохранения сессии и Ctrl+S binding
+- #233: feat — рендеринг оверлея сохранения с прогресс-баром
+- #234: feat — Markdown-экспорт и асинхронная запись файла
+- #235: feat — интеграция канала сохранения в runner
+- #240: feat — плавная анимация прогресса сохранения
+- #242: feat — `^S` в F1 help overlay (Normal mode)
 
 **Публичные контракты:** `App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `finish_save()`.
 Тип `SaveProgress`. Модуль `crates/tui/src/ui/save_overlay.rs`.

@@ -199,6 +199,12 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
             available: |m| m == AppMode::Normal,
         },
         HelpEntry {
+            key: "^S",
+            desc: "Save current session to .md file",
+            section: "Input",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
             key: "Up / Down",
             desc: "Browse input history",
             section: "Input",
@@ -350,6 +356,7 @@ mod tests {
         assert!(available.contains(&"!cmd"));
         assert!(available.contains(&"^N"));
         assert!(available.contains(&"^Q"));
+        assert!(available.contains(&"^S"));
         assert!(available.contains(&"wheel"));
         assert!(available.contains(&"drag"));
         assert!(available.contains(&"PgUp"));
