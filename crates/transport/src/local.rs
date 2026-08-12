@@ -172,8 +172,8 @@ mod tests {
     fn build_shell_command_windows_has_stderr_redirect() {
         let result = build_shell_command("dir");
         assert!(
-            result.ends_with(" 2>&1"),
-            "Windows command must redirect stderr to stdout for UTF-8 encoding, got: {result}"
+            result.starts_with("chcp 65001 > $null; ") && result.ends_with(" 2>&1"),
+            "Windows command must have chcp prefix and 2>&1 suffix, got: {result}"
         );
     }
 
