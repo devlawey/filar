@@ -3940,6 +3940,9 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 - #235: feat — интеграция канала сохранения в runner
 - #240: feat — плавная анимация прогресса сохранения
 - #242: feat — `^S` в F1 help overlay (Normal mode)
+- #243: fix — PowerShell error stream encoding:
+  - `2>&1` в `build_shell_command` (crates/transport/src/local.rs)
+  - stderr PowerShell (ошибки на русском) проходит через UTF-8 stdout
 
 **Публичные контракты:** `App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `finish_save()`.
 Тип `SaveProgress`. Модуль `crates/tui/src/ui/save_overlay.rs`.
