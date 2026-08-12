@@ -35,8 +35,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 - Session-save directory, LLM profiles and SSH targets are now passed from
   the GUI launcher to the TUI via `pending_launch.json` instead of being
-  duplicated into `config.toml`. `config.toml` now holds only non-launch
-  settings (`timeouts`, `confirm_mode`) and manual `FILAR_CONFIG` overrides.
+  written into `config.toml`. The primary `[llm]` section and any manually
+  configured profiles/targets/save_dir remain in `config.toml` as a fallback
+  for direct (non-GUI) TUI launches.
   ([#255](https://github.com/devlawey/filar/issues/255)).
 
 ### Fixed

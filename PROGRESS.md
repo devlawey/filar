@@ -3958,7 +3958,7 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 - #255: refactor — устранение дублирования конфигурации:
   - `LaunchConfig` получил `save_dir`, `profiles`, `ssh_targets` (передаются через `pending_launch.json`)
   - `main.rs`: `tui_config` собирается из `launch`, а не из устаревшего `config`
-  - `save_config_toml()` больше НЕ пишет `llm_profiles`/`ssh_targets`/`save_dir` — TOML только для `timeouts`/`confirm_mode`/`FILAR_CONFIG`
+  - `save_config_toml()` больше НЕ пишет `llm_profiles`/`ssh_targets`/`save_dir` (но и НЕ чистит их — fallback для direct-TUI); первичная секция `[llm]` остаётся
 
 **Публичные контракты:** `LaunchConfig` — новые поля `save_dir`, `profiles`, `ssh_targets`.
 `App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `save_dir`, `finish_save()`.
