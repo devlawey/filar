@@ -3947,6 +3947,9 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
   - `bars.rs`: `Clear` перед `render_status_bar` и `render_separator`
   - `input.rs`: `Clear` перед `render_thinking`
   - Убирает жёлтый артефакт от mode-бейджа Thinking
+- #246: fix — замена `chcp 65001` на `[Console]::OutputEncoding`:
+  - Не вызывает `SetConsoleOutputCP` → нет смены шрифта консоли → нет resize
+  - UTF-8 сохраняется для stdout/stderr; `2>&1` из #243 остаётся
 
 **Публичные контракты:** `App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `finish_save()`.
 Тип `SaveProgress`. Модуль `crates/tui/src/ui/save_overlay.rs`.

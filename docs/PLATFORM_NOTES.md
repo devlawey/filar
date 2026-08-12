@@ -54,16 +54,16 @@ Mapped via `ctrl_key(en, ru)` helper in `crates/tui/src/app.rs`.
 
 | Platform | Default console code page | filar behaviour |
 |----------|--------------------------|-----------------|
-| Windows  | CP866 or CP1251 (locale-dependent) | `chcp 65001` prepended to every PowerShell command |
+| Windows  | CP866 or CP1251 (locale-dependent) | `[Console]::OutputEncoding = UTF8` + `2>&1` stderr redirect |
 | Unix     | UTF-8                    | No conversion needed |
 
 > PowerShell on Windows uses the system locale code page (CP866 for Russian,
-> CP1252 for Western) for console output by default. `chcp 65001` changes the
-> **console active code page** to UTF-8, which affects how child processes
-> encode their stdout/stderr. This does not change PowerShell's internal
-> `[Console]::OutputEncoding` or `$OutputEncoding` settings — but since
-> `LocalExecutor` reads raw stdout bytes via `tokio::process::Command` (not
-> through the PowerShell pipeline), the console code page is what matters.
+> CP1252 for Western) for console output by default. `[Console]::OutputEncoding`
+> changes the output stream encoding (stdout/stderr) to UTF-8 **without**
+> touching the console active code page (`SetConsoleOutputCP`). This avoids
+> triggering console font switches and resize events on some Windows
+> configurations (#246). `2>&1` appends to redirect stderr through stdout
+> so that PowerShell error messages are also decoded correctly (#243).
 > `String::from_utf8_lossy` then decodes the bytes correctly (#228).
 
 
