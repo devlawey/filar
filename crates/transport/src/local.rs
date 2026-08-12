@@ -168,6 +168,16 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn build_shell_command_windows_has_stderr_redirect() {
+        let result = build_shell_command("dir");
+        assert!(
+            result.ends_with(" 2>&1"),
+            "Windows command must redirect stderr to stdout for UTF-8 encoding, got: {result}"
+        );
+    }
+
+    #[test]
     #[cfg(not(windows))]
     fn build_shell_command_unix_no_chcp() {
         let result = build_shell_command("ls");

@@ -26,6 +26,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   instead of jumping instantly to completion.
   ([#240](https://github.com/devlawey/filar/issues/240)).
 
+### Fixed
+
+- PowerShell error output (stderr) on Windows now displays correctly in
+  UTF-8 — redirected to stdout via `2>&1`
+  ([#243](https://github.com/devlawey/filar/issues/243)).
+
 ## [0.8.6] - 2026-08-02
 
 ### Fixed
