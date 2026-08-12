@@ -619,15 +619,18 @@ impl Agent {
 
     /// Truncate output to `max_output_chars`, appending a notice if truncated.
     fn truncate_output(&self, output: &str) -> String {
-        if output.len() <= self.max_output_chars {
+        let total_chars = output.chars().count();
+        if total_chars <= self.max_output_chars {
             return output.to_string();
         }
 
-        let truncated = &output[..self.max_output_chars];
+        // Truncate by characters, not bytes — slicing at `max_output_chars`
+        // bytes could land mid-UTF-8-char and panic (#260).
+        let truncated: String = output.chars().take(self.max_output_chars).collect();
         format!(
             "{truncated}\n\n[... output truncated: showed {shown} of {total} characters ...]",
             shown = self.max_output_chars,
-            total = output.len()
+            total = total_chars
         )
     }
 }
@@ -930,6 +933,30 @@ mod tests {
         assert!(truncated.starts_with("0123456789"));
         assert!(truncated.contains("truncated"));
         assert!(truncated.contains("16"));
+    }
+
+    #[test]
+    fn truncate_output_multibyte_no_panic() {
+        let agent = Agent::builder()
+            .llm(Arc::new(MockLlm::new(vec![])))
+            .executor(Arc::new(MockExecutor {
+                last_command: std::sync::Mutex::new(String::new()),
+            }))
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .max_output_chars(10)
+            .build()
+            .unwrap();
+
+        // Cyrillic: 2 bytes per char. Byte 10 lands inside a char,
+        // which previously panicked at `&output[..10]`.
+        let output = "абвгдеёжзийк"; // 12 chars, 24 bytes
+        let truncated = agent.truncate_output(output);
+        assert!(
+            truncated.starts_with("абвгдеёжзи"),
+            "must keep first 10 chars, got: {truncated}"
+        );
+        assert!(truncated.contains("truncated"));
+        assert!(truncated.contains("12"));
     }
 
     #[test]

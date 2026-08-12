@@ -3966,6 +3966,9 @@ SSH-коннектор использует `~/.ssh/id_rsa` по умолчан�
 - #258: fix — `SshAuth::Password` с `password: None` не сериализует ключ `"password"`:
   - Регрессия #255: `LaunchConfig.ssh_targets` эмитил `"password": null` → `load_pending_launch` удалял pending_launch.json → TUI не стартовал
   - Фикс: `#[serde(skip_serializing_if = "Option::is_none")]` на `password`; regression-тест добавлен
+- #260: fix — `truncate_output` паниковал на многобайтовой границе:
+  - `&output[..max_output_chars]` резал по байтам → паника на кириллице (10 000-й байт в середине символа)
+  - Фикс: обрезка по символам (`chars().take()`); regression-тест с кириллицей
 
 **Публичные контракты:** `LaunchConfig` — новые поля `save_dir`, `profiles`, `ssh_targets`.
 `App` — поля `save_overlay_visible`, `save_progress`, `save_error`, `save_in_flight`, `save_tx`, `save_dir`, `finish_save()`.

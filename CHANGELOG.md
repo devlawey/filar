@@ -51,6 +51,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   encodes as UTF-8 via `[Console]::OutputEncoding`, replacing the
   ineffective `chcp 65001` (which .NET ignores for piped output)
   ([#253](https://github.com/devlawey/filar/issues/253)).
+- Fixed panic when agent output was truncated in the middle of a multibyte
+  (e.g. Cyrillic) character — truncation is now by characters, not bytes
+  ([#260](https://github.com/devlawey/filar/issues/260)).
 
 ## [0.8.6] - 2026-08-02
 
