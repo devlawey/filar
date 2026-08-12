@@ -133,12 +133,13 @@ impl crate::CommandExecutor for LocalExecutor {
 /// Build the shell command string for the current platform.
 ///
 /// On Windows, prepends `chcp 65001 > $null;` to set the console code page
-/// to UTF-8 so that non-ASCII output (filenames, text) is decoded correctly
-/// by `String::from_utf8_lossy`.
+/// to UTF-8 and appends `2>&1` to redirect stderr through stdout so that
+/// PowerShell error messages are also decoded correctly by
+/// `String::from_utf8_lossy`.
 fn build_shell_command(command: &str) -> String {
     #[cfg(windows)]
     {
-        format!("chcp 65001 > $null; {command}")
+        format!("chcp 65001 > $null; {command} 2>&1")
     }
     #[cfg(not(windows))]
     {
