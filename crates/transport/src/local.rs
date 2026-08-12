@@ -64,9 +64,12 @@ impl crate::CommandExecutor for LocalExecutor {
             let full = build_shell_command(command);
             let mut c = std::process::Command::new("powershell");
             c.args(["-NoProfile", "-NonInteractive", "-Command", &full]);
-            // CREATE_NO_WINDOW: give the child its own hidden console so that
-            // `chcp 65001` does not change the parent TUI's console code page
-            // (which could trigger font switch / resize events).
+            // CREATE_NO_WINDOW: run the child without a visible console window.
+            // On modern Windows this allocates a private (windowless) console,
+            // so `chcp 65001` inside the child does not touch the parent TUI's
+            // console code page (avoids font switch / resize events, #246).
+            // Verified behavior on the target Windows configuration is pending
+            // a smoke test — see #246.
             c.creation_flags(0x0800_0000);
             tokio::process::Command::from(c)
         };
@@ -141,8 +144,9 @@ impl crate::CommandExecutor for LocalExecutor {
 /// On Windows, prepends `chcp 65001 > $null;` to set the console code page
 /// to UTF-8 and appends `2>&1` to redirect stderr through stdout so that
 /// PowerShell error messages are also decoded correctly by
-/// `String::from_utf8_lossy`. The child process runs with `CREATE_NO_WINDOW`
-/// so `chcp` affects only its own hidden console, not the parent TUI console.
+/// `String::from_utf8_lossy`. The child runs with `CREATE_NO_WINDOW` so
+/// `chcp` is intended to affect only the child's console — behaviour pending
+/// a Windows smoke test (#246).
 fn build_shell_command(command: &str) -> String {
     #[cfg(windows)]
     {

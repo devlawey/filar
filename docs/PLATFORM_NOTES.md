@@ -61,10 +61,15 @@ Mapped via `ctrl_key(en, ru)` helper in `crates/tui/src/app.rs`.
 > CP1252 for Western) for console output by default. `chcp 65001` changes the
 > **console active code page** to UTF-8, which affects how child processes
 > encode their stdout/stderr. The child PowerShell process is spawned with the
-> `CREATE_NO_WINDOW` flag so `chcp 65001` affects only its own hidden console,
-> **not** the parent TUI's console — this avoids font switches and resize
-> events on some Windows configurations (#246). `2>&1` appends to redirect
-> stderr through stdout so PowerShell error messages are also decoded
-> correctly (#243). `String::from_utf8_lossy` then decodes the bytes (#228).
+> `CREATE_NO_WINDOW` flag, which runs it without a visible console window; the
+> intent is that `chcp 65001` then does **not** touch the parent TUI's console
+> (avoiding font switches and resize events on some Windows configurations,
+> #246). `2>&1` appends to redirect stderr through stdout so PowerShell error
+> messages are also decoded correctly (#243). `String::from_utf8_lossy` then
+> decodes the bytes (#228).
+>
+> **Note:** exact behaviour of `CREATE_NO_WINDOW` (private windowless console
+> vs. inheritance) depends on the Windows version; final verification of
+> non-ASCII native stdout/stderr is pending a Windows smoke test (#246).
 
 
