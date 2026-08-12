@@ -31,6 +31,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - PowerShell error output (stderr) on Windows now displays correctly in
   UTF-8 — redirected to stdout via `2>&1` (local Windows executor only)
   ([#243](https://github.com/devlawey/filar/issues/243)).
+- Fixed visual artifact in Thinking mode where the mode badge yellow
+  background would bleed into adjacent cells during spinner animation
+  ([#245](https://github.com/devlawey/filar/issues/245)).
 
 ## [0.8.6] - 2026-08-02
 
