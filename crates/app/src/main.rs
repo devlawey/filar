@@ -273,7 +273,7 @@ async fn run() -> anyhow::Result<()> {
     // ── Determine launch parameters ──────────────────────────────────
     // When no CLI args, check for pending launch from a previous GUI
     // session, or spawn the GUI as a subprocess.
-    let (target_name, session_id, llm_config, api_key, ssh_target, gui_selected_profile) = if args.is_empty() {
+    let (target_name, session_id, llm_config, api_key, ssh_target, gui_selected_profile, launch_profiles, launch_ssh_targets, launch_save_dir) = if args.is_empty() {
         // Check if the GUI subprocess already saved a launch config.
         let launch = filar_gui::load_pending_launch().or_else(|| {
             // Spawn GUI subprocess.
@@ -374,6 +374,9 @@ async fn run() -> anyhow::Result<()> {
                     api_key,
                     ssh_target,
                     launch.selected_profile,
+                    launch.profiles,
+                    launch.ssh_targets,
+                    launch.save_dir,
                 )
             }
             None => {
@@ -404,7 +407,7 @@ async fn run() -> anyhow::Result<()> {
             None
         };
 
-        (target, args.session, llm_config, key, ssh_target, None)
+        (target, args.session, llm_config, key, ssh_target, None, config.llm_profiles.clone(), config.ssh_targets.clone(), config.save_dir.clone())
     };
 
     // Validate API key.
@@ -498,7 +501,7 @@ async fn run() -> anyhow::Result<()> {
 
     // ── Launch TUI ─────────────────────────────────────────────────────
     let default_profile_name =
-        resolve_startup_profile(&config.llm_profiles, cli_llm_name.as_deref(), gui_selected_profile.as_deref());
+        resolve_startup_profile(&launch_profiles, cli_llm_name.as_deref(), gui_selected_profile.as_deref());
     let key_checker_provider = secret_provider.clone();
     let tui_config = TuiConfig {
         target_name: target_name.clone(),
@@ -517,7 +520,7 @@ async fn run() -> anyhow::Result<()> {
         is_local: ssh_target.is_none(),
         secret_provider: secret_provider.clone(),
         log_rx,
-        profiles: config.llm_profiles.clone(),
+        profiles: launch_profiles,
         default_profile_name,
         llm_factory: {
             let llm_timeout_secs = config.timeouts.llm_secs;
@@ -542,8 +545,8 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
         }),
-        ssh_targets: config.ssh_targets.clone(),
-        save_dir: config.save_dir.clone(),
+        ssh_targets: launch_ssh_targets,
+        save_dir: launch_save_dir,
     };
 
     info!("launching TUI");

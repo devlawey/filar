@@ -166,6 +166,15 @@ pub struct LaunchConfig {
     /// Env var / credential name for the API key.
     #[serde(default = "default_glm_key_env_gui")]
     pub key_env: String,
+    /// Directory for Ctrl+S session exports (`None` = CWD).
+    #[serde(default)]
+    pub save_dir: Option<std::path::PathBuf>,
+    /// Full LLM profile list (for Ctrl+L cycling in the TUI).
+    #[serde(default)]
+    pub profiles: Vec<filar_core::LlmProfile>,
+    /// Full SSH target list (for Ctrl+O cycling in the TUI).
+    #[serde(default)]
+    pub ssh_targets: Vec<filar_core::SshTarget>,
 }
 
 fn default_glm_key_env_gui() -> String {
@@ -383,7 +392,9 @@ fn save_config_toml(settings: &Settings) {
         filar_core::Config::default()
     };
 
-    // Update primary LLM section (backward compat) and profiles.
+    // Update primary LLM section (backward compat) only. Launch-specific
+    // data (profiles, ssh_targets, save_dir) is passed to the TUI via
+    // `pending_launch.json` (#255) — no longer duplicated into config.toml.
     if !settings.model.is_empty() {
         config.llm.model = settings.model.clone();
     }
@@ -396,16 +407,6 @@ fn save_config_toml(settings: &Settings) {
     if !settings.extra_body.is_empty() {
         config.llm.extra_body = serde_json::from_str(&settings.extra_body).ok();
     }
-    // Whenever profiles are defined, write them to config.toml.
-    if !settings.profiles.is_empty() {
-        config.llm_profiles = settings.profiles.clone();
-    }
-
-    // Sync launcher SSH profiles to [[ssh_targets]].
-    config.ssh_targets = build_ssh_targets_from_profiles(&settings.ssh_profiles);
-
-    // Save directory for Ctrl+S session exports.
-    config.save_dir = settings.save_dir.clone();
 
     if let Err(e) = std::fs::create_dir_all(&app_dir) {
         tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");
@@ -772,12 +773,23 @@ impl LauncherApp {
             else { delete_secret(&ssh_cred_name(i, &slot.alias)); }
         }
         let session_id = self.selected_session.map(|i| self.sessions[i].id.clone());
+        let ssh_targets = build_ssh_targets_from_profiles(
+            &self.ssh_slots.iter().map(|s| s.to_profile()).collect::<Vec<_>>(),
+        );
         let cfg = LaunchConfig {
             target: target.to_string(), ssh,
             model: p.model.clone(), api_base_url: p.api_base_url.clone(),
             api_key: p.api_key.clone(), session_id,
             temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
             selected_profile: Some(p.name.clone()), key_env: p.key_env.clone(),
+            save_dir: self.save_dir.clone(),
+            profiles: self.profiles.iter().map(|d| filar_core::LlmProfile {
+                name: d.name.clone(), model: d.model.clone(), api_base_url: d.api_base_url.clone(),
+                key_env: d.key_env.clone(), max_tokens: 4096,
+                temperature: d.temperature.trim().parse().ok(),
+                top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
+            }).collect(),
+            ssh_targets,
         };
         save_pending_launch(&cfg);
         std::process::exit(0);
@@ -994,6 +1006,9 @@ mod tests {
             extra_body: String::new(),
             selected_profile: None,
             key_env: "GLM_API_KEY".into(),
+            save_dir: None,
+            profiles: vec![],
+            ssh_targets: vec![],
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(!json.contains("supersecret"));
