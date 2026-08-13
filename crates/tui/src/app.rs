@@ -507,14 +507,15 @@ impl App {
                 )));
             }
         } else {
-            // Exiting Explain mode — final transcript save, then clear path
+            // Exiting Explain mode — push deactivation message BEFORE the
+            // final save so it appears in the transcript, then clear path
             // so the next F2 entry creates a new file.
-            self.save_transcript_silent();
-            self.sessions[self.active].transcript_path = None;
-            self.sessions[self.active].transcript_error_shown = false;
             self.push_message(ChatBlock::System(
                 "Safe mode (Explain) deactivated".into(),
             ));
+            self.save_transcript_silent();
+            self.sessions[self.active].transcript_path = None;
+            self.sessions[self.active].transcript_error_shown = false;
         }
     }
 
@@ -6625,15 +6626,14 @@ mod tests {
     fn messages_to_markdown_date_has_timezone_offset() {
         let blocks = vec![ChatBlock::User("hi".into())];
         let md = messages_to_markdown(&blocks, "test", &None);
-        // Date line should contain a timezone offset like +03:00
+        // Date line must match "YYYY-MM-DD HH:MM:SS ±HH:MM" format.
         let date_line = md.lines().find(|l| l.starts_with("Date:"));
         assert!(date_line.is_some(), "must have Date line");
         let date_line = date_line.unwrap();
-        assert!(!date_line.contains("UTC"), "must not say UTC");
-        // Should end with a timezone offset like +03:00 or -05:00
+        let rest = date_line.strip_prefix("Date: ").expect("Date line");
         assert!(
-            date_line.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false),
-            "Date line should end with timezone offset digit: {date_line}"
+            chrono::DateTime::parse_from_str(rest, "%Y-%m-%d %H:%M:%S %:z").is_ok(),
+            "Date line must contain timezone offset (YYYY-MM-DD HH:MM:SS ±HH:MM): {date_line}"
         );
     }
 }

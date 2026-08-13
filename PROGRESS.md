@@ -4298,10 +4298,14 @@ core+agent проходят. Тесты падают на старом коде 
 **Milestone:** 0.9.0. **Ветка:** `fix/277b-remove-mode-from-connected`.
 
 **Что сделано:**
-- `messages_to_markdown()`: вместо UTC с меткой используется `chrono::Local::now()` —
-  местное время без суффикса UTC.
+- `messages_to_markdown()`: местное время с numeric timezone offset
+  (`chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z")`), например `+03:00`.
 - `Session::new()`: убран `| Mode: {confirm_mode:?}` из начального сообщения.
   Режим теперь виден только через F2 activation/deactivation messages.
+- `toggle_explain_mode()`: deactivation message добавляется ДО `save_transcript_silent()`,
+  чтобы попасть в финальный транскрипт.
 - `chrono` добавлен как зависимость workspace + tui crate.
 
-**Публичный API:** добавлена зависимость `chrono` в `filar-tui`.
+**Публичный API:** нет изменений. `Session::new()` сигнатура не изменилась.
+
+**Дальше:** issue #271–#274 (session persistence overhaul).
