@@ -776,7 +776,7 @@ async fn generate_save_filename(
 fn messages_to_markdown(messages: &[ChatBlock], session_name: &str, ssh_info: &Option<String>) -> String {
     let mut md = String::new();
     md.push_str(&format!("# Session: {session_name}\n\n"));
-    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z").to_string();
     md.push_str(&format!("Date: {ts}\n"));
     if let Some(ref info) = ssh_info {
         md.push_str(&format!("Target: {info}\n"));
@@ -6609,5 +6609,31 @@ mod tests {
         assert!(md.contains("**$ ls**\n"), "approved command must be rendered");
         // Denied command — has *(denied)* marker.
         assert!(md.contains("**$ rm -rf /tmp** *(denied)*"), "denied command must have *(denied)* marker");
+    }
+
+    #[test]
+    fn session_initial_message_has_no_mode() {
+        let app = App::new("test-server".into(), CommandConfirmMode::Explain);
+        let first_msg = &app.messages[0];
+        assert!(
+            matches!(first_msg, ChatBlock::System(s) if s == "Connected to: test-server"),
+            "initial message must be 'Connected to: {{name}}' without Mode"
+        );
+    }
+
+    #[test]
+    fn messages_to_markdown_date_has_timezone_offset() {
+        let blocks = vec![ChatBlock::User("hi".into())];
+        let md = messages_to_markdown(&blocks, "test", &None);
+        // Date line should contain a timezone offset like +03:00
+        let date_line = md.lines().find(|l| l.starts_with("Date:"));
+        assert!(date_line.is_some(), "must have Date line");
+        let date_line = date_line.unwrap();
+        assert!(!date_line.contains("UTC"), "must not say UTC");
+        // Should end with a timezone offset like +03:00 or -05:00
+        assert!(
+            date_line.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false),
+            "Date line should end with timezone offset digit: {date_line}"
+        );
     }
 }

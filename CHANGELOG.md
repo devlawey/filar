@@ -58,9 +58,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   file. Previously the same file was reused across toggle cycles because
   `transcript_path` was never cleared on exit.
   ([#275](https://github.com/devlawey/filar/issues/275)).
-- Transcript date now uses local time (via `chrono`). The initial "Connected to"
-  message no longer includes the mode — mode changes are shown via F2
-  activation/deactivation messages.
+- Transcript date now uses local time with timezone offset (via `chrono`).
+  The initial "Connected to" message no longer includes the mode.
+  ([#277](https://github.com/devlawey/filar/issues/277)).
+- Safe mode (Explain) activation/deactivation messages added to the chat feed
+  and transcript: "Safe mode (Explain) activated. Transcript: {path}" on F2
+  entry, "Safe mode (Explain) deactivated" on exit.
   ([#277](https://github.com/devlawey/filar/issues/277)).
 
 ### Changed
