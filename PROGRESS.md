@@ -339,10 +339,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 ## 8. Тесты
 
-- **470 unit-тестов** проходят (включая doc-тесты):
-  - filar-agent: 67 тестов
+- **491 unit-тестов** проходят (включая doc-тесты):
+  - filar-agent: 87 тестов
   - filar-app: 14 тестов
-  - filar-core: 49 тестов + 2 doc-теста
+  - filar-core: 50 тестов + 2 doc-теста
   - filar-gui: 16 тестов
   - filar-transport: 26 тестов (7 ignored — требуют Docker sshd)
   - filar-tui: 296 тестов
@@ -4135,3 +4135,40 @@ agent (session_id). Тег `engine-v0.6.1` ставится.
 ## Issue #190: feat(agent,tui) — стоимость запросов из OpenRouter, токены по профилям, фактическая модель
 
 **Milestone:** Filar v0.7.2. **Ветка:** `feat/190-openrouter-cost-per-profile`.
+
+---
+
+## Issue #262: feat(agent,core) — Explain mode: ядро режима (схема, промпт, валидация, отказ)
+
+**Milestone:** 0.9.0. **Ветка:** `feat/262-explain-mode-core`.
+
+**Что сделано:**
+- Добавлен `CommandConfirmMode::Explain` в `crates/core/src/config.rs` — четвёртый
+  режим подтверждения. Парсится из `"explain"` в `config.toml`.
+- `tool_definitions(mode)` в `crates/agent/src/tools.rs` стала режим-зависимой: в
+  `Explain` поле `explanation` добавляется в `required` для всех инструментов
+  (`run_command`, `read_file`, `list_dir`). В остальных режимах — без изменений.
+- `ReadFileParams` и `ListDirParams` получили поле `explanation` (`#[serde(default)]`).
+  Если модель не прислала explanation — `parse_tool_call` использует автогенерацию
+  (`"Read file: {path}"`) для обратной совместимости.
+- `check_explanation()` в `tools.rs` — проверяет наличие непустого explanation для
+  каждого инструмента. Возвращает `Some(error_msg)` если пусто.
+- В `agent.rs::run_loop()` валидация: в Explain режиме каждый tool call проверяется
+  через `check_explanation()`. При пустом explanation — ошибка возвращается модели
+  для повторной попытки. Лимит повторов — `MAX_MISSING_EXPLANATION_RETRIES = 2`,
+  после исчерпания — остановка с сообщением пользователю.
+- `SAFE_MODE_PROMPT` — блок системного промпта с правилами для объяснений.
+  Добавляется к `system_prompt` в `AgentBuilder::build()` при `confirm_mode == Explain`.
+- `security::check_command()` и `tool_needs_confirmation()` — `Explain` ведёт себя
+  как `Always`: все команды (включая read-only) требуют подтверждения.
+- Отказ пользователя (пункт 8): текущий механизм уже возвращает модели
+  `"Command denied by user. Try a different approach."` — работает корректно.
+
+**Публичный API:** `tool_definitions()` изменила сигнатуру — теперь принимает
+`CommandConfirmMode`. External consumers (engine) должны обновить вызовы.
+`CommandConfirmMode` получил новый вариант `Explain`.
+
+**Тесты:** 16 новых (tools: 12, security: 3, config: 1). Все 133 теста
+core+agent проходят. Тесты падают на старом коде (новые behaviour не существует).
+
+**Не вошло (вынесено в #263–#265):** F2 toggle, авто-расшифровка, подсказки/документация.

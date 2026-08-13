@@ -253,6 +253,8 @@ pub enum ConfirmDecision {
 /// - `Never` → always auto-approve (dangerous).
 /// - `Allowlist` → auto-approve read-only commands, confirm everything else.
 /// - `Always` → confirm everything.
+/// - `Explain` → confirm everything (same as `Always`), plus the agent
+///   requires a mandatory `explanation` field on every tool call.
 ///
 /// Destructive commands always require confirmation (even in `Never` mode they
 /// get a warning, but are still auto-approved — the user chose `Never`).
@@ -275,7 +277,9 @@ pub fn check_command(command: &str, mode: CommandConfirmMode) -> ConfirmDecision
                 ConfirmDecision::NeedsConfirmation
             }
         }
-        CommandConfirmMode::Always => ConfirmDecision::NeedsConfirmation,
+        CommandConfirmMode::Always | CommandConfirmMode::Explain => {
+            ConfirmDecision::NeedsConfirmation
+        }
     }
 }
 
@@ -290,7 +294,9 @@ pub fn tool_needs_confirmation(kind: ToolKind, command: &str, mode: CommandConfi
                 match mode {
                     CommandConfirmMode::Never => ConfirmDecision::AutoApproved,
                     CommandConfirmMode::Allowlist => ConfirmDecision::AutoApproved,
-                    CommandConfirmMode::Always => ConfirmDecision::NeedsConfirmation,
+                    CommandConfirmMode::Always | CommandConfirmMode::Explain => {
+                        ConfirmDecision::NeedsConfirmation
+                    }
                 }
             } else {
                 check_command(command, mode)
@@ -503,6 +509,46 @@ mod tests {
             ToolKind::ReadFile,
             "cat /etc/hostname",
             CommandConfirmMode::Always,
+        );
+        assert_eq!(decision, ConfirmDecision::NeedsConfirmation);
+    }
+
+    #[test]
+    fn check_explain_mode() {
+        // Read-only commands also need confirmation in Explain mode.
+        assert_eq!(
+            check_command("ls", CommandConfirmMode::Explain),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            check_command("cat /etc/hostname", CommandConfirmMode::Explain),
+            ConfirmDecision::NeedsConfirmation
+        );
+        // Destructive commands also need confirmation.
+        assert_eq!(
+            check_command("rm -rf /", CommandConfirmMode::Explain),
+            ConfirmDecision::NeedsConfirmation
+        );
+    }
+
+    #[test]
+    fn tool_needs_confirmation_explain_read_file() {
+        // read_file generates "cat <path>" — read-only, but Explain requires confirmation.
+        let decision = tool_needs_confirmation(
+            ToolKind::ReadFile,
+            "cat /etc/hostname",
+            CommandConfirmMode::Explain,
+        );
+        assert_eq!(decision, ConfirmDecision::NeedsConfirmation);
+    }
+
+    #[test]
+    fn tool_needs_confirmation_explain_list_dir() {
+        // list_dir generates "ls -la <path>" — read-only, but Explain requires confirmation.
+        let decision = tool_needs_confirmation(
+            ToolKind::ListDir,
+            "ls -la /var/log",
+            CommandConfirmMode::Explain,
         );
         assert_eq!(decision, ConfirmDecision::NeedsConfirmation);
     }

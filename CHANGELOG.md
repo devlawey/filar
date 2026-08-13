@@ -30,6 +30,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   directory). The GUI launcher gained a "Save directory" field with a
   Browse folder picker.
   ([#247](https://github.com/devlawey/filar/issues/247)).
+- Explain (safe mode) confirm mode: `CommandConfirmMode::Explain` requires
+  every command to have a mandatory `explanation` from the model. In this
+  mode, `explanation` is added to the `required` array in all tool schemas,
+  a SAFE MODE block is appended to the system prompt, and all commands
+  (including read-only) require confirmation. Missing explanations are
+  rejected with a retry limit of 2.
+  ([#262](https://github.com/devlawey/filar/issues/262)).
 
 ### Changed
 
@@ -38,6 +45,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   writes these launch-specific sections to `config.toml`; they remain only
   as a fallback for direct (non-GUI) TUI launches.
   ([#255](https://github.com/devlawey/filar/issues/255)).
+- `tool_definitions()` now takes a `CommandConfirmMode` argument to produce
+  mode-aware tool schemas. External engine consumers must update calls.
+  ([#262](https://github.com/devlawey/filar/issues/262)).
 
 ### Fixed
 
