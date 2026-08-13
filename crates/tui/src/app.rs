@@ -1030,7 +1030,9 @@ impl App {
     /// the SSH connection via the password flow (`pending_ssh` + Ctrl+P).
     fn apply_loaded_session(&mut self, session: filar_core::Session) {
         // Reset active runtime state before replacing history so stale events
-        // from the previous session don't leak into the restored one.
+        // from the previous session don't leak into the restored one. This
+        // runs on the single-threaded event loop (from `handle_key`), so the
+        // read-then-write of `terminal`/`pending_*` below cannot race.
         if let Some(token) = self.cancellation.take() {
             token.cancel();
         }
@@ -3137,24 +3139,31 @@ fn parse_ssh_command(cmd: &str) -> Option<(String, String, u16)> {
 }
 
 /// Parse `user@host[:port]` (the persisted `ssh_info` format) into
-/// `(user, host, port)`. The port defaults to 22 when omitted, and IPv6
-/// addresses in square brackets are supported (`user@[::1]:22`).
+/// `(user, host, port)`. The port defaults to 22 when omitted. IPv6 addresses
+/// in square brackets are supported, with or without a port
+/// (`user@[::1]`, `user@[::1]:22`).
 fn parse_ssh_info(info: &str) -> Option<(String, String, u16)> {
     let (user, host_port) = info.split_once('@')?;
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse().ok()?),
-        None => (host_port, 22),
-    };
-    // Strip IPv6 brackets: `[::1]` → `::1`.
-    let host = if host.starts_with('[') && host.ends_with(']') {
-        &host[1..host.len() - 1]
+    let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+        // Bracketed IPv6: the port, if present, follows the closing bracket.
+        let end = rest.find(']')?;
+        let host = &rest[..end];
+        let after = &rest[end + 1..];
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse().ok()?,
+            None => 22,
+        };
+        (host.to_string(), port)
     } else {
-        host
+        match host_port.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse().ok()?),
+            None => (host_port.to_string(), 22),
+        }
     };
     if user.is_empty() || host.is_empty() {
         return None;
     }
-    Some((user.to_string(), host.to_string(), port))
+    Some((user.to_string(), host, port))
 }
 
 /// Check if a command is interactive (would hang the executor waiting for input).
@@ -6418,6 +6427,14 @@ mod tests {
     #[test]
     fn parse_ssh_info_handles_ipv6_brackets() {
         let (user, host, port) = parse_ssh_info("root@[::1]:22").unwrap();
+        assert_eq!(user, "root");
+        assert_eq!(host, "::1");
+        assert_eq!(port, 22);
+    }
+
+    #[test]
+    fn parse_ssh_info_handles_ipv6_without_port() {
+        let (user, host, port) = parse_ssh_info("root@[::1]").unwrap();
         assert_eq!(user, "root");
         assert_eq!(host, "::1");
         assert_eq!(port, 22);
