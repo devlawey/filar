@@ -79,6 +79,14 @@ For CLI usage, create `config.toml`. The file is searched in this order:
 ```toml
 confirm_mode = "allowlist"
 
+# Confirmation modes:
+#   always    — every command requires explicit user approval
+#   allowlist — read-only commands auto-approved, others require confirmation (default)
+#   never     — no confirmation (dangerous, sandbox only)
+#   explain   — safe mode: agent tool calls require approval AND a mandatory
+#               explanation. Toggle at runtime with F2. Session is auto-saved
+#               to Markdown. (!command shell escape is not affected.)
+
 [llm]
 model = "glm-5.1"
 api_base_url = "https://open.bigmodel.cn/api/paas/v4"
@@ -231,6 +239,7 @@ Type `!` followed by a command to run it directly (bypassing the agent):
 | Key | Action |
 |-----|--------|
 | `F1` | Show full help overlay (all shortcuts and commands grouped by section) |
+| `F2` | Toggle safe mode (Explain): agent must justify each command; session auto-saved to Markdown |
 | `Enter` | Send message / Confirm selected button |
 | `Ctrl+Q` | Quit the app (denies a pending command first in Confirming) |
 | `Ctrl+Z` | Cancel: stop the agent (Thinking) / deny the command (Confirming) |

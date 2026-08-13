@@ -52,10 +52,23 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
             available: |m| m != AppMode::PasswordInput,
         },
         HelpEntry {
+            key: "F2",
+            desc: "Toggle safe mode: agent must justify each command and wait\n             for confirmation; session is auto-saved to Markdown",
+            section: "Modes",
+            available: |m| m != AppMode::PasswordInput,
+        },
+        HelpEntry {
             key: "^P",
             desc: "Enter password input mode",
             section: "Modes",
             available: |m| m == AppMode::Normal,
+        },
+        // ── Status bar ───────────────────────────────────────────────
+        HelpEntry {
+            key: "mode",
+            desc: "Status bar shows the confirm mode (right side).\n             Highlighted in accent color when safe mode is active",
+            section: "Status bar",
+            available: |_| true,
         },
         // ── Tabs ──────────────────────────────────────────────────────
         HelpEntry {

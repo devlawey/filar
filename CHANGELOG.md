@@ -46,6 +46,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   in the configured save directory. The file is overwritten on each save.
   Errors are shown once per session without blocking the agent.
   ([#264](https://github.com/devlawey/filar/issues/264)).
+- F2 visible in the help overlay (`F1`) and bottom help bar. README documents
+  all four confirmation modes (`always`, `allowlist`, `never`, `explain`) and
+  F2 in the keyboard shortcuts table. `docs/SMOKE.md` includes a safe-mode
+  checklist.
+  ([#265](https://github.com/devlawey/filar/issues/265)).
 
 ### Changed
 
