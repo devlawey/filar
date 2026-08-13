@@ -52,6 +52,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   checklist.
   ([#265](https://github.com/devlawey/filar/issues/265)).
 
+### Fixed
+
+- Explain mode transcript: each F2 toggle cycle now creates a new `.md`
+  file. Previously the same file was reused across toggle cycles because
+  `transcript_path` was never cleared on exit.
+  ([#275](https://github.com/devlawey/filar/issues/275)).
+
 ### Changed
 
 - Session-save directory, LLM profiles and SSH targets are now passed from

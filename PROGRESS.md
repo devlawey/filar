@@ -4256,3 +4256,20 @@ core+agent проходят. Тесты падают на старом коде 
 **Тесты:** 1 новый (normal_mode_help_includes_f2). Все 307 tui-тестов проходят.
 
 **Дальше:** milestone 0.9.0 завершён (все 4 issue: #262–#265). Релиз v0.9.0.
+
+---
+
+## Issue #275: fix(tui) — Explain mode: each F2 entry creates a new transcript file
+
+**Milestone:** 0.9.0. **Ветка:** `fix/275-transcript-new-file-per-toggle`.
+
+**Что сделано:**
+- `toggle_explain_mode()`: при выходе из Explain (F2) `transcript_path`
+  очищается в `None` + `transcript_error_shown = false`. Следующий вход в
+  Explain создаёт новый файл (новый timestamp).
+- Тест `toggle_explain_creates_new_file_each_entry` заменяет старый
+  `toggle_explain_path_persists_across_toggle`.
+
+**Публичный API:** нет изменений.
+
+**Тесты:** 1 обновлён. Все 307 tui-тестов проходят.
