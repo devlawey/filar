@@ -339,13 +339,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 ## 8. Тесты
 
-- **491 unit-тестов** проходят (включая doc-тесты):
+- **495 unit-тестов** проходят (включая doc-тесты):
   - filar-agent: 87 тестов
   - filar-app: 14 тестов
   - filar-core: 50 тестов + 2 doc-теста
   - filar-gui: 16 тестов
   - filar-transport: 26 тестов (7 ignored — требуют Docker sshd)
-  - filar-tui: 296 тестов
+  - filar-tui: 300 тестов
 - **0 failures**, 7 ignored (Docker)
 
 ```powershell
@@ -4172,3 +4172,26 @@ agent (session_id). Тег `engine-v0.6.1` ставится.
 core+agent проходят. Тесты падают на старом коде (новые behaviour не существует).
 
 **Не вошло (вынесено в #263–#265):** F2 toggle, авто-расшифровка, подсказки/документация.
+
+---
+
+## Issue #263: feat(tui) — Explain mode: F2 toggle with abort of pending confirmation
+
+**Milestone:** 0.9.0. **Ветка:** `feat/263-f2-toggle-explain-mode`.
+
+**Что сделано:**
+- `confirm_mode` и `prev_confirm_mode` добавлены на `Session` (per-tab).
+  `App.confirm_mode` — зеркало активной вкладки, синхронизируется при переключении.
+- `toggle_explain_mode()` на `App`: переключает Explain ↔ предыдущий режим,
+  обрывает `pending_confirm` (отправляет `false` в `respond_to`), добавляет
+  системную строку «Command cancelled: confirm mode switched».
+- `F2` в `handle_key()`: обрабатывается до mode-specific кода (как `F1`),
+  перехватывается в интерактивном режиме (не уходит в терминал как `\x1bOQ`).
+- Синхронизация `App.confirm_mode` на всех tab-switch методах: `prev_tab`,
+  `next_tab`, `switch_to_tab`, `new_tab`, `close_tab`.
+- Runner: `config.confirm_mode` → `app.confirm_mode` — агент строится с
+  актуальным режимом активной вкладки.
+- Статус-бар: режим `Explain` подсвечен акцентным цветом.
+
+**Тесты:** 4 новых (f2_toggles, f2_aborts_pending_confirm,
+  f2_in_interactive_mode, tab_switch_syncs). Все 300 tui-тестов проходят.

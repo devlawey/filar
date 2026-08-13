@@ -707,7 +707,7 @@ async fn run_app(
                             session_llm,
                             agent_exec,
                             confirmer.clone(),
-                            config.confirm_mode,
+                            app.confirm_mode,
                             user_input,
                             app.messages.clone(),
                             agent_tx.clone(),

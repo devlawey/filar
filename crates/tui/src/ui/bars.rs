@@ -155,6 +155,11 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // toast, pushed afterwards, starts at column == width and gets clipped by
     // ratatui (the original bug: the toast was never visible).
     let confirm_text = format!(" {:?}", app.confirm_mode);
+    let confirm_style = if app.confirm_mode == filar_core::CommandConfirmMode::Explain {
+        app.theme.muted().fg(app.theme.accent)
+    } else {
+        app.theme.muted()
+    };
     // left_len already includes mode-badge spans (pushed above), so we
     // must NOT add mode_len again — that would double-count and break
     // the right-alignment in non-Normal modes.
@@ -178,7 +183,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     if padding > 0 {
         spans.push(Span::raw(" ".repeat(padding)));
     }
-    spans.push(Span::styled(confirm_text, app.theme.muted()));
+    spans.push(Span::styled(confirm_text, confirm_style));
     if let Some(text) = toast_span_text {
         spans.push(Span::styled(text, app.theme.success_fg()));
     }
