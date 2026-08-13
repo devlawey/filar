@@ -485,10 +485,10 @@ impl Agent {
                 // If any tool call lacks an explanation, reject the entire batch
                 // and let the model retry — no partial execution in safe mode.
                 if self.confirm_mode == CommandConfirmMode::Explain {
-                    let mut errors: Vec<(&str, String)> = Vec::new();
+                    let mut errors: Vec<(String, String)> = Vec::new();
                     for tc in &tool_calls {
                         if let Some(err) = tools::check_explanation(&tc.name, &tc.arguments) {
-                            errors.push((&tc.id, err));
+                            errors.push((tc.id.clone(), err));
                         }
                     }
                     if !errors.is_empty() {
