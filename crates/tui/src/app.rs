@@ -507,8 +507,11 @@ impl App {
                 )));
             }
         } else {
-            // Exiting Explain mode — final transcript save.
+            // Exiting Explain mode — final transcript save, then clear path
+            // so the next F2 entry creates a new file.
             self.save_transcript_silent();
+            self.sessions[self.active].transcript_path = None;
+            self.sessions[self.active].transcript_error_shown = false;
         }
     }
 
@@ -6556,31 +6559,35 @@ mod tests {
     }
 
     #[test]
-    fn toggle_explain_path_persists_across_toggle() {
+    fn toggle_explain_creates_new_file_each_entry() {
         let mut app = App::new("test".into(), CommandConfirmMode::Allowlist);
 
-        // Enter Explain.
+        // Enter Explain — first file created.
         app.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::F(2),
             crossterm::event::KeyModifiers::NONE,
         ));
-        let path = app.sessions[0].transcript_path.clone();
-        assert!(path.is_some());
+        let path1 = app.sessions[0].transcript_path.clone();
+        assert!(path1.is_some(), "transcript_path must be set on first entry");
 
-        // Exit Explain.
+        // Exit Explain — path should be cleared.
         app.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::F(2),
             crossterm::event::KeyModifiers::NONE,
         ));
-        // Path should NOT change — it persists across toggles.
-        assert_eq!(app.sessions[0].transcript_path, path, "transcript_path must persist across toggles");
+        assert!(app.sessions[0].transcript_path.is_none(), "transcript_path must be cleared on exit");
 
-        // Re-enter Explain — path should still be the same.
+        // Wait 1 second so the new file gets a different timestamp.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // Re-enter Explain — new file created (different path).
         app.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::F(2),
             crossterm::event::KeyModifiers::NONE,
         ));
-        assert_eq!(app.sessions[0].transcript_path, path, "transcript_path must not change on re-entry");
+        let path2 = app.sessions[0].transcript_path.clone();
+        assert!(path2.is_some(), "transcript_path must be set on re-entry");
+        assert_ne!(path1, path2, "each F2 entry must create a new file");
     }
 
     #[test]
