@@ -41,6 +41,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   confirmation is pending when F2 is pressed, it is aborted (denied).
   The status bar highlights Explain mode with an accent color.
   ([#263](https://github.com/devlawey/filar/issues/263)).
+- Automatic Markdown session transcript in Explain mode: all commands,
+  explanations, outputs, and denials are written to a single `.md` file
+  in the configured save directory. The file is overwritten on each save.
+  Errors are shown once per session without blocking the agent.
+  ([#264](https://github.com/devlawey/filar/issues/264)).
 
 ### Changed
 

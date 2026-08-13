@@ -339,13 +339,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 ## 8. Тесты
 
-- **495 unit-тестов** проходят (включая doc-тесты):
+- **501 unit-тестов** проходят (включая doc-тесты):
   - filar-agent: 87 тестов
   - filar-app: 14 тестов
   - filar-core: 50 тестов + 2 doc-теста
   - filar-gui: 16 тестов
   - filar-transport: 26 тестов (7 ignored — требуют Docker sshd)
-  - filar-tui: 300 тестов
+  - filar-tui: 306 тестов
 - **0 failures**, 7 ignored (Docker)
 
 ```powershell
@@ -4201,3 +4201,36 @@ core+agent проходят. Тесты падают на старом коде 
 и `prev_confirm_mode`, но `Session` не является публичным контрактом.
 
 **Дальше:** #264 (авто-расшифровка), #265 (подсказки/документация).
+
+---
+
+## Issue #264: feat(tui) — Explain mode: automatic Markdown session transcript
+
+**Milestone:** 0.9.0. **Ветка:** `feat/264-auto-transcript`.
+
+**Что сделано:**
+- `transcript_path`, `transcript_saving`, `transcript_error_shown` добавлены на
+  `Session`. Путь фиксируется один раз при первом входе в Explain через F2.
+- `transcript_filename()` — sync-хелпер (без collision check, т.к. файл
+  перезаписывается).
+- `save_transcript_silent()` — тихий путь записи: переиспользует
+  `messages_to_markdown`, не показывает оверлей, учитывает `save_in_flight`
+  и `transcript_saving` для сериализации.
+- `SaveProgress::TranscriptDone(SessionId, Option<String>)` — новый вариант
+  для результата тихой записи. Runner очищает `transcript_saving` и показывает
+  ошибку один раз (флаг `transcript_error_shown`).
+- Хуки: `toggle_explain_mode` (создание пути + final save),
+  `respond_to_confirmation` (после отказа), `CommandFinished` (после вывода),
+  `close_tab` и `quit` (final save).
+- `messages_to_markdown` обновлён: explanation как blockquote, `*(denied)*`
+  маркер для отклонённых команд.
+
+**Публичный API:** `SaveProgress` получил новый вариант `TranscriptDone`.
+`Session` (TUI crate) — не публичный контракт.
+
+**Тесты:** 6 новых (transcript_filename, save_transcript_silent_noop,
+  save_transcript_silent_skips, toggle_explain_creates_transcript_path,
+  toggle_explain_path_persists, messages_to_markdown_includes_explanation_denied).
+  Все 306 tui-тестов проходят.
+
+**Дальше:** #265 (подсказки/документация).
