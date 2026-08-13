@@ -6502,6 +6502,9 @@ mod tests {
             "expected slug.date.time.md format, got: {name}"
         );
         assert!(!name.contains(' '), "filename must not contain spaces");
+        // Verify format: slug.date.time.md — at least 3 dots.
+        let dot_count = name.chars().filter(|&c| c == '.').count();
+        assert!(dot_count >= 3, "expected at least 3 dots (slug.date.time.md), got {dot_count} dots in: {name}");
     }
 
     #[test]
@@ -6519,6 +6522,16 @@ mod tests {
         app.save_in_flight = true;
         app.save_transcript_silent();
         assert!(!app.sessions[0].transcript_saving, "must skip when save_in_flight is true");
+    }
+
+    #[test]
+    fn save_transcript_silent_skips_when_already_saving() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Explain);
+        app.sessions[0].transcript_path = Some(std::path::PathBuf::from("/tmp/test.md"));
+        app.sessions[0].transcript_saving = true;
+        app.save_transcript_silent();
+        // Should not reset the flag or spawn another task.
+        assert!(app.sessions[0].transcript_saving, "must skip when transcript_saving is already true");
     }
 
     #[test]
