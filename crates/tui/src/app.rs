@@ -359,6 +359,10 @@ pub struct Session {
     /// Used to attribute the response to the correct profile even if the
     /// user pressed Ctrl+L before the response arrived.
     pub pending_llm_profile: Option<String>,
+    /// Command confirmation mode for this tab (per-session, toggled via F2).
+    pub confirm_mode: CommandConfirmMode,
+    /// Previous confirm mode (to toggle back from Explain via F2).
+    pub prev_confirm_mode: CommandConfirmMode,
 }
 
 impl App {
@@ -418,6 +422,7 @@ impl App {
         self.pending_local_executors.push(session.id);
         self.sessions.push(session);
         self.active = self.sessions.len() - 1;
+        self.confirm_mode = self.sessions[self.active].confirm_mode;
     }
 
     /// Close the active tab. If it's the last tab, set should_quit.
@@ -438,7 +443,38 @@ impl App {
         if self.active >= self.sessions.len() {
             self.active = self.sessions.len() - 1;
         }
+        self.confirm_mode = self.sessions[self.active].confirm_mode;
         self.closed_ids.push(sid);
+    }
+
+    /// Toggle Explain (safe mode) for the active tab via F2.
+    ///
+    /// Switches between `Explain` and the previous mode. If a confirmation
+    /// is pending, it is aborted (sent `false`) so the toggle doesn't block.
+    pub fn toggle_explain_mode(&mut self) {
+        {
+            let session = &mut self.sessions[self.active];
+            if session.confirm_mode == CommandConfirmMode::Explain {
+                session.confirm_mode = session.prev_confirm_mode;
+            } else {
+                session.prev_confirm_mode = session.confirm_mode;
+                session.confirm_mode = CommandConfirmMode::Explain;
+            }
+        }
+        // Sync App-level mirror.
+        self.confirm_mode = self.sessions[self.active].confirm_mode;
+
+        // Abort pending confirmation if any — toggle must not block.
+        if let Some(confirm) = self.pending_confirm.take() {
+            let _ = confirm.respond_to.send(false);
+            self.mode = AppMode::Thinking;
+            self.awaiting_confirmation = false;
+            self.confirm_button_areas.clear();
+            self.hovered_button = None;
+            self.push_message(ChatBlock::System(
+                "Command cancelled: confirm mode switched".into(),
+            ));
+        }
     }
 
     /// Take and clear the list of closed session IDs (for runner to process).
@@ -460,6 +496,7 @@ impl App {
         };
         self.sessions[prev].has_new = false;
         self.active = prev;
+        self.confirm_mode = self.sessions[self.active].confirm_mode;
     }
 
     /// Switch to the next tab (wraps around).
@@ -467,6 +504,7 @@ impl App {
         let next = (self.active + 1) % self.sessions.len();
         self.sessions[next].has_new = false;
         self.active = next;
+        self.confirm_mode = self.sessions[self.active].confirm_mode;
     }
 
     /// Switch to tab at index (1-based from user, clamped).
@@ -477,6 +515,7 @@ impl App {
             self.sessions[idx].has_new = false;
         }
         self.active = idx;
+        self.confirm_mode = self.sessions[self.active].confirm_mode;
     }
 
     /// Find the index of a session by its stable id.
@@ -559,6 +598,8 @@ impl Session {
             last_served_model: None,
             model_per_profile: HashMap::new(),
             pending_llm_profile: None,
+            confirm_mode,
+            prev_confirm_mode: CommandConfirmMode::Allowlist,
         }
     }
 
@@ -1103,6 +1144,14 @@ impl App {
         // the overlay would steal Esc from the password-cancel flow.
         if key.code == KeyCode::F(1) && self.mode != AppMode::PasswordInput {
             self.toggle_help_overlay();
+            return;
+        }
+
+        // F2 toggles Explain (safe mode) — same availability as F1.
+        // Intercepted before mode-specific handling so it works in Interactive
+        // mode too (doesn't get sent to the terminal as \x1bOQ).
+        if key.code == KeyCode::F(2) && self.mode != AppMode::PasswordInput {
+            self.toggle_explain_mode();
             return;
         }
 
@@ -6190,5 +6239,145 @@ mod tests {
         // finish_save must allow a new save.
         app.finish_save();
         assert!(!app.save_in_flight, "finish_save must clear the flag");
+    }
+
+    // ── F2 Explain mode toggle tests ───────────────────────────────────
+
+    #[test]
+    fn f2_toggles_explain_mode() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Allowlist);
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Allowlist);
+
+        // Press F2 → should switch to Explain.
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Explain);
+
+        // Press F2 again → should switch back to Allowlist.
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Allowlist);
+    }
+
+    #[test]
+    fn f2_toggles_off_when_session_starts_in_explain() {
+        // Session starts in Explain (e.g. from config.toml) — prev_confirm_mode
+        // must default to Allowlist so F2 can toggle it off.
+        let mut app = App::new("test".into(), CommandConfirmMode::Explain);
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Explain);
+
+        // Press F2 → should switch to Allowlist (not back to Explain).
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Allowlist);
+
+        // Press F2 again → should switch back to Explain.
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Explain);
+    }
+
+    #[test]
+    fn f2_aborts_pending_confirm() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Allowlist);
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        app.pending_confirm = Some(PendingConfirm {
+            command: "ls".into(),
+            explanation: "list".into(),
+            destructive: false,
+            respond_to: tx,
+        });
+        app.mode = AppMode::Confirming;
+        app.awaiting_confirmation = true;
+        app.confirm_button_areas = vec![(Rect::new(0, 0, 10, 3), true), (Rect::new(0, 0, 10, 3), false)];
+        app.hovered_button = Some(true);
+
+        // Press F2 → should abort the pending confirmation.
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        // Confirmation should be cleared and denied.
+        assert!(app.pending_confirm.is_none(), "pending_confirm must be cleared");
+        assert_eq!(app.mode, AppMode::Thinking, "mode should return to Thinking");
+        assert!(!rx.try_recv().unwrap(), "respond_to should have received false (denied)");
+
+        // All confirmation UI state must be cleared — stale hit-areas must not
+        // consume subsequent clicks.
+        assert!(!app.awaiting_confirmation, "awaiting_confirmation must be cleared");
+        assert!(app.confirm_button_areas.is_empty(), "confirm_button_areas must be cleared");
+        assert!(app.hovered_button.is_none(), "hovered_button must be cleared");
+
+        // A system message about cancellation should be present.
+        assert!(
+            app.messages.iter().any(|m| matches!(m, ChatBlock::System(s) if s.contains("cancelled"))),
+            "a system message about cancellation should be present"
+        );
+
+        // Mode should have toggled to Explain.
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Explain);
+    }
+
+    #[test]
+    fn f2_in_interactive_mode_does_not_go_to_terminal() {
+        let mut app = make_interactive_app();
+        // make_interactive_app uses Always mode.
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Always);
+
+        // Press F2 in interactive mode.
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        // F2 should be intercepted — no terminal input should be produced.
+        assert!(
+            app.pending_term_input.is_none(),
+            "F2 must not be sent to terminal in interactive mode"
+        );
+
+        // Mode should have toggled to Explain.
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Explain);
+    }
+
+    #[test]
+    fn tab_switch_syncs_confirm_mode() {
+        let mut app = App::new("tab1".into(), CommandConfirmMode::Allowlist);
+        app.new_tab(); // Creates tab2, makes it active (index 1)
+        assert_eq!(app.active, 1);
+
+        // Switch back to tab 1.
+        app.prev_tab(); // active = 0
+        assert_eq!(app.active, 0);
+
+        // Toggle Explain on tab 1.
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Explain);
+
+        // Switch to tab 2 — app.confirm_mode should reflect tab 2's mode (Allowlist).
+        app.next_tab();
+        assert_eq!(
+            app.confirm_mode, CommandConfirmMode::Allowlist,
+            "tab switch must sync confirm_mode"
+        );
+
+        // Switch back to tab 1 — should be Explain again.
+        app.prev_tab();
+        assert_eq!(
+            app.confirm_mode, CommandConfirmMode::Explain,
+            "switching back should restore Explain"
+        );
     }
 }

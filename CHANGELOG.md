@@ -37,6 +37,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   (including read-only) require confirmation. Missing explanations are
   rejected with a retry limit of 2.
   ([#262](https://github.com/devlawey/filar/issues/262)).
+- F2 key toggles Explain (safe mode) on/off at runtime, per-tab. If a
+  confirmation is pending when F2 is pressed, it is aborted (denied).
+  The status bar highlights Explain mode with an accent color.
+  ([#263](https://github.com/devlawey/filar/issues/263)).
 
 ### Changed
 
