@@ -188,6 +188,10 @@ pub struct App {
     /// SessionIds of recently closed tabs — consumed by runner to teardown
     /// corresponding interactive backends.
     pub closed_ids: Vec<SessionId>,
+    /// SessionIds of tabs whose interactive backend should be torn down by the
+    /// runner without closing the tab (set by session restore when the tab was
+    /// in Interactive mode).
+    pub pending_term_teardown: Vec<SessionId>,
     /// SessionIds of new tabs awaiting a local executor from the runner.
     /// App signals the runner here; runner creates the executor asynchronously
     /// and stores it in its per-session map.
@@ -402,6 +406,7 @@ impl App {
             status_bar_area: Rect::default(),
             help_bar_area: Rect::default(),
             closed_ids: Vec::new(),
+            pending_term_teardown: Vec::new(),
             pending_local_executors: Vec::new(),
             help_overlay_visible: false,
             help_scroll: 0,
@@ -531,6 +536,11 @@ impl App {
     /// Take and clear the list of closed session IDs (for runner to process).
     pub fn take_closed_ids(&mut self) -> Vec<SessionId> {
         std::mem::take(&mut self.closed_ids)
+    }
+
+    /// Take and clear the list of tabs awaiting interactive-backend teardown.
+    pub fn take_pending_term_teardown(&mut self) -> Vec<SessionId> {
+        std::mem::take(&mut self.pending_term_teardown)
     }
 
     /// Take and clear the list of sessions awaiting a local executor (for runner to process).
@@ -960,16 +970,28 @@ impl App {
     /// Open the session-selection overlay (F3). Loads the list of saved
     /// sessions from disk into [`session_select_metas`](Self::session_select_metas).
     fn open_session_select(&mut self) {
-        self.session_select_metas = match SessionStore::with_default_dir() {
-            Ok(store) => store.list().unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
-        if self.session_select_metas.is_empty() {
-            self.push_message(ChatBlock::System(
-                "No saved sessions found. Sessions are saved automatically every \
-                 30s and on exit (Ctrl+Q)."
-                    .into(),
-            ));
+        match SessionStore::with_default_dir() {
+            Ok(store) => match store.list() {
+                Ok(metas) if metas.is_empty() => {
+                    self.session_select_metas = Vec::new();
+                    self.push_message(ChatBlock::System(
+                        "No saved sessions found. Sessions are saved automatically every \
+                         30s and on exit (Ctrl+Q)."
+                            .into(),
+                    ));
+                }
+                Ok(metas) => {
+                    self.session_select_metas = metas;
+                }
+                Err(e) => {
+                    self.session_select_metas = Vec::new();
+                    self.push_error(format!("Failed to list saved sessions: {e}"));
+                }
+            },
+            Err(e) => {
+                self.session_select_metas = Vec::new();
+                self.push_error(format!("Failed to init session store: {e}"));
+            }
         }
         self.session_select_index = 0;
         self.session_select_visible = true;
@@ -1007,6 +1029,37 @@ impl App {
     /// profile, token stats, and — if the session was over SSH — re-initiate
     /// the SSH connection via the password flow (`pending_ssh` + Ctrl+P).
     fn apply_loaded_session(&mut self, session: filar_core::Session) {
+        // Reset active runtime state before replacing history so stale events
+        // from the previous session don't leak into the restored one.
+        if let Some(token) = self.cancellation.take() {
+            token.cancel();
+        }
+        self.cancellation = None;
+        if let Some(confirm) = self.pending_confirm.take() {
+            let _ = confirm.respond_to.send(false);
+        }
+        if self.terminal.is_some() {
+            let sid = self.active_session().id;
+            self.pending_term_teardown.push(sid);
+        }
+        self.mode = AppMode::Normal;
+        self.agent_running = false;
+        self.awaiting_confirmation = false;
+        self.background_activity = false;
+        self.streaming = false;
+        self.pending_proposal = None;
+        self.pending_input = None;
+        self.pending_term_input = None;
+        self.toggle_interactive = false;
+        self.terminal = None;
+        self.pending_ssh_password = None;
+        self.ctrl_o_pending_target = None;
+        self.ctrl_o_pending_session_id = None;
+        self.confirm_button_areas.clear();
+        self.hovered_button = None;
+        self.collapsed_overrides.clear();
+        self.selection = None;
+
         self.messages = session.messages;
         self.message_rev = self.message_rev.wrapping_add(1);
         self.push_message(ChatBlock::System(
@@ -1022,23 +1075,28 @@ impl App {
         self.model_per_profile = session.model_per_profile;
         self.scroll = 0;
 
-        // Resolve LLM profile with the same validation as startup restore.
+        // Resolve LLM profile. Reset to the default when the saved session has
+        // no profile, so we don't reuse the replaced tab's profile.
         let default_name = if self.default_profile_name.is_empty() {
             "default".to_string()
         } else {
             self.default_profile_name.clone()
         };
-        if let Some(profile) = session.llm_profile {
-            if profile.is_empty() {
-                self.llm_profile = Some(default_name.clone());
-            } else if self.profiles.iter().any(|p| p.name == profile) {
+        match session.llm_profile {
+            Some(profile) if self.profiles.iter().any(|p| p.name == profile) => {
                 self.llm_profile = Some(profile);
-            } else {
+            }
+            Some(profile) => {
                 self.llm_profile = Some(default_name.clone());
-                self.push_message(ChatBlock::System(format!(
-                    "Profile '{}' not found — using '{}'",
-                    profile, default_name
-                )));
+                if !profile.is_empty() {
+                    self.push_message(ChatBlock::System(format!(
+                        "Profile '{}' not found — using '{}'",
+                        profile, default_name
+                    )));
+                }
+            }
+            None => {
+                self.llm_profile = Some(default_name.clone());
             }
         }
 
@@ -3079,12 +3137,19 @@ fn parse_ssh_command(cmd: &str) -> Option<(String, String, u16)> {
 }
 
 /// Parse `user@host[:port]` (the persisted `ssh_info` format) into
-/// `(user, host, port)`. The port defaults to 22 when omitted.
+/// `(user, host, port)`. The port defaults to 22 when omitted, and IPv6
+/// addresses in square brackets are supported (`user@[::1]:22`).
 fn parse_ssh_info(info: &str) -> Option<(String, String, u16)> {
     let (user, host_port) = info.split_once('@')?;
     let (host, port) = match host_port.rsplit_once(':') {
         Some((h, p)) => (h, p.parse().ok()?),
         None => (host_port, 22),
+    };
+    // Strip IPv6 brackets: `[::1]` → `::1`.
+    let host = if host.starts_with('[') && host.ends_with(']') {
+        &host[1..host.len() - 1]
+    } else {
+        host
     };
     if user.is_empty() || host.is_empty() {
         return None;
@@ -6351,6 +6416,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_ssh_info_handles_ipv6_brackets() {
+        let (user, host, port) = parse_ssh_info("root@[::1]:22").unwrap();
+        assert_eq!(user, "root");
+        assert_eq!(host, "::1");
+        assert_eq!(port, 22);
+    }
+
+    #[test]
     fn f3_toggles_session_select_overlay() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -6449,6 +6522,43 @@ mod tests {
         );
         assert_eq!(app.ssh_info.as_deref(), Some("root@10.0.0.5:22"));
         assert_eq!(app.target_name, "root@10.0.0.5:22");
+    }
+
+    #[test]
+    fn apply_loaded_session_resets_profile_when_none() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.default_profile_name = "glm".into();
+        app.profiles = vec![filar_core::LlmProfile {
+            name: "glm".into(),
+            model: "glm-5.1".into(),
+            api_base_url: String::new(),
+            max_tokens: 1024,
+            key_env: String::new(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+        }];
+        app.llm_profile = Some("other".into());
+        let session = filar_core::Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "local".into(),
+            llm_profile: None,
+            messages: vec![],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+        };
+        app.apply_loaded_session(session);
+        assert_eq!(app.llm_profile.as_deref(), Some("glm"));
     }
 
     #[test]
