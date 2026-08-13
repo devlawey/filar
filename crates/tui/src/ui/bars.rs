@@ -23,6 +23,7 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
         AppMode::Normal => vec![
             HelpItem { key: "enter", desc: "send", action: Some(HelpAction::Send) },
             HelpItem { key: "F1", desc: "help", action: None },
+            HelpItem { key: "F2", desc: "safe", action: None },
             HelpItem { key: "!", desc: "shell", action: Some(HelpAction::Shell) },
             HelpItem { key: "^T", desc: "terminal", action: Some(HelpAction::Terminal) },
             HelpItem { key: "^O", desc: "hosts", action: None },
@@ -463,5 +464,12 @@ mod tests {
         let items = help_items(AppMode::Normal);
         let has_s = items.iter().any(|i| i.key == "^S" && i.desc == "save");
         assert!(has_s, "Normal mode help must include ^S save");
+    }
+
+    #[test]
+    fn normal_mode_help_includes_f2() {
+        let items = help_items(AppMode::Normal);
+        let has_f2 = items.iter().any(|i| i.key == "F2" && i.desc == "safe");
+        assert!(has_f2, "Normal mode help must include F2 safe");
     }
 }

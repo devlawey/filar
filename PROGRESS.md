@@ -339,13 +339,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 ## 8. Тесты
 
-- **501 unit-тестов** проходят (включая doc-тесты):
+- **502 unit-тестов** проходят (включая doc-тесты):
   - filar-agent: 87 тестов
   - filar-app: 14 тестов
   - filar-core: 50 тестов + 2 doc-теста
   - filar-gui: 16 тестов
   - filar-transport: 26 тестов (7 ignored — требуют Docker sshd)
-  - filar-tui: 306 тестов
+  - filar-tui: 307 тестов
 - **0 failures**, 7 ignored (Docker)
 
 ```powershell
@@ -4234,3 +4234,24 @@ core+agent проходят. Тесты падают на старом коде 
   Все 306 tui-тестов проходят.
 
 **Дальше:** #265 (подсказки/документация).
+
+---
+
+## Issue #265: chore(tui,docs) — Explain mode: F2 hints and documentation
+
+**Milestone:** 0.9.0. **Ветка:** `chore/265-f2-hints-docs`.
+
+**Что сделано:**
+- `help_registry()`: F2 в секции Modes с описанием что делает режим.
+  Новая секция "Status bar" с легендой индикатора confirm_mode.
+- `help_items(Normal)`: добавлен `F2 safe` после `F1 help`.
+- `README.md`: комментарий про все 4 режима подтверждения (always,
+  allowlist, never, explain) в config.toml; F2 в таблице горячих клавиш.
+- `docs/SMOKE.md`: чек-лист для safe mode (F2, пояснение, расшифровка, toggle off).
+- Юнит-тест: `normal_mode_help_includes_f2`.
+
+**Публичный API:** нет изменений.
+
+**Тесты:** 1 новый (normal_mode_help_includes_f2). Все 307 tui-тестов проходят.
+
+**Дальше:** milestone 0.9.0 завершён (все 4 issue: #262–#265). Релиз v0.9.0.
