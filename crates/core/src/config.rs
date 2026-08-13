@@ -303,6 +303,10 @@ pub enum CommandConfirmMode {
     Allowlist,
     /// No confirmation required (dangerous — use only in trusted sandboxes).
     Never,
+    /// Safe mode: every command requires confirmation AND a mandatory
+    /// explanation from the model. Read-only commands are NOT auto-approved.
+    /// The system prompt gets a SAFE MODE block appended.
+    Explain,
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +429,19 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_config_with_explain_mode() {
+        let toml = r#"
+confirm_mode = "explain"
+
+[llm]
+model = "glm-5.1"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.confirm_mode, CommandConfirmMode::Explain);
+    }
 
     #[test]
     fn parse_minimal_config() {

@@ -11,7 +11,7 @@
 use serde::Deserialize;
 use tracing::{debug, info};
 
-use filar_core::{CoreError, Result};
+use filar_core::{CommandConfirmMode, CoreError, Result};
 use filar_transport::CommandExecutor;
 
 use crate::ToolDef;
@@ -43,6 +43,9 @@ pub struct RunCommandParams {
 pub struct ReadFileParams {
     /// Path to the file to read.
     pub path: String,
+    /// Human-readable explanation (required in Explain mode).
+    #[serde(default)]
+    pub explanation: String,
 }
 
 /// Parameters for the `list_dir` tool.
@@ -50,6 +53,9 @@ pub struct ReadFileParams {
 pub struct ListDirParams {
     /// Path to the directory to list.
     pub path: String,
+    /// Human-readable explanation (required in Explain mode).
+    #[serde(default)]
+    pub explanation: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -57,7 +63,26 @@ pub struct ListDirParams {
 // ---------------------------------------------------------------------------
 
 /// Return the list of tool definitions available to the LLM.
-pub fn tool_definitions() -> Vec<ToolDef> {
+///
+/// In `Explain` mode, the `explanation` field is added to `required` for all
+/// tools, forcing the model to provide a justification for each command.
+pub fn tool_definitions(mode: CommandConfirmMode) -> Vec<ToolDef> {
+    let require_explanation = mode == CommandConfirmMode::Explain;
+    let required_cmd = if require_explanation {
+        serde_json::json!(["command", "explanation"])
+    } else {
+        serde_json::json!(["command"])
+    };
+    let required_path = if require_explanation {
+        serde_json::json!(["path", "explanation"])
+    } else {
+        serde_json::json!(["path"])
+    };
+    let explanation_prop = || serde_json::json!({
+        "type": "string",
+        "description": "A brief explanation of what this command does and why."
+    });
+
     vec![
         ToolDef {
             name: TOOL_RUN_COMMAND.into(),
@@ -72,12 +97,9 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "The shell command to execute."
                     },
-                    "explanation": {
-                        "type": "string",
-                        "description": "A brief explanation of what this command does and why."
-                    }
+                    "explanation": explanation_prop()
                 },
-                "required": ["command"]
+                "required": required_cmd
             }),
         },
         ToolDef {
@@ -91,9 +113,10 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "path": {
                         "type": "string",
                         "description": "Absolute or relative path to the file."
-                    }
+                    },
+                    "explanation": explanation_prop()
                 },
-                "required": ["path"]
+                "required": required_path
             }),
         },
         ToolDef {
@@ -107,9 +130,10 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "path": {
                         "type": "string",
                         "description": "Absolute or relative path to the directory."
-                    }
+                    },
+                    "explanation": explanation_prop()
                 },
-                "required": ["path"]
+                "required": required_path
             }),
         },
     ]
@@ -166,7 +190,11 @@ pub fn parse_tool_call(id: &str, name: &str, arguments: &serde_json::Value) -> R
                 id: id.to_string(),
                 kind: ToolKind::ReadFile,
                 command: format!("cat {}", shell_quote(&params.path)),
-                explanation: format!("Read file: {}", params.path),
+                explanation: if params.explanation.is_empty() {
+                    format!("Read file: {}", params.path)
+                } else {
+                    params.explanation
+                },
             })
         }
         TOOL_LIST_DIR => {
@@ -176,11 +204,58 @@ pub fn parse_tool_call(id: &str, name: &str, arguments: &serde_json::Value) -> R
                 id: id.to_string(),
                 kind: ToolKind::ListDir,
                 command: format!("ls -la {}", shell_quote(&params.path)),
-                explanation: format!("List directory: {}", params.path),
+                explanation: if params.explanation.is_empty() {
+                    format!("List directory: {}", params.path)
+                } else {
+                    params.explanation
+                },
             })
         }
         other => Err(CoreError::Other(format!("unknown tool: {other}"))),
     }
+}
+
+/// Check if a tool call has a non-empty explanation (required in Explain mode).
+///
+/// Returns `Some(error_message)` if the explanation is missing or empty,
+/// `None` if the explanation is present (or the tool is unknown — let
+/// `parse_tool_call` handle that).
+pub fn check_explanation(name: &str, arguments: &serde_json::Value) -> Option<String> {
+    match name {
+        TOOL_RUN_COMMAND => {
+            let params: RunCommandParams = serde_json::from_value(arguments.clone()).ok()?;
+            if params.explanation.trim().is_empty() {
+                return Some(
+                    "Error: in safe mode, every command must include an `explanation` \
+                     describing what it does, why it is needed now, and what it changes. \
+                     Please resubmit with a meaningful explanation."
+                        .into(),
+                );
+            }
+        }
+        TOOL_READ_FILE => {
+            let params: ReadFileParams = serde_json::from_value(arguments.clone()).ok()?;
+            if params.explanation.trim().is_empty() {
+                return Some(
+                    "Error: in safe mode, read_file also requires an `explanation`. \
+                     Please describe why you need to read this file."
+                        .into(),
+                );
+            }
+        }
+        TOOL_LIST_DIR => {
+            let params: ListDirParams = serde_json::from_value(arguments.clone()).ok()?;
+            if params.explanation.trim().is_empty() {
+                return Some(
+                    "Error: in safe mode, list_dir also requires an `explanation`. \
+                     Please describe why you need to list this directory."
+                        .into(),
+                );
+            }
+        }
+        _ => {}
+    }
+    None
 }
 
 /// Execute a parsed tool call via the given executor and return the output string.
@@ -248,7 +323,7 @@ mod tests {
 
     #[test]
     fn tool_definitions_count() {
-        let defs = tool_definitions();
+        let defs = tool_definitions(CommandConfirmMode::Allowlist);
         assert_eq!(defs.len(), 3);
         assert!(defs.iter().any(|d| d.name == TOOL_RUN_COMMAND));
         assert!(defs.iter().any(|d| d.name == TOOL_READ_FILE));
@@ -311,5 +386,103 @@ mod tests {
     #[test]
     fn shell_quote_with_single_quote() {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    // ── Explain mode tests ──────────────────────────────────────────
+
+    #[test]
+    fn tool_definitions_explain_requires_explanation() {
+        let defs = tool_definitions(CommandConfirmMode::Explain);
+        for def in &defs {
+            let required = def.parameters["required"].as_array().unwrap();
+            assert!(
+                required.iter().any(|v| v.as_str() == Some("explanation")),
+                "tool '{}' must require 'explanation' in Explain mode",
+                def.name
+            );
+        }
+    }
+
+    #[test]
+    fn tool_definitions_non_explain_no_explanation_required() {
+        for mode in [
+            CommandConfirmMode::Always,
+            CommandConfirmMode::Allowlist,
+            CommandConfirmMode::Never,
+        ] {
+            let defs = tool_definitions(mode);
+            for def in &defs {
+                let required = def.parameters["required"].as_array().unwrap();
+                assert!(
+                    !required.iter().any(|v| v.as_str() == Some("explanation")),
+                    "tool '{}' must NOT require 'explanation' in {:?} mode",
+                    def.name,
+                    mode
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn check_explanation_empty_run_command() {
+        let args = serde_json::json!({"command": "ls"});
+        assert!(check_explanation(TOOL_RUN_COMMAND, &args).is_some());
+    }
+
+    #[test]
+    fn check_explanation_whitespace_run_command() {
+        let args = serde_json::json!({"command": "ls", "explanation": "   "});
+        assert!(check_explanation(TOOL_RUN_COMMAND, &args).is_some());
+    }
+
+    #[test]
+    fn check_explanation_present_run_command() {
+        let args = serde_json::json!({"command": "ls", "explanation": "list files"});
+        assert!(check_explanation(TOOL_RUN_COMMAND, &args).is_none());
+    }
+
+    #[test]
+    fn check_explanation_empty_read_file() {
+        let args = serde_json::json!({"path": "/etc/hostname"});
+        assert!(check_explanation(TOOL_READ_FILE, &args).is_some());
+    }
+
+    #[test]
+    fn check_explanation_present_read_file() {
+        let args = serde_json::json!({"path": "/etc/hostname", "explanation": "check hostname"});
+        assert!(check_explanation(TOOL_READ_FILE, &args).is_none());
+    }
+
+    #[test]
+    fn check_explanation_empty_list_dir() {
+        let args = serde_json::json!({"path": "/var/log"});
+        assert!(check_explanation(TOOL_LIST_DIR, &args).is_some());
+    }
+
+    #[test]
+    fn check_explanation_unknown_tool() {
+        let args = serde_json::json!({});
+        assert!(check_explanation("unknown_tool", &args).is_none());
+    }
+
+    #[test]
+    fn parse_read_file_with_explanation() {
+        let args = serde_json::json!({"path": "/etc/hostname", "explanation": "check hostname"});
+        let call = parse_tool_call("call_1", TOOL_READ_FILE, &args).unwrap();
+        assert_eq!(call.explanation, "check hostname");
+    }
+
+    #[test]
+    fn parse_read_file_without_explanation_falls_back() {
+        let args = serde_json::json!({"path": "/etc/hostname"});
+        let call = parse_tool_call("call_1", TOOL_READ_FILE, &args).unwrap();
+        assert_eq!(call.explanation, "Read file: /etc/hostname");
+    }
+
+    #[test]
+    fn parse_list_dir_with_explanation() {
+        let args = serde_json::json!({"path": "/var/log", "explanation": "list logs"});
+        let call = parse_tool_call("call_1", TOOL_LIST_DIR, &args).unwrap();
+        assert_eq!(call.explanation, "list logs");
     }
 }

@@ -33,6 +33,38 @@ const DEFAULT_MAX_ITERATIONS: usize = 50;
 /// Default maximum output length (in characters) before truncation.
 const DEFAULT_MAX_OUTPUT_CHARS: usize = 10_000;
 
+/// Maximum number of retries for missing explanation in Explain mode.
+const MAX_MISSING_EXPLANATION_RETRIES: u32 = 2;
+
+/// System prompt block appended when `CommandConfirmMode::Explain` is active.
+const SAFE_MODE_PROMPT: &str = r#"
+
+SAFE MODE IS ACTIVE.
+
+Every command you propose must include an `explanation` that lets the user decide
+whether to approve it, without having to reconstruct your reasoning. In 1–3 sentences,
+each explanation must cover:
+
+1. What the command does — in plain language, not a restatement of its flags.
+2. Why it is needed right now — the link to the user's task or to what you just
+   observed. This is the most important part.
+3. What it changes — say that it only reads state, or name exactly what it creates,
+   modifies, restarts, or deletes.
+
+For anything that modifies state, also state the blast radius and how to undo it — or
+say plainly that it cannot be undone.
+
+Rules:
+- Never write an explanation that merely restates the command ("runs df -h to show
+  disk usage"). If it would not help someone decide, it is not good enough.
+- Distinguish what you know from what you assume. Say "assuming this service is managed
+  by systemd" rather than asserting it.
+- Prefer several small commands, each separately explainable, over one compound command
+  whose combined effect is hard to describe.
+- If the user rejects a command, do not resubmit the same command with a reworded
+  explanation. Propose a different approach or ask a clarifying question.
+"#;
+
 /// Build the system prompt based on execution context.
 ///
 /// - `is_local`: true when executing commands on the local machine.
@@ -286,6 +318,13 @@ impl AgentBuilder {
             Some(provider) => Arc::new(SecretSubstitutingExecutor::new(executor, provider.clone())),
             None => executor,
         };
+        let mut system_prompt = self.system_prompt.unwrap_or_else(||
+            build_system_prompt(false, None, cfg!(windows))
+        );
+        // Append SAFE MODE block in Explain mode.
+        if self.confirm_mode == CommandConfirmMode::Explain {
+            system_prompt.push_str(SAFE_MODE_PROMPT);
+        }
         Ok(Agent {
             llm: self.llm.ok_or_else(|| CoreError::Other("LLM client not set".into()))?,
             executor,
@@ -293,9 +332,7 @@ impl AgentBuilder {
             confirm_mode: self.confirm_mode,
             max_iterations: self.max_iterations,
             max_output_chars: self.max_output_chars,
-            system_prompt: self.system_prompt.unwrap_or_else(||
-                build_system_prompt(false, None, cfg!(windows))
-            ),
+            system_prompt,
             on_text_delta: self.on_text_delta,
             event_sink: self.event_sink,
             cancellation: self.cancellation,
@@ -390,9 +427,11 @@ impl Agent {
         messages.extend_from_slice(history);
         messages.push(ChatMessage::user(user_prompt));
 
-        let tool_defs = tools::tool_definitions();
+        let tool_defs = tools::tool_definitions(self.confirm_mode);
 
         info!(prompt = %user_prompt, "agent loop started");
+
+        let mut missing_explanation_count: u32 = 0;
 
         for iteration in 0..self.max_iterations {
             info!(iteration, "sending request to LLM");
@@ -443,6 +482,21 @@ impl Agent {
 
                 // Process each tool call.
                 for tc in &tool_calls {
+                    // In Explain mode, validate explanation before processing.
+                    if self.confirm_mode == CommandConfirmMode::Explain {
+                        if let Some(err) = tools::check_explanation(&tc.name, &tc.arguments) {
+                            missing_explanation_count += 1;
+                            if missing_explanation_count > MAX_MISSING_EXPLANATION_RETRIES {
+                                warn!(count = missing_explanation_count, "explanation retries exhausted");
+                                return Err(CoreError::Other(
+                                    "Agent repeatedly proposed commands without the required explanation. Stopping.".into()
+                                ));
+                            }
+                            warn!(tool = %tc.name, "missing explanation in safe mode");
+                            messages.push(ChatMessage::tool(&tc.id, err));
+                            continue;
+                        }
+                    }
                     let result = self.process_tool_call(tc).await?;
                     messages.push(result);
                 }
