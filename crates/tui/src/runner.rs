@@ -1420,17 +1420,32 @@ mod tests {
     fn session_snapshot_captures_launch_context() {
         use filar_core::{CommandConfirmMode, LlmProfile};
         let mut app = App::new("prod".into(), CommandConfirmMode::Always);
-        app.profiles = vec![LlmProfile {
-            name: "glm".into(),
-            model: "glm-5.1".into(),
-            api_base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
-            max_tokens: 1024,
-            key_env: "GLM_API_KEY".into(),
-            temperature: None,
-            top_p: None,
-            extra_body: None,
-        }];
-        app.default_profile_name = "glm".into();
+        app.profiles = vec![
+            LlmProfile {
+                name: "glm".into(),
+                model: "glm-5.1".into(),
+                api_base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
+                max_tokens: 1024,
+                key_env: "GLM_API_KEY".into(),
+                temperature: None,
+                top_p: None,
+                extra_body: None,
+            },
+            LlmProfile {
+                name: "other".into(),
+                model: "other-model".into(),
+                api_base_url: "https://other.example.com".into(),
+                max_tokens: 1024,
+                key_env: "OTHER_API_KEY".into(),
+                temperature: None,
+                top_p: None,
+                extra_body: None,
+            },
+        ];
+        // Default differs from the session's selected profile, so the test
+        // proves the snapshot resolves model/api_base_url from the session
+        // profile, not from default_profile_name.
+        app.default_profile_name = "other".into();
         {
             let s = &mut app.sessions[0];
             s.ssh_info = Some("root@10.0.0.5:22".into());
