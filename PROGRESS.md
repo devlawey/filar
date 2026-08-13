@@ -339,8 +339,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 ## 8. Тесты
 
-- **490 unit-тестов** проходят (включая doc-тесты):
-  - filar-agent: 83 теста
+- **491 unit-тестов** проходят (включая doc-тесты):
+  - filar-agent: 87 тестов
   - filar-app: 14 тестов
   - filar-core: 50 тестов + 2 doc-теста
   - filar-gui: 16 тестов

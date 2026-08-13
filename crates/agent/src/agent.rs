@@ -323,6 +323,7 @@ impl AgentBuilder {
         );
         // Append SAFE MODE block in Explain mode.
         if self.confirm_mode == CommandConfirmMode::Explain {
+            system_prompt.push('\n');
             system_prompt.push_str(SAFE_MODE_PROMPT);
         }
         Ok(Agent {
@@ -480,23 +481,37 @@ impl Agent {
                 );
                 messages.push(assistant_msg);
 
-                // Process each tool call.
-                for tc in &tool_calls {
-                    // In Explain mode, validate explanation before processing.
-                    if self.confirm_mode == CommandConfirmMode::Explain {
+                // In Explain mode, validate ALL explanations before executing any.
+                // If any tool call lacks an explanation, reject the entire batch
+                // and let the model retry — no partial execution in safe mode.
+                if self.confirm_mode == CommandConfirmMode::Explain {
+                    let mut errors: Vec<(&str, String)> = Vec::new();
+                    for tc in &tool_calls {
                         if let Some(err) = tools::check_explanation(&tc.name, &tc.arguments) {
-                            missing_explanation_count += 1;
-                            if missing_explanation_count > MAX_MISSING_EXPLANATION_RETRIES {
-                                warn!(count = missing_explanation_count, "explanation retries exhausted");
-                                return Err(CoreError::Other(
-                                    "Agent repeatedly proposed commands without the required explanation. Stopping.".into()
-                                ));
-                            }
-                            warn!(tool = %tc.name, "missing explanation in safe mode");
-                            messages.push(ChatMessage::tool(&tc.id, err));
-                            continue;
+                            errors.push((&tc.id, err));
                         }
                     }
+                    if !errors.is_empty() {
+                        missing_explanation_count += 1;
+                        if missing_explanation_count > MAX_MISSING_EXPLANATION_RETRIES {
+                            warn!(count = missing_explanation_count, "explanation retries exhausted");
+                            return Err(CoreError::Other(
+                                "Agent repeatedly proposed commands without the required explanation. Stopping.".into()
+                            ));
+                        }
+                        for (id, err) in errors {
+                            warn!(tool = %id, "missing explanation in safe mode");
+                            messages.push(ChatMessage::tool(id, err));
+                        }
+                        // Skip execution for this entire batch — let the model retry.
+                        continue;
+                    }
+                    // All tool calls have valid explanations — reset the counter.
+                    missing_explanation_count = 0;
+                }
+
+                // Process each tool call.
+                for tc in &tool_calls {
                     let result = self.process_tool_call(tc).await?;
                     messages.push(result);
                 }
@@ -1432,6 +1447,123 @@ mod tests {
             snapshot.trim_end(),
             expected.trim_end(),
             "eval/prompts/agent-system.txt is out of sync with build_system_prompt(false, None, false)"
+        );
+    }
+
+    // ── Explain mode agent-level tests ─────────────────────────────────
+
+    #[test]
+    fn build_explain_mode_appends_safe_mode_prompt() {
+        let agent = Agent::builder()
+            .llm(Arc::new(MockLlm::new(vec![])))
+            .executor(Arc::new(MockExecutor {
+                last_command: std::sync::Mutex::new(String::new()),
+            }))
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .confirm_mode(CommandConfirmMode::Explain)
+            .build()
+            .unwrap();
+
+        assert!(
+            agent.system_prompt.contains("SAFE MODE IS ACTIVE"),
+            "system prompt must contain SAFE MODE block in Explain mode"
+        );
+    }
+
+    #[test]
+    fn build_non_explain_mode_no_safe_mode_prompt() {
+        for mode in [
+            CommandConfirmMode::Always,
+            CommandConfirmMode::Allowlist,
+            CommandConfirmMode::Never,
+        ] {
+            let agent = Agent::builder()
+                .llm(Arc::new(MockLlm::new(vec![])))
+                .executor(Arc::new(MockExecutor {
+                    last_command: std::sync::Mutex::new(String::new()),
+                }))
+                .confirmer(Arc::new(MockConfirmer { approve: true }))
+                .confirm_mode(mode)
+                .build()
+                .unwrap();
+
+            assert!(
+                !agent.system_prompt.contains("SAFE MODE IS ACTIVE"),
+                "system prompt must NOT contain SAFE MODE block in {:?} mode",
+                mode
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_mode_rejects_missing_explanation() {
+        // Tool call without explanation — should be rejected, executor not called.
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        }]);
+
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call,
+            ChatResponse::text("OK, let me explain first."),
+        ]));
+
+        let executor = Arc::new(MockExecutor {
+            last_command: std::sync::Mutex::new(String::new()),
+        });
+
+        let agent = Agent::builder()
+            .llm(llm)
+            .executor(executor.clone())
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .confirm_mode(CommandConfirmMode::Explain)
+            .build()
+            .unwrap();
+
+        let result = agent.run("list files", &[]).await.unwrap();
+        assert!(result.contains("explain"));
+        // Executor must NOT have been called — no command was executed.
+        assert!(
+            executor.last_command.lock().unwrap().is_empty(),
+            "executor must not be called when explanation is missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_mode_stops_after_retry_limit() {
+        // Repeatedly send tool calls without explanation.
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        }]);
+
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call.clone(),
+            tool_call.clone(),
+            tool_call,
+        ]));
+
+        let executor = Arc::new(MockExecutor {
+            last_command: std::sync::Mutex::new(String::new()),
+        });
+
+        let agent = Agent::builder()
+            .llm(llm)
+            .executor(executor)
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .confirm_mode(CommandConfirmMode::Explain)
+            .max_iterations(10)
+            .build()
+            .unwrap();
+
+        let result = agent.run("list files", &[]).await;
+        assert!(result.is_err(), "agent should stop after retry limit");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("explanation"),
+            "error should mention missing explanation, got: {err}"
         );
     }
 }
