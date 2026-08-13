@@ -65,21 +65,82 @@ cargo build --release
 
 The executable will be at `target\release\filar.exe`.
 
-### Configuration (optional)
+### Configuration
 
-Filar works without a config file — the GUI launcher handles everything.
-For CLI usage, create `config.toml`. The file is searched in this order:
+Filar stores configuration in **three places**. Most users never need to
+think about this — the GUI launcher handles everything automatically.
 
-1. `FILAR_CONFIG` environment variable (explicit path)
-2. `./config.toml` in the current working directory (local override for development)
-3. `%APPDATA%\filar\config.toml` (per-user app-data directory, written by GUI launcher;
-   `~/.local/share/filar` on Linux, `~/Library/Application Support/filar` on macOS)
+#### 1. GUI Launcher settings (`settings.json`)
+
+Location: `%APPDATA%\filar\settings.json` (Windows),
+`~/.local/share/filar/settings.json` (Linux).
+
+The launcher saves non-sensitive UI state here: SSH profiles (host, port,
+user, alias), model name, API base URL, temperature, extra body JSON, save
+directory, and the last selected target/profile. **No secrets** — API keys
+and SSH passwords go to the OS Credential Manager.
+
+You never edit this file manually — the launcher reads/writes it on every
+Launch.
+
+#### 2. Handoff file (`pending_launch.json`)
+
+Location: `%APPDATA%\filar\pending_launch.json`.
+
+A **transient** file written by the launcher on "Launch" and read+deleted by
+the TUI subprocess. It carries the launch-specific settings (model, API URL,
+LLM profiles, SSH targets, save directory, selected target) from the GUI to
+the TUI. Users never see or edit this file.
+
+If you launch the TUI directly (CLI mode, without the GUI), this file does
+not exist — the TUI falls back to `config.toml`.
+
+#### 3. Fallback config (`config.toml`)
+
+Location (search order):
+1. `FILAR_CONFIG` env var (explicit path)
+2. `./config.toml` in the current working directory
+3. `%APPDATA%\filar\config.toml` (app-data dir — **the launcher writes here**)
 4. `config.toml` next to the executable
 
-```toml
-confirm_mode = "allowlist"
+**When is `config.toml` created?** The launcher writes the `[llm]` section
+(model, api_base_url, temperature, extra_body) to `%APPDATA%\filar\config.toml`
+on every Launch, as a fallback for CLI usage. It merges into the existing
+file — it does not overwrite `[[ssh_targets]]`, `[[llm_profiles]]`, or
+other sections you may have added manually.
 
-# Confirmation modes:
+**When do you need `config.toml`?**
+- **GUI users**: never. The launcher + `pending_launch.json` handle everything.
+- **CLI users** (`filar --target ...`): the TUI reads `config.toml` because
+  there is no `pending_launch.json`. This is where you define SSH targets,
+LLM profiles, timeouts, and the default confirm mode.
+- **Power users**: edit `%APPDATA%\filar\config.toml` manually to add
+  `[[llm_profiles]]`, tweak `[timeouts]`, or set `confirm_mode`. The
+  launcher will preserve these sections on next Launch.
+
+#### Secrets (OS Credential Manager)
+
+API keys and SSH passwords are stored in the **OS Credential Manager**
+(Windows Credential Manager, macOS Keychain, Linux Secret Service). They are
+**never** written to `config.toml`, `settings.json`, `pending_launch.json`,
+or log files.
+
+In the GUI launcher, the API key is entered in the UI field and saved
+automatically on first Launch. SSH passwords are saved when you check
+"Save password" for that SSH slot.
+
+In CLI mode, set environment variables:
+```powershell
+$env:GLM_API_KEY = "your-key"       # default profile
+$env:DEEPSEEK_API_KEY = "your-key"  # named profile
+$env:SSH_PASSWORD = "ssh-password"   # SSH auth type = "password"
+```
+
+#### config.toml reference
+
+```toml
+# ── Confirmation mode ──────────────────────────────────────
+confirm_mode = "allowlist"
 #   always    — every command requires explicit user approval
 #   allowlist — read-only commands auto-approved, others require confirmation (default)
 #   never     — no confirmation (dangerous, sandbox only)
@@ -87,17 +148,35 @@ confirm_mode = "allowlist"
 #               explanation. Toggle at runtime with F2. Session is auto-saved
 #               to Markdown. (!command shell escape is not affected.)
 
+# ── LLM (default profile) ─────────────────────────────────
 [llm]
 model = "glm-5.1"
 api_base_url = "https://open.bigmodel.cn/api/paas/v4"
 max_tokens = 4096
+# temperature = 0.3         # optional (0.0–2.0)
+# top_p = 0.9              # optional (0.0–1.0]
+# [llm.extra_body]          # optional, arbitrary fields merged into request
+# thinking = { type = "disabled" }
 
+# ── Additional LLM profiles ────────────────────────────────
+# Each profile can use a different model/provider. Keys are stored
+# in the OS credential manager under the name specified by `key_env`.
+[[llm_profiles]]
+name = "deepseek"
+model = "deepseek-chat"
+api_base_url = "https://api.deepseek.com/v1"
+max_tokens = 8192
+key_env = "DEEPSEEK_API_KEY"
+
+# ── Timeouts (seconds) ─────────────────────────────────────
 [timeouts]
-command_secs = 120
-llm_secs = 60
-connect_secs = 15
+command_secs = 120   # single command execution
+llm_secs = 60        # single LLM API call
+connect_secs = 15    # SSH connection establishment
 
-# SSH targets (optional)
+# ── SSH targets ────────────────────────────────────────────
+# The launcher syncs its SSH profiles into this section on every Launch.
+# You can also add targets manually — the launcher preserves non-matching entries.
 [[ssh_targets]]
 name = "my-server"
 host = "192.168.1.100"
@@ -105,34 +184,15 @@ port = 22
 user = "admin"
 
 [ssh_targets.auth]
-type = "password"
+type = "agent"        # agent | key | password
+# path = "~/.ssh/id_ed25519"  # only for type = "key"
+# password = "..."            # only for type = "password" (prefer SSH_PASSWORD env)
+
+# ── Save directory for session exports ────────────────────
+# Where Ctrl+S and auto-transcript (Explain mode) write .md files.
+# None = current working directory.
+# save_dir = "C:\\Users\\me\\Documents\\filar-transcripts"
 ```
-
-#### Multiple LLM Profiles (since v0.7.0)
-
-```toml
-# Define any number of profiles with independent API keys.
-[[llm_profiles]]
-name = "glm-5.2"
-model = "glm-5.2"
-api_base_url = "https://open.bigmodel.cn/api/paas/v4"
-max_tokens = 4096
-
-[[llm_profiles]]
-name = "deepseek"
-model = "deepseek-chat"
-api_base_url = "https://api.deepseek.com/v1"
-max_tokens = 8192
-
-[[llm_profiles]]
-name = "local-llama"
-model = "llama3.1"
-api_base_url = "http://localhost:11434/v1"
-max_tokens = 4096
-```
-
-API keys are stored in the OS credential store (Windows Credential Manager)
-and are **never** written to `config.toml`, `settings.json`, or log files.
 
 ### Run
 
@@ -144,13 +204,13 @@ From the GUI you can:
 - Configure up to 5 SSH profiles
 - Start a session
 
-Or via command line:
+Or via command line (reads `config.toml`, no GUI):
 
 ```powershell
 # Local mode
 filar --target local
 
-# SSH mode (requires config.toml)
+# SSH mode (requires config.toml with [[ssh_targets]])
 filar --target my-server --llm default
 
 # Restore a previous session
