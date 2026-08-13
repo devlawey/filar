@@ -4290,3 +4290,18 @@ core+agent проходят. Тесты падают на старом коде 
 **Публичный API:** нет изменений.
 
 **Тесты:** 1 обновлён. Все 307 tui-тестов проходят.
+
+---
+
+## Issue #277 (follow-up): fix(tui) — Local time + remove stale mode from Connected message
+
+**Milestone:** 0.9.0. **Ветка:** `fix/277b-remove-mode-from-connected`.
+
+**Что сделано:**
+- `messages_to_markdown()`: вместо UTC с меткой используется `chrono::Local::now()` —
+  местное время без суффикса UTC.
+- `Session::new()`: убран `| Mode: {confirm_mode:?}` из начального сообщения.
+  Режим теперь виден только через F2 activation/deactivation messages.
+- `chrono` добавлен как зависимость workspace + tui crate.
+
+**Публичный API:** добавлена зависимость `chrono` в `filar-tui`.

@@ -587,7 +587,7 @@ impl Session {
             id: SessionId::next(),
             target_name,
             messages: vec![ChatBlock::System(format!(
-                "Connected to: {name} | Mode: {confirm_mode:?}"
+                "Connected to: {name}"
             ))],
             input: String::new(),
             cursor_pos: 0,
@@ -776,14 +776,7 @@ async fn generate_save_filename(
 fn messages_to_markdown(messages: &[ChatBlock], session_name: &str, ssh_info: &Option<String>) -> String {
     let mut md = String::new();
     md.push_str(&format!("# Session: {session_name}\n\n"));
-    let ts = {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let (y, mo, d, h, mi, s) = unix_to_ymdhms(secs);
-        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
-    };
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     md.push_str(&format!("Date: {ts}\n"));
     if let Some(ref info) = ssh_info {
         md.push_str(&format!("Target: {info}\n"));
