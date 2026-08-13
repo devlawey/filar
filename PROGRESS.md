@@ -4273,3 +4273,20 @@ core+agent проходят. Тесты падают на старом коде 
 **Публичный API:** нет изменений.
 
 **Тесты:** 1 обновлён. Все 307 tui-тестов проходят.
+
+---
+
+## Issue #277: fix(tui) — Transcript: UTC time label and mode activation messages
+
+**Milestone:** 0.9.0. **Ветка:** `fix/277-transcript-utc-mode`.
+
+**Что сделано:**
+- `messages_to_markdown()`: дата помечена как UTC — `Date: ... UTC`.
+- `toggle_explain_mode()`: при входе в Explain добавляется системное сообщение
+  `Safe mode (Explain) activated. Transcript: {path}`. При выходе —
+  `Safe mode (Explain) deactivated`. Транскрипт теперь показывает смену режима.
+- Тест обновлён: проверяет `contains("Safe mode")`.
+
+**Публичный API:** нет изменений.
+
+**Тесты:** 1 обновлён. Все 307 tui-тестов проходят.

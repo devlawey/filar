@@ -503,7 +503,7 @@ impl App {
                 session.transcript_path = Some(path.clone());
                 session.transcript_error_shown = false;
                 self.push_message(ChatBlock::System(format!(
-                    "Transcript: {}", path.display()
+                    "Safe mode (Explain) activated. Transcript: {}", path.display()
                 )));
             }
         } else {
@@ -512,6 +512,9 @@ impl App {
             self.save_transcript_silent();
             self.sessions[self.active].transcript_path = None;
             self.sessions[self.active].transcript_error_shown = false;
+            self.push_message(ChatBlock::System(
+                "Safe mode (Explain) deactivated".into(),
+            ));
         }
     }
 
@@ -779,7 +782,7 @@ fn messages_to_markdown(messages: &[ChatBlock], session_name: &str, ssh_info: &O
             .unwrap_or_default()
             .as_secs();
         let (y, mo, d, h, mi, s) = unix_to_ymdhms(secs);
-        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
     };
     md.push_str(&format!("Date: {ts}\n"));
     if let Some(ref info) = ssh_info {
@@ -6553,8 +6556,8 @@ mod tests {
 
         // A system message with the path should be in the feed.
         assert!(
-            app.messages.iter().any(|m| matches!(m, ChatBlock::System(s) if s.contains("Transcript:"))),
-            "feed should contain transcript path"
+            app.messages.iter().any(|m| matches!(m, ChatBlock::System(s) if s.contains("Safe mode") && s.contains("Transcript:"))),
+            "feed should contain safe mode activation with transcript path"
         );
     }
 

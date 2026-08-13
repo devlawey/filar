@@ -58,6 +58,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   file. Previously the same file was reused across toggle cycles because
   `transcript_path` was never cleared on exit.
   ([#275](https://github.com/devlawey/filar/issues/275)).
+- Transcript date now labeled as UTC (`Date: ... UTC`). Safe mode
+  activation/deactivation messages added to the chat feed and transcript.
+  ([#277](https://github.com/devlawey/filar/issues/277)).
 
 ### Changed
 
