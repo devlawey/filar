@@ -56,6 +56,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   SSH host is surfaced in the tab label and the saved confirm mode is
   re-applied.
   ([#271](https://github.com/devlawey/filar/issues/271)).
+- Periodic session auto-save: the active session is persisted every 30
+  seconds (only when it changed) and once more from the panic hook, so
+  closing the window or killing the process loses at most ~30 seconds of
+  history. Each run reuses a single session id, and pruning keeps at most 10
+  session files.
+  ([#272](https://github.com/devlawey/filar/issues/272)).
 
 ### Fixed
 

@@ -4336,3 +4336,27 @@ core+agent проходят. Тесты падают на старом коде 
 session_meta_includes_launch_context). `cargo test --workspace` зелёные.
 
 **Дальше:** #272 (автосейв + panic-safe), #273 (F3 overlay), #274 (GUI авто-выбор).
+
+---
+
+## Issue #272: feat(tui) — Periodic auto-save + panic-safe session save
+
+**Milestone:** 0.9.0. **Ветка:** `feat/272-session-auto-save`.
+
+**Что сделано:**
+- `runner.rs`: стабильный id сессии генерируется один раз на запуск — каждый
+  30-секундный автосейв перезаписывает тот же файл (не плодит новые).
+- В `select!` добавлен `auto_save_interval` (30s, `MissedTickBehavior::Skip`);
+  сохраняется только если активная вкладка изменилась (`session_changed`:
+  `message_rev` или смена вкладки). После каждого сохранения — prune до 10.
+- Panic-safe: `PanicHookGuard` принимает `Arc<Mutex<Option<Session>>>`
+  (shared snapshot), обновляемый при каждом сохранении; panic hook делает
+  best-effort сохранение (`try_lock`, без блокировки event loop).
+- `session_snapshot()` и `save_session_now()` переработаны под стабильный id.
+
+**Публичный API:** нет изменений (внутренние функции runner).
+
+**Тесты:** 2 новых (session_changed_detects_rev_and_tab, id/timestamp-ассерты в
+session_snapshot-тестах). `cargo test -p filar-tui` — 314 passed.
+
+**Дальше:** #273 (F3 overlay), #274 (GUI авто-выбор).
