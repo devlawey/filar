@@ -51,6 +51,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   F2 in the keyboard shortcuts table. `docs/SMOKE.md` includes a safe-mode
   checklist.
   ([#265](https://github.com/devlawey/filar/issues/265)).
+- Session launch context: saved sessions now record `ssh_info`, `model`,
+  `api_base_url`, and `confirm_mode`. On restore (`--session`), the saved
+  SSH host is surfaced in the tab label and the saved confirm mode is
+  re-applied.
+  ([#271](https://github.com/devlawey/filar/issues/271)).
 
 ### Fixed
 

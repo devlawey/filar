@@ -4309,3 +4309,30 @@ core+agent проходят. Тесты падают на старом коде 
 **Публичный API:** нет изменений. `Session::new()` сигнатура не изменилась.
 
 **Дальше:** issue #271–#274 (session persistence overhaul).
+
+---
+
+## Issue #271: feat(core) — Extend Session with launch context
+
+**Milestone:** 0.9.0. **Ветка:** `feat/271-session-launch-context`.
+
+**Что сделано:**
+- `filar_core::Session` получил 4 новых поля (все `#[serde(default)]`,
+  обратная совместимость): `ssh_info: Option<String>`, `model: Option<String>`,
+  `api_base_url: Option<String>`, `confirm_mode: Option<CommandConfirmMode>`.
+- `SessionMeta` получил `ssh_info` и `model` (для отображения в списках).
+- `runner.rs`: извлечён `session_snapshot()` — при сохранении сессии
+  заполняются новые поля (ssh_info из активной вкладки, model/api_base_url из
+  активного LLM-профиля, confirm_mode из активной вкладки).
+- `app/main.rs`: при восстановлении (`--session`) читаются `ssh_info` и
+  `confirm_mode`; `ssh_info` передаётся в TUI (`TuiConfig::initial_ssh_info`)
+  для отображения хоста, `confirm_mode` переопределяет конфиг.
+- `model`/`api_base_url` используются GUI-лаунчером (#274), сюда не входят.
+
+**Публичный контракт:** `filar_core::Session` и `SessionMeta` расширены
+(additive, serde-совместимо). `TuiConfig` получил поле `initial_ssh_info`.
+
+**Тесты:** 3 новых (launch_context_roundtrip, launch_context_backward_compat,
+session_meta_includes_launch_context). `cargo test --workspace` зелёные.
+
+**Дальше:** #272 (автосейв + panic-safe), #273 (F3 overlay), #274 (GUI авто-выбор).

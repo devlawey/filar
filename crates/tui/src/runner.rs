@@ -212,6 +212,10 @@ pub struct TuiConfig {
     /// SSH target for interactive terminal mode (Ctrl+T).
     /// If `None`, the agent runs in local mode.
     pub ssh_target: Option<filar_core::SshTarget>,
+    /// SSH connection info restored from a saved session (e.g. `user@host:port`).
+    /// Used to pre-populate the session's display info on restore; the actual
+    /// reconnection is handled by the session-select overlay / launcher.
+    pub initial_ssh_info: Option<String>,
     /// Whether commands execute on the local machine (true) or over SSH (false).
     pub is_local: bool,
     /// Secret provider for command substitution and output sanitisation.
@@ -371,6 +375,11 @@ async fn run_app(
     if let Some(ref target) = config.ssh_target {
         app.sessions[0].ssh_info =
             Some(format!("{}@{}:{}", target.user, target.host, target.port));
+    } else if let Some(ref info) = config.initial_ssh_info {
+        // Restored session was over SSH but no live ssh_target was provided
+        // (e.g. `--session` restore without `--target`). Surface the saved
+        // host in the tab label; reconnecting is handled by the overlay.
+        app.sessions[0].ssh_info = Some(info.clone());
     }
 
     // Crossterm event stream for async keyboard input.
@@ -1134,22 +1143,7 @@ async fn run_app(
     }
 
     // Save session to disk for future restore.
-    let (id, timestamp) = filar_core::session::now_session_id();
-    let mut session = filar_core::Session {
-        id,
-        timestamp,
-        target: config.target_name.clone(),
-        llm_profile: app.llm_profile.clone(),
-        messages: app.messages.clone(),
-        input_history: app.input_history().to_vec(),
-        tokens_in: app.tokens_in,
-        tokens_out: app.tokens_out,
-        cost_usd: app.cost_usd,
-        per_profile: app.per_profile.clone(),
-        last_served_model: app.last_served_model.clone(),
-        model_per_profile: app.model_per_profile.clone(),
-    };
-    session.truncate_history();
+    let session = session_snapshot(&app, &config.target_name);
     match filar_core::SessionStore::with_default_dir() {
         Ok(store) => {
             if let Err(e) = store.save(&session) {
@@ -1166,6 +1160,43 @@ async fn run_app(
 
     info!("TUI session ended");
     Ok(())
+}
+
+/// Build a serialisable [`filar_core::Session`] snapshot from the active TUI
+/// session, including launch context (ssh_info, model, api_base_url,
+/// confirm_mode) so a later restore can re-select the same host and model.
+fn session_snapshot(app: &App, target_name: &str) -> filar_core::Session {
+    let (id, timestamp) = filar_core::session::now_session_id();
+    let active_profile_name = app
+        .llm_profile
+        .clone()
+        .unwrap_or_else(|| app.default_profile_name.clone());
+    let (model, api_base_url) = app
+        .profiles
+        .iter()
+        .find(|p| p.name == active_profile_name)
+        .map(|p| (Some(p.model.clone()), Some(p.api_base_url.clone())))
+        .unwrap_or((None, None));
+    let mut session = filar_core::Session {
+        id,
+        timestamp,
+        target: target_name.to_string(),
+        llm_profile: app.llm_profile.clone(),
+        messages: app.messages.clone(),
+        input_history: app.input_history().to_vec(),
+        tokens_in: app.tokens_in,
+        tokens_out: app.tokens_out,
+        cost_usd: app.cost_usd,
+        per_profile: app.per_profile.clone(),
+        last_served_model: app.last_served_model.clone(),
+        model_per_profile: app.model_per_profile.clone(),
+        ssh_info: app.ssh_info.clone(),
+        model,
+        api_base_url,
+        confirm_mode: Some(app.active_session().confirm_mode),
+    };
+    session.truncate_history();
+    session
 }
 
 /// Await the next forwarded log line from the optional receiver.
@@ -1383,5 +1414,67 @@ mod tests {
             assert_eq!(t.rows(), 30);
             assert_eq!(t.cols(), 100);
         }
+    }
+
+    #[test]
+    fn session_snapshot_captures_launch_context() {
+        use filar_core::{CommandConfirmMode, LlmProfile};
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.profiles = vec![
+            LlmProfile {
+                name: "glm".into(),
+                model: "glm-5.1".into(),
+                api_base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
+                max_tokens: 1024,
+                key_env: "GLM_API_KEY".into(),
+                temperature: None,
+                top_p: None,
+                extra_body: None,
+            },
+            LlmProfile {
+                name: "other".into(),
+                model: "other-model".into(),
+                api_base_url: "https://other.example.com".into(),
+                max_tokens: 1024,
+                key_env: "OTHER_API_KEY".into(),
+                temperature: None,
+                top_p: None,
+                extra_body: None,
+            },
+        ];
+        // Default differs from the session's selected profile, so the test
+        // proves the snapshot resolves model/api_base_url from the session
+        // profile, not from default_profile_name.
+        app.default_profile_name = "other".into();
+        {
+            let s = &mut app.sessions[0];
+            s.ssh_info = Some("root@10.0.0.5:22".into());
+            s.llm_profile = Some("glm".into());
+            s.confirm_mode = CommandConfirmMode::Explain;
+        }
+
+        let snapshot = session_snapshot(&app, "prod");
+
+        assert_eq!(snapshot.ssh_info.as_deref(), Some("root@10.0.0.5:22"));
+        assert_eq!(snapshot.model.as_deref(), Some("glm-5.1"));
+        assert_eq!(
+            snapshot.api_base_url.as_deref(),
+            Some("https://open.bigmodel.cn/api/paas/v4")
+        );
+        assert_eq!(snapshot.confirm_mode, Some(CommandConfirmMode::Explain));
+        assert_eq!(snapshot.target, "prod");
+        assert_eq!(snapshot.llm_profile.as_deref(), Some("glm"));
+    }
+
+    #[test]
+    fn session_snapshot_nulls_launch_context_when_absent() {
+        use filar_core::CommandConfirmMode;
+        let app = App::new("local".into(), CommandConfirmMode::Allowlist);
+        let snapshot = session_snapshot(&app, "local");
+        assert_eq!(snapshot.ssh_info, None);
+        assert_eq!(snapshot.model, None);
+        assert_eq!(snapshot.api_base_url, None);
+        assert_eq!(snapshot.confirm_mode, Some(CommandConfirmMode::Allowlist));
+        assert_eq!(snapshot.llm_profile, None);
     }
 }

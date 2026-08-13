@@ -462,6 +462,8 @@ async fn run() -> anyhow::Result<()> {
         per_profile: HashMap<String, filar_core::ProfileUsage>,
         last_served_model: Option<String>,
         model_per_profile: HashMap<String, String>,
+        ssh_info: Option<String>,
+        confirm_mode: Option<filar_core::CommandConfirmMode>,
     }
     let loaded = if let Some(ref sid) = session_id {
         info!(session_id = %sid, "loading session");
@@ -479,6 +481,8 @@ async fn run() -> anyhow::Result<()> {
                         per_profile: session.per_profile,
                         last_served_model: session.last_served_model,
                         model_per_profile: session.model_per_profile,
+                        ssh_info: session.ssh_info,
+                        confirm_mode: session.confirm_mode,
                     }
                 }
                 Ok(None) => {
@@ -505,7 +509,7 @@ async fn run() -> anyhow::Result<()> {
     let key_checker_provider = secret_provider.clone();
     let tui_config = TuiConfig {
         target_name: target_name.clone(),
-        confirm_mode: config.confirm_mode,
+        confirm_mode: loaded.confirm_mode.unwrap_or(config.confirm_mode),
         llm_profile: default_profile_name.clone(),
         initial_messages: loaded.messages,
         initial_input_history: loaded.input_history,
@@ -518,6 +522,7 @@ async fn run() -> anyhow::Result<()> {
         initial_model_per_profile: loaded.model_per_profile,
         ssh_target: ssh_target.clone(),
         is_local: ssh_target.is_none(),
+        initial_ssh_info: loaded.ssh_info,
         secret_provider: secret_provider.clone(),
         log_rx,
         profiles: launch_profiles,

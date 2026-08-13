@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::chat::ChatBlock;
+use crate::config::CommandConfirmMode;
 use crate::error::{CoreError, Result};
 
 /// Maximum number of sessions to retain on disk.
@@ -76,6 +77,19 @@ pub struct Session {
     /// Keyed by profile name. `#[serde(default)]` for backward compat.
     #[serde(default)]
     pub model_per_profile: HashMap<String, String>,
+    /// SSH connection info the session was launched with (e.g. `user@host:port`).
+    /// `None` = local. `#[serde(default)]` for backward compat.
+    #[serde(default)]
+    pub ssh_info: Option<String>,
+    /// Model identifier used at launch (e.g. `glm-5.1`). `#[serde(default)]`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// API base URL used at launch. `#[serde(default)]`.
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+    /// Command confirmation mode at launch. `#[serde(default)]`.
+    #[serde(default)]
+    pub confirm_mode: Option<CommandConfirmMode>,
 }
 
 /// Lightweight metadata for listing sessions without loading full messages.
@@ -85,6 +99,12 @@ pub struct SessionMeta {
     pub timestamp: String,
     pub target: String,
     pub llm_profile: Option<String>,
+    /// SSH connection info (e.g. `user@host:port`). `None` = local.
+    #[serde(default)]
+    pub ssh_info: Option<String>,
+    /// Model identifier used at launch.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Preview of the first user message (or system message).
     pub preview: String,
 }
@@ -103,6 +123,8 @@ impl From<&Session> for SessionMeta {
             timestamp: s.timestamp.clone(),
             target: s.target.clone(),
             llm_profile: s.llm_profile.clone(),
+            ssh_info: s.ssh_info.clone(),
+            model: s.model.clone(),
             preview,
         }
     }
@@ -318,6 +340,10 @@ mod tests {
             per_profile: HashMap::new(),
             last_served_model: None,
             model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
         };
         let meta = SessionMeta::from(&session);
         assert_eq!(meta.id, "123");
@@ -340,6 +366,10 @@ mod tests {
             per_profile: HashMap::new(),
             last_served_model: None,
             model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
         };
         let meta = SessionMeta::from(&session);
         assert!(meta.preview.is_empty());
@@ -371,6 +401,10 @@ mod tests {
             per_profile: HashMap::new(),
             last_served_model: None,
             model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
         };
 
         store.save(&session).unwrap();
@@ -415,6 +449,10 @@ mod tests {
             per_profile: HashMap::new(),
             last_served_model: None,
             model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
             };
             store.save(&session).unwrap();
         }
@@ -493,6 +531,7 @@ mod tests {
             llm_profile: Some("glm".into()), messages: vec![], input_history: vec![],
             tokens_in: 150, tokens_out: 300,
             cost_usd: None, per_profile: HashMap::new(), last_served_model: None, model_per_profile: HashMap::new(),
+            ssh_info: None, model: None, api_base_url: None, confirm_mode: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("tokens_in"), "must serialize tokens_in");
@@ -533,6 +572,10 @@ mod tests {
             per_profile: HashMap::new(),
             last_served_model: None,
             model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
         };
         let json = serde_json::to_string_pretty(&session).unwrap();
         assert!(json.contains("input_history"), "JSON must contain input_history");
@@ -573,6 +616,10 @@ mod tests {
             per_profile: HashMap::new(),
             last_served_model: None,
             model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
         };
         assert!(session.input_history.len() > MAX_INPUT_HISTORY);
         session.truncate_history();
@@ -606,6 +653,10 @@ mod tests {
             tokens_in: 0, tokens_out: 0,
             cost_usd: None, per_profile: HashMap::new(), last_served_model: None,
             model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
         };
         session.model_per_profile.insert("glm".into(), "openai/gpt-4o-mini".into());
         let json = serde_json::to_string(&session).unwrap();
@@ -622,5 +673,75 @@ mod tests {
         }"#;
         let s: Session = serde_json::from_str(old_json).unwrap();
         assert!(s.model_per_profile.is_empty());
+    }
+
+    #[test]
+    fn launch_context_roundtrip() {
+        let session = Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "prod".into(),
+            llm_profile: Some("glm".into()),
+            messages: vec![],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: Some("root@10.0.0.5:22".into()),
+            model: Some("glm-5.1".into()),
+            api_base_url: Some("https://open.bigmodel.cn/api/paas/v4".into()),
+            confirm_mode: Some(CommandConfirmMode::Always),
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        let restored: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.ssh_info.as_deref(), Some("root@10.0.0.5:22"));
+        assert_eq!(restored.model.as_deref(), Some("glm-5.1"));
+        assert_eq!(
+            restored.api_base_url.as_deref(),
+            Some("https://open.bigmodel.cn/api/paas/v4")
+        );
+        assert_eq!(restored.confirm_mode, Some(CommandConfirmMode::Always));
+    }
+
+    #[test]
+    fn launch_context_backward_compat() {
+        let old_json = r#"{
+            "id":"1","timestamp":"t","target":"t",
+            "messages":[], "input_history":[],
+            "tokens_in":0, "tokens_out":0
+        }"#;
+        let s: Session = serde_json::from_str(old_json).unwrap();
+        assert_eq!(s.ssh_info, None);
+        assert_eq!(s.model, None);
+        assert_eq!(s.api_base_url, None);
+        assert_eq!(s.confirm_mode, None);
+    }
+
+    #[test]
+    fn session_meta_includes_launch_context() {
+        let session = Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "prod".into(),
+            llm_profile: Some("glm".into()),
+            messages: vec![ChatBlock::User("hi".into())],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: Some("root@10.0.0.5:22".into()),
+            model: Some("glm-5.1".into()),
+            api_base_url: Some("https://example.com".into()),
+            confirm_mode: Some(CommandConfirmMode::Allowlist),
+        };
+        let meta = SessionMeta::from(&session);
+        assert_eq!(meta.ssh_info.as_deref(), Some("root@10.0.0.5:22"));
+        assert_eq!(meta.model.as_deref(), Some("glm-5.1"));
     }
 }
