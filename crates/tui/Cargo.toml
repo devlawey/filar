@@ -17,4 +17,5 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 alacritty_terminal = { workspace = true }
 arboard = { workspace = true }
+chrono = { workspace = true }
 tokio-util = { workspace = true }

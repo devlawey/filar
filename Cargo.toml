@@ -64,6 +64,9 @@ keyring = { version = "3", default-features = false, features = ["apple-native",
 # Clipboard
 arboard = "3"
 
+# Date/time
+chrono = "0.4"
+
 # Secret zeroization
 zeroize = { version = "1", features = ["derive"] }
 

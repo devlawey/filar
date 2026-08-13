@@ -507,14 +507,15 @@ impl App {
                 )));
             }
         } else {
-            // Exiting Explain mode — final transcript save, then clear path
+            // Exiting Explain mode — push deactivation message BEFORE the
+            // final save so it appears in the transcript, then clear path
             // so the next F2 entry creates a new file.
-            self.save_transcript_silent();
-            self.sessions[self.active].transcript_path = None;
-            self.sessions[self.active].transcript_error_shown = false;
             self.push_message(ChatBlock::System(
                 "Safe mode (Explain) deactivated".into(),
             ));
+            self.save_transcript_silent();
+            self.sessions[self.active].transcript_path = None;
+            self.sessions[self.active].transcript_error_shown = false;
         }
     }
 
@@ -587,7 +588,7 @@ impl Session {
             id: SessionId::next(),
             target_name,
             messages: vec![ChatBlock::System(format!(
-                "Connected to: {name} | Mode: {confirm_mode:?}"
+                "Connected to: {name}"
             ))],
             input: String::new(),
             cursor_pos: 0,
@@ -776,14 +777,7 @@ async fn generate_save_filename(
 fn messages_to_markdown(messages: &[ChatBlock], session_name: &str, ssh_info: &Option<String>) -> String {
     let mut md = String::new();
     md.push_str(&format!("# Session: {session_name}\n\n"));
-    let ts = {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let (y, mo, d, h, mi, s) = unix_to_ymdhms(secs);
-        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
-    };
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z").to_string();
     md.push_str(&format!("Date: {ts}\n"));
     if let Some(ref info) = ssh_info {
         md.push_str(&format!("Target: {info}\n"));
@@ -6616,5 +6610,30 @@ mod tests {
         assert!(md.contains("**$ ls**\n"), "approved command must be rendered");
         // Denied command — has *(denied)* marker.
         assert!(md.contains("**$ rm -rf /tmp** *(denied)*"), "denied command must have *(denied)* marker");
+    }
+
+    #[test]
+    fn session_initial_message_has_no_mode() {
+        let app = App::new("test-server".into(), CommandConfirmMode::Explain);
+        let first_msg = &app.messages[0];
+        assert!(
+            matches!(first_msg, ChatBlock::System(s) if s == "Connected to: test-server"),
+            "initial message must be 'Connected to: {{name}}' without Mode"
+        );
+    }
+
+    #[test]
+    fn messages_to_markdown_date_has_timezone_offset() {
+        let blocks = vec![ChatBlock::User("hi".into())];
+        let md = messages_to_markdown(&blocks, "test", &None);
+        // Date line must match "YYYY-MM-DD HH:MM:SS ±HH:MM" format.
+        let date_line = md.lines().find(|l| l.starts_with("Date:"));
+        assert!(date_line.is_some(), "must have Date line");
+        let date_line = date_line.unwrap();
+        let rest = date_line.strip_prefix("Date: ").expect("Date line");
+        assert!(
+            chrono::DateTime::parse_from_str(rest, "%Y-%m-%d %H:%M:%S %:z").is_ok(),
+            "Date line must contain timezone offset (YYYY-MM-DD HH:MM:SS ±HH:MM): {date_line}"
+        );
     }
 }
