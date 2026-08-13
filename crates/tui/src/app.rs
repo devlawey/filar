@@ -363,6 +363,12 @@ pub struct Session {
     pub confirm_mode: CommandConfirmMode,
     /// Previous confirm mode (to toggle back from Explain via F2).
     pub prev_confirm_mode: CommandConfirmMode,
+    /// Fixed path for auto-transcript in Explain mode (set once on first entry).
+    pub transcript_path: Option<std::path::PathBuf>,
+    /// Whether a silent transcript save is currently in flight.
+    pub transcript_saving: bool,
+    /// Whether the transcript write error warning has been shown (show once).
+    pub transcript_error_shown: bool,
 }
 
 impl App {
@@ -430,9 +436,12 @@ impl App {
     /// runner can teardown its interactive backend (PTY/reader task).
     pub fn close_tab(&mut self) {
         if self.sessions.len() <= 1 {
+            self.save_transcript_silent();
             self.should_quit = true;
             return;
         }
+        // Final transcript save before closing the tab.
+        self.save_transcript_silent();
         let sid = self.sessions[self.active].id;
         // Cancel the agent task for the tab being closed so leftover
         // events don't land on the next active session.
@@ -452,6 +461,7 @@ impl App {
     /// Switches between `Explain` and the previous mode. If a confirmation
     /// is pending, it is aborted (sent `false`) so the toggle doesn't block.
     pub fn toggle_explain_mode(&mut self) {
+        let was_explain = self.sessions[self.active].confirm_mode == CommandConfirmMode::Explain;
         {
             let session = &mut self.sessions[self.active];
             if session.confirm_mode == CommandConfirmMode::Explain {
@@ -474,6 +484,31 @@ impl App {
             self.push_message(ChatBlock::System(
                 "Command cancelled: confirm mode switched".into(),
             ));
+        }
+
+        // Transcript handling.
+        if !was_explain {
+            // Entering Explain mode — create transcript path if not yet set.
+            let session = &mut self.sessions[self.active];
+            if session.transcript_path.is_none() {
+                let base_dir = self
+                    .save_dir
+                    .clone()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+                let filename = transcript_filename(
+                    &session.target_name,
+                    &session.ssh_info,
+                );
+                let path = base_dir.join(&filename);
+                session.transcript_path = Some(path.clone());
+                session.transcript_error_shown = false;
+                self.push_message(ChatBlock::System(format!(
+                    "Transcript: {}", path.display()
+                )));
+            }
+        } else {
+            // Exiting Explain mode — final transcript save.
+            self.save_transcript_silent();
         }
     }
 
@@ -600,6 +635,9 @@ impl Session {
             pending_llm_profile: None,
             confirm_mode,
             prev_confirm_mode: CommandConfirmMode::Allowlist,
+            transcript_path: None,
+            transcript_saving: false,
+            transcript_error_shown: false,
         }
     }
 
@@ -633,6 +671,8 @@ pub enum SaveProgress {
     Writing,
     Done(String),   // display filename
     Error(String),  // error message
+    /// Silent transcript save completed. `None` = success, `Some` = error.
+    TranscriptDone(SessionId, Option<String>),
 }
 
 /// Convert a Unix timestamp (seconds) to broken-down UTC time.
@@ -683,6 +723,15 @@ fn slugify(s: &str) -> String {
         }
     }
     result.trim_matches('-').chars().take(80).collect()
+}
+
+/// Generate a transcript filename: `{slug}.{date}.{time}.md`.
+/// No collision check — the file is overwritten on each save.
+fn transcript_filename(session_name: &str, ssh_info: &Option<String>) -> String {
+    let base = ssh_info.as_deref().unwrap_or(session_name);
+    let slug = slugify(base);
+    let ts = format_now_utc();
+    format!("{slug}.{ts}.md")
 }
 
 /// Generate a save filename: `{slug}.{date}.{time}.md`, avoiding collisions
@@ -743,8 +792,15 @@ fn messages_to_markdown(messages: &[ChatBlock], session_name: &str, ssh_info: &O
             ChatBlock::Agent(s) => {
                 md.push_str(&format!("**Agent:** {s}\n\n"));
             }
-            ChatBlock::Command { command, output, .. } => {
-                md.push_str(&format!("**$ {command}**\n"));
+            ChatBlock::Command { command, explanation, output, approved } => {
+                if !explanation.is_empty() {
+                    md.push_str(&format!("> {explanation}\n\n"));
+                }
+                md.push_str(&format!("**$ {command}**"));
+                if !*approved {
+                    md.push_str(" *(denied)*");
+                }
+                md.push('\n');
                 if let Some(out) = output {
                     let max_ticks = out
                         .chars()
@@ -979,6 +1035,8 @@ impl App {
             }
             _ => {}
         }
+        // Final transcript save before quitting.
+        self.save_transcript_silent();
         self.should_quit = true;
     }
 
@@ -1114,6 +1172,55 @@ impl App {
     /// Esc while the task was still running.
     pub fn finish_save(&mut self) {
         self.save_in_flight = false;
+    }
+
+    /// Silently save the transcript for the active session (Explain mode only).
+    ///
+    /// No overlay, no progress bar. Skips if:
+    /// - `transcript_path` is not set (not in Explain mode or not yet initialized)
+    /// - `save_in_flight` is true (manual Ctrl+S in progress)
+    /// - `transcript_saving` is true (a silent save is already in flight)
+    ///
+    /// On error: warns in the log and shows a feed warning once per session.
+    pub fn save_transcript_silent(&mut self) {
+        let session = &mut self.sessions[self.active];
+
+        // Only if transcript path is set (Explain mode was entered).
+        let path = match &session.transcript_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        // Skip if manual save or silent save is in flight.
+        if self.save_in_flight || session.transcript_saving {
+            return;
+        }
+
+        let Some(ref tx) = self.save_tx else {
+            return;
+        };
+
+        session.transcript_saving = true;
+
+        let sid = session.id;
+        let messages = session.messages.clone();
+        let session_name = session.target_name.clone();
+        let ssh_info = session.ssh_info.clone();
+        let tx = tx.clone();
+
+        tokio::spawn(async move {
+            let md = messages_to_markdown(&messages, &session_name, &ssh_info);
+            let result = tokio::fs::write(&path, &md).await;
+            match result {
+                Ok(()) => {
+                    tx.send(SaveProgress::TranscriptDone(sid, None)).ok();
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "transcript write failed");
+                    tx.send(SaveProgress::TranscriptDone(sid, Some(e.to_string()))).ok();
+                }
+            }
+        });
     }
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
@@ -2410,6 +2517,8 @@ impl App {
             self.confirm_button_areas.clear();
             self.hovered_button = None;
         }
+        // Save transcript if in Explain mode (denied commands are part of the protocol).
+        self.save_transcript_silent();
     }
 
     /// Compute the default collapse state for a chat block.
@@ -2549,6 +2658,8 @@ impl App {
                         auto_scroll = self.scroll == 0;
                     }
                     self.pending_proposal = None;
+                    // Save transcript if in Explain mode.
+                    self.save_transcript_silent();
                 }
                 filar_agent::AgentEvent::Finished(text) => {
                     if self.streaming {
@@ -6379,5 +6490,108 @@ mod tests {
             app.confirm_mode, CommandConfirmMode::Explain,
             "switching back should restore Explain"
         );
+    }
+
+    // ── Auto-transcript tests ───────────────────────────────────────────
+
+    #[test]
+    fn transcript_filename_has_correct_format() {
+        let name = transcript_filename("my-server", &Some("root@10.0.0.5:22".into()));
+        assert!(
+            name.starts_with("root-10.0.0.5-22.") && name.ends_with(".md"),
+            "expected slug.date.time.md format, got: {name}"
+        );
+        assert!(!name.contains(' '), "filename must not contain spaces");
+    }
+
+    #[test]
+    fn save_transcript_silent_noop_without_path() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Explain);
+        // transcript_path is None by default — save should be a no-op.
+        app.save_transcript_silent();
+        assert!(!app.sessions[0].transcript_saving, "transcript_saving must not be set without path");
+    }
+
+    #[test]
+    fn save_transcript_silent_skips_when_save_in_flight() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Explain);
+        app.sessions[0].transcript_path = Some(std::path::PathBuf::from("/tmp/test.md"));
+        app.save_in_flight = true;
+        app.save_transcript_silent();
+        assert!(!app.sessions[0].transcript_saving, "must skip when save_in_flight is true");
+    }
+
+    #[test]
+    fn toggle_explain_creates_transcript_path() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Allowlist);
+        assert!(app.sessions[0].transcript_path.is_none(), "transcript_path must start as None");
+
+        // Press F2 to enter Explain mode.
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        // transcript_path should now be set.
+        assert!(app.sessions[0].transcript_path.is_some(), "transcript_path must be set on entering Explain");
+
+        // A system message with the path should be in the feed.
+        assert!(
+            app.messages.iter().any(|m| matches!(m, ChatBlock::System(s) if s.contains("Transcript:"))),
+            "feed should contain transcript path"
+        );
+    }
+
+    #[test]
+    fn toggle_explain_path_persists_across_toggle() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Allowlist);
+
+        // Enter Explain.
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let path = app.sessions[0].transcript_path.clone();
+        assert!(path.is_some());
+
+        // Exit Explain.
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        // Path should NOT change — it persists across toggles.
+        assert_eq!(app.sessions[0].transcript_path, path, "transcript_path must persist across toggles");
+
+        // Re-enter Explain — path should still be the same.
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.sessions[0].transcript_path, path, "transcript_path must not change on re-entry");
+    }
+
+    #[test]
+    fn messages_to_markdown_includes_explanation_and_denied() {
+        let blocks = vec![
+            ChatBlock::Command {
+                command: "ls".into(),
+                explanation: "List files to diagnose disk usage".into(),
+                output: Some("file.txt".into()),
+                approved: true,
+            },
+            ChatBlock::Command {
+                command: "rm -rf /tmp".into(),
+                explanation: "Clean temp files".into(),
+                output: None,
+                approved: false,
+            },
+        ];
+        let md = messages_to_markdown(&blocks, "test", &None);
+        // Explanation rendered as blockquote.
+        assert!(md.contains("> List files to diagnose disk usage"), "must include explanation");
+        // Approved command — no *(denied)* marker.
+        assert!(md.contains("**$ ls**\n"), "approved command must be rendered");
+        // Denied command — has *(denied)* marker.
+        assert!(md.contains("**$ rm -rf /tmp** *(denied)*"), "denied command must have *(denied)* marker");
     }
 }

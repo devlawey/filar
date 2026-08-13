@@ -440,6 +440,21 @@ async fn run_app(
                         }
                         app.finish_save();
                     }
+                    SaveProgress::TranscriptDone(sid, result) => {
+                        if let Some(idx) = app.find_session_idx(sid) {
+                            app.sessions[idx].transcript_saving = false;
+                            if let Some(err) = result {
+                                if !app.sessions[idx].transcript_error_shown {
+                                    app.sessions[idx].transcript_error_shown = true;
+                                    app.sessions[idx].messages.push(filar_core::ChatBlock::Error(
+                                        format!("Transcript write failed: {err}")
+                                    ));
+                                    app.sessions[idx].message_rev =
+                                        app.sessions[idx].message_rev.wrapping_add(1);
+                                }
+                            }
+                        }
+                    }
                 }
                 // Drain any remaining messages delivered during this iteration.
                 while let Ok(p) = save_rx.try_recv() {
@@ -464,6 +479,21 @@ async fn run_app(
                         }
                         SaveProgress::Writing => {
                             app.save_progress = 50;
+                        }
+                        SaveProgress::TranscriptDone(sid, result) => {
+                            if let Some(idx) = app.find_session_idx(sid) {
+                                app.sessions[idx].transcript_saving = false;
+                                if let Some(err) = result {
+                                    if !app.sessions[idx].transcript_error_shown {
+                                        app.sessions[idx].transcript_error_shown = true;
+                                        app.sessions[idx].messages.push(filar_core::ChatBlock::Error(
+                                            format!("Transcript write failed: {err}")
+                                        ));
+                                        app.sessions[idx].message_rev =
+                                            app.sessions[idx].message_rev.wrapping_add(1);
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     }
