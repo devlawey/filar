@@ -4350,13 +4350,15 @@ session_meta_includes_launch_context). `cargo test --workspace` зелёные.
   сохраняется только если активная вкладка изменилась (`session_changed`:
   `message_rev` или смена вкладки). После каждого сохранения — prune до 10.
 - Panic-safe: `PanicHookGuard` принимает `Arc<Mutex<Option<Session>>>`
-  (shared snapshot), обновляемый при каждом сохранении; panic hook делает
-  best-effort сохранение (`try_lock`, без блокировки event loop).
-- `session_snapshot()` и `save_session_now()` переработаны под стабильный id.
+  (shared snapshot); panic hook делает best-effort сохранение (`try_lock`).
+- Crash-safe запись: `SessionStore::save` стал атомарным (tmp-файл + `rename`).
+- Сохранение вынесено в `tokio::task::spawn_blocking` (`save_session_async`),
+  чтобы не блокировать event loop; запись сериализуется с panic hook общим
+  мьютексом (мьютекс удерживается на время `store.save`).
 
-**Публичный API:** нет изменений (внутренние функции runner).
+**Публичный API:** `SessionStore::save` теперь атомарный (семантика прежняя).
 
-**Тесты:** 2 новых (session_changed_detects_rev_and_tab, id/timestamp-ассерты в
-session_snapshot-тестах). `cargo test -p filar-tui` — 314 passed.
+**Тесты:** 3 новых (session_store_save_is_atomic в core, session_changed_detects_rev_and_tab
+и id/timestamp-ассерты в tui). `cargo test --workspace` зелёные (core 54, tui 314).
 
 **Дальше:** #273 (F3 overlay), #274 (GUI авто-выбор).

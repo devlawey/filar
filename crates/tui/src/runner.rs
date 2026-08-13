@@ -182,10 +182,14 @@ impl PanicHookGuard {
 
             // Best-effort session save. `try_lock` avoids blocking (and a
             // potential double-panic) if the mutex is somehow still held.
-            if let Some(session) = snapshot.try_lock().ok().and_then(|g| g.clone()) {
-                if let Ok(store) = filar_core::SessionStore::with_default_dir() {
-                    let _ = store.save(&session);
-                    let _ = store.prune_to(filar_core::session::MAX_SESSIONS);
+            // Holding the lock while writing serialises this save with the
+            // periodic auto-save (which uses the same mutex around its write).
+            if let Ok(guard) = snapshot.try_lock() {
+                if let Some(session) = guard.clone() {
+                    if let Ok(store) = filar_core::SessionStore::with_default_dir() {
+                        let _ = store.save(&session);
+                        let _ = store.prune_to(filar_core::session::MAX_SESSIONS);
+                    }
                 }
             }
 
@@ -532,14 +536,14 @@ async fn run_app(
             _ = auto_save_interval.tick() => {
                 let changed = session_changed(&app, last_saved_rev, last_saved_session);
                 if changed {
-                    match save_session_now(
+                    let session = session_snapshot(
                         &app,
                         &config.target_name,
                         &session_id,
                         &session_timestamp,
-                        &snapshot,
-                    ) {
-                        Ok(_) => {
+                    );
+                    match save_session_async(session, snapshot.clone()).await {
+                        Ok(()) => {
                             last_saved_rev = app.active_session().message_rev;
                             last_saved_session = app.active_session().id;
                             info!("session auto-saved");
@@ -1199,9 +1203,11 @@ async fn run_app(
     }
 
     // Save session to disk for future restore.
-    match save_session_now(&app, &config.target_name, &session_id, &session_timestamp, &snapshot) {
-        Ok(session) => {
-            eprintln!("\nSession saved ({} messages).", session.messages.len());
+    let session = session_snapshot(&app, &config.target_name, &session_id, &session_timestamp);
+    let msg_count = session.messages.len();
+    match save_session_async(session, snapshot.clone()).await {
+        Ok(()) => {
+            eprintln!("\nSession saved ({msg_count} messages).");
         }
         Err(e) => {
             eprintln!("\nFailed to save session: {e}");
@@ -1212,23 +1218,24 @@ async fn run_app(
     Ok(())
 }
 
-/// Save the active session snapshot to disk and refresh the shared
-/// panic-safe snapshot. Returns the saved session on success.
-fn save_session_now(
-    app: &App,
-    target_name: &str,
-    id: &str,
-    timestamp: &str,
-    snapshot: &SessionSnapshot,
-) -> std::result::Result<filar_core::Session, CoreError> {
-    let session = session_snapshot(app, target_name, id, timestamp);
-    let store = filar_core::SessionStore::with_default_dir()?;
-    store.save(&session)?;
-    let _ = store.prune_to(filar_core::session::MAX_SESSIONS);
-    if let Ok(mut guard) = snapshot.lock() {
-        *guard = Some(session.clone());
-    }
-    Ok(session)
+/// Persist an already-built session snapshot off the event loop, refresh the
+/// shared panic-safe snapshot, and prune old sessions. The file write runs on
+/// a blocking thread and is serialised with the panic hook via the shared
+/// mutex (see [`PanicHookGuard`]).
+async fn save_session_async(
+    session: filar_core::Session,
+    snapshot: SessionSnapshot,
+) -> std::result::Result<(), CoreError> {
+    tokio::task::spawn_blocking(move || {
+        let store = filar_core::SessionStore::with_default_dir()?;
+        let mut guard = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        store.save(&session)?;
+        let _ = store.prune_to(filar_core::session::MAX_SESSIONS);
+        *guard = Some(session);
+        Ok(())
+    })
+    .await
+    .map_err(|e| CoreError::Other(format!("session save task panicked: {e}")))?
 }
 
 /// Build a serialisable [`filar_core::Session`] snapshot from the active TUI
