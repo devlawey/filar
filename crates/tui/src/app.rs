@@ -596,7 +596,7 @@ impl Session {
             model_per_profile: HashMap::new(),
             pending_llm_profile: None,
             confirm_mode,
-            prev_confirm_mode: confirm_mode,
+            prev_confirm_mode: CommandConfirmMode::Allowlist,
         }
     }
 
@@ -6258,6 +6258,28 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         ));
         assert_eq!(app.confirm_mode, CommandConfirmMode::Allowlist);
+    }
+
+    #[test]
+    fn f2_toggles_off_when_session_starts_in_explain() {
+        // Session starts in Explain (e.g. from config.toml) — prev_confirm_mode
+        // must default to Allowlist so F2 can toggle it off.
+        let mut app = App::new("test".into(), CommandConfirmMode::Explain);
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Explain);
+
+        // Press F2 → should switch to Allowlist (not back to Explain).
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Allowlist);
+
+        // Press F2 again → should switch back to Explain.
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(2),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Explain);
     }
 
     #[test]
