@@ -83,8 +83,9 @@ confirm_mode = "allowlist"
 #   always    — every command requires explicit user approval
 #   allowlist — read-only commands auto-approved, others require confirmation (default)
 #   never     — no confirmation (dangerous, sandbox only)
-#   explain   — safe mode: every command requires approval AND a mandatory explanation.
-#               Toggle at runtime with F2. Session is auto-saved to Markdown.
+#   explain   — safe mode: agent tool calls require approval AND a mandatory
+#               explanation. Toggle at runtime with F2. Session is auto-saved
+#               to Markdown. (!command shell escape is not affected.)
 
 [llm]
 model = "glm-5.1"

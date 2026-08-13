@@ -339,7 +339,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 ## 8. Тесты
 
-- **502 unit-тестов** проходят (включая doc-тесты):
+- **502 тестов** (495 passed + 7 ignored Docker sshd):
   - filar-agent: 87 тестов
   - filar-app: 14 тестов
   - filar-core: 50 тестов + 2 doc-теста
@@ -350,7 +350,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 ```powershell
 cd c:\dev\warper
-cargo test -p filar-tui -p filar-agent -p filar-transport
+cargo build --workspace
+cargo test --workspace
 ```
 
 ---
