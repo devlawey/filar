@@ -468,6 +468,9 @@ impl App {
         if let Some(confirm) = self.pending_confirm.take() {
             let _ = confirm.respond_to.send(false);
             self.mode = AppMode::Thinking;
+            self.awaiting_confirmation = false;
+            self.confirm_button_areas.clear();
+            self.hovered_button = None;
             self.push_message(ChatBlock::System(
                 "Command cancelled: confirm mode switched".into(),
             ));
@@ -6293,6 +6296,9 @@ mod tests {
             respond_to: tx,
         });
         app.mode = AppMode::Confirming;
+        app.awaiting_confirmation = true;
+        app.confirm_button_areas = vec![(Rect::new(0, 0, 10, 3), true), (Rect::new(0, 0, 10, 3), false)];
+        app.hovered_button = Some(true);
 
         // Press F2 → should abort the pending confirmation.
         app.handle_key(crossterm::event::KeyEvent::new(
@@ -6304,6 +6310,12 @@ mod tests {
         assert!(app.pending_confirm.is_none(), "pending_confirm must be cleared");
         assert_eq!(app.mode, AppMode::Thinking, "mode should return to Thinking");
         assert!(!rx.try_recv().unwrap(), "respond_to should have received false (denied)");
+
+        // All confirmation UI state must be cleared — stale hit-areas must not
+        // consume subsequent clicks.
+        assert!(!app.awaiting_confirmation, "awaiting_confirmation must be cleared");
+        assert!(app.confirm_button_areas.is_empty(), "confirm_button_areas must be cleared");
+        assert!(app.hovered_button.is_none(), "hovered_button must be cleared");
 
         // A system message about cancellation should be present.
         assert!(

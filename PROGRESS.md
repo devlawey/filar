@@ -4193,5 +4193,11 @@ core+agent проходят. Тесты падают на старом коде 
   актуальным режимом активной вкладки.
 - Статус-бар: режим `Explain` подсвечен акцентным цветом.
 
-**Тесты:** 4 новых (f2_toggles, f2_aborts_pending_confirm,
-  f2_in_interactive_mode, tab_switch_syncs). Все 300 tui-тестов проходят.
+**Тесты:** 5 новых (f2_toggles, f2_toggles_off_when_session_starts_in_explain,
+  f2_aborts_pending_confirm, f2_in_interactive_mode, tab_switch_syncs).
+  Все 301 tui-тест проходит.
+
+**Публичный API:** нет изменений. `Session` (TUI crate) получил поля `confirm_mode`
+и `prev_confirm_mode`, но `Session` не является публичным контрактом.
+
+**Дальше:** #264 (авто-расшифровка), #265 (подсказки/документация).
