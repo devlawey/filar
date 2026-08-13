@@ -1415,4 +1415,51 @@ mod tests {
             assert_eq!(t.cols(), 100);
         }
     }
+
+    #[test]
+    fn session_snapshot_captures_launch_context() {
+        use filar_core::{CommandConfirmMode, LlmProfile};
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.profiles = vec![LlmProfile {
+            name: "glm".into(),
+            model: "glm-5.1".into(),
+            api_base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
+            max_tokens: 1024,
+            key_env: "GLM_API_KEY".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+        }];
+        app.default_profile_name = "glm".into();
+        {
+            let s = &mut app.sessions[0];
+            s.ssh_info = Some("root@10.0.0.5:22".into());
+            s.llm_profile = Some("glm".into());
+            s.confirm_mode = CommandConfirmMode::Explain;
+        }
+
+        let snapshot = session_snapshot(&app, "prod");
+
+        assert_eq!(snapshot.ssh_info.as_deref(), Some("root@10.0.0.5:22"));
+        assert_eq!(snapshot.model.as_deref(), Some("glm-5.1"));
+        assert_eq!(
+            snapshot.api_base_url.as_deref(),
+            Some("https://open.bigmodel.cn/api/paas/v4")
+        );
+        assert_eq!(snapshot.confirm_mode, Some(CommandConfirmMode::Explain));
+        assert_eq!(snapshot.target, "prod");
+        assert_eq!(snapshot.llm_profile.as_deref(), Some("glm"));
+    }
+
+    #[test]
+    fn session_snapshot_nulls_launch_context_when_absent() {
+        use filar_core::CommandConfirmMode;
+        let app = App::new("local".into(), CommandConfirmMode::Allowlist);
+        let snapshot = session_snapshot(&app, "local");
+        assert_eq!(snapshot.ssh_info, None);
+        assert_eq!(snapshot.model, None);
+        assert_eq!(snapshot.api_base_url, None);
+        assert_eq!(snapshot.confirm_mode, Some(CommandConfirmMode::Allowlist));
+        assert_eq!(snapshot.llm_profile, None);
+    }
 }
