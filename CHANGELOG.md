@@ -63,6 +63,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   session files. Session writes are now atomic (temp file + rename), so a
   crash mid-write cannot corrupt a saved session.
   ([#272](https://github.com/devlawey/filar/issues/272)).
+- F3 session selection overlay: restore a saved session from within the TUI.
+  The overlay lists saved sessions (date, host, profile, preview); Enter
+  restores messages/history/profile/tokens and re-initiates the SSH
+  connection (password prompt via Ctrl+P), Esc cancels. F3 is shown in the
+  bottom help bar and the F1 help overlay.
+  ([#273](https://github.com/devlawey/filar/issues/273)).
 
 ### Fixed
 

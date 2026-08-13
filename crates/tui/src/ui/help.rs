@@ -58,6 +58,12 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
             available: |m| m != AppMode::PasswordInput,
         },
         HelpEntry {
+            key: "F3",
+            desc: "Open session selection overlay (restore a saved session)",
+            section: "Modes",
+            available: |m| m != AppMode::PasswordInput,
+        },
+        HelpEntry {
             key: "^P",
             desc: "Enter password input mode",
             section: "Modes",

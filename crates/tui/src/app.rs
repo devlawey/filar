@@ -6,7 +6,7 @@
 
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use filar_core::{ChatBlock, CommandConfirmMode, StaticSecretProvider};
+use filar_core::{ChatBlock, CommandConfirmMode, SessionMeta, SessionStore, StaticSecretProvider};
 use ratatui::layout::Rect;
 
 use crate::event::TuiEvent;
@@ -230,6 +230,12 @@ pub struct App {
     pub save_tx: Option<tokio::sync::mpsc::UnboundedSender<SaveProgress>>,
     /// Directory where Ctrl+S session exports are written (`None` = CWD).
     pub save_dir: Option<std::path::PathBuf>,
+    /// Whether the session-selection overlay is visible (F3).
+    pub session_select_visible: bool,
+    /// Cursor position in the session-selection overlay.
+    pub session_select_index: usize,
+    /// Cached list of saved session metadata shown in the overlay.
+    pub session_select_metas: Vec<SessionMeta>,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -416,6 +422,9 @@ impl App {
             save_in_flight: false,
             save_tx: None,
             save_dir: None,
+            session_select_visible: false,
+            session_select_index: 0,
+            session_select_metas: Vec::new(),
         }
     }
 
@@ -948,6 +957,110 @@ impl App {
         }
     }
 
+    /// Open the session-selection overlay (F3). Loads the list of saved
+    /// sessions from disk into [`session_select_metas`](Self::session_select_metas).
+    fn open_session_select(&mut self) {
+        self.session_select_metas = match SessionStore::with_default_dir() {
+            Ok(store) => store.list().unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        if self.session_select_metas.is_empty() {
+            self.push_message(ChatBlock::System(
+                "No saved sessions found. Sessions are saved automatically every \
+                 30s and on exit (Ctrl+Q)."
+                    .into(),
+            ));
+        }
+        self.session_select_index = 0;
+        self.session_select_visible = true;
+    }
+
+    /// Confirm the session selection (Enter): load the full session and apply
+    /// it to the active tab — messages, input history, LLM profile, token
+    /// stats. If the session was over SSH, re-initiate the SSH connection via
+    /// the password flow (`pending_ssh` + Ctrl+P).
+    fn select_session(&mut self) {
+        let idx = self.session_select_index;
+        self.session_select_visible = false;
+
+        let meta = match self.session_select_metas.get(idx).cloned() {
+            Some(m) => m,
+            None => return,
+        };
+        match SessionStore::with_default_dir() {
+            Ok(store) => match store.load(&meta.id) {
+                Ok(Some(session)) => self.apply_loaded_session(session),
+                Ok(None) => {
+                    self.push_error(format!("Session '{}' no longer exists.", meta.id));
+                }
+                Err(e) => {
+                    self.push_error(format!("Failed to load session: {e}"));
+                }
+            },
+            Err(e) => {
+                self.push_error(format!("Failed to init session store: {e}"));
+            }
+        }
+    }
+
+    /// Apply a loaded session to the active tab: messages, input history, LLM
+    /// profile, token stats, and — if the session was over SSH — re-initiate
+    /// the SSH connection via the password flow (`pending_ssh` + Ctrl+P).
+    fn apply_loaded_session(&mut self, session: filar_core::Session) {
+        self.messages = session.messages;
+        self.message_rev = self.message_rev.wrapping_add(1);
+        self.push_message(ChatBlock::System(
+            "Session restored — history loaded from disk".into(),
+        ));
+        self.input_history = session.input_history;
+        self.history_pos = None;
+        self.tokens_in = session.tokens_in;
+        self.tokens_out = session.tokens_out;
+        self.cost_usd = session.cost_usd;
+        self.per_profile = session.per_profile;
+        self.last_served_model = session.last_served_model;
+        self.model_per_profile = session.model_per_profile;
+        self.scroll = 0;
+
+        // Resolve LLM profile with the same validation as startup restore.
+        let default_name = if self.default_profile_name.is_empty() {
+            "default".to_string()
+        } else {
+            self.default_profile_name.clone()
+        };
+        if let Some(profile) = session.llm_profile {
+            if profile.is_empty() {
+                self.llm_profile = Some(default_name.clone());
+            } else if self.profiles.iter().any(|p| p.name == profile) {
+                self.llm_profile = Some(profile);
+            } else {
+                self.llm_profile = Some(default_name.clone());
+                self.push_message(ChatBlock::System(format!(
+                    "Profile '{}' not found — using '{}'",
+                    profile, default_name
+                )));
+            }
+        }
+
+        // SSH reconnect: parse the saved `ssh_info` and re-initiate the
+        // password flow (the same path as `!ssh user@host`).
+        if let Some((user, host, port)) = session
+            .ssh_info
+            .as_deref()
+            .and_then(parse_ssh_info)
+        {
+            self.pending_ssh = Some((user.clone(), host.clone(), port));
+            self.ssh_info = Some(format!("{user}@{host}:{port}"));
+            self.target_name = format!("{user}@{host}:{port}");
+            self.push_message(ChatBlock::System(format!(
+                "Restored SSH target {user}@{host}:{port}. Press Ctrl+P to enter the password."
+            )));
+        } else {
+            self.ssh_info = None;
+            self.target_name = session.target.clone();
+        }
+    }
+
     /// Append a message to the history and bump [`message_rev`](Self::message_rev).
     ///
     /// All mutations of `messages` must go through this method (or explicitly
@@ -1262,6 +1375,16 @@ impl App {
             return;
         }
 
+        // F3 toggles the session-selection overlay — same availability as F1/F2.
+        if key.code == KeyCode::F(3) && self.mode != AppMode::PasswordInput {
+            if self.session_select_visible {
+                self.session_select_visible = false;
+            } else {
+                self.open_session_select();
+            }
+            return;
+        }
+
         // When the help overlay is visible, only navigation and close keys
         // are processed; all other keys are consumed.
         if self.help_overlay_visible {
@@ -1349,6 +1472,30 @@ impl App {
                 }
                 KeyCode::Enter => {
                     self.select_host();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // When the session-selection overlay is visible, only navigation and
+        // select/cancel keys are processed; all other keys are consumed.
+        if self.session_select_visible {
+            let list_size = self.session_select_metas.len();
+            match key.code {
+                KeyCode::Esc => {
+                    self.session_select_visible = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.session_select_index = self.session_select_index.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.session_select_index + 1 < list_size {
+                        self.session_select_index += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    self.select_session();
                 }
                 _ => {}
             }
@@ -1804,6 +1951,11 @@ impl App {
 
         // When the host-selection overlay is visible, consume all mouse events.
         if self.host_select_visible {
+            return;
+        }
+
+        // When the session-selection overlay is visible, consume all mouse events.
+        if self.session_select_visible {
             return;
         }
 
@@ -2923,6 +3075,20 @@ fn parse_ssh_command(cmd: &str) -> Option<(String, String, u16)> {
         return None;
     }
 
+    Some((user.to_string(), host.to_string(), port))
+}
+
+/// Parse `user@host[:port]` (the persisted `ssh_info` format) into
+/// `(user, host, port)`. The port defaults to 22 when omitted.
+fn parse_ssh_info(info: &str) -> Option<(String, String, u16)> {
+    let (user, host_port) = info.split_once('@')?;
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().ok()?),
+        None => (host_port, 22),
+    };
+    if user.is_empty() || host.is_empty() {
+        return None;
+    }
     Some((user.to_string(), host.to_string(), port))
 }
 
@@ -6160,6 +6326,129 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.target_name, "~local");
+    }
+
+    #[test]
+    fn parse_ssh_info_parses_user_host_port() {
+        let (user, host, port) = parse_ssh_info("root@10.0.0.5:22").unwrap();
+        assert_eq!(user, "root");
+        assert_eq!(host, "10.0.0.5");
+        assert_eq!(port, 22);
+    }
+
+    #[test]
+    fn parse_ssh_info_defaults_port() {
+        let (user, host, port) = parse_ssh_info("admin@devbox").unwrap();
+        assert_eq!(user, "admin");
+        assert_eq!(host, "devbox");
+        assert_eq!(port, 22);
+    }
+
+    #[test]
+    fn parse_ssh_info_rejects_malformed() {
+        assert!(parse_ssh_info("no-at-sign").is_none());
+        assert!(parse_ssh_info("").is_none());
+    }
+
+    #[test]
+    fn f3_toggles_session_select_overlay() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        assert!(app.session_select_visible, "F3 must open the overlay");
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        assert!(!app.session_select_visible, "F3 must close the overlay");
+    }
+
+    #[test]
+    fn session_select_esc_cancels() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.session_select_metas = vec![filar_core::SessionMeta {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "t".into(),
+            llm_profile: None,
+            ssh_info: None,
+            model: None,
+            preview: String::new(),
+        }];
+        app.session_select_visible = true;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.session_select_visible);
+    }
+
+    #[test]
+    fn apply_loaded_session_restores_messages_and_profile() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.default_profile_name = "glm".into();
+        app.profiles = vec![filar_core::LlmProfile {
+            name: "glm".into(),
+            model: "glm-5.1".into(),
+            api_base_url: String::new(),
+            max_tokens: 1024,
+            key_env: String::new(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+        }];
+        let session = filar_core::Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "prod".into(),
+            llm_profile: Some("glm".into()),
+            messages: vec![ChatBlock::User("hello".into())],
+            input_history: vec!["ls".into()],
+            tokens_in: 11,
+            tokens_out: 22,
+            cost_usd: Some(0.5),
+            per_profile: HashMap::new(),
+            last_served_model: Some("glm-5.1".into()),
+            model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+        };
+        app.apply_loaded_session(session);
+        assert!(app.messages.iter().any(|b| matches!(b, ChatBlock::User(s) if s == "hello")));
+        assert!(app.input_history().iter().any(|s| s == "ls"));
+        assert_eq!(app.tokens_in, 11);
+        assert_eq!(app.tokens_out, 22);
+        assert_eq!(app.llm_profile.as_deref(), Some("glm"));
+        assert_eq!(app.target_name, "prod");
+        assert!(app.ssh_info.is_none());
+        assert!(app.pending_ssh.is_none());
+    }
+
+    #[test]
+    fn apply_loaded_session_ssh_reconnects() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let session = filar_core::Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "prod".into(),
+            llm_profile: None,
+            messages: vec![],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: Some("root@10.0.0.5:22".into()),
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+        };
+        app.apply_loaded_session(session);
+        assert_eq!(
+            app.pending_ssh,
+            Some(("root".into(), "10.0.0.5".into(), 22))
+        );
+        assert_eq!(app.ssh_info.as_deref(), Some("root@10.0.0.5:22"));
+        assert_eq!(app.target_name, "root@10.0.0.5:22");
     }
 
     #[test]
