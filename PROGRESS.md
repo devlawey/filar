@@ -4336,3 +4336,29 @@ core+agent проходят. Тесты падают на старом коде 
 session_meta_includes_launch_context). `cargo test --workspace` зелёные.
 
 **Дальше:** #272 (автосейв + panic-safe), #273 (F3 overlay), #274 (GUI авто-выбор).
+
+---
+
+## Issue #272: feat(tui) — Periodic auto-save + panic-safe session save
+
+**Milestone:** 0.9.0. **Ветка:** `feat/272-session-auto-save`.
+
+**Что сделано:**
+- `runner.rs`: стабильный id сессии генерируется один раз на запуск — каждый
+  30-секундный автосейв перезаписывает тот же файл (не плодит новые).
+- В `select!` добавлен `auto_save_interval` (30s, `MissedTickBehavior::Skip`);
+  сохраняется только если активная вкладка изменилась (`session_changed`:
+  `message_rev` или смена вкладки). После каждого сохранения — prune до 10.
+- Panic-safe: `PanicHookGuard` принимает `Arc<Mutex<Option<Session>>>`
+  (shared snapshot); panic hook делает best-effort сохранение (`try_lock`).
+- Crash-safe запись: `SessionStore::save` стал атомарным (tmp-файл + `rename`).
+- Сохранение вынесено в `tokio::task::spawn_blocking` (`save_session_async`),
+  чтобы не блокировать event loop; запись сериализуется с panic hook общим
+  мьютексом (мьютекс удерживается на время `store.save`).
+
+**Публичный API:** `SessionStore::save` теперь атомарный (семантика прежняя).
+
+**Тесты:** 3 новых (session_store_save_is_atomic в core, session_changed_detects_rev_and_tab
+и id/timestamp-ассерты в tui). `cargo test --workspace` зелёные (core 54, tui 314).
+
+**Дальше:** #273 (F3 overlay), #274 (GUI авто-выбор).

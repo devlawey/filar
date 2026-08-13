@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Stdout};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{EnableBracketedPaste, DisableBracketedPaste, EnableMouseCapture, DisableMouseCapture, Event, EventStream};
@@ -143,6 +143,12 @@ struct ExecutorEntry {
 // Panic hook guard
 // ---------------------------------------------------------------------------
 
+/// Shared panic-safe session snapshot.
+///
+/// The periodic auto-save keeps this fresh so the panic hook can persist the
+/// last known-good session even when the app dies unexpectedly.
+type SessionSnapshot = Arc<Mutex<Option<filar_core::Session>>>;
+
 /// RAII guard that restores the default panic hook when dropped.
 ///
 /// Installs a custom panic hook that restores the terminal state
@@ -151,6 +157,9 @@ struct ExecutorEntry {
 /// the panic text and select it with the mouse even if a panic occurs
 /// inside the event loop or rendering code.
 ///
+/// The hook also performs a best-effort session save from the shared
+/// snapshot (see [`run`]), so a panic loses at most one auto-save period.
+///
 /// When the guard is dropped (either after normal teardown or on early
 /// return), the original panic hook is restored via `take_hook()`, so
 /// code running after the TUI is unaffected.
@@ -158,7 +167,7 @@ struct PanicHookGuard;
 
 impl PanicHookGuard {
     /// Install the terminal-restoring panic hook and return a guard.
-    fn install() -> Self {
+    fn install(snapshot: SessionSnapshot) -> Self {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             // Restore terminal state BEFORE printing the panic message
@@ -170,6 +179,20 @@ impl PanicHookGuard {
                 crossterm::terminal::LeaveAlternateScreen
             );
             let _ = crossterm::terminal::disable_raw_mode();
+
+            // Best-effort session save. `try_lock` avoids blocking (and a
+            // potential double-panic) if the mutex is somehow still held.
+            // Holding the lock while writing serialises this save with the
+            // periodic auto-save (which uses the same mutex around its write).
+            if let Ok(guard) = snapshot.try_lock() {
+                if let Some(session) = guard.clone() {
+                    if let Ok(store) = filar_core::SessionStore::with_default_dir() {
+                        let _ = store.save(&session);
+                        let _ = store.prune_to(filar_core::session::MAX_SESSIONS);
+                    }
+                }
+            }
+
             default_hook(info);
         }));
         Self
@@ -249,8 +272,10 @@ pub async fn run(
 ) -> Result<()> {
     // Install panic hook to restore terminal state on panic.
     // The hook is automatically uninstalled when _hook_guard is dropped
-    // (on normal return, early error, or panic).
-    let _hook_guard = PanicHookGuard::install();
+    // (on normal return, early error, or panic). The shared snapshot lets
+    // the hook persist the last auto-saved session on a crash.
+    let snapshot: SessionSnapshot = Arc::new(Mutex::new(None));
+    let _hook_guard = PanicHookGuard::install(snapshot.clone());
 
     // Set up terminal.
     enable_raw_mode().map_err(|e| CoreError::Other(format!("failed to enable raw mode: {e}")))?;
@@ -273,7 +298,7 @@ pub async fn run(
     let mut terminal = Terminal::new(backend)
         .map_err(|e| CoreError::Other(format!("failed to create terminal: {e}")))?;
 
-    let result = run_app(&mut terminal, _llm, executor, config).await;
+    let result = run_app(&mut terminal, _llm, executor, config, snapshot).await;
 
     // Restore the original panic hook before terminal teardown.
     // The custom hook is no longer needed — teardown uses .ok() and
@@ -294,6 +319,7 @@ async fn run_app(
     _llm: Arc<dyn LlmClient>,
     executor: Arc<dyn CommandExecutor>,
     mut config: TuiConfig,
+    snapshot: SessionSnapshot,
 ) -> Result<()> {
     let profiles_for_restore = std::mem::take(&mut config.profiles);
     let default_for_restore = std::mem::take(&mut config.default_profile_name);
@@ -415,6 +441,15 @@ async fn run_app(
     // and a frame deadline has passed, avoiding competition with read_output.
     let mut last_draw = Instant::now();
 
+    // Periodic auto-save (#272): one stable id for the whole run so each
+    // 30s save overwrites the same file, plus the revision/session of the
+    // last saved snapshot so unchanged sessions skip the write.
+    let (session_id, session_timestamp) = filar_core::session::now_session_id();
+    let mut auto_save_interval = tokio::time::interval(Duration::from_secs(30));
+    auto_save_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_saved_rev = app.active_session().message_rev;
+    let mut last_saved_session = app.active_session().id;
+
     loop {
         let in_interactive = app.mode == AppMode::Interactive;
         tokio::select! {
@@ -493,6 +528,31 @@ async fn run_app(
                     }
                 }
                 needs_redraw = true;
+            }
+
+            // Periodic auto-save (#272): every 30 seconds, persist the active
+            // session if it changed since the last save (message_rev or tab).
+            // The write is synchronous but tiny (<100 KB, ~a few ms).
+            _ = auto_save_interval.tick() => {
+                let changed = session_changed(&app, last_saved_rev, last_saved_session);
+                if changed {
+                    let session = session_snapshot(
+                        &app,
+                        &config.target_name,
+                        &session_id,
+                        &session_timestamp,
+                    );
+                    match save_session_async(session, snapshot.clone()).await {
+                        Ok(()) => {
+                            last_saved_rev = app.active_session().message_rev;
+                            last_saved_session = app.active_session().id;
+                            info!("session auto-saved");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "session auto-save failed");
+                        }
+                    }
+                }
             }
 
             // Terminal keyboard / resize event.
@@ -1143,18 +1203,14 @@ async fn run_app(
     }
 
     // Save session to disk for future restore.
-    let session = session_snapshot(&app, &config.target_name);
-    match filar_core::SessionStore::with_default_dir() {
-        Ok(store) => {
-            if let Err(e) = store.save(&session) {
-                eprintln!("\nFailed to save session: {e}");
-            } else {
-                eprintln!("\nSession saved ({} messages).", session.messages.len());
-            }
-            let _ = store.prune_to(filar_core::session::MAX_SESSIONS);
+    let session = session_snapshot(&app, &config.target_name, &session_id, &session_timestamp);
+    let msg_count = session.messages.len();
+    match save_session_async(session, snapshot.clone()).await {
+        Ok(()) => {
+            eprintln!("\nSession saved ({msg_count} messages).");
         }
         Err(e) => {
-            eprintln!("\nFailed to create session store: {e}");
+            eprintln!("\nFailed to save session: {e}");
         }
     }
 
@@ -1162,11 +1218,30 @@ async fn run_app(
     Ok(())
 }
 
+/// Persist an already-built session snapshot off the event loop, refresh the
+/// shared panic-safe snapshot, and prune old sessions. The file write runs on
+/// a blocking thread and is serialised with the panic hook via the shared
+/// mutex (see [`PanicHookGuard`]).
+async fn save_session_async(
+    session: filar_core::Session,
+    snapshot: SessionSnapshot,
+) -> std::result::Result<(), CoreError> {
+    tokio::task::spawn_blocking(move || {
+        let store = filar_core::SessionStore::with_default_dir()?;
+        let mut guard = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        store.save(&session)?;
+        let _ = store.prune_to(filar_core::session::MAX_SESSIONS);
+        *guard = Some(session);
+        Ok(())
+    })
+    .await
+    .map_err(|e| CoreError::Other(format!("session save task panicked: {e}")))?
+}
+
 /// Build a serialisable [`filar_core::Session`] snapshot from the active TUI
 /// session, including launch context (ssh_info, model, api_base_url,
 /// confirm_mode) so a later restore can re-select the same host and model.
-fn session_snapshot(app: &App, target_name: &str) -> filar_core::Session {
-    let (id, timestamp) = filar_core::session::now_session_id();
+fn session_snapshot(app: &App, target_name: &str, id: &str, timestamp: &str) -> filar_core::Session {
     let active_profile_name = app
         .llm_profile
         .clone()
@@ -1178,8 +1253,8 @@ fn session_snapshot(app: &App, target_name: &str) -> filar_core::Session {
         .map(|p| (Some(p.model.clone()), Some(p.api_base_url.clone())))
         .unwrap_or((None, None));
     let mut session = filar_core::Session {
-        id,
-        timestamp,
+        id: id.to_string(),
+        timestamp: timestamp.to_string(),
         target: target_name.to_string(),
         llm_profile: app.llm_profile.clone(),
         messages: app.messages.clone(),
@@ -1197,6 +1272,12 @@ fn session_snapshot(app: &App, target_name: &str) -> filar_core::Session {
     };
     session.truncate_history();
     session
+}
+
+/// Whether the active session changed since the last auto-save: either its
+/// message revision advanced or the user switched to a different tab.
+fn session_changed(app: &App, last_rev: u64, last_session: crate::app::SessionId) -> bool {
+    app.active_session().message_rev != last_rev || app.active_session().id != last_session
 }
 
 /// Await the next forwarded log line from the optional receiver.
@@ -1453,8 +1534,10 @@ mod tests {
             s.confirm_mode = CommandConfirmMode::Explain;
         }
 
-        let snapshot = session_snapshot(&app, "prod");
+        let snapshot = session_snapshot(&app, "prod", "123456", "2026-08-14 00:00:00");
 
+        assert_eq!(snapshot.id, "123456");
+        assert_eq!(snapshot.timestamp, "2026-08-14 00:00:00");
         assert_eq!(snapshot.ssh_info.as_deref(), Some("root@10.0.0.5:22"));
         assert_eq!(snapshot.model.as_deref(), Some("glm-5.1"));
         assert_eq!(
@@ -1470,11 +1553,33 @@ mod tests {
     fn session_snapshot_nulls_launch_context_when_absent() {
         use filar_core::CommandConfirmMode;
         let app = App::new("local".into(), CommandConfirmMode::Allowlist);
-        let snapshot = session_snapshot(&app, "local");
+        let snapshot = session_snapshot(&app, "local", "123456", "2026-08-14 00:00:00");
         assert_eq!(snapshot.ssh_info, None);
         assert_eq!(snapshot.model, None);
         assert_eq!(snapshot.api_base_url, None);
         assert_eq!(snapshot.confirm_mode, Some(CommandConfirmMode::Allowlist));
         assert_eq!(snapshot.llm_profile, None);
+    }
+
+    #[test]
+    fn session_changed_detects_rev_and_tab() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("t0".into(), CommandConfirmMode::Allowlist);
+        let sid0 = app.active_session().id;
+        let rev0 = app.active_session().message_rev;
+
+        // Unchanged: same tab, same revision.
+        assert!(!session_changed(&app, rev0, sid0));
+
+        // Revision advanced.
+        app.push_error("hi".into());
+        assert!(session_changed(&app, rev0, sid0));
+
+        // Same revision, but a different active tab.
+        app.new_tab();
+        let sid1 = app.active_session().id;
+        let rev1 = app.active_session().message_rev;
+        assert!(session_changed(&app, rev1, sid0));
+        assert!(!session_changed(&app, rev1, sid1));
     }
 }

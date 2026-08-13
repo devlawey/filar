@@ -181,12 +181,26 @@ impl SessionStore {
         Self::new(default_base_dir()?)
     }
 
-    /// Save a session to disk (overwrites if the ID already exists).
+    /// Save a session to disk atomically (overwrites if the ID already exists).
+    ///
+    /// The JSON is written to a temporary file first and then renamed over the
+    /// target, so a crash mid-write never leaves a truncated or corrupt session
+    /// file — the previous (complete) version stays in place until the rename.
     pub fn save(&self, session: &Session) -> Result<()> {
         let path = self.dir.join(format!("{}.json", session.id));
+        let tmp = self
+            .dir
+            .join(format!("{}.json.tmp{}", session.id, std::process::id()));
         let json = serde_json::to_string_pretty(session)
             .map_err(|e| CoreError::Other(format!("failed to serialise session: {e}")))?;
-        std::fs::write(&path, json)?;
+        std::fs::write(&tmp, json)?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(CoreError::Other(format!(
+                "failed to replace session file {}: {e}",
+                path.display()
+            )));
+        }
         tracing::info!(session_id = %session.id, path = %path.display(), "session saved");
         Ok(())
     }
@@ -373,6 +387,46 @@ mod tests {
         };
         let meta = SessionMeta::from(&session);
         assert!(meta.preview.is_empty());
+    }
+
+    #[test]
+    fn session_store_save_is_atomic() {
+        let tmp = std::env::temp_dir().join(format!("filar_atomic_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let store = SessionStore { dir: tmp.clone() };
+        let session = Session {
+            id: "777".into(),
+            timestamp: "2026-01-01 00:00:00".into(),
+            target: "test".into(),
+            llm_profile: Some("glm".into()),
+            messages: vec![ChatBlock::User("hello".into())],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+        };
+
+        store.save(&session).unwrap();
+
+        // The temp file must be renamed away and only the final file remain.
+        assert!(tmp.join("777.json").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp files should remain: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
