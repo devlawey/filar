@@ -60,7 +60,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   seconds (only when it changed) and once more from the panic hook, so
   closing the window or killing the process loses at most ~30 seconds of
   history. Each run reuses a single session id, and pruning keeps at most 10
-  session files.
+  session files. Session writes are now atomic (temp file + rename), so a
+  crash mid-write cannot corrupt a saved session.
   ([#272](https://github.com/devlawey/filar/issues/272)).
 
 ### Fixed
