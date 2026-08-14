@@ -814,6 +814,14 @@ async fn run_app(
                         let tx = agent_tx.clone();
                         let exec_entry = executors.get(&sid)
                             .map(|e| (e.executor.clone(), e.ssh_target.clone()));
+                        // Cancel any previous in-flight attempt for this tab so
+                        // a stale connection can't overwrite a newer one (race
+                        // between `!ssh` and F3 restore).
+                        if let Some(tok) = app.pending_ssh_cancel.take() {
+                            tok.cancel();
+                        }
+                        let token = CancellationToken::new();
+                        app.pending_ssh_cancel = Some(token.clone());
                         tokio::spawn(async move {
                             let _ = tx.send(TuiEvent::Thinking);
                             let target = filar_core::SshTarget {
@@ -829,6 +837,11 @@ async fn run_app(
                             let new_ssh_info = format!("{user}@{host}:{port}");
                             match filar_transport::SshExecutor::connect(&target).await {
                                 Ok(ssh_exec) => {
+                                    // A newer attempt superseded this one while
+                                    // we were connecting — drop the result.
+                                    if token.is_cancelled() {
+                                        return;
+                                    }
                                     // Swap the executor for this session only.
                                     if let Some((ref exec, ref st)) = exec_entry {
                                         exec.swap_executor(Arc::new(ssh_exec)

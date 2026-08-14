@@ -179,6 +179,9 @@ pub struct App {
     pub pending_ssh: Option<(String, String, u16)>,
     /// Pending SSH password entered by the user via Ctrl+P.
     pub pending_ssh_password: Option<String>,
+    /// Cancellation token for an in-flight `!ssh`/F3-restore connection attempt,
+    /// so a stale attempt can't overwrite a newer one.
+    pub pending_ssh_cancel: Option<CancellationToken>,
     /// Colour theme used by the UI renderer.
     pub theme: Theme,
     /// Status bar area (set during render, for hit-testing).
@@ -402,6 +405,7 @@ impl App {
             secrets: Arc::new(StaticSecretProvider::new()),
             pending_ssh: None,
             pending_ssh_password: None,
+            pending_ssh_cancel: None,
             theme: Theme::default_dark(),
             status_bar_area: Rect::default(),
             help_bar_area: Rect::default(),
@@ -999,8 +1003,8 @@ impl App {
 
     /// Confirm the session selection (Enter): load the full session and apply
     /// it to the active tab — messages, input history, LLM profile, token
-    /// stats. If the session was over SSH, re-initiate the SSH connection via
-    /// the password flow (`pending_ssh` + Ctrl+P).
+    /// stats. If the session was over SSH, the tab switches to password input
+    /// and reconnects via the same flow as `!ssh user@host`.
     fn select_session(&mut self) {
         let idx = self.session_select_index;
         self.session_select_visible = false;
@@ -1026,8 +1030,10 @@ impl App {
     }
 
     /// Apply a loaded session to the active tab: messages, input history, LLM
-    /// profile, token stats, and — if the session was over SSH — re-initiate
-    /// the SSH connection via the password flow (`pending_ssh` + Ctrl+P).
+    /// profile, token stats, and — if the session was over SSH — switch to
+    /// `PasswordInput` to reconnect (the same flow as `!ssh user@host`). The
+    /// tab's `ssh_info`/`target_name` are only updated after the connection
+    /// succeeds (via `TransportChanged`).
     fn apply_loaded_session(&mut self, session: filar_core::Session) {
         // Reset active runtime state before replacing history so stale events
         // from the previous session don't leak into the restored one. This
@@ -1055,6 +1061,10 @@ impl App {
         self.toggle_interactive = false;
         self.terminal = None;
         self.pending_ssh_password = None;
+        self.pending_ssh = None;
+        if let Some(tok) = self.pending_ssh_cancel.take() {
+            tok.cancel();
+        }
         self.ctrl_o_pending_target = None;
         self.ctrl_o_pending_session_id = None;
         self.confirm_button_areas.clear();
@@ -6556,6 +6566,35 @@ mod tests {
         assert_eq!(app.ssh_info.as_deref(), None);
         assert_eq!(app.target_name, "local");
         assert_eq!(app.mode, AppMode::PasswordInput);
+    }
+
+    #[test]
+    fn apply_loaded_session_clears_stale_pending_ssh() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_ssh = Some(("old".into(), "old-host".into(), 22));
+        app.pending_ssh_password = Some("secret".into());
+        let session = filar_core::Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "local".into(),
+            llm_profile: None,
+            messages: vec![],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+        };
+        app.apply_loaded_session(session);
+        assert!(app.pending_ssh.is_none(), "stale pending_ssh must be cleared");
+        assert!(app.pending_ssh_password.is_none());
+        assert_eq!(app.mode, AppMode::Normal);
     }
 
     #[test]
