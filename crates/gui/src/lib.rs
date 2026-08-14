@@ -595,22 +595,23 @@ impl LauncherApp {
             return;
         };
 
-        // Auto-select the LLM profile by name.
+        // Auto-select the LLM profile by name and fill its model / API base
+        // URL from the session launch context. Only the matched profile is
+        // touched, so an unrelated profile is never overwritten.
         if let Some(ref name) = meta.llm_profile {
             if let Some(idx) = self.profiles.iter().position(|p| p.name == *name) {
                 self.selected_profile = idx;
-            }
-        }
-        // Fill model / API base URL into the selected profile from the session.
-        if let Some(p) = self.profiles.get_mut(self.selected_profile) {
-            if let Some(model) = &meta.model {
-                if !model.is_empty() {
-                    p.model = model.clone();
-                }
-            }
-            if let Some(url) = &meta.api_base_url {
-                if !url.is_empty() {
-                    p.api_base_url = url.clone();
+                if let Some(p) = self.profiles.get_mut(idx) {
+                    if let Some(model) = &meta.model {
+                        if !model.is_empty() {
+                            p.model = model.clone();
+                        }
+                    }
+                    if let Some(url) = &meta.api_base_url {
+                        if !url.is_empty() {
+                            p.api_base_url = url.clone();
+                        }
+                    }
                 }
             }
         }
@@ -619,7 +620,7 @@ impl LauncherApp {
         match meta.ssh_info.as_deref().and_then(parse_ssh_host_port) {
             Some((host, port)) => {
                 if let Some(slot_idx) = self.ssh_slots.iter().position(|s| {
-                    s.host == host && s.port.parse::<u16>().unwrap_or(0) == port
+                    s.host == host && s.port.parse::<u16>().unwrap_or(22) == port
                 }) {
                     self.target_mode = slot_idx + 1;
                     self.validation_error.clear();
@@ -633,6 +634,7 @@ impl LauncherApp {
             }
             None => {
                 self.target_mode = 0;
+                self.validation_error.clear();
             }
         }
     }
@@ -1446,6 +1448,41 @@ mod tests {
             app.validation_error.contains("No SSH profile matches"),
             "must warn about unmatched ssh_info"
         );
+    }
+
+    #[test]
+    fn session_click_unknown_profile_does_not_overwrite() {
+        let meta = make_meta(
+            None,
+            Some("nonexistent"),
+            Some("other-model"),
+            Some("https://other.example.com"),
+        );
+        let mut app = make_app(meta);
+        app.profiles[0].model = "keep-me".into();
+        app.profiles[0].api_base_url = "https://keep.example.com".into();
+        app.on_session_selected(0);
+        assert_eq!(app.selected_profile, 0, "no matching profile → keep current");
+        assert_eq!(app.profiles[0].model, "keep-me", "unrelated profile must not be overwritten");
+        assert_eq!(app.profiles[0].api_base_url, "https://keep.example.com");
+    }
+
+    #[test]
+    fn session_click_matches_default_port_when_slot_empty() {
+        let meta = make_meta(Some("root@10.0.0.5"), None, None, None);
+        let mut app = make_app(meta);
+        app.ssh_slots[0].port = String::new();
+        app.on_session_selected(0);
+        assert_eq!(app.target_mode, 1, "empty slot port must be treated as 22");
+    }
+
+    #[test]
+    fn session_click_clears_stale_warning_on_local() {
+        let meta = make_meta(None, None, None, None);
+        let mut app = make_app(meta);
+        app.validation_error = "stale warning".into();
+        app.on_session_selected(0);
+        assert!(app.validation_error.is_empty(), "Local selection must clear stale warning");
     }
 }
 
