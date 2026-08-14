@@ -4362,3 +4362,27 @@ session_meta_includes_launch_context). `cargo test --workspace` зелёные.
 и id/timestamp-ассерты в tui). `cargo test --workspace` зелёные (core 54, tui 314).
 
 **Дальше:** #273 (F3 overlay), #274 (GUI авто-выбор).
+
+---
+
+## Issue #273: feat(tui) — F3 session selection overlay
+
+**Milestone:** 0.9.0. **Ветка:** `feat/273-session-select-overlay`.
+
+**Что сделано:**
+- Новый модуль `crates/tui/src/ui/session_select.rs` (по образцу `host_select`) —
+  оверлей списка сохранённых сессий (дата, host/ssh_info, профиль, preview).
+- `App`: поля `session_select_visible/index/metas`; `open_session_select()`
+  (грузит `SessionStore::list()`), `select_session()` + `apply_loaded_session()`
+  (заменяют messages / input_history / llm_profile / token stats на активной вкладке).
+- SSH-восстановление: `parse_ssh_info("user@host:port")` → `pending_ssh` +
+  password flow через Ctrl+P (тот же путь, что `!ssh`).
+- F3 перехватывается до mode-specific кода (кроме PasswordInput), как F1/F2.
+- F3 в `help_registry()` (секция Modes) и `help_items(Normal)` («sessions»).
+
+**Публичный API:** нет изменений (внутренние поля `App`).
+
+**Тесты:** 7 новых (parse_ssh_info×3, f3 toggle, esc cancel,
+apply_loaded_session×2). `cargo test -p filar-tui` — 321 passed.
+
+**Дальше:** #274 (GUI авто-выбор target/profile).

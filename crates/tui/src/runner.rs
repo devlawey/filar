@@ -1007,6 +1007,15 @@ async fn run_app(
             executors.remove(&sid);
         }
 
+        // Teardown interactive backends for tabs reset by session restore
+        // (F3) — the tab stays open, but its PTY/SSH reader must stop.
+        for sid in app.take_pending_term_teardown() {
+            if let Some((term, handle)) = interactive_backends.remove(&sid) {
+                let _ = term.close().await;
+                handle.abort();
+            }
+        }
+
         // Create local executors for new tabs signalled via new_tab().
         for sid in app.take_pending_local_executors() {
             match filar_transport::LocalExecutor::new().await {
