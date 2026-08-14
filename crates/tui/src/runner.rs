@@ -899,9 +899,15 @@ async fn run_app(
                     .map(|e| (e.executor.clone(), e.ssh_target.clone()));
                 let tx = agent_tx.clone();
                 let alias = target.name.clone();
+                if let Some(handle) = app.ctrl_o_handle.take() {
+                    handle.abort();
+                }
+                if let Some(tok) = app.ctrl_o_cancel.take() {
+                    tok.cancel();
+                }
                 let token = CancellationToken::new();
                 app.ctrl_o_cancel = Some(token.clone());
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     tokio::select! {
                         _ = token.cancelled() => return,
                         _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
@@ -929,9 +935,16 @@ async fn run_app(
                         }
                     }
                 });
+                app.ctrl_o_handle = Some(handle);
                 continue;
             }
             app.ctrl_o_needs_connect = false;
+            if let Some(handle) = app.ctrl_o_handle.take() {
+                handle.abort();
+            }
+            if let Some(tok) = app.ctrl_o_cancel.take() {
+                tok.cancel();
+            }
             let token = CancellationToken::new();
             app.ctrl_o_cancel = Some(token.clone());
             let selection = app.ctrl_o_selection;
@@ -940,7 +953,7 @@ async fn run_app(
             let exec_entry = executors.get(&sid)
                 .map(|e| (e.executor.clone(), e.ssh_target.clone()));
             let tx = agent_tx.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 tokio::select! {
                     _ = token.cancelled() => return,
                     _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
@@ -1016,6 +1029,7 @@ async fn run_app(
                     }
                 }
             });
+            app.ctrl_o_handle = Some(handle);
         }
 
         // Teardown backends for tabs closed via Ctrl+W / close_tab.

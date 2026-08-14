@@ -221,6 +221,9 @@ pub struct App {
     pub ctrl_o_needs_connect: bool,
     /// Cancellation token for an in-flight Ctrl+O connection attempt.
     pub ctrl_o_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Join handle for the in-flight Ctrl+O connection, aborted when a newer
+    /// selection or session restore supersedes it.
+    pub ctrl_o_handle: Option<tokio::task::JoinHandle<()>>,
     /// Pending Ctrl+O target that needs a password before connecting.
     pub ctrl_o_pending_target: Option<filar_core::SshTarget>,
     /// Session ID of the tab that initiated a password-needed connection.
@@ -426,6 +429,7 @@ impl App {
             ctrl_o_selection: None,
             ctrl_o_needs_connect: false,
             ctrl_o_cancel: None,
+            ctrl_o_handle: None,
             ctrl_o_pending_target: None,
             ctrl_o_pending_session_id: None,
             host_select_visible: false,
@@ -971,6 +975,9 @@ impl App {
         };
         self.target_name = alias;
         self.ctrl_o_needs_connect = true;
+        if let Some(handle) = self.ctrl_o_handle.take() {
+            handle.abort();
+        }
         if let Some(tok) = self.ctrl_o_cancel.take() {
             tok.cancel();
         }
@@ -1074,6 +1081,9 @@ impl App {
         }
         if let Some(tok) = self.pending_ssh_cancel.take() {
             tok.cancel();
+        }
+        if let Some(handle) = self.ctrl_o_handle.take() {
+            handle.abort();
         }
         if let Some(tok) = self.ctrl_o_cancel.take() {
             tok.cancel();
@@ -6627,6 +6637,40 @@ mod tests {
         assert!(app.pending_ssh_password.is_none());
         assert!(token.is_cancelled(), "in-flight pending_ssh must be cancelled");
         assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn apply_loaded_session_aborts_pending_ssh_task() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            let _ = tx.send(());
+        });
+        app.pending_ssh_handle = Some(handle);
+        let session = filar_core::Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "local".into(),
+            llm_profile: None,
+            messages: vec![],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+        };
+        app.apply_loaded_session(session);
+        assert!(app.pending_ssh_handle.is_none(), "handle must be taken on reset");
+        // The spawned task is aborted, so its oneshot sender is dropped without
+        // sending — awaiting the receiver resolves to `Err`.
+        assert!(rx.await.is_err(), "aborted task must not run to completion");
     }
 
     #[test]

@@ -4443,12 +4443,15 @@ session_click_without_ssh_info_stays_local, session_click_unmatched_ssh_warns_an
   по образцу `ctrl_o_cancel`). Предыдущая попытка **абортится** при старте новой;
   устаревший результат (и ошибка) отбрасывается по `is_cancelled()` в обеих ветках
   (`Ok`/`Err`) перед сменой executor'а / отправкой события в UI.
-- Сброс `apply_loaded_session` дополнительно отменяет `ctrl_o_cancel`, чтобы
-  незавершённое Ctrl+O-подключение не переживало восстановление сессии.
+- Путь Ctrl+O получил симметричный `ctrl_o_handle` (`JoinHandle`): и `select_host`,
+  и сброс `apply_loaded_session` теперь **абортят** незавершённое Ctrl+O-подключение
+  (не только отменяют токен), чтобы оно не переживало новый выбор/восстановление.
 - Тесты: `apply_loaded_session_ssh_reconnects` (fallback: `ssh_info == None`,
-  `target_name` не меняется, `mode == PasswordInput`) и новый
+  `target_name` не меняется, `mode == PasswordInput`), новый
   `apply_loaded_session_ssh_matches_target_autoconnects` (совпадение с целью →
-  `ctrl_o_needs_connect`, `ctrl_o_selection == Some(1)`, `target_name == ~alias`).
+  `ctrl_o_needs_connect`, `ctrl_o_selection == Some(1)`, `target_name == ~alias`)
+  и `apply_loaded_session_aborts_pending_ssh_task` (abort реально останавливает
+  in-flight задачу).
 
 **Публичный API:** нет изменений (приватный метод `apply_loaded_session`,
 внутренние поля `App`).
