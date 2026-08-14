@@ -4386,3 +4386,25 @@ session_meta_includes_launch_context). `cargo test --workspace` зелёные.
 apply_loaded_session×2). `cargo test -p filar-tui` — 321 passed.
 
 **Дальше:** #274 (GUI авто-выбор target/profile).
+
+---
+
+## Issue #274: feat(gui) — auto-select target/profile on session click
+
+**Milestone:** 0.9.0. **Ветка:** `feat/274-gui-session-autoselect`.
+
+**Что сделано:**
+- `SessionMeta` расширен полем `api_base_url` (для лаунчера).
+- GUI: `on_session_selected()` — при клике на сессию авто-выбирает SSH-слот
+  (по host:port из `ssh_info`), LLM-профиль (по имени), заполняет Model /
+  API base URL из launch-контекста. Нет совпадения SSH → Local + предупреждение.
+  Нет `ssh_info` → Local.
+- Список сессий показывает `ssh_info` (или target) и model.
+
+**Публичный API:** `SessionMeta` получил `api_base_url` (additive, serde-совместимо).
+
+**Тесты:** 4 новых (parse_ssh_host_port, session_click_autoselects_ssh_and_profile,
+session_click_without_ssh_info_stays_local, session_click_unmatched_ssh_warns_and_stays_local).
+`cargo test -p filar-gui` — 21 passed.
+
+**Дальше:** milestone 0.9.0 (session persistence) завершён.

@@ -69,6 +69,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   connection (password prompt via Ctrl+P), Esc cancels. F3 is shown in the
   bottom help bar and the F1 help overlay.
   ([#273](https://github.com/devlawey/filar/issues/273)).
+- GUI launcher: clicking a saved session now auto-selects the matching SSH
+  target (by host:port) and LLM profile (by name), and fills the Model / API
+  base URL fields from the session's launch context. The session list shows
+  the SSH host and model.
+  ([#274](https://github.com/devlawey/filar/issues/274)).
 
 ### Fixed
 

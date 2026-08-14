@@ -517,6 +517,32 @@ fn configure_theme(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
+/// Parse `user@host[:port]` (the persisted `ssh_info` format) into
+/// `(host, port)`. Supports bracketed IPv6 with an optional port.
+fn parse_ssh_host_port(info: &str) -> Option<(String, u16)> {
+    let (_, host_port) = info.split_once('@')?;
+    let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = &rest[..end];
+        let after = &rest[end + 1..];
+        let port = if after.is_empty() {
+            22
+        } else {
+            after.strip_prefix(':')?.parse().ok()?
+        };
+        (host.to_string(), port)
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse().ok()?),
+            None => (host_port.to_string(), 22),
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port))
+}
+
 impl LauncherApp {
     fn render_session_list(&mut self, ui: &mut egui::Ui) {
         ui.label("Recent sessions:");
@@ -531,19 +557,84 @@ impl LauncherApp {
         {
             self.selected_session = None;
         }
+        let mut clicked: Option<usize> = None;
         egui::ScrollArea::vertical()
             .max_height(100.0)
             .show(ui, |ui| {
                 for (i, session) in self.sessions.iter().enumerate() {
                     let selected = self.selected_session == Some(i);
+                    let host = session
+                        .ssh_info
+                        .clone()
+                        .unwrap_or_else(|| session.target.clone());
+                    let model = session
+                        .model
+                        .clone()
+                        .or_else(|| session.llm_profile.clone())
+                        .unwrap_or_default();
                     let text = format!(
-                        "  {} | {} | {}",
-                        session.timestamp, session.target, session.preview
+                        "  {} | {} | {} | {}",
+                        session.timestamp, host, model, session.preview
                     );
                     if ui.selectable_label(selected, &text).clicked() {
-                        self.selected_session = Some(i);
+                        clicked = Some(i);
                     }
-            }});
+                }
+            });
+        if let Some(i) = clicked {
+            self.on_session_selected(i);
+        }
+    }
+
+    /// Select a saved session and auto-configure the launcher from its launch
+    /// context: SSH target (matched by `ssh_info`), LLM profile (matched by
+    /// name), and the model / API base URL fields.
+    fn on_session_selected(&mut self, i: usize) {
+        self.selected_session = Some(i);
+        let Some(meta) = self.sessions.get(i).cloned() else {
+            return;
+        };
+
+        // Auto-select the LLM profile by name.
+        if let Some(ref name) = meta.llm_profile {
+            if let Some(idx) = self.profiles.iter().position(|p| p.name == *name) {
+                self.selected_profile = idx;
+            }
+        }
+        // Fill model / API base URL into the selected profile from the session.
+        if let Some(p) = self.profiles.get_mut(self.selected_profile) {
+            if let Some(model) = &meta.model {
+                if !model.is_empty() {
+                    p.model = model.clone();
+                }
+            }
+            if let Some(url) = &meta.api_base_url {
+                if !url.is_empty() {
+                    p.api_base_url = url.clone();
+                }
+            }
+        }
+
+        // Auto-select the SSH target by ssh_info.
+        match meta.ssh_info.as_deref().and_then(parse_ssh_host_port) {
+            Some((host, port)) => {
+                if let Some(slot_idx) = self.ssh_slots.iter().position(|s| {
+                    s.host == host && s.port.parse::<u16>().unwrap_or(0) == port
+                }) {
+                    self.target_mode = slot_idx + 1;
+                    self.validation_error.clear();
+                } else {
+                    self.target_mode = 0;
+                    self.validation_error = format!(
+                        "No SSH profile matches '{}'. Select a target manually.",
+                        meta.ssh_info.as_deref().unwrap_or_default()
+                    );
+                }
+            }
+            None => {
+                self.target_mode = 0;
+            }
+        }
     }
 
     fn render_target_selector(&mut self, ui: &mut egui::Ui) {
@@ -1260,6 +1351,101 @@ mod tests {
     fn ssh_cred_name_special_chars_preserved() {
         assert_eq!(ssh_cred_name(0, "my server!"), "ssh_target:my server!");
         assert_eq!(ssh_cred_name(1, "сервер"), "ssh_target:сервер");
+    }
+
+    fn make_meta(ssh_info: Option<&str>, llm_profile: Option<&str>, model: Option<&str>, api_base_url: Option<&str>) -> SessionMeta {
+        SessionMeta {
+            id: "1".into(),
+            timestamp: "2026-08-14 00:00:00".into(),
+            target: "local".into(),
+            llm_profile: llm_profile.map(str::to_string),
+            ssh_info: ssh_info.map(str::to_string),
+            model: model.map(str::to_string),
+            api_base_url: api_base_url.map(str::to_string),
+            preview: "hi".into(),
+        }
+    }
+
+    fn make_app(meta: SessionMeta) -> LauncherApp {
+        LauncherApp {
+            sessions: vec![meta],
+            selected_session: None,
+            target_mode: 0,
+            ssh_slots: vec![SshSlot {
+                host: "10.0.0.5".into(),
+                port: "22".into(),
+                user: "root".into(),
+                alias: String::new(),
+                password: String::new(),
+                save_password: false,
+            }],
+            profiles: vec![LlmProfileData {
+                name: "glm".into(),
+                model: String::new(),
+                api_base_url: String::new(),
+                key_env: "GLM_API_KEY".into(),
+                api_key: String::new(),
+                temperature: String::new(),
+                extra_body: String::new(),
+            }],
+            selected_profile: 0,
+            validation_error: String::new(),
+            save_dir: None,
+        }
+    }
+
+    #[test]
+    fn parse_ssh_host_port_parses_user_host_port() {
+        assert_eq!(
+            parse_ssh_host_port("root@10.0.0.5:22"),
+            Some(("10.0.0.5".to_string(), 22))
+        );
+        assert_eq!(
+            parse_ssh_host_port("admin@devbox"),
+            Some(("devbox".to_string(), 22))
+        );
+        assert_eq!(
+            parse_ssh_host_port("root@[::1]:2222"),
+            Some(("::1".to_string(), 2222))
+        );
+        assert!(parse_ssh_host_port("no-at-sign").is_none());
+    }
+
+    #[test]
+    fn session_click_autoselects_ssh_and_profile() {
+        let meta = make_meta(
+            Some("root@10.0.0.5:22"),
+            Some("glm"),
+            Some("glm-5.1"),
+            Some("https://example.com"),
+        );
+        let mut app = make_app(meta);
+        app.on_session_selected(0);
+        assert_eq!(app.target_mode, 1, "matching SSH slot must be selected");
+        assert_eq!(app.selected_profile, 0);
+        assert_eq!(app.profiles[0].model, "glm-5.1");
+        assert_eq!(app.profiles[0].api_base_url, "https://example.com");
+        assert!(app.validation_error.is_empty());
+    }
+
+    #[test]
+    fn session_click_without_ssh_info_stays_local() {
+        let meta = make_meta(None, None, None, None);
+        let mut app = make_app(meta);
+        app.on_session_selected(0);
+        assert_eq!(app.target_mode, 0, "no ssh_info → Local");
+    }
+
+    #[test]
+    fn session_click_unmatched_ssh_warns_and_stays_local() {
+        let meta = make_meta(Some("root@192.168.9.9:22"), None, None, None);
+        let mut app = make_app(meta);
+        app.on_session_selected(0);
+        assert_eq!(app.target_mode, 0, "no matching slot → Local");
+        assert!(
+            app.validation_error.contains("No SSH profile matches"),
+            "must warn about unmatched ssh_info"
+        );
     }
 }
 
