@@ -105,6 +105,9 @@ pub struct SessionMeta {
     /// Model identifier used at launch.
     #[serde(default)]
     pub model: Option<String>,
+    /// API base URL used at launch.
+    #[serde(default)]
+    pub api_base_url: Option<String>,
     /// Preview of the first user message (or system message).
     pub preview: String,
 }
@@ -125,6 +128,7 @@ impl From<&Session> for SessionMeta {
             llm_profile: s.llm_profile.clone(),
             ssh_info: s.ssh_info.clone(),
             model: s.model.clone(),
+            api_base_url: s.api_base_url.clone(),
             preview,
         }
     }
@@ -797,5 +801,6 @@ mod tests {
         let meta = SessionMeta::from(&session);
         assert_eq!(meta.ssh_info.as_deref(), Some("root@10.0.0.5:22"));
         assert_eq!(meta.model.as_deref(), Some("glm-5.1"));
+        assert_eq!(meta.api_base_url.as_deref(), Some("https://example.com"));
     }
 }

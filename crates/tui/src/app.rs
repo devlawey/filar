@@ -6467,6 +6467,7 @@ mod tests {
             llm_profile: None,
             ssh_info: None,
             model: None,
+            api_base_url: None,
             preview: String::new(),
         }];
         app.session_select_visible = true;
