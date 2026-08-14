@@ -632,10 +632,11 @@ impl LauncherApp {
         match meta.ssh_info.as_deref().and_then(parse_ssh_host_port) {
             Some((host, port)) => {
                 if let Some(slot_idx) = self.ssh_slots.iter().position(|s| {
-                    let slot_port = if s.port.trim().is_empty() {
+                    let trimmed = s.port.trim();
+                    let slot_port = if trimmed.is_empty() {
                         Some(22)
                     } else {
-                        s.port.parse::<u16>().ok()
+                        trimmed.parse::<u16>().ok()
                     };
                     s.host == host && slot_port == Some(port)
                 }) {
@@ -1519,6 +1520,15 @@ mod tests {
         app.ssh_slots[0].port = "22abc".into();
         app.on_session_selected(0);
         assert_eq!(app.target_mode, 0, "invalid non-empty port must not match 22");
+    }
+
+    #[test]
+    fn session_click_slot_port_with_spaces_matches() {
+        let meta = make_meta(Some("root@10.0.0.5:22"), None, None, None);
+        let mut app = make_app(meta);
+        app.ssh_slots[0].port = " 22 ".into();
+        app.on_session_selected(0);
+        assert_eq!(app.target_mode, 1, "whitespace around port must be trimmed");
     }
 }
 
