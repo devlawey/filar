@@ -4428,9 +4428,13 @@ session_click_without_ssh_info_stays_local, session_click_unmatched_ssh_warns_an
   `target_name`/`ssh_info` — вкладка остаётся на прежнем подключении
   (local или старый хост), `TransportChanged` заполняет их после успешного
   коннекта.
-- Вместо сообщения «Press Ctrl+P» — сразу вход в `PasswordInput` (тот же
-  путь, что Ctrl+P), чтобы восстановление реально подключалось, а не парковало
-  `pending_ssh`.
+- **Авто-подключение как в лаунчере:** если восстановленный хост совпадает с
+  настроенной `ssh_target` (host/port/user), `apply_loaded_session` идёт через
+  путь Ctrl+O (`ctrl_o_selection` + `ctrl_o_needs_connect`) — пароль резолвится
+  автоматически (config → keyring `ssh_target:{name}` → `SSH_PASSWORD` env) и
+  подключение происходит без запроса; при отсутствии пароля — `PasswordNeeded`.
+- **Fallback:** если хост не совпадает ни с одной целью — вход в `PasswordInput`
+  (тот же путь, что `!ssh` / Ctrl+P).
 - Сброс состояния в `apply_loaded_session` теперь также очищает `pending_ssh`
   и отменяет `pending_ssh_cancel`, чтобы старый SSH-таргет/подключение не
   переживали восстановление другой сессии.
@@ -4438,17 +4442,20 @@ session_click_without_ssh_info_stays_local, session_click_unmatched_ssh_warns_an
   `CancellationToken` (`pending_ssh_cancel`, по образцу `ctrl_o_cancel`) —
   предыдущая попытка отменяется при старте новой, а устаревший результат
   отбрасывается по `is_cancelled()` перед сменой executor'а.
-- Тест `apply_loaded_session_ssh_reconnects` обновлён: `ssh_info == None`,
-  `target_name` не меняется, `mode == PasswordInput`.
+- Тесты: `apply_loaded_session_ssh_reconnects` (fallback: `ssh_info == None`,
+  `target_name` не меняется, `mode == PasswordInput`) и новый
+  `apply_loaded_session_ssh_matches_target_autoconnects` (совпадение с целью →
+  `ctrl_o_needs_connect`, `ctrl_o_selection == Some(1)`, `target_name == ~alias`).
 
 **Публичный API:** нет изменений (приватный метод `apply_loaded_session`,
-внутреннее поле `App`).
+внутренние поля `App`).
 
 **Тесты:** `cargo build --workspace` и `cargo test --workspace` зелёные;
 7 тестов `#[ignore]` (docker-sshd) пропущены.
 
-**DoD (требует ручной проверки):** local → F3 → SSH-сессия → статус-бар
-остаётся local, открывается ввод пароля → ввод пароля → вкладка реально
-переключается на удалённый хост, статус-бар показывает хост.
+**DoD (требует ручной проверки):** local → F3 → SSH-сессия, чей хост совпадает
+с настроенной целью с сохранённым в keyring паролем → подключение без запроса,
+статус-бар показывает хост; если пароля нет — запрос пароля; если хост не
+совпадает ни с одной целью — ввод пароля вручную.
 
 **Дальше:** ручная проверка сценария DoD; затем CodeRabbit повторное ревью.

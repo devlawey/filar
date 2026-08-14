@@ -1030,10 +1030,12 @@ impl App {
     }
 
     /// Apply a loaded session to the active tab: messages, input history, LLM
-    /// profile, token stats, and — if the session was over SSH — switch to
-    /// `PasswordInput` to reconnect (the same flow as `!ssh user@host`). The
-    /// tab's `ssh_info`/`target_name` are only updated after the connection
-    /// succeeds (via `TransportChanged`).
+    /// profile, token stats, and — if the session was over SSH — reconnect to
+    /// the saved host. A host matching a configured SSH target reconnects via
+    /// the Ctrl+O path (password auto-resolved from keyring/env, like the
+    /// launcher); otherwise the tab switches to `PasswordInput`. The tab's
+    /// `ssh_info`/`target_name` are only updated after the connection succeeds
+    /// (via `TransportChanged`).
     fn apply_loaded_session(&mut self, session: filar_core::Session) {
         // Reset active runtime state before replacing history so stale events
         // from the previous session don't leak into the restored one. This
@@ -1112,24 +1114,42 @@ impl App {
             }
         }
 
-        // SSH reconnect: parse the saved `ssh_info` and re-initiate the
-        // password flow (the same path as `!ssh user@host`).
+        // SSH reconnect: parse the saved `ssh_info` and reconnect to the remote
+        // host. If it matches a configured SSH target, route through the Ctrl+O
+        // connect path so the password is auto-resolved from keyring/env (like
+        // the launcher); otherwise fall back to the manual password prompt.
         if let Some((user, host, port)) = session
             .ssh_info
             .as_deref()
             .and_then(parse_ssh_info)
         {
-            self.pending_ssh = Some((user.clone(), host.clone(), port));
-            // Do not touch `ssh_info`/`target_name` yet: the tab is still on
-            // its previous connection (local or old host) until the password is
-            // entered and the runner swaps the executor. `TransportChanged`
-            // fills both after a successful connect (#287).
-            self.input.clear();
-            self.cursor_pos = 0;
-            self.mode = AppMode::PasswordInput;
-            self.push_message(ChatBlock::System(format!(
-                "Enter SSH password for {user}@{host}:{port}"
-            )));
+            if let Some(pos) = self
+                .ssh_targets
+                .iter()
+                .position(|t| t.user == user && t.host == host && t.port == port)
+            {
+                // Mirrors `select_host` for the matched target: show the
+                // unconfirmed alias and let the runner resolve the password
+                // and connect (falling back to `PasswordNeeded` if none).
+                self.ctrl_o_selection = Some(pos + 1); // 0 is reserved for "local"
+                self.target_name = format!("~{}", self.ssh_targets[pos].name);
+                self.ctrl_o_needs_connect = true;
+                if let Some(tok) = self.ctrl_o_cancel.take() {
+                    tok.cancel();
+                }
+            } else {
+                self.pending_ssh = Some((user.clone(), host.clone(), port));
+                // Do not touch `ssh_info`/`target_name` yet: the tab is still
+                // on its previous connection until the password is entered and
+                // the runner swaps the executor. `TransportChanged` fills both
+                // after a successful connect (#287).
+                self.input.clear();
+                self.cursor_pos = 0;
+                self.mode = AppMode::PasswordInput;
+                self.push_message(ChatBlock::System(format!(
+                    "Enter SSH password for {user}@{host}:{port}"
+                )));
+            }
         } else {
             self.ssh_info = None;
             self.target_name = session.target.clone();
@@ -6595,6 +6615,45 @@ mod tests {
         assert!(app.pending_ssh.is_none(), "stale pending_ssh must be cleared");
         assert!(app.pending_ssh_password.is_none());
         assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn apply_loaded_session_ssh_matches_target_autoconnects() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![filar_core::SshTarget {
+            name: "srv-a".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            user: "root".into(),
+            auth: filar_core::SshAuth::Password { password: None },
+            host_key_policy: filar_core::HostKeyPolicy::Tofu,
+        }];
+        let session = filar_core::Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "prod".into(),
+            llm_profile: None,
+            messages: vec![],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: Some("root@10.0.0.5:22".into()),
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+        };
+        app.apply_loaded_session(session);
+        // Matching target → routed through the Ctrl+O connect path (password
+        // auto-resolved in the runner), not the manual password prompt.
+        assert!(app.ctrl_o_needs_connect, "matched target must trigger connect");
+        assert_eq!(app.ctrl_o_selection, Some(1));
+        assert_eq!(app.target_name, "~srv-a");
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.pending_ssh.is_none());
     }
 
     #[test]
