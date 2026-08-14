@@ -115,6 +115,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Fixed panic when agent output was truncated in the middle of a multibyte
   (e.g. Cyrillic) character — truncation is now by characters, not bytes
   ([#260](https://github.com/devlawey/filar/issues/260)).
+- F3 session restore: selecting a saved SSH session no longer shows the
+  remote host in the status bar before the connection is actually
+  established. When the saved host matches a configured SSH target, the tab
+  reconnects using that target's stored credentials (OS keyring /
+  `SSH_PASSWORD` environment), falling back to a password prompt if none are
+  available; otherwise it opens the password prompt and stays on its previous
+  connection until the reconnect completes
+  ([#287](https://github.com/devlawey/filar/issues/287)).
 
 ## [0.8.6] - 2026-08-02
 

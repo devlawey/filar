@@ -4408,3 +4408,61 @@ session_click_without_ssh_info_stays_local, session_click_unmatched_ssh_warns_an
 `cargo test -p filar-gui` — 21 passed.
 
 **Дальше:** milestone 0.9.0 (session persistence) завершён.
+
+---
+
+## Issue #287: fix(tui) — F3 восстановление SSH-сессии не переключало executor
+
+**Milestone:** 0.9.0 (follow-up). **Ветка:** `fix/287-ssh-restore-connect`.
+
+**Симптом:** F3 → выбор сохранённой SSH-сессии → статус-бар и подпись вкладки
+сразу показывали `user@host:port`, но вкладка оставалась на локальном executor'е,
+команды выполнялись локально.
+
+**Первопричина:** `App::apply_loaded_session` выставляла `target_name` и
+`ssh_info` немедленно, а реальная смена executor'а происходила только позже —
+после ручного Ctrl+P + пароль (`runner.rs`, ветка `pending_ssh_password`).
+
+**Решение:**
+- `apply_loaded_session`: при наличии `ssh_info` больше не трогает
+  `target_name`/`ssh_info` — вкладка остаётся на прежнем подключении
+  (local или старый хост), `TransportChanged` заполняет их после успешного
+  коннекта.
+- **Авто-подключение как в лаунчере:** если восстановленный хост совпадает с
+  настроенной `ssh_target` (host/port/user), `apply_loaded_session` идёт через
+  путь Ctrl+O (`ctrl_o_selection` + `ctrl_o_needs_connect`) — пароль резолвится
+  автоматически (config → keyring `ssh_target:{name}` → `SSH_PASSWORD` env) и
+  подключение происходит без запроса; при отсутствии пароля — `PasswordNeeded`.
+- **Fallback:** если хост не совпадает ни с одной целью — вход в `PasswordInput`
+  (тот же путь, что `!ssh` / Ctrl+P).
+- Сброс состояния в `apply_loaded_session` теперь также очищает `pending_ssh`
+  и отменяет `pending_ssh_cancel`, чтобы старый SSH-таргет/подключение не
+  переживали восстановление другой сессии.
+- Гонка отложенного коннекта: в `runner.rs` путь `pending_ssh` получил
+  `CancellationToken` (`pending_ssh_cancel`) и `JoinHandle` (`pending_ssh_handle`,
+  по образцу `ctrl_o_cancel`). Предыдущая попытка **абортится** при старте новой;
+  устаревший результат (и ошибка) отбрасывается по `is_cancelled()` в обеих ветках
+  (`Ok`/`Err`) перед сменой executor'а / отправкой события в UI.
+- Путь Ctrl+O получил симметричный `ctrl_o_handle` (`JoinHandle`): и `select_host`,
+  и сброс `apply_loaded_session` теперь **абортят** незавершённое Ctrl+O-подключение
+  (не только отменяют токен), чтобы оно не переживало новый выбор/восстановление.
+- Тесты: `apply_loaded_session_ssh_reconnects` (fallback: `ssh_info == None`,
+  `target_name` не меняется, `mode == PasswordInput`), новый
+  `apply_loaded_session_ssh_matches_target_autoconnects` (совпадение с целью →
+  `ctrl_o_needs_connect`, `ctrl_o_selection == Some(1)`, `target_name == ~alias`),
+  `apply_loaded_session_aborts_pending_ssh_task` и
+  `apply_loaded_session_aborts_ctrl_o_task` (abort реально останавливает in-flight
+  задачу для обоих путей).
+
+**Публичный API:** нет изменений (приватный метод `apply_loaded_session`,
+внутренние поля `App`).
+
+**Тесты:** `cargo build --workspace` и `cargo test --workspace` зелёные;
+7 тестов `#[ignore]` (docker-sshd) пропущены.
+
+**DoD (требует ручной проверки):** local → F3 → SSH-сессия, чей хост совпадает
+с настроенной целью с сохранённым в keyring паролем → подключение без запроса,
+статус-бар показывает хост; если пароля нет — запрос пароля; если хост не
+совпадает ни с одной целью — ввод пароля вручную.
+
+**Дальше:** ручная проверка сценария DoD; затем CodeRabbit повторное ревью.

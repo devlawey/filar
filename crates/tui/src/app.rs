@@ -179,6 +179,13 @@ pub struct App {
     pub pending_ssh: Option<(String, String, u16)>,
     /// Pending SSH password entered by the user via Ctrl+P.
     pub pending_ssh_password: Option<String>,
+    /// Cancellation token for an in-flight `!ssh`/F3-restore connection attempt,
+    /// so a stale attempt can't overwrite a newer one.
+    pub pending_ssh_cancel: Option<CancellationToken>,
+    /// Join handle for the in-flight connection attempt, aborted when a newer
+    /// attempt supersedes it so the connect is actually cancelled (not just
+    /// its result discarded).
+    pub pending_ssh_handle: Option<tokio::task::JoinHandle<()>>,
     /// Colour theme used by the UI renderer.
     pub theme: Theme,
     /// Status bar area (set during render, for hit-testing).
@@ -214,6 +221,9 @@ pub struct App {
     pub ctrl_o_needs_connect: bool,
     /// Cancellation token for an in-flight Ctrl+O connection attempt.
     pub ctrl_o_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Join handle for the in-flight Ctrl+O connection, aborted when a newer
+    /// selection or session restore supersedes it.
+    pub ctrl_o_handle: Option<tokio::task::JoinHandle<()>>,
     /// Pending Ctrl+O target that needs a password before connecting.
     pub ctrl_o_pending_target: Option<filar_core::SshTarget>,
     /// Session ID of the tab that initiated a password-needed connection.
@@ -402,6 +412,8 @@ impl App {
             secrets: Arc::new(StaticSecretProvider::new()),
             pending_ssh: None,
             pending_ssh_password: None,
+            pending_ssh_cancel: None,
+            pending_ssh_handle: None,
             theme: Theme::default_dark(),
             status_bar_area: Rect::default(),
             help_bar_area: Rect::default(),
@@ -417,6 +429,7 @@ impl App {
             ctrl_o_selection: None,
             ctrl_o_needs_connect: false,
             ctrl_o_cancel: None,
+            ctrl_o_handle: None,
             ctrl_o_pending_target: None,
             ctrl_o_pending_session_id: None,
             host_select_visible: false,
@@ -962,6 +975,9 @@ impl App {
         };
         self.target_name = alias;
         self.ctrl_o_needs_connect = true;
+        if let Some(handle) = self.ctrl_o_handle.take() {
+            handle.abort();
+        }
         if let Some(tok) = self.ctrl_o_cancel.take() {
             tok.cancel();
         }
@@ -999,8 +1015,8 @@ impl App {
 
     /// Confirm the session selection (Enter): load the full session and apply
     /// it to the active tab — messages, input history, LLM profile, token
-    /// stats. If the session was over SSH, re-initiate the SSH connection via
-    /// the password flow (`pending_ssh` + Ctrl+P).
+    /// stats. If the session was over SSH, the tab switches to password input
+    /// and reconnects via the same flow as `!ssh user@host`.
     fn select_session(&mut self) {
         let idx = self.session_select_index;
         self.session_select_visible = false;
@@ -1026,8 +1042,12 @@ impl App {
     }
 
     /// Apply a loaded session to the active tab: messages, input history, LLM
-    /// profile, token stats, and — if the session was over SSH — re-initiate
-    /// the SSH connection via the password flow (`pending_ssh` + Ctrl+P).
+    /// profile, token stats, and — if the session was over SSH — reconnect to
+    /// the saved host. A host matching a configured SSH target reconnects via
+    /// the Ctrl+O path (password auto-resolved from keyring/env, like the
+    /// launcher) and shows the unconfirmed `~alias` until connected; otherwise
+    /// the tab switches to `PasswordInput` and keeps its current
+    /// `ssh_info`/`target_name` until `TransportChanged` confirms the connect.
     fn apply_loaded_session(&mut self, session: filar_core::Session) {
         // Reset active runtime state before replacing history so stale events
         // from the previous session don't leak into the restored one. This
@@ -1055,6 +1075,19 @@ impl App {
         self.toggle_interactive = false;
         self.terminal = None;
         self.pending_ssh_password = None;
+        self.pending_ssh = None;
+        if let Some(handle) = self.pending_ssh_handle.take() {
+            handle.abort();
+        }
+        if let Some(tok) = self.pending_ssh_cancel.take() {
+            tok.cancel();
+        }
+        if let Some(handle) = self.ctrl_o_handle.take() {
+            handle.abort();
+        }
+        if let Some(tok) = self.ctrl_o_cancel.take() {
+            tok.cancel();
+        }
         self.ctrl_o_pending_target = None;
         self.ctrl_o_pending_session_id = None;
         self.confirm_button_areas.clear();
@@ -1102,19 +1135,40 @@ impl App {
             }
         }
 
-        // SSH reconnect: parse the saved `ssh_info` and re-initiate the
-        // password flow (the same path as `!ssh user@host`).
+        // SSH reconnect: parse the saved `ssh_info` and reconnect to the remote
+        // host. If it matches a configured SSH target, route through the Ctrl+O
+        // connect path so the password is auto-resolved from keyring/env (like
+        // the launcher); otherwise fall back to the manual password prompt.
         if let Some((user, host, port)) = session
             .ssh_info
             .as_deref()
             .and_then(parse_ssh_info)
         {
-            self.pending_ssh = Some((user.clone(), host.clone(), port));
-            self.ssh_info = Some(format!("{user}@{host}:{port}"));
-            self.target_name = format!("{user}@{host}:{port}");
-            self.push_message(ChatBlock::System(format!(
-                "Restored SSH target {user}@{host}:{port}. Press Ctrl+P to enter the password."
-            )));
+            if let Some(pos) = self
+                .ssh_targets
+                .iter()
+                .position(|t| t.user == user && t.host == host && t.port == port)
+            {
+                // Mirrors `select_host` for the matched target: show the
+                // unconfirmed alias and let the runner resolve the password
+                // and connect (falling back to `PasswordNeeded` if none).
+                // `ctrl_o_cancel` was already cleared in the reset above.
+                self.ctrl_o_selection = Some(pos + 1); // 0 is reserved for "local"
+                self.target_name = format!("~{}", self.ssh_targets[pos].name);
+                self.ctrl_o_needs_connect = true;
+            } else {
+                self.pending_ssh = Some((user.clone(), host.clone(), port));
+                // Do not touch `ssh_info`/`target_name` yet: the tab is still
+                // on its previous connection until the password is entered and
+                // the runner swaps the executor. `TransportChanged` fills both
+                // after a successful connect (#287).
+                self.input.clear();
+                self.cursor_pos = 0;
+                self.mode = AppMode::PasswordInput;
+                self.push_message(ChatBlock::System(format!(
+                    "Enter SSH password for {user}@{host}:{port}"
+                )));
+            }
         } else {
             self.ssh_info = None;
             self.target_name = session.target.clone();
@@ -6545,8 +6599,149 @@ mod tests {
             app.pending_ssh,
             Some(("root".into(), "10.0.0.5".into(), 22))
         );
-        assert_eq!(app.ssh_info.as_deref(), Some("root@10.0.0.5:22"));
-        assert_eq!(app.target_name, "root@10.0.0.5:22");
+        // The tab must not claim to be remote until the connection is actually
+        // established: `ssh_info`/`target_name` stay untouched and the password
+        // prompt opens immediately (#287).
+        assert_eq!(app.ssh_info.as_deref(), None);
+        assert_eq!(app.target_name, "local");
+        assert_eq!(app.mode, AppMode::PasswordInput);
+    }
+
+    #[test]
+    fn apply_loaded_session_clears_stale_pending_ssh() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_ssh = Some(("old".into(), "old-host".into(), 22));
+        app.pending_ssh_password = Some("secret".into());
+        let token = tokio_util::sync::CancellationToken::new();
+        app.pending_ssh_cancel = Some(token.clone());
+        let session = filar_core::Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "local".into(),
+            llm_profile: None,
+            messages: vec![],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+        };
+        app.apply_loaded_session(session);
+        assert!(app.pending_ssh.is_none(), "stale pending_ssh must be cleared");
+        assert!(app.pending_ssh_password.is_none());
+        assert!(token.is_cancelled(), "in-flight pending_ssh must be cancelled");
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[tokio::test]
+    async fn apply_loaded_session_aborts_pending_ssh_task() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            let _ = tx.send(());
+        });
+        app.pending_ssh_handle = Some(handle);
+        let session = filar_core::Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "local".into(),
+            llm_profile: None,
+            messages: vec![],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+        };
+        app.apply_loaded_session(session);
+        assert!(app.pending_ssh_handle.is_none(), "handle must be taken on reset");
+        // The spawned task is aborted, so its oneshot sender is dropped without
+        // sending — awaiting the receiver resolves to `Err`.
+        assert!(rx.await.is_err(), "aborted task must not run to completion");
+    }
+
+    #[tokio::test]
+    async fn apply_loaded_session_aborts_ctrl_o_task() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            let _ = tx.send(());
+        });
+        app.ctrl_o_handle = Some(handle);
+        let session = filar_core::Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "local".into(),
+            llm_profile: None,
+            messages: vec![],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+        };
+        app.apply_loaded_session(session);
+        assert!(app.ctrl_o_handle.is_none(), "ctrl_o handle must be taken on reset");
+        assert!(rx.await.is_err(), "aborted Ctrl+O task must not run to completion");
+    }
+
+    #[test]
+    fn apply_loaded_session_ssh_matches_target_autoconnects() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![filar_core::SshTarget {
+            name: "srv-a".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            user: "root".into(),
+            auth: filar_core::SshAuth::Password { password: None },
+            host_key_policy: filar_core::HostKeyPolicy::Tofu,
+        }];
+        let session = filar_core::Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "prod".into(),
+            llm_profile: None,
+            messages: vec![],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: Some("root@10.0.0.5:22".into()),
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+        };
+        app.apply_loaded_session(session);
+        // Matching target → routed through the Ctrl+O connect path (password
+        // auto-resolved in the runner), not the manual password prompt.
+        assert!(app.ctrl_o_needs_connect, "matched target must trigger connect");
+        assert_eq!(app.ctrl_o_selection, Some(1));
+        assert_eq!(app.target_name, "~srv-a");
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.pending_ssh.is_none());
     }
 
     #[test]

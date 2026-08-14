@@ -814,7 +814,18 @@ async fn run_app(
                         let tx = agent_tx.clone();
                         let exec_entry = executors.get(&sid)
                             .map(|e| (e.executor.clone(), e.ssh_target.clone()));
-                        tokio::spawn(async move {
+                        // Cancel any previous in-flight attempt for this tab so
+                        // a stale connection can't overwrite a newer one (race
+                        // between `!ssh` and F3 restore).
+                        if let Some(handle) = app.pending_ssh_handle.take() {
+                            handle.abort();
+                        }
+                        if let Some(tok) = app.pending_ssh_cancel.take() {
+                            tok.cancel();
+                        }
+                        let token = CancellationToken::new();
+                        app.pending_ssh_cancel = Some(token.clone());
+                        let handle = tokio::spawn(async move {
                             let _ = tx.send(TuiEvent::Thinking);
                             let target = filar_core::SshTarget {
                                 name: "dynamic".into(),
@@ -829,6 +840,11 @@ async fn run_app(
                             let new_ssh_info = format!("{user}@{host}:{port}");
                             match filar_transport::SshExecutor::connect(&target).await {
                                 Ok(ssh_exec) => {
+                                    // A newer attempt superseded this one while
+                                    // we were connecting — drop the result.
+                                    if token.is_cancelled() {
+                                        return;
+                                    }
                                     // Swap the executor for this session only.
                                     if let Some((ref exec, ref st)) = exec_entry {
                                         exec.swap_executor(Arc::new(ssh_exec)
@@ -854,6 +870,11 @@ async fn run_app(
                                     });
                                 }
                                 Err(e) => {
+                                    // Don't surface a stale error from an
+                                    // attempt that a newer one superseded.
+                                    if token.is_cancelled() {
+                                        return;
+                                    }
                                     let _ = tx.send(TuiEvent::Agent {
                                         session_id: sid,
                                         event: filar_agent::AgentEvent::Error(format!(
@@ -863,6 +884,7 @@ async fn run_app(
                                 }
                             }
                         });
+                        app.pending_ssh_handle = Some(handle);
                     }
                 }
 
@@ -877,9 +899,15 @@ async fn run_app(
                     .map(|e| (e.executor.clone(), e.ssh_target.clone()));
                 let tx = agent_tx.clone();
                 let alias = target.name.clone();
+                if let Some(handle) = app.ctrl_o_handle.take() {
+                    handle.abort();
+                }
+                if let Some(tok) = app.ctrl_o_cancel.take() {
+                    tok.cancel();
+                }
                 let token = CancellationToken::new();
                 app.ctrl_o_cancel = Some(token.clone());
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     tokio::select! {
                         _ = token.cancelled() => return,
                         _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
@@ -907,9 +935,15 @@ async fn run_app(
                         }
                     }
                 });
+                app.ctrl_o_handle = Some(handle);
                 continue;
             }
-            app.ctrl_o_needs_connect = false;
+            if let Some(handle) = app.ctrl_o_handle.take() {
+                handle.abort();
+            }
+            if let Some(tok) = app.ctrl_o_cancel.take() {
+                tok.cancel();
+            }
             let token = CancellationToken::new();
             app.ctrl_o_cancel = Some(token.clone());
             let selection = app.ctrl_o_selection;
@@ -918,7 +952,7 @@ async fn run_app(
             let exec_entry = executors.get(&sid)
                 .map(|e| (e.executor.clone(), e.ssh_target.clone()));
             let tx = agent_tx.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 tokio::select! {
                     _ = token.cancelled() => return,
                     _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
@@ -994,6 +1028,7 @@ async fn run_app(
                     }
                 }
             });
+            app.ctrl_o_handle = Some(handle);
         }
 
         // Teardown backends for tabs closed via Ctrl+W / close_tab.
