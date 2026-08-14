@@ -543,6 +543,21 @@ fn parse_ssh_host_port(info: &str) -> Option<(String, u16)> {
     Some((host, port))
 }
 
+/// Fill a profile's model / API base URL fields from a session's launch
+/// context (empty session values leave the profile untouched).
+fn fill_profile_from_meta(p: &mut LlmProfileData, meta: &SessionMeta) {
+    if let Some(model) = &meta.model {
+        if !model.is_empty() {
+            p.model = model.clone();
+        }
+    }
+    if let Some(url) = &meta.api_base_url {
+        if !url.is_empty() {
+            p.api_base_url = url.clone();
+        }
+    }
+}
+
 impl LauncherApp {
     fn render_session_list(&mut self, ui: &mut egui::Ui) {
         ui.label("Recent sessions:");
@@ -597,21 +612,18 @@ impl LauncherApp {
 
         // Auto-select the LLM profile by name and fill its model / API base
         // URL from the session launch context. Only the matched profile is
-        // touched, so an unrelated profile is never overwritten.
-        if let Some(ref name) = meta.llm_profile {
-            if let Some(idx) = self.profiles.iter().position(|p| p.name == *name) {
-                self.selected_profile = idx;
-                if let Some(p) = self.profiles.get_mut(idx) {
-                    if let Some(model) = &meta.model {
-                        if !model.is_empty() {
-                            p.model = model.clone();
-                        }
-                    }
-                    if let Some(url) = &meta.api_base_url {
-                        if !url.is_empty() {
-                            p.api_base_url = url.clone();
-                        }
-                    }
+        // touched when a name is present; without a name, the flat model/URL
+        // is restored into the current selection.
+        match &meta.llm_profile {
+            Some(name) => {
+                if let Some(idx) = self.profiles.iter().position(|p| p.name == *name) {
+                    self.selected_profile = idx;
+                    fill_profile_from_meta(&mut self.profiles[idx], &meta);
+                }
+            }
+            None => {
+                if let Some(p) = self.profiles.get_mut(self.selected_profile) {
+                    fill_profile_from_meta(p, &meta);
                 }
             }
         }
@@ -620,7 +632,12 @@ impl LauncherApp {
         match meta.ssh_info.as_deref().and_then(parse_ssh_host_port) {
             Some((host, port)) => {
                 if let Some(slot_idx) = self.ssh_slots.iter().position(|s| {
-                    s.host == host && s.port.parse::<u16>().unwrap_or(22) == port
+                    let slot_port = if s.port.trim().is_empty() {
+                        Some(22)
+                    } else {
+                        s.port.parse::<u16>().ok()
+                    };
+                    s.host == host && slot_port == Some(port)
                 }) {
                     self.target_mode = slot_idx + 1;
                     self.validation_error.clear();
@@ -1483,6 +1500,25 @@ mod tests {
         app.validation_error = "stale warning".into();
         app.on_session_selected(0);
         assert!(app.validation_error.is_empty(), "Local selection must clear stale warning");
+    }
+
+    #[test]
+    fn session_click_flat_model_fills_current_profile() {
+        let meta = make_meta(None, None, Some("flat-model"), Some("https://flat.example.com"));
+        let mut app = make_app(meta);
+        app.on_session_selected(0);
+        assert_eq!(app.selected_profile, 0);
+        assert_eq!(app.profiles[0].model, "flat-model");
+        assert_eq!(app.profiles[0].api_base_url, "https://flat.example.com");
+    }
+
+    #[test]
+    fn session_click_invalid_slot_port_does_not_match() {
+        let meta = make_meta(Some("root@10.0.0.5:22"), None, None, None);
+        let mut app = make_app(meta);
+        app.ssh_slots[0].port = "22abc".into();
+        app.on_session_selected(0);
+        assert_eq!(app.target_mode, 0, "invalid non-empty port must not match 22");
     }
 }
 
