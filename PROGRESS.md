@@ -4408,3 +4408,37 @@ session_click_without_ssh_info_stays_local, session_click_unmatched_ssh_warns_an
 `cargo test -p filar-gui` вЂ” 21 passed.
 
 **Р”Р°Р»СЊС€Рµ:** milestone 0.9.0 (session persistence) Р·Р°РІРµСЂС€С‘РЅ.
+
+---
+
+## Issue #287: fix(tui) — F3 восстановление SSH-сессии не переключало executor
+
+**Milestone:** 0.9.0 (follow-up). **Ветка:** `fix/287-ssh-restore-connect`.
+
+**Симптом:** F3 > выбор сохранённой SSH-сессии > статус-бар и подпись вкладки
+сразу показывали `user@host:port`, но вкладка оставалась на локальном executor'е,
+команды выполнялись локально.
+
+**Первопричина:** `App::apply_loaded_session` выставляла `target_name` и
+`ssh_info` немедленно, а реальная смена executor'а происходила только позже —
+после ручного Ctrl+P + пароль (`runner.rs`, ветка `pending_ssh_password`).
+
+**Решение:**
+- `apply_loaded_session`: при наличии `ssh_info` больше не трогает
+  `target_name`/`ssh_info` — вкладка остаётся на прежнем подключении
+  (local или старый хост), `TransportChanged` заполняет их после успешного
+  коннекта (#287).
+- Вместо сообщения «Press Ctrl+P» — сразу вход в `PasswordInput` (тот же
+  путь, что Ctrl+P), чтобы восстановление реально подключалось, а не парковало
+  `pending_ssh`.
+- Тест `apply_loaded_session_ssh_reconnects` обновлён: `ssh_info == None`,
+  `target_name` не меняется, `mode == PasswordInput`.
+
+**Публичный API:** нет изменений (приватный метод `apply_loaded_session`).
+
+**Тесты:** `cargo build --workspace` и `cargo test --workspace` зелёные;
+7 тестов `#[ignore]` (docker-sshd) пропущены.
+
+**DoD (требует ручной проверки):** local > F3 > SSH-сессия > статус-бар
+остаётся local, открывается ввод пароля > ввод пароля > вкладка реально
+переключается на удалённый хост, статус-бар показывает хост.

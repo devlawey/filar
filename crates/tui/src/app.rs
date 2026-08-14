@@ -1110,10 +1110,15 @@ impl App {
             .and_then(parse_ssh_info)
         {
             self.pending_ssh = Some((user.clone(), host.clone(), port));
-            self.ssh_info = Some(format!("{user}@{host}:{port}"));
-            self.target_name = format!("{user}@{host}:{port}");
+            // Do not touch `ssh_info`/`target_name` yet: the tab is still on
+            // its previous connection (local or old host) until the password is
+            // entered and the runner swaps the executor. `TransportChanged`
+            // fills both after a successful connect (#287).
+            self.input.clear();
+            self.cursor_pos = 0;
+            self.mode = AppMode::PasswordInput;
             self.push_message(ChatBlock::System(format!(
-                "Restored SSH target {user}@{host}:{port}. Press Ctrl+P to enter the password."
+                "Enter SSH password for {user}@{host}:{port}"
             )));
         } else {
             self.ssh_info = None;
@@ -6545,8 +6550,12 @@ mod tests {
             app.pending_ssh,
             Some(("root".into(), "10.0.0.5".into(), 22))
         );
-        assert_eq!(app.ssh_info.as_deref(), Some("root@10.0.0.5:22"));
-        assert_eq!(app.target_name, "root@10.0.0.5:22");
+        // The tab must not claim to be remote until the connection is actually
+        // established: `ssh_info`/`target_name` stay untouched and the password
+        // prompt opens immediately (#287).
+        assert_eq!(app.ssh_info.as_deref(), None);
+        assert_eq!(app.target_name, "local");
+        assert_eq!(app.mode, AppMode::PasswordInput);
     }
 
     #[test]
