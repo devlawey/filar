@@ -1556,6 +1556,7 @@ dependencies = [
  "alacritty_terminal",
  "arboard",
  "async-trait",
+ "chrono",
  "crossterm",
  "filar-agent",
  "filar-core",
