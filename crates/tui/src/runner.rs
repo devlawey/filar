@@ -817,12 +817,15 @@ async fn run_app(
                         // Cancel any previous in-flight attempt for this tab so
                         // a stale connection can't overwrite a newer one (race
                         // between `!ssh` and F3 restore).
+                        if let Some(handle) = app.pending_ssh_handle.take() {
+                            handle.abort();
+                        }
                         if let Some(tok) = app.pending_ssh_cancel.take() {
                             tok.cancel();
                         }
                         let token = CancellationToken::new();
                         app.pending_ssh_cancel = Some(token.clone());
-                        tokio::spawn(async move {
+                        let handle = tokio::spawn(async move {
                             let _ = tx.send(TuiEvent::Thinking);
                             let target = filar_core::SshTarget {
                                 name: "dynamic".into(),
@@ -867,6 +870,11 @@ async fn run_app(
                                     });
                                 }
                                 Err(e) => {
+                                    // Don't surface a stale error from an
+                                    // attempt that a newer one superseded.
+                                    if token.is_cancelled() {
+                                        return;
+                                    }
                                     let _ = tx.send(TuiEvent::Agent {
                                         session_id: sid,
                                         event: filar_agent::AgentEvent::Error(format!(
@@ -876,6 +884,7 @@ async fn run_app(
                                 }
                             }
                         });
+                        app.pending_ssh_handle = Some(handle);
                     }
                 }
 

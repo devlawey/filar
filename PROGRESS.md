@@ -4439,9 +4439,12 @@ session_click_without_ssh_info_stays_local, session_click_unmatched_ssh_warns_an
   и отменяет `pending_ssh_cancel`, чтобы старый SSH-таргет/подключение не
   переживали восстановление другой сессии.
 - Гонка отложенного коннекта: в `runner.rs` путь `pending_ssh` получил
-  `CancellationToken` (`pending_ssh_cancel`, по образцу `ctrl_o_cancel`) —
-  предыдущая попытка отменяется при старте новой, а устаревший результат
-  отбрасывается по `is_cancelled()` перед сменой executor'а.
+  `CancellationToken` (`pending_ssh_cancel`) и `JoinHandle` (`pending_ssh_handle`,
+  по образцу `ctrl_o_cancel`). Предыдущая попытка **абортится** при старте новой;
+  устаревший результат (и ошибка) отбрасывается по `is_cancelled()` в обеих ветках
+  (`Ok`/`Err`) перед сменой executor'а / отправкой события в UI.
+- Сброс `apply_loaded_session` дополнительно отменяет `ctrl_o_cancel`, чтобы
+  незавершённое Ctrl+O-подключение не переживало восстановление сессии.
 - Тесты: `apply_loaded_session_ssh_reconnects` (fallback: `ssh_info == None`,
   `target_name` не меняется, `mode == PasswordInput`) и новый
   `apply_loaded_session_ssh_matches_target_autoconnects` (совпадение с целью →

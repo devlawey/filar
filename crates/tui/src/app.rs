@@ -182,6 +182,10 @@ pub struct App {
     /// Cancellation token for an in-flight `!ssh`/F3-restore connection attempt,
     /// so a stale attempt can't overwrite a newer one.
     pub pending_ssh_cancel: Option<CancellationToken>,
+    /// Join handle for the in-flight connection attempt, aborted when a newer
+    /// attempt supersedes it so the connect is actually cancelled (not just
+    /// its result discarded).
+    pub pending_ssh_handle: Option<tokio::task::JoinHandle<()>>,
     /// Colour theme used by the UI renderer.
     pub theme: Theme,
     /// Status bar area (set during render, for hit-testing).
@@ -406,6 +410,7 @@ impl App {
             pending_ssh: None,
             pending_ssh_password: None,
             pending_ssh_cancel: None,
+            pending_ssh_handle: None,
             theme: Theme::default_dark(),
             status_bar_area: Rect::default(),
             help_bar_area: Rect::default(),
@@ -1033,9 +1038,9 @@ impl App {
     /// profile, token stats, and — if the session was over SSH — reconnect to
     /// the saved host. A host matching a configured SSH target reconnects via
     /// the Ctrl+O path (password auto-resolved from keyring/env, like the
-    /// launcher); otherwise the tab switches to `PasswordInput`. The tab's
-    /// `ssh_info`/`target_name` are only updated after the connection succeeds
-    /// (via `TransportChanged`).
+    /// launcher) and shows the unconfirmed `~alias` until connected; otherwise
+    /// the tab switches to `PasswordInput` and keeps its current
+    /// `ssh_info`/`target_name` until `TransportChanged` confirms the connect.
     fn apply_loaded_session(&mut self, session: filar_core::Session) {
         // Reset active runtime state before replacing history so stale events
         // from the previous session don't leak into the restored one. This
@@ -1064,7 +1069,13 @@ impl App {
         self.terminal = None;
         self.pending_ssh_password = None;
         self.pending_ssh = None;
+        if let Some(handle) = self.pending_ssh_handle.take() {
+            handle.abort();
+        }
         if let Some(tok) = self.pending_ssh_cancel.take() {
+            tok.cancel();
+        }
+        if let Some(tok) = self.ctrl_o_cancel.take() {
             tok.cancel();
         }
         self.ctrl_o_pending_target = None;
@@ -1131,12 +1142,10 @@ impl App {
                 // Mirrors `select_host` for the matched target: show the
                 // unconfirmed alias and let the runner resolve the password
                 // and connect (falling back to `PasswordNeeded` if none).
+                // `ctrl_o_cancel` was already cleared in the reset above.
                 self.ctrl_o_selection = Some(pos + 1); // 0 is reserved for "local"
                 self.target_name = format!("~{}", self.ssh_targets[pos].name);
                 self.ctrl_o_needs_connect = true;
-                if let Some(tok) = self.ctrl_o_cancel.take() {
-                    tok.cancel();
-                }
             } else {
                 self.pending_ssh = Some((user.clone(), host.clone(), port));
                 // Do not touch `ssh_info`/`target_name` yet: the tab is still
@@ -6593,6 +6602,8 @@ mod tests {
         let mut app = App::new("local".into(), CommandConfirmMode::Always);
         app.pending_ssh = Some(("old".into(), "old-host".into(), 22));
         app.pending_ssh_password = Some("secret".into());
+        let token = tokio_util::sync::CancellationToken::new();
+        app.pending_ssh_cancel = Some(token.clone());
         let session = filar_core::Session {
             id: "1".into(),
             timestamp: "t".into(),
@@ -6614,6 +6625,7 @@ mod tests {
         app.apply_loaded_session(session);
         assert!(app.pending_ssh.is_none(), "stale pending_ssh must be cleared");
         assert!(app.pending_ssh_password.is_none());
+        assert!(token.is_cancelled(), "in-flight pending_ssh must be cancelled");
         assert_eq!(app.mode, AppMode::Normal);
     }
 
