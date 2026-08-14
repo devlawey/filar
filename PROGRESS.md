@@ -4449,9 +4449,10 @@ session_click_without_ssh_info_stays_local, session_click_unmatched_ssh_warns_an
 - Тесты: `apply_loaded_session_ssh_reconnects` (fallback: `ssh_info == None`,
   `target_name` не меняется, `mode == PasswordInput`), новый
   `apply_loaded_session_ssh_matches_target_autoconnects` (совпадение с целью →
-  `ctrl_o_needs_connect`, `ctrl_o_selection == Some(1)`, `target_name == ~alias`)
-  и `apply_loaded_session_aborts_pending_ssh_task` (abort реально останавливает
-  in-flight задачу).
+  `ctrl_o_needs_connect`, `ctrl_o_selection == Some(1)`, `target_name == ~alias`),
+  `apply_loaded_session_aborts_pending_ssh_task` и
+  `apply_loaded_session_aborts_ctrl_o_task` (abort реально останавливает in-flight
+  задачу для обоих путей).
 
 **Публичный API:** нет изменений (приватный метод `apply_loaded_session`,
 внутренние поля `App`).

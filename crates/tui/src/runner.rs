@@ -938,7 +938,6 @@ async fn run_app(
                 app.ctrl_o_handle = Some(handle);
                 continue;
             }
-            app.ctrl_o_needs_connect = false;
             if let Some(handle) = app.ctrl_o_handle.take() {
                 handle.abort();
             }

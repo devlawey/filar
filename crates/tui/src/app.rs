@@ -6673,6 +6673,38 @@ mod tests {
         assert!(rx.await.is_err(), "aborted task must not run to completion");
     }
 
+    #[tokio::test]
+    async fn apply_loaded_session_aborts_ctrl_o_task() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            let _ = tx.send(());
+        });
+        app.ctrl_o_handle = Some(handle);
+        let session = filar_core::Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "local".into(),
+            llm_profile: None,
+            messages: vec![],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+        };
+        app.apply_loaded_session(session);
+        assert!(app.ctrl_o_handle.is_none(), "ctrl_o handle must be taken on reset");
+        assert!(rx.await.is_err(), "aborted Ctrl+O task must not run to completion");
+    }
+
     #[test]
     fn apply_loaded_session_ssh_matches_target_autoconnects() {
         let mut app = App::new("local".into(), CommandConfirmMode::Always);
