@@ -3149,9 +3149,10 @@ fn parse_ssh_info(info: &str) -> Option<(String, String, u16)> {
         let end = rest.find(']')?;
         let host = &rest[..end];
         let after = &rest[end + 1..];
-        let port = match after.strip_prefix(':') {
-            Some(p) => p.parse().ok()?,
-            None => 22,
+        let port = if after.is_empty() {
+            22
+        } else {
+            after.strip_prefix(':')?.parse().ok()?
         };
         (host.to_string(), port)
     } else {
@@ -6438,6 +6439,12 @@ mod tests {
         assert_eq!(user, "root");
         assert_eq!(host, "::1");
         assert_eq!(port, 22);
+    }
+
+    #[test]
+    fn parse_ssh_info_rejects_garbage_after_bracket() {
+        assert!(parse_ssh_info("root@[::1]oops").is_none());
+        assert!(parse_ssh_info("root@[::1]:22oops").is_none());
     }
 
     #[test]
