@@ -110,6 +110,34 @@ pub fn resolve_startup_profile(
     }
 }
 
+/// Build an [`SshTarget`](filar_core::SshTarget) from a GUI [`SshConnection`](filar_gui::SshConnection).
+///
+/// When the password is empty (normal after `pending_launch.json` deserialize —
+/// it is `#[serde(skip)]`), reads it from the OS keyring under
+/// [`filar_core::ssh_cred_name`] — the same key the launcher writes.
+/// Target `name` uses [`filar_core::ssh_target_display_name`] so later TUI
+/// reconnects (`ssh_target:{name}`) hit the same entry.
+fn resolve_gui_ssh_target(s: &filar_gui::SshConnection) -> filar_core::SshTarget {
+    let name = filar_core::ssh_target_display_name(s.slot, &s.alias);
+    let password = if s.password.is_empty() {
+        let cred = filar_core::KeyringSecretProvider::new();
+        let key = filar_core::ssh_cred_name(s.slot, &s.alias);
+        cred.get(&key)
+            .inspect_err(|e| tracing::debug!(error = %e, %key, "no saved SSH password in keyring"))
+            .ok()
+    } else {
+        Some(s.password.clone())
+    };
+    filar_core::SshTarget {
+        name,
+        host: s.host.clone(),
+        port: s.port,
+        user: s.user.clone(),
+        auth: filar_core::SshAuth::Password { password },
+        host_key_policy: filar_core::HostKeyPolicy::Tofu,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LLM client factory
 // ---------------------------------------------------------------------------
@@ -334,26 +362,9 @@ async fn run() -> anyhow::Result<()> {
                 // Build SshTarget if the user selected SSH in the GUI.
                 // Read password from OS credential store if not passed in
                 // (since the struct now excludes secrets from serialization).
+                // Keyring key MUST match GUI/`ssh_cred_name` (#290), not legacy `ssh{slot}`.
                 let ssh_target = launch.ssh.map(|s| {
-                    let password = if s.password.is_empty() {
-                        let cred = filar_core::KeyringSecretProvider::new();
-                        let name = format!("ssh{}", s.slot);
-                        cred.get(&name)
-                            .inspect_err(|e| tracing::debug!(error = %e, %name, "no saved SSH password in keyring"))
-                            .ok()
-                    } else {
-                        Some(s.password)
-                    };
-                    filar_core::SshTarget {
-                        name: "gui-ssh".to_string(),
-                        host: s.host,
-                        port: s.port,
-                        user: s.user,
-                        auth: filar_core::SshAuth::Password {
-                            password,
-                        },
-                        host_key_policy: filar_core::HostKeyPolicy::Tofu,
-                    }
+                    resolve_gui_ssh_target(&s)
                 });
 
                 // Read API key from OS credential store using the profile's key_env.
@@ -570,7 +581,61 @@ async fn run() -> anyhow::Result<()> {
 mod tests {
     use filar_core::{LlmProfile, SecretProvider, StaticSecretProvider};
 
-    use super::build_llm_client_from_profile;
+    use super::{build_llm_client_from_profile, resolve_gui_ssh_target};
+
+    // ── GUI→TUI SSH keyring handoff (#290) ──────────────────────────────
+
+    #[test]
+    fn resolve_gui_ssh_uses_cred_name_not_legacy_ssh_slot() {
+        // Empty password → keyring lookup uses ssh_target:…, never ssh{N}.
+        let conn = filar_gui::SshConnection {
+            host: "10.0.0.1".into(),
+            port: 22,
+            user: "root".into(),
+            password: String::new(),
+            slot: 0,
+            alias: String::new(),
+        };
+        let target = resolve_gui_ssh_target(&conn);
+        assert_eq!(target.name, "SSH1", "empty alias → SSH{{slot+1}}");
+        assert_eq!(
+            filar_core::ssh_cred_name(conn.slot, &conn.alias),
+            "ssh_target:SSH1",
+            "keyring key must match GUI save contract"
+        );
+        // Legacy key `ssh0` must NOT be what we document/use.
+        assert_ne!(
+            filar_core::ssh_cred_name(conn.slot, &conn.alias),
+            format!("ssh{}", conn.slot)
+        );
+    }
+
+    #[test]
+    fn resolve_gui_ssh_alias_sets_target_name_and_cred_key() {
+        let conn = filar_gui::SshConnection {
+            host: "example.com".into(),
+            port: 2222,
+            user: "admin".into(),
+            password: "in-memory".into(),
+            slot: 2,
+            alias: "prod-web".into(),
+        };
+        let target = resolve_gui_ssh_target(&conn);
+        assert_eq!(target.name, "prod-web");
+        assert_eq!(target.host, "example.com");
+        assert_eq!(target.port, 2222);
+        assert_eq!(target.user, "admin");
+        assert_eq!(
+            filar_core::ssh_cred_name(conn.slot, &conn.alias),
+            "ssh_target:prod-web"
+        );
+        match target.auth {
+            filar_core::SshAuth::Password { password: Some(p) } => {
+                assert_eq!(p, "in-memory", "in-memory password must win over keyring");
+            }
+            other => panic!("expected Password auth, got {other:?}"),
+        }
+    }
 
     // ── Key resolution tests ────────────────────────────────────────────
 

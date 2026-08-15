@@ -11,6 +11,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- GUI→TUI SSH password handoff now reads the OS keyring under
+  `ssh_target:{alias|SSHn}` (same key the launcher writes), instead of the
+  legacy `ssh{slot}` name that never matched
+  ([#290](https://github.com/devlawey/filar/issues/290)).
+
 ### Changed
 
 - Release CI now builds and attaches both Windows (`*-windows-x86_64.exe`)

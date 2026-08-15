@@ -94,12 +94,7 @@ fn unique_profile_name(existing: &[LlmProfileData], prefix: &str) -> String {
 /// up the password under `format!("ssh_target:{}", target.name)`.
 /// Both functions use `SSH{slot+1}` as the fallback for empty alias.
 fn ssh_cred_name(slot: usize, alias: &str) -> String {
-    let name = if alias.is_empty() {
-        format!("SSH{}", slot + 1)
-    } else {
-        alias.to_string()
-    };
-    format!("ssh_target:{name}")
+    filar_core::ssh_cred_name(slot, alias)
 }
 
 /// Migration: fix duplicate profile names and key_env entries in a loaded list.
@@ -196,6 +191,11 @@ pub struct SshConnection {
     /// Not a secret — must be persisted so resume picks the correct keyring entry.
     #[serde(default)]
     pub slot: usize,
+    /// Optional alias for the slot (empty → `SSH{slot+1}`). Not a secret —
+    /// persisted so GUI→TUI handoff can rebuild the keyring key via
+    /// [`filar_core::ssh_cred_name`].
+    #[serde(default)]
+    pub alias: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -338,11 +338,7 @@ fn build_ssh_targets_from_profiles(profiles: &[SshProfile]) -> Vec<filar_core::S
     let mut targets: Vec<filar_core::SshTarget> = Vec::new();
     for (i, profile) in profiles.iter().enumerate() {
         if profile.host.is_empty() { continue; }
-        let name = if profile.alias.is_empty() {
-            format!("SSH{}", i + 1)
-        } else {
-            profile.alias.clone()
-        };
+        let name = filar_core::ssh_target_display_name(i, &profile.alias);
         if seen.contains(&name) { continue; }
         seen.insert(name.clone());
         let port: u16 = profile.port.parse().unwrap_or_else(|_| {
@@ -862,7 +858,14 @@ impl LauncherApp {
         let target = if self.target_mode == 0 { "local" } else { "ssh" };
         let ssh = if self.target_mode > 0 {
             let slot = &self.ssh_slots[self.target_mode - 1];
-            Some(SshConnection { host: slot.host.clone(), port: slot.port.parse().unwrap_or(22), user: slot.user.clone(), password: slot.password.clone(), slot: self.target_mode.saturating_sub(1) })
+            Some(SshConnection {
+                host: slot.host.clone(),
+                port: slot.port.parse().unwrap_or(22),
+                user: slot.user.clone(),
+                password: slot.password.clone(),
+                slot: self.target_mode.saturating_sub(1),
+                alias: slot.alias.clone(),
+            })
         } else { None };
 
         let settings = Settings {
@@ -1113,6 +1116,7 @@ mod tests {
                 user: "root".into(),
                 password: "supersecret".into(),
                 slot: 0,
+                alias: "prod".into(),
             }),
             model: "glm".into(),
             api_base_url: "https://api.example.com".into(),
@@ -1137,6 +1141,7 @@ mod tests {
         assert_eq!(loaded.model, "glm");
         assert!(loaded.ssh.is_some());
         assert_eq!(loaded.ssh.as_ref().unwrap().slot, 0);
+        assert_eq!(loaded.ssh.as_ref().unwrap().alias, "prod");
         // Secrets must be absent after deserialization (serde(skip) → default).
         assert!(loaded.api_key.is_empty());
         assert!(loaded.ssh.as_ref().unwrap().password.is_empty());
@@ -1150,6 +1155,7 @@ mod tests {
             user: "admin".into(),
             password: "p@ssw0rd".into(),
             slot: 2,
+            alias: String::new(),
         };
         let json = serde_json::to_string(&conn).unwrap();
         assert!(!json.contains("p@ssw0rd"));
@@ -1159,6 +1165,27 @@ mod tests {
         assert_eq!(loaded.host, "host");
         assert_eq!(loaded.slot, 2);
         assert!(loaded.password.is_empty());
+    }
+
+    #[test]
+    fn ssh_connection_alias_survives_round_trip() {
+        let conn = SshConnection {
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            password: "secret".into(),
+            slot: 1,
+            alias: "VPS DE".into(),
+        };
+        let json = serde_json::to_string(&conn).unwrap();
+        assert!(json.contains("VPS DE"));
+        assert!(!json.contains("secret"));
+        let loaded: SshConnection = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.alias, "VPS DE");
+        assert_eq!(
+            filar_core::ssh_cred_name(loaded.slot, &loaded.alias),
+            "ssh_target:VPS DE"
+        );
     }
 
     #[test]
