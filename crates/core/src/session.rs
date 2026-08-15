@@ -638,20 +638,10 @@ mod tests {
     fn default_base_dir_returns_os_data_parent_without_creating_filar() {
         if let Ok(base) = default_base_dir() {
             assert!(base.exists(), "OS data dir parent should already exist");
-            if let Some(expected) = dirs::data_dir() {
-                assert_eq!(base, expected, "default_base_dir must use dirs::data_dir()");
-            }
-            // Contract: returns the parent; callers join "filar". This call must
-            // not create `{base}/filar` by itself (SessionStore::new does that).
-            let app_root = base.join("filar");
-            // We cannot assert !exists in general (user may already have data),
-            // but we can assert the returned path is NOT the app root.
-            assert_ne!(
-                base.file_name().and_then(|s| s.to_str()),
-                Some("filar"),
-                "default_base_dir must return the OS parent, not …/filar"
-            );
-            let _ = app_root; // documented join target for callers
+            // Contract: equals dirs::data_dir() (the OS parent). Callers join
+            // "filar"; SessionStore::new creates `{base}/filar/sessions`.
+            let expected = dirs::data_dir().expect("dirs::data_dir available in test env");
+            assert_eq!(base, expected, "default_base_dir must use dirs::data_dir()");
         }
     }
 
