@@ -4519,3 +4519,29 @@ session_click_without_ssh_info_stays_local, session_click_unmatched_ssh_warns_an
 
 **Дальше:** #296 (prepare-release skill под dual assets), packaging #297,
 smoke #294.
+
+---
+
+## Issue #290: fix(app,gui) — SSH password keyring key mismatch on GUI→TUI handoff
+
+**Milestone:** Filar v1.0.0. **Ветка:** `fix/290-ssh-keyring-handoff`.
+
+**Проблема:** GUI писал пароль как `ssh_target:{alias|SSHn}`, а `main.rs`
+после subprocess читал `ssh{slot}` — handoff Save password → Launch ломался.
+
+**Решение:**
+- `filar_core::{ssh_cred_name, ssh_target_display_name}` — единый контракт имён.
+- `SshConnection.alias` сериализуется в `pending_launch.json` (не секрет).
+- `resolve_gui_ssh_target` в `main.rs`: keyring lookup + `SshTarget.name` = display name
+  (больше не `"gui-ssh"` / `ssh{N}`).
+- GUI wrapper и `build_ssh_targets_from_profiles` используют те же helpers.
+- **Review:** sync keyring задокументирован как one-shot startup (до TUI loop);
+  `spawn_blocking` для всех keyring-чтений на старте — вне скоупа #290.
+
+**Публичный API:** additive — `ssh_cred_name` / `ssh_target_display_name` в core;
+`SshConnection.alias` (default `""`).
+
+**Тесты:** core naming; gui round-trip alias; app `resolve_gui_ssh_*`.
+**DoD smoke:** Save password → Launch → SSH без повторного ввода (Win/Mac) — вручную.
+
+**Дальше:** CodeRabbit / ревью.

@@ -237,6 +237,31 @@ pub fn api_key(env_var: &str) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// SSH keyring key naming (GUI ↔ TUI contract)
+// ---------------------------------------------------------------------------
+
+/// Display / config name for an SSH launcher slot.
+///
+/// Empty `alias` → `SSH{slot+1}` (e.g. slot 0 → `"SSH1"`). Non-empty alias is
+/// returned as-is. Must stay in sync with the GUI launcher and TUI runner.
+pub fn ssh_target_display_name(slot: usize, alias: &str) -> String {
+    if alias.is_empty() {
+        format!("SSH{}", slot + 1)
+    } else {
+        alias.to_string()
+    }
+}
+
+/// OS credential-store username for an SSH launcher slot password.
+///
+/// Format: `ssh_target:{name}` where `name` is [`ssh_target_display_name`].
+/// Used by the GUI when saving, `main` on GUI→TUI handoff, and the TUI runner
+/// on reconnect (`format!("ssh_target:{}", target.name)`).
+pub fn ssh_cred_name(slot: usize, alias: &str) -> String {
+    format!("ssh_target:{}", ssh_target_display_name(slot, alias))
+}
+
+// ---------------------------------------------------------------------------
 // KeyringSecretProvider
 // ---------------------------------------------------------------------------
 
@@ -488,5 +513,27 @@ mod tests {
         let expected_prefix = redact(name);
         assert!(!msg.contains(name));
         assert!(msg.contains(&expected_prefix));
+    }
+
+    // ── SSH keyring naming (#290) ─────────────────────────────────────
+
+    #[test]
+    fn ssh_cred_name_empty_alias_uses_slot() {
+        assert_eq!(ssh_cred_name(0, ""), "ssh_target:SSH1");
+        assert_eq!(ssh_cred_name(4, ""), "ssh_target:SSH5");
+        assert_eq!(ssh_target_display_name(0, ""), "SSH1");
+    }
+
+    #[test]
+    fn ssh_cred_name_nonempty_alias_uses_alias() {
+        assert_eq!(ssh_cred_name(0, "VPS DE"), "ssh_target:VPS DE");
+        assert_eq!(ssh_cred_name(2, "prod-web"), "ssh_target:prod-web");
+        assert_eq!(ssh_target_display_name(2, "prod-web"), "prod-web");
+    }
+
+    #[test]
+    fn ssh_cred_name_special_chars_preserved() {
+        assert_eq!(ssh_cred_name(0, "my server!"), "ssh_target:my server!");
+        assert_eq!(ssh_cred_name(1, "сервер"), "ssh_target:сервер");
     }
 }
