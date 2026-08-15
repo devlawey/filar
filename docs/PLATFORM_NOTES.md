@@ -88,6 +88,10 @@ Mapped via `ctrl_key(en, ru)` helper in `crates/tui/src/app.rs`.
 > (Apple Silicon). The job pins `macos-14` (not floating `macos-latest`) and
 > asserts `uname -m == arm64` before packaging so the asset name cannot drift.
 > Intel (`x86_64`) and universal binaries are out of scope until packaging
-> follow-up (#297). Unsigned OSS downloads on macOS may need
-> `xattr -d com.apple.quarantine <path>` before first run.
+> follow-up (#297). After downloading the raw asset from GitHub Releases,
+> restore the executable bit and clear Gatekeeper quarantine if needed:
+>
+> ```bash
+> chmod +x filar-*-macos-aarch64 && xattr -d com.apple.quarantine filar-*-macos-aarch64
+> ```
 

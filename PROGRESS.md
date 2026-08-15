@@ -4506,6 +4506,9 @@ session_click_without_ssh_info_stays_local, session_click_unmatched_ssh_warns_an
 - **Review fix:** runner закреплён на `macos-14` (не `macos-latest`) +
   assert `uname -m == arm64` перед упаковкой — имя ассета не может уехать
   при смене floating alias.
+- **Review fix (2):** в PLATFORM_NOTES добавлен `chmod +x` вместе с
+  `xattr -d com.apple.quarantine` — raw asset с Releases без +x даёт
+  permission denied.
 - `docs/PLATFORM_NOTES.md` — секция Release binaries + quarantine note.
 - CHANGELOG `[Unreleased]` — строка про dual-platform CI.
 
