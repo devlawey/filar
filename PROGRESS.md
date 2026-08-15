@@ -4489,3 +4489,27 @@ session_click_without_ssh_info_stays_local, session_click_unmatched_ssh_warns_an
 
 **Дальше:** SMOKE-чекап (`docs/SMOKE.md`, включая новые F3-кейсы) → тег
 `v0.9.0` + GitHub Release → тег движка `engine-v0.9.0`.
+
+---
+
+## Issue #289: ci(release) — dual-platform Windows + macOS
+
+**Milestone:** Filar v1.0.0. **Ветка:** `feat/289-dual-platform-release`.
+
+**Что сделано:**
+- `.github/workflows/release.yml` переименован в «Release build» (не Windows-only).
+- Job `build-windows` сохранён (asset `filar-{tag}-windows-x86_64.exe`).
+- Добавлен job `build-macos` на `macos-latest` → asset
+  `filar-{tag}-macos-aarch64` (оба аттачатся к одному GitHub Release).
+- **Решение по аркам:** одна — `aarch64` (Apple Silicon). Intel / universal —
+  follow-up (#297), не в этом PR.
+- `docs/PLATFORM_NOTES.md` — секция Release binaries + quarantine note.
+- CHANGELOG `[Unreleased]` — строка про dual-platform CI.
+
+**Публичный API:** нет (только CI/docs).
+
+**Тесты:** локально `cargo build --workspace` / `cargo test --workspace`
+(юнит); macOS job проверяется только на publish release (нет dry-run в этом PR).
+
+**Дальше:** #296 (prepare-release skill под dual assets), packaging #297,
+smoke #294.

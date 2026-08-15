@@ -75,4 +75,17 @@ Mapped via `ctrl_key(en, ru)` helper in `crates/tui/src/app.rs`.
 > bytes to the pipe in the OEM code page may still be mis-decoded; that is a
 > separate, harder problem and is not handled here.
 
+## Release binaries (CI)
+
+`.github/workflows/release.yml` builds and attaches assets on release publish:
+
+| Platform | Runner | Asset name |
+|----------|--------|------------|
+| Windows  | `windows-latest` | `filar-{tag}-windows-x86_64.exe` |
+| macOS    | `macos-latest`   | `filar-{tag}-macos-aarch64` |
+
+> **Arch decision (#289):** macOS ships **one** architecture — `aarch64`
+> (Apple Silicon). Intel (`x86_64`) and universal binaries are out of scope for
+> this workflow until packaging follow-up (#297). Unsigned OSS downloads on
+> macOS may need `xattr -d com.apple.quarantine <path>` before first run.
 
