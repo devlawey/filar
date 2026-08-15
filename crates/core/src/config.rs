@@ -342,7 +342,7 @@ impl Config {
     /// Search order:
     /// 1. `FILAR_CONFIG` environment variable (explicit path)
     /// 2. `config.toml` in the current working directory (override for development)
-    /// 3. `%APPDATA%\filar\config.toml` (shared system-wide config)
+    /// 3. `{OS data dir}/filar/config.toml` (shared system-wide config)
     /// 4. `config.toml` next to the executable
     ///
     /// Falls back to built-in defaults if no file is found anywhere.

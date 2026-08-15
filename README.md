@@ -73,7 +73,8 @@ think about this — the GUI launcher handles everything automatically.
 #### 1. GUI Launcher settings (`settings.json`)
 
 Location: `%APPDATA%\filar\settings.json` (Windows),
-`~/.local/share/filar/settings.json` (Linux).
+`~/Library/Application Support/filar/settings.json` (macOS),
+`~/.local/share/filar/settings.json` (Linux; or `$XDG_DATA_HOME/filar/`).
 
 The launcher saves non-sensitive UI state here: SSH profiles (host, port,
 user, alias), model name, API base URL, temperature, extra body JSON, save
@@ -85,7 +86,8 @@ Launch.
 
 #### 2. Handoff file (`pending_launch.json`)
 
-Location: `%APPDATA%\filar\pending_launch.json`.
+Location: `{OS data dir}/filar/pending_launch.json` (same directory as
+`settings.json` — see above).
 
 A **transient** file written by the launcher on "Launch" and read+deleted by
 the TUI subprocess. It carries the launch-specific settings (model, API URL,
@@ -100,11 +102,11 @@ not exist — the TUI falls back to `config.toml`.
 Location (search order):
 1. `FILAR_CONFIG` env var (explicit path)
 2. `./config.toml` in the current working directory
-3. `%APPDATA%\filar\config.toml` (app-data dir — **the launcher writes here**)
+3. `{OS data dir}/filar/config.toml` (app-data dir — **the launcher writes here**)
 4. `config.toml` next to the executable
 
 **When is `config.toml` created?** The launcher writes the `[llm]` section
-(model, api_base_url, temperature, extra_body) to `%APPDATA%\filar\config.toml`
+(model, api_base_url, temperature, extra_body) to `{OS data dir}/filar/config.toml`
 on every Launch, as a fallback for CLI usage. It merges into the existing
 file — it does not overwrite `[[ssh_targets]]`, `[[llm_profiles]]`, or
 other sections you may have added manually.
@@ -114,7 +116,7 @@ other sections you may have added manually.
 - **CLI users** (`filar --target ...`): the TUI reads `config.toml` because
   there is no `pending_launch.json`. This is where you define SSH targets,
 LLM profiles, timeouts, and the default confirm mode.
-- **Power users**: edit `%APPDATA%\filar\config.toml` manually to add
+- **Power users**: edit `{OS data dir}/filar/config.toml` manually to add
   `[[llm_profiles]]`, tweak `[timeouts]`, or set `confirm_mode`. The
   launcher will preserve these sections on next Launch.
 
@@ -450,8 +452,9 @@ SSH integration tests require a Docker `sshd` container (skipped if Docker is no
 ## Logging
 
 Application logs are written to:
-- `%APPDATA%\filar\filar.log` (Windows)
-- `~/.local/share/filar/filar.log` (Linux)
+- `%APPDATA%\filar\logs\filar.log` (Windows)
+- `~/Library/Application Support/filar/logs/filar.log` (macOS)
+- `~/.local/share/filar/logs/filar.log` (Linux)
 
 For verbose logging:
 ```powershell

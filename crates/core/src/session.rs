@@ -1,8 +1,9 @@
 ﻿//! Session persistence: save and restore chat histories.
 //!
-//! Sessions are stored as JSON files in a per-user directory:
+//! Sessions are stored as JSON files under the platform data directory:
 //! - Windows: `%APPDATA%/filar/sessions/<id>.json`
-//! - Unix:    `$HOME/.filar/sessions/<id>.json`
+//! - macOS:   `~/Library/Application Support/filar/sessions/<id>.json`
+//! - Linux:   `$XDG_DATA_HOME/filar/sessions/` or `~/.local/share/filar/sessions/`
 //!
 //! At most [`MAX_SESSIONS`] sessions are kept; older ones are pruned.
 
@@ -178,9 +179,9 @@ impl SessionStore {
 
     /// Create a store using the platform-default base directory.
     ///
-    /// On Windows this is `%APPDATA%`; on Unix it is `$HOME`.
-    /// For cross-compilation targets (Android, iOS) where these variables
-    /// may not be set, use [`new`](Self::new) with an explicit path.
+    /// See [`default_base_dir`]. For cross-compilation targets (Android, iOS)
+    /// where an OS data dir is unavailable, use [`new`](Self::new) with an
+    /// explicit path.
     pub fn with_default_dir() -> Result<Self> {
         Self::new(default_base_dir()?)
     }
@@ -272,23 +273,82 @@ impl SessionStore {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Determine the platform-default base directory for filar data.
+/// Determine the platform-default **parent** directory for filar data.
 ///
-/// Returns `%APPDATA%` on Windows, `$HOME` on Unix.
-/// The sessions directory is `base/filar/sessions`.
+/// Returns the OS user data directory (`dirs::data_dir`):
+/// - Windows → `%APPDATA%` (Roaming)
+/// - macOS → `~/Library/Application Support`
+/// - Linux → `$XDG_DATA_HOME` or `~/.local/share`
 ///
-/// This function does **not** create any directories — use it when you only
-/// need the base path (e.g. for `settings.json`, `pending_launch.json`).
-/// For session storage, use [`SessionStore::with_default_dir`] instead.
+/// App files live under `{base}/filar/` (`settings.json`, `pending_launch.json`,
+/// `config.toml`, `sessions/`, `logs/`). This function does **not** create
+/// directories — use it when you only need the base path. For session storage,
+/// use [`SessionStore::with_default_dir`].
+///
+/// On Unix, if a legacy `$HOME/filar` directory exists and the new
+/// `{data_dir}/filar` does not, it is renamed once (best-effort; failures are
+/// logged and ignored so startup still proceeds).
 pub fn default_base_dir() -> Result<PathBuf> {
-    if cfg!(windows) {
-        std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .map_err(|_| CoreError::Other("APPDATA environment variable not set".into()))
-    } else {
-        std::env::var("HOME")
-            .map(PathBuf::from)
-            .map_err(|_| CoreError::Other("HOME environment variable not set".into()))
+    let base = dirs::data_dir().ok_or_else(|| {
+        CoreError::Other(
+            "could not determine OS data directory (dirs::data_dir returned None)".into(),
+        )
+    })?;
+
+    #[cfg(unix)]
+    try_migrate_legacy_home_filar(&base);
+
+    Ok(base)
+}
+
+/// Best-effort one-shot migration from legacy `$HOME/filar` to
+/// `{data_dir}/filar` (macOS Application Support / Linux XDG).
+///
+/// No-op when the legacy path is missing, the destination already exists, or
+/// `HOME` is unset. Exposed for unit tests.
+#[cfg(any(unix, test))]
+pub(crate) fn migrate_legacy_filar_dir(
+    legacy_filar: &std::path::Path,
+    new_filar: &std::path::Path,
+) -> std::io::Result<bool> {
+    if !legacy_filar.is_dir() || new_filar.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = new_filar.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(legacy_filar, new_filar)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn try_migrate_legacy_home_filar(data_dir: &std::path::Path) {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let legacy = home.join("filar");
+    let dest = data_dir.join("filar");
+    // Skip when legacy path is already the destination (e.g. unusual HOME).
+    if legacy == dest {
+        return;
+    }
+    match migrate_legacy_filar_dir(&legacy, &dest) {
+        Ok(true) => {
+            tracing::info!(
+                from = %legacy.display(),
+                to = %dest.display(),
+                "migrated legacy filar data directory"
+            );
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(
+                from = %legacy.display(),
+                to = %dest.display(),
+                error = %e,
+                "failed to migrate legacy filar data directory; continuing with new path"
+            );
+        }
     }
 }
 
@@ -550,10 +610,9 @@ mod tests {
 
     #[test]
     fn session_store_with_default_dir_resolves_platform_path() {
-        // with_default_dir() should succeed when APPDATA (Windows) or HOME (Unix)
-        // is set, and the resulting directory should be base/filar/sessions.
+        // with_default_dir() should succeed when the OS data dir is available,
+        // and the resulting directory should be base/filar/sessions.
         let store = SessionStore::with_default_dir();
-        // In CI / test environments the env var is usually set.
         if let Ok(s) = store {
             assert!(
                 s.dir().ends_with(std::path::Path::new("filar/sessions")),
@@ -562,18 +621,56 @@ mod tests {
             );
             assert!(s.dir().exists(), "directory should exist after creation");
         }
-        // If env var is not set, that's also acceptable in exotic environments.
     }
 
     #[test]
     fn default_base_dir_does_not_create_directories() {
-        // default_base_dir() should return a path but NOT create any directories.
-        // We can't easily verify "no directory created" in general, but we can
-        // check that the function returns a path that makes sense.
         if let Ok(base) = default_base_dir() {
-            // The base dir itself (APPDATA or HOME) should already exist.
+            // The OS data dir itself should already exist.
             assert!(base.exists(), "base directory should already exist");
+            // Must match dirs::data_dir() (Windows APPDATA / macOS Application Support / XDG).
+            if let Some(expected) = dirs::data_dir() {
+                assert_eq!(base, expected, "default_base_dir must use dirs::data_dir()");
+            }
         }
+    }
+
+    #[test]
+    fn migrate_legacy_filar_renames_when_dest_missing() {
+        let tmp = std::env::temp_dir().join(format!("filar_migrate_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let legacy = tmp.join("home").join("filar");
+        let dest = tmp.join("data").join("filar");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("settings.json"), "{}").unwrap();
+
+        let migrated = migrate_legacy_filar_dir(&legacy, &dest).unwrap();
+        assert!(migrated);
+        assert!(!legacy.exists());
+        assert!(dest.join("settings.json").exists());
+
+        // Second call is a no-op.
+        assert!(!migrate_legacy_filar_dir(&legacy, &dest).unwrap());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn migrate_legacy_filar_skips_when_dest_exists() {
+        let tmp = std::env::temp_dir().join(format!("filar_migrate_skip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let legacy = tmp.join("home").join("filar");
+        let dest = tmp.join("data").join("filar");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(legacy.join("old.json"), "legacy").unwrap();
+        std::fs::write(dest.join("new.json"), "fresh").unwrap();
+
+        assert!(!migrate_legacy_filar_dir(&legacy, &dest).unwrap());
+        assert!(legacy.join("old.json").exists());
+        assert!(dest.join("new.json").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

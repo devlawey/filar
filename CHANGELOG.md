@@ -11,18 +11,23 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Changed
+
+- Desktop data directory now uses `dirs::data_dir()`:
+  Windows `%APPDATA%\filar\`, macOS `~/Library/Application Support/filar/`,
+  Linux `~/.local/share/filar/` (or `$XDG_DATA_HOME`). Legacy Unix
+  `$HOME/filar` is migrated once on startup when the new path is empty
+  ([#291](https://github.com/devlawey/filar/issues/291)).
+- Release CI now builds and attaches both Windows (`*-windows-x86_64.exe`)
+  and macOS (`*-macos-aarch64`) binaries to the same GitHub Release
+  ([#289](https://github.com/devlawey/filar/issues/289)).
+
 ### Fixed
 
 - GUI→TUI SSH password handoff now reads the OS keyring under
   `ssh_target:{alias|SSHn}` (same key the launcher writes), instead of the
   legacy `ssh{slot}` name that never matched
   ([#290](https://github.com/devlawey/filar/issues/290)).
-
-### Changed
-
-- Release CI now builds and attaches both Windows (`*-windows-x86_64.exe`)
-  and macOS (`*-macos-aarch64`) binaries to the same GitHub Release
-  ([#289](https://github.com/devlawey/filar/issues/289)).
 
 ## [0.9.0] - 2026-08-15
 

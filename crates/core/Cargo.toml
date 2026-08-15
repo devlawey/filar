@@ -12,3 +12,4 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 keyring = "3"
+dirs = { workspace = true }

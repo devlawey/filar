@@ -4545,3 +4545,24 @@ smoke #294.
 **DoD smoke:** Save password → Launch → SSH без повторного ввода (Win/Mac) — вручную.
 
 **Дальше:** CodeRabbit / ревью.
+
+---
+
+## Issue #291: core — OS-appropriate data directory (Win + Mac)
+
+**Milestone:** Filar v1.0.0. **Ветка:** `feat/291-os-data-dir`.
+
+**Решение (option 2):** `dirs::data_dir()` как parent; app root = `{base}/filar/`.
+- Windows: `%APPDATA%\filar\` (без изменений)
+- macOS: `~/Library/Application Support/filar/`
+- Linux: `~/.local/share/filar/` (или `$XDG_DATA_HOME`)
+
+**Миграция:** на Unix, если есть legacy `$HOME/filar` и нет нового пути —
+`rename` один раз (best-effort + warn).
+
+**Документы:** PLATFORM_NOTES, README, USER_GUIDE, ENGINE_API.
+
+**Публичный API:** поведение `default_base_dir()` на macOS/Linux меняется
+(Windows тот же Roaming APPDATA).
+
+**Дальше:** CodeRabbit / ревью.

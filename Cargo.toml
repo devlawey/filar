@@ -61,6 +61,9 @@ rfd = "0.15"
 # OS credential storage (Windows Credential Manager, macOS Keychain, Linux Secret Service)
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }
 
+# Platform data directories (APPDATA / Application Support / XDG)
+dirs = "6"
+
 # Clipboard
 arboard = "3"
 

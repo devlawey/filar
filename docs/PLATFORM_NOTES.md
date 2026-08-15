@@ -95,3 +95,20 @@ Mapped via `ctrl_key(en, ru)` helper in `crates/tui/src/app.rs`.
 > chmod +x filar-*-macos-aarch64 && xattr -d com.apple.quarantine filar-*-macos-aarch64
 > ```
 
+## Application data directory
+
+Decision for [#291](https://github.com/devlawey/filar/issues/291): use the OS
+user **data** directory via `dirs::data_dir()`, then `filar/` underneath.
+`settings.json`, `pending_launch.json`, `config.toml`, `sessions/`, and
+`logs/` all share this single base.
+
+| Platform | Base (`default_base_dir()`) | App root |
+|----------|------------------------------|----------|
+| Windows  | `%APPDATA%` (Roaming) | `%APPDATA%\filar\` |
+| macOS    | `~/Library/Application Support` | `~/Library/Application Support/filar/` |
+| Linux    | `$XDG_DATA_HOME` or `~/.local/share` | `~/.local/share/filar/` |
+
+> **Legacy Unix path:** before 1.0.0, non-Windows builds used `$HOME/filar/`.
+> On first run, if `$HOME/filar` exists and the new app root does not, filar
+> renames it into the new location (best-effort). Windows paths are unchanged.
+

@@ -167,8 +167,8 @@ use filar_core::SessionStore;
 let store = SessionStore::new(std::path::PathBuf::from("/data/data/com.example.app"))?;
 ```
 
-For desktop platforms, use `SessionStore::with_default_dir()` which reads
-`APPDATA` (Windows) or `HOME` (Unix).
+For desktop platforms, use `SessionStore::with_default_dir()` which uses
+`dirs::data_dir()` (Windows `%APPDATA%`, macOS Application Support, Linux XDG).
 
 ## LLM request parameters
 
