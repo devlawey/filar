@@ -4499,10 +4499,13 @@ session_click_without_ssh_info_stays_local, session_click_unmatched_ssh_warns_an
 **Что сделано:**
 - `.github/workflows/release.yml` переименован в «Release build» (не Windows-only).
 - Job `build-windows` сохранён (asset `filar-{tag}-windows-x86_64.exe`).
-- Добавлен job `build-macos` на `macos-latest` → asset
-  `filar-{tag}-macos-aarch64` (оба аттачатся к одному GitHub Release).
+- Добавлен job `build-macos` → asset `filar-{tag}-macos-aarch64`
+  (оба аттачатся к одному GitHub Release).
 - **Решение по аркам:** одна — `aarch64` (Apple Silicon). Intel / universal —
   follow-up (#297), не в этом PR.
+- **Review fix:** runner закреплён на `macos-14` (не `macos-latest`) +
+  assert `uname -m == arm64` перед упаковкой — имя ассета не может уехать
+  при смене floating alias.
 - `docs/PLATFORM_NOTES.md` — секция Release binaries + quarantine note.
 - CHANGELOG `[Unreleased]` — строка про dual-platform CI.
 

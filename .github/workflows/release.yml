@@ -42,14 +42,22 @@ jobs:
           files: filar-*-windows-x86_64.exe
 
   # Decision for #289: one macOS arch for now — aarch64 (Apple Silicon).
-  # `macos-latest` is arm64; Intel (x86_64) / universal binary left for a
-  # follow-up (see packaging issue #297) if demand appears.
+  # Pin `macos-14` (arm64), not the floating `macos-latest` alias, so the
+  # asset name `*-macos-aarch64` cannot drift if GitHub retargets the alias.
+  # Intel (x86_64) / universal binary left for follow-up (#297).
   build-macos:
-    runs-on: macos-latest
+    runs-on: macos-14
     timeout-minutes: 45
     steps:
       - name: Checkout code (at the release tag)
         uses: actions/checkout@v4
+
+      - name: Assert Apple Silicon runner
+        run: |
+          test "$(uname -m)" = "arm64" || {
+            echo "Expected arm64 runner for *-macos-aarch64 asset, got $(uname -m)"
+            exit 1
+          }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

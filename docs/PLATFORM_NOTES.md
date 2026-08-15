@@ -82,10 +82,12 @@ Mapped via `ctrl_key(en, ru)` helper in `crates/tui/src/app.rs`.
 | Platform | Runner | Asset name |
 |----------|--------|------------|
 | Windows  | `windows-latest` | `filar-{tag}-windows-x86_64.exe` |
-| macOS    | `macos-latest`   | `filar-{tag}-macos-aarch64` |
+| macOS    | `macos-14` (arm64) | `filar-{tag}-macos-aarch64` |
 
 > **Arch decision (#289):** macOS ships **one** architecture — `aarch64`
-> (Apple Silicon). Intel (`x86_64`) and universal binaries are out of scope for
-> this workflow until packaging follow-up (#297). Unsigned OSS downloads on
-> macOS may need `xattr -d com.apple.quarantine <path>` before first run.
+> (Apple Silicon). The job pins `macos-14` (not floating `macos-latest`) and
+> asserts `uname -m == arm64` before packaging so the asset name cannot drift.
+> Intel (`x86_64`) and universal binaries are out of scope until packaging
+> follow-up (#297). Unsigned OSS downloads on macOS may need
+> `xattr -d com.apple.quarantine <path>` before first run.
 
