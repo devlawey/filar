@@ -1,22 +1,22 @@
-name: Release build (Windows)
+name: Release build
 
-# Триггер — ПУБЛИКАЦИЯ релиза через интерфейс GitHub.
-# Флоу: Releases → "Draft a new release" → выбираешь/создаёшь тег (например v0.1.1)
-#       → жмёшь "Generate release notes" (GitHub сам соберёт список из PR)
-#       → "Publish release".
-# Публикация запускает этот workflow: он собирает Windows-бинарник и прикладывает
-# его к тому же релизу как файл для скачивания.
+# Trigger — publishing a GitHub Release.
+# Flow: Releases → "Draft a new release" → create/select tag (e.g. v1.0.0)
+#       → "Generate release notes" → "Publish release".
+# Publishing runs this workflow: it builds Windows + macOS binaries and
+# attaches them to the same release as downloadable assets.
 on:
   release:
     types: [published]
 
-# Нужно право записи в содержимое репозитория, чтобы загрузить файл в релиз.
+# Write access is required to upload assets to the release.
 permissions:
   contents: write
 
 jobs:
   build-windows:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout code (at the release tag)
         uses: actions/checkout@v4
@@ -40,3 +40,43 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: filar-*-windows-x86_64.exe
+
+  # Decision for #289: one macOS arch for now — aarch64 (Apple Silicon).
+  # Pin `macos-14` (arm64), not the floating `macos-latest` alias, so the
+  # asset name `*-macos-aarch64` cannot drift if GitHub retargets the alias.
+  # Intel (x86_64) / universal binary left for follow-up (#297).
+  build-macos:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code (at the release tag)
+        uses: actions/checkout@v4
+
+      - name: Assert Apple Silicon runner
+        run: |
+          test "$(uname -m)" = "arm64" || {
+            echo "Expected arm64 runner for *-macos-aarch64 asset, got $(uname -m)"
+            exit 1
+          }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --package filar-app
+
+      - name: Package binary with version in the name
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          cp target/release/filar "filar-${tag}-macos-aarch64"
+          chmod +x "filar-${tag}-macos-aarch64"
+          file "filar-${tag}-macos-aarch64"
+          rustc -vV | grep host
+
+      - name: Attach binary to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: filar-*-macos-aarch64

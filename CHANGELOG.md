@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Changed
+
+- Release CI now builds and attaches both Windows (`*-windows-x86_64.exe`)
+  and macOS (`*-macos-aarch64`) binaries to the same GitHub Release
+  ([#289](https://github.com/devlawey/filar/issues/289)).
+
 ## [0.9.0] - 2026-08-15
 
 ### Added
