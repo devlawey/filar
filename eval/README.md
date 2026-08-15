@@ -5,7 +5,7 @@ understanding shell output, and following the agent system prompt. Public
 benchmarks don't measure filar's profile; this harness does.
 
 Built with [promptfoo](https://www.promptfoo.dev/) on top of
-[`docs/EVAL-METHODOLOGY.md`](../docs/EVAL-METHODOLOGY.md). The main filar
+[`docs/EVAL_METHODOLOGY.md`](../docs/EVAL_METHODOLOGY.md). The main filar
 adaptation: the agent's primary response is a **tool call** (`run_command`),
 not text, so the asserts check tool-call structure rather than string
 equality.

@@ -1911,7 +1911,7 @@ milestone v0.4.0.
 ## Issue #72: eval-каркас + promptfoo-конфиг с проверками tool calling (milestone v0.4.0)
 
 **Что сделано:**
-- Создан `eval/` (методика — `docs/EVAL-METHODOLOGY.md`): `promptfooconfig.yaml`,
+- Создан `eval/` (методика — `docs/EVAL_METHODOLOGY.md`): `promptfooconfig.yaml`,
   `prompts/agent-system.txt`, `asserts.js`, `asserts.test.js`, `README.md`,
   `datasets/.gitkeep` (датасет — отдельная issue #73), `eval/.gitignore`.
 - `prompts/agent-system.txt` — snapshot боевого системного промпта filar,

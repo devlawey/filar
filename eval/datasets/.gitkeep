@@ -2,4 +2,4 @@
 #
 # The starter dataset (~30 filar cases: operations, safety, language) is
 # added in a separate issue (#73). Until then this directory is empty.
-# Case format and anonymisation rules: docs/EVAL-METHODOLOGY.md (§4.3, §4.5).
+# Case format and anonymisation rules: docs/EVAL_METHODOLOGY.md (§4.3, §4.5).
