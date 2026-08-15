@@ -1,5 +1,5 @@
 # filar eval dataset — 50 anonymised cases across three buckets.
-# Methodology: docs/eval-methodology.md (§4.3 case = input + criterion + metadata,
+# Methodology: docs/EVAL-METHODOLOGY.md (§4.3 case = input + criterion + metadata,
 # §4.5 anonymisation, §10 regression). Each case carries `vars.bucket` and
 # `vars.priority` so runs can be filtered (e.g. only `operations`).
 #
