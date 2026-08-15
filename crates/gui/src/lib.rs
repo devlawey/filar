@@ -361,9 +361,8 @@ fn build_ssh_targets_from_profiles(profiles: &[SshProfile]) -> Vec<filar_core::S
     targets
 }
 
-/// Write `[llm]` and `[[ssh_targets]]` settings to `config.toml` in
-/// `%APPDATA%\filar\` so `filar-tui` invoked without the GUI launcher picks
-/// them up.
+/// Write `[llm]` settings to `{OS data dir}/filar/config.toml` so `filar`
+/// invoked without the GUI launcher still picks them up.
 ///
 /// If a `config.toml` already exists, the `[llm]` and `[[ssh_targets]]`
 /// sections are merged; unrelated sections are preserved.

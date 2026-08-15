@@ -65,10 +65,15 @@ cargo build --release
 
 | Файл | Где | Кто пишет | Зачем |
 |------|-----|-----------|-------|
-| `settings.json` | `%APPDATA%\filar\` | GUI-лаунчер | Сохраняет состояние UI (SSH-профили, модель, URL, выбор) |
-| `pending_launch.json` | `%APPDATA%\filar\` | GUI-лаунчер → TUI | Транзитный: передаёт настройки запуска от GUI к TUI, удаляется после чтения |
-| `config.toml` | `%APPDATA%\filar\` | GUI-лаунчер (частично) + пользователь | Фолбэк для CLI-режима; полный набор настроек |
+| `settings.json` | `{OS data dir}/filar/` | GUI-лаунчер | Сохраняет состояние UI (SSH-профили, модель, URL, выбор) |
+| `pending_launch.json` | `{OS data dir}/filar/` | GUI-лаунчер → TUI | Транзитный: передаёт настройки запуска от GUI к TUI, удаляется после чтения |
+| `config.toml` | `{OS data dir}/filar/` | GUI-лаунчер (частично) + пользователь | Фолбэк для CLI-режима; полный набор настроек |
 | OS Credential Manager | Системное хранилище | GUI / TUI | API-ключи и SSH-пароли — **только здесь**, нигде в файлах |
+
+Пути `{OS data dir}/filar/`:
+- Windows: `%APPDATA%\filar\`
+- macOS: `~/Library/Application Support/filar/`
+- Linux: `~/.local/share/filar/` (или `$XDG_DATA_HOME/filar/`)
 
 **Поток при запуске через GUI:**
 1. Пользователь редактирует поля в лаунчере → сохраняются в `settings.json`
@@ -168,7 +173,7 @@ $env:SSH_PASSWORD = "пароль-ssh"    # SSH auth type = "password"
 Поиск в порядке приоритета:
 1. `FILAR_CONFIG` env (явный путь)
 2. `./config.toml` (текущая директория)
-3. `%APPDATA%\filar\config.toml` (сюда пишет лаунчер)
+3. `{OS data dir}/filar/config.toml` (сюда пишет лаунчер; см. §2.1)
 4. `config.toml` рядом с `.exe`
 
 Если ни одного файла нет — используются встроенные значения по умолчанию.
@@ -343,7 +348,8 @@ Explanation:         Updating package lists to check available versions
 ### 6.2. Хранилище
 
 - **Windows:** `%APPDATA%\filar\sessions\`
-- **Unix:** `~/.local/share/filar/sessions/`
+- **macOS:** `~/Library/Application Support/filar/sessions/`
+- **Linux:** `~/.local/share/filar/sessions/`
 
 Формат: JSON-файлы (`<id>.json`). Хранится не более **10 последних** сессий
 (старые удаляются автоматически).
@@ -372,7 +378,8 @@ filar.exe --target local --session 1718900000
 ### 7.1. Где лежит файл
 
 - **Windows:** `%APPDATA%\filar\logs\filar.log`
-- **Unix:** `~/.local/share/filar/logs/filar.log`
+- **macOS:** `~/Library/Application Support/filar/logs/filar.log`
+- **Linux:** `~/.local/share/filar/logs/filar.log`
 
 Файл ротируется посуточно (`filar.log.YYYY-MM-DD`). В нём — полная запись
 с временными метками, включая уровни ниже WARN.
@@ -455,7 +462,7 @@ filar
 
 ### "failed to load config"
 - Filar работает и без `config.toml` — используются значения по умолчанию
-- Для CLI-режима создайте `%APPDATA%\filar\config.toml` (см. раздел 2)
+- Для CLI-режима создайте `{OS data dir}/filar/config.toml` (см. раздел 2)
 - Или укажите путь: `$env:FILAR_CONFIG = "C:\path\to\config.toml"`
 
 ### "API key is required"
@@ -476,7 +483,7 @@ filar
 - Минимальный размер окна: ~80×24
 
 ### Сессии не сохраняются
-- Проверьте права на запись в `%APPDATA%\filar\sessions\`
+- Проверьте права на запись в `{OS data dir}/filar/sessions/`
 - Создайте директорию вручную при необходимости
 
 ---
@@ -515,5 +522,5 @@ filar
 - [ ] CLI: `--target local` — локальный executor
 - [ ] CLI: `--llm <profile>` — выбор LLM-профиля
 - [ ] SSH: подключение к тестовому серверу (если доступен)
-- [ ] Сессии: сохранение в `%APPDATA%\filar\sessions\`
+- [ ] Сессии: сохранение в `{OS data dir}/filar/sessions/`
 - [ ] Сессии: не более 10 файлов (prune работает)
