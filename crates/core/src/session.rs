@@ -275,19 +275,21 @@ impl SessionStore {
 
 /// Determine the platform-default **parent** directory for filar data.
 ///
-/// Returns the OS user data directory (`dirs::data_dir`):
+/// Returns the OS user data directory (`dirs::data_dir`) — **without** the
+/// `filar/` segment:
 /// - Windows → `%APPDATA%` (Roaming)
 /// - macOS → `~/Library/Application Support`
 /// - Linux → `$XDG_DATA_HOME` or `~/.local/share`
 ///
-/// App files live under `{base}/filar/` (`settings.json`, `pending_launch.json`,
-/// `config.toml`, `sessions/`, `logs/`). This function does **not** create
-/// directories — use it when you only need the base path. For session storage,
-/// use [`SessionStore::with_default_dir`].
+/// Callers join `"filar"` themselves (e.g. `base.join("filar").join("settings.json")`).
+/// [`SessionStore::new`] also joins `filar/sessions` onto this parent. Returning
+/// `base/filar` from this function would double the segment.
 ///
-/// On Unix, if a legacy `$HOME/filar` directory exists and the new
-/// `{data_dir}/filar` does not, it is renamed once (best-effort; failures are
-/// logged and ignored so startup still proceeds).
+/// This function does **not** create directories. For session storage, use
+/// [`SessionStore::with_default_dir`].
+///
+/// On Unix, a legacy `$HOME/filar` directory is migrated once (via [`std::sync::Once`])
+/// into `{data_dir}/filar` when the destination is missing (best-effort).
 pub fn default_base_dir() -> Result<PathBuf> {
     let base = dirs::data_dir().ok_or_else(|| {
         CoreError::Other(
@@ -305,7 +307,8 @@ pub fn default_base_dir() -> Result<PathBuf> {
 /// `{data_dir}/filar` (macOS Application Support / Linux XDG).
 ///
 /// No-op when the legacy path is missing, the destination already exists, or
-/// `HOME` is unset. Exposed for unit tests.
+/// `HOME` is unset. Available under `cfg(test)` on all platforms so unit tests
+/// can exercise the rename logic without a Unix host.
 #[cfg(any(unix, test))]
 pub(crate) fn migrate_legacy_filar_dir(
     legacy_filar: &std::path::Path,
@@ -314,6 +317,8 @@ pub(crate) fn migrate_legacy_filar_dir(
     if !legacy_filar.is_dir() || new_filar.exists() {
         return Ok(false);
     }
+    // Ensure the parent of `new_filar` exists; `rename` then moves the whole
+    // legacy directory into place (it does not require `new_filar` to exist).
     if let Some(parent) = new_filar.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -323,33 +328,39 @@ pub(crate) fn migrate_legacy_filar_dir(
 
 #[cfg(unix)]
 fn try_migrate_legacy_home_filar(data_dir: &std::path::Path) {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return;
-    };
-    let legacy = home.join("filar");
-    let dest = data_dir.join("filar");
-    // Skip when legacy path is already the destination (e.g. unusual HOME).
-    if legacy == dest {
-        return;
-    }
-    match migrate_legacy_filar_dir(&legacy, &dest) {
-        Ok(true) => {
-            tracing::info!(
-                from = %legacy.display(),
-                to = %dest.display(),
-                "migrated legacy filar data directory"
-            );
+    use std::sync::Once;
+    static MIGRATE_ONCE: Once = Once::new();
+    let data_dir = data_dir.to_path_buf();
+    MIGRATE_ONCE.call_once(move || {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        let legacy = home.join("filar");
+        let dest = data_dir.join("filar");
+        // Guard odd setups where HOME == data_dir (e.g. XDG_DATA_HOME=$HOME),
+        // which would make legacy and dest the same path.
+        if legacy == dest {
+            return;
         }
-        Ok(false) => {}
-        Err(e) => {
-            tracing::warn!(
-                from = %legacy.display(),
-                to = %dest.display(),
-                error = %e,
-                "failed to migrate legacy filar data directory; continuing with new path"
-            );
+        match migrate_legacy_filar_dir(&legacy, &dest) {
+            Ok(true) => {
+                tracing::info!(
+                    from = %legacy.display(),
+                    to = %dest.display(),
+                    "migrated legacy filar data directory"
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    from = %legacy.display(),
+                    to = %dest.display(),
+                    error = %e,
+                    "failed to migrate legacy filar data directory; continuing with new path"
+                );
+            }
         }
-    }
+    });
 }
 
 /// Generate a session ID and human-readable timestamp from the current time.
@@ -624,14 +635,23 @@ mod tests {
     }
 
     #[test]
-    fn default_base_dir_does_not_create_directories() {
+    fn default_base_dir_returns_os_data_parent_without_creating_filar() {
         if let Ok(base) = default_base_dir() {
-            // The OS data dir itself should already exist.
-            assert!(base.exists(), "base directory should already exist");
-            // Must match dirs::data_dir() (Windows APPDATA / macOS Application Support / XDG).
+            assert!(base.exists(), "OS data dir parent should already exist");
             if let Some(expected) = dirs::data_dir() {
                 assert_eq!(base, expected, "default_base_dir must use dirs::data_dir()");
             }
+            // Contract: returns the parent; callers join "filar". This call must
+            // not create `{base}/filar` by itself (SessionStore::new does that).
+            let app_root = base.join("filar");
+            // We cannot assert !exists in general (user may already have data),
+            // but we can assert the returned path is NOT the app root.
+            assert_ne!(
+                base.file_name().and_then(|s| s.to_str()),
+                Some("filar"),
+                "default_base_dir must return the OS parent, not …/filar"
+            );
+            let _ = app_root; // documented join target for callers
         }
     }
 

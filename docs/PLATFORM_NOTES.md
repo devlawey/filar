@@ -98,9 +98,10 @@ Mapped via `ctrl_key(en, ru)` helper in `crates/tui/src/app.rs`.
 ## Application data directory
 
 Decision for [#291](https://github.com/devlawey/filar/issues/291): use the OS
-user **data** directory via `dirs::data_dir()`, then `filar/` underneath.
-`settings.json`, `pending_launch.json`, `config.toml`, `sessions/`, and
-`logs/` all share this single base.
+user **data** directory via `dirs::data_dir()` as the **parent** returned by
+`default_base_dir()`, then join `filar/` in callers (`SessionStore::new` does
+the same). `settings.json`, `pending_launch.json`, `config.toml`, `sessions/`,
+and `logs/` all share this single app root.
 
 | Platform | Base (`default_base_dir()`) | App root |
 |----------|------------------------------|----------|

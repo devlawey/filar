@@ -28,6 +28,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   `ssh_target:{alias|SSHn}` (same key the launcher writes), instead of the
   legacy `ssh{slot}` name that never matched
   ([#290](https://github.com/devlawey/filar/issues/290)).
+- Docs: log file path documented as `{app data}/filar/logs/filar.log`
+  (the `logs/` segment was missing in README)
+  ([#291](https://github.com/devlawey/filar/issues/291)).
 
 ## [0.9.0] - 2026-08-15
 

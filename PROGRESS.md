@@ -4558,7 +4558,13 @@ smoke #294.
 - Linux: `~/.local/share/filar/` (или `$XDG_DATA_HOME`)
 
 **Миграция:** на Unix, если есть legacy `$HOME/filar` и нет нового пути —
-`rename` один раз (best-effort + warn).
+`rename` один раз через `std::sync::Once` (best-effort + warn).
+
+**Review fixes:**
+- Уточнён контракт: `default_base_dir()` = OS parent (не `…/filar`); callers
+  join `"filar"` (как `SessionStore::new`).
+- Миграция — `Once`, не на каждый вызов.
+- Тест переименован под реальное поведение; docs log path `logs/` в CHANGELOG.
 
 **Документы:** PLATFORM_NOTES, README, USER_GUIDE, ENGINE_API.
 
