@@ -4535,6 +4535,8 @@ smoke #294.
 - `resolve_gui_ssh_target` в `main.rs`: keyring lookup + `SshTarget.name` = display name
   (больше не `"gui-ssh"` / `ssh{N}`).
 - GUI wrapper и `build_ssh_targets_from_profiles` используют те же helpers.
+- **Review:** sync keyring задокументирован как one-shot startup (до TUI loop);
+  `spawn_blocking` для всех keyring-чтений на старте — вне скоупа #290.
 
 **Публичный API:** additive — `ssh_cred_name` / `ssh_target_display_name` в core;
 `SshConnection.alias` (default `""`).

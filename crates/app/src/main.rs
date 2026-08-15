@@ -117,6 +117,13 @@ pub fn resolve_startup_profile(
 /// [`filar_core::ssh_cred_name`] — the same key the launcher writes.
 /// Target `name` uses [`filar_core::ssh_target_display_name`] so later TUI
 /// reconnects (`ssh_target:{name}`) hit the same entry.
+///
+/// # Sync keyring
+///
+/// `KeyringSecretProvider::get` is synchronous. Callers must invoke this
+/// **once during startup**, before the TUI event loop is running (same
+/// pattern as the GUI API-key lookup a few lines below). Do not call it from
+/// a hot async path without `spawn_blocking`.
 fn resolve_gui_ssh_target(s: &filar_gui::SshConnection) -> filar_core::SshTarget {
     let name = filar_core::ssh_target_display_name(s.slot, &s.alias);
     let password = if s.password.is_empty() {
