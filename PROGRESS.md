@@ -4466,3 +4466,26 @@ session_click_without_ssh_info_stays_local, session_click_unmatched_ssh_warns_an
 совпадает ни с одной целью — ввод пароля вручную.
 
 **Дальше:** ручная проверка сценария DoD; затем CodeRabbit повторное ревью.
+
+---
+
+## Релиз v0.9.0 (подготовка)
+
+**Дата:** 2026-08-15. **Milestone:** 0.9.0 (26 issue, все закрыты).
+
+**Что вошло (основное):**
+- Session persistence: launch context (#271), автосейв 30s (#272), F3-оверлей
+  выбора сессии (#273), автовыбор в GUI при клике на сессию (#274), F3
+  восстановление SSH с авто-резолвом пароля (#287)
+- Session export: Ctrl+S markdown (#232–#235), прогресс-анимация (#240),
+  настраиваемый save_dir (#247)
+- Explain (safe mode): ядро (#262), F2-переключатель (#263), автотранскрипт
+  (#264, #265, #275, #277)
+- Конфиг: launch-данные через pending_launch.json (#255)
+- Windows UTF-8: local stderr (#243, #253), multibyte truncation (#260),
+  Clear-виджеты (#245)
+
+**Engine:** менялись core/transport/agent. Тег `engine-v0.9.0` ставится.
+
+**Дальше:** SMOKE-чекап (`docs/SMOKE.md`, включая новые F3-кейсы) → тег
+`v0.9.0` + GitHub Release → тег движка `engine-v0.9.0`.
