@@ -4582,8 +4582,10 @@ smoke #294.
 **Что сделано:**
 - `PLATFORM_NOTES`: секция macOS shortcuts (Ctrl vs ⌘, Fn+F1, paste, known limitation).
 - USER_GUIDE §4.1: преамбула + F1/Fn.
-- Help overlay: F1 desc + note «Ctrl, not ⌘».
+- Help overlay: F1 desc включает Fn+F1 и «Ctrl, not ⌘» (без псевдо-клавиши `note`).
 - `SMOKE.md`: блок macOS (F1/Fn, ^T, ^V, ^Q, help note).
+
+**Review:** убран `HelpEntry { key: "note" }` — текст свёрнут в desc у F1.
 
 **Публичный API:** нет (docs + help strings).
 

@@ -40,13 +40,7 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
         // ── Help ──────────────────────────────────────────────────────
         HelpEntry {
             key: "F1",
-            desc: "Toggle this help overlay (macOS: often Fn+F1)",
-            section: "Help",
-            available: |_| true,
-        },
-        HelpEntry {
-            key: "note",
-            desc: "Shortcuts use Ctrl, not ⌘ Command (same on Win/Linux/macOS)",
+            desc: "Toggle this help overlay (macOS: often Fn+F1; Ctrl, not ⌘)",
             section: "Help",
             available: |_| true,
         },
