@@ -131,3 +131,14 @@ and `logs/` all share this single app root.
 > On first run, if `$HOME/filar` exists and the new app root does not, filar
 > renames it into the new location (best-effort). Windows paths are unchanged.
 
+## Local interactive shell (Ctrl+T)
+
+| Platform | Default PTY shell |
+|----------|-------------------|
+| Unix / macOS | `$SHELL` if set to an existing file; otherwise `sh` |
+| Windows | `cmd.exe` (PowerShell as default is out of scope) |
+
+> Agent command execution (`LocalExecutor`) is separate: Unix still uses
+> `sh -c`, Windows PowerShell. Only the interactive PTY follows `$SHELL`
+> ([#293](https://github.com/devlawey/filar/issues/293)).
+

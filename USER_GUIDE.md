@@ -323,6 +323,9 @@ Explanation:         Updating package lists to check available versions
 ```
 
 - Работает локальный PTY (команды выполняются на вашей машине)
+- **Шелл:** на Unix/macOS — `$SHELL` (обычно `zsh` на Mac), иначе `sh`;
+  на Windows — `cmd.exe`. Команды агента по-прежнему идут через отдельный
+  non-interactive executor (`sh -c` / PowerShell) и не зависят от этого PTY
 - Полная поддержка ANSI: `vim`, `htop`, `less`, `top` и т.д.
 - Ресайз окна автоматически меняет размер терминала
 - `Ctrl+T` — вернуться в режим агента (терминал остаётся живым в фоне)

@@ -19,6 +19,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Changed
 
+- Local interactive PTY (Ctrl+T) on Unix/macOS uses `$SHELL` when set to an
+  existing file, otherwise `sh`; Windows remains `cmd.exe`. Agent
+  `LocalExecutor` is unchanged (`sh -c` / PowerShell)
+  ([#293](https://github.com/devlawey/filar/issues/293)).
 - Desktop data directory now uses `dirs::data_dir()`:
   Windows `%APPDATA%\filar\`, macOS `~/Library/Application Support/filar/`,
   Linux `~/.local/share/filar/` (or `$XDG_DATA_HOME`). Legacy Unix
