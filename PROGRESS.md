@@ -4644,3 +4644,24 @@ smoke #294.
 **Публичный API:** нет (skill docs).
 
 **Дальше:** CodeRabbit / ревью.
+
+---
+
+## Issue #297: macos — packaging decision (binary-only for 1.0.0)
+
+**Milestone:** Filar v1.0.0. **Ветка:** `docs/297-macos-binary-only`.
+
+**Решение (подтверждено):** binary-only `filar-{tag}-macos-aarch64` — как
+Windows `.exe`. Не `.app`, без notarization. `.app` / notarize / Intel —
+follow-up после 1.0.0.
+
+**Политика unsigned OSS:** одна линия с [#80](https://github.com/devlawey/filar/issues/80)
+(SmartScreen) — предупреждения ОС ожидаемы; обход задокументирован
+(quarantine / SmartScreen).
+
+**CI:** уже реализовано в #289 (`release.yml` raw binary). Docs: PLATFORM_NOTES
+(решение + snippet для release notes), README Downloads.
+
+**Публичный API:** нет.
+
+**Дальше:** CodeRabbit / ревью.
