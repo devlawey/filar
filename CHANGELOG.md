@@ -23,6 +23,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Changed
 
+- `prepare-release` skill: preflight accepts Windows + macOS from `release.yml`;
+  `all` expects both jobs/assets; release notes list both binary names
+  ([#296](https://github.com/devlawey/filar/issues/296)).
 - Local interactive PTY (Ctrl+T) on Unix/macOS uses `$SHELL` when set to an
   existing file, otherwise `sh`; Windows remains `cmd.exe`. Agent
   `LocalExecutor` is unchanged (`sh -c` / PowerShell)

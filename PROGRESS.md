@@ -4625,3 +4625,18 @@ smoke #294.
 **Публичный API:** нет (docs only).
 
 **Дальше:** CodeRabbit / ревью.
+
+---
+
+## Issue #296: chore(skills) — prepare-release windows|macos|all
+
+**Milestone:** Filar v1.0.0. **Ветка:** `chore/296-prepare-release-dual`.
+
+**Решение:** скилл читает `release.yml` (`build-windows` + `build-macos`);
+`all` = оба job’а и оба ассета; body релиза перечисляет
+`*-windows-x86_64.exe` и `*-macos-aarch64`; `linux` по-прежнему стоп.
+Синхронизированы `.qoder` (в git) и `.cursor` (local exclude) копии.
+
+**Публичный API:** нет (skill docs).
+
+**Дальше:** CodeRabbit / ревью.
