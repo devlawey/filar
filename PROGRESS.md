@@ -4590,3 +4590,19 @@ smoke #294.
 **Публичный API:** нет (docs + help strings).
 
 **Дальше:** CodeRabbit / ревью.
+
+---
+
+## Issue #293: transport — prefer `$SHELL` for local interactive PTY
+
+**Milestone:** Filar v1.0.0. **Ветка:** `feat/293-local-interactive-shell`.
+
+**Решение:** `LocalInteractive` на Unix берёт `$SHELL` (trim + `Path::is_file`),
+иначе `sh`. Windows — `cmd.exe` без изменений. `LocalExecutor` (`sh -c`) не трогали.
+
+**Документы:** PLATFORM_NOTES, USER_GUIDE §5, SMOKE (Unix/macOS prompt).
+
+**Публичный API:** поведение default shell у `LocalInteractive::with_size` /
+`with_shell_and_size(None)` на Unix меняется с hardcoded `sh` на `$SHELL`.
+
+**Дальше:** CodeRabbit / ревью.

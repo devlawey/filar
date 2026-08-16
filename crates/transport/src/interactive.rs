@@ -61,8 +61,9 @@ pub trait InteractiveTerminal: Send + Sync {
 
 /// [`InteractiveTerminal`] backed by a local PTY via `portable-pty`.
 ///
-/// Spawns a shell (`sh` on Unix, `cmd.exe` on Windows) in a pseudo-terminal
-/// and provides raw read/write/resize access.
+/// Spawns a shell in a pseudo-terminal and provides raw read/write/resize
+/// access. Default shell: `$SHELL` on Unix/macOS (fallback `sh` if unset or
+/// not a usable path); `cmd.exe` on Windows.
 #[cfg(feature = "local")]
 pub struct LocalInteractive {
     /// Receiver for output bytes (fed by a reader thread).
@@ -74,6 +75,34 @@ pub struct LocalInteractive {
     /// Child process handle (kept alive).
     #[allow(dead_code)]
     child: Arc<std::sync::Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+}
+
+/// Resolve the default local interactive shell when none is passed explicitly.
+///
+/// On Unix: `$SHELL` if non-empty and the path is an existing file; otherwise
+/// `"sh"`. On Windows: `"cmd.exe"`. Agent command execution (`LocalExecutor`)
+/// still uses `sh -c` / PowerShell and is unchanged.
+#[cfg(feature = "local")]
+fn resolve_default_local_shell() -> String {
+    #[cfg(unix)]
+    {
+        resolve_unix_interactive_shell(std::env::var("SHELL").ok().as_deref())
+    }
+    #[cfg(windows)]
+    {
+        "cmd.exe".to_string()
+    }
+}
+
+/// Pick Unix interactive shell from an env-style value (for tests + default).
+#[cfg(all(unix, feature = "local"))]
+fn resolve_unix_interactive_shell(env_shell: Option<&str>) -> String {
+    env_shell
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| std::path::Path::new(s).is_file())
+        .unwrap_or("sh")
+        .to_string()
 }
 
 #[cfg(feature = "local")]
@@ -90,7 +119,8 @@ impl LocalInteractive {
 
     /// Create a local interactive terminal with a specific shell and size.
     ///
-    /// If `shell` is `None`, defaults to `sh` on Unix, `cmd.exe` on Windows.
+    /// If `shell` is `None`, uses [`resolve_default_local_shell`]: `$SHELL` on
+    /// Unix/macOS (fallback `sh`), `cmd.exe` on Windows.
     pub async fn with_shell_and_size(
         shell: Option<&str>,
         cols: u16,
@@ -106,11 +136,8 @@ impl LocalInteractive {
             })
             .map_err(|e| CoreError::Other(format!("failed to open PTY: {e}")))?;
 
-        // Determine shell program.
-        #[cfg(unix)]
-        let shell_prog = shell.unwrap_or("sh");
-        #[cfg(windows)]
-        let shell_prog = shell.unwrap_or("cmd.exe");
+        let default_shell = resolve_default_local_shell();
+        let shell_prog = shell.unwrap_or(default_shell.as_str());
 
         let mut cmd = CommandBuilder::new(shell_prog);
         cmd.cwd(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
@@ -153,7 +180,7 @@ impl LocalInteractive {
             }
         });
 
-        info!(cols, rows, "local interactive PTY shell ready");
+        info!(cols, rows, shell = %shell_prog, "local interactive PTY shell ready");
 
         Ok(Self {
             rx: Arc::new(Mutex::new(rx)),
@@ -436,8 +463,30 @@ mod tests {
     use super::*;
 
     #[cfg(all(unix, feature = "local"))]
+    #[test]
+    fn unix_shell_prefers_valid_env_path() {
+        // `/bin/sh` exists on essentially every Unix CI image.
+        assert_eq!(
+            resolve_unix_interactive_shell(Some("/bin/sh")),
+            "/bin/sh"
+        );
+    }
+
+    #[cfg(all(unix, feature = "local"))]
+    #[test]
+    fn unix_shell_falls_back_when_empty_or_missing() {
+        assert_eq!(resolve_unix_interactive_shell(None), "sh");
+        assert_eq!(resolve_unix_interactive_shell(Some("")), "sh");
+        assert_eq!(resolve_unix_interactive_shell(Some("   ")), "sh");
+        assert_eq!(
+            resolve_unix_interactive_shell(Some("/no/such/filar-shell-xyz")),
+            "sh"
+        );
+    }
+
+    #[cfg(all(unix, feature = "local"))]
     #[tokio::test]
-    #[ignore = "requires sh on Unix"]
+    #[ignore = "requires a local PTY and a usable shell"]
     async fn local_interactive_echo() {
         let term = LocalInteractive::with_size(80, 24).await.unwrap();
 
