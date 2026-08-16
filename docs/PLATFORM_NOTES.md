@@ -29,6 +29,7 @@ Add findings here whenever a platform difference is discovered.
 > `Ctrl+H` is indistinguishable from `Backspace` on all tested terminals
 > (both arrive as `KeyCode::Backspace` or `0x08`). For this reason the help
 > overlay is bound only to `F1` (#142), and `Ctrl+H` is not reserved.
+> On macOS see [macOS shortcuts](#macos-shortcuts) for Fn+F1 and Ctrl vs ⌘.
 
 ## Key mapping (Russian ЙЦУКЕН)
 
@@ -44,6 +45,23 @@ Add findings here whenever a platform difference is discovered.
 | V         | м           | ^V (paste) |
 
 Mapped via `ctrl_key(en, ru)` helper in `crates/tui/src/app.rs`.
+
+## macOS shortcuts
+
+TUI bindings use **Control**, not Command (⌘). This matches Windows/Linux and
+is intentional for 1.0.0 (#292); remapping to ⌘ is out of scope.
+
+| Topic | Behaviour on macOS |
+|-------|---------------------|
+| Modifier | `KeyModifiers::CONTROL` only. ⌘+letter is **not** a filar shortcut (often claimed by the terminal or the OS). |
+| Help (`F1`) | Apple keyboards often need **Fn+F1** (Touch Bar / “Use F1, F2, etc. as standard function keys” off). If F1 does nothing, try Fn+F1 or enable standard F-keys in System Settings → Keyboard. |
+| Paste (`Ctrl+V`) | Uses `arboard` (`NSPasteboard`) — works in Terminal.app / iTerm2 when the terminal forwards Ctrl+V. Bracketed paste also works when the terminal enables it. |
+| Quit / terminal / tabs | `Ctrl+Q`, `Ctrl+T`, `Ctrl+N`/`W`/`Tab` — same as other platforms; use the **Control** key, not ⌘. |
+| Russian ЙЦУКЕН | Same `ctrl_key(en, ru)` mapping as elsewhere; verify in the terminal you use (Terminal.app / iTerm2). |
+
+**Known limitation:** if the terminal swallows Ctrl+letter or F-keys before
+crossterm sees them, filar cannot receive the shortcut — that is a terminal
+configuration issue, not a silent failure inside filar.
 
 ## Async blockers
 
