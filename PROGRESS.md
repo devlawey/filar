@@ -4628,6 +4628,25 @@ smoke #294.
 
 ---
 
+## Issue #296: chore(skills) — prepare-release windows|macos|all
+
+**Milestone:** Filar v1.0.0. **Ветка:** `refactor/296-prepare-release-dual`.
+
+**Решение:** скилл читает `release.yml` (`build-windows` + `build-macos`);
+`all` = оба job’а и оба ассета; body релиза перечисляет
+`*-windows-x86_64.exe` и `*-macos-aarch64`; `linux` по-прежнему стоп.
+Синхронизированы `.qoder` (в git) и `.cursor` (local exclude) копии.
+
+**Review:** ветка переименована `chore/` → `refactor/` (AGENTS.md); для
+неполного `all` — recovery через `draft: true` (CI всё равно стартует с
+`published`, draft-first сломал бы триггер).
+
+**Публичный API:** нет (skill docs).
+
+**Дальше:** CodeRabbit / ревью.
+
+---
+
 ## Issue #297: macos — packaging decision (binary-only for 1.0.0)
 
 **Milestone:** Filar v1.0.0. **Ветка:** `docs/297-macos-binary-only`.
