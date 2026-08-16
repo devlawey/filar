@@ -9,19 +9,25 @@
 
 ### 1.1. Запуск (основной способ)
 
-1. Скачайте `filar.exe` (или соберите из исходников: `cargo build --release`)
-2. Дважды кликните `filar.exe`
+1. Скачайте релизный бинарник или соберите из исходников (`cargo build --release`):
+   - **Windows:** `filar.exe`
+   - **macOS (Apple Silicon):** `filar-*-macos-aarch64` → `chmod +x` и при
+     необходимости `xattr -d com.apple.quarantine …` (см. `docs/PLATFORM_NOTES.md`)
+2. Запустите бинарник (двойной клик или из терминала)
 3. Откроется GUI-лаунчер — введите модель, URL и API-ключ прямо в интерфейсе
 4. Нажмите **Launch**
 
-API-ключ сохранится в диспетчере учётных данных Windows автоматически — при
-следующем запуске он уже будет заполнен. Пароли SSH сохраняются, если отметить
-«Save password» для соответствующего SSH-профиля.
+API-ключ сохранится в системном хранилище учётных данных автоматически —
+**Windows Credential Manager** или **macOS Keychain** (service `filar`).
+При следующем запуске поле уже будет заполнено. Пароли SSH сохраняются, если
+отметить «Save password» для соответствующего SSH-профиля (ключ
+`ssh_target:{alias|SSHn}`).
 
-### 1.2. Запуск через PowerShell
+### 1.2. Запуск из терминала
 
-```powershell
-filar.exe
+```bash
+# Windows (PowerShell) или macOS (Terminal / iTerm2)
+filar          # Windows: filar.exe
 ```
 
 Без аргументов — всегда открывается GUI-лаунчер.
@@ -30,28 +36,34 @@ filar.exe
 
 CLI-режим читает `config.toml` (см. раздел 2). Нужны env-переменные для ключей.
 
-```powershell
+```bash
 # Локальная машина (требуется GLM_API_KEY в env)
-$env:GLM_API_KEY = "ваш-ключ"
-filar.exe --target local
+export GLM_API_KEY="ваш-ключ"          # macOS / bash / zsh
+# $env:GLM_API_KEY = "ваш-ключ"        # Windows PowerShell
+filar --target local
 
 # SSH-таргет + конкретный LLM-профиль
-filar.exe --target test-docker --llm glm
+filar --target test-docker --llm glm
 
 # Восстановить предыдущую сессию
-filar.exe --target local --session 1718900000
+filar --target local --session 1718900000
 ```
 
 ### 1.4. Сборка из исходников
 
-```powershell
-$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:USERPROFILE\mingw\mingw64\bin;$env:PATH"
+```bash
 git clone https://github.com/devlawey/filar.git
 cd filar
 cargo build --release
 ```
 
-Бинарник: `target\release\filar.exe`
+| Платформа | Бинарник |
+|-----------|----------|
+| Windows | `target\release\filar.exe` |
+| macOS | `target/release/filar` |
+
+**1.0.0** официально поддерживает Windows и macOS; Linux — не цель релиза
+(пути данных через XDG уже есть в движке).
 
 ---
 
@@ -68,12 +80,12 @@ cargo build --release
 | `settings.json` | `{OS data dir}/filar/` | GUI-лаунчер | Сохраняет состояние UI (SSH-профили, модель, URL, выбор) |
 | `pending_launch.json` | `{OS data dir}/filar/` | GUI-лаунчер → TUI | Транзитный: передаёт настройки запуска от GUI к TUI, удаляется после чтения |
 | `config.toml` | `{OS data dir}/filar/` | GUI-лаунчер (частично) + пользователь | Фолбэк для CLI-режима; полный набор настроек |
-| OS Credential Manager | Системное хранилище | GUI / TUI | API-ключи и SSH-пароли — **только здесь**, нигде в файлах |
+| OS Credential Manager / Keychain | Системное хранилище | GUI / TUI | API-ключи и SSH-пароли — **только здесь**, нигде в файлах |
 
 Пути `{OS data dir}/filar/`:
 - Windows: `%APPDATA%\filar\`
 - macOS: `~/Library/Application Support/filar/`
-- Linux: `~/.local/share/filar/` (или `$XDG_DATA_HOME/filar/`)
+- Linux: `~/.local/share/filar/` (или `$XDG_DATA_HOME/filar/`; не цель 1.0.0)
 
 **Поток при запуске через GUI:**
 1. Пользователь редактирует поля в лаунчере → сохраняются в `settings.json`
@@ -154,15 +166,21 @@ type = "agent"        # agent | key | password
 
 ### 2.4. API-ключи и пароли
 
-**В GUI-режиме:** ввести ключ прямо в интерфейсе. Сохраняется в Credential
-Manager автоматически при первом Launch.
+**В GUI-режиме:** ввести ключ прямо в интерфейсе. Сохраняется в OS credential
+store автоматически при первом Launch:
+
+| Платформа | Хранилище | Service / ключи |
+|-----------|-----------|-----------------|
+| Windows | Credential Manager | service `filar` |
+| macOS | Keychain | service `filar`; SSH — `ssh_target:{alias\|SSHn}` |
 
 **В CLI-режиме:** через переменные окружения:
 
-```powershell
-$env:GLM_API_KEY = "ваш-ключ"       # профиль по умолчанию
-$env:DEEPSEEK_API_KEY = "ваш-ключ"   # именованный профиль
-$env:SSH_PASSWORD = "пароль-ssh"    # SSH auth type = "password"
+```bash
+export GLM_API_KEY="ваш-ключ"          # профиль по умолчанию
+export DEEPSEEK_API_KEY="ваш-ключ"    # именованный профиль
+export SSH_PASSWORD="пароль-ssh"     # SSH auth type = "password"
+# Windows PowerShell: $env:GLM_API_KEY = "…"
 ```
 
 Ключи **никогда** не записываются в `config.toml`, `settings.json`, или
@@ -174,7 +192,7 @@ $env:SSH_PASSWORD = "пароль-ssh"    # SSH auth type = "password"
 1. `FILAR_CONFIG` env (явный путь)
 2. `./config.toml` (текущая директория)
 3. `{OS data dir}/filar/config.toml` (сюда пишет лаунчер; см. §2.1)
-4. `config.toml` рядом с `.exe`
+4. `config.toml` рядом с исполняемым файлом (`filar.exe` / `filar`)
 
 Если ни одного файла нет — используются встроенные значения по умолчанию.
 

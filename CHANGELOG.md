@@ -13,6 +13,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Dual-platform docs for 1.0.0: README badge and Getting Started cover
+  Windows + macOS; USER_GUIDE Credential Manager / Keychain; SMOKE and
+  PLATFORM_NOTES index findings from #289–#293
+  ([#295](https://github.com/devlawey/filar/issues/295)).
 - macOS keyboard notes: Ctrl (not ⌘), Fn+F1 for help, smoke checks, and
   help-overlay hints
   ([#292](https://github.com/devlawey/filar/issues/292)).
