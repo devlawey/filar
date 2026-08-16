@@ -7,7 +7,7 @@ Filar is a Rust-based terminal application that integrates an AI agent (LLM) wit
 
 ![Rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey)
 
 ---
 
@@ -15,7 +15,7 @@ Filar is a Rust-based terminal application that integrates an AI agent (LLM) wit
 
 - **AI Agent** — powered by any OpenAI-compatible LLM (default: GLM), with tool calling support
 - **SSH Remote Execution** — agent manages remote machines via SSH, zero-install (no files left on the remote)
-- **Local Mode** — run commands on your own machine via PowerShell
+- **Local Mode** — run commands on your own machine (PowerShell on Windows; POSIX `sh -c` on macOS)
 - **TUI Interface** — built with [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm)
 - **Mouse Support** — scroll wheel, click-to-expand command blocks, drag-to-select and copy text
 - **Streaming Responses** — real-time streaming of LLM responses with spinner animation
@@ -47,23 +47,36 @@ for a consumer guide with Cargo.toml example and a minimal code sample.
 
 ## Getting Started
 
+**Supported platforms for 1.0.0:** Windows (x86_64) and macOS (Apple Silicon /
+`aarch64`). Linux paths exist in the engine but are **not** a release target
+for 1.0.0.
+
 ### Prerequisites
 
 - **Rust** (stable, [rustup](https://rustup.rs/))
 - **Windows** with either:
   - Visual Studio Build Tools (MSVC target), or
   - MinGW/GCC (GNU target) — see `.cargo/config.toml.example`
+- **macOS** (Apple Silicon): Xcode Command Line Tools (`xcode-select --install`)
 - An **LLM API key** (e.g. GLM / OpenAI-compatible)
 
 ### Build
 
-```powershell
+```bash
 git clone https://github.com/devlawey/filar.git
 cd filar
 cargo build --release
 ```
 
-The executable will be at `target\release\filar.exe`.
+| Platform | Binary |
+|----------|--------|
+| Windows | `target\release\filar.exe` |
+| macOS | `target/release/filar` |
+
+Or download release assets from GitHub Releases:
+`filar-*-windows-x86_64.exe` and `filar-*-macos-aarch64` (after download on
+macOS: `chmod +x … && xattr -d com.apple.quarantine …` — see
+[`docs/PLATFORM_NOTES.md`](docs/PLATFORM_NOTES.md)).
 
 ### Configuration
 
@@ -198,17 +211,18 @@ type = "agent"        # agent | key | password
 
 ### Run
 
-Just double-click `filar.exe` — the GUI launcher will appear.
+Double-click the binary (`filar.exe` on Windows, `filar` on macOS) — the GUI
+launcher appears.
 
 From the GUI you can:
-- Enter your LLM API key (saved in OS Credential Manager)
+- Enter your LLM API key (saved in Windows Credential Manager or macOS Keychain)
 - Choose Local or SSH mode
 - Configure up to 5 SSH profiles
 - Start a session
 
 Or via command line (reads `config.toml`, no GUI):
 
-```powershell
+```bash
 # Local mode
 filar --target local
 
@@ -401,7 +415,8 @@ filar/
 - **Zero-Install SSH** — no files are left on the remote machine; all commands are injected via the SSH channel
 - **Secure by Default** — all commands require confirmation; destructive commands are detected and blocked
 - **Dynamic System Prompt** — the agent's system prompt adapts to local/SSH context and OS/shell type
-- **OS Credential Storage** — API keys and SSH passwords stored via `keyring` (Windows Credential Manager)
+- **OS Credential Storage** — API keys and SSH passwords stored via `keyring`
+  (Windows Credential Manager / macOS Keychain)
 
 ---
 

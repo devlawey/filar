@@ -3,6 +3,15 @@
 Known platform-specific behaviours that affect development or runtime.
 Add findings here whenever a platform difference is discovered.
 
+**1.0.0 dual-platform summary** (Windows + macOS; Linux not a release target):
+
+| Topic | Section | Issues |
+|--------|---------|--------|
+| App data dirs | [Application data directory](#application-data-directory) | #291 |
+| macOS Ctrl vs ⌘, Fn+F1 | [macOS shortcuts](#macos-shortcuts) | #292 |
+| Interactive PTY shell | [Local interactive shell](#local-interactive-shell-ctrlt) | #293 |
+| Release assets / quarantine | [Release binaries (CI)](#release-binaries-ci) | #289, #297 |
+
 ## Clipboard
 
 | Platform | `arboard::get_text()` | Bracketed paste |

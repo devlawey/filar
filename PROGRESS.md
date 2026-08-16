@@ -4606,3 +4606,22 @@ smoke #294.
 `with_shell_and_size(None)` на Unix меняется с hardcoded `sh` на `$SHELL`.
 
 **Дальше:** CodeRabbit / ревью.
+
+---
+
+## Issue #295: docs — dual-platform (Win+Mac) README / USER_GUIDE / SMOKE / PLATFORM_NOTES
+
+**Milestone:** Filar v1.0.0. **Ветка:** `docs/295-dual-platform-docs`.
+
+**Что сделано:**
+- README: badge Windows \| macOS; Getting Started / build / run для обеих ОС;
+  1.0.0 supported platforms; Keychain в design notes.
+- USER_GUIDE §1–2: Win+Mac быстрый старт, Credential Manager / Keychain, пути.
+- SMOKE: преамбула Win+Mac + keyring; macOS-блок уже был.
+- PLATFORM_NOTES: индекс dual-platform (#289/#291/#292/#293).
+
+**Вне скоупа:** Linux как supported release target; #294 GUI Mac smoke; #297 packaging.
+
+**Публичный API:** нет (docs only).
+
+**Дальше:** CodeRabbit / ревью.
