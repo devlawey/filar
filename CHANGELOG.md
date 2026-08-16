@@ -13,6 +13,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- macOS 1.0.0 packaging decision: **binary-only** (not `.app` / not notarized);
+  unsigned OSS policy aligned with Windows SmartScreen (#80); README and
+  PLATFORM_NOTES quarantine / download notes
+  ([#297](https://github.com/devlawey/filar/issues/297)).
 - Dual-platform docs for 1.0.0: README badge and Getting Started cover
   Windows + macOS; USER_GUIDE Credential Manager / Keychain; SMOKE and
   PLATFORM_NOTES index findings from #289–#293

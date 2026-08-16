@@ -10,7 +10,7 @@ Add findings here whenever a platform difference is discovered.
 | App data dirs | [Application data directory](#application-data-directory) | #291 |
 | macOS Ctrl vs ⌘, Fn+F1 | [macOS shortcuts](#macos-shortcuts) | #292 |
 | Interactive PTY shell | [Local interactive shell](#local-interactive-shell-ctrlt) | #293 |
-| Release assets / quarantine | [Release binaries (CI)](#release-binaries-ci) | #289, #297 |
+| Release assets / packaging | [Release binaries (CI)](#release-binaries-ci) | #289, #297, #80 |
 
 ## Clipboard
 
@@ -111,16 +111,53 @@ configuration issue, not a silent failure inside filar.
 | Windows  | `windows-latest` | `filar-{tag}-windows-x86_64.exe` |
 | macOS    | `macos-14` (arm64) | `filar-{tag}-macos-aarch64` |
 
-> **Arch decision (#289):** macOS ships **one** architecture — `aarch64`
-> (Apple Silicon). The job pins `macos-14` (not floating `macos-latest`) and
-> asserts `uname -m == arm64` before packaging so the asset name cannot drift.
-> Intel (`x86_64`) and universal binaries are out of scope until packaging
-> follow-up (#297). After downloading the raw asset from GitHub Releases,
-> restore the executable bit and clear Gatekeeper quarantine if needed:
->
-> ```bash
-> chmod +x filar-*-macos-aarch64 && xattr -d com.apple.quarantine filar-*-macos-aarch64
-> ```
+### Packaging decision for 1.0.0 (#297)
+
+**Chosen: binary-only** (same shape as Windows `.exe` — one downloadable
+file, no installer). macOS asset is the raw Mach-O executable
+`filar-{tag}-macos-aarch64`, **not** a `.app` bundle and **not** notarized.
+
+| Option | 1.0.0 |
+|--------|--------|
+| Raw binary | **Yes** (this release) |
+| `.app` + zip | Follow-up after 1.0.0 |
+| Notarization / staple | Follow-up after 1.0.0 (OSS cost/complexity) |
+| Intel (`x86_64`) / universal | Out of scope (still Apple Silicon only, #289) |
+
+### Unsigned OSS policy (macOS Gatekeeper + Windows SmartScreen)
+
+Release builds are **unsigned** open-source binaries. Users may see OS
+warnings; that is expected until code-signing / notarization land.
+
+| Platform | Typical warning | User workaround |
+|----------|----------------|-----------------|
+| macOS | Gatekeeper quarantine / “cannot be opened” | `chmod +x` + `xattr -d com.apple.quarantine …` (below) |
+| Windows | SmartScreen / “Windows protected your PC” | “More info” → Run anyway (tracked in [#80](https://github.com/devlawey/filar/issues/80)) |
+
+Same policy on both platforms: document the bypass; do not pretend the
+build is signed.
+
+> **Arch (#289):** macOS ships **one** architecture — `aarch64` (Apple Silicon).
+> The job pins `macos-14` and asserts `uname -m == arm64` before packaging.
+
+After downloading the macOS asset from GitHub Releases:
+
+```bash
+chmod +x filar-*-macos-aarch64 && xattr -d com.apple.quarantine filar-*-macos-aarch64
+```
+
+### Release notes snippet (for `/prepare-release`)
+
+Include under Downloads (adapt version):
+
+```markdown
+## Downloads
+- Windows: `filar-vX.Y.Z-windows-x86_64.exe` (unsigned; SmartScreen may warn — see #80)
+- macOS (Apple Silicon): `filar-vX.Y.Z-macos-aarch64` (raw binary, not a `.app`; not notarized)
+  ```bash
+  chmod +x filar-vX.Y.Z-macos-aarch64 && xattr -d com.apple.quarantine filar-vX.Y.Z-macos-aarch64
+  ```
+```
 
 ## Application data directory
 

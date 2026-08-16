@@ -73,10 +73,19 @@ cargo build --release
 | Windows | `target\release\filar.exe` |
 | macOS | `target/release/filar` |
 
-Or download release assets from GitHub Releases:
-`filar-*-windows-x86_64.exe` and `filar-*-macos-aarch64` (after download on
-macOS: `chmod +x … && xattr -d com.apple.quarantine …` — see
-[`docs/PLATFORM_NOTES.md`](docs/PLATFORM_NOTES.md)).
+Or download release assets from [GitHub Releases](https://github.com/devlawey/filar/releases)
+(1.0.0 ships **unsigned** binaries — same OSS policy on Windows and macOS;
+see [#80](https://github.com/devlawey/filar/issues/80) / `docs/PLATFORM_NOTES.md`):
+
+| Platform | Asset | After download |
+|----------|--------|----------------|
+| Windows | `filar-*-windows-x86_64.exe` | If SmartScreen warns: More info → Run anyway |
+| macOS (Apple Silicon) | `filar-*-macos-aarch64` (raw binary, **not** a `.app`) | `chmod +x … && xattr -d com.apple.quarantine …` |
+
+```bash
+# macOS (Gatekeeper quarantine on browser/GitHub downloads)
+chmod +x filar-*-macos-aarch64 && xattr -d com.apple.quarantine filar-*-macos-aarch64
+```
 
 ### Configuration
 
