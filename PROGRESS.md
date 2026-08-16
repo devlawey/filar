@@ -4572,3 +4572,21 @@ smoke #294.
 (Windows тот же Roaming APPDATA).
 
 **Дальше:** CodeRabbit / ревью.
+
+---
+
+## Issue #292: tui/docs — macOS hotkeys & F1 (Fn)
+
+**Milestone:** Filar v1.0.0. **Ветка:** `docs/292-macos-hotkeys-notes`.
+
+**Что сделано:**
+- `PLATFORM_NOTES`: секция macOS shortcuts (Ctrl vs ⌘, Fn+F1, paste, known limitation).
+- USER_GUIDE §4.1: преамбула + F1/Fn.
+- Help overlay: F1 desc включает Fn+F1 и «Ctrl, not ⌘» (без псевдо-клавиши `note`).
+- `SMOKE.md`: блок macOS (F1/Fn, ^T, ^V, ^Q, help note).
+
+**Review:** убран `HelpEntry { key: "note" }` — текст свёрнут в desc у F1.
+
+**Публичный API:** нет (docs + help strings).
+
+**Дальше:** CodeRabbit / ревью.

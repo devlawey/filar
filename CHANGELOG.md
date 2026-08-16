@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- macOS keyboard notes: Ctrl (not ⌘), Fn+F1 for help, smoke checks, and
+  help-overlay hints
+  ([#292](https://github.com/devlawey/filar/issues/292)).
+
 ### Changed
 
 - Desktop data directory now uses `dirs::data_dir()`:
