@@ -4665,3 +4665,33 @@ follow-up после 1.0.0.
 **Публичный API:** нет.
 
 **Дальше:** CodeRabbit / ревью.
+
+---
+
+## Release v1.0.0 (dual-platform)
+
+**Дата:** 2026-08-17. Bump `0.9.0` → `1.0.0` на `main`.
+
+**Входит:** Windows + macOS aarch64 assets (#289); data dir (#291); SSH keyring
+handoff (#290); `$SHELL` PTY (#293); docs/hotkeys/packaging (#292/#295/#297);
+prepare-release dual (#296).
+
+**Отложено на проверку ассетов:** ручной SMOKE Win/Mac (#294/#298).
+**Открыто:** #80 code-sign / SmartScreen.
+
+**Теги:** `v1.0.0` + `engine-v1.0.0` (core/transport/agent менялись).
+
+---
+
+## Release v1.0.0 (dual-platform)
+
+**Дата:** 2026-08-17. Bump `0.9.0` → `1.0.0` на `main`.
+
+**Входит:** Windows + macOS aarch64 assets (#289); data dir (#291); SSH keyring
+handoff (#290); `$SHELL` PTY (#293); docs/hotkeys/packaging (#292/#295/#297);
+prepare-release dual (#296).
+
+**Отложено на проверку ассетов:** ручной SMOKE Win/Mac (#294/#298).
+**Открыто:** #80 code-sign / SmartScreen.
+
+**Теги:** `v1.0.0` + `engine-v1.0.0` (core/transport/agent менялись).
