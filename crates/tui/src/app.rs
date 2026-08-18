@@ -362,8 +362,8 @@ pub struct Session {
     /// Set when `!ssh` succeeds for this tab. Used for display and system prompt.
     pub ssh_info: Option<String>,
     /// Last known working directory for the status bar (`None` = unknown).
-    /// Local tabs start from the process cwd; SSH is filled after `pwd` / OSC 7.
-    /// Agent↔interactive sync of this value is #313.
+    /// Local tabs start from the process cwd; SSH is filled from OSC 7
+    /// (interactive PTY). Agent↔interactive sync of this value is #313.
     pub cwd: Option<String>,
     /// LLM profile selected via Ctrl+L. None = use App default.
     pub llm_profile: Option<String>,
@@ -3126,8 +3126,10 @@ impl App {
             TuiEvent::TransportChanged { .. } => {
                 // Handled by the runner before reaching here — no-op.
             }
-            TuiEvent::CwdChanged { cwd, .. } => {
-                self.cwd = Some(cwd);
+            TuiEvent::CwdChanged { session_id, cwd } => {
+                if let Some(idx) = self.find_session_idx(session_id) {
+                    self.sessions[idx].cwd = Some(cwd);
+                }
             }
             TuiEvent::PasswordNeeded { session_id, target } => {
                 self.ctrl_o_pending_target = Some(target);
@@ -6757,6 +6759,23 @@ mod tests {
             cwd: "/var/log".into(),
         });
         assert_eq!(app.cwd.as_deref(), Some("/var/log"));
+    }
+
+    #[test]
+    fn cwd_changed_routes_to_named_session_not_active() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.new_tab();
+        let inactive_id = app.sessions[0].id;
+        let active_id = app.sessions[1].id;
+        assert_eq!(app.sessions[app.active].id, active_id);
+        let active_cwd = app.sessions[1].cwd.clone();
+        app.handle_agent_event(TuiEvent::CwdChanged {
+            session_id: inactive_id,
+            cwd: "/opt/bg".into(),
+        });
+        assert_eq!(app.sessions[0].cwd.as_deref(), Some("/opt/bg"));
+        assert_eq!(app.sessions[1].cwd, active_cwd);
+        assert_eq!(app.active, 1, "active tab must not change");
     }
 
     #[test]

@@ -4782,16 +4782,19 @@ NSPasteboard; egui 0.29 `TextEdit::singleline` заменяет `\n`/`\r` на �
 
 ## Issue #309: feat(tui) — SSH status bar alias + host + pwd
 
-**Milestone:** 1.0.1. **Ветка:** `feat/309-ssh-status-alias-host-pwd`.
+**Milestone:** 1.0.1. **Ветка:** `feat/309-ssh-status-alias-host-pwd`. **PR:** #318.
 
 **Проблема:** в статус-баре при SSH был только `target_name`, без host и pwd.
 
 **Решение:**
 - `Session::status_target()`: SSH `alias host pwd`, local `name pwd`.
 - Нет alias → только host + pwd (если `target_name` = raw `user@host`).
-- `Session.cwd`: local — process cwd; SSH — `pwd` после connect; interactive — OSC 7.
+- `Session.cwd`: local — process cwd; SSH — OSC 7 из interactive PTY. Автоматический `pwd` после connect убран: это обход confirm-гейта (AGENTS.md).
 - Синхронизация cwd агент↔PTY — **#313** (здесь только отображение).
 
 **Публичный API:** `Session::status_target`, `TuiEvent::CwdChanged`. Breaking для exhaustiveness match `TuiEvent`.
 
-**Дальше:** CodeRabbit / ревью.
+**Review (#318):**
+- Убран `spawn_remote_cwd_probe` (`exec.run("pwd")` без approve).
+- `CwdChanged` пишет в сессию по `session_id` явно; тест на фоновую вкладку.
+- CHANGELOG: запись #309 в `### Changed`.

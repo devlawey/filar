@@ -11,12 +11,20 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 
 - SSH status bar shows **alias** (or host-only when there is no alias),
   **host**, and last-known **pwd**. Local tabs still show `local` plus the
   process cwd. Interactive OSC 7 updates pwd; agent↔PTY sync is #313
   ([#309](https://github.com/devlawey/filar/issues/309)).
+- Default command timeout is now 5 minutes (`[timeouts].command_secs = 300`).
+  The value is applied to SSH marker wait and local subprocess execution, so
+  long jobs such as `du`/`find` are no longer killed at 120s (SSH) or 60s
+  (local) under default settings
+  ([#308](https://github.com/devlawey/filar/issues/308)).
+
+### Fixed
+
 - GUI launcher: paste into API key / SSH password no longer keeps a trailing
   newline (or the space egui 0.29 substituted for it). Show-password /
   show-API-key toggles were added
@@ -28,14 +36,6 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - F1 help overlay no longer uses `⌘` on Windows (console fonts render it as
   `?`); macOS keeps Fn+F1 / Ctrl vs ⌘ wording
   ([#310](https://github.com/devlawey/filar/issues/310)).
-
-### Changed
-
-- Default command timeout is now 5 minutes (`[timeouts].command_secs = 300`).
-  The value is applied to SSH marker wait and local subprocess execution, so
-  long jobs such as `du`/`find` are no longer killed at 120s (SSH) or 60s
-  (local) under default settings
-  ([#308](https://github.com/devlawey/filar/issues/308)).
 
 ## [1.0.0] - 2026-08-17
 

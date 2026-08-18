@@ -91,31 +91,6 @@ fn route_term_chunk(app: &mut App, sid: SessionId, chunk: TermChunk) -> RouteOut
     }
 }
 
-fn spawn_remote_cwd_probe(
-    exec: Arc<TuiExecutor>,
-    session_id: crate::app::SessionId,
-    tx: mpsc::UnboundedSender<TuiEvent>,
-) {
-    tokio::spawn(async move {
-        if let Ok(result) = exec.run("pwd").await {
-            if let Some(cwd) = sanitize_pwd_output(&result.stdout) {
-                let _ = tx.send(TuiEvent::CwdChanged { session_id, cwd });
-            }
-        }
-    });
-}
-
-fn sanitize_pwd_output(stdout: &str) -> Option<String> {
-    let line = stdout
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.eq_ignore_ascii_case("path") && *l != "----")?;
-    if line.len() > 1024 {
-        return None;
-    }
-    Some(line.to_string())
-}
-
 use filar_core::ChatBlock;
 
 // ---------------------------------------------------------------------------
@@ -440,10 +415,9 @@ async fn run_app(
     if let Some(ref target) = config.ssh_target {
         app.sessions[0].ssh_info =
             Some(format!("{}@{}:{}", target.user, target.host, target.port));
+        // Do not run unconfirmed `pwd` here (AGENTS.md confirm gate).
+        // Pwd appears once OSC 7 reports it (interactive) or #313 syncs it.
         app.sessions[0].cwd = None;
-        if let Some(entry) = executors.get(&initial_sid) {
-            spawn_remote_cwd_probe(entry.executor.clone(), initial_sid, agent_tx.clone());
-        }
     } else if let Some(ref info) = config.initial_ssh_info {
         // Restored session was over SSH but no live ssh_target was provided
         // (e.g. `--session` restore without `--target`). Surface the saved
@@ -1166,14 +1140,8 @@ async fn run_app(
                                     .ok()
                                     .map(|p| p.display().to_string());
                             } else {
+                                // Unknown until OSC 7 / #313 — no unconfirmed remote `pwd`.
                                 app.sessions[idx].cwd = None;
-                                if let Some(entry) = executors.get(session_id) {
-                                    spawn_remote_cwd_probe(
-                                        entry.executor.clone(),
-                                        *session_id,
-                                        agent_tx.clone(),
-                                    );
-                                }
                             }
                         }
                     }

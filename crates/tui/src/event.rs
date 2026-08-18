@@ -49,7 +49,7 @@ pub enum TuiEvent {
         alias: Option<String>,
     },
 
-    /// Working directory for a tab (from remote `pwd` or OSC 7). Status bar only.
+    /// Working directory for a tab (OSC 7 / later sync). Status bar only.
     CwdChanged {
         session_id: SessionId,
         cwd: String,
