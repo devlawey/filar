@@ -13,6 +13,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- GUI launcher: paste into API key / SSH password no longer keeps a trailing
+  newline (or the space egui 0.29 substituted for it). Show-password /
+  show-API-key toggles were added
+  ([#312](https://github.com/devlawey/filar/issues/312)).
 - Interactive terminal (Ctrl+T): drag-select copies to the clipboard like
   agent mode when the PTY has not requested mouse tracking. Apps that enable
   SGR/legacy mouse still receive events; Ctrl+C is unchanged

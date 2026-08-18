@@ -31,15 +31,72 @@ const CRED_SERVICE: &str = "filar";
 // Credential store helpers (OS keyring / Credential Manager)
 // ---------------------------------------------------------------------------
 
+/// Normalize clipboard / pasteboard text for API keys and SSH passwords.
+///
+/// macOS Keychain and browsers typically copy a trailing newline (and sometimes
+/// a UTF-8 BOM or zero-width chars). egui 0.29 single-line `TextEdit` then
+/// replaces `\n`/`\r` with a **space**, so the secret becomes `"token "` and
+/// LLM auth / SSH login fail — while typing the same value by hand works (#312).
+fn sanitize_secret_clipboard(raw: &str) -> String {
+    let s = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let first = s.split(['\n', '\r']).next().unwrap_or("");
+    first
+        .chars()
+        .filter(|c| {
+            !c.is_control() && !matches!(*c, '\u{feff}' | '\u{200b}' | '\u{200c}' | '\u{200d}')
+        })
+        .collect()
+}
+
+/// If a secret field is focused, consume `Event::Paste` before `TextEdit` can
+/// turn a trailing newline into a trailing space, and assign the sanitized value.
+fn apply_focused_secret_paste(ui: &mut egui::Ui, id: egui::Id, value: &mut String) {
+    if !ui.memory(|m| m.has_focus(id)) {
+        return;
+    }
+    let mut paste = None;
+    ui.input(|i| {
+        for ev in &i.events {
+            if let egui::Event::Paste(s) = ev {
+                paste = Some(s.clone());
+                break;
+            }
+        }
+    });
+    let Some(raw) = paste else {
+        return;
+    };
+    ui.input_mut(|i| {
+        i.events.retain(|e| !matches!(e, egui::Event::Paste(_)));
+    });
+    let clean = sanitize_secret_clipboard(&raw);
+    if !clean.is_empty() {
+        *value = clean;
+    }
+}
+
+/// Masked (or plain) single-line secret editor with paste sanitization.
+fn secret_text_edit(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    value: &mut String,
+    show: bool,
+) -> egui::Response {
+    let id = ui.id().with(id_salt);
+    apply_focused_secret_paste(ui, id, value);
+    ui.add(egui::TextEdit::singleline(value).password(!show).id(id))
+}
+
 /// Save a secret to the OS credential store.
 fn save_secret(username: &str, secret: &str) {
+    let secret = sanitize_secret_clipboard(secret);
     if secret.is_empty() {
         delete_secret(username);
         return;
     }
     match keyring::Entry::new(CRED_SERVICE, username) {
         Ok(entry) => {
-            if let Err(e) = entry.set_password(secret) {
+            if let Err(e) = entry.set_password(&secret) {
                 tracing::warn!(error = %e, "failed to save secret to credential store");
             }
         }
@@ -49,10 +106,11 @@ fn save_secret(username: &str, secret: &str) {
 
 /// Load a secret from the OS credential store. Returns empty string if not found.
 fn load_secret(username: &str) -> String {
-    match keyring::Entry::new(CRED_SERVICE, username) {
+    let raw = match keyring::Entry::new(CRED_SERVICE, username) {
         Ok(entry) => entry.get_password().unwrap_or_default(),
         Err(_) => String::new(),
-    }
+    };
+    sanitize_secret_clipboard(&raw)
 }
 
 /// Delete a secret from the OS credential store.
@@ -481,6 +539,10 @@ struct LauncherApp {
     validation_error: String,
     /// Directory for Ctrl+S session exports (`None` = CWD).
     save_dir: Option<std::path::PathBuf>,
+    /// Reveal SSH password field (not persisted).
+    show_ssh_password: bool,
+    /// Reveal API key field (not persisted).
+    show_api_key: bool,
 }
 
 /// Local copy of an LLM profile for GUI editing.
@@ -675,45 +737,51 @@ impl LauncherApp {
             return;
         }
         let idx = self.target_mode - 1;
-        let slot = &mut self.ssh_slots[idx];
-        egui::Grid::new("ssh_grid")
-            .num_columns(2)
-            .spacing([10.0, 6.0])
-            .show(ui, |ui| {
-                ui.label("Host:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut slot.host)
-                        .hint_text("192.168.1.100"),
-                );
-                ui.end_row();
-                ui.label("Port:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut slot.port)
-                        .hint_text("22"),
-                );
-                ui.end_row();
-                ui.label("User:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut slot.user)
-                        .hint_text("root"),
-                );
-                ui.end_row();
-                ui.label("Alias:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut slot.alias)
-                        .hint_text("deploy")
-                        .desired_width(120.0),
-                );
-                ui.end_row();
-                ui.label("Password:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut slot.password)
-                        .password(true)
-                        .hint_text(""),
-                );
-                ui.end_row();
-            });
-        ui.checkbox(&mut slot.save_password, "Save password (encrypted in OS credential store)");
+        let mut show = self.show_ssh_password;
+        {
+            let slot = &mut self.ssh_slots[idx];
+            egui::Grid::new("ssh_grid")
+                .num_columns(2)
+                .spacing([10.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Host:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut slot.host)
+                            .hint_text("192.168.1.100"),
+                    );
+                    ui.end_row();
+                    ui.label("Port:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut slot.port)
+                            .hint_text("22"),
+                    );
+                    ui.end_row();
+                    ui.label("User:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut slot.user)
+                            .hint_text("root"),
+                    );
+                    ui.end_row();
+                    ui.label("Alias:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut slot.alias)
+                            .hint_text("deploy")
+                            .desired_width(120.0),
+                    );
+                    ui.end_row();
+                    ui.label("Password:");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut show, "Show");
+                        secret_text_edit(ui, "ssh_password", &mut slot.password, show);
+                    });
+                    ui.end_row();
+                });
+        }
+        self.show_ssh_password = show;
+        ui.checkbox(
+            &mut self.ssh_slots[idx].save_password,
+            "Save password (encrypted in OS credential store)",
+        );
     }
 
     fn render_llm_settings(&mut self, ui: &mut egui::Ui) {
@@ -763,20 +831,30 @@ impl LauncherApp {
                 self.save_profiles();
             }
         });
-        let p = &mut self.profiles[self.selected_profile];
-        ui.horizontal(|ui| { ui.label("Name:"); ui.text_edit_singleline(&mut p.name); });
-        ui.horizontal(|ui| { ui.label("Model:"); ui.text_edit_singleline(&mut p.model); });
-        ui.horizontal(|ui| { ui.label("API URL:"); ui.text_edit_singleline(&mut p.api_base_url); });
-        ui.horizontal(|ui| {
-            ui.label("API key:");
-            ui.add(egui::TextEdit::singleline(&mut p.api_key).password(true).hint_text("saved in OS credential store"));
-        });
-        ui.horizontal(|ui| { ui.label("Key env:"); ui.text_edit_singleline(&mut p.key_env); });
-        ui.horizontal(|ui| { ui.label("Temp:"); ui.text_edit_singleline(&mut p.temperature); });
-        ui.label("Extra body (JSON):");
-        ui.add(egui::TextEdit::multiline(&mut p.extra_body)
-            .hint_text("e.g. {\"thinking\":{\"type\":\"disabled\"}}")
-            .desired_rows(2).desired_width(f32::INFINITY));
+        let mut show_api_key = self.show_api_key;
+        {
+            let p = &mut self.profiles[self.selected_profile];
+            ui.horizontal(|ui| { ui.label("Name:"); ui.text_edit_singleline(&mut p.name); });
+            ui.horizontal(|ui| { ui.label("Model:"); ui.text_edit_singleline(&mut p.model); });
+            ui.horizontal(|ui| { ui.label("API URL:"); ui.text_edit_singleline(&mut p.api_base_url); });
+            ui.horizontal(|ui| {
+                ui.label("API key:");
+                ui.checkbox(&mut show_api_key, "Show");
+                secret_text_edit(
+                    ui,
+                    ("api_key", self.selected_profile),
+                    &mut p.api_key,
+                    show_api_key,
+                );
+            });
+            ui.horizontal(|ui| { ui.label("Key env:"); ui.text_edit_singleline(&mut p.key_env); });
+            ui.horizontal(|ui| { ui.label("Temp:"); ui.text_edit_singleline(&mut p.temperature); });
+            ui.label("Extra body (JSON):");
+            ui.add(egui::TextEdit::multiline(&mut p.extra_body)
+                .hint_text("e.g. {\"thinking\":{\"type\":\"disabled\"}}")
+                .desired_rows(2).desired_width(f32::INFINITY));
+        }
+        self.show_api_key = show_api_key;
     }
 
     /// Folder picker for the Ctrl+S session export directory.
@@ -861,7 +939,7 @@ impl LauncherApp {
                 host: slot.host.clone(),
                 port: slot.port.parse().unwrap_or(22),
                 user: slot.user.clone(),
-                password: slot.password.clone(),
+                password: sanitize_secret_clipboard(&slot.password),
                 slot: self.target_mode.saturating_sub(1),
                 alias: slot.alias.clone(),
             })
@@ -897,7 +975,7 @@ impl LauncherApp {
         let cfg = LaunchConfig {
             target: target.to_string(), ssh,
             model: p.model.clone(), api_base_url: p.api_base_url.clone(),
-            api_key: p.api_key.clone(), session_id,
+            api_key: sanitize_secret_clipboard(&p.api_key), session_id,
             temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
             selected_profile: Some(p.name.clone()), key_env: p.key_env.clone(),
             save_dir: self.save_dir.clone(),
@@ -1058,6 +1136,8 @@ pub fn run_launcher(config: &Config) {
         selected_profile,
         validation_error: String::new(),
         save_dir: settings.save_dir.clone(),
+        show_ssh_password: false,
+        show_api_key: false,
     };
 
     let options = eframe::NativeOptions {
@@ -1104,6 +1184,21 @@ fn load_icon() -> egui::IconData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_secret_clipboard_strips_pasteboard_artifacts() {
+        assert_eq!(sanitize_secret_clipboard("sk-abc\n"), "sk-abc");
+        assert_eq!(sanitize_secret_clipboard("sk-abc\r\n"), "sk-abc");
+        assert_eq!(sanitize_secret_clipboard("\u{feff}sk-abc\n"), "sk-abc");
+        // Surrounding ASCII spaces are kept (valid in some SSH passwords).
+        // Paste intercept runs before egui can turn a trailing newline into a space.
+        assert_eq!(sanitize_secret_clipboard("  sk-abc  \n"), "  sk-abc  ");
+        assert_eq!(sanitize_secret_clipboard("sk-abc "), "sk-abc ");
+        assert_eq!(sanitize_secret_clipboard("pass word"), "pass word");
+        assert_eq!(sanitize_secret_clipboard("line1\nline2"), "line1");
+        assert_eq!(sanitize_secret_clipboard("\n"), "");
+        assert_eq!(sanitize_secret_clipboard("sk-\u{200b}abc"), "sk-abc");
+    }
 
     #[test]
     fn launch_config_serialization_excludes_secrets() {
@@ -1437,6 +1532,8 @@ mod tests {
             selected_profile: 0,
             validation_error: String::new(),
             save_dir: None,
+            show_ssh_password: false,
+            show_api_key: false,
         }
     }
 

@@ -4756,3 +4756,26 @@ Ctrl+C не трогали. Help: `drag` доступен и в Interactive.
 `render_with_selection`.
 
 **Дальше:** CodeRabbit / ревью.
+
+## Issue #312: fix(gui) — macOS paste into API key / SSH password + show toggle
+
+**Milestone:** 1.0.1. **Ветка:** `fix/312-macos-secret-paste`.
+
+**Проблема:** на macOS paste API-токена / SSH-пароля в GUI launcher вставлял
+«не то» (ручной ввод работал). Keychain/браузер кладут trailing newline на
+NSPasteboard; egui 0.29 `TextEdit::singleline` заменяет `\n`/`\r` на пробел →
+`"token "` → auth/SSH fail.
+
+**Решение:**
+- `sanitize_secret_clipboard`: первая строка, trim, BOM/ZWSP/control.
+- Paste в focused secret field перехватывается до TextEdit.
+- Повторная санация на Launch и при load/save keyring.
+- Чекбоксы Show password / Show (API key), не пишутся на диск.
+- Секреты по-прежнему не в `settings.json` / `pending_launch.json` / `config.toml`.
+- `docs/PLATFORM_NOTES.md`: секция GUI launcher secrets.
+
+**Публичный API:** нет.
+
+**Дальше:** CodeRabbit / ревью.
+
+**Review:** убран `.trim()` (пробелы в SSH-пароле валидны; newline/BOM/ZWSP остаются). Show-чекбокс рисуется до поля, чтобы маска менялась в том же кадре.
