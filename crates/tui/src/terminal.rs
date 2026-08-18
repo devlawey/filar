@@ -166,14 +166,28 @@ impl TerminalModel {
 
     /// Characters on a visible row (display_offset applied), trailing spaces trimmed.
     pub fn visible_line_text(&self, vis_row: usize) -> String {
+        self.visible_range_text(vis_row, 0, usize::MAX)
+    }
+
+    /// Text on a visible row for grid columns `[start_col, end_col)`.
+    ///
+    /// Indices are **screen columns**, not UTF-8/char indexes, so a wide glyph
+    /// (CJK/emoji + `WIDE_CHAR_SPACER`) does not shift later Latin letters.
+    pub fn visible_range_text(&self, vis_row: usize, start_col: usize, end_col: usize) -> String {
         let grid = self.term.grid();
         if vis_row >= grid.screen_lines() {
             return String::new();
         }
         let offset = grid.display_offset() as i32;
         let grid_row = &grid[Line(vis_row as i32 - offset)];
+        let cols = grid.columns();
+        let start = start_col.min(cols);
+        let end = end_col.min(cols);
+        if start >= end {
+            return String::new();
+        }
         let mut s = String::new();
-        for col in 0..grid.columns() {
+        for col in start..end {
             let cell = &grid_row[Column(col)];
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
@@ -622,6 +636,16 @@ mod tests {
         model.feed(b"hello");
         let pos = model.cursor_position();
         assert_eq!(pos, Some((5, 0)));
+    }
+
+    #[test]
+    fn visible_range_text_uses_grid_columns_not_char_indexes() {
+        // `界` occupies two columns (glyph + WIDE_CHAR_SPACER); `abc` follows.
+        // Screen columns 2..4 must be `ab`, not `bc`.
+        let mut model = TerminalModel::new(20, 4);
+        model.feed("界abc\r\n".as_bytes());
+        assert_eq!(model.visible_line_text(0), "界abc");
+        assert_eq!(model.visible_range_text(0, 2, 4), "ab");
     }
 
     #[test]

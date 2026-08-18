@@ -193,7 +193,7 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
         // ── Copy ──────────────────────────────────────────────────────
         HelpEntry {
             key: "drag",
-            desc: "Select text (copies on release)",
+            desc: "Select text, copies on release (not if the app captured the mouse)",
             section: "Copy",
             available: |m| m != AppMode::PasswordInput,
         },

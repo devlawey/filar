@@ -2342,8 +2342,8 @@ impl App {
 
         // No mouse mode — filar owns the mouse: scroll wheel + drag-select copy.
         use crossterm::event::MouseButton;
-        let vis_col = (m.column - area.x) as usize;
-        let vis_row = (m.row - area.y) as usize;
+        let vis_col = m.column.saturating_sub(area.x) as usize;
+        let vis_row = m.row.saturating_sub(area.y) as usize;
         match m.kind {
             MouseEventKind::ScrollUp => {
                 if alt_screen {
@@ -2743,20 +2743,16 @@ impl App {
         let ((start_line, start_col), (end_line, end_col)) = sel.normalised();
         let mut result = String::new();
         for row in start_line..=end_line {
-            let text = term.visible_line_text(row);
-            if row == start_line && row == end_line {
-                let s = start_col.min(text.chars().count());
-                let e = end_col.min(text.chars().count());
-                result.push_str(&text.chars().skip(s).take(e.saturating_sub(s)).collect::<String>());
+            let (sc, ec) = if row == start_line && row == end_line {
+                (start_col, end_col)
             } else if row == start_line {
-                let s = start_col.min(text.chars().count());
-                result.push_str(&text.chars().skip(s).collect::<String>());
+                (start_col, usize::MAX)
             } else if row == end_line {
-                let e = end_col.min(text.chars().count());
-                result.push_str(&text.chars().take(e).collect::<String>());
+                (0, end_col)
             } else {
-                result.push_str(&text);
-            }
+                (0, usize::MAX)
+            };
+            result.push_str(&term.visible_range_text(row, sc, ec));
             if row < end_line {
                 result.push('\n');
             }
@@ -5443,6 +5439,21 @@ mod tests {
             head_col: 5,
         });
         assert_eq!(app.selected_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn interactive_drag_select_wide_glyph_uses_grid_columns() {
+        let mut app = make_interactive_app();
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed("界abc\r\n".as_bytes());
+        }
+        app.selection = Some(Selection {
+            anchor_line: 0,
+            anchor_col: 2,
+            head_line: 0,
+            head_col: 4,
+        });
+        assert_eq!(app.selected_text().as_deref(), Some("ab"));
     }
 
     #[test]
