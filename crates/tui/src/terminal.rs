@@ -54,6 +54,10 @@ impl Dimensions for TermDimensions {
 pub struct TerminalModel {
     term: Term<VoidListener>,
     processor: alacritty_terminal::vte::ansi::Processor,
+    /// Last OSC 7 working directory parsed from PTY output.
+    osc7_cwd: Option<String>,
+    /// Carry buffer so OSC 7 split across reads is still recognized.
+    osc_scan: Vec<u8>,
 }
 
 impl TerminalModel {
@@ -69,12 +73,30 @@ impl TerminalModel {
         };
         let term = Term::new(config, &dims, VoidListener);
         let processor = <_>::default();
-        Self { term, processor }
+        Self {
+            term,
+            processor,
+            osc7_cwd: None,
+            osc_scan: Vec::new(),
+        }
     }
 
     /// Feed output bytes (from PTY/SSH) into the terminal model.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.osc_scan.extend_from_slice(bytes);
+        if self.osc_scan.len() > 4096 {
+            let drop = self.osc_scan.len() - 4096;
+            self.osc_scan.drain(..drop);
+        }
+        if let Some(cwd) = drain_osc7_cwd(&mut self.osc_scan) {
+            self.osc7_cwd = Some(cwd);
+        }
         self.processor.advance(&mut self.term, bytes);
+    }
+
+    /// Take the latest OSC 7 cwd, if the PTY reported one since the last take.
+    pub fn take_osc7_cwd(&mut self) -> Option<String> {
+        self.osc7_cwd.take()
     }
 
     /// Resize the terminal to the given dimensions.
@@ -592,6 +614,110 @@ fn ctrl_char_to_bytes(c: char) -> Vec<u8> {
     vec![byte]
 }
 
+/// Pull complete OSC 7 sequences out of `buf`, leaving a possible incomplete
+/// suffix. Returns the last decoded path.
+fn drain_osc7_cwd(buf: &mut Vec<u8>) -> Option<String> {
+    let mut last = None;
+    loop {
+        let Some(start) = find_osc7_start(buf) else {
+            // Keep a short tail in case ESC is at the end.
+            if buf.len() > 8 {
+                let keep = 8;
+                let drop = buf.len() - keep;
+                buf.drain(..drop);
+            }
+            break;
+        };
+        if start > 0 {
+            buf.drain(..start);
+        }
+        // buf now starts with ESC ] 7 ;
+        let Some(end) = find_osc_end(buf) else {
+            break;
+        };
+        let payload = buf[4..end].to_vec();
+        let skip = osc_end_skip(buf, end);
+        buf.drain(..end + skip);
+        if let Ok(s) = std::str::from_utf8(&payload) {
+            if let Some(path) = parse_osc7_payload(s) {
+                last = Some(path);
+            }
+        }
+    }
+    last
+}
+
+fn find_osc7_start(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == [0x1b, b']', b'7', b';'])
+}
+
+fn find_osc_end(buf: &[u8]) -> Option<usize> {
+    for i in 4..buf.len() {
+        if buf[i] == 0x07 {
+            return Some(i);
+        }
+        if buf[i] == 0x1b && i + 1 < buf.len() && buf[i + 1] == b'\\' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn osc_end_skip(buf: &[u8], end: usize) -> usize {
+    if buf[end] == 0x07 {
+        1
+    } else {
+        2 // ESC \
+    }
+}
+
+fn parse_osc7_payload(payload: &str) -> Option<String> {
+    let uri = payload.trim();
+    let rest = uri.strip_prefix("file://")?;
+    let path = if let Some(stripped) = rest.strip_prefix("//") {
+        // file:////path (unusual) — treat as path
+        format!("/{stripped}")
+    } else if rest.starts_with('/') {
+        rest.to_string()
+    } else {
+        let slash = rest.find('/')?;
+        rest[slash..].to_string()
+    };
+    let decoded = percent_decode(&path);
+    let chars: Vec<char> = decoded.chars().collect();
+    if chars.len() >= 3 && chars[0] == '/' && chars[1].is_ascii_alphabetic() && chars[2] == ':' {
+        return Some(decoded.chars().skip(1).collect());
+    }
+    Some(decoded)
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -605,6 +731,38 @@ mod tests {
         let model = TerminalModel::new(80, 24);
         assert_eq!(model.cols(), 80);
         assert_eq!(model.rows(), 24);
+    }
+
+    #[test]
+    fn osc7_bel_unix_path() {
+        let mut model = TerminalModel::new(80, 24);
+        model.feed(b"\x1b]7;file://host/tmp/work\x07");
+        assert_eq!(model.take_osc7_cwd().as_deref(), Some("/tmp/work"));
+        assert!(model.take_osc7_cwd().is_none());
+    }
+
+    #[test]
+    fn osc7_st_and_percent_decode() {
+        let mut model = TerminalModel::new(80, 24);
+        model.feed(b"\x1b]7;file:///home/user/my%20dir\x1b\\");
+        assert_eq!(model.take_osc7_cwd().as_deref(), Some("/home/user/my dir"));
+    }
+
+    #[test]
+    fn osc7_split_across_chunks() {
+        let mut model = TerminalModel::new(80, 24);
+        model.feed(b"\x1b]7;file://h");
+        assert!(model.take_osc7_cwd().is_none());
+        model.feed(b"ost/var/log\x07");
+        assert_eq!(model.take_osc7_cwd().as_deref(), Some("/var/log"));
+    }
+
+    #[test]
+    fn osc7_windows_drive_path() {
+        assert_eq!(
+            parse_osc7_payload("file://localhost/C:/Users/me"),
+            Some("C:/Users/me".into())
+        );
     }
 
     #[test]

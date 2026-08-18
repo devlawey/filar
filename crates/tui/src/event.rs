@@ -49,6 +49,12 @@ pub enum TuiEvent {
         alias: Option<String>,
     },
 
+    /// Working directory for a tab (OSC 7 / later sync). Status bar only.
+    CwdChanged {
+        session_id: SessionId,
+        cwd: String,
+    },
+
     /// Ctrl+O encountered a password target with no cached password.
     /// The UI must switch to password entry mode.
     PasswordNeeded {

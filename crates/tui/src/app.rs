@@ -361,6 +361,10 @@ pub struct Session {
     /// SSH connection info for this tab (e.g. "user@host:port"). None = local.
     /// Set when `!ssh` succeeds for this tab. Used for display and system prompt.
     pub ssh_info: Option<String>,
+    /// Last known working directory for the status bar (`None` = unknown).
+    /// Local tabs start from the process cwd; SSH is filled from OSC 7
+    /// (interactive PTY). Agent↔interactive sync of this value is #313.
+    pub cwd: Option<String>,
     /// LLM profile selected via Ctrl+L. None = use App default.
     pub llm_profile: Option<String>,
     /// Cumulative input tokens consumed by this session.
@@ -664,6 +668,7 @@ impl Session {
             has_new: false,
             awaiting_confirmation: false,
             ssh_info: None,
+            cwd: local_cwd(),
             llm_profile: None,
             tokens_in: 0,
             tokens_out: 0,
@@ -678,6 +683,55 @@ impl Session {
             transcript_saving: false,
             transcript_error_shown: false,
         }
+    }
+
+    /// Status-bar location: local `name pwd`; SSH `alias host pwd`.
+    ///
+    /// Alias falls back to empty (host + pwd only) when `target_name` is just
+    /// the raw `user@host` ssh_info. Missing cwd omits the path.
+    pub fn status_target(&self) -> String {
+        let pwd = self.cwd.as_deref().map(|p| truncate_pwd(p, 24)).unwrap_or_default();
+        match self.ssh_info.as_deref().and_then(parse_ssh_info) {
+            Some((_, host, _)) => {
+                let alias = self.alias_for_status();
+                match (alias.is_empty(), pwd.is_empty()) {
+                    (true, true) => host,
+                    (true, false) => format!("{host} {pwd}"),
+                    (false, true) => format!("{alias} {host}"),
+                    (false, false) => format!("{alias} {host} {pwd}"),
+                }
+            }
+            None => {
+                if pwd.is_empty() {
+                    self.target_name.clone()
+                } else {
+                    format!("{} {pwd}", self.target_name)
+                }
+            }
+        }
+    }
+
+    /// Distinct alias for the status bar, or empty if `target_name` duplicates ssh_info.
+    fn alias_for_status(&self) -> String {
+        let name = self.target_name.trim();
+        if name.is_empty() {
+            return String::new();
+        }
+        if let Some(info) = &self.ssh_info {
+            if name == info {
+                return String::new();
+            }
+            if let Some(no_port) = info.strip_suffix(":22") {
+                if name == no_port {
+                    return String::new();
+                }
+            }
+            // Raw user@host is not an alias.
+            if name.contains('@') && !name.starts_with('~') {
+                return String::new();
+            }
+        }
+        name.to_string()
     }
 
     /// Format the tab label: `local-N` for local sessions, `user@host` for
@@ -2907,7 +2961,8 @@ impl App {
             TuiEvent::Agent { session_id, .. } => *session_id,
             TuiEvent::Thinking => self.sessions[self.active].id,
             TuiEvent::ConfirmationRequest { .. } => self.sessions[self.active].id,
-            TuiEvent::TransportChanged { .. } => self.sessions[self.active].id,
+            TuiEvent::TransportChanged { session_id, .. } => *session_id,
+            TuiEvent::CwdChanged { session_id, .. } => *session_id,
             TuiEvent::PasswordNeeded { session_id, .. } => *session_id,
         };
 
@@ -3070,6 +3125,11 @@ impl App {
             }
             TuiEvent::TransportChanged { .. } => {
                 // Handled by the runner before reaching here — no-op.
+            }
+            TuiEvent::CwdChanged { session_id, cwd } => {
+                if let Some(idx) = self.find_session_idx(session_id) {
+                    self.sessions[idx].cwd = Some(cwd);
+                }
             }
             TuiEvent::PasswordNeeded { session_id, target } => {
                 self.ctrl_o_pending_target = Some(target);
@@ -3256,6 +3316,22 @@ fn parse_ssh_command(cmd: &str) -> Option<(String, String, u16)> {
     }
 
     Some((user.to_string(), host.to_string(), port))
+}
+
+fn local_cwd() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string())
+}
+
+/// Truncate a path from the left so the status bar stays compact.
+fn truncate_pwd(pwd: &str, max: usize) -> String {
+    let chars: Vec<char> = pwd.chars().collect();
+    if chars.len() <= max {
+        pwd.to_string()
+    } else {
+        format!("…{}", chars[chars.len() - (max.saturating_sub(1))..].iter().collect::<String>())
+    }
 }
 
 /// Parse `user@host[:port]` (the persisted `ssh_info` format) into
@@ -6641,6 +6717,75 @@ mod tests {
     fn parse_ssh_info_rejects_garbage_after_bracket() {
         assert!(parse_ssh_info("root@[::1]oops").is_none());
         assert!(parse_ssh_info("root@[::1]:22oops").is_none());
+    }
+
+    #[test]
+    fn status_target_ssh_shows_alias_host_pwd() {
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.ssh_info = Some("root@10.0.0.5:22".into());
+        app.cwd = Some("/home/deploy".into());
+        assert_eq!(app.status_target(), "prod 10.0.0.5 /home/deploy");
+    }
+
+    #[test]
+    fn status_target_ssh_without_alias_shows_host_pwd() {
+        let mut app = App::new("root@10.0.0.5:22".into(), CommandConfirmMode::Always);
+        app.ssh_info = Some("root@10.0.0.5:22".into());
+        app.cwd = Some("/root".into());
+        assert_eq!(app.status_target(), "10.0.0.5 /root");
+    }
+
+    #[test]
+    fn status_target_local_shows_name_and_pwd() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.cwd = Some("/tmp/proj".into());
+        assert_eq!(app.status_target(), "local /tmp/proj");
+    }
+
+    #[test]
+    fn status_target_omits_pwd_when_unknown() {
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.ssh_info = Some("root@10.0.0.5:22".into());
+        app.cwd = None;
+        assert_eq!(app.status_target(), "prod 10.0.0.5");
+    }
+
+    #[test]
+    fn cwd_changed_event_sets_session_cwd() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        app.handle_agent_event(TuiEvent::CwdChanged {
+            session_id: sid,
+            cwd: "/var/log".into(),
+        });
+        assert_eq!(app.cwd.as_deref(), Some("/var/log"));
+    }
+
+    #[test]
+    fn cwd_changed_routes_to_named_session_not_active() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.new_tab();
+        let inactive_id = app.sessions[0].id;
+        let active_id = app.sessions[1].id;
+        assert_eq!(app.sessions[app.active].id, active_id);
+        let active_cwd = app.sessions[1].cwd.clone();
+        app.handle_agent_event(TuiEvent::CwdChanged {
+            session_id: inactive_id,
+            cwd: "/opt/bg".into(),
+        });
+        assert_eq!(app.sessions[0].cwd.as_deref(), Some("/opt/bg"));
+        assert_eq!(app.sessions[1].cwd, active_cwd);
+        assert_eq!(app.active, 1, "active tab must not change");
+    }
+
+    #[test]
+    fn truncate_pwd_keeps_tail() {
+        assert_eq!(truncate_pwd("/a", 24), "/a");
+        let long = "/very/long/path/that/exceeds/limit";
+        let t = truncate_pwd(long, 24);
+        assert!(t.starts_with('…'), "{t}");
+        assert!(t.ends_with("exceeds/limit") || t.ends_with(long.rsplit('/').next().unwrap()), "{t}");
+        assert!(t.chars().count() <= 24, "{t}");
     }
 
     #[test]
