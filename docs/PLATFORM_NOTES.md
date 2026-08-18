@@ -42,9 +42,10 @@ Typing the same value by hand works because it has no newline (#312).
 The launcher therefore:
 
 1. Intercepts `Event::Paste` on focused secret fields **before** TextEdit, and
-   stores `sanitize_secret_clipboard` (first line, trim, drop BOM / ZWSP).
-2. Sanitizes again on Launch and when reading/writing the OS keyring, so a
-   leftover trailing space from an older session is not sent to the API/SSH.
+   stores `sanitize_secret_clipboard` (first line, drop BOM / ZWSP / controls;
+   surrounding ASCII spaces are kept so SSH passwords are not altered).
+2. Sanitizes again on Launch and when reading/writing the OS keyring (newlines /
+   BOM only — surrounding spaces are kept).
 3. Offers **Show password** / **Show** (API key) checkboxes (not persisted) so
    the pasted value can be verified. Secrets are still never written to
    `settings.json`, `pending_launch.json`, or `config.toml`.

@@ -41,7 +41,6 @@ fn sanitize_secret_clipboard(raw: &str) -> String {
     let s = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let first = s.split(['\n', '\r']).next().unwrap_or("");
     first
-        .trim()
         .chars()
         .filter(|c| {
             !c.is_control() && !matches!(*c, '\u{feff}' | '\u{200b}' | '\u{200c}' | '\u{200d}')
@@ -738,7 +737,7 @@ impl LauncherApp {
             return;
         }
         let idx = self.target_mode - 1;
-        let show = self.show_ssh_password;
+        let mut show = self.show_ssh_password;
         {
             let slot = &mut self.ssh_slots[idx];
             egui::Grid::new("ssh_grid")
@@ -771,11 +770,14 @@ impl LauncherApp {
                     );
                     ui.end_row();
                     ui.label("Password:");
-                    secret_text_edit(ui, "ssh_password", &mut slot.password, show);
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut show, "Show");
+                        secret_text_edit(ui, "ssh_password", &mut slot.password, show);
+                    });
                     ui.end_row();
                 });
         }
-        ui.checkbox(&mut self.show_ssh_password, "Show password");
+        self.show_ssh_password = show;
         ui.checkbox(
             &mut self.ssh_slots[idx].save_password,
             "Save password (encrypted in OS credential store)",
@@ -837,13 +839,13 @@ impl LauncherApp {
             ui.horizontal(|ui| { ui.label("API URL:"); ui.text_edit_singleline(&mut p.api_base_url); });
             ui.horizontal(|ui| {
                 ui.label("API key:");
+                ui.checkbox(&mut show_api_key, "Show");
                 secret_text_edit(
                     ui,
                     ("api_key", self.selected_profile),
                     &mut p.api_key,
                     show_api_key,
                 );
-                ui.checkbox(&mut show_api_key, "Show");
             });
             ui.horizontal(|ui| { ui.label("Key env:"); ui.text_edit_singleline(&mut p.key_env); });
             ui.horizontal(|ui| { ui.label("Temp:"); ui.text_edit_singleline(&mut p.temperature); });
@@ -1188,9 +1190,10 @@ mod tests {
         assert_eq!(sanitize_secret_clipboard("sk-abc\n"), "sk-abc");
         assert_eq!(sanitize_secret_clipboard("sk-abc\r\n"), "sk-abc");
         assert_eq!(sanitize_secret_clipboard("\u{feff}sk-abc\n"), "sk-abc");
-        assert_eq!(sanitize_secret_clipboard("  sk-abc  \n"), "sk-abc");
-        // egui 0.29 single-line TextEdit replaces `\n` with a trailing space.
-        assert_eq!(sanitize_secret_clipboard("sk-abc "), "sk-abc");
+        // Surrounding ASCII spaces are kept (valid in some SSH passwords).
+        // Paste intercept runs before egui can turn a trailing newline into a space.
+        assert_eq!(sanitize_secret_clipboard("  sk-abc  \n"), "  sk-abc  ");
+        assert_eq!(sanitize_secret_clipboard("sk-abc "), "sk-abc ");
         assert_eq!(sanitize_secret_clipboard("pass word"), "pass word");
         assert_eq!(sanitize_secret_clipboard("line1\nline2"), "line1");
         assert_eq!(sanitize_secret_clipboard("\n"), "");
