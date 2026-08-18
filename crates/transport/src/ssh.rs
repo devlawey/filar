@@ -684,27 +684,34 @@ impl SshExecutor {
     fn store_cwd_from(&self, result: &Result<CommandResult>) {
         if let Ok(r) = result {
             if let Some(cwd) = r.cwd.as_deref().filter(|p| crate::is_safe_cwd(p)) {
-                if let Ok(mut g) = self.last_cwd.lock() {
-                    *g = Some(cwd.to_string());
-                }
+                *lock_opt_string(&self.last_cwd) = Some(cwd.to_string());
             }
         }
     }
 
-    /// Prefix `cd … &&` once so the next *user-approved* command lands in `path`.
-    fn take_prefixed_command(&self, command: &str) -> String {
-        let pending = self.pending_cwd.lock().ok().and_then(|mut g| g.take());
+    /// Prefix `cd … &&` if a tab cwd is pending. Does not consume the pending
+    /// value until the command has been dispatched (see [`clear_pending_cwd`]).
+    fn prefixed_command(&self, command: &str) -> String {
+        let pending = lock_opt_string(&self.pending_cwd).clone();
         match pending.as_deref().and_then(crate::posix_cd_command) {
             Some(cd) => format!("{cd} && {command}"),
             None => command.to_string(),
         }
     }
+
+    fn clear_pending_cwd(&self) {
+        *lock_opt_string(&self.pending_cwd) = None;
+    }
+}
+
+fn lock_opt_string(m: &StdMutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<String>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[async_trait::async_trait]
 impl crate::CommandExecutor for SshExecutor {
     async fn run(&self, command: &str) -> Result<CommandResult> {
-        let command = self.take_prefixed_command(command);
+        let command = self.prefixed_command(command);
         // First attempt on the current session.
         let first = { self.session.read().await.run(&command).await };
 
@@ -715,6 +722,9 @@ impl crate::CommandExecutor for SshExecutor {
         let should_reconnect =
             self.config.auto_reconnect && matches!(first, Err(CoreError::ConnectionLost(_)));
         if !should_reconnect {
+            if !matches!(first, Err(CoreError::ConnectionLost(_))) {
+                self.clear_pending_cwd();
+            }
             self.store_cwd_from(&first);
             return first;
         }
@@ -755,6 +765,9 @@ impl crate::CommandExecutor for SshExecutor {
 
         // Single retry on the fresh session.
         let retry = self.session.read().await.run(&command).await;
+        if !matches!(retry, Err(CoreError::ConnectionLost(_))) {
+            self.clear_pending_cwd();
+        }
         self.store_cwd_from(&retry);
         retry
     }
@@ -767,17 +780,13 @@ impl crate::CommandExecutor for SshExecutor {
         let _ = crate::posix_cd_command(path)
             .ok_or_else(|| CoreError::Other("invalid cwd".into()))?;
         let path = path.trim().to_string();
-        if let Ok(mut g) = self.pending_cwd.lock() {
-            *g = Some(path.clone());
-        }
-        if let Ok(mut g) = self.last_cwd.lock() {
-            *g = Some(path);
-        }
+        *lock_opt_string(&self.pending_cwd) = Some(path.clone());
+        *lock_opt_string(&self.last_cwd) = Some(path);
         Ok(())
     }
 
     async fn current_cwd(&self) -> Option<String> {
-        self.last_cwd.lock().ok().and_then(|g| g.clone())
+        self.last_cwd.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -1007,7 +1016,8 @@ async fn recv_until_marker(
 
 /// Parse `<marker_tag>__<exit>__` or `<marker_tag>__<exit>__<pwd>__`.
 ///
-/// `pwd` is accepted only when the line is exactly `<pwd>__` (no `__` inside).
+/// `pwd` is the text before the last `__` on the marker line (so names like
+/// `my__project` still parse).
 fn parse_filar_marker(buf: &str, marker_tag: &str) -> Option<(i32, Option<String>, usize)> {
     let pos = buf.find(marker_tag)?;
     let after_tag = &buf[pos + marker_tag.len()..];
@@ -1017,7 +1027,7 @@ fn parse_filar_marker(buf: &str, marker_tag: &str) -> Option<(i32, Option<String
     let after_code = &rest[end + 2..];
     let line = after_code.split(['\n', '\r']).next().unwrap_or("");
     let cwd = line.strip_suffix("__").map(str::trim).and_then(|pwd| {
-        if crate::is_safe_cwd(pwd) && !pwd.contains("__") {
+        if crate::is_safe_cwd(pwd) {
             Some(pwd.to_string())
         } else {
             None
@@ -1109,12 +1119,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_marker_rejects_pwd_with_double_underscore() {
+    fn parse_marker_pwd_allows_double_underscore_in_name() {
         let tag = "__FILAR_req_00000001";
-        let buf = "out\n__FILAR_req_00000001__0__/tmp__evil__\n";
+        let buf = "out\n__FILAR_req_00000001__0__/home/u/my__project__\n";
         let (code, cwd, _) = parse_filar_marker(buf, tag).unwrap();
         assert_eq!(code, 0);
-        assert!(cwd.is_none());
+        assert_eq!(cwd.as_deref(), Some("/home/u/my__project"));
     }
 
     /// Integration test — requires a running SSH server.
