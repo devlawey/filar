@@ -193,9 +193,9 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
         // ── Copy ──────────────────────────────────────────────────────
         HelpEntry {
             key: "drag",
-            desc: "Select text (copies on release)",
+            desc: "Select text, copies on release (not if the app captured the mouse)",
             section: "Copy",
-            available: |m| m != AppMode::Interactive,
+            available: |m| m != AppMode::PasswordInput,
         },
         // ── Input ─────────────────────────────────────────────────────
         HelpEntry {
@@ -447,6 +447,7 @@ mod tests {
         assert!(always_available.contains(&"^T")); // toggles out of interactive
         assert!(always_available.contains(&"wheel"));
         assert!(always_available.contains(&"^Q"));
+        assert!(always_available.contains(&"drag"));
         // Tabs/agent/input entries should be dimmed.
         assert!(!always_available.contains(&"^N"));
         assert!(!always_available.contains(&"Enter"));

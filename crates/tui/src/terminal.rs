@@ -164,12 +164,59 @@ impl TerminalModel {
         self.term.grid().total_lines()
     }
 
+    /// Characters on a visible row (display_offset applied), trailing spaces trimmed.
+    pub fn visible_line_text(&self, vis_row: usize) -> String {
+        self.visible_range_text(vis_row, 0, usize::MAX)
+    }
+
+    /// Text on a visible row for grid columns `[start_col, end_col)`.
+    ///
+    /// Indices are **screen columns**, not UTF-8/char indexes, so a wide glyph
+    /// (CJK/emoji + `WIDE_CHAR_SPACER`) does not shift later Latin letters.
+    pub fn visible_range_text(&self, vis_row: usize, start_col: usize, end_col: usize) -> String {
+        let grid = self.term.grid();
+        if vis_row >= grid.screen_lines() {
+            return String::new();
+        }
+        let offset = grid.display_offset() as i32;
+        let grid_row = &grid[Line(vis_row as i32 - offset)];
+        let cols = grid.columns();
+        let start = start_col.min(cols);
+        let end = end_col.min(cols);
+        if start >= end {
+            return String::new();
+        }
+        let mut s = String::new();
+        for col in start..end {
+            let cell = &grid_row[Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            s.push(cell.c);
+        }
+        s.trim_end().to_string()
+    }
+
     /// Render the terminal grid to a ratatui frame.
     ///
     /// Each cell is rendered as a character with its foreground/background
     /// colors and text attributes (bold, italic, underline, etc.). The cursor
     /// cell is rendered with inverted colors when visible.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        self.render_with_selection(frame, area, None, Color::DarkGray);
+    }
+
+    /// Like [`render`](Self::render), with an optional drag-select highlight.
+    ///
+    /// `selection` is a normalised `((start_row, start_col), (end_row, end_col))`
+    /// in visible-grid coordinates (0-based, display_offset already applied).
+    pub fn render_with_selection(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        selection: Option<((usize, usize), (usize, usize))>,
+        selection_bg: Color,
+    ) {
         let grid = self.term.grid();
         let num_cols = grid.columns();
         let num_lines = grid.screen_lines();
@@ -210,7 +257,10 @@ impl TerminalModel {
                 // Determine if this is the cursor cell.
                 let is_cursor = cursor.is_some_and(|(c, r)| c as usize == col && r as usize == row);
 
-                let (fg, bg) = cell_colors(cell, is_cursor);
+                let (fg, mut bg) = cell_colors(cell, is_cursor);
+                if selection.is_some_and(|range| visible_cell_selected(range, row, col)) {
+                    bg = selection_bg;
+                }
                 let style = build_style(cell.flags, fg, bg);
 
                 // If style changed, flush the current span.
@@ -251,6 +301,28 @@ impl TerminalModel {
             }
         }
     }
+}
+
+/// Whether `(row, col)` sits inside a normalised visible-grid selection.
+fn visible_cell_selected(
+    range: ((usize, usize), (usize, usize)),
+    row: usize,
+    col: usize,
+) -> bool {
+    let ((sr, sc), (er, ec)) = range;
+    if row < sr || row > er {
+        return false;
+    }
+    if sr == er {
+        return col >= sc && col < ec;
+    }
+    if row == sr {
+        return col >= sc;
+    }
+    if row == er {
+        return col < ec;
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -564,6 +636,16 @@ mod tests {
         model.feed(b"hello");
         let pos = model.cursor_position();
         assert_eq!(pos, Some((5, 0)));
+    }
+
+    #[test]
+    fn visible_range_text_uses_grid_columns_not_char_indexes() {
+        // `界` occupies two columns (glyph + WIDE_CHAR_SPACER); `abc` follows.
+        // Screen columns 2..4 must be `ab`, not `bc`.
+        let mut model = TerminalModel::new(20, 4);
+        model.feed("界abc\r\n".as_bytes());
+        assert_eq!(model.visible_line_text(0), "界abc");
+        assert_eq!(model.visible_range_text(0, 2, 4), "ab");
     }
 
     #[test]
