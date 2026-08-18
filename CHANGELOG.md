@@ -36,6 +36,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - F1 help overlay no longer uses `⌘` on Windows (console fonts render it as
   `?`); macOS keeps Fn+F1 / Ctrl vs ⌘ wording
   ([#310](https://github.com/devlawey/filar/issues/310)).
+- Interactive `cd` (Ctrl+T) is applied to the agent executor on return, and
+  entering interactive starts the PTY in the tab cwd (local spawn cwd; SSH
+  sends `cd`). Status-bar pwd tracks OSC 7, a POSIX leave-probe, and SSH
+  `$PWD` in the command marker
+  ([#313](https://github.com/devlawey/filar/issues/313)).
 
 ## [1.0.0] - 2026-08-17
 

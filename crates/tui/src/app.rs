@@ -362,8 +362,9 @@ pub struct Session {
     /// Set when `!ssh` succeeds for this tab. Used for display and system prompt.
     pub ssh_info: Option<String>,
     /// Last known working directory for the status bar (`None` = unknown).
-    /// Local tabs start from the process cwd; SSH is filled from OSC 7
-    /// (interactive PTY). Agent↔interactive sync of this value is #313.
+    /// Local tabs start from the process cwd; SSH is filled from OSC 7,
+    /// a POSIX `pwd` probe on Ctrl+T leave, or the SSH command marker `$PWD`.
+    /// Agent↔interactive sync applies this value via `CommandExecutor::set_cwd`.
     pub cwd: Option<String>,
     /// LLM profile selected via Ctrl+L. None = use App default.
     pub llm_profile: Option<String>,

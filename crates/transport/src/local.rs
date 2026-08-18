@@ -4,10 +4,13 @@
 //! are run via PowerShell (`-NoProfile -NonInteractive -Command`). On Unix,
 //! commands are run via `sh -c`.
 //!
-//! Shell state (cwd, env) does NOT persist between calls — each command runs
-//! in a fresh process. The system prompt informs the agent of this.
+//! Shell state (env) does NOT persist between calls — each command runs
+//! in a fresh process. Working directory can persist via [`LocalExecutor::set_cwd`]
+//! (interactive ↔ agent sync). The system prompt still warns that `cd` inside
+//! a command does not stick.
 
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
@@ -27,12 +30,14 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SE
 /// [`crate::CommandExecutor`] implementation backed by local subprocess execution.
 ///
 /// On Windows, uses PowerShell. On Unix, uses `sh`.
-/// Each command runs in a separate process — no persistent shell session.
+/// Each command runs in a separate process — env does not persist.
+/// Working directory persists when set via [`CommandExecutor::set_cwd`].
 /// Commands have a 5-minute timeout by default to prevent hanging on
 /// interactive prompts; override with [`LocalExecutor::with_timeout`].
 pub struct LocalExecutor {
     cancel_notify: Arc<Notify>,
     timeout: Duration,
+    cwd: Mutex<Option<PathBuf>>,
 }
 
 impl LocalExecutor {
@@ -47,6 +52,7 @@ impl LocalExecutor {
         Ok(Self {
             cancel_notify: Arc::new(Notify::new()),
             timeout,
+            cwd: Mutex::new(None),
         })
     }
 
@@ -84,6 +90,11 @@ impl crate::CommandExecutor for LocalExecutor {
         cmd.stderr(std::process::Stdio::piped());
         // Kill the child process if the future is dropped (cancel/timeout).
         cmd.kill_on_drop(true);
+        if let Ok(guard) = self.cwd.lock() {
+            if let Some(ref dir) = *guard {
+                cmd.current_dir(dir);
+            }
+        }
 
         // Wait for output, with timeout and cancel support.
         // When cancel/timeout fires, the output() future is dropped,
@@ -114,6 +125,9 @@ impl crate::CommandExecutor for LocalExecutor {
             stderr,
             exit_code,
             duration,
+            cwd: self.cwd.lock().ok().and_then(|g| {
+                g.as_ref().map(|p| p.to_string_lossy().into_owned())
+            }),
         })
     }
 
@@ -135,6 +149,24 @@ impl crate::CommandExecutor for LocalExecutor {
     async fn cancel(&self) -> Result<()> {
         self.cancel_notify.notify_one();
         Ok(())
+    }
+
+    async fn set_cwd(&self, path: &str) -> Result<()> {
+        if !crate::is_safe_cwd(path) {
+            return Err(CoreError::Other("invalid cwd".into()));
+        }
+        let mut guard = self.cwd.lock().map_err(|_| {
+            CoreError::Other("cwd lock poisoned".into())
+        })?;
+        *guard = Some(PathBuf::from(path.trim()));
+        Ok(())
+    }
+
+    async fn current_cwd(&self) -> Option<String> {
+        self.cwd
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|p| p.to_string_lossy().into_owned()))
     }
 }
 
@@ -160,6 +192,7 @@ fn build_shell_command(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CommandExecutor;
 
     #[test]
     fn default_timeout_is_five_minutes() {
@@ -199,5 +232,33 @@ mod tests {
         let result = build_shell_command("ls");
         assert_eq!(result, "ls");
         assert!(!result.contains("OutputEncoding"));
+    }
+
+    #[tokio::test]
+    async fn set_cwd_is_used_by_subsequent_run() {
+        let exec = LocalExecutor::new().await.unwrap();
+        let marker = format!("filar_cwd_{}", std::process::id());
+        let dir = std::env::temp_dir().join(&marker);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_string_lossy().into_owned();
+        exec.set_cwd(&dir_str).await.unwrap();
+        assert_eq!(exec.current_cwd().await.as_deref(), Some(dir_str.as_str()));
+        #[cfg(windows)]
+        let cmd = "(Get-Location).Path";
+        #[cfg(unix)]
+        let cmd = "pwd";
+        let result = exec.run(cmd).await.unwrap();
+        assert!(
+            result.stdout.contains(&marker),
+            "cwd output {:?} should contain {marker}",
+            result.stdout
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_cwd_rejects_newline() {
+        let exec = LocalExecutor::new().await.unwrap();
+        assert!(exec.set_cwd("/tmp\n/etc").await.is_err());
     }
 }

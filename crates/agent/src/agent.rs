@@ -789,6 +789,7 @@ mod tests {
                 stderr: String::new(),
                 exit_code: Some(0),
                 duration: Duration::from_millis(10),
+                cwd: None,
             })
         }
 

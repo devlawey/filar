@@ -20,8 +20,8 @@ use tracing::{error, info, warn};
 use filar_agent::{AgentBuilder, CommandConfirmer, LlmClient};
 use filar_core::{CommandConfirmMode, CoreError, Result, SecretProvider, StaticSecretProvider};
 use filar_transport::{
-    CommandExecutor, InteractiveTerminal, LocalInteractive, SecretSubstitutingExecutor,
-    SshExecutor, SshInteractive, SshTransportConfig,
+    posix_cd_input, CommandExecutor, InteractiveTerminal, LocalInteractive,
+    SecretSubstitutingExecutor, SshExecutor, SshInteractive, SshTransportConfig, OSC7_PWD_PROBE,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -91,6 +91,36 @@ fn route_term_chunk(app: &mut App, sid: SessionId, chunk: TermChunk) -> RouteOut
     }
 }
 
+/// Drain PTY output until `session.cwd` is set or `timeout` elapses.
+async fn drain_pty_cwd(
+    app: &mut App,
+    sid: SessionId,
+    term_rx: &mut Option<mpsc::UnboundedReceiver<(SessionId, TermChunk)>>,
+    timeout: Duration,
+) {
+    let Some(rx) = term_rx.as_mut() else {
+        return;
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some((chunk_sid, chunk))) => {
+                let _ = route_term_chunk(app, chunk_sid, chunk);
+                if app
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == sid)
+                    .and_then(|s| s.cwd.as_ref())
+                    .is_some()
+                {
+                    return;
+                }
+            }
+            _ => return,
+        }
+    }
+}
+
 use filar_core::ChatBlock;
 
 // ---------------------------------------------------------------------------
@@ -125,6 +155,16 @@ impl CommandExecutor for TuiExecutor {
     async fn cancel(&self) -> Result<()> {
         let executor = self.inner.read().await.clone();
         executor.cancel().await
+    }
+
+    async fn set_cwd(&self, path: &str) -> Result<()> {
+        let executor = self.inner.read().await.clone();
+        executor.set_cwd(path).await
+    }
+
+    async fn current_cwd(&self) -> Option<String> {
+        let executor = self.inner.read().await.clone();
+        executor.current_cwd().await
     }
 }
 
@@ -626,8 +666,41 @@ async fn run_app(
                 if app.take_toggle_interactive() {
                     let toggle_sid = app.sessions[app.active].id;
                     if in_interactive {
-                        // Exit interactive mode — close backend, abort reader.
+                        // Exit interactive: capture PTY cwd, apply it to the
+                        // agent executor, then close the backend.
                         if let Some((term, handle)) = interactive_backends.remove(&toggle_sid) {
+                            let is_ssh = match executors.get(&toggle_sid) {
+                                Some(e) => e.ssh_target.read().await.is_some(),
+                                None => false,
+                            };
+                            let cwd_known = app
+                                .sessions
+                                .iter()
+                                .find(|s| s.id == toggle_sid)
+                                .and_then(|s| s.cwd.as_ref())
+                                .is_some();
+                            if !cwd_known && (is_ssh || cfg!(unix)) {
+                                let _ = term.write_input(OSC7_PWD_PROBE).await;
+                                drain_pty_cwd(
+                                    &mut app,
+                                    toggle_sid,
+                                    &mut term_rx_opt,
+                                    Duration::from_millis(400),
+                                )
+                                .await;
+                            }
+                            if let Some(cwd) = app
+                                .sessions
+                                .iter()
+                                .find(|s| s.id == toggle_sid)
+                                .and_then(|s| s.cwd.clone())
+                            {
+                                if let Some(entry) = executors.get(&toggle_sid) {
+                                    if let Err(e) = entry.executor.set_cwd(&cwd).await {
+                                        warn!(error = %e, "failed to sync executor cwd");
+                                    }
+                                }
+                            }
                             let _ = term.close().await;
                             handle.abort();
                         }
@@ -647,18 +720,39 @@ async fn run_app(
                             Some(g) => g.read().await.clone(),
                             None => None,
                         };
+                        let mut tab_cwd = app
+                            .sessions
+                            .iter()
+                            .find(|s| s.id == toggle_sid)
+                            .and_then(|s| s.cwd.clone());
+                        if tab_cwd.is_none() {
+                            if let Some(entry) = executors.get(&toggle_sid) {
+                                tab_cwd = entry.executor.current_cwd().await;
+                                if let Some(ref c) = tab_cwd {
+                                    if let Some(idx) = app.find_session_idx(toggle_sid) {
+                                        app.sessions[idx].cwd = Some(c.clone());
+                                    }
+                                }
+                            }
+                        }
                         let term_result: Result<Arc<dyn InteractiveTerminal>> =
                             if let Some(ref target) = ssh_target {
                                 SshInteractive::connect(target, cols, rows)
                                     .await
                                     .map(|t| Arc::new(t) as Arc<dyn InteractiveTerminal>)
                             } else {
-                                LocalInteractive::with_size(cols, rows)
+                                LocalInteractive::with_size_in(cols, rows, tab_cwd.as_deref())
                                     .await
                                     .map(|t| Arc::new(t) as Arc<dyn InteractiveTerminal>)
                             };
                         match term_result {
                             Ok(term) => {
+                                if ssh_target.is_some() {
+                                    if let Some(input) = tab_cwd.as_deref().and_then(posix_cd_input)
+                                    {
+                                        let _ = term.write_input(input.as_bytes()).await;
+                                    }
+                                }
                                 let model = TerminalModel::new(cols, rows);
                                 let term_for_read = term.clone();
                                 let sid = toggle_sid;
@@ -1140,8 +1234,21 @@ async fn run_app(
                                     .ok()
                                     .map(|p| p.display().to_string());
                             } else {
-                                // Unknown until OSC 7 / #313 — no unconfirmed remote `pwd`.
+                                // Unknown until OSC 7 / command marker / #313 sync.
                                 app.sessions[idx].cwd = None;
+                            }
+                        }
+                    }
+                    if let TuiEvent::Agent {
+                        session_id,
+                        event: filar_agent::AgentEvent::CommandFinished { denied: false, .. },
+                    } = &event
+                    {
+                        if let Some(entry) = executors.get(session_id) {
+                            if let Some(cwd) = entry.executor.current_cwd().await {
+                                if let Some(idx) = app.find_session_idx(*session_id) {
+                                    app.sessions[idx].cwd = Some(cwd);
+                                }
                             }
                         }
                     }

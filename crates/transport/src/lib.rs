@@ -8,6 +8,7 @@
 //! - [`LocalExecutor`] — local PTY implementation using `portable-pty` (Stage 3).
 //!   Only available with the `local` feature (enabled by default).
 
+pub mod cwd;
 pub mod error;
 pub mod interactive;
 #[cfg(feature = "local")]
@@ -27,6 +28,9 @@ pub use interactive::LocalInteractive;
 pub use interactive::{InteractiveTerminal, SshInteractive};
 #[cfg(feature = "local")]
 pub use local::LocalExecutor;
+pub use cwd::{
+    is_safe_cwd, posix_cd_command, posix_cd_input, posix_shell_quote, OSC7_PWD_PROBE,
+};
 pub use secret::SecretSubstitutingExecutor;
 pub use ssh::{SshExecutor, SshSession, SshTransportConfig};
 
@@ -41,6 +45,9 @@ pub struct CommandResult {
     pub exit_code: Option<i32>,
     /// Wall-clock duration the command ran for.
     pub duration: Duration,
+    /// Working directory after the command, when the transport can report it
+    /// (SSH marker includes `$PWD`; local uses the executor's stored cwd).
+    pub cwd: Option<String>,
 }
 
 /// A streaming event emitted during command execution.
@@ -87,6 +94,20 @@ pub trait CommandExecutor: Send + Sync {
     /// Cancel the currently running command by sending Ctrl-C (SIGINT).
     /// If no command is running, this is a no-op.
     async fn cancel(&self) -> Result<()>;
+
+    /// Point subsequent [`run`](Self::run) calls at `path` (tab cwd sync).
+    ///
+    /// Transport bookkeeping for Ctrl+T / OSC 7, not an LLM tool call.
+    /// Default is a no-op. `path` must pass [`is_safe_cwd`].
+    async fn set_cwd(&self, path: &str) -> Result<()> {
+        let _ = path;
+        Ok(())
+    }
+
+    /// Last known working directory for this executor, if tracked.
+    async fn current_cwd(&self) -> Option<String> {
+        None
+    }
 }
 
 // Re-export the async_trait macro so downstream crates don't need a direct dep.
