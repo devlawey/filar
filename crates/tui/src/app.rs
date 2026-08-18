@@ -2258,11 +2258,10 @@ impl App {
 
     /// Handle a mouse event in Interactive terminal mode.
     ///
-    /// If the terminal application has requested mouse events (SGR mode),
-    /// all mouse events are encoded as SGR sequences and forwarded to the
-    /// terminal input.  Otherwise, the scroll wheel either scrolls the
-    /// scrollback history (primary screen) or translates to arrow keys
-    /// (alternate screen, e.g. `less`, `man`).
+    /// If the terminal application has requested mouse events (SGR/legacy mode),
+    /// all mouse events are encoded and forwarded to the PTY. Otherwise filar
+    /// owns the mouse: scroll wheel (scrollback or arrow keys on the alt
+    /// screen) and drag-select copy, without sending bytes to the remote.
     fn handle_interactive_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::MouseEventKind;
 
@@ -2322,7 +2321,10 @@ impl App {
         let alt_screen = self.terminal.as_ref().is_some_and(|t| t.is_alt_screen());
 
         if mouse_mode {
-            // Forward mouse events to the terminal.
+            // Forward mouse events to the terminal (vim/less/etc. requested them).
+            // Filar drag-select is disabled in this path so PTY apps keep the mouse.
+            self.selection = None;
+            self.mouse_drag = None;
             if sgr_mouse {
                 // SGR encoding: \x1b[<{button};{x};{y}M/m
                 if let Some(seq) = encode_sgr_mouse(&m, x, y) {
@@ -2338,7 +2340,10 @@ impl App {
             return;
         }
 
-        // No mouse mode — handle scroll wheel only.
+        // No mouse mode — filar owns the mouse: scroll wheel + drag-select copy.
+        use crossterm::event::MouseButton;
+        let vis_col = (m.column - area.x) as usize;
+        let vis_row = (m.row - area.y) as usize;
         match m.kind {
             MouseEventKind::ScrollUp => {
                 if alt_screen {
@@ -2356,6 +2361,33 @@ impl App {
                 } else if let Some(t) = self.terminal.as_mut() {
                     t.scroll_display(-3);
                 }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.selection = Some(Selection {
+                    anchor_line: vis_row,
+                    anchor_col: vis_col,
+                    head_line: vis_row,
+                    head_col: vis_col,
+                });
+                self.mouse_drag = Some(DragKind::Selection);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.mouse_drag == Some(DragKind::Selection) {
+                    if let Some(sel) = &mut self.selection {
+                        sel.head_line = vis_row;
+                        sel.head_col = vis_col;
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.mouse_drag == Some(DragKind::Selection) {
+                    if self.selection.as_ref().is_some_and(|s| s.is_empty()) {
+                        self.selection = None;
+                    } else {
+                        self.copy_selection_to_clipboard();
+                    }
+                }
+                self.mouse_drag = None;
             }
             _ => {}
         }
@@ -2664,11 +2696,14 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Extract the selected text from `layout_cache.lines`.
+    /// Extract the selected text from the chat layout or the interactive grid.
     ///
     /// For the start and end lines, only the portion within the selection
     /// column range is included.  Middle lines are included in full.
     fn selected_text(&self) -> Option<String> {
+        if self.mode == AppMode::Interactive {
+            return self.term_selected_text();
+        }
         let sel = self.selection.as_ref()?;
         if sel.is_empty() {
             return None;
@@ -2692,6 +2727,37 @@ impl App {
                 result.push_str(&text);
             }
             if line_idx < end_line {
+                result.push('\n');
+            }
+        }
+        if result.is_empty() { None } else { Some(result) }
+    }
+
+    /// Extract selected text from the interactive terminal grid.
+    fn term_selected_text(&self) -> Option<String> {
+        let sel = self.selection.as_ref()?;
+        if sel.is_empty() {
+            return None;
+        }
+        let term = self.terminal.as_ref()?;
+        let ((start_line, start_col), (end_line, end_col)) = sel.normalised();
+        let mut result = String::new();
+        for row in start_line..=end_line {
+            let text = term.visible_line_text(row);
+            if row == start_line && row == end_line {
+                let s = start_col.min(text.chars().count());
+                let e = end_col.min(text.chars().count());
+                result.push_str(&text.chars().skip(s).take(e.saturating_sub(s)).collect::<String>());
+            } else if row == start_line {
+                let s = start_col.min(text.chars().count());
+                result.push_str(&text.chars().skip(s).collect::<String>());
+            } else if row == end_line {
+                let e = end_col.min(text.chars().count());
+                result.push_str(&text.chars().take(e).collect::<String>());
+            } else {
+                result.push_str(&text);
+            }
+            if row < end_line {
                 result.push('\n');
             }
         }
@@ -3071,6 +3137,8 @@ impl App {
     pub fn hide_interactive_view(&mut self) {
         if self.mode == AppMode::Interactive {
             self.mode = AppMode::Normal;
+            self.selection = None;
+            self.mouse_drag = None;
         }
     }
 
@@ -3078,6 +3146,8 @@ impl App {
     pub fn show_interactive_view(&mut self) {
         if self.terminal.is_some() {
             self.mode = AppMode::Interactive;
+            self.selection = None;
+            self.mouse_drag = None;
         }
     }
 
@@ -5328,6 +5398,67 @@ mod tests {
         let input = app.take_term_input().unwrap();
         // x=16, y=6.
         assert_eq!(input, b"\x1b[<64;16;6M");
+    }
+
+    #[test]
+    fn interactive_drag_select_sets_selection_without_pty_bytes() {
+        let mut app = make_interactive_app();
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed(b"hello world\r\n");
+        }
+        // Down at vis (10, 3) → screen col=10, row=5 (area.y=2).
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 10,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        assert!(app.pending_term_input.is_none(), "select must not write to PTY");
+        assert_eq!(app.mouse_drag, Some(DragKind::Selection));
+        let sel = app.selection.expect("selection started");
+        assert_eq!(sel.anchor_line, 3);
+        assert_eq!(sel.anchor_col, 10);
+
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 15,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        let sel = app.selection.expect("selection after drag");
+        assert_eq!(sel.head_col, 15);
+        assert!(app.pending_term_input.is_none());
+    }
+
+    #[test]
+    fn interactive_drag_select_extracts_grid_text() {
+        let mut app = make_interactive_app();
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed(b"hello world\r\n");
+        }
+        app.selection = Some(Selection {
+            anchor_line: 0,
+            anchor_col: 0,
+            head_line: 0,
+            head_col: 5,
+        });
+        assert_eq!(app.selected_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn interactive_sgr_mouse_does_not_start_filar_selection() {
+        let mut app = make_interactive_app();
+        if let Some(t) = app.terminal.as_mut() {
+            t.feed(b"\x1b[?1006h\x1b[?1002h");
+        }
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 10,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        });
+        assert!(app.selection.is_none());
+        assert!(app.take_term_input().is_some());
     }
 
     #[test]

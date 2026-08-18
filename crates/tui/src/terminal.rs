@@ -164,12 +164,45 @@ impl TerminalModel {
         self.term.grid().total_lines()
     }
 
+    /// Characters on a visible row (display_offset applied), trailing spaces trimmed.
+    pub fn visible_line_text(&self, vis_row: usize) -> String {
+        let grid = self.term.grid();
+        if vis_row >= grid.screen_lines() {
+            return String::new();
+        }
+        let offset = grid.display_offset() as i32;
+        let grid_row = &grid[Line(vis_row as i32 - offset)];
+        let mut s = String::new();
+        for col in 0..grid.columns() {
+            let cell = &grid_row[Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            s.push(cell.c);
+        }
+        s.trim_end().to_string()
+    }
+
     /// Render the terminal grid to a ratatui frame.
     ///
     /// Each cell is rendered as a character with its foreground/background
     /// colors and text attributes (bold, italic, underline, etc.). The cursor
     /// cell is rendered with inverted colors when visible.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
+        self.render_with_selection(frame, area, None, Color::DarkGray);
+    }
+
+    /// Like [`render`](Self::render), with an optional drag-select highlight.
+    ///
+    /// `selection` is a normalised `((start_row, start_col), (end_row, end_col))`
+    /// in visible-grid coordinates (0-based, display_offset already applied).
+    pub fn render_with_selection(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        selection: Option<((usize, usize), (usize, usize))>,
+        selection_bg: Color,
+    ) {
         let grid = self.term.grid();
         let num_cols = grid.columns();
         let num_lines = grid.screen_lines();
@@ -210,7 +243,10 @@ impl TerminalModel {
                 // Determine if this is the cursor cell.
                 let is_cursor = cursor.is_some_and(|(c, r)| c as usize == col && r as usize == row);
 
-                let (fg, bg) = cell_colors(cell, is_cursor);
+                let (fg, mut bg) = cell_colors(cell, is_cursor);
+                if selection.is_some_and(|range| visible_cell_selected(range, row, col)) {
+                    bg = selection_bg;
+                }
                 let style = build_style(cell.flags, fg, bg);
 
                 // If style changed, flush the current span.
@@ -251,6 +287,28 @@ impl TerminalModel {
             }
         }
     }
+}
+
+/// Whether `(row, col)` sits inside a normalised visible-grid selection.
+fn visible_cell_selected(
+    range: ((usize, usize), (usize, usize)),
+    row: usize,
+    col: usize,
+) -> bool {
+    let ((sr, sc), (er, ec)) = range;
+    if row < sr || row > er {
+        return false;
+    }
+    if sr == er {
+        return col >= sc && col < ec;
+    }
+    if row == sr {
+        return col >= sc;
+    }
+    if row == er {
+        return col < ec;
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------

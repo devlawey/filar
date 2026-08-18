@@ -4737,3 +4737,22 @@ TUI help overlay glyphs. Markdown-доки не трогали (не ренде�
 **Публичный API:** нет.
 
 **Дальше:** CodeRabbit / ревью.
+
+---
+
+## Issue #311: fix(tui) — mouse drag-select copy in interactive mode
+
+**Milestone:** 1.0.1. **Ветка:** `fix/311-interactive-mouse-copy`.
+
+**Проблема:** В Ctrl+T drag-select не копировал (только wheel/scrollbar / SGR
+в PTY).
+
+**Решение:** Если приложение не запросило mouse tracking — filar drag-select
+по сетке `TerminalModel`, copy on release (как в agent). Если mouse mode
+включён (vim/less) — события по-прежнему в PTY, своей селекции нет.
+Ctrl+C не трогали. Help: `drag` доступен и в Interactive.
+
+**Публичный API:** `TerminalModel::visible_line_text`,
+`render_with_selection`.
+
+**Дальше:** CodeRabbit / ревью.

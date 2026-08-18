@@ -163,7 +163,12 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
 
     // Render the terminal model grid.
     if let Some(ref term) = app.terminal {
-        term.render(f, chunks[2]);
+        term.render_with_selection(
+            f,
+            chunks[2],
+            app.selection.filter(|s| !s.is_empty()).map(|s| s.normalised()),
+            app.theme.selection_bg,
+        );
 
         // Scrollbar for scrollback — shown on the right edge of the
         // terminal area when there's history to scroll through.
