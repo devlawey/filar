@@ -4695,3 +4695,27 @@ prepare-release dual (#296).
 **Открыто:** #80 code-sign / SmartScreen.
 
 **Теги:** `v1.0.0` + `engine-v1.0.0` (core/transport/agent менялись).
+
+---
+
+## Issue #308: fix(timeouts) — default command timeout 300s
+
+**Milestone:** 1.0.1. **Ветка:** `fix/308-command-timeout-300s`.
+
+**Проблема:** `[timeouts].command_secs` жил только в конфиге. SSH ждал маркер
+фиксированные **120s** (`recv_until_marker`); local subprocess — **60s**.
+`du`/`find` на больших деревьях падали с `timeout waiting for command marker`.
+
+**Решение:**
+- Дефолт `command_secs` = **300** (`DEFAULT_COMMAND_TIMEOUT_SECS`).
+- Значение пробрасывается в `SshTransportConfig.command_timeout` (маркер SSH)
+  и `LocalExecutor::with_timeout` (локальный subprocess).
+- Пользователь по-прежнему меняет `[timeouts].command_secs` в `config.toml`.
+- GUI таймаут не пробрасывает (поля нет) — только `config.toml`.
+- Confirm-gate / zero-install не трогались.
+
+**Публичный API:** новое поле `SshTransportConfig.command_timeout` (default
+300s) и `LocalExecutor::with_timeout`. Добавление поля — breaking для
+struct-literal без `..Default`; `Default` / `connect()` совместимы.
+
+**Дальше:** CodeRabbit / ревью.

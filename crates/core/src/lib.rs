@@ -12,7 +12,10 @@ pub mod secrets;
 pub mod session;
 
 pub use chat::ChatBlock;
-pub use config::{Config, SshTarget, SshAuth, LlmConfig, LlmProfile, CommandConfirmMode, TimeoutConfig, HostKeyPolicy};
+pub use config::{
+    Config, SshTarget, SshAuth, LlmConfig, LlmProfile, CommandConfirmMode, TimeoutConfig,
+    HostKeyPolicy, DEFAULT_COMMAND_TIMEOUT_SECS,
+};
 pub use error::{CoreError, Result};
 pub use secrets::{
     ssh_cred_name, ssh_target_display_name, EnvSecretProvider, KeyringSecretProvider,

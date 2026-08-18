@@ -17,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 use filar_agent::OpenAiCompatClient;
 use filar_agent::LlmClient;
 use filar_core::{secrets, default_base_dir, ChatBlock, Config, CoreError, SecretProvider, SessionStore, StaticSecretProvider};
-use filar_transport::{LocalExecutor, SshExecutor};
+use filar_transport::{LocalExecutor, SshExecutor, SshTransportConfig};
 use filar_tui::TuiConfig;
 
 // ---------------------------------------------------------------------------
@@ -449,15 +449,21 @@ async fn run() -> anyhow::Result<()> {
     info!(model = %llm_config.model, "LLM client initialised");
 
     // ── Create executor (local or SSH) ─────────────────────────────────
+    let command_timeout = Duration::from_secs(config.timeouts.command_secs);
     let executor: Arc<dyn filar_transport::CommandExecutor> = if target_name == "local" {
         info!("initialising local command executor");
-        Arc::new(LocalExecutor::new().await.map_err(|e| {
+        Arc::new(LocalExecutor::with_timeout(command_timeout).await.map_err(|e| {
             warn!(error = %e, "failed to create local executor");
             anyhow::anyhow!(e)
         })?)
     } else if let Some(ref target) = ssh_target {
         info!(host = %target.host, port = target.port, user = %target.user, "connecting via SSH");
-        let ssh = SshExecutor::connect(target).await.map_err(|e| {
+        let ssh = SshExecutor::connect_with_config(
+            target,
+            SshTransportConfig::default().with_command_timeout(command_timeout),
+        )
+        .await
+        .map_err(|e| {
             warn!(error = %e, "SSH connection failed");
             anyhow::anyhow!(e)
         })?;
@@ -570,6 +576,7 @@ async fn run() -> anyhow::Result<()> {
         }),
         ssh_targets: launch_ssh_targets,
         save_dir: launch_save_dir,
+        command_timeout,
     };
 
     info!("launching TUI");

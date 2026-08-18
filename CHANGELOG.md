@@ -11,6 +11,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Changed
+
+- Default command timeout is now 5 minutes (`[timeouts].command_secs = 300`).
+  The value is applied to SSH marker wait and local subprocess execution, so
+  long jobs such as `du`/`find` are no longer killed at 120s (SSH) or 60s
+  (local) under default settings
+  ([#308](https://github.com/devlawey/filar/issues/308)).
+
 ## [1.0.0] - 2026-08-17
 
 ### Added

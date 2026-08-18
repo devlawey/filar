@@ -13,12 +13,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tracing::info;
 
-use filar_core::{CoreError, Result};
+use filar_core::{CoreError, Result, DEFAULT_COMMAND_TIMEOUT_SECS};
 
 use crate::{CommandResult, StreamEvent};
 
-/// Default timeout for command execution (60 seconds).
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default timeout for command execution (5 minutes).
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS);
 
 // ---------------------------------------------------------------------------
 // LocalExecutor
@@ -28,15 +28,26 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// On Windows, uses PowerShell. On Unix, uses `sh`.
 /// Each command runs in a separate process — no persistent shell session.
-/// Commands have a 60-second timeout to prevent hanging on interactive prompts.
+/// Commands have a 5-minute timeout by default to prevent hanging on
+/// interactive prompts; override with [`LocalExecutor::with_timeout`].
 pub struct LocalExecutor {
     cancel_notify: Arc<Notify>,
+    timeout: Duration,
 }
 
 impl LocalExecutor {
-    /// Create a new local executor.
+    /// Create a new local executor with the default command timeout.
     pub async fn new() -> Result<Self> {
-        Self::with_shell(None).await
+        Self::with_timeout(DEFAULT_TIMEOUT).await
+    }
+
+    /// Create a local executor with an explicit command timeout.
+    pub async fn with_timeout(timeout: Duration) -> Result<Self> {
+        info!(timeout_secs = timeout.as_secs(), "local subprocess executor ready");
+        Ok(Self {
+            cancel_notify: Arc::new(Notify::new()),
+            timeout,
+        })
     }
 
     /// Create a local executor with a specific shell program.
@@ -44,10 +55,7 @@ impl LocalExecutor {
     /// The `shell` parameter is accepted for API compatibility but ignored —
     /// the shell is determined automatically by platform.
     pub async fn with_shell(_shell: Option<&str>) -> Result<Self> {
-        info!("local subprocess executor ready");
-        Ok(Self {
-            cancel_notify: Arc::new(Notify::new()),
-        })
+        Self::with_timeout(DEFAULT_TIMEOUT).await
     }
 }
 
@@ -87,10 +95,10 @@ impl crate::CommandExecutor for LocalExecutor {
             _ = self.cancel_notify.notified() => {
                 return Err(CoreError::Other("command cancelled by user".into()));
             }
-            _ = tokio::time::sleep(DEFAULT_TIMEOUT) => {
+            _ = tokio::time::sleep(self.timeout) => {
                 return Err(CoreError::Other(format!(
                     "command timed out after {} seconds",
-                    DEFAULT_TIMEOUT.as_secs()
+                    self.timeout.as_secs()
                 )));
             }
         };
@@ -152,6 +160,11 @@ fn build_shell_command(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_timeout_is_five_minutes() {
+        assert_eq!(DEFAULT_TIMEOUT, Duration::from_secs(300));
+    }
 
     #[test]
     fn build_shell_command_contains_user_command() {
