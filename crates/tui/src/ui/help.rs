@@ -31,6 +31,18 @@ pub(crate) struct HelpEntry {
     pub available: fn(AppMode) -> bool,
 }
 
+/// Overlay copy that must render in Windows console fonts.
+///
+/// Windows console fonts often lack `⌘` (it shows as `?`). Keep macOS-only
+/// glyphs out of the TUI on other platforms (#310).
+fn overlay_desc_macos(macos: &'static str, other: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") {
+        macos
+    } else {
+        other
+    }
+}
+
 /// Return the full command registry — all entries, all modes.
 ///
 /// The bottom help bar filters this by mode; the overlay shows everything,
@@ -40,7 +52,10 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
         // ── Help ──────────────────────────────────────────────────────
         HelpEntry {
             key: "F1",
-            desc: "Toggle this help overlay (macOS: often Fn+F1; Ctrl, not ⌘)",
+            desc: overlay_desc_macos(
+                "Toggle this help overlay (macOS: often Fn+F1; Ctrl, not ⌘)",
+                "Toggle this help overlay (Ctrl, not Cmd)",
+            ),
             section: "Help",
             available: |_| true,
         },
@@ -344,6 +359,40 @@ mod tests {
     fn registry_is_nonempty() {
         let r = help_registry();
         assert!(!r.is_empty(), "help registry must not be empty");
+    }
+
+    #[test]
+    fn f1_desc_avoids_command_glyph_off_macos() {
+        let f1 = help_registry()
+            .into_iter()
+            .find(|e| e.key == "F1")
+            .expect("F1 entry");
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                f1.desc.contains("Fn+F1"),
+                "macOS F1 help should mention Fn+F1: {}",
+                f1.desc
+            );
+            assert!(
+                f1.desc.contains('⌘'),
+                "macOS F1 help should mention ⌘: {}",
+                f1.desc
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(
+                !f1.desc.contains('⌘'),
+                "non-macOS overlay must not use ⌘ (Windows console renders it as ?): {}",
+                f1.desc
+            );
+            assert!(
+                f1.desc.contains("Ctrl"),
+                "non-macOS F1 help should still mention Ctrl: {}",
+                f1.desc
+            );
+        }
     }
 
     #[test]

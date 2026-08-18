@@ -4721,3 +4721,19 @@ struct-literal без `..Default`; `Default` / `connect()` совместимы.
 **Review:** command_secs = 0 отвергается в TimeoutConfig::validate (иначе маркер/subprocess сразу таймаутятся).
 
 **Дальше:** CodeRabbit / ревью.
+
+---
+
+## Issue #310: fix(tui) — F1 help overlay without ⌘ on Windows
+
+**Milestone:** 1.0.1. **Ветка:** `fix/310-f1-help-no-cmd-glyph`.
+
+**Проблема:** Windows console font не содержит `⌘` → в F1-оверлее «?».
+
+**Решение:** `overlay_desc_macos` в `help.rs` — на macOS прежний текст
+(Fn+F1 / Ctrl vs ⌘), на остальных — ASCII `Cmd`. PLATFORM_NOTES: секция
+TUI help overlay glyphs. Markdown-доки не трогали (не рендерятся в консоли).
+
+**Публичный API:** нет.
+
+**Дальше:** CodeRabbit / ревью.

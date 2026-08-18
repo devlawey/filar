@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- F1 help overlay no longer uses `⌘` on Windows (console fonts render it as
+  `?`); macOS keeps Fn+F1 / Ctrl vs ⌘ wording
+  ([#310](https://github.com/devlawey/filar/issues/310)).
+
 ### Changed
 
 - Default command timeout is now 5 minutes (`[timeouts].command_secs = 300`).
