@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use filar_core::{
     CoreError, EnvSecretProvider, HostKeyPolicy, Result, SecretProvider, SshAuth, SshTarget,
+    DEFAULT_COMMAND_TIMEOUT_SECS,
 };
 
 use crate::CommandResult;
@@ -61,6 +62,10 @@ pub struct SshTransportConfig {
     /// *before dispatch* triggers one silent reconnect and a single retry.
     /// A command that may already have executed is never auto-retried.
     pub auto_reconnect: bool,
+    /// How long to wait for a command's end-of-output marker before sending
+    /// Ctrl-C and failing with `timeout waiting for command marker`.
+    /// Default: [`DEFAULT_COMMAND_TIMEOUT_SECS`] (5 minutes).
+    pub command_timeout: Duration,
 }
 
 impl Default for SshTransportConfig {
@@ -69,7 +74,16 @@ impl Default for SshTransportConfig {
             keepalive_interval: Some(DEFAULT_KEEPALIVE_INTERVAL),
             keepalive_max: DEFAULT_KEEPALIVE_MAX,
             auto_reconnect: true,
+            command_timeout: Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS),
         }
+    }
+}
+
+impl SshTransportConfig {
+    /// Override the per-command marker-wait timeout.
+    pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = timeout;
+        self
     }
 }
 
@@ -225,6 +239,8 @@ pub struct SshSession {
     /// on reconnect). The reader task reads this to decide whether a channel
     /// closure is expected (INFO) or unexpected (WARN).
     shutdown: Arc<AtomicBool>,
+    /// Per-command marker-wait timeout from [`SshTransportConfig`].
+    command_timeout: Duration,
 }
 
 impl SshSession {
@@ -379,6 +395,7 @@ impl SshSession {
             session: Mutex::new(session),
             req_counter: AtomicU64::new(0),
             shutdown,
+            command_timeout: cfg.command_timeout,
         })
     }
 
@@ -438,7 +455,7 @@ impl SshSession {
 
         // Read events until we find the marker — without holding any lock
         // that `cancel()` needs.
-        match recv_until_marker(&mut event_rx, &marker_tag, Duration::from_secs(120)).await {
+        match recv_until_marker(&mut event_rx, &marker_tag, self.command_timeout).await {
             Ok((stdout, stderr, exit_code)) => {
                 let duration = start.elapsed();
                 Ok(CommandResult {
@@ -1296,6 +1313,11 @@ mod tests {
         assert_eq!(cfg.keepalive_interval, Some(Duration::from_secs(20)));
         assert_eq!(cfg.keepalive_max, 3);
         assert!(cfg.auto_reconnect);
+        assert_eq!(
+            cfg.command_timeout,
+            Duration::from_secs(DEFAULT_COMMAND_TIMEOUT_SECS)
+        );
+        assert_eq!(cfg.command_timeout, Duration::from_secs(300));
     }
 
     #[test]

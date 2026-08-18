@@ -133,6 +133,13 @@ The transport itself **never reads environment variables** for the password. The
 reading `SSH_PASSWORD` from the environment, while external consumers whose env is
 not a secret source are not trapped by it.
 
+`SshTransportConfig::command_timeout` (default 300s,
+`filar_core::DEFAULT_COMMAND_TIMEOUT_SECS`) is how long `SshSession::run` waits
+for the command marker. Override with
+`SshTransportConfig::default().with_command_timeout(duration)`. Locally,
+`LocalExecutor::with_timeout` is the equivalent (`LocalExecutor::new` uses the
+same 300s default).
+
 ```rust,no_run
 use std::sync::Arc;
 use filar_core::{SshTarget, SshAuth, HostKeyPolicy, StaticSecretProvider};

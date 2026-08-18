@@ -194,7 +194,7 @@ key_env = "DEEPSEEK_API_KEY"
 
 # ── Timeouts (seconds) ─────────────────────────────────────
 [timeouts]
-command_secs = 120   # single command execution
+command_secs = 300   # single command execution
 llm_secs = 60        # single LLM API call
 connect_secs = 15    # SSH connection establishment
 

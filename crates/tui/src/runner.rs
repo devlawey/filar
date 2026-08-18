@@ -20,7 +20,8 @@ use tracing::{error, info, warn};
 use filar_agent::{AgentBuilder, CommandConfirmer, LlmClient};
 use filar_core::{CommandConfirmMode, CoreError, Result, SecretProvider, StaticSecretProvider};
 use filar_transport::{
-    CommandExecutor, InteractiveTerminal, LocalInteractive, SecretSubstitutingExecutor, SshInteractive,
+    CommandExecutor, InteractiveTerminal, LocalInteractive, SecretSubstitutingExecutor,
+    SshExecutor, SshInteractive, SshTransportConfig,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -262,6 +263,14 @@ pub struct TuiConfig {
     pub log_rx: Option<mpsc::UnboundedReceiver<String>>,
     /// Directory where Ctrl+S session exports are written (`None` = CWD).
     pub save_dir: Option<std::path::PathBuf>,
+    /// Per-command execution timeout from `[timeouts].command_secs`.
+    /// Applied to SSH marker wait and local subprocess execution.
+    pub command_timeout: Duration,
+}
+
+/// SSH transport tunables with the app-configured command timeout.
+fn ssh_transport_config(command_timeout: Duration) -> SshTransportConfig {
+    SshTransportConfig::default().with_command_timeout(command_timeout)
 }
 
 /// Run the TUI with the given LLM client, executor, and configuration.
@@ -321,6 +330,7 @@ async fn run_app(
     mut config: TuiConfig,
     snapshot: SessionSnapshot,
 ) -> Result<()> {
+    let command_timeout = config.command_timeout;
     let profiles_for_restore = std::mem::take(&mut config.profiles);
     let default_for_restore = std::mem::take(&mut config.default_profile_name);
     let has_history = !config.initial_messages.is_empty()
@@ -838,7 +848,11 @@ async fn run_app(
                                 host_key_policy: filar_core::HostKeyPolicy::Tofu,
                             };
                             let new_ssh_info = format!("{user}@{host}:{port}");
-                            match filar_transport::SshExecutor::connect(&target).await {
+                            match SshExecutor::connect_with_config(
+                                &target,
+                                ssh_transport_config(command_timeout),
+                            )
+                            .await {
                                 Ok(ssh_exec) => {
                                     // A newer attempt superseded this one while
                                     // we were connecting — drop the result.
@@ -913,7 +927,11 @@ async fn run_app(
                         _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
                     }
                     let new_info = format!("{}@{}:{}", target.user, target.host, target.port);
-                    match filar_transport::SshExecutor::connect(&target).await {
+                    match SshExecutor::connect_with_config(
+                        &target,
+                        ssh_transport_config(command_timeout),
+                    )
+                    .await {
                         Ok(ssh_exec) => {
                             if let Some((ref exec, ref st)) = exec_entry {
                                 exec.swap_executor(Arc::new(ssh_exec) as Arc<dyn CommandExecutor>).await;
@@ -960,7 +978,10 @@ async fn run_app(
                 if let Some(idx) = selection {
                     if idx == 0 {
                         // Switch to local.
-                        let local_exec = match filar_transport::LocalExecutor::new().await {
+                        let local_exec = match filar_transport::LocalExecutor::with_timeout(
+                            command_timeout,
+                        )
+                        .await {
                             Ok(exec) => exec,
                             Err(e) => {
                                 let _ = tx.send(TuiEvent::Agent {
@@ -1003,7 +1024,11 @@ async fn run_app(
                             }
                         }
                         let new_info = format!("{}@{}:{}", target.user, target.host, target.port);
-                        match filar_transport::SshExecutor::connect(&target).await {
+                        match SshExecutor::connect_with_config(
+                            &target,
+                            ssh_transport_config(command_timeout),
+                        )
+                        .await {
                             Ok(ssh_exec) => {
                                 if let Some((ref exec, ref st)) = exec_entry {
                                     exec.swap_executor(Arc::new(ssh_exec) as Arc<dyn CommandExecutor>).await;
@@ -1053,7 +1078,7 @@ async fn run_app(
 
         // Create local executors for new tabs signalled via new_tab().
         for sid in app.take_pending_local_executors() {
-            match filar_transport::LocalExecutor::new().await {
+            match filar_transport::LocalExecutor::with_timeout(command_timeout).await {
                 Ok(local) => {
                     executors.insert(
                         sid,

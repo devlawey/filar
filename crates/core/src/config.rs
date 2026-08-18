@@ -253,6 +253,12 @@ impl From<&LlmProfile> for LlmConfig {
 // Timeouts
 // ---------------------------------------------------------------------------
 
+/// Default `[timeouts].command_secs` — 5 minutes.
+///
+/// Applied to SSH marker wait and local subprocess execution. Long jobs such as
+/// `du`/`find` on large trees need more than the previous 120s cap.
+pub const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
+
 /// Timeout configuration (all values in seconds).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimeoutConfig {
@@ -278,13 +284,25 @@ impl Default for TimeoutConfig {
 }
 
 fn default_command_timeout() -> u64 {
-    120
+    DEFAULT_COMMAND_TIMEOUT_SECS
 }
 fn default_llm_timeout() -> u64 {
     60
 }
 fn default_connect_timeout() -> u64 {
     15
+}
+
+impl TimeoutConfig {
+    /// Reject values that would make every command fail immediately.
+    pub fn validate(&self) -> Result<()> {
+        if self.command_secs == 0 {
+            return Err(CoreError::Config(
+                "timeouts.command_secs must be greater than 0".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +352,7 @@ impl Config {
         for p in &cfg.llm_profiles {
             LlmConfig::from(p).validate()?;
         }
+        cfg.timeouts.validate()?;
         Ok(cfg)
     }
 
@@ -461,6 +480,51 @@ user = "testuser"
         assert_eq!(cfg.ssh_targets.len(), 1);
         assert_eq!(cfg.ssh_targets[0].port, 2222);
         assert_eq!(cfg.confirm_mode, CommandConfirmMode::Allowlist);
+        assert_eq!(cfg.timeouts.command_secs, DEFAULT_COMMAND_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn default_command_timeout_is_five_minutes() {
+        assert_eq!(DEFAULT_COMMAND_TIMEOUT_SECS, 300);
+        assert_eq!(TimeoutConfig::default().command_secs, 300);
+        // Omitted `[timeouts]` still deserialises to the 300s default.
+        let cfg: Config = toml::from_str(
+            r#"
+[llm]
+model = "glm-5.1"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.timeouts.command_secs, 300);
+    }
+
+    #[test]
+    fn reject_zero_command_timeout() {
+        let toml = r#"
+[llm]
+model = "glm-5.1"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+
+[timeouts]
+command_secs = 0
+"#;
+        let tmp = std::env::temp_dir().join(format!(
+            "filar_config_timeout_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&tmp, toml).unwrap();
+        let result = Config::load(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        let err = result.expect_err("Config::load should reject command_secs = 0");
+        assert!(
+            err.to_string().contains("command_secs"),
+            "error should mention command_secs: {err}"
+        );
     }
 
     #[test]
@@ -474,7 +538,7 @@ api_base_url = "https://open.bigmodel.cn/api/paas/v4"
 max_tokens = 8192
 
 [timeouts]
-command_secs = 300
+command_secs = 90
 llm_secs = 90
 connect_secs = 10
 
@@ -497,7 +561,7 @@ type = "agent"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.llm.max_tokens, 8192);
-        assert_eq!(cfg.timeouts.command_secs, 300);
+        assert_eq!(cfg.timeouts.command_secs, 90);
         assert_eq!(cfg.confirm_mode, CommandConfirmMode::Allowlist);
         assert_eq!(cfg.ssh_targets.len(), 2);
         assert_eq!(cfg.ssh_target("staging").unwrap().host, "10.0.0.6");
