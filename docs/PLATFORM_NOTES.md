@@ -9,6 +9,7 @@ Add findings here whenever a platform difference is discovered.
 |--------|---------|--------|
 | App data dirs | [Application data directory](#application-data-directory) | #291 |
 | macOS Ctrl vs ⌘, Fn+F1 | [macOS shortcuts](#macos-shortcuts) | #292 |
+| Windows console missing `⌘` glyph | [TUI help overlay glyphs](#tui-help-overlay-glyphs) | #310 |
 | Interactive PTY shell | [Local interactive shell](#local-interactive-shell-ctrlt) | #293 |
 | Release assets / packaging | [Release binaries (CI)](#release-binaries-ci) | #289, #297, #80 |
 
@@ -71,6 +72,16 @@ is intentional for 1.0.0 (#292); remapping to ⌘ is out of scope.
 **Known limitation:** if the terminal swallows Ctrl+letter or F-keys before
 crossterm sees them, filar cannot receive the shortcut — that is a terminal
 configuration issue, not a silent failure inside filar.
+
+## TUI help overlay glyphs
+
+Windows console fonts (conhost / many raster and TrueType faces) do not include
+`⌘`. Ratatui then shows `?` in the F1 overlay (#310).
+
+The help registry therefore uses `overlay_desc_macos` in
+`crates/tui/src/ui/help.rs`: macOS keeps `⌘` / Fn+F1 wording; Windows and
+Linux use ASCII (`Cmd`). Markdown docs (`USER_GUIDE`, this file) may still
+use `⌘` because they are not rendered in the Windows console.
 
 ## Async blockers
 
