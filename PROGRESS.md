@@ -4779,3 +4779,19 @@ NSPasteboard; egui 0.29 `TextEdit::singleline` заменяет `\n`/`\r` на �
 **Дальше:** CodeRabbit / ревью.
 
 **Review:** убран `.trim()` (пробелы в SSH-пароле валидны; newline/BOM/ZWSP остаются). Show-чекбокс рисуется до поля, чтобы маска менялась в том же кадре.
+
+## Issue #309: feat(tui) — SSH status bar alias + host + pwd
+
+**Milestone:** 1.0.1. **Ветка:** `feat/309-ssh-status-alias-host-pwd`.
+
+**Проблема:** в статус-баре при SSH был только `target_name`, без host и pwd.
+
+**Решение:**
+- `Session::status_target()`: SSH `alias host pwd`, local `name pwd`.
+- Нет alias → только host + pwd (если `target_name` = raw `user@host`).
+- `Session.cwd`: local — process cwd; SSH — `pwd` после connect; interactive — OSC 7.
+- Синхронизация cwd агент↔PTY — **#313** (здесь только отображение).
+
+**Публичный API:** `Session::status_target`, `TuiEvent::CwdChanged`. Breaking для exhaustiveness match `TuiEvent`.
+
+**Дальше:** CodeRabbit / ревью.

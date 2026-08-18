@@ -65,8 +65,8 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
 
 /// Render the status bar (top line).
 ///
-/// Layout: `filar ▸ {target}` on the left (accent on target name),
-/// mode indicator in the center (only for non-Normal modes),
+/// Layout: `filar ▸ {alias host pwd}` on the left for SSH (`name pwd` when
+/// local), mode indicator in the center (only for non-Normal modes),
 /// `confirm_mode` on the right (muted).
 pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let glyphs = app.theme.glyphs();
@@ -79,7 +79,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(glyphs.target_sep, app.theme.muted()),
         Span::raw(" "),
         Span::styled(
-            app.target_name.clone(),
+            app.status_target(),
             app.theme.user_style(),
         ),
     ];
@@ -416,6 +416,26 @@ mod tests {
         app.active_session_mut().llm_profile = Some("glm".into());
         let row = render_status_row(&mut app, 120);
         assert!(row.contains("toks: —"), "zero tokens must show dash, got: {row}");
+    }
+
+    #[test]
+    fn status_bar_ssh_shows_alias_host_and_pwd() {
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.ssh_info = Some("root@10.0.0.5:22".into());
+        app.cwd = Some("/srv".into());
+        let row = render_status_row(&mut app, 120);
+        assert!(row.contains("prod"), "alias, got: {row}");
+        assert!(row.contains("10.0.0.5"), "host, got: {row}");
+        assert!(row.contains("/srv"), "pwd, got: {row}");
+    }
+
+    #[test]
+    fn status_bar_local_still_shows_name() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.cwd = Some("/tmp".into());
+        let row = render_status_row(&mut app, 120);
+        assert!(row.contains("local"), "local name, got: {row}");
+        assert!(row.contains("/tmp"), "local pwd, got: {row}");
     }
 
     #[test]

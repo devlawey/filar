@@ -77,6 +77,9 @@ fn route_term_chunk(app: &mut App, sid: SessionId, chunk: TermChunk) -> RouteOut
         TermChunk::Bytes(bytes) => {
             if let Some(ref mut model) = session.terminal {
                 model.feed(&bytes);
+                if let Some(cwd) = model.take_osc7_cwd() {
+                    session.cwd = Some(cwd);
+                }
             }
             if is_background {
                 session.has_new = true;
@@ -87,6 +90,32 @@ fn route_term_chunk(app: &mut App, sid: SessionId, chunk: TermChunk) -> RouteOut
         TermChunk::Err(e) => RouteOutcome::Error(e),
     }
 }
+
+fn spawn_remote_cwd_probe(
+    exec: Arc<TuiExecutor>,
+    session_id: crate::app::SessionId,
+    tx: mpsc::UnboundedSender<TuiEvent>,
+) {
+    tokio::spawn(async move {
+        if let Ok(result) = exec.run("pwd").await {
+            if let Some(cwd) = sanitize_pwd_output(&result.stdout) {
+                let _ = tx.send(TuiEvent::CwdChanged { session_id, cwd });
+            }
+        }
+    });
+}
+
+fn sanitize_pwd_output(stdout: &str) -> Option<String> {
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.eq_ignore_ascii_case("path") && *l != "----")?;
+    if line.len() > 1024 {
+        return None;
+    }
+    Some(line.to_string())
+}
+
 use filar_core::ChatBlock;
 
 // ---------------------------------------------------------------------------
@@ -411,11 +440,16 @@ async fn run_app(
     if let Some(ref target) = config.ssh_target {
         app.sessions[0].ssh_info =
             Some(format!("{}@{}:{}", target.user, target.host, target.port));
+        app.sessions[0].cwd = None;
+        if let Some(entry) = executors.get(&initial_sid) {
+            spawn_remote_cwd_probe(entry.executor.clone(), initial_sid, agent_tx.clone());
+        }
     } else if let Some(ref info) = config.initial_ssh_info {
         // Restored session was over SSH but no live ssh_target was provided
         // (e.g. `--session` restore without `--target`). Surface the saved
         // host in the tab label; reconnecting is handled by the overlay.
         app.sessions[0].ssh_info = Some(info.clone());
+        app.sessions[0].cwd = None;
     }
 
     // Crossterm event stream for async keyboard input.
@@ -1118,7 +1152,7 @@ async fn run_app(
             } => {
                 if let Some(event) = maybe_agent_event {
                     // Intercept TransportChanged to update per-session info.
-                    if let TuiEvent::TransportChanged { session_id, ref ssh_info, ref alias, .. } = &event {
+                    if let TuiEvent::TransportChanged { session_id, is_local, ref ssh_info, ref alias, .. } = &event {
                         if let Some(idx) = app.find_session_idx(*session_id) {
                             app.sessions[idx].ssh_info = ssh_info.clone();
                             app.sessions[idx].target_name =
@@ -1127,6 +1161,20 @@ async fn run_app(
                                         format!("local-{}", idx + 1)
                                     })
                                 });
+                            if *is_local {
+                                app.sessions[idx].cwd = std::env::current_dir()
+                                    .ok()
+                                    .map(|p| p.display().to_string());
+                            } else {
+                                app.sessions[idx].cwd = None;
+                                if let Some(entry) = executors.get(session_id) {
+                                    spawn_remote_cwd_probe(
+                                        entry.executor.clone(),
+                                        *session_id,
+                                        agent_tx.clone(),
+                                    );
+                                }
+                            }
                         }
                     }
                     // All agent events just need a redraw — the borderless
@@ -1526,6 +1574,21 @@ mod tests {
         );
         assert!(matches!(outcome, RouteOutcome::Fed));
         assert!(app.sessions[0].has_new, "background tab must be marked");
+    }
+
+    #[test]
+    fn route_osc7_updates_session_cwd() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        app.sessions[0].terminal = Some(crate::terminal::TerminalModel::new(80, 24));
+        let outcome = route_term_chunk(
+            &mut app,
+            sid,
+            TermChunk::Bytes(b"\x1b]7;file://host/opt/app\x07".to_vec()),
+        );
+        assert!(matches!(outcome, RouteOutcome::Fed));
+        assert_eq!(app.sessions[0].cwd.as_deref(), Some("/opt/app"));
     }
 
     #[test]

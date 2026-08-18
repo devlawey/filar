@@ -13,6 +13,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- SSH status bar shows **alias** (or host-only when there is no alias),
+  **host**, and last-known **pwd**. Local tabs still show `local` plus the
+  process cwd. Interactive OSC 7 updates pwd; agent↔PTY sync is #313
+  ([#309](https://github.com/devlawey/filar/issues/309)).
 - GUI launcher: paste into API key / SSH password no longer keeps a trailing
   newline (or the space egui 0.29 substituted for it). Show-password /
   show-API-key toggles were added
