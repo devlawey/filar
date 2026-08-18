@@ -4718,4 +4718,6 @@ prepare-release dual (#296).
 300s) и `LocalExecutor::with_timeout`. Добавление поля — breaking для
 struct-literal без `..Default`; `Default` / `connect()` совместимы.
 
+**Review:** command_secs = 0 отвергается в TimeoutConfig::validate (иначе маркер/subprocess сразу таймаутятся).
+
 **Дальше:** CodeRabbit / ревью.

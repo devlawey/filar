@@ -293,6 +293,18 @@ fn default_connect_timeout() -> u64 {
     15
 }
 
+impl TimeoutConfig {
+    /// Reject values that would make every command fail immediately.
+    pub fn validate(&self) -> Result<()> {
+        if self.command_secs == 0 {
+            return Err(CoreError::Config(
+                "timeouts.command_secs must be greater than 0".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Confirmation mode
 // ---------------------------------------------------------------------------
@@ -340,6 +352,7 @@ impl Config {
         for p in &cfg.llm_profiles {
             LlmConfig::from(p).validate()?;
         }
+        cfg.timeouts.validate()?;
         Ok(cfg)
     }
 
@@ -484,6 +497,26 @@ api_base_url = "https://open.bigmodel.cn/api/paas/v4"
         )
         .unwrap();
         assert_eq!(cfg.timeouts.command_secs, 300);
+    }
+
+    #[test]
+    fn reject_zero_command_timeout() {
+        let cfg: Config = toml::from_str(
+            r#"
+[llm]
+model = "glm-5.1"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+
+[timeouts]
+command_secs = 0
+"#,
+        )
+        .unwrap();
+        let err = cfg.timeouts.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("command_secs"),
+            "error should mention command_secs: {err}"
+        );
     }
 
     #[test]
