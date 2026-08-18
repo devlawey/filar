@@ -10,6 +10,7 @@ Add findings here whenever a platform difference is discovered.
 | App data dirs | [Application data directory](#application-data-directory) | #291 |
 | macOS Ctrl vs ⌘, Fn+F1 | [macOS shortcuts](#macos-shortcuts) | #292 |
 | Windows console missing `⌘` glyph | [TUI help overlay glyphs](#tui-help-overlay-glyphs) | #310 |
+| GUI launcher paste / show password | [GUI launcher secrets](#gui-launcher-secrets-macos) | #312 |
 | Interactive PTY shell | [Local interactive shell](#local-interactive-shell-ctrlt) | #293 |
 | Release assets / packaging | [Release binaries (CI)](#release-binaries-ci) | #289, #297, #80 |
 
@@ -26,6 +27,30 @@ Add findings here whenever a platform difference is discovered.
 > clipboard owner can be a remote process and the call may block; when a Linux
 > build becomes supported, the clipboard read in `handle_key` (#153) should be
 > wrapped in `tokio::task::spawn_blocking`.
+>
+> GUI launcher secret fields (API key / SSH password) do **not** take the raw
+> egui paste: see [GUI launcher secrets](#gui-launcher-secrets-macos).
+
+## GUI launcher secrets (macOS)
+
+On macOS, copying an API token or SSH password from Keychain Access or a
+browser puts **UTF-8 text plus a trailing newline** (sometimes a BOM) on
+`NSPasteboard`. egui 0.29 `TextEdit::singleline` then replaces `\n`/`\r` with
+a space, so the field becomes `"token "` and LLM auth / SSH login fail.
+Typing the same value by hand works because it has no newline (#312).
+
+The launcher therefore:
+
+1. Intercepts `Event::Paste` on focused secret fields **before** TextEdit, and
+   stores `sanitize_secret_clipboard` (first line, trim, drop BOM / ZWSP).
+2. Sanitizes again on Launch and when reading/writing the OS keyring, so a
+   leftover trailing space from an older session is not sent to the API/SSH.
+3. Offers **Show password** / **Show** (API key) checkboxes (not persisted) so
+   the pasted value can be verified. Secrets are still never written to
+   `settings.json`, `pending_launch.json`, or `config.toml`.
+
+Windows is not the original report, but the same sanitizer runs there (browser
+copy can also include a trailing newline).
 
 ## Terminal features
 
