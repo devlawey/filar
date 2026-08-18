@@ -630,6 +630,8 @@ pub struct SshExecutor {
     secrets: Arc<dyn SecretProvider>,
     /// Last `$PWD` reported by the command marker (or [`set_cwd`]).
     last_cwd: StdMutex<Option<String>>,
+    /// Applied once as `cd … &&` on the next [`run`] (user-approved command).
+    pending_cwd: StdMutex<Option<String>>,
 }
 
 impl SshExecutor {
@@ -670,6 +672,7 @@ impl SshExecutor {
             config,
             secrets,
             last_cwd: StdMutex::new(None),
+            pending_cwd: StdMutex::new(None),
         })
     }
 
@@ -687,13 +690,23 @@ impl SshExecutor {
             }
         }
     }
+
+    /// Prefix `cd … &&` once so the next *user-approved* command lands in `path`.
+    fn take_prefixed_command(&self, command: &str) -> String {
+        let pending = self.pending_cwd.lock().ok().and_then(|mut g| g.take());
+        match pending.as_deref().and_then(crate::posix_cd_command) {
+            Some(cd) => format!("{cd} && {command}"),
+            None => command.to_string(),
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl crate::CommandExecutor for SshExecutor {
     async fn run(&self, command: &str) -> Result<CommandResult> {
+        let command = self.take_prefixed_command(command);
         // First attempt on the current session.
-        let first = { self.session.read().await.run(command).await };
+        let first = { self.session.read().await.run(&command).await };
 
         // Reconnect only when the connection was lost *before* the command was
         // dispatched (the `ConnectionLost` variant). A command that may have
@@ -741,7 +754,7 @@ impl crate::CommandExecutor for SshExecutor {
         );
 
         // Single retry on the fresh session.
-        let retry = self.session.read().await.run(command).await;
+        let retry = self.session.read().await.run(&command).await;
         self.store_cwd_from(&retry);
         retry
     }
@@ -751,17 +764,14 @@ impl crate::CommandExecutor for SshExecutor {
     }
 
     async fn set_cwd(&self, path: &str) -> Result<()> {
-        let cmd = crate::posix_cd_command(path)
+        let _ = crate::posix_cd_command(path)
             .ok_or_else(|| CoreError::Other("invalid cwd".into()))?;
-        let result = self.run(&cmd).await?;
-        if result.exit_code.unwrap_or(-1) != 0 {
-            return Err(CoreError::Other(format!(
-                "cd failed with exit {}",
-                result.exit_code.unwrap_or(-1)
-            )));
+        let path = path.trim().to_string();
+        if let Ok(mut g) = self.pending_cwd.lock() {
+            *g = Some(path.clone());
         }
         if let Ok(mut g) = self.last_cwd.lock() {
-            *g = Some(path.trim().to_string());
+            *g = Some(path);
         }
         Ok(())
     }
@@ -997,7 +1007,7 @@ async fn recv_until_marker(
 
 /// Parse `<marker_tag>__<exit>__` or `<marker_tag>__<exit>__<pwd>__`.
 ///
-/// Returns `(exit_code, cwd, start_of_marker_line)`.
+/// `pwd` is accepted only when the line is exactly `<pwd>__` (no `__` inside).
 fn parse_filar_marker(buf: &str, marker_tag: &str) -> Option<(i32, Option<String>, usize)> {
     let pos = buf.find(marker_tag)?;
     let after_tag = &buf[pos + marker_tag.len()..];
@@ -1006,16 +1016,13 @@ fn parse_filar_marker(buf: &str, marker_tag: &str) -> Option<(i32, Option<String
     let code: i32 = rest[..end].trim().parse().ok()?;
     let after_code = &rest[end + 2..];
     let line = after_code.split(['\n', '\r']).next().unwrap_or("");
-    let cwd = line
-        .strip_suffix("__")
-        .unwrap_or(line)
-        .trim()
-        .to_string();
-    let cwd = if crate::is_safe_cwd(&cwd) {
-        Some(cwd)
-    } else {
-        None
-    };
+    let cwd = line.strip_suffix("__").map(str::trim).and_then(|pwd| {
+        if crate::is_safe_cwd(pwd) && !pwd.contains("__") {
+            Some(pwd.to_string())
+        } else {
+            None
+        }
+    });
     let line_start = buf[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
     Some((code, cwd, line_start))
 }
@@ -1098,6 +1105,15 @@ mod tests {
         let buf = "out\n__FILAR_req_00000001__1__\n";
         let (code, cwd, _) = parse_filar_marker(buf, tag).unwrap();
         assert_eq!(code, 1);
+        assert!(cwd.is_none());
+    }
+
+    #[test]
+    fn parse_marker_rejects_pwd_with_double_underscore() {
+        let tag = "__FILAR_req_00000001";
+        let buf = "out\n__FILAR_req_00000001__0__/tmp__evil__\n";
+        let (code, cwd, _) = parse_filar_marker(buf, tag).unwrap();
+        assert_eq!(code, 0);
         assert!(cwd.is_none());
     }
 

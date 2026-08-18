@@ -22,7 +22,10 @@ pub fn is_safe_cwd(path: &str) -> bool {
     !trimmed.is_empty() && trimmed.len() <= MAX_CWD_LEN
 }
 
-/// POSIX single-quote a path for `cd` / similar.
+/// POSIX single-quote a path for `cd`.
+///
+/// `\` is quoted (not treated as a bare-safe char) so dash/`printf` cannot
+/// reinterpret escapes. Inside single quotes a backslash is literal.
 pub fn posix_shell_quote(value: &str) -> String {
     if value
         .chars()
@@ -79,5 +82,9 @@ mod tests {
     fn cd_input_none_when_unsafe() {
         assert!(posix_cd_input("").is_none());
         assert_eq!(posix_cd_input("/opt/app").as_deref(), Some("cd /opt/app\n"));
+        assert_eq!(
+            posix_cd_command("/opt/app").as_deref(),
+            Some("cd /opt/app")
+        );
     }
 }

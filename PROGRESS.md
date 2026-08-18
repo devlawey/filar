@@ -4813,3 +4813,5 @@ NSPasteboard; egui 0.29 `TextEdit::singleline` заменяет `\n`/`\r` на �
 - Windows local `cmd.exe` без OSC 7 — см. PLATFORM_NOTES.
 
 **Публичный API:** `CommandExecutor::set_cwd`/`current_cwd`; `CommandResult.cwd`; `posix_cd_*` / `OSC7_PWD_PROBE`.
+
+**Review (#319):** SSH `set_cwd` больше не вызывает `run("cd")`. `cd` префиксируется к следующей **подтверждённой** команде агента (`cd … &&`). Парсер маркера требует `__` после pwd.
