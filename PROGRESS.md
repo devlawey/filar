@@ -4798,3 +4798,20 @@ NSPasteboard; egui 0.29 `TextEdit::singleline` заменяет `\n`/`\r` на �
 - Убран `spawn_remote_cwd_probe` (`exec.run("pwd")` без approve).
 - `CwdChanged` пишет в сессию по `session_id` явно; тест на фоновую вкладку.
 - CHANGELOG: запись #309 в `### Changed`.
+
+## Issue #313: fix(tui) — sync cwd between interactive and agent
+
+**Milestone:** 1.0.1. **Ветка:** `fix/313-sync-cwd-agent-interactive`.
+
+**Проблема:** `cd` в Ctrl+T не применялся к агентскому executor; статус-бар мог врать.
+
+**Решение:**
+- `CommandExecutor::set_cwd` / `current_cwd` (default no-op). Local: `current_dir` на процесс. SSH: `cd` в persistent shell.
+- Выход из interactive: OSC 7 или POSIX `printf`/`pwd` probe, затем `set_cwd`.
+- Вход: local PTY spawn с cwd; SSH — `cd` в PTY. После agent `CommandFinished` — cwd из SSH-маркера `$PWD`.
+- Маркер SSH: `printf ... "$?" "$PWD"` (не отдельный unconfirmed `pwd`).
+- Windows local `cmd.exe` без OSC 7 — см. PLATFORM_NOTES.
+
+**Публичный API:** `CommandExecutor::set_cwd`/`current_cwd`; `CommandResult.cwd`; `posix_cd_*` / `OSC7_PWD_PROBE`.
+
+**Review (#319):** SSH `set_cwd` больше не вызывает `run("cd")`. `cd` префиксируется к следующей **подтверждённой** команде агента (`cd … &&`). Парсер маркера требует `__` после pwd.

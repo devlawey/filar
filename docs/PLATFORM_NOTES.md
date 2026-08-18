@@ -11,7 +11,7 @@ Add findings here whenever a platform difference is discovered.
 | macOS Ctrl vs ⌘, Fn+F1 | [macOS shortcuts](#macos-shortcuts) | #292 |
 | Windows console missing `⌘` glyph | [TUI help overlay glyphs](#tui-help-overlay-glyphs) | #310 |
 | GUI launcher paste / show password | [GUI launcher secrets](#gui-launcher-secrets-macos) | #312 |
-| Interactive PTY shell | [Local interactive shell](#local-interactive-shell-ctrlt) | #293 |
+| Interactive PTY shell | [Local interactive shell](#local-interactive-shell-ctrlt) | #293, #313 |
 | Release assets / packaging | [Release binaries (CI)](#release-binaries-ci) | #289, #297, #80 |
 
 ## Clipboard
@@ -224,4 +224,10 @@ and `logs/` all share this single app root.
 > Agent command execution (`LocalExecutor`) is separate: Unix still uses
 > `sh -c`, Windows PowerShell. Only the interactive PTY follows `$SHELL`
 > ([#293](https://github.com/devlawey/filar/issues/293)).
+>
+> Cwd sync (#313): on Unix/macOS and on SSH (POSIX remote), leaving
+> interactive can emit OSC 7 via `printf`/`pwd` if the shell did not.
+> Windows **local** interactive is `cmd.exe`, which typically does not
+> emit OSC 7; leave-sync then uses the last known tab cwd only. Entering
+> interactive still spawns `cmd.exe` with `CommandBuilder::cwd`.
 

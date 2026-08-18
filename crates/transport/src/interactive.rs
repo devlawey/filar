@@ -114,7 +114,12 @@ impl LocalInteractive {
 
     /// Create a local interactive terminal with the given initial size.
     pub async fn with_size(cols: u16, rows: u16) -> Result<Self> {
-        Self::with_shell_and_size(None, cols, rows).await
+        Self::with_shell_size_and_cwd(None, cols, rows, None).await
+    }
+
+    /// Create a local interactive PTY in `cwd` when set (tab cwd sync).
+    pub async fn with_size_in(cols: u16, rows: u16, cwd: Option<&str>) -> Result<Self> {
+        Self::with_shell_size_and_cwd(None, cols, rows, cwd).await
     }
 
     /// Create a local interactive terminal with a specific shell and size.
@@ -125,6 +130,16 @@ impl LocalInteractive {
         shell: Option<&str>,
         cols: u16,
         rows: u16,
+    ) -> Result<Self> {
+        Self::with_shell_size_and_cwd(shell, cols, rows, None).await
+    }
+
+    /// Create a local interactive terminal with a specific shell, size, and cwd.
+    pub async fn with_shell_size_and_cwd(
+        shell: Option<&str>,
+        cols: u16,
+        rows: u16,
+        cwd: Option<&str>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -140,7 +155,13 @@ impl LocalInteractive {
         let shell_prog = shell.unwrap_or(default_shell.as_str());
 
         let mut cmd = CommandBuilder::new(shell_prog);
-        cmd.cwd(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+        let dir = cwd
+            .map(str::trim)
+            .filter(|p| crate::is_safe_cwd(p))
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        cmd.cwd(dir);
 
         // Spawn the shell.
         let child = pair

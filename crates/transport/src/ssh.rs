@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use russh::client::{self, Handle, Msg};
@@ -415,9 +415,9 @@ impl SshSession {
         let marker_id = format!("req_{:08x}_{}", req_id, Uuid::new_v4().simple());
         let marker_tag = format!("{}{}", MARKER_PREFIX, marker_id);
 
-        // Build the full payload: <command>\n printf marker\n
+        // Build the full payload: <command>\n printf marker with exit + PWD\n
         let payload = format!(
-            "{}\nprintf '\\n{}__%d__\\n' \"$?\"\n",
+            "{}\nprintf '\\n{}__%d__%s__\\n' \"$?\" \"$PWD\"\n",
             command, marker_tag
         );
 
@@ -456,13 +456,14 @@ impl SshSession {
         // Read events until we find the marker — without holding any lock
         // that `cancel()` needs.
         match recv_until_marker(&mut event_rx, &marker_tag, self.command_timeout).await {
-            Ok((stdout, stderr, exit_code)) => {
+            Ok((stdout, stderr, exit_code, cwd)) => {
                 let duration = start.elapsed();
                 Ok(CommandResult {
                     stdout,
                     stderr,
                     exit_code,
                     duration,
+                    cwd,
                 })
             }
             Err(e) => {
@@ -627,6 +628,10 @@ pub struct SshExecutor {
     /// Secret provider used to resolve the SSH password on connect and on every
     /// auto-reconnect. Retained so re-dialling uses the same credential source.
     secrets: Arc<dyn SecretProvider>,
+    /// Last `$PWD` reported by the command marker (or [`set_cwd`]).
+    last_cwd: StdMutex<Option<String>>,
+    /// Applied once as `cd … &&` on the next [`run`] (user-approved command).
+    pending_cwd: StdMutex<Option<String>>,
 }
 
 impl SshExecutor {
@@ -666,6 +671,8 @@ impl SshExecutor {
             target: target.clone(),
             config,
             secrets,
+            last_cwd: StdMutex::new(None),
+            pending_cwd: StdMutex::new(None),
         })
     }
 
@@ -673,13 +680,40 @@ impl SshExecutor {
     pub async fn close(&self) -> Result<()> {
         self.session.read().await.close().await
     }
+
+    fn store_cwd_from(&self, result: &Result<CommandResult>) {
+        if let Ok(r) = result {
+            if let Some(cwd) = r.cwd.as_deref().filter(|p| crate::is_safe_cwd(p)) {
+                *lock_opt_string(&self.last_cwd) = Some(cwd.to_string());
+            }
+        }
+    }
+
+    /// Prefix `cd … &&` if a tab cwd is pending. Does not consume the pending
+    /// value until the command has been dispatched (see [`clear_pending_cwd`]).
+    fn prefixed_command(&self, command: &str) -> String {
+        let pending = lock_opt_string(&self.pending_cwd).clone();
+        match pending.as_deref().and_then(crate::posix_cd_command) {
+            Some(cd) => format!("{cd} && {command}"),
+            None => command.to_string(),
+        }
+    }
+
+    fn clear_pending_cwd(&self) {
+        *lock_opt_string(&self.pending_cwd) = None;
+    }
+}
+
+fn lock_opt_string(m: &StdMutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<String>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[async_trait::async_trait]
 impl crate::CommandExecutor for SshExecutor {
     async fn run(&self, command: &str) -> Result<CommandResult> {
+        let command = self.prefixed_command(command);
         // First attempt on the current session.
-        let first = { self.session.read().await.run(command).await };
+        let first = { self.session.read().await.run(&command).await };
 
         // Reconnect only when the connection was lost *before* the command was
         // dispatched (the `ConnectionLost` variant). A command that may have
@@ -688,6 +722,10 @@ impl crate::CommandExecutor for SshExecutor {
         let should_reconnect =
             self.config.auto_reconnect && matches!(first, Err(CoreError::ConnectionLost(_)));
         if !should_reconnect {
+            if !matches!(first, Err(CoreError::ConnectionLost(_))) {
+                self.clear_pending_cwd();
+            }
+            self.store_cwd_from(&first);
             return first;
         }
 
@@ -726,11 +764,29 @@ impl crate::CommandExecutor for SshExecutor {
         );
 
         // Single retry on the fresh session.
-        self.session.read().await.run(command).await
+        let retry = self.session.read().await.run(&command).await;
+        if !matches!(retry, Err(CoreError::ConnectionLost(_))) {
+            self.clear_pending_cwd();
+        }
+        self.store_cwd_from(&retry);
+        retry
     }
 
     async fn cancel(&self) -> Result<()> {
         self.session.read().await.cancel().await
+    }
+
+    async fn set_cwd(&self, path: &str) -> Result<()> {
+        let _ = crate::posix_cd_command(path)
+            .ok_or_else(|| CoreError::Other("invalid cwd".into()))?;
+        let path = path.trim().to_string();
+        *lock_opt_string(&self.pending_cwd) = Some(path.clone());
+        *lock_opt_string(&self.last_cwd) = Some(path);
+        Ok(())
+    }
+
+    async fn current_cwd(&self) -> Option<String> {
+        self.last_cwd.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -906,16 +962,13 @@ async fn drain_until_marker(
 }
 
 /// Read events from the reader task until a marker of the form
-/// `<marker_tag>__<exit_code>__` is found. Returns the output before the
-/// marker and the parsed exit code.
-///
-/// Unlike `drain_until_marker`, this reads from an `mpsc::UnboundedReceiver`
-/// and does NOT touch the SSH channel directly — the reader task does that.
+/// `<marker_tag>__<exit_code>__[<pwd>__]` is found. Returns stdout, stderr,
+/// exit code, and optional `$PWD` from the marker.
 async fn recv_until_marker(
     event_rx: &mut mpsc::UnboundedReceiver<ChannelEvent>,
     marker_tag: &str,
     timeout: Duration,
-) -> Result<(String, String, Option<i32>)> {
+) -> Result<(String, String, Option<i32>, Option<String>)> {
     let mut buf = String::new();
     let mut stderr_buf = String::new();
     let deadline = tokio::time::Instant::now() + timeout;
@@ -930,41 +983,23 @@ async fn recv_until_marker(
             ChannelEvent::Data(text) => {
                 buf.push_str(&text);
 
-                // Look for the marker line: <marker_tag>__<digits>__
-                if let Some(pos) = buf.find(marker_tag) {
-                    let after_tag = &buf[pos + marker_tag.len()..];
-                    if let Some(rest) = after_tag.strip_prefix("__") {
-                        if let Some(end) = rest.find("__") {
-                            let code_str = &rest[..end];
-                            if let Ok(code) = code_str.trim().parse::<i32>() {
-                                let line_start =
-                                    buf[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
-                                let output = buf[..line_start].to_string();
-                                // Strip the synthetic trailing newline added by the
-                                // printf marker's leading '\n'. This removes
-                                // exactly one '\n' — not the command's own output.
-                                let output = output
-                                    .strip_suffix('\n')
-                                    .map(str::to_string)
-                                    .unwrap_or(output);
+                if let Some((code, cwd, line_start)) = parse_filar_marker(&buf, marker_tag) {
+                    let output = buf[..line_start].to_string();
+                    let output = output
+                        .strip_suffix('\n')
+                        .map(str::to_string)
+                        .unwrap_or(output);
 
-                                // Drain any trailing stderr that may still be
-                                // in the event pipeline. Without this, late
-                                // stderr could contaminate the next run's result.
-                                while let Ok(Some(ChannelEvent::Stderr(text))) =
-                                    tokio::time::timeout(
-                                        Duration::from_millis(50),
-                                        event_rx.recv(),
-                                    )
-                                    .await
-                                {
-                                    stderr_buf.push_str(&text);
-                                }
-                                return Ok((output, stderr_buf, Some(code)));
-                            }
-                        }
+                    while let Ok(Some(ChannelEvent::Stderr(text))) =
+                        tokio::time::timeout(
+                            Duration::from_millis(50),
+                            event_rx.recv(),
+                        )
+                        .await
+                    {
+                        stderr_buf.push_str(&text);
                     }
-                    // Marker tag found but couldn't parse exit code — keep reading.
+                    return Ok((output, stderr_buf, Some(code), cwd));
                 }
             }
             ChannelEvent::Stderr(text) => {
@@ -977,6 +1012,29 @@ async fn recv_until_marker(
             }
         }
     }
+}
+
+/// Parse `<marker_tag>__<exit>__` or `<marker_tag>__<exit>__<pwd>__`.
+///
+/// `pwd` is the text before the last `__` on the marker line (so names like
+/// `my__project` still parse).
+fn parse_filar_marker(buf: &str, marker_tag: &str) -> Option<(i32, Option<String>, usize)> {
+    let pos = buf.find(marker_tag)?;
+    let after_tag = &buf[pos + marker_tag.len()..];
+    let rest = after_tag.strip_prefix("__")?;
+    let end = rest.find("__")?;
+    let code: i32 = rest[..end].trim().parse().ok()?;
+    let after_code = &rest[end + 2..];
+    let line = after_code.split(['\n', '\r']).next().unwrap_or("");
+    let cwd = line.strip_suffix("__").map(str::trim).and_then(|pwd| {
+        if crate::is_safe_cwd(pwd) {
+            Some(pwd.to_string())
+        } else {
+            None
+        }
+    });
+    let line_start = buf[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
+    Some((code, cwd, line_start))
 }
 
 /// Read events from the reader task until `marker` is found. Used for
@@ -1034,11 +1092,39 @@ mod tests {
         let command = "echo hello";
         let marker_tag = "__FILAR_req_00000001";
         let payload = format!(
-            "{}\nprintf '\\n{}__%d__\\n' \"$?\"\n",
+            "{}\nprintf '\\n{}__%d__%s__\\n' \"$?\" \"$PWD\"\n",
             command, marker_tag
         );
         assert!(payload.contains("echo hello"));
-        assert!(payload.contains("__FILAR_req_00000001__%d__"));
+        assert!(payload.contains("__FILAR_req_00000001__%d__%s__"));
+    }
+
+    #[test]
+    fn parse_marker_with_pwd() {
+        let tag = "__FILAR_req_00000001";
+        let buf = "hello\n__FILAR_req_00000001__0__/tmp/work__\n";
+        let (code, cwd, start) = parse_filar_marker(buf, tag).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(cwd.as_deref(), Some("/tmp/work"));
+        assert_eq!(&buf[..start], "hello\n");
+    }
+
+    #[test]
+    fn parse_marker_exit_only() {
+        let tag = "__FILAR_req_00000001";
+        let buf = "out\n__FILAR_req_00000001__1__\n";
+        let (code, cwd, _) = parse_filar_marker(buf, tag).unwrap();
+        assert_eq!(code, 1);
+        assert!(cwd.is_none());
+    }
+
+    #[test]
+    fn parse_marker_pwd_allows_double_underscore_in_name() {
+        let tag = "__FILAR_req_00000001";
+        let buf = "out\n__FILAR_req_00000001__0__/home/u/my__project__\n";
+        let (code, cwd, _) = parse_filar_marker(buf, tag).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(cwd.as_deref(), Some("/home/u/my__project"));
     }
 
     /// Integration test — requires a running SSH server.

@@ -109,6 +109,14 @@ impl CommandExecutor for SecretSubstitutingExecutor {
     async fn cancel(&self) -> Result<()> {
         self.inner.cancel().await
     }
+
+    async fn set_cwd(&self, path: &str) -> Result<()> {
+        self.inner.set_cwd(path).await
+    }
+
+    async fn current_cwd(&self) -> Option<String> {
+        self.inner.current_cwd().await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +156,7 @@ mod tests {
                 stderr: self.stderr.clone(),
                 exit_code: Some(0),
                 duration: std::time::Duration::from_millis(1),
+                cwd: None,
             })
         }
         async fn cancel(&self) -> Result<()> {
