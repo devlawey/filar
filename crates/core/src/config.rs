@@ -501,18 +501,26 @@ api_base_url = "https://open.bigmodel.cn/api/paas/v4"
 
     #[test]
     fn reject_zero_command_timeout() {
-        let cfg: Config = toml::from_str(
-            r#"
+        let toml = r#"
 [llm]
 model = "glm-5.1"
 api_base_url = "https://open.bigmodel.cn/api/paas/v4"
 
 [timeouts]
 command_secs = 0
-"#,
-        )
-        .unwrap();
-        let err = cfg.timeouts.validate().unwrap_err();
+"#;
+        let tmp = std::env::temp_dir().join(format!(
+            "filar_config_timeout_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&tmp, toml).unwrap();
+        let result = Config::load(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        let err = result.expect_err("Config::load should reject command_secs = 0");
         assert!(
             err.to_string().contains("command_secs"),
             "error should mention command_secs: {err}"
