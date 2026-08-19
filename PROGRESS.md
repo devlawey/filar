@@ -4815,3 +4815,16 @@ NSPasteboard; egui 0.29 `TextEdit::singleline` заменяет `\n`/`\r` на �
 **Публичный API:** `CommandExecutor::set_cwd`/`current_cwd`; `CommandResult.cwd`; `posix_cd_*` / `OSC7_PWD_PROBE`.
 
 **Review (#319):** SSH `set_cwd` больше не вызывает `run("cd")`. `cd` префиксируется к следующей **подтверждённой** команде агента (`cd … &&`). Парсер маркера требует `__` после pwd.
+
+
+## Release v1.0.1
+
+**Date:** 2026-08-19. Preparing 1.0.1 from main.
+
+**Includes:** command timeout 300s (#308); SSH status bar alias/host/pwd (#309);
+Windows-safe F1 help glyph (#310); interactive drag-select copy (#311); GUI
+secret paste sanitization and show toggles (#312); agent<->interactive cwd sync
+(#313).
+
+**Engine tag:** engine-v1.0.1 required (core/transport/agent changed in this
+release).

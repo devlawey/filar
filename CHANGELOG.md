@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-19
+
 ### Changed
 
 - SSH status bar shows **alias** (or host-only when there is no alias),
@@ -617,7 +619,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/devlawey/filar/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/devlawey/filar/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/devlawey/filar/compare/v0.8.6...v0.9.0
 [0.8.6]: https://github.com/devlawey/filar/compare/v0.8.5...v0.8.6
