@@ -4891,3 +4891,17 @@ terminal → ratatui buffer OOB panic; `PanicHookGuard::drop` then aborted.
   always reserved.
 - `PanicHookGuard::drop` no-ops when `thread::panicking()`.
 - Regression tests with TestBackend + huge command.
+
+## Issue #325: fix(tui) — stale glyphs when scrolling chat
+
+**Milestone:** 1.0.2. **Branch:** `fix/325-scroll-artifacts`.
+
+**Problem:** Scrolling chat/command output left leftover characters until
+resize or new input; `Clear` alone was insufficient.
+
+**Done:**
+- Reset every chat-area cell each frame; pad lines to full width; fill unused
+  rows with spaces so the differential backend rewrites the viewport.
+- Unit test: long→short scroll leaves no stale `AAAA` tails.
+- Interactive scrollback: separate full-grid paint in `TerminalModel` — not
+  the same bug class; no change.

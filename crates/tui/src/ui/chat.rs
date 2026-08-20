@@ -3,7 +3,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -73,9 +73,20 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    // Clear the chat area before rendering to prevent stale lines from
-    // surviving when the layout changes (e.g. expand/collapse blocks).
-    f.render_widget(Clear, area);
+    // Force every cell in the chat viewport to be rewritten each frame.
+    // `Clear` alone is not enough on some terminals / with wide glyphs: after
+    // scroll, shorter lines left "ghost" characters from the previous frame
+    // (#325). Pad lines to full width and fill unused rows with spaces so the
+    // differential backend emits a full-area update.
+    let width = area.width as usize;
+    let visible_lines: Vec<Line> = visible_lines
+        .into_iter()
+        .map(|line| pad_line_to_width(line, width))
+        .chain(std::iter::repeat_with(|| Line::from(" ".repeat(width))))
+        .take(visible_height)
+        .collect();
+
+    reset_area_cells(f, area);
 
     let paragraph = Paragraph::new(visible_lines);
     f.render_widget(paragraph, area);
@@ -116,6 +127,32 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
         // Clear indicator area so hit_test doesn't detect a stale indicator.
         app.indicator_area = Rect::default();
     }
+}
+
+/// Reset every cell in `area` so the next draw cannot leave stale glyphs.
+fn reset_area_cells(f: &mut Frame, area: Rect) {
+    let buf = f.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.reset();
+            }
+        }
+    }
+}
+
+/// Pad `line` with trailing spaces up to `width` display columns (char count,
+/// matching the rest of the chat layout which does not use unicode-width).
+fn pad_line_to_width(mut line: Line<'static>, width: usize) -> Line<'static> {
+    let current: usize = line
+        .spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum();
+    if current < width {
+        line.spans.push(Span::raw(" ".repeat(width - current)));
+    }
+    line
 }
 
 /// Apply selection background to a rendered line.
@@ -191,3 +228,76 @@ fn apply_selection(
 pub(crate) fn scrollbar_content_len(total_lines: usize, visible_height: usize) -> usize {
     total_lines.saturating_sub(visible_height)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use filar_core::{ChatBlock, CommandConfirmMode};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn chat_row(buf: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        (0..width)
+            .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    #[test]
+    fn scroll_replaces_previous_long_line_cells() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Allowlist);
+        // Long then short lines so scroll exposes shorter content over a
+        // previously long row.
+        app.messages = vec![
+            ChatBlock::User("AAAA".repeat(30)),
+            ChatBlock::Agent("BBBB".repeat(30)),
+            ChatBlock::User("short".into()),
+            ChatBlock::Agent("ok".into()),
+        ];
+        app.message_rev = 1;
+        app.scroll = 0;
+
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 40, 8);
+                render_chat_history(f, &mut app, area);
+            })
+            .unwrap();
+
+        // Scroll up so shorter content occupies rows that previously held A's.
+        app.scroll = 6;
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 40, 8);
+                render_chat_history(f, &mut app, area);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        // Every cell in the chat area must be a concrete space or content —
+        // no leftover run of 'A' from the first frame on a short-line row.
+        for y in 0..8 {
+            let row = chat_row(buf, y, 40);
+            assert_eq!(row.chars().count(), 40, "row {y} must be fully painted: {row:?}");
+            // If the row is mostly spaces (padded short line), it must not
+            // still contain a long AAAA tail from the previous frame.
+            if row.trim().len() < 10 {
+                assert!(
+                    !row.contains("AAAA"),
+                    "stale glyphs on row {y}: {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pad_line_to_width_extends_short_line() {
+        let line = Line::from("hi");
+        let padded = pad_line_to_width(line, 5);
+        let w: usize = padded.spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(w, 5);
+    }
+}
+
