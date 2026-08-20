@@ -41,11 +41,19 @@ pub fn enrich_timeout_message(base: &str) -> String {
 }
 
 /// Largest sleep/Start-Sleep duration found in `command`, in seconds.
+///
+/// Splits on newlines, `;`, `|`, `&&`, `||`, and background `&` so that
+/// `sleep 30 & sleep 120` still surfaces the 120s wait. Redirections like
+/// `2>&1` may produce inert fragments after `&` splitting; those do not
+/// parse as sleeps.
 fn longest_wait_secs(command: &str) -> Option<u64> {
     let mut best: Option<u64> = None;
     for token_run in command.split(['\n', ';', '|']) {
-        // Also split on `&&` / `||` without treating single `&` (background) specially.
-        for part in token_run.split("&&").flat_map(|p| p.split("||")) {
+        for part in token_run
+            .split("&&")
+            .flat_map(|p| p.split("||"))
+            .flat_map(|p| p.split('&'))
+        {
             let part = part.trim();
             if part.is_empty() {
                 continue;
@@ -112,6 +120,10 @@ fn strip_leading_command_words(part: &str) -> &str {
     }
 }
 
+/// Parse an integer duration, optionally with a GNU-style suffix (`s`/`m`/`h`/`d`).
+///
+/// Fractional values such as `30.5` are intentionally unsupported — they do
+/// not match typical agent-generated waits and fall through as "not a wait".
 fn parse_duration_arg(arg: &str) -> Option<u64> {
     let arg = arg.trim();
     if arg.is_empty() {
@@ -187,5 +199,11 @@ mod tests {
             1,
             "guidance must not duplicate"
         );
+    }
+
+    #[test]
+    fn detects_sleep_after_background_ampersand() {
+        assert_eq!(longest_wait_secs("sleep 5 & sleep 120"), Some(120));
+        assert!(reject_long_wait("sleep 5 & sleep 120").is_some());
     }
 }

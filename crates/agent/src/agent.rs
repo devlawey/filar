@@ -657,10 +657,7 @@ impl Agent {
                         output: output.clone(),
                         denied: false,
                     });
-                    return Ok(ChatMessage::tool(
-                        &tc.id,
-                        format!("Error executing command: {output}"),
-                    ));
+                    return Ok(ChatMessage::tool(&tc.id, output));
                 }
                 Err(_) => {
                     warn!(command = %parsed.command, "command timed out");
@@ -694,10 +691,7 @@ impl Agent {
                         output: output.clone(),
                         denied: false,
                     });
-                    return Ok(ChatMessage::tool(
-                        &tc.id,
-                        format!("Error executing command: {output}"),
-                    ));
+                    return Ok(ChatMessage::tool(&tc.id, output));
                 }
             }
         };
