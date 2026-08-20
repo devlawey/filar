@@ -8,6 +8,7 @@
 
 pub mod agent;
 pub mod events;
+pub mod long_wait;
 pub mod openai_compat;
 pub mod security;
 pub mod tools;

@@ -4860,3 +4860,21 @@ README Ollama row marked pending until then.
 clearing GUI in-memory `api_key` field when keyless (keyring already skipped).
 
 **Public API:** `LlmProfile::requires_api_key`.
+
+## Issue #323: feat(agent) — long-running / background without wall-clock fail
+
+**Milestone:** 1.0.2. **Branch:** `feat/323-long-running-commands`.
+
+**Design (chosen):** option 1 — system-prompt policy + hard reject of long
+`sleep`/`Start-Sleep` (≥ 30s) before confirm/execute; timeout errors enriched
+with the same background+poll / Ctrl+T guidance. No new background tool and no
+cancel-only long-job path in this PR (options 2/4 deferred).
+
+**Done:**
+- Rule 10 in `build_system_prompt` + synced `eval/prompts/agent-system.txt`.
+- `filar_agent::long_wait` — detect/reject long waits; enrich timeout messages.
+- Agent emits `CommandFinished` with refusal text (executor not called).
+- USER_GUIDE note under `[timeouts]`; CHANGELOG Unreleased.
+
+**Not in scope:** true background job tool, idle-activity timeout, confirm
+cancel-only long runs.

@@ -17,6 +17,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   (no `Authorization` header; redirects disabled); GUI hints for ollama URL and
   keyless status; clearer tool-calling and LLM timeout errors; README section
   ([#320](https://github.com/devlawey/filar/issues/320)).
+- Agent rejects long wall-clock waits (`sleep` / `Start-Sleep` ≥ 30s) before
+  execute and steers toward background + short poll (or Ctrl+T); timeout errors
+  include the same guidance
+  ([#323](https://github.com/devlawey/filar/issues/323)).
 
 ## [1.0.1] - 2026-08-19
 

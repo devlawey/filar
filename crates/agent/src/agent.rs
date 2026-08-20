@@ -127,6 +127,7 @@ Rules:
 7. If you need information from the user (e.g. a password, a choice between options), ask them directly in your text response — do not try to use interactive prompts in commands. Wait for their reply before continuing.
 8. Never put passwords or secrets directly in commands. If a password is needed, ask the user to provide it. The user can press Ctrl+P to enter the password in a secure masked input field. The password will be stored as a secret variable (e.g. $FILAR_SECRET_1) and you will be told the variable name. Use this variable directly in your commands (e.g. echo "user:$FILAR_SECRET_1" | chpasswd). The actual value is substituted at execution time — you never see the real password. Do not try to echo or print secret variables.
 9. NEVER run interactive commands (vim, nano, top, htop, less, man, mc, screen, tmux, ssh, etc.). These commands take over the terminal and will hang indefinitely. Instead, use non-interactive alternatives: 'cat file' instead of 'less file', 'grep -n pattern file' instead of 'vim file', 'head -n 50 file' to preview. For editing files, use 'sed' or 'tee' with heredocs.
+10. NEVER use long wall-clock waits (`sleep N`, `Start-Sleep`, etc.) to poll progress. Every tool command shares a hard timeout (`[timeouts].command_secs`). A `sleep` near or above that timeout will fail. For downloads, pulls, builds, or other long jobs: start them in the background and poll with short commands (POSIX: `nohup … > /tmp/job.log 2>&1 & echo $!` then `tail`/`ps`; Windows: `Start-Process` / background jobs, then check the log). For live interactive progress, ask the user to use Ctrl+T (interactive terminal) instead of blocking the agent tool call.
 {shell_desc}"#
     )
 }
@@ -565,6 +566,20 @@ impl Agent {
             destructive,
         });
 
+        // Reject long sleep/wait patterns before confirm/execute — they only
+        // burn the command timeout and never finish usefully (#323).
+        if matches!(parsed.kind, tools::ToolKind::RunCommand) {
+            if let Some(msg) = crate::long_wait::reject_long_wait(&parsed.command) {
+                warn!(command = %parsed.command, "long wait rejected by policy");
+                self.emit(AgentEvent::CommandFinished {
+                    command: parsed.command.clone(),
+                    output: msg.clone(),
+                    denied: false,
+                });
+                return Ok(ChatMessage::tool(&tc.id, msg));
+            }
+        }
+
         match decision {
             ConfirmDecision::Blocked(reason) => {
                 warn!(command = %parsed.command, reason = %reason, "command blocked by security");
@@ -631,25 +646,32 @@ impl Agent {
                 }
                 Ok(Err(e)) => {
                     warn!(command = %parsed.command, error = %e, "tool execution failed");
+                    let detail = e.to_string();
+                    let output = if detail.to_ascii_lowercase().contains("timed out") {
+                        crate::long_wait::enrich_timeout_message(&format!("Error: {detail}"))
+                    } else {
+                        format!("Error: {detail}")
+                    };
                     self.emit(AgentEvent::CommandFinished {
                         command: parsed.command.clone(),
-                        output: format!("Error: {e}"),
+                        output: output.clone(),
                         denied: false,
                     });
                     return Ok(ChatMessage::tool(
                         &tc.id,
-                        format!("Error executing command: {e}"),
+                        format!("Error executing command: {output}"),
                     ));
                 }
                 Err(_) => {
                     warn!(command = %parsed.command, "command timed out");
                     let _ = self.executor.cancel().await;
+                    let output = crate::long_wait::enrich_timeout_message("Command timed out.");
                     self.emit(AgentEvent::CommandFinished {
                         command: parsed.command.clone(),
-                        output: "Command timed out".to_string(),
+                        output: output.clone(),
                         denied: false,
                     });
-                    return Ok(ChatMessage::tool(&tc.id, "Command timed out.".to_string()));
+                    return Ok(ChatMessage::tool(&tc.id, output));
                 }
             }
         } else {
@@ -661,14 +683,20 @@ impl Agent {
                 }
                 Err(e) => {
                     warn!(command = %parsed.command, error = %e, "tool execution failed");
+                    let detail = e.to_string();
+                    let output = if detail.to_ascii_lowercase().contains("timed out") {
+                        crate::long_wait::enrich_timeout_message(&format!("Error: {detail}"))
+                    } else {
+                        format!("Error: {detail}")
+                    };
                     self.emit(AgentEvent::CommandFinished {
                         command: parsed.command.clone(),
-                        output: format!("Error: {e}"),
+                        output: output.clone(),
                         denied: false,
                     });
                     return Ok(ChatMessage::tool(
                         &tc.id,
-                        format!("Error executing command: {e}"),
+                        format!("Error executing command: {output}"),
                     ));
                 }
             }
@@ -1383,8 +1411,10 @@ mod tests {
             id: "call_1".into(),
             name: "run_command".into(),
             arguments: serde_json::json!({
-                "command": "sleep 999",
-                "explanation": "Long sleep"
+                // Must not be a long `sleep` — those are rejected by long_wait
+                // policy (#323) before the executor runs.
+                "command": "make all",
+                "explanation": "Hang until agent timeout"
             }),
         }]);
 
@@ -1414,7 +1444,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let result = agent.run("run sleep", &[]).await.unwrap();
+        let result = agent.run("run make", &[]).await.unwrap();
         assert_eq!(result, "Done!");
 
         // executor.cancel() must have been called on timeout.
@@ -1422,7 +1452,7 @@ mod tests {
         assert_eq!(cancel_count, 1, "executor.cancel() should be called once on timeout");
 
         let received = events.lock().unwrap();
-        // Expected: Started → CommandProposed → CommandFinished(output="Command timed out") → Finished
+        // Expected: Started → CommandProposed → CommandFinished(output contains timed out) → Finished
         assert!(received.len() >= 3, "expected at least 3 events, got {received:?}");
         assert!(matches!(&received[0], AgentEvent::Started),
             "first event should be Started, got {:?}", received[0]);
@@ -1430,6 +1460,85 @@ mod tests {
             "second event should be CommandProposed, got {:?}", received[1]);
         assert!(matches!(&received[2], AgentEvent::CommandFinished { denied: false, output, .. } if output.contains("timed out")),
             "third event should be CommandFinished with timeout message, got {:?}", received[2]);
+        assert!(matches!(&received[2], AgentEvent::CommandFinished { output, .. } if output.contains("Ctrl+T")),
+            "timeout message should include long-wait guidance, got {:?}", received[2]);
+    }
+
+    #[tokio::test]
+    async fn long_wait_sleep_rejected_without_executor() {
+        use std::sync::Mutex;
+
+        struct CountingExecutor {
+            runs: Mutex<usize>,
+        }
+
+        #[async_trait::async_trait]
+        impl CommandExecutor for CountingExecutor {
+            async fn run(&self, _command: &str) -> Result<CommandResult> {
+                *self.runs.lock().unwrap() += 1;
+                Ok(CommandResult {
+                    stdout: "should not run".into(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                    duration: Duration::from_millis(1),
+                    cwd: None,
+                })
+            }
+
+            async fn cancel(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "sleep 120 && tail /tmp/x.log",
+                "explanation": "Wait for pull"
+            }),
+        }]);
+
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call,
+            ChatResponse::text("Switched to background poll."),
+        ]));
+        let executor = Arc::new(CountingExecutor {
+            runs: Mutex::new(0),
+        });
+        let confirmer = Arc::new(MockConfirmer { approve: true });
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let sink: EventSink = Arc::new(move |event: AgentEvent| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let agent = Agent::builder()
+            .llm(llm)
+            .executor(executor.clone())
+            .confirmer(confirmer)
+            .confirm_mode(CommandConfirmMode::Never)
+            .event_sink(sink)
+            .build()
+            .unwrap();
+
+        let result = agent.run("wait for pull", &[]).await.unwrap();
+        assert!(result.contains("background") || result.contains("Switched"));
+        assert_eq!(
+            *executor.runs.lock().unwrap(),
+            0,
+            "long sleep must not reach the executor"
+        );
+
+        let received = events.lock().unwrap();
+        assert!(
+            received.iter().any(|e| matches!(
+                e,
+                AgentEvent::CommandFinished { denied: false, output, .. }
+                    if output.contains("refused") && output.contains("120")
+            )),
+            "expected CommandFinished with long-wait refusal, got {received:?}"
+        );
     }
 
     #[test]
