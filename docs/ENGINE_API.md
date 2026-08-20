@@ -268,14 +268,26 @@ let config = LlmConfig {
 ### Choosing the API key environment variable
 
 By default the key is read from `GLM_API_KEY`. A profile can override this with
-`key_env` so each provider uses its own variable:
+`key_env` so each provider uses its own variable.
+
+**Empty `key_env`** means the profile is keyless (local / air-gapped servers):
+no key is resolved and the HTTP client does not send `Authorization`.
 
 ```toml
 [[llm_profiles]]
-name = "local"
+name = "ollama"
 model = "llama3.1"
 api_base_url = "http://localhost:11434/v1"
-key_env = "OLLAMA_KEY"          # any name; value just needs to be non-empty
+key_env = ""                    # keyless — no Authorization header
+temperature = 0.3
+```
+
+```toml
+[[llm_profiles]]
+name = "local-with-dummy"
+model = "llama3.1"
+api_base_url = "http://localhost:11434/v1"
+key_env = "OLLAMA_KEY"          # non-empty: key required (env / keyring)
 temperature = 0.3
 ```
 

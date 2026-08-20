@@ -11,6 +11,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Local / air-gapped OpenAI-compatible models: empty `key_env` means keyless
+  (no `Authorization` header); GUI hints for ollama URL and keyless status;
+  clearer tool-calling and LLM timeout errors; README section
+  ([#320](https://github.com/devlawey/filar/issues/320)).
+
 ## [1.0.1] - 2026-08-19
 
 ### Changed

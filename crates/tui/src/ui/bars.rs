@@ -126,7 +126,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
             app.theme.muted(),
         ));
     }
-    if let Some(cost) = app.cost_usd {
+    if let Some(cost) = app.cost_usd.filter(|c| *c > 0.0) {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!("${:.4}", cost),

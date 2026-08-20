@@ -4828,3 +4828,29 @@ secret paste sanitization and show toggles (#312); agent<->interactive cwd sync
 
 **Engine tag:** engine-v1.0.1 required (core/transport/agent changed in this
 release).
+
+## Issue #320: feat(llm) — local / air-gapped OpenAI-compatible models
+
+**Milestone:** 1.0.2. **Branch:** `feat/320-local-models`.
+
+**Problem:** Local servers (ollama, vLLM, LM Studio) need no API key, but
+`build_llm_client_from_profile` / `key_checker` / launch path rejected empty
+keys; some servers also reject empty `Authorization`.
+
+**Design:** Empty `key_env` is the explicit keyless marker (`LlmProfile::requires_api_key`).
+Non-empty `key_env` with missing secret keeps the previous error.
+
+**Done:**
+- `build_llm_client_from_profile` + `check_profile_api_key` + GUI/CLI launch
+  allow keyless profiles; `OpenAiCompatClient` skips bearer auth when key empty.
+- GUI: API URL hint, Key env hint, banner when keyless; no secret save under empty env;
+  multiple empty `key_env` allowed in `deduplicate_profiles`.
+- Tools-unsupported HTTP bodies → clear user error (no text-tool emulation).
+- LLM timeout message hints raising `[timeouts].llm_secs` for local models.
+- Status bar: do not show `$0.0000` when cost is zero; toks dash unchanged.
+- README: local/air-gapped section (data stays on endpoint; tools; timeouts; no compression yet).
+
+**Not in scope / deferred:** per-profile `llm_secs`; context compression (document only).
+
+**Public API:** `LlmProfile::requires_api_key`, `OpenAiCompatClient::sends_authorization`,
+`check_profile_api_key` (app).

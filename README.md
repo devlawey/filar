@@ -251,24 +251,69 @@ agent client is not GLM-specific. You switch providers by changing only the
 config (`model`, `api_base_url`, and the API key env var).
 
 The default profile points at the GLM cloud (`open.bigmodel.cn`,
-`GLM_API_KEY`). To use a local model (Ollama / LM Studio) or another cloud
-provider, point `api_base_url` at its OpenAI-compatible base URL and supply
-the key its API expects (local servers usually accept any non-empty string):
+`GLM_API_KEY`).
+
+### Local / air-gapped models (ollama, vLLM, LM Studio, …)
+
+Closed networks and air-gapped setups can point filar at a **local**
+OpenAI-compatible server. **Request data stays on that endpoint** — nothing is
+sent to a public cloud when `api_base_url` is local or internal.
+
+1. Run a server that exposes `/v1/chat/completions` (example: ollama).
+2. Create a profile with:
+   - **API URL** such as `http://localhost:11434/v1` (hint in the GUI)
+   - **Key env left empty** — that is the explicit “no API key” marker
+   - **API key** empty
+3. Launch. `Ctrl+L` can switch between local and cloud profiles.
+
+```toml
+[[llm_profiles]]
+name = "ollama"
+model = "llama3.1"
+api_base_url = "http://localhost:11434/v1"
+max_tokens = 4096
+key_env = ""          # empty = keyless; Authorization header is not sent
+temperature = 0.3
+```
+
+**Tool calling required.** The agent loop needs models that support
+OpenAI-style tools/`function` calling. Without it, filar cannot run commands
+and shows a clear error — it does **not** fake tools by parsing free text.
+
+**Timeouts.** Local CPU generation is often slower than cloud. Raise
+`[timeouts].llm_secs` in `config.toml` (default `60`) if requests time out.
+The timeout applies to every profile (including local).
+
+**Context window.** Automatic context compression is not implemented yet.
+Local models usually have smaller windows (8k–32k); keep sessions short or
+trim history manually until compression lands.
+
+**Usage / cost.** Local servers often omit `usage`; the status bar shows
+`toks: —` and no `$0.00` placeholder.
+
+### Cloud / other providers
+
+Point `api_base_url` at the provider and set a non-empty `key_env` (key via
+env or OS credential store / GUI):
 
 ```toml
 [llm]
 model = "llama3.1"
 api_base_url = "http://localhost:11434/v1"
 max_tokens = 4096
-temperature = 0.3          # local models benefit from lower temperature
+temperature = 0.3
 ```
+
+> Prefer a named `[[llm_profiles]]` with `key_env = ""` for local keyless use;
+> the default `[llm]` block still expects `GLM_API_KEY` unless you select a
+> keyless profile.
 
 ### Verified providers
 
 | Provider | Endpoint | Tool calling | Streaming | Notes |
 |----------|----------|--------------|-----------|-------|
 | GLM cloud | `https://open.bigmodel.cn/api/paas/v4` | verified | verified | Default profile; key via `GLM_API_KEY`. |
-| Ollama (local) | `http://localhost:11434/v1` | pending manual check | pending manual check | OpenAI-compatible; set a non-empty key. |
+| Ollama (local) | `http://localhost:11434/v1` | depends on model | depends on model | Use empty `key_env`; pick a model with tool support. |
 
 > The table lists only what has been checked by hand. Add rows as more
 > providers are verified (including via the eval tasks of milestone v0.4.0).

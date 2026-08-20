@@ -12,6 +12,7 @@
 //! - Configurable model, base URL, and max tokens (from [`filar_core::LlmConfig`]).
 //! - API key read from the `GLM_API_KEY` environment variable by default
 //!   (overridable per profile via `filar_core::LlmProfile::key_env`).
+//!   Empty `key_env` = keyless local profile: no `Authorization` header.
 //! - Retries with exponential backoff on transient failures (5xx, 429, network).
 //! - Request timeout.
 //! - Tool calling (function calling) support.
@@ -119,6 +120,26 @@ impl OpenAiCompatClient {
     /// Build the full API endpoint URL.
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.api_base_url)
+    }
+
+    /// Whether outbound requests will include an `Authorization` header.
+    ///
+    /// Keyless local profiles use an empty API key; a bearer header must not
+    /// be sent — some local servers reject empty/garbage auth.
+    pub fn sends_authorization(&self) -> bool {
+        !self.api_key.is_empty()
+    }
+
+    /// Attach bearer auth only when a key is present.
+    fn apply_auth(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        if self.sends_authorization() {
+            builder.bearer_auth(&self.api_key)
+        } else {
+            builder
+        }
     }
 }
 
@@ -282,9 +303,7 @@ impl OpenAiCompatClient {
     /// Send a single request to the API and return the raw response.
     async fn send_request(&self, body: &serde_json::Value) -> std::result::Result<ApiResponse, ApiError> {
         let response = self
-            .http
-            .post(self.endpoint())
-            .bearer_auth(&self.api_key)
+            .apply_auth(self.http.post(self.endpoint()))
             .json(body)
             .send()
             .await
@@ -321,12 +340,7 @@ impl OpenAiCompatClient {
             let status_code = status.as_u16();
             let body_text = response.text().await.unwrap_or_default();
             info!(status_code, body = %body_text, "OpenAI-compatible API returned error status");
-            match status_code {
-                401 | 403 => Err(ApiError::Auth(format!("HTTP {status_code}: {body_text}"))),
-                429 => Err(ApiError::RateLimit(body_text)),
-                500..=599 => Err(ApiError::Server(status_code, body_text)),
-                _ => Err(ApiError::Client(status_code, body_text)),
-            }
+            Err(ApiError::from_http_status(status_code, body_text))
         }
     }
 
@@ -336,9 +350,7 @@ impl OpenAiCompatClient {
         body: &serde_json::Value,
     ) -> std::result::Result<reqwest::Response, ApiError> {
         let response = self
-            .http
-            .post(self.endpoint())
-            .bearer_auth(&self.api_key)
+            .apply_auth(self.http.post(self.endpoint()))
             .json(body)
             .send()
             .await
@@ -360,12 +372,7 @@ impl OpenAiCompatClient {
             let status_code = status.as_u16();
             let body_text = response.text().await.unwrap_or_default();
             info!(status_code, body = %body_text, "OpenAI-compatible API returned error status");
-            match status_code {
-                401 | 403 => Err(ApiError::Auth(format!("HTTP {status_code}: {body_text}"))),
-                429 => Err(ApiError::RateLimit(body_text)),
-                500..=599 => Err(ApiError::Server(status_code, body_text)),
-                _ => Err(ApiError::Client(status_code, body_text)),
-            }
+            Err(ApiError::from_http_status(status_code, body_text))
         }
     }
 }
@@ -390,8 +397,46 @@ enum ApiError {
     Server(u16, String),
     /// Other client error (4xx) — not retryable.
     Client(u16, String),
+    /// Provider rejected tool/function calling — agent loop cannot run.
+    ToolsUnsupported(String),
     /// Failed to parse the response body.
     Parse(String),
+}
+
+impl ApiError {
+    fn from_http_status(status_code: u16, body_text: String) -> Self {
+        if looks_like_tools_unsupported(&body_text) {
+            return ApiError::ToolsUnsupported(body_text);
+        }
+        match status_code {
+            401 | 403 => ApiError::Auth(format!("HTTP {status_code}: {body_text}")),
+            429 => ApiError::RateLimit(body_text),
+            500..=599 => ApiError::Server(status_code, body_text),
+            _ => ApiError::Client(status_code, body_text),
+        }
+    }
+}
+
+/// Heuristic: provider body says the model/server cannot do tool calling.
+fn looks_like_tools_unsupported(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    let mentions_tools = lower.contains("tool")
+        || lower.contains("function call")
+        || lower.contains("function_call")
+        || lower.contains("tools");
+    if !mentions_tools {
+        return false;
+    }
+    lower.contains("not support")
+        || lower.contains("unsupported")
+        || lower.contains("does not support")
+        || lower.contains("doesn't support")
+        || lower.contains("not available")
+        || lower.contains("no support")
+        || lower.contains("unknown field")
+        || lower.contains("unexpected field")
+        || lower.contains("invalid parameter")
+        || lower.contains("is not enabled")
 }
 
 impl std::fmt::Display for ApiError {
@@ -399,11 +444,18 @@ impl std::fmt::Display for ApiError {
         match self {
             ApiError::Connect(msg) => write!(f, "connection error: {msg}"),
             ApiError::Network(msg) => write!(f, "network error: {msg}"),
-            ApiError::Timeout(d) => write!(f, "request timed out after {d:?}"),
+            ApiError::Timeout(d) => write!(
+                f,
+                "request timed out after {d:?}. For local models, increase [timeouts].llm_secs in config.toml (CPU generation is often slower than cloud)"
+            ),
             ApiError::Auth(msg) => write!(f, "authentication error: {msg}"),
             ApiError::RateLimit(msg) => write!(f, "rate limited: {msg}"),
             ApiError::Server(code, msg) => write!(f, "server error {code}: {msg}"),
             ApiError::Client(code, msg) => write!(f, "client error {code}: {msg}"),
+            ApiError::ToolsUnsupported(ref body) => write!(
+                f,
+                "this model does not support tool calling; the agent cannot run commands. Choose a model with tool/function calling support (or a different profile). Provider detail: {body}"
+            ),
             ApiError::Parse(msg) => write!(f, "failed to parse API response: {msg}"),
         }
     }
@@ -423,11 +475,16 @@ impl ApiError {
         match self {
             ApiError::Connect(msg) => CoreError::Other(format!("connection error: {msg}")),
             ApiError::Network(msg) => CoreError::Other(format!("network error: {msg}")),
-            ApiError::Timeout(d) => CoreError::Other(format!("request timed out after {d:?}")),
+            ApiError::Timeout(d) => CoreError::Other(format!(
+                "request timed out after {d:?}. For local models, increase [timeouts].llm_secs in config.toml (CPU generation is often slower than cloud)"
+            )),
             ApiError::Auth(msg) => CoreError::Other(format!("authentication error: {msg}")),
             ApiError::RateLimit(msg) => CoreError::Other(format!("rate limited: {msg}")),
             ApiError::Server(code, msg) => CoreError::Other(format!("server error {code}: {msg}")),
             ApiError::Client(code, msg) => CoreError::Other(format!("client error {code}: {msg}")),
+            ApiError::ToolsUnsupported(body) => CoreError::Other(format!(
+                "this model does not support tool calling; the agent cannot run commands. Choose a model with tool/function calling support (or a different profile). Provider detail: {body}"
+            )),
             ApiError::Parse(msg) => CoreError::Other(format!("failed to parse API response: {msg}")),
         }
     }
@@ -1497,5 +1554,63 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         state.process_chunk("data: [DONE]\n");
         let resp = state.into_response().unwrap();
         assert_eq!(resp.model.as_deref(), Some("cohere/command-r"));
+    }
+
+    #[test]
+    fn empty_api_key_does_not_send_authorization() {
+        let config = LlmConfig {
+            model: "local".into(),
+            api_base_url: "http://localhost:11434/v1".into(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+        };
+        let client = OpenAiCompatClient::new_with_key(&config, Duration::from_secs(30), "").unwrap();
+        assert!(
+            !client.sends_authorization(),
+            "keyless client must not attach Authorization"
+        );
+    }
+
+    #[test]
+    fn non_empty_api_key_sends_authorization() {
+        let config = LlmConfig {
+            model: "cloud".into(),
+            api_base_url: "https://example.com/v1".into(),
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+        };
+        let client =
+            OpenAiCompatClient::new_with_key(&config, Duration::from_secs(30), "sk-test").unwrap();
+        assert!(client.sends_authorization());
+    }
+
+    #[test]
+    fn tools_unsupported_heuristic_matches_common_bodies() {
+        assert!(looks_like_tools_unsupported(
+            r#"{"error":"does not support tools"}"#
+        ));
+        assert!(looks_like_tools_unsupported(
+            "model does not support function calling"
+        ));
+        assert!(!looks_like_tools_unsupported("rate limited, try later"));
+        let err = ApiError::from_http_status(400, "tools are not supported by this model".into());
+        assert!(matches!(err, ApiError::ToolsUnsupported(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not support tool calling"),
+            "user-facing message must be clear, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn timeout_message_hints_local_llm_secs() {
+        let err = ApiError::Timeout(Duration::from_secs(60));
+        let msg = err.to_string();
+        assert!(msg.contains("llm_secs"), "timeout must hint llm_secs: {msg}");
+        assert!(msg.contains("local"), "timeout must mention local models: {msg}");
     }
 }
