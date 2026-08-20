@@ -22,6 +22,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   include the same guidance
   ([#323](https://github.com/devlawey/filar/issues/323)).
 
+### Fixed
+
+- Confirm modal clamps/truncates oversized commands so long heredocs no longer
+  panic the TUI buffer; `PanicHookGuard` skips `take_hook` while unwinding
+  ([#324](https://github.com/devlawey/filar/issues/324)).
+
 ## [1.0.1] - 2026-08-19
 
 ### Changed

@@ -4878,3 +4878,16 @@ cancel-only long-job path in this PR (options 2/4 deferred).
 
 **Not in scope:** true background job tool, idle-activity timeout, confirm
 cancel-only long runs.
+
+## Issue #324: fix(tui) — confirm modal OOB panic on long commands
+
+**Milestone:** 1.0.2. **Branch:** `fix/324-confirm-modal-oob`.
+
+**Problem:** Huge confirm commands (Modelfile heredoc) made `modal_height` ≫
+terminal → ratatui buffer OOB panic; `PanicHookGuard::drop` then aborted.
+
+**Done:**
+- Clamp modal to chat area; truncate explanation/command with notice; buttons
+  always reserved.
+- `PanicHookGuard::drop` no-ops when `thread::panicking()`.
+- Regression tests with TestBackend + huge command.

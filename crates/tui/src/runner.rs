@@ -246,6 +246,11 @@ impl PanicHookGuard {
 
 impl Drop for PanicHookGuard {
     fn drop(&mut self) {
+        // Never call take_hook/set_hook while unwinding — that panics again and
+        // turns a recoverable TUI panic into abort (#324).
+        if std::thread::panicking() {
+            return;
+        }
         // Restore the original panic hook.
         let _ = std::panic::take_hook();
     }
