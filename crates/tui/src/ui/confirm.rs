@@ -507,4 +507,15 @@ mod tests {
         assert_eq!(out, "hello\nworld");
         assert!(!out.contains('…'));
     }
+
+    #[test]
+    fn truncate_leading_empty_lines_respects_budget() {
+        let text = format!("{}{}", "\n\n", "ABCDEFGHIJKLMNOPQRSTUVWXYZ".repeat(5));
+        let out = truncate_to_rows(&text, 8, 3);
+        assert!(
+            estimate_wrapped_rows(&out, 8) <= 3,
+            "overflow rows: {out:?}"
+        );
+        assert!(out.contains('…') || out == "…");
+    }
 }
