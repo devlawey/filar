@@ -128,10 +128,14 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     }
     if let Some(cost) = app.cost_usd {
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!("${:.4}", cost),
-            app.theme.success_fg(),
-        ));
+        if cost > 0.0 {
+            spans.push(Span::styled(
+                format!("${:.4}", cost),
+                app.theme.success_fg(),
+            ));
+        } else {
+            spans.push(Span::styled("—", app.theme.muted()));
+        }
     }
     // Model: per-profile served model if known, else configured model with ~ prefix.
     let model_display = if let Some(sm) = served {
@@ -416,6 +420,31 @@ mod tests {
         app.active_session_mut().llm_profile = Some("glm".into());
         let row = render_status_row(&mut app, 120);
         assert!(row.contains("toks: —"), "zero tokens must show dash, got: {row}");
+    }
+
+    #[test]
+    fn status_bar_zero_cost_shows_dash_not_dollar_zero() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.active_session_mut().cost_usd = Some(0.0);
+        let row = render_status_row(&mut app, 120);
+        assert!(!row.contains("$0"), "zero cost must not show $0.00, got: {row}");
+        assert!(row.contains('—'), "zero cost must show dash, got: {row}");
+    }
+
+    #[test]
+    fn status_bar_positive_cost_shows_dollar_amount() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.active_session_mut().cost_usd = Some(0.0123);
+        let row = render_status_row(&mut app, 120);
+        assert!(row.contains("$0.0123"), "positive cost, got: {row}");
+    }
+
+    #[test]
+    fn status_bar_absent_cost_has_no_dollar_or_cost_dash_slot() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.active_session_mut().cost_usd = None;
+        let row = render_status_row(&mut app, 120);
+        assert!(!row.contains('$'), "absent cost must omit $ amount, got: {row}");
     }
 
     #[test]

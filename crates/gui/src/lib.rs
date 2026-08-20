@@ -169,9 +169,14 @@ fn deduplicate_profiles(profiles: &mut Vec<LlmProfileData>) {
         }
         seen_names.insert(p.name.clone());
     }
-    // Fix key_env collisions: ensure each profile has a unique key_env.
+    // Fix key_env collisions: ensure each *non-empty* key_env is unique.
+    // Empty key_env is allowed on multiple profiles (keyless local servers).
     let mut seen_envs = std::collections::BTreeSet::new();
     for p in profiles.iter_mut() {
+        if p.key_env.trim().is_empty() {
+            p.key_env.clear();
+            continue;
+        }
         let mut env = p.key_env.clone();
         while seen_envs.contains(&env) {
             env = format!("api_key_{env}");
@@ -836,7 +841,14 @@ impl LauncherApp {
             let p = &mut self.profiles[self.selected_profile];
             ui.horizontal(|ui| { ui.label("Name:"); ui.text_edit_singleline(&mut p.name); });
             ui.horizontal(|ui| { ui.label("Model:"); ui.text_edit_singleline(&mut p.model); });
-            ui.horizontal(|ui| { ui.label("API URL:"); ui.text_edit_singleline(&mut p.api_base_url); });
+            ui.horizontal(|ui| {
+                ui.label("API URL:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut p.api_base_url)
+                        .hint_text("e.g. http://localhost:11434/v1")
+                        .desired_width(280.0),
+                );
+            });
             ui.horizontal(|ui| {
                 ui.label("API key:");
                 ui.checkbox(&mut show_api_key, "Show");
@@ -847,7 +859,32 @@ impl LauncherApp {
                     show_api_key,
                 );
             });
-            ui.horizontal(|ui| { ui.label("Key env:"); ui.text_edit_singleline(&mut p.key_env); });
+            ui.horizontal(|ui| {
+                ui.label("Key env:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut p.key_env)
+                        .hint_text("empty = no key (local)")
+                        .desired_width(200.0),
+                );
+            });
+            if p.key_env.trim().is_empty() {
+                let url = if p.api_base_url.trim().is_empty() {
+                    "(set API URL above)".to_string()
+                } else {
+                    p.api_base_url.trim().to_string()
+                };
+                ui.colored_label(
+                    egui::Color32::from_rgb(180, 180, 100),
+                    format!(
+                        "No API key — requests go only to {url} (local / air-gapped)."
+                    ),
+                );
+            } else if p.api_key.trim().is_empty() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(140, 140, 140),
+                    "API key empty: loaded from OS store / env on Launch, or clear Key env for local models.",
+                );
+            }
             ui.horizontal(|ui| { ui.label("Temp:"); ui.text_edit_singleline(&mut p.temperature); });
             ui.label("Extra body (JSON):");
             ui.add(egui::TextEdit::multiline(&mut p.extra_body)
@@ -912,6 +949,12 @@ impl LauncherApp {
             self.validation_error = "Profile name must not be empty.".to_string();
             return;
         }
+        if p.key_env.trim().is_empty() && p.api_base_url.trim().is_empty() {
+            self.validation_error =
+                "Keyless (local) profile needs an API URL (e.g. http://localhost:11434/v1)."
+                    .to_string();
+            return;
+        }
         for (i, other) in self.profiles.iter().enumerate() {
             if i != self.selected_profile && other.name == p.name {
                 self.validation_error = format!("Duplicate profile name: \"{}\". Names must be unique.", p.name);
@@ -962,7 +1005,9 @@ impl LauncherApp {
         settings.save();
         save_config_toml(&settings);
         for prof in &self.profiles {
-            if !prof.api_key.is_empty() { save_secret(&prof.key_env, &prof.api_key); }
+            if !prof.key_env.trim().is_empty() && !prof.api_key.is_empty() {
+                save_secret(&prof.key_env, &prof.api_key);
+            }
         }
         for (i, slot) in self.ssh_slots.iter().enumerate() {
             if slot.save_password && !slot.password.is_empty() { save_secret(&ssh_cred_name(i, &slot.alias), &slot.password); }

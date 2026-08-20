@@ -217,8 +217,12 @@ pub struct LlmProfile {
     /// Maximum number of tokens to generate.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
-    /// Name of the environment variable holding the API key
+    /// Name of the environment variable / OS credential holding the API key
     /// (default: `"GLM_API_KEY"`).
+    ///
+    /// An **empty** `key_env` is an explicit marker that this profile does not
+    /// require a key (local / air-gapped OpenAI-compatible servers such as
+    /// ollama). A non-empty `key_env` whose secret is missing is still an error.
     #[serde(default = "default_glm_key_env")]
     pub key_env: String,
     /// Sampling temperature (0.0–2.0). `None` = provider default.
@@ -234,6 +238,16 @@ pub struct LlmProfile {
 
 fn default_glm_key_env() -> String {
     "GLM_API_KEY".to_string()
+}
+
+impl LlmProfile {
+    /// Whether this profile requires an API key.
+    ///
+    /// Empty `key_env` means keyless (local / air-gapped). Non-empty means the
+    /// key must be resolved from memory, OS credential store, or the env var.
+    pub fn requires_api_key(&self) -> bool {
+        !self.key_env.trim().is_empty()
+    }
 }
 
 impl From<&LlmProfile> for LlmConfig {

@@ -155,6 +155,10 @@ fn resolve_gui_ssh_target(s: &filar_gui::SshConnection) -> filar_core::SshTarget
 /// (keyring) → environment variable. On first keyring hit, the key is cached in
 /// `sp` to avoid repeated OS credential store calls.
 ///
+/// An **empty** [`LlmProfile::key_env`] means the profile is keyless (local /
+/// air-gapped OpenAI-compatible server): key resolution is skipped and the
+/// client is created without an API key (no `Authorization` header).
+///
 /// This is a free function (not an inline closure) so that it can be
 /// unit-tested independently from `main`.
 pub fn build_llm_client_from_profile(
@@ -162,25 +166,30 @@ pub fn build_llm_client_from_profile(
     sp: &filar_core::StaticSecretProvider,
     llm_timeout_secs: u64,
 ) -> std::result::Result<Arc<dyn LlmClient>, CoreError> {
-    let key = sp.get(&profile.key_env).unwrap_or_default();
-    let key = if key.is_empty() {
-        let keyring = filar_core::KeyringSecretProvider::new();
-        let kr_key = keyring.get(&profile.key_env).ok().unwrap_or_default();
-        if !kr_key.is_empty() {
-            sp.insert(&profile.key_env, &kr_key);
-            kr_key
-        } else {
-            std::env::var(&profile.key_env).unwrap_or_default()
-        }
+    let key = if !profile.requires_api_key() {
+        String::new()
     } else {
+        let key = sp.get(&profile.key_env).unwrap_or_default();
+        let key = if key.is_empty() {
+            let keyring = filar_core::KeyringSecretProvider::new();
+            let kr_key = keyring.get(&profile.key_env).ok().unwrap_or_default();
+            if !kr_key.is_empty() {
+                sp.insert(&profile.key_env, &kr_key);
+                kr_key
+            } else {
+                std::env::var(&profile.key_env).unwrap_or_default()
+            }
+        } else {
+            key
+        };
+        if key.is_empty() {
+            return Err(filar_core::CoreError::Secret(format!(
+                "no API key found for profile {}",
+                profile.name
+            )));
+        }
         key
     };
-    if key.is_empty() {
-        return Err(filar_core::CoreError::Secret(format!(
-            "no API key found for profile {}",
-            profile.name
-        )));
-    }
     let llm_config: filar_core::LlmConfig = profile.into();
     Ok(Arc::new(
         OpenAiCompatClient::new_with_key(
@@ -191,6 +200,42 @@ pub fn build_llm_client_from_profile(
         .inspect_err(|_| warn!("LLM client construction failed"))
         .map_err(|_| filar_core::CoreError::Other("failed to construct LLM client".into()))?,
     ))
+}
+
+/// Check whether an LLM profile has a resolvable API key (for `Ctrl+L`).
+///
+/// Returns `None` when the profile is usable (keyless or key found). Returns
+/// `Some(message)` when a required key is missing.
+fn check_profile_api_key(
+    profile: &filar_core::LlmProfile,
+    sp: &filar_core::StaticSecretProvider,
+) -> Option<String> {
+    if !profile.requires_api_key() {
+        return None;
+    }
+    let key = sp.get(&profile.key_env).unwrap_or_default();
+    if !key.is_empty() {
+        return None;
+    }
+    let keyring = filar_core::KeyringSecretProvider::new();
+    match keyring.get(&profile.key_env) {
+        Ok(k) if !k.is_empty() => {
+            sp.insert(&profile.key_env, &k);
+            None
+        }
+        _ => {
+            if std::env::var(&profile.key_env)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            Some(format!(
+                "no API key found (checked memory, OS store, env '{}')",
+                profile.key_env
+            ))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +353,7 @@ async fn run() -> anyhow::Result<()> {
     // ── Determine launch parameters ──────────────────────────────────
     // When no CLI args, check for pending launch from a previous GUI
     // session, or spawn the GUI as a subprocess.
-    let (target_name, session_id, llm_config, api_key, ssh_target, gui_selected_profile, launch_profiles, launch_ssh_targets, launch_save_dir) = if args.is_empty() {
+    let (target_name, session_id, llm_config, api_key, key_env_name, ssh_target, gui_selected_profile, launch_profiles, launch_ssh_targets, launch_save_dir) = if args.is_empty() {
         // Check if the GUI subprocess already saved a launch config.
         let launch = filar_gui::load_pending_launch().or_else(|| {
             // Spawn GUI subprocess.
@@ -374,12 +419,14 @@ async fn run() -> anyhow::Result<()> {
                     resolve_gui_ssh_target(&s)
                 });
 
-                // Read API key from OS credential store using the profile's key_env.
-                let api_key = if launch.api_key.is_empty() {
+                // Empty key_env = keyless local profile (#320): skip keyring lookup.
+                let key_env_name = launch.key_env.clone();
+                let api_key = if key_env_name.trim().is_empty() {
+                    String::new()
+                } else if launch.api_key.is_empty() {
                     let cred = filar_core::KeyringSecretProvider::new();
-                    let key_name = if launch.key_env.is_empty() { "api_key".to_string() } else { launch.key_env.clone() };
-                    cred.get(&key_name)
-                        .inspect_err(|e| tracing::warn!(error = %e, %key_name, "failed to read API key from OS credential store"))
+                    cred.get(&key_env_name)
+                        .inspect_err(|e| tracing::warn!(error = %e, key_name = %key_env_name, "failed to read API key from OS credential store"))
                         .unwrap_or_default()
                 } else {
                     launch.api_key
@@ -390,6 +437,7 @@ async fn run() -> anyhow::Result<()> {
                     launch.session_id,
                     llm_config,
                     api_key,
+                    key_env_name,
                     ssh_target,
                     launch.selected_profile,
                     launch.profiles,
@@ -414,9 +462,13 @@ async fn run() -> anyhow::Result<()> {
         let (llm_config, key_env) = config
             .select_llm(profile_ref)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let key = secrets::api_key(&key_env).map_err(|e| {
-            anyhow::anyhow!("{e}. Set the {key_env} environment variable or use the GUI launcher.")
-        })?;
+        let key = if key_env.trim().is_empty() {
+            String::new()
+        } else {
+            secrets::api_key(&key_env).map_err(|e| {
+                anyhow::anyhow!("{e}. Set the {key_env} environment variable or use the GUI launcher.")
+            })?
+        };
 
         // Look up SSH target from config if not local.
         let ssh_target = if target != "local" {
@@ -425,28 +477,48 @@ async fn run() -> anyhow::Result<()> {
             None
         };
 
-        (target, args.session, llm_config, key, ssh_target, None, config.llm_profiles.clone(), config.ssh_targets.clone(), config.save_dir.clone())
+        (target, args.session, llm_config, key, key_env, ssh_target, None, config.llm_profiles.clone(), config.ssh_targets.clone(), config.save_dir.clone())
     };
 
-    // Validate API key.
-    if api_key.is_empty() {
-        anyhow::bail!("API key is required. Enter it in the GUI launcher or set the GLM_API_KEY environment variable.");
+    // Validate API key unless the profile is explicitly keyless (empty key_env).
+    let requires_key = !key_env_name.trim().is_empty();
+    if api_key.is_empty() && requires_key {
+        anyhow::bail!("API key is required. Enter it in the GUI launcher or set the {key_env_name} environment variable. For local models, clear Key env on the profile.");
     }
 
     // ── Create SecretProvider ──────────────────────────────────────────
     // The StaticSecretProvider holds the API key and will also hold dynamic
     // $FILAR_SECRET_N variables added at runtime (via Ctrl+P in the TUI).
     let secret_provider = Arc::new(StaticSecretProvider::new());
-    secret_provider.insert(secrets::env_vars::GLM_API_KEY, &api_key);
+    if !api_key.is_empty() {
+        let insert_name = if key_env_name.trim().is_empty() {
+            secrets::env_vars::GLM_API_KEY
+        } else {
+            key_env_name.as_str()
+        };
+        secret_provider.insert(insert_name, &api_key);
+        // Keep GLM_API_KEY alias for the initial client when using default name.
+        if insert_name != secrets::env_vars::GLM_API_KEY {
+            secret_provider.insert(secrets::env_vars::GLM_API_KEY, &api_key);
+        }
+    }
 
-    let llm: Arc<dyn LlmClient> = Arc::new(OpenAiCompatClient::new_with_provider(
-        &llm_config,
-        Duration::from_secs(config.timeouts.llm_secs),
-        secrets::env_vars::GLM_API_KEY,
-        &*secret_provider,
-    )?);
+    let llm: Arc<dyn LlmClient> = Arc::new(if api_key.is_empty() {
+        OpenAiCompatClient::new_with_key(
+            &llm_config,
+            Duration::from_secs(config.timeouts.llm_secs),
+            "",
+        )?
+    } else {
+        OpenAiCompatClient::new_with_provider(
+            &llm_config,
+            Duration::from_secs(config.timeouts.llm_secs),
+            secrets::env_vars::GLM_API_KEY,
+            &*secret_provider,
+        )?
+    });
 
-    info!(model = %llm_config.model, "LLM client initialised");
+    info!(model = %llm_config.model, keyless = api_key.is_empty(), "LLM client initialised");
 
     // ── Create executor (local or SSH) ─────────────────────────────────
     let command_timeout = Duration::from_secs(config.timeouts.command_secs);
@@ -530,7 +602,6 @@ async fn run() -> anyhow::Result<()> {
     // ── Launch TUI ─────────────────────────────────────────────────────
     let default_profile_name =
         resolve_startup_profile(&launch_profiles, cli_llm_name.as_deref(), gui_selected_profile.as_deref());
-    let key_checker_provider = secret_provider.clone();
     let tui_config = TuiConfig {
         target_name: target_name.clone(),
         confirm_mode: loaded.confirm_mode.unwrap_or(config.confirm_mode),
@@ -557,23 +628,12 @@ async fn run() -> anyhow::Result<()> {
                 build_llm_client_from_profile(profile, sp, llm_timeout_secs)
             })
         },
-        key_checker: Arc::new(move |profile: &filar_core::LlmProfile| {
-            let key = key_checker_provider.get(&profile.key_env).unwrap_or_default();
-            if !key.is_empty() { return None; }
-            let keyring = filar_core::KeyringSecretProvider::new();
-            match keyring.get(&profile.key_env) {
-                Ok(k) if !k.is_empty() => {
-                    key_checker_provider.insert(&profile.key_env, &k);
-                    None
-                }
-                _ => {
-                    if std::env::var(&profile.key_env).map(|v| !v.is_empty()).unwrap_or(false) {
-                        return None;
-                    }
-                    Some(format!("no API key found (checked memory, OS store, env '{}')", profile.key_env))
-                }
-            }
-        }),
+        key_checker: {
+            let key_checker_provider = secret_provider.clone();
+            Arc::new(move |profile: &filar_core::LlmProfile| {
+                check_profile_api_key(profile, &key_checker_provider)
+            })
+        },
         ssh_targets: launch_ssh_targets,
         save_dir: launch_save_dir,
         command_timeout,
@@ -595,7 +655,9 @@ async fn run() -> anyhow::Result<()> {
 mod tests {
     use filar_core::{LlmProfile, SecretProvider, StaticSecretProvider};
 
-    use super::{build_llm_client_from_profile, resolve_gui_ssh_target};
+    use super::{
+        build_llm_client_from_profile, check_profile_api_key, resolve_gui_ssh_target,
+    };
 
     // ── GUI→TUI SSH keyring handoff (#290) ──────────────────────────────
 
@@ -752,6 +814,66 @@ mod tests {
         };
         let result = build_llm_client_from_profile(&profile, &sp, 60);
         assert!(result.is_err(), "factory must fail when no key is available");
+    }
+
+    #[test]
+    fn factory_empty_key_env_is_keyless_ok() {
+        let sp = StaticSecretProvider::new();
+        let profile = LlmProfile {
+            name: "ollama-local".into(),
+            model: "llama3.1".into(),
+            api_base_url: "http://localhost:11434/v1".into(),
+            max_tokens: 1024,
+            key_env: String::new(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+        };
+        let result = build_llm_client_from_profile(&profile, &sp, 60);
+        assert!(
+            result.is_ok(),
+            "empty key_env must create a keyless client without error"
+        );
+    }
+
+    #[test]
+    fn key_checker_allows_empty_key_env() {
+        let sp = StaticSecretProvider::new();
+        let profile = LlmProfile {
+            name: "local".into(),
+            model: "m".into(),
+            api_base_url: "http://127.0.0.1:11434/v1".into(),
+            max_tokens: 1024,
+            key_env: String::new(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+        };
+        assert!(
+            check_profile_api_key(&profile, &sp).is_none(),
+            "key_checker must accept keyless profiles"
+        );
+    }
+
+    #[test]
+    fn key_checker_rejects_missing_key_when_key_env_set() {
+        let sp = StaticSecretProvider::new();
+        let profile = LlmProfile {
+            name: "cloud".into(),
+            model: "m".into(),
+            api_base_url: "https://example.com/v1".into(),
+            max_tokens: 1024,
+            key_env: "FILAR_TEST_MISSING_KEY_ENV_XYZ".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+        };
+        let msg = check_profile_api_key(&profile, &sp);
+        assert!(msg.is_some(), "key_checker must fail when required key is missing");
+        assert!(
+            msg.unwrap().contains("no API key found"),
+            "message must mention missing key"
+        );
     }
 
     #[test]
