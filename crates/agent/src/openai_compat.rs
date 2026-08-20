@@ -82,9 +82,15 @@ impl OpenAiCompatClient {
     }
 
     /// Create a new `OpenAiCompatClient` with an explicit API key (useful for testing).
+    ///
+    /// When `api_key` is empty (keyless / local profile), HTTP redirects are
+    /// disabled so request bodies cannot be forwarded to another host.
     pub fn new_with_key(config: &LlmConfig, timeout: Duration, api_key: &str) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(timeout)
+        let mut builder = reqwest::Client::builder().timeout(timeout);
+        if api_key.is_empty() {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let http = builder
             .build()
             .map_err(|e| CoreError::Other(format!("failed to build HTTP client: {e}")))?;
 
@@ -123,10 +129,7 @@ impl OpenAiCompatClient {
     }
 
     /// Whether outbound requests will include an `Authorization` header.
-    ///
-    /// Keyless local profiles use an empty API key; a bearer header must not
-    /// be sent — some local servers reject empty/garbage auth.
-    pub fn sends_authorization(&self) -> bool {
+    fn sends_authorization(&self) -> bool {
         !self.api_key.is_empty()
     }
 
@@ -405,7 +408,12 @@ enum ApiError {
 
 impl ApiError {
     fn from_http_status(status_code: u16, body_text: String) -> Self {
-        if looks_like_tools_unsupported(&body_text) {
+        // Only classify tool-calling rejection on non-retryable 4xx (not 429).
+        // Applying the heuristic to 5xx would turn transient failures into
+        // non-retryable ToolsUnsupported.
+        let is_client_4xx = (400..500).contains(&status_code) && status_code != 429;
+        if is_client_4xx && looks_like_tools_unsupported(&body_text) {
+            warn!(status_code, body = %body_text, "provider rejected tool calling");
             return ApiError::ToolsUnsupported(body_text);
         }
         match status_code {
@@ -422,20 +430,14 @@ fn looks_like_tools_unsupported(body: &str) -> bool {
     let lower = body.to_lowercase();
     let mentions_tools = lower.contains("tool")
         || lower.contains("function call")
-        || lower.contains("function_call")
-        || lower.contains("tools");
+        || lower.contains("function_call");
     if !mentions_tools {
         return false;
     }
     lower.contains("not support")
         || lower.contains("unsupported")
-        || lower.contains("does not support")
         || lower.contains("doesn't support")
         || lower.contains("not available")
-        || lower.contains("no support")
-        || lower.contains("unknown field")
-        || lower.contains("unexpected field")
-        || lower.contains("invalid parameter")
         || lower.contains("is not enabled")
 }
 
@@ -446,15 +448,15 @@ impl std::fmt::Display for ApiError {
             ApiError::Network(msg) => write!(f, "network error: {msg}"),
             ApiError::Timeout(d) => write!(
                 f,
-                "request timed out after {d:?}. For local models, increase [timeouts].llm_secs in config.toml (CPU generation is often slower than cloud)"
+                "request timed out after {d:?}. For local models, increase [timeouts].llm_secs in config.toml"
             ),
             ApiError::Auth(msg) => write!(f, "authentication error: {msg}"),
             ApiError::RateLimit(msg) => write!(f, "rate limited: {msg}"),
             ApiError::Server(code, msg) => write!(f, "server error {code}: {msg}"),
             ApiError::Client(code, msg) => write!(f, "client error {code}: {msg}"),
-            ApiError::ToolsUnsupported(ref body) => write!(
+            ApiError::ToolsUnsupported(_) => write!(
                 f,
-                "this model does not support tool calling; the agent cannot run commands. Choose a model with tool/function calling support (or a different profile). Provider detail: {body}"
+                "this model does not support tool calling; the agent cannot run commands. Choose a model with tool/function calling support"
             ),
             ApiError::Parse(msg) => write!(f, "failed to parse API response: {msg}"),
         }
@@ -472,19 +474,16 @@ impl ApiError {
 
     /// Convert to a [`CoreError`] for the final result.
     fn into_core_error(self) -> CoreError {
-        match self {
+        match &self {
+            ApiError::Timeout(_) | ApiError::ToolsUnsupported(_) => {
+                CoreError::Other(self.to_string())
+            }
             ApiError::Connect(msg) => CoreError::Other(format!("connection error: {msg}")),
             ApiError::Network(msg) => CoreError::Other(format!("network error: {msg}")),
-            ApiError::Timeout(d) => CoreError::Other(format!(
-                "request timed out after {d:?}. For local models, increase [timeouts].llm_secs in config.toml (CPU generation is often slower than cloud)"
-            )),
             ApiError::Auth(msg) => CoreError::Other(format!("authentication error: {msg}")),
             ApiError::RateLimit(msg) => CoreError::Other(format!("rate limited: {msg}")),
             ApiError::Server(code, msg) => CoreError::Other(format!("server error {code}: {msg}")),
             ApiError::Client(code, msg) => CoreError::Other(format!("client error {code}: {msg}")),
-            ApiError::ToolsUnsupported(body) => CoreError::Other(format!(
-                "this model does not support tool calling; the agent cannot run commands. Choose a model with tool/function calling support (or a different profile). Provider detail: {body}"
-            )),
             ApiError::Parse(msg) => CoreError::Other(format!("failed to parse API response: {msg}")),
         }
     }
@@ -1567,25 +1566,10 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
             extra_body: None,
         };
         let client = OpenAiCompatClient::new_with_key(&config, Duration::from_secs(30), "").unwrap();
-        assert!(
-            !client.sends_authorization(),
-            "keyless client must not attach Authorization"
-        );
-    }
-
-    #[test]
-    fn non_empty_api_key_sends_authorization() {
-        let config = LlmConfig {
-            model: "cloud".into(),
-            api_base_url: "https://example.com/v1".into(),
-            max_tokens: 128,
-            temperature: None,
-            top_p: None,
-            extra_body: None,
-        };
-        let client =
+        assert!(!client.sends_authorization());
+        let with_key =
             OpenAiCompatClient::new_with_key(&config, Duration::from_secs(30), "sk-test").unwrap();
-        assert!(client.sends_authorization());
+        assert!(with_key.sends_authorization());
     }
 
     #[test]
@@ -1597,6 +1581,9 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
             "model does not support function calling"
         ));
         assert!(!looks_like_tools_unsupported("rate limited, try later"));
+        assert!(!looks_like_tools_unsupported(
+            "invalid parameter: temperature"
+        ));
         let err = ApiError::from_http_status(400, "tools are not supported by this model".into());
         assert!(matches!(err, ApiError::ToolsUnsupported(_)));
         let msg = err.to_string();
@@ -1604,6 +1591,20 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
             msg.contains("does not support tool calling"),
             "user-facing message must be clear, got: {msg}"
         );
+        assert!(
+            !msg.contains("tools are not supported by this model"),
+            "raw provider body must stay in logs, not the user message"
+        );
+        // 5xx with similar wording must stay retryable Server, not ToolsUnsupported.
+        let server = ApiError::from_http_status(
+            503,
+            "tools are not supported by this model".into(),
+        );
+        assert!(matches!(server, ApiError::Server(503, _)));
+        assert!(server.is_retryable());
+        let rate = ApiError::from_http_status(429, "tools not available, retry".into());
+        assert!(matches!(rate, ApiError::RateLimit(_)));
+        assert!(rate.is_retryable());
     }
 
     #[test]
@@ -1611,6 +1612,5 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         let err = ApiError::Timeout(Duration::from_secs(60));
         let msg = err.to_string();
         assert!(msg.contains("llm_secs"), "timeout must hint llm_secs: {msg}");
-        assert!(msg.contains("local"), "timeout must mention local models: {msg}");
     }
 }

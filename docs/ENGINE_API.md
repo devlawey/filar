@@ -262,7 +262,7 @@ let config = LlmConfig {
     temperature: Some(0.3),
     ..Default::default()
 };
-// key: any non-empty placeholder for a local server
+// Prefer a [[llm_profiles]] entry with key_env = "" (keyless); do not send a dummy key.
 ```
 
 ### Choosing the API key environment variable
@@ -291,4 +291,4 @@ key_env = "OLLAMA_KEY"          # non-empty: key required (env / keyring)
 temperature = 0.3
 ```
 
-Select it at launch with `--llm local` (or `Config::select_llm(Some("local"))`).
+Select it at launch with `--llm ollama` (or `Config::select_llm(Some("ollama"))`).

@@ -206,7 +206,7 @@ pub fn build_llm_client_from_profile(
 ///
 /// Returns `None` when the profile is usable (keyless or key found). Returns
 /// `Some(message)` when a required key is missing.
-pub fn check_profile_api_key(
+fn check_profile_api_key(
     profile: &filar_core::LlmProfile,
     sp: &filar_core::StaticSecretProvider,
 ) -> Option<String> {

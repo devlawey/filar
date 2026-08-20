@@ -297,23 +297,23 @@ Point `api_base_url` at the provider and set a non-empty `key_env` (key via
 env or OS credential store / GUI):
 
 ```toml
-[llm]
-model = "llama3.1"
-api_base_url = "http://localhost:11434/v1"
+[[llm_profiles]]
+name = "glm"
+model = "glm-5.1"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
 max_tokens = 4096
-temperature = 0.3
+key_env = "GLM_API_KEY"
 ```
 
-> Prefer a named `[[llm_profiles]]` with `key_env = ""` for local keyless use;
-> the default `[llm]` block still expects `GLM_API_KEY` unless you select a
-> keyless profile.
+> For local keyless use, prefer `key_env = ""` (see above). The default `[llm]`
+> block still expects `GLM_API_KEY` unless you select a keyless profile.
 
 ### Verified providers
 
 | Provider | Endpoint | Tool calling | Streaming | Notes |
 |----------|----------|--------------|-----------|-------|
 | GLM cloud | `https://open.bigmodel.cn/api/paas/v4` | verified | verified | Default profile; key via `GLM_API_KEY`. |
-| Ollama (local) | `http://localhost:11434/v1` | depends on model | depends on model | Use empty `key_env`; pick a model with tool support. |
+| Ollama (local) | `http://localhost:11434/v1` | pending manual check | pending manual check | Use empty `key_env`; pick a model with tool support. |
 
 > The table lists only what has been checked by hand. Add rows as more
 > providers are verified (including via the eval tasks of milestone v0.4.0).

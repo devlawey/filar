@@ -4847,10 +4847,16 @@ Non-empty `key_env` with missing secret keeps the previous error.
   multiple empty `key_env` allowed in `deduplicate_profiles`.
 - Tools-unsupported HTTP bodies → clear user error (no text-tool emulation).
 - LLM timeout message hints raising `[timeouts].llm_secs` for local models.
-- Status bar: do not show `$0.0000` when cost is zero; toks dash unchanged.
+- Status bar: `Some(0.0)` cost shows `—` (not `$0.00`); absent cost stays unlabeled.
 - README: local/air-gapped section (data stays on endpoint; tools; timeouts; no compression yet).
+- Keyless HTTP client: `redirect::Policy::none()` so bodies are not followed off-host.
+- Tools-unsupported heuristic only on 4xx (not 429/5xx) so retries stay intact.
 
-**Not in scope / deferred:** per-profile `llm_secs`; context compression (document only).
+**Manual smoke (deferred):** ollama had no models pulled; after pull — keyless profile
+chat + tool confirm + `Ctrl+L` local↔cloud; cloud profile with missing key still errors;
+README Ollama row marked pending until then.
 
-**Public API:** `LlmProfile::requires_api_key`, `OpenAiCompatClient::sends_authorization`,
-`check_profile_api_key` (app).
+**Not in scope / deferred:** per-profile `llm_secs`; context compression (document only);
+clearing GUI in-memory `api_key` field when keyless (keyring already skipped).
+
+**Public API:** `LlmProfile::requires_api_key`.
