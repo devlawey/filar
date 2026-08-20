@@ -216,6 +216,10 @@ fn build_modal_lines(
 }
 
 /// Truncate `text` so its wrapped row count is ≤ `max_rows`.
+///
+/// When any content is dropped, the result always includes a trailing `…`
+/// (possibly replacing the last character of the last kept line) so truncation
+/// is never silent.
 fn truncate_to_rows(text: &str, width: usize, max_rows: usize) -> String {
     if max_rows == 0 || width == 0 {
         return String::new();
@@ -224,37 +228,70 @@ fn truncate_to_rows(text: &str, width: usize, max_rows: usize) -> String {
         return text.to_string();
     }
 
-    let mut out = String::new();
+    let mut kept: Vec<String> = Vec::new();
     let mut rows = 0usize;
-    for (i, line) in text.split('\n').enumerate() {
+    let all: Vec<&str> = text.split('\n').collect();
+
+    for (idx, line) in all.iter().enumerate() {
         let line_rows = estimate_wrapped_rows(line, width);
-        if rows + line_rows > max_rows {
-            // Fit a prefix of this line into remaining rows.
-            let remain = max_rows.saturating_sub(rows);
-            if remain == 0 {
-                break;
-            }
-            let chars_budget = remain.saturating_mul(width).saturating_sub(1); // room for …
-            let prefix: String = line.chars().take(chars_budget).collect();
-            if i > 0 || !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&prefix);
-            out.push('…');
+        if rows + line_rows <= max_rows {
+            kept.push((*line).to_string());
+            rows += line_rows;
+            // If this was the last source line we would be done, but we already
+            // know the full text overflows — so more content follows somehow.
+            // Continue; after the loop we force an ellipsis.
+            let _ = idx;
+            continue;
+        }
+
+        // Current line does not fit as a whole — take a prefix into `remain` rows.
+        let remain = max_rows.saturating_sub(rows);
+        if remain == 0 {
             break;
         }
-        if i > 0 {
-            out.push('\n');
-        }
-        out.push_str(line);
-        rows += line_rows;
+        let take = remain.saturating_mul(width).saturating_sub(1);
+        let mut prefix: String = line.chars().take(take).collect();
+        prefix.push('…');
+        kept.push(prefix);
+        return kept.join("\n");
     }
-    if out.is_empty() {
-        let chars_budget = max_rows.saturating_mul(width).saturating_sub(1);
-        let prefix: String = text.chars().take(chars_budget).collect();
-        format!("{prefix}…")
+
+    // All kept lines fit exactly in `max_rows`, but source still had more
+    // (or we broke because remain==0). Force a visible ellipsis.
+    ensure_ellipsis(&mut kept, width, max_rows);
+    if kept.is_empty() {
+        "…".to_string()
     } else {
-        out
+        kept.join("\n")
+    }
+}
+
+/// Ensure `kept` ends with `…` and still wraps to ≤ `max_rows`.
+fn ensure_ellipsis(kept: &mut Vec<String>, width: usize, max_rows: usize) {
+    if kept.is_empty() {
+        kept.push("…".to_string());
+        return;
+    }
+    if kept.last().is_some_and(|l| l.ends_with('…')) {
+        return;
+    }
+    let last = kept.last().cloned().unwrap_or_default();
+    let candidate = format!("{last}…");
+    let mut trial = kept.clone();
+    if let Some(slot) = trial.last_mut() {
+        *slot = candidate.clone();
+    }
+    if estimate_wrapped_rows(&trial.join("\n"), width) <= max_rows {
+        *kept.last_mut().unwrap() = candidate;
+        return;
+    }
+    // Replace last character of last line.
+    let mut chars: Vec<char> = last.chars().collect();
+    if chars.is_empty() {
+        *kept.last_mut().unwrap() = "…".to_string();
+    } else {
+        *chars.last_mut().unwrap() = '…';
+        *kept.last_mut().unwrap() = chars.into_iter().collect();
     }
 }
 
@@ -453,5 +490,24 @@ mod tests {
         let out = truncate_to_rows(&text, 10, 3);
         assert!(estimate_wrapped_rows(&out, 10) <= 3);
         assert!(out.contains('…'));
+    }
+
+    #[test]
+    fn truncate_marks_when_budget_exact() {
+        // Three short lines, budget 2 → keep first two with ellipsis on last kept.
+        let out = truncate_to_rows("aa\nbb\ncc\ndd", 10, 2);
+        assert!(estimate_wrapped_rows(&out, 10) <= 2, "got {out:?}");
+        assert!(out.contains('…'), "silent truncate forbidden: {out:?}");
+    }
+
+    #[test]
+    fn truncate_leading_empty_lines_respects_budget() {
+        let text = "\n\nABCDEFGHIJKLMNOPQRSTUVWXYZ".repeat(3);
+        let out = truncate_to_rows(&text, 8, 3);
+        assert!(
+            estimate_wrapped_rows(&out, 8) <= 3,
+            "overflow rows: {out:?}"
+        );
+        assert!(out.contains('…') || out == "…");
     }
 }
