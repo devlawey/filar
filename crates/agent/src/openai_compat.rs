@@ -401,7 +401,7 @@ enum ApiError {
     /// Other client error (4xx) — not retryable.
     Client(u16, String),
     /// Provider rejected tool/function calling — agent loop cannot run.
-    ToolsUnsupported(String),
+    ToolsUnsupported,
     /// Failed to parse the response body.
     Parse(String),
 }
@@ -414,7 +414,7 @@ impl ApiError {
         let is_client_4xx = (400..500).contains(&status_code) && status_code != 429;
         if is_client_4xx && looks_like_tools_unsupported(&body_text) {
             warn!(status_code, body = %body_text, "provider rejected tool calling");
-            return ApiError::ToolsUnsupported(body_text);
+            return ApiError::ToolsUnsupported;
         }
         match status_code {
             401 | 403 => ApiError::Auth(format!("HTTP {status_code}: {body_text}")),
@@ -454,7 +454,7 @@ impl std::fmt::Display for ApiError {
             ApiError::RateLimit(msg) => write!(f, "rate limited: {msg}"),
             ApiError::Server(code, msg) => write!(f, "server error {code}: {msg}"),
             ApiError::Client(code, msg) => write!(f, "client error {code}: {msg}"),
-            ApiError::ToolsUnsupported(_) => write!(
+            ApiError::ToolsUnsupported => write!(
                 f,
                 "this model does not support tool calling; the agent cannot run commands. Choose a model with tool/function calling support"
             ),
@@ -475,7 +475,7 @@ impl ApiError {
     /// Convert to a [`CoreError`] for the final result.
     fn into_core_error(self) -> CoreError {
         match &self {
-            ApiError::Timeout(_) | ApiError::ToolsUnsupported(_) => {
+            ApiError::Timeout(_) | ApiError::ToolsUnsupported => {
                 CoreError::Other(self.to_string())
             }
             ApiError::Connect(msg) => CoreError::Other(format!("connection error: {msg}")),
@@ -1585,7 +1585,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
             "invalid parameter: temperature"
         ));
         let err = ApiError::from_http_status(400, "tools are not supported by this model".into());
-        assert!(matches!(err, ApiError::ToolsUnsupported(_)));
+        assert!(matches!(err, ApiError::ToolsUnsupported));
         let msg = err.to_string();
         assert!(
             msg.contains("does not support tool calling"),
