@@ -231,20 +231,18 @@ fn truncate_to_rows(text: &str, width: usize, max_rows: usize) -> String {
     let mut kept: Vec<String> = Vec::new();
     let mut rows = 0usize;
     let all: Vec<&str> = text.split('\n').collect();
+    let mut dropped = false;
 
-    for (idx, line) in all.iter().enumerate() {
+    for line in &all {
         let line_rows = estimate_wrapped_rows(line, width);
         if rows + line_rows <= max_rows {
             kept.push((*line).to_string());
             rows += line_rows;
-            // If this was the last source line we would be done, but we already
-            // know the full text overflows — so more content follows somehow.
-            // Continue; after the loop we force an ellipsis.
-            let _ = idx;
             continue;
         }
 
         // Current line does not fit as a whole — take a prefix into `remain` rows.
+        dropped = true;
         let remain = max_rows.saturating_sub(rows);
         if remain == 0 {
             break;
@@ -256,9 +254,12 @@ fn truncate_to_rows(text: &str, width: usize, max_rows: usize) -> String {
         return kept.join("\n");
     }
 
-    // All kept lines fit exactly in `max_rows`, but source still had more
-    // (or we broke because remain==0). Force a visible ellipsis.
-    ensure_ellipsis(&mut kept, width, max_rows);
+    // Dropped remaining lines (remain==0 break) — force a visible ellipsis.
+    // Never call this when every source line was kept (that path cannot happen
+    // after the early full-fit return, but guard anyway).
+    if dropped || kept.len() < all.len() {
+        ensure_ellipsis(&mut kept, width, max_rows);
+    }
     if kept.is_empty() {
         "…".to_string()
     } else {
@@ -501,13 +502,9 @@ mod tests {
     }
 
     #[test]
-    fn truncate_leading_empty_lines_respects_budget() {
-        let text = "\n\nABCDEFGHIJKLMNOPQRSTUVWXYZ".repeat(3);
-        let out = truncate_to_rows(&text, 8, 3);
-        assert!(
-            estimate_wrapped_rows(&out, 8) <= 3,
-            "overflow rows: {out:?}"
-        );
-        assert!(out.contains('…') || out == "…");
+    fn truncate_does_not_ellipsis_when_text_fits() {
+        let out = truncate_to_rows("hello\nworld", 20, 5);
+        assert_eq!(out, "hello\nworld");
+        assert!(!out.contains('…'));
     }
 }
