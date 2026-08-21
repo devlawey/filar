@@ -5006,4 +5006,5 @@ regression tests; CHANGELOG.
 
 **Public contract:** none.
 
-**Next steps:** human TUI glance at `!pwd` caret (agent cannot drive TUI).
+**Next steps:** human TUI glance at `!` / `!pwd` caret (agent cannot drive
+interactive TUI; TestBackend asserts cover place_cursor math).

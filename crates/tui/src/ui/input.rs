@@ -167,17 +167,20 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    fn draw_input(app: &mut App, width: u16, height: u16) -> (u16, u16) {
+    fn draw_input(app: &mut App, width: u16, height: u16) -> Result<(u16, u16), String> {
         let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal =
+            Terminal::new(backend).map_err(|e| format!("TestBackend terminal: {e}"))?;
         terminal
             .draw(|f| {
                 let area = Rect::new(0, 0, width, height);
                 render_input_area(f, app, area);
             })
-            .unwrap();
-        let pos = terminal.get_cursor_position().unwrap();
-        (pos.x, pos.y)
+            .map_err(|e| format!("draw input: {e}"))?;
+        let pos = terminal
+            .get_cursor_position()
+            .map_err(|e| format!("cursor position: {e}"))?;
+        Ok((pos.x, pos.y))
     }
 
     #[test]
@@ -190,7 +193,7 @@ mod tests {
         assert_eq!(app.input, "!");
         assert_eq!(app.cursor_pos, 1, "cursor must be past '!'");
         // Prompt "$ " (2 cols) + bang at col 2 → cursor after bang at col 3.
-        let (x, y) = draw_input(&mut app, 40, 3);
+        let (x, y) = draw_input(&mut app, 40, 3).expect("draw shell bang");
         assert_eq!(y, 0);
         assert_eq!(x, 3, "cursor after '$ !', got col {x}");
     }
@@ -201,7 +204,7 @@ mod tests {
         app.input = "!pwd".into();
         app.cursor_pos = 4;
         // "$ " + "!pwd" → cursor after 'd' at column 2+4=6.
-        let (x, _) = draw_input(&mut app, 40, 3);
+        let (x, _) = draw_input(&mut app, 40, 3).expect("draw !pwd");
         assert_eq!(x, 6);
     }
 
@@ -211,7 +214,7 @@ mod tests {
         app.input = "hi".into();
         app.cursor_pos = 2;
         // Prompt glyph + space (2) + "hi" → cursor at col 4.
-        let (x, _) = draw_input(&mut app, 40, 3);
+        let (x, _) = draw_input(&mut app, 40, 3).expect("draw normal input");
         assert_eq!(x, 4);
     }
 }
