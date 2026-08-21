@@ -4957,3 +4957,17 @@ enrich path); no trait/`CommandExecutor`/`LlmClient` signature changes.
 **Next steps:** manual TUI — trigger sudo password failure and confirm short
 hint in command block (not runnable in this agent CI/agent shell; left for
 human DoD). Full `docs/SMOKE.md` remains a release gate, not per-issue.
+
+## Issue #332: fix(tui) — paste UTF-8 char vs byte cursor
+
+**Milestone:** 1.0.3. **Branch:** `fix/332-paste-utf8-cursor`.
+
+**Design:** `paste_text` mirrors `insert_char`: `cursor_pos` → byte via
+`char_indices().nth`; advance cursor by pasted char count.
+
+**Done:** fix + UTF-8 / Cyrillic / long multiline regression tests; CHANGELOG.
+
+**Public contract:** none (TUI-internal `App::paste_text`).
+
+**Next steps:** human macOS TUI paste mid-Cyrillic (agent env cannot drive
+interactive paste); PasswordInput path covered by existing unit test.

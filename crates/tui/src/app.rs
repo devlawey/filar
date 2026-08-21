@@ -1368,9 +1368,16 @@ impl App {
                 if clean.is_empty() {
                     return;
                 }
-                let pos = self.cursor_pos.min(self.input.len());
-                self.input.insert_str(pos, &clean);
-                self.cursor_pos = pos + clean.len();
+                let char_count = self.input.chars().count();
+                let insert_at = self.cursor_pos.min(char_count);
+                let byte_pos = self
+                    .input
+                    .char_indices()
+                    .nth(insert_at)
+                    .map(|(i, _)| i)
+                    .unwrap_or(self.input.len());
+                self.input.insert_str(byte_pos, &clean);
+                self.cursor_pos = insert_at + clean.chars().count();
             }
             AppMode::PasswordInput => {
                 // Same as typing: masked, never logged, never in history.
@@ -6376,6 +6383,48 @@ mod tests {
         app.paste_text("XYZ");
         assert_eq!(app.input, "heXYZllo");
         assert_eq!(app.cursor_pos, 5); // moved after inserted text
+    }
+
+    #[test]
+    fn paste_mid_utf8_uses_char_index_not_bytes() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        // "привет" is 6 chars / 12 bytes; cursor before 'и' (char index 2).
+        app.input = "привет".into();
+        app.cursor_pos = 2;
+        app.paste_text("XY");
+        assert_eq!(app.input, "прXYивет");
+        assert_eq!(app.cursor_pos, 4);
+    }
+
+    #[test]
+    fn paste_into_cyrillic_prefix_advances_by_char_count() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.input = "абв".into();
+        app.cursor_pos = 3; // end
+        app.paste_text("гдеж");
+        assert_eq!(app.input, "абвгдеж");
+        assert_eq!(app.cursor_pos, 7);
+    }
+
+    #[test]
+    fn paste_long_multiline_utf8_no_panic() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.input = "начало конец".into();
+        app.cursor_pos = 7; // after space, before "конец"
+        let blob = "раз\nдва\r\nтри ".repeat(40);
+        app.paste_text(&blob);
+        assert!(app.input.starts_with("начало "));
+        assert!(app.input.ends_with("конец"));
+        assert!(!app.input.contains('\n'));
+        assert!(!app.input.contains('\r'));
+        assert_eq!(
+            app.cursor_pos,
+            7 + blob
+                .chars()
+                .filter(|c| *c != '\r')
+                .map(|c| if c == '\n' { ' ' } else { c })
+                .count()
+        );
     }
 
     #[test]
