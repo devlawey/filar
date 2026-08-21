@@ -231,3 +231,16 @@ and `logs/` all share this single app root.
 > emit OSC 7; leave-sync then uses the last known tab cwd only. Entering
 > interactive still spawns `cmd.exe` with `CommandBuilder::cwd`.
 
+## Agent local commands and controlling TTY (#329)
+
+| Surface | Controlling TTY | Password prompts |
+|---------|-----------------|------------------|
+| Local agent `LocalExecutor` (Unix/macOS) | Child runs after `setsid` — **no** controlling TTY | `sudo`/`passwd` cannot paint `Password:` over the filar TUI; they fail fast (e.g. “terminal is required”) → agent guidance: Ctrl+P / `$FILAR_SECRET_N` + `sudo -S` |
+| Local agent `LocalExecutor` (Windows) | No POSIX `setsid`; PowerShell `-NonInteractive` | Interactive secure-string prompts are uncommon; same Ctrl+P / secret substitution contract |
+| Interactive Ctrl+T PTY | Full PTY — prompts allowed | Shell/`sudo` password UI is expected here |
+| SSH agent channel | Remote shell PTY (persistent channel) | Bare `sudo` can still block until timeout; Allowlist never auto-approves `sudo`; prompt + `sudo -S` + secrets |
+
+> Before #329, Unix local agent children inherited the TUI’s controlling
+> terminal, so macOS `sudo` wrote `Password:` on top of ratatui while the
+> session stayed in Thinking.
+

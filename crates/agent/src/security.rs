@@ -187,6 +187,42 @@ const WRITE_PATTERNS: &[&str] = &[
     "ip link set",
 ];
 
+/// Privilege elevators that may prompt for a password and must never be
+/// treated as read-only (Allowlist auto-approve). See #329.
+fn is_privilege_elevator(sub: &str) -> bool {
+    let s = sub.trim_start();
+    s == "sudo"
+        || s.starts_with("sudo ")
+        || s == "doas"
+        || s.starts_with("doas ")
+        // `su` alone / `su -` / `su user` — not `sort`, `sudo`, etc.
+        || s == "su"
+        || s.starts_with("su ")
+}
+
+/// Detect `sysctl` forms that **write** a kernel parameter.
+///
+/// Read examples (not write): `sysctl hw.memsize`, `sysctl -n hw.ncpu`, `sysctl -a`.
+/// Write examples: `sysctl -w key=value`, `sysctl key=value`.
+fn is_sysctl_write(sub: &str) -> bool {
+    let s = sub.trim_start();
+    if s != "sysctl" && !s.starts_with("sysctl ") {
+        return false;
+    }
+    let rest = s.strip_prefix("sysctl").unwrap_or("").trim_start();
+    for token in rest.split_whitespace() {
+        if token == "-w" || token.starts_with("-w") {
+            return true;
+        }
+        if token.starts_with('-') {
+            continue;
+        }
+        // First non-flag argument: `key=value` is a write; bare `key` is a read.
+        return token.contains('=');
+    }
+    false
+}
+
 /// Check whether a command modifies the system (writes, deletes, installs, etc.).
 pub fn is_write_command(command: &str) -> bool {
     let lower = command.to_lowercase();
@@ -214,8 +250,14 @@ pub fn is_write_command(command: &str) -> bool {
         .filter(|s| !s.is_empty());
 
     for sub in sub_commands {
-        // Remove leading "sudo " if present.
-        let sub = sub.strip_prefix("sudo ").unwrap_or(sub);
+        // Any sudo/doas/su segment needs confirmation — never Allowlist auto-approve (#329).
+        if is_privilege_elevator(sub) {
+            return true;
+        }
+
+        if is_sysctl_write(sub) {
+            return true;
+        }
 
         for pattern in WRITE_PATTERNS {
             // Match if the sub-command starts with the pattern.
@@ -445,6 +487,51 @@ mod tests {
         assert!(!is_readonly("mkdir /tmp/newdir"));
         assert!(!is_readonly("systemctl restart nginx"));
         assert!(!is_readonly("apt install htop"));
+    }
+
+    #[test]
+    fn sudo_and_privilege_elevators_are_never_readonly() {
+        assert!(!is_readonly("sudo sysctl iogpu.wired_limit_mb=114688 2>&1"));
+        assert!(!is_readonly("sudo ls /root"));
+        assert!(!is_readonly("sudo -n true"));
+        assert!(!is_readonly("doas pkg install foo"));
+        assert!(!is_readonly("su -"));
+        assert!(!is_readonly("su root -c id"));
+        // `sort` / `sudo` substring false friends
+        assert!(is_readonly("sort /tmp/a"));
+        assert_eq!(
+            check_command(
+                "sudo sysctl iogpu.wired_limit_mb=114688 2>&1",
+                CommandConfirmMode::Allowlist
+            ),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            check_command("sudo ls /tmp", CommandConfirmMode::Allowlist),
+            ConfirmDecision::NeedsConfirmation
+        );
+    }
+
+    #[test]
+    fn sysctl_write_vs_read() {
+        // Writes
+        assert!(!is_readonly("sysctl iogpu.wired_limit_mb=114688"));
+        assert!(!is_readonly("sysctl -w kern.maxfiles=65536"));
+        assert_eq!(
+            check_command(
+                "sysctl iogpu.wired_limit_mb=114688",
+                CommandConfirmMode::Allowlist
+            ),
+            ConfirmDecision::NeedsConfirmation
+        );
+        // Reads stay allowlisted
+        assert!(is_readonly("sysctl hw.memsize"));
+        assert!(is_readonly("sysctl -n hw.ncpu"));
+        assert!(is_readonly("sysctl -a"));
+        assert_eq!(
+            check_command("sysctl -n hw.memsize", CommandConfirmMode::Allowlist),
+            ConfirmDecision::AutoApproved
+        );
     }
 
     #[test]

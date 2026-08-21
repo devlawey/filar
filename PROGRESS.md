@@ -4905,3 +4905,24 @@ resize or new input; `Clear` alone was insufficient.
 - Unit test: long→short scroll leaves no stale `AAAA` tails.
 - Interactive scrollback: separate full-grid paint in `TerminalModel` — not
   the same bug class; no change.
+
+## Issue #329: fix(agent,transport) — sudo/password prompts vs TUI
+
+**Milestone:** 1.0.2. **Branch:** `fix/329-sudo-password-tui`.
+
+**Problem:** Allowlist auto-approved `sudo sysctl …=…` (sysctl write not in
+WRITE_PATTERNS; sudo stripped before classify). Local child kept controlling
+TTY → macOS `sudo` painted `Password:` over Thinking; no PasswordInput.
+
+**Design:**
+- A: `sudo`/`su`/`doas` always write (NeedsConfirmation in Allowlist); detect
+  `sysctl key=value` / `-w` writes; reads stay allowlisted.
+- B: system prompt rule 8 + enrich tool output on password/TTY failure →
+  Ctrl+P / `$FILAR_SECRET_N` + `sudo -S` (existing secret substitution).
+- C: Unix `LocalExecutor` `setsid` in `pre_exec` (interactive PTY unchanged).
+
+**Done:** security tests; `password_prompt` module; eval prompt sync;
+PLATFORM_NOTES; CHANGELOG.
+
+**Not in scope:** cancel-hotkey hint text; remote SSH `setsid` (channel already
+PTY — rely on confirm + prompt + secrets).

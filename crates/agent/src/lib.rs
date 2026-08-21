@@ -10,6 +10,7 @@ pub mod agent;
 pub mod events;
 pub mod long_wait;
 pub mod openai_compat;
+pub mod password_prompt;
 pub mod security;
 pub mod tools;
 
