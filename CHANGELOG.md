@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Changed
+
+- Password/TTY failure guidance shortened to a compact Ctrl+P /
+  `$FILAR_SECRET_N` / `sudo -S` hint in command output
+  ([#331](https://github.com/devlawey/filar/issues/331)).
+
 ## [1.0.2] - 2026-08-21
 
 ### Added

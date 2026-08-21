@@ -4941,3 +4941,19 @@ gate (#329). #322 closed not_planned (manual config edit).
 
 **Smoke:** dual-platform checklist in `docs/SMOKE.md` (#298) — manual after
 CI assets land.
+
+## Issue #331: ux(agent) — shorten sudo/password guidance
+
+**Milestone:** 1.0.3. **Branch:** `fix/331-shorten-password-guidance`.
+
+**Design:** option 1 — one short `PASSWORD_PROMPT_GUIDANCE` (~2 lines) for both
+UI and LLM tool result (no separate user/LLM split).
+
+**Done:** shortened constant; length assert in unit test; CHANGELOG.
+
+**Public contract:** `pub const PASSWORD_PROMPT_GUIDANCE` text shortened (same
+enrich path); no trait/`CommandExecutor`/`LlmClient` signature changes.
+
+**Next steps:** manual TUI — trigger sudo password failure and confirm short
+hint in command block (not runnable in this agent CI/agent shell; left for
+human DoD). Full `docs/SMOKE.md` remains a release gate, not per-issue.
