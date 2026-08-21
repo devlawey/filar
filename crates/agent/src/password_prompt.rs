@@ -1,14 +1,12 @@
 //! Detect interactive password prompts in tool output and steer the agent
-//! toward Ctrl+P / `$FILAR_SECRET_N` (see #329).
+//! toward Ctrl+P / `$FILAR_SECRET_N` (see #329, #331).
 
-/// Guidance appended when a command fails because it needs a TTY password.
+/// Short guidance appended when a command fails because it needs a TTY password.
+/// Kept to ~2 lines so it stays readable in the TUI command block (#331).
 pub const PASSWORD_PROMPT_GUIDANCE: &str = "\
-This command needs a password, but agent tool calls cannot use an interactive \
-TTY password prompt (it would hang or paint over the UI). Ask the user to press \
-Ctrl+P, enter the password into the masked field, then retry using the given \
-$FILAR_SECRET_N placeholder — e.g. `printf '%s\\n' \"$FILAR_SECRET_1\" | sudo -S …` \
-(POSIX) or an equivalent non-interactive form. Never embed the real password in \
-the command text.";
+Password required (no interactive TTY). Ask the user for Ctrl+P → \
+$FILAR_SECRET_N, then retry with e.g. `printf '%s\\n' \"$FILAR_SECRET_1\" | sudo -S …`. \
+Do not embed the real password in the command.";
 
 /// Heuristic: output looks like a password / sudo TTY failure.
 pub fn looks_like_password_prompt(output: &str) -> bool {
@@ -60,6 +58,14 @@ mod tests {
         let once = enrich_password_prompt_message("sudo: a password is required");
         assert!(once.contains(PASSWORD_PROMPT_GUIDANCE));
         assert!(once.contains("Ctrl+P"));
+        assert!(once.contains("$FILAR_SECRET_N"));
+        assert!(once.contains("sudo -S"));
+        // Keep UI-friendly: guidance itself should stay short.
+        assert!(
+            PASSWORD_PROMPT_GUIDANCE.len() < 220,
+            "guidance too long for TUI: {} chars",
+            PASSWORD_PROMPT_GUIDANCE.len()
+        );
         let twice = enrich_password_prompt_message(&once);
         assert_eq!(
             twice.matches(PASSWORD_PROMPT_GUIDANCE).count(),
