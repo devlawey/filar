@@ -108,8 +108,8 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
     // N is the number of lines below the viewport (= scroll after clamping).
     if app.scroll > 0 && area.height >= 3 && area.width >= 3 {
         let indicator = format!("\u{2193} {} new", app.scroll);
-        // Use char count, not byte length — `↓` (U+2193) is 3 bytes but 1 column.
-        let indicator_width = indicator.chars().count() as u16;
+        // Display columns (↓ is width 1); match pad/wrap (#333).
+        let indicator_width = unicode_width::UnicodeWidthStr::width(indicator.as_str()) as u16;
         let indicator_width = indicator_width.min(inner_width);
         let indicator_area = Rect::new(
             area.x + area.width.saturating_sub(indicator_width),
@@ -141,18 +141,54 @@ fn reset_area_cells(f: &mut Frame, area: Rect) {
     }
 }
 
-/// Pad `line` with trailing spaces up to `width` display columns (char count,
-/// matching the rest of the chat layout which does not use unicode-width).
+/// Pad `line` with trailing spaces up to `width` **display columns**
+/// (ratatui / unicode-width). Truncate if the line is already wider so the
+/// Paragraph never spills past the viewport (#333).
 fn pad_line_to_width(mut line: Line<'static>, width: usize) -> Line<'static> {
-    let current: usize = line
-        .spans
-        .iter()
-        .map(|s| s.content.chars().count())
-        .sum();
+    let current = line.width();
     if current < width {
         line.spans.push(Span::raw(" ".repeat(width - current)));
+        return line;
+    }
+    if current > width {
+        return truncate_line_to_width(line, width);
     }
     line
+}
+
+/// Truncate a styled line to at most `width` display columns.
+fn truncate_line_to_width(line: Line<'static>, width: usize) -> Line<'static> {
+    use unicode_width::UnicodeWidthChar;
+
+    let style = line.style;
+    let alignment = line.alignment;
+    let mut new_spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for span in line.spans {
+        if used >= width {
+            break;
+        }
+        let mut kept = String::new();
+        for c in span.content.chars() {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            // Keep combining marks with the preceding base even at the edge.
+            if cw > 0 && used + cw > width {
+                break;
+            }
+            kept.push(c);
+            used += cw;
+        }
+        if !kept.is_empty() {
+            new_spans.push(Span::styled(kept, span.style));
+        }
+    }
+    if used < width {
+        new_spans.push(Span::raw(" ".repeat(width - used)));
+    }
+    let mut out = Line::from(new_spans);
+    out.style = style;
+    out.alignment = alignment;
+    out
 }
 
 /// Apply selection background to a rendered line.
@@ -296,8 +332,89 @@ mod tests {
     fn pad_line_to_width_extends_short_line() {
         let line = Line::from("hi");
         let padded = pad_line_to_width(line, 5);
-        let w: usize = padded.spans.iter().map(|s| s.content.chars().count()).sum();
-        assert_eq!(w, 5);
+        assert_eq!(padded.width(), 5);
+    }
+
+    #[test]
+    fn pad_line_to_width_uses_display_columns_for_wide_chars() {
+        // Two CJK chars = 4 columns; pad to 6 → two trailing spaces.
+        let padded = pad_line_to_width(Line::from("你好"), 6);
+        assert_eq!(padded.width(), 6);
+        let text: String = padded.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.ends_with("  "));
+    }
+
+    #[test]
+    fn pad_line_to_width_truncates_overwide() {
+        let padded = pad_line_to_width(Line::from("你好世界"), 4);
+        assert_eq!(padded.width(), 4);
+        let text: String = padded.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "你好");
+    }
+
+    #[test]
+    fn scroll_wide_and_columnar_leaves_no_stale_glyphs() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Allowlist);
+        // Wide CJK + tab-aligned columns that used to overflow char-based wrap.
+        app.messages = vec![
+            ChatBlock::User("用户消息".repeat(20)),
+            ChatBlock::Agent("代理回复".repeat(20)),
+            ChatBlock::Command {
+                command: "ps".into(),
+                explanation: String::new(),
+                output: Some("PID\tTTY\tTIME\tCMD\n1\t??\t0:00.01\t/sbin/launchd\n".repeat(8)),
+                approved: true,
+            },
+            ChatBlock::User("short".into()),
+            ChatBlock::Agent("ok".into()),
+        ];
+        app.message_rev = 1;
+        // High scroll → oldest lines (wide CJK) fill the viewport first.
+        app.scroll = 40;
+
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 40, 8);
+                render_chat_history(f, &mut app, area);
+            })
+            .unwrap();
+
+        let before: Vec<String> = (0..8)
+            .map(|y| chat_row(terminal.backend().buffer(), y, 40))
+            .collect();
+        assert!(
+            before
+                .iter()
+                .any(|r| r.contains('用') || r.contains('代') || r.contains("PID") || r.contains("CMD")),
+            "first frame should show wide/columnar content: {before:?}"
+        );
+
+        // Back to bottom: short lines must fully replace prior wide cells.
+        app.scroll = 0;
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 40, 8);
+                render_chat_history(f, &mut app, area);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        for y in 0..8 {
+            let row = chat_row(buf, y, 40);
+            assert_eq!(row.chars().count(), 40, "row {y} must be fully painted: {row:?}");
+            assert!(!row.contains('\t'), "tab leaked on row {y}: {row:?}");
+            if row.trim().chars().count() < 10 {
+                assert!(
+                    !row.contains('用')
+                        && !row.contains('代')
+                        && !row.contains("PID")
+                        && !row.contains("launchd"),
+                    "stale wide/columnar glyphs on row {y}: {row:?}"
+                );
+            }
+        }
     }
 }
 

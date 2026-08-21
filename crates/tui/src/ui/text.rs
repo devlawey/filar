@@ -1,8 +1,30 @@
 //! Text utility helpers — emoji stripping, line wrapping, and markdown-lite rendering.
 
 use ratatui::text::Span;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::theme::Theme;
+
+/// Tab stop used when expanding `\t` for wrap/pad (columnar `ps` / tables).
+const TAB_STOP: usize = 8;
+
+/// Expand horizontal tabs to spaces at [`TAB_STOP`] boundaries so wrap and
+/// pad agree with typical terminal columnar layout (#333).
+pub(crate) fn expand_tabs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0usize;
+    for c in s.chars() {
+        if c == '\t' {
+            let spaces = TAB_STOP - (col % TAB_STOP);
+            out.push_str(&" ".repeat(spaces));
+            col += spaces;
+        } else {
+            out.push(c);
+            col += UnicodeWidthChar::width(c).unwrap_or(0);
+        }
+    }
+    out
+}
 
 /// Strip emoji and other non-renderable Unicode characters from a string.
 /// Windows terminal (conhost) can't display most emojis, so they show as '?'.
@@ -29,31 +51,39 @@ pub(crate) fn strip_emoji(s: &str) -> String {
         .collect()
 }
 
-/// Wrap a single line of text to fit within `width` characters.
-/// Returns one or more strings, each at most `width` chars wide.
+/// Wrap a single line of text to fit within `width` **display columns**
+/// (unicode-width, matching ratatui). Tabs are expanded first (#333).
+///
+/// Returns one or more strings, each at most `width` columns wide. A single
+/// character wider than `width` is placed alone on its own line. Zero-width
+/// combining marks stay with their preceding base character.
 pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }
     let mut result = Vec::new();
     for line in text.lines() {
-        let char_count = line.chars().count();
-        if char_count <= width {
-            result.push(line.to_string());
-        } else {
-            let mut current = String::new();
-            let mut count = 0;
-            for c in line.chars() {
-                if count >= width {
-                    result.push(std::mem::take(&mut current));
-                    count = 0;
-                }
-                current.push(c);
-                count += 1;
+        let line = expand_tabs(line);
+        let line_width = UnicodeWidthStr::width(line.as_str());
+        if line_width <= width {
+            result.push(line);
+            continue;
+        }
+        let mut current = String::new();
+        let mut col = 0usize;
+        for c in line.chars() {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            // Only break before a positive-width char; combining marks (cw=0)
+            // stay attached to the previous base.
+            if cw > 0 && col > 0 && col + cw > width {
+                result.push(std::mem::take(&mut current));
+                col = 0;
             }
-            if !current.is_empty() {
-                result.push(current);
-            }
+            current.push(c);
+            col += cw;
+        }
+        if !current.is_empty() {
+            result.push(current);
         }
     }
     if result.is_empty() {
@@ -243,6 +273,27 @@ mod tests {
     #[test]
     fn wrap_text_zero_width() {
         assert_eq!(wrap_text("hello", 0), vec!["hello"]);
+    }
+
+    #[test]
+    fn wrap_text_wide_chars_by_display_columns() {
+        // Each CJK char is 2 columns; width 4 → two chars per line.
+        assert_eq!(wrap_text("你好世界", 4), vec!["你好", "世界"]);
+    }
+
+    #[test]
+    fn wrap_text_expands_tabs_for_columns() {
+        let lines = wrap_text("a\tb", 16);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "a       b");
+        assert_eq!(UnicodeWidthStr::width(lines[0].as_str()), 9);
+    }
+
+    #[test]
+    fn wrap_text_keeps_combining_mark_with_base() {
+        let acute = '\u{0301}';
+        let s = format!("a{acute}b");
+        assert_eq!(wrap_text(&s, 1), vec![format!("a{acute}"), "b".into()]);
     }
 
     // --- Markdown-lite tests ---
