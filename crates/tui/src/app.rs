@@ -566,8 +566,12 @@ impl App {
     }
 
     /// Take and clear tabs awaiting OSC 7 / executor cwd sync (PTY kept alive).
+    /// Deduplicates so repeated hide before the runner drains still sync once.
     pub fn take_pending_cwd_sync(&mut self) -> Vec<SessionId> {
-        std::mem::take(&mut self.pending_cwd_sync)
+        let mut v = std::mem::take(&mut self.pending_cwd_sync);
+        v.sort_by_key(|id| id.0);
+        v.dedup();
+        v
     }
 
     /// Take and clear the list of sessions awaiting a local executor (for runner to process).
@@ -3213,9 +3217,7 @@ impl App {
     pub fn hide_interactive_view(&mut self) {
         if self.mode == AppMode::Interactive {
             let sid = self.sessions[self.active].id;
-            if !self.pending_cwd_sync.contains(&sid) {
-                self.pending_cwd_sync.push(sid);
-            }
+            self.pending_cwd_sync.push(sid);
             self.mode = AppMode::Normal;
             self.selection = None;
             self.mouse_drag = None;
@@ -6070,8 +6072,11 @@ mod tests {
         let sid = app.sessions[0].id;
         app.enter_interactive(crate::terminal::TerminalModel::new(80, 24));
         app.hide_interactive_view();
+        app.hide_interactive_view(); // mode already Normal — no second push
         app.show_interactive_view();
         app.hide_interactive_view();
+        app.hide_interactive_view(); // still Interactive→Normal once; push again while queued
+        // Two pushes from two Interactive→Normal transitions; take dedups.
         assert_eq!(app.take_pending_cwd_sync(), vec![sid]);
     }
 

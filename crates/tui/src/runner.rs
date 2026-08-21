@@ -146,20 +146,26 @@ async fn sync_cwd_from_interactive(
         if let Some(idx) = app.find_session_idx(sid) {
             app.sessions[idx].cwd = None;
         }
-        let _ = term.write_input(OSC7_PWD_PROBE).await;
-        drain_pty_cwd(app, sid, term_rx, Duration::from_millis(400)).await;
-        let still_empty = app
-            .sessions
-            .iter()
-            .find(|s| s.id == sid)
-            .and_then(|s| s.cwd.as_ref())
-            .is_none();
-        if still_empty {
+        if term.write_input(OSC7_PWD_PROBE).await.is_err() {
             if let Some(idx) = app.find_session_idx(sid) {
                 app.sessions[idx].cwd = prev;
             }
+        } else {
+            drain_pty_cwd(app, sid, term_rx, Duration::from_millis(400)).await;
+            let still_empty = app
+                .sessions
+                .iter()
+                .find(|s| s.id == sid)
+                .and_then(|s| s.cwd.as_ref())
+                .is_none();
+            if still_empty {
+                if let Some(idx) = app.find_session_idx(sid) {
+                    app.sessions[idx].cwd = prev;
+                }
+            }
         }
     }
+    // Always apply known cwd to the executor (incl. Windows last-known path).
     if let Some(cwd) = app
         .sessions
         .iter()
