@@ -25,6 +25,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Chat wrap/pad use unicode display columns (and expand tabs) so long
   wrap / CJK / columnar output no longer leave stale glyphs after scroll
   ([#333](https://github.com/devlawey/filar/issues/333)).
+- Shell (`!`) input prompt no longer double-spaces `$`, so the cursor sits
+  after the last character instead of on it
+  ([#337](https://github.com/devlawey/filar/issues/337)).
 
 ## [1.0.2] - 2026-08-21
 

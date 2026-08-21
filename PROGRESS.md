@@ -4992,3 +4992,18 @@ CHANGELOG.
 
 **Next steps:** human macOS Terminal long agent cycle with `ps`-style
 columns + CJK (agent cannot drive interactive TUI).
+
+## Issue #337: fix(tui) — ! shell cursor past end
+
+**Milestone:** 1.0.3. **Branch:** `fix/337-shell-cursor-end`.
+
+**Problem:** shell prompt was `"$ "` then `format!("{prompt} ")` added a
+second space (display width 3) while `place_cursor` assumed width 2 →
+caret sat on the last input character.
+
+**Done:** shell glyph is `"$"` (space added once); cursor/TestBackend
+regression tests; CHANGELOG.
+
+**Public contract:** none.
+
+**Next steps:** human TUI glance at `!pwd` caret (agent cannot drive TUI).
