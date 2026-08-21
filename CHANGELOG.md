@@ -31,6 +31,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Ctrl+T hide refreshes tab cwd via OSC 7 probe and `set_cwd` (status bar +
   agent) without tearing down the PTY; stale enter-time cwd no longer skips
   the probe ([#338](https://github.com/devlawey/filar/issues/338)).
+- Ctrl+O host switch tears down the tab's interactive PTY/`TerminalModel`
+  so the previous host's shell cannot be reused after reconnect
+  ([#339](https://github.com/devlawey/filar/issues/339)).
 
 ## [1.0.2] - 2026-08-21
 
