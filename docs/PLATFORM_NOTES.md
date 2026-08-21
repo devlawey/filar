@@ -13,6 +13,7 @@ Add findings here whenever a platform difference is discovered.
 | GUI launcher paste / show password | [GUI launcher secrets](#gui-launcher-secrets-macos) | #312 |
 | Interactive PTY shell | [Local interactive shell](#local-interactive-shell-ctrlt) | #293, #313 |
 | Release assets / packaging | [Release binaries (CI)](#release-binaries-ci) | #289, #297, #80 |
+| Chat wrap display columns | [Chat display width vs char count](#chat-display-width-vs-char-count-333) | #333 |
 
 ## Clipboard
 
@@ -243,4 +244,17 @@ and `logs/` all share this single app root.
 > Before #329, Unix local agent children inherited the TUI’s controlling
 > terminal, so macOS `sudo` wrote `Password:` on top of ratatui while the
 > session stayed in Thinking.
+
+## Chat display width vs char count (#333)
+
+Chat wrap/pad (#325 follow-up) measure lines in **unicode display columns**
+(same `unicode-width` 0.1 as ratatui), not `chars().count()`. Tabs in
+command output are expanded to spaces (tab stop 8) before wrap so
+columnar tools (`ps`, aligned tables) stay consistent.
+
+| Concern | Note |
+|---------|------|
+| CJK / wide glyphs | Two columns each; char-count wrap overflowed the viewport and left ghosts after scroll |
+| Ambiguous width (e.g. some box-drawing) | Follow unicode-width/ratatui; Terminal.app vs Windows Terminal can still differ for East-Asian Ambiguous characters — report if still visible after #333 |
+| Interactive PTY scrollback | Separate `TerminalModel` path; not changed by #333 |
 

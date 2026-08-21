@@ -4971,3 +4971,24 @@ human DoD). Full `docs/SMOKE.md` remains a release gate, not per-issue.
 
 **Next steps:** human macOS TUI paste mid-Cyrillic (agent env cannot drive
 interactive paste); PasswordInput path covered by existing unit test.
+
+## Issue #333: fix(tui) — glyph artifacts on wrap / columnar output
+
+**Milestone:** 1.0.3. **Branch:** `fix/333-glyph-artifacts-wrap`.
+
+**Problem:** #325 cell-reset + char-count pad fixed short-over-long ASCII
+scroll, but wrap/pad still used `chars().count()` while ratatui paints by
+unicode-width; CJK/wide glyphs and `\t` columns under/over-filled the
+viewport → ghost glyphs until resize.
+
+**Design:** `wrap_text` + `pad_line_to_width` use display columns
+(`unicode-width` 0.1, same as ratatui); expand tabs (stop 8); truncate
+over-wide lines; keep #325 reset_area_cells.
+
+**Done:** tests for CJK wrap/pad, tab expand, wide+columnar scroll; PLATFORM_NOTES;
+CHANGELOG.
+
+**Public contract:** none (TUI-internal layout).
+
+**Next steps:** human macOS Terminal long agent cycle with `ps`-style
+columns + CJK (agent cannot drive interactive TUI).

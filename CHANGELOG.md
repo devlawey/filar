@@ -22,6 +22,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Paste into the input field uses char indices (not bytes), so UTF-8 /
   Cyrillic mid-string paste no longer panics or jumps the cursor
   ([#332](https://github.com/devlawey/filar/issues/332)).
+- Chat wrap/pad use unicode display columns (and expand tabs) so long
+  wrap / CJK / columnar output no longer leave stale glyphs after scroll
+  ([#333](https://github.com/devlawey/filar/issues/333)).
 
 ## [1.0.2] - 2026-08-21
 
