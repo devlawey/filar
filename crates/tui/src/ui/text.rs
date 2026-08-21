@@ -55,7 +55,8 @@ pub(crate) fn strip_emoji(s: &str) -> String {
 /// (unicode-width, matching ratatui). Tabs are expanded first (#333).
 ///
 /// Returns one or more strings, each at most `width` columns wide. A single
-/// grapheme wider than `width` is placed alone on its own line.
+/// character wider than `width` is placed alone on its own line. Zero-width
+/// combining marks stay with their preceding base character.
 pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
@@ -72,16 +73,14 @@ pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
         let mut col = 0usize;
         for c in line.chars() {
             let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-            if col > 0 && col + cw > width {
+            // Only break before a positive-width char; combining marks (cw=0)
+            // stay attached to the previous base.
+            if cw > 0 && col > 0 && col + cw > width {
                 result.push(std::mem::take(&mut current));
                 col = 0;
             }
             current.push(c);
             col += cw;
-            if col >= width {
-                result.push(std::mem::take(&mut current));
-                col = 0;
-            }
         }
         if !current.is_empty() {
             result.push(current);
@@ -288,6 +287,13 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], "a       b");
         assert_eq!(UnicodeWidthStr::width(lines[0].as_str()), 9);
+    }
+
+    #[test]
+    fn wrap_text_keeps_combining_mark_with_base() {
+        let acute = '\u{0301}';
+        let s = format!("a{acute}b");
+        assert_eq!(wrap_text(&s, 1), vec![format!("a{acute}"), "b".into()]);
     }
 
     // --- Markdown-lite tests ---

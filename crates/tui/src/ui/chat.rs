@@ -160,6 +160,8 @@ fn pad_line_to_width(mut line: Line<'static>, width: usize) -> Line<'static> {
 fn truncate_line_to_width(line: Line<'static>, width: usize) -> Line<'static> {
     use unicode_width::UnicodeWidthChar;
 
+    let style = line.style;
+    let alignment = line.alignment;
     let mut new_spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     for span in line.spans {
@@ -169,7 +171,8 @@ fn truncate_line_to_width(line: Line<'static>, width: usize) -> Line<'static> {
         let mut kept = String::new();
         for c in span.content.chars() {
             let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-            if used + cw > width {
+            // Keep combining marks with the preceding base even at the edge.
+            if cw > 0 && used + cw > width {
                 break;
             }
             kept.push(c);
@@ -182,7 +185,10 @@ fn truncate_line_to_width(line: Line<'static>, width: usize) -> Line<'static> {
     if used < width {
         new_spans.push(Span::raw(" ".repeat(width - used)));
     }
-    Line::from(new_spans)
+    let mut out = Line::from(new_spans);
+    out.style = style;
+    out.alignment = alignment;
+    out
 }
 
 /// Apply selection background to a rendered line.
@@ -363,7 +369,8 @@ mod tests {
             ChatBlock::Agent("ok".into()),
         ];
         app.message_rev = 1;
-        app.scroll = 0;
+        // High scroll → oldest lines (wide CJK) fill the viewport first.
+        app.scroll = 40;
 
         let backend = TestBackend::new(40, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -374,7 +381,18 @@ mod tests {
             })
             .unwrap();
 
-        app.scroll = 10;
+        let before: Vec<String> = (0..8)
+            .map(|y| chat_row(terminal.backend().buffer(), y, 40))
+            .collect();
+        assert!(
+            before
+                .iter()
+                .any(|r| r.contains('用') || r.contains('代') || r.contains("PID") || r.contains("CMD")),
+            "first frame should show wide/columnar content: {before:?}"
+        );
+
+        // Back to bottom: short lines must fully replace prior wide cells.
+        app.scroll = 0;
         terminal
             .draw(|f| {
                 let area = Rect::new(0, 0, 40, 8);
@@ -386,8 +404,16 @@ mod tests {
         for y in 0..8 {
             let row = chat_row(buf, y, 40);
             assert_eq!(row.chars().count(), 40, "row {y} must be fully painted: {row:?}");
-            // No raw tab characters should reach the buffer.
             assert!(!row.contains('\t'), "tab leaked on row {y}: {row:?}");
+            if row.trim().chars().count() < 10 {
+                assert!(
+                    !row.contains('用')
+                        && !row.contains('代')
+                        && !row.contains("PID")
+                        && !row.contains("launchd"),
+                    "stale wide/columnar glyphs on row {y}: {row:?}"
+                );
+            }
         }
     }
 }
