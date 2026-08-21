@@ -4950,3 +4950,9 @@ CI assets land.
 UI and LLM tool result (no separate user/LLM split).
 
 **Done:** shortened constant; length assert in unit test; CHANGELOG.
+
+**Public contract:** `pub const PASSWORD_PROMPT_GUIDANCE` text shortened (same
+enrich path); no trait/`CommandExecutor`/`LlmClient` signature changes.
+
+**Next steps:** manual TUI — trigger sudo password failure and confirm short
+hint in command block. Full `docs/SMOKE.md` remains a release gate, not per-issue.
