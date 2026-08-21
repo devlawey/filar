@@ -1028,6 +1028,9 @@ impl App {
 
     /// Confirm the host selection from the overlay: close it and trigger
     /// a delayed connection to the chosen target.
+    ///
+    /// Tears down any interactive PTY for this tab first (#339) so Ctrl+T
+    /// cannot reuse the previous host's shell after the executor swaps.
     fn select_host(&mut self) {
         let idx = self.host_select_index;
         self.host_select_visible = false;
@@ -1042,12 +1045,34 @@ impl App {
             }
         };
         self.target_name = alias;
+        self.tear_down_interactive_on_target_change();
         self.ctrl_o_needs_connect = true;
         if let Some(handle) = self.ctrl_o_handle.take() {
             handle.abort();
         }
         if let Some(tok) = self.ctrl_o_cancel.take() {
             tok.cancel();
+        }
+    }
+
+    /// Drop the active tab's interactive terminal before a host/target switch.
+    ///
+    /// Queues runner teardown of the PTY backend (same as F3 restore) and
+    /// clears the view so a wrong-host scrollback cannot be shown (#339).
+    fn tear_down_interactive_on_target_change(&mut self) {
+        if self.terminal.is_some() {
+            let sid = self.active_session().id;
+            if !self.pending_term_teardown.contains(&sid) {
+                self.pending_term_teardown.push(sid);
+            }
+        }
+        self.terminal = None;
+        self.pending_term_input = None;
+        self.cwd = None;
+        if self.mode == AppMode::Interactive {
+            self.mode = AppMode::Normal;
+            self.selection = None;
+            self.mouse_drag = None;
         }
     }
 
@@ -6731,6 +6756,39 @@ mod tests {
         assert_eq!(app.target_name, "~srv-a");
         assert!(app.ctrl_o_needs_connect, "connect must be triggered");
         assert_eq!(app.ctrl_o_selection, Some(1));
+    }
+
+    #[test]
+    fn host_select_tears_down_interactive_terminal() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![make_ssh_target("srv-a")];
+        let sid = app.sessions[0].id;
+        app.cwd = Some("/old/host/path".into());
+        app.enter_interactive(crate::terminal::TerminalModel::new(80, 24));
+        app.hide_interactive_view(); // PTY kept; model still present
+        assert!(app.terminal.is_some());
+        let _ = app.take_pending_cwd_sync(); // discard hide sync for this assert
+
+        app.open_host_select();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.terminal.is_none(), "old TerminalModel must be cleared (#339)");
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(app.cwd.is_none(), "stale host cwd must clear during switch");
+        assert_eq!(
+            app.take_pending_term_teardown(),
+            vec![sid],
+            "runner must close the old PTY backend"
+        );
+        app.show_interactive_view();
+        assert_eq!(
+            app.mode,
+            AppMode::Normal,
+            "cannot reuse old interactive view without a model"
+        );
+        assert!(app.ctrl_o_needs_connect);
     }
 
     #[test]

@@ -5026,3 +5026,19 @@ same helper on full teardown. Status bar already reads `Session.cwd`.
 
 **Next steps:** human smoke `Ctrl+T` → `cd /tmp` → `Ctrl+T` → status/`!pwd`
 (agent cannot drive interactive PTY).
+
+## Issue #339: fix(tui) — Ctrl+O tears down interactive on host switch
+
+**Milestone:** 1.0.3. **Branch:** `fix/339-ctrl-o-interactive-host`.
+
+**Problem:** Ctrl+O swapped the executor but kept `interactive_backends[SessionId]`
+and `Session.terminal`, so Ctrl+T reuse showed the previous host's PTY.
+
+**Design:** `select_host` → `tear_down_interactive_on_target_change` (queue
+`pending_term_teardown`, clear model/cwd, force Normal) — same pattern as F3.
+
+**Done:** unit test; CHANGELOG; PROGRESS.
+
+**Public contract:** none.
+
+**Next steps:** human smoke Local↔SSH / SSH↔SSH with interactive (agent cannot).
