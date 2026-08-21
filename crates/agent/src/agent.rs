@@ -125,7 +125,7 @@ Rules:
 5. Summarize the results concisely after each command.
 6. When the task is complete, provide a clear final answer in the user's language.
 7. If you need information from the user (e.g. a password, a choice between options), ask them directly in your text response — do not try to use interactive prompts in commands. Wait for their reply before continuing.
-8. Never put passwords or secrets directly in commands. If a password is needed, ask the user to provide it. The user can press Ctrl+P to enter the password in a secure masked input field. The password will be stored as a secret variable (e.g. $FILAR_SECRET_1) and you will be told the variable name. Use this variable directly in your commands (e.g. echo "user:$FILAR_SECRET_1" | chpasswd). The actual value is substituted at execution time — you never see the real password. Do not try to echo or print secret variables.
+8. Never put passwords or secrets directly in commands. If a password is needed, ask the user to provide it via Ctrl+P (secure masked input). The password is stored as $FILAR_SECRET_N and you are told the variable name — use that placeholder in commands (substituted at execution; you never see the real value). Do not echo or print secret variables. Never run bare `sudo`/`su`/`doas` that would prompt on a TTY — agent commands have no interactive password UI. After the user provides a secret, use a non-interactive form such as `printf '%s\n' "$FILAR_SECRET_1" | sudo -S <command>` (POSIX) or an equivalent that reads the password from stdin.
 9. NEVER run interactive commands (vim, nano, top, htop, less, man, mc, screen, tmux, ssh, etc.). These commands take over the terminal and will hang indefinitely. Instead, use non-interactive alternatives: 'cat file' instead of 'less file', 'grep -n pattern file' instead of 'vim file', 'head -n 50 file' to preview. For editing files, use 'sed' or 'tee' with heredocs.
 10. NEVER use long wall-clock waits (`sleep N`, `Start-Sleep`, etc.) to poll progress. Every tool command shares a hard timeout (`[timeouts].command_secs`). A `sleep` near or above that timeout will fail. For downloads, pulls, builds, or other long jobs: start them in the background and poll with short commands (POSIX: `nohup … > /tmp/job.log 2>&1 & echo $!` then `tail`/`ps`; Windows: `Start-Process` / background jobs, then check the log). For live interactive progress, ask the user to use Ctrl+T (interactive terminal) instead of blocking the agent tool call.
 {shell_desc}"#
@@ -647,11 +647,12 @@ impl Agent {
                 Ok(Err(e)) => {
                     warn!(command = %parsed.command, error = %e, "tool execution failed");
                     let detail = e.to_string();
-                    let output = if detail.to_ascii_lowercase().contains("timed out") {
+                    let mut output = if detail.to_ascii_lowercase().contains("timed out") {
                         crate::long_wait::enrich_timeout_message(&format!("Error: {detail}"))
                     } else {
                         format!("Error: {detail}")
                     };
+                    output = crate::password_prompt::enrich_password_prompt_message(&output);
                     self.emit(AgentEvent::CommandFinished {
                         command: parsed.command.clone(),
                         output: output.clone(),
@@ -681,11 +682,12 @@ impl Agent {
                 Err(e) => {
                     warn!(command = %parsed.command, error = %e, "tool execution failed");
                     let detail = e.to_string();
-                    let output = if detail.to_ascii_lowercase().contains("timed out") {
+                    let mut output = if detail.to_ascii_lowercase().contains("timed out") {
                         crate::long_wait::enrich_timeout_message(&format!("Error: {detail}"))
                     } else {
                         format!("Error: {detail}")
                     };
+                    output = crate::password_prompt::enrich_password_prompt_message(&output);
                     self.emit(AgentEvent::CommandFinished {
                         command: parsed.command.clone(),
                         output: output.clone(),
@@ -696,8 +698,9 @@ impl Agent {
             }
         };
 
-        // Truncate output if too long.
-        let truncated = self.truncate_output(&output);
+        // Truncate output if too long; enrich password/TTY failures for the LLM.
+        let enriched = crate::password_prompt::enrich_password_prompt_message(&output);
+        let truncated = self.truncate_output(&enriched);
 
         self.emit(AgentEvent::CommandFinished {
             command: parsed.command.clone(),

@@ -30,6 +30,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Chat scroll fully repaints the viewport (cell reset + width padding) so
   shorter lines no longer leave glyph artifacts from previous frames
   ([#325](https://github.com/devlawey/filar/issues/325)).
+- Allowlist never auto-approves `sudo`/`su`/`doas` or write-form `sysctl`;
+  Unix local agent children `setsid` so password prompts cannot overwrite the
+  TUI; agent steers to Ctrl+P / `$FILAR_SECRET_N` + `sudo -S`
+  ([#329](https://github.com/devlawey/filar/issues/329)).
 
 ## [1.0.1] - 2026-08-19
 

@@ -8,6 +8,11 @@
 //! in a fresh process. Working directory can persist via [`LocalExecutor::set_cwd`]
 //! (interactive ↔ agent sync). The system prompt still warns that `cd` inside
 //! a command does not stick.
+//!
+//! On Unix, agent children are started in a new session (`setsid`) so they
+//! lose the controlling TTY. That prevents tools like `sudo` from painting
+//! `Password:` over the filar TUI (#329). Interactive Ctrl+T PTY is separate
+//! and is not affected.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -65,6 +70,29 @@ impl LocalExecutor {
     }
 }
 
+/// Detach the child from the parent's controlling terminal (Unix).
+///
+/// If `setsid` fails, `pre_exec` returns an error and the command is not
+/// started — running without TTY isolation would again allow password prompts
+/// to overwrite the TUI (#329).
+#[cfg(unix)]
+fn detach_from_controlling_tty(cmd: &mut tokio::process::Command) {
+    // SAFETY: pre_exec runs in the child after fork, before exec. Only
+    // async-signal-safe calls are allowed; setsid(2) is async-signal-safe.
+    // `tokio::process::Command::pre_exec` wraps std's CommandExt.
+    unsafe {
+        cmd.pre_exec(|| {
+            extern "C" {
+                fn setsid() -> i32;
+            }
+            if setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::CommandExecutor for LocalExecutor {
     async fn run(&self, command: &str) -> Result<CommandResult> {
@@ -90,6 +118,8 @@ impl crate::CommandExecutor for LocalExecutor {
         cmd.stderr(std::process::Stdio::piped());
         // Kill the child process if the future is dropped (cancel/timeout).
         cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        detach_from_controlling_tty(&mut cmd);
         if let Ok(guard) = self.cwd.lock() {
             if let Some(ref dir) = *guard {
                 cmd.current_dir(dir);
@@ -260,5 +290,25 @@ mod tests {
     async fn set_cwd_rejects_newline() {
         let exec = LocalExecutor::new().await.unwrap();
         assert!(exec.set_cwd("/tmp\n/etc").await.is_err());
+    }
+
+    /// Agent local commands must not keep a controlling TTY (#329).
+    ///
+    /// After `setsid`, `ps -o tty=` for this process reports `??` / blank /
+    /// `?` rather than a real tty name like `ttys001`.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn unix_agent_child_has_no_controlling_tty() {
+        let exec = LocalExecutor::with_timeout(Duration::from_secs(10))
+            .await
+            .unwrap();
+        let result = exec.run("ps -o tty= -p $$").await.unwrap();
+        let tty = result.stdout.trim();
+        assert!(
+            tty.is_empty() || tty == "?" || tty == "??" || tty == "-",
+            "expected no controlling tty for agent child, got {tty:?} (stdout={:?} stderr={:?})",
+            result.stdout,
+            result.stderr
+        );
     }
 }

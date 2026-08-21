@@ -187,6 +187,138 @@ const WRITE_PATTERNS: &[&str] = &[
     "ip link set",
 ];
 
+/// Basename of a path-like token (`/usr/bin/sudo` → `sudo`).
+fn cmd_basename(tok: &str) -> &str {
+    tok.rsplit('/').next().unwrap_or(tok)
+}
+
+/// Whether `flag` (possibly `--opt=value`) is one of `names` (e.g. `-u`, `--unset`).
+fn flag_matches(flag: &str, names: &[&str]) -> bool {
+    let head = flag.split('=').next().unwrap_or(flag);
+    names.iter().any(|n| head == *n)
+}
+
+/// Skip leading wrapper flags; for flags that take a separate argument, skip
+/// that argument too. Tokens with `=` already embed their value.
+fn skip_wrapper_flags(words: &[&str], mut i: usize, flags_with_arg: &[&str]) -> usize {
+    while i < words.len() && words[i].starts_with('-') {
+        let flag = words[i];
+        let embedded_value = flag.contains('=');
+        let needs_arg = !embedded_value && flag_matches(flag, flags_with_arg);
+        i += 1;
+        if needs_arg && i < words.len() {
+            i += 1;
+        }
+    }
+    i
+}
+
+/// Privilege elevators that may prompt for a password and must never be
+/// treated as read-only (Allowlist auto-approve). See #329.
+///
+/// Recognises bare names, path-qualified binaries (`/usr/bin/sudo`), and
+/// common wrappers (`env`, `command`, `nice`, `nohup`, `time`, `timeout`, …)
+/// so `env sudo ls` / `env -u FOO sudo ls` cannot sneak through Allowlist.
+fn is_privilege_elevator(sub: &str) -> bool {
+    // `env` flags that take a following argument (GNU / BSD common set).
+    const ENV_FLAGS_WITH_ARG: &[&str] = &[
+        "-u",
+        "--unset",
+        "-C",
+        "--chdir",
+        "-P",
+        "-S",
+        "--split-string",
+    ];
+    // `timeout` flags that take a following argument.
+    const TIMEOUT_FLAGS_WITH_ARG: &[&str] =
+        &["-k", "--kill-after", "-s", "--signal"];
+    // `stdbuf` / `nice` / `ionice` value-taking short options (best-effort).
+    const STDBUF_FLAGS_WITH_ARG: &[&str] = &["-i", "-o", "-e"];
+    const NICE_FLAGS_WITH_ARG: &[&str] = &["-n", "--adjustment"];
+    const IONICE_FLAGS_WITH_ARG: &[&str] = &["-c", "-n", "-p"];
+
+    let words: Vec<&str> = sub.trim_start().split_whitespace().collect();
+    let mut i = 0;
+    while i < words.len() {
+        let base = cmd_basename(words[i]);
+        match base {
+            "sudo" | "doas" | "su" => return true,
+            "env" => {
+                i += 1;
+                i = skip_wrapper_flags(&words, i, ENV_FLAGS_WITH_ARG);
+                // Skip KEY=VAL assignments.
+                while i < words.len() {
+                    let t = words[i];
+                    if t.contains('=') && !t.starts_with('/') && !t.starts_with('-') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "command" | "nohup" | "time" => {
+                i += 1;
+                // These wrappers' common flags do not take separate args.
+                while i < words.len() && words[i].starts_with('-') {
+                    i += 1;
+                }
+            }
+            "nice" => {
+                i += 1;
+                i = skip_wrapper_flags(&words, i, NICE_FLAGS_WITH_ARG);
+            }
+            "ionice" => {
+                i += 1;
+                i = skip_wrapper_flags(&words, i, IONICE_FLAGS_WITH_ARG);
+            }
+            "timeout" => {
+                i += 1;
+                i = skip_wrapper_flags(&words, i, TIMEOUT_FLAGS_WITH_ARG);
+                // Duration before the command.
+                if i < words.len()
+                    && words[i]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit())
+                {
+                    i += 1;
+                }
+            }
+            "stdbuf" => {
+                i += 1;
+                i = skip_wrapper_flags(&words, i, STDBUF_FLAGS_WITH_ARG);
+            }
+            // First real command is not a privilege elevator.
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Detect `sysctl` forms that **write** a kernel parameter.
+///
+/// Read examples (not write): `sysctl hw.memsize`, `sysctl -n hw.ncpu`, `sysctl -a`.
+/// Write examples: `sysctl -w key=value`, `sysctl key=value`.
+fn is_sysctl_write(sub: &str) -> bool {
+    let s = sub.trim_start();
+    if s != "sysctl" && !s.starts_with("sysctl ") {
+        return false;
+    }
+    let rest = s.strip_prefix("sysctl").unwrap_or("").trim_start();
+    for token in rest.split_whitespace() {
+        if token == "-w" || token.starts_with("-w") {
+            return true;
+        }
+        if token.starts_with('-') {
+            continue;
+        }
+        // First non-flag argument: `key=value` is a write; bare `key` is a read.
+        return token.contains('=');
+    }
+    false
+}
+
 /// Check whether a command modifies the system (writes, deletes, installs, etc.).
 pub fn is_write_command(command: &str) -> bool {
     let lower = command.to_lowercase();
@@ -214,8 +346,14 @@ pub fn is_write_command(command: &str) -> bool {
         .filter(|s| !s.is_empty());
 
     for sub in sub_commands {
-        // Remove leading "sudo " if present.
-        let sub = sub.strip_prefix("sudo ").unwrap_or(sub);
+        // Any sudo/doas/su segment needs confirmation — never Allowlist auto-approve (#329).
+        if is_privilege_elevator(sub) {
+            return true;
+        }
+
+        if is_sysctl_write(sub) {
+            return true;
+        }
 
         for pattern in WRITE_PATTERNS {
             // Match if the sub-command starts with the pattern.
@@ -445,6 +583,98 @@ mod tests {
         assert!(!is_readonly("mkdir /tmp/newdir"));
         assert!(!is_readonly("systemctl restart nginx"));
         assert!(!is_readonly("apt install htop"));
+    }
+
+    #[test]
+    fn sudo_and_privilege_elevators_are_never_readonly() {
+        assert!(!is_readonly("sudo sysctl iogpu.wired_limit_mb=114688 2>&1"));
+        assert!(!is_readonly("sudo ls /root"));
+        assert!(!is_readonly("sudo -n true"));
+        assert!(!is_readonly("doas pkg install foo"));
+        assert!(!is_readonly("su -"));
+        assert!(!is_readonly("su root -c id"));
+        // Wrappers / path-qualified forms must not bypass Allowlist (#329 review).
+        assert!(!is_readonly("env sudo ls /root"));
+        assert!(!is_readonly("env FOO=1 sudo -n true"));
+        assert!(!is_readonly("command sudo ls /root"));
+        assert!(!is_readonly("/usr/bin/sudo ls /root"));
+        assert!(!is_readonly("/usr/bin/env sudo id"));
+        assert!(!is_readonly("nice sudo ls"));
+        assert!(!is_readonly("nohup sudo ls"));
+        assert!(!is_readonly("timeout 5 sudo ls"));
+        // Flags that take an argument must not eat the elevator (#330 review).
+        assert!(!is_readonly("env -u FOO sudo ls /root"));
+        assert!(!is_readonly("env --unset FOO sudo id"));
+        assert!(!is_readonly("env -i -u PATH sudo -n true"));
+        // Boolean / unknown wrapper flags are still skipped by skip_wrapper_flags
+        // (anything starting with '-'), so these must keep detecting sudo.
+        assert!(!is_readonly("env -i sudo ls"));
+        assert!(!is_readonly("nice -v sudo ls"));
+        assert!(!is_readonly("timeout -v 5 sudo ls"));
+        assert!(!is_readonly("stdbuf -oL sudo ls"));
+        assert!(!is_readonly("timeout -k 5s 10s sudo ls"));
+        assert!(!is_readonly("timeout --kill-after=5s 10 sudo id"));
+        assert!(!is_readonly("nice -n 10 sudo ls"));
+        // `sort` / bare mention of the word is not an elevator.
+        assert!(is_readonly("sort /tmp/a"));
+        assert!(is_readonly("echo sudo"));
+        assert_eq!(
+            check_command(
+                "sudo sysctl iogpu.wired_limit_mb=114688 2>&1",
+                CommandConfirmMode::Allowlist
+            ),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            check_command("sudo ls /tmp", CommandConfirmMode::Allowlist),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            check_command("env sudo ls /root", CommandConfirmMode::Allowlist),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            check_command("/usr/bin/sudo id", CommandConfirmMode::Allowlist),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            check_command("env -u FOO sudo ls", CommandConfirmMode::Allowlist),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            check_command("env -i sudo ls", CommandConfirmMode::Allowlist),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            check_command("timeout -k 5s 10s sudo ls", CommandConfirmMode::Allowlist),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            check_command("timeout -v 5 sudo ls", CommandConfirmMode::Allowlist),
+            ConfirmDecision::NeedsConfirmation
+        );
+    }
+
+    #[test]
+    fn sysctl_write_vs_read() {
+        // Writes
+        assert!(!is_readonly("sysctl iogpu.wired_limit_mb=114688"));
+        assert!(!is_readonly("sysctl -w kern.maxfiles=65536"));
+        assert_eq!(
+            check_command(
+                "sysctl iogpu.wired_limit_mb=114688",
+                CommandConfirmMode::Allowlist
+            ),
+            ConfirmDecision::NeedsConfirmation
+        );
+        // Reads stay allowlisted
+        assert!(is_readonly("sysctl hw.memsize"));
+        assert!(is_readonly("sysctl -n hw.ncpu"));
+        assert!(is_readonly("sysctl -a"));
+        assert_eq!(
+            check_command("sysctl -n hw.memsize", CommandConfirmMode::Allowlist),
+            ConfirmDecision::AutoApproved
+        );
     }
 
     #[test]
