@@ -606,6 +606,12 @@ mod tests {
         assert!(!is_readonly("env -u FOO sudo ls /root"));
         assert!(!is_readonly("env --unset FOO sudo id"));
         assert!(!is_readonly("env -i -u PATH sudo -n true"));
+        // Boolean / unknown wrapper flags are still skipped by skip_wrapper_flags
+        // (anything starting with '-'), so these must keep detecting sudo.
+        assert!(!is_readonly("env -i sudo ls"));
+        assert!(!is_readonly("nice -v sudo ls"));
+        assert!(!is_readonly("timeout -v 5 sudo ls"));
+        assert!(!is_readonly("stdbuf -oL sudo ls"));
         assert!(!is_readonly("timeout -k 5s 10s sudo ls"));
         assert!(!is_readonly("timeout --kill-after=5s 10 sudo id"));
         assert!(!is_readonly("nice -n 10 sudo ls"));
@@ -636,7 +642,15 @@ mod tests {
             ConfirmDecision::NeedsConfirmation
         );
         assert_eq!(
+            check_command("env -i sudo ls", CommandConfirmMode::Allowlist),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
             check_command("timeout -k 5s 10s sudo ls", CommandConfirmMode::Allowlist),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            check_command("timeout -v 5 sudo ls", CommandConfirmMode::Allowlist),
             ConfirmDecision::NeedsConfirmation
         );
     }
