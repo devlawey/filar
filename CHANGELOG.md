@@ -28,6 +28,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Shell (`!`) input prompt no longer double-spaces `$`, so the cursor sits
   after the last character instead of on it
   ([#337](https://github.com/devlawey/filar/issues/337)).
+- Ctrl+T hide refreshes tab cwd via OSC 7 probe and `set_cwd` (status bar +
+  agent) without tearing down the PTY; stale enter-time cwd no longer skips
+  the probe ([#338](https://github.com/devlawey/filar/issues/338)).
 
 ## [1.0.2] - 2026-08-21
 

@@ -91,7 +91,7 @@ fn route_term_chunk(app: &mut App, sid: SessionId, chunk: TermChunk) -> RouteOut
     }
 }
 
-/// Drain PTY output until `session.cwd` is set or `timeout` elapses.
+/// Drain PTY output until `session.cwd` is set (fresh after clear) or timeout.
 async fn drain_pty_cwd(
     app: &mut App,
     sid: SessionId,
@@ -117,6 +117,59 @@ async fn drain_pty_cwd(
                 }
             }
             _ => return,
+        }
+    }
+}
+
+/// Probe OSC 7 on a live interactive PTY, update `session.cwd`, and `set_cwd`
+/// on the agent executor. Does not close the backend (#338).
+///
+/// Always probes on Unix/SSH so a stale `session.cwd` from enter-time does not
+/// skip refresh. Restores the previous cwd if the probe times out.
+async fn sync_cwd_from_interactive(
+    app: &mut App,
+    sid: SessionId,
+    term: &Arc<dyn InteractiveTerminal>,
+    executors: &HashMap<SessionId, ExecutorEntry>,
+    term_rx: &mut Option<mpsc::UnboundedReceiver<(SessionId, TermChunk)>>,
+) {
+    let is_ssh = match executors.get(&sid) {
+        Some(e) => e.ssh_target.read().await.is_some(),
+        None => false,
+    };
+    let prev = app
+        .sessions
+        .iter()
+        .find(|s| s.id == sid)
+        .and_then(|s| s.cwd.clone());
+    if is_ssh || cfg!(unix) {
+        if let Some(idx) = app.find_session_idx(sid) {
+            app.sessions[idx].cwd = None;
+        }
+        let _ = term.write_input(OSC7_PWD_PROBE).await;
+        drain_pty_cwd(app, sid, term_rx, Duration::from_millis(400)).await;
+        let still_empty = app
+            .sessions
+            .iter()
+            .find(|s| s.id == sid)
+            .and_then(|s| s.cwd.as_ref())
+            .is_none();
+        if still_empty {
+            if let Some(idx) = app.find_session_idx(sid) {
+                app.sessions[idx].cwd = prev;
+            }
+        }
+    }
+    if let Some(cwd) = app
+        .sessions
+        .iter()
+        .find(|s| s.id == sid)
+        .and_then(|s| s.cwd.clone())
+    {
+        if let Some(entry) = executors.get(&sid) {
+            if let Err(e) = entry.executor.set_cwd(&cwd).await {
+                warn!(error = %e, "failed to sync executor cwd");
+            }
         }
     }
 }
@@ -674,38 +727,14 @@ async fn run_app(
                         // Exit interactive: capture PTY cwd, apply it to the
                         // agent executor, then close the backend.
                         if let Some((term, handle)) = interactive_backends.remove(&toggle_sid) {
-                            let is_ssh = match executors.get(&toggle_sid) {
-                                Some(e) => e.ssh_target.read().await.is_some(),
-                                None => false,
-                            };
-                            let cwd_known = app
-                                .sessions
-                                .iter()
-                                .find(|s| s.id == toggle_sid)
-                                .and_then(|s| s.cwd.as_ref())
-                                .is_some();
-                            if !cwd_known && (is_ssh || cfg!(unix)) {
-                                let _ = term.write_input(OSC7_PWD_PROBE).await;
-                                drain_pty_cwd(
-                                    &mut app,
-                                    toggle_sid,
-                                    &mut term_rx_opt,
-                                    Duration::from_millis(400),
-                                )
-                                .await;
-                            }
-                            if let Some(cwd) = app
-                                .sessions
-                                .iter()
-                                .find(|s| s.id == toggle_sid)
-                                .and_then(|s| s.cwd.clone())
-                            {
-                                if let Some(entry) = executors.get(&toggle_sid) {
-                                    if let Err(e) = entry.executor.set_cwd(&cwd).await {
-                                        warn!(error = %e, "failed to sync executor cwd");
-                                    }
-                                }
-                            }
+                            sync_cwd_from_interactive(
+                                &mut app,
+                                toggle_sid,
+                                &term,
+                                &executors,
+                                &mut term_rx_opt,
+                            )
+                            .await;
                             let _ = term.close().await;
                             handle.abort();
                         }
@@ -1180,6 +1209,23 @@ async fn run_app(
             if let Some((term, handle)) = interactive_backends.remove(&sid) {
                 let _ = term.close().await;
                 handle.abort();
+            }
+        }
+
+        // Ctrl+T hide: refresh session.cwd + agent executor from the live PTY
+        // without tearing it down (#338).
+        for sid in app.take_pending_cwd_sync() {
+            if let Some((term, _)) = interactive_backends.get(&sid) {
+                let term = term.clone();
+                sync_cwd_from_interactive(
+                    &mut app,
+                    sid,
+                    &term,
+                    &executors,
+                    &mut term_rx_opt,
+                )
+                .await;
+                needs_redraw = true;
             }
         }
 
