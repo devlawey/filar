@@ -72,7 +72,9 @@ impl LocalExecutor {
 
 /// Detach the child from the parent's controlling terminal (Unix).
 ///
-/// Best-effort: failure of `setsid` is ignored so the command still runs.
+/// If `setsid` fails, `pre_exec` returns an error and the command is not
+/// started — running without TTY isolation would again allow password prompts
+/// to overwrite the TUI (#329).
 #[cfg(unix)]
 fn detach_from_controlling_tty(cmd: &mut tokio::process::Command) {
     // SAFETY: pre_exec runs in the child after fork, before exec. Only
@@ -83,7 +85,9 @@ fn detach_from_controlling_tty(cmd: &mut tokio::process::Command) {
             extern "C" {
                 fn setsid() -> i32;
             }
-            let _ = setsid();
+            if setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }

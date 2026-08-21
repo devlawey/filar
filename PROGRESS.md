@@ -4916,13 +4916,15 @@ TTY → macOS `sudo` painted `Password:` over Thinking; no PasswordInput.
 
 **Design:**
 - A: `sudo`/`su`/`doas` always write (NeedsConfirmation in Allowlist); detect
-  `sysctl key=value` / `-w` writes; reads stay allowlisted.
+  `sysctl key=value` / `-w` writes; reads stay allowlisted. Wrappers
+  (`env`/`command`/…) and path-qualified binaries also detected (review #330).
 - B: system prompt rule 8 + enrich tool output on password/TTY failure →
   Ctrl+P / `$FILAR_SECRET_N` + `sudo -S` (existing secret substitution).
-- C: Unix `LocalExecutor` `setsid` in `pre_exec` (interactive PTY unchanged).
+- C: Unix `LocalExecutor` `setsid` in `pre_exec` (fail if `setsid` fails;
+  interactive PTY unchanged).
 
 **Done:** security tests; `password_prompt` module; eval prompt sync;
-PLATFORM_NOTES; CHANGELOG.
+PLATFORM_NOTES; CHANGELOG. Review round: wrapped elevators + strict setsid.
 
 **Not in scope:** cancel-hotkey hint text; remote SSH `setsid` (channel already
 PTY — rely on confirm + prompt + secrets).

@@ -187,17 +187,68 @@ const WRITE_PATTERNS: &[&str] = &[
     "ip link set",
 ];
 
+/// Basename of a path-like token (`/usr/bin/sudo` → `sudo`).
+fn cmd_basename(tok: &str) -> &str {
+    tok.rsplit('/').next().unwrap_or(tok)
+}
+
 /// Privilege elevators that may prompt for a password and must never be
 /// treated as read-only (Allowlist auto-approve). See #329.
+///
+/// Recognises bare names, path-qualified binaries (`/usr/bin/sudo`), and
+/// common wrappers (`env`, `command`, `nice`, `nohup`, `time`, `timeout`, …)
+/// so `env sudo ls` cannot sneak through Allowlist.
 fn is_privilege_elevator(sub: &str) -> bool {
-    let s = sub.trim_start();
-    s == "sudo"
-        || s.starts_with("sudo ")
-        || s == "doas"
-        || s.starts_with("doas ")
-        // `su` alone / `su -` / `su user` — not `sort`, `sudo`, etc.
-        || s == "su"
-        || s.starts_with("su ")
+    let words: Vec<&str> = sub.trim_start().split_whitespace().collect();
+    let mut i = 0;
+    while i < words.len() {
+        let base = cmd_basename(words[i]);
+        match base {
+            "sudo" | "doas" | "su" => return true,
+            "env" => {
+                i += 1;
+                // Skip env flags and KEY=VAL assignments.
+                while i < words.len() {
+                    let t = words[i];
+                    if t.starts_with('-') || (t.contains('=') && !t.starts_with('/')) {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "command" | "nice" | "nohup" | "time" | "ionice" => {
+                i += 1;
+                while i < words.len() && words[i].starts_with('-') {
+                    i += 1;
+                }
+            }
+            "timeout" => {
+                i += 1;
+                while i < words.len() && words[i].starts_with('-') {
+                    i += 1;
+                }
+                // Optional duration argument.
+                if i < words.len()
+                    && words[i]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit())
+                {
+                    i += 1;
+                }
+            }
+            "stdbuf" => {
+                i += 1;
+                while i < words.len() && words[i].starts_with('-') {
+                    i += 1;
+                }
+            }
+            // First real command is not a privilege elevator.
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Detect `sysctl` forms that **write** a kernel parameter.
@@ -497,8 +548,18 @@ mod tests {
         assert!(!is_readonly("doas pkg install foo"));
         assert!(!is_readonly("su -"));
         assert!(!is_readonly("su root -c id"));
-        // `sort` / `sudo` substring false friends
+        // Wrappers / path-qualified forms must not bypass Allowlist (#329 review).
+        assert!(!is_readonly("env sudo ls /root"));
+        assert!(!is_readonly("env FOO=1 sudo -n true"));
+        assert!(!is_readonly("command sudo ls /root"));
+        assert!(!is_readonly("/usr/bin/sudo ls /root"));
+        assert!(!is_readonly("/usr/bin/env sudo id"));
+        assert!(!is_readonly("nice sudo ls"));
+        assert!(!is_readonly("nohup sudo ls"));
+        assert!(!is_readonly("timeout 5 sudo ls"));
+        // `sort` / bare mention of the word is not an elevator.
         assert!(is_readonly("sort /tmp/a"));
+        assert!(is_readonly("echo sudo"));
         assert_eq!(
             check_command(
                 "sudo sysctl iogpu.wired_limit_mb=114688 2>&1",
@@ -508,6 +569,14 @@ mod tests {
         );
         assert_eq!(
             check_command("sudo ls /tmp", CommandConfirmMode::Allowlist),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            check_command("env sudo ls /root", CommandConfirmMode::Allowlist),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            check_command("/usr/bin/sudo id", CommandConfirmMode::Allowlist),
             ConfirmDecision::NeedsConfirmation
         );
     }
