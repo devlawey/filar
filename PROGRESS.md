@@ -4955,4 +4955,5 @@ UI and LLM tool result (no separate user/LLM split).
 enrich path); no trait/`CommandExecutor`/`LlmClient` signature changes.
 
 **Next steps:** manual TUI — trigger sudo password failure and confirm short
-hint in command block. Full `docs/SMOKE.md` remains a release gate, not per-issue.
+hint in command block (not runnable in this agent CI/agent shell; left for
+human DoD). Full `docs/SMOKE.md` remains a release gate, not per-issue.
