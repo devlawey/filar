@@ -4929,3 +4929,15 @@ wrapper flags with args (`env -u`, `timeout -k`) (#330).
 
 **Not in scope:** cancel-hotkey hint text; remote SSH `setsid` (channel already
 PTY — rely on confirm + prompt + secrets).
+
+## Release v1.0.2 (2026-08-21)
+
+**Platforms:** Windows + macOS (`all`). Engine tag: `engine-v1.0.2` (agent /
+transport / core changed: #320, #323, #329).
+
+**Includes:** keyless local LLM profiles (#320); long-wait policy (#323);
+confirm modal OOB fix (#324); chat scroll glyphs (#325); sudo/password TTY
+gate (#329). #322 closed not_planned (manual config edit).
+
+**Smoke:** dual-platform checklist in `docs/SMOKE.md` (#298) — manual after
+CI assets land.
