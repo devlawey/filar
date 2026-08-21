@@ -5000,6 +5000,7 @@ mod tests {
         assert!(app.input.is_empty());
         app.execute_help_action(HelpAction::Shell);
         assert_eq!(app.input, "!");
+        assert_eq!(app.cursor_pos, 1, "cursor must sit past '!' (#337)");
     }
 
     #[test]

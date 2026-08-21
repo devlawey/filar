@@ -31,11 +31,14 @@ pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
 fn render_normal_input(f: &mut Frame, app: &mut App, area: Rect) {
     let glyphs = app.theme.glyphs();
 
-    // Shell-escape: input starts with `!` -> prompt `$ ` in warning.
+    // Shell-escape: input starts with `!` -> `$` prompt in warning.
+    // Prompt glyph is a single char (like `❯` / `>`); the trailing space is
+    // added once via `format!("{prompt} ")` so display width stays 2 and
+    // matches `place_cursor` / click mapping (#337).
     let is_shell = app.input.starts_with('!');
 
     let (prompt, prompt_style, text_style) = if is_shell {
-        ("$ ", app.theme.warning_fg(), app.theme.warning_fg())
+        ("$", app.theme.warning_fg(), app.theme.warning_fg())
     } else {
         (glyphs.prompt, app.theme.user_style(), app.theme.fg_style())
     };
@@ -155,4 +158,63 @@ fn place_cursor(f: &mut Frame, app: &App, area: Rect, prompt_width: u16, scroll_
     let cursor_x = area.x + prompt_width + cursor_col;
     let cursor_y = area.y + cursor_row.min(area.height.saturating_sub(1));
     f.set_cursor_position((cursor_x, cursor_y));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use filar_core::CommandConfirmMode;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn draw_input(app: &mut App, width: u16, height: u16) -> Result<(u16, u16), String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal =
+            Terminal::new(backend).map_err(|e| format!("TestBackend terminal: {e}"))?;
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, width, height);
+                render_input_area(f, app, area);
+            })
+            .map_err(|e| format!("draw input: {e}"))?;
+        let pos = terminal
+            .get_cursor_position()
+            .map_err(|e| format!("cursor position: {e}"))?;
+        Ok((pos.x, pos.y))
+    }
+
+    #[test]
+    fn shell_bang_places_cursor_after_prefix() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('!'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.input, "!");
+        assert_eq!(app.cursor_pos, 1, "cursor must be past '!'");
+        // Prompt "$ " (2 cols) + bang at col 2 → cursor after bang at col 3.
+        let (x, y) = draw_input(&mut app, 40, 3).expect("draw shell bang");
+        assert_eq!(y, 0);
+        assert_eq!(x, 3, "cursor after '$ !', got col {x}");
+    }
+
+    #[test]
+    fn shell_command_places_cursor_after_last_char() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.input = "!pwd".into();
+        app.cursor_pos = 4;
+        // "$ " + "!pwd" → cursor after 'd' at column 2+4=6.
+        let (x, _) = draw_input(&mut app, 40, 3).expect("draw !pwd");
+        assert_eq!(x, 6);
+    }
+
+    #[test]
+    fn normal_input_cursor_still_after_last_char() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.input = "hi".into();
+        app.cursor_pos = 2;
+        // Prompt glyph + space (2) + "hi" → cursor at col 4.
+        let (x, _) = draw_input(&mut app, 40, 3).expect("draw normal input");
+        assert_eq!(x, 4);
+    }
 }
