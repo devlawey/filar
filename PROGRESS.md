@@ -4924,7 +4924,8 @@ TTY → macOS `sudo` painted `Password:` over Thinking; no PasswordInput.
   interactive PTY unchanged).
 
 **Done:** security tests; `password_prompt` module; eval prompt sync;
-PLATFORM_NOTES; CHANGELOG. Review round: wrapped elevators + strict setsid.
+PLATFORM_NOTES; CHANGELOG. Review round: wrapped elevators + strict setsid;
+wrapper flags with args (`env -u`, `timeout -k`) (#330).
 
 **Not in scope:** cancel-hotkey hint text; remote SSH `setsid` (channel already
 PTY — rely on confirm + prompt + secrets).

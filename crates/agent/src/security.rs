@@ -192,13 +192,52 @@ fn cmd_basename(tok: &str) -> &str {
     tok.rsplit('/').next().unwrap_or(tok)
 }
 
+/// Whether `flag` (possibly `--opt=value`) is one of `names` (e.g. `-u`, `--unset`).
+fn flag_matches(flag: &str, names: &[&str]) -> bool {
+    let head = flag.split('=').next().unwrap_or(flag);
+    names.iter().any(|n| head == *n)
+}
+
+/// Skip leading wrapper flags; for flags that take a separate argument, skip
+/// that argument too. Tokens with `=` already embed their value.
+fn skip_wrapper_flags(words: &[&str], mut i: usize, flags_with_arg: &[&str]) -> usize {
+    while i < words.len() && words[i].starts_with('-') {
+        let flag = words[i];
+        let embedded_value = flag.contains('=');
+        let needs_arg = !embedded_value && flag_matches(flag, flags_with_arg);
+        i += 1;
+        if needs_arg && i < words.len() {
+            i += 1;
+        }
+    }
+    i
+}
+
 /// Privilege elevators that may prompt for a password and must never be
 /// treated as read-only (Allowlist auto-approve). See #329.
 ///
 /// Recognises bare names, path-qualified binaries (`/usr/bin/sudo`), and
 /// common wrappers (`env`, `command`, `nice`, `nohup`, `time`, `timeout`, …)
-/// so `env sudo ls` cannot sneak through Allowlist.
+/// so `env sudo ls` / `env -u FOO sudo ls` cannot sneak through Allowlist.
 fn is_privilege_elevator(sub: &str) -> bool {
+    // `env` flags that take a following argument (GNU / BSD common set).
+    const ENV_FLAGS_WITH_ARG: &[&str] = &[
+        "-u",
+        "--unset",
+        "-C",
+        "--chdir",
+        "-P",
+        "-S",
+        "--split-string",
+    ];
+    // `timeout` flags that take a following argument.
+    const TIMEOUT_FLAGS_WITH_ARG: &[&str] =
+        &["-k", "--kill-after", "-s", "--signal"];
+    // `stdbuf` / `nice` / `ionice` value-taking short options (best-effort).
+    const STDBUF_FLAGS_WITH_ARG: &[&str] = &["-i", "-o", "-e"];
+    const NICE_FLAGS_WITH_ARG: &[&str] = &["-n", "--adjustment"];
+    const IONICE_FLAGS_WITH_ARG: &[&str] = &["-c", "-n", "-p"];
+
     let words: Vec<&str> = sub.trim_start().split_whitespace().collect();
     let mut i = 0;
     while i < words.len() {
@@ -207,28 +246,36 @@ fn is_privilege_elevator(sub: &str) -> bool {
             "sudo" | "doas" | "su" => return true,
             "env" => {
                 i += 1;
-                // Skip env flags and KEY=VAL assignments.
+                i = skip_wrapper_flags(&words, i, ENV_FLAGS_WITH_ARG);
+                // Skip KEY=VAL assignments.
                 while i < words.len() {
                     let t = words[i];
-                    if t.starts_with('-') || (t.contains('=') && !t.starts_with('/')) {
+                    if t.contains('=') && !t.starts_with('/') && !t.starts_with('-') {
                         i += 1;
                     } else {
                         break;
                     }
                 }
             }
-            "command" | "nice" | "nohup" | "time" | "ionice" => {
+            "command" | "nohup" | "time" => {
                 i += 1;
+                // These wrappers' common flags do not take separate args.
                 while i < words.len() && words[i].starts_with('-') {
                     i += 1;
                 }
             }
+            "nice" => {
+                i += 1;
+                i = skip_wrapper_flags(&words, i, NICE_FLAGS_WITH_ARG);
+            }
+            "ionice" => {
+                i += 1;
+                i = skip_wrapper_flags(&words, i, IONICE_FLAGS_WITH_ARG);
+            }
             "timeout" => {
                 i += 1;
-                while i < words.len() && words[i].starts_with('-') {
-                    i += 1;
-                }
-                // Optional duration argument.
+                i = skip_wrapper_flags(&words, i, TIMEOUT_FLAGS_WITH_ARG);
+                // Duration before the command.
                 if i < words.len()
                     && words[i]
                         .chars()
@@ -240,9 +287,7 @@ fn is_privilege_elevator(sub: &str) -> bool {
             }
             "stdbuf" => {
                 i += 1;
-                while i < words.len() && words[i].starts_with('-') {
-                    i += 1;
-                }
+                i = skip_wrapper_flags(&words, i, STDBUF_FLAGS_WITH_ARG);
             }
             // First real command is not a privilege elevator.
             _ => return false,
@@ -557,6 +602,13 @@ mod tests {
         assert!(!is_readonly("nice sudo ls"));
         assert!(!is_readonly("nohup sudo ls"));
         assert!(!is_readonly("timeout 5 sudo ls"));
+        // Flags that take an argument must not eat the elevator (#330 review).
+        assert!(!is_readonly("env -u FOO sudo ls /root"));
+        assert!(!is_readonly("env --unset FOO sudo id"));
+        assert!(!is_readonly("env -i -u PATH sudo -n true"));
+        assert!(!is_readonly("timeout -k 5s 10s sudo ls"));
+        assert!(!is_readonly("timeout --kill-after=5s 10 sudo id"));
+        assert!(!is_readonly("nice -n 10 sudo ls"));
         // `sort` / bare mention of the word is not an elevator.
         assert!(is_readonly("sort /tmp/a"));
         assert!(is_readonly("echo sudo"));
@@ -577,6 +629,14 @@ mod tests {
         );
         assert_eq!(
             check_command("/usr/bin/sudo id", CommandConfirmMode::Allowlist),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            check_command("env -u FOO sudo ls", CommandConfirmMode::Allowlist),
+            ConfirmDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            check_command("timeout -k 5s 10s sudo ls", CommandConfirmMode::Allowlist),
             ConfirmDecision::NeedsConfirmation
         );
     }
