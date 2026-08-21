@@ -5008,3 +5008,21 @@ regression tests; CHANGELOG.
 
 **Next steps:** human TUI glance at `!` / `!pwd` caret (agent cannot drive
 interactive TUI; TestBackend asserts cover place_cursor math).
+
+## Issue #338: fix(tui) — cwd sync on Ctrl+T hide + status bar
+
+**Milestone:** 1.0.3. **Branch:** `fix/338-cwd-sync-status`.
+
+**Problem:** #313 leave-sync only ran on PTY teardown; normal Ctrl+T **hide**
+kept the PTY and never probed/`set_cwd`. Stale `cwd_known` also skipped probe.
+
+**Design:** `pending_cwd_sync` on hide → runner `sync_cwd_from_interactive`
+(always OSC 7 probe on Unix/SSH, restore previous on timeout, `set_cwd`);
+same helper on full teardown. Status bar already reads `Session.cwd`.
+
+**Done:** app queue + runner helper; unit tests; PLATFORM_NOTES; CHANGELOG.
+
+**Public contract:** none (TUI-internal).
+
+**Next steps:** human smoke `Ctrl+T` → `cd /tmp` → `Ctrl+T` → status/`!pwd`
+(agent cannot drive interactive PTY).

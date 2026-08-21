@@ -199,6 +199,9 @@ pub struct App {
     /// runner without closing the tab (set by session restore when the tab was
     /// in Interactive mode).
     pub pending_term_teardown: Vec<SessionId>,
+    /// SessionIds awaiting a cwd refresh from a live interactive PTY (Ctrl+T
+    /// hide keeps the PTY; runner probes OSC 7 and `set_cwd` without teardown).
+    pub pending_cwd_sync: Vec<SessionId>,
     /// SessionIds of new tabs awaiting a local executor from the runner.
     /// App signals the runner here; runner creates the executor asynchronously
     /// and stores it in its per-session map.
@@ -424,6 +427,7 @@ impl App {
             help_bar_area: Rect::default(),
             closed_ids: Vec::new(),
             pending_term_teardown: Vec::new(),
+            pending_cwd_sync: Vec::new(),
             pending_local_executors: Vec::new(),
             help_overlay_visible: false,
             help_scroll: 0,
@@ -559,6 +563,15 @@ impl App {
     /// Take and clear the list of tabs awaiting interactive-backend teardown.
     pub fn take_pending_term_teardown(&mut self) -> Vec<SessionId> {
         std::mem::take(&mut self.pending_term_teardown)
+    }
+
+    /// Take and clear tabs awaiting OSC 7 / executor cwd sync (PTY kept alive).
+    /// Deduplicates so repeated hide before the runner drains still sync once.
+    pub fn take_pending_cwd_sync(&mut self) -> Vec<SessionId> {
+        let mut v = std::mem::take(&mut self.pending_cwd_sync);
+        v.sort_by_key(|id| id.0);
+        v.dedup();
+        v
     }
 
     /// Take and clear the list of sessions awaiting a local executor (for runner to process).
@@ -3198,8 +3211,13 @@ impl App {
     }
 
     /// Hide the interactive view, keeping the terminal alive in the background.
+    ///
+    /// Queues a cwd sync so the agent executor and status bar pick up any `cd`
+    /// done in the PTY (#338). The runner probes OSC 7 without closing the PTY.
     pub fn hide_interactive_view(&mut self) {
         if self.mode == AppMode::Interactive {
+            let sid = self.sessions[self.active].id;
+            self.pending_cwd_sync.push(sid);
             self.mode = AppMode::Normal;
             self.selection = None;
             self.mouse_drag = None;
@@ -6032,10 +6050,51 @@ mod tests {
     #[test]
     fn hide_view_keeps_terminal_alive() {
         let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
         app.enter_interactive(crate::terminal::TerminalModel::new(80, 24));
         app.hide_interactive_view();
         assert_eq!(app.mode, AppMode::Normal);
         assert!(app.terminal.is_some(), "terminal model must persist");
+        assert_eq!(
+            app.take_pending_cwd_sync(),
+            vec![sid],
+            "hide must queue OSC7/cwd sync for runner (#338)"
+        );
+        assert!(
+            app.take_pending_cwd_sync().is_empty(),
+            "take clears the queue"
+        );
+    }
+
+    #[test]
+    fn hide_view_queues_cwd_sync_once_per_session() {
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        app.enter_interactive(crate::terminal::TerminalModel::new(80, 24));
+        app.hide_interactive_view();
+        app.hide_interactive_view(); // mode already Normal — no second push
+        app.show_interactive_view();
+        app.hide_interactive_view();
+        app.hide_interactive_view(); // still Interactive→Normal once; push again while queued
+        // Two pushes from two Interactive→Normal transitions; take dedups.
+        assert_eq!(app.take_pending_cwd_sync(), vec![sid]);
+    }
+
+    #[test]
+    fn status_target_reflects_cwd_after_sync() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.cwd = None;
+        assert!(
+            !app.status_target().contains('/'),
+            "no pwd when unknown: {}",
+            app.status_target()
+        );
+        app.cwd = Some("/tmp/filar-cwd-sync".into());
+        assert!(
+            app.status_target().contains("/tmp/filar-cwd-sync"),
+            "status must show synced cwd: {}",
+            app.status_target()
+        );
     }
 
     #[test]
