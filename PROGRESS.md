@@ -5074,3 +5074,17 @@ dialog, inserts quoted path + trailing space. Local FS only (zero-install).
 **Public contract:** none.
 
 **Next steps:** human smoke native dialog on macOS (agent cannot open GUI).
+
+## Issue #345: fix(tui) — confirm overlay on wrong tab
+
+**Milestone:** 1.0.3. **Branch:** `fix/345-confirm-wrong-tab`.
+
+**Problem:** `ConfirmationRequest` had no `session_id`; confirm landed on active tab B while agent ran on A.
+
+**Design:** per-session `TuiConfirmer`; `session_id` on event; dispatch like Agent events; auto-switch active tab on confirm (no restore).
+
+**Done:** event/confirmer/runner/app + multi-tab unit test; CHANGELOG.
+
+**Public contract:** `TuiEvent::ConfirmationRequest` gains `session_id`; `TuiConfirmer::new(tx, sid)`.
+
+**Next steps:** human multi-tab smoke (agent cannot drive TUI).

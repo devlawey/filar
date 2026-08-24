@@ -496,9 +496,6 @@ async fn run_app(
     // Receiver for WARN/ERROR log lines mirrored into the chat.
     let mut log_rx = config.log_rx.take();
 
-    // Create the TUI confirmer.
-    let confirmer = Arc::new(TuiConfirmer::new(agent_tx.clone()));
-
     // Per-session executors. The initial executor (from main.rs) is stored
     // for the start-up session; new tabs get a LocalExecutor created on demand.
     let initial_tui = Arc::new(TuiExecutor {
@@ -957,7 +954,6 @@ async fn run_app(
                         spawn_agent(
                             session_llm,
                             agent_exec,
-                            confirmer.clone(),
                             app.confirm_mode,
                             user_input,
                             app.messages.clone(),
@@ -1592,7 +1588,6 @@ pub fn resize_all_models(app: &mut App, cols: u16, rows: u16) {
 fn spawn_agent(
     llm: Arc<dyn LlmClient>,
     executor: Arc<dyn CommandExecutor>,
-    confirmer: Arc<dyn CommandConfirmer>,
     confirm_mode: CommandConfirmMode,
     user_input: String,
     chat_history: Vec<ChatBlock>,
@@ -1604,6 +1599,7 @@ fn spawn_agent(
     sid: SessionId,
 ) {
     let tx = event_tx.clone();
+    let confirmer = Arc::new(TuiConfirmer::new(event_tx.clone(), sid)) as Arc<dyn CommandConfirmer>;
 
     tokio::spawn(async move {
         let _ = tx.send(TuiEvent::Thinking);

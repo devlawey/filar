@@ -32,6 +32,7 @@ pub enum TuiEvent {
     /// The UI must respond via the included [`oneshot::Sender`]:
     /// `true` = approve, `false` = deny.
     ConfirmationRequest {
+        session_id: SessionId,
         command: String,
         explanation: String,
         destructive: bool,
@@ -67,6 +68,24 @@ pub enum TuiEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confirmation_request_carries_session_id() {
+        let sid = SessionId(99);
+        let (_tx, _rx) = oneshot::channel();
+        let event = TuiEvent::ConfirmationRequest {
+            session_id: sid,
+            command: "ls".into(),
+            explanation: "list".into(),
+            destructive: false,
+            respond_to: _tx,
+        };
+        if let TuiEvent::ConfirmationRequest { session_id, .. } = event {
+            assert_eq!(session_id, SessionId(99));
+        } else {
+            panic!("expected ConfirmationRequest");
+        }
+    }
 
     #[test]
     fn transport_changed_carries_session_id() {

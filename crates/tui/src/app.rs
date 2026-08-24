@@ -3069,10 +3069,11 @@ impl App {
 
     /// Handle a TUI event (forwarded agent event or TUI-specific event).
     pub fn handle_agent_event(&mut self, event: TuiEvent) {
+        let is_confirm_request = matches!(&event, TuiEvent::ConfirmationRequest { .. });
         let sid = match &event {
             TuiEvent::Agent { session_id, .. } => *session_id,
             TuiEvent::Thinking => self.sessions[self.active].id,
-            TuiEvent::ConfirmationRequest { .. } => self.sessions[self.active].id,
+            TuiEvent::ConfirmationRequest { session_id, .. } => *session_id,
             TuiEvent::TransportChanged { session_id, .. } => *session_id,
             TuiEvent::CwdChanged { session_id, .. } => *session_id,
             TuiEvent::PasswordNeeded { session_id, .. } => *session_id,
@@ -3217,6 +3218,7 @@ impl App {
                 self.mode = AppMode::Thinking;
             }
             TuiEvent::ConfirmationRequest {
+                session_id: _,
                 command,
                 explanation,
                 destructive,
@@ -3264,8 +3266,10 @@ impl App {
         } else {
             self.active_session_mut().awaiting_confirmation = false;
         }
-        // Restore the original active tab.
-        self.active = orig_active;
+        // Restore the original active tab — except confirm: stay on originating tab (#345).
+        if !is_confirm_request {
+            self.active = orig_active;
+        }
     }
 
     /// Take the pending user input (called by the runner to send to the agent).
@@ -4563,6 +4567,7 @@ mod tests {
         // Simulate a new confirmation request.
         let (tx, _rx) = oneshot::channel::<bool>();
         app.handle_agent_event(TuiEvent::ConfirmationRequest {
+            session_id: app.sessions[0].id,
             command: "ls".into(),
             explanation: "list".into(),
             destructive: false,
@@ -5000,6 +5005,7 @@ mod tests {
 
         let (tx, _rx) = oneshot::channel::<bool>();
         app.handle_agent_event(TuiEvent::ConfirmationRequest {
+            session_id: app.sessions[0].id,
             command: "ls".into(),
             explanation: "list files".into(),
             destructive: false,
@@ -5008,6 +5014,35 @@ mod tests {
 
         assert!(!app.streaming);
         assert_eq!(app.mode, AppMode::Confirming);
+    }
+
+    #[test]
+    fn confirmation_request_on_background_tab_switches_active() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.new_tab();
+        let sid_a = app.sessions[0].id;
+        app.active = 1;
+        app.sessions[0].mode = AppMode::Thinking;
+        app.sessions[0].agent_running = true;
+
+        let (tx, mut rx) = oneshot::channel();
+        app.handle_agent_event(TuiEvent::ConfirmationRequest {
+            session_id: sid_a,
+            command: "rm x".into(),
+            explanation: "cleanup".into(),
+            destructive: true,
+            respond_to: tx,
+        });
+
+        assert_eq!(app.active, 0, "must auto-switch to originating tab");
+        assert_eq!(app.sessions[0].mode, AppMode::Confirming);
+        assert_eq!(app.sessions[1].mode, AppMode::Normal);
+        assert!(app.sessions[0].pending_confirm.is_some());
+        assert!(app.sessions[1].pending_confirm.is_none());
+
+        app.handle_key(key_event(crossterm::event::KeyCode::Char('a')));
+        assert_eq!(app.sessions[0].mode, AppMode::Thinking);
+        assert_eq!(rx.try_recv(), Ok(true));
     }
 
     #[test]
