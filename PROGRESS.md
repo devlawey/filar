@@ -5042,3 +5042,19 @@ and `Session.terminal`, so Ctrl+T reuse showed the previous host's PTY.
 **Public contract:** none.
 
 **Next steps:** human smoke Local↔SSH / SSH↔SSH with interactive (agent cannot).
+
+## Issue #343: feat(tui) — topic slug in Ctrl+S export filename
+
+**Milestone:** 1.0.3. **Branch:** `feat/343-ctrl-s-topic-filename`.
+
+**Problem:** Ctrl+S names were only `{host}.{ts}.md`; launcher already shows
+preview from the first user message.
+
+**Design:** `topic_slug_from_messages` → optional segment (max 40) via same
+`slugify` rules; empty/system-only → omit segment (no `..`).
+
+**Done:** `generate_save_filename` takes messages; unit tests; CHANGELOG.
+
+**Public contract:** none.
+
+**Next steps:** none (filename unit-tested).

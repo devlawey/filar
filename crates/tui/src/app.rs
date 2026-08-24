@@ -816,8 +816,8 @@ fn format_now_utc() -> String {
 }
 
 /// Slugify a string for use in a filename:
-/// replace non-alphanumeric (except `._-`) with `-`, limit length to 80.
-fn slugify(s: &str) -> String {
+/// replace non-alphanumeric (except `._-`) with `-`, limit length to `max`.
+fn slugify_max(s: &str, max: usize) -> String {
     let mut result = String::new();
     let mut prev_dash = false;
     for ch in s.chars() {
@@ -829,7 +829,36 @@ fn slugify(s: &str) -> String {
             prev_dash = true;
         }
     }
-    result.trim_matches('-').chars().take(80).collect()
+    result.trim_matches('-').chars().take(max).collect()
+}
+
+/// Slugify a string for use in a filename (max 80 chars).
+fn slugify(s: &str) -> String {
+    slugify_max(s, 80)
+}
+
+/// Short topic slug from the first user message (same source as launcher preview).
+///
+/// Returns `None` when there is no user text — callers omit the segment so the
+/// filename stays `{host}.{ts}.md` without an empty `..` gap (#343).
+fn topic_slug_from_messages(messages: &[ChatBlock]) -> Option<String> {
+    let text = messages.iter().find_map(|b| match b {
+        ChatBlock::User(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        }
+        _ => None,
+    })?;
+    let slug = slugify_max(text, 40);
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug)
+    }
 }
 
 /// Generate a transcript filename: `{slug}.{date}.{time}.md`.
@@ -841,21 +870,27 @@ fn transcript_filename(session_name: &str, ssh_info: &Option<String>) -> String 
     format!("{slug}.{ts}.md")
 }
 
-/// Generate a save filename: `{slug}.{date}.{time}.md`, avoiding collisions
-/// within `base_dir`. Async because existence checks are non-blocking I/O.
+/// Generate a Ctrl+S save filename: `{host}.{topic?}.{date}.{time}.md`,
+/// avoiding collisions within `base_dir`. Topic comes from the first user
+/// message (launcher-style preview). Async for non-blocking existence checks.
 async fn generate_save_filename(
     session_name: &str,
     ssh_info: &Option<String>,
+    messages: &[ChatBlock],
     base_dir: &std::path::Path,
 ) -> String {
     let base = ssh_info.as_deref().unwrap_or(session_name);
-    let slug = slugify(base);
+    let host = slugify(base);
     let ts = format_now_utc();
-    let mut name = format!("{slug}.{ts}.md");
+    let stem = match topic_slug_from_messages(messages) {
+        Some(topic) => format!("{host}.{topic}.{ts}"),
+        None => format!("{host}.{ts}"),
+    };
+    let mut name = format!("{stem}.md");
     // Avoid overwriting: append -1, -2, … if file already exists.
     if tokio::fs::try_exists(base_dir.join(&name)).await.unwrap_or(false) {
         for n in 1u32..1000 {
-            let alt = format!("{slug}.{ts}-{n}.md");
+            let alt = format!("{stem}-{n}.md");
             if !tokio::fs::try_exists(base_dir.join(&alt)).await.unwrap_or(false) {
                 name = alt;
                 break;
@@ -867,7 +902,7 @@ async fn generate_save_filename(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .subsec_nanos();
-            name = format!("{slug}.{ts}-{ns}.md");
+            name = format!("{stem}-{ns}.md");
         }
     }
     name
@@ -1470,7 +1505,8 @@ impl App {
             // Small delay so the overlay has time to render the 0% state.
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-            let filename = generate_save_filename(&session_name, &ssh_info, &base_dir).await;
+            let filename =
+                generate_save_filename(&session_name, &ssh_info, &messages, &base_dir).await;
             let md_content = messages_to_markdown(&messages, &session_name, &ssh_info);
 
             tx.send(SaveProgress::Writing).ok();
@@ -7373,6 +7409,7 @@ mod tests {
         let name = generate_save_filename(
             "my-server",
             &Some("root@10.0.0.5:22".into()),
+            &[],
             std::path::Path::new("."),
         )
         .await;
@@ -7381,6 +7418,57 @@ mod tests {
             "expected slug.date.time.md format, got: {name}"
         );
         assert!(!name.contains(' '), "filename must not contain spaces");
+    }
+
+    #[tokio::test]
+    async fn generate_save_filename_includes_topic_slug() {
+        let msgs = vec![ChatBlock::User("fix nginx timeout on prod".into())];
+        let name = generate_save_filename(
+            "local",
+            &None,
+            &msgs,
+            std::path::Path::new("."),
+        )
+        .await;
+        assert!(
+            name.starts_with("local.fix-nginx-timeout-on-prod."),
+            "expected host.topic.ts.md, got: {name}"
+        );
+        assert!(name.ends_with(".md"));
+    }
+
+    #[tokio::test]
+    async fn generate_save_filename_omits_empty_topic() {
+        let msgs = vec![ChatBlock::System("connected".into())];
+        let name = generate_save_filename("local", &None, &msgs, std::path::Path::new(".")).await;
+        // No empty `..` segment — host.date.time.md
+        assert!(
+            name.starts_with("local.") && name.ends_with(".md"),
+            "system-only session must omit topic: {name}"
+        );
+        assert!(
+            !name.contains("local.."),
+            "must not leave empty topic segment: {name}"
+        );
+        // After host slug: immediately the date (YYYY-…), not a topic word.
+        let after_host = name.strip_prefix("local.").unwrap();
+        assert!(
+            after_host.as_bytes().get(..4).is_some_and(|b| b.iter().all(u8::is_ascii_digit)),
+            "expected date after host when no topic, got: {name}"
+        );
+    }
+
+    #[test]
+    fn topic_slug_from_first_user_message() {
+        let msgs = vec![
+            ChatBlock::System("hi".into()),
+            ChatBlock::User("Check /etc/passwd".into()),
+        ];
+        assert_eq!(
+            topic_slug_from_messages(&msgs).as_deref(),
+            Some("Check-etc-passwd")
+        );
+        assert!(topic_slug_from_messages(&[]).is_none());
     }
 
     #[test]
