@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Ctrl+S Markdown export filenames include a short topic slug from the first
+  user message (`host.topic.date.time.md`)
+  ([#343](https://github.com/devlawey/filar/issues/343)).
+
 ### Changed
 
 - Password/TTY failure guidance shortened to a compact Ctrl+P /
