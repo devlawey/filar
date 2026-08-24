@@ -43,6 +43,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Ctrl+O host switch tears down the tab's interactive PTY/`TerminalModel`
   so the previous host's shell cannot be reused after reconnect
   ([#339](https://github.com/devlawey/filar/issues/339)).
+- Confirm overlay no longer opens on the wrong tab when the agent on a
+  background session requests approval; auto-switches to the originating tab
+  ([#345](https://github.com/devlawey/filar/issues/345)).
 
 ## [1.0.2] - 2026-08-21
 
