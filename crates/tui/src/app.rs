@@ -7443,12 +7443,18 @@ mod tests {
         let name = generate_save_filename("local", &None, &msgs, std::path::Path::new(".")).await;
         // No empty `..` segment — host.date.time.md
         assert!(
-            name.starts_with("local.20") && name.ends_with(".md"),
+            name.starts_with("local.") && name.ends_with(".md"),
             "system-only session must omit topic: {name}"
         );
         assert!(
             !name.contains("local.."),
             "must not leave empty topic segment: {name}"
+        );
+        // After host slug: immediately the date (YYYY-…), not a topic word.
+        let after_host = name.strip_prefix("local.").unwrap();
+        assert!(
+            after_host.as_bytes().get(..4).is_some_and(|b| b.iter().all(u8::is_ascii_digit)),
+            "expected date after host when no topic, got: {name}"
         );
     }
 
