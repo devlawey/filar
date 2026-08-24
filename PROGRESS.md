@@ -5088,3 +5088,16 @@ dialog, inserts quoted path + trailing space. Local FS only (zero-install).
 **Public contract:** `TuiEvent::ConfirmationRequest` gains `session_id`; `TuiConfirmer::new(tx, sid)`.
 
 **Next steps:** human multi-tab smoke (agent cannot drive TUI).
+
+## Release v1.0.3 (2026-08-24)
+
+**Scope:** milestone 1.0.3 — TUI polish (Ctrl+S filename, path picker, confirm
+wrong-tab fix, paste/wrap/shell cursor, cwd sync, Ctrl+O teardown) + shorter
+agent password guidance (#331).
+
+**Preflight:** `cargo build --workspace` and `cargo test --workspace` green on
+main before bump.
+
+**Tags:** `v1.0.3`, `engine-v1.0.3` (agent crate changed).
+
+**Manual smoke:** `docs/SMOKE.md` on Windows + macOS (#298 tracking).
