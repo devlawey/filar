@@ -5058,3 +5058,19 @@ preview from the first user message.
 **Public contract:** none.
 
 **Next steps:** none (filename unit-tested).
+
+## Issue #344: feat(tui) — file/folder picker in agent input
+
+**Milestone:** 1.0.3. **Branch:** `feat/344-path-picker`.
+
+**Problem:** typing long absolute paths in agent input is awkward.
+
+**Design:** `path_picker` module (`rfd`); `/` at path-token start or
+`Ctrl+Shift+F`/`Ctrl+Shift+D` queue picker; runner suspends TUI, opens native
+dialog, inserts quoted path + trailing space. Local FS only (zero-install).
+
+**Done:** `path_picker.rs`, App wiring, help entries, unit tests; CHANGELOG.
+
+**Public contract:** none.
+
+**Next steps:** human smoke native dialog on macOS (agent cannot open GUI).

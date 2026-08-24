@@ -19,5 +19,6 @@ alacritty_terminal = { workspace = true }
 arboard = { workspace = true }
 chrono = { workspace = true }
 tokio-util = { workspace = true }
+rfd = { workspace = true }
 # Match ratatui 0.28 (display columns for wrap/pad; #333).
 unicode-width = "0.1"

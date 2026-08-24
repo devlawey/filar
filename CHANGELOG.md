@@ -16,6 +16,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Ctrl+S Markdown export filenames include a short topic slug from the first
   user message (`host.topic.date.time.md`)
   ([#343](https://github.com/devlawey/filar/issues/343)).
+- Native file/folder picker in agent input: `/` at path-token start, `Ctrl+Shift+F`
+  (file), `Ctrl+Shift+D` (folder); inserts quoted absolute path from local FS
+  ([#344](https://github.com/devlawey/filar/issues/344)).
 
 ### Changed
 

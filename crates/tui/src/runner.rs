@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use crate::app::{App, AppMode, SaveProgress, SessionId};
 use crate::confirmer::TuiConfirmer;
 use crate::event::TuiEvent;
+use crate::path_picker;
 use crate::terminal::TerminalModel;
 use crate::ui;
 
@@ -724,6 +725,20 @@ async fn run_app(
                         error!(error = %e, "terminal event error");
                     }
                     None => {} // stream ended
+                }
+
+                // Native file/folder picker (#344): suspend TUI, open dialog, insert path.
+                if let Some(kind) = app.take_pending_path_picker() {
+                    path_picker::suspend_terminal(&mut *terminal);
+                    let picked =
+                        tokio::task::spawn_blocking(move || path_picker::pick_path(kind)).await;
+                    path_picker::resume_terminal(&mut *terminal);
+                    match picked {
+                        Ok(Some(path)) => app.insert_path_at_cursor(&path),
+                        Ok(None) => {}
+                        Err(e) => warn!(error = %e, "path picker task panicked"),
+                    }
+                    needs_redraw = true;
                 }
 
                 // Handle mode toggle (Ctrl+T).
