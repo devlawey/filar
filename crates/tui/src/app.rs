@@ -253,6 +253,8 @@ pub struct App {
     pub session_select_index: usize,
     /// Cached list of saved session metadata shown in the overlay.
     pub session_select_metas: Vec<SessionMeta>,
+    /// Native path picker queued from Normal input (^⇧F / `/` at path start).
+    pub pending_path_picker: Option<crate::path_picker::PathPickerKind>,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -452,6 +454,7 @@ impl App {
             session_select_visible: false,
             session_select_index: 0,
             session_select_metas: Vec::new(),
+            pending_path_picker: None,
         }
     }
 
@@ -1758,6 +1761,23 @@ impl App {
             return;
         }
 
+        // Ctrl+Shift+F / Ctrl+Shift+D — native file/folder picker (#344).
+        if self.mode == AppMode::Normal {
+            let ctrl_shift_key = |en: char, ru: char| {
+                key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT)
+                    && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&en) || c == ru)
+            };
+            if ctrl_shift_key('f', 'а') {
+                self.pending_path_picker = Some(crate::path_picker::PathPickerKind::File);
+                return;
+            }
+            if ctrl_shift_key('d', 'в') {
+                self.pending_path_picker = Some(crate::path_picker::PathPickerKind::Folder);
+                return;
+            }
+        }
+
         // Global control hotkeys — active in every mode EXCEPT Interactive, where
         // all keys (including ^Q/^Z/^C) are forwarded to the remote PTY.
         //
@@ -1908,7 +1928,17 @@ impl App {
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     // Any char input cancels history browsing.
                     self.history_pos = None;
-                    self.insert_char(c);
+                    if c == '/'
+                        && crate::path_picker::path_token_starts_at_cursor(
+                            &self.input,
+                            self.cursor_pos,
+                        )
+                    {
+                        self.pending_path_picker =
+                            Some(crate::path_picker::PathPickerKind::File);
+                    } else {
+                        self.insert_char(c);
+                    }
                 }
                 KeyCode::Backspace => {
                     self.history_pos = None;
@@ -3300,6 +3330,28 @@ impl App {
     }
 
     // ----- Input editing helpers (char-index based) -----
+
+    /// Take a queued native path-picker request (handled by the runner).
+    pub fn take_pending_path_picker(&mut self) -> Option<crate::path_picker::PathPickerKind> {
+        self.pending_path_picker.take()
+    }
+
+    /// Insert a filesystem path at the input cursor (Normal / Confirming).
+    pub fn insert_path_at_cursor(&mut self, path: &std::path::Path) {
+        if !matches!(self.mode, AppMode::Normal | AppMode::Confirming) {
+            return;
+        }
+        let formatted = crate::path_picker::format_path_for_input(path);
+        if formatted.is_empty() {
+            return;
+        }
+        let text = if formatted.ends_with(' ') {
+            formatted
+        } else {
+            format!("{formatted} ")
+        };
+        self.paste_text(&text);
+    }
 
     /// Insert a character at the cursor position.
     fn insert_char(&mut self, c: char) {
@@ -6580,6 +6632,83 @@ mod tests {
         app.input = "before".into();
         app.paste_text("pasted");
         assert_eq!(app.input, "before", "paste must be no-op in Thinking mode");
+    }
+
+    // ── Path picker tests (#344) ──────────────────────────────────────
+
+    #[test]
+    fn slash_at_path_token_start_queues_file_picker() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('/'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.input, "", "slash must not be inserted when picker opens");
+        assert_eq!(
+            app.pending_path_picker,
+            Some(crate::path_picker::PathPickerKind::File)
+        );
+    }
+
+    #[test]
+    fn slash_mid_token_inserts_normally() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.input = "foo".into();
+        app.cursor_pos = 3;
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('/'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.input, "foo/");
+        assert!(app.pending_path_picker.is_none());
+    }
+
+    #[test]
+    fn ctrl_shift_f_queues_file_picker() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('F'),
+            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::SHIFT,
+        ));
+        assert_eq!(
+            app.pending_path_picker,
+            Some(crate::path_picker::PathPickerKind::File)
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_d_queues_folder_picker() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('D'),
+            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::SHIFT,
+        ));
+        assert_eq!(
+            app.pending_path_picker,
+            Some(crate::path_picker::PathPickerKind::Folder)
+        );
+    }
+
+    #[test]
+    fn insert_path_at_cursor_quotes_spaces_and_adds_trailing_space() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.insert_path_at_cursor(std::path::Path::new("/tmp/my dir"));
+        assert_eq!(app.input, "'/tmp/my dir' ");
+        app.input.clear();
+        app.cursor_pos = 0;
+        app.insert_path_at_cursor(std::path::Path::new("/tmp/a"));
+        assert_eq!(app.input, "/tmp/a ");
+    }
+
+    #[test]
+    fn take_pending_path_picker_clears_queue() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.pending_path_picker = Some(crate::path_picker::PathPickerKind::Folder);
+        assert_eq!(
+            app.take_pending_path_picker(),
+            Some(crate::path_picker::PathPickerKind::Folder)
+        );
+        assert!(app.pending_path_picker.is_none());
     }
 
     #[test]

@@ -1585,6 +1585,7 @@ dependencies = [
  "filar-transport",
  "futures",
  "ratatui",
+ "rfd",
  "tokio",
  "tokio-util",
  "tracing",
