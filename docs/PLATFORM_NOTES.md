@@ -260,3 +260,19 @@ columnar tools (`ps`, aligned tables) stay consistent.
 | Ambiguous width (e.g. some box-drawing) | Follow unicode-width/ratatui; Terminal.app vs Windows Terminal can still differ for East-Asian Ambiguous characters — report if still visible after #333 |
 | Interactive PTY scrollback | Separate `TerminalModel` path; not changed by #333 |
 
+## TUI path picker (#351)
+
+Agent input path picker (`/`, `Ctrl+Shift+F`, `Ctrl+Shift+D`) is an in-TUI
+overlay listing the **active tab's target** filesystem:
+
+| Tab | Listing source |
+|-----|----------------|
+| Local | Client `read_dir` |
+| SSH | Readonly remote `ls -1Ap` via session executor (zero-install) |
+
+Native OS file dialogs (`rfd`) are no longer used in the TUI; the GUI launcher
+Browse button still uses `rfd` locally.
+
+Remote listing requires a live SSH executor on the tab; large directories are
+capped at 500 entries with a truncation warning.
+

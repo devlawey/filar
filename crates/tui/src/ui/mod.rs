@@ -34,6 +34,7 @@ mod confirm;
 mod help;
 mod host_select;
 mod input;
+mod path_picker_overlay;
 mod save_overlay;
 mod session_select;
 #[allow(unused_imports)]
@@ -135,6 +136,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
         session_select::render_session_select(f, app, full);
     }
 
+    // Render in-TUI path picker (#351).
+    if app.path_picker_visible {
+        let full = f.area();
+        path_picker_overlay::render_path_picker(f, app, full);
+    }
+
     // Render session-save progress overlay on top of everything if active.
     if app.save_overlay_visible {
         let full = f.area();
@@ -217,6 +224,12 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
     if app.session_select_visible {
         let full = f.area();
         session_select::render_session_select(f, app, full);
+    }
+
+    // Render in-TUI path picker (#351).
+    if app.path_picker_visible {
+        let full = f.area();
+        path_picker_overlay::render_path_picker(f, app, full);
     }
 
     // Render session-save progress overlay on top of everything if active.

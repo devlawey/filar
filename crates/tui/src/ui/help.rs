@@ -240,19 +240,19 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
         },
         HelpEntry {
             key: "/",
-            desc: "At path-token start: open file picker (local FS)",
+            desc: "At path-token start: open path picker (active target)",
             section: "Input",
             available: |m| m == AppMode::Normal,
         },
         HelpEntry {
             key: "^Shift+F",
-            desc: "Open file picker (local FS)",
+            desc: "Open file picker (active target)",
             section: "Input",
             available: |m| m == AppMode::Normal,
         },
         HelpEntry {
             key: "^Shift+D",
-            desc: "Open folder picker (local FS)",
+            desc: "Open folder picker (active target)",
             section: "Input",
             available: |m| m == AppMode::Normal,
         },

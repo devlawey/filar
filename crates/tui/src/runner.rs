@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use crate::app::{App, AppMode, SaveProgress, SessionId};
 use crate::confirmer::TuiConfirmer;
 use crate::event::TuiEvent;
-use crate::path_picker;
+use crate::path_picker::{self, PathEntry};
 use crate::terminal::TerminalModel;
 use crate::ui;
 
@@ -493,6 +493,12 @@ async fn run_app(
     let (save_tx, mut save_rx) = tokio::sync::mpsc::unbounded_channel::<SaveProgress>();
     app.save_tx = Some(save_tx);
 
+    // Channel for in-TUI path picker directory listings (#351).
+    let (path_picker_tx, mut path_picker_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(u64, PathPickerLoadResult)>();
+    let path_picker_tx_load = path_picker_tx.clone();
+    let mut path_picker_load_in_flight: Option<u64> = None;
+
     // Receiver for WARN/ERROR log lines mirrored into the chat.
     let mut log_rx = config.log_rx.take();
 
@@ -574,6 +580,21 @@ async fn run_app(
         let in_interactive = app.mode == AppMode::Interactive;
         tokio::select! {
             biased;
+
+            Some((token, result)) = path_picker_rx.recv() => {
+                path_picker_load_in_flight = None;
+                if app.path_picker_visible && app.path_picker_load_token == token {
+                    match result {
+                        Ok((entries, truncated)) => {
+                            app.apply_path_picker_load(entries, truncated, None);
+                        }
+                        Err(e) => {
+                            app.apply_path_picker_load(vec![], false, Some(e));
+                        }
+                    }
+                }
+                needs_redraw = true;
+            }
 
             // Save progress updates (Ctrl+S, #235). Must be inside the
             // select so the progress bar updates even when the user is idle.
@@ -724,18 +745,27 @@ async fn run_app(
                     None => {} // stream ended
                 }
 
-                // Native file/folder picker (#344): suspend TUI, open dialog, insert path.
+                // In-TUI path picker (#351): open overlay instead of native dialog.
                 if let Some(kind) = app.take_pending_path_picker() {
-                    path_picker::suspend_terminal(&mut *terminal);
-                    let picked =
-                        tokio::task::spawn_blocking(move || path_picker::pick_path(kind)).await;
-                    path_picker::resume_terminal(&mut *terminal);
-                    match picked {
-                        Ok(Some(path)) => app.insert_path_at_cursor(&path),
-                        Ok(None) => {}
-                        Err(e) => warn!(error = %e, "path picker task panicked"),
-                    }
+                    app.open_path_picker(kind);
                     needs_redraw = true;
+                }
+
+                // Path picker async directory listing.
+                if app.path_picker_visible && app.path_picker_loading {
+                    let token = app.path_picker_load_token;
+                    if path_picker_load_in_flight != Some(token) {
+                        path_picker_load_in_flight = Some(token);
+                        let dir = app.path_picker_dir.clone();
+                        let is_remote = app.sessions[app.active].ssh_info.is_some();
+                        let sid = app.sessions[app.active].id;
+                        let exec = executors.get(&sid).map(|e| e.executor.clone());
+                        let tx = path_picker_tx_load.clone();
+                        tokio::spawn(async move {
+                            let result = load_path_picker_dir(is_remote, &dir, exec).await;
+                            tx.send((token, result)).ok();
+                        });
+                    }
                 }
 
                 // Handle mode toggle (Ctrl+T).
@@ -1671,6 +1701,39 @@ fn spawn_agent(
         // don't need to send them again here.
         let _ = agent.run(&user_input, &history).await;
     });
+}
+
+type PathPickerLoadResult = std::result::Result<(Vec<PathEntry>, bool), String>;
+
+async fn load_path_picker_dir(
+    is_remote: bool,
+    dir: &str,
+    executor: Option<Arc<TuiExecutor>>,
+) -> PathPickerLoadResult {
+    if is_remote {
+        let exec = executor.ok_or_else(|| "No executor for remote session".to_string())?;
+        let cmd = path_picker::remote_ls_command(dir);
+        let result = exec.run(&cmd).await.map_err(|e| e.to_string())?;
+        if result.stdout.trim().is_empty() && result.exit_code != Some(0) {
+            let detail = if result.stderr.trim().is_empty() {
+                format!("ls failed (exit {:?})", result.exit_code)
+            } else {
+                result.stderr.trim().to_string()
+            };
+            return Err(detail);
+        }
+        let entries = path_picker::parse_ls_output(&result.stdout);
+        let truncated = entries.len() >= path_picker::MAX_ENTRIES
+            || result.stdout.lines().count() >= path_picker::MAX_ENTRIES;
+        Ok((entries, truncated))
+    } else {
+        let dir = dir.to_string();
+        tokio::task::spawn_blocking(move || {
+            path_picker::list_local_dir(&dir).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
 }
 
 #[cfg(test)]

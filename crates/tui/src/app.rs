@@ -255,6 +255,17 @@ pub struct App {
     pub session_select_metas: Vec<SessionMeta>,
     /// Native path picker queued from Normal input (^⇧F / `/` at path start).
     pub pending_path_picker: Option<crate::path_picker::PathPickerKind>,
+    /// In-TUI path picker overlay (#351).
+    pub path_picker_visible: bool,
+    pub path_picker_kind: crate::path_picker::PathPickerKind,
+    pub path_picker_dir: String,
+    pub path_picker_entries: Vec<crate::path_picker::PathEntry>,
+    pub path_picker_index: usize,
+    pub path_picker_loading: bool,
+    pub path_picker_error: Option<String>,
+    pub path_picker_truncated: bool,
+    /// Bumped to request (re)load of `path_picker_dir` in the runner.
+    pub path_picker_load_token: u64,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -455,6 +466,15 @@ impl App {
             session_select_index: 0,
             session_select_metas: Vec::new(),
             pending_path_picker: None,
+            path_picker_visible: false,
+            path_picker_kind: crate::path_picker::PathPickerKind::File,
+            path_picker_dir: String::new(),
+            path_picker_entries: Vec::new(),
+            path_picker_index: 0,
+            path_picker_loading: false,
+            path_picker_error: None,
+            path_picker_truncated: false,
+            path_picker_load_token: 0,
         }
     }
 
@@ -1741,6 +1761,25 @@ impl App {
             return;
         }
 
+        // In-TUI path picker (#351): navigate directories on the active target.
+        if self.path_picker_visible {
+            let list_size = self.path_picker_entries.len();
+            match key.code {
+                KeyCode::Esc => self.close_path_picker(),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.path_picker_index = self.path_picker_index.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.path_picker_index + 1 < list_size {
+                        self.path_picker_index += 1;
+                    }
+                }
+                KeyCode::Enter => self.path_picker_activate(),
+                _ => {}
+            }
+            return;
+        }
+
         // When the session-selection overlay is visible, only navigation and
         // select/cancel keys are processed; all other keys are consumed.
         if self.session_select_visible {
@@ -1771,7 +1810,7 @@ impl App {
             return;
         }
 
-        // Ctrl+Shift+F / Ctrl+Shift+D — native file/folder picker (#344).
+        // Ctrl+Shift+F / Ctrl+Shift+D — in-TUI file/folder picker (#344, #351).
         if self.mode == AppMode::Normal {
             let ctrl_shift_key = |en: char, ru: char| {
                 key.modifiers.contains(KeyModifiers::CONTROL)
@@ -3345,13 +3384,85 @@ impl App {
 
     // ----- Input editing helpers (char-index based) -----
 
-    /// Take a queued native path-picker request (handled by the runner).
+    /// Take a queued path-picker request (handled by the runner).
     pub fn take_pending_path_picker(&mut self) -> Option<crate::path_picker::PathPickerKind> {
         self.pending_path_picker.take()
     }
 
-    /// Insert a filesystem path at the input cursor (Normal / Confirming).
-    pub fn insert_path_at_cursor(&mut self, path: &std::path::Path) {
+    /// Open the in-TUI path picker overlay.
+    pub fn open_path_picker(&mut self, kind: crate::path_picker::PathPickerKind) {
+        let session = &self.sessions[self.active];
+        let is_remote = session.ssh_info.is_some();
+        self.path_picker_kind = kind;
+        self.path_picker_dir =
+            crate::path_picker::initial_picker_dir(&session.cwd, is_remote);
+        self.path_picker_index = 0;
+        self.path_picker_entries.clear();
+        self.path_picker_loading = true;
+        self.path_picker_error = None;
+        self.path_picker_truncated = false;
+        self.path_picker_visible = true;
+        self.path_picker_load_token = self.path_picker_load_token.wrapping_add(1);
+    }
+
+    pub fn close_path_picker(&mut self) {
+        self.path_picker_visible = false;
+        self.path_picker_loading = false;
+        self.path_picker_error = None;
+        self.path_picker_entries.clear();
+    }
+
+    pub fn path_picker_navigate(&mut self, dir: String) {
+        self.path_picker_dir = dir;
+        self.path_picker_index = 0;
+        self.path_picker_loading = true;
+        self.path_picker_error = None;
+        self.path_picker_load_token = self.path_picker_load_token.wrapping_add(1);
+    }
+
+    pub fn apply_path_picker_load(
+        &mut self,
+        entries: Vec<crate::path_picker::PathEntry>,
+        truncated: bool,
+        error: Option<String>,
+    ) {
+        self.path_picker_loading = false;
+        self.path_picker_truncated = truncated;
+        self.path_picker_error = error;
+        self.path_picker_entries =
+            crate::path_picker::entries_with_parent(&self.path_picker_dir, entries);
+        if self.path_picker_index >= self.path_picker_entries.len() {
+            self.path_picker_index = self.path_picker_entries.len().saturating_sub(1);
+        }
+    }
+
+    fn path_picker_activate(&mut self) {
+        let Some(entry) = self.path_picker_entries.get(self.path_picker_index).cloned() else {
+            return;
+        };
+        if entry.name == ".." {
+            if let Some(parent) = crate::path_picker::parent_path(&self.path_picker_dir) {
+                self.path_picker_navigate(parent);
+            }
+            return;
+        }
+        if entry.is_dir {
+            let path = crate::path_picker::join_path(&self.path_picker_dir, &entry.name);
+            if self.path_picker_kind == crate::path_picker::PathPickerKind::Folder {
+                self.insert_path_string_at_cursor(&path);
+                self.close_path_picker();
+            } else {
+                self.path_picker_navigate(path);
+            }
+        } else if self.path_picker_kind == crate::path_picker::PathPickerKind::File {
+            let path = crate::path_picker::join_path(&self.path_picker_dir, &entry.name);
+            self.insert_path_string_at_cursor(&path);
+            self.close_path_picker();
+        }
+    }
+
+    /// Insert a path string at the input cursor (Normal / Confirming).
+    pub fn insert_path_string_at_cursor(&mut self, path: &str) {
         if !matches!(self.mode, AppMode::Normal | AppMode::Confirming) {
             return;
         }
@@ -3365,6 +3476,11 @@ impl App {
             format!("{formatted} ")
         };
         self.paste_text(&text);
+    }
+
+    /// Insert a filesystem path at the input cursor (Normal / Confirming).
+    pub fn insert_path_at_cursor(&mut self, path: &std::path::Path) {
+        self.insert_path_string_at_cursor(&path.to_string_lossy());
     }
 
     /// Insert a character at the cursor position.
@@ -6732,6 +6848,43 @@ mod tests {
             app.pending_path_picker,
             Some(crate::path_picker::PathPickerKind::Folder)
         );
+    }
+
+    #[test]
+    fn open_path_picker_sets_remote_root() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.sessions[0].ssh_info = Some("root@host:22".into());
+        app.open_path_picker(crate::path_picker::PathPickerKind::File);
+        assert!(app.path_picker_visible);
+        assert_eq!(app.path_picker_dir, "/");
+        assert!(app.path_picker_loading);
+        assert_eq!(app.path_picker_load_token, 1);
+    }
+
+    #[test]
+    fn path_picker_file_select_inserts_absolute_path() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.path_picker_visible = true;
+        app.path_picker_kind = crate::path_picker::PathPickerKind::File;
+        app.path_picker_dir = "/etc".into();
+        app.path_picker_entries = vec![crate::path_picker::PathEntry {
+            name: "hosts".into(),
+            is_dir: false,
+        }];
+        app.path_picker_activate();
+        assert!(!app.path_picker_visible);
+        assert_eq!(app.input, "/etc/hosts ");
+    }
+
+    #[test]
+    fn path_picker_esc_cancels() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.open_path_picker(crate::path_picker::PathPickerKind::Folder);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(!app.path_picker_visible);
     }
 
     #[test]

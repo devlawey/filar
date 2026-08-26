@@ -5106,6 +5106,24 @@ and `toggle_explain` use `App::messages`; regression unit tests.
 
 **Next steps:** merge PR; human smoke Ctrl+S + F2 on SSH session.
 
+## Issue #351: fix(tui) — in-TUI path picker on target host
+
+**Milestone:** 1.0.4. **Branch:** `fix/351-tui-path-picker-target-host`.
+
+**Problem:** #344 native `rfd` dialog always listed local client FS; on SSH tabs
+users expected paths on the remote host.
+
+**Design:** in-TUI overlay (like F3 session select); local `read_dir`, remote
+readonly `ls` via session executor; unified picker for local + SSH tabs; removed
+`rfd` from `filar-tui`.
+
+**Done:** `path_picker.rs`, `ui/path_picker_overlay.rs`, runner async load,
+help/CHANGELOG updates, unit tests.
+
+**Public contract:** none (TUI-only).
+
+**Next steps:** manual smoke SSH + local path insert.
+
 ## Release v1.0.3 (2026-08-24)
 
 **Scope:** milestone 1.0.3 — TUI polish (Ctrl+S filename, path picker, confirm
