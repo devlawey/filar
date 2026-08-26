@@ -375,6 +375,10 @@ pub struct TuiConfig {
     /// Per-command execution timeout from `[timeouts].command_secs`.
     /// Applied to SSH marker wait and local subprocess execution.
     pub command_timeout: Duration,
+    /// When true, run the command arbiter before each confirmation gate.
+    pub arbiter_enabled: bool,
+    /// Optional named profile for the arbiter (`None` = session profile).
+    pub arbiter_profile: Option<String>,
 }
 
 /// SSH transport tunables with the app-configured command timeout.
@@ -960,11 +964,12 @@ async fn run_app(
                         let cancel_token = CancellationToken::new();
                         app.cancellation = Some(cancel_token.clone());
                         // Resolve the LLM client for this session's profile.
+                        let profile_name = app.sessions[app.active]
+                            .llm_profile
+                            .as_deref()
+                            .unwrap_or(&app.default_profile_name)
+                            .to_string();
                         let session_llm = {
-                            let profile_name = app.sessions[app.active]
-                                .llm_profile
-                                .as_deref()
-                                .unwrap_or(&app.default_profile_name);
                             let profile = app.profiles.iter()
                                 .find(|p| p.name == profile_name);
                             match profile {
@@ -981,8 +986,38 @@ async fn run_app(
                                 }
                             }
                         };
+                        let arbiter_cfg = filar_core::Config {
+                            arbiter_profile: config.arbiter_profile.clone(),
+                            arbiter_enabled: config.arbiter_enabled,
+                            ..Default::default()
+                        };
+                        let (arbiter_profile_name, fallback_msg) = arbiter_cfg
+                            .resolve_arbiter_profile(&profile_name, &app.profiles);
+                        let arbiter_profile_name = arbiter_profile_name.to_string();
+                        if let Some(msg) = fallback_msg {
+                            app.push_message(ChatBlock::System(msg));
+                        }
+                        let (arbiter_llm, arbiter_model_name) = if config.arbiter_enabled {
+                            match app.profiles.iter().find(|p| p.name == arbiter_profile_name) {
+                                Some(p) => match (config.llm_factory)(p, &config.secret_provider) {
+                                    Ok(c) => (Some(c), p.name.clone()),
+                                    Err(e) => {
+                                        app.push_message(ChatBlock::System(format!(
+                                            "Arbiter LLM unavailable ({e}) — confirmation proceeds without audit."
+                                        )));
+                                        (None, arbiter_profile_name.clone())
+                                    }
+                                },
+                                None => (None, profile_name.clone()),
+                            }
+                        } else {
+                            (None, profile_name.clone())
+                        };
                         spawn_agent(
                             session_llm,
+                            arbiter_llm,
+                            config.arbiter_enabled,
+                            arbiter_model_name,
                             agent_exec,
                             app.confirm_mode,
                             user_input,
@@ -1617,6 +1652,9 @@ pub fn resize_all_models(app: &mut App, cols: u16, rows: u16) {
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent(
     llm: Arc<dyn LlmClient>,
+    arbiter_llm: Option<Arc<dyn LlmClient>>,
+    arbiter_enabled: bool,
+    arbiter_model_name: String,
     executor: Arc<dyn CommandExecutor>,
     confirm_mode: CommandConfirmMode,
     user_input: String,
@@ -1677,11 +1715,14 @@ fn spawn_agent(
             .confirm_mode(confirm_mode)
             .event_sink(sink)
             .cancellation(cancellation)
-            .secret_provider(secret_provider);
+            .secret_provider(secret_provider)
+            .arbiter_enabled(arbiter_enabled)
+            .arbiter_llm(arbiter_llm)
+            .arbiter_model_name(arbiter_model_name);
         if is_local {
-            builder = builder.local_mode();
+            builder = builder.local_mode().arbiter_local_context();
         } else {
-            builder = builder.ssh_mode(ssh_info.as_deref());
+            builder = builder.ssh_mode(ssh_info.as_deref()).arbiter_ssh_context(ssh_info.clone());
         }
 
         let agent = match builder.build() {

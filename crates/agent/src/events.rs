@@ -39,6 +39,22 @@ pub enum AgentEvent {
         destructive: bool,
     },
 
+    /// Independent arbiter verdict on a command awaiting confirmation.
+    ///
+    /// Emitted after [`CommandProposed`] and **before** the confirmer runs.
+    /// The arbiter never auto-approves or auto-denies — this is advisory only.
+    CommandAudited {
+        /// Verdict label: `AGREE`, `MISMATCH`, `UNDERSTATED_RISK`,
+        /// `CONTRADICTS_EVIDENCE`, or `UNAVAILABLE`.
+        verdict: String,
+        /// One-sentence reason (empty when `AGREE`).
+        reason: String,
+        /// Display name / slug of the arbiter model (if known).
+        arbiter_model: Option<String>,
+        /// `true` when the audit could not be completed (timeout, error, bad JSON).
+        unavailable: bool,
+    },
+
     /// A command was executed (or denied by the user).
     CommandFinished {
         /// The command that was processed.
@@ -62,6 +78,8 @@ pub enum AgentEvent {
         cost: Option<f64>,
         /// The actually served model slug. None when not reported.
         model: Option<String>,
+        /// `true` when this usage is from the command arbiter, not the main agent loop.
+        arbiter: bool,
     },
 
     /// The agent encountered an error (network, LLM, transport).

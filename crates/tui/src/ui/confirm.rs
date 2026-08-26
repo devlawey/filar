@@ -51,6 +51,10 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let explanation = confirm.explanation.clone();
     let command = confirm.command.clone();
     let destructive = confirm.destructive;
+    let audit_verdict = confirm.audit_verdict.clone();
+    let audit_reason = confirm.audit_reason.clone();
+    let audit_model = confirm.audit_model.clone();
+    let audit_unavailable = confirm.audit_unavailable;
 
     // --- Estimate modal dimensions ---
     // Minimum width 32 so buttons fit inside borders (30 chars + 2 borders).
@@ -63,11 +67,17 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         0
     };
+    let audit_rows = audit_display_rows(
+        audit_unavailable,
+        audit_verdict.as_deref(),
+        &audit_reason,
+        audit_model.as_deref(),
+    );
     let warning_rows = if destructive { 1 } else { 0 };
     let command_rows = estimate_wrapped_rows(&command_text, inner_width);
     let empty_rows = 1; // separator line before buttons
 
-    let natural_content = (explanation_rows + warning_rows + command_rows + empty_rows) as u16;
+    let natural_content = (explanation_rows + audit_rows + warning_rows + command_rows + empty_rows) as u16;
     // +2 borders +1 buttons
     let natural_height = natural_content.saturating_add(3);
 
@@ -79,10 +89,16 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         &explanation,
         &command_text,
         destructive,
+        audit_unavailable,
+        audit_verdict.as_deref(),
+        &audit_reason,
+        audit_model.as_deref(),
         app.theme.fg_style(),
         app.theme.danger_fg(),
         app.theme.warning_fg(),
         app.theme.muted(),
+        app.theme.success_fg(),
+        app.theme.accent,
         inner_width,
         max_content_rows,
     );
@@ -142,15 +158,47 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     render_buttons(f, app, chunks[1]);
 }
 
+/// Estimate rows used by the arbiter audit block.
+fn audit_display_rows(
+    unavailable: bool,
+    verdict: Option<&str>,
+    reason: &str,
+    model: Option<&str>,
+) -> usize {
+    if unavailable {
+        return 1;
+    }
+    let Some(verdict) = verdict else {
+        return 0;
+    };
+    if verdict.eq_ignore_ascii_case("AGREE") {
+        return 1;
+    }
+    let mut rows = 1; // verdict header
+    if !reason.is_empty() {
+        rows += 1;
+    }
+    if model.is_some() {
+        rows += 1;
+    }
+    rows
+}
+
 /// Build modal body lines, truncating so wrapped height ≤ `max_rows`.
 fn build_modal_lines(
     explanation: &str,
     command_text: &str,
     destructive: bool,
+    audit_unavailable: bool,
+    audit_verdict: Option<&str>,
+    audit_reason: &str,
+    audit_model: Option<&str>,
     fg: Style,
     danger: Style,
     warning: Style,
     muted: Style,
+    success: Style,
+    accent: ratatui::style::Color,
     inner_width: usize,
     max_rows: usize,
 ) -> Vec<Line<'static>> {
@@ -180,6 +228,23 @@ fn build_modal_lines(
             )));
             used = used.saturating_add(1).min(max_rows);
         }
+    }
+
+    if used < max_rows {
+        append_audit_lines(
+            &mut lines,
+            &mut used,
+            max_rows,
+            inner_width,
+            audit_unavailable,
+            audit_verdict,
+            audit_reason,
+            audit_model,
+            muted,
+            success,
+            danger,
+            accent,
+        );
     }
 
     if destructive && used < max_rows {
@@ -213,6 +278,97 @@ fn build_modal_lines(
     }
 
     lines
+}
+
+fn append_audit_lines(
+    lines: &mut Vec<Line<'static>>,
+    used: &mut usize,
+    max_rows: usize,
+    inner_width: usize,
+    unavailable: bool,
+    verdict: Option<&str>,
+    reason: &str,
+    model: Option<&str>,
+    muted: Style,
+    success: Style,
+    danger: Style,
+    accent: ratatui::style::Color,
+) {
+    if *used >= max_rows {
+        return;
+    }
+    if unavailable {
+        let _ = push_line(
+            lines,
+            used,
+            max_rows,
+            inner_width,
+            "Audit: check unavailable — decide from the explanation.".to_string(),
+            muted,
+        );
+        return;
+    }
+    let Some(verdict) = verdict else {
+        return;
+    };
+    if verdict.eq_ignore_ascii_case("AGREE") {
+        let model_note = model
+            .map(|m| format!(" (checked by {m})"))
+            .unwrap_or_default();
+        let _ = push_line(
+            lines,
+            used,
+            max_rows,
+            inner_width,
+            format!("Audit: agree{model_note}"),
+            success,
+        );
+        return;
+    }
+    let header = format!("Audit: {verdict}");
+    let _ = push_line(lines, used, max_rows, inner_width, header, Style::default().fg(accent).add_modifier(Modifier::BOLD));
+    if !reason.is_empty() && *used < max_rows {
+        let _ = push_line(
+            lines,
+            used,
+            max_rows,
+            inner_width,
+            reason.to_string(),
+            danger,
+        );
+    }
+    if let Some(m) = model {
+        if *used < max_rows {
+            let _ = push_line(
+                lines,
+                used,
+                max_rows,
+                inner_width,
+                format!("— {m}"),
+                muted,
+            );
+        }
+    }
+}
+
+fn push_line(
+    lines: &mut Vec<Line<'static>>,
+    used: &mut usize,
+    max_rows: usize,
+    inner_width: usize,
+    text: String,
+    style: Style,
+) -> bool {
+    if *used >= max_rows {
+        return false;
+    }
+    let rows = estimate_wrapped_rows(&text, inner_width);
+    if *used + rows > max_rows {
+        return false;
+    }
+    lines.push(Line::from(Span::styled(text, style)));
+    *used += rows;
+    true
 }
 
 /// Truncate `text` so its wrapped row count is ≤ `max_rows`.
@@ -429,12 +585,12 @@ mod tests {
 
     fn pending(command: &str, destructive: bool) -> PendingConfirm {
         let (tx, _rx) = oneshot::channel();
-        PendingConfirm {
-            command: command.to_string(),
-            explanation: "long command".into(),
+        PendingConfirm::new(
+            command.to_string(),
+            "long command".into(),
             destructive,
-            respond_to: tx,
-        }
+            tx,
+        )
     }
 
     #[test]

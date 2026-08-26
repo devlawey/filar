@@ -11,6 +11,15 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Independent command arbiter: a second LLM audits each command awaiting
+  confirmation, checking whether the explanation matches the command. Verdict
+  is shown in the confirm dialog; user approval is unchanged. Config:
+  `arbiter_profile` (optional) and `arbiter_enabled` (default `true`; runs only
+  on `NeedsConfirmation`). Arbiter token usage appears separately in the F1 help
+  overlay ([#353](https://github.com/devlawey/filar/issues/353)).
+
 ### Fixed
 
 - Ctrl+S and F2 Explain Markdown exports now take topic slug from live chat

@@ -338,6 +338,8 @@ pub(crate) fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
         lines.push(line);
     }
 
+    append_usage_summary(&mut lines, app);
+
     let inner = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.accent))
@@ -367,6 +369,59 @@ pub(crate) fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
         .wrap(Wrap { trim: false });
 
     f.render_widget(paragraph, overlay_area);
+}
+
+/// Append session token usage summary (including arbiter) to the help overlay.
+fn append_usage_summary(lines: &mut Vec<Line>, app: &App) {
+    let active = app
+        .llm_profile
+        .clone()
+        .unwrap_or_else(|| app.default_profile_name.clone());
+    let profile_usage = app.per_profile.get(&active);
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        " Usage ",
+        Style::default()
+            .fg(app.theme.accent)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    if let Some(pu) = profile_usage {
+        if pu.tokens_in > 0 || pu.tokens_out > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  Session ({active}): {}↑ {}↓", pu.tokens_in, pu.tokens_out),
+                app.theme.fg_style(),
+            )));
+        }
+    } else if app.tokens_in > 0 || app.tokens_out > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  Session: {}↑ {}↓", app.tokens_in, app.tokens_out),
+            app.theme.fg_style(),
+        )));
+    }
+
+    if app.arbiter_tokens_in > 0 || app.arbiter_tokens_out > 0 {
+        let mut arb = format!(
+            "  Arbiter: {}↑ {}↓",
+            app.arbiter_tokens_in, app.arbiter_tokens_out
+        );
+        if let Some(cost) = app.arbiter_cost_usd {
+            if cost > 0.0 {
+                arb.push_str(&format!(" ${cost:.4}"));
+            }
+        }
+        lines.push(Line::from(Span::styled(arb, app.theme.dim())));
+    }
+
+    if let Some(cost) = app.cost_usd {
+        if cost > 0.0 {
+            lines.push(Line::from(Span::styled(
+                format!("  Total cost: ${cost:.4}"),
+                app.theme.muted(),
+            )));
+        }
+    }
 }
 
 #[cfg(test)]

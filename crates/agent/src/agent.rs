@@ -17,6 +17,7 @@ use filar_core::{CommandConfirmMode, CoreError, Result, SecretProvider};
 use filar_transport::{CommandExecutor, SecretSubstitutingExecutor};
 
 use crate::{
+    arbiter::{self, ArbiterContext, ARBITER_TIMEOUT_SECS, HISTORY_TAIL_EXCHANGES},
     events::{AgentEvent, EventSink},
     security::{self, CommandConfirmer, ConfirmDecision},
     tools::{self},
@@ -160,6 +161,14 @@ pub struct Agent {
     /// during `build()` if this is set.
     #[allow(dead_code)]
     secret_provider: Option<Arc<dyn SecretProvider>>,
+    /// Optional LLM client for the independent command arbiter.
+    arbiter_llm: Option<Arc<dyn LlmClient>>,
+    /// When false, skip arbiter audits even if `arbiter_llm` is set.
+    arbiter_enabled: bool,
+    /// Execution context passed to the arbiter (local vs remote).
+    arbiter_context: ArbiterContext,
+    /// Display name of the arbiter profile (for events / TUI).
+    arbiter_model_name: String,
 }
 
 /// Builder for [`Agent`].
@@ -177,6 +186,10 @@ pub struct AgentBuilder {
     confirm_timeout: Option<Duration>,
     command_timeout: Option<Duration>,
     secret_provider: Option<Arc<dyn SecretProvider>>,
+    arbiter_llm: Option<Arc<dyn LlmClient>>,
+    arbiter_enabled: bool,
+    arbiter_context: Option<ArbiterContext>,
+    arbiter_model_name: Option<String>,
 }
 
 impl AgentBuilder {
@@ -196,6 +209,10 @@ impl AgentBuilder {
             confirm_timeout: None,
             command_timeout: None,
             secret_provider: None,
+            arbiter_llm: None,
+            arbiter_enabled: true,
+            arbiter_context: None,
+            arbiter_model_name: None,
         }
     }
 
@@ -300,6 +317,46 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the LLM client used for independent command audits.
+    pub fn arbiter_llm(mut self, llm: Option<Arc<dyn LlmClient>>) -> Self {
+        self.arbiter_llm = llm;
+        self
+    }
+
+    /// Enable or disable the command arbiter (default: enabled).
+    pub fn arbiter_enabled(mut self, enabled: bool) -> Self {
+        self.arbiter_enabled = enabled;
+        self
+    }
+
+    /// Set execution context for arbiter prompts (local vs SSH target).
+    pub fn arbiter_context(mut self, ctx: ArbiterContext) -> Self {
+        self.arbiter_context = Some(ctx);
+        self
+    }
+
+    /// Set the display name of the arbiter profile (shown in the TUI).
+    pub fn arbiter_model_name(mut self, name: impl Into<String>) -> Self {
+        self.arbiter_model_name = Some(name.into());
+        self
+    }
+
+    /// Convenience: set arbiter context for local execution.
+    pub fn arbiter_local_context(self) -> Self {
+        self.arbiter_context(ArbiterContext {
+            is_local: true,
+            ssh_info: None,
+        })
+    }
+
+    /// Convenience: set arbiter context for SSH remote execution.
+    pub fn arbiter_ssh_context(self, ssh_info: Option<String>) -> Self {
+        self.arbiter_context(ArbiterContext {
+            is_local: false,
+            ssh_info,
+        })
+    }
+
     /// Convenience: set the system prompt for local execution.
     pub fn local_mode(self) -> Self {
         self.system_prompt(build_system_prompt(true, None, cfg!(windows)))
@@ -341,6 +398,15 @@ impl AgentBuilder {
             confirm_timeout: self.confirm_timeout,
             command_timeout: self.command_timeout,
             secret_provider,
+            arbiter_llm: self.arbiter_llm,
+            arbiter_enabled: self.arbiter_enabled,
+            arbiter_context: self.arbiter_context.unwrap_or(ArbiterContext {
+                is_local: false,
+                ssh_info: None,
+            }),
+            arbiter_model_name: self
+                .arbiter_model_name
+                .unwrap_or_else(|| "session profile".into()),
         })
     }
 }
@@ -383,6 +449,63 @@ impl Agent {
     fn emit(&self, event: AgentEvent) {
         if let Some(ref sink) = self.event_sink {
             sink(event);
+        }
+    }
+
+    /// Run the independent command arbiter when enabled. Never blocks confirmation.
+    async fn run_command_audit(
+        &self,
+        command: &str,
+        explanation: &str,
+        destructive: bool,
+        conversation: &[ChatMessage],
+    ) {
+        if !self.arbiter_enabled || self.confirm_mode == CommandConfirmMode::Never {
+            return;
+        }
+        let Some(ref arbiter_llm) = self.arbiter_llm else {
+            return;
+        };
+
+        let target_desc = arbiter::target_description(&self.arbiter_context);
+        let history_tail =
+            arbiter::history_tail_from_messages(conversation, HISTORY_TAIL_EXCHANGES);
+        let messages = arbiter::build_audit_messages(
+            command,
+            explanation,
+            destructive,
+            &target_desc,
+            &history_tail,
+        );
+
+        let audit = arbiter::run_audit(
+            arbiter_llm.as_ref(),
+            messages,
+            Duration::from_secs(ARBITER_TIMEOUT_SECS),
+            self.cancellation.as_ref(),
+        )
+        .await;
+
+        let model_display = audit
+            .model
+            .clone()
+            .unwrap_or_else(|| self.arbiter_model_name.clone());
+
+        self.emit(AgentEvent::CommandAudited {
+            verdict: audit.verdict.label().to_string(),
+            reason: audit.reason.clone(),
+            arbiter_model: Some(model_display),
+            unavailable: audit.unavailable,
+        });
+
+        if audit.tokens_in > 0 || audit.tokens_out > 0 {
+            self.emit(AgentEvent::TokenUsage {
+                tokens_in: audit.tokens_in,
+                tokens_out: audit.tokens_out,
+                cost: audit.cost,
+                model: audit.model,
+                arbiter: true,
+            });
         }
     }
 
@@ -468,6 +591,7 @@ impl Agent {
                     tokens_out: u.completion_tokens.unwrap_or(0),
                     cost: u.cost,
                     model: response.model.clone(),
+                    arbiter: false,
                 });
             }
 
@@ -513,7 +637,7 @@ impl Agent {
 
                 // Process each tool call.
                 for tc in &tool_calls {
-                    let result = self.process_tool_call(tc).await?;
+                    let result = self.process_tool_call(tc, &messages).await?;
                     messages.push(result);
                 }
             } else {
@@ -535,7 +659,11 @@ impl Agent {
     ///
     /// Emits [`AgentEvent::CommandProposed`] before confirmation and
     /// [`AgentEvent::CommandFinished`] after execution (or denial).
-    async fn process_tool_call(&self, tc: &ToolCall) -> Result<ChatMessage> {
+    async fn process_tool_call(
+        &self,
+        tc: &ToolCall,
+        conversation: &[ChatMessage],
+    ) -> Result<ChatMessage> {
         // Parse the tool call.
         let parsed = match tools::parse_tool_call(&tc.id, &tc.name, &tc.arguments) {
             Ok(p) => p,
@@ -595,6 +723,14 @@ impl Agent {
                 info!(command = %parsed.command, "command auto-approved");
             }
             ConfirmDecision::NeedsConfirmation => {
+                self.run_command_audit(
+                    &parsed.command,
+                    &parsed.explanation,
+                    destructive,
+                    conversation,
+                )
+                .await;
+
                 let confirm_fut = self
                     .confirmer
                     .confirm(&parsed.command, &parsed.explanation, destructive);
@@ -1671,6 +1807,141 @@ mod tests {
         assert!(
             err.contains("explanation"),
             "error should mention missing explanation, got: {err}"
+        );
+    }
+
+    // ── Command arbiter tests (#353) ────────────────────────────────────
+
+    struct StaticArbiterLlm {
+        text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for StaticArbiterLlm {
+        async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse> {
+            Ok(ChatResponse::text(self.text.clone()))
+        }
+    }
+
+    fn tool_call_echo() -> ChatResponse {
+        ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "echo hello",
+                "explanation": "Print hello"
+            }),
+        }])
+    }
+
+    #[tokio::test]
+    async fn arbiter_unavailable_does_not_block_confirm() {
+        use std::sync::Mutex;
+
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call_echo(),
+            ChatResponse::text("Done."),
+        ]));
+        let executor = Arc::new(MockExecutor {
+            last_command: Mutex::new(String::new()),
+        });
+        let confirmer = Arc::new(MockConfirmer { approve: true });
+        let arbiter = Arc::new(StaticArbiterLlm {
+            text: "not valid json".into(),
+        });
+
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let sink: EventSink = Arc::new(move |event: AgentEvent| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let agent = Agent::builder()
+            .llm(llm)
+            .executor(executor.clone())
+            .confirmer(confirmer)
+            .confirm_mode(CommandConfirmMode::Always)
+            .event_sink(sink)
+            .arbiter_llm(Some(arbiter))
+            .arbiter_enabled(true)
+            .arbiter_local_context()
+            .build()
+            .unwrap();
+
+        let _ = agent.run("say hello", &[]).await.unwrap();
+        assert_eq!(
+            *executor.last_command.lock().unwrap(),
+            "echo hello",
+            "command must execute when arbiter is unavailable"
+        );
+
+        let received = events.lock().unwrap();
+        assert!(
+            received.iter().any(|e| matches!(
+                e,
+                AgentEvent::CommandAudited { unavailable: true, .. }
+            )),
+            "expected CommandAudited unavailable, got {received:?}"
+        );
+        assert!(
+            received.iter().any(|e| matches!(
+                e,
+                AgentEvent::CommandFinished { denied: false, .. }
+            )),
+            "command must not be auto-denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn arbiter_mismatch_does_not_auto_deny() {
+        use std::sync::Mutex;
+
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call_echo(),
+            ChatResponse::text("Done."),
+        ]));
+        let executor = Arc::new(MockExecutor {
+            last_command: Mutex::new(String::new()),
+        });
+        let confirmer = Arc::new(MockConfirmer { approve: true });
+        let arbiter = Arc::new(StaticArbiterLlm {
+            text: r#"{"verdict":"MISMATCH","reason":"Command prints hello but explanation claims goodbye."}"#
+                .into(),
+        });
+
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let sink: EventSink = Arc::new(move |event: AgentEvent| {
+            events_clone.lock().unwrap().push(event);
+        });
+
+        let agent = Agent::builder()
+            .llm(llm)
+            .executor(executor.clone())
+            .confirmer(confirmer)
+            .confirm_mode(CommandConfirmMode::Always)
+            .event_sink(sink)
+            .arbiter_llm(Some(arbiter))
+            .arbiter_enabled(true)
+            .arbiter_local_context()
+            .build()
+            .unwrap();
+
+        let _ = agent.run("say hello", &[]).await.unwrap();
+        assert_eq!(
+            *executor.last_command.lock().unwrap(),
+            "echo hello",
+            "MISMATCH verdict must not auto-deny the command"
+        );
+
+        let received = events.lock().unwrap();
+        assert!(
+            received.iter().any(|e| matches!(
+                e,
+                AgentEvent::CommandAudited { verdict, unavailable: false, .. }
+                    if verdict == "MISMATCH"
+            )),
+            "expected MISMATCH CommandAudited, got {received:?}"
         );
     }
 }
