@@ -5089,6 +5089,23 @@ dialog, inserts quoted path + trailing space. Local FS only (zero-install).
 
 **Next steps:** human multi-tab smoke (agent cannot drive TUI).
 
+## Issue #350: fix(tui) — export filename topic slug regression
+
+**Milestone:** 1.0.4. **Branch:** `fix/350-export-filename-topic-slug`.
+
+**Problem:** Ctrl+S and F2 Explain still produced `{host}.{ts}.md` without topic
+slug because exports read `Session::messages` (empty until F3 restore) instead
+of live `App::messages`.
+
+**Design:** shared `export_filename_stem`; `start_save`, `save_transcript_silent`,
+and `toggle_explain` use `App::messages`; regression unit tests.
+
+**Done:** `app.rs`, CHANGELOG `[Unreleased]`.
+
+**Public contract:** none.
+
+**Next steps:** merge PR; human smoke Ctrl+S + F2 on SSH session.
+
 ## Release v1.0.3 (2026-08-24)
 
 **Scope:** milestone 1.0.3 — TUI polish (Ctrl+S filename, path picker, confirm
