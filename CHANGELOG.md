@@ -11,6 +11,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- Ctrl+S and F2 Explain Markdown exports now take topic slug from live chat
+  (`App::messages`), not stale `Session::messages`; Explain transcript uses the
+  same `{host}.{topic}.{timestamp}.md` naming as manual export
+  ([#350](https://github.com/devlawey/filar/issues/350)).
+
 ## [1.0.3] - 2026-08-24
 
 ### Added

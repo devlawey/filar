@@ -528,6 +528,7 @@ impl App {
         // Transcript handling.
         if !was_explain {
             // Entering Explain mode — create transcript path if not yet set.
+            let messages = self.messages.clone();
             let session = &mut self.sessions[self.active];
             if session.transcript_path.is_none() {
                 let base_dir = self
@@ -537,6 +538,7 @@ impl App {
                 let filename = transcript_filename(
                     &session.target_name,
                     &session.ssh_info,
+                    &messages,
                 );
                 let path = base_dir.join(&filename);
                 session.transcript_path = Some(path.clone());
@@ -864,13 +866,28 @@ fn topic_slug_from_messages(messages: &[ChatBlock]) -> Option<String> {
     }
 }
 
-/// Generate a transcript filename: `{slug}.{date}.{time}.md`.
-/// No collision check — the file is overwritten on each save.
-fn transcript_filename(session_name: &str, ssh_info: &Option<String>) -> String {
+/// Shared stem for Markdown exports: `{host}.{topic?}.{date}.{time}`.
+fn export_filename_stem(
+    session_name: &str,
+    ssh_info: &Option<String>,
+    messages: &[ChatBlock],
+) -> String {
     let base = ssh_info.as_deref().unwrap_or(session_name);
-    let slug = slugify(base);
+    let host = slugify(base);
     let ts = format_now_utc();
-    format!("{slug}.{ts}.md")
+    match topic_slug_from_messages(messages) {
+        Some(topic) => format!("{host}.{topic}.{ts}"),
+        None => format!("{host}.{ts}"),
+    }
+}
+
+/// Explain-mode transcript filename (`{stem}.md`). Overwritten on each silent save.
+fn transcript_filename(
+    session_name: &str,
+    ssh_info: &Option<String>,
+    messages: &[ChatBlock],
+) -> String {
+    format!("{}.md", export_filename_stem(session_name, ssh_info, messages))
 }
 
 /// Generate a Ctrl+S save filename: `{host}.{topic?}.{date}.{time}.md`,
@@ -882,13 +899,7 @@ async fn generate_save_filename(
     messages: &[ChatBlock],
     base_dir: &std::path::Path,
 ) -> String {
-    let base = ssh_info.as_deref().unwrap_or(session_name);
-    let host = slugify(base);
-    let ts = format_now_utc();
-    let stem = match topic_slug_from_messages(messages) {
-        Some(topic) => format!("{host}.{topic}.{ts}"),
-        None => format!("{host}.{ts}"),
-    };
+    let stem = export_filename_stem(session_name, ssh_info, messages);
     let mut name = format!("{stem}.md");
     // Avoid overwriting: append -1, -2, … if file already exists.
     if tokio::fs::try_exists(base_dir.join(&name)).await.unwrap_or(false) {
@@ -1494,7 +1505,9 @@ impl App {
 
         let session_name = self.sessions[self.active].target_name.clone();
         let ssh_info = self.sessions[self.active].ssh_info.clone();
-        let messages = self.sessions[self.active].messages.clone();
+        // Live chat lives on `App::messages`; `Session::messages` is only
+        // populated on F3 restore (#350).
+        let messages = self.messages.clone();
         let tx = tx.clone();
         // Resolve the export directory: configured `save_dir`, else CWD.
         let base_dir = self
@@ -1549,16 +1562,14 @@ impl App {
     ///
     /// On error: warns in the log and shows a feed warning once per session.
     pub fn save_transcript_silent(&mut self) {
-        let session = &mut self.sessions[self.active];
-
         // Only if transcript path is set (Explain mode was entered).
-        let path = match &session.transcript_path {
-            Some(p) => p.clone(),
+        let path = match self.sessions[self.active].transcript_path.clone() {
+            Some(p) => p,
             None => return,
         };
 
         // Skip if manual save or silent save is in flight.
-        if self.save_in_flight || session.transcript_saving {
+        if self.save_in_flight || self.sessions[self.active].transcript_saving {
             return;
         }
 
@@ -1566,12 +1577,11 @@ impl App {
             return;
         };
 
-        session.transcript_saving = true;
-
-        let sid = session.id;
-        let messages = session.messages.clone();
-        let session_name = session.target_name.clone();
-        let ssh_info = session.ssh_info.clone();
+        let sid = self.sessions[self.active].id;
+        let messages = self.messages.clone();
+        let session_name = self.sessions[self.active].target_name.clone();
+        let ssh_info = self.sessions[self.active].ssh_info.clone();
+        self.sessions[self.active].transcript_saving = true;
         let tx = tx.clone();
 
         tokio::spawn(async move {
@@ -7636,6 +7646,17 @@ mod tests {
     }
 
     #[test]
+    fn transcript_filename_includes_topic_slug() {
+        let msgs = vec![ChatBlock::User("fix nginx timeout on prod".into())];
+        let name = transcript_filename("local", &None, &msgs);
+        assert!(
+            name.starts_with("local.fix-nginx-timeout-on-prod."),
+            "expected host.topic.ts.md, got: {name}"
+        );
+        assert!(name.ends_with(".md"));
+    }
+
+    #[test]
     fn messages_to_markdown_covers_all_block_types() {
         let blocks = vec![
             ChatBlock::User("hello".into()),
@@ -7822,7 +7843,7 @@ mod tests {
 
     #[test]
     fn transcript_filename_has_correct_format() {
-        let name = transcript_filename("my-server", &Some("root@10.0.0.5:22".into()));
+        let name = transcript_filename("my-server", &Some("root@10.0.0.5:22".into()), &[]);
         assert!(
             name.starts_with("root-10.0.0.5-22.") && name.ends_with(".md"),
             "expected slug.date.time.md format, got: {name}"
