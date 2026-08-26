@@ -1724,6 +1724,7 @@ fn spawn_agent(
         } else {
             builder = builder.ssh_mode(ssh_info.as_deref()).arbiter_ssh_context(ssh_info.clone());
         }
+        builder = builder.session_id(sid.0.to_string());
 
         let agent = match builder.build() {
             Ok(a) => a,

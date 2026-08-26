@@ -135,8 +135,9 @@ command_secs = 300   # выполнение одной команды
 llm_secs = 60        # один вызов LLM API
 connect_secs = 15    # установка SSH-соединения
 
-# Долгие jobs (pull/download/build): агент не должен делать `sleep N` под
-# command_secs — стартуйте в фоне и поллите короткими командами, либо Ctrl+T.
+# Долгие jobs (pull/download/build): используйте инструменты
+# start_background_job / background_job_status / cancel_background_job —
+# не делайте `sleep N` под command_secs; для live-прогресса — Ctrl+T.
 
 # ── SSH-таргеты ───────────────────────────────────────────
 # Лаунчер синхронизирует свои SSH-профили в эту секцию при каждом Launch.

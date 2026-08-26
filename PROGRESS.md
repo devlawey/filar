@@ -5146,6 +5146,39 @@ modal. Never auto-approve/deny; 12s timeout; secrets redacted from history.
 **Next steps:** merge PR; **eval-smoke required** (new system prompt in arbiter);
 manual smoke 10+ confirmable commands, note objection rate in PR.
 
+## Issue #349: feat(agent) — background job tool
+
+**Milestone:** 1.0.4. **Branch:** `feat/349-background-job-tool`.
+
+**Problem:** After #323 the agent rejects long `sleep` under `command_secs`, but
+there is no first-class contract for detached jobs — the model must hand-roll
+`nohup`/`Start-Process`, and cancel is guesswork.
+
+**Design (fixed in PR):**
+- **Tools:** separate LLM tools — `start_background_job`, `background_job_status`,
+  `cancel_background_job`, `list_background_jobs` (not one `action=` enum).
+- **Scope:** in-memory registry in `crates/agent/src/background.rs`, keyed by
+  `AgentBuilder::session_id` (tab id from TUI runner).
+- **Confirm-gate:** start uses same policy as `run_command` (destructive highlight
+  on the user command); status/list auto-approved in Allowlist; cancel always
+  needs confirmation (kill).
+- **Local:** `tokio::process` spawn (Unix `setsid`); stdout/stderr → in-memory
+  buffer — no disk artifacts.
+- **SSH (zero-install):** start via `nohup sh -c … & echo $!`; status polls
+  `kill -0` + `tail` on ephemeral `/tmp/filar-job-{session}-{id}.log`; log removed
+  on completion/cancel. No persistent remote state beyond the running process.
+- **Prompt / long_wait guidance:** rule 10 + `LONG_WAIT_GUIDANCE` point at the
+  new tools instead of manual nohup patterns.
+
+**Done:** `background.rs`, tool wiring, `session_id` on `AgentBuilder`, unit
+tests (start/status/cancel, unknown job_id), eval snapshot update.
+
+**Public contract:** four new agent tools; `AgentBuilder::session_id`,
+`AgentBuilder::is_local`.
+
+**Next steps:** merge PR; manual smoke local long job + SSH background job;
+eval-smoke on agent prompt change.
+
 ## Release v1.0.3 (2026-08-24)
 
 **Scope:** milestone 1.0.3 — TUI polish (Ctrl+S filename, path picker, confirm

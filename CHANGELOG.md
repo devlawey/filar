@@ -13,6 +13,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Background job tools for long-running work: `start_background_job`,
+  `background_job_status`, `cancel_background_job`, and `list_background_jobs`.
+  Jobs are scoped per agent session; confirm-gate matches `run_command` for
+  start, readonly allowlist for status/list, confirmation for cancel
+  ([#349](https://github.com/devlawey/filar/issues/349)).
+
 - Independent command arbiter: a second LLM audits each command awaiting
   confirmation, checking whether the explanation matches the command. Verdict
   is shown in the confirm dialog; user approval is unchanged. Config:

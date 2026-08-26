@@ -115,6 +115,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## Agent tools (including background jobs)
+
+The agent exposes shell tools (`run_command`, `read_file`, `list_dir`) plus
+background job tools for work that outlasts `[timeouts].command_secs`:
+
+| Tool | Purpose |
+|------|---------|
+| `start_background_job` | Detach a command; returns `job_id` (+ pid when known) |
+| `background_job_status` | Short poll for status/output (timeout applies to the poll only) |
+| `cancel_background_job` | Stop a job by `job_id` |
+| `list_background_jobs` | List jobs for the current session |
+
+Embedders must set `AgentBuilder::session_id` (unique per tab/session) so job
+state does not leak across concurrent agents. Set `AgentBuilder::is_local(true)`
+for local executors (affects spawn strategy). Background jobs on SSH use
+ephemeral `/tmp/filar-job-*` logs removed on completion; local jobs capture
+output in memory only.
+
 ## SSH credentials (password auth)
 
 For `SshAuth::Password`, the SSH password is resolved in this order:

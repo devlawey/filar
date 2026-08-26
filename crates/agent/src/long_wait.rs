@@ -15,10 +15,10 @@ pub const LONG_WAIT_SECS_THRESHOLD: u64 = 30;
 /// rejected or a command times out.
 pub const LONG_WAIT_GUIDANCE: &str = "\
 Do not use sleep/Start-Sleep (or similar wall-clock waits) under the command \
-timeout. Start long jobs in the background and poll with short commands \
-(POSIX: `nohup … >log 2>&1 & echo $!` then `tail`/`ps`; Windows: \
-`Start-Process` / jobs, then check output). For live interactive progress, \
-ask the user to use Ctrl+T (interactive terminal).";
+timeout. Use start_background_job, then poll with background_job_status (short \
+calls; timeout applies to each poll, not job lifetime). Cancel with \
+cancel_background_job. For live interactive progress, ask the user to use Ctrl+T \
+(interactive terminal).";
 
 /// If `command` is primarily a long wall-clock wait, return a tool-error
 /// message the agent should follow. Otherwise `None` (command may run).
@@ -153,7 +153,7 @@ mod tests {
     fn rejects_sleep_above_threshold() {
         let msg = reject_long_wait("sleep 120 && tail log").unwrap();
         assert!(msg.contains("120"));
-        assert!(msg.contains("nohup") || msg.contains("background"));
+        assert!(msg.contains("start_background_job") || msg.contains("background"));
     }
 
     #[test]

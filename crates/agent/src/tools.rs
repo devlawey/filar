@@ -1,9 +1,11 @@
 //! Tool definitions and execution for the agent.
 //!
-//! The agent exposes three tools to the LLM:
+//! The agent exposes tools to the LLM:
 //! - `run_command` — execute a shell command on the current target.
 //! - `read_file` — read a file's contents (wrapper around `cat`).
 //! - `list_dir` — list directory contents (wrapper around `ls`).
+//! - `start_background_job` / `background_job_status` / `cancel_background_job` /
+//!   `list_background_jobs` — long-running work without blocking tool timeouts.
 //!
 //! All tools are implemented as wrappers over shell commands to maintain the
 //! **zero-install** invariant — no files are created on the remote machine.
@@ -23,6 +25,10 @@ use crate::ToolDef;
 pub const TOOL_RUN_COMMAND: &str = "run_command";
 pub const TOOL_READ_FILE: &str = "read_file";
 pub const TOOL_LIST_DIR: &str = "list_dir";
+pub const TOOL_START_BACKGROUND_JOB: &str = "start_background_job";
+pub const TOOL_BACKGROUND_JOB_STATUS: &str = "background_job_status";
+pub const TOOL_CANCEL_BACKGROUND_JOB: &str = "cancel_background_job";
+pub const TOOL_LIST_BACKGROUND_JOBS: &str = "list_background_jobs";
 
 // ---------------------------------------------------------------------------
 // Tool parameter structs
@@ -58,6 +64,43 @@ pub struct ListDirParams {
     pub explanation: String,
 }
 
+/// Parameters for `start_background_job`.
+#[derive(Debug, Deserialize)]
+pub struct StartBackgroundJobParams {
+    pub command: String,
+    #[serde(default)]
+    pub explanation: String,
+}
+
+/// Parameters for `background_job_status`.
+#[derive(Debug, Deserialize)]
+pub struct BackgroundJobStatusParams {
+    pub job_id: String,
+    #[serde(default = "default_tail_lines")]
+    pub tail_lines: u32,
+    #[serde(default)]
+    pub explanation: String,
+}
+
+fn default_tail_lines() -> u32 {
+    50
+}
+
+/// Parameters for `cancel_background_job`.
+#[derive(Debug, Deserialize)]
+pub struct CancelBackgroundJobParams {
+    pub job_id: String,
+    #[serde(default)]
+    pub explanation: String,
+}
+
+/// Parameters for `list_background_jobs`.
+#[derive(Debug, Deserialize)]
+pub struct ListBackgroundJobsParams {
+    #[serde(default)]
+    pub explanation: String,
+}
+
 // ---------------------------------------------------------------------------
 // Tool definitions (for the LLM)
 // ---------------------------------------------------------------------------
@@ -82,6 +125,22 @@ pub fn tool_definitions(mode: CommandConfirmMode) -> Vec<ToolDef> {
         "type": "string",
         "description": "A brief explanation of what this command does and why."
     });
+
+    let required_job_id = if require_explanation {
+        serde_json::json!(["job_id", "explanation"])
+    } else {
+        serde_json::json!(["job_id"])
+    };
+    let required_start = if require_explanation {
+        serde_json::json!(["command", "explanation"])
+    } else {
+        serde_json::json!(["command"])
+    };
+    let required_list_jobs = if require_explanation {
+        serde_json::json!(["explanation"])
+    } else {
+        serde_json::json!([])
+    };
 
     vec![
         ToolDef {
@@ -136,6 +195,75 @@ pub fn tool_definitions(mode: CommandConfirmMode) -> Vec<ToolDef> {
                 "required": required_path
             }),
         },
+        ToolDef {
+            name: TOOL_START_BACKGROUND_JOB.into(),
+            description: "Start a long-running command in the background and return a job_id \
+                immediately. Use background_job_status to poll progress with short calls; the \
+                job keeps running beyond the normal command timeout. Prefer this over run_command \
+                for downloads, builds, pulls, and other work that may take many minutes."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to run in the background."
+                    },
+                    "explanation": explanation_prop()
+                },
+                "required": required_start
+            }),
+        },
+        ToolDef {
+            name: TOOL_BACKGROUND_JOB_STATUS.into(),
+            description: "Poll a background job started with start_background_job. Returns \
+                running/done/failed/cancelled status and recent output. This call is short — \
+                it does not wait for the job to finish."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job id returned by start_background_job."
+                    },
+                    "tail_lines": {
+                        "type": "integer",
+                        "description": "How many lines of output to include (default 50)."
+                    },
+                    "explanation": explanation_prop()
+                },
+                "required": required_job_id
+            }),
+        },
+        ToolDef {
+            name: TOOL_CANCEL_BACKGROUND_JOB.into(),
+            description: "Cancel a background job by job_id. Stops the underlying process."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job id returned by start_background_job."
+                    },
+                    "explanation": explanation_prop()
+                },
+                "required": required_job_id
+            }),
+        },
+        ToolDef {
+            name: TOOL_LIST_BACKGROUND_JOBS.into(),
+            description: "List background jobs for the current session with their status."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "explanation": explanation_prop()
+                },
+                "required": required_list_jobs
+            }),
+        },
     ]
 }
 
@@ -152,6 +280,14 @@ pub enum ToolKind {
     ReadFile,
     /// Lists a directory via `ls` — still executes a command, confirmation depends on policy.
     ListDir,
+    /// Start a detached background job — same confirm policy as RunCommand.
+    StartBackgroundJob,
+    /// Poll background job status — readonly / allowlisted.
+    BackgroundJobStatus,
+    /// Cancel a background job — requires confirmation.
+    CancelBackgroundJob,
+    /// List session background jobs — readonly / allowlisted.
+    ListBackgroundJobs,
 }
 
 /// Parsed tool call — the tool name, the shell command to execute, and an
@@ -166,6 +302,10 @@ pub struct ParsedToolCall {
     pub command: String,
     /// Human-readable explanation (from the LLM or derived).
     pub explanation: String,
+    /// Background job id (status / cancel tools).
+    pub job_id: Option<String>,
+    /// Lines of output to tail (status tool).
+    pub tail_lines: Option<u32>,
 }
 
 /// Parse a tool call from the LLM into a `ParsedToolCall`.
@@ -181,6 +321,8 @@ pub fn parse_tool_call(id: &str, name: &str, arguments: &serde_json::Value) -> R
                 kind: ToolKind::RunCommand,
                 command: params.command,
                 explanation: params.explanation,
+                job_id: None,
+                tail_lines: None,
             })
         }
         TOOL_READ_FILE => {
@@ -195,6 +337,8 @@ pub fn parse_tool_call(id: &str, name: &str, arguments: &serde_json::Value) -> R
                 } else {
                     params.explanation
                 },
+                job_id: None,
+                tail_lines: None,
             })
         }
         TOOL_LIST_DIR => {
@@ -209,6 +353,68 @@ pub fn parse_tool_call(id: &str, name: &str, arguments: &serde_json::Value) -> R
                 } else {
                     params.explanation
                 },
+                job_id: None,
+                tail_lines: None,
+            })
+        }
+        TOOL_START_BACKGROUND_JOB => {
+            let params: StartBackgroundJobParams = serde_json::from_value(arguments.clone())
+                .map_err(|e| CoreError::Other(format!("invalid start_background_job arguments: {e}")))?;
+            Ok(ParsedToolCall {
+                id: id.to_string(),
+                kind: ToolKind::StartBackgroundJob,
+                command: params.command,
+                explanation: params.explanation,
+                job_id: None,
+                tail_lines: None,
+            })
+        }
+        TOOL_BACKGROUND_JOB_STATUS => {
+            let params: BackgroundJobStatusParams = serde_json::from_value(arguments.clone())
+                .map_err(|e| CoreError::Other(format!("invalid background_job_status arguments: {e}")))?;
+            Ok(ParsedToolCall {
+                id: id.to_string(),
+                kind: ToolKind::BackgroundJobStatus,
+                command: format!("background_job_status {}", params.job_id),
+                explanation: if params.explanation.is_empty() {
+                    format!("Poll background job: {}", params.job_id)
+                } else {
+                    params.explanation
+                },
+                job_id: Some(params.job_id),
+                tail_lines: Some(params.tail_lines),
+            })
+        }
+        TOOL_CANCEL_BACKGROUND_JOB => {
+            let params: CancelBackgroundJobParams = serde_json::from_value(arguments.clone())
+                .map_err(|e| CoreError::Other(format!("invalid cancel_background_job arguments: {e}")))?;
+            Ok(ParsedToolCall {
+                id: id.to_string(),
+                kind: ToolKind::CancelBackgroundJob,
+                command: crate::background::confirm_command_for_cancel(&params.job_id, None),
+                explanation: if params.explanation.is_empty() {
+                    format!("Cancel background job: {}", params.job_id)
+                } else {
+                    params.explanation
+                },
+                job_id: Some(params.job_id),
+                tail_lines: None,
+            })
+        }
+        TOOL_LIST_BACKGROUND_JOBS => {
+            let params: ListBackgroundJobsParams = serde_json::from_value(arguments.clone())
+                .map_err(|e| CoreError::Other(format!("invalid list_background_jobs arguments: {e}")))?;
+            Ok(ParsedToolCall {
+                id: id.to_string(),
+                kind: ToolKind::ListBackgroundJobs,
+                command: "list_background_jobs".into(),
+                explanation: if params.explanation.is_empty() {
+                    "List background jobs".into()
+                } else {
+                    params.explanation
+                },
+                job_id: None,
+                tail_lines: None,
             })
         }
         other => Err(CoreError::Other(format!("unknown tool: {other}"))),
@@ -249,6 +455,43 @@ pub fn check_explanation(name: &str, arguments: &serde_json::Value) -> Option<St
                 return Some(
                     "Error: in safe mode, list_dir also requires an `explanation`. \
                      Please describe why you need to list this directory."
+                        .into(),
+                );
+            }
+        }
+        TOOL_START_BACKGROUND_JOB => {
+            let params: StartBackgroundJobParams = serde_json::from_value(arguments.clone()).ok()?;
+            if params.explanation.trim().is_empty() {
+                return Some(
+                    "Error: in safe mode, start_background_job requires an `explanation`. \
+                     Please describe why this long-running job is needed."
+                        .into(),
+                );
+            }
+        }
+        TOOL_BACKGROUND_JOB_STATUS => {
+            let params: BackgroundJobStatusParams = serde_json::from_value(arguments.clone()).ok()?;
+            if params.explanation.trim().is_empty() {
+                return Some(
+                    "Error: in safe mode, background_job_status requires an `explanation`."
+                        .into(),
+                );
+            }
+        }
+        TOOL_CANCEL_BACKGROUND_JOB => {
+            let params: CancelBackgroundJobParams = serde_json::from_value(arguments.clone()).ok()?;
+            if params.explanation.trim().is_empty() {
+                return Some(
+                    "Error: in safe mode, cancel_background_job requires an `explanation`."
+                        .into(),
+                );
+            }
+        }
+        TOOL_LIST_BACKGROUND_JOBS => {
+            let params: ListBackgroundJobsParams = serde_json::from_value(arguments.clone()).ok()?;
+            if params.explanation.trim().is_empty() {
+                return Some(
+                    "Error: in safe mode, list_background_jobs requires an `explanation`."
                         .into(),
                 );
             }
@@ -324,10 +567,14 @@ mod tests {
     #[test]
     fn tool_definitions_count() {
         let defs = tool_definitions(CommandConfirmMode::Allowlist);
-        assert_eq!(defs.len(), 3);
+        assert_eq!(defs.len(), 7);
         assert!(defs.iter().any(|d| d.name == TOOL_RUN_COMMAND));
         assert!(defs.iter().any(|d| d.name == TOOL_READ_FILE));
         assert!(defs.iter().any(|d| d.name == TOOL_LIST_DIR));
+        assert!(defs.iter().any(|d| d.name == TOOL_START_BACKGROUND_JOB));
+        assert!(defs.iter().any(|d| d.name == TOOL_BACKGROUND_JOB_STATUS));
+        assert!(defs.iter().any(|d| d.name == TOOL_CANCEL_BACKGROUND_JOB));
+        assert!(defs.iter().any(|d| d.name == TOOL_LIST_BACKGROUND_JOBS));
     }
 
     #[test]

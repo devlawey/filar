@@ -128,7 +128,7 @@ Rules:
 7. If you need information from the user (e.g. a password, a choice between options), ask them directly in your text response — do not try to use interactive prompts in commands. Wait for their reply before continuing.
 8. Never put passwords or secrets directly in commands. If a password is needed, ask the user to provide it via Ctrl+P (secure masked input). The password is stored as $FILAR_SECRET_N and you are told the variable name — use that placeholder in commands (substituted at execution; you never see the real value). Do not echo or print secret variables. Never run bare `sudo`/`su`/`doas` that would prompt on a TTY — agent commands have no interactive password UI. After the user provides a secret, use a non-interactive form such as `printf '%s\n' "$FILAR_SECRET_1" | sudo -S <command>` (POSIX) or an equivalent that reads the password from stdin.
 9. NEVER run interactive commands (vim, nano, top, htop, less, man, mc, screen, tmux, ssh, etc.). These commands take over the terminal and will hang indefinitely. Instead, use non-interactive alternatives: 'cat file' instead of 'less file', 'grep -n pattern file' instead of 'vim file', 'head -n 50 file' to preview. For editing files, use 'sed' or 'tee' with heredocs.
-10. NEVER use long wall-clock waits (`sleep N`, `Start-Sleep`, etc.) to poll progress. Every tool command shares a hard timeout (`[timeouts].command_secs`). A `sleep` near or above that timeout will fail. For downloads, pulls, builds, or other long jobs: start them in the background and poll with short commands (POSIX: `nohup … > /tmp/job.log 2>&1 & echo $!` then `tail`/`ps`; Windows: `Start-Process` / background jobs, then check the log). For live interactive progress, ask the user to use Ctrl+T (interactive terminal) instead of blocking the agent tool call.
+10. NEVER use long wall-clock waits (`sleep N`, `Start-Sleep`, etc.) to poll progress. Every tool command shares a hard timeout (`[timeouts].command_secs`). A `sleep` near or above that timeout will fail. For downloads, pulls, builds, or other long jobs: use `start_background_job` then poll with `background_job_status` (short calls; timeout applies to each poll, not job lifetime). Cancel with `cancel_background_job`; list jobs with `list_background_jobs`. For live interactive progress, ask the user to use Ctrl+T (interactive terminal) instead of blocking the agent tool call.
 {shell_desc}"#
     )
 }
@@ -169,6 +169,10 @@ pub struct Agent {
     arbiter_context: ArbiterContext,
     /// Display name of the arbiter profile (for events / TUI).
     arbiter_model_name: String,
+    /// Session id (tab) — scopes background jobs.
+    session_id: String,
+    /// True when commands run on the local machine (vs SSH).
+    is_local: bool,
 }
 
 /// Builder for [`Agent`].
@@ -190,6 +194,8 @@ pub struct AgentBuilder {
     arbiter_enabled: bool,
     arbiter_context: Option<ArbiterContext>,
     arbiter_model_name: Option<String>,
+    session_id: Option<String>,
+    is_local: bool,
 }
 
 impl AgentBuilder {
@@ -213,6 +219,8 @@ impl AgentBuilder {
             arbiter_enabled: true,
             arbiter_context: None,
             arbiter_model_name: None,
+            session_id: None,
+            is_local: false,
         }
     }
 
@@ -341,6 +349,18 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the session id used to scope background jobs (typically the tab id).
+    pub fn session_id(mut self, id: impl Into<String>) -> Self {
+        self.session_id = Some(id.into());
+        self
+    }
+
+    /// Mark whether the executor targets the local machine (affects background spawn).
+    pub fn is_local(mut self, is_local: bool) -> Self {
+        self.is_local = is_local;
+        self
+    }
+
     /// Convenience: set arbiter context for local execution.
     pub fn arbiter_local_context(self) -> Self {
         self.arbiter_context(ArbiterContext {
@@ -360,11 +380,13 @@ impl AgentBuilder {
     /// Convenience: set the system prompt for local execution.
     pub fn local_mode(self) -> Self {
         self.system_prompt(build_system_prompt(true, None, cfg!(windows)))
+            .is_local(true)
     }
 
     /// Convenience: set the system prompt for SSH remote execution.
     pub fn ssh_mode(self, ssh_info: Option<&str>) -> Self {
         self.system_prompt(build_system_prompt(false, ssh_info, false))
+            .is_local(false)
     }
 
     /// Build the agent.
@@ -407,6 +429,10 @@ impl AgentBuilder {
             arbiter_model_name: self
                 .arbiter_model_name
                 .unwrap_or_else(|| "session profile".into()),
+            session_id: self
+                .session_id
+                .unwrap_or_else(|| "default".into()),
+            is_local: self.is_local,
         })
     }
 }
@@ -678,6 +704,18 @@ impl Agent {
 
         info!(tool = ?parsed.kind, command = %parsed.command, "processing tool call");
 
+        let display_command = match parsed.kind {
+            tools::ToolKind::StartBackgroundJob => {
+                crate::background::confirm_command_for_start(&parsed.command)
+            }
+            tools::ToolKind::CancelBackgroundJob => parsed
+                .job_id
+                .as_ref()
+                .map(|id| crate::background::confirm_command_for_cancel(id, None))
+                .unwrap_or_else(|| parsed.command.clone()),
+            _ => parsed.command.clone(),
+        };
+
         // Check security / confirmation.
         let decision = security::tool_needs_confirmation(
             parsed.kind,
@@ -685,11 +723,12 @@ impl Agent {
             self.confirm_mode,
         );
 
-        let destructive = security::is_destructive(&parsed.command);
+        let destructive = security::is_destructive(&parsed.command)
+            || matches!(parsed.kind, tools::ToolKind::CancelBackgroundJob);
 
         // Emit CommandProposed before any confirmation logic.
         self.emit(AgentEvent::CommandProposed {
-            command: parsed.command.clone(),
+            command: display_command.clone(),
             explanation: parsed.explanation.clone(),
             destructive,
         });
@@ -733,14 +772,14 @@ impl Agent {
 
                 let confirm_fut = self
                     .confirmer
-                    .confirm(&parsed.command, &parsed.explanation, destructive);
+                    .confirm(&display_command, &parsed.explanation, destructive);
                 let approved = if let Some(ct) = self.confirm_timeout {
                     match tokio::time::timeout(ct, with_cancellation(self.cancellation.as_ref(), confirm_fut)).await {
                         Ok(result) => result?,
                         Err(_) => {
-                            info!(command = %parsed.command, "confirmation timed out");
+                            info!(command = %display_command, "confirmation timed out");
                             self.emit(AgentEvent::CommandFinished {
-                                command: parsed.command.clone(),
+                                command: display_command.clone(),
                                 output: "Confirmation timed out".to_string(),
                                 denied: true,
                             });
@@ -755,9 +794,9 @@ impl Agent {
                 };
 
                 if !approved {
-                    info!(command = %parsed.command, "command denied by user");
+                    info!(command = %display_command, "command denied by user");
                     self.emit(AgentEvent::CommandFinished {
-                        command: parsed.command.clone(),
+                        command: display_command.clone(),
                         output: String::new(),
                         denied: true,
                     });
@@ -766,22 +805,30 @@ impl Agent {
                         "Command denied by user. Try a different approach.".to_string(),
                     ));
                 }
-                info!(command = %parsed.command, "command approved by user");
+                info!(command = %display_command, "command approved by user");
             }
         }
 
         // Execute the tool, with optional cancellation and command timeout.
-        let exec_fut = tools::execute_tool_call(&parsed, self.executor.as_ref());
+        let exec_fut = self.execute_parsed_tool(&parsed);
         let output = if let Some(ct) = self.command_timeout {
             match tokio::time::timeout(ct, with_cancellation(self.cancellation.as_ref(), exec_fut)).await {
                 Ok(Ok(o)) => o,
                 Ok(Err(e)) if e.to_string() == "cancelled" => {
-                    // Cancellation — kill the running command.
-                    let _ = self.executor.cancel().await;
+                    // Cancellation — kill the running command (foreground only).
+                    if !matches!(
+                        parsed.kind,
+                        tools::ToolKind::StartBackgroundJob
+                            | tools::ToolKind::BackgroundJobStatus
+                            | tools::ToolKind::CancelBackgroundJob
+                            | tools::ToolKind::ListBackgroundJobs
+                    ) {
+                        let _ = self.executor.cancel().await;
+                    }
                     return Err(e);
                 }
                 Ok(Err(e)) => {
-                    warn!(command = %parsed.command, error = %e, "tool execution failed");
+                    warn!(command = %display_command, error = %e, "tool execution failed");
                     let detail = e.to_string();
                     let mut output = if detail.to_ascii_lowercase().contains("timed out") {
                         crate::long_wait::enrich_timeout_message(&format!("Error: {detail}"))
@@ -790,18 +837,26 @@ impl Agent {
                     };
                     output = crate::password_prompt::enrich_password_prompt_message(&output);
                     self.emit(AgentEvent::CommandFinished {
-                        command: parsed.command.clone(),
+                        command: display_command.clone(),
                         output: output.clone(),
                         denied: false,
                     });
                     return Ok(ChatMessage::tool(&tc.id, output));
                 }
                 Err(_) => {
-                    warn!(command = %parsed.command, "command timed out");
-                    let _ = self.executor.cancel().await;
+                    warn!(command = %display_command, "command timed out");
+                    if !matches!(
+                        parsed.kind,
+                        tools::ToolKind::StartBackgroundJob
+                            | tools::ToolKind::BackgroundJobStatus
+                            | tools::ToolKind::CancelBackgroundJob
+                            | tools::ToolKind::ListBackgroundJobs
+                    ) {
+                        let _ = self.executor.cancel().await;
+                    }
                     let output = crate::long_wait::enrich_timeout_message("Command timed out.");
                     self.emit(AgentEvent::CommandFinished {
-                        command: parsed.command.clone(),
+                        command: display_command.clone(),
                         output: output.clone(),
                         denied: false,
                     });
@@ -812,11 +867,19 @@ impl Agent {
             match with_cancellation(self.cancellation.as_ref(), exec_fut).await {
                 Ok(o) => o,
                 Err(e) if e.to_string() == "cancelled" => {
-                    let _ = self.executor.cancel().await;
+                    if !matches!(
+                        parsed.kind,
+                        tools::ToolKind::StartBackgroundJob
+                            | tools::ToolKind::BackgroundJobStatus
+                            | tools::ToolKind::CancelBackgroundJob
+                            | tools::ToolKind::ListBackgroundJobs
+                    ) {
+                        let _ = self.executor.cancel().await;
+                    }
                     return Err(e);
                 }
                 Err(e) => {
-                    warn!(command = %parsed.command, error = %e, "tool execution failed");
+                    warn!(command = %display_command, error = %e, "tool execution failed");
                     let detail = e.to_string();
                     let mut output = if detail.to_ascii_lowercase().contains("timed out") {
                         crate::long_wait::enrich_timeout_message(&format!("Error: {detail}"))
@@ -825,7 +888,7 @@ impl Agent {
                     };
                     output = crate::password_prompt::enrich_password_prompt_message(&output);
                     self.emit(AgentEvent::CommandFinished {
-                        command: parsed.command.clone(),
+                        command: display_command.clone(),
                         output: output.clone(),
                         denied: false,
                     });
@@ -839,12 +902,58 @@ impl Agent {
         let truncated = self.truncate_output(&enriched);
 
         self.emit(AgentEvent::CommandFinished {
-            command: parsed.command.clone(),
+            command: display_command,
             output: truncated.clone(),
             denied: false,
         });
 
         Ok(ChatMessage::tool(&tc.id, truncated))
+    }
+
+    async fn execute_parsed_tool(&self, parsed: &tools::ParsedToolCall) -> Result<String> {
+        match parsed.kind {
+            tools::ToolKind::StartBackgroundJob => {
+                crate::background::start_job(
+                    &self.session_id,
+                    &parsed.command,
+                    self.is_local,
+                    self.executor.as_ref(),
+                )
+                .await
+            }
+            tools::ToolKind::BackgroundJobStatus => {
+                let job_id = parsed
+                    .job_id
+                    .as_deref()
+                    .ok_or_else(|| CoreError::Other("missing job_id".into()))?;
+                let tail = parsed.tail_lines.unwrap_or(50);
+                crate::background::job_status(
+                    &self.session_id,
+                    job_id,
+                    tail,
+                    self.is_local,
+                    self.executor.as_ref(),
+                )
+                .await
+            }
+            tools::ToolKind::CancelBackgroundJob => {
+                let job_id = parsed
+                    .job_id
+                    .as_deref()
+                    .ok_or_else(|| CoreError::Other("missing job_id".into()))?;
+                crate::background::cancel_job(
+                    &self.session_id,
+                    job_id,
+                    self.is_local,
+                    self.executor.as_ref(),
+                )
+                .await
+            }
+            tools::ToolKind::ListBackgroundJobs => {
+                Ok(crate::background::list_jobs(&self.session_id)?)
+            }
+            _ => tools::execute_tool_call(parsed, self.executor.as_ref()).await,
+        }
     }
 
     /// Truncate output to `max_output_chars`, appending a notice if truncated.
