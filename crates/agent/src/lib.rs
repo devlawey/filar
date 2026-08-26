@@ -3,11 +3,12 @@
 //! This crate houses:
 //! - The [`LlmClient`] trait and its `OpenAiCompatClient` implementation (Stage 4).
 //! - The agent loop that orchestrates LLM ↔ tool execution (Stage 5).
-//! - Tool definitions (`run_command`, `read_file`, `list_dir`) (Stage 5).
+//! - Tool definitions (`run_command`, `read_file`, `list_dir`, background jobs) (Stage 5).
 //! - Security layer: confirmation, destructive command detection (Stage 5).
 
 pub mod agent;
 pub mod arbiter;
+pub mod background;
 pub mod events;
 pub mod long_wait;
 pub mod openai_compat;

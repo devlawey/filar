@@ -424,7 +424,17 @@ pub fn check_command(command: &str, mode: CommandConfirmMode) -> ConfirmDecision
 /// Determine if a tool kind requires confirmation given the confirm mode.
 pub fn tool_needs_confirmation(kind: ToolKind, command: &str, mode: CommandConfirmMode) -> ConfirmDecision {
     match kind {
-        ToolKind::RunCommand => check_command(command, mode),
+        ToolKind::RunCommand | ToolKind::StartBackgroundJob => check_command(command, mode),
+        ToolKind::BackgroundJobStatus | ToolKind::ListBackgroundJobs => {
+            match mode {
+                CommandConfirmMode::Never => ConfirmDecision::AutoApproved,
+                CommandConfirmMode::Allowlist => ConfirmDecision::AutoApproved,
+                CommandConfirmMode::Always | CommandConfirmMode::Explain => {
+                    ConfirmDecision::NeedsConfirmation
+                }
+            }
+        }
+        ToolKind::CancelBackgroundJob => check_command("kill ", mode),
         // read_file and list_dir are wrappers around cat/ls — check the
         // generated command, but they're typically read-only.
         ToolKind::ReadFile | ToolKind::ListDir => {
