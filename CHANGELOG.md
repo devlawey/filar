@@ -18,6 +18,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   same `{host}.{topic}.{timestamp}.md` naming as manual export
   ([#350](https://github.com/devlawey/filar/issues/350)).
 
+### Changed
+
+- Agent input path picker (`/`, `Ctrl+Shift+F`, `Ctrl+Shift+D`) is now an in-TUI
+  overlay that lists directories on the **active target** (local FS or remote via
+  readonly `ls` over SSH), replacing the native OS dialog that always showed the
+  client filesystem ([#351](https://github.com/devlawey/filar/issues/351)).
+
 ## [1.0.3] - 2026-08-24
 
 ### Added
