@@ -5179,6 +5179,20 @@ tests (start/status/cancel, unknown job_id), eval snapshot update.
 **Next steps:** merge PR; manual smoke local long job + SSH background job;
 eval-smoke on agent prompt change.
 
+## Release v1.0.4 (2026-08-26)
+
+**Scope:** milestone 1.0.4 — export filename fix (#350), in-TUI path picker on
+target host (#351), independent command arbiter (#353), background job tools
+(#349).
+
+**Preflight:** `cargo build --workspace` and `cargo test --workspace` green on
+main before bump.
+
+**Tags:** `v1.0.4`, `engine-v1.0.4` (core + agent changed).
+
+**Manual smoke:** `docs/SMOKE.md` on Windows + macOS (#298 tracking); eval-smoke
+for arbiter + background job prompt changes.
+
 ## Release v1.0.3 (2026-08-24)
 
 **Scope:** milestone 1.0.3 — TUI polish (Ctrl+S filename, path picker, confirm

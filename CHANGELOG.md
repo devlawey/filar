@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-08-26
+
 ### Added
 
 - Background job tools for long-running work: `start_background_job`,
@@ -712,7 +714,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v1.0.4...HEAD
+[1.0.4]: https://github.com/devlawey/filar/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/devlawey/filar/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/devlawey/filar/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/devlawey/filar/compare/v1.0.0...v1.0.1
