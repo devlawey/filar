@@ -341,6 +341,9 @@ struct Settings {
     /// Directory for Ctrl+S session exports (`None` = CWD).
     #[serde(default)]
     save_dir: Option<std::path::PathBuf>,
+    /// Optional LLM profile name for the command arbiter (`None` = session profile).
+    #[serde(default)]
+    arbiter_profile: Option<String>,
 }
 
 impl Settings {
@@ -465,6 +468,7 @@ fn save_config_toml(settings: &Settings) {
     if !settings.extra_body.is_empty() {
         config.llm.extra_body = serde_json::from_str(&settings.extra_body).ok();
     }
+    config.arbiter_profile = settings.arbiter_profile.clone();
     // The primary `[llm]` section above is the ONLY section the GUI still
     // writes to config.toml (backward-compat). Launch-specific sections
     // (llm_profiles, ssh_targets, save_dir) are intentionally left untouched:
@@ -548,6 +552,8 @@ struct LauncherApp {
     show_ssh_password: bool,
     /// Reveal API key field (not persisted).
     show_api_key: bool,
+    /// Arbiter profile selection (`None` = same as session profile).
+    arbiter_profile: Option<String>,
 }
 
 /// Local copy of an LLM profile for GUI editing.
@@ -892,6 +898,39 @@ impl LauncherApp {
                 .desired_rows(2).desired_width(f32::INFINITY));
         }
         self.show_api_key = show_api_key;
+
+        ui.separator();
+        ui.label("Arbiter profile (optional — independent command audit before confirm):");
+        let mut arbiter_choice = self.arbiter_profile.clone().unwrap_or_default();
+        let same_label = "(same as session profile)";
+        egui::ComboBox::from_label("Arbiter")
+            .selected_text(if arbiter_choice.is_empty() {
+                same_label
+            } else {
+                &arbiter_choice
+            })
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(arbiter_choice.is_empty(), same_label).clicked() {
+                    arbiter_choice.clear();
+                }
+                for name in &profile_names {
+                    if ui.selectable_label(arbiter_choice == *name, name).clicked() {
+                        arbiter_choice = name.clone();
+                    }
+                }
+            });
+        self.arbiter_profile = if arbiter_choice.is_empty() {
+            None
+        } else {
+            Some(arbiter_choice)
+        };
+        ui.label(
+            egui::RichText::new(
+                "Tip: a different vendor catches mismatches between command and explanation.",
+            )
+            .small()
+            .weak(),
+        );
     }
 
     /// Folder picker for the Ctrl+S session export directory.
@@ -935,6 +974,7 @@ impl LauncherApp {
             }).collect(),
             selected_profile: self.selected_profile,
             save_dir: self.save_dir.clone(),
+            arbiter_profile: self.arbiter_profile.clone(),
         }.save();
     }
 
@@ -1001,6 +1041,7 @@ impl LauncherApp {
             }).collect(),
             selected_profile: self.selected_profile,
             save_dir: self.save_dir.clone(),
+            arbiter_profile: self.arbiter_profile.clone(),
         };
         settings.save();
         save_config_toml(&settings);
@@ -1162,6 +1203,7 @@ pub fn run_launcher(config: &Config) {
             }).collect(),
             selected_profile: settings.selected_profile.min(profiles.len().saturating_sub(1)),
             save_dir: settings.save_dir.clone(),
+            arbiter_profile: settings.arbiter_profile.clone(),
         }.save();
         tracing::info!("persisted deduplicated profile config on startup");
     }
@@ -1183,6 +1225,7 @@ pub fn run_launcher(config: &Config) {
         save_dir: settings.save_dir.clone(),
         show_ssh_password: false,
         show_api_key: false,
+        arbiter_profile: settings.arbiter_profile.clone(),
     };
 
     let options = eframe::NativeOptions {
@@ -1379,6 +1422,7 @@ mod tests {
             profiles: vec![],
             selected_profile: 0,
             save_dir: None,
+            arbiter_profile: None,
         };
         std::fs::write(&file, serde_json::to_string_pretty(&s).unwrap()).unwrap();
 
@@ -1579,6 +1623,7 @@ mod tests {
             save_dir: None,
             show_ssh_password: false,
             show_api_key: false,
+            arbiter_profile: None,
         }
     }
 

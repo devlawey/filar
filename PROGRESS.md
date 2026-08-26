@@ -5124,6 +5124,28 @@ help/CHANGELOG updates, unit tests.
 
 **Next steps:** manual smoke SSH + local path insert.
 
+## Issue #353: feat(agent) — independent command arbiter
+
+**Milestone:** 1.0.4. **Branch:** `feat/353-command-arbiter`.
+
+**Problem:** In Explain mode the same model writes both the command and its
+explanation — a coherent but wrong rationale can mislead the operator.
+
+**Design:** Before `CommandConfirmer::confirm`, a second LLM (configurable
+`arbiter_profile`, fallback session profile) audits command vs explanation +
+recent history tail. Emits `AgentEvent::CommandAudited`; TUI merges into confirm
+modal. Never auto-approve/deny; 12s timeout; secrets redacted from history.
+
+**Done:** `crates/agent/src/arbiter.rs`, config `arbiter_profile` /
+`arbiter_enabled`, GUI arbiter dropdown, F1 usage line for arbiter tokens, unit
++ agent tests.
+
+**Public contract:** `AgentEvent::CommandAudited`, `TokenUsage { arbiter }`,
+`Config::arbiter_*`.
+
+**Next steps:** merge PR; **eval-smoke required** (new system prompt in arbiter);
+manual smoke 10+ confirmable commands, note objection rate in PR.
+
 ## Release v1.0.3 (2026-08-24)
 
 **Scope:** milestone 1.0.3 — TUI polish (Ctrl+S filename, path picker, confirm

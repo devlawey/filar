@@ -637,6 +637,8 @@ async fn run() -> anyhow::Result<()> {
         ssh_targets: launch_ssh_targets,
         save_dir: launch_save_dir,
         command_timeout,
+        arbiter_enabled: config.arbiter_enabled,
+        arbiter_profile: config.arbiter_profile.clone(),
     };
 
     info!("launching TUI");

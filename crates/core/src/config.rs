@@ -41,6 +41,18 @@ pub struct Config {
     /// `None` means the process working directory at startup.
     #[serde(default)]
     pub save_dir: Option<PathBuf>,
+
+    /// Optional named LLM profile used as the command arbiter.
+    /// When unset or invalid, the session profile is used instead.
+    #[serde(default)]
+    pub arbiter_profile: Option<String>,
+
+    /// When `true`, run the independent command arbiter before each confirmation
+    /// gate (`NeedsConfirmation`). Defaults to `true`; the arbiter only runs when
+    /// a command actually needs confirmation (not in `Never` mode or allowlist
+    /// auto-approve paths).
+    #[serde(default = "default_arbiter_enabled")]
+    pub arbiter_enabled: bool,
 }
 
 impl Default for Config {
@@ -52,8 +64,14 @@ impl Default for Config {
             timeouts: TimeoutConfig::default(),
             confirm_mode: CommandConfirmMode::Allowlist,
             save_dir: None,
+            arbiter_profile: None,
+            arbiter_enabled: default_arbiter_enabled(),
         }
     }
+}
+
+fn default_arbiter_enabled() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +388,36 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Resolve the effective arbiter profile name.
+    ///
+    /// When `arbiter_profile` is unset, returns `session_profile`. When set but
+    /// not found in `profiles`, falls back to `session_profile` and returns a
+    /// human-readable warning for the UI.
+    pub fn resolve_arbiter_profile<'a>(
+        &'a self,
+        session_profile: &'a str,
+        profiles: &'a [LlmProfile],
+    ) -> (&'a str, Option<String>) {
+        let requested = match &self.arbiter_profile {
+            None => {
+                return (session_profile, None);
+            }
+            Some(name) if name.trim().is_empty() => {
+                return (session_profile, None);
+            }
+            Some(name) => name.as_str(),
+        };
+
+        if profiles.iter().any(|p| p.name == requested) {
+            return (requested, None);
+        }
+
+        let warning = format!(
+            "Arbiter profile '{requested}' not found — using session profile '{session_profile}' for command audits."
+        );
+        (session_profile, Some(warning))
+    }
+
     /// Convenience: load from `config.toml`.
     ///
     /// Search order:
@@ -474,6 +522,39 @@ api_base_url = "https://open.bigmodel.cn/api/paas/v4"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.confirm_mode, CommandConfirmMode::Explain);
+    }
+
+    #[test]
+    fn parse_config_arbiter_defaults() {
+        let toml = r#"
+[llm]
+model = "glm-5.1"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.arbiter_enabled);
+        assert!(cfg.arbiter_profile.is_none());
+    }
+
+    #[test]
+    fn resolve_arbiter_profile_falls_back_when_missing() {
+        let cfg = Config {
+            arbiter_profile: Some("missing".into()),
+            ..Config::default()
+        };
+        let profiles = vec![LlmProfile {
+            name: "session".into(),
+            model: "m".into(),
+            api_base_url: "http://localhost".into(),
+            key_env: String::new(),
+            max_tokens: 4096,
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+        }];
+        let (name, warn) = cfg.resolve_arbiter_profile("session", &profiles);
+        assert_eq!(name, "session");
+        assert!(warn.is_some());
     }
 
     #[test]

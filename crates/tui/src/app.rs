@@ -157,6 +157,44 @@ pub struct PendingConfirm {
     pub explanation: String,
     pub destructive: bool,
     pub respond_to: oneshot::Sender<bool>,
+    /// Arbiter verdict label (`AGREE`, `MISMATCH`, …) when audit completed.
+    pub audit_verdict: Option<String>,
+    /// One-sentence arbiter reason (empty when `AGREE`).
+    pub audit_reason: String,
+    /// Model that produced the arbiter verdict.
+    pub audit_model: Option<String>,
+    /// `true` when the arbiter audit was unavailable.
+    pub audit_unavailable: bool,
+}
+
+/// Pending arbiter audit result, stored until `ConfirmationRequest` merges it.
+#[derive(Debug, Clone)]
+pub struct PendingAudit {
+    pub verdict: String,
+    pub reason: String,
+    pub arbiter_model: Option<String>,
+    pub unavailable: bool,
+}
+
+impl PendingConfirm {
+    /// Create a pending confirmation (audit fields default to empty/unavailable).
+    pub fn new(
+        command: String,
+        explanation: String,
+        destructive: bool,
+        respond_to: oneshot::Sender<bool>,
+    ) -> Self {
+        Self {
+            command,
+            explanation,
+            destructive,
+            respond_to,
+            audit_verdict: None,
+            audit_reason: String::new(),
+            audit_model: None,
+            audit_unavailable: false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +374,8 @@ pub struct Session {
     pub streaming: bool,
     /// Pending command proposal metadata from `CommandProposed`.
     pub pending_proposal: Option<(String, String)>,
+    /// Arbiter audit received before the confirmation dialog opens.
+    pub pending_audit: Option<PendingAudit>,
     /// Spinner animation tick counter — incremented each render frame.
     pub tick: u64,
     /// Clickable help-bar zones: (rect, action) filled during render.
@@ -400,6 +440,12 @@ pub struct Session {
     /// Used to attribute the response to the correct profile even if the
     /// user pressed Ctrl+L before the response arrived.
     pub pending_llm_profile: Option<String>,
+    /// Cumulative arbiter input tokens for this session.
+    pub arbiter_tokens_in: u64,
+    /// Cumulative arbiter output tokens for this session.
+    pub arbiter_tokens_out: u64,
+    /// Cumulative arbiter cost in USD.
+    pub arbiter_cost_usd: Option<f64>,
     /// Command confirmation mode for this tab (per-session, toggled via F2).
     pub confirm_mode: CommandConfirmMode,
     /// Previous confirm mode (to toggle back from Explain via F2).
@@ -693,6 +739,7 @@ impl Session {
             cancellation: None,
             streaming: false,
             pending_proposal: None,
+            pending_audit: None,
             tick: 0,
             helpbar_zones: Vec::new(),
             input_scroll_offset: 0,
@@ -716,6 +763,9 @@ impl Session {
             last_served_model: None,
             model_per_profile: HashMap::new(),
             pending_llm_profile: None,
+            arbiter_tokens_in: 0,
+            arbiter_tokens_out: 0,
+            arbiter_cost_usd: None,
             confirm_mode,
             prev_confirm_mode: CommandConfirmMode::Allowlist,
             transcript_path: None,
@@ -1342,7 +1392,7 @@ impl App {
     /// All mutations of `messages` must go through this method (or explicitly
     /// bump `message_rev`) so that [`layout_cache`](Self::layout_cache)
     /// invalidates correctly.
-    fn push_message(&mut self, msg: ChatBlock) {
+    pub(crate) fn push_message(&mut self, msg: ChatBlock) {
         self.messages.push(msg);
         self.message_rev = self.message_rev.wrapping_add(1);
         // New message invalidates line indices — clear any active selection.
@@ -3165,6 +3215,19 @@ impl App {
                 filar_agent::AgentEvent::CommandProposed { command, explanation, .. } => {
                     self.pending_proposal = Some((command, explanation));
                 }
+                filar_agent::AgentEvent::CommandAudited {
+                    verdict,
+                    reason,
+                    arbiter_model,
+                    unavailable,
+                } => {
+                    self.pending_audit = Some(PendingAudit {
+                        verdict,
+                        reason,
+                        arbiter_model,
+                        unavailable,
+                    });
+                }
                 filar_agent::AgentEvent::CommandFinished { command, output, denied } => {
                     if !denied {
                         self.streaming = false;
@@ -3226,24 +3289,33 @@ impl App {
                     self.cancellation = None;
                     self.active_session_mut().background_activity = false;
                 }
-                filar_agent::AgentEvent::TokenUsage { tokens_in, tokens_out, cost, model } => {
+                filar_agent::AgentEvent::TokenUsage { tokens_in, tokens_out, cost, model, arbiter } => {
                     if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                        s.tokens_in += tokens_in;
-                        s.tokens_out += tokens_out;
-                        if let Some(c) = cost {
-                            let total = s.cost_usd.unwrap_or(0.0) + c;
-                            s.cost_usd = Some((total * 10000.0).round() / 10000.0);
-                        }
-                        let profile_key = s.pending_llm_profile.clone().unwrap_or_else(|| {
-                            warn!("pending_llm_profile is None — usage attributed to default profile");
-                            self.default_profile_name.clone()
-                        });
-                        let pu = s.per_profile.entry(profile_key.clone()).or_default();
-                        pu.tokens_in += tokens_in;
-                        pu.tokens_out += tokens_out;
-                        if let Some(m) = model {
-                            s.last_served_model = Some(m.clone());
-                            s.model_per_profile.insert(profile_key, m);
+                        if arbiter {
+                            s.arbiter_tokens_in += tokens_in;
+                            s.arbiter_tokens_out += tokens_out;
+                            if let Some(c) = cost {
+                                let total = s.arbiter_cost_usd.unwrap_or(0.0) + c;
+                                s.arbiter_cost_usd = Some((total * 10000.0).round() / 10000.0);
+                            }
+                        } else {
+                            s.tokens_in += tokens_in;
+                            s.tokens_out += tokens_out;
+                            if let Some(c) = cost {
+                                let total = s.cost_usd.unwrap_or(0.0) + c;
+                                s.cost_usd = Some((total * 10000.0).round() / 10000.0);
+                            }
+                            let profile_key = s.pending_llm_profile.clone().unwrap_or_else(|| {
+                                warn!("pending_llm_profile is None — usage attributed to default profile");
+                                self.default_profile_name.clone()
+                            });
+                            let pu = s.per_profile.entry(profile_key.clone()).or_default();
+                            pu.tokens_in += tokens_in;
+                            pu.tokens_out += tokens_out;
+                            if let Some(m) = model {
+                                s.last_served_model = Some(m.clone());
+                                s.model_per_profile.insert(profile_key, m);
+                            }
                         }
                     }
                 }
@@ -3276,12 +3348,20 @@ impl App {
                 // Finalize any streaming text before showing the dialog.
                 self.streaming = false;
                 auto_scroll = self.scroll == 0;
-                self.pending_confirm = Some(PendingConfirm {
-                    command: command.clone(),
-                    explanation: explanation.clone(),
+                let audit = self.pending_audit.take();
+                let mut pending = PendingConfirm::new(
+                    command.clone(),
+                    explanation.clone(),
                     destructive,
                     respond_to,
-                });
+                );
+                if let Some(a) = audit {
+                    pending.audit_verdict = Some(a.verdict);
+                    pending.audit_reason = a.reason;
+                    pending.audit_model = a.arbiter_model;
+                    pending.audit_unavailable = a.unavailable;
+                }
+                self.pending_confirm = Some(pending);
                 self.mode = AppMode::Confirming;
                 // Reset selection to safe default (Deny).
                 self.confirm_selected = false;
@@ -4041,12 +4121,12 @@ mod tests {
     fn confirmation_response_bumps_message_rev() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let (tx, _rx) = oneshot::channel();
-        app.pending_confirm = Some(PendingConfirm {
-            command: "rm -rf /tmp/test".into(),
-            explanation: "cleanup".into(),
-            destructive: false,
-            respond_to: tx,
-        });
+        app.pending_confirm = Some(PendingConfirm::new(
+            "rm -rf /tmp/test".into(),
+            "cleanup".into(),
+            false,
+            tx,
+        ));
         app.mode = AppMode::Confirming;
         let rev_before = app.message_rev;
 
@@ -4245,12 +4325,12 @@ mod tests {
     fn end_key_resets_scroll_in_confirming_mode() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let (tx, _rx) = oneshot::channel();
-        app.pending_confirm = Some(PendingConfirm {
-            command: "ls".into(),
-            explanation: "test".into(),
-            destructive: false,
-            respond_to: tx,
-        });
+        app.pending_confirm = Some(PendingConfirm::new(
+            "ls".into(),
+            "test".into(),
+            false,
+            tx,
+        ));
         app.mode = AppMode::Confirming;
         app.scroll = 12;
         app.handle_key(crossterm::event::KeyEvent::new(
@@ -4523,12 +4603,12 @@ mod tests {
         // but for tests we just check mode/message changes.
         // Use a fresh sender that we drop to simulate a real channel.
         let (tx, _rx2) = oneshot::channel::<bool>();
-        app.pending_confirm = Some(PendingConfirm {
-            command: "rm -rf /tmp/test".into(),
-            explanation: "cleanup".into(),
+        app.pending_confirm = Some(PendingConfirm::new(
+            "rm -rf /tmp/test".into(),
+            "cleanup".into(),
             destructive,
-            respond_to: tx,
-        });
+            tx,
+        ));
         app.mode = AppMode::Confirming;
         app.confirm_selected = false; // safe default
         app
@@ -5308,12 +5388,12 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         app.mode = AppMode::Confirming;
-        app.pending_confirm = Some(PendingConfirm {
-            command: "ls".into(),
-            explanation: "list".into(),
-            destructive: false,
-            respond_to: tx,
-        });
+        app.pending_confirm = Some(PendingConfirm::new(
+            "ls".into(),
+            "list".into(),
+            false,
+            tx,
+        ));
         app.execute_help_action(HelpAction::Approve);
         assert_eq!(app.mode, AppMode::Thinking);
         assert!(rx.try_recv().unwrap());
@@ -5324,12 +5404,12 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         app.mode = AppMode::Confirming;
-        app.pending_confirm = Some(PendingConfirm {
-            command: "rm".into(),
-            explanation: "remove".into(),
-            destructive: true,
-            respond_to: tx,
-        });
+        app.pending_confirm = Some(PendingConfirm::new(
+            "rm".into(),
+            "remove".into(),
+            true,
+            tx,
+        ));
         app.execute_help_action(HelpAction::Deny);
         assert_eq!(app.mode, AppMode::Thinking);
         assert!(!rx.try_recv().unwrap());
@@ -6951,7 +7031,7 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
-            event: filar_agent::AgentEvent::TokenUsage { tokens_in: 10, tokens_out: 20, cost: None, model: None },
+            event: filar_agent::AgentEvent::TokenUsage { tokens_in: 10, tokens_out: 20, cost: None, model: None, arbiter: false },
         });
         assert_eq!(app.sessions[0].tokens_in, 10);
         app.new_tab();
@@ -6969,7 +7049,7 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
             event: filar_agent::AgentEvent::TokenUsage {
-                tokens_in: 100, tokens_out: 200, cost: Some(0.0015), model: None,
+                tokens_in: 100, tokens_out: 200, cost: Some(0.0015), model: None, arbiter: false,
             },
         });
         assert_eq!(app.sessions[0].tokens_in, 100);
@@ -6981,7 +7061,7 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
             event: filar_agent::AgentEvent::TokenUsage {
-                tokens_in: 50, tokens_out: 100, cost: Some(0.0030), model: Some("cohere/command-r".into()),
+                tokens_in: 50, tokens_out: 100, cost: Some(0.0030), model: Some("cohere/command-r".into()), arbiter: false,
             },
         });
         assert_eq!(app.sessions[0].tokens_in, 150);
@@ -7032,7 +7112,7 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
             event: filar_agent::AgentEvent::TokenUsage {
-                tokens_in: 10, tokens_out: 20, cost: None, model: Some("served-glm".into()),
+                tokens_in: 10, tokens_out: 20, cost: None, model: Some("served-glm".into()), arbiter: false,
             },
         });
         assert_eq!(app.sessions[0].per_profile["glm"].tokens_in, 10);
@@ -7051,7 +7131,7 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
             event: filar_agent::AgentEvent::TokenUsage {
-                tokens_in: 10, tokens_out: 20, cost: None, model: None,
+                tokens_in: 10, tokens_out: 20, cost: None, model: None, arbiter: false,
             },
         });
         let pu = app.sessions[0].per_profile.get("fallback-profile").unwrap();
@@ -7900,12 +7980,12 @@ mod tests {
     fn f2_aborts_pending_confirm() {
         let mut app = App::new("test".into(), CommandConfirmMode::Allowlist);
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        app.pending_confirm = Some(PendingConfirm {
-            command: "ls".into(),
-            explanation: "list".into(),
-            destructive: false,
-            respond_to: tx,
-        });
+        app.pending_confirm = Some(PendingConfirm::new(
+            "ls".into(),
+            "list".into(),
+            false,
+            tx,
+        ));
         app.mode = AppMode::Confirming;
         app.awaiting_confirmation = true;
         app.confirm_button_areas = vec![(Rect::new(0, 0, 10, 3), true), (Rect::new(0, 0, 10, 3), false)];
