@@ -288,6 +288,12 @@ mod tests {
     }
 
     #[test]
+    fn parent_posix_trims_trailing_slash() {
+        assert_eq!(parent_posix("/home/").as_deref(), Some("/"));
+        assert_eq!(parent_posix("/home/user/").as_deref(), Some("/home"));
+    }
+
+    #[test]
     fn selection_cursor_is_ascii() {
         assert_eq!(SELECTION_CURSOR, ">");
         assert!(SELECTION_CURSOR.is_ascii());
