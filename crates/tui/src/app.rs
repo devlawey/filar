@@ -890,13 +890,20 @@ fn format_now_utc() -> String {
     format!("{year:04}-{month:02}-{day:02}.{hour:02}{min:02}{sec:02}")
 }
 
-/// Slugify a string for use in a filename:
-/// replace non-alphanumeric (except `._-`) with `-`, limit length to `max`.
+/// Characters illegal in Windows filenames (also unsafe on POSIX paths).
+fn is_filename_hostile(ch: char) -> bool {
+    matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+}
+
+/// Slugify a string for use in a filename: keep Unicode letters/digits and
+/// `._-`, replace other chars with `-`, limit length to `max` (#358).
 fn slugify_max(s: &str, max: usize) -> String {
     let mut result = String::new();
     let mut prev_dash = false;
     for ch in s.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
+        if !is_filename_hostile(ch)
+            && (ch.is_alphanumeric() || ch == '.' || ch == '_' || ch == '-')
+        {
             result.push(ch);
             prev_dash = ch == '-';
         } else if !prev_dash {
@@ -912,10 +919,21 @@ fn slugify(s: &str) -> String {
     slugify_max(s, 80)
 }
 
+/// Short hash for emoji-only / symbol-only topics (#358).
+/// Deterministic within a single process (DefaultHasher is not cross-version stable).
+fn topic_hash_slug(text: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("msg-{:08x}", hasher.finish() as u32)
+}
+
 /// Short topic slug from the first user message (same source as launcher preview).
 ///
-/// Returns `None` when there is no user text — callers omit the segment so the
-/// filename stays `{host}.{ts}.md` without an empty `..` gap (#343).
+/// Returns `None` only when there is no user text — callers omit the segment so
+/// the filename stays `{host}.{ts}.md` without an empty `..` gap (#343).
+/// Non-ASCII letters are kept (#358). If a user message exists but sanitization
+/// leaves nothing (emoji-only), falls back to `msg-<hash>`.
 fn topic_slug_from_messages(messages: &[ChatBlock]) -> Option<String> {
     let text = messages.iter().find_map(|b| match b {
         ChatBlock::User(s) => {
@@ -930,7 +948,7 @@ fn topic_slug_from_messages(messages: &[ChatBlock]) -> Option<String> {
     })?;
     let slug = slugify_max(text, 40);
     if slug.is_empty() {
-        None
+        Some(topic_hash_slug(text))
     } else {
         Some(slug)
     }
@@ -1651,6 +1669,34 @@ impl App {
         let messages = self.messages.clone();
         let session_name = self.sessions[self.active].target_name.clone();
         let ssh_info = self.sessions[self.active].ssh_info.clone();
+
+        // #358: if Explain was entered before any user message, the path has no
+        // topic segment — upgrade the filename once a topic becomes available
+        // (new file; old empty-topic path is left unused). Compare via
+        // `.{topic}.` marker so a fresh timestamp does not rewrite every save.
+        let path = if let Some(topic) = topic_slug_from_messages(&messages) {
+            let current_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let topic_marker = format!(".{topic}.");
+            if current_name.contains(&topic_marker) {
+                path
+            } else {
+                let desired = transcript_filename(&session_name, &ssh_info, &messages);
+                let base = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| {
+                    self.save_dir.clone().unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    })
+                });
+                let new_path = base.join(&desired);
+                self.sessions[self.active].transcript_path = Some(new_path.clone());
+                new_path
+            }
+        } else {
+            path
+        };
+
         self.sessions[self.active].transcript_saving = true;
         let tx = tx.clone();
 
@@ -7876,6 +7922,43 @@ mod tests {
             Some("Check-etc-passwd")
         );
         assert!(topic_slug_from_messages(&[]).is_none());
+    }
+
+    #[test]
+    fn topic_slug_keeps_cyrillic() {
+        let msgs = vec![ChatBlock::User("проверь nginx на проде".into())];
+        let slug = topic_slug_from_messages(&msgs).expect("slug");
+        assert!(
+            slug.contains("проверь") || slug.contains("nginx"),
+            "expected Cyrillic/latin topic, got: {slug}"
+        );
+        assert!(!slug.is_empty());
+    }
+
+    #[test]
+    fn topic_slug_pure_cyrillic_not_empty() {
+        let msgs = vec![ChatBlock::User("проверь конфиг сервера".into())];
+        let slug = topic_slug_from_messages(&msgs).expect("pure Cyrillic must yield topic");
+        assert!(
+            slug.chars().any(|c| c.is_alphabetic() && !c.is_ascii()),
+            "expected non-ASCII letters in slug, got: {slug}"
+        );
+        let name = export_filename_stem("local", &None, &msgs);
+        assert!(
+            name.contains(&slug),
+            "stem must include Cyrillic topic: {name}"
+        );
+        assert!(!name.contains(".."), "no empty topic gap: {name}");
+    }
+
+    #[test]
+    fn topic_slug_emoji_only_uses_hash_fallback() {
+        let msgs = vec![ChatBlock::User("🔥🚀".into())];
+        let slug = topic_slug_from_messages(&msgs).expect("emoji-only must not omit topic");
+        assert!(
+            slug.starts_with("msg-"),
+            "expected msg-<hash> fallback, got: {slug}"
+        );
     }
 
     #[test]
