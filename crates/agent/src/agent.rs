@@ -512,15 +512,12 @@ impl Agent {
         )
         .await;
 
-        let model_display = audit
-            .model
-            .clone()
-            .unwrap_or_else(|| self.arbiter_model_name.clone());
-
+        // Confirm overlay labels the auditor by profile name (not API model id)
+        // so launcher-chosen arbiter B is distinguishable from session A (#360).
         self.emit(AgentEvent::CommandAudited {
             verdict: audit.verdict.label().to_string(),
             reason: audit.reason.clone(),
-            arbiter_model: Some(model_display),
+            arbiter_model: Some(self.arbiter_model_name.clone()),
             unavailable: audit.unavailable,
         });
 

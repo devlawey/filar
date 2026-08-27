@@ -353,7 +353,7 @@ async fn run() -> anyhow::Result<()> {
     // ── Determine launch parameters ──────────────────────────────────
     // When no CLI args, check for pending launch from a previous GUI
     // session, or spawn the GUI as a subprocess.
-    let (target_name, session_id, llm_config, api_key, key_env_name, ssh_target, gui_selected_profile, launch_profiles, launch_ssh_targets, launch_save_dir) = if args.is_empty() {
+    let (target_name, session_id, llm_config, api_key, key_env_name, ssh_target, gui_selected_profile, launch_profiles, launch_ssh_targets, launch_save_dir, launch_arbiter_profile) = if args.is_empty() {
         // Check if the GUI subprocess already saved a launch config.
         let launch = filar_gui::load_pending_launch().or_else(|| {
             // Spawn GUI subprocess.
@@ -443,6 +443,9 @@ async fn run() -> anyhow::Result<()> {
                     launch.profiles,
                     launch.ssh_targets,
                     launch.save_dir,
+                    launch
+                        .arbiter_profile
+                        .or_else(|| config.arbiter_profile.clone()),
                 )
             }
             None => {
@@ -477,7 +480,7 @@ async fn run() -> anyhow::Result<()> {
             None
         };
 
-        (target, args.session, llm_config, key, key_env, ssh_target, None, config.llm_profiles.clone(), config.ssh_targets.clone(), config.save_dir.clone())
+        (target, args.session, llm_config, key, key_env, ssh_target, None, config.llm_profiles.clone(), config.ssh_targets.clone(), config.save_dir.clone(), config.arbiter_profile.clone())
     };
 
     // Validate API key unless the profile is explicitly keyless (empty key_env).
@@ -638,7 +641,9 @@ async fn run() -> anyhow::Result<()> {
         save_dir: launch_save_dir,
         command_timeout,
         arbiter_enabled: config.arbiter_enabled,
-        arbiter_profile: config.arbiter_profile.clone(),
+        // GUI: from pending_launch (including explicit None = same as session).
+        // CLI: from config.toml (see tuple construction above).
+        arbiter_profile: launch_arbiter_profile,
     };
 
     info!("launching TUI");
