@@ -443,9 +443,9 @@ async fn run() -> anyhow::Result<()> {
                     launch.profiles,
                     launch.ssh_targets,
                     launch.save_dir,
-                    launch
-                        .arbiter_profile
-                        .or_else(|| config.arbiter_profile.clone()),
+                    // Explicit `None` means "same as session" from the launcher —
+                    // do not fall back to CWD/app-data config.toml (#360).
+                    launch.arbiter_profile,
                 )
             }
             None => {

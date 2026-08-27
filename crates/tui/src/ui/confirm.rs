@@ -56,6 +56,8 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let audit_model = confirm.audit_model.clone();
     let audit_unavailable = confirm.audit_unavailable;
 
+    // `audit_model` holds the arbiter *profile* name from `CommandAudited`
+    // (runner passes `LlmProfile.name` as `arbiter_model_name`).
     let session_profile = app.llm_profile.clone();
     let same_as_session = match (audit_model.as_deref(), session_profile.as_deref()) {
         (Some(arb), Some(sess)) => arb == sess,

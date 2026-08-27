@@ -5223,9 +5223,10 @@ selection glyph ▶ rendered as `?`.
 **Design:** `LaunchConfig.arbiter_profile` → main → `TuiConfig`; confirm overlay
 distinguishes same vs independent profile.
 
-**Done:** GUI + main wiring (`LaunchConfig` → `TuiConfig`, fall back to
-`config.arbiter_profile`), confirm copy (same vs independent + session name),
-`CommandAudited` always labels by arbiter **profile** name, round-trip test.
+**Done:** GUI + main wiring (`LaunchConfig.arbiter_profile` as-is → `TuiConfig`;
+no config.toml fallback that would override explicit same-as-session), confirm
+copy (same vs independent + session name), `CommandAudited` labels by arbiter
+**profile** name (`arbiter_model_name` = `LlmProfile.name`), round-trip test.
 
 **Public contract:** `LaunchConfig` gains `arbiter_profile`.
 

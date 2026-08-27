@@ -512,8 +512,9 @@ impl Agent {
         )
         .await;
 
-        // Confirm overlay labels the auditor by profile name (not API model id)
-        // so launcher-chosen arbiter B is distinguishable from session A (#360).
+        // `arbiter_model_name` is the arbiter *profile* name (set in runner from
+        // `LlmProfile.name`), despite the historical field name. Confirm overlay
+        // compares it to the session profile name (#360).
         self.emit(AgentEvent::CommandAudited {
             verdict: audit.verdict.label().to_string(),
             reason: audit.reason.clone(),
