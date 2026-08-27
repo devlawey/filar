@@ -5196,6 +5196,23 @@ message source.
 
 **Next steps:** manual smoke Ctrl+S with Russian prompt.
 
+## Issue #359: fix(tui) — path picker POSIX nav + ASCII cursor
+
+**Milestone:** 1.0.5. **Branch:** `fix/359-path-picker-posix-nav`.
+
+**Problem:** On Windows clients, SSH path picker used `cfg!(windows)` /
+`std::path` for remote paths (`/`+`home`→`home`, parent `/home`→`\\`);
+selection glyph ▶ rendered as `?`.
+
+**Design:** `join_posix`/`parent_posix` when `path_picker_remote`; local keeps
+`std::path`; cursor `>`; keep `..` on load error.
+
+**Done:** `path_picker.rs`, App wiring, overlay, PLATFORM_NOTES, tests.
+
+**Public contract:** none.
+
+**Next steps:** manual SSH smoke from Windows: `/` → home → up.
+
 ## Release v1.0.4 (2026-08-26)
 
 **Scope:** milestone 1.0.4 — export filename fix (#350), in-TUI path picker on

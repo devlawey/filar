@@ -302,6 +302,8 @@ pub struct App {
     pub path_picker_loading: bool,
     pub path_picker_error: Option<String>,
     pub path_picker_truncated: bool,
+    /// Whether the picker is browsing a remote (POSIX) target (#359).
+    pub path_picker_remote: bool,
     /// Bumped to request (re)load of `path_picker_dir` in the runner.
     pub path_picker_load_token: u64,
 }
@@ -520,6 +522,7 @@ impl App {
             path_picker_loading: false,
             path_picker_error: None,
             path_picker_truncated: false,
+            path_picker_remote: false,
             path_picker_load_token: 0,
         }
     }
@@ -3520,6 +3523,7 @@ impl App {
         let session = &self.sessions[self.active];
         let is_remote = session.ssh_info.is_some();
         self.path_picker_kind = kind;
+        self.path_picker_remote = is_remote;
         self.path_picker_dir =
             crate::path_picker::initial_picker_dir(&session.cwd, is_remote);
         self.path_picker_index = 0;
@@ -3555,8 +3559,17 @@ impl App {
         self.path_picker_loading = false;
         self.path_picker_truncated = truncated;
         self.path_picker_error = error;
-        self.path_picker_entries =
-            crate::path_picker::entries_with_parent(&self.path_picker_dir, entries);
+        // On error keep a navigable `..` row when not at root (#359).
+        let entries = if self.path_picker_error.is_some() {
+            Vec::new()
+        } else {
+            entries
+        };
+        self.path_picker_entries = crate::path_picker::entries_with_parent(
+            &self.path_picker_dir,
+            entries,
+            self.path_picker_remote,
+        );
         if self.path_picker_index >= self.path_picker_entries.len() {
             self.path_picker_index = self.path_picker_entries.len().saturating_sub(1);
         }
@@ -3566,14 +3579,16 @@ impl App {
         let Some(entry) = self.path_picker_entries.get(self.path_picker_index).cloned() else {
             return;
         };
+        let remote = self.path_picker_remote;
         if entry.name == ".." {
-            if let Some(parent) = crate::path_picker::parent_path(&self.path_picker_dir) {
+            if let Some(parent) = crate::path_picker::parent_path(&self.path_picker_dir, remote) {
                 self.path_picker_navigate(parent);
             }
             return;
         }
         if entry.is_dir {
-            let path = crate::path_picker::join_path(&self.path_picker_dir, &entry.name);
+            let path =
+                crate::path_picker::join_path(&self.path_picker_dir, &entry.name, remote);
             if self.path_picker_kind == crate::path_picker::PathPickerKind::Folder {
                 self.insert_path_string_at_cursor(&path);
                 self.close_path_picker();
@@ -3581,7 +3596,8 @@ impl App {
                 self.path_picker_navigate(path);
             }
         } else if self.path_picker_kind == crate::path_picker::PathPickerKind::File {
-            let path = crate::path_picker::join_path(&self.path_picker_dir, &entry.name);
+            let path =
+                crate::path_picker::join_path(&self.path_picker_dir, &entry.name, remote);
             self.insert_path_string_at_cursor(&path);
             self.close_path_picker();
         }
@@ -6988,9 +7004,39 @@ mod tests {
     }
 
     #[test]
+    fn path_picker_enter_home_from_root_uses_posix() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.sessions[0].ssh_info = Some("root@host:22".into());
+        app.open_path_picker(crate::path_picker::PathPickerKind::File);
+        assert_eq!(app.path_picker_dir, "/");
+        assert!(app.path_picker_remote);
+        app.path_picker_loading = false;
+        app.apply_path_picker_load(
+            vec![crate::path_picker::PathEntry {
+                name: "home".into(),
+                is_dir: true,
+            }],
+            false,
+            None,
+        );
+        // Skip `..` if present — select `home`.
+        app.path_picker_index = app
+            .path_picker_entries
+            .iter()
+            .position(|e| e.name == "home")
+            .expect("home entry");
+        app.path_picker_activate();
+        assert_eq!(
+            app.path_picker_dir, "/home",
+            "SSH navigate must use POSIX join on Windows client"
+        );
+    }
+
+    #[test]
     fn path_picker_file_select_inserts_absolute_path() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.path_picker_visible = true;
+        app.path_picker_remote = true;
         app.path_picker_kind = crate::path_picker::PathPickerKind::File;
         app.path_picker_dir = "/etc".into();
         app.path_picker_entries = vec![crate::path_picker::PathEntry {

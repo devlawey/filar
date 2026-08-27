@@ -60,7 +60,11 @@ pub(crate) fn render_path_picker(f: &mut Frame, app: &App, area: Rect) {
         )])));
     } else {
         for (i, entry) in app.path_picker_entries.iter().enumerate() {
-            let cursor = if app.path_picker_index == i { "\u{25b6}" } else { " " };
+            let cursor = if app.path_picker_index == i {
+                crate::path_picker::SELECTION_CURSOR
+            } else {
+                " "
+            };
             let suffix = if entry.is_dir { "/" } else { "" };
             items.push(ListItem::new(Line::from(vec![
                 Span::raw(format!(" {cursor} ")),
