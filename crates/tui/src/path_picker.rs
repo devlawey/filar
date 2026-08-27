@@ -1,7 +1,11 @@
-//! In-TUI file/folder picker for inserting paths into agent input (#344, #351).
+//! In-TUI file/folder picker for inserting paths into agent input (#344, #351, #359).
 //!
 //! Lists directories on the active target: local FS via `std::fs`, remote via
 //! readonly `ls` through the session executor (zero-install).
+//!
+//! Path algebra follows the **active target** style (POSIX for SSH), not the
+//! OS that compiled the TUI — Windows clients browsing remote `/home` must not
+//! go through `std::path::Path` (#359).
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +29,9 @@ pub struct PathEntry {
 /// Maximum directory entries shown (extra rows trigger a warning).
 pub const MAX_ENTRIES: usize = 500;
 
+/// ASCII selection cursor — Unicode ▶ renders as `?` on many Windows consoles (#359 / #310).
+pub const SELECTION_CURSOR: &str = ">";
+
 /// True when `/` at the cursor would start an absolute-path token (input start or after space).
 pub fn path_token_starts_at_cursor(input: &str, cursor_pos: usize) -> bool {
     if cursor_pos == 0 {
@@ -47,45 +54,84 @@ pub fn format_path_for_input(path: &str) -> String {
     }
 }
 
-/// Join `base` and `name` into an absolute path string.
-pub fn join_path(base: &str, name: &str) -> String {
+/// Join `base` and `name` using POSIX rules (SSH / remote target).
+pub fn join_posix(base: &str, name: &str) -> String {
     if name == ".." {
-        return parent_path(base).unwrap_or_else(|| base.to_string());
+        return parent_posix(base).unwrap_or_else(|| base.to_string());
     }
-    let base = base.trim_end_matches(['/', '\\']);
-    if base.is_empty() {
-        if name.starts_with('/') || (cfg!(windows) && name.contains(':')) {
-            name.to_string()
-        } else if cfg!(windows) {
-            format!("{name}")
-        } else {
-            format!("/{name}")
-        }
-    } else if cfg!(windows) && base.contains(':') {
-        format!("{base}\\{name}")
+    if name.starts_with('/') {
+        return name.to_string();
+    }
+    let base = base.trim_end_matches('/');
+    if base.is_empty() || base == "/" {
+        format!("/{name}")
     } else {
         format!("{base}/{name}")
     }
 }
 
-/// Parent directory, or `None` at filesystem root.
-pub fn parent_path(path: &str) -> Option<String> {
+/// Parent directory under POSIX rules, or `None` at `/`.
+pub fn parent_posix(path: &str) -> Option<String> {
+    if path.is_empty() || path == "/" {
+        return None;
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" {
+        return None;
+    }
+    match trimmed.rfind('/') {
+        None => Some("/".to_string()),
+        Some(0) => Some("/".to_string()),
+        Some(i) => Some(trimmed[..i].to_string()),
+    }
+}
+
+/// Join using the local host filesystem conventions.
+pub fn join_local(base: &str, name: &str) -> String {
+    if name == ".." {
+        return parent_local(base).unwrap_or_else(|| base.to_string());
+    }
+    let base_path = Path::new(base);
+    base_path.join(name).to_string_lossy().into_owned()
+}
+
+/// Parent on the local host filesystem.
+pub fn parent_local(path: &str) -> Option<String> {
     let p = Path::new(path);
-    p.parent().map(|parent| {
-        let s = parent.to_string_lossy();
-        if s.is_empty() {
-            if cfg!(windows) {
-                path.chars()
-                    .take_while(|c| *c != '\\')
-                    .chain(std::iter::once('\\'))
-                    .collect()
-            } else {
-                "/".to_string()
+    let parent = p.parent()?;
+    let s = parent.to_string_lossy();
+    if s.is_empty() {
+        // Drive root on Windows (e.g. parent of `C:\Users` → `C:\`).
+        if cfg!(windows) {
+            let drive: String = path
+                .chars()
+                .take_while(|c| *c != '\\' && *c != '/')
+                .collect();
+            if drive.ends_with(':') {
+                return Some(format!("{drive}\\"));
             }
-        } else {
-            s.into_owned()
         }
-    })
+        return None;
+    }
+    Some(s.into_owned())
+}
+
+/// Join path for the active target style.
+pub fn join_path(base: &str, name: &str, is_remote: bool) -> String {
+    if is_remote {
+        join_posix(base, name)
+    } else {
+        join_local(base, name)
+    }
+}
+
+/// Parent path for the active target style.
+pub fn parent_path(path: &str, is_remote: bool) -> Option<String> {
+    if is_remote {
+        parent_posix(path)
+    } else {
+        parent_local(path)
+    }
 }
 
 /// Initial directory when opening the picker for a session tab.
@@ -155,7 +201,7 @@ pub fn list_local_dir(dir: &str) -> Result<(Vec<PathEntry>, bool)> {
             .file_type()
             .map_err(|e| CoreError::Other(e.to_string()))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == "." {
+        if name == "." || name == ".." {
             continue;
         }
         entries.push(PathEntry {
@@ -173,8 +219,8 @@ pub fn list_local_dir(dir: &str) -> Result<(Vec<PathEntry>, bool)> {
 }
 
 /// Build display list with optional `..` parent row at the top.
-pub fn entries_with_parent(dir: &str, mut entries: Vec<PathEntry>) -> Vec<PathEntry> {
-    if parent_path(dir).is_some() {
+pub fn entries_with_parent(dir: &str, mut entries: Vec<PathEntry>, is_remote: bool) -> Vec<PathEntry> {
+    if parent_path(dir, is_remote).is_some() {
         entries.insert(
             0,
             PathEntry {
@@ -222,15 +268,28 @@ mod tests {
     }
 
     #[test]
-    fn join_and_parent_posix() {
-        assert_eq!(join_path("/etc", "nginx"), "/etc/nginx");
-        assert_eq!(parent_path("/etc/nginx").as_deref(), Some("/etc"));
-        assert_eq!(parent_path("/").as_deref(), None);
+    fn join_and_parent_posix_from_root() {
+        // Must work on Windows hosts browsing SSH (#359).
+        assert_eq!(join_posix("/", "home"), "/home");
+        assert_eq!(join_posix("/home", "user"), "/home/user");
+        assert_eq!(parent_posix("/home").as_deref(), Some("/"));
+        assert_eq!(parent_posix("/home/user").as_deref(), Some("/home"));
+        assert_eq!(parent_posix("/").as_deref(), None);
+        assert_eq!(join_path("/", "home", true), "/home");
+        assert_eq!(parent_path("/home", true).as_deref(), Some("/"));
     }
 
     #[test]
-    fn entries_with_parent_inserts_dotdot() {
-        let entries = entries_with_parent("/etc", vec![]);
+    fn entries_with_parent_inserts_dotdot_posix() {
+        let entries = entries_with_parent("/etc", vec![], true);
         assert_eq!(entries[0].name, "..");
+        let at_root = entries_with_parent("/", vec![], true);
+        assert!(at_root.iter().all(|e| e.name != ".."));
+    }
+
+    #[test]
+    fn selection_cursor_is_ascii() {
+        assert_eq!(SELECTION_CURSOR, ">");
+        assert!(SELECTION_CURSOR.is_ascii());
     }
 }

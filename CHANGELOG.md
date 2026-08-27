@@ -19,6 +19,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   Explain transcript path upgrades once a topic appears
   ([#358](https://github.com/devlawey/filar/issues/358)).
 
+- In-TUI path picker on SSH from a Windows client no longer mangles POSIX paths
+  (`/` + `home` → `/home`, parent of `/home` → `/`); selection cursor is ASCII
+  `>` so it does not render as `?`
+  ([#359](https://github.com/devlawey/filar/issues/359)).
+
 ## [1.0.4] - 2026-08-26
 
 ### Added
