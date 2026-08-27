@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-08-27
+
 ### Fixed
 
 - Ctrl+S / F2 Explain export filenames keep Unicode (Cyrillic) letters in the
@@ -732,7 +734,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v1.0.4...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v1.0.5...HEAD
+[1.0.5]: https://github.com/devlawey/filar/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/devlawey/filar/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/devlawey/filar/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/devlawey/filar/compare/v1.0.1...v1.0.2

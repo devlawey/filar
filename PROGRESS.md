@@ -5232,6 +5232,19 @@ copy (same vs independent + session name), `CommandAudited` labels by arbiter
 
 **Next steps:** manual — pick arbiter B ≠ session A, confirm overlay shows B.
 
+## Release v1.0.5 (2026-08-27)
+
+**Scope:** milestone 1.0.5 — regression fixes for 1.0.4: Unicode export topic slug
+(#358), SSH path picker on Windows (#359), arbiter profile launch handoff (#360).
+
+**Preflight:** `cargo build --workspace` and `cargo test --workspace` green on
+main before bump.
+
+**Tags:** `v1.0.5`, `engine-v1.0.5` (agent crate changed).
+
+**Manual smoke:** `docs/SMOKE.md` on Windows + macOS (#298 tracking): RU Ctrl+S
+filename, SSH path picker `/` → home → up, arbiter B ≠ session A in confirm overlay.
+
 ## Release v1.0.4 (2026-08-26)
 
 **Scope:** milestone 1.0.4 — export filename fix (#350), in-TUI path picker on
