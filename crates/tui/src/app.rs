@@ -919,7 +919,8 @@ fn slugify(s: &str) -> String {
     slugify_max(s, 80)
 }
 
-/// Stable short hash for emoji-only / symbol-only topics (#358).
+/// Short hash for emoji-only / symbol-only topics (#358).
+/// Deterministic within a single process (DefaultHasher is not cross-version stable).
 fn topic_hash_slug(text: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1671,13 +1672,15 @@ impl App {
 
         // #358: if Explain was entered before any user message, the path has no
         // topic segment — upgrade the filename once a topic becomes available
-        // (new file; old empty-topic path is left unused).
+        // (new file; old empty-topic path is left unused). Compare via
+        // `.{topic}.` marker so a fresh timestamp does not rewrite every save.
         let path = if let Some(topic) = topic_slug_from_messages(&messages) {
             let current_name = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
-            if current_name.contains(&topic) {
+            let topic_marker = format!(".{topic}.");
+            if current_name.contains(&topic_marker) {
                 path
             } else {
                 let desired = transcript_filename(&session_name, &ssh_info, &messages);
