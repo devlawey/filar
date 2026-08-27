@@ -5213,6 +5213,25 @@ selection glyph ▶ rendered as `?`.
 
 **Next steps:** manual SSH smoke from Windows: `/` → home → up.
 
+## Issue #360: fix(gui/agent) — arbiter profile launch handoff
+
+**Milestone:** 1.0.5. **Branch:** `fix/360-arbiter-launch-handoff`.
+
+**Problem:** Launcher arbiter dropdown saved to settings/config but not
+`LaunchConfig` / pending_launch; TUI always resolved session profile.
+
+**Design:** `LaunchConfig.arbiter_profile` → main → `TuiConfig`; confirm overlay
+distinguishes same vs independent profile.
+
+**Done:** GUI + main wiring (`LaunchConfig.arbiter_profile` as-is → `TuiConfig`;
+no config.toml fallback that would override explicit same-as-session), confirm
+copy (same vs independent + session name), `CommandAudited` labels by arbiter
+**profile** name (`arbiter_model_name` = `LlmProfile.name`), round-trip test.
+
+**Public contract:** `LaunchConfig` gains `arbiter_profile`.
+
+**Next steps:** manual — pick arbiter B ≠ session A, confirm overlay shows B.
+
 ## Release v1.0.4 (2026-08-26)
 
 **Scope:** milestone 1.0.4 — export filename fix (#350), in-TUI path picker on

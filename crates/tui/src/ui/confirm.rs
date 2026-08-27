@@ -56,6 +56,16 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let audit_model = confirm.audit_model.clone();
     let audit_unavailable = confirm.audit_unavailable;
 
+    // `audit_model` holds the arbiter *profile* name from `CommandAudited`
+    // (runner passes `LlmProfile.name` as `arbiter_model_name`).
+    let session_profile = app.llm_profile.clone();
+    let same_as_session = match (audit_model.as_deref(), session_profile.as_deref()) {
+        (Some(arb), Some(sess)) => arb == sess,
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
+    let session_name = session_profile.clone().unwrap_or_default();
+
     // --- Estimate modal dimensions ---
     // Minimum width 32 so buttons fit inside borders (30 chars + 2 borders).
     let modal_width = 70u16.min(area.width.saturating_sub(8)).max(32);
@@ -93,6 +103,8 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         audit_verdict.as_deref(),
         &audit_reason,
         audit_model.as_deref(),
+        same_as_session,
+        &session_name,
         app.theme.fg_style(),
         app.theme.danger_fg(),
         app.theme.warning_fg(),
@@ -193,6 +205,8 @@ fn build_modal_lines(
     audit_verdict: Option<&str>,
     audit_reason: &str,
     audit_model: Option<&str>,
+    same_as_session: bool,
+    session_name: &str,
     fg: Style,
     danger: Style,
     warning: Style,
@@ -240,6 +254,8 @@ fn build_modal_lines(
             audit_verdict,
             audit_reason,
             audit_model,
+            same_as_session,
+            session_name,
             muted,
             success,
             danger,
@@ -289,6 +305,8 @@ fn append_audit_lines(
     verdict: Option<&str>,
     reason: &str,
     model: Option<&str>,
+    same_as_session: bool,
+    session_name: &str,
     muted: Style,
     success: Style,
     danger: Style,
@@ -312,9 +330,16 @@ fn append_audit_lines(
         return;
     };
     if verdict.eq_ignore_ascii_case("AGREE") {
-        let model_note = model
-            .map(|m| format!(" (checked by {m})"))
-            .unwrap_or_default();
+        let model_note = match model {
+            Some(m) if same_as_session => {
+                format!(" (same as session profile: {m})")
+            }
+            Some(m) if !session_name.is_empty() => {
+                format!(" (arbiter profile: {m}; session: {session_name})")
+            }
+            Some(m) => format!(" (arbiter profile: {m})"),
+            None => String::new(),
+        };
         let _ = push_line(
             lines,
             used,
@@ -339,12 +364,19 @@ fn append_audit_lines(
     }
     if let Some(m) = model {
         if *used < max_rows {
+            let label = if same_as_session {
+                format!("— same as session profile: {m}")
+            } else if !session_name.is_empty() {
+                format!("— arbiter profile: {m} (session: {session_name})")
+            } else {
+                format!("— arbiter profile: {m}")
+            };
             let _ = push_line(
                 lines,
                 used,
                 max_rows,
                 inner_width,
-                format!("— {m}"),
+                label,
                 muted,
             );
         }

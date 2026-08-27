@@ -512,15 +512,13 @@ impl Agent {
         )
         .await;
 
-        let model_display = audit
-            .model
-            .clone()
-            .unwrap_or_else(|| self.arbiter_model_name.clone());
-
+        // `arbiter_model_name` is the arbiter *profile* name (set in runner from
+        // `LlmProfile.name`), despite the historical field name. Confirm overlay
+        // compares it to the session profile name (#360).
         self.emit(AgentEvent::CommandAudited {
             verdict: audit.verdict.label().to_string(),
             reason: audit.reason.clone(),
-            arbiter_model: Some(model_display),
+            arbiter_model: Some(self.arbiter_model_name.clone()),
             unavailable: audit.unavailable,
         });
 

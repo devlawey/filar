@@ -24,6 +24,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   `>` so it does not render as `?`
   ([#359](https://github.com/devlawey/filar/issues/359)).
 
+- Arbiter profile chosen in the GUI launcher is passed through `pending_launch.json`
+  into the TUI (was ignored; CWD `config.toml` always fell back to the session
+  profile). Confirm overlay labels same-vs-independent arbiter clearly
+  ([#360](https://github.com/devlawey/filar/issues/360)).
+
 ## [1.0.4] - 2026-08-26
 
 ### Added

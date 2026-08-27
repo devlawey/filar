@@ -233,6 +233,10 @@ pub struct LaunchConfig {
     /// Full SSH target list (for Ctrl+O cycling in the TUI).
     #[serde(default)]
     pub ssh_targets: Vec<filar_core::SshTarget>,
+    /// Optional arbiter LLM profile name (`None` = same as session profile).
+    /// Carried through pending_launch so the TUI does not depend on CWD config.toml (#360).
+    #[serde(default)]
+    pub arbiter_profile: Option<String>,
 }
 
 fn default_glm_key_env_gui() -> String {
@@ -1072,6 +1076,7 @@ impl LauncherApp {
                 top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
             }).collect(),
             ssh_targets,
+            arbiter_profile: self.arbiter_profile.clone(),
         };
         save_pending_launch(&cfg);
         std::process::exit(0);
@@ -1311,6 +1316,7 @@ mod tests {
             save_dir: None,
             profiles: vec![],
             ssh_targets: vec![],
+            arbiter_profile: None,
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(!json.contains("supersecret"));
@@ -1396,12 +1402,36 @@ mod tests {
                 auth: filar_core::SshAuth::Password { password: None },
                 host_key_policy: filar_core::HostKeyPolicy::Tofu,
             }],
+            arbiter_profile: None,
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(!json.contains("\"password\":"), "must not emit password key when None, got: {json}");
         assert!(json.contains("10.0.0.1"), "ssh target must survive");
         // And the secret-detection heuristic in load_pending_launch must not trip.
         assert!(!json.contains("\"api_key\":"), "must not emit api_key");
+    }
+
+    #[test]
+    fn launch_config_round_trips_arbiter_profile() {
+        let cfg = LaunchConfig {
+            target: "local".into(),
+            ssh: None,
+            model: "glm".into(),
+            api_base_url: "https://api.example.com".into(),
+            api_key: String::new(),
+            session_id: None,
+            temperature: String::new(),
+            extra_body: String::new(),
+            selected_profile: Some("session-a".into()),
+            key_env: "GLM_API_KEY".into(),
+            save_dir: None,
+            profiles: vec![],
+            ssh_targets: vec![],
+            arbiter_profile: Some("arbiter-b".into()),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let loaded: LaunchConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.arbiter_profile.as_deref(), Some("arbiter-b"));
     }
 
     #[test]
