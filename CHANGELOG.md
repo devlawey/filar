@@ -11,6 +11,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- Ctrl+S / F2 Explain export filenames keep Unicode (Cyrillic) letters in the
+  topic slug instead of stripping them to empty and falling back to
+  `{host}.{timestamp}.md`; emoji-only topics use a short `msg-<hash>` fallback;
+  Explain transcript path upgrades once a topic appears
+  ([#358](https://github.com/devlawey/filar/issues/358)).
+
 ## [1.0.4] - 2026-08-26
 
 ### Added

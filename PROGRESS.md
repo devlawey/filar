@@ -5179,6 +5179,23 @@ tests (start/status/cancel, unknown job_id), eval snapshot update.
 **Next steps:** merge PR; manual smoke local long job + SSH background job;
 eval-smoke on agent prompt change.
 
+## Issue #358: fix(tui) — Unicode topic slug in export filenames
+
+**Milestone:** 1.0.5. **Branch:** `fix/358-unicode-export-topic-slug`.
+
+**Problem:** `slugify_max` kept only ASCII alphanumerics, so Russian user
+messages produced an empty topic → `{host}.{ts}.md` despite #350 fixing the
+message source.
+
+**Design:** Unicode `is_alphanumeric` (reject path-hostile chars); emoji-only →
+`msg-<hash>`; F2 silent save upgrades transcript path when topic appears.
+
+**Done:** `app.rs` slugify + tests; CHANGELOG.
+
+**Public contract:** none.
+
+**Next steps:** manual smoke Ctrl+S with Russian prompt.
+
 ## Release v1.0.4 (2026-08-26)
 
 **Scope:** milestone 1.0.4 — export filename fix (#350), in-TUI path picker on
