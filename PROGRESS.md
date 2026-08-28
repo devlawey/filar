@@ -5232,6 +5232,35 @@ copy (same vs independent + session name), `CommandAudited` labels by arbiter
 
 **Next steps:** manual — pick arbiter B ≠ session A, confirm overlay shows B.
 
+## Issue #364: fix(agent/transport) — sudo/secret stdin conflict guidance
+
+**Milestone:** 1.0.6. **Branch:** `fix/364-secret-stdin-hijack`.
+
+**Problem:** Ctrl+P secret appeared "not substituted": agent built
+`printf '%s\n' "$FILAR_SECRET_1" | sudo -S tee … <<'EOF' … EOF`. Investigation
+showed substitution itself is intact (new tests through the real `sh -c`
+executor, pipeline and heredoc). Actual failure: POSIX `sh` attaches the
+heredoc to the last pipeline command's stdin, so `sudo -S` received the
+heredoc body ("Password:Sorry, try again." ×3), never the secret.
+
+**Design:** engine guidance rather than silent rewriting — detect
+`sudo -S` + `<<` on a password/TTY failure and append short
+`SUDO_HEREDOC_GUIDANCE` (temp file first, then `sudo -S cp`); system prompt
+rule 8 forbids the combination. Substitution path unchanged.
+
+**Done:** `sudo_heredoc_stdin_conflict()` + command-aware enrich
+(`enrich_password_prompt_message_for_command`, all three call sites), prompt
+rule 8 (agent.rs + eval/prompts in sync), regression tests: transport heredoc
+substitution, real LocalExecutor pipeline + heredoc-to-file (cfg unix, local),
+agent-level secret-inserted-after-build with output sanitisation.
+
+**Public contract:** new `password_prompt` helpers; `enrich_password_prompt_message`
+kept unchanged for other callers.
+
+**Next steps:** manual macOS release build (PR notes); pre-existing unrelated
+tui `path_picker` test failures (cwd-dependent, fail on main too) — need a
+separate issue.
+
 ## Release v1.0.5 (2026-08-27)
 
 **Scope:** milestone 1.0.5 — regression fixes for 1.0.4: Unicode export topic slug
