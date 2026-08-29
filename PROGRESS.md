@@ -5318,10 +5318,15 @@ prompt changes (#331, #349, #353, #364) merged past a gate that was checking
 nothing.
 
 **Design:** restore the subcommand in the wrapper (`PROMPTFOO_BIN` now
-documented as the binary only), then remove the masking that made the failure
-unreadable — the run step no longer swallows its exit code, and an explicit
-"Assert results were produced" step fails with a message distinguishing a
-tooling break from a model regression.
+documented as the binary only), then make the failure readable instead of
+merely unmasked. The first attempt simply dropped `continue-on-error` from the
+run step, which was wrong: promptfoo exits non-zero as soon as one case fails
+an assertion, so a healthy 11/12 run was reported as a broken run. The wrapper
+now distinguishes the two in smoke mode — no results file means the eval never
+ran (exit 1, with a message pointing at the invocation rather than the model);
+results plus a non-zero promptfoo exit means cases failed, which is the
+pass-rate step's verdict (exit 0). An explicit "Assert results were produced"
+step in the workflow carries the same distinction.
 
 **Done:** wrapper fixed; `eval/scripts/run-eval.test.js` added — plain-Node
 tests that run the wrapper against a stub binary in a temp directory and assert

@@ -123,9 +123,17 @@ async function main() {
   const run1ok = promptfoo(run1Args);
 
   if (isSmoke) {
-    if (!run1ok || !fs.existsSync(RESULTS)) {
-      console.error('[run-eval] smoke run failed — no results produced');
+    // Distinguish "the eval never ran" from "the eval ran and some cases
+    // failed". promptfoo exits non-zero whenever any case fails an assertion,
+    // which is a verdict for the pass-rate step — not a reason to claim the
+    // run did not happen. Conflating the two is what made #369 unreadable.
+    if (!fs.existsSync(RESULTS)) {
+      console.error('[run-eval] smoke run produced no results — the eval did not run');
+      console.error('[run-eval] check the promptfoo invocation and its arguments, not the model');
       process.exit(1);
+    }
+    if (!run1ok) {
+      console.log('[run-eval] promptfoo exited non-zero (failing cases) — pass rate is checked separately');
     }
     // CI smoke — no retries; pass-rate check is a separate CI step.
     process.exit(0);
