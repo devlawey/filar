@@ -5232,6 +5232,37 @@ copy (same vs independent + session name), `CommandAudited` labels by arbiter
 
 **Next steps:** manual — pick arbiter B ≠ session A, confirm overlay shows B.
 
+## Issue #367: chore(ci) — build and test workspace on every PR
+
+**Milestone:** 1.0.6. **Branch:** `chore/367-ci-build-test-pr`.
+
+**Problem:** no workflow built or tested the full workspace before merge.
+`engine-targets.yml` only `cargo check`s the engine crates without the `local`
+feature; `eval-smoke.yml` is path-scoped and secret-gated; `release.yml` runs
+only after publish. A PR breaking `tui`/`gui`/`app` — or a failing unit test —
+passed CI green. The AGENTS.md requirement of green
+`cargo build --workspace` / `cargo test --workspace` rested entirely on the
+author running them locally.
+
+**Design:** new `.github/workflows/ci.yml` — `cargo build --workspace --locked`
++ `cargo test --workspace --locked` on a `fail-fast: false` matrix of
+`windows-latest` and `macos-14`, matching the 1.0.x release targets. Triggers on
+`pull_request` and on `push: main`; the latter makes the release preflight
+checkable through the check-runs API instead of on trust. `paths-ignore` for
+`**.md` / `pics/**` / `LICENSE`; `concurrency` with `cancel-in-progress`;
+toolchain and cache actions match `engine-targets.yml`.
+
+**Done:** workflow added. Linux excluded on purpose (not a 1.0.x release
+target; engine crates already covered by `engine-targets.yml`; a full workspace
+build would need GTK/GL system deps).
+
+**Public contract:** none.
+
+**Next steps:** confirm both check-runs appear on the first PR; if CI becomes a
+required check in branch protection, revisit `paths-ignore` (a skipped check on
+a docs-only PR can block merge). Clippy / `cargo fmt --check` deliberately left
+out of scope — separate issue after the existing warnings are triaged.
+
 ## Issue #370: fix(tui/tests) — path picker tests assumed a Windows-shaped cwd
 
 **Milestone:** 1.0.6. **Branch:** `fix/370-path-picker-tests-cwd`.
