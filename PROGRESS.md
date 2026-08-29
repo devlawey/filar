@@ -5232,6 +5232,40 @@ copy (same vs independent + session name), `CommandAudited` labels by arbiter
 
 **Next steps:** manual — pick arbiter B ≠ session A, confirm overlay shows B.
 
+## Issue #370: fix(tui/tests) — path picker tests assumed a Windows-shaped cwd
+
+**Milestone:** 1.0.6. **Branch:** `fix/370-path-picker-tests-cwd`.
+
+**Problem:** `open_path_picker_sets_remote_root` and
+`path_picker_enter_home_from_root_uses_posix` failed on macOS
+(`left: "/Users/runner/work/filar/filar/crates/tui", right: "/"`) while passing
+on Windows. Both set `ssh_info` on a session built by `App::new()` but left
+`cwd` at the process working directory — a remote-session-with-local-cwd state
+that production never produces. `initial_picker_dir` keeps a remote `cwd` only
+when it `starts_with('/')`, so a Windows `D:\…` path fell through to the `"/"`
+fallback and the assertion held by accident; a POSIX path does not.
+
+Surfaced by the new CI (#367) — the first `cargo test` run on macOS in the
+project. `release.yml` only builds `filar-app`, `engine-targets.yml` only
+`cargo check`s the engine crates on Linux, so the failure had been invisible.
+
+**Design:** tests only. Clear `cwd` alongside `ssh_info`, mirroring what
+`runner.rs` does at both sites where a session goes remote (startup with
+`--target`, and `TuiEvent::TransportChanged`), where the comment already
+records that a remote cwd is unknown until OSC 7 / the #313 sync reports one.
+
+**Done:** `cwd = None` added to both tests with a comment pointing at the
+invariant. Audited the other `ssh_info = Some(...)` tests in `app.rs` — tab
+labels, `new_tab` inheritance and `status_target` do not read `cwd` through
+`initial_picker_dir` and are unaffected.
+
+**Public contract:** none. `initial_picker_dir` / `open_path_picker` unchanged.
+
+**Next steps:** the "remote ⇒ cwd is None or POSIX" invariant is maintained by
+hand at two places in `runner.rs`; a third site that forgets it would open the
+picker at a *local* path on a macOS/Linux client (masked on Windows by the
+`starts_with('/')` filter). Worth a separate issue if it ever recurs.
+
 ## Release v1.0.5 (2026-08-27)
 
 **Scope:** milestone 1.0.5 — regression fixes for 1.0.4: Unicode export topic slug
