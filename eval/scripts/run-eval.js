@@ -11,8 +11,10 @@
 //   --smoke     : short circuit at first pass, no retries (for CI smoke workflow)
 //
 // Extra args are forwarded to promptfoo. The promptfoo binary is resolved as
-// `npx promptfoo` by default; set PROMPTFOO_BIN env to override.  Results are
-// written to eval/results.json (and eval/results.retry.json on retry).
+// `npx promptfoo` by default; set PROMPTFOO_BIN env to override. PROMPTFOO_BIN
+// must contain the binary only — this script appends the `eval` subcommand
+// itself (#369). Results are written to eval/results.json (and
+// eval/results.retry.json on retry).
 // Exit code 0 = pass rate ≥ threshold (via smoke-check.js), 1 = below threshold,
 // 2 = script error (missing results, unexpected failure).
 
@@ -31,7 +33,14 @@ function sleep(ms) {
 }
 
 function promptfoo(args) {
-  const cmd = `${PROMPTFOO_BIN} ${args.join(' ')}`;
+  // The `eval` subcommand is mandatory: options like --filter-metadata and
+  // --filter-providers are registered on it, not on the root program, and
+  // promptfoo does not mark `eval` as the default command. Invoking the binary
+  // without it fails at argument parsing ("unknown option '--filter-metadata'")
+  // before any network call — which is how eval-smoke silently stopped running
+  // for six weeks (#369). PROMPTFOO_BIN holds the binary only, never the
+  // subcommand.
+  const cmd = `${PROMPTFOO_BIN} eval ${args.join(' ')}`;
   console.log(`\n[run-eval] ${cmd}`);
   try {
     execSync(cmd, { stdio: 'inherit', cwd: process.cwd() });

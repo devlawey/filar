@@ -5297,6 +5297,47 @@ hand at two places in `runner.rs`; a third site that forgets it would open the
 picker at a *local* path on a macOS/Linux client (masked on Windows by the
 `starts_with('/')` filter). Worth a separate issue if it ever recurs.
 
+## Issue #369: fix(eval) — run-eval.js dropped the `eval` subcommand
+
+**Milestone:** 1.0.6. **Branch:** `fix/369-run-eval-missing-eval-subcommand`.
+
+**Problem:** `eval-smoke` had not executed a single case since 2026-07-18 — 29
+consecutive red runs, secret present and healthy the whole time. #88 made the
+promptfoo binary configurable (`PROMPTFOO_BIN`) for the CI version pin and lost
+the `eval` subcommand in the process. `--filter-metadata` / `--filter-providers`
+are registered on that subcommand and `eval` is not promptfoo's default
+command, so the wrapper died at argument parsing before any network call.
+Reproduced against the pinned `promptfoo@0.121.19`: without `eval` →
+`error: unknown option '--filter-metadata'`; with it → the provider resolves
+and it fails only on the missing key.
+
+Three layers of masking hid it: the run step and the pass-rate step both had
+`continue-on-error`, so the missing `eval/results.json` surfaced as "the
+flakiness retry failed" rather than "the run never happened". Six weeks of
+prompt changes (#331, #349, #353, #364) merged past a gate that was checking
+nothing.
+
+**Design:** restore the subcommand in the wrapper (`PROMPTFOO_BIN` now
+documented as the binary only), then remove the masking that made the failure
+unreadable — the run step no longer swallows its exit code, and an explicit
+"Assert results were produced" step fails with a message distinguishing a
+tooling break from a model regression.
+
+**Done:** wrapper fixed; `eval/scripts/run-eval.test.js` added — plain-Node
+tests that run the wrapper against a stub binary in a temp directory and assert
+the `eval` subcommand, argument order and `-o` target, with no network and no
+provider key. Verified the test fails when the bug is reintroduced. New `unit`
+job in `eval-smoke.yml` runs it plus `asserts.test.js` on every triggering PR,
+including forks (no secret needed). Trigger paths gained `eval/scripts/**` —
+their absence is why the change that broke the wrapper never ran this workflow
+on its own PR. `eval/README.md` updated.
+
+**Public contract:** none (eval tooling only).
+
+**Next steps:** the first honest smoke run may well be red — six weeks of prompt
+changes went unverified. If it is, triage the failures as a separate issue and
+**do not lower the 90% threshold** to make it pass.
+
 ## Release v1.0.5 (2026-08-27)
 
 **Scope:** milestone 1.0.5 — regression fixes for 1.0.4: Unicode export topic slug

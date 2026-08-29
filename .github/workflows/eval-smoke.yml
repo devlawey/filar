@@ -15,12 +15,38 @@ on:
       - 'eval/datasets/**'
       - 'eval/promptfooconfig.yaml'
       - 'eval/asserts.js'
+      # The runner scripts themselves were missing here, so the change that
+      # broke the wrapper (#369) never triggered this workflow on its own PR.
+      - 'eval/scripts/**'
+      - 'eval/asserts.test.js'
       - '.github/workflows/eval-smoke.yml'
 
 permissions:
   contents: read
 
 jobs:
+  # Plain-Node unit tests for the eval tooling itself. No secret, no network,
+  # so this runs on forks too — and it is the guard that would have caught #369
+  # on the day it was introduced, six weeks before anyone noticed.
+  unit:
+    name: eval script unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Assert helpers
+        run: node eval/asserts.test.js
+
+      - name: run-eval.js wrapper contract
+        run: node eval/scripts/run-eval.test.js
+
   # Secrets cannot be referenced in a job-level `if` (actionlint: the "secrets"
   # context is not allowed there), so a tiny gate job evaluates the secret in its
   # env and exports a boolean. The smoke job then runs only when the secret is
@@ -65,9 +91,13 @@ jobs:
 
       # Low temperature (0) and throttling are set in promptfooconfig.yaml.
       # PROMPTFOO_BIN uses the globally installed (pinned) version, not npx@latest.
+      # NOTE: no `continue-on-error` here. This step used to swallow its own
+      # failure, so a wrapper that never started (#369) looked identical to a
+      # model that missed the threshold: the run surfaced as "the flakiness
+      # retry failed" while the smoke set had not executed at all. A run that
+      # cannot produce results must fail loudly and immediately.
       - name: Run smoke subset with retry wrapper
         id: run1
-        continue-on-error: true
         env:
           PROMPTFOO_BIN: promptfoo
         run: |
@@ -76,6 +106,16 @@ jobs:
             --filter-providers 'glm-5.2' \
             --no-cache \
             -c eval/promptfooconfig.yaml
+
+      - name: Assert results were produced
+        if: always()
+        run: |
+          if [ ! -s eval/results.json ]; then
+            echo "::error::eval/results.json is missing or empty — promptfoo produced no results."
+            echo "The smoke set did not run. This is not a model regression:"
+            echo "check the wrapper invocation and the promptfoo arguments (#369)."
+            exit 1
+          fi
 
       - name: Check pass rate (≥ 90%)
         id: check1
