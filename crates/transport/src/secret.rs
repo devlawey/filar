@@ -369,4 +369,88 @@ mod tests {
 
         std::env::remove_var("FILAR_SECRET_TESTENV");
     }
+
+    // ── #364: heredoc commands and the real local executor path ────────
+
+    #[tokio::test]
+    async fn heredoc_multiline_command_substitution() {
+        let provider = Arc::new(StaticSecretProvider::new());
+        provider.insert("$FILAR_SECRET_2", "hunter2");
+        let provider_trait: Arc<dyn SecretProvider> = provider;
+
+        let mock = Arc::new(MockExecutor::new(""));
+        let exec = SecretSubstitutingExecutor::new(mock.clone(), provider_trait);
+
+        // Command shape from #364: secret pipe + `sudo -S` + quoted heredoc.
+        let cmd = "printf '%s\n' \"$FILAR_SECRET_2\" | sudo -S tee /tmp/f >/dev/null <<'EOF'\nline1\nline2\nEOF\necho done";
+        exec.run(cmd).await.unwrap();
+
+        let executed = mock.last_command.lock().unwrap().clone();
+        assert!(
+            executed.contains("printf '%s\n' \"hunter2\" | sudo -S tee"),
+            "placeholder not substituted in heredoc command: {executed}"
+        );
+        assert!(
+            !executed.contains("$FILAR_SECRET_2"),
+            "placeholder must be fully substituted: {executed}"
+        );
+        // The heredoc body must survive substitution intact.
+        assert!(executed.contains("<<'EOF'\nline1\nline2\nEOF"));
+    }
+
+    #[cfg(all(unix, feature = "local"))]
+    #[tokio::test]
+    async fn real_local_executor_substitutes_secret_via_pipeline() {
+        // #364 DoD: substitution through the real local `sh -c` executor.
+        let provider = Arc::new(StaticSecretProvider::new());
+        provider.insert("$FILAR_SECRET_1", "p@ss-w0rd-364");
+        let provider_trait: Arc<dyn SecretProvider> = provider;
+
+        let local = Arc::new(crate::LocalExecutor::new().await.unwrap());
+        let exec = SecretSubstitutingExecutor::new(local, provider_trait);
+
+        let result = exec
+            .run("printf '%s\n' \"$FILAR_SECRET_1\" | cat")
+            .await
+            .unwrap();
+
+        assert_eq!(result.exit_code, Some(0));
+        // The shell received the real secret and printed it; sanitisation
+        // masked it back to the placeholder for the LLM.
+        assert_eq!(result.stdout.trim(), "$FILAR_SECRET_1");
+        assert!(!result.stdout.contains("p@ss-w0rd-364"));
+    }
+
+    #[cfg(all(unix, feature = "local"))]
+    #[tokio::test]
+    async fn real_local_executor_heredoc_body_contains_substituted_secret() {
+        // Textual substitution must reach inside quoted heredoc bodies too —
+        // it happens before `sh -c` sees the command (#364).
+        let dir = std::env::temp_dir().join(format!("filar-364-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plist");
+
+        let provider = Arc::new(StaticSecretProvider::new());
+        provider.insert("$FILAR_SECRET_2", "secret-in-heredoc");
+        let provider_trait: Arc<dyn SecretProvider> = provider;
+
+        let local = Arc::new(crate::LocalExecutor::new().await.unwrap());
+        let exec = SecretSubstitutingExecutor::new(local, provider_trait);
+
+        let cmd = format!(
+            "cat > {} <<'EOF'\npassword=$FILAR_SECRET_2\nEOF\necho written",
+            path.display()
+        );
+        let result = exec.run(&cmd).await.unwrap();
+        assert_eq!(result.exit_code, Some(0));
+
+        // Read and clean up *before* asserting: a failing assertion must not
+        // leave a file containing the substituted secret behind in temp.
+        let body = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            body.contains("password=secret-in-heredoc"),
+            "substituted secret missing from heredoc file: {body}"
+        );
+    }
 }

@@ -126,7 +126,7 @@ Rules:
 5. Summarize the results concisely after each command.
 6. When the task is complete, provide a clear final answer in the user's language.
 7. If you need information from the user (e.g. a password, a choice between options), ask them directly in your text response — do not try to use interactive prompts in commands. Wait for their reply before continuing.
-8. Never put passwords or secrets directly in commands. If a password is needed, ask the user to provide it via Ctrl+P (secure masked input). The password is stored as $FILAR_SECRET_N and you are told the variable name — use that placeholder in commands (substituted at execution; you never see the real value). Do not echo or print secret variables. Never run bare `sudo`/`su`/`doas` that would prompt on a TTY — agent commands have no interactive password UI. After the user provides a secret, use a non-interactive form such as `printf '%s\n' "$FILAR_SECRET_1" | sudo -S <command>` (POSIX) or an equivalent that reads the password from stdin.
+8. Never put passwords or secrets directly in commands. If a password is needed, ask the user to provide it via Ctrl+P (secure masked input). The password is stored as $FILAR_SECRET_N and you are told the variable name — use that placeholder in commands (substituted at execution; you never see the real value). Do not echo or print secret variables. Never run bare `sudo`/`su`/`doas` that would prompt on a TTY — agent commands have no interactive password UI. After the user provides a secret, use a non-interactive form such as `printf '%s\n' "$FILAR_SECRET_1" | sudo -S <command>` (POSIX) or an equivalent that reads the password from stdin. NEVER combine such a secret pipe with a `<<EOF` heredoc on the same command: the heredoc replaces the last pipeline command's stdin, so sudo tries the heredoc lines as the password. To write a file via sudo, keep one stdin for both the password and the body instead of staging a temp file: `{{ printf '%s\n' "$FILAR_SECRET_1"; cat <<'EOF' ... EOF }} | sudo -S tee <target> >/dev/null` — sudo consumes only the first line, tee receives the rest. Never leave files on the remote host that the user did not ask for.
 9. NEVER run interactive commands (vim, nano, top, htop, less, man, mc, screen, tmux, ssh, etc.). These commands take over the terminal and will hang indefinitely. Instead, use non-interactive alternatives: 'cat file' instead of 'less file', 'grep -n pattern file' instead of 'vim file', 'head -n 50 file' to preview. For editing files, use 'sed' or 'tee' with heredocs.
 10. NEVER use long wall-clock waits (`sleep N`, `Start-Sleep`, etc.) to poll progress. Every tool command shares a hard timeout (`[timeouts].command_secs`). A `sleep` near or above that timeout will fail. For downloads, pulls, builds, or other long jobs: use `start_background_job` then poll with `background_job_status` (short calls; timeout applies to each poll, not job lifetime). Cancel with `cancel_background_job`; list jobs with `list_background_jobs`. For live interactive progress, ask the user to use Ctrl+T (interactive terminal) instead of blocking the agent tool call.
 {shell_desc}"#
@@ -833,7 +833,9 @@ impl Agent {
                     } else {
                         format!("Error: {detail}")
                     };
-                    output = crate::password_prompt::enrich_password_prompt_message(&output);
+                    output = crate::password_prompt::enrich_password_prompt_message_for_command(
+                        &parsed.command, &output,
+                    );
                     self.emit(AgentEvent::CommandFinished {
                         command: display_command.clone(),
                         output: output.clone(),
@@ -884,7 +886,9 @@ impl Agent {
                     } else {
                         format!("Error: {detail}")
                     };
-                    output = crate::password_prompt::enrich_password_prompt_message(&output);
+                    output = crate::password_prompt::enrich_password_prompt_message_for_command(
+                        &parsed.command, &output,
+                    );
                     self.emit(AgentEvent::CommandFinished {
                         command: display_command.clone(),
                         output: output.clone(),
@@ -896,7 +900,9 @@ impl Agent {
         };
 
         // Truncate output if too long; enrich password/TTY failures for the LLM.
-        let enriched = crate::password_prompt::enrich_password_prompt_message(&output);
+        let enriched = crate::password_prompt::enrich_password_prompt_message_for_command(
+            &parsed.command, &output,
+        );
         let truncated = self.truncate_output(&enriched);
 
         self.emit(AgentEvent::CommandFinished {
@@ -1200,6 +1206,78 @@ mod tests {
 
         let result = agent.run("list files", &[]).await.unwrap();
         assert!(result.contains("Files listed"));
+    }
+
+    #[tokio::test]
+    async fn agent_substitutes_secret_inserted_after_build() {
+        // #364 regression: a Ctrl+P secret registered AFTER the agent is
+        // built must be substituted into tool commands (heredoc included),
+        // and the real value must never reach the LLM-visible output.
+        let heredoc_cmd = "printf '%s\n' \"$FILAR_SECRET_1\" | sudo -S tee /tmp/f <<'EOF'\n<x/>\nEOF";
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": heredoc_cmd,
+                "explanation": "Write file with sudo"
+            }),
+        }]);
+
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call,
+            ChatResponse::text("Done."),
+        ]));
+
+        let executor = Arc::new(MockExecutor {
+            last_command: std::sync::Mutex::new(String::new()),
+        });
+        let confirmer = Arc::new(MockConfirmer { approve: true });
+        let provider = Arc::new(filar_core::StaticSecretProvider::new());
+
+        let finished: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = finished.clone();
+        let sink: EventSink = Arc::new(move |event| {
+            if let AgentEvent::CommandFinished { output, .. } = event {
+                sink_events.lock().unwrap().push(output);
+            }
+        });
+
+        let agent = Agent::builder()
+            .llm(llm)
+            .executor(executor.clone())
+            .confirmer(confirmer)
+            .confirm_mode(CommandConfirmMode::Always)
+            .secret_provider(provider.clone() as Arc<dyn filar_core::SecretProvider>)
+            .event_sink(sink)
+            .build()
+            .unwrap();
+
+        // Secret appears AFTER build — like a real Ctrl+P during a session.
+        provider.insert("$FILAR_SECRET_1", "hunter2");
+
+        let result = agent.run("write the file", &[]).await.unwrap();
+        assert!(result.contains("Done."));
+
+        // The inner executor received the substituted command.
+        let executed = executor.last_command.lock().unwrap().clone();
+        assert!(
+            executed.contains("\"hunter2\""),
+            "secret not substituted in executed command: {executed}"
+        );
+        assert!(
+            !executed.contains("$FILAR_SECRET_1"),
+            "placeholder not substituted: {executed}"
+        );
+
+        // The LLM-visible output is sanitised — no real secret.
+        let outputs = finished.lock().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(
+            !outputs[0].contains("hunter2"),
+            "secret leaked into tool output: {}",
+            outputs[0]
+        );
+        assert!(outputs[0].contains("$FILAR_SECRET_1"));
     }
 
     #[tokio::test]

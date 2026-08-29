@@ -11,6 +11,16 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- `sudo -S` combined with a `<<EOF` heredoc in one command silently fed the
+  heredoc body to sudo as password attempts (the heredoc replaces the secret
+  pipe's stdin), making Ctrl+P secrets appear "not substituted". The agent now
+  gets explicit guidance on this stdin conflict when it fails, the system
+  prompt forbids the combination, and substitution through the real local
+  executor (pipeline and heredoc commands) is covered by regression tests
+  ([#364](https://github.com/devlawey/filar/issues/364)).
+
 ## [1.0.5] - 2026-08-27
 
 ### Fixed

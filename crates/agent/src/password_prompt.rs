@@ -28,6 +28,34 @@ pub fn looks_like_password_prompt(output: &str) -> bool {
     NEEDLES.iter().any(|n| lower.contains(n))
 }
 
+/// Guidance for the stdin conflict between `sudo -S` and a `<<EOF` heredoc
+/// on the same command (#364). In POSIX `sh`, a heredoc attached to the last
+/// pipeline segment **replaces** its stdin, so `sudo -S` reads the heredoc
+/// body as password attempts instead of the piped secret.
+///
+/// The fix keeps a single stdin for both the password and the body: `sudo -S`
+/// consumes only the first line, and `tee` receives the remainder. Staging the
+/// content in a temp file on the target host would violate the zero-install
+/// invariant and briefly expose the body at a predictable path.
+pub const SUDO_HEREDOC_GUIDANCE: &str = "\
+stdin conflict: a `<<EOF` heredoc on the same command as `sudo -S` replaces \
+the secret pipe — sudo tried the heredoc lines as the password. Fix: one stdin \
+for both — `{ printf '%s\\n' \"$FILAR_SECRET_1\"; cat <<'EOF' ... EOF } | sudo -S \
+tee <target> >/dev/null`; sudo takes the first line, tee the rest. No temp file.";
+
+/// Heuristic: the command combines `sudo -S` with a heredoc, so the heredoc
+/// steals `sudo -S`'s stdin (see [`SUDO_HEREDOC_GUIDANCE`], #364).
+pub fn sudo_heredoc_stdin_conflict(command: &str) -> bool {
+    let has_sudo = command
+        .split_whitespace()
+        .any(|t| t == "sudo" || t.ends_with("/sudo"));
+    let has_dash_s = command
+        .split_whitespace()
+        .any(|t| t.starts_with('-') && !t.starts_with("--") && t.contains('S'));
+    let has_heredoc = command.contains("<<");
+    has_sudo && has_dash_s && has_heredoc
+}
+
 /// Append password guidance once when the output indicates a password/TTY failure.
 pub fn enrich_password_prompt_message(base: &str) -> String {
     if base.contains(PASSWORD_PROMPT_GUIDANCE) {
@@ -37,6 +65,20 @@ pub fn enrich_password_prompt_message(base: &str) -> String {
         return base.to_string();
     }
     format!("{base}\n\n{PASSWORD_PROMPT_GUIDANCE}")
+}
+
+/// Like [`enrich_password_prompt_message`], but also appends
+/// [`SUDO_HEREDOC_GUIDANCE`] when the failed command combined `sudo -S` with
+/// a heredoc (#364). Only applied on password/TTY failures.
+pub fn enrich_password_prompt_message_for_command(command: &str, base: &str) -> String {
+    let enriched = enrich_password_prompt_message(base);
+    if enriched == base {
+        return enriched;
+    }
+    if sudo_heredoc_stdin_conflict(command) && !enriched.contains(SUDO_HEREDOC_GUIDANCE) {
+        return format!("{enriched}\n\n{SUDO_HEREDOC_GUIDANCE}");
+    }
+    enriched
 }
 
 #[cfg(test)]
@@ -78,5 +120,52 @@ mod tests {
     fn enrich_skips_unrelated() {
         let out = enrich_password_prompt_message("ls: cannot access");
         assert_eq!(out, "ls: cannot access");
+    }
+
+    #[test]
+    fn detects_sudo_heredoc_stdin_conflict() {
+        let cmd = "printf '%s\\n' \"$FILAR_SECRET_1\" | sudo -S tee /tmp/f >/dev/null <<'EOF'\ncontent\nEOF";
+        assert!(sudo_heredoc_stdin_conflict(cmd));
+        assert!(sudo_heredoc_stdin_conflict("echo x | sudo -S sh <<'EOF'\ntrue\nEOF"));
+        // No heredoc → no conflict.
+        assert!(!sudo_heredoc_stdin_conflict(
+            "printf '%s\\n' \"$FILAR_SECRET_1\" | sudo -S true"
+        ));
+        // Heredoc without sudo -S → no conflict.
+        assert!(!sudo_heredoc_stdin_conflict("cat > /tmp/f <<'EOF'\nx\nEOF"));
+        // Heredoc with bare sudo (no -S) → no conflict.
+        assert!(!sudo_heredoc_stdin_conflict("sudo sh <<'EOF'\nx\nEOF"));
+    }
+
+    #[test]
+    fn enrich_for_command_appends_heredoc_guidance_on_failure() {
+        let cmd = "printf '%s\\n' \"$FILAR_SECRET_2\" | sudo -S tee /tmp/f <<'EOF'\n<x/>\nEOF";
+        let out = enrich_password_prompt_message_for_command(cmd, "Password:Sorry, try again.\nsudo: 3 incorrect password attempts");
+        assert!(out.contains(PASSWORD_PROMPT_GUIDANCE));
+        assert!(out.contains(SUDO_HEREDOC_GUIDANCE));
+        // Keep UI-friendly: combined guidance stays bounded.
+        assert!(
+            SUDO_HEREDOC_GUIDANCE.len() < 320,
+            "guidance too long: {} chars",
+            SUDO_HEREDOC_GUIDANCE.len()
+        );
+    }
+
+    #[test]
+    fn enrich_for_command_heredoc_only_on_password_failure() {
+        // Successful/unrelated output → no guidance even with conflicting command.
+        let cmd = "printf x | sudo -S tee /tmp/f <<'EOF'\ncontent\nEOF";
+        let out = enrich_password_prompt_message_for_command(cmd, "ok done");
+        assert_eq!(out, "ok done");
+    }
+
+    #[test]
+    fn enrich_for_command_without_heredoc_keeps_base_guidance_only() {
+        let out = enrich_password_prompt_message_for_command(
+            "printf '%s\\n' \"$FILAR_SECRET_1\" | sudo -S true",
+            "sudo: a password is required",
+        );
+        assert!(out.contains(PASSWORD_PROMPT_GUIDANCE));
+        assert!(!out.contains(SUDO_HEREDOC_GUIDANCE));
     }
 }

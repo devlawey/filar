@@ -5232,6 +5232,48 @@ copy (same vs independent + session name), `CommandAudited` labels by arbiter
 
 **Next steps:** manual — pick arbiter B ≠ session A, confirm overlay shows B.
 
+## Issue #364: fix(agent/transport) — sudo/secret stdin conflict guidance
+
+**Milestone:** 1.0.6. **Branch:** `fix/364-secret-stdin-hijack`.
+
+**Problem:** Ctrl+P secret appeared "not substituted": agent built
+`printf '%s\n' "$FILAR_SECRET_1" | sudo -S tee … <<'EOF' … EOF`. Investigation
+showed substitution itself is intact (new tests through the real `sh -c`
+executor, pipeline and heredoc). Actual failure: POSIX `sh` attaches the
+heredoc to the last pipeline command's stdin, so `sudo -S` received the
+heredoc body ("Password:Sorry, try again." ×3), never the secret.
+
+**Design:** engine guidance rather than silent rewriting — detect
+`sudo -S` + `<<` on a password/TTY failure and append short
+`SUDO_HEREDOC_GUIDANCE`; system prompt rule 8 forbids the combination.
+Substitution path unchanged.
+
+The recommended fix keeps a **single stdin** for both the password and the
+body — `{ printf '%s\n' "$FILAR_SECRET_1"; cat <<'EOF' ... EOF } | sudo -S tee
+<target> >/dev/null` — because `sudo -S` reads stdin only up to the first
+newline, leaving the remainder for `tee`. Verified against real `sudo`: the
+file lands with the exact body and root ownership, and a wrong password exits
+non-zero without creating the target.
+
+Staging the content in a temp file first (the earlier `sudo -S cp /tmp/file`
+wording) was rejected in review: it leaves an artifact on the remote host if
+the second step fails, which the zero-install invariant forbids, and it briefly
+exposes the body at a predictable world-readable path — bad when the body is a
+config holding credentials.
+
+**Done:** `sudo_heredoc_stdin_conflict()` + command-aware enrich
+(`enrich_password_prompt_message_for_command`, all three call sites), prompt
+rule 8 (agent.rs + eval/prompts in sync), regression tests: transport heredoc
+substitution, real LocalExecutor pipeline + heredoc-to-file (cfg unix, local),
+agent-level secret-inserted-after-build with output sanitisation.
+
+**Public contract:** new `password_prompt` helpers; `enrich_password_prompt_message`
+kept unchanged for other callers.
+
+**Next steps:** manual macOS release build (PR notes). The `path_picker` test
+failures noted here were unrelated and are fixed in #370 (tests assumed a
+Windows-shaped cwd); CI from #367 now covers both platforms.
+
 ## Issue #367: chore(ci) — build and test workspace on every PR
 
 **Milestone:** 1.0.6. **Branch:** `chore/367-ci-build-test-pr`.
