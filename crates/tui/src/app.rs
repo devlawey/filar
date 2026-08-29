@@ -6996,6 +6996,12 @@ mod tests {
     fn open_path_picker_sets_remote_root() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.sessions[0].ssh_info = Some("root@host:22".into());
+        // A remote session has no known cwd until OSC 7 / the #313 sync
+        // reports one — `runner.rs` clears it whenever a session goes remote.
+        // Without this the test inherits the process cwd, which passes on
+        // Windows only because `D:\...` fails the `starts_with('/')` filter in
+        // `initial_picker_dir` (#370).
+        app.sessions[0].cwd = None;
         app.open_path_picker(crate::path_picker::PathPickerKind::File);
         assert!(app.path_picker_visible);
         assert_eq!(app.path_picker_dir, "/");
@@ -7007,6 +7013,8 @@ mod tests {
     fn path_picker_enter_home_from_root_uses_posix() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.sessions[0].ssh_info = Some("root@host:22".into());
+        // Remote session: cwd unknown until synced (see #370).
+        app.sessions[0].cwd = None;
         app.open_path_picker(crate::path_picker::PathPickerKind::File);
         assert_eq!(app.path_picker_dir, "/");
         assert!(app.path_picker_remote);
