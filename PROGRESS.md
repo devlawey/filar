@@ -5245,8 +5245,21 @@ heredoc body ("Password:Sorry, try again." ×3), never the secret.
 
 **Design:** engine guidance rather than silent rewriting — detect
 `sudo -S` + `<<` on a password/TTY failure and append short
-`SUDO_HEREDOC_GUIDANCE` (temp file first, then `sudo -S cp`); system prompt
-rule 8 forbids the combination. Substitution path unchanged.
+`SUDO_HEREDOC_GUIDANCE`; system prompt rule 8 forbids the combination.
+Substitution path unchanged.
+
+The recommended fix keeps a **single stdin** for both the password and the
+body — `{ printf '%s\n' "$FILAR_SECRET_1"; cat <<'EOF' ... EOF } | sudo -S tee
+<target> >/dev/null` — because `sudo -S` reads stdin only up to the first
+newline, leaving the remainder for `tee`. Verified against real `sudo`: the
+file lands with the exact body and root ownership, and a wrong password exits
+non-zero without creating the target.
+
+Staging the content in a temp file first (the earlier `sudo -S cp /tmp/file`
+wording) was rejected in review: it leaves an artifact on the remote host if
+the second step fails, which the zero-install invariant forbids, and it briefly
+exposes the body at a predictable world-readable path — bad when the body is a
+config holding credentials.
 
 **Done:** `sudo_heredoc_stdin_conflict()` + command-aware enrich
 (`enrich_password_prompt_message_for_command`, all three call sites), prompt

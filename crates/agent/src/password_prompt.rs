@@ -32,11 +32,16 @@ pub fn looks_like_password_prompt(output: &str) -> bool {
 /// on the same command (#364). In POSIX `sh`, a heredoc attached to the last
 /// pipeline segment **replaces** its stdin, so `sudo -S` reads the heredoc
 /// body as password attempts instead of the piped secret.
+///
+/// The fix keeps a single stdin for both the password and the body: `sudo -S`
+/// consumes only the first line, and `tee` receives the remainder. Staging the
+/// content in a temp file on the target host would violate the zero-install
+/// invariant and briefly expose the body at a predictable path.
 pub const SUDO_HEREDOC_GUIDANCE: &str = "\
 stdin conflict: a `<<EOF` heredoc on the same command as `sudo -S` replaces \
-the secret pipe — sudo tried the heredoc lines as the password. Fix: write \
-the content to a temp file first (no sudo), then \
-`printf '%s\\n' \"$FILAR_SECRET_1\" | sudo -S cp /tmp/file <target>`.";
+the secret pipe — sudo tried the heredoc lines as the password. Fix: one stdin \
+for both — `{ printf '%s\\n' \"$FILAR_SECRET_1\"; cat <<'EOF' ... EOF } | sudo -S \
+tee <target> >/dev/null`; sudo takes the first line, tee the rest. No temp file.";
 
 /// Heuristic: the command combines `sudo -S` with a heredoc, so the heredoc
 /// steals `sudo -S`'s stdin (see [`SUDO_HEREDOC_GUIDANCE`], #364).

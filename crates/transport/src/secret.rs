@@ -444,12 +444,13 @@ mod tests {
         let result = exec.run(&cmd).await.unwrap();
         assert_eq!(result.exit_code, Some(0));
 
+        // Read and clean up *before* asserting: a failing assertion must not
+        // leave a file containing the substituted secret behind in temp.
         let body = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
         assert!(
             body.contains("password=secret-in-heredoc"),
             "substituted secret missing from heredoc file: {body}"
         );
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
