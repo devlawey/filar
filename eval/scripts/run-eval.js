@@ -11,8 +11,10 @@
 //   --smoke     : short circuit at first pass, no retries (for CI smoke workflow)
 //
 // Extra args are forwarded to promptfoo. The promptfoo binary is resolved as
-// `npx promptfoo` by default; set PROMPTFOO_BIN env to override.  Results are
-// written to eval/results.json (and eval/results.retry.json on retry).
+// `npx promptfoo` by default; set PROMPTFOO_BIN env to override. PROMPTFOO_BIN
+// must contain the binary only — this script appends the `eval` subcommand
+// itself (#369). Results are written to eval/results.json (and
+// eval/results.retry.json on retry).
 // Exit code 0 = pass rate ≥ threshold (via smoke-check.js), 1 = below threshold,
 // 2 = script error (missing results, unexpected failure).
 
@@ -31,7 +33,14 @@ function sleep(ms) {
 }
 
 function promptfoo(args) {
-  const cmd = `${PROMPTFOO_BIN} ${args.join(' ')}`;
+  // The `eval` subcommand is mandatory: options like --filter-metadata and
+  // --filter-providers are registered on it, not on the root program, and
+  // promptfoo does not mark `eval` as the default command. Invoking the binary
+  // without it fails at argument parsing ("unknown option '--filter-metadata'")
+  // before any network call — which is how eval-smoke silently stopped running
+  // for six weeks (#369). PROMPTFOO_BIN holds the binary only, never the
+  // subcommand.
+  const cmd = `${PROMPTFOO_BIN} eval ${args.join(' ')}`;
   console.log(`\n[run-eval] ${cmd}`);
   try {
     execSync(cmd, { stdio: 'inherit', cwd: process.cwd() });
@@ -114,9 +123,17 @@ async function main() {
   const run1ok = promptfoo(run1Args);
 
   if (isSmoke) {
-    if (!run1ok || !fs.existsSync(RESULTS)) {
-      console.error('[run-eval] smoke run failed — no results produced');
+    // Distinguish "the eval never ran" from "the eval ran and some cases
+    // failed". promptfoo exits non-zero whenever any case fails an assertion,
+    // which is a verdict for the pass-rate step — not a reason to claim the
+    // run did not happen. Conflating the two is what made #369 unreadable.
+    if (!fs.existsSync(RESULTS)) {
+      console.error('[run-eval] smoke run produced no results — the eval did not run');
+      console.error('[run-eval] check the promptfoo invocation and its arguments, not the model');
       process.exit(1);
+    }
+    if (!run1ok) {
+      console.log('[run-eval] promptfoo exited non-zero (failing cases) — pass rate is checked separately');
     }
     // CI smoke — no retries; pass-rate check is a separate CI step.
     process.exit(0);

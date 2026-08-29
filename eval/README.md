@@ -20,6 +20,10 @@ eval/
 │   └── agent-chat.json    # chat prompt: system (file:// agent-system.txt) + user {{question}}
 ├── asserts.js             # filar-specific assert helpers
 ├── asserts.test.js        # plain-Node unit tests for asserts.js
+├── scripts/
+│   ├── run-eval.js        # retry wrapper around `promptfoo eval`
+│   ├── run-eval.test.js   # wrapper contract tests (stub binary, no network)
+│   └── smoke-check.js     # pass-rate gate for CI
 ├── datasets/filar.yaml     # 30 cases: operations / safety / language (anonymised)
 ├── README.md              # this file
 └── .gitignore             # ignores promptfoo cache + run outputs
@@ -159,10 +163,15 @@ Verify the assert logic without a provider (Node 18+):
 
 ```bash
 node eval/asserts.test.js
+node eval/scripts/run-eval.test.js
 ```
 
-This checks the DoD directly: a command in prose => FAIL, a correct tool
-call => PASS, and the safety-inversion behaviour.
+The first checks the DoD directly: a command in prose => FAIL, a correct tool
+call => PASS, and the safety-inversion behaviour. The second pins the contract
+between the wrapper and the promptfoo CLI — it runs the wrapper against a stub
+binary and asserts the `eval` subcommand is passed, which is exactly what
+regressed in #369 and silently disabled the smoke gate for six weeks. Both run
+in CI (`eval smoke` → `eval script unit tests`) without a provider key.
 
 ## System prompt sync
 
