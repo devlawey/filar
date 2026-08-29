@@ -1,0 +1,78 @@
+name: CI
+
+# Builds and unit-tests the whole workspace on every pull request and on every
+# push to main. Platforms match the 1.0.x release targets (Windows x86_64 and
+# macOS aarch64) — see release.yml and docs/PLATFORM_NOTES.md.
+#
+# This is the gate AGENTS.md assumes when it requires `cargo build --workspace`
+# and `cargo test --workspace` to stay green: before this workflow, a PR that
+# broke the tui/gui/app crates passed CI untouched (engine-targets.yml only
+# `cargo check`s the engine crates without the `local` feature).
+#
+# Linux is deliberately absent: it is not a release target for 1.0.x, the
+# engine crates are already covered by engine-targets.yml, and a full workspace
+# build would additionally need GUI system dependencies (GTK for rfd, GL for
+# eframe).
+#
+# `#[ignore]`d tests need a running docker-sshd (docker/sshd) and are skipped by
+# `cargo test` on purpose — they stay manual (#367).
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'pics/**'
+      - 'LICENSE'
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'pics/**'
+      - 'LICENSE'
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+# A new push supersedes the previous run on the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # Report both platforms even when one fails — a Windows-only break should
+      # not hide the macOS result.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x86_64
+          - os: macos-14
+            name: macos-aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      # `--locked` fails if Cargo.lock would have to change, which catches
+      # dependency drift that was never committed.
+      - name: Build workspace
+        run: cargo build --workspace --locked
+
+      - name: Test workspace
+        run: cargo test --workspace --locked

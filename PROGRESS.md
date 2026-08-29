@@ -5270,9 +5270,74 @@ agent-level secret-inserted-after-build with output sanitisation.
 **Public contract:** new `password_prompt` helpers; `enrich_password_prompt_message`
 kept unchanged for other callers.
 
-**Next steps:** manual macOS release build (PR notes); pre-existing unrelated
-tui `path_picker` test failures (cwd-dependent, fail on main too) — need a
-separate issue.
+**Next steps:** manual macOS release build (PR notes). The `path_picker` test
+failures noted here were unrelated and are fixed in #370 (tests assumed a
+Windows-shaped cwd); CI from #367 now covers both platforms.
+
+## Issue #367: chore(ci) — build and test workspace on every PR
+
+**Milestone:** 1.0.6. **Branch:** `chore/367-ci-build-test-pr`.
+
+**Problem:** no workflow built or tested the full workspace before merge.
+`engine-targets.yml` only `cargo check`s the engine crates without the `local`
+feature; `eval-smoke.yml` is path-scoped and secret-gated; `release.yml` runs
+only after publish. A PR breaking `tui`/`gui`/`app` — or a failing unit test —
+passed CI green. The AGENTS.md requirement of green
+`cargo build --workspace` / `cargo test --workspace` rested entirely on the
+author running them locally.
+
+**Design:** new `.github/workflows/ci.yml` — `cargo build --workspace --locked`
++ `cargo test --workspace --locked` on a `fail-fast: false` matrix of
+`windows-latest` and `macos-14`, matching the 1.0.x release targets. Triggers on
+`pull_request` and on `push: main`; the latter makes the release preflight
+checkable through the check-runs API instead of on trust. `paths-ignore` for
+`**.md` / `pics/**` / `LICENSE`; `concurrency` with `cancel-in-progress`;
+toolchain and cache actions match `engine-targets.yml`.
+
+**Done:** workflow added. Linux excluded on purpose (not a 1.0.x release
+target; engine crates already covered by `engine-targets.yml`; a full workspace
+build would need GTK/GL system deps).
+
+**Public contract:** none.
+
+**Next steps:** confirm both check-runs appear on the first PR; if CI becomes a
+required check in branch protection, revisit `paths-ignore` (a skipped check on
+a docs-only PR can block merge). Clippy / `cargo fmt --check` deliberately left
+out of scope — separate issue after the existing warnings are triaged.
+
+## Issue #370: fix(tui/tests) — path picker tests assumed a Windows-shaped cwd
+
+**Milestone:** 1.0.6. **Branch:** `fix/370-path-picker-tests-cwd`.
+
+**Problem:** `open_path_picker_sets_remote_root` and
+`path_picker_enter_home_from_root_uses_posix` failed on macOS
+(`left: "/Users/runner/work/filar/filar/crates/tui", right: "/"`) while passing
+on Windows. Both set `ssh_info` on a session built by `App::new()` but left
+`cwd` at the process working directory — a remote-session-with-local-cwd state
+that production never produces. `initial_picker_dir` keeps a remote `cwd` only
+when it `starts_with('/')`, so a Windows `D:\…` path fell through to the `"/"`
+fallback and the assertion held by accident; a POSIX path does not.
+
+Surfaced by the new CI (#367) — the first `cargo test` run on macOS in the
+project. `release.yml` only builds `filar-app`, `engine-targets.yml` only
+`cargo check`s the engine crates on Linux, so the failure had been invisible.
+
+**Design:** tests only. Clear `cwd` alongside `ssh_info`, mirroring what
+`runner.rs` does at both sites where a session goes remote (startup with
+`--target`, and `TuiEvent::TransportChanged`), where the comment already
+records that a remote cwd is unknown until OSC 7 / the #313 sync reports one.
+
+**Done:** `cwd = None` added to both tests with a comment pointing at the
+invariant. Audited the other `ssh_info = Some(...)` tests in `app.rs` — tab
+labels, `new_tab` inheritance and `status_target` do not read `cwd` through
+`initial_picker_dir` and are unaffected.
+
+**Public contract:** none. `initial_picker_dir` / `open_path_picker` unchanged.
+
+**Next steps:** the "remote ⇒ cwd is None or POSIX" invariant is maintained by
+hand at two places in `runner.rs`; a third site that forgets it would open the
+picker at a *local* path on a macOS/Linux client (masked on Windows by the
+`starts_with('/')` filter). Worth a separate issue if it ever recurs.
 
 ## Release v1.0.5 (2026-08-27)
 
