@@ -5398,12 +5398,16 @@ with its control bytes intact, a `\r` moved the real cursor to column 0, and
 the diff then legitimately skipped cells it believed unchanged. No per-frame
 buffer reset can fix that by construction.
 
-**Design:** sanitise at the source. `text.rs::sanitize_output` runs per line:
-strip ANSI escapes first (CSI to its final byte, OSC to BEL/ST, two-character
-escapes) so parameter bytes are never mistaken for text; then resolve `\r` and
-`\x08` as cursor movement; then drop remaining C0/C1/DEL, keeping `\t` for
-`expand_tabs`. Applied in `layout_cache.rs` where `ChatBlock::Command` output
-becomes lines, with a fast path for output containing no control bytes.
+**Design:** sanitise at the source. `text.rs::sanitize_line` replays one line
+as a terminal would, in a **single pass** over escapes and cursor motion: erase
+sequences act relative to the cursor, so stripping escapes in a separate pass
+would lose the position they apply to. Cells are addressed in display columns
+(`LineCells`), a double-width character occupies two, and `None` marks its right
+half so clobbering the left one leaves a blank column. Recognised: 7-bit and
+8-bit CSI/OSC, erase (`K` with 0/1/2), cursor motion (`G`, `C`, `D`), `\r`,
+`\x08`, `\t`; presentation-only sequences (SGR) and stray C0/C1/DEL are
+dropped. Applied in `layout_cache.rs` where `ChatBlock::Command` output becomes
+lines, with a fast path for output containing no control bytes.
 
 `\r` is **emulated, not dropped**: progress bars (`hf download`, `pip`, `curl`)
 send frame after frame separated by `\r` with no `\n`, so the whole animation
@@ -5423,9 +5427,19 @@ timer, as first proposed in the issue, would also repaint forever and keep the
 process awake, breaking the deliberate zero-CPU-at-idle property of the render
 tick.
 
-**Done:** sanitiser + 8 unit tests (progress-bar frames, overwrite tail, CSI,
-OSC with both terminators, truncated CSI, backspace, stray C0/C1/DEL, line
-structure), `strip_emoji` control-character test, settle repaint.
+**Done:** sanitiser + 11 unit tests (progress-bar frames, overwrite tail,
+erase-to-end/start/all, 8-bit C1 introducers, display-column arithmetic with
+tabs and wide characters, cursor motion, backspace, SGR, OSC with both
+terminators, truncated CSI, stray C0/DEL, line structure), `strip_emoji`
+control-character test, settle repaint.
+
+Review (#373) caught three real gaps in the first, two-pass version, all
+confirmed against a prototype before fixing: 8-bit C1 introducers left their
+parameter bytes as visible text; `CSI K` was discarded, so `\r` + erase — the
+standard way a progress bar clears its previous frame — still left the stale
+tail that #366 is about; and column arithmetic counted `char`s, so CR/BS after
+a tab or a wide character landed on the wrong position. The single-pass,
+column-addressed rewrite is the answer to all three.
 
 **Public contract:** none. `CommandExecutor` / `LlmClient` untouched;
 confirm gate and transport not involved.
