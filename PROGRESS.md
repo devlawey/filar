@@ -5385,6 +5385,57 @@ on its own PR. `eval/README.md` updated.
 changes went unverified. If it is, triage the failures as a separate issue and
 **do not lower the 90% threshold** to make it pass.
 
+## Issue #366: fix(tui) — control/ANSI bytes desynced the physical screen
+
+**Milestone:** 1.0.6. **Branch:** `fix/366-sanitize-command-output`.
+
+**Problem:** leftover glyphs and lines painted over one another, healed only by
+resizing the window. Four earlier attempts (#231, #245, #328, #333) fixed the
+ratatui *buffer* — `reset_area_cells`, `pad_line_to_width`, `Clear` — and the
+buffer was already correct. The desync was between the buffer and the
+*physical* screen: raw command output reached the terminal through `Span::raw`
+with its control bytes intact, a `\r` moved the real cursor to column 0, and
+the diff then legitimately skipped cells it believed unchanged. No per-frame
+buffer reset can fix that by construction.
+
+**Design:** sanitise at the source. `text.rs::sanitize_output` runs per line:
+strip ANSI escapes first (CSI to its final byte, OSC to BEL/ST, two-character
+escapes) so parameter bytes are never mistaken for text; then resolve `\r` and
+`\x08` as cursor movement; then drop remaining C0/C1/DEL, keeping `\t` for
+`expand_tabs`. Applied in `layout_cache.rs` where `ChatBlock::Command` output
+becomes lines, with a fast path for output containing no control bytes.
+
+`\r` is **emulated, not dropped**: progress bars (`hf download`, `pip`, `curl`)
+send frame after frame separated by `\r` with no `\n`, so the whole animation
+arrives as one line. Emulation reproduces what a terminal would show — the last
+frame, plus the tail of a longer previous frame when the last one is shorter —
+instead of concatenating every frame or truncating to the last segment.
+
+`strip_emoji` also fixed: its `cp <= 0x024F` whitelist admitted the entire C0
+block, so `ESC`/`CR`/`BS` passed through in every block type. `\n` and `\t` stay
+whitelisted — wrapping depends on them.
+
+Safety net in `runner.rs`: a debounced settle repaint — one `terminal.clear()`
++ draw, 250 ms after the last frame — armed only while output is streaming
+(Thinking mode, or the starved-tick fallback path). Arming it after every frame
+would flash the whole screen after each typing pause; an unconditional 1 Hz
+timer, as first proposed in the issue, would also repaint forever and keep the
+process awake, breaking the deliberate zero-CPU-at-idle property of the render
+tick.
+
+**Done:** sanitiser + 8 unit tests (progress-bar frames, overwrite tail, CSI,
+OSC with both terminators, truncated CSI, backspace, stray C0/C1/DEL, line
+structure), `strip_emoji` control-character test, settle repaint.
+
+**Public contract:** none. `CommandExecutor` / `LlmClient` untouched;
+confirm gate and transport not involved.
+
+**Next steps:** manual repro on both platforms is required and could not be run
+by the agent (no Rust toolchain) — see the PR. A manual force-repaint binding
+was left out: `Ctrl+R` is reverse-i-search in a shell and would collide in
+interactive mode, so the key choice needs a decision of its own. Translating
+SGR into ratatui styles instead of discarding colour is a possible follow-up.
+
 ## Release v1.0.5 (2026-08-27)
 
 **Scope:** milestone 1.0.5 — regression fixes for 1.0.4: Unicode export topic slug

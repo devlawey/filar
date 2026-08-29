@@ -26,14 +26,148 @@ pub(crate) fn expand_tabs(s: &str) -> String {
     out
 }
 
+/// Strip ANSI escape sequences from a single line: CSI (`ESC [` … final byte
+/// `0x40..=0x7E`), OSC (`ESC ]` … `BEL` or `ESC \`), and two-character escapes
+/// (`ESC (B`, `ESC =`, …). A truncated sequence at end of line is dropped whole.
+fn strip_escapes(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '\u{1b}' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        if i + 1 >= chars.len() {
+            break; // lone trailing ESC
+        }
+        match chars[i + 1] {
+            '[' => {
+                let mut j = i + 2;
+                while j < chars.len() {
+                    let cp = chars[j] as u32;
+                    if (0x40..=0x7E).contains(&cp) {
+                        break;
+                    }
+                    j += 1;
+                }
+                i = if j < chars.len() { j + 1 } else { chars.len() };
+            }
+            ']' => {
+                let mut j = i + 2;
+                while j < chars.len() {
+                    if chars[j] == '\u{7}' {
+                        j += 1;
+                        break;
+                    }
+                    if chars[j] == '\u{1b}' && j + 1 < chars.len() && chars[j + 1] == '\\' {
+                        j += 2;
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+            _ => i += 2,
+        }
+    }
+    out
+}
+
+/// Apply the cursor semantics of `\r` (carriage return) and `\x08` (backspace)
+/// inside one line, reproducing what a terminal would actually display.
+///
+/// Progress bars (`hf download`, `pip`, `curl`, `docker pull`) redraw by
+/// emitting frame after frame separated by `\r` with no `\n`, so the whole
+/// animation arrives as a single line. Dropping `\r` would concatenate every
+/// frame; emulating it keeps the final frame — and, exactly like a real
+/// terminal, keeps the tail of a longer previous frame when the last one is
+/// shorter.
+fn apply_overwrite(line: &str) -> String {
+    let mut buf: Vec<char> = Vec::new();
+    let mut col = 0usize;
+    for c in line.chars() {
+        match c {
+            '\r' => col = 0,
+            '\u{8}' => col = col.saturating_sub(1),
+            _ => {
+                if col < buf.len() {
+                    buf[col] = c;
+                } else {
+                    buf.push(c);
+                }
+                col += 1;
+            }
+        }
+    }
+    buf.into_iter().collect()
+}
+
+/// Drop C0/C1 control characters and DEL, keeping `\t` (expanded later by
+/// [`expand_tabs`]).
+fn drop_controls(line: &str) -> String {
+    line.chars()
+        .filter(|&c| {
+            if c == '\t' {
+                return true;
+            }
+            let cp = c as u32;
+            !(cp < 0x20 || cp == 0x7F || (0x80..=0x9F).contains(&cp))
+        })
+        .collect()
+}
+
+/// Sanitise raw command output before it becomes chat lines (#366).
+///
+/// Command stdout is not text: it carries `\r`, backspaces and ANSI escapes.
+/// ratatui writes span content to the terminal verbatim, so a stray `\r` moves
+/// the physical cursor to column 0 and the rest of the frame is painted over
+/// whatever was there — while ratatui's buffer still believes the cell is
+/// unchanged and its diff emits nothing. That desync is what left redraw
+/// artifacts on screen until a window resize forced a full repaint.
+///
+/// Escapes are removed first (so CSI parameter bytes are never mistaken for
+/// text), then `\r`/`\x08` are resolved as cursor movement, then any remaining
+/// control characters are dropped. Newlines are preserved: each line is
+/// processed independently.
+pub(crate) fn sanitize_output(s: &str) -> String {
+    // Fast path: the overwhelming majority of command output is plain text.
+    let needs_work = s.chars().any(|c| {
+        let cp = c as u32;
+        c != '\t' && c != '\n' && (cp < 0x20 || cp == 0x7F || (0x80..=0x9F).contains(&cp))
+    });
+    if !needs_work {
+        return s.to_string();
+    }
+
+    let mut out = String::with_capacity(s.len());
+    for (i, line) in s.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let stripped = strip_escapes(line);
+        let overwritten = apply_overwrite(&stripped);
+        out.push_str(&drop_controls(&overwritten));
+    }
+    out
+}
+
 /// Strip emoji and other non-renderable Unicode characters from a string.
 /// Windows terminal (conhost) can't display most emojis, so they show as '?'.
 /// Conservative whitelist: ASCII, Cyrillic, Latin, punctuation, arrows, math, box drawing.
+///
+/// Control characters are **not** whitelisted: `ESC`/`CR`/`BS` reaching the
+/// terminal desynchronise ratatui's buffer from the physical screen (#366).
+/// `\t` and `\n` are kept — wrapping and [`expand_tabs`] depend on them.
 pub(crate) fn strip_emoji(s: &str) -> String {
     s.chars()
         .filter(|&c| {
             let cp = c as u32;
-            cp <= 0x024F                        // ASCII + Latin + Latin Extended
+            c == '\n' || c == '\t'
+            || ((0x20..=0x024F).contains(&cp)   // ASCII + Latin + Latin Extended
+                && cp != 0x7F                   // minus DEL
+                && !(0x80..=0x9F).contains(&cp))// minus C1 controls
             || (0x0300..=0x036F).contains(&cp)  // Combining diacritics
             || (0x0400..=0x04FF).contains(&cp)  // Cyrillic
             || (0x2000..=0x206F).contains(&cp)  // General punctuation (— " " ' ')
@@ -406,5 +540,85 @@ mod tests {
         let spans = md_spans("`foo` and `bar`");
         assert!(spans.iter().any(|s| s == "foo"));
         assert!(spans.iter().any(|s| s == "bar"));
+    }
+
+    // ── #366: command output sanitisation ────────────────────────────────
+
+    #[test]
+    fn sanitize_keeps_plain_output_untouched() {
+        let plain = "total 12\ndrwxr-xr-x 2 user user 4096 Aug 30 10:00 dir\n";
+        assert_eq!(sanitize_output(plain), plain);
+        assert_eq!(sanitize_output("col1\tcol2"), "col1\tcol2");
+    }
+
+    #[test]
+    fn sanitize_resolves_progress_bar_frames() {
+        // `hf download` style: frames separated by \r, no \n at all.
+        let src = "Fetching 4 files:   0%| | 0/4\rFetching 4 files:  25%|# | 1/4\rFetching 4 files: 100%|##| 4/4";
+        assert_eq!(sanitize_output(src), "Fetching 4 files: 100%|##| 4/4");
+    }
+
+    #[test]
+    fn sanitize_overwrite_keeps_tail_like_a_real_terminal() {
+        // A shorter frame does not erase the longer one underneath it.
+        assert_eq!(sanitize_output("abcdefghij\rXY"), "XYcdefghij");
+    }
+
+    #[test]
+    fn sanitize_handles_backspace() {
+        assert_eq!(sanitize_output("loading |\u{8}/\u{8}-"), "loading -");
+    }
+
+    #[test]
+    fn sanitize_strips_csi_sequences() {
+        // `ls --color=always`
+        assert_eq!(
+            sanitize_output("\u{1b}[0m\u{1b}[01;34mdir\u{1b}[0m  file"),
+            "dir  file"
+        );
+        // `grep --color`: SGR plus erase-to-end-of-line.
+        assert_eq!(
+            sanitize_output("pre\u{1b}[01;31m\u{1b}[Kmatch\u{1b}[m\u{1b}[Kpost"),
+            "prematchpost"
+        );
+        // Truncated sequence at end of line is dropped whole.
+        assert_eq!(sanitize_output("text\u{1b}[38;5;"), "text");
+    }
+
+    #[test]
+    fn sanitize_strips_osc_sequences() {
+        // OSC 7 (cwd report) terminated by BEL.
+        assert_eq!(
+            sanitize_output("\u{1b}]7;file://host/tmp\u{7}text"),
+            "text"
+        );
+        // OSC terminated by ST (ESC \).
+        assert_eq!(sanitize_output("\u{1b}]0;title\u{1b}\\body"), "body");
+    }
+
+    #[test]
+    fn sanitize_drops_stray_c0_c1_and_del() {
+        assert_eq!(sanitize_output("a\u{9b}b\u{7f}c\u{0}d"), "abcd");
+    }
+
+    #[test]
+    fn sanitize_preserves_line_structure() {
+        assert_eq!(sanitize_output("line1\nline2"), "line1\nline2");
+        // Trailing newline must survive so `str::lines()` sees the same count.
+        assert_eq!(sanitize_output("a\u{1b}[0m\nb\n"), "a\nb\n");
+    }
+
+    #[test]
+    fn strip_emoji_removes_control_characters() {
+        // #366: ESC/CR/BS used to pass the `cp <= 0x024F` whitelist.
+        assert_eq!(strip_emoji("a\u{1b}b"), "ab");
+        assert_eq!(strip_emoji("a\rb"), "ab");
+        assert_eq!(strip_emoji("a\u{8}b"), "ab");
+        assert_eq!(strip_emoji("a\u{7f}b"), "ab");
+        assert_eq!(strip_emoji("a\u{9b}b"), "ab");
+        // Newlines and tabs are still needed by wrapping and expand_tabs.
+        assert_eq!(strip_emoji("a\nb\tc"), "a\nb\tc");
+        // Regression guard: normal text is unaffected.
+        assert_eq!(strip_emoji("Привет — ok ✓"), "Привет — ok ✓");
     }
 }

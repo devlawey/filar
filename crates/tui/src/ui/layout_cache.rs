@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 
 use filar_core::ChatBlock;
 
-use super::text::{render_markdown_line, strip_emoji, wrap_text, MarkdownState};
+use super::text::{render_markdown_line, sanitize_output, strip_emoji, wrap_text, MarkdownState};
 use super::theme::Theme;
 
 /// Which part of a [`ChatBlock`] a rendered line belongs to.
@@ -181,6 +181,11 @@ impl ChatLayoutCache {
                     }
 
                     if let Some(out) = output {
+                        // Command stdout carries \r, backspaces and ANSI escapes.
+                        // They must not reach the terminal: ratatui writes span
+                        // content verbatim, and a stray \r moves the physical
+                        // cursor out from under its buffer (#366).
+                        let out = sanitize_output(out);
                         let all_lines: Vec<&str> = out.lines().collect();
                         let total = all_lines.len();
 
