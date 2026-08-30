@@ -13,6 +13,16 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- Redraw artifacts (leftover glyphs, one line painted over another) that
+  persisted until the terminal window was resized. Raw command output reached
+  the terminal with its control bytes intact — a `\r` from a progress bar moved
+  the physical cursor out from under ratatui's buffer, so the diff skipped
+  cells that were actually stale. Command output is now sanitised (CR/backspace
+  resolved as cursor movement, ANSI escapes and remaining control characters
+  removed) before it becomes chat lines, and a single full repaint settles the
+  screen shortly after output stops
+  ([#366](https://github.com/devlawey/filar/issues/366)).
+
 - `sudo -S` combined with a `<<EOF` heredoc in one command silently fed the
   heredoc body to sudo as password attempts (the heredoc replaces the secret
   pipe's stdin), making Ctrl+P secrets appear "not substituted". The agent now

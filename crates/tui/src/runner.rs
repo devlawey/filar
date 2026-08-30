@@ -570,6 +570,18 @@ async fn run_app(
     // PTY); we draw at the end of the iteration body if a frame is pending
     // and a frame deadline has passed, avoiding competition with read_output.
     let mut last_draw = Instant::now();
+    // Settle repaint (#366): one full repaint shortly after output stops.
+    //
+    // Sanitising command output removes the known source of buffer/screen
+    // desync, but ratatui's diff cannot detect a screen that drifted for any
+    // other reason — that is precisely why nudging the window used to "fix"
+    // the display. This is the safety net: after the last draw settles, issue
+    // a single `terminal.clear()` + draw. It costs one extra frame after a
+    // burst of output and nothing at all while idle, unlike an unconditional
+    // timer, which would repaint forever and keep the process awake (the
+    // render tick is deliberately gated so CPU idle stays at zero).
+    const SETTLE_DELAY: Duration = Duration::from_millis(250);
+    let mut settle_pending = false;
 
     // Periodic auto-save (#272): one stable id for the whole run so each
     // 30s save overwrites the same file, plus the revision/session of the
@@ -1479,11 +1491,34 @@ async fn run_app(
                 terminal.draw(|f| ui::render(f, &mut app)).ok();
                 needs_redraw = false;
                 last_draw = Instant::now();
+                // Arm the settle repaint only while output is actually
+                // streaming (agent running commands). Arming it after every
+                // frame would repaint the whole screen after each typing
+                // pause — a visible flash over SSH, for no benefit: plain
+                // keystroke rendering does not desync the screen.
+                if app.mode == AppMode::Thinking {
+                    settle_pending = true;
+                }
                 // Clear an expired toast so the next tick's guard goes false and
                 // ticking stops after this erasing frame.
                 if app.toast_text().is_none() {
                     app.toast = None;
                 }
+            }
+
+            // Settle repaint (#366). Fires once, SETTLE_DELAY after the last
+            // frame, and only when no newer frame arrived in between — while
+            // output streams, draws keep resetting `last_draw` and this branch
+            // never becomes ready. `settle_pending` is cleared here, so a quiet
+            // session performs exactly one repaint and then stops: the guard is
+            // false afterwards and the process goes back to sleep.
+            _ = tokio::time::sleep(SETTLE_DELAY.saturating_sub(last_draw.elapsed())),
+                if settle_pending && !app.should_quit => {
+                terminal.clear().ok();
+                terminal.draw(|f| ui::render(f, &mut app)).ok();
+                settle_pending = false;
+                last_draw = Instant::now();
+                render_interval.reset();
             }
         }
 
@@ -1512,6 +1547,14 @@ async fn run_app(
             terminal.draw(|f| ui::render(f, &mut app)).ok();
             needs_redraw = false;
             last_draw = Instant::now();
+            // Same condition as the render tick: only a run producing output
+            // needs the settle repaint. This fallback also fires for ordinary
+            // keystroke redraws when the 16 ms deadline has passed, and arming
+            // it there would clear and repaint the screen after every typing
+            // pause (#373 review).
+            if app.mode == AppMode::Thinking {
+                settle_pending = true;
+            }
             // Prevent the normal render tick from firing immediately on
             // the next iteration — the frame we just drew is current.
             render_interval.reset();

@@ -5385,6 +5385,82 @@ on its own PR. `eval/README.md` updated.
 changes went unverified. If it is, triage the failures as a separate issue and
 **do not lower the 90% threshold** to make it pass.
 
+## Issue #366: fix(tui) — control/ANSI bytes desynced the physical screen
+
+**Milestone:** 1.0.6. **Branch:** `fix/366-sanitize-command-output`.
+
+**Problem:** leftover glyphs and lines painted over one another, healed only by
+resizing the window. Four earlier attempts (#231, #245, #328, #333) fixed the
+ratatui *buffer* — `reset_area_cells`, `pad_line_to_width`, `Clear` — and the
+buffer was already correct. The desync was between the buffer and the
+*physical* screen: raw command output reached the terminal through `Span::raw`
+with its control bytes intact, a `\r` moved the real cursor to column 0, and
+the diff then legitimately skipped cells it believed unchanged. No per-frame
+buffer reset can fix that by construction.
+
+**Design:** sanitise at the source. `text.rs::sanitize_line` replays one line
+as a terminal would, in a **single pass** over escapes and cursor motion: erase
+sequences act relative to the cursor, so stripping escapes in a separate pass
+would lose the position they apply to. Cells are addressed in display columns
+(`LineCells`), a double-width character occupies two, and `None` marks its right
+half so clobbering the left one leaves a blank column. Recognised: 7-bit and
+8-bit CSI/OSC, erase (`K` with 0/1/2), cursor motion (`G`, `C`, `D`), `\r`,
+`\x08`, `\t`; presentation-only sequences (SGR) and stray C0/C1/DEL are
+dropped. Applied in `layout_cache.rs` where `ChatBlock::Command` output becomes
+lines, with a fast path for output containing no control bytes.
+
+`\r` is **emulated, not dropped**: progress bars (`hf download`, `pip`, `curl`)
+send frame after frame separated by `\r` with no `\n`, so the whole animation
+arrives as one line. Emulation reproduces what a terminal would show — the last
+frame, plus the tail of a longer previous frame when the last one is shorter —
+instead of concatenating every frame or truncating to the last segment.
+
+`strip_emoji` also fixed: its `cp <= 0x024F` whitelist admitted the entire C0
+block, so `ESC`/`CR`/`BS` passed through in every block type. `\n` and `\t` stay
+whitelisted — wrapping depends on them.
+
+Safety net in `runner.rs`: a debounced settle repaint — one `terminal.clear()`
++ draw, 250 ms after the last frame — armed only while output is streaming
+(Thinking mode, or the starved-tick fallback path). Arming it after every frame
+would flash the whole screen after each typing pause; an unconditional 1 Hz
+timer, as first proposed in the issue, would also repaint forever and keep the
+process awake, breaking the deliberate zero-CPU-at-idle property of the render
+tick.
+
+**Done:** sanitiser + 11 unit tests (progress-bar frames, overwrite tail,
+erase-to-end/start/all, 8-bit C1 introducers, display-column arithmetic with
+tabs and wide characters, cursor motion, backspace, SGR, OSC with both
+terminators, truncated CSI, stray C0/DEL, line structure), `strip_emoji`
+control-character test, settle repaint.
+
+Review (#373) caught real gaps in two rounds, each confirmed against a
+prototype before fixing. First round, on the two-pass version: 8-bit C1 introducers left their
+parameter bytes as visible text; `CSI K` was discarded, so `\r` + erase — the
+standard way a progress bar clears its previous frame — still left the stale
+tail that #366 is about; and column arithmetic counted `char`s, so CR/BS after
+a tab or a wide character landed on the wrong position. The single-pass,
+column-addressed rewrite is the answer to all three.
+
+Second round, on the rewrite: writing into the right half of a wide character
+left its left half on screen; a combining mark after a wide character was
+dropped (its base cell is two columns back); 8-bit ST (`U+009C`) was not
+accepted as an OSC terminator; and — the serious one — `CSI G`/`C` took an
+unbounded column from untrusted output, so `ESC[1000000000G` would have made
+the next printable character pad a billion cells and hang the TUI. Cursor jumps
+are now clamped to `MAX_CURSOR_COL`; ordinary left-to-right writing is
+deliberately *not* clamped, so long lines are never truncated. The settle
+repaint was also armed by the fallback draw path, which fires for plain
+keystroke redraws too — now gated on Thinking mode in both places.
+
+**Public contract:** none. `CommandExecutor` / `LlmClient` untouched;
+confirm gate and transport not involved.
+
+**Next steps:** manual repro on both platforms is required and could not be run
+by the agent (no Rust toolchain) — see the PR. A manual force-repaint binding
+was left out: `Ctrl+R` is reverse-i-search in a shell and would collide in
+interactive mode, so the key choice needs a decision of its own. Translating
+SGR into ratatui styles instead of discarding colour is a possible follow-up.
+
 ## Release v1.0.5 (2026-08-27)
 
 **Scope:** milestone 1.0.5 — regression fixes for 1.0.4: Unicode export topic slug
