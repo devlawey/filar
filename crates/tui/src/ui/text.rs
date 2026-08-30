@@ -8,6 +8,13 @@ use super::theme::Theme;
 /// Tab stop used when expanding `\t` for wrap/pad (columnar `ps` / tables).
 const TAB_STOP: usize = 8;
 
+/// Upper bound for **explicit cursor jumps** (`CSI G`/`C`, tabs) while
+/// replaying a line. Command output is untrusted: `ESC[1000000000G` would
+/// otherwise make the next printable character pad a billion cells and hang
+/// the TUI (#373 review). Natural left-to-right writing is not capped, so a
+/// genuinely long line is never truncated.
+const MAX_CURSOR_COL: usize = 4096;
+
 /// Expand horizontal tabs to spaces at [`TAB_STOP`] boundaries so wrap and
 /// pad agree with typical terminal columnar layout (#333).
 pub(crate) fn expand_tabs(s: &str) -> String {
@@ -41,6 +48,7 @@ impl LineCells {
     }
 
     fn pad_to(&mut self, n: usize) {
+        let n = n.min(MAX_CURSOR_COL);
         while self.cells.len() < n {
             self.cells.push(Some(" ".to_string()));
         }
@@ -49,13 +57,22 @@ impl LineCells {
     fn put(&mut self, c: char) {
         let w = UnicodeWidthChar::width(c).unwrap_or(0);
         if w == 0 {
-            // Combining mark: attach to the base character to its left.
-            if self.col > 0 {
-                if let Some(Some(prev)) = self.cells.get_mut(self.col - 1) {
-                    prev.push(c);
+            // Combining mark: attach to the nearest base cell to the left. A
+            // wide character puts its base two columns back, not one.
+            let mut k = self.col.min(self.cells.len());
+            while k > 0 {
+                k -= 1;
+                if let Some(text) = self.cells[k].as_mut() {
+                    text.push(c);
+                    break;
                 }
             }
             return;
+        }
+        // Writing into the right half of a wide character destroys the whole
+        // character; its orphaned left half becomes a blank column.
+        if matches!(self.cells.get(self.col), Some(None)) && self.col > 0 {
+            self.cells[self.col - 1] = Some(" ".to_string());
         }
         self.pad_to(self.col);
         for i in 0..w {
@@ -76,7 +93,7 @@ impl LineCells {
     }
 
     fn tab(&mut self) {
-        let target = self.col + (TAB_STOP - (self.col % TAB_STOP));
+        let target = (self.col + (TAB_STOP - (self.col % TAB_STOP))).min(MAX_CURSOR_COL - 1);
         self.pad_to(target);
         self.col = target;
     }
@@ -159,8 +176,8 @@ fn sanitize_line(src: &str) -> String {
                     2 => line.cells.clear(),
                     _ => line.erase_to_end(),
                 },
-                'G' => line.col = num.saturating_sub(1),
-                'C' => line.col += num.max(1),
+                'G' => line.col = num.saturating_sub(1).min(MAX_CURSOR_COL - 1),
+                'C' => line.col = line.col.saturating_add(num.max(1)).min(MAX_CURSOR_COL - 1),
                 'D' => line.col = line.col.saturating_sub(num.max(1)),
                 _ => {} // SGR and friends: presentation only
             }
@@ -171,8 +188,8 @@ fn sanitize_line(src: &str) -> String {
         if esc_next == Some(']') || cp == 0x9D {
             let mut j = i + if c == '\u{1b}' { 2 } else { 1 };
             while j < chars.len() {
-                if chars[j] == '\u{7}' {
-                    j += 1;
+                if chars[j] == '\u{7}' || chars[j] == '\u{9c}' {
+                    j += 1; // BEL or 8-bit ST
                     break;
                 }
                 if chars[j] == '\u{1b}' && j + 1 < chars.len() && chars[j + 1] == '\\' {
@@ -723,8 +740,45 @@ mod tests {
     #[test]
     fn sanitize_preserves_line_structure() {
         assert_eq!(sanitize_output("line1\nline2"), "line1\nline2");
-        // Line count must not change: `str::lines()` runs on the result.
+        // `split('\n')` is used rather than `lines()`, so a trailing newline
+        // survives and `str::lines()` on the result sees the same count.
+        assert_eq!(sanitize_output("a\u{1b}[0m\nb\n"), "a\nb\n");
         assert_eq!(sanitize_output("a\u{1b}[0m\nb\n").lines().count(), 2);
+    }
+
+    #[test]
+    fn sanitize_clobbering_wide_char_right_half_blanks_the_left() {
+        // Writing into the right half destroys the whole wide character.
+        assert_eq!(sanitize_output("\u{5bbd}\u{1b}[2GA"), " A");
+    }
+
+    #[test]
+    fn sanitize_keeps_combining_mark_after_wide_char() {
+        // The base cell of a wide character is two columns back, not one.
+        assert_eq!(sanitize_output("\u{4f60}\u{301}"), "\u{4f60}\u{301}");
+    }
+
+    #[test]
+    fn sanitize_accepts_c1_string_terminator() {
+        assert_eq!(sanitize_output("a\u{9d}0;title\u{9c}b"), "ab");
+    }
+
+    #[test]
+    fn sanitize_bounds_cursor_jumps() {
+        // Untrusted output must not make us pad a billion cells (#373 review).
+        let out = sanitize_output("\u{1b}[1000000000GX");
+        assert!(out.ends_with('X'));
+        assert_eq!(out.chars().count(), MAX_CURSOR_COL);
+        let out = sanitize_output("a\u{1b}[999999999CX");
+        assert!(out.ends_with('X'));
+        assert_eq!(out.chars().count(), MAX_CURSOR_COL);
+    }
+
+    #[test]
+    fn sanitize_does_not_truncate_long_lines() {
+        // Only explicit cursor jumps are clamped; ordinary writing is not.
+        let long: String = "y".repeat(9000);
+        assert_eq!(sanitize_output(&format!("\u{{1b}}[0m{long}")), long);
     }
 
     #[test]

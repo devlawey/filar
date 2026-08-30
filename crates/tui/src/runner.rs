@@ -1547,9 +1547,14 @@ async fn run_app(
             terminal.draw(|f| ui::render(f, &mut app)).ok();
             needs_redraw = false;
             last_draw = Instant::now();
-            // This path exists because continuous output starves the render
-            // tick, so reaching it always means a burst of output (#366).
-            settle_pending = true;
+            // Same condition as the render tick: only a run producing output
+            // needs the settle repaint. This fallback also fires for ordinary
+            // keystroke redraws when the 16 ms deadline has passed, and arming
+            // it there would clear and repaint the screen after every typing
+            // pause (#373 review).
+            if app.mode == AppMode::Thinking {
+                settle_pending = true;
+            }
             // Prevent the normal render tick from firing immediately on
             // the next iteration — the frame we just drew is current.
             render_interval.reset();

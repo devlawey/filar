@@ -5433,13 +5433,24 @@ tabs and wide characters, cursor motion, backspace, SGR, OSC with both
 terminators, truncated CSI, stray C0/DEL, line structure), `strip_emoji`
 control-character test, settle repaint.
 
-Review (#373) caught three real gaps in the first, two-pass version, all
-confirmed against a prototype before fixing: 8-bit C1 introducers left their
+Review (#373) caught real gaps in two rounds, each confirmed against a
+prototype before fixing. First round, on the two-pass version: 8-bit C1 introducers left their
 parameter bytes as visible text; `CSI K` was discarded, so `\r` + erase — the
 standard way a progress bar clears its previous frame — still left the stale
 tail that #366 is about; and column arithmetic counted `char`s, so CR/BS after
 a tab or a wide character landed on the wrong position. The single-pass,
 column-addressed rewrite is the answer to all three.
+
+Second round, on the rewrite: writing into the right half of a wide character
+left its left half on screen; a combining mark after a wide character was
+dropped (its base cell is two columns back); 8-bit ST (`U+009C`) was not
+accepted as an OSC terminator; and — the serious one — `CSI G`/`C` took an
+unbounded column from untrusted output, so `ESC[1000000000G` would have made
+the next printable character pad a billion cells and hang the TUI. Cursor jumps
+are now clamped to `MAX_CURSOR_COL`; ordinary left-to-right writing is
+deliberately *not* clamped, so long lines are never truncated. The settle
+repaint was also armed by the fallback draw path, which fires for plain
+keystroke redraws too — now gated on Thinking mode in both places.
 
 **Public contract:** none. `CommandExecutor` / `LlmClient` untouched;
 confirm gate and transport not involved.
