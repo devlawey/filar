@@ -381,16 +381,13 @@ impl OpenAiCompatClient {
                 }
                 None => {
                     debug!("stream ended");
-                    // The stream is over: `emitted_any` is not tracked past
-                    // this point, it only governs whether a *failure* may be
-                    // retried.
-                    //
                     // Flush raw_buffer: if there's leftover data without a
                     // trailing newline, process it as a final line.
                     if !raw_buffer.is_empty() {
                         let leftover = String::from_utf8_lossy(&raw_buffer).into_owned();
                         let deltas = state.process_chunk(&format!("{}\n", leftover));
                         for d in deltas {
+                            emitted_any = true;
                             on_delta(d);
                         }
                     }
@@ -398,8 +395,29 @@ impl OpenAiCompatClient {
                     // line that was not terminated by a newline.
                     let deltas = state.flush();
                     for d in deltas {
+                        emitted_any = true;
                         on_delta(d);
                     }
+
+                    // A body that ends without `[DONE]` is not an error by
+                    // itself: plenty of OpenAI-compatible servers (local ones
+                    // in particular) just close the connection after the last
+                    // chunk. But a body that ends carrying *nothing at all* —
+                    // no text, no tool calls, no completion marker — is
+                    // indistinguishable from a truncated response, and
+                    // returning it as success would hand the user an empty
+                    // answer. Retry instead; `emitted_any` is false here by
+                    // construction, so nothing can be replayed.
+                    if !state.done && state.is_empty() {
+                        warn!("stream closed without any content or a [DONE] marker");
+                        return StreamOutcome::Failed {
+                            error: ApiError::Network(
+                                "stream closed without any content".into(),
+                            ),
+                            emitted_any,
+                        };
+                    }
+
                     return StreamOutcome::Complete(state.into_response());
                 }
             }
@@ -1018,6 +1036,14 @@ impl SseState {
     }
 
     /// Build the final [`ChatResponse`] from accumulated state.
+    /// Whether the stream carried no payload at all.
+    ///
+    /// Usage and model metadata alone do not count as content — an answer with
+    /// neither text nor tool calls is nothing the caller can use.
+    fn is_empty(&self) -> bool {
+        self.full_text.is_empty() && self.tool_calls.is_empty()
+    }
+
     fn into_response(self) -> Result<ChatResponse> {
         let mut resp = if !self.tool_calls.is_empty() {
             let calls: Vec<ToolCall> = self.tool_calls.values().map(|tc| {
@@ -2032,6 +2058,48 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
             1,
             "the second script step must stay unused"
         );
+    }
+
+    /// A body that closes cleanly without delivering anything is treated as a
+    /// failed attempt, not as an empty answer.
+    #[tokio::test]
+    async fn stream_retries_when_closed_without_any_content() {
+        let (url, served) = spawn_provider(vec![
+            Step::finished(vec![]),
+            Step::finished(vec![text_frame("recovered"), done_frame()]),
+        ])
+        .await;
+
+        let client = stream_test_client(&url, 1, Duration::from_secs(5));
+        let callback = |_: String| {};
+
+        let response = client
+            .chat_stream(&simple_request(), &callback)
+            .await
+            .expect("the retry must produce the answer");
+
+        assert_eq!(response.text, "recovered");
+        assert_eq!(served.load(Ordering::SeqCst), 2, "the empty stream must be retried");
+    }
+
+    /// Missing `[DONE]` on its own is not a failure: OpenAI-compatible servers
+    /// (local ones especially) often just close the connection after the last
+    /// chunk. As long as content arrived, the answer stands.
+    #[tokio::test]
+    async fn stream_without_done_marker_but_with_content_succeeds() {
+        let (url, served) =
+            spawn_provider(vec![Step::finished(vec![role_frame(), text_frame("Hi")])]).await;
+
+        let client = stream_test_client(&url, 1, Duration::from_secs(5));
+        let callback = |_: String| {};
+
+        let response = client
+            .chat_stream(&simple_request(), &callback)
+            .await
+            .expect("a complete body without [DONE] is still a valid answer");
+
+        assert_eq!(response.text, "Hi");
+        assert_eq!(served.load(Ordering::SeqCst), 1, "no retry expected");
     }
 
     /// A stream that runs longer than the configured timeout but never stalls

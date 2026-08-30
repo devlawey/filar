@@ -14,13 +14,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 ### Fixed
 
 - Streaming LLM replies no longer die on the first transient network hiccup
-  with `stream error: error decoding response body`. A stream that breaks
-  before any text has been shown is retried transparently (same backoff as the
-  connection retry), and the final error now names the attempt count, the
-  elapsed time and the real cause instead of reqwest's top-level wrapper. The
-  streaming client also stopped using a total request timeout, which silently
-  capped every answer at `[timeouts].llm_secs`: for streaming that setting now
-  bounds the pause between chunks, so long answers are no longer cut off
+  with `stream error: error decoding response body`. A stream that breaks — or
+  closes without delivering anything at all — before any text has been shown is
+  retried transparently (same backoff as the connection retry), and the final
+  error now names the attempt count, the elapsed time and the real cause
+  instead of reqwest's top-level wrapper. The streaming client also stopped
+  using a total request timeout, which silently capped every answer at
+  `[timeouts].llm_secs`: for streaming that setting now bounds the pause
+  between chunks, so long answers are no longer cut off
   ([#374](https://github.com/devlawey/filar/issues/374)).
 
 - Redraw artifacts (leftover glyphs, one line painted over another) that

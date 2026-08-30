@@ -5444,6 +5444,18 @@ of `[timeouts].llm_secs` for streaming changed (pause between chunks, not total)
 **Next steps:** neither build nor tests could be run by the agent (no Rust
 toolchain) — CI and a manual run are required, see the PR.
 
+**Review (PR #375).** CodeRabbit asked for a stream without `data: [DONE]` to be
+treated as failed. Accepted only for the unambiguous half: a body that closes
+carrying nothing — no text, no tool calls, no marker — is now a retryable
+`Failed`, since it is indistinguishable from truncation and returning it as
+success hands the user an empty answer. Making a *missing marker* fatal in
+general was rejected: many OpenAI-compatible servers, local ones especially,
+simply close the connection after the last chunk, and three retries plus an
+error on every request would break those profiles. `SseState::is_empty` is the
+new predicate; two tests cover both directions. The second comment (shorten the
+CHANGELOG entry to one line) was rejected — AGENTS.md means one entry per
+change, and every neighbouring entry in `[Unreleased]` runs 8–9 lines.
+
 ## Issue #366: fix(tui) — control/ANSI bytes desynced the physical screen
 
 **Milestone:** 1.0.6. **Branch:** `fix/366-sanitize-command-output`.
