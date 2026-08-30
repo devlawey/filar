@@ -778,7 +778,8 @@ mod tests {
     fn sanitize_does_not_truncate_long_lines() {
         // Only explicit cursor jumps are clamped; ordinary writing is not.
         let long: String = "y".repeat(9000);
-        assert_eq!(sanitize_output(&format!("\u{{1b}}[0m{long}")), long);
+        let src = format!("\u{1b}[0m{long}");
+        assert_eq!(sanitize_output(&src), long);
     }
 
     #[test]
