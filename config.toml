@@ -10,6 +10,8 @@ max_tokens = 4096
 
 [timeouts]
 command_secs = 300
+# One non-streaming LLM call end to end. While a reply is streaming, this is
+# the longest allowed silence between chunks — a long answer is not cut off.
 llm_secs = 60
 connect_secs = 15
 

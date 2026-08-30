@@ -298,6 +298,11 @@ pub struct TimeoutConfig {
     #[serde(default = "default_command_timeout")]
     pub command_secs: u64,
     /// Timeout for a single LLM API call.
+    ///
+    /// For a non-streaming call this bounds the whole request. For a streaming
+    /// reply it bounds the connect phase and the pause between chunks, not the
+    /// total length of the answer — a model that keeps producing tokens is
+    /// never cut off.
     #[serde(default = "default_llm_timeout")]
     pub llm_secs: u64,
     /// Timeout for establishing an SSH connection.

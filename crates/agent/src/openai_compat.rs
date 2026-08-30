@@ -41,10 +41,64 @@ const DEFAULT_BACKOFF_BASE: Duration = Duration::from_millis(500);
 // OpenAiCompatClient
 // ---------------------------------------------------------------------------
 
+/// Build an HTTP client with the policy shared by both clients, applying the
+/// caller's timeout configuration.
+///
+/// When `api_key` is empty (keyless / local profile), HTTP redirects are
+/// disabled so request bodies cannot be forwarded to another host.
+fn build_http_client(
+    api_key: &str,
+    configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+) -> Result<reqwest::Client> {
+    let mut builder = configure(reqwest::Client::builder());
+    if api_key.is_empty() {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
+    builder
+        .build()
+        .map_err(|e| CoreError::Other(format!("failed to build HTTP client: {e}")))
+}
+
+/// Render an error together with its `source()` chain.
+///
+/// `reqwest::Error` prints only its own layer — a dropped connection and an
+/// elapsed timeout both read as `error decoding response body` — so the real
+/// cause is only visible one or two levels down. Used for logs and for the
+/// message the user finally sees.
+fn describe_error_chain(err: &dyn std::error::Error) -> String {
+    const MAX_LEVELS: usize = 8;
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(e) = source {
+        if parts.len() >= MAX_LEVELS {
+            break;
+        }
+        let text = e.to_string();
+        if !parts.iter().any(|p| p == &text) {
+            parts.push(text);
+        }
+        source = e.source();
+    }
+    parts.join(": ")
+}
+
+/// Outcome of reading one streaming response body.
+enum StreamOutcome {
+    /// The stream ended on its own; carries the assembled response.
+    Complete(Result<ChatResponse>),
+    /// The transport failed while the body was being read.
+    Failed {
+        error: ApiError,
+        /// Whether any text delta already reached the caller's callback.
+        emitted_any: bool,
+    },
+}
+
 /// [`LlmClient`] implementation backed by an OpenAI-compatible
 /// `chat/completions` API (default endpoint: GLM).
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
+    http_stream: reqwest::Client,
     api_base_url: String,
     model: String,
     max_tokens: u32,
@@ -86,16 +140,24 @@ impl OpenAiCompatClient {
     /// When `api_key` is empty (keyless / local profile), HTTP redirects are
     /// disabled so request bodies cannot be forwarded to another host.
     pub fn new_with_key(config: &LlmConfig, timeout: Duration, api_key: &str) -> Result<Self> {
-        let mut builder = reqwest::Client::builder().timeout(timeout);
-        if api_key.is_empty() {
-            builder = builder.redirect(reqwest::redirect::Policy::none());
-        }
-        let http = builder
-            .build()
-            .map_err(|e| CoreError::Other(format!("failed to build HTTP client: {e}")))?;
+        // Non-streaming calls keep a total request timeout: the whole response
+        // arrives at once, so bounding the whole call is the right shape.
+        let http = build_http_client(api_key, |b| b.timeout(timeout))?;
+
+        // Streaming deliberately does NOT use a total timeout. In reqwest,
+        // `Client::timeout` also covers reading the response body, so for a
+        // streaming request it caps the entire generation at
+        // `[timeouts].llm_secs` and cuts long answers off mid-stream — which
+        // surfaces as a body error, not as a timeout. Bound the connect phase
+        // and the silence between chunks instead, so a stream may run as long
+        // as the model keeps sending.
+        let http_stream = build_http_client(api_key, |b| {
+            b.connect_timeout(timeout).read_timeout(timeout)
+        })?;
 
         Ok(Self {
             http,
+            http_stream,
             api_base_url: config.api_base_url.trim_end_matches('/').to_string(),
             model: config.model.clone(),
             max_tokens: config.max_tokens,
@@ -215,48 +277,83 @@ impl LlmClient for OpenAiCompatClient {
 
         debug!(model = %self.model, "sending streaming chat request to OpenAI-compatible API");
 
-        // Retry loop for the initial connection only (not mid-stream).
-        let response = {
-            let mut last_error: Option<ApiError> = None;
-            let mut resp: Option<reqwest::Response> = None;
-            for attempt in 0..=self.max_retries {
-                if attempt > 0 {
-                    let delay = self.backoff_base * 2u32.pow(attempt - 1);
-                    warn!(attempt, delay_ms = delay.as_millis(), "retrying after transient error");
-                    tokio::time::sleep(delay).await;
-                }
-                match self.send_stream_request(&body).await {
-                    Ok(r) => {
-                        resp = Some(r);
-                        break;
-                    }
-                    Err(e) if e.is_retryable() => {
-                        warn!(attempt, error = %e, "transient error, will retry");
-                        last_error = Some(e);
-                        continue;
-                    }
-                    Err(e) => {
-                        return Err(e.into_core_error());
-                    }
-                }
-            }
-            match resp {
-                Some(r) => r,
-                None => {
-                    return Err(last_error
-                        .map(|e| e.into_core_error())
-                        .unwrap_or_else(|| CoreError::Other("exhausted retries".into())))
-                }
-            }
-        };
+        // One retry loop covering both phases: establishing the connection and
+        // reading the body. Re-sending is safe here — no tool has executed at
+        // this point, tool calls run only after this function returns a
+        // complete response, so a repeated request has no side effects.
+        let started = std::time::Instant::now();
+        let mut last_error: Option<ApiError> = None;
+        let mut attempts: u32 = 0;
 
-        // Parse the SSE stream.
-        // Buffer raw bytes and decode only complete lines to avoid
-        // corrupting multi-byte UTF-8 characters split across chunks.
+        for attempt in 0..=self.max_retries {
+            if attempt > 0 {
+                let delay = self.backoff_base * 2u32.pow(attempt - 1);
+                warn!(attempt, delay_ms = delay.as_millis(), "retrying after transient error");
+                // Awaited inside this future so a cancellation token wrapping
+                // `chat_stream` aborts during the backoff, not after it.
+                tokio::time::sleep(delay).await;
+            }
+            attempts += 1;
+
+            let response = match self.send_stream_request(&body).await {
+                Ok(r) => r,
+                Err(e) if e.is_retryable() => {
+                    warn!(attempt, error = %e, "transient error, will retry");
+                    last_error = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e.into_core_error()),
+            };
+
+            match self.read_stream(response, on_delta).await {
+                StreamOutcome::Complete(result) => return result,
+                StreamOutcome::Failed { error, emitted_any } => {
+                    // Retrying after deltas already reached the UI would replay
+                    // the answer from the start and show it twice: `on_delta`
+                    // can only append, there is no way to retract what was
+                    // shown. Fail instead, with the real cause.
+                    if emitted_any {
+                        warn!(attempt, error = %error, "stream failed after partial output, not retrying");
+                        return Err(CoreError::Other(format!(
+                            "stream interrupted after partial response: {error}"
+                        )));
+                    }
+                    if !error.is_retryable() {
+                        return Err(error.into_core_error());
+                    }
+                    warn!(attempt, error = %error, "stream failed before any output, will retry");
+                    last_error = Some(error);
+                    continue;
+                }
+            }
+        }
+
+        Err(match last_error {
+            Some(e) => CoreError::Other(format!(
+                "LLM stream failed after {attempts} attempts over {:.1}s: {e}",
+                started.elapsed().as_secs_f32()
+            )),
+            None => CoreError::Other("exhausted retries".into()),
+        })
+    }
+}
+
+impl OpenAiCompatClient {
+    /// Read one streaming response body to its end, emitting text deltas as
+    /// they arrive.
+    ///
+    /// Buffers raw bytes and decodes only complete lines, so a multi-byte
+    /// UTF-8 character split across two chunks is not corrupted.
+    async fn read_stream(
+        &self,
+        response: reqwest::Response,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> StreamOutcome {
         use futures::StreamExt;
         let mut stream = response.bytes_stream();
         let mut state = SseState::new();
         let mut raw_buffer: Vec<u8> = Vec::new();
+        let mut emitted_any = false;
 
         loop {
             match stream.next().await {
@@ -268,12 +365,19 @@ impl LlmClient for OpenAiCompatClient {
                         raw_buffer = raw_buffer[pos + 1..].to_vec();
                         let deltas = state.process_chunk(&line);
                         for d in deltas {
+                            emitted_any = true;
                             on_delta(d);
                         }
                     }
                 }
                 Some(Err(e)) => {
-                    return Err(CoreError::Other(format!("stream error: {e}")));
+                    let error = self.classify_stream_error(&e);
+                    warn!(
+                        cause = %describe_error_chain(&e),
+                        emitted_any,
+                        "LLM stream failed while reading the response body"
+                    );
+                    return StreamOutcome::Failed { error, emitted_any };
                 }
                 None => {
                     debug!("stream ended");
@@ -283,6 +387,7 @@ impl LlmClient for OpenAiCompatClient {
                         let leftover = String::from_utf8_lossy(&raw_buffer).into_owned();
                         let deltas = state.process_chunk(&format!("{}\n", leftover));
                         for d in deltas {
+                            emitted_any = true;
                             on_delta(d);
                         }
                     }
@@ -290,19 +395,51 @@ impl LlmClient for OpenAiCompatClient {
                     // line that was not terminated by a newline.
                     let deltas = state.flush();
                     for d in deltas {
+                        emitted_any = true;
                         on_delta(d);
                     }
-                    return state.into_response();
+
+                    // A body that ends without `[DONE]` is not an error by
+                    // itself: plenty of OpenAI-compatible servers (local ones
+                    // in particular) just close the connection after the last
+                    // chunk. But a body that ends carrying *nothing at all* —
+                    // no text, no tool calls, no completion marker — is
+                    // indistinguishable from a truncated response, and
+                    // returning it as success would hand the user an empty
+                    // answer. Retry instead; `emitted_any` is false here by
+                    // construction, so nothing can be replayed.
+                    if !state.done && state.is_empty() {
+                        warn!("stream closed without any content or a [DONE] marker");
+                        return StreamOutcome::Failed {
+                            error: ApiError::Network(
+                                "stream closed without any content".into(),
+                            ),
+                            emitted_any,
+                        };
+                    }
+
+                    return StreamOutcome::Complete(state.into_response());
                 }
             }
             if state.done {
-                return state.into_response();
+                return StreamOutcome::Complete(state.into_response());
             }
         }
     }
-}
 
-impl OpenAiCompatClient {
+    /// Classify a failure that happened while reading the response body.
+    ///
+    /// Both a dropped connection and an elapsed read timeout are reported by
+    /// reqwest as `error decoding response body`; only the source chain tells
+    /// them apart. Both are transient and worth retrying.
+    fn classify_stream_error(&self, e: &reqwest::Error) -> ApiError {
+        if e.is_timeout() {
+            ApiError::Timeout(self.timeout)
+        } else {
+            ApiError::Network(describe_error_chain(e))
+        }
+    }
+
     /// Send a single request to the API and return the raw response.
     async fn send_request(&self, body: &serde_json::Value) -> std::result::Result<ApiResponse, ApiError> {
         let response = self
@@ -353,7 +490,7 @@ impl OpenAiCompatClient {
         body: &serde_json::Value,
     ) -> std::result::Result<reqwest::Response, ApiError> {
         let response = self
-            .apply_auth(self.http.post(self.endpoint()))
+            .apply_auth(self.http_stream.post(self.endpoint()))
             .json(body)
             .send()
             .await
@@ -361,9 +498,9 @@ impl OpenAiCompatClient {
                 if e.is_timeout() {
                     ApiError::Timeout(self.timeout)
                 } else if e.is_connect() {
-                    ApiError::Connect(e.to_string())
+                    ApiError::Connect(describe_error_chain(&e))
                 } else {
-                    ApiError::Network(e.to_string())
+                    ApiError::Network(describe_error_chain(&e))
                 }
             })?;
 
@@ -899,6 +1036,14 @@ impl SseState {
     }
 
     /// Build the final [`ChatResponse`] from accumulated state.
+    /// Whether the stream carried no payload at all.
+    ///
+    /// Usage and model metadata alone do not count as content — an answer with
+    /// neither text nor tool calls is nothing the caller can use.
+    fn is_empty(&self) -> bool {
+        self.full_text.is_empty() && self.tool_calls.is_empty()
+    }
+
     fn into_response(self) -> Result<ChatResponse> {
         let mut resp = if !self.tool_calls.is_empty() {
             let calls: Vec<ToolCall> = self.tool_calls.values().map(|tc| {
@@ -1612,5 +1757,390 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         let err = ApiError::Timeout(Duration::from_secs(60));
         let msg = err.to_string();
         assert!(msg.contains("llm_secs"), "timeout must hint llm_secs: {msg}");
+    }
+
+    #[test]
+    fn error_chain_includes_sources() {
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "connection closed before message completed")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error decoding response body")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let text = describe_error_chain(&Outer(Inner));
+        assert!(
+            text.contains("error decoding response body"),
+            "top level must be kept: {text}"
+        );
+        assert!(
+            text.contains("connection closed"),
+            "source must be unwrapped: {text}"
+        );
+    }
+
+    // ── Mid-stream retry (#374) ──────────────────────────────────────────
+    //
+    // A scripted fake provider over a real loopback socket. Each `Step` serves
+    // exactly one connection, so the script also asserts how many attempts the
+    // client made.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// One scripted connection of the fake provider.
+    struct Step {
+        /// SSE frames to send, each as one chunked-encoding chunk.
+        frames: Vec<String>,
+        /// Pause before each frame — models a slow but alive stream.
+        gap: Duration,
+        /// `true` terminates the chunked body properly; `false` drops the
+        /// socket mid-body, which is what a lost connection looks like.
+        complete: bool,
+    }
+
+    impl Step {
+        /// Send the frames, then drop the socket without terminating the
+        /// chunked body — what a connection lost mid-answer looks like.
+        fn dropped(frames: Vec<String>) -> Self {
+            Self {
+                frames,
+                gap: Duration::ZERO,
+                complete: false,
+            }
+        }
+
+        /// Send the frames and terminate the body properly.
+        fn finished(frames: Vec<String>) -> Self {
+            Self {
+                frames,
+                gap: Duration::ZERO,
+                complete: true,
+            }
+        }
+
+        fn with_gap(mut self, gap: Duration) -> Self {
+            self.gap = gap;
+            self
+        }
+    }
+
+    /// SSE frame carrying a text delta.
+    fn text_frame(content: &str) -> String {
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\n")
+    }
+
+    /// First frame of a typical response: announces the role, no content yet.
+    fn role_frame() -> String {
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n".to_string()
+    }
+
+    fn done_frame() -> String {
+        "data: [DONE]\n\n".to_string()
+    }
+
+    /// Read one HTTP request (headers plus `Content-Length` body) and discard
+    /// it — the fake provider replies from its script regardless of content.
+    async fn drain_request(socket: &mut tokio::net::TcpStream) {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 2048];
+        loop {
+            let Ok(n) = socket.read(&mut tmp).await else {
+                return;
+            };
+            if n == 0 {
+                return;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
+            let len = head
+                .split("content-length:")
+                .nth(1)
+                .and_then(|s| s.split("\r\n").next())
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut have = buf.len() - end;
+            while have < len {
+                let Ok(n) = socket.read(&mut tmp).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                have += n;
+            }
+            return;
+        }
+    }
+
+    /// Start the fake provider. Returns its base URL and a counter of served
+    /// connections (= attempts the client made).
+    async fn spawn_provider(steps: Vec<Step>) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = served.clone();
+
+        tokio::spawn(async move {
+            for step in steps {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                drain_request(&mut socket).await;
+
+                // `Connection: close` keeps one attempt = one connection.
+                // Without it, an attempt whose body terminated cleanly leaves
+                // the socket idle in reqwest's pool, and the next attempt
+                // reuses it instead of opening a connection the script is
+                // waiting to accept — so the retry would be written into a
+                // socket this loop has already moved on from.
+                let head = "HTTP/1.1 200 OK\r\n\
+                            Content-Type: text/event-stream\r\n\
+                            Transfer-Encoding: chunked\r\n\
+                            Connection: close\r\n\r\n";
+                if socket.write_all(head.as_bytes()).await.is_err() {
+                    continue;
+                }
+                let _ = socket.flush().await;
+
+                for frame in &step.frames {
+                    if !step.gap.is_zero() {
+                        tokio::time::sleep(step.gap).await;
+                    }
+                    let chunk = format!("{:x}\r\n{}\r\n", frame.len(), frame);
+                    if socket.write_all(chunk.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    let _ = socket.flush().await;
+                }
+
+                if step.complete {
+                    let _ = socket.write_all(b"0\r\n\r\n").await;
+                    let _ = socket.flush().await;
+                    // Give the client a moment to read the terminator before
+                    // the socket is dropped.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                drop(socket);
+            }
+        });
+
+        (format!("http://{addr}"), served)
+    }
+
+    fn stream_test_client(base_url: &str, retries: u32, timeout: Duration) -> OpenAiCompatClient {
+        let config = LlmConfig {
+            model: "test-model".into(),
+            api_base_url: base_url.to_string(),
+            max_tokens: 128,
+            ..Default::default()
+        };
+        OpenAiCompatClient::new_with_key(&config, timeout, "test-key")
+            .unwrap()
+            .with_max_retries(retries)
+            .with_backoff_base(Duration::from_millis(10))
+    }
+
+    fn simple_request() -> ChatRequest {
+        ChatRequest {
+            messages: vec![ChatMessage::user("hi")],
+            tools: vec![],
+        }
+    }
+
+    /// A drop before any content delta is retried, and the retry's output is
+    /// delivered exactly once.
+    #[tokio::test]
+    async fn stream_retries_when_dropped_before_any_delta() {
+        let (url, served) = spawn_provider(vec![
+            Step::dropped(vec![role_frame()]),
+            Step::finished(vec![
+                role_frame(),
+                text_frame("Hello"),
+                text_frame(" world"),
+                done_frame(),
+            ]),
+        ])
+        .await;
+
+        let client = stream_test_client(&url, 1, Duration::from_secs(5));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let callback = move |d: String| sink.lock().unwrap().push(d);
+
+        let response = client
+            .chat_stream(&simple_request(), &callback)
+            .await
+            .expect("second attempt must succeed");
+
+        assert_eq!(response.text, "Hello world");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["Hello".to_string(), " world".to_string()],
+            "deltas must be delivered once, without replaying the first attempt"
+        );
+        assert_eq!(served.load(Ordering::SeqCst), 2, "expected exactly one retry");
+    }
+
+    /// When every attempt fails, the error names the attempt count, the elapsed
+    /// time and the unwrapped cause.
+    #[tokio::test]
+    async fn stream_gives_up_after_all_attempts_with_diagnostic() {
+        let (url, served) = spawn_provider(vec![
+            Step::dropped(vec![role_frame()]),
+            Step::dropped(vec![role_frame()]),
+            Step::dropped(vec![role_frame()]),
+        ])
+        .await;
+
+        let client = stream_test_client(&url, 2, Duration::from_secs(5));
+        let callback = |_: String| {};
+
+        let err = client
+            .chat_stream(&simple_request(), &callback)
+            .await
+            .expect_err("all attempts fail, so the call must fail");
+        let msg = err.to_string();
+
+        assert!(msg.contains("3 attempts"), "attempt count missing: {msg}");
+        assert!(msg.contains("over "), "elapsed time missing: {msg}");
+        assert!(
+            msg.contains("network error"),
+            "classified cause missing: {msg}"
+        );
+        assert_eq!(served.load(Ordering::SeqCst), 3);
+    }
+
+    /// Once deltas have reached the caller there is no retry: replaying would
+    /// show the answer twice.
+    #[tokio::test]
+    async fn stream_does_not_retry_after_partial_output() {
+        let (url, served) = spawn_provider(vec![
+            Step::dropped(vec![role_frame(), text_frame("Hel")]),
+            Step::finished(vec![text_frame("Hello"), done_frame()]),
+        ])
+        .await;
+
+        let client = stream_test_client(&url, 1, Duration::from_secs(5));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let callback = move |d: String| sink.lock().unwrap().push(d);
+
+        let err = client
+            .chat_stream(&simple_request(), &callback)
+            .await
+            .expect_err("a partial response must not be retried");
+
+        assert!(
+            err.to_string().contains("partial response"),
+            "error must say the response was partial: {err}"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["Hel".to_string()],
+            "no duplicated text"
+        );
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "the second script step must stay unused"
+        );
+    }
+
+    /// A body that closes cleanly without delivering anything is treated as a
+    /// failed attempt, not as an empty answer.
+    #[tokio::test]
+    async fn stream_retries_when_closed_without_any_content() {
+        let (url, served) = spawn_provider(vec![
+            Step::finished(vec![]),
+            Step::finished(vec![text_frame("recovered"), done_frame()]),
+        ])
+        .await;
+
+        let client = stream_test_client(&url, 1, Duration::from_secs(5));
+        let callback = |_: String| {};
+
+        let response = client
+            .chat_stream(&simple_request(), &callback)
+            .await
+            .expect("the retry must produce the answer");
+
+        assert_eq!(response.text, "recovered");
+        assert_eq!(served.load(Ordering::SeqCst), 2, "the empty stream must be retried");
+    }
+
+    /// Missing `[DONE]` on its own is not a failure: OpenAI-compatible servers
+    /// (local ones especially) often just close the connection after the last
+    /// chunk. As long as content arrived, the answer stands.
+    #[tokio::test]
+    async fn stream_without_done_marker_but_with_content_succeeds() {
+        let (url, served) =
+            spawn_provider(vec![Step::finished(vec![role_frame(), text_frame("Hi")])]).await;
+
+        let client = stream_test_client(&url, 1, Duration::from_secs(5));
+        let callback = |_: String| {};
+
+        let response = client
+            .chat_stream(&simple_request(), &callback)
+            .await
+            .expect("a complete body without [DONE] is still a valid answer");
+
+        assert_eq!(response.text, "Hi");
+        assert_eq!(served.load(Ordering::SeqCst), 1, "no retry expected");
+    }
+
+    /// A stream that runs longer than the configured timeout but never stalls
+    /// is not cut off: the timeout bounds silence between chunks, not the total
+    /// length of the answer. Regression test for the total-timeout behaviour of
+    /// `Client::timeout` on streaming bodies.
+    #[tokio::test]
+    async fn stream_outlives_timeout_while_chunks_keep_arriving() {
+        let timeout = Duration::from_millis(300);
+        let frames = vec![
+            role_frame(),
+            text_frame("a"),
+            text_frame("b"),
+            text_frame("c"),
+            text_frame("d"),
+            done_frame(),
+        ];
+        // 6 frames × 100 ms ≈ 600 ms total — twice the timeout, but no single
+        // gap exceeds it.
+        let (url, served) =
+            spawn_provider(vec![
+                Step::finished(frames).with_gap(Duration::from_millis(100))
+            ])
+            .await;
+
+        let client = stream_test_client(&url, 0, timeout);
+        let callback = |_: String| {};
+
+        let response = client
+            .chat_stream(&simple_request(), &callback)
+            .await
+            .expect("a slow but alive stream must not be cut off");
+
+        assert_eq!(response.text, "abcd");
+        assert_eq!(served.load(Ordering::SeqCst), 1, "no retry expected");
     }
 }
