@@ -195,7 +195,8 @@ key_env = "DEEPSEEK_API_KEY"
 # ── Timeouts (seconds) ─────────────────────────────────────
 [timeouts]
 command_secs = 300   # single command execution
-llm_secs = 60        # single LLM API call
+llm_secs = 60        # one non-streaming LLM call; for streaming replies,
+                     # the longest allowed pause between chunks
 connect_secs = 15    # SSH connection establishment
 
 # ── SSH targets ────────────────────────────────────────────
@@ -282,7 +283,10 @@ and shows a clear error — it does **not** fake tools by parsing free text.
 
 **Timeouts.** Local CPU generation is often slower than cloud. Raise
 `[timeouts].llm_secs` in `config.toml` (default `60`) if requests time out.
-The timeout applies to every profile (including local).
+The timeout applies to every profile (including local). For streaming replies
+it bounds the **pause between chunks**, not the total length of the answer —
+a model that keeps producing tokens is never cut off, however long it takes.
+For non-streaming calls it still bounds the whole request.
 
 **Context window.** Automatic context compression is not implemented yet.
 Local models usually have smaller windows (8k–32k); keep sessions short or

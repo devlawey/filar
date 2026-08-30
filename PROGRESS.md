@@ -5385,6 +5385,65 @@ on its own PR. `eval/README.md` updated.
 changes went unverified. If it is, triage the failures as a separate issue and
 **do not lower the 90% threshold** to make it pass.
 
+## Issue #374: fix(agent) — mid-stream LLM failures were never retried
+
+**Milestone:** 1.0.6. **Branch:** `fix/374-stream-retry`.
+
+**Problem:** `· response interrupted` + `✗ stream error: error decoding response
+body` in the middle of a session, no answer, user has to type «продолжай». The
+retry loop in `chat_stream` was explicitly scoped to the initial connection
+(`// Retry loop for the initial connection only (not mid-stream)`); once the
+response headers had arrived, the first error while reading the body ended the
+whole agent iteration.
+
+**Two causes behind one message.** `bytes_stream()` wraps every body error with
+`error::decode`, whose Display is exactly `error decoding response body` — the
+same text for a dropped connection and for an elapsed timeout. Verified against
+reqwest 0.12.28 sources: `Client::timeout` is carried into the response body
+(`total_timeout(body, total)` in `async_impl/body.rs`) and fires as
+`error::body(TimedOut)`, so the *total* timeout was capping every streamed
+answer at `[timeouts].llm_secs` (default 60 s). Long answers were being killed
+by our own configuration and reported as a network fault.
+
+**Design.** Two HTTP clients instead of one, built by `build_http_client` with
+the shared redirect policy: `http` keeps the total timeout for non-streaming
+`chat()`, `http_stream` uses `connect_timeout` + `read_timeout` so the bound is
+the silence between chunks, not the length of the answer. Body reading moved
+into `read_stream`, returning `StreamOutcome::{Complete, Failed}` where `Failed`
+carries `emitted_any`. The retry loop now covers both phases — safe because no
+tool has executed at that point, tool calls run only after `chat_stream`
+returns, so a repeat is side-effect free.
+
+**The one case that cannot be hidden:** if deltas already reached the UI, a
+retry would replay the answer from the start and show it twice — `on_delta` can
+only append. Those failures still surface, now with the real cause. Fixing that
+properly needs a reset signal in the delta callback, i.e. a change to the
+`LlmClient` contract consumed by external frontends — deliberately out of scope
+(AGENTS.md requires prior agreement).
+
+**Diagnostics:** `describe_error_chain` unwraps `source()` for logs and for the
+final message; `classify_stream_error` uses `e.is_timeout()` (which walks the
+chain) to tell timeout from disconnect. Exhaustion message now reads
+`LLM stream failed after N attempts over T.Ts: <cause>`.
+
+**TUI:** no change needed. `app.rs` sets `streaming = true` only on the first
+`TextDelta`, so `response interrupted` was already printed only when partial
+text had actually been shown. The optional «reconnecting 2/4» status hint from
+the issue was **not** implemented: it would need a new `AgentEvent` variant, and
+that enum is part of the engine API for external frontends.
+
+**Done:** 5 new tests — 4 against a scripted fake provider on a loopback socket
+(retry after a pre-delta drop with no duplicated output; exhaustion message;
+no retry once deltas were emitted; a 600 ms stream surviving a 300 ms timeout
+with 100 ms gaps) plus a `describe_error_chain` unit test.
+
+**Public contract:** none. `LlmClient` and `CommandExecutor` untouched. Semantics
+of `[timeouts].llm_secs` for streaming changed (pause between chunks, not total)
+— documented in `README.md`, `config.toml` and the field's doc comment.
+
+**Next steps:** neither build nor tests could be run by the agent (no Rust
+toolchain) — CI and a manual run are required, see the PR.
+
 ## Issue #366: fix(tui) — control/ANSI bytes desynced the physical screen
 
 **Milestone:** 1.0.6. **Branch:** `fix/366-sanitize-command-output`.
