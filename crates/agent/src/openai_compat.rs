@@ -1908,9 +1908,16 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
                 counter.fetch_add(1, Ordering::SeqCst);
                 drain_request(&mut socket).await;
 
+                // `Connection: close` keeps one attempt = one connection.
+                // Without it, an attempt whose body terminated cleanly leaves
+                // the socket idle in reqwest's pool, and the next attempt
+                // reuses it instead of opening a connection the script is
+                // waiting to accept — so the retry would be written into a
+                // socket this loop has already moved on from.
                 let head = "HTTP/1.1 200 OK\r\n\
                             Content-Type: text/event-stream\r\n\
-                            Transfer-Encoding: chunked\r\n\r\n";
+                            Transfer-Encoding: chunked\r\n\
+                            Connection: close\r\n\r\n";
                 if socket.write_all(head.as_bytes()).await.is_err() {
                     continue;
                 }
