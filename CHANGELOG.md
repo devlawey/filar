@@ -11,6 +11,16 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Sessions now track how full the model's context is, measured from the
+  `prompt_tokens` the provider reports for the most recent request rather than
+  from the session's running total. A new per-profile `compact_at_tokens`
+  setting (default `200000`, `0` disables) marks the point at which the history
+  will be compacted; reaching it currently logs and shows a one-off notice in
+  the feed, and the summarisation itself follows in a later change
+  ([#376](https://github.com/devlawey/filar/issues/376)).
+
 ### Fixed
 
 - Streaming LLM replies no longer die on the first transient network hiccup

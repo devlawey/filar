@@ -191,6 +191,32 @@ model = "deepseek-chat"
 api_base_url = "https://api.deepseek.com/v1"
 max_tokens = 8192
 key_env = "DEEPSEEK_API_KEY"
+# Prompt tokens at which the context is considered full. Per-profile, because
+# context windows differ. Currently this only logs and shows a notice — history
+# compaction is not implemented yet. 0 turns the notice off.
+compact_at_tokens = 200000
+
+#### Context fill
+
+A long investigation eventually fills the model's context window: the whole
+history is re-sent with every request, so each turn costs more than the last
+until the provider refuses outright. `compact_at_tokens` marks the point at
+which that becomes a problem.
+
+**Today this only reports.** Reaching the threshold writes a warning to the log
+and adds one notice to the session feed; the history is left untouched. Folding
+the earlier part of the conversation into a summary is not implemented yet, so
+do not rely on this setting to keep a session under the window.
+
+The threshold is per-profile because context windows differ — a figure that
+suits a 1M-token model is meaningless for a 128k one. Set it comfortably below
+the window, since the reply and the tool definitions also need room. `0` turns
+the notice off for that profile.
+
+Fill is measured from the `prompt_tokens` the provider reports for the most
+recent request, not from the session's running total, so the figure reflects
+the context actually being sent. It is not saved with the session: after
+reopening one, the first response measures it again.
 
 # ── Timeouts (seconds) ─────────────────────────────────────
 [timeouts]

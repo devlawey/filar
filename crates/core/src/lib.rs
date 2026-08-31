@@ -6,15 +6,17 @@
 //! - [`secrets`]: Secure reading of API keys and other secrets from the environment.
 
 pub mod chat;
+pub mod compaction;
 pub mod config;
 pub mod error;
 pub mod secrets;
 pub mod session;
 
 pub use chat::ChatBlock;
+pub use compaction::{compaction_boundary, should_compact, DEFAULT_KEEP_TURNS};
 pub use config::{
     Config, SshTarget, SshAuth, LlmConfig, LlmProfile, CommandConfirmMode, TimeoutConfig,
-    HostKeyPolicy, DEFAULT_COMMAND_TIMEOUT_SECS,
+    HostKeyPolicy, DEFAULT_COMMAND_TIMEOUT_SECS, DEFAULT_COMPACT_AT_TOKENS,
 };
 pub use error::{CoreError, Result};
 pub use secrets::{

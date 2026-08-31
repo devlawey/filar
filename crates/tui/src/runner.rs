@@ -1934,6 +1934,7 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 extra_body: None,
+                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
             },
             LlmProfile {
                 name: "other".into(),
@@ -1944,6 +1945,7 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 extra_body: None,
+                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
             },
         ];
         // Default differs from the session's selected profile, so the test

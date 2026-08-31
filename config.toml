@@ -8,6 +8,22 @@ model = "glm-5.1"
 api_base_url = "https://open.bigmodel.cn/api/paas/v4"
 max_tokens = 4096
 
+# ── LLM profiles ─────────────────────────────────────────────────────
+# Named profiles cycled with Ctrl+L in the TUI. The `[llm]` section above is
+# the fallback when no profiles are defined. API keys live in the OS credential
+# store under the name given by `key_env` — never here.
+
+# [[llm_profiles]]
+# name = "glm"
+# model = "glm-5.1"
+# api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+# key_env = "GLM_API_KEY"
+# max_tokens = 4096
+# # Prompt tokens at which the context is considered full. Set it below the
+# # model's context window. Currently this only logs and shows a notice in the
+# # session feed — history compaction is not implemented yet. 0 turns it off.
+# compact_at_tokens = 200000
+
 [timeouts]
 command_secs = 300
 # One non-streaming LLM call end to end. While a reply is streaming, this is

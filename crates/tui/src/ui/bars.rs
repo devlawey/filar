@@ -374,6 +374,7 @@ mod tests {
                 name: "glm".into(), model: "z-ai/glm-5.2".into(), api_base_url: "".into(),
                 max_tokens: 1024, key_env: "K".into(),
                 temperature: None, top_p: None, extra_body: None,
+                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
             },
         ];
         app.active_session_mut().llm_profile = Some("glm".into());
@@ -389,6 +390,7 @@ mod tests {
                 name: "glm".into(), model: "z-ai/glm-5.2".into(), api_base_url: "".into(),
                 max_tokens: 1024, key_env: "K".into(),
                 temperature: None, top_p: None, extra_body: None,
+                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
             },
         ];
         app.active_session_mut().llm_profile = Some("glm".into());
@@ -475,11 +477,13 @@ mod tests {
                 name: "glm".into(), model: "z-ai/glm-5.2".into(), api_base_url: "".into(),
                 max_tokens: 1024, key_env: "K".into(),
                 temperature: None, top_p: None, extra_body: None,
+                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
             },
             filar_core::LlmProfile {
                 name: "ds".into(), model: "deepseek-v3".into(), api_base_url: "".into(),
                 max_tokens: 1024, key_env: "K".into(),
                 temperature: None, top_p: None, extra_body: None,
+                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
             },
         ];
         // Profile A: has served model and tokens

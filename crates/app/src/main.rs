@@ -801,6 +801,7 @@ mod tests {
             temperature: None,
             top_p: None,
             extra_body: None,
+            compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         };
         let result = build_llm_client_from_profile(&profile, &sp, 60);
         assert!(result.is_ok(), "factory must succeed with a valid key");
@@ -818,6 +819,7 @@ mod tests {
             temperature: None,
             top_p: None,
             extra_body: None,
+            compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         };
         let result = build_llm_client_from_profile(&profile, &sp, 60);
         assert!(result.is_err(), "factory must fail when no key is available");
@@ -835,6 +837,7 @@ mod tests {
             temperature: None,
             top_p: None,
             extra_body: None,
+            compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         };
         let result = build_llm_client_from_profile(&profile, &sp, 60);
         assert!(
@@ -855,6 +858,7 @@ mod tests {
             temperature: None,
             top_p: None,
             extra_body: None,
+            compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         };
         assert!(
             check_profile_api_key(&profile, &sp).is_none(),
@@ -874,6 +878,7 @@ mod tests {
             temperature: None,
             top_p: None,
             extra_body: None,
+            compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         };
         let msg = check_profile_api_key(&profile, &sp);
         assert!(msg.is_some(), "key_checker must fail when required key is missing");
@@ -896,6 +901,7 @@ mod tests {
             temperature: None,
             top_p: None,
             extra_body: None,
+            compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         };
         // Test 1: key is absent → error must NOT contain the test value.
         let result = build_llm_client_from_profile(&profile, &sp, 60);
@@ -930,6 +936,7 @@ mod tests {
             temperature: None,
             top_p: None,
             extra_body: None,
+            compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         }
     }
 
