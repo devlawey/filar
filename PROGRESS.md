@@ -5385,6 +5385,66 @@ on its own PR. `eval/README.md` updated.
 changes went unverified. If it is, triage the failures as a separate issue and
 **do not lower the 90% threshold** to make it pass.
 
+## Issue #380: fix(gui) — the launcher reset `max_tokens` and `top_p` on every save
+
+**Milestone:** 1.0.6. **Branch:** `fix/380-launcher-profile-fields`. Found while
+slicing #376; not a blocker for it, but the same defect mechanism.
+
+**The mechanism.** The launcher edits profiles through the flat
+`LlmProfileData`, and the conversion back to `filar_core::LlmProfile` was
+written out by hand at four sites (`save_profiles`, both `do_launch` payloads,
+and the startup dedup migration). Two fields were not read from the editor at
+all but pinned in every copy — `max_tokens: 4096, top_p: None` — so any value
+set in `[[llm_profiles]]` was replaced the first time the user pressed Launch,
+silently and with `config.toml` still showing the old figure.
+
+**Fix, and why it is wider than the two fields.** Adding the fields to four
+copies would leave the mechanism intact for the next field. The conversion now
+lives in one place, `LlmProfileData::to_profile` / `from_profile`, mirroring the
+existing `SshSlot::to_profile` / `from_profile`, and all five sites call it.
+This is what makes the round-trip tests meaningful: they exercise the code the
+launcher actually runs, whereas the test added in #376 built the `LlmProfile`
+by hand and therefore guarded none of the four sites. It has been rewritten
+onto the real conversion.
+
+**Visible in the UI, not a hidden pass-through.** The issue offered both. A
+pass-through would leave `max_tokens` with nowhere to set it: the launcher does
+not read `[[llm_profiles]]` from `config.toml` once `settings.json` exists, so
+the value would only ever be whatever happened to be stored already. Both
+fields now sit next to `Temp:` with hint text and Launch-time validation
+(`max_tokens` a whole number above 0, `top_p` in `(0.0, 1.0]`), matching how
+`temperature` and `compact_at_tokens` behave.
+
+**Empty-field semantics.** Blank `max_tokens` falls back to the default, as
+does `0` — the API reads `max_tokens = 0` as "generate nothing", so it is never
+a value worth storing (unlike `compact_at_tokens`, where `0` legitimately means
+"off"). Blank `top_p` becomes `None`, the provider default, like `temperature`.
+`DEFAULT_MAX_TOKENS` was made a public constant in `filar-core` so the launcher
+shows the real fallback instead of repeating `4096`.
+
+**Migration path.** The default profile built on first upgrade now inherits
+`max_tokens` and `top_p` from the `[llm]` section it stands in for, rather than
+resetting them.
+
+**Done:** 3 new GUI tests (round trip through `settings.json` and back into the
+editor, `pending_launch.json` handoff, blank-field fallbacks) plus the #376 test
+moved onto the real conversion. The round-trip test fails on the pre-fix code at
+its first assertion — by construction, since `max_tokens` was the literal
+`4096`; this was reasoned, not observed, as no toolchain was available.
+
+**Public contract:** `filar-core` gains `DEFAULT_MAX_TOKENS`. Additive.
+`CommandExecutor` / `LlmClient` untouched.
+
+**Not in scope:** the flat `[llm]` section written by `save_config_toml` still
+carries only model, URL, temperature and extra_body — `max_tokens` there is left
+as the user wrote it, which is correct, but it means the launcher and the `[llm]`
+fallback can hold different figures. The launcher also still ignores
+`[[llm_profiles]]` in `config.toml` whenever `settings.json` exists; that is the
+reason a hidden pass-through was rejected above and deserves its own issue.
+
+**Next steps:** neither build nor tests could be run by the agent (no Rust
+toolchain) — CI and a manual run are required, see the PR.
+
 ## Issue #376: feat(tui) — context fill tracking and the compaction threshold
 
 **Milestone:** 1.0.6. **Branch:** `feat/376-context-fill-tracking`. Part 1 of 4

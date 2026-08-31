@@ -212,8 +212,14 @@ impl LlmConfig {
     }
 }
 
+/// Default `max_tokens` for `[llm]` and `[[llm_profiles]]` — 4096 tokens.
+///
+/// Public so that front-ends can show the value they fall back to instead of
+/// repeating the literal (see #380).
+pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+
 fn default_max_tokens() -> u32 {
-    4096
+    DEFAULT_MAX_TOKENS
 }
 
 // ---------------------------------------------------------------------------

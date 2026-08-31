@@ -23,6 +23,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- The GUI launcher no longer resets a profile's `max_tokens` to 4096 and drops
+  its `top_p` on every save. Both are now editable in the Models tab, validated
+  before Launch, and carried through `settings.json` and `pending_launch.json`;
+  an empty `max_tokens` means the default and an empty `top_p` means the
+  provider default ([#380](https://github.com/devlawey/filar/issues/380)).
+
 - Streaming LLM replies no longer die on the first transient network hiccup
   with `stream error: error decoding response body`. A stream that breaks — or
   closes without delivering anything at all — before any text has been shown is
