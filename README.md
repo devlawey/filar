@@ -99,9 +99,9 @@ Location: `%APPDATA%\filar\settings.json` (Windows),
 `~/.local/share/filar/settings.json` (Linux; or `$XDG_DATA_HOME/filar/`).
 
 The launcher saves non-sensitive UI state here: SSH profiles (host, port,
-user, alias), model name, API base URL, temperature, extra body JSON, save
-directory, and the last selected target/profile. **No secrets** — API keys
-and SSH passwords go to the OS Credential Manager.
+user, alias), model name, API base URL, temperature, max tokens, top-p, extra
+body JSON, save directory, and the last selected target/profile. **No
+secrets** — API keys and SSH passwords go to the OS Credential Manager.
 
 You never edit this file manually — the launcher reads/writes it on every
 Launch.

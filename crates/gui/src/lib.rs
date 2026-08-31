@@ -130,8 +130,6 @@ fn load_secret_for_profile(profile: &filar_core::LlmProfile) -> String {
     load_secret(&profile.key_env)
 }
 
-/// Generate a unique profile name with the given prefix.
-/// Finds the first free number (profile-1, profile-2, ...) not already in use.
 /// Parse the compaction threshold typed in the launcher.
 ///
 /// An empty or unparseable field falls back to the built-in default rather
@@ -146,6 +144,20 @@ fn parse_compact_at_tokens(raw: &str) -> u64 {
     text.parse().unwrap_or(filar_core::DEFAULT_COMPACT_AT_TOKENS)
 }
 
+/// Parse the reply-length cap typed in the launcher.
+///
+/// An empty or unparseable field falls back to the built-in default, as does
+/// `0`: the API reads `max_tokens = 0` as "produce nothing", so it is never a
+/// meaningful thing to save. Validation rejects malformed input before Launch.
+fn parse_max_tokens(raw: &str) -> u32 {
+    match raw.trim().parse::<u32>() {
+        Ok(n) if n > 0 => n,
+        _ => filar_core::DEFAULT_MAX_TOKENS,
+    }
+}
+
+/// Generate a unique profile name with the given prefix.
+/// Finds the first free number (profile-1, profile-2, ...) not already in use.
 fn unique_profile_name(existing: &[LlmProfileData], prefix: &str) -> String {
     let mut n = 1;
     loop {
@@ -583,11 +595,64 @@ struct LlmProfileData {
     key_env: String,
     api_key: String,
     temperature: String,
+    /// Upper bound on the length of one reply, as typed. Empty = the built-in
+    /// default. A string like `temperature` so a half-typed value does not
+    /// reset the field.
+    max_tokens: String,
+    /// Nucleus sampling probability, as typed. Empty = provider default.
+    top_p: String,
     extra_body: String,
     /// Compaction threshold in prompt tokens, as typed. Empty = profile
     /// default; `0` disables compaction. Kept as a string like `temperature`
     /// so a half-typed value does not reset the field.
     compact_at_tokens: String,
+}
+
+impl LlmProfileData {
+    /// Convert the edited fields into the profile stored in `settings.json`
+    /// and handed to the TUI through `pending_launch.json`.
+    ///
+    /// A single conversion point on purpose. These lines used to be written
+    /// out at four call sites, and a field missing from one of them was reset
+    /// on every save without any error: that is how `max_tokens` and `top_p`
+    /// were lost (#380).
+    fn to_profile(&self) -> filar_core::LlmProfile {
+        filar_core::LlmProfile {
+            name: self.name.clone(),
+            model: self.model.clone(),
+            api_base_url: self.api_base_url.clone(),
+            key_env: self.key_env.clone(),
+            max_tokens: parse_max_tokens(&self.max_tokens),
+            temperature: self.temperature.trim().parse().ok(),
+            top_p: self.top_p.trim().parse().ok(),
+            extra_body: serde_json::from_str(&self.extra_body).ok(),
+            compact_at_tokens: parse_compact_at_tokens(&self.compact_at_tokens),
+        }
+    }
+
+    /// Build the editor fields from a stored profile — the reverse of
+    /// [`LlmProfileData::to_profile`].
+    ///
+    /// `api_key` is passed in because it lives in the OS credential store, not
+    /// in the profile.
+    fn from_profile(profile: &filar_core::LlmProfile, api_key: String) -> Self {
+        Self {
+            name: profile.name.clone(),
+            model: profile.model.clone(),
+            api_base_url: profile.api_base_url.clone(),
+            key_env: profile.key_env.clone(),
+            api_key,
+            temperature: profile.temperature.map(|t| t.to_string()).unwrap_or_default(),
+            max_tokens: profile.max_tokens.to_string(),
+            top_p: profile.top_p.map(|t| t.to_string()).unwrap_or_default(),
+            extra_body: profile
+                .extra_body
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            compact_at_tokens: profile.compact_at_tokens.to_string(),
+        }
+    }
 }
 
 /// Apply the dark theme, matching the TUI accent palette:
@@ -827,6 +892,7 @@ impl LauncherApp {
                     name: "default".into(), model: String::new(),
                     api_base_url: String::new(), key_env: "GLM_API_KEY".into(),
                     api_key: String::new(), temperature: String::new(),
+                    max_tokens: String::new(), top_p: String::new(),
                     extra_body: String::new(), compact_at_tokens: String::new(),
                 });
                 self.selected_profile = 0;
@@ -851,6 +917,7 @@ impl LauncherApp {
                     name, key_env,
                     model: String::new(), api_base_url: String::new(),
                     api_key: String::new(), temperature: String::new(),
+                    max_tokens: String::new(), top_p: String::new(),
                     extra_body: String::new(), compact_at_tokens: String::new(),
                 });
                 self.selected_profile = self.profiles.len() - 1;
@@ -914,6 +981,31 @@ impl LauncherApp {
                 );
             }
             ui.horizontal(|ui| { ui.label("Temp:"); ui.text_edit_singleline(&mut p.temperature); });
+            ui.horizontal(|ui| {
+                ui.label("Max tokens:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut p.max_tokens)
+                        .hint_text(format!("{} — default when empty", filar_core::DEFAULT_MAX_TOKENS))
+                        .desired_width(160.0),
+                )
+                .on_hover_text(
+                    "Upper bound on the length of a single reply, in tokens. \
+                     Raise it if long answers are being cut off; leave empty \
+                     for the default.",
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Top-p:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut p.top_p)
+                        .hint_text("provider default when empty")
+                        .desired_width(160.0),
+                )
+                .on_hover_text(
+                    "Nucleus sampling: above 0.0 and up to 1.0. Leave empty to \
+                     let the provider decide.",
+                );
+            });
             ui.horizontal(|ui| {
                 ui.label("Compact at:");
                 ui.add(
@@ -1003,13 +1095,7 @@ impl LauncherApp {
             last_ssh: if self.target_mode > 0 { self.target_mode - 1 } else { 0 },
             temperature: p.map_or_else(String::new, |x| x.temperature.clone()),
             extra_body: p.map_or_else(String::new, |x| x.extra_body.clone()),
-            profiles: self.profiles.iter().map(|d| filar_core::LlmProfile {
-                name: d.name.clone(), model: d.model.clone(), api_base_url: d.api_base_url.clone(),
-                key_env: d.key_env.clone(), max_tokens: 4096,
-                temperature: d.temperature.trim().parse().ok(),
-                top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
-                compact_at_tokens: parse_compact_at_tokens(&d.compact_at_tokens),
-            }).collect(),
+            profiles: self.profiles.iter().map(LlmProfileData::to_profile).collect(),
             selected_profile: self.selected_profile,
             save_dir: self.save_dir.clone(),
             arbiter_profile: self.arbiter_profile.clone(),
@@ -1043,6 +1129,22 @@ impl LauncherApp {
             && !matches!(p.temperature.trim().parse::<f32>(), Ok(t) if t.is_finite() && (0.0..=2.0).contains(&t))
         {
             self.validation_error = format!("Invalid temperature: '{}'. Expected [0.0, 2.0].", p.temperature);
+        }
+        if self.validation_error.is_empty()
+            && !p.max_tokens.trim().is_empty()
+            && !matches!(p.max_tokens.trim().parse::<u32>(), Ok(n) if n > 0)
+        {
+            self.validation_error = format!(
+                "Invalid max tokens: '{}'. Expected a whole number above 0.",
+                p.max_tokens
+            );
+        }
+        if self.validation_error.is_empty()
+            && !p.top_p.trim().is_empty()
+            && !matches!(p.top_p.trim().parse::<f32>(), Ok(t) if t.is_finite() && t > 0.0 && t <= 1.0)
+        {
+            self.validation_error =
+                format!("Invalid top_p: '{}'. Expected (0.0, 1.0].", p.top_p);
         }
         if self.validation_error.is_empty()
             && !p.compact_at_tokens.trim().is_empty()
@@ -1080,13 +1182,7 @@ impl LauncherApp {
             ssh_profiles: self.ssh_slots.iter().map(|s| s.to_profile()).collect(),
             last_ssh: if self.target_mode > 0 { self.target_mode - 1 } else { 0 },
             temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
-            profiles: self.profiles.iter().map(|d| filar_core::LlmProfile {
-                name: d.name.clone(), model: d.model.clone(), api_base_url: d.api_base_url.clone(),
-                key_env: d.key_env.clone(), max_tokens: 4096,
-                temperature: d.temperature.trim().parse().ok(),
-                top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
-                compact_at_tokens: parse_compact_at_tokens(&d.compact_at_tokens),
-            }).collect(),
+            profiles: self.profiles.iter().map(LlmProfileData::to_profile).collect(),
             selected_profile: self.selected_profile,
             save_dir: self.save_dir.clone(),
             arbiter_profile: self.arbiter_profile.clone(),
@@ -1113,13 +1209,7 @@ impl LauncherApp {
             temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
             selected_profile: Some(p.name.clone()), key_env: p.key_env.clone(),
             save_dir: self.save_dir.clone(),
-            profiles: self.profiles.iter().map(|d| filar_core::LlmProfile {
-                name: d.name.clone(), model: d.model.clone(), api_base_url: d.api_base_url.clone(),
-                key_env: d.key_env.clone(), max_tokens: 4096,
-                temperature: d.temperature.trim().parse().ok(),
-                top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
-                compact_at_tokens: parse_compact_at_tokens(&d.compact_at_tokens),
-            }).collect(),
+            profiles: self.profiles.iter().map(LlmProfileData::to_profile).collect(),
             ssh_targets,
             arbiter_profile: self.arbiter_profile.clone(),
         };
@@ -1198,19 +1288,7 @@ pub fn run_launcher(config: &Config) {
     let mut profiles: Vec<LlmProfileData> = settings
         .profiles
         .iter()
-        .map(|p| LlmProfileData {
-            name: p.name.clone(),
-            model: p.model.clone(),
-            api_base_url: p.api_base_url.clone(),
-            key_env: p.key_env.clone(),
-            api_key: load_secret_for_profile(p),
-            temperature: p.temperature.map(|t| t.to_string()).unwrap_or_default(),
-            extra_body: p.extra_body
-                .as_ref()
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-            compact_at_tokens: p.compact_at_tokens.to_string(),
-        })
+        .map(|p| LlmProfileData::from_profile(p, load_secret_for_profile(p)))
         .collect();
 
     // If no profiles exist, create a default from flat fields / config.
@@ -1223,6 +1301,10 @@ pub fn run_launcher(config: &Config) {
             key_env: api_key_cred_name().to_string(),
             api_key,
             temperature: settings.temperature.clone(),
+            // This profile stands in for the `[llm]` section, so it inherits
+            // that section's values rather than resetting them to the default.
+            max_tokens: config.llm.max_tokens.to_string(),
+            top_p: config.llm.top_p.map(|t| t.to_string()).unwrap_or_default(),
             extra_body: settings.extra_body.clone(),
             compact_at_tokens: String::new(),
         });
@@ -1247,13 +1329,7 @@ pub fn run_launcher(config: &Config) {
             last_ssh: settings.last_ssh,
             temperature: settings.temperature.clone(),
             extra_body: settings.extra_body.clone(),
-            profiles: profiles.iter().map(|d| filar_core::LlmProfile {
-                name: d.name.clone(), model: d.model.clone(), api_base_url: d.api_base_url.clone(),
-                key_env: d.key_env.clone(), max_tokens: 4096,
-                temperature: d.temperature.trim().parse().ok(),
-                top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
-                compact_at_tokens: parse_compact_at_tokens(&d.compact_at_tokens),
-            }).collect(),
+            profiles: profiles.iter().map(LlmProfileData::to_profile).collect(),
             selected_profile: settings.selected_profile.min(profiles.len().saturating_sub(1)),
             save_dir: settings.save_dir.clone(),
             arbiter_profile: settings.arbiter_profile.clone(),
@@ -1459,34 +1535,31 @@ mod tests {
         assert!(!json.contains("\"api_key\":"), "must not emit api_key");
     }
 
-    #[test]
-    fn compact_threshold_survives_the_launcher_round_trip() {
-        // The launcher edits profiles through a flat string struct, and the
-        // conversion back to `LlmProfile` is written out by hand in four
-        // places. A field that is not threaded through all of them is silently
-        // reset — which is exactly how `max_tokens` was lost (see #380).
-        let edited = LlmProfileData {
+    /// A profile as edited in the launcher, with every optional field filled
+    /// in with a non-default value. Anything a conversion drops shows up as a
+    /// changed field on the way back.
+    fn edited_profile() -> LlmProfileData {
+        LlmProfileData {
             name: "glm".into(),
             model: "glm-5.1".into(),
             api_base_url: "https://example.invalid/v1".into(),
             key_env: "GLM_API_KEY".into(),
             api_key: String::new(),
-            temperature: String::new(),
+            temperature: "0.3".into(),
+            max_tokens: "32000".into(),
+            top_p: "0.85".into(),
             extra_body: String::new(),
             compact_at_tokens: "120000".into(),
-        };
+        }
+    }
 
-        let stored = filar_core::LlmProfile {
-            name: edited.name.clone(),
-            model: edited.model.clone(),
-            api_base_url: edited.api_base_url.clone(),
-            key_env: edited.key_env.clone(),
-            max_tokens: 4096,
-            temperature: None,
-            top_p: None,
-            extra_body: None,
-            compact_at_tokens: parse_compact_at_tokens(&edited.compact_at_tokens),
-        };
+    #[test]
+    fn compact_threshold_survives_the_launcher_round_trip() {
+        // The launcher edits profiles through a flat string struct. A field
+        // missing from the conversion is reset without any error — which is
+        // exactly how `max_tokens` was lost (see #380).
+        let edited = edited_profile();
+        let stored = edited.to_profile();
         assert_eq!(stored.compact_at_tokens, 120_000);
 
         // …and back into the editor, unchanged.
@@ -1497,6 +1570,79 @@ mod tests {
         let json = serde_json::to_string(&stored).unwrap();
         let loaded: filar_core::LlmProfile = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.compact_at_tokens, 120_000);
+    }
+
+    #[test]
+    fn max_tokens_and_top_p_survive_the_launcher_round_trip() {
+        // Regression for #380: both fields were hard-coded in the conversion
+        // (`max_tokens: 4096, top_p: None`), so every save reset them. On the
+        // pre-fix code this test fails at the first assertion.
+        let edited = edited_profile();
+        let stored = edited.to_profile();
+
+        assert_eq!(stored.max_tokens, 32_000, "max_tokens must not be reset");
+        assert_eq!(stored.top_p, Some(0.85), "top_p must not be dropped");
+        assert_eq!(stored.temperature, Some(0.3), "temperature must survive too");
+
+        // Through settings.json / pending_launch.json…
+        let json = serde_json::to_string(&stored).unwrap();
+        let loaded: filar_core::LlmProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.max_tokens, 32_000);
+        assert_eq!(loaded.top_p, Some(0.85));
+
+        // …and back into the editor, so the next save keeps them as well.
+        let reopened = LlmProfileData::from_profile(&loaded, String::new());
+        assert_eq!(reopened.max_tokens, "32000");
+        assert_eq!(reopened.top_p, "0.85");
+        assert_eq!(reopened.to_profile().max_tokens, 32_000);
+        assert_eq!(reopened.to_profile().top_p, Some(0.85));
+    }
+
+    #[test]
+    fn pending_launch_carries_max_tokens_and_top_p_to_the_tui() {
+        // The handoff file is what the TUI actually reads (#255), so the
+        // values have to arrive there, not only in settings.json.
+        let cfg = LaunchConfig {
+            target: "local".into(),
+            ssh: None,
+            model: "glm-5.1".into(),
+            api_base_url: "https://example.invalid/v1".into(),
+            api_key: String::new(),
+            session_id: None,
+            temperature: "0.3".into(),
+            extra_body: String::new(),
+            selected_profile: Some("glm".into()),
+            key_env: "GLM_API_KEY".into(),
+            save_dir: None,
+            profiles: vec![edited_profile().to_profile()],
+            ssh_targets: vec![],
+            arbiter_profile: None,
+        };
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        let loaded: LaunchConfig = serde_json::from_str(&json).unwrap();
+        let profile = &loaded.profiles[0];
+        assert_eq!(profile.max_tokens, 32_000, "must not arrive as the 4096 default");
+        assert_eq!(profile.top_p, Some(0.85), "must not arrive as None");
+    }
+
+    #[test]
+    fn blank_max_tokens_falls_back_to_the_default_and_blank_top_p_to_none() {
+        assert_eq!(parse_max_tokens(""), filar_core::DEFAULT_MAX_TOKENS);
+        assert_eq!(parse_max_tokens("   "), filar_core::DEFAULT_MAX_TOKENS);
+        assert_eq!(parse_max_tokens("nonsense"), filar_core::DEFAULT_MAX_TOKENS);
+        // `0` would mean "generate nothing", so it is never worth saving.
+        assert_eq!(parse_max_tokens("0"), filar_core::DEFAULT_MAX_TOKENS);
+        assert_eq!(parse_max_tokens(" 8192 "), 8_192);
+
+        let blank = LlmProfileData {
+            max_tokens: String::new(),
+            top_p: String::new(),
+            ..edited_profile()
+        };
+        let stored = blank.to_profile();
+        assert_eq!(stored.max_tokens, filar_core::DEFAULT_MAX_TOKENS);
+        assert_eq!(stored.top_p, None, "empty top_p means provider default");
     }
 
     #[test]
@@ -1664,8 +1810,8 @@ mod tests {
     #[test]
     fn unique_profile_name_fills_gaps() {
         let existing = vec![
-            LlmProfileData { name: "profile-1".into(), model: String::new(), api_base_url: String::new(), key_env: String::new(), api_key: String::new(), temperature: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
-            LlmProfileData { name: "profile-3".into(), model: String::new(), api_base_url: String::new(), key_env: String::new(), api_key: String::new(), temperature: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
+            LlmProfileData { name: "profile-1".into(), model: String::new(), api_base_url: String::new(), key_env: String::new(), api_key: String::new(), temperature: String::new(), max_tokens: String::new(), top_p: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
+            LlmProfileData { name: "profile-3".into(), model: String::new(), api_base_url: String::new(), key_env: String::new(), api_key: String::new(), temperature: String::new(), max_tokens: String::new(), top_p: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
         ];
         let name = unique_profile_name(&existing, "profile");
         assert_eq!(name, "profile-2", "must find first free number, not len+1");
@@ -1681,8 +1827,8 @@ mod tests {
     #[test]
     fn deduplicate_profiles_renames_collisions() {
         let mut profiles = vec![
-            LlmProfileData { name: "dup".into(), model: String::new(), api_base_url: String::new(), key_env: "k1".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
-            LlmProfileData { name: "dup".into(), model: String::new(), api_base_url: String::new(), key_env: "k2".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
+            LlmProfileData { name: "dup".into(), model: String::new(), api_base_url: String::new(), key_env: "k1".into(), api_key: String::new(), temperature: String::new(), max_tokens: String::new(), top_p: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
+            LlmProfileData { name: "dup".into(), model: String::new(), api_base_url: String::new(), key_env: "k2".into(), api_key: String::new(), temperature: String::new(), max_tokens: String::new(), top_p: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
         ];
         deduplicate_profiles(&mut profiles);
         assert_ne!(profiles[0].name, profiles[1].name, "names must differ after dedup");
@@ -1691,9 +1837,9 @@ mod tests {
     #[test]
     fn deduplicate_three_identical_names_completes() {
         let mut profiles = vec![
-            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k1".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
-            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k2".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
-            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k3".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
+            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k1".into(), api_key: String::new(), temperature: String::new(), max_tokens: String::new(), top_p: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
+            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k2".into(), api_key: String::new(), temperature: String::new(), max_tokens: String::new(), top_p: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
+            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k3".into(), api_key: String::new(), temperature: String::new(), max_tokens: String::new(), top_p: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
         ];
         deduplicate_profiles(&mut profiles);
         assert_ne!(profiles[0].name, profiles[1].name);
@@ -1752,6 +1898,8 @@ mod tests {
                 key_env: "GLM_API_KEY".into(),
                 api_key: String::new(),
                 temperature: String::new(),
+                max_tokens: String::new(),
+                top_p: String::new(),
                 extra_body: String::new(),
                 compact_at_tokens: String::new(),
             }],
