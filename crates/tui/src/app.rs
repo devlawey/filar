@@ -428,6 +428,19 @@ pub struct Session {
     pub llm_profile: Option<String>,
     /// Cumulative input tokens consumed by this session.
     pub tokens_in: u64,
+    /// Prompt tokens the provider reported for the **most recent** main-loop
+    /// request.
+    ///
+    /// This is the measured size of the context that was actually sent, and it
+    /// is the only correct trigger for compaction. `tokens_in` above sums every
+    /// request in the session and would cross any threshold far too early.
+    ///
+    /// `None` until the first response carrying usage arrives — including right
+    /// after a saved session is reopened, since the figure is not persisted.
+    pub last_prompt_tokens: Option<u64>,
+    /// Whether the "context is full" notice has already been shown for the
+    /// current crossing of the threshold (reset when it drops back below).
+    pub context_full_notice_shown: bool,
     /// Cumulative output tokens generated for this session.
     pub tokens_out: u64,
     /// Cumulative cost in USD. Summed across all profiles.
@@ -760,6 +773,8 @@ impl Session {
             cwd: local_cwd(),
             llm_profile: None,
             tokens_in: 0,
+            last_prompt_tokens: None,
+            context_full_notice_shown: false,
             tokens_out: 0,
             cost_usd: None,
             per_profile: HashMap::new(),
@@ -1140,10 +1155,64 @@ impl App {
             .llm_profile
             .clone()
             .unwrap_or_else(|| self.default_profile_name.clone());
+        self.report_context_fill(&profile);
         self.mode = AppMode::Thinking;
         self.agent_running = true;
         self.pending_input = Some(input);
         self.active_session_mut().pending_llm_profile = Some(profile);
+    }
+
+    /// Compaction threshold for a profile, in prompt tokens (`0` = disabled).
+    ///
+    /// An unknown profile falls back to the built-in default so that behaviour
+    /// does not depend on whether a profile list was configured at all.
+    pub fn compact_at_tokens_for(&self, profile_name: &str) -> u64 {
+        self.profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .map(|p| p.compact_at_tokens)
+            .unwrap_or(filar_core::DEFAULT_COMPACT_AT_TOKENS)
+    }
+
+    /// Report that the context has reached the compaction threshold.
+    ///
+    /// Called before a request is sent rather than when the response arrives,
+    /// so the user is not made to wait on anything after their answer.
+    ///
+    /// This only reports: the history is left untouched. Replacing the head
+    /// with a summary is issue #377, and until that lands the message must not
+    /// promise something that will not happen.
+    fn report_context_fill(&mut self, profile_name: &str) {
+        let threshold = self.compact_at_tokens_for(profile_name);
+        let used = self.active_session().last_prompt_tokens;
+
+        if !filar_core::should_compact(used, threshold) {
+            // Back below the threshold (a new session, or a smaller request):
+            // arm the notice again.
+            self.active_session_mut().context_full_notice_shown = false;
+            return;
+        }
+        if self.active_session().context_full_notice_shown {
+            return;
+        }
+
+        let used = used.unwrap_or(0);
+        let boundary = filar_core::compaction_boundary(
+            &self.active_session().messages,
+            filar_core::DEFAULT_KEEP_TURNS,
+        );
+        warn!(
+            profile = %profile_name,
+            last_prompt_tokens = used,
+            threshold,
+            compactable_blocks = boundary,
+            "context reached the compaction threshold"
+        );
+        self.active_session_mut().context_full_notice_shown = true;
+        self.push_message(ChatBlock::System(format!(
+            "Context is at {used} prompt tokens, at or above the {threshold} threshold \
+             for profile '{profile_name}'. History compaction is not enabled yet."
+        )));
     }
 
     /// Open the host-selection overlay. The cursor starts on the currently
@@ -3350,6 +3419,16 @@ impl App {
                         } else {
                             s.tokens_in += tokens_in;
                             s.tokens_out += tokens_out;
+                            // The size of the context that was actually sent,
+                            // kept separately from the running total above:
+                            // this is what compaction triggers on. Arbiter
+                            // usage is excluded on purpose — the arbiter sends
+                            // its own short prompt, not the session history.
+                            // A zero means the provider reported usage without
+                            // `prompt_tokens`, which tells us nothing.
+                            if tokens_in > 0 {
+                                s.last_prompt_tokens = Some(tokens_in);
+                            }
                             if let Some(c) = cost {
                                 let total = s.cost_usd.unwrap_or(0.0) + c;
                                 s.cost_usd = Some((total * 10000.0).round() / 10000.0);
@@ -7093,8 +7172,8 @@ mod tests {
     fn ctrl_l_cycles_llm_profiles() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.profiles = vec![
-            filar_core::LlmProfile { name: "glm".into(), model: "g".into(), api_base_url: "u".into(), max_tokens: 4096, key_env: "k1".into(), temperature: None, top_p: None, extra_body: None },
-            filar_core::LlmProfile { name: "ds".into(), model: "d".into(), api_base_url: "u".into(), max_tokens: 4096, key_env: "k2".into(), temperature: None, top_p: None, extra_body: None },
+            filar_core::LlmProfile { name: "glm".into(), model: "g".into(), api_base_url: "u".into(), max_tokens: 4096, key_env: "k1".into(), temperature: None, top_p: None, extra_body: None, compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS },
+            filar_core::LlmProfile { name: "ds".into(), model: "d".into(), api_base_url: "u".into(), max_tokens: 4096, key_env: "k2".into(), temperature: None, top_p: None, extra_body: None, compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS },
         ];
         app.default_profile_name = "glm".into();
 
@@ -7172,6 +7251,151 @@ mod tests {
     }
 
     #[test]
+    fn last_prompt_tokens_tracks_the_last_request_not_the_running_total() {
+        // The compaction trigger must read the size of the context that was
+        // actually sent. `tokens_in` accumulates and would cross any threshold
+        // long before the context itself does.
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        for used in [30_000u64, 45_000, 20_000] {
+            app.handle_agent_event(TuiEvent::Agent {
+                session_id: sid,
+                event: filar_agent::AgentEvent::TokenUsage {
+                    tokens_in: used, tokens_out: 100, cost: None, model: None, arbiter: false,
+                },
+            });
+        }
+        assert_eq!(app.sessions[0].tokens_in, 95_000, "the running total still accumulates");
+        assert_eq!(
+            app.sessions[0].last_prompt_tokens,
+            Some(20_000),
+            "the trigger reads the most recent request only"
+        );
+        assert!(
+            !filar_core::should_compact(app.sessions[0].last_prompt_tokens, 50_000),
+            "must not fire: the real context is 20k, not the 95k total"
+        );
+    }
+
+    #[test]
+    fn arbiter_usage_does_not_move_the_compaction_trigger() {
+        // The arbiter sends its own short prompt, not the session history.
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: sid,
+            event: filar_agent::AgentEvent::TokenUsage {
+                tokens_in: 40_000, tokens_out: 100, cost: None, model: None, arbiter: false,
+            },
+        });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: sid,
+            event: filar_agent::AgentEvent::TokenUsage {
+                tokens_in: 800, tokens_out: 20, cost: None, model: None, arbiter: true,
+            },
+        });
+        assert_eq!(app.sessions[0].last_prompt_tokens, Some(40_000));
+        assert_eq!(app.sessions[0].arbiter_tokens_in, 800, "arbiter usage is still counted");
+    }
+
+    #[test]
+    fn usage_without_prompt_tokens_leaves_the_context_size_unknown() {
+        // A provider may report usage with no `prompt_tokens`, which arrives
+        // here as a zero. That is not a measurement of anything.
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: sid,
+            event: filar_agent::AgentEvent::TokenUsage {
+                tokens_in: 0, tokens_out: 50, cost: None, model: None, arbiter: false,
+            },
+        });
+        assert_eq!(app.sessions[0].last_prompt_tokens, None);
+    }
+
+    #[test]
+    fn context_notice_fires_once_per_crossing_and_leaves_history_alone() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.profiles = vec![filar_core::LlmProfile {
+            name: "glm".into(), model: "g".into(), api_base_url: "u".into(),
+            max_tokens: 4096, key_env: "k".into(),
+            temperature: None, top_p: None, extra_body: None,
+            compact_at_tokens: 50_000,
+        }];
+        app.llm_profile = Some("glm".into());
+        app.default_profile_name = "glm".into();
+        app.active_session_mut().last_prompt_tokens = Some(60_000);
+
+        let before = app.active_session().messages.len();
+        app.begin_agent_request("one".into());
+        let after_first = app.active_session().messages.len();
+        assert_eq!(after_first, before + 1, "one notice is pushed");
+        assert!(matches!(
+            app.active_session().messages.last(),
+            Some(ChatBlock::System(s)) if s.contains("60000") && s.contains("50000")
+        ));
+
+        app.begin_agent_request("two".into());
+        assert_eq!(
+            app.active_session().messages.len(),
+            after_first,
+            "the notice must not repeat on every request"
+        );
+
+        // Back under the threshold: the notice is armed again.
+        app.active_session_mut().last_prompt_tokens = Some(1_000);
+        app.begin_agent_request("three".into());
+        assert!(!app.active_session().context_full_notice_shown);
+        app.active_session_mut().last_prompt_tokens = Some(60_000);
+        app.begin_agent_request("four".into());
+        assert_eq!(app.active_session().messages.len(), after_first + 1);
+    }
+
+    #[test]
+    fn zero_threshold_profile_never_reports() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.profiles = vec![filar_core::LlmProfile {
+            name: "glm".into(), model: "g".into(), api_base_url: "u".into(),
+            max_tokens: 4096, key_env: "k".into(),
+            temperature: None, top_p: None, extra_body: None,
+            compact_at_tokens: 0,
+        }];
+        app.llm_profile = Some("glm".into());
+        app.default_profile_name = "glm".into();
+        app.active_session_mut().last_prompt_tokens = Some(u64::MAX);
+
+        let before = app.active_session().messages.len();
+        app.begin_agent_request("hello".into());
+        assert_eq!(app.active_session().messages.len(), before);
+    }
+
+    #[test]
+    fn threshold_follows_the_active_profile() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.profiles = vec![
+            filar_core::LlmProfile {
+                name: "big".into(), model: "g".into(), api_base_url: "u".into(),
+                max_tokens: 4096, key_env: "k".into(),
+                temperature: None, top_p: None, extra_body: None,
+                compact_at_tokens: 900_000,
+            },
+            filar_core::LlmProfile {
+                name: "small".into(), model: "d".into(), api_base_url: "u".into(),
+                max_tokens: 4096, key_env: "k".into(),
+                temperature: None, top_p: None, extra_body: None,
+                compact_at_tokens: 100_000,
+            },
+        ];
+        assert_eq!(app.compact_at_tokens_for("big"), 900_000);
+        assert_eq!(app.compact_at_tokens_for("small"), 100_000);
+        assert_eq!(
+            app.compact_at_tokens_for("missing"),
+            filar_core::DEFAULT_COMPACT_AT_TOKENS,
+            "an unknown profile falls back to the built-in default"
+        );
+    }
+
+    #[test]
     fn begin_agent_request_sets_pending_llm_profile() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.profiles = vec![
@@ -7179,6 +7403,7 @@ mod tests {
                 name: "glm".into(), model: "glm".into(), api_base_url: "".into(),
                 max_tokens: 1024, key_env: "K".into(),
                 temperature: None, top_p: None, extra_body: None,
+                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
             },
         ];
         app.llm_profile = Some("glm".into());
@@ -7196,11 +7421,13 @@ mod tests {
                 name: "glm".into(), model: "glm".into(), api_base_url: "".into(),
                 max_tokens: 1024, key_env: "K".into(),
                 temperature: None, top_p: None, extra_body: None,
+                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
             },
             filar_core::LlmProfile {
                 name: "ds".into(), model: "ds".into(), api_base_url: "".into(),
                 max_tokens: 1024, key_env: "K".into(),
                 temperature: None, top_p: None, extra_body: None,
+                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
             },
         ];
         // Send time: profile = glm, so pending = glm.
@@ -7541,6 +7768,7 @@ mod tests {
             temperature: None,
             top_p: None,
             extra_body: None,
+            compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         }];
         let session = filar_core::Session {
             id: "1".into(),
@@ -7755,6 +7983,7 @@ mod tests {
             temperature: None,
             top_p: None,
             extra_body: None,
+            compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         }];
         app.llm_profile = Some("other".into());
         let session = filar_core::Session {

@@ -5385,6 +5385,65 @@ on its own PR. `eval/README.md` updated.
 changes went unverified. If it is, triage the failures as a separate issue and
 **do not lower the 90% threshold** to make it pass.
 
+## Issue #376: feat(tui) — context fill tracking and the compaction threshold
+
+**Milestone:** 1.0.6. **Branch:** `feat/376-context-fill-tracking`. Part 1 of 4
+of the context-compaction spec; #377–#379 build on it.
+
+**The trap this issue exists to avoid.** `Session::tokens_in` accumulates every
+request in the session (`s.tokens_in += tokens_in`), so triggering on it would
+fire many times too early and then keep firing. The measurement that matters is
+`prompt_tokens` of the *last* request, which arrives as `tokens_in` on a single
+`AgentEvent::TokenUsage`. Stored separately as `last_prompt_tokens`, leaving the
+running totals untouched. Arbiter events (`arbiter: true`) are excluded — the
+arbiter sends its own short prompt, not the session history — and a reported
+zero is treated as "no measurement" rather than as an empty context.
+
+**Where the check runs.** `begin_agent_request` is the single choke point before
+a request is sent, which is also where the spec wants it: deciding after the
+response arrives would make the user wait on something after their answer.
+
+**Boundary, and a correction to the spec.** The spec frames the cut in terms of
+orphaned `tool_call_id`s. That does not apply here: the TUI keeps history as
+`Vec<ChatBlock>` and flattens it in `runner.rs`, where `ChatBlock::Command`
+becomes a plain assistant message — there are no `tool` role messages in what is
+sent, they exist only inside one `run_loop` call. The real invariant is that a
+turn is a `User` block plus everything answering it, so `compaction_boundary`
+always returns the index of a `User` block; otherwise the tail would open with
+commands belonging to a request that is no longer there. The original
+`tool_call_id` requirement is recorded in the function's doc comment for
+whenever the representation changes.
+
+**Config plumbing.** `LlmProfile::compact_at_tokens` had to be threaded through
+every hand-written conversion, which in the GUI means four separate
+`LlmProfileData` → `LlmProfile` sites plus the reverse, the default-profile
+path, both add-profile buttons and the test literals. `parse_compact_at_tokens`
+falls back to the default rather than to `0` on empty input, because `0` means
+"disabled" and a blank box must not silently switch the feature off. This is the
+same class of defect as #380, where `max_tokens` and `top_p` are lost on every
+launcher save; the round-trip test here exists specifically to stop this field
+going the same way.
+
+**Deliberately not done:** `last_prompt_tokens` is not persisted in the session
+JSON, so after reopening a saved session the threshold stays dormant until the
+first response. Persisting it would mean touching the session format, which is
+#379's territory, and the gap is exactly what the reactive path in #378 covers.
+`keep_turns` is a documented constant rather than a config field: nothing
+consumes it until #377 actually compacts, and a second config knob would mean a
+second round of the plumbing above for no present benefit.
+
+**Done:** 9 unit tests on the pure functions in `filar_core::compaction`,
+6 in the TUI (trigger source, arbiter exclusion, zero-usage, one-notice-per-
+crossing, disabled profile, per-profile threshold) and 2 in the GUI for the
+config round trip.
+
+**Public contract:** `LlmProfile` gains a field. Additive and `#[serde(default)]`,
+so existing `config.toml`, `settings.json` and `pending_launch.json` files load
+unchanged, but every struct literal in the workspace had to be updated.
+
+**Next steps:** neither build nor tests could be run by the agent (no Rust
+toolchain) — CI and a manual run are required, see the PR.
+
 ## Issue #374: fix(agent) — mid-stream LLM failures were never retried
 
 **Milestone:** 1.0.6. **Branch:** `fix/374-stream-retry`.

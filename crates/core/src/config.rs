@@ -252,6 +252,21 @@ pub struct LlmProfile {
     /// Arbitrary extra fields merged into the JSON request body.
     #[serde(default)]
     pub extra_body: Option<serde_json::Value>,
+    /// Prompt-token count at which the session history is compacted before the
+    /// next request. `0` disables compaction for this profile.
+    ///
+    /// Per-profile because context windows differ: a threshold that makes
+    /// sense for a 1M-token window is meaningless for 128k. This is a
+    /// client-side setting and is never sent to the API.
+    #[serde(default = "default_compact_at_tokens")]
+    pub compact_at_tokens: u64,
+}
+
+/// Default `[[llm_profiles]].compact_at_tokens` — 200k prompt tokens.
+pub const DEFAULT_COMPACT_AT_TOKENS: u64 = 200_000;
+
+fn default_compact_at_tokens() -> u64 {
+    DEFAULT_COMPACT_AT_TOKENS
 }
 
 fn default_glm_key_env() -> String {
@@ -556,6 +571,7 @@ api_base_url = "https://open.bigmodel.cn/api/paas/v4"
             temperature: None,
             top_p: None,
             extra_body: None,
+            compact_at_tokens: DEFAULT_COMPACT_AT_TOKENS,
         }];
         let (name, warn) = cfg.resolve_arbiter_profile("session", &profiles);
         assert_eq!(name, "session");

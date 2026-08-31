@@ -191,6 +191,25 @@ model = "deepseek-chat"
 api_base_url = "https://api.deepseek.com/v1"
 max_tokens = 8192
 key_env = "DEEPSEEK_API_KEY"
+# Prompt tokens at which the session history is compacted before the next
+# request. Per-profile, because context windows differ. 0 disables it.
+compact_at_tokens = 200000
+
+#### Context compaction
+
+A long investigation eventually fills the model's context window: the whole
+history is re-sent with every request, so each turn costs more than the last
+until the provider refuses outright. `compact_at_tokens` is the point at which
+filar folds the earlier part of the conversation into a summary and carries on.
+
+The threshold is per-profile because context windows differ — a figure that
+suits a 1M-token model is meaningless for a 128k one. Set it comfortably below
+the window, since the reply and the tool definitions also need room. `0`
+disables compaction for that profile.
+
+filar measures fill from the `prompt_tokens` the provider reports for the most
+recent request, not from the session's running total, so the figure reflects
+the context actually being sent.
 
 # ── Timeouts (seconds) ─────────────────────────────────────
 [timeouts]

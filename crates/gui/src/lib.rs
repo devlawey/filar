@@ -132,6 +132,20 @@ fn load_secret_for_profile(profile: &filar_core::LlmProfile) -> String {
 
 /// Generate a unique profile name with the given prefix.
 /// Finds the first free number (profile-1, profile-2, ...) not already in use.
+/// Parse the compaction threshold typed in the launcher.
+///
+/// An empty or unparseable field falls back to the built-in default rather
+/// than to `0`, because `0` means "compaction disabled" and silently disabling
+/// a feature because someone left a box blank would be the wrong default.
+/// Validation rejects genuinely malformed input before Launch.
+fn parse_compact_at_tokens(raw: &str) -> u64 {
+    let text = raw.trim();
+    if text.is_empty() {
+        return filar_core::DEFAULT_COMPACT_AT_TOKENS;
+    }
+    text.parse().unwrap_or(filar_core::DEFAULT_COMPACT_AT_TOKENS)
+}
+
 fn unique_profile_name(existing: &[LlmProfileData], prefix: &str) -> String {
     let mut n = 1;
     loop {
@@ -570,6 +584,10 @@ struct LlmProfileData {
     api_key: String,
     temperature: String,
     extra_body: String,
+    /// Compaction threshold in prompt tokens, as typed. Empty = profile
+    /// default; `0` disables compaction. Kept as a string like `temperature`
+    /// so a half-typed value does not reset the field.
+    compact_at_tokens: String,
 }
 
 /// Apply the dark theme, matching the TUI accent palette:
@@ -809,7 +827,7 @@ impl LauncherApp {
                     name: "default".into(), model: String::new(),
                     api_base_url: String::new(), key_env: "GLM_API_KEY".into(),
                     api_key: String::new(), temperature: String::new(),
-                    extra_body: String::new(),
+                    extra_body: String::new(), compact_at_tokens: String::new(),
                 });
                 self.selected_profile = 0;
                 self.save_profiles();
@@ -833,7 +851,7 @@ impl LauncherApp {
                     name, key_env,
                     model: String::new(), api_base_url: String::new(),
                     api_key: String::new(), temperature: String::new(),
-                    extra_body: String::new(),
+                    extra_body: String::new(), compact_at_tokens: String::new(),
                 });
                 self.selected_profile = self.profiles.len() - 1;
                 self.save_profiles();
@@ -896,6 +914,17 @@ impl LauncherApp {
                 );
             }
             ui.horizontal(|ui| { ui.label("Temp:"); ui.text_edit_singleline(&mut p.temperature); });
+            ui.horizontal(|ui| {
+                ui.label("Compact at:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut p.compact_at_tokens)
+                        .hint_text(format!("{} (0 = off)", filar_core::DEFAULT_COMPACT_AT_TOKENS)),
+                )
+                .on_hover_text(
+                    "Prompt tokens at which the session history is compacted. \
+                     Set below the model's context window. 0 disables it.",
+                );
+            });
             ui.label("Extra body (JSON):");
             ui.add(egui::TextEdit::multiline(&mut p.extra_body)
                 .hint_text("e.g. {\"thinking\":{\"type\":\"disabled\"}}")
@@ -975,6 +1004,7 @@ impl LauncherApp {
                 key_env: d.key_env.clone(), max_tokens: 4096,
                 temperature: d.temperature.trim().parse().ok(),
                 top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
+                compact_at_tokens: parse_compact_at_tokens(&d.compact_at_tokens),
             }).collect(),
             selected_profile: self.selected_profile,
             save_dir: self.save_dir.clone(),
@@ -1011,6 +1041,15 @@ impl LauncherApp {
             self.validation_error = format!("Invalid temperature: '{}'. Expected [0.0, 2.0].", p.temperature);
         }
         if self.validation_error.is_empty()
+            && !p.compact_at_tokens.trim().is_empty()
+            && p.compact_at_tokens.trim().parse::<u64>().is_err()
+        {
+            self.validation_error = format!(
+                "Invalid compaction threshold: '{}'. Expected a whole number of tokens (0 = off).",
+                p.compact_at_tokens
+            );
+        }
+        if self.validation_error.is_empty()
             && !p.extra_body.trim().is_empty()
             && serde_json::from_str::<serde_json::Value>(&p.extra_body).is_err()
         {
@@ -1042,6 +1081,7 @@ impl LauncherApp {
                 key_env: d.key_env.clone(), max_tokens: 4096,
                 temperature: d.temperature.trim().parse().ok(),
                 top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
+                compact_at_tokens: parse_compact_at_tokens(&d.compact_at_tokens),
             }).collect(),
             selected_profile: self.selected_profile,
             save_dir: self.save_dir.clone(),
@@ -1074,6 +1114,7 @@ impl LauncherApp {
                 key_env: d.key_env.clone(), max_tokens: 4096,
                 temperature: d.temperature.trim().parse().ok(),
                 top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
+                compact_at_tokens: parse_compact_at_tokens(&d.compact_at_tokens),
             }).collect(),
             ssh_targets,
             arbiter_profile: self.arbiter_profile.clone(),
@@ -1164,6 +1205,7 @@ pub fn run_launcher(config: &Config) {
                 .as_ref()
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
+            compact_at_tokens: p.compact_at_tokens.to_string(),
         })
         .collect();
 
@@ -1178,6 +1220,7 @@ pub fn run_launcher(config: &Config) {
             api_key,
             temperature: settings.temperature.clone(),
             extra_body: settings.extra_body.clone(),
+            compact_at_tokens: String::new(),
         });
     }
 
@@ -1205,6 +1248,7 @@ pub fn run_launcher(config: &Config) {
                 key_env: d.key_env.clone(), max_tokens: 4096,
                 temperature: d.temperature.trim().parse().ok(),
                 top_p: None, extra_body: serde_json::from_str(&d.extra_body).ok(),
+                compact_at_tokens: parse_compact_at_tokens(&d.compact_at_tokens),
             }).collect(),
             selected_profile: settings.selected_profile.min(profiles.len().saturating_sub(1)),
             save_dir: settings.save_dir.clone(),
@@ -1412,8 +1456,66 @@ mod tests {
     }
 
     #[test]
-    fn launch_config_round_trips_arbiter_profile() {
-        let cfg = LaunchConfig {
+    fn compact_threshold_survives_the_launcher_round_trip() {
+        // The launcher edits profiles through a flat string struct, and the
+        // conversion back to `LlmProfile` is written out by hand in four
+        // places. A field that is not threaded through all of them is silently
+        // reset — which is exactly how `max_tokens` was lost (see #380).
+        let edited = LlmProfileData {
+            name: "glm".into(),
+            model: "glm-5.1".into(),
+            api_base_url: "https://example.invalid/v1".into(),
+            key_env: "GLM_API_KEY".into(),
+            api_key: String::new(),
+            temperature: String::new(),
+            extra_body: String::new(),
+            compact_at_tokens: "120000".into(),
+        };
+
+        let stored = filar_core::LlmProfile {
+            name: edited.name.clone(),
+            model: edited.model.clone(),
+            api_base_url: edited.api_base_url.clone(),
+            key_env: edited.key_env.clone(),
+            max_tokens: 4096,
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+            compact_at_tokens: parse_compact_at_tokens(&edited.compact_at_tokens),
+        };
+        assert_eq!(stored.compact_at_tokens, 120_000);
+
+        // …and back into the editor, unchanged.
+        assert_eq!(stored.compact_at_tokens.to_string(), edited.compact_at_tokens);
+
+        // The value must also survive serialisation into settings.json /
+        // pending_launch.json.
+        let json = serde_json::to_string(&stored).unwrap();
+        let loaded: filar_core::LlmProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.compact_at_tokens, 120_000);
+    }
+
+    #[test]
+    fn blank_compact_threshold_falls_back_to_the_default_not_to_zero() {
+        // `0` means "compaction disabled"; an empty box must not mean that.
+        assert_eq!(
+            parse_compact_at_tokens(""),
+            filar_core::DEFAULT_COMPACT_AT_TOKENS
+        );
+        assert_eq!(
+            parse_compact_at_tokens("  "),
+            filar_core::DEFAULT_COMPACT_AT_TOKENS
+        );
+        assert_eq!(
+            parse_compact_at_tokens("nonsense"),
+            filar_core::DEFAULT_COMPACT_AT_TOKENS
+        );
+        assert_eq!(parse_compact_at_tokens("0"), 0, "an explicit 0 disables it");
+        assert_eq!(parse_compact_at_tokens(" 65536 "), 65_536);
+    }
+
+    #[test]
+    fn launch_config_round_trips_arbiter_profile() {        let cfg = LaunchConfig {
             target: "local".into(),
             ssh: None,
             model: "glm".into(),
@@ -1558,8 +1660,8 @@ mod tests {
     #[test]
     fn unique_profile_name_fills_gaps() {
         let existing = vec![
-            LlmProfileData { name: "profile-1".into(), model: String::new(), api_base_url: String::new(), key_env: String::new(), api_key: String::new(), temperature: String::new(), extra_body: String::new() },
-            LlmProfileData { name: "profile-3".into(), model: String::new(), api_base_url: String::new(), key_env: String::new(), api_key: String::new(), temperature: String::new(), extra_body: String::new() },
+            LlmProfileData { name: "profile-1".into(), model: String::new(), api_base_url: String::new(), key_env: String::new(), api_key: String::new(), temperature: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
+            LlmProfileData { name: "profile-3".into(), model: String::new(), api_base_url: String::new(), key_env: String::new(), api_key: String::new(), temperature: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
         ];
         let name = unique_profile_name(&existing, "profile");
         assert_eq!(name, "profile-2", "must find first free number, not len+1");
@@ -1575,8 +1677,8 @@ mod tests {
     #[test]
     fn deduplicate_profiles_renames_collisions() {
         let mut profiles = vec![
-            LlmProfileData { name: "dup".into(), model: String::new(), api_base_url: String::new(), key_env: "k1".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new() },
-            LlmProfileData { name: "dup".into(), model: String::new(), api_base_url: String::new(), key_env: "k2".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new() },
+            LlmProfileData { name: "dup".into(), model: String::new(), api_base_url: String::new(), key_env: "k1".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
+            LlmProfileData { name: "dup".into(), model: String::new(), api_base_url: String::new(), key_env: "k2".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
         ];
         deduplicate_profiles(&mut profiles);
         assert_ne!(profiles[0].name, profiles[1].name, "names must differ after dedup");
@@ -1585,9 +1687,9 @@ mod tests {
     #[test]
     fn deduplicate_three_identical_names_completes() {
         let mut profiles = vec![
-            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k1".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new() },
-            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k2".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new() },
-            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k3".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new() },
+            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k1".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
+            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k2".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
+            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k3".into(), api_key: String::new(), temperature: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
         ];
         deduplicate_profiles(&mut profiles);
         assert_ne!(profiles[0].name, profiles[1].name);
@@ -1647,6 +1749,7 @@ mod tests {
                 api_key: String::new(),
                 temperature: String::new(),
                 extra_body: String::new(),
+                compact_at_tokens: String::new(),
             }],
             selected_profile: 0,
             validation_error: String::new(),
