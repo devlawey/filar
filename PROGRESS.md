@@ -5442,8 +5442,19 @@ fallback can hold different figures. The launcher also still ignores
 `[[llm_profiles]]` in `config.toml` whenever `settings.json` exists; that is the
 reason a hidden pass-through was rejected above and deserves its own issue.
 
+**Review (PR #382).** Two findings, both declined in this PR. Validation runs
+only on the selected profile, so an invalid value left in another profile is
+written out as the default by `save_profiles`: real, but it predates this change
+and applies to `temperature` and `compact_at_tokens` just as much, so it belongs
+in its own issue rather than widening this one. The second asked for the build
+and test run the agent's environment cannot perform; CI covers it.
+
 **Next steps:** neither build nor tests could be run by the agent (no Rust
-toolchain) — CI and a manual run are required, see the PR.
+toolchain). CI has since run `cargo build --workspace` and
+`cargo test --workspace` on Windows and macOS, both green. Still outstanding is
+the DoD run of the built binary: raise `max_tokens` for a profile in the
+launcher, relaunch, and confirm a long reply is no longer cut off at 4096 —
+that needs a human on a real desktop.
 
 ## Issue #376: feat(tui) — context fill tracking and the compaction threshold
 
