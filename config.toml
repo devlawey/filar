@@ -19,8 +19,9 @@ max_tokens = 4096
 # api_base_url = "https://open.bigmodel.cn/api/paas/v4"
 # key_env = "GLM_API_KEY"
 # max_tokens = 4096
-# # Prompt tokens at which the session history is compacted before the next
-# # request. Set it below the model's context window; 0 disables compaction.
+# # Prompt tokens at which the context is considered full. Set it below the
+# # model's context window. Currently this only logs and shows a notice in the
+# # session feed — history compaction is not implemented yet. 0 turns it off.
 # compact_at_tokens = 200000
 
 [timeouts]

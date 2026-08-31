@@ -918,11 +918,15 @@ impl LauncherApp {
                 ui.label("Compact at:");
                 ui.add(
                     egui::TextEdit::singleline(&mut p.compact_at_tokens)
-                        .hint_text(format!("{} (0 = off)", filar_core::DEFAULT_COMPACT_AT_TOKENS)),
+                        .hint_text(format!(
+                            "{} — default when empty, 0 = off",
+                            filar_core::DEFAULT_COMPACT_AT_TOKENS
+                        )),
                 )
                 .on_hover_text(
                     "Prompt tokens at which the session history is compacted. \
-                     Set below the model's context window. 0 disables it.",
+                     Set below the model's context window. Leave empty for the \
+                     default; enter 0 to disable compaction for this profile.",
                 );
             });
             ui.label("Extra body (JSON):");

@@ -5426,11 +5426,20 @@ going the same way.
 
 **Deliberately not done:** `last_prompt_tokens` is not persisted in the session
 JSON, so after reopening a saved session the threshold stays dormant until the
-first response. Persisting it would mean touching the session format, which is
-#379's territory, and the gap is exactly what the reactive path in #378 covers.
-`keep_turns` is a documented constant rather than a config field: nothing
-consumes it until #377 actually compacts, and a second config knob would mean a
-second round of the plumbing above for no present benefit.
+first response arrives. Persisting it would mean touching the session format,
+which belongs to #379, and the gap is exactly what the reactive path in #378
+covers. `keep_turns` is a documented constant rather than a config field:
+nothing consumes it until #377 actually compacts, and a second config knob would
+mean a second round of the plumbing above for no present benefit.
+
+**Review (PR #381).** Three findings, all accepted. The important one: neither
+`apply_loaded_session` nor `with_history` reset the two new runtime fields, so
+restoring a session over a tab kept the replaced conversation's measurement —
+which would report a crossing that never happened for the new history, or hold a
+real one suppressed. Both paths now clear them, with a regression test. The
+launcher hint did not say that an empty threshold field means "default" rather
+than "off", and `README.md` / `config.toml` described compaction as if it
+already happened; both corrected to state that this change only reports.
 
 **Done:** 9 unit tests on the pure functions in `filar_core::compaction`,
 6 in the TUI (trigger source, arbiter exclusion, zero-usage, one-notice-per-

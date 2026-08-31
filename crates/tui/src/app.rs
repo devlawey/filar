@@ -1126,6 +1126,9 @@ impl App {
             s.per_profile = per_profile;
             s.last_served_model = last_served_model;
             s.model_per_profile = model_per_profile;
+            // Not restored on purpose — see `apply_loaded_session`.
+            s.last_prompt_tokens = None;
+            s.context_full_notice_shown = false;
         }
         let default_name = if default_profile_name.is_empty() { "default" } else { default_profile_name };
         if let Some(profile) = llm_profile {
@@ -1410,6 +1413,13 @@ impl App {
         self.per_profile = session.per_profile;
         self.last_served_model = session.last_served_model;
         self.model_per_profile = session.model_per_profile;
+        // Compaction state is measured, not saved: it describes the context of
+        // the request this tab last sent, which has nothing to do with the
+        // history just loaded. Carrying the replaced tab's values over would
+        // either report a crossing that never happened or keep a real one
+        // suppressed. The first response with usage measures it again.
+        self.last_prompt_tokens = None;
+        self.context_full_notice_shown = false;
         self.scroll = 0;
 
         // Resolve LLM profile. Reset to the default when the saved session has
@@ -7797,6 +7807,62 @@ mod tests {
         assert_eq!(app.target_name, "prod");
         assert!(app.ssh_info.is_none());
         assert!(app.pending_ssh.is_none());
+    }
+
+    #[test]
+    fn apply_loaded_session_clears_measured_context_state() {
+        // The compaction figures describe the request this tab last sent, not
+        // the history being loaded over it. Carrying them across a restore
+        // would report a crossing that never happened for the new history, or
+        // keep a real one suppressed.
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.profiles = vec![filar_core::LlmProfile {
+            name: "glm".into(),
+            model: "glm-5.1".into(),
+            api_base_url: String::new(),
+            max_tokens: 1024,
+            key_env: String::new(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+            compact_at_tokens: 50_000,
+        }];
+        app.default_profile_name = "glm".into();
+        app.llm_profile = Some("glm".into());
+        app.active_session_mut().last_prompt_tokens = Some(250_000);
+        app.active_session_mut().context_full_notice_shown = true;
+
+        let session = filar_core::Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "prod".into(),
+            llm_profile: Some("glm".into()),
+            messages: vec![ChatBlock::User("fresh start".into())],
+            input_history: vec![],
+            tokens_in: 11,
+            tokens_out: 22,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+        };
+        app.apply_loaded_session(session);
+
+        assert_eq!(app.active_session().last_prompt_tokens, None);
+        assert!(!app.active_session().context_full_notice_shown);
+
+        // And the stale figure must not produce a notice on the next request.
+        let before = app.active_session().messages.len();
+        app.begin_agent_request("hello".into());
+        assert_eq!(
+            app.active_session().messages.len(),
+            before,
+            "a restored session has no measurement yet, so nothing is reported"
+        );
     }
 
     #[test]
