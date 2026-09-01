@@ -207,7 +207,9 @@ fn validate_profile_fields(p: &LlmProfileData) -> Result<(), String> {
 /// Every persistence path converts the whole list through
 /// [`LlmProfileData::to_profile`], so checking only the selected profile left
 /// the others free to be rewritten with defaults (#385).
-fn validate_all_profile_fields(profiles: &[LlmProfileData]) -> Result<(), String> {
+fn validate_all_profile_fields<'a>(
+    profiles: impl IntoIterator<Item = &'a LlmProfileData>,
+) -> Result<(), String> {
     for p in profiles {
         if let Err(msg) = validate_profile_fields(p) {
             return Err(format!("Profile \"{}\": {msg}", p.name));
@@ -862,18 +864,18 @@ impl LauncherApp {
                     s.host == host && slot_port == Some(port)
                 }) {
                     self.target_mode = slot_idx + 1;
-                    self.validation_error.clear();
+                    self.clear_error();
                 } else {
                     self.target_mode = 0;
-                    self.validation_error = format!(
+                    self.set_other_error(format!(
                         "No SSH profile matches '{}'. Select a target manually.",
                         meta.ssh_info.as_deref().unwrap_or_default()
-                    );
+                    ));
                 }
             }
             None => {
                 self.target_mode = 0;
-                self.validation_error.clear();
+                self.clear_error();
             }
         }
     }
@@ -990,11 +992,26 @@ impl LauncherApp {
                 self.save_profiles();
             }
             if self.profiles.len() > 1 && ui.button("X").on_hover_text("Delete profile").clicked() {
-                let removed = &self.profiles[self.selected_profile];
-                delete_secret(&removed.key_env);
-                self.profiles.remove(self.selected_profile);
-                self.selected_profile = self.selected_profile.min(self.profiles.len().saturating_sub(1));
-                self.save_profiles();
+                // Validate what the list *would* be before touching anything.
+                // `delete_secret` is irreversible and `save_profiles` may now
+                // refuse to write, which would strand the profile in
+                // settings.json with its API key already gone from the OS store.
+                let idx = self.selected_profile;
+                let remaining = self
+                    .profiles
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != idx)
+                    .map(|(_, p)| p);
+                match validate_all_profile_fields(remaining) {
+                    Err(msg) => self.set_profile_error(msg),
+                    Ok(()) => {
+                        delete_secret(&self.profiles[idx].key_env);
+                        self.profiles.remove(idx);
+                        self.selected_profile = idx.min(self.profiles.len().saturating_sub(1));
+                        self.save_profiles();
+                    }
+                }
             }
         });
         let mut show_api_key = self.show_api_key;
@@ -1153,17 +1170,33 @@ impl LauncherApp {
     }
 
     /// Show a profile-validation message and remember that it is ours.
+    ///
+    /// Every other write to `validation_error` must go through
+    /// [`LauncherApp::set_other_error`] or [`LauncherApp::clear_error`], which
+    /// drop the flag. Setting the text directly would leave the flag standing
+    /// over someone else's message, and the next successful save would erase it.
     fn set_profile_error(&mut self, msg: String) {
         self.validation_error = msg;
         self.profile_error_shown = true;
+    }
+
+    /// Show a message that did not come from profile validation.
+    fn set_other_error(&mut self, msg: String) {
+        self.validation_error = msg;
+        self.profile_error_shown = false;
+    }
+
+    /// Clear the slot whoever wrote it.
+    fn clear_error(&mut self) {
+        self.validation_error.clear();
+        self.profile_error_shown = false;
     }
 
     /// Drop a previously shown profile-validation message, leaving any other
     /// warning (an unmatched SSH target, for one) on screen.
     fn clear_profile_error(&mut self) {
         if self.profile_error_shown {
-            self.validation_error.clear();
-            self.profile_error_shown = false;
+            self.clear_error();
         }
     }
 
@@ -1204,8 +1237,7 @@ impl LauncherApp {
     /// harness with it — and, worse, exit `0`, so a lost check would look like
     /// a passing run.
     fn validate_launch(&mut self) -> bool {
-        self.validation_error.clear();
-        self.profile_error_shown = false;
+        self.clear_error();
         // Field checks cover every profile, not just the selected one: a launch
         // writes the whole list to settings.json and pending_launch.json, so an
         // unnoticed typo elsewhere would be normalised away (#385).
@@ -1214,26 +1246,32 @@ impl LauncherApp {
             return false;
         }
         let Some(p) = self.profiles.get(self.selected_profile) else {
-            self.validation_error = "No profile selected".to_string();
+            self.set_other_error("No profile selected".to_string());
             return false;
         };
         // Validate unique names and non-empty name.
         if p.name.trim().is_empty() {
-            self.validation_error = "Profile name must not be empty.".to_string();
+            self.set_other_error("Profile name must not be empty.".to_string());
             return false;
         }
         if p.key_env.trim().is_empty() && p.api_base_url.trim().is_empty() {
-            self.validation_error =
+            self.set_other_error(
                 "Keyless (local) profile needs an API URL (e.g. http://localhost:11434/v1)."
-                    .to_string();
+                    .to_string(),
+            );
             return false;
         }
-        for (i, other) in self.profiles.iter().enumerate() {
-            if i != self.selected_profile && other.name == p.name {
-                self.validation_error =
-                    format!("Duplicate profile name: \"{}\". Names must be unique.", p.name);
-                return false;
-            }
+        let duplicate = self
+            .profiles
+            .iter()
+            .enumerate()
+            .any(|(i, other)| i != self.selected_profile && other.name == p.name);
+        if duplicate {
+            let name = p.name.clone();
+            self.set_other_error(format!(
+                "Duplicate profile name: \"{name}\". Names must be unique."
+            ));
+            return false;
         }
         true
     }
@@ -1824,6 +1862,11 @@ mod tests {
                 "{field}: launch must report the field, got {:?}",
                 app.validation_error
             );
+            assert!(
+                app.validation_error.contains("other"),
+                "{field}: launch must name the offending profile, got {:?}",
+                app.validation_error
+            );
         }
     }
 
@@ -1856,8 +1899,7 @@ mod tests {
         // from session selection. Clearing a profile error must not take that
         // with it.
         let mut app = app_with_profiles(vec![edited_profile()]);
-        app.validation_error = "No SSH profile matches 'root@10.0.0.9'.".into();
-        app.profile_error_shown = false;
+        app.set_other_error("No SSH profile matches 'root@10.0.0.9'.".into());
 
         app.clear_profile_error();
 
@@ -1869,6 +1911,60 @@ mod tests {
         app.set_profile_error("Profile \"x\": Invalid top_p: '9'.".into());
         app.clear_profile_error();
         assert!(app.validation_error.is_empty(), "our own error must clear");
+    }
+
+    #[test]
+    fn a_warning_arriving_after_a_profile_error_survives_the_next_save() {
+        // The first version of the test above only covered a slot that was
+        // never ours. The reachable case is the other order: a profile error is
+        // shown, the user then clicks a session whose SSH target does not
+        // match, and that warning overwrites the text. If the flag stayed set,
+        // the next successful save would wipe the warning (review of #389).
+        let mut app = app_with_profiles(vec![edited_profile()]);
+        app.set_profile_error("Profile \"x\": Invalid top_p: '9'.".into());
+
+        app.set_other_error("No SSH profile matches 'root@10.0.0.9'.".into());
+        app.clear_profile_error();
+
+        assert_eq!(
+            app.validation_error, "No SSH profile matches 'root@10.0.0.9'.",
+            "the warning that replaced our error is not ours to clear"
+        );
+    }
+
+    #[test]
+    fn deleting_a_profile_is_refused_before_the_credential_is_dropped() {
+        // `delete_secret` cannot be undone and `save_profiles` can now refuse,
+        // so the list has to be checked *without* the doomed profile before
+        // anything is removed — otherwise settings.json keeps a profile whose
+        // API key is already gone from the OS store (review of #389).
+        let doomed = LlmProfileData { name: "doomed".into(), ..edited_profile() };
+        let broken = LlmProfileData {
+            name: "broken".into(),
+            max_tokens: "abc".into(),
+            ..edited_profile()
+        };
+        let profiles = vec![doomed, broken];
+
+        // What the delete handler checks: everything except the selected entry.
+        let remaining = profiles.iter().enumerate().filter(|(i, _)| *i != 0).map(|(_, p)| p);
+        let verdict = validate_all_profile_fields(remaining);
+
+        assert!(
+            verdict.is_err(),
+            "an invalid profile elsewhere must block the delete before delete_secret runs"
+        );
+        assert!(verdict.unwrap_err().contains("broken"));
+    }
+
+    #[test]
+    fn deleting_a_profile_is_allowed_when_the_rest_are_valid() {
+        let profiles = vec![
+            LlmProfileData { name: "doomed".into(), ..edited_profile() },
+            LlmProfileData { name: "fine".into(), ..edited_profile() },
+        ];
+        let remaining = profiles.iter().enumerate().filter(|(i, _)| *i != 0).map(|(_, p)| p);
+        assert!(validate_all_profile_fields(remaining).is_ok());
     }
 
     #[test]

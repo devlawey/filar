@@ -5813,6 +5813,31 @@ to `settings.json` or `pending_launch.json` formats.
 selected profile at launch. Unlike the numeric fields they survive a save
 intact, so it is a UX gap rather than data loss — separate issue if wanted.
 
+**Review round (PR #389):** four comments, all fair, two of them real holes in
+the work above.
+
+The `profile_error_shown` flag was only half a solution. It was set in
+`set_profile_error` and cleared at the start of `validate_launch`, but nothing
+cleared it when the slot was overwritten by a *different* message — and
+`on_session_selected` does exactly that with the "No SSH profile matches"
+warning. Profile error shown, then a session clicked, then a successful save:
+the flag was still standing and the warning was wiped. The test written to
+prevent this only covered a slot that had never been ours, which is the case
+that cannot fail. Every write now goes through `set_profile_error`,
+`set_other_error` or `clear_error`, the last two dropping the flag, and the
+replacement test walks the reachable order.
+
+The second was a regression this branch introduced. The "X" delete handler
+called `delete_secret`, removed the profile from memory and only then called
+`save_profiles` — which can now refuse. The credential is gone from the OS
+store for good while `settings.json` still lists the profile, so it returns on
+restart without its API key. The handler now validates the list *without* the
+doomed profile first and touches nothing on failure. `validate_all_profile_fields`
+takes an iterator rather than a slice so the check needs no clone.
+
+Also added the missing profile-name assertion to the launch test, which the PR
+text had claimed was there.
+
 ## Issue #386: fix(core/tests) — two tests raced over the `FILAR_CONFIG` env var
 
 **Milestone:** 1.0.6. **Branch:** `fix/386-filar-config-test-race`.
