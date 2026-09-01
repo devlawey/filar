@@ -5752,6 +5752,92 @@ was left out: `Ctrl+R` is reverse-i-search in a shell and would collide in
 interactive mode, so the key choice needs a decision of its own. Translating
 SGR into ratatui styles instead of discarding colour is a possible follow-up.
 
+## Issue #385: fix(gui) — validation only ever looked at the selected profile
+
+**Milestone:** 1.0.6. **Branch:** `fix/385-validate-all-profiles`.
+
+**Problem:** `do_launch` validated the selected profile, while `save_profiles`
+and the launch persistence path converted the *whole* list through
+`LlmProfileData::to_profile`, which falls back on unparseable input. A typo left
+in another profile was therefore rewritten as a default with no error on the
+next save — and clicking "+" saves. Predates #380 for `temperature` and
+`compact_at_tokens`; #380 added `max_tokens` and `top_p` to the same scheme.
+
+**Design:** took the first option in the issue — validate the whole list before
+every write — and not the fallible-`to_profile` one. Two shared functions:
+`validate_profile_fields` holds the per-field checks lifted verbatim out of
+`do_launch`, and `validate_all_profile_fields` runs them over the list and
+prefixes the message with the profile name. `save_profiles` refuses to write
+when it fails; `do_launch` runs the same check before its own name and
+keyless-URL checks, which stay selected-profile-only because names are not
+silently normalised.
+
+The concern about having nowhere to show the message turned out not to exist:
+`validation_error` renders in the fixed bottom panel, visible from every tab, so
+an error raised by "+" in Models is already on screen. That is what made the
+first option sufficient — the second option's cost was mostly this same UI
+question.
+
+`extra_body` is validated by the shared function too. It is in the same class
+(`serde_json::from_str(...).ok()` in `to_profile`) and was already checked for
+the selected profile, so leaving it out of the loop would have been arbitrary.
+
+**Refusing rather than preserving:** the DoD allows either. Preserving is not
+actually reachable — `settings.json` holds typed fields and `max_tokens = "abc"`
+has no representation there, so the only alternatives are a silent default and a
+refusal. Recorded in the `save_profiles` doc comment.
+
+`validation_error` is one slot shared with the "No SSH profile matches" warning
+from session selection, so a `profile_error_shown` flag now marks who wrote it;
+a successful save clears only its own message.
+
+**Testing note worth keeping:** the first version of the launch test called
+`do_launch` directly. With the guard reverted it did not fail — the call ran on
+to `std::process::exit(0)`, killing the test binary mid-run with a success code,
+and cargo reported the run as passing. A test that silently passes when the bug
+returns is worse than none, so the checks moved into `validate_launch`, which
+returns `bool` and is what the test calls. Both new tests were confirmed to fail
+when their guard is removed.
+
+**Done:** 5 tests added (40 pass in `filar-gui`, up from 35): save refused for
+each of the four fields in an *unselected* profile with the profile and field
+named, the same for launch, a valid-and-empty list accepted on both paths, and
+the unrelated-warning case. Tests only ever exercise the rejection path, which
+returns before `Settings::save` — the success path writes to the real OS data
+directory.
+
+**Public contract:** none. `CommandExecutor` / `LlmClient` untouched; no change
+to `settings.json` or `pending_launch.json` formats.
+
+**Next steps:** duplicate and empty profile names are still checked only for the
+selected profile at launch. Unlike the numeric fields they survive a save
+intact, so it is a UX gap rather than data loss — separate issue if wanted.
+
+**Review round (PR #389):** four comments, all fair, two of them real holes in
+the work above.
+
+The `profile_error_shown` flag was only half a solution. It was set in
+`set_profile_error` and cleared at the start of `validate_launch`, but nothing
+cleared it when the slot was overwritten by a *different* message — and
+`on_session_selected` does exactly that with the "No SSH profile matches"
+warning. Profile error shown, then a session clicked, then a successful save:
+the flag was still standing and the warning was wiped. The test written to
+prevent this only covered a slot that had never been ours, which is the case
+that cannot fail. Every write now goes through `set_profile_error`,
+`set_other_error` or `clear_error`, the last two dropping the flag, and the
+replacement test walks the reachable order.
+
+The second was a regression this branch introduced. The "X" delete handler
+called `delete_secret`, removed the profile from memory and only then called
+`save_profiles` — which can now refuse. The credential is gone from the OS
+store for good while `settings.json` still lists the profile, so it returns on
+restart without its API key. The handler now validates the list *without* the
+doomed profile first and touches nothing on failure. `validate_all_profile_fields`
+takes an iterator rather than a slice so the check needs no clone.
+
+Also added the missing profile-name assertion to the launch test, which the PR
+text had claimed was there.
+
 ## Issue #386: fix(core/tests) — two tests raced over the `FILAR_CONFIG` env var
 
 **Milestone:** 1.0.6. **Branch:** `fix/386-filar-config-test-race`.

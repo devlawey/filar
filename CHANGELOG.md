@@ -29,6 +29,19 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- Deleting a launcher profile no longer removes its stored API key when the
+  deletion cannot be saved. The remaining profiles are checked first, so a
+  malformed field elsewhere blocks the delete instead of leaving a profile in
+  `settings.json` whose credential is already gone
+  ([#385](https://github.com/devlawey/filar/issues/385)).
+
+- The GUI launcher no longer rewrites a malformed field as a default when the
+  profile it sits in is not the selected one. `temperature`, `max_tokens`,
+  `top_p` and `compact_at_tokens` are now checked across every profile before
+  anything is written, on save and on Launch alike, and the message names the
+  offending profile and field
+  ([#385](https://github.com/devlawey/filar/issues/385)).
+
 - The GUI launcher no longer resets a profile's `max_tokens` to 4096 and drops
   its `top_p` on every save. Both are now editable in the Models tab, validated
   before Launch, and carried through `settings.json` and `pending_launch.json`;

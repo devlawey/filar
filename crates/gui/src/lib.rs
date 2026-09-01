@@ -156,6 +156,68 @@ fn parse_max_tokens(raw: &str) -> u32 {
     }
 }
 
+/// Validate the numeric and JSON fields of one profile as typed.
+///
+/// Returns the message to show, or `Ok(())` when every field either parses or
+/// is empty (empty means "use the default" for each of them).
+///
+/// These are exactly the fields [`LlmProfileData::to_profile`] converts with a
+/// fallback: an unparseable value there becomes `None` or a built-in default
+/// with no error, which is how a typo in one profile used to be swallowed on
+/// save (#385). Keep the two in step — a field that gains a fallback in
+/// `to_profile` needs a check here, or it will silently reset again.
+fn validate_profile_fields(p: &LlmProfileData) -> Result<(), String> {
+    if !p.temperature.trim().is_empty()
+        && !matches!(p.temperature.trim().parse::<f32>(), Ok(t) if t.is_finite() && (0.0..=2.0).contains(&t))
+    {
+        return Err(format!(
+            "Invalid temperature: '{}'. Expected [0.0, 2.0].",
+            p.temperature
+        ));
+    }
+    if !p.max_tokens.trim().is_empty()
+        && !matches!(p.max_tokens.trim().parse::<u32>(), Ok(n) if n > 0)
+    {
+        return Err(format!(
+            "Invalid max tokens: '{}'. Expected a whole number above 0.",
+            p.max_tokens
+        ));
+    }
+    if !p.top_p.trim().is_empty()
+        && !matches!(p.top_p.trim().parse::<f32>(), Ok(t) if t.is_finite() && t > 0.0 && t <= 1.0)
+    {
+        return Err(format!("Invalid top_p: '{}'. Expected (0.0, 1.0].", p.top_p));
+    }
+    if !p.compact_at_tokens.trim().is_empty() && p.compact_at_tokens.trim().parse::<u64>().is_err() {
+        return Err(format!(
+            "Invalid compaction threshold: '{}'. Expected a whole number of tokens (0 = off).",
+            p.compact_at_tokens
+        ));
+    }
+    if !p.extra_body.trim().is_empty()
+        && serde_json::from_str::<serde_json::Value>(&p.extra_body).is_err()
+    {
+        return Err("Invalid extra body JSON.".to_string());
+    }
+    Ok(())
+}
+
+/// Validate every profile, not just the selected one, naming the offender.
+///
+/// Every persistence path converts the whole list through
+/// [`LlmProfileData::to_profile`], so checking only the selected profile left
+/// the others free to be rewritten with defaults (#385).
+fn validate_all_profile_fields<'a>(
+    profiles: impl IntoIterator<Item = &'a LlmProfileData>,
+) -> Result<(), String> {
+    for p in profiles {
+        if let Err(msg) = validate_profile_fields(p) {
+            return Err(format!("Profile \"{}\": {msg}", p.name));
+        }
+    }
+    Ok(())
+}
+
 /// Generate a unique profile name with the given prefix.
 /// Finds the first free number (profile-1, profile-2, ...) not already in use.
 fn unique_profile_name(existing: &[LlmProfileData], prefix: &str) -> String {
@@ -576,6 +638,12 @@ struct LauncherApp {
     /// Currently selected profile index.
     selected_profile: usize,
     validation_error: String,
+    /// Whether `validation_error` currently holds a profile-field message.
+    ///
+    /// The slot is shared with the session/SSH-target warning, so a successful
+    /// save clears only what profile validation itself put there instead of
+    /// wiping an unrelated warning.
+    profile_error_shown: bool,
     /// Directory for Ctrl+S session exports (`None` = CWD).
     save_dir: Option<std::path::PathBuf>,
     /// Reveal SSH password field (not persisted).
@@ -796,18 +864,18 @@ impl LauncherApp {
                     s.host == host && slot_port == Some(port)
                 }) {
                     self.target_mode = slot_idx + 1;
-                    self.validation_error.clear();
+                    self.clear_error();
                 } else {
                     self.target_mode = 0;
-                    self.validation_error = format!(
+                    self.set_other_error(format!(
                         "No SSH profile matches '{}'. Select a target manually.",
                         meta.ssh_info.as_deref().unwrap_or_default()
-                    );
+                    ));
                 }
             }
             None => {
                 self.target_mode = 0;
-                self.validation_error.clear();
+                self.clear_error();
             }
         }
     }
@@ -924,11 +992,26 @@ impl LauncherApp {
                 self.save_profiles();
             }
             if self.profiles.len() > 1 && ui.button("X").on_hover_text("Delete profile").clicked() {
-                let removed = &self.profiles[self.selected_profile];
-                delete_secret(&removed.key_env);
-                self.profiles.remove(self.selected_profile);
-                self.selected_profile = self.selected_profile.min(self.profiles.len().saturating_sub(1));
-                self.save_profiles();
+                // Validate what the list *would* be before touching anything.
+                // `delete_secret` is irreversible and `save_profiles` may now
+                // refuse to write, which would strand the profile in
+                // settings.json with its API key already gone from the OS store.
+                let idx = self.selected_profile;
+                let remaining = self
+                    .profiles
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != idx)
+                    .map(|(_, p)| p);
+                match validate_all_profile_fields(remaining) {
+                    Err(msg) => self.set_profile_error(msg),
+                    Ok(()) => {
+                        delete_secret(&self.profiles[idx].key_env);
+                        self.profiles.remove(idx);
+                        self.selected_profile = idx.min(self.profiles.len().saturating_sub(1));
+                        self.save_profiles();
+                    }
+                }
             }
         });
         let mut show_api_key = self.show_api_key;
@@ -1086,7 +1169,51 @@ impl LauncherApp {
         });
     }
 
+    /// Show a profile-validation message and remember that it is ours.
+    ///
+    /// Every other write to `validation_error` must go through
+    /// [`LauncherApp::set_other_error`] or [`LauncherApp::clear_error`], which
+    /// drop the flag. Setting the text directly would leave the flag standing
+    /// over someone else's message, and the next successful save would erase it.
+    fn set_profile_error(&mut self, msg: String) {
+        self.validation_error = msg;
+        self.profile_error_shown = true;
+    }
+
+    /// Show a message that did not come from profile validation.
+    fn set_other_error(&mut self, msg: String) {
+        self.validation_error = msg;
+        self.profile_error_shown = false;
+    }
+
+    /// Clear the slot whoever wrote it.
+    fn clear_error(&mut self) {
+        self.validation_error.clear();
+        self.profile_error_shown = false;
+    }
+
+    /// Drop a previously shown profile-validation message, leaving any other
+    /// warning (an unmatched SSH target, for one) on screen.
+    fn clear_profile_error(&mut self) {
+        if self.profile_error_shown {
+            self.clear_error();
+        }
+    }
+
+    /// Persist settings, refusing to write when any profile has a malformed
+    /// field.
+    ///
+    /// The whole list goes through [`LlmProfileData::to_profile`] below, which
+    /// converts with fallbacks, so *keeping* an invalid value is not an option:
+    /// `settings.json` holds typed fields and `max_tokens = "abc"` has no
+    /// representation there. The choice is between rewriting it as a default
+    /// silently and refusing with a message; this refuses (#385).
     fn save_profiles(&mut self) {
+        if let Err(msg) = validate_all_profile_fields(&self.profiles) {
+            self.set_profile_error(msg);
+            return;
+        }
+        self.clear_profile_error();
         let p = self.profiles.get(self.selected_profile);
         Settings {
             model: p.map_or_else(String::new, |x| x.model.clone()),
@@ -1102,68 +1229,60 @@ impl LauncherApp {
         }.save();
     }
 
-    fn do_launch(&mut self) {
-        self.validation_error.clear();
+    /// Check everything that must hold before a launch, reporting the first
+    /// problem through `validation_error`.
+    ///
+    /// Split out of [`LauncherApp::do_launch`] so it can be tested: the rest of
+    /// `do_launch` ends in `std::process::exit`, which would take the test
+    /// harness with it — and, worse, exit `0`, so a lost check would look like
+    /// a passing run.
+    fn validate_launch(&mut self) -> bool {
+        self.clear_error();
+        // Field checks cover every profile, not just the selected one: a launch
+        // writes the whole list to settings.json and pending_launch.json, so an
+        // unnoticed typo elsewhere would be normalised away (#385).
+        if let Err(msg) = validate_all_profile_fields(&self.profiles) {
+            self.set_profile_error(msg);
+            return false;
+        }
         let Some(p) = self.profiles.get(self.selected_profile) else {
-            self.validation_error = "No profile selected".to_string();
-            return;
+            self.set_other_error("No profile selected".to_string());
+            return false;
         };
         // Validate unique names and non-empty name.
         if p.name.trim().is_empty() {
-            self.validation_error = "Profile name must not be empty.".to_string();
-            return;
+            self.set_other_error("Profile name must not be empty.".to_string());
+            return false;
         }
         if p.key_env.trim().is_empty() && p.api_base_url.trim().is_empty() {
-            self.validation_error =
+            self.set_other_error(
                 "Keyless (local) profile needs an API URL (e.g. http://localhost:11434/v1)."
-                    .to_string();
+                    .to_string(),
+            );
+            return false;
+        }
+        let duplicate = self
+            .profiles
+            .iter()
+            .enumerate()
+            .any(|(i, other)| i != self.selected_profile && other.name == p.name);
+        if duplicate {
+            let name = p.name.clone();
+            self.set_other_error(format!(
+                "Duplicate profile name: \"{name}\". Names must be unique."
+            ));
+            return false;
+        }
+        true
+    }
+
+    fn do_launch(&mut self) {
+        if !self.validate_launch() {
             return;
         }
-        for (i, other) in self.profiles.iter().enumerate() {
-            if i != self.selected_profile && other.name == p.name {
-                self.validation_error = format!("Duplicate profile name: \"{}\". Names must be unique.", p.name);
-                return;
-            }
-        }
-        if !p.temperature.trim().is_empty()
-            && !matches!(p.temperature.trim().parse::<f32>(), Ok(t) if t.is_finite() && (0.0..=2.0).contains(&t))
-        {
-            self.validation_error = format!("Invalid temperature: '{}'. Expected [0.0, 2.0].", p.temperature);
-        }
-        if self.validation_error.is_empty()
-            && !p.max_tokens.trim().is_empty()
-            && !matches!(p.max_tokens.trim().parse::<u32>(), Ok(n) if n > 0)
-        {
-            self.validation_error = format!(
-                "Invalid max tokens: '{}'. Expected a whole number above 0.",
-                p.max_tokens
-            );
-        }
-        if self.validation_error.is_empty()
-            && !p.top_p.trim().is_empty()
-            && !matches!(p.top_p.trim().parse::<f32>(), Ok(t) if t.is_finite() && t > 0.0 && t <= 1.0)
-        {
-            self.validation_error =
-                format!("Invalid top_p: '{}'. Expected (0.0, 1.0].", p.top_p);
-        }
-        if self.validation_error.is_empty()
-            && !p.compact_at_tokens.trim().is_empty()
-            && p.compact_at_tokens.trim().parse::<u64>().is_err()
-        {
-            self.validation_error = format!(
-                "Invalid compaction threshold: '{}'. Expected a whole number of tokens (0 = off).",
-                p.compact_at_tokens
-            );
-        }
-        if self.validation_error.is_empty()
-            && !p.extra_body.trim().is_empty()
-            && serde_json::from_str::<serde_json::Value>(&p.extra_body).is_err()
-        {
-            self.validation_error = "Invalid extra body JSON.".to_string();
-        }
-        if !self.validation_error.is_empty() {
+        let Some(p) = self.profiles.get(self.selected_profile) else {
             return;
-        }
+        };
         let target = if self.target_mode == 0 { "local" } else { "ssh" };
         let ssh = if self.target_mode > 0 {
             let slot = &self.ssh_slots[self.target_mode - 1];
@@ -1351,6 +1470,7 @@ pub fn run_launcher(config: &Config) {
         profiles,
         selected_profile,
         validation_error: String::new(),
+        profile_error_shown: false,
         save_dir: settings.save_dir.clone(),
         show_ssh_password: false,
         show_api_key: false,
@@ -1664,6 +1784,189 @@ mod tests {
         assert_eq!(parse_compact_at_tokens(" 65536 "), 65_536);
     }
 
+    /// Build a launcher holding `profiles`, with the first one selected.
+    fn app_with_profiles(profiles: Vec<LlmProfileData>) -> LauncherApp {
+        let mut app = make_app(make_meta(None, None, None, None));
+        app.profiles = profiles;
+        app.selected_profile = 0;
+        app
+    }
+
+    /// The four fields `to_profile` converts with a fallback, each with a value
+    /// that fails to parse and the wording the message must carry.
+    fn invalid_field_cases() -> Vec<(&'static str, LlmProfileData, &'static str)> {
+        vec![
+            (
+                "temperature",
+                LlmProfileData { name: "other".into(), temperature: "5".into(), ..edited_profile() },
+                "Invalid temperature",
+            ),
+            (
+                "max_tokens",
+                LlmProfileData { name: "other".into(), max_tokens: "abc".into(), ..edited_profile() },
+                "Invalid max tokens",
+            ),
+            (
+                "top_p",
+                LlmProfileData { name: "other".into(), top_p: "2.5".into(), ..edited_profile() },
+                "Invalid top_p",
+            ),
+            (
+                "compact_at_tokens",
+                LlmProfileData { name: "other".into(), compact_at_tokens: "-1".into(), ..edited_profile() },
+                "Invalid compaction threshold",
+            ),
+        ]
+    }
+
+    #[test]
+    fn save_is_blocked_by_an_invalid_field_in_an_unselected_profile() {
+        // The regression from #385: validation looked at the selected profile
+        // only, so a typo left in another one was rewritten as a default by the
+        // next save — adding a profile with "+" was enough to trigger it.
+        for (field, bad, expected) in invalid_field_cases() {
+            let selected = LlmProfileData { name: "selected".into(), ..edited_profile() };
+            let mut app = app_with_profiles(vec![selected, bad]);
+
+            app.save_profiles();
+
+            assert!(
+                app.validation_error.contains(expected),
+                "{field}: message must name the field, got {:?}",
+                app.validation_error
+            );
+            assert!(
+                app.validation_error.contains("other"),
+                "{field}: message must name the offending profile, got {:?}",
+                app.validation_error
+            );
+            assert!(
+                app.profile_error_shown,
+                "{field}: the error must be marked as ours so a later save can clear it"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_is_blocked_by_an_invalid_field_in_an_unselected_profile() {
+        // Launch writes every profile to settings.json and pending_launch.json
+        // too, so it needs the same check. `validate_launch` is the part of
+        // `do_launch` that can be called here — the rest exits the process.
+        for (field, bad, expected) in invalid_field_cases() {
+            let selected = LlmProfileData { name: "selected".into(), ..edited_profile() };
+            let mut app = app_with_profiles(vec![selected, bad]);
+
+            assert!(!app.validate_launch(), "{field}: launch must be refused");
+            assert!(
+                app.validation_error.contains(expected),
+                "{field}: launch must report the field, got {:?}",
+                app.validation_error
+            );
+            assert!(
+                app.validation_error.contains("other"),
+                "{field}: launch must name the offending profile, got {:?}",
+                app.validation_error
+            );
+        }
+    }
+
+    #[test]
+    fn launch_accepts_a_list_where_every_profile_is_valid() {
+        let mut app = app_with_profiles(vec![
+            LlmProfileData { name: "one".into(), ..edited_profile() },
+            LlmProfileData { name: "two".into(), temperature: String::new(), ..edited_profile() },
+        ]);
+        assert!(app.validate_launch(), "got {:?}", app.validation_error);
+    }
+
+    #[test]
+    fn valid_and_empty_fields_pass_validation() {
+        let empty = LlmProfileData {
+            name: "blank".into(),
+            temperature: String::new(),
+            max_tokens: String::new(),
+            top_p: String::new(),
+            compact_at_tokens: String::new(),
+            extra_body: String::new(),
+            ..edited_profile()
+        };
+        assert!(validate_all_profile_fields(&[edited_profile(), empty]).is_ok());
+    }
+
+    #[test]
+    fn a_successful_save_leaves_an_unrelated_warning_alone() {
+        // `validation_error` is one slot shared with the SSH-target warning
+        // from session selection. Clearing a profile error must not take that
+        // with it.
+        let mut app = app_with_profiles(vec![edited_profile()]);
+        app.set_other_error("No SSH profile matches 'root@10.0.0.9'.".into());
+
+        app.clear_profile_error();
+
+        assert_eq!(
+            app.validation_error, "No SSH profile matches 'root@10.0.0.9'.",
+            "an SSH warning is not ours to clear"
+        );
+
+        app.set_profile_error("Profile \"x\": Invalid top_p: '9'.".into());
+        app.clear_profile_error();
+        assert!(app.validation_error.is_empty(), "our own error must clear");
+    }
+
+    #[test]
+    fn a_warning_arriving_after_a_profile_error_survives_the_next_save() {
+        // The first version of the test above only covered a slot that was
+        // never ours. The reachable case is the other order: a profile error is
+        // shown, the user then clicks a session whose SSH target does not
+        // match, and that warning overwrites the text. If the flag stayed set,
+        // the next successful save would wipe the warning (review of #389).
+        let mut app = app_with_profiles(vec![edited_profile()]);
+        app.set_profile_error("Profile \"x\": Invalid top_p: '9'.".into());
+
+        app.set_other_error("No SSH profile matches 'root@10.0.0.9'.".into());
+        app.clear_profile_error();
+
+        assert_eq!(
+            app.validation_error, "No SSH profile matches 'root@10.0.0.9'.",
+            "the warning that replaced our error is not ours to clear"
+        );
+    }
+
+    #[test]
+    fn deleting_a_profile_is_refused_before_the_credential_is_dropped() {
+        // `delete_secret` cannot be undone and `save_profiles` can now refuse,
+        // so the list has to be checked *without* the doomed profile before
+        // anything is removed — otherwise settings.json keeps a profile whose
+        // API key is already gone from the OS store (review of #389).
+        let doomed = LlmProfileData { name: "doomed".into(), ..edited_profile() };
+        let broken = LlmProfileData {
+            name: "broken".into(),
+            max_tokens: "abc".into(),
+            ..edited_profile()
+        };
+        let profiles = vec![doomed, broken];
+
+        // What the delete handler checks: everything except the selected entry.
+        let remaining = profiles.iter().enumerate().filter(|(i, _)| *i != 0).map(|(_, p)| p);
+        let verdict = validate_all_profile_fields(remaining);
+
+        assert!(
+            verdict.is_err(),
+            "an invalid profile elsewhere must block the delete before delete_secret runs"
+        );
+        assert!(verdict.unwrap_err().contains("broken"));
+    }
+
+    #[test]
+    fn deleting_a_profile_is_allowed_when_the_rest_are_valid() {
+        let profiles = vec![
+            LlmProfileData { name: "doomed".into(), ..edited_profile() },
+            LlmProfileData { name: "fine".into(), ..edited_profile() },
+        ];
+        let remaining = profiles.iter().enumerate().filter(|(i, _)| *i != 0).map(|(_, p)| p);
+        assert!(validate_all_profile_fields(remaining).is_ok());
+    }
+
     #[test]
     fn launch_config_round_trips_arbiter_profile() {        let cfg = LaunchConfig {
             target: "local".into(),
@@ -1905,6 +2208,7 @@ mod tests {
             }],
             selected_profile: 0,
             validation_error: String::new(),
+            profile_error_shown: false,
             save_dir: None,
             show_ssh_password: false,
             show_api_key: false,
