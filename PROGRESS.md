@@ -5752,6 +5752,54 @@ was left out: `Ctrl+R` is reverse-i-search in a shell and would collide in
 interactive mode, so the key choice needs a decision of its own. Translating
 SGR into ratatui styles instead of discarding colour is a possible follow-up.
 
+## Issue #386: fix(core/tests) — two tests raced over the `FILAR_CONFIG` env var
+
+**Milestone:** 1.0.6. **Branch:** `fix/386-filar-config-test-race`.
+
+**Problem:** `load_default_prefers_filar_config_env` and
+`load_default_cwd_wins_over_app_data` both set `FILAR_CONFIG`. `cargo test` runs
+tests as threads of a single process and environment variables are per-process,
+so the two were mutually incompatible no matter what their `EnvGuard`s did: one
+could overwrite the other's path, or drop the variable before the other reached
+`load_default`, after which the lookup fell through the rest of the chain and the
+model assertion failed. Seen on CI for PR #382 — red on `windows-x86_64`, green
+on `macos-aarch64`, green again on a bare re-run.
+
+**Design:** merged the two into one test rather than putting a shared mutex
+around them (the second option in the issue, and the honest one). The second test
+did not test what its name claimed: its own comment conceded that CWD priority
+was out of reach because `default_base_dir` is OS-dependent, so it set
+`FILAR_CONFIG` to a temp path and asserted the model — the same assertion as the
+first test with a different string. Merging removes the race by construction:
+one test, one writer, nothing to serialise.
+
+Testing CWD priority for real was left alone deliberately. It needs
+`set_current_dir`, which is process-global in exactly the same way, so it would
+reintroduce this class of race rather than close it.
+
+**Done:** one test kept, carrying a doc comment that records why it must stay the
+only reader or writer of `FILAR_CONFIG` in the crate and that a second one needs
+a shared lock. Duplicate `EnvGuard`/`DirGuard` definitions inside the removed
+test body dropped in favour of the module-level ones. Audited the crate per the
+DoD: `FILAR_CONFIG` now appears only in `Config::load_default` and this test, and
+`load_default` has no other test caller. The `secrets.rs` tests touch env vars
+too, but private `FILAR_SECRET_TEST_*` names, one writer each.
+
+**Verification:** `cargo test -p filar-core` run 20× at default parallelism plus
+5× each at `--test-threads=1` and `--test-threads=16`, all green. The failure
+itself did not reproduce here in 30 pre-fix runs, which matches the issue: the
+window is narrow and it had only ever been seen on Windows.
+
+**Public contract:** none. Test-only change; no `CHANGELOG.md` entry, per the
+internal-changes rule in `AGENTS.md`.
+
+**Next steps:** an unrelated order-dependent test surfaced in the same run —
+`session::tests::default_base_dir_returns_os_data_parent_without_creating_filar`
+asserts that `dirs::data_dir()` already exists, which on a fresh Linux profile is
+only true after a sibling test has created `~/.local/share` via
+`SessionStore::new`. Invisible on Windows and macOS, where the directory always
+exists. Left out of this PR — different cause, needs its own issue.
+
 ## Release v1.0.5 (2026-08-27)
 
 **Scope:** milestone 1.0.5 — regression fixes for 1.0.4: Unicode export topic slug
