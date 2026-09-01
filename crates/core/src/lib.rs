@@ -13,7 +13,10 @@ pub mod secrets;
 pub mod session;
 
 pub use chat::ChatBlock;
-pub use compaction::{compaction_boundary, should_compact, DEFAULT_KEEP_TURNS};
+pub use compaction::{
+    compact_history, compaction_boundary, should_compact, transcript_for_summary,
+    DEFAULT_KEEP_TURNS,
+};
 pub use config::{
     Config, SshTarget, SshAuth, LlmConfig, LlmProfile, CommandConfirmMode, TimeoutConfig,
     HostKeyPolicy, DEFAULT_COMMAND_TIMEOUT_SECS, DEFAULT_COMPACT_AT_TOKENS,

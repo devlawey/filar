@@ -63,6 +63,17 @@ pub enum TuiEvent {
         /// The target the user wants to connect to.
         target: filar_core::SshTarget,
     },
+
+    /// The history was compacted: the head up to `boundary` is replaced by
+    /// `summary`, or left untouched when `summary` is an `Err` (#377).
+    ///
+    /// `boundary` is echoed back from the request so the app cannot cut a
+    /// history that changed while the summary was being produced.
+    HistoryCompacted {
+        session_id: SessionId,
+        boundary: usize,
+        summary: std::result::Result<String, String>,
+    },
 }
 
 #[cfg(test)]

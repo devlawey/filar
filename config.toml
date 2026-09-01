@@ -20,8 +20,9 @@ max_tokens = 4096
 # key_env = "GLM_API_KEY"
 # max_tokens = 4096
 # # Prompt tokens at which the context is considered full. Set it below the
-# # model's context window. Currently this only logs and shows a notice in the
-# # session feed — history compaction is not implemented yet. 0 turns it off.
+# # model's context window. Reaching it folds the earlier part of the history
+# # into a summary and keeps the last turns verbatim. 0 disables automatic
+# # compaction; Ctrl+K still compacts on request.
 # compact_at_tokens = 200000
 
 [timeouts]

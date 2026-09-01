@@ -21,6 +21,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   the feed, and the summarisation itself follows in a later change
   ([#376](https://github.com/devlawey/filar/issues/376)).
 
+- The TUI now compacts a long history instead of only warning about it: the head
+  is folded into a single summary and the last turns are kept verbatim. The feed
+  shows a line before and after, and the summary stays there as a collapsed block
+  you can expand. `Ctrl+K` compacts on request, regardless of the threshold
+  ([#377](https://github.com/devlawey/filar/issues/377)).
+
 ### Fixed
 
 - The GUI launcher no longer resets a profile's `max_tokens` to 4096 and drops

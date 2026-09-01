@@ -441,6 +441,10 @@ pub struct Session {
     /// Whether the "context is full" notice has already been shown for the
     /// current crossing of the threshold (reset when it drops back below).
     pub context_full_notice_shown: bool,
+    /// Set when the history should be compacted before the next request, to
+    /// the boundary index the head ends at. The runner performs the summary
+    /// and hands it back; `None` means no compaction is due (#377).
+    pub pending_compaction: Option<usize>,
     /// Cumulative output tokens generated for this session.
     pub tokens_out: u64,
     /// Cumulative cost in USD. Summed across all profiles.
@@ -775,6 +779,7 @@ impl Session {
             tokens_in: 0,
             last_prompt_tokens: None,
             context_full_notice_shown: false,
+            pending_compaction: None,
             tokens_out: 0,
             cost_usd: None,
             per_profile: HashMap::new(),
@@ -1086,6 +1091,14 @@ fn messages_to_markdown(messages: &[ChatBlock], session_name: &str, ssh_info: &O
             ChatBlock::System(s) => {
                 md.push_str(&format!("*{s}*\n\n"));
             }
+            ChatBlock::Summary {
+                text,
+                replaced_blocks,
+            } => {
+                md.push_str(&format!(
+                    "**Summary of {replaced_blocks} earlier blocks:**\n\n{text}\n\n"
+                ));
+            }
         }
     }
     md
@@ -1129,6 +1142,7 @@ impl App {
             // Not restored on purpose — see `apply_loaded_session`.
             s.last_prompt_tokens = None;
             s.context_full_notice_shown = false;
+            s.pending_compaction = None;
         }
         let default_name = if default_profile_name.is_empty() { "default" } else { default_profile_name };
         if let Some(profile) = llm_profile {
@@ -1177,14 +1191,16 @@ impl App {
             .unwrap_or(filar_core::DEFAULT_COMPACT_AT_TOKENS)
     }
 
-    /// Report that the context has reached the compaction threshold.
+    /// Decide whether the history should be compacted before this request, and
+    /// announce it in the feed.
     ///
-    /// Called before a request is sent rather than when the response arrives,
-    /// so the user is not made to wait on anything after their answer.
+    /// Called before the request is sent rather than when the response
+    /// arrives, so the user is not made to wait on anything after their
+    /// answer. The decision is recorded in `pending_compaction`; the summary
+    /// itself is produced by the runner, which is where the LLM client lives.
     ///
-    /// This only reports: the history is left untouched. Replacing the head
-    /// with a summary is issue #377, and until that lands the message must not
-    /// promise something that will not happen.
+    /// Compaction must never be silent: the user has to be able to tell why
+    /// the agent stopped remembering the beginning of the conversation.
     fn report_context_fill(&mut self, profile_name: &str) {
         let threshold = self.compact_at_tokens_for(profile_name);
         let used = self.active_session().last_prompt_tokens;
@@ -1212,9 +1228,94 @@ impl App {
             "context reached the compaction threshold"
         );
         self.active_session_mut().context_full_notice_shown = true;
+
+        if boundary == 0 {
+            // Above the threshold but the whole history is the verbatim tail:
+            // there is nothing to fold, and promising otherwise would be a lie.
+            self.push_message(ChatBlock::System(format!(
+                "Context is at {used} prompt tokens, at or above the {threshold} threshold \
+                 for profile '{profile_name}', but the history is too short to compact."
+            )));
+            return;
+        }
+
         self.push_message(ChatBlock::System(format!(
             "Context is at {used} prompt tokens, at or above the {threshold} threshold \
-             for profile '{profile_name}'. History compaction is not enabled yet."
+             for profile '{profile_name}'. Compacting the first {boundary} blocks of history."
+        )));
+        self.active_session_mut().pending_compaction = Some(boundary);
+    }
+
+    /// Compact the history on the user's own initiative (Ctrl+K), without
+    /// waiting for the threshold.
+    ///
+    /// Deliberately independent of `compact_at_tokens`: the point is to fold
+    /// the history before moving on to a new phase of work, and that decision
+    /// is the user's. It therefore also works when compaction is disabled with
+    /// `compact_at_tokens = 0`.
+    fn request_manual_compaction(&mut self) {
+        if self.agent_running {
+            self.push_message(ChatBlock::System(
+                "Cannot compact while the agent is working - wait for it to finish.".into(),
+            ));
+            return;
+        }
+
+        let boundary = filar_core::compaction_boundary(
+            &self.active_session().messages,
+            filar_core::DEFAULT_KEEP_TURNS,
+        );
+        if boundary == 0 {
+            self.push_message(ChatBlock::System(
+                "Nothing to compact yet - the whole history is still recent.".into(),
+            ));
+            return;
+        }
+        if self.active_session().pending_compaction.is_some() {
+            return;
+        }
+
+        self.push_message(ChatBlock::System(format!(
+            "Compacting the first {boundary} blocks of history on request."
+        )));
+        self.active_session_mut().pending_compaction = Some(boundary);
+    }
+
+    /// Apply a summary produced by the runner, replacing the compacted head.
+    ///
+    /// `boundary` is echoed back from the request so a history that changed
+    /// while the summary was being produced cannot be cut at a stale index.
+    pub fn apply_compaction(&mut self, boundary: usize, summary: String) {
+        let before = self.active_session().messages.len();
+        if boundary == 0 || boundary > before {
+            self.active_session_mut().pending_compaction = None;
+            return;
+        }
+
+        let compacted = filar_core::compact_history(
+            &self.active_session().messages,
+            boundary,
+            &summary,
+        );
+        let after = compacted.len();
+        self.active_session_mut().messages = compacted;
+        self.active_session_mut().pending_compaction = None;
+        // Block indices moved, so any user collapse overrides now point at the
+        // wrong blocks.
+        self.collapsed_overrides.clear();
+        self.message_rev = self.message_rev.wrapping_add(1);
+        self.selection = None;
+
+        self.push_message(ChatBlock::System(format!(
+            "History compacted: {before} blocks to {after}. The summary is in the feed above."
+        )));
+    }
+
+    /// Report that compaction failed, leaving the history untouched.
+    pub fn report_compaction_failure(&mut self, error: String) {
+        self.active_session_mut().pending_compaction = None;
+        self.push_message(ChatBlock::System(format!(
+            "History compaction failed ({error}). Continuing with the full history."
         )));
     }
 
@@ -1979,6 +2080,13 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        // Ctrl+K — compact the history on request, without waiting for the
+        // threshold (#377). ЙЦУКЕН: K = л.
+        if ctrl_key('k', 'л') && self.mode == AppMode::Normal {
+            self.request_manual_compaction();
             return;
         }
 
@@ -3244,8 +3352,14 @@ impl App {
 
     /// Compute the default collapse state for a chat block.
     /// A Command block is collapsed by default if its output has more than 6 lines.
+    /// A Summary block is always collapsed by default: it is there to be
+    /// auditable, not to push the conversation off the screen.
     fn default_collapsed_for(msg: &ChatBlock) -> bool {
-        matches!(msg, ChatBlock::Command { output: Some(out), .. } if out.lines().count() > 6)
+        match msg {
+            ChatBlock::Command { output: Some(out), .. } => out.lines().count() > 6,
+            ChatBlock::Summary { .. } => true,
+            _ => false,
+        }
     }
 
     /// Compute the set of collapsed block indices from `collapsed_overrides`
@@ -7359,6 +7473,130 @@ mod tests {
         app.active_session_mut().last_prompt_tokens = Some(60_000);
         app.begin_agent_request("four".into());
         assert_eq!(app.active_session().messages.len(), after_first + 1);
+    }
+
+    #[test]
+    fn manual_compaction_works_even_when_the_threshold_is_disabled() {
+        // Ctrl+K is the user's own decision, so it must not depend on
+        // `compact_at_tokens` — including the `0` that turns automatic
+        // compaction off entirely.
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.profiles = vec![filar_core::LlmProfile {
+            name: "glm".into(), model: "g".into(), api_base_url: "u".into(),
+            max_tokens: 4096, key_env: "k".into(),
+            temperature: None, top_p: None, extra_body: None,
+            compact_at_tokens: 0,
+        }];
+        app.llm_profile = Some("glm".into());
+        app.default_profile_name = "glm".into();
+        // No usage reported at all: the automatic path cannot fire.
+        app.active_session_mut().last_prompt_tokens = None;
+
+        for i in 0..8 {
+            app.push_message(ChatBlock::User(format!("q{i}")));
+            app.push_message(ChatBlock::Agent(format!("a{i}")));
+        }
+
+        app.request_manual_compaction();
+        let boundary = app.active_session().pending_compaction;
+        assert!(
+            matches!(boundary, Some(n) if n > 0),
+            "manual compaction must arm regardless of the threshold, got {boundary:?}"
+        );
+        assert!(matches!(
+            app.active_session().messages.last(),
+            Some(ChatBlock::System(s)) if s.contains("on request")
+        ));
+    }
+
+    #[test]
+    fn manual_compaction_on_a_short_history_says_so_instead_of_arming() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.push_message(ChatBlock::User("only turn".into()));
+
+        app.request_manual_compaction();
+        assert_eq!(app.active_session().pending_compaction, None);
+        assert!(matches!(
+            app.active_session().messages.last(),
+            Some(ChatBlock::System(s)) if s.contains("Nothing to compact")
+        ));
+    }
+
+    #[test]
+    fn manual_compaction_is_refused_while_the_agent_is_working() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        for i in 0..8 {
+            app.push_message(ChatBlock::User(format!("q{i}")));
+            app.push_message(ChatBlock::Agent(format!("a{i}")));
+        }
+        app.agent_running = true;
+
+        app.request_manual_compaction();
+        assert_eq!(app.active_session().pending_compaction, None);
+    }
+
+    #[test]
+    fn applying_a_summary_replaces_the_head_and_keeps_the_tail() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        for i in 0..8 {
+            app.push_message(ChatBlock::User(format!("q{i}")));
+            app.push_message(ChatBlock::Agent(format!("a{i}")));
+        }
+        let before = app.active_session().messages.clone();
+        let boundary = filar_core::compaction_boundary(&before, filar_core::DEFAULT_KEEP_TURNS);
+        assert!(boundary > 0, "fixture must have something to compact");
+
+        app.apply_compaction(boundary, "earlier turns, briefly".into());
+
+        let after = app.active_session().messages.clone();
+        assert!(matches!(
+            &after[0],
+            ChatBlock::Summary { text, replaced_blocks }
+                if text == "earlier turns, briefly" && *replaced_blocks == boundary
+        ));
+        // Tail preserved verbatim; the trailing System line is the report.
+        let kept = &after[1..after.len() - 1];
+        let original_tail = &before[boundary..];
+        assert_eq!(
+            serde_json::to_string(kept).unwrap(),
+            serde_json::to_string(original_tail).unwrap()
+        );
+        assert_eq!(app.active_session().pending_compaction, None);
+    }
+
+    #[test]
+    fn a_failed_summary_leaves_the_history_untouched() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        for i in 0..8 {
+            app.push_message(ChatBlock::User(format!("q{i}")));
+        }
+        app.active_session_mut().pending_compaction = Some(4);
+        let before = app.active_session().messages.len();
+
+        app.report_compaction_failure("rate limited".into());
+
+        assert_eq!(app.active_session().pending_compaction, None);
+        assert_eq!(
+            app.active_session().messages.len(),
+            before + 1,
+            "only the failure notice is added"
+        );
+        assert!(matches!(
+            app.active_session().messages.last(),
+            Some(ChatBlock::System(s)) if s.contains("rate limited")
+        ));
+    }
+
+    #[test]
+    fn a_stale_boundary_is_ignored_rather_than_cutting_the_wrong_place() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.push_message(ChatBlock::User("one".into()));
+        let before = app.active_session().messages.len();
+
+        app.apply_compaction(99, "summary of a history that no longer exists".into());
+
+        assert_eq!(app.active_session().messages.len(), before);
+        assert_eq!(app.active_session().pending_compaction, None);
     }
 
     #[test]

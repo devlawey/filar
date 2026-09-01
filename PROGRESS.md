@@ -5385,6 +5385,71 @@ on its own PR. `eval/README.md` updated.
 changes went unverified. If it is, triage the failures as a separate issue and
 **do not lower the 90% threshold** to make it pass.
 
+## Issue #377: feat(tui) — folding the head of the history into a summary
+
+**Milestone:** 1.0.6. **Branch:** `feat/377-history-summary`. Part 2 of 4 of the
+context-compaction spec, on top of #376; #378 and #379 build on it.
+
+**Where the summary lives, and why.** The issue left this open. It is a new
+`ChatBlock::Summary { text, replaced_blocks }` in `filar-core`, not an injection
+at the point the history is flattened into `ChatMessage`s. The summary has to be
+visible and auditable in the feed — compaction that the user cannot inspect is
+compaction they cannot trust — and injection leaves no block to render. It also
+gives #379 something concrete to persist. Backward compatibility runs the way
+that matters: old session files simply do not contain the variant, and a test
+pins that they still load.
+
+**The trap from the issue.** `ChatBlock::System` is dropped when the history is
+built for the model, so a summary stored as a system block would never reach it
+and compaction would be a silent loss of the whole head. The flattening was
+extracted out of `spawn_agent` into `history_to_messages` for exactly this
+reason: whether a block reaches the model is a correctness property and now has
+a test, rather than being a detail buried in a spawned task.
+
+**Where the summarising call runs.** Inside the agent task, before the agent is
+built, rather than in a separate orchestration path. `app.rs` is synchronous and
+the LLM client lives in the runner; a second async path would have meant a second
+state machine for the same wait, and the spinner is already up. The result comes
+back as `TuiEvent::HistoryCompacted` and is applied to the session it belongs to,
+which may no longer be the active tab.
+
+**Model.** The session's own profile. The optional cheap-profile optimisation
+from the issue is deliberately skipped: it requires attributing the usage to the
+profile that actually computed rather than the current one, and that is a real
+risk to `per_profile` accounting in a change that already adds a system prompt
+and an enum variant. Worth doing separately.
+
+**Failure is not the user's problem.** If the summary call fails, the history is
+left untouched and the turn still goes out on the full history, with a line in
+the feed. Recovering from an outright context overflow is #378.
+
+**Manual trigger.** `Ctrl+K` (ЙЦУКЕН: `Ctrl+Л`), independent of
+`compact_at_tokens` — including `0`. It refuses while the agent is working, and
+says so rather than queueing.
+
+**Done:** 5 tests in `filar-core` (head replaced by one summary, tail byte-for-
+byte identical, no-op when there is nothing to compact, summaries fold rather
+than stack, transcript keeps command outcomes but not feed chrome), 2 in
+`filar-agent` on the prompt, 2 in the runner (the summary reaches the model,
+system lines do not), and 6 in `app.rs` (manual trigger with the threshold
+disabled, short history, refusal while running, applying a summary, failure
+path, stale boundary).
+
+**Public contract:** `filar-core` gains the `ChatBlock::Summary` variant plus
+`compact_history` and `transcript_for_summary`; `filar-agent` gains
+`summarise_history` and `COMPACTION_SYSTEM_PROMPT`. Additive, but a new enum
+variant means embedders matching exhaustively on `ChatBlock` must add an arm —
+worth a line in `docs/ENGINE_API.md` when the next engine tag is cut.
+
+**Not verified by the agent:** no Rust toolchain, so nothing was compiled or run.
+This change is far larger than #380 and touches an enum matched on in several
+places plus the signature of `spawn_agent`; CI is the first real check. The
+manual DoD run and the eval run belong to the PR.
+
+**Next steps:** #378 (reactive path when the provider refuses outright, and
+handling a refused summary), #379 (persistence and profile switching). The
+cheap-profile summariser is an open optimisation.
+
 ## Issue #380: fix(gui) — the launcher reset `max_tokens` and `top_p` on every save
 
 **Milestone:** 1.0.6. **Branch:** `fix/380-launcher-profile-fields`. Found while
