@@ -975,6 +975,10 @@ async fn run_app(
                         // Create a cancellation token for this agent run.
                         let cancel_token = CancellationToken::new();
                         app.cancellation = Some(cancel_token.clone());
+                        // Whether the history must be folded before this
+                        // request. Taken here so a stale flag cannot survive
+                        // into a later turn if the run fails.
+                        let pending_compaction = app.sessions[app.active].pending_compaction;
                         // Resolve the LLM client for this session's profile.
                         let profile_name = app.sessions[app.active]
                             .llm_profile
@@ -1040,7 +1044,12 @@ async fn run_app(
                             cancel_token,
                             config.secret_provider.clone(),
                             sid,
+                            pending_compaction,
                         );
+                        // Consumed by this run: the summary comes back as an
+                        // event, and a leftover flag would fold the history a
+                        // second time on the next turn.
+                        app.sessions[app.active].pending_compaction = None;
                     }
 
                     // Ctrl+T changes what's on screen — force immediate redraw.
@@ -1691,6 +1700,43 @@ pub fn resize_all_models(app: &mut App, cols: u16, rows: u16) {
     }
 }
 
+/// Flatten the chat history into the messages sent to the model.
+///
+/// Extracted from `spawn_agent` so the mapping can be tested directly: whether
+/// a block reaches the model is a correctness property, not a detail. Note the
+/// two deliberate asymmetries — `System` blocks are feed-only chrome and are
+/// dropped, while `Summary` blocks stand in for the turns they replaced and
+/// must be sent (#377).
+fn history_to_messages(blocks: &[ChatBlock]) -> Vec<filar_agent::ChatMessage> {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ChatBlock::User(text) => Some(filar_agent::ChatMessage::user(text)),
+            ChatBlock::Agent(text) => Some(filar_agent::ChatMessage::assistant(text)),
+            ChatBlock::Command {
+                command,
+                output,
+                approved,
+                ..
+            } => {
+                let output_text = output.as_deref().unwrap_or(
+                    if *approved { "(no output)" } else { "(denied by user)" },
+                );
+                Some(filar_agent::ChatMessage::assistant(format!(
+                    "Command: {command}\nOutput: {output_text}"
+                )))
+            }
+            ChatBlock::Error(text) => Some(filar_agent::ChatMessage::assistant(format!(
+                "Error: {text}"
+            ))),
+            ChatBlock::System(_) => None,
+            ChatBlock::Summary { text, .. } => Some(filar_agent::ChatMessage::user(format!(
+                "Summary of earlier turns in this session:\n{text}"
+            ))),
+        })
+        .collect()
+}
+
 /// Spawn the agent in a tokio task to process the user's input.
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent(
@@ -1708,6 +1754,9 @@ fn spawn_agent(
     cancellation: CancellationToken,
     secret_provider: Arc<dyn SecretProvider>,
     sid: SessionId,
+    // Boundary index when the history must be compacted before this request
+    // (#377). `None` means send it as is.
+    pending_compaction: Option<usize>,
 ) {
     let tx = event_tx.clone();
     let confirmer = Arc::new(TuiConfirmer::new(event_tx.clone(), sid)) as Arc<dyn CommandConfirmer>;
@@ -1715,32 +1764,42 @@ fn spawn_agent(
     tokio::spawn(async move {
         let _ = tx.send(TuiEvent::Thinking);
 
-        let history: Vec<filar_agent::ChatMessage> = chat_history
-            .iter()
-            .filter_map(|block| match block {
-                ChatBlock::User(text) => Some(filar_agent::ChatMessage::user(text)),
-                ChatBlock::Agent(text) => Some(filar_agent::ChatMessage::assistant(text)),
-                ChatBlock::Command {
-                    command,
-                    output,
-                    approved,
-                    ..
-                } => {
-                    let output_text = output.as_deref().unwrap_or(
-                        if *approved { "(no output)" } else { "(denied by user)" },
-                    );
-                    Some(filar_agent::ChatMessage::assistant(format!(
-                        "Command: {command}\nOutput: {output_text}"
-                    )))
+        // Compaction runs here, before the agent is built, because this is
+        // where the LLM client lives and the spinner is already up. The
+        // summary uses the session's own profile, so its cost lands on the
+        // profile the user is actually working with.
+        let chat_history = match pending_compaction {
+            Some(boundary) if boundary > 0 && boundary <= chat_history.len() => {
+                let transcript =
+                    filar_core::transcript_for_summary(&chat_history[..boundary]);
+                match filar_agent::summarise_history(llm.as_ref(), &transcript).await {
+                    Ok(summary) => {
+                        let compacted =
+                            filar_core::compact_history(&chat_history, boundary, &summary);
+                        let _ = tx.send(TuiEvent::HistoryCompacted {
+                            session_id: sid,
+                            boundary,
+                            summary: Ok(summary),
+                        });
+                        compacted
+                    }
+                    Err(e) => {
+                        // The request still goes out on the full history: a
+                        // failed summary must not cost the user their turn.
+                        // Recovering from an outright context overflow is #378.
+                        let _ = tx.send(TuiEvent::HistoryCompacted {
+                            session_id: sid,
+                            boundary,
+                            summary: Err(e.to_string()),
+                        });
+                        chat_history
+                    }
                 }
-                ChatBlock::Error(text) => {
-                    Some(filar_agent::ChatMessage::assistant(format!(
-                        "Error: {text}"
-                    )))
-                }
-                ChatBlock::System(_) => None,
-            })
-            .collect();
+            }
+            _ => chat_history,
+        };
+
+        let history = history_to_messages(&chat_history);
 
         let tx_for_sink = tx.clone();
         let sink: filar_agent::EventSink = Arc::new(move |event: filar_agent::AgentEvent| {
@@ -1824,6 +1883,57 @@ async fn load_path_picker_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_summary_reaches_the_model_and_feed_chrome_does_not() {
+        // The trap this feature had to avoid: `System` blocks are filtered out
+        // when the history is flattened, so putting the summary in one would
+        // have made compaction a silent loss of the whole head (#377).
+        let blocks = vec![
+            ChatBlock::Summary {
+                text: "Restarted nginx, still 502. Config at /etc/nginx.".into(),
+                replaced_blocks: 12,
+            },
+            ChatBlock::System("History compacted: 14 blocks to 3.".into()),
+            ChatBlock::User("what next".into()),
+        ];
+
+        let messages = history_to_messages(&blocks);
+        let joined: String = messages.iter().map(|m| m.content.clone()).collect();
+
+        assert!(
+            joined.contains("Restarted nginx, still 502."),
+            "the summary must be part of what the model is sent"
+        );
+        assert!(
+            !joined.contains("History compacted: 14 blocks to 3."),
+            "feed-only system lines must stay out of the request"
+        );
+        assert_eq!(messages.len(), 2, "summary + user turn");
+    }
+
+    #[test]
+    fn a_command_and_its_outcome_still_reach_the_model_unchanged() {
+        // Guards the extraction of `history_to_messages` out of `spawn_agent`.
+        let blocks = vec![
+            ChatBlock::Command {
+                command: "systemctl restart nginx".into(),
+                explanation: "restart it".into(),
+                output: Some("done".into()),
+                approved: true,
+            },
+            ChatBlock::Command {
+                command: "rm -rf /var/log".into(),
+                explanation: String::new(),
+                output: None,
+                approved: false,
+            },
+        ];
+        let messages = history_to_messages(&blocks);
+        assert!(messages[0].content.contains("Command: systemctl restart nginx"));
+        assert!(messages[0].content.contains("Output: done"));
+        assert!(messages[1].content.contains("(denied by user)"));
+    }
 
     #[tokio::test]
     async fn recv_log_line_returns_sent_line_and_keeps_channel() {

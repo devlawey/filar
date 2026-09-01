@@ -25,6 +25,18 @@ pub enum ChatBlock {
     Error(String),
     /// A system message (e.g. "agent started").
     System(String),
+    /// A summary that replaced the compacted head of the history (#377).
+    ///
+    /// Unlike [`ChatBlock::System`], this block **is** sent to the model: it
+    /// stands in for the turns it replaced, and dropping it would make
+    /// compaction a silent loss of the whole beginning of the conversation.
+    ///
+    /// `replaced_blocks` is how many blocks were folded into it, used for the
+    /// feed line and for diagnostics.
+    Summary {
+        text: String,
+        replaced_blocks: usize,
+    },
 }
 
 impl ChatBlock {
@@ -36,6 +48,9 @@ impl ChatBlock {
             ChatBlock::Command { command, .. } => format!("$ {}", truncate(command, 60)),
             ChatBlock::Error(s) => format!("Error: {}", truncate(s, 60)),
             ChatBlock::System(s) => truncate(s, 60),
+            ChatBlock::Summary { replaced_blocks, .. } => {
+                format!("Summary of {replaced_blocks} earlier blocks")
+            }
         }
     }
 }
@@ -74,6 +89,28 @@ mod tests {
         assert_eq!(blocks.len(), decoded.len());
         assert!(matches!(&decoded[0], ChatBlock::User(s) if s == "hello"));
         assert!(matches!(&decoded[2], ChatBlock::Command { command, .. } if command == "ls -la"));
+    }
+
+    #[test]
+    fn summary_block_roundtrip_and_preview() {
+        let block = ChatBlock::Summary {
+            text: "Restarted nginx, still 502.".into(),
+            replaced_blocks: 12,
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        let decoded: ChatBlock = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, ChatBlock::Summary { replaced_blocks, .. } if replaced_blocks == 12));
+        assert_eq!(block.preview(), "Summary of 12 earlier blocks");
+    }
+
+    #[test]
+    fn session_files_written_before_the_summary_variant_still_load() {
+        // Adding an enum variant must not break history written by an earlier
+        // build: those files simply never contain it.
+        let old = r#"[{"User":"hello"},{"Agent":"hi"},{"System":"connected"}]"#;
+        let decoded: Vec<ChatBlock> = serde_json::from_str(old).unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert!(matches!(&decoded[0], ChatBlock::User(s) if s == "hello"));
     }
 
     #[test]

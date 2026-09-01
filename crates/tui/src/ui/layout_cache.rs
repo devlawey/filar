@@ -249,6 +249,39 @@ impl ChatLayoutCache {
                     ]);
                     self.push_spacer();
                 }
+
+                // The summary that replaced the compacted head (#377).
+                // Collapsed by default, expandable like command output: it is
+                // context the user may want to audit, not part of the
+                // conversation they actually had.
+                ChatBlock::Summary { text, replaced_blocks } => {
+                    let is_collapsed = collapsed.contains(&idx);
+                    let arrow = if is_collapsed { glyphs.collapse_arrow } else { glyphs.expand_arrow };
+
+                    self.push_header(idx, vec![
+                        Span::raw("  "),
+                        Span::styled(format!("{} ", arrow), theme.muted()),
+                        Span::styled(
+                            format!("History compacted - {replaced_blocks} blocks summarised"),
+                            theme.muted(),
+                        ),
+                    ]);
+
+                    if !is_collapsed {
+                        for line in strip_emoji(text).lines() {
+                            for wrapped in wrap_text(line, output_width) {
+                                self.push_output(idx, format!("  {} {}", glyphs.gutter, wrapped));
+                            }
+                        }
+                        self.push_output_toggle(idx, format!("  {} collapse", glyphs.expand_arrow));
+                    } else {
+                        self.push_output_toggle(
+                            idx,
+                            format!("  {} click to show the summary", glyphs.collapse_arrow),
+                        );
+                    }
+                    self.push_spacer();
+                }
             }
         }
 

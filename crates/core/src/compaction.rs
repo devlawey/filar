@@ -73,6 +73,66 @@ pub fn compaction_boundary(blocks: &[ChatBlock], keep_turns: usize) -> usize {
     turn_starts[turn_starts.len() - keep_turns]
 }
 
+/// Replace the head of `blocks` with a single summary block.
+///
+/// Everything from `boundary` onward is kept byte for byte: the tail is what
+/// the model still needs verbatim, and paraphrasing it is exactly the loss
+/// compaction is meant to avoid. `boundary` is expected to come from
+/// [`compaction_boundary`].
+///
+/// A `boundary` of `0` (nothing to compact) returns the history unchanged, so
+/// the caller does not have to special-case a short conversation. Any earlier
+/// summary in the head is folded into the new one along with everything else —
+/// summaries compound rather than accumulate.
+pub fn compact_history(blocks: &[ChatBlock], boundary: usize, summary: &str) -> Vec<ChatBlock> {
+    if boundary == 0 || boundary > blocks.len() {
+        return blocks.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(blocks.len() - boundary + 1);
+    out.push(ChatBlock::Summary {
+        text: summary.to_string(),
+        replaced_blocks: boundary,
+    });
+    out.extend_from_slice(&blocks[boundary..]);
+    out
+}
+
+/// The transcript handed to the summarising model, as plain text.
+///
+/// Command output is included: what a command actually printed is the evidence
+/// the summary has to preserve. The caller decides how much of the history to
+/// pass — normally the head being replaced.
+pub fn transcript_for_summary(blocks: &[ChatBlock]) -> String {
+    let mut out = String::new();
+    for block in blocks {
+        match block {
+            ChatBlock::User(text) => out.push_str(&format!("User: {text}\n")),
+            ChatBlock::Agent(text) => out.push_str(&format!("Agent: {text}\n")),
+            ChatBlock::Command {
+                command,
+                output,
+                approved,
+                ..
+            } => {
+                let outcome = match (approved, output) {
+                    (false, _) => "(denied by user)".to_string(),
+                    (true, None) => "(no output)".to_string(),
+                    (true, Some(o)) => o.clone(),
+                };
+                out.push_str(&format!("Command: {command}\nOutput: {outcome}\n"));
+            }
+            ChatBlock::Error(text) => out.push_str(&format!("Error: {text}\n")),
+            // Feed-only chrome: never part of what the model was told.
+            ChatBlock::System(_) => {}
+            ChatBlock::Summary { text, .. } => {
+                out.push_str(&format!("Summary of earlier turns: {text}\n"))
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,6 +153,101 @@ mod tests {
     }
     fn system(s: &str) -> ChatBlock {
         ChatBlock::System(s.into())
+    }
+
+    #[test]
+    fn compaction_replaces_the_head_and_keeps_the_tail_byte_for_byte() {
+        let blocks = vec![
+            user("first"),
+            agent("a1"),
+            command("systemctl restart nginx"),
+            user("second"),
+            agent("a2"),
+            user("third"),
+            agent("a3"),
+        ];
+        let boundary = compaction_boundary(&blocks, 2);
+        assert_eq!(boundary, 3, "tail starts at the third user turn");
+
+        let compacted = compact_history(&blocks, boundary, "restarted nginx, still 502");
+
+        // One summary in place of the whole head…
+        assert_eq!(compacted.len(), 1 + (blocks.len() - boundary));
+        match &compacted[0] {
+            ChatBlock::Summary {
+                text,
+                replaced_blocks,
+            } => {
+                assert_eq!(text, "restarted nginx, still 502");
+                assert_eq!(*replaced_blocks, 3);
+            }
+            other => panic!("expected a summary, got {other:?}"),
+        }
+
+        // …and the tail unchanged, block for block.
+        let original_tail = serde_json::to_string(&blocks[boundary..]).unwrap();
+        let kept_tail = serde_json::to_string(&compacted[1..]).unwrap();
+        assert_eq!(kept_tail, original_tail, "the tail must not be rewritten");
+    }
+
+    #[test]
+    fn compaction_with_nothing_to_compact_is_a_no_op() {
+        let blocks = vec![user("only"), agent("turn")];
+        let before = serde_json::to_string(&blocks).unwrap();
+        let after = serde_json::to_string(&compact_history(&blocks, 0, "unused")).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn compacting_twice_folds_the_earlier_summary_in_rather_than_stacking() {
+        let blocks = vec![
+            ChatBlock::Summary {
+                text: "first summary".into(),
+                replaced_blocks: 4,
+            },
+            user("second"),
+            agent("a2"),
+            user("third"),
+            agent("a3"),
+        ];
+        let compacted = compact_history(&blocks, 3, "second summary");
+        assert_eq!(
+            compacted
+                .iter()
+                .filter(|b| matches!(b, ChatBlock::Summary { .. }))
+                .count(),
+            1,
+            "summaries must not accumulate"
+        );
+    }
+
+    #[test]
+    fn the_transcript_carries_commands_and_their_output_but_not_feed_chrome() {
+        let blocks = vec![
+            user("why is it 502"),
+            command("systemctl restart nginx"),
+            system("context is filling up"),
+        ];
+        let text = transcript_for_summary(&blocks);
+        assert!(text.contains("why is it 502"));
+        assert!(text.contains("Command: systemctl restart nginx"));
+        assert!(text.contains("Output: ok"), "outcome is the evidence");
+        assert!(
+            !text.contains("context is filling up"),
+            "feed-only system lines were never sent to the model"
+        );
+    }
+
+    #[test]
+    fn a_denied_command_reads_as_denied_not_as_executed() {
+        let blocks = vec![ChatBlock::Command {
+            command: "rm -rf /var/log".into(),
+            explanation: String::new(),
+            output: None,
+            approved: false,
+        }];
+        let text = transcript_for_summary(&blocks);
+        assert!(text.contains("(denied by user)"));
     }
 
     #[test]

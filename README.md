@@ -192,8 +192,8 @@ api_base_url = "https://api.deepseek.com/v1"
 max_tokens = 8192
 key_env = "DEEPSEEK_API_KEY"
 # Prompt tokens at which the context is considered full. Per-profile, because
-# context windows differ. Currently this only logs and shows a notice — history
-# compaction is not implemented yet. 0 turns the notice off.
+# context windows differ. Reaching it folds the earlier part of the history into
+# a summary. 0 disables automatic compaction (Ctrl+K still works).
 compact_at_tokens = 200000
 
 #### Context fill
@@ -203,10 +203,25 @@ history is re-sent with every request, so each turn costs more than the last
 until the provider refuses outright. `compact_at_tokens` marks the point at
 which that becomes a problem.
 
-**Today this only reports.** Reaching the threshold writes a warning to the log
-and adds one notice to the session feed; the history is left untouched. Folding
-the earlier part of the conversation into a summary is not implemented yet, so
-do not rely on this setting to keep a session under the window.
+Reaching the threshold folds the head of the history into a single summary and
+keeps the last few turns verbatim. Nothing about this is silent: the feed gets a
+line before ("compacting the first N blocks") and one after ("N blocks to M"),
+and the summary itself stays in the feed as a collapsed block you can expand and
+audit. The summary is produced by the session's own profile, so its cost lands
+where you would expect.
+
+What the summary is asked to keep, in order: commands already executed and what
+they did, established facts about the system, the current hypothesis, and any
+constraints you stated. Executed commands come first for a reason — the failure
+that matters is an agent re-running a destructive action it no longer remembers
+performing.
+
+`Ctrl+K` compacts on your own initiative, without waiting for the threshold —
+useful before moving to a new phase of work. It ignores `compact_at_tokens`
+entirely, so it still works when automatic compaction is off.
+
+If the summary request fails, the history is left alone and your turn still goes
+out on the full history; the feed says so.
 
 The threshold is per-profile because context windows differ — a figure that
 suits a 1M-token model is meaningless for a 128k one. Set it comfortably below
@@ -409,6 +424,7 @@ Type `!` followed by a command to run it directly (bypassing the agent):
 | `Ctrl+N` | New local session tab (always local, never inherits another tab's SSH) |
 | `Ctrl+W` | Close active session tab |
 | `Ctrl+L` | Cycle LLM profile for this tab (different model per tab) |
+| `Ctrl+K` | Compact history now — fold earlier turns into a summary |
 | `Ctrl+O` | Open host-selection overlay (local + configured `[[ssh_targets]]`) |
 | `Ctrl+V` | Paste from system clipboard (also via bracketed paste) |
 | `Ctrl+P` | Enter password input mode (masked) |
