@@ -870,6 +870,13 @@ temperature = 5.0
         assert!(result.is_err(), "Config::load should reject temperature=5.0");
     }
 
+    /// The only test in this crate that touches `FILAR_CONFIG`.
+    ///
+    /// `cargo test` runs tests as threads of one process and environment
+    /// variables are per-process, so two tests setting this variable race each
+    /// other regardless of what their guards do. Keep it that way: a second
+    /// test that reads or writes `FILAR_CONFIG` (or calls `load_default`, which
+    /// reads it) must not be added without putting both behind a shared lock.
     #[test]
     fn load_default_prefers_filar_config_env() {
         let dir = std::env::temp_dir().join(format!("filar_cfg_test_{}", std::process::id()));
@@ -878,46 +885,13 @@ temperature = 5.0
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, "[llm]\nmodel = \"env-model\"\napi_base_url = \"https://test.example.com\"\n").unwrap();
 
-        // Guard structs for cleanup.
-        struct DirGuard(std::path::PathBuf);
-        impl Drop for DirGuard { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
-        struct EnvGuard { key: &'static str, old: Option<String> }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match &self.old {
-                    Some(v) => std::env::set_var(self.key, v),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-
         let _dir_guard = DirGuard(dir);
         let old_val = std::env::var("FILAR_CONFIG").ok();
-        std::env::set_var("FILAR_CONFIG", path.to_str().unwrap());
+        std::env::set_var("FILAR_CONFIG", path.as_os_str());
         let _env_guard = EnvGuard { key: "FILAR_CONFIG", old: old_val };
 
         let cfg = Config::load_default().unwrap();
         assert_eq!(cfg.llm.model, "env-model", "FILAR_CONFIG must take priority");
-    }
-
-    #[test]
-    fn load_default_cwd_wins_over_app_data() {
-        // Write a local config.toml. Since `default_base_dir` is OS-dependent,
-        // we test the general priority chain by putting files in CWD only.
-        // FILAR_CONFIG → CWD order is tested above.
-        let dir = std::env::temp_dir().join(format!("filar_cfg_cwd_{}", std::process::id()));
-        let path = dir.join("config.toml");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&path, "[llm]\nmodel = \"cwd-model\"\napi_base_url = \"https://test.example.com\"\n").unwrap();
-
-        let old = std::env::var("FILAR_CONFIG").ok();
-        std::env::set_var("FILAR_CONFIG", path.as_os_str());
-        let _env = EnvGuard { key: "FILAR_CONFIG", old };
-        let _dir = DirGuard(dir);
-
-        let cfg = Config::load_default().unwrap();
-        assert_eq!(cfg.llm.model, "cwd-model", "FILAR_CONFIG must find config via CWD path");
     }
 
     struct EnvGuard { key: &'static str, old: Option<String> }
