@@ -5446,9 +5446,25 @@ This change is far larger than #380 and touches an enum matched on in several
 places plus the signature of `spawn_agent`; CI is the first real check. The
 manual DoD run and the eval run belong to the PR.
 
+**Review (PR #384).** Two findings fixed. The notice flag doubled as the
+compaction trigger, so a compaction that did not bring the context back under
+the threshold — a large tail, a long summary — would have been the last one of
+the session; `apply_compaction` now re-arms it. And a summary that arrived after
+a cancel or a session restore could be cut into a history it was not made from,
+silently dropping turns; the result is now applied only when it matches what the
+session is still waiting for, and cancel and restore both clear that.
+
+Declined: threading the summarising call's own token usage into the session and
+`per_profile` accounting. Real — the reported cost is currently short by the
+summary — but it is a change to the accounting path #376 built, and it belongs
+with the cheap-profile option, where correct attribution stops being optional.
+Separate issue. Also declined: a request to run the build, tests, eval and
+SMOKE checklist before merging, which restates the DoD rather than finding
+anything; CI covers the first three, the rest is the human's.
+
 **Next steps:** #378 (reactive path when the provider refuses outright, and
 handling a refused summary), #379 (persistence and profile switching). The
-cheap-profile summariser is an open optimisation.
+cheap-profile summariser and the usage accounting above are open.
 
 ## Issue #380: fix(gui) — the launcher reset `max_tokens` and `top_p` on every save
 

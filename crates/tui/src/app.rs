@@ -1286,6 +1286,16 @@ impl App {
     /// `boundary` is echoed back from the request so a history that changed
     /// while the summary was being produced cannot be cut at a stale index.
     pub fn apply_compaction(&mut self, boundary: usize, summary: String) {
+        // The history may have moved while the summary was being produced: the
+        // user can cancel the run or restore a saved session, and cutting the
+        // result into a history it was not made from would silently lose turns.
+        // `pending_compaction` is the session's own record of what it is
+        // waiting for, and every path that replaces a history clears it.
+        if self.active_session().pending_compaction != Some(boundary) {
+            tracing::debug!(boundary, "discarding a stale compaction result");
+            return;
+        }
+
         let before = self.active_session().messages.len();
         if boundary == 0 || boundary > before {
             self.active_session_mut().pending_compaction = None;
@@ -1300,6 +1310,11 @@ impl App {
         let after = compacted.len();
         self.active_session_mut().messages = compacted;
         self.active_session_mut().pending_compaction = None;
+        // Re-arm the threshold. The flag records that the notice was shown for
+        // one crossing; leaving it set after a compaction that did not bring
+        // the context back under the threshold — a large tail, a long summary —
+        // would mean compaction never fires again for the rest of the session.
+        self.active_session_mut().context_full_notice_shown = false;
         // Block indices moved, so any user collapse overrides now point at the
         // wrong blocks.
         self.collapsed_overrides.clear();
@@ -1503,6 +1518,10 @@ impl App {
 
         self.messages = session.messages;
         self.message_rev = self.message_rev.wrapping_add(1);
+        // A summary still in flight was made from the history this just
+        // replaced, so it must not be applied to the restored one (#377).
+        self.active_session_mut().pending_compaction = None;
+        self.active_session_mut().context_full_notice_shown = false;
         self.push_message(ChatBlock::System(
             "Session restored — history loaded from disk".into(),
         ));
@@ -1695,6 +1714,10 @@ impl App {
                 self.cancellation = None;
                 self.agent_running = false;
                 self.pending_input = None;
+                // A summary may still be in flight for this run; the user has
+                // just asked for the run to stop, so its result is discarded
+                // rather than applied to a history they may now edit (#377).
+                self.active_session_mut().pending_compaction = None;
                 self.pending_ssh = None;
                 self.pending_ssh_password = None;
                 self.mode = AppMode::Normal;
@@ -7553,6 +7576,7 @@ mod tests {
         let before = app.active_session().messages.clone();
         let boundary = filar_core::compaction_boundary(&before, filar_core::DEFAULT_KEEP_TURNS);
         assert!(boundary > 0, "fixture must have something to compact");
+        app.active_session_mut().pending_compaction = Some(boundary);
 
         app.apply_compaction(boundary, "earlier turns, briefly".into());
 
@@ -7601,11 +7625,70 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.push_message(ChatBlock::User("one".into()));
         let before = app.active_session().messages.len();
+        app.active_session_mut().pending_compaction = Some(99);
 
         app.apply_compaction(99, "summary of a history that no longer exists".into());
 
         assert_eq!(app.active_session().messages.len(), before);
         assert_eq!(app.active_session().pending_compaction, None);
+    }
+
+    #[test]
+    fn a_summary_that_arrives_after_a_cancel_is_discarded() {
+        // The user pressed Ctrl+C while the summary was being produced, or
+        // restored a session: the result was made from a history that is no
+        // longer there, and applying it would silently drop turns.
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        for i in 0..8 {
+            app.push_message(ChatBlock::User(format!("q{i}")));
+            app.push_message(ChatBlock::Agent(format!("a{i}")));
+        }
+        let boundary = filar_core::compaction_boundary(
+            &app.active_session().messages,
+            filar_core::DEFAULT_KEEP_TURNS,
+        );
+        app.active_session_mut().pending_compaction = Some(boundary);
+        // Cancellation clears what the session is waiting for.
+        app.active_session_mut().pending_compaction = None;
+        let before = app.active_session().messages.len();
+
+        app.apply_compaction(boundary, "summary of a cancelled run".into());
+
+        assert_eq!(
+            app.active_session().messages.len(),
+            before,
+            "a result nobody is waiting for must not touch the history"
+        );
+        assert!(!app
+            .active_session()
+            .messages
+            .iter()
+            .any(|m| matches!(m, ChatBlock::Summary { .. })));
+    }
+
+    #[test]
+    fn compaction_rearms_the_threshold_for_the_next_crossing() {
+        // The notice flag records one crossing. If a compaction that failed to
+        // bring the context back under the threshold left it set, compaction
+        // would never fire again for the rest of the session.
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        for i in 0..8 {
+            app.push_message(ChatBlock::User(format!("q{i}")));
+            app.push_message(ChatBlock::Agent(format!("a{i}")));
+        }
+        let boundary = filar_core::compaction_boundary(
+            &app.active_session().messages,
+            filar_core::DEFAULT_KEEP_TURNS,
+        );
+        app.active_session_mut().pending_compaction = Some(boundary);
+        app.active_session_mut().context_full_notice_shown = true;
+
+        app.apply_compaction(boundary, "brief".into());
+
+        assert!(
+            !app.active_session().context_full_notice_shown,
+            "the next crossing must be able to arm compaction again"
+        );
     }
 
     #[test]
