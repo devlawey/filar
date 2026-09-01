@@ -7566,8 +7566,9 @@ mod tests {
         let kept = &after[1..after.len() - 1];
         let original_tail = &before[boundary..];
         assert_eq!(
-            serde_json::to_string(kept).unwrap(),
-            serde_json::to_string(original_tail).unwrap()
+            format!("{kept:?}"),
+            format!("{original_tail:?}"),
+            "the tail must not be rewritten"
         );
         assert_eq!(app.active_session().pending_compaction, None);
     }
