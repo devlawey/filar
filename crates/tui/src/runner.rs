@@ -1373,21 +1373,6 @@ async fn run_app(
                 }
             } => {
                 if let Some(event) = maybe_agent_event {
-                    // Compaction result: applied to the session it belongs to,
-                    // which may no longer be the active tab (#377).
-                    if let TuiEvent::HistoryCompacted { session_id, boundary, ref summary } = &event {
-                        if let Some(idx) = app.find_session_idx(*session_id) {
-                            let previous = app.active;
-                            app.active = idx;
-                            match summary {
-                                Ok(text) => app.apply_compaction(*boundary, text.clone()),
-                                Err(e) => app.report_compaction_failure(e.clone()),
-                            }
-                            app.active = previous;
-                        }
-                        needs_redraw = true;
-                        continue;
-                    }
                     // Intercept TransportChanged to update per-session info.
                     if let TuiEvent::TransportChanged { session_id, is_local, ref ssh_info, ref alias, .. } = &event {
                         if let Some(idx) = app.find_session_idx(*session_id) {
@@ -1769,8 +1754,8 @@ fn spawn_agent(
     cancellation: CancellationToken,
     secret_provider: Arc<dyn SecretProvider>,
     sid: SessionId,
-    /// Boundary index when the history must be compacted before this request
-    /// (#377). `None` means send it as is.
+    // Boundary index when the history must be compacted before this request
+    // (#377). `None` means send it as is.
     pending_compaction: Option<usize>,
 ) {
     let tx = event_tx.clone();

@@ -3418,6 +3418,7 @@ impl App {
             TuiEvent::TransportChanged { session_id, .. } => *session_id,
             TuiEvent::CwdChanged { session_id, .. } => *session_id,
             TuiEvent::PasswordNeeded { session_id, .. } => *session_id,
+            TuiEvent::HistoryCompacted { session_id, .. } => *session_id,
         };
 
         // Dispatch to the originating session. Save the active index so we can
@@ -3632,6 +3633,13 @@ impl App {
                 self.mode = AppMode::PasswordInput;
                 self.agent_running = false;
             }
+            // Dispatch above already switched to the originating session, so
+            // a summary that arrives while the user is on another tab still
+            // lands on the history it was made from (#377).
+            TuiEvent::HistoryCompacted { boundary, summary, .. } => match summary {
+                Ok(text) => self.apply_compaction(boundary, text),
+                Err(e) => self.report_compaction_failure(e),
+            },
         }
         // Auto-scroll to bottom on new content (unless user scrolled up during streaming).
         if auto_scroll {
