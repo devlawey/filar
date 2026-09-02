@@ -455,6 +455,16 @@ pub struct Session {
     /// Set once the user has been told that compaction cannot shrink this
     /// session further, so the notice is not repeated on every turn.
     pub compaction_exhausted: bool,
+    /// Bumped whenever the history is replaced wholesale or the run is
+    /// cancelled — never on an append.
+    ///
+    /// A reactive compaction computes its boundary inside the runner, from a
+    /// copy of the history, and only arms the session afterwards. Comparing
+    /// lengths is not enough to tell whether that boundary still means
+    /// anything: a restored session of the same length would pass, and cutting
+    /// the new history at the old boundary would lose its tail. This counter
+    /// gives the boundary an identity to be checked against (review of #390).
+    pub history_epoch: u64,
     /// Cumulative output tokens generated for this session.
     pub tokens_out: u64,
     /// Cumulative cost in USD. Summed across all profiles.
@@ -790,6 +800,7 @@ impl Session {
             last_prompt_tokens: None,
             context_full_notice_shown: false,
             pending_compaction: None,
+            history_epoch: 0,
             compacted_without_relief: false,
             compaction_exhausted: false,
             tokens_out: 0,
@@ -1155,6 +1166,7 @@ impl App {
             s.last_prompt_tokens = None;
             s.context_full_notice_shown = false;
             s.pending_compaction = None;
+            s.history_epoch = s.history_epoch.wrapping_add(1);
             // A restored history is a different context: whatever the previous
             // one could or could not be reduced to says nothing about it.
             s.compacted_without_relief = false;
@@ -1562,6 +1574,8 @@ impl App {
         // A summary still in flight was made from the history this just
         // replaced, so it must not be applied to the restored one (#377).
         self.active_session_mut().pending_compaction = None;
+        let e = self.active_session().history_epoch.wrapping_add(1);
+        self.active_session_mut().history_epoch = e;
         self.active_session_mut().context_full_notice_shown = false;
         // The restored history is a different context: what the previous one
         // could or could not be reduced to says nothing about it, and keeping
@@ -1765,6 +1779,8 @@ impl App {
                 // just asked for the run to stop, so its result is discarded
                 // rather than applied to a history they may now edit (#377).
                 self.active_session_mut().pending_compaction = None;
+                let e = self.active_session().history_epoch.wrapping_add(1);
+                self.active_session_mut().history_epoch = e;
                 self.pending_ssh = None;
                 self.pending_ssh_password = None;
                 self.mode = AppMode::Normal;
@@ -3708,11 +3724,16 @@ impl App {
             // Dispatch above already switched to the originating session, so
             // a summary that arrives while the user is on another tab still
             // lands on the history it was made from (#377).
-            TuiEvent::CompactionStarted { boundary, .. } => {
-                // Only arm what this history can actually be cut at; a
-                // boundary past its end means the history moved underneath.
-                if boundary > 0 && boundary <= self.active_session().messages.len() {
+            TuiEvent::CompactionStarted { boundary, epoch, .. } => {
+                // The boundary was computed inside the runner, so it is only
+                // meaningful against the history it was computed from. The
+                // epoch changes when that history is replaced or the run is
+                // cancelled; the length check stays as a cheap sanity bound.
+                let s = self.active_session();
+                if epoch == s.history_epoch && boundary > 0 && boundary <= s.messages.len() {
                     self.active_session_mut().pending_compaction = Some(boundary);
+                } else {
+                    tracing::debug!(boundary, epoch, "ignoring a reactive compaction for a history that has moved");
                 }
             }
             TuiEvent::Notice { text, .. } => {
@@ -7840,7 +7861,8 @@ mod tests {
         let sid = app.active_session().id;
         let before = app.active_session().messages.len();
 
-        app.handle_agent_event(TuiEvent::CompactionStarted { session_id: sid, boundary });
+        let epoch = app.active_session().history_epoch;
+        app.handle_agent_event(TuiEvent::CompactionStarted { session_id: sid, boundary, epoch });
         assert_eq!(app.active_session().pending_compaction, Some(boundary));
 
         app.handle_agent_event(TuiEvent::HistoryCompacted {
@@ -7860,6 +7882,36 @@ mod tests {
     }
 
     #[test]
+    fn a_restored_history_of_the_same_length_refuses_the_reactive_boundary() {
+        // The length check alone let this through: restore a session with the
+        // same number of blocks while the summary is in flight, and the old
+        // boundary would be armed against the new history and cut its tail
+        // off (review of #390). The epoch is what distinguishes them.
+        let mut app = app_over_threshold(1_000, 5_000);
+        let sid = app.active_session().id;
+        let boundary = filar_core::compaction_boundary(
+            &app.active_session().messages,
+            filar_core::DEFAULT_KEEP_TURNS,
+        );
+        let epoch = app.active_session().history_epoch;
+        let same_length: Vec<ChatBlock> = (0..app.active_session().messages.len())
+            .map(|i| ChatBlock::User(format!("restored {i}")))
+            .collect();
+
+        // The user restores a different session of identical length.
+        app.active_session_mut().messages = same_length;
+        let bumped = app.active_session().history_epoch.wrapping_add(1);
+        app.active_session_mut().history_epoch = bumped;
+
+        app.handle_agent_event(TuiEvent::CompactionStarted { session_id: sid, boundary, epoch });
+
+        assert_eq!(
+            app.active_session().pending_compaction, None,
+            "a boundary from the previous history must not arm the new one"
+        );
+    }
+
+    #[test]
     fn a_stale_reactive_boundary_is_still_refused() {
         // Arming must not weaken the guard: a boundary past the end of the
         // history means it moved underneath, and cutting there would lose
@@ -7868,7 +7920,8 @@ mod tests {
         let sid = app.active_session().id;
         let past_end = app.active_session().messages.len() + 5;
 
-        app.handle_agent_event(TuiEvent::CompactionStarted { session_id: sid, boundary: past_end });
+        let epoch = app.active_session().history_epoch;
+        app.handle_agent_event(TuiEvent::CompactionStarted { session_id: sid, boundary: past_end, epoch });
 
         assert_eq!(app.active_session().pending_compaction, None);
     }

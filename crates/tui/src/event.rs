@@ -90,6 +90,9 @@ pub enum TuiEvent {
     CompactionStarted {
         session_id: SessionId,
         boundary: usize,
+        /// The session's `history_epoch` when the run was spawned. The app
+        /// refuses to arm if it has moved since.
+        epoch: u64,
     },
 
     /// A note for the feed that does not end the run.

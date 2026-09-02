@@ -5857,6 +5857,15 @@ session before the summary request goes out; the channel is ordered, so it lands
 first, and the stale guard keeps working because anything that replaces the
 history in between clears the flag again.
 
+A second round on that fix found the arming itself too weak. Checking
+`boundary <= messages.len()` does not tell a restored history from the one the
+boundary was computed against — restore a session of the same length while the
+summary is in flight and the old boundary would be armed on the new history and
+cut its tail off. Sessions now carry a `history_epoch`, bumped only when the
+history is replaced wholesale or the run is cancelled, never on an append. The
+runner captures it at spawn and sends it with `CompactionStarted`; the app
+refuses to arm if it has moved. The length check stays as a cheap bound.
+
 Declined: plumbing cancellation into `compact_for_request`, because the check
 before starting a reactive summary already exists in
 `should_retry_after_overflow` and interrupting one in flight would change the

@@ -1038,6 +1038,7 @@ async fn run_app(
                             app.confirm_mode,
                             user_input,
                             app.messages.clone(),
+                            app.active_session().history_epoch,
                             agent_tx.clone(),
                             is_local,
                             ssh_info,
@@ -1748,6 +1749,7 @@ fn spawn_agent(
     confirm_mode: CommandConfirmMode,
     user_input: String,
     chat_history: Vec<ChatBlock>,
+    history_epoch: u64,
     event_tx: mpsc::UnboundedSender<TuiEvent>,
     is_local: bool,
     ssh_info: Option<String>,
@@ -1876,6 +1878,7 @@ fn spawn_agent(
             let _ = tx.send(TuiEvent::CompactionStarted {
                 session_id: sid,
                 boundary,
+                epoch: history_epoch,
             });
             chat_history =
                 compact_for_request(chat_history, Some(boundary), llm.as_ref(), &tx, sid).await;
