@@ -70,16 +70,21 @@ pub enum TuiEvent {
     /// `boundary` is echoed back from the request so the app cannot cut a
     /// history that changed while the summary was being produced.
     ///
-    /// `usage` is what the summarising request itself cost. It rides along with
-    /// the result rather than going through [`filar_agent::AgentEvent::TokenUsage`]
-    /// because that path also records the size of the context that was sent,
-    /// which drives compaction — and a summary's prompt is the head being
-    /// folded, not the session's context (#387).
+    /// `usage` is what the summarising request itself cost, and `profile` is
+    /// the profile that computed it, captured when the run was spawned. Both
+    /// ride along with the result rather than being read from the session when
+    /// it arrives: the usage would otherwise go through
+    /// [`filar_agent::AgentEvent::TokenUsage`], which also records the size of
+    /// the context that was sent and drives compaction — and a summary's prompt
+    /// is the head being folded, not the session's context. The profile would
+    /// otherwise be read from `pending_llm_profile`, which a later turn can
+    /// already have overwritten by then (#387).
     HistoryCompacted {
         session_id: SessionId,
         boundary: usize,
         summary: std::result::Result<String, String>,
         usage: Option<filar_agent::TokenUsage>,
+        profile: String,
     },
 
     /// A reactive compaction is about to be summarised — arm the session for

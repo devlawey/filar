@@ -6059,41 +6059,60 @@ guard rejects a result whose history has moved. Charging from there would either
 double the figures or drop them exactly when the user was billed. Both cases
 have tests.
 
-**Attribution.** `pending_llm_profile`, the profile the request was sent under —
-correct today because the summary runs on the session's own profile inside the
-same agent task. The cheap-profile option from the #377 spec was **not**
-implemented: nothing in the repo defines how such a profile would be configured
-or selected, and inventing that is outside this issue. When it lands, the
-profile that computed the summary has to travel on the event, because the value
-read here would then be the wrong one. Noted in the doc comment on
-`record_summary_usage` so the next person meets it there.
+**Attribution.** The profile is captured when the run is spawned and travels on
+the event. The first cut read `pending_llm_profile` when the result arrived,
+which review of PR #391 showed to be wrong: `cancel_work` does not abort the
+summarising call — nothing in `compact_for_request` consults the cancellation
+token — so a summary can still be in flight while the user switches profile and
+sends another turn, and `begin_agent_request` overwrites the field before the
+result lands. The session total is owed either way, but `per_profile` would have
+charged a profile that never computed it. `spawn_agent` now takes
+`profile_name`, and this is also where a cheap-profile summariser would plug in:
+it would set that field and nothing downstream would change.
 
 **Done:** 4 tests in `filar-agent` (usage survives an accepted summary, survives
-a rejected one, absent when no response came back) and 5 in `app.rs` (counted
+a rejected one, absent when no response came back) and 6 in `app.rs` (counted
 once in session and `per_profile`, no double count on re-application, an
 unusable summary is still paid for, the compaction trigger does not move, a
-provider reporting no usage changes nothing).
+provider reporting no usage changes nothing, and a summary in flight across a
+cancel plus profile switch is billed to the profile that computed it).
 
 **Public contract:** `filar-agent::summarise_history` changes signature —
 `Result<String>` → the new `SummaryOutcome`. Breaking for embedders that call it
 directly, though `ENGINE_API.md` does not document it, so nothing there goes
-stale. `TuiEvent::HistoryCompacted` gains a field; `filar-tui` is not an engine
-crate. `CommandExecutor` and `LlmClient` untouched. `COMPACTION_SYSTEM_PROMPT`
-unchanged, so eval behaviour should be unaffected — but the change is inside
-`crates/agent/src/**`, which triggers `eval-smoke` regardless.
+stale. `TuiEvent::HistoryCompacted` gains two fields; `filar-tui` is not an
+engine crate. `CommandExecutor` and `LlmClient` untouched.
+`COMPACTION_SYSTEM_PROMPT` unchanged, so eval behaviour should be unaffected —
+but the change is inside `crates/agent/src/**`, which triggers `eval-smoke`
+regardless, and it passed on the first commit.
 
 **Verification:** `cargo build --workspace`, `cargo test --workspace` and
 `cargo build --release` were all run here — the container now has a Rust
 toolchain, which the skill's `reference/environment.md` still says is
-impossible. The four positive tests were confirmed to fail with the accounting
-call removed. The TUI itself was not driven: no interactive terminal in this
-environment, so the cost-line check is the human's.
+impossible. The positive tests were confirmed to fail with the accounting call
+removed, and the attribution test to fail against the `pending_llm_profile`
+version. The TUI itself was not driven: no interactive terminal in this
+environment, so the cost-line check is the human's. Review asked for that run to
+be performed and recorded instead; it cannot be, and AGENTS.md says to say so
+rather than close the requirement quietly.
+
+**Review (PR #391).** Two findings taken. The profile race above, and a
+changelog entry too long for the one-line rule in AGENTS.md. Three declined. A
+claimed panic in `record_summary_usage` on a closed session, and a claim that
+the handler does not dispatch by `session_id`: `handle_agent_event` resolves the
+session with `find_session_idx` and returns early when it is gone, before any
+arm runs. A `String` clone per compaction called redundant — it mirrors the
+neighbouring `TokenUsage` arm and sits next to a network round trip; the
+attribution fix removed it anyway. And the request for TUI results that cannot
+be produced here.
 
 **Next steps:** #379 (4/4) is the last open task of 1.0.6, and it is larger than
 it reads — `apply_compaction` replaces `Session::messages`, so the transcript's
 "full history including the folded part" does not hold by construction and has
-to be built. The cheap-profile summariser remains open and now has a named place
-to hook into.
+to be built. The cheap-profile summariser remains open and now has its hook. A
+separate defect surfaced in review and is **not** fixed here: the summarising
+call ignores the cancellation token, so Ctrl+Z leaves the user paying for a
+request whose result is then discarded. Needs its own issue.
 
 ## Release v1.0.5 (2026-08-27)
 

@@ -43,11 +43,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
-- The cost a session reports now includes the requests it makes to compact its
-  own history. Each summary was billed but counted nowhere, so on a long session
-  the reported figure was short by the whole compacted head every time. A
-  summary the model returns unusably short is counted too, since it was paid for
-  either way ([#387](https://github.com/devlawey/filar/issues/387)).
+- Session cost now includes the requests made to compact the history, counting
+  a summary the model returns unusably short as well, since it is billed either
+  way ([#387](https://github.com/devlawey/filar/issues/387)).
 
 - Deleting a launcher profile no longer removes its stored API key when the
   deletion cannot be saved. The remaining profiles are checked first, so a

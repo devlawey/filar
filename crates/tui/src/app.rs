@@ -1390,16 +1390,18 @@ impl App {
     /// to do with how full the session's context is. Arbiter usage is left out
     /// of that figure for the same reason.
     ///
-    /// Attribution follows `pending_llm_profile`, the profile the session was
-    /// sent with, because the summary is produced by that same profile inside
-    /// the same agent task. Should the summariser ever move to a separate cheap
-    /// profile, the profile that computed it has to travel with the event
-    /// instead — the value read here would then be the wrong one.
-    fn record_summary_usage(&mut self, usage: &filar_agent::TokenUsage) {
+    /// `profile` is the one the run was spawned with, carried on the event
+    /// rather than read from `pending_llm_profile` here. Cancelling a turn does
+    /// not abort the summarising call, so it can still be in flight while the
+    /// user switches profile and sends another turn — which overwrites
+    /// `pending_llm_profile` and would put this cost on a profile that never
+    /// computed it (review of #391). Passing it also leaves the cheap-profile
+    /// summariser from the #377 spec a place to plug into: it would set this
+    /// field and nothing here would change.
+    fn record_summary_usage(&mut self, usage: &filar_agent::TokenUsage, profile: String) {
         let tokens_in = usage.prompt_tokens.unwrap_or(0);
         let tokens_out = usage.completion_tokens.unwrap_or(0);
         let cost = usage.cost;
-        let fallback_profile = self.default_profile_name.clone();
         let s = self.active_session_mut();
         s.tokens_in += tokens_in;
         s.tokens_out += tokens_out;
@@ -1407,11 +1409,7 @@ impl App {
             let total = s.cost_usd.unwrap_or(0.0) + c;
             s.cost_usd = Some((total * 10000.0).round() / 10000.0);
         }
-        let profile_key = s.pending_llm_profile.clone().unwrap_or_else(|| {
-            warn!("pending_llm_profile is None — summary usage attributed to default profile");
-            fallback_profile
-        });
-        let pu = s.per_profile.entry(profile_key).or_default();
+        let pu = s.per_profile.entry(profile).or_default();
         pu.tokens_in += tokens_in;
         pu.tokens_out += tokens_out;
     }
@@ -3777,7 +3775,7 @@ impl App {
                 // and the cancellation token are all left alone.
                 self.push_message(ChatBlock::System(text));
             }
-            TuiEvent::HistoryCompacted { boundary, summary, usage, .. } => {
+            TuiEvent::HistoryCompacted { boundary, summary, usage, profile, .. } => {
                 // Counted here, before the summary is judged: the tokens were
                 // spent by the time this event exists, so an unusable summary
                 // and one that no longer fits the history are both owed for.
@@ -3785,7 +3783,7 @@ impl App {
                 // below can be reached again with the same boundary, and
                 // charging from there would double the figures (#387).
                 if let Some(u) = usage {
-                    self.record_summary_usage(&u);
+                    self.record_summary_usage(&u, profile);
                 }
                 match summary {
                     Ok(text) => self.apply_compaction(boundary, text),
@@ -7926,6 +7924,7 @@ mod tests {
             boundary,
             summary: Ok("A real summary of the earlier turns of this session.".into()),
             usage: Some(summary_usage(9_000, 120, Some(0.25))),
+            profile: "p".into(),
         });
 
         assert_eq!(app.active_session().tokens_in, before_in + 9_000);
@@ -7950,6 +7949,7 @@ mod tests {
             boundary,
             summary: Ok(summary.into()),
             usage: Some(summary_usage(9_000, 120, Some(0.25))),
+            profile: "p".into(),
         });
         let after_first = app.active_session().tokens_in;
         let blocks = app.active_session().messages.len();
@@ -7975,6 +7975,7 @@ mod tests {
             boundary,
             summary: Err("the model returned a summary too short to be usable".into()),
             usage: Some(summary_usage(9_000, 3, Some(0.2))),
+            profile: "p".into(),
         });
 
         assert_eq!(app.active_session().tokens_in, 9_000);
@@ -7997,6 +7998,7 @@ mod tests {
             boundary,
             summary: Ok("A real summary of the earlier turns of this session.".into()),
             usage: Some(summary_usage(9_000, 120, None)),
+            profile: "p".into(),
         });
 
         assert_eq!(app.active_session().last_prompt_tokens, before);
@@ -8013,11 +8015,57 @@ mod tests {
             boundary,
             summary: Ok("A real summary of the earlier turns of this session.".into()),
             usage: None,
+            profile: "p".into(),
         });
 
         assert_eq!(app.active_session().tokens_in, 0);
         assert_eq!(app.active_session().cost_usd, None);
         assert!(app.active_session().per_profile.is_empty());
+    }
+
+    #[test]
+    fn a_summary_in_flight_is_billed_to_the_profile_that_computed_it() {
+        // Cancelling a turn does not abort the summarising call, so it can
+        // still be in flight while the user switches profile and sends another
+        // turn. Reading `pending_llm_profile` when the result lands would then
+        // charge the head of a `p` session to `other` (review of #391).
+        let (mut app, sid, boundary) = app_awaiting_summary();
+        app.profiles.push(filar_core::LlmProfile {
+            name: "other".into(), model: "m2".into(), api_base_url: "u".into(),
+            max_tokens: 4096, key_env: "k".into(),
+            temperature: None, top_p: None, extra_body: None,
+            compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
+        });
+
+        // Ctrl+Z, then Ctrl+L to `other`, then a new turn: the session now
+        // points at a profile that had nothing to do with the summary.
+        app.mode = AppMode::Thinking;
+        app.cancel_work();
+        app.llm_profile = Some("other".into());
+        app.begin_agent_request("another question".into());
+        assert_eq!(
+            app.active_session().pending_llm_profile.as_deref(),
+            Some("other"),
+            "the fixture must actually have moved the session's profile on"
+        );
+
+        // The summary from the cancelled run finally comes back.
+        app.handle_agent_event(TuiEvent::HistoryCompacted {
+            session_id: sid,
+            boundary,
+            summary: Ok("A real summary of the earlier turns of this session.".into()),
+            usage: Some(summary_usage(9_000, 120, Some(0.25))),
+            profile: "p".into(),
+        });
+
+        assert_eq!(app.active_session().per_profile["p"].tokens_in, 9_000);
+        let other = app.active_session().per_profile.get("other");
+        assert!(
+            other.map_or(true, |u| u.tokens_in == 0 && u.tokens_out == 0),
+            "the profile that never computed the summary must not be charged for it"
+        );
+        // The session total is owed either way — the request was billed.
+        assert_eq!(app.active_session().tokens_in, 9_000);
     }
 
     #[test]
@@ -8045,6 +8093,7 @@ mod tests {
             boundary,
             summary: Ok("A real summary of the earlier turns of this session.".into()),
             usage: None,
+            profile: "p".into(),
         });
 
         assert!(
