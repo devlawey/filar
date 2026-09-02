@@ -1952,13 +1952,18 @@ async fn compact_for_request(
         return chat_history;
     }
     let transcript = filar_core::transcript_for_summary(&chat_history[..boundary]);
-    match filar_agent::summarise_history(llm, &transcript).await {
+    // The usage goes back in both branches: the call was billed whether or not
+    // the reply turned out to be usable (#387).
+    let outcome = filar_agent::summarise_history(llm, &transcript).await;
+    let usage = outcome.usage;
+    match outcome.summary {
         Ok(summary) => {
             let compacted = filar_core::compact_history(&chat_history, boundary, &summary);
             let _ = tx.send(TuiEvent::HistoryCompacted {
                 session_id: sid,
                 boundary,
                 summary: Ok(summary),
+                usage,
             });
             compacted
         }
@@ -1970,6 +1975,7 @@ async fn compact_for_request(
                 session_id: sid,
                 boundary,
                 summary: Err(e.to_string()),
+                usage,
             });
             chat_history
         }

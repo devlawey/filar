@@ -1380,6 +1380,42 @@ impl App {
     }
 
     /// Report that compaction failed, leaving the history untouched.
+    /// Add a summarising call's token usage to the session that paid for it.
+    ///
+    /// Deliberately not routed through [`filar_agent::AgentEvent::TokenUsage`].
+    /// That arm also records `last_prompt_tokens` — the measured size of the
+    /// context actually sent, and the trigger compaction fires on (#376). A
+    /// summary's prompt is the head being folded, sent as its own request, so
+    /// feeding it in there would move the trigger by an amount that has nothing
+    /// to do with how full the session's context is. Arbiter usage is left out
+    /// of that figure for the same reason.
+    ///
+    /// Attribution follows `pending_llm_profile`, the profile the session was
+    /// sent with, because the summary is produced by that same profile inside
+    /// the same agent task. Should the summariser ever move to a separate cheap
+    /// profile, the profile that computed it has to travel with the event
+    /// instead — the value read here would then be the wrong one.
+    fn record_summary_usage(&mut self, usage: &filar_agent::TokenUsage) {
+        let tokens_in = usage.prompt_tokens.unwrap_or(0);
+        let tokens_out = usage.completion_tokens.unwrap_or(0);
+        let cost = usage.cost;
+        let fallback_profile = self.default_profile_name.clone();
+        let s = self.active_session_mut();
+        s.tokens_in += tokens_in;
+        s.tokens_out += tokens_out;
+        if let Some(c) = cost {
+            let total = s.cost_usd.unwrap_or(0.0) + c;
+            s.cost_usd = Some((total * 10000.0).round() / 10000.0);
+        }
+        let profile_key = s.pending_llm_profile.clone().unwrap_or_else(|| {
+            warn!("pending_llm_profile is None — summary usage attributed to default profile");
+            fallback_profile
+        });
+        let pu = s.per_profile.entry(profile_key).or_default();
+        pu.tokens_in += tokens_in;
+        pu.tokens_out += tokens_out;
+    }
+
     pub fn report_compaction_failure(&mut self, error: String) {
         self.active_session_mut().pending_compaction = None;
         self.push_message(ChatBlock::System(format!(
@@ -3741,10 +3777,21 @@ impl App {
                 // and the cancellation token are all left alone.
                 self.push_message(ChatBlock::System(text));
             }
-            TuiEvent::HistoryCompacted { boundary, summary, .. } => match summary {
-                Ok(text) => self.apply_compaction(boundary, text),
-                Err(e) => self.report_compaction_failure(e),
-            },
+            TuiEvent::HistoryCompacted { boundary, summary, usage, .. } => {
+                // Counted here, before the summary is judged: the tokens were
+                // spent by the time this event exists, so an unusable summary
+                // and one that no longer fits the history are both owed for.
+                // This is also the only place it happens — `apply_compaction`
+                // below can be reached again with the same boundary, and
+                // charging from there would double the figures (#387).
+                if let Some(u) = usage {
+                    self.record_summary_usage(&u);
+                }
+                match summary {
+                    Ok(text) => self.apply_compaction(boundary, text),
+                    Err(e) => self.report_compaction_failure(e),
+                }
+            }
         }
         // Auto-scroll to bottom on new content (unless user scrolled up during streaming).
         if auto_scroll {
@@ -7845,6 +7892,134 @@ mod tests {
         assert_eq!(app.active_session().pending_compaction, None);
     }
 
+    fn summary_usage(prompt: u64, completion: u64, cost: Option<f64>) -> filar_agent::TokenUsage {
+        filar_agent::TokenUsage {
+            prompt_tokens: Some(prompt),
+            completion_tokens: Some(completion),
+            total_tokens: Some(prompt + completion),
+            cost,
+        }
+    }
+
+    /// An app armed for compaction with `p` as the profile the request was
+    /// sent under, which is what the summary's usage must be attributed to.
+    fn app_awaiting_summary() -> (App, SessionId, usize) {
+        let mut app = app_over_threshold(1_000, 5_000);
+        let sid = app.active_session().id;
+        app.active_session_mut().pending_llm_profile = Some("p".into());
+        app.report_context_fill("p");
+        let boundary = app.active_session().pending_compaction.expect("compaction armed");
+        (app, sid, boundary)
+    }
+
+    #[test]
+    fn summary_usage_is_counted_once_in_the_session_and_the_profile() {
+        // The summarising call is a real request the user pays for, and its
+        // cost was going nowhere: the session's reported total was short by
+        // every summary it had ever produced (#387).
+        let (mut app, sid, boundary) = app_awaiting_summary();
+        let before_in = app.active_session().tokens_in;
+        let before_out = app.active_session().tokens_out;
+
+        app.handle_agent_event(TuiEvent::HistoryCompacted {
+            session_id: sid,
+            boundary,
+            summary: Ok("A real summary of the earlier turns of this session.".into()),
+            usage: Some(summary_usage(9_000, 120, Some(0.25))),
+        });
+
+        assert_eq!(app.active_session().tokens_in, before_in + 9_000);
+        assert_eq!(app.active_session().tokens_out, before_out + 120);
+        assert_eq!(app.active_session().cost_usd, Some(0.25));
+        let pu = app.active_session().per_profile.get("p").expect("attributed to the sending profile");
+        assert_eq!(pu.tokens_in, 9_000);
+        assert_eq!(pu.tokens_out, 120);
+    }
+
+    #[test]
+    fn a_summary_applied_twice_is_not_paid_for_twice() {
+        // The second delivery is stale — `pending_compaction` was cleared by
+        // the first — and must not add to the figures again. Charging from
+        // inside `apply_compaction` would have looked equivalent and been
+        // wrong here (#387).
+        let (mut app, sid, boundary) = app_awaiting_summary();
+        let summary = "A real summary of the earlier turns of this session.";
+
+        app.handle_agent_event(TuiEvent::HistoryCompacted {
+            session_id: sid,
+            boundary,
+            summary: Ok(summary.into()),
+            usage: Some(summary_usage(9_000, 120, Some(0.25))),
+        });
+        let after_first = app.active_session().tokens_in;
+        let blocks = app.active_session().messages.len();
+
+        // Applying the same result again: no usage rides along a second time,
+        // and the history is left alone.
+        app.apply_compaction(boundary, summary.into());
+
+        assert_eq!(app.active_session().tokens_in, after_first, "no double count");
+        assert_eq!(app.active_session().per_profile["p"].tokens_in, 9_000);
+        assert_eq!(app.active_session().cost_usd, Some(0.25));
+        assert_eq!(app.active_session().messages.len(), blocks, "history untouched");
+    }
+
+    #[test]
+    fn an_unusable_summary_is_still_paid_for() {
+        // The provider billed the request before anyone could tell the reply
+        // was too short to use (#378 failure path, #387 accounting).
+        let (mut app, sid, boundary) = app_awaiting_summary();
+
+        app.handle_agent_event(TuiEvent::HistoryCompacted {
+            session_id: sid,
+            boundary,
+            summary: Err("the model returned a summary too short to be usable".into()),
+            usage: Some(summary_usage(9_000, 3, Some(0.2))),
+        });
+
+        assert_eq!(app.active_session().tokens_in, 9_000);
+        assert_eq!(app.active_session().per_profile["p"].tokens_in, 9_000);
+        assert_eq!(app.active_session().cost_usd, Some(0.2));
+    }
+
+    #[test]
+    fn summary_usage_does_not_move_the_compaction_trigger() {
+        // `last_prompt_tokens` is the size of the context that was sent, and
+        // it is what compaction fires on (#376). The summary's prompt is the
+        // head being folded, in a request of its own, so letting it in there
+        // would move the trigger for reasons unrelated to how full the
+        // session's context is — the same reason arbiter usage is excluded.
+        let (mut app, sid, boundary) = app_awaiting_summary();
+        let before = app.active_session().last_prompt_tokens;
+
+        app.handle_agent_event(TuiEvent::HistoryCompacted {
+            session_id: sid,
+            boundary,
+            summary: Ok("A real summary of the earlier turns of this session.".into()),
+            usage: Some(summary_usage(9_000, 120, None)),
+        });
+
+        assert_eq!(app.active_session().last_prompt_tokens, before);
+        assert_eq!(app.active_session().tokens_in, 9_000, "but it is still counted");
+    }
+
+    #[test]
+    fn a_summary_with_no_reported_usage_changes_no_figures() {
+        // Providers that report no usage must not turn into zero-token rows.
+        let (mut app, sid, boundary) = app_awaiting_summary();
+
+        app.handle_agent_event(TuiEvent::HistoryCompacted {
+            session_id: sid,
+            boundary,
+            summary: Ok("A real summary of the earlier turns of this session.".into()),
+            usage: None,
+        });
+
+        assert_eq!(app.active_session().tokens_in, 0);
+        assert_eq!(app.active_session().cost_usd, None);
+        assert!(app.active_session().per_profile.is_empty());
+    }
+
     #[test]
     fn a_reactive_compaction_is_adopted_by_the_session() {
         // The reactive path decides mid-run, so nothing armed
@@ -7869,6 +8044,7 @@ mod tests {
             session_id: sid,
             boundary,
             summary: Ok("A real summary of the earlier turns of this session.".into()),
+            usage: None,
         });
 
         assert!(

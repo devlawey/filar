@@ -6021,6 +6021,80 @@ only true after a sibling test has created `~/.local/share` via
 `SessionStore::new`. Invisible on Windows and macOS, where the directory always
 exists. Left out of this PR — different cause, needs its own issue.
 
+## Issue #387: feat(tui/agent) — the summarising call is now paid for
+
+**Milestone:** 1.0.6. **Branch:** `feat/387-summary-token-usage`. Raised in
+review of PR #384 and deferred from #377 as its own task.
+
+**Problem:** compaction sends a real request to the model and the reply was the
+only thing kept from it. `summarise_history` returned `Result<String>`, so the
+`usage` on the `ChatResponse` was dropped on the floor: neither the session's
+`tokens_in` / `tokens_out` / `cost_usd` nor `per_profile` saw it. On a long
+session the input of every summary is the entire head being folded, so the
+figure shown to the user was short by a large amount and grew shorter with use.
+
+**Shape.** `summarise_history` now returns `SummaryOutcome { usage, summary }`
+instead of `Result<String>`. Usage and summary are separated because they are
+owed to different places: whether the brief is usable decides only whether the
+head is folded, while the request was billed before anyone could judge it. A
+reply rejected as too short (#378) therefore comes back with its usage intact;
+a call that failed before a response existed reports `None` rather than a
+fabricated zero. The runner passes it through on `TuiEvent::HistoryCompacted`,
+which gained a `usage` field.
+
+**Where it is counted, and why not the obvious place.** Not through
+`AgentEvent::TokenUsage`. That arm also records `last_prompt_tokens` — the
+measured size of the context actually sent, and the trigger compaction fires on
+(#376). A summary's prompt is the head being folded, in a request of its own, so
+routing it there would move the trigger by an amount unrelated to how full the
+session's context is, and could re-arm compaction immediately after one just
+ran. Arbiter usage is excluded from that same figure for the same reason, so the
+new `App::record_summary_usage` follows the arbiter's precedent: session totals
+and `per_profile`, no `last_prompt_tokens`, no `last_served_model`.
+
+**Counted once.** In the `HistoryCompacted` arm, before the summary is judged,
+rather than inside `apply_compaction`. The two look equivalent and are not:
+`apply_compaction` is reachable again with the same boundary, and its stale
+guard rejects a result whose history has moved. Charging from there would either
+double the figures or drop them exactly when the user was billed. Both cases
+have tests.
+
+**Attribution.** `pending_llm_profile`, the profile the request was sent under —
+correct today because the summary runs on the session's own profile inside the
+same agent task. The cheap-profile option from the #377 spec was **not**
+implemented: nothing in the repo defines how such a profile would be configured
+or selected, and inventing that is outside this issue. When it lands, the
+profile that computed the summary has to travel on the event, because the value
+read here would then be the wrong one. Noted in the doc comment on
+`record_summary_usage` so the next person meets it there.
+
+**Done:** 4 tests in `filar-agent` (usage survives an accepted summary, survives
+a rejected one, absent when no response came back) and 5 in `app.rs` (counted
+once in session and `per_profile`, no double count on re-application, an
+unusable summary is still paid for, the compaction trigger does not move, a
+provider reporting no usage changes nothing).
+
+**Public contract:** `filar-agent::summarise_history` changes signature —
+`Result<String>` → the new `SummaryOutcome`. Breaking for embedders that call it
+directly, though `ENGINE_API.md` does not document it, so nothing there goes
+stale. `TuiEvent::HistoryCompacted` gains a field; `filar-tui` is not an engine
+crate. `CommandExecutor` and `LlmClient` untouched. `COMPACTION_SYSTEM_PROMPT`
+unchanged, so eval behaviour should be unaffected — but the change is inside
+`crates/agent/src/**`, which triggers `eval-smoke` regardless.
+
+**Verification:** `cargo build --workspace`, `cargo test --workspace` and
+`cargo build --release` were all run here — the container now has a Rust
+toolchain, which the skill's `reference/environment.md` still says is
+impossible. The four positive tests were confirmed to fail with the accounting
+call removed. The TUI itself was not driven: no interactive terminal in this
+environment, so the cost-line check is the human's.
+
+**Next steps:** #379 (4/4) is the last open task of 1.0.6, and it is larger than
+it reads — `apply_compaction` replaces `Session::messages`, so the transcript's
+"full history including the folded part" does not hold by construction and has
+to be built. The cheap-profile summariser remains open and now has a named place
+to hook into.
+
 ## Release v1.0.5 (2026-08-27)
 
 **Scope:** milestone 1.0.5 — regression fixes for 1.0.4: Unicode export topic slug
