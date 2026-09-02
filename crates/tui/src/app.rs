@@ -3490,6 +3490,7 @@ impl App {
             TuiEvent::PasswordNeeded { session_id, .. } => *session_id,
             TuiEvent::HistoryCompacted { session_id, .. } => *session_id,
             TuiEvent::Notice { session_id, .. } => *session_id,
+            TuiEvent::CompactionStarted { session_id, .. } => *session_id,
         };
 
         // Dispatch to the originating session. Save the active index so we can
@@ -3707,6 +3708,13 @@ impl App {
             // Dispatch above already switched to the originating session, so
             // a summary that arrives while the user is on another tab still
             // lands on the history it was made from (#377).
+            TuiEvent::CompactionStarted { boundary, .. } => {
+                // Only arm what this history can actually be cut at; a
+                // boundary past its end means the history moved underneath.
+                if boundary > 0 && boundary <= self.active_session().messages.len() {
+                    self.active_session_mut().pending_compaction = Some(boundary);
+                }
+            }
             TuiEvent::Notice { text, .. } => {
                 // Feed-only: the run continues, so `agent_running`, the mode
                 // and the cancellation token are all left alone.
@@ -7813,6 +7821,55 @@ mod tests {
         let after_notice = app.active_session().messages.len();
         app.report_context_fill("p");
         assert_eq!(app.active_session().messages.len(), after_notice);
+        assert_eq!(app.active_session().pending_compaction, None);
+    }
+
+    #[test]
+    fn a_reactive_compaction_is_adopted_by_the_session() {
+        // The reactive path decides mid-run, so nothing armed
+        // `pending_compaction` and the summary that came back was rejected as
+        // stale: the retry ran on a compacted history the session never
+        // adopted, and the next turn overflowed all over again (review of
+        // #390). CompactionStarted is what closes that gap.
+        let mut app = app_over_threshold(1_000, 5_000);
+        let boundary = filar_core::compaction_boundary(
+            &app.active_session().messages,
+            filar_core::DEFAULT_KEEP_TURNS,
+        );
+        assert!(boundary > 0, "the fixture must have a compactable head");
+        let sid = app.active_session().id;
+        let before = app.active_session().messages.len();
+
+        app.handle_agent_event(TuiEvent::CompactionStarted { session_id: sid, boundary });
+        assert_eq!(app.active_session().pending_compaction, Some(boundary));
+
+        app.handle_agent_event(TuiEvent::HistoryCompacted {
+            session_id: sid,
+            boundary,
+            summary: Ok("A real summary of the earlier turns of this session.".into()),
+        });
+
+        assert!(
+            app.active_session().messages.len() < before,
+            "the session's own history must end up compacted, not just the runner's copy"
+        );
+        assert!(matches!(
+            app.active_session().messages.first(),
+            Some(ChatBlock::Summary { .. })
+        ));
+    }
+
+    #[test]
+    fn a_stale_reactive_boundary_is_still_refused() {
+        // Arming must not weaken the guard: a boundary past the end of the
+        // history means it moved underneath, and cutting there would lose
+        // turns.
+        let mut app = app_over_threshold(1_000, 5_000);
+        let sid = app.active_session().id;
+        let past_end = app.active_session().messages.len() + 5;
+
+        app.handle_agent_event(TuiEvent::CompactionStarted { session_id: sid, boundary: past_end });
+
         assert_eq!(app.active_session().pending_compaction, None);
     }
 

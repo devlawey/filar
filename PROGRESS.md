@@ -5846,6 +5846,17 @@ Terms are now split into ones that can only mean the conversation
 length-shaped complaint (`input`, `prompt`). The mutex around the held error
 recovers from poisoning instead of unwrapping.
 
+The most consequential one arrived last and was nearly missed: the reactive
+path never persisted its own compaction. `pending_compaction` is `None` on that
+path, so `apply_compaction` discarded the summary as stale — the retry ran on a
+local compacted copy while the session kept the full history, and every
+following turn overflowed again, paying an overflow, a summary and a retry each
+time. The manual trace in the PR showed it (a turn after the retry was back up
+to 16 messages) and I read past it. A `TuiEvent::CompactionStarted` now arms the
+session before the summary request goes out; the channel is ordered, so it lands
+first, and the stale guard keeps working because anything that replaces the
+history in between clears the flag again.
+
 Declined: plumbing cancellation into `compact_for_request`, because the check
 before starting a reactive summary already exists in
 `should_retry_after_overflow` and interrupting one in flight would change the

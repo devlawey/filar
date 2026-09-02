@@ -1870,6 +1870,13 @@ fn spawn_agent(
                     .to_string(),
             });
             let before = chat_history.len();
+            // Arm the session before the summary goes out, or the result that
+            // comes back is discarded as stale and only this local copy is
+            // ever compacted (review of #390).
+            let _ = tx.send(TuiEvent::CompactionStarted {
+                session_id: sid,
+                boundary,
+            });
             chat_history =
                 compact_for_request(chat_history, Some(boundary), llm.as_ref(), &tx, sid).await;
             if chat_history.len() >= before {
