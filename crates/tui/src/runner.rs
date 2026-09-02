@@ -1038,12 +1038,14 @@ async fn run_app(
                             app.confirm_mode,
                             user_input,
                             app.messages.clone(),
+                            app.active_session().history_epoch,
                             agent_tx.clone(),
                             is_local,
                             ssh_info,
                             cancel_token,
                             config.secret_provider.clone(),
                             sid,
+                            app.active_session().compaction_exhausted,
                             pending_compaction,
                         );
                         // Consumed by this run: the summary comes back as an
@@ -1748,12 +1750,17 @@ fn spawn_agent(
     confirm_mode: CommandConfirmMode,
     user_input: String,
     chat_history: Vec<ChatBlock>,
+    history_epoch: u64,
     event_tx: mpsc::UnboundedSender<TuiEvent>,
     is_local: bool,
     ssh_info: Option<String>,
     cancellation: CancellationToken,
     secret_provider: Arc<dyn SecretProvider>,
     sid: SessionId,
+    // The session has already been told that compaction cannot shrink it any
+    // further. The reactive path honours that rather than quietly compacting
+    // behind the notice (review of #390).
+    compaction_exhausted: bool,
     // Boundary index when the history must be compacted before this request
     // (#377). `None` means send it as is.
     pending_compaction: Option<usize>,
@@ -1764,87 +1771,209 @@ fn spawn_agent(
     tokio::spawn(async move {
         let _ = tx.send(TuiEvent::Thinking);
 
-        // Compaction runs here, before the agent is built, because this is
-        // where the LLM client lives and the spinner is already up. The
-        // summary uses the session's own profile, so its cost lands on the
-        // profile the user is actually working with.
-        let chat_history = match pending_compaction {
-            Some(boundary) if boundary > 0 && boundary <= chat_history.len() => {
-                let transcript =
-                    filar_core::transcript_for_summary(&chat_history[..boundary]);
-                match filar_agent::summarise_history(llm.as_ref(), &transcript).await {
-                    Ok(summary) => {
-                        let compacted =
-                            filar_core::compact_history(&chat_history, boundary, &summary);
-                        let _ = tx.send(TuiEvent::HistoryCompacted {
-                            session_id: sid,
-                            boundary,
-                            summary: Ok(summary),
-                        });
-                        compacted
-                    }
-                    Err(e) => {
-                        // The request still goes out on the full history: a
-                        // failed summary must not cost the user their turn.
-                        // Recovering from an outright context overflow is #378.
-                        let _ = tx.send(TuiEvent::HistoryCompacted {
-                            session_id: sid,
-                            boundary,
-                            summary: Err(e.to_string()),
-                        });
-                        chat_history
-                    }
-                }
-            }
-            _ => chat_history,
-        };
-
-        let history = history_to_messages(&chat_history);
+        // `AgentEvent::Error` is emitted exactly once, by `Agent::run`, right
+        // before it returns the same error. Holding it here rather than
+        // forwarding it lets the reactive path below decide whether the user
+        // ever needs to see it: an overflow that is fixed by compacting and
+        // retrying is not a failure worth reporting (#378).
+        let held_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let tx_for_sink = tx.clone();
+        let held_for_sink = Arc::clone(&held_error);
         let sink: filar_agent::EventSink = Arc::new(move |event: filar_agent::AgentEvent| {
+            if let filar_agent::AgentEvent::Error(msg) = &event {
+                *held_for_sink.lock().unwrap_or_else(|p| p.into_inner()) = Some(msg.clone());
+                return;
+            }
             let _ = tx_for_sink.send(TuiEvent::Agent {
                 session_id: sid,
                 event,
             });
         });
 
-        // Build the agent with appropriate system prompt.
-        let mut builder = AgentBuilder::new()
-            .llm(llm)
-            .executor(executor)
-            .confirmer(confirmer)
-            .confirm_mode(confirm_mode)
-            .event_sink(sink)
-            .cancellation(cancellation)
-            .secret_provider(secret_provider)
-            .arbiter_enabled(arbiter_enabled)
-            .arbiter_llm(arbiter_llm)
-            .arbiter_model_name(arbiter_model_name);
-        if is_local {
-            builder = builder.local_mode().arbiter_local_context();
-        } else {
-            builder = builder.ssh_mode(ssh_info.as_deref()).arbiter_ssh_context(ssh_info.clone());
-        }
-        builder = builder.session_id(sid.0.to_string());
+        // Compaction runs here, before the agent is built, because this is
+        // where the LLM client lives and the spinner is already up. The
+        // summary uses the session's own profile, so its cost lands on the
+        // profile the user is actually working with.
+        let before_compaction = chat_history.len();
+        let mut chat_history = compact_for_request(
+            chat_history,
+            pending_compaction,
+            llm.as_ref(),
+            &tx,
+            sid,
+        )
+        .await;
 
-        let agent = match builder.build() {
-            Ok(a) => a,
-            Err(e) => {
-                let _ = tx.send(TuiEvent::Agent {
-                    session_id: sid,
-                    event: filar_agent::AgentEvent::Error(e.to_string()),
-                });
-                return;
+        // At most two attempts, and at most one compaction per turn. The
+        // proactive pass counts: if the threshold already folded the head, a
+        // reactive fold would be the second compaction in a row, which the
+        // history cannot survive usefully and the user was not promised.
+        // A *failed* proactive summary leaves the history untouched and does
+        // not count, so the reactive path is still available then (#378).
+        let mut already_compacted = chat_history.len() < before_compaction;
+        loop {
+            let history = history_to_messages(&chat_history);
+
+            let mut builder = AgentBuilder::new()
+                .llm(Arc::clone(&llm))
+                .executor(Arc::clone(&executor))
+                .confirmer(Arc::clone(&confirmer))
+                .confirm_mode(confirm_mode)
+                .event_sink(Arc::clone(&sink))
+                .cancellation(cancellation.clone())
+                .secret_provider(Arc::clone(&secret_provider))
+                .arbiter_enabled(arbiter_enabled)
+                .arbiter_llm(arbiter_llm.clone())
+                .arbiter_model_name(arbiter_model_name.clone());
+            if is_local {
+                builder = builder.local_mode().arbiter_local_context();
+            } else {
+                builder = builder
+                    .ssh_mode(ssh_info.as_deref())
+                    .arbiter_ssh_context(ssh_info.clone());
             }
-        };
+            builder = builder.session_id(sid.0.to_string());
 
-        // Run the agent loop. All events (Started, TextDelta, CommandProposed,
-        // CommandFinished, Finished, Error) are emitted via the EventSink.
-        // The run() wrapper emits Finished on Ok and Error on Err, so we
-        // don't need to send them again here.
-        let _ = agent.run(&user_input, &history).await;
+            let agent = match builder.build() {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = tx.send(TuiEvent::Agent {
+                        session_id: sid,
+                        event: filar_agent::AgentEvent::Error(e.to_string()),
+                    });
+                    return;
+                }
+            };
+
+            *held_error.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            // Run the agent loop. All events (Started, TextDelta,
+            // CommandProposed, CommandFinished, Finished) are emitted via the
+            // EventSink; Error is held back until the outcome is known.
+            let outcome = agent.run(&user_input, &history).await;
+
+            let overflow = matches!(outcome, Err(CoreError::ContextOverflow(_)));
+            if !should_retry_after_overflow(
+                overflow,
+                already_compacted,
+                cancellation.is_cancelled(),
+                compaction_exhausted,
+            ) {
+                break;
+            }
+
+            // The threshold was set too high for this model's window, or no
+            // usage figure ever arrived. Compact and try once more — this is
+            // what keeps the feature useful when the threshold is wrong.
+            let boundary =
+                filar_core::compaction_boundary(&chat_history, filar_core::DEFAULT_KEEP_TURNS);
+            if boundary == 0 {
+                // Nothing but the verbatim tail: compacting cannot shorten it,
+                // so the overflow stands.
+                break;
+            }
+            let _ = tx.send(TuiEvent::Notice {
+                session_id: sid,
+                text: "The context window overflowed. Compacting the history and retrying once."
+                    .to_string(),
+            });
+            let before = chat_history.len();
+            // Arm the session before the summary goes out, or the result that
+            // comes back is discarded as stale and only this local copy is
+            // ever compacted (review of #390).
+            let _ = tx.send(TuiEvent::CompactionStarted {
+                session_id: sid,
+                boundary,
+                epoch: history_epoch,
+            });
+            chat_history =
+                compact_for_request(chat_history, Some(boundary), llm.as_ref(), &tx, sid).await;
+            if chat_history.len() >= before {
+                // The summary failed, so the history is unchanged and the
+                // retry would send exactly what just overflowed.
+                break;
+            }
+            already_compacted = true;
+        }
+
+        let final_error = held_error.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(msg) = final_error {
+            let _ = tx.send(TuiEvent::Agent {
+                session_id: sid,
+                event: filar_agent::AgentEvent::Error(msg),
+            });
+        }
     });
+}
+
+/// Whether an attempt that just finished should be retried over a compacted
+/// history.
+///
+/// The whole reactive rule lives here rather than inline in the task so it can
+/// be tested: the loop around it ends in `agent.run`, and a lost condition
+/// there would either retry forever or never retry at all, with nothing to
+/// catch it (#378).
+///
+/// - only a context overflow is worth retrying — every other failure returns
+///   the same result over a shorter history, and a success has nothing to fix;
+/// - only once: the second attempt already ran on a compacted history, so a
+///   third would send exactly what the second did;
+/// - never after a cancellation, which is the user asking for it to stop;
+/// - never once the session is exhausted. `already_retried` covers a single
+///   run, so without this a later turn would start clean and compact again
+///   after the user had been told the history cannot be reduced further
+///   (review of #390). Checked here rather than at the compaction itself so
+///   the retry notice is not emitted either.
+fn should_retry_after_overflow(
+    overflowed: bool,
+    already_retried: bool,
+    cancelled: bool,
+    compaction_exhausted: bool,
+) -> bool {
+    overflowed && !already_retried && !cancelled && !compaction_exhausted
+}
+
+/// Summarise the head of `chat_history` and fold it, reporting the outcome.
+///
+/// Returns the history to send. A failed or unusable summary returns it
+/// **unchanged**: losing the user's turn because the summariser misbehaved
+/// would be a worse outcome than a long context (#377, #378).
+async fn compact_for_request(
+    chat_history: Vec<ChatBlock>,
+    boundary: Option<usize>,
+    llm: &dyn LlmClient,
+    tx: &mpsc::UnboundedSender<TuiEvent>,
+    sid: SessionId,
+) -> Vec<ChatBlock> {
+    let Some(boundary) = boundary else {
+        return chat_history;
+    };
+    if boundary == 0 || boundary > chat_history.len() {
+        return chat_history;
+    }
+    let transcript = filar_core::transcript_for_summary(&chat_history[..boundary]);
+    match filar_agent::summarise_history(llm, &transcript).await {
+        Ok(summary) => {
+            let compacted = filar_core::compact_history(&chat_history, boundary, &summary);
+            let _ = tx.send(TuiEvent::HistoryCompacted {
+                session_id: sid,
+                boundary,
+                summary: Ok(summary),
+            });
+            compacted
+        }
+        Err(e) => {
+            // The request still goes out on the full history: a failed summary
+            // must not cost the user their turn. An empty or too-short reply
+            // arrives here as an error too (#378).
+            let _ = tx.send(TuiEvent::HistoryCompacted {
+                session_id: sid,
+                boundary,
+                summary: Err(e.to_string()),
+            });
+            chat_history
+        }
+    }
 }
 
 type PathPickerLoadResult = std::result::Result<(Vec<PathEntry>, bool), String>;
@@ -1883,6 +2012,66 @@ async fn load_path_picker_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_overflow_is_retried_exactly_once() {
+        // The reactive path exists because the threshold is set by hand and
+        // can be wrong: without it the very case the feature was written for
+        // is the one it cannot handle (#378).
+        assert!(
+            should_retry_after_overflow(true, false, false, false),
+            "the first overflow must be compacted and retried"
+        );
+        assert!(
+            !should_retry_after_overflow(true, true, false, false),
+            "a second overflow must not start a third attempt"
+        );
+    }
+
+    #[test]
+    fn only_an_overflow_triggers_the_retry() {
+        assert!(!should_retry_after_overflow(false, false, false, false), "a success");
+        // Any other failure would fail identically over a shorter history, so
+        // retrying it just costs the user another request.
+        assert!(!should_retry_after_overflow(false, true, false, false), "another error");
+    }
+
+    #[test]
+    fn a_proactive_compaction_uses_up_the_turn_s_one_compaction() {
+        // The threshold path folds the head before the request goes out. If
+        // that request still overflows, a reactive fold would be the second
+        // compaction in a row - the thing the feature explicitly refuses to
+        // do (review of #390). The runner seeds `already_compacted` from
+        // whether the history actually got shorter, so this is the same rule.
+        assert!(
+            !should_retry_after_overflow(true, true, false, false),
+            "a turn that already compacted must not compact again"
+        );
+        // A *failed* proactive summary leaves the history unchanged and so
+        // does not use the turn up.
+        assert!(should_retry_after_overflow(true, false, false, false));
+    }
+
+    #[test]
+    fn an_exhausted_session_is_not_compacted_behind_the_notice() {
+        // `already_retried` only covers one run, so a later turn would start
+        // clean and compact again even though the user had been told the
+        // session cannot be reduced further and to start a new one (review of
+        // #390). Every other condition here says "retry" - the exhausted flag
+        // alone must stop it.
+        assert!(
+            !should_retry_after_overflow(true, false, false, true),
+            "an exhausted session must not be compacted again"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_run_is_not_retried() {
+        assert!(
+            !should_retry_after_overflow(true, false, true, false),
+            "cancellation is the user asking for it to stop"
+        );
+    }
 
     #[test]
     fn the_summary_reaches_the_model_and_feed_chrome_does_not() {

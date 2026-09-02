@@ -539,6 +539,8 @@ enum ApiError {
     Client(u16, String),
     /// Provider rejected tool/function calling — agent loop cannot run.
     ToolsUnsupported,
+    /// Provider refused the request: the context window is exceeded (#378).
+    ContextOverflow(String),
     /// Failed to parse the response body.
     Parse(String),
 }
@@ -549,6 +551,14 @@ impl ApiError {
         // Applying the heuristic to 5xx would turn transient failures into
         // non-retryable ToolsUnsupported.
         let is_client_4xx = (400..500).contains(&status_code) && status_code != 429;
+        // Checked before the tool heuristic: an overflow body often mentions
+        // tools as part of what did not fit, and the overflow is the more
+        // specific diagnosis. Same 4xx-only restriction, for the same reason —
+        // a 5xx that happens to mention length is transient, not an overflow.
+        if is_client_4xx && looks_like_context_overflow(&body_text) {
+            warn!(status_code, body = %body_text, "provider reports the context window is exceeded");
+            return ApiError::ContextOverflow(body_text);
+        }
         if is_client_4xx && looks_like_tools_unsupported(&body_text) {
             warn!(status_code, body = %body_text, "provider rejected tool calling");
             return ApiError::ToolsUnsupported;
@@ -560,6 +570,51 @@ impl ApiError {
             _ => ApiError::Client(status_code, body_text),
         }
     }
+}
+
+/// Heuristic: provider body says the conversation exceeds the context window.
+///
+/// OpenAI-compatible providers share no code for this. OpenAI itself returns
+/// `400` with `context_length_exceeded` and "maximum context length"; others
+/// phrase it as "too many tokens", "input is too long", "prompt is too long",
+/// "exceeds the maximum" or "reduce the length of the messages", and a few use
+/// `413`. Matching on the wording is therefore the only portable option — the
+/// same trade-off `looks_like_tools_unsupported` already makes.
+///
+/// A false positive costs one compaction and a retry; a false negative leaves
+/// the user with a failed turn, which is the worse of the two.
+fn looks_like_context_overflow(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    if lower.contains("context_length_exceeded") || lower.contains("context length exceeded") {
+        return true;
+    }
+    // Terms that can only be about the conversation itself. Any complaint
+    // about size next to one of these is an overflow.
+    let names_the_context = lower.contains("context length")
+        || lower.contains("context window")
+        || lower.contains("token")
+        || lower.contains("messages");
+    // Terms that are about the request but not necessarily its length —
+    // "input exceeds maximum file size" is an upload limit, and compacting the
+    // history would not help it. These need an explicitly length-shaped
+    // complaint, not a bare "exceeds".
+    let names_the_request = lower.contains("prompt") || lower.contains("input");
+
+    let complains_about_size = lower.contains("too long")
+        || lower.contains("too many")
+        || lower.contains("too large")
+        || lower.contains("exceed")
+        || lower.contains("maximum context")
+        || lower.contains("max context")
+        || lower.contains("reduce the length")
+        || lower.contains("longer than");
+    let complains_about_length = lower.contains("too long")
+        || lower.contains("too many")
+        || lower.contains("longer than")
+        || lower.contains("reduce the length");
+
+    (names_the_context && complains_about_size)
+        || (names_the_request && complains_about_length)
 }
 
 /// Heuristic: provider body says the model/server cannot do tool calling.
@@ -582,6 +637,9 @@ impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApiError::Connect(msg) => write!(f, "connection error: {msg}"),
+            ApiError::ContextOverflow(msg) => {
+                write!(f, "the conversation exceeds the model's context window: {msg}")
+            }
             ApiError::Network(msg) => write!(f, "network error: {msg}"),
             ApiError::Timeout(d) => write!(
                 f,
@@ -615,6 +673,9 @@ impl ApiError {
             ApiError::Timeout(_) | ApiError::ToolsUnsupported => {
                 CoreError::Other(self.to_string())
             }
+            // Kept as its own variant all the way to the TUI: it is the signal
+            // that compacting and retrying once is worth doing (#378).
+            ApiError::ContextOverflow(msg) => CoreError::ContextOverflow(msg.clone()),
             ApiError::Connect(msg) => CoreError::Other(format!("connection error: {msg}")),
             ApiError::Network(msg) => CoreError::Other(format!("network error: {msg}")),
             ApiError::Auth(msg) => CoreError::Other(format!("authentication error: {msg}")),
@@ -2142,5 +2203,86 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
 
         assert_eq!(response.text, "abcd");
         assert_eq!(served.load(Ordering::SeqCst), 1, "no retry expected");
+    }
+}
+
+#[cfg(test)]
+mod context_overflow_tests {
+    use super::*;
+
+    /// Bodies collected from the phrasings OpenAI-compatible providers use.
+    /// Each must classify as an overflow, or the reactive path never fires
+    /// for that provider (#378).
+    #[test]
+    fn typical_provider_wordings_are_recognised() {
+        let bodies = [
+            r#"{"error":{"message":"This model's maximum context length is 8192 tokens. However, your messages resulted in 9231 tokens.","code":"context_length_exceeded"}}"#,
+            r#"{"error":{"message":"Input is too long for requested model."}}"#,
+            r#"{"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#,
+            r#"{"error":{"message":"Please reduce the length of the messages."}}"#,
+            r#"{"error":{"message":"too many tokens in the request"}}"#,
+            r#"{"error":{"message":"the context window was exceeded"}}"#,
+        ];
+        for body in bodies {
+            assert!(
+                matches!(
+                    ApiError::from_http_status(400, body.to_string()),
+                    ApiError::ContextOverflow(_)
+                ),
+                "not recognised as an overflow: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_overflow_is_not_treated_as_a_transient_failure() {
+        // Blindly retrying the identical request gets the identical refusal.
+        // The retry is only meaningful once the history has been shortened,
+        // which is the TUI's job, not the transport's.
+        let err = ApiError::ContextOverflow("maximum context length".into());
+        assert!(!err.is_retryable());
+        assert!(matches!(
+            err.into_core_error(),
+            CoreError::ContextOverflow(_)
+        ));
+    }
+
+    #[test]
+    fn a_size_limit_that_compaction_cannot_fix_is_not_an_overflow() {
+        // "input" plus "exceeds" is not enough: an upload limit says both, and
+        // compacting the conversation would not shorten a file (review of
+        // #390). Only an explicitly length-shaped complaint counts for the
+        // vaguer terms.
+        for body in [
+            r#"{"error":{"message":"input exceeds maximum file size"}}"#,
+            r#"{"error":{"message":"prompt exceeds the allowed number of images"}}"#,
+        ] {
+            assert!(
+                matches!(
+                    ApiError::from_http_status(400, body.to_string()),
+                    ApiError::Client(400, _)
+                ),
+                "must stay a plain client error: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_failures_are_left_alone() {
+        assert!(!matches!(
+            ApiError::from_http_status(400, "invalid api key".into()),
+            ApiError::ContextOverflow(_)
+        ));
+        // A 5xx that happens to mention tokens is transient, and turning it
+        // into a non-retryable overflow would lose a free recovery.
+        assert!(matches!(
+            ApiError::from_http_status(503, "token service unavailable, too many".into()),
+            ApiError::Server(503, _)
+        ));
+        // 429 keeps its own meaning and its own retry.
+        assert!(matches!(
+            ApiError::from_http_status(429, "too many tokens per minute".into()),
+            ApiError::RateLimit(_)
+        ));
     }
 }

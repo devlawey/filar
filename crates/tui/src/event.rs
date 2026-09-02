@@ -74,6 +74,37 @@ pub enum TuiEvent {
         boundary: usize,
         summary: std::result::Result<String, String>,
     },
+
+    /// A reactive compaction is about to be summarised — arm the session for
+    /// the result that follows.
+    ///
+    /// The threshold path arms `pending_compaction` in the app before the run
+    /// is spawned; the reactive path decides mid-run, so it has to say so.
+    /// Without this the `HistoryCompacted` that follows is rejected as stale,
+    /// the retry runs on a history the session never adopts, and every
+    /// subsequent turn overflows again (#378).
+    ///
+    /// The channel is ordered, so this always lands before the result it
+    /// arms, and the stale guard in `apply_compaction` still does its job:
+    /// anything that replaces the history in between clears the flag again.
+    CompactionStarted {
+        session_id: SessionId,
+        boundary: usize,
+        /// The session's `history_epoch` when the run was spawned. The app
+        /// refuses to arm if it has moved since.
+        epoch: u64,
+    },
+
+    /// A note for the feed that does not end the run.
+    ///
+    /// Deliberately separate from [`AgentEvent::Error`], which the app treats
+    /// as final: it clears the cancellation token and marks the agent idle.
+    /// Reporting mid-run progress through that variant would leave a request
+    /// in flight that the user can no longer cancel (#378).
+    Notice {
+        session_id: SessionId,
+        text: String,
+    },
 }
 
 #[cfg(test)]

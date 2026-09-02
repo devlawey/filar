@@ -5752,6 +5752,141 @@ was left out: `Ctrl+R` is reverse-i-search in a shell and would collide in
 interactive mode, so the key choice needs a decision of its own. Translating
 SGR into ratatui styles instead of discarding colour is a possible follow-up.
 
+## Issue #378: feat(tui/agent) — reactive compaction and summary-failure handling (3/4)
+
+**Milestone:** 1.0.6. **Branch:** `feat/378-reactive-compaction`.
+
+**Reactive path.** `compact_at_tokens` is set by hand, so it can be set above
+the model's real window — and then the request fails before compaction ever
+fires, which is precisely the case the feature was written for. The provider's
+refusal is now classified as `CoreError::ContextOverflow`, and the runner
+compacts and re-sends once.
+
+Classification lives in `ApiError::from_http_status`, following the
+`ToolsUnsupported` precedent: OpenAI-compatible providers share no code for
+this, so matching on the wording is the only portable option.
+`looks_like_context_overflow` is checked *before* the tool heuristic — an
+overflow body often mentions tools among what did not fit, and the overflow is
+the more specific diagnosis — and is restricted to non-429 4xx for the same
+reason the tool check is: a 5xx that happens to mention tokens is transient, and
+turning it into a non-retryable overflow would throw away a free recovery.
+Overflow is deliberately absent from `is_retryable()`; repeating the identical
+request earns the identical refusal, and only the owner of the history can make
+a retry mean anything.
+
+**Where the retry rule lives.** In `should_retry_after_overflow`, a free
+function, not inline in the spawned task. The loop around it ends in
+`agent.run`, so a lost condition there would either retry forever or never
+retry, and a test of the loop would be a test of the agent. This is the lesson
+from the #389 review applied before the fact rather than after it.
+
+**Suppressing the first error.** `Agent::run` emits `AgentEvent::Error` once,
+immediately before returning the same error, so the sink now holds it and the
+task forwards it only when the outcome is final. Without that the user would
+see a failure notice and then a successful answer for the same turn.
+
+**Summary failures.** Mostly already handled by #377, which sends the turn on
+the full history and warns. Added the length rule: `MIN_SUMMARY_CHARS = 40`.
+The prompt from #377 asks for executed commands first and established facts
+second, and neither fits in under a clause; the observed failure modes — an
+empty string, `OK`, `None.`, a refusal such as `I cannot summarize this.` (24
+chars) — all sit far below it. Chosen low on purpose: rejecting a real summary
+costs a warning and an uncompacted history, while accepting a non-summary
+silently destroys the head. A one-line summary of a trivial exchange clears 40
+comfortably, and there is a test pinning exactly that.
+
+**No second compaction in a row.** Two session flags:
+`compacted_without_relief` is set when a summary is applied and cleared when the
+context is next seen below the threshold; `compaction_exhausted` is set once the
+user has been told, so the notice does not repeat every turn. Both are cleared
+when a saved session is restored, since a restored history says nothing about
+what the previous one could be reduced to.
+
+**Done:** 11 tests added. Six real provider wordings classify as overflow; a
+5xx and a 429 mentioning tokens keep their own meaning; overflow is not
+retryable and survives into `CoreError`; empty and too-short summaries are
+failures while a short real one is not; the second compaction in a row is
+refused with a single notice and re-arms after the context drops; a failed
+summary leaves the history identical block for block; and the retry rule fires
+once and not on success, other errors, or cancellation. Confirmed by reverting:
+the re-compaction guard and the length rule each fail their test.
+
+**Public contract:** `CoreError` gains a variant. No exhaustive match on it
+exists in the workspace, so nothing breaks; the sanitiser in
+`transport/src/secret.rs` has a catch-all that would flatten it to `Other`, but
+that path carries command-execution errors, never LLM ones.
+
+**Next steps:** #387 must count the summary request's own tokens exactly once,
+and it now has two call sites to cover — the threshold path and the reactive
+one — both funnelled through `compact_for_request`, which is the place to do it.
+
+**Review round (PR #390):** seven comments, five taken, two declined.
+
+The worst was self-inflicted. The retry notice was sent as
+`AgentEvent::Error`, and that handler is terminal: it sets `agent_running =
+false`, drops back to `Normal` and clears `self.cancellation`. A request was
+therefore left in flight that the user could no longer cancel, with the spinner
+off and the input unlocked — while the whole point of holding the first error
+back had been to avoid exactly this kind of false signal. A `TuiEvent::Notice`
+variant now carries feed-only text and touches no run state.
+
+The reactive path also did not know about the proactive one. If the threshold
+folded the head and the request still overflowed, the runner would fold again
+in the same turn, against the rule this issue sets. `already_compacted` is now
+seeded from whether `compact_for_request` actually shortened the history, which
+gets both halves right: a successful proactive fold uses the turn's one
+compaction, a failed one leaves the reactive path available.
+
+Two smaller ones were plain oversights: `apply_loaded_session` is a second
+restore path and did not clear the new flags (the first one did), and the
+overflow heuristic accepted `input` next to a bare `exceed`, which matches
+`input exceeds maximum file size` — an upload limit that compaction cannot fix.
+Terms are now split into ones that can only mean the conversation
+(`context length`, `token`, `messages`) and ones that need an explicitly
+length-shaped complaint (`input`, `prompt`). The mutex around the held error
+recovers from poisoning instead of unwrapping.
+
+The most consequential one arrived last and was nearly missed: the reactive
+path never persisted its own compaction. `pending_compaction` is `None` on that
+path, so `apply_compaction` discarded the summary as stale — the retry ran on a
+local compacted copy while the session kept the full history, and every
+following turn overflowed again, paying an overflow, a summary and a retry each
+time. The manual trace in the PR showed it (a turn after the retry was back up
+to 16 messages) and I read past it. A `TuiEvent::CompactionStarted` now arms the
+session before the summary request goes out; the channel is ordered, so it lands
+first, and the stale guard keeps working because anything that replaces the
+history in between clears the flag again.
+
+A second round on that fix found the arming itself too weak. Checking
+`boundary <= messages.len()` does not tell a restored history from the one the
+boundary was computed against — restore a session of the same length while the
+summary is in flight and the old boundary would be armed on the new history and
+cut its tail off. Sessions now carry a `history_epoch`, bumped only when the
+history is replaced wholesale or the run is cancelled, never on an append. The
+runner captures it at spawn and sends it with `CompactionStarted`; the app
+refuses to arm if it has moved. The length check stays as a cheap bound.
+
+A later round caught the reactive path ignoring session-level exhaustion:
+`already_retried` covers a single run, so the next turn started clean and would
+compact again after the user had been told the history cannot be reduced
+further. `compaction_exhausted` is now passed into `spawn_agent` and folded
+into `should_retry_after_overflow`, so the retry notice is not emitted either.
+Only that flag blocks the reactive path, not `compacted_without_relief`: the
+latter is derived from a hand-set threshold that may simply be wrong, which is
+the premise of the whole feature, whereas a provider refusal is ground truth.
+
+Declined: plumbing cancellation into `compact_for_request`, because the check
+before starting a reactive summary already exists in
+`should_retry_after_overflow` and interrupting one in flight would change the
+public signature of `summarise_history`, which external embedders consume by
+tag — and #377's path has the same property. Also declined content-matching for
+refusals that clear `MIN_SUMMARY_CHARS`: the issue scopes this to a length
+threshold, and the #377 prompt tells the model to answer in the session's
+language, so a list of English refusal phrases would miss most of them while
+false-rejecting real summaries. The gap is real, so the doc comment now says
+plainly that this is a length check and nothing more, rather than implying
+refusals are caught.
+
 ## Issue #385: fix(gui) — validation only ever looked at the selected profile
 
 **Milestone:** 1.0.6. **Branch:** `fix/385-validate-all-profiles`.
