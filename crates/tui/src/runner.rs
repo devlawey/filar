@@ -1775,7 +1775,7 @@ fn spawn_agent(
         let held_for_sink = Arc::clone(&held_error);
         let sink: filar_agent::EventSink = Arc::new(move |event: filar_agent::AgentEvent| {
             if let filar_agent::AgentEvent::Error(msg) = &event {
-                *held_for_sink.lock().unwrap() = Some(msg.clone());
+                *held_for_sink.lock().unwrap_or_else(|p| p.into_inner()) = Some(msg.clone());
                 return;
             }
             let _ = tx_for_sink.send(TuiEvent::Agent {
@@ -1788,6 +1788,7 @@ fn spawn_agent(
         // where the LLM client lives and the spinner is already up. The
         // summary uses the session's own profile, so its cost lands on the
         // profile the user is actually working with.
+        let before_compaction = chat_history.len();
         let mut chat_history = compact_for_request(
             chat_history,
             pending_compaction,
@@ -1797,10 +1798,13 @@ fn spawn_agent(
         )
         .await;
 
-        // At most two attempts: the second only after a compaction that
-        // actually shortened the history. A third would repeat the second
-        // verbatim and fail the same way.
-        let mut compacted_reactively = false;
+        // At most two attempts, and at most one compaction per turn. The
+        // proactive pass counts: if the threshold already folded the head, a
+        // reactive fold would be the second compaction in a row, which the
+        // history cannot survive usefully and the user was not promised.
+        // A *failed* proactive summary leaves the history untouched and does
+        // not count, so the reactive path is still available then (#378).
+        let mut already_compacted = chat_history.len() < before_compaction;
         loop {
             let history = history_to_messages(&chat_history);
 
@@ -1835,7 +1839,7 @@ fn spawn_agent(
                 }
             };
 
-            *held_error.lock().unwrap() = None;
+            *held_error.lock().unwrap_or_else(|p| p.into_inner()) = None;
             // Run the agent loop. All events (Started, TextDelta,
             // CommandProposed, CommandFinished, Finished) are emitted via the
             // EventSink; Error is held back until the outcome is known.
@@ -1844,7 +1848,7 @@ fn spawn_agent(
             let overflow = matches!(outcome, Err(CoreError::ContextOverflow(_)));
             if !should_retry_after_overflow(
                 overflow,
-                compacted_reactively,
+                already_compacted,
                 cancellation.is_cancelled(),
             ) {
                 break;
@@ -1860,12 +1864,10 @@ fn spawn_agent(
                 // so the overflow stands.
                 break;
             }
-            let _ = tx.send(TuiEvent::Agent {
+            let _ = tx.send(TuiEvent::Notice {
                 session_id: sid,
-                event: filar_agent::AgentEvent::Error(
-                    "The context window overflowed. Compacting the history and retrying once."
-                        .to_string(),
-                ),
+                text: "The context window overflowed. Compacting the history and retrying once."
+                    .to_string(),
             });
             let before = chat_history.len();
             chat_history =
@@ -1875,10 +1877,10 @@ fn spawn_agent(
                 // retry would send exactly what just overflowed.
                 break;
             }
-            compacted_reactively = true;
+            already_compacted = true;
         }
 
-        let final_error = held_error.lock().unwrap().take();
+        let final_error = held_error.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(msg) = final_error {
             let _ = tx.send(TuiEvent::Agent {
                 session_id: sid,
@@ -2010,6 +2012,22 @@ mod tests {
         // Any other failure would fail identically over a shorter history, so
         // retrying it just costs the user another request.
         assert!(!should_retry_after_overflow(false, true, false), "another error");
+    }
+
+    #[test]
+    fn a_proactive_compaction_uses_up_the_turn_s_one_compaction() {
+        // The threshold path folds the head before the request goes out. If
+        // that request still overflows, a reactive fold would be the second
+        // compaction in a row - the thing the feature explicitly refuses to
+        // do (review of #390). The runner seeds `already_compacted` from
+        // whether the history actually got shorter, so this is the same rule.
+        assert!(
+            !should_retry_after_overflow(true, true, false),
+            "a turn that already compacted must not compact again"
+        );
+        // A *failed* proactive summary leaves the history unchanged and so
+        // does not use the turn up.
+        assert!(should_retry_after_overflow(true, false, false));
     }
 
     #[test]

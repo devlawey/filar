@@ -74,6 +74,17 @@ pub enum TuiEvent {
         boundary: usize,
         summary: std::result::Result<String, String>,
     },
+
+    /// A note for the feed that does not end the run.
+    ///
+    /// Deliberately separate from [`AgentEvent::Error`], which the app treats
+    /// as final: it clears the cancellation token and marks the agent idle.
+    /// Reporting mid-run progress through that variant would leave a request
+    /// in flight that the user can no longer cancel (#378).
+    Notice {
+        session_id: SessionId,
+        text: String,
+    },
 }
 
 #[cfg(test)]

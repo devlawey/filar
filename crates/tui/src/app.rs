@@ -1563,6 +1563,12 @@ impl App {
         // replaced, so it must not be applied to the restored one (#377).
         self.active_session_mut().pending_compaction = None;
         self.active_session_mut().context_full_notice_shown = false;
+        // The restored history is a different context: what the previous one
+        // could or could not be reduced to says nothing about it, and keeping
+        // the flags would make the first over-threshold request here report
+        // that it cannot be compacted (#378).
+        self.active_session_mut().compacted_without_relief = false;
+        self.active_session_mut().compaction_exhausted = false;
         self.push_message(ChatBlock::System(
             "Session restored — history loaded from disk".into(),
         ));
@@ -3483,6 +3489,7 @@ impl App {
             TuiEvent::CwdChanged { session_id, .. } => *session_id,
             TuiEvent::PasswordNeeded { session_id, .. } => *session_id,
             TuiEvent::HistoryCompacted { session_id, .. } => *session_id,
+            TuiEvent::Notice { session_id, .. } => *session_id,
         };
 
         // Dispatch to the originating session. Save the active index so we can
@@ -3700,6 +3707,11 @@ impl App {
             // Dispatch above already switched to the originating session, so
             // a summary that arrives while the user is on another tab still
             // lands on the history it was made from (#377).
+            TuiEvent::Notice { text, .. } => {
+                // Feed-only: the run continues, so `agent_running`, the mode
+                // and the cancellation token are all left alone.
+                self.push_message(ChatBlock::System(text));
+            }
             TuiEvent::HistoryCompacted { boundary, summary, .. } => match summary {
                 Ok(text) => self.apply_compaction(boundary, text),
                 Err(e) => self.report_compaction_failure(e),
@@ -8294,6 +8306,8 @@ mod tests {
         app.llm_profile = Some("glm".into());
         app.active_session_mut().last_prompt_tokens = Some(250_000);
         app.active_session_mut().context_full_notice_shown = true;
+        app.active_session_mut().compacted_without_relief = true;
+        app.active_session_mut().compaction_exhausted = true;
 
         let session = filar_core::Session {
             id: "1".into(),
@@ -8315,6 +8329,11 @@ mod tests {
         };
         app.apply_loaded_session(session);
 
+        assert!(
+            !app.active_session().compacted_without_relief,
+            "a restored history must not inherit the previous one's verdict"
+        );
+        assert!(!app.active_session().compaction_exhausted);
         assert_eq!(app.active_session().last_prompt_tokens, None);
         assert!(!app.active_session().context_full_notice_shown);
 

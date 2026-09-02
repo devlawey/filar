@@ -588,23 +588,33 @@ fn looks_like_context_overflow(body: &str) -> bool {
     if lower.contains("context_length_exceeded") || lower.contains("context length exceeded") {
         return true;
     }
-    let mentions_size = lower.contains("context length")
+    // Terms that can only be about the conversation itself. Any complaint
+    // about size next to one of these is an overflow.
+    let names_the_context = lower.contains("context length")
         || lower.contains("context window")
         || lower.contains("token")
-        || lower.contains("prompt")
-        || lower.contains("input")
         || lower.contains("messages");
-    if !mentions_size {
-        return false;
-    }
-    lower.contains("too long")
+    // Terms that are about the request but not necessarily its length —
+    // "input exceeds maximum file size" is an upload limit, and compacting the
+    // history would not help it. These need an explicitly length-shaped
+    // complaint, not a bare "exceeds".
+    let names_the_request = lower.contains("prompt") || lower.contains("input");
+
+    let complains_about_size = lower.contains("too long")
         || lower.contains("too many")
         || lower.contains("too large")
         || lower.contains("exceed")
         || lower.contains("maximum context")
         || lower.contains("max context")
         || lower.contains("reduce the length")
+        || lower.contains("longer than");
+    let complains_about_length = lower.contains("too long")
+        || lower.contains("too many")
         || lower.contains("longer than")
+        || lower.contains("reduce the length");
+
+    (names_the_context && complains_about_size)
+        || (names_the_request && complains_about_length)
 }
 
 /// Heuristic: provider body says the model/server cannot do tool calling.
@@ -2235,6 +2245,26 @@ mod context_overflow_tests {
             err.into_core_error(),
             CoreError::ContextOverflow(_)
         ));
+    }
+
+    #[test]
+    fn a_size_limit_that_compaction_cannot_fix_is_not_an_overflow() {
+        // "input" plus "exceeds" is not enough: an upload limit says both, and
+        // compacting the conversation would not shorten a file (review of
+        // #390). Only an explicitly length-shaped complaint counts for the
+        // vaguer terms.
+        for body in [
+            r#"{"error":{"message":"input exceeds maximum file size"}}"#,
+            r#"{"error":{"message":"prompt exceeds the allowed number of images"}}"#,
+        ] {
+            assert!(
+                matches!(
+                    ApiError::from_http_status(400, body.to_string()),
+                    ApiError::Client(400, _)
+                ),
+                "must stay a plain client error: {body}"
+            );
+        }
     }
 
     #[test]

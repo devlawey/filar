@@ -5820,6 +5820,44 @@ that path carries command-execution errors, never LLM ones.
 and it now has two call sites to cover — the threshold path and the reactive
 one — both funnelled through `compact_for_request`, which is the place to do it.
 
+**Review round (PR #390):** seven comments, five taken, two declined.
+
+The worst was self-inflicted. The retry notice was sent as
+`AgentEvent::Error`, and that handler is terminal: it sets `agent_running =
+false`, drops back to `Normal` and clears `self.cancellation`. A request was
+therefore left in flight that the user could no longer cancel, with the spinner
+off and the input unlocked — while the whole point of holding the first error
+back had been to avoid exactly this kind of false signal. A `TuiEvent::Notice`
+variant now carries feed-only text and touches no run state.
+
+The reactive path also did not know about the proactive one. If the threshold
+folded the head and the request still overflowed, the runner would fold again
+in the same turn, against the rule this issue sets. `already_compacted` is now
+seeded from whether `compact_for_request` actually shortened the history, which
+gets both halves right: a successful proactive fold uses the turn's one
+compaction, a failed one leaves the reactive path available.
+
+Two smaller ones were plain oversights: `apply_loaded_session` is a second
+restore path and did not clear the new flags (the first one did), and the
+overflow heuristic accepted `input` next to a bare `exceed`, which matches
+`input exceeds maximum file size` — an upload limit that compaction cannot fix.
+Terms are now split into ones that can only mean the conversation
+(`context length`, `token`, `messages`) and ones that need an explicitly
+length-shaped complaint (`input`, `prompt`). The mutex around the held error
+recovers from poisoning instead of unwrapping.
+
+Declined: plumbing cancellation into `compact_for_request`, because the check
+before starting a reactive summary already exists in
+`should_retry_after_overflow` and interrupting one in flight would change the
+public signature of `summarise_history`, which external embedders consume by
+tag — and #377's path has the same property. Also declined content-matching for
+refusals that clear `MIN_SUMMARY_CHARS`: the issue scopes this to a length
+threshold, and the #377 prompt tells the model to answer in the session's
+language, so a list of English refusal phrases would miss most of them while
+false-rejecting real summaries. The gap is real, so the doc comment now says
+plainly that this is a length check and nothing more, rather than implying
+refusals are caught.
+
 ## Issue #385: fix(gui) — validation only ever looked at the selected profile
 
 **Milestone:** 1.0.6. **Branch:** `fix/385-validate-all-profiles`.

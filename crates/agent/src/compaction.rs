@@ -39,7 +39,7 @@ Write in the language the session is conducted in.";
 /// command and one established fact — the first two things
 /// [`COMPACTION_SYSTEM_PROMPT`] asks for — and that cannot be done in under a
 /// clause. The observed failure modes are all far below this: an empty string,
-/// `OK`, `None.`, or a refusal such as `I cannot summarize this.` (24 chars).
+/// `OK`, `None.`, a bare refusal.
 ///
 /// Deliberately low rather than generous. The cost of rejecting a real summary
 /// is a warning and an uncompacted history, which for a genuinely tiny history
@@ -47,6 +47,13 @@ Write in the language the session is conducted in.";
 /// whole head. A one-line summary of even a trivial exchange — "User asked for
 /// disk usage; agent ran df -h; root is 82% full." — clears it comfortably, so
 /// the false-rejection risk stays near zero.
+///
+/// **This is a length check and nothing more.** A *wordy* refusal — "I cannot
+/// summarize this conversation at this time." — is longer than the threshold
+/// and passes. Catching that needs content matching, which the prompt above
+/// makes language-dependent by asking the model to answer in the language of
+/// the session, so it is a separate mechanism rather than a bigger number
+/// here (raised in review of #390).
 pub const MIN_SUMMARY_CHARS: usize = 40;
 
 /// Ask the model to summarise `transcript`.
