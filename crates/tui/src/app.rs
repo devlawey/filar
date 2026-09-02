@@ -8069,6 +8069,35 @@ mod tests {
     }
 
     #[test]
+    fn summary_usage_lands_in_the_session_that_compacted_not_the_visible_tab() {
+        // `record_summary_usage` reaches for `active_session_mut()`, which
+        // reads as "whatever tab the user is looking at" — it is not.
+        // `handle_agent_event` resolves `session_id` and points `active` at it
+        // before any arm runs, restoring the original tab afterwards. Raised
+        // twice in review of #391, so it is pinned here rather than argued
+        // again.
+        let (mut app, sid, boundary) = app_awaiting_summary();
+        app.new_tab();
+        let other_tab = app.active;
+        assert_ne!(app.sessions[other_tab].id, sid, "the fixture needs two tabs");
+
+        app.handle_agent_event(TuiEvent::HistoryCompacted {
+            session_id: sid,
+            boundary,
+            summary: Ok("A real summary of the earlier turns of this session.".into()),
+            usage: Some(summary_usage(9_000, 120, Some(0.25))),
+            profile: "p".into(),
+        });
+
+        let compacted = app.sessions.iter().find(|s| s.id == sid).expect("session alive");
+        assert_eq!(compacted.tokens_in, 9_000);
+        assert_eq!(compacted.per_profile["p"].tokens_in, 9_000);
+        assert_eq!(app.sessions[other_tab].tokens_in, 0, "the visible tab pays nothing");
+        assert!(app.sessions[other_tab].per_profile.is_empty());
+        assert_eq!(app.active, other_tab, "the user's tab must be where it was");
+    }
+
+    #[test]
     fn a_reactive_compaction_is_adopted_by_the_session() {
         // The reactive path decides mid-run, so nothing armed
         // `pending_compaction` and the summary that came back was rejected as

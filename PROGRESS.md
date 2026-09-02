@@ -6071,11 +6071,12 @@ charged a profile that never computed it. `spawn_agent` now takes
 it would set that field and nothing downstream would change.
 
 **Done:** 4 tests in `filar-agent` (usage survives an accepted summary, survives
-a rejected one, absent when no response came back) and 6 in `app.rs` (counted
+a rejected one, absent when no response came back) and 7 in `app.rs` (counted
 once in session and `per_profile`, no double count on re-application, an
 unusable summary is still paid for, the compaction trigger does not move, a
 provider reporting no usage changes nothing, and a summary in flight across a
-cancel plus profile switch is billed to the profile that computed it).
+cancel plus profile switch is billed to the profile that computed it, and the
+cost lands in the session that compacted rather than the visible tab).
 
 **Public contract:** `filar-agent::summarise_history` changes signature —
 `Result<String>` → the new `SummaryOutcome`. Breaking for embedders that call it
@@ -6105,6 +6106,15 @@ arm runs. A `String` clone per compaction called redundant — it mirrors the
 neighbouring `TokenUsage` arm and sits next to a network round trip; the
 attribution fix removed it anyway. And the request for TUI results that cannot
 be produced here.
+
+Second round re-raised the session-attribution claim as a blocker: that
+`active_session_mut()` means the tab the user is looking at, so a tab switch
+between the event and its handling would charge the wrong session. It does not.
+`handle_agent_event` points `active` at the originating session before the match
+and restores the original tab at the end — which is the fix the review itself
+proposed as an alternative. Declined again, but pinned with a test
+(`summary_usage_lands_in_the_session_that_compacted_not_the_visible_tab`) so the
+question is settled by the suite rather than re-argued each round.
 
 **Next steps:** #379 (4/4) is the last open task of 1.0.6, and it is larger than
 it reads — `apply_compaction` replaces `Session::messages`, so the transcript's
