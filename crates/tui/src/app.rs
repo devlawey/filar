@@ -445,6 +445,16 @@ pub struct Session {
     /// the boundary index the head ends at. The runner performs the summary
     /// and hands it back; `None` means no compaction is due (#377).
     pub pending_compaction: Option<usize>,
+    /// Set when a compaction was applied and the context has not been seen
+    /// below the threshold since.
+    ///
+    /// A second compaction in that state cannot help: the history is already
+    /// a summary plus the verbatim tail, so folding again would spend a
+    /// request and a wait to remove almost nothing (#378).
+    pub compacted_without_relief: bool,
+    /// Set once the user has been told that compaction cannot shrink this
+    /// session further, so the notice is not repeated on every turn.
+    pub compaction_exhausted: bool,
     /// Cumulative output tokens generated for this session.
     pub tokens_out: u64,
     /// Cumulative cost in USD. Summed across all profiles.
@@ -780,6 +790,8 @@ impl Session {
             last_prompt_tokens: None,
             context_full_notice_shown: false,
             pending_compaction: None,
+            compacted_without_relief: false,
+            compaction_exhausted: false,
             tokens_out: 0,
             cost_usd: None,
             per_profile: HashMap::new(),
@@ -1143,6 +1155,10 @@ impl App {
             s.last_prompt_tokens = None;
             s.context_full_notice_shown = false;
             s.pending_compaction = None;
+            // A restored history is a different context: whatever the previous
+            // one could or could not be reduced to says nothing about it.
+            s.compacted_without_relief = false;
+            s.compaction_exhausted = false;
         }
         let default_name = if default_profile_name.is_empty() { "default" } else { default_profile_name };
         if let Some(profile) = llm_profile {
@@ -1207,8 +1223,30 @@ impl App {
 
         if !filar_core::should_compact(used, threshold) {
             // Back below the threshold (a new session, or a smaller request):
-            // arm the notice again.
-            self.active_session_mut().context_full_notice_shown = false;
+            // arm the notice again, and forget that the last compaction did
+            // not help — it evidently did, or the history has moved on.
+            let s = self.active_session_mut();
+            s.context_full_notice_shown = false;
+            s.compacted_without_relief = false;
+            s.compaction_exhausted = false;
+            return;
+        }
+        if self.active_session().compaction_exhausted {
+            // Already told them; saying it again every turn helps nobody.
+            return;
+        }
+        if self.active_session().compacted_without_relief {
+            // Still above the threshold immediately after a compaction: the
+            // head is already folded and what remains is the verbatim tail.
+            // Compacting again cannot reduce it, so say so once and stop
+            // rather than spending another summary request (#378).
+            let used = used.unwrap_or(0);
+            self.active_session_mut().compaction_exhausted = true;
+            self.push_message(ChatBlock::System(format!(
+                "Context is still at {used} prompt tokens after compacting, at or above the \
+                 {threshold} threshold for profile '{profile_name}'. The history cannot be \
+                 reduced further - start a new session to continue with a clean context."
+            )));
             return;
         }
         if self.active_session().context_full_notice_shown {
@@ -1315,6 +1353,9 @@ impl App {
         // the context back under the threshold — a large tail, a long summary —
         // would mean compaction never fires again for the rest of the session.
         self.active_session_mut().context_full_notice_shown = false;
+        // Until the context is measured below the threshold again, a further
+        // compaction is known to be pointless (#378).
+        self.active_session_mut().compacted_without_relief = true;
         // Block indices moved, so any user collapse overrides now point at the
         // wrong blocks.
         self.collapsed_overrides.clear();
@@ -7707,6 +7748,98 @@ mod tests {
         let before = app.active_session().messages.len();
         app.begin_agent_request("hello".into());
         assert_eq!(app.active_session().messages.len(), before);
+    }
+
+    /// An app with `profile` at `threshold` and a history long enough to have
+    /// a compactable head.
+    fn app_over_threshold(threshold: u64, used: u64) -> App {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.profiles = vec![filar_core::LlmProfile {
+            name: "p".into(), model: "m".into(), api_base_url: "u".into(),
+            max_tokens: 4096, key_env: "k".into(),
+            temperature: None, top_p: None, extra_body: None,
+            compact_at_tokens: threshold,
+        }];
+        app.default_profile_name = "p".into();
+        for i in 0..20 {
+            app.push_message(ChatBlock::User(format!("turn {i}")));
+            app.push_message(ChatBlock::Agent(format!("reply {i}")));
+        }
+        app.active_session_mut().last_prompt_tokens = Some(used);
+        app
+    }
+
+    #[test]
+    fn a_second_compaction_is_not_attempted_when_the_first_did_not_help() {
+        // After a compaction the history is a summary plus the verbatim tail.
+        // If that is still over the threshold, folding again cannot shrink it,
+        // so a second attempt would spend a summary request and a wait to
+        // achieve nothing (#378).
+        let mut app = app_over_threshold(1_000, 5_000);
+
+        app.report_context_fill("p");
+        let boundary = app.active_session().pending_compaction.expect("first arms");
+
+        app.apply_compaction(boundary, "A real summary of the earlier turns here.".into());
+        assert!(app.active_session().compacted_without_relief);
+
+        // Still over the threshold on the next request.
+        app.active_session_mut().last_prompt_tokens = Some(5_000);
+        app.report_context_fill("p");
+
+        assert_eq!(
+            app.active_session().pending_compaction, None,
+            "compaction must not be armed a second time in a row"
+        );
+        assert!(
+            matches!(app.active_session().messages.last(),
+                Some(ChatBlock::System(s)) if s.contains("cannot be") && s.contains("new session")),
+            "the user must be told, got {:?}", app.active_session().messages.last()
+        );
+
+        // And the notice is not repeated on every following turn.
+        let after_notice = app.active_session().messages.len();
+        app.report_context_fill("p");
+        assert_eq!(app.active_session().messages.len(), after_notice);
+        assert_eq!(app.active_session().pending_compaction, None);
+    }
+
+    #[test]
+    fn dropping_back_under_the_threshold_re_arms_compaction() {
+        let mut app = app_over_threshold(1_000, 5_000);
+        app.report_context_fill("p");
+        let boundary = app.active_session().pending_compaction.expect("first arms");
+        app.apply_compaction(boundary, "A real summary of the earlier turns here.".into());
+
+        app.active_session_mut().last_prompt_tokens = Some(100);
+        app.report_context_fill("p");
+        assert!(!app.active_session().compacted_without_relief);
+        assert!(!app.active_session().compaction_exhausted);
+    }
+
+    #[test]
+    fn a_failed_summary_leaves_the_history_byte_for_byte_unchanged() {
+        // Losing the head because the summariser misbehaved would be worse
+        // than a long context, so the failure path must not touch it (#378).
+        let mut app = app_over_threshold(1_000, 5_000);
+        app.report_context_fill("p");
+        let before = app.active_session().messages.clone();
+
+        app.report_compaction_failure("the model returned a summary too short to be usable".into());
+
+        let after = &app.active_session().messages;
+        // Compared through the debug rendering: `ChatBlock` is not `PartialEq`,
+        // and "unchanged" here means every field of every block.
+        assert_eq!(
+            format!("{:?}", &after[..before.len()]),
+            format!("{before:?}"),
+            "every existing block must survive a failed summary untouched"
+        );
+        assert_eq!(app.active_session().pending_compaction, None);
+        assert!(
+            matches!(after.last(), Some(ChatBlock::System(s)) if s.contains("compaction failed")),
+            "the failure must be visible, got {:?}", after.last()
+        );
     }
 
     #[test]

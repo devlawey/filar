@@ -5752,6 +5752,74 @@ was left out: `Ctrl+R` is reverse-i-search in a shell and would collide in
 interactive mode, so the key choice needs a decision of its own. Translating
 SGR into ratatui styles instead of discarding colour is a possible follow-up.
 
+## Issue #378: feat(tui/agent) — reactive compaction and summary-failure handling (3/4)
+
+**Milestone:** 1.0.6. **Branch:** `feat/378-reactive-compaction`.
+
+**Reactive path.** `compact_at_tokens` is set by hand, so it can be set above
+the model's real window — and then the request fails before compaction ever
+fires, which is precisely the case the feature was written for. The provider's
+refusal is now classified as `CoreError::ContextOverflow`, and the runner
+compacts and re-sends once.
+
+Classification lives in `ApiError::from_http_status`, following the
+`ToolsUnsupported` precedent: OpenAI-compatible providers share no code for
+this, so matching on the wording is the only portable option.
+`looks_like_context_overflow` is checked *before* the tool heuristic — an
+overflow body often mentions tools among what did not fit, and the overflow is
+the more specific diagnosis — and is restricted to non-429 4xx for the same
+reason the tool check is: a 5xx that happens to mention tokens is transient, and
+turning it into a non-retryable overflow would throw away a free recovery.
+Overflow is deliberately absent from `is_retryable()`; repeating the identical
+request earns the identical refusal, and only the owner of the history can make
+a retry mean anything.
+
+**Where the retry rule lives.** In `should_retry_after_overflow`, a free
+function, not inline in the spawned task. The loop around it ends in
+`agent.run`, so a lost condition there would either retry forever or never
+retry, and a test of the loop would be a test of the agent. This is the lesson
+from the #389 review applied before the fact rather than after it.
+
+**Suppressing the first error.** `Agent::run` emits `AgentEvent::Error` once,
+immediately before returning the same error, so the sink now holds it and the
+task forwards it only when the outcome is final. Without that the user would
+see a failure notice and then a successful answer for the same turn.
+
+**Summary failures.** Mostly already handled by #377, which sends the turn on
+the full history and warns. Added the length rule: `MIN_SUMMARY_CHARS = 40`.
+The prompt from #377 asks for executed commands first and established facts
+second, and neither fits in under a clause; the observed failure modes — an
+empty string, `OK`, `None.`, a refusal such as `I cannot summarize this.` (24
+chars) — all sit far below it. Chosen low on purpose: rejecting a real summary
+costs a warning and an uncompacted history, while accepting a non-summary
+silently destroys the head. A one-line summary of a trivial exchange clears 40
+comfortably, and there is a test pinning exactly that.
+
+**No second compaction in a row.** Two session flags:
+`compacted_without_relief` is set when a summary is applied and cleared when the
+context is next seen below the threshold; `compaction_exhausted` is set once the
+user has been told, so the notice does not repeat every turn. Both are cleared
+when a saved session is restored, since a restored history says nothing about
+what the previous one could be reduced to.
+
+**Done:** 11 tests added. Six real provider wordings classify as overflow; a
+5xx and a 429 mentioning tokens keep their own meaning; overflow is not
+retryable and survives into `CoreError`; empty and too-short summaries are
+failures while a short real one is not; the second compaction in a row is
+refused with a single notice and re-arms after the context drops; a failed
+summary leaves the history identical block for block; and the retry rule fires
+once and not on success, other errors, or cancellation. Confirmed by reverting:
+the re-compaction guard and the length rule each fail their test.
+
+**Public contract:** `CoreError` gains a variant. No exhaustive match on it
+exists in the workspace, so nothing breaks; the sanitiser in
+`transport/src/secret.rs` has a catch-all that would flatten it to `Other`, but
+that path carries command-execution errors, never LLM ones.
+
+**Next steps:** #387 must count the summary request's own tokens exactly once,
+and it now has two call sites to cover — the threshold path and the reactive
+one — both funnelled through `compact_for_request`, which is the place to do it.
+
 ## Issue #385: fix(gui) — validation only ever looked at the selected profile
 
 **Milestone:** 1.0.6. **Branch:** `fix/385-validate-all-profiles`.

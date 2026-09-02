@@ -27,6 +27,20 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   you can expand. `Ctrl+K` compacts on request, regardless of the threshold
   ([#377](https://github.com/devlawey/filar/issues/377)).
 
+- Compaction no longer depends on `compact_at_tokens` being set correctly. When
+  the provider refuses a request because the context window is exceeded, the
+  history is compacted and the request is sent once more, so a threshold set
+  above the model's actual window is recovered from rather than fatal. A second
+  overflow is reported instead of retried
+  ([#378](https://github.com/devlawey/filar/issues/378)).
+
+- A summary that comes back empty, unusably short, or as an outright error no
+  longer costs you the history: the turn is sent with the full history and a
+  warning appears in the feed. When the context is still over the threshold
+  immediately after a compaction, the TUI now says the history cannot be reduced
+  further and suggests starting a new session, rather than compacting again to
+  no effect ([#378](https://github.com/devlawey/filar/issues/378)).
+
 ### Fixed
 
 - Deleting a launcher profile no longer removes its stored API key when the

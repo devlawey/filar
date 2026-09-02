@@ -28,6 +28,17 @@ pub enum CoreError {
     #[error("connection lost: {0}")]
     ConnectionLost(String),
 
+    /// The provider refused the request because the conversation no longer
+    /// fits the model's context window.
+    ///
+    /// Distinct from [`CoreError::Other`] because the caller can act on it:
+    /// repeating the same request is guaranteed to fail again, but the same
+    /// request over a shortened history may succeed. It is deliberately *not*
+    /// retryable at the transport level for that reason — only the owner of
+    /// the history can make the retry meaningful (#378).
+    #[error("context overflow: {0}")]
+    ContextOverflow(String),
+
     /// Generic error for cases that don't fit a more specific variant.
     #[error("{0}")]
     Other(String),
