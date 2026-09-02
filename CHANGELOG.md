@@ -43,6 +43,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- Session cost now includes the requests made to compact the history, counting
+  a summary the model returns unusably short as well, since it is billed either
+  way ([#387](https://github.com/devlawey/filar/issues/387)).
+
 - Deleting a launcher profile no longer removes its stored API key when the
   deletion cannot be saved. The remaining profiles are checked first, so a
   malformed field elsewhere blocks the delete instead of leaving a profile in

@@ -1045,6 +1045,7 @@ async fn run_app(
                             cancel_token,
                             config.secret_provider.clone(),
                             sid,
+                            profile_name.clone(),
                             app.active_session().compaction_exhausted,
                             pending_compaction,
                         );
@@ -1757,6 +1758,11 @@ fn spawn_agent(
     cancellation: CancellationToken,
     secret_provider: Arc<dyn SecretProvider>,
     sid: SessionId,
+    // The profile this run was resolved from. Travels with the summary result
+    // so the cost of compaction is attributed to the profile that computed it,
+    // even if the session has moved on to another one by the time it lands
+    // (#387).
+    profile_name: String,
     // The session has already been told that compaction cannot shrink it any
     // further. The reactive path honours that rather than quietly compacting
     // behind the notice (review of #390).
@@ -1802,6 +1808,7 @@ fn spawn_agent(
             llm.as_ref(),
             &tx,
             sid,
+            &profile_name,
         )
         .await;
 
@@ -1886,8 +1893,15 @@ fn spawn_agent(
                 boundary,
                 epoch: history_epoch,
             });
-            chat_history =
-                compact_for_request(chat_history, Some(boundary), llm.as_ref(), &tx, sid).await;
+            chat_history = compact_for_request(
+                chat_history,
+                Some(boundary),
+                llm.as_ref(),
+                &tx,
+                sid,
+                &profile_name,
+            )
+            .await;
             if chat_history.len() >= before {
                 // The summary failed, so the history is unchanged and the
                 // retry would send exactly what just overflowed.
@@ -1944,6 +1958,7 @@ async fn compact_for_request(
     llm: &dyn LlmClient,
     tx: &mpsc::UnboundedSender<TuiEvent>,
     sid: SessionId,
+    profile: &str,
 ) -> Vec<ChatBlock> {
     let Some(boundary) = boundary else {
         return chat_history;
@@ -1952,13 +1967,21 @@ async fn compact_for_request(
         return chat_history;
     }
     let transcript = filar_core::transcript_for_summary(&chat_history[..boundary]);
-    match filar_agent::summarise_history(llm, &transcript).await {
+    // The usage goes back in both branches: the call was billed whether or not
+    // the reply turned out to be usable. So does the profile that computed it,
+    // which is this run's, not whichever one the session holds by the time the
+    // result lands (#387).
+    let outcome = filar_agent::summarise_history(llm, &transcript).await;
+    let usage = outcome.usage;
+    match outcome.summary {
         Ok(summary) => {
             let compacted = filar_core::compact_history(&chat_history, boundary, &summary);
             let _ = tx.send(TuiEvent::HistoryCompacted {
                 session_id: sid,
                 boundary,
                 summary: Ok(summary),
+                usage,
+                profile: profile.to_string(),
             });
             compacted
         }
@@ -1970,6 +1993,8 @@ async fn compact_for_request(
                 session_id: sid,
                 boundary,
                 summary: Err(e.to_string()),
+                usage,
+                profile: profile.to_string(),
             });
             chat_history
         }

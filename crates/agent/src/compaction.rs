@@ -6,7 +6,7 @@
 //! It is a single, self-contained LLM call with no tools: the summariser must
 //! not be able to run anything on the host.
 
-use crate::{ChatMessage, ChatRequest, LlmClient, MessageRole};
+use crate::{ChatMessage, ChatRequest, LlmClient, MessageRole, TokenUsage};
 use filar_core::{CoreError, Result};
 
 /// System prompt for the summarising call.
@@ -56,17 +56,37 @@ Write in the language the session is conducted in.";
 /// here (raised in review of #390).
 pub const MIN_SUMMARY_CHARS: usize = 40;
 
+/// What a summarising call produced and what it cost.
+///
+/// The two are kept apart because they are owed to different places. The
+/// summary decides whether the head is folded; the usage is owed to the
+/// session's token and cost counters either way, since the request was billed
+/// before anyone could judge the reply. Returning only the brief is what left
+/// the reported cost short of every summary the session ever paid for (#387).
+///
+/// `usage` is `None` when the provider reported none, and when the call failed
+/// before a response existed at all.
+#[derive(Debug)]
+pub struct SummaryOutcome {
+    /// Token usage the summarising request itself consumed.
+    pub usage: Option<TokenUsage>,
+    /// The brief, or why there isn't one.
+    pub summary: Result<String>,
+}
+
 /// Ask the model to summarise `transcript`.
 ///
-/// Returns the brief that will replace the compacted head. The call carries no
-/// tool definitions, so the summariser cannot propose commands, and it is a
-/// plain [`LlmClient::chat`] rather than a streaming call: nothing renders the
-/// partial text, and the caller only needs the finished brief.
+/// Returns the brief that will replace the compacted head, together with what
+/// the call cost. The call carries no tool definitions, so the summariser
+/// cannot propose commands, and it is a plain [`LlmClient::chat`] rather than a
+/// streaming call: nothing renders the partial text, and the caller only needs
+/// the finished brief.
 ///
 /// A reply shorter than [`MIN_SUMMARY_CHARS`] — an empty string included — is
 /// reported as an error rather than silently accepted: replacing the head with
-/// a non-summary would lose it outright (#378).
-pub async fn summarise_history(llm: &dyn LlmClient, transcript: &str) -> Result<String> {
+/// a non-summary would lose it outright (#378). Such a reply still carries its
+/// usage back, because it was paid for like any other.
+pub async fn summarise_history(llm: &dyn LlmClient, transcript: &str) -> SummaryOutcome {
     let request = ChatRequest {
         messages: vec![
             ChatMessage::new(MessageRole::System, COMPACTION_SYSTEM_PROMPT),
@@ -75,17 +95,25 @@ pub async fn summarise_history(llm: &dyn LlmClient, transcript: &str) -> Result<
         tools: Vec::new(),
     };
 
-    let response = llm.chat(&request).await?;
+    let response = match llm.chat(&request).await {
+        Ok(response) => response,
+        // No response, so nothing was billed that we know of.
+        Err(e) => return SummaryOutcome { usage: None, summary: Err(e) },
+    };
+    let usage = response.usage.clone();
     let text = response.text.trim().to_string();
     if text.chars().count() < MIN_SUMMARY_CHARS {
         // Treated exactly like an outright failure by the caller: the history
         // is left alone and the user is warned (#378).
-        return Err(CoreError::Other(format!(
-            "the model returned a summary too short to be usable ({} chars)",
-            text.chars().count()
-        )));
+        return SummaryOutcome {
+            usage,
+            summary: Err(CoreError::Other(format!(
+                "the model returned a summary too short to be usable ({} chars)",
+                text.chars().count()
+            ))),
+        };
     }
-    Ok(text)
+    SummaryOutcome { usage, summary: Ok(text) }
 }
 
 #[cfg(test)]
@@ -110,17 +138,42 @@ mod tests {
         assert!(COMPACTION_SYSTEM_PROMPT.contains("Do not speculate"));
     }
 
-    struct FixedLlm(String);
+    struct FixedLlm(String, Option<TokenUsage>);
 
     #[async_trait::async_trait]
     impl crate::LlmClient for FixedLlm {
         async fn chat(&self, _request: &crate::ChatRequest) -> Result<crate::ChatResponse> {
-            Ok(crate::ChatResponse::text(self.0.clone()))
+            let mut response = crate::ChatResponse::text(self.0.clone());
+            response.usage = self.1.clone();
+            Ok(response)
+        }
+    }
+
+    struct FailingLlm;
+
+    #[async_trait::async_trait]
+    impl crate::LlmClient for FailingLlm {
+        async fn chat(&self, _request: &crate::ChatRequest) -> Result<crate::ChatResponse> {
+            Err(CoreError::Other("provider is down".into()))
+        }
+    }
+
+    fn usage(prompt: u64, completion: u64) -> TokenUsage {
+        TokenUsage {
+            prompt_tokens: Some(prompt),
+            completion_tokens: Some(completion),
+            total_tokens: Some(prompt + completion),
+            cost: Some(0.5),
         }
     }
 
     async fn summarise(reply: &str) -> Result<String> {
-        summarise_history(&FixedLlm(reply.to_string()), "User: hi\nAgent: hello\n").await
+        summarise_with_usage(reply, None).await.summary
+    }
+
+    async fn summarise_with_usage(reply: &str, usage: Option<TokenUsage>) -> SummaryOutcome {
+        let llm = FixedLlm(reply.to_string(), usage);
+        summarise_history(&llm, "User: hi\nAgent: hello\n").await
     }
 
     #[tokio::test]
@@ -133,6 +186,37 @@ mod tests {
                 "must be rejected as a summary: {reply:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_summary_still_reports_what_it_cost() {
+        // The request was billed before the reply could be judged unusable.
+        // Dropping its usage here is how the session's cost went short (#387).
+        let outcome = summarise_with_usage("OK", Some(usage(9_000, 5))).await;
+        assert!(outcome.summary.is_err(), "too short to be a summary");
+        let u = outcome.usage.expect("usage must survive the rejection");
+        assert_eq!(u.prompt_tokens, Some(9_000));
+        assert_eq!(u.completion_tokens, Some(5));
+        assert_eq!(u.cost, Some(0.5));
+    }
+
+    #[tokio::test]
+    async fn an_accepted_summary_reports_what_it_cost() {
+        let real = "User asked for disk usage; agent ran df -h; root is 82% full.";
+        let outcome = summarise_with_usage(real, Some(usage(9_000, 120))).await;
+        assert_eq!(outcome.summary.unwrap(), real);
+        let u = outcome.usage.expect("usage must come back with the summary");
+        assert_eq!(u.prompt_tokens, Some(9_000));
+        assert_eq!(u.completion_tokens, Some(120));
+    }
+
+    #[tokio::test]
+    async fn a_call_that_never_returned_a_response_reports_no_usage() {
+        // Nothing to attribute: inventing a zero here would be indistinguishable
+        // from a provider that reports no usage.
+        let outcome = summarise_history(&FailingLlm, "User: hi\n").await;
+        assert!(outcome.summary.is_err());
+        assert!(outcome.usage.is_none());
     }
 
     #[tokio::test]

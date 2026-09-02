@@ -6021,6 +6021,109 @@ only true after a sibling test has created `~/.local/share` via
 `SessionStore::new`. Invisible on Windows and macOS, where the directory always
 exists. Left out of this PR — different cause, needs its own issue.
 
+## Issue #387: feat(tui/agent) — the summarising call is now paid for
+
+**Milestone:** 1.0.6. **Branch:** `feat/387-summary-token-usage`. Raised in
+review of PR #384 and deferred from #377 as its own task.
+
+**Problem:** compaction sends a real request to the model and the reply was the
+only thing kept from it. `summarise_history` returned `Result<String>`, so the
+`usage` on the `ChatResponse` was dropped on the floor: neither the session's
+`tokens_in` / `tokens_out` / `cost_usd` nor `per_profile` saw it. On a long
+session the input of every summary is the entire head being folded, so the
+figure shown to the user was short by a large amount and grew shorter with use.
+
+**Shape.** `summarise_history` now returns `SummaryOutcome { usage, summary }`
+instead of `Result<String>`. Usage and summary are separated because they are
+owed to different places: whether the brief is usable decides only whether the
+head is folded, while the request was billed before anyone could judge it. A
+reply rejected as too short (#378) therefore comes back with its usage intact;
+a call that failed before a response existed reports `None` rather than a
+fabricated zero. The runner passes it through on `TuiEvent::HistoryCompacted`,
+which gained a `usage` field.
+
+**Where it is counted, and why not the obvious place.** Not through
+`AgentEvent::TokenUsage`. That arm also records `last_prompt_tokens` — the
+measured size of the context actually sent, and the trigger compaction fires on
+(#376). A summary's prompt is the head being folded, in a request of its own, so
+routing it there would move the trigger by an amount unrelated to how full the
+session's context is, and could re-arm compaction immediately after one just
+ran. Arbiter usage is excluded from that same figure for the same reason, so the
+new `App::record_summary_usage` follows the arbiter's precedent: session totals
+and `per_profile`, no `last_prompt_tokens`, no `last_served_model`.
+
+**Counted once.** In the `HistoryCompacted` arm, before the summary is judged,
+rather than inside `apply_compaction`. The two look equivalent and are not:
+`apply_compaction` is reachable again with the same boundary, and its stale
+guard rejects a result whose history has moved. Charging from there would either
+double the figures or drop them exactly when the user was billed. Both cases
+have tests.
+
+**Attribution.** The profile is captured when the run is spawned and travels on
+the event. The first cut read `pending_llm_profile` when the result arrived,
+which review of PR #391 showed to be wrong: `cancel_work` does not abort the
+summarising call — nothing in `compact_for_request` consults the cancellation
+token — so a summary can still be in flight while the user switches profile and
+sends another turn, and `begin_agent_request` overwrites the field before the
+result lands. The session total is owed either way, but `per_profile` would have
+charged a profile that never computed it. `spawn_agent` now takes
+`profile_name`, and this is also where a cheap-profile summariser would plug in:
+it would set that field and nothing downstream would change.
+
+**Done:** 4 tests in `filar-agent` (usage survives an accepted summary, survives
+a rejected one, absent when no response came back) and 7 in `app.rs` (counted
+once in session and `per_profile`, no double count on re-application, an
+unusable summary is still paid for, the compaction trigger does not move, a
+provider reporting no usage changes nothing, and a summary in flight across a
+cancel plus profile switch is billed to the profile that computed it, and the
+cost lands in the session that compacted rather than the visible tab).
+
+**Public contract:** `filar-agent::summarise_history` changes signature —
+`Result<String>` → the new `SummaryOutcome`. Breaking for embedders that call it
+directly, though `ENGINE_API.md` does not document it, so nothing there goes
+stale. `TuiEvent::HistoryCompacted` gains two fields; `filar-tui` is not an
+engine crate. `CommandExecutor` and `LlmClient` untouched.
+`COMPACTION_SYSTEM_PROMPT` unchanged, so eval behaviour should be unaffected —
+but the change is inside `crates/agent/src/**`, which triggers `eval-smoke`
+regardless, and it passed on the first commit.
+
+**Verification:** `cargo build --workspace`, `cargo test --workspace` and
+`cargo build --release` were all run here — the container now has a Rust
+toolchain, which the skill's `reference/environment.md` still says is
+impossible. The positive tests were confirmed to fail with the accounting call
+removed, and the attribution test to fail against the `pending_llm_profile`
+version. The TUI itself was not driven: no interactive terminal in this
+environment, so the cost-line check is the human's. Review asked for that run to
+be performed and recorded instead; it cannot be, and AGENTS.md says to say so
+rather than close the requirement quietly.
+
+**Review (PR #391).** Two findings taken. The profile race above, and a
+changelog entry too long for the one-line rule in AGENTS.md. Three declined. A
+claimed panic in `record_summary_usage` on a closed session, and a claim that
+the handler does not dispatch by `session_id`: `handle_agent_event` resolves the
+session with `find_session_idx` and returns early when it is gone, before any
+arm runs. A `String` clone per compaction called redundant — it mirrors the
+neighbouring `TokenUsage` arm and sits next to a network round trip; the
+attribution fix removed it anyway. And the request for TUI results that cannot
+be produced here.
+
+Second round re-raised the session-attribution claim as a blocker: that
+`active_session_mut()` means the tab the user is looking at, so a tab switch
+between the event and its handling would charge the wrong session. It does not.
+`handle_agent_event` points `active` at the originating session before the match
+and restores the original tab at the end — which is the fix the review itself
+proposed as an alternative. Declined again, but pinned with a test
+(`summary_usage_lands_in_the_session_that_compacted_not_the_visible_tab`) so the
+question is settled by the suite rather than re-argued each round.
+
+**Next steps:** #379 (4/4) is the last open task of 1.0.6, and it is larger than
+it reads — `apply_compaction` replaces `Session::messages`, so the transcript's
+"full history including the folded part" does not hold by construction and has
+to be built. The cheap-profile summariser remains open and now has its hook. A
+separate defect surfaced in review and is **not** fixed here: the summarising
+call ignores the cancellation token, so Ctrl+Z leaves the user paying for a
+request whose result is then discarded. Needs its own issue.
+
 ## Release v1.0.5 (2026-08-27)
 
 **Scope:** milestone 1.0.5 — regression fixes for 1.0.4: Unicode export topic slug
