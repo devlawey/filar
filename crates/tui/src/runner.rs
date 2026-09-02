@@ -1045,6 +1045,7 @@ async fn run_app(
                             cancel_token,
                             config.secret_provider.clone(),
                             sid,
+                            app.active_session().compaction_exhausted,
                             pending_compaction,
                         );
                         // Consumed by this run: the summary comes back as an
@@ -1756,6 +1757,10 @@ fn spawn_agent(
     cancellation: CancellationToken,
     secret_provider: Arc<dyn SecretProvider>,
     sid: SessionId,
+    // The session has already been told that compaction cannot shrink it any
+    // further. The reactive path honours that rather than quietly compacting
+    // behind the notice (review of #390).
+    compaction_exhausted: bool,
     // Boundary index when the history must be compacted before this request
     // (#377). `None` means send it as is.
     pending_compaction: Option<usize>,
@@ -1852,6 +1857,7 @@ fn spawn_agent(
                 overflow,
                 already_compacted,
                 cancellation.is_cancelled(),
+                compaction_exhausted,
             ) {
                 break;
             }
@@ -1912,13 +1918,19 @@ fn spawn_agent(
 ///   the same result over a shorter history, and a success has nothing to fix;
 /// - only once: the second attempt already ran on a compacted history, so a
 ///   third would send exactly what the second did;
-/// - never after a cancellation, which is the user asking for it to stop.
+/// - never after a cancellation, which is the user asking for it to stop;
+/// - never once the session is exhausted. `already_retried` covers a single
+///   run, so without this a later turn would start clean and compact again
+///   after the user had been told the history cannot be reduced further
+///   (review of #390). Checked here rather than at the compaction itself so
+///   the retry notice is not emitted either.
 fn should_retry_after_overflow(
     overflowed: bool,
     already_retried: bool,
     cancelled: bool,
+    compaction_exhausted: bool,
 ) -> bool {
-    overflowed && !already_retried && !cancelled
+    overflowed && !already_retried && !cancelled && !compaction_exhausted
 }
 
 /// Summarise the head of `chat_history` and fold it, reporting the outcome.
@@ -2007,21 +2019,21 @@ mod tests {
         // can be wrong: without it the very case the feature was written for
         // is the one it cannot handle (#378).
         assert!(
-            should_retry_after_overflow(true, false, false),
+            should_retry_after_overflow(true, false, false, false),
             "the first overflow must be compacted and retried"
         );
         assert!(
-            !should_retry_after_overflow(true, true, false),
+            !should_retry_after_overflow(true, true, false, false),
             "a second overflow must not start a third attempt"
         );
     }
 
     #[test]
     fn only_an_overflow_triggers_the_retry() {
-        assert!(!should_retry_after_overflow(false, false, false), "a success");
+        assert!(!should_retry_after_overflow(false, false, false, false), "a success");
         // Any other failure would fail identically over a shorter history, so
         // retrying it just costs the user another request.
-        assert!(!should_retry_after_overflow(false, true, false), "another error");
+        assert!(!should_retry_after_overflow(false, true, false, false), "another error");
     }
 
     #[test]
@@ -2032,18 +2044,31 @@ mod tests {
         // do (review of #390). The runner seeds `already_compacted` from
         // whether the history actually got shorter, so this is the same rule.
         assert!(
-            !should_retry_after_overflow(true, true, false),
+            !should_retry_after_overflow(true, true, false, false),
             "a turn that already compacted must not compact again"
         );
         // A *failed* proactive summary leaves the history unchanged and so
         // does not use the turn up.
-        assert!(should_retry_after_overflow(true, false, false));
+        assert!(should_retry_after_overflow(true, false, false, false));
+    }
+
+    #[test]
+    fn an_exhausted_session_is_not_compacted_behind_the_notice() {
+        // `already_retried` only covers one run, so a later turn would start
+        // clean and compact again even though the user had been told the
+        // session cannot be reduced further and to start a new one (review of
+        // #390). Every other condition here says "retry" - the exhausted flag
+        // alone must stop it.
+        assert!(
+            !should_retry_after_overflow(true, false, false, true),
+            "an exhausted session must not be compacted again"
+        );
     }
 
     #[test]
     fn a_cancelled_run_is_not_retried() {
         assert!(
-            !should_retry_after_overflow(true, false, true),
+            !should_retry_after_overflow(true, false, true, false),
             "cancellation is the user asking for it to stop"
         );
     }

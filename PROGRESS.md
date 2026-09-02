@@ -5866,6 +5866,15 @@ history is replaced wholesale or the run is cancelled, never on an append. The
 runner captures it at spawn and sends it with `CompactionStarted`; the app
 refuses to arm if it has moved. The length check stays as a cheap bound.
 
+A later round caught the reactive path ignoring session-level exhaustion:
+`already_retried` covers a single run, so the next turn started clean and would
+compact again after the user had been told the history cannot be reduced
+further. `compaction_exhausted` is now passed into `spawn_agent` and folded
+into `should_retry_after_overflow`, so the retry notice is not emitted either.
+Only that flag blocks the reactive path, not `compacted_without_relief`: the
+latter is derived from a hand-set threshold that may simply be wrong, which is
+the premise of the whole feature, whereas a provider refusal is ground truth.
+
 Declined: plumbing cancellation into `compact_for_request`, because the check
 before starting a reactive summary already exists in
 `should_retry_after_overflow` and interrupting one in flight would change the
