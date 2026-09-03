@@ -195,7 +195,135 @@ let store = SessionStore::new(std::path::PathBuf::from("/data/data/com.example.a
 For desktop platforms, use `SessionStore::with_default_dir()` which uses
 `dirs::data_dir()` (Windows `%APPDATA%`, macOS Application Support, Linux XDG).
 
-## LLM request parameters
+## Chat history and compaction
+
+A long session eventually fills the model's context window. The engine deals
+with this by **compaction**: the head of the history is folded into a single
+summary and the recent turns are kept verbatim. Three parts of the public API
+are involved, and an embedder that ignores any of them will lose data silently
+rather than loudly.
+
+### `ChatBlock::Summary` — this one goes to the model
+
+```rust
+ChatBlock::Summary { text: String, replaced_blocks: usize }
+```
+
+`replaced_blocks` is how many blocks were folded into it — useful for a status
+line, not otherwise load-bearing.
+
+Flattening `ChatBlock`s into `ChatMessage`s is the embedder's job, and this is
+where the mistake is easy to make. `ChatBlock::System` is chrome: connection
+notices, error banners, anything the frontend wrote for the user rather than for
+the model, and it is correct to drop it. `ChatBlock::Summary` looks like chrome
+and is not. It **stands in for turns that are no longer in the history at all**,
+so dropping it does not shorten the context — it erases the entire beginning of
+the conversation without any error, and the model then answers as though the
+session had just started.
+
+A summary is best sent as a user-role message that says what it is, so the model
+treats it as context rather than as something it said:
+
+```rust
+ChatBlock::Summary { text, .. } => Some(ChatMessage::user(
+    format!("Summary of earlier turns in this session:\n{text}")
+)),
+```
+
+If your match on `ChatBlock` is exhaustive, the compiler will point at this
+variant when you upgrade. Do not reach for a `_ => None` arm to make it build.
+
+### `summarise_history` — asking the model for the summary
+
+```rust
+pub async fn summarise_history(llm: &dyn LlmClient, transcript: &str) -> SummaryOutcome;
+
+pub struct SummaryOutcome {
+    pub usage: Option<TokenUsage>,
+    pub summary: Result<String>,
+}
+```
+
+The usage is returned separately from the summary because the two are owed to
+different places. Whether the brief is usable decides only whether you fold the
+head; the request was billed before anyone could judge it. So a reply the engine
+rejects as too short still carries its `usage` back, and any per-session cost
+accounting you keep should add it. `usage` is `None` when the provider reported
+none, and when the call failed before a response existed — a real absence, not a
+zero.
+
+`summary` is `Err` both for transport failures and for a reply too short to be a
+usable brief. Treat them the same way: leave the history alone and send the turn
+on the full history. A failed summary must not cost the user their turn.
+
+Pair it with the two helpers in `filar-core`:
+
+```rust
+let transcript = filar_core::transcript_for_summary(&blocks[..boundary]);
+let outcome = filar_agent::summarise_history(llm.as_ref(), &transcript).await;
+if let Ok(summary) = outcome.summary {
+    let compacted = filar_core::compact_history(&blocks, boundary, &summary);
+}
+```
+
+If you drive the summarising call from a task the user can cancel, guard it —
+otherwise a cancelled fold keeps billing for a result you are going to discard.
+
+### `Session::folded_history` — where the folded turns live
+
+```rust
+pub struct Session {
+    pub messages: Vec<ChatBlock>,        // the context: what the model is sent
+    pub folded_history: Vec<ChatBlock>,  // the heads compaction folded away
+    // ...
+}
+```
+
+`compact_history` really does drop the head from the list it returns, so the two
+fields mean different things and are not interchangeable:
+
+- **`messages`** is the working context — what you send to the model and, in
+  filar's own UI, what the feed shows.
+- **`folded_history`** is every block compaction has removed, oldest first,
+  appended to on each fold. It is never sent to the model.
+
+Anything that claims to be a *record* of the session rather than a *view of its
+context* must be built from both, in order:
+
+```rust
+let whole_conversation: Vec<ChatBlock> = session
+    .folded_history
+    .iter()
+    .chain(session.messages.iter())
+    .cloned()
+    .collect();
+```
+
+Transcripts, exports, audit logs and anything you show a user as "the
+conversation" belong in that category. Building them from `messages` alone
+produces a record with a hole exactly where the beginning used to be — and the
+hole appears only in sessions long enough to have been compacted, which is to
+say the ones where it matters.
+
+`folded_history` is `#[serde(default)]`, so sessions written before it existed
+load with an empty archive.
+
+## Upgrading to `engine-v1.0.6`
+
+Three changes to the public API. All three fail loudly at compile time except
+the third, which is the one worth reading twice.
+
+| Change | Breaks | What to do |
+|--------|--------|------------|
+| `ChatBlock::Summary` added | Exhaustive matches on `ChatBlock` | Send it to the model. See above — a `_ => None` arm here is a silent data loss |
+| `summarise_history` returns `SummaryOutcome` instead of `Result<String>` | Direct callers | Match on `outcome.summary`; add `outcome.usage` to your cost accounting |
+| `Session::folded_history` added | Struct literals constructing `Session` | `Vec::new()` for a fresh session. Build transcripts from it plus `messages` |
+
+The first two stop the build. The third stops the build only if you construct
+`Session` with a struct literal — if you deserialize sessions, it compiles and
+runs, and your transcripts quietly lose the folded head.
+
+
 
 `LlmConfig` supports optional parameters that are sent in the API request body:
 

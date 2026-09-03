@@ -6271,6 +6271,63 @@ some seconds later is the human's, and is written out in the PR.
 1.0.6, both deliberately sequenced after this one so they describe final
 behaviour. #395 in particular has to mention what Ctrl+Z does during a fold.
 
+## Issue #393: docs(engine) — ENGINE_API.md caught up with the 1.0.6 contract
+
+**Milestone:** 1.0.6. **Branch:** `docs/393-engine-api-contract`. Blocks
+`engine-v1.0.6`.
+
+**Problem.** Three changes to the public API landed across the compaction series
+and none reached the document embedders read: `ChatBlock::Summary` (#377), the
+`summarise_history` signature (#387), and `Session::folded_history` (#379). The
+gap was noticed in #377 and deferred to "the next engine tag", which was never
+cut, so it accumulated.
+
+**Shape.** A new "Chat history and compaction" section covering all three, and
+an "Upgrading to `engine-v1.0.6`" table. The tag references in the Cargo
+examples were left at `engine-v1.0.5`: `prepare-release` rewrites them in the
+bump commit, and pointing at a tag that does not exist yet would be worse than
+pointing at the current one.
+
+**What the document had to get across.** Two of the three break the build and
+document themselves; the section spends its length on the parts that do not.
+
+`ChatBlock::Summary` looks like `ChatBlock::System` and must not be treated like
+it. Flattening blocks into messages happens in the embedder's code —
+`history_to_messages` lives in `filar-tui`, not in an engine crate — so the
+temptation on upgrade is a `_ => None` arm to make it compile. That erases the
+whole beginning of the conversation with no error at all, and the model then
+answers as though the session had just started. Called out explicitly, with the
+user-role framing filar itself uses.
+
+`folded_history` is the one that can be missed entirely: it only breaks the
+build for embedders who construct `Session` with a struct literal. Anyone who
+deserializes sessions gets a clean compile and transcripts with a hole where the
+head used to be — visible only in sessions long enough to have been compacted,
+which are exactly the ones where it matters. The section draws the line between
+`messages` as *context* and the pair as *record*.
+
+For `summarise_history`, the point worth documenting is why usage is returned
+apart from the summary: the call is billed before its reply can be judged, so a
+rejected brief still owes its tokens.
+
+**Kept honest by the compiler.** Markdown in `docs/` is compiled by nothing, so
+a document describing a signature can drift without a single test going red —
+which is how this issue happened in the first place. The snippets now live in
+`crates/agent/examples/engine_api_snippets.rs`, so `cargo build --workspace`
+fails when the API they describe moves. That is the part of this PR most likely
+to still be paying off in a year.
+
+**Done:** the example compiles as part of the workspace build. No behaviour
+changed, so there are no behavioural tests to fail on the old code, and none are
+claimed.
+
+**Verification:** `cargo build --workspace`, `cargo test --workspace`,
+`cargo build --release`.
+
+**Next steps:** #395 (README and user guide) is the last open issue in 1.0.6.
+After it, `prepare-release` — which will also rewrite the `engine-v1.0.5` tags
+in this document.
+
 ## Release v1.0.5 (2026-08-27)
 
 **Scope:** milestone 1.0.5 — regression fixes for 1.0.4: Unicode export topic slug
