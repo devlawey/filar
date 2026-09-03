@@ -1821,6 +1821,7 @@ fn spawn_agent(
             &tx,
             sid,
             &profile_name,
+            &cancellation,
         )
         .await;
 
@@ -1912,6 +1913,7 @@ fn spawn_agent(
                 &tx,
                 sid,
                 &profile_name,
+                &cancellation,
             )
             .await;
             if chat_history.len() >= before {
@@ -1964,6 +1966,12 @@ fn should_retry_after_overflow(
 /// Returns the history to send. A failed or unusable summary returns it
 /// **unchanged**: losing the user's turn because the summariser misbehaved
 /// would be a worse outcome than a long context (#377, #378).
+/// Fold the head of `chat_history` into a summary before the request goes out.
+///
+/// Returns the history to send. On cancellation, on a summary the model refuses
+/// to produce, or on one too short to use, that is the history it was given:
+/// compaction is an optimisation, and failing at it must never cost the user
+/// their turn (#378).
 async fn compact_for_request(
     chat_history: Vec<ChatBlock>,
     boundary: Option<usize>,
@@ -1971,6 +1979,7 @@ async fn compact_for_request(
     tx: &mpsc::UnboundedSender<TuiEvent>,
     sid: SessionId,
     profile: &str,
+    cancellation: &CancellationToken,
 ) -> Vec<ChatBlock> {
     let Some(boundary) = boundary else {
         return chat_history;
@@ -1978,12 +1987,30 @@ async fn compact_for_request(
     if boundary == 0 || boundary > chat_history.len() {
         return chat_history;
     }
+    // Ctrl+Z between arming the compaction and getting here: do not start a
+    // request the user has already called off (#394).
+    if cancellation.is_cancelled() {
+        return chat_history;
+    }
     let transcript = filar_core::transcript_for_summary(&chat_history[..boundary]);
     // The usage goes back in both branches: the call was billed whether or not
     // the reply turned out to be usable. So does the profile that computed it,
     // which is this run's, not whichever one the session holds by the time the
     // result lands (#387).
-    let outcome = filar_agent::summarise_history(llm, &transcript).await;
+    let outcome = tokio::select! {
+        outcome = filar_agent::summarise_history(llm, &transcript) => outcome,
+        _ = cancellation.cancelled() => {
+            // Deliberately silent. The result is abandoned, so no
+            // `HistoryCompacted` goes out: the stale guard would discard it
+            // anyway, and a second feed line about a failed summary underneath
+            // the user's own "Cancelled." is noise about a thing they stopped.
+            //
+            // Nothing is charged either. The provider returned no `usage`, and
+            // inventing a zero or an estimate would be worse than recording
+            // nothing — the figures the user reads are meant to be measured.
+            return chat_history;
+        }
+    };
     let usage = outcome.usage;
     match outcome.summary {
         Ok(summary) => {
@@ -2107,6 +2134,145 @@ mod tests {
         assert!(
             !should_retry_after_overflow(true, false, true, false),
             "cancellation is the user asking for it to stop"
+        );
+    }
+
+    /// An `LlmClient` that hangs until released, so a test can cancel it
+    /// mid-flight the way `Ctrl+Z` does.
+    struct HangingLlm {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for HangingLlm {
+        async fn chat(
+            &self,
+            _request: &filar_agent::ChatRequest,
+        ) -> filar_core::Result<filar_agent::ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(filar_agent::ChatResponse::text(
+                "A real summary of the earlier turns of this session.".to_string(),
+            ))
+        }
+    }
+
+    fn history(n: usize) -> Vec<ChatBlock> {
+        (0..n).map(|i| ChatBlock::User(format!("turn {i}"))).collect()
+    }
+
+    #[tokio::test]
+    async fn cancelling_mid_summary_abandons_the_request_and_says_nothing() {
+        // Ctrl+Z used to leave the summary running to completion: the user
+        // stopped the work and went on paying for a result that the stale
+        // guard would then throw away (#394).
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let token = CancellationToken::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let llm = HangingLlm {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let blocks = history(6);
+
+        let cancel = token.clone();
+        let waiter = tokio::spawn(async move {
+            started.notified().await;
+            cancel.cancel();
+        });
+
+        // Bounded: without the guard this call never returns, and a hung
+        // suite is a much worse regression signal than a failed assertion.
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            compact_for_request(blocks.clone(), Some(4), &llm, &tx, SessionId(1), "p", &token),
+        )
+        .await
+        .expect("cancellation must abandon the request, not wait it out");
+        waiter.await.unwrap();
+        release.notify_waiters();
+
+        assert_eq!(
+            format!("{out:?}"),
+            format!("{blocks:?}"),
+            "the turn goes out on the history it already had"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no HistoryCompacted: the user stopped this, and the feed already says so"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_summary_is_not_even_started_after_a_cancel() {
+        // Cancelling between arming the compaction and reaching it must not
+        // open a request at all — the cheapest possible outcome, and the one
+        // the user asked for.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let token = CancellationToken::new();
+        token.cancel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let llm = HangingLlm {
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            calls: Arc::clone(&calls),
+        };
+        let blocks = history(6);
+
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            compact_for_request(blocks.clone(), Some(4), &llm, &tx, SessionId(1), "p", &token),
+        )
+        .await
+        .expect("an already-cancelled compaction must return at once");
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "no request sent");
+        assert_eq!(format!("{out:?}"), format!("{blocks:?}"), "history untouched");
+        assert!(rx.try_recv().is_err(), "and nothing announced");
+    }
+
+    #[tokio::test]
+    async fn an_uncancelled_summary_still_compacts_and_reports() {
+        // The guard must not have turned compaction off in the normal case.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let token = CancellationToken::new();
+        let release = Arc::new(tokio::sync::Notify::new());
+        release.notify_waiters();
+        let llm = HangingLlm {
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::clone(&release),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let blocks = history(6);
+
+        let releaser = {
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                release.notify_waiters();
+            })
+        };
+        let out = compact_for_request(
+            blocks.clone(),
+            Some(4),
+            &llm,
+            &tx,
+            SessionId(1),
+            "p",
+            &token,
+        )
+        .await;
+        releaser.await.unwrap();
+
+        assert!(out.len() < blocks.len(), "the head was folded");
+        assert!(
+            matches!(rx.try_recv(), Ok(TuiEvent::HistoryCompacted { summary: Ok(_), .. })),
+            "and the result was reported"
         );
     }
 

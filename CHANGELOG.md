@@ -43,6 +43,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- `Ctrl+Z` during compaction now cancels the summarising request itself instead
+  of leaving it to finish and be discarded, so a cancelled fold stops costing
+  tokens ([#394](https://github.com/devlawey/filar/issues/394)).
+
 - Compacting the history no longer shortens the transcript or the saved session:
   the folded head is kept alongside the compacted context
   ([#379](https://github.com/devlawey/filar/issues/379)).
