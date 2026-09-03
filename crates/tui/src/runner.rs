@@ -1621,7 +1621,12 @@ async fn save_session_async(
 /// Build a serialisable [`filar_core::Session`] snapshot from the active TUI
 /// session, including launch context (ssh_info, model, api_base_url,
 /// confirm_mode) so a later restore can re-select the same host and model.
-fn session_snapshot(app: &App, target_name: &str, id: &str, timestamp: &str) -> filar_core::Session {
+pub(crate) fn session_snapshot(
+    app: &App,
+    target_name: &str,
+    id: &str,
+    timestamp: &str,
+) -> filar_core::Session {
     let active_profile_name = app
         .llm_profile
         .clone()
@@ -1638,6 +1643,10 @@ fn session_snapshot(app: &App, target_name: &str, id: &str, timestamp: &str) -> 
         target: target_name.to_string(),
         llm_profile: app.llm_profile.clone(),
         messages: app.messages.clone(),
+        // Persisted separately from `messages` so a reopened session keeps the
+        // context compaction left it with, while still holding every turn it
+        // ever had (#379).
+        folded_history: app.active_session().folded_history.clone(),
         input_history: app.input_history().to_vec(),
         tokens_in: app.tokens_in,
         tokens_out: app.tokens_out,

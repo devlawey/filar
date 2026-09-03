@@ -330,8 +330,15 @@ pub struct Session {
     pub id: SessionId,
     /// Display name shown on the tab label.
     pub target_name: String,
-    /// Chat history blocks.
+    /// Chat history blocks: what the feed shows and what the model is sent.
     pub messages: Vec<ChatBlock>,
+    /// Heads folded away by compaction, oldest first (#379).
+    ///
+    /// `messages` is deliberately one list for the feed and the model (#377),
+    /// so compaction really does drop the head from it. These are the blocks it
+    /// dropped, kept so the transcript and the saved session still hold the
+    /// whole conversation. Append-only; the only writer is `apply_compaction`.
+    pub folded_history: Vec<ChatBlock>,
     /// Current input text.
     pub input: String,
     /// Cursor position in the input (char index, 0 = before first char).
@@ -748,6 +755,7 @@ impl Session {
         Self {
             id: SessionId::next(),
             target_name,
+            folded_history: Vec::new(),
             messages: vec![ChatBlock::System(format!(
                 "Connected to: {name}"
             ))],
@@ -1335,6 +1343,23 @@ impl App {
     ///
     /// `boundary` is echoed back from the request so a history that changed
     /// while the summary was being produced cannot be cut at a stale index.
+    /// The active session's whole conversation: everything compaction folded
+    /// away, followed by what the feed currently shows.
+    ///
+    /// `messages` alone is the *context* — the compacted view the model is
+    /// sent. Anything that claims to be a record of the session rather than a
+    /// view of its context wants this instead (#379).
+    pub fn full_history(&self) -> Vec<ChatBlock> {
+        let s = self.active_session();
+        if s.folded_history.is_empty() {
+            return s.messages.clone();
+        }
+        let mut out = Vec::with_capacity(s.folded_history.len() + s.messages.len());
+        out.extend_from_slice(&s.folded_history);
+        out.extend_from_slice(&s.messages);
+        out
+    }
+
     pub fn apply_compaction(&mut self, boundary: usize, summary: String) {
         // The history may have moved while the summary was being produced: the
         // user can cancel the run or restore a saved session, and cutting the
@@ -1358,6 +1383,13 @@ impl App {
             &summary,
         );
         let after = compacted.len();
+        // The head leaves `messages` — that is the point of compaction — but it
+        // does not leave the session. The transcript and the saved file are
+        // written from `folded_history` followed by `messages`, so folding the
+        // context the model carries never costs the user the record of what
+        // happened (#379).
+        let folded: Vec<_> = self.active_session().messages[..boundary].to_vec();
+        self.active_session_mut().folded_history.extend(folded);
         self.active_session_mut().messages = compacted;
         self.active_session_mut().pending_compaction = None;
         // Re-arm the threshold. The flag records that the notice was shown for
@@ -1604,6 +1636,10 @@ impl App {
         self.selection = None;
 
         self.messages = session.messages;
+        // Restored alongside the context it was folded out of, so reopening a
+        // compacted session does not quietly shorten its transcript. Sessions
+        // saved before #379 carry none, which is simply an empty archive.
+        self.active_session_mut().folded_history = session.folded_history;
         self.message_rev = self.message_rev.wrapping_add(1);
         // A summary still in flight was made from the history this just
         // replaced, so it must not be applied to the restored one (#377).
@@ -1969,7 +2005,10 @@ impl App {
         };
 
         let sid = self.sessions[self.active].id;
-        let messages = self.messages.clone();
+        // The whole conversation, not the compacted context: an audit trail
+        // with a hole where the head used to be is worth little, and the
+        // transcript must not depend on whether compaction happened (#379).
+        let messages = self.full_history();
         let session_name = self.sessions[self.active].target_name.clone();
         let ssh_info = self.sessions[self.active].ssh_info.clone();
 
@@ -8097,6 +8136,175 @@ mod tests {
         assert_eq!(app.active, other_tab, "the user's tab must be where it was");
     }
 
+    /// An app whose head has already been folded once.
+    fn app_after_one_compaction() -> (App, Vec<ChatBlock>, usize) {
+        let (mut app, sid, boundary) = app_awaiting_summary();
+        let before = app.active_session().messages.clone();
+        app.handle_agent_event(TuiEvent::HistoryCompacted {
+            session_id: sid,
+            boundary,
+            summary: Ok("A real summary of the earlier turns of this session.".into()),
+            usage: None,
+            profile: "p".into(),
+        });
+        assert!(
+            app.active_session().messages.len() < before.len(),
+            "the fixture must actually have compacted something"
+        );
+        (app, before, boundary)
+    }
+
+    #[test]
+    fn compaction_moves_the_head_into_the_archive_rather_than_out_of_the_session() {
+        // The context shrinks — that is the point — but the record does not.
+        // An audit trail with a hole where the head used to be is worth little,
+        // and it must not depend on whether compaction happened (#379).
+        let (app, before, boundary) = app_after_one_compaction();
+
+        assert_eq!(
+            format!("{:?}", app.active_session().folded_history),
+            format!("{:?}", &before[..boundary]),
+            "every folded block is kept, in order"
+        );
+        let full = app.full_history();
+        assert!(
+            full.iter().any(|b| matches!(b, ChatBlock::User(t) if t == "turn 0")),
+            "the record still holds the first turn, which the context no longer does"
+        );
+        // The record reads head, then the summary that stood in for it, then
+        // the verbatim tail — so it says both what happened and where the
+        // model's view of it was folded.
+        // Two blocks more than before: the summary, and the feed line
+        // announcing the fold.
+        assert_eq!(full.len(), before.len() + 2);
+        assert!(
+            matches!(full.last(), Some(ChatBlock::System(t)) if t.starts_with("History compacted")),
+            "the notice is the last thing on the record"
+        );
+        for (i, block) in before[..boundary].iter().enumerate() {
+            assert_eq!(
+                format!("{:?}", &full[i]),
+                format!("{:?}", block),
+                "head block {i}"
+            );
+        }
+        assert!(
+            matches!(full[boundary], ChatBlock::Summary { replaced_blocks, .. } if replaced_blocks == boundary),
+            "the summary sits where the fold happened"
+        );
+        for (i, block) in before[boundary..].iter().enumerate() {
+            assert_eq!(
+                format!("{:?}", &full[boundary + 1 + i]),
+                format!("{:?}", block),
+                "tail block {i}"
+            );
+        }
+        // The model-facing context is untouched by any of this.
+        assert!(matches!(app.messages.first(), Some(ChatBlock::Summary { .. })));
+    }
+
+    #[test]
+    fn the_transcript_is_written_from_the_whole_conversation() {
+        let (app, _, _) = app_after_one_compaction();
+        let md = messages_to_markdown(&app.full_history(), "test", &None);
+        assert!(md.contains("turn 0"), "the folded head reaches the transcript");
+        assert!(md.contains("turn 19"), "so does the tail");
+        assert!(
+            !messages_to_markdown(&app.messages, "test", &None).contains("turn 0"),
+            "and the compacted context alone would not have — which is the bug"
+        );
+    }
+
+    #[test]
+    fn a_reopened_session_keeps_both_the_context_and_the_folded_head() {
+        let (mut app, before, boundary) = app_after_one_compaction();
+        let saved = crate::runner::session_snapshot(&app, "test", "1", "t");
+
+        app.apply_loaded_session(saved);
+
+        assert_eq!(
+            format!("{:?}", app.active_session().folded_history),
+            format!("{:?}", &before[..boundary]),
+            "the archive came back with the session"
+        );
+        let full = app.full_history();
+        for (i, block) in before[..boundary].iter().enumerate() {
+            assert_eq!(
+                format!("{:?}", &full[i]),
+                format!("{:?}", block),
+                "folded block {i} survived the round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_profile_keeps_the_folded_history_and_takes_the_new_threshold() {
+        // Ctrl+L changes the profile of the tab, not the history of the
+        // session, and the threshold is read from whichever profile is active.
+        let (mut app, _, _) = app_after_one_compaction();
+        app.profiles.push(filar_core::LlmProfile {
+            name: "wide".into(), model: "m2".into(), api_base_url: "u".into(),
+            max_tokens: 4096, key_env: "k".into(),
+            temperature: None, top_p: None, extra_body: None,
+            compact_at_tokens: 900_000,
+        });
+        let folded = app.active_session().folded_history.clone();
+        let messages = app.messages.clone();
+
+        app.mode = AppMode::Normal;
+        let ctrl_l = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        app.handle_key(ctrl_l);
+
+        assert_eq!(
+            format!("{:?}", app.active_session().folded_history),
+            format!("{:?}", folded),
+            "archive intact"
+        );
+        assert_eq!(
+            app.messages.iter().filter(|b| !matches!(b, ChatBlock::System(_))).count(),
+            messages.iter().filter(|b| !matches!(b, ChatBlock::System(_))).count(),
+            "the compacted context is intact apart from the switch notice"
+        );
+        let now = app.llm_profile.clone().expect("a profile is selected");
+        assert_eq!(
+            app.compact_at_tokens_for(&now),
+            if now == "wide" { 900_000 } else { 1_000 },
+            "the threshold follows the active profile, with no restart"
+        );
+    }
+
+    #[test]
+    fn cancelling_during_compaction_leaves_the_history_and_the_archive_alone() {
+        // Ctrl+Z mid-compaction behaves like a failed summary (#378): nothing
+        // is half-folded, and the late result is discarded by the stale guard.
+        let (mut app, sid, boundary) = app_awaiting_summary();
+
+        app.mode = AppMode::Thinking;
+        app.cancel_work();
+        // Snapshot after the cancel notice, so the comparison is about the
+        // history and not about that one system line.
+        let before = app.active_session().messages.clone();
+
+        app.handle_agent_event(TuiEvent::HistoryCompacted {
+            session_id: sid,
+            boundary,
+            summary: Ok("A real summary of the earlier turns of this session.".into()),
+            usage: None,
+            profile: "p".into(),
+        });
+
+        assert_eq!(
+            format!("{:?}", app.active_session().messages),
+            format!("{:?}", before),
+            "history byte for byte"
+        );
+        assert!(app.active_session().folded_history.is_empty(), "nothing archived");
+        assert_eq!(format!("{:?}", app.full_history()), format!("{:?}", before));
+    }
+
     #[test]
     fn a_reactive_compaction_is_adopted_by_the_session() {
         // The reactive path decides mid-run, so nothing armed
@@ -8620,6 +8828,7 @@ mod tests {
             compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         }];
         let session = filar_core::Session {
+            folded_history: Vec::new(),
             id: "1".into(),
             timestamp: "t".into(),
             target: "prod".into(),
@@ -8674,6 +8883,7 @@ mod tests {
         app.active_session_mut().compaction_exhausted = true;
 
         let session = filar_core::Session {
+            folded_history: Vec::new(),
             id: "1".into(),
             timestamp: "t".into(),
             target: "prod".into(),
@@ -8715,6 +8925,7 @@ mod tests {
     fn apply_loaded_session_ssh_reconnects() {
         let mut app = App::new("local".into(), CommandConfirmMode::Always);
         let session = filar_core::Session {
+            folded_history: Vec::new(),
             id: "1".into(),
             timestamp: "t".into(),
             target: "prod".into(),
@@ -8753,6 +8964,7 @@ mod tests {
         let token = tokio_util::sync::CancellationToken::new();
         app.pending_ssh_cancel = Some(token.clone());
         let session = filar_core::Session {
+            folded_history: Vec::new(),
             id: "1".into(),
             timestamp: "t".into(),
             target: "local".into(),
@@ -8787,6 +8999,7 @@ mod tests {
         });
         app.pending_ssh_handle = Some(handle);
         let session = filar_core::Session {
+            folded_history: Vec::new(),
             id: "1".into(),
             timestamp: "t".into(),
             target: "local".into(),
@@ -8821,6 +9034,7 @@ mod tests {
         });
         app.ctrl_o_handle = Some(handle);
         let session = filar_core::Session {
+            folded_history: Vec::new(),
             id: "1".into(),
             timestamp: "t".into(),
             target: "local".into(),
@@ -8855,6 +9069,7 @@ mod tests {
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
         }];
         let session = filar_core::Session {
+            folded_history: Vec::new(),
             id: "1".into(),
             timestamp: "t".into(),
             target: "prod".into(),
@@ -8899,6 +9114,7 @@ mod tests {
         }];
         app.llm_profile = Some("other".into());
         let session = filar_core::Session {
+            folded_history: Vec::new(),
             id: "1".into(),
             timestamp: "t".into(),
             target: "local".into(),
