@@ -1621,6 +1621,9 @@ async fn save_session_async(
 /// Build a serialisable [`filar_core::Session`] snapshot from the active TUI
 /// session, including launch context (ssh_info, model, api_base_url,
 /// confirm_mode) so a later restore can re-select the same host and model.
+/// Build the persisted snapshot of the active session: its compacted context,
+/// the heads compaction folded away, and the launch metadata that goes with
+/// them.
 pub(crate) fn session_snapshot(
     app: &App,
     target_name: &str,

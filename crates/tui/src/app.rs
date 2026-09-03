@@ -1932,9 +1932,11 @@ impl App {
 
         let session_name = self.sessions[self.active].target_name.clone();
         let ssh_info = self.sessions[self.active].ssh_info.clone();
-        // Live chat lives on `App::messages`; `Session::messages` is only
-        // populated on F3 restore (#350).
-        let messages = self.messages.clone();
+        // The whole conversation, for the same reason the silent save uses it:
+        // an export that drops the turns compaction folded away is a record
+        // with a hole in it (#379). Both save paths go through this one
+        // accessor so they cannot drift apart.
+        let messages = self.full_history();
         let tx = tx.clone();
         // Resolve the export directory: configured `save_dir`, else CWD.
         let base_dir = self
@@ -8235,6 +8237,40 @@ mod tests {
                 "folded block {i} survived the round trip"
             );
         }
+    }
+
+    #[test]
+    fn loading_a_session_replaces_the_context_as_well_as_the_archive() {
+        // Raised in review of #392 as a claim that `apply_loaded_session` sets
+        // only `App::messages` and leaves `Session::messages` behind. `App`
+        // derefs to the active session, so the two are one field — but the
+        // test is cheaper than the argument, and it uses a session whose
+        // content differs from the current one so a real divergence would show.
+        let (mut app, _, _) = app_after_one_compaction();
+        let mut saved = crate::runner::session_snapshot(&app, "test", "1", "t");
+        saved.messages = vec![ChatBlock::User("from the saved file".into())];
+        saved.folded_history = vec![ChatBlock::User("folded in the saved file".into())];
+
+        app.apply_loaded_session(saved);
+
+        assert!(
+            app.active_session().messages.iter().any(
+                |b| matches!(b, ChatBlock::User(t) if t == "from the saved file")
+            ),
+            "the loaded context reached the session, not just App::messages"
+        );
+        assert!(
+            !app.active_session().messages.iter().any(
+                |b| matches!(b, ChatBlock::User(t) if t == "turn 19")
+            ),
+            "and the previous context is gone"
+        );
+        assert!(
+            app.full_history().iter().any(
+                |b| matches!(b, ChatBlock::User(t) if t == "folded in the saved file")
+            ),
+            "the loaded archive is what the record is built from"
+        );
     }
 
     #[test]

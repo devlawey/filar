@@ -6196,13 +6196,28 @@ crashing with a stack dump on the final link. It reads as a compiler bug and is
 not one; clearing the release artifacts fixed it. Worth knowing before anyone
 files it upstream.
 
-**Next steps:** milestone 1.0.6 has no open issues left and is ready for
-`prepare-release`. `docs/ENGINE_API.md` still documents neither
-`ChatBlock::Summary` (noted in #377), nor `summarise_history`, whose signature
-#387 changed, nor this field — all three want a pass before the next engine tag.
-Also still open from #391's review: the summarising call ignores the
+**Review (PR #392).** Two findings taken. The manual `Ctrl+S` export still ran
+off `messages`, so an export taken after a compaction would have had the same
+hole this issue is about — only the silent transcript save had been switched.
+Both save paths now go through `full_history()`, which is the point of having
+the accessor. And `session_snapshot`, made `pub(crate)` for a test, had no doc
+comment. The changelog entry was condensed as well.
+
+Declined: a blocker claiming `apply_loaded_session` sets `App::messages` without
+touching `Session::messages`, leaving a restored session with its old context.
+`App` derefs to the active session, so those are one field and the suggested fix
+is the same assignment written twice. The review was right that the round-trip
+test could not have caught such a divergence, though — it snapshotted the
+session it then loaded — so there is now a test that loads a session whose
+content differs from the current one.
+
+**Next steps:** both loose ends now have issues in 1.0.6. #393 covers
+`docs/ENGINE_API.md`, which documents neither `ChatBlock::Summary` (noted in
+#377), nor `summarise_history`, whose signature #387 changed, nor this field —
+it blocks `engine-v1.0.6`. #394 covers the summarising call ignoring the
 cancellation token, so Ctrl+Z during compaction leaves the user paying for a
-request whose result is then thrown away. The history is safe; the money is not.
+request whose result is thrown away: the history is safe, the money is not.
+`prepare-release` after those.
 
 ## Release v1.0.5 (2026-08-27)
 

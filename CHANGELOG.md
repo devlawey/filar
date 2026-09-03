@@ -43,9 +43,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
-- Compacting the history no longer shortens the transcript or the saved
-  session: the folded head is kept alongside the compacted context, so the `.md`
-  record and a reopened session still hold every turn
+- Compacting the history no longer shortens the transcript or the saved session:
+  the folded head is kept alongside the compacted context
   ([#379](https://github.com/devlawey/filar/issues/379)).
 
 - Session cost now includes the requests made to compact the history, counting
