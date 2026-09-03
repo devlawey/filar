@@ -6219,6 +6219,58 @@ cancellation token, so Ctrl+Z during compaction leaves the user paying for a
 request whose result is thrown away: the history is safe, the money is not.
 `prepare-release` after those.
 
+## Issue #394: fix(tui) — cancelling compaction now cancels the request
+
+**Milestone:** 1.0.6. **Branch:** `fix/394-cancel-summary-request`. Found while
+answering review on PR #391, filed rather than folded into that PR.
+
+**Problem.** `compact_for_request` awaited `summarise_history` without ever
+consulting the `CancellationToken` it had in scope one frame up. `Ctrl+Z` during
+a fold therefore stopped nothing: the task ran the summary to completion and
+sent `HistoryCompacted` afterwards. Everything downstream behaved — the stale
+guard from #377 discarded the result, so the history was safe, and #387
+attributed the cost to the right profile — but the user kept paying for several
+more seconds for a result already destined for the bin. On a long history the
+summary's input is the entire head being folded, so a cancelled compaction cost
+more than the turn it was cancelling.
+
+**Shape.** The token is passed into `compact_for_request` and the call runs
+inside a `tokio::select!` against `cancellation.cancelled()`, matching how
+`Agent::run` guards its own LLM calls. There is also an `is_cancelled()` check
+before the request is built, for the case where Ctrl+Z lands between arming the
+compaction and reaching it: not opening the request at all is the cheapest
+outcome and the one the user asked for.
+
+**Two deliberate silences.** A cancelled fold sends no `HistoryCompacted`, not
+even an error one. The stale guard would discard it, and a feed line about a
+failed summary underneath the user's own "Cancelled." is noise about something
+they stopped. And nothing is charged: the provider returned no `usage` for an
+abandoned request, and inventing a zero or an estimate would be worse than
+recording nothing, since these figures are meant to be measured rather than
+guessed. Both are commented at the site.
+
+**Done:** 3 tests in `runner.rs`, using an `LlmClient` that hangs until
+released so the cancel lands mid-flight: cancelling abandons the request and
+emits nothing while the turn keeps its full history; an already-cancelled token
+means the request is never sent at all; and an uncancelled summary still folds
+and still reports, so the guard did not quietly disable the feature. The first
+two were confirmed to fail on the old code — by hanging, since without the guard
+the call never returns, so both are wrapped in a `tokio::time::timeout`: a
+regression should fail an assertion rather than wedge the suite.
+
+**Public contract:** none. `compact_for_request` is private to `filar-tui`;
+nothing in `crates/agent/src/**` or `crates/core/src/**` changed, so `eval-smoke`
+should not trigger.
+
+**Verification:** `cargo build --workspace`, `cargo test --workspace`,
+`cargo build --release`. The TUI was not driven — no interactive terminal here —
+so the manual check that Ctrl+Z now stops the spinner immediately rather than
+some seconds later is the human's, and is written out in the PR.
+
+**Next steps:** #393 (engine docs) and #395 (README and user guide) remain in
+1.0.6, both deliberately sequenced after this one so they describe final
+behaviour. #395 in particular has to mention what Ctrl+Z does during a fold.
+
 ## Release v1.0.5 (2026-08-27)
 
 **Scope:** milestone 1.0.5 — regression fixes for 1.0.4: Unicode export topic slug
