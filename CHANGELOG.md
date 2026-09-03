@@ -43,6 +43,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- `README.md` and `USER_GUIDE.md` now describe history compaction as it actually
+  behaves in this release; the user guide had not mentioned the feature at all
+  ([#395](https://github.com/devlawey/filar/issues/395)).
+
 - `docs/ENGINE_API.md` now documents the three contract changes in this release
   — `ChatBlock::Summary`, the `summarise_history` signature, and
   `Session::folded_history` — with an upgrade table for embedders

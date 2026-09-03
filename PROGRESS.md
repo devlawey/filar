@@ -6328,6 +6328,85 @@ claimed.
 After it, `prepare-release` — which will also rewrite the `engine-v1.0.5` tags
 in this document.
 
+## Issue #395: docs — README and the user guide caught up with 1.0.6
+
+**Milestone:** 1.0.6. **Branch:** `docs/395-readme-user-guide`. Last open issue
+of the milestone.
+
+**Problem.** Compaction shipped across four issues and reached the user-facing
+docs unevenly. `README.md` described it in detail but had been written against
+issues 376–378 and predated three later changes. `USER_GUIDE.md` — 555 lines, the
+Russian-language document — did not mention it once: no `compact_at_tokens` in
+the `config.toml` reference, no `Ctrl+K` in the hotkey table, no section. A
+reader of the guide would meet "compacting the first N blocks" in the feed, see
+their history shorten, and have nowhere to look.
+
+**Decision.** The two documents stay independent, each in its own current style
+and language, rather than the guide becoming canonical with the README pointing
+at it. That was the user's call, made explicitly. The cost is a known one: a
+future change to compaction has to be written twice, and the two can drift. The
+benefit is that each document stays self-contained for its own audience.
+
+**README.** Extended in place: the summarising request is charged like any other
+and shows up in the session and per-profile figures (#387); folding shortens the
+context and not the record, so the exit transcript, `Ctrl+S` export and a
+reopened session all still hold every turn (#379); `Ctrl+Z` mid-fold cancels the
+request itself rather than letting it finish and be discarded (#394).
+
+**User guide.** New section 4.6, matching the guide's own register — short
+bolded lead-ins, concrete keys, no API talk: when it fires and why the threshold
+is per-profile, what appears in the feed, `Ctrl+K`, that the record keeps what
+the context loses, the cost, the failure path, and cancellation. Plus
+`compact_at_tokens` in the 2.2 reference, `Ctrl+K` in the hotkey table, the
+`Ctrl+Z` entry extended, a `Summary` row in the chat-block table, and a line in
+6.1 saying folded turns are saved separately so a reopened session keeps the
+beginning of the conversation.
+
+**Cross-check of the milestone.** Walked the other closed issues for claims that
+are no longer true. Nothing stale found: #380 and #385 changed launcher
+behaviour the guide never described in that detail, and #374's stream retry is
+invisible to the user by design. One real gap surfaced and was **not** closed
+here: `Ctrl+P` appears in both hotkey tables as "password input", but neither
+document explains `$FILAR_SECRET_N` — that a secret entered this way can be
+referenced by the agent in command arguments without ever being echoed. That is
+a security-relevant feature with a one-line mention, and it deserves its own
+issue rather than being folded into a compaction PR.
+
+**Done:** documentation only, no behaviour changed, so no tests fail on the old
+code and none are claimed. Both documents were re-read end to end for dangling
+cross-references after editing — the section numbering in the guide is manual.
+
+**Verification:** `cargo build --workspace`, `cargo test --workspace`,
+`cargo build --release`.
+
+**Note on the working tree.** Part of this change was already present as
+uncommitted edits in the agent's container when the task started, from an
+earlier session that was not carried to a commit: the README paragraphs and four
+of the guide's smaller edits. They were correct and were kept, but they
+referenced a section 4.6 that did not exist — the guide stopped at 4.5. Anyone
+who had run with that tree would have shipped two dangling references.
+
+**Review (PR #398).** Two taken. The cancellation wording overclaimed: `Ctrl+Z`
+was described as making a fold "stop costing tokens the moment you say so",
+which filar cannot promise — the request may already be in flight and billed
+upstream. What cancelling actually guarantees is that nothing waits on the
+result and nothing enters the session's figures, and both documents now say that
+instead. Also an MD018 hit in this entry, from a line beginning with `#376`.
+
+Two declined. A qualification that cost accounting depends on provider-reported
+usage: true, but true of every token figure filar shows, not of summaries in
+particular, so putting the caveat only in the compaction paragraph would imply
+summary costs are less reliable than the rest. Belongs in a general note about
+the figures, if anywhere. And the branch prefix `docs/`, against a rule reading
+`fix/<номер-issue>-<слаг>` (или `feat/`, `refactor/` по характеру) — the list
+reads as illustrative and #397 merged under the same prefix, so the record was
+left truthful rather than renamed to a branch that never existed.
+
+**Next steps:** milestone 1.0.6 has no open issues left. `prepare-release`,
+which will also rewrite the `engine-v1.0.5` tag references in
+`docs/ENGINE_API.md`. The `$FILAR_SECRET_N` documentation gap above wants an
+issue.
+
 ## Release v1.0.5 (2026-08-27)
 
 **Scope:** milestone 1.0.5 — regression fixes for 1.0.4: Unicode export topic slug
