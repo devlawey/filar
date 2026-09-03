@@ -207,8 +207,16 @@ Reaching the threshold folds the head of the history into a single summary and
 keeps the last few turns verbatim. Nothing about this is silent: the feed gets a
 line before ("compacting the first N blocks") and one after ("N blocks to M"),
 and the summary itself stays in the feed as a collapsed block you can expand and
-audit. The summary is produced by the session's own profile, so its cost lands
-where you would expect.
+audit. The summary is produced by the session's own profile, and the request it
+takes is charged like any other — it appears in the session's token and cost
+figures and in the per-profile breakdown, so a session that has compacted
+several times shows what that cost.
+
+Folding the history shortens the context, not the record. The turns that were
+folded away stay in the session and in the transcript: the `.md` written on exit,
+the `Ctrl+S` export, and a session you save and reopen all still contain every
+turn, with the summary shown at the point where the fold happened. What the model
+carries and what you can go back and read are deliberately two different things.
 
 What the summary is asked to keep, in order: commands already executed and what
 they did, established facts about the system, the current hypothesis, and any
@@ -221,7 +229,10 @@ useful before moving to a new phase of work. It ignores `compact_at_tokens`
 entirely, so it still works when automatic compaction is off.
 
 If the summary request fails, the history is left alone and your turn still goes
-out on the full history; the feed says so.
+out on the full history; the feed says so. `Ctrl+Z` while a fold is in progress
+cancels the summarising request itself rather than letting it finish and be
+thrown away, so a compaction you change your mind about stops costing tokens the
+moment you say so. The history is untouched and the session carries on.
 
 The threshold is per-profile because context windows differ — a figure that
 suits a 1M-token model is meaningless for a 128k one. Set it comfortably below
