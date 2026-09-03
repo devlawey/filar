@@ -6124,6 +6124,101 @@ separate defect surfaced in review and is **not** fixed here: the summarising
 call ignores the cancellation token, so Ctrl+Z leaves the user paying for a
 request whose result is then discarded. Needs its own issue.
 
+## Issue #379: feat(tui/core) — compaction stopped costing the record (4/4)
+
+**Milestone:** 1.0.6. **Branch:** `feat/379-compaction-transcript-session`.
+Closes the four-part compaction series (376 → 377 → 378 → 379).
+
+**Problem.** The issue allowed that its first requirement might already hold:
+the transcript is written from `Session::messages`, so it keeps the whole
+conversation *if* compaction only changes what goes to the model. It did not.
+`apply_compaction` assigned `messages = compacted`, so the folded head left the
+session outright — the `.md` record had a hole exactly where the beginning of
+the conversation used to be, and a reopened session had lost it for good. The
+issue's second branch applied: fix it, do not describe it.
+
+**Decision, stated as the issue asks.** The full history is kept, but not in
+`messages`. `Session` gains `folded_history: Vec<ChatBlock>`, appended to by
+`apply_compaction` before the head is replaced, in both the TUI session and the
+persisted `filar_core::Session`.
+
+This is deliberately not the spec's literal recommendation of holding the whole
+history in `messages` and projecting it for the model. #377 made the feed and
+the model's context one list on purpose: the summary is visible in the feed
+precisely so that compaction is something the user can audit, and a projection
+would mean the feed shows turns the model no longer has. It would also force
+every reader of `messages` — feed rendering, block indices, collapse overrides,
+topic slug, the #376 fill measurement — to choose between the full and the
+projected list, which is a change across `app.rs` and `ui/` rather than a change
+to compaction. The guarantee is identical either way: nothing is lost. What
+differs is where the folded head lives and how much code has to know about it.
+
+**Consumers.** New `App::full_history()` returns archive followed by context;
+`save_transcript_silent` writes from it. `session_snapshot` persists both lists
+and `apply_loaded_session` restores both. `#[serde(default)]` keeps older files
+readable, and a file with the new field is ignored rather than rejected by
+readers that do not know it, the same way every other field added since 1.0 has
+behaved. The record reads head, then the summary that stood in for it, then the
+verbatim tail — it says both what happened and where the model's view was
+folded.
+
+**Profile switch and cancel needed no change, and the tests say so honestly.**
+Ctrl+L only reassigns `llm_profile` and pushes a notice; it touches neither the
+history nor `pending_compaction`, `compacted_without_relief` or
+`context_full_notice_shown`, and `compact_at_tokens_for` already reads the
+threshold from whichever profile is active, so a switch changes the threshold
+with no restart. Ctrl+Z clears `pending_compaction` in `cancel_work`, so a late
+summary is discarded by the stale guard from #377 and nothing is half-folded.
+Both are covered, but as characterisation tests: they do **not** fail on the old
+code, because the behaviour was already right. Only the archive tests do.
+
+**Done:** 2 tests in `filar-core` (the archive survives a round trip; a file
+saved before this field loads with an empty one) and 5 in `app.rs` (the head
+moves to the archive rather than out of the session, with the exact shape of the
+record pinned; the transcript holds the whole conversation while `messages`
+alone would not; reopening keeps both lists; Ctrl+L driven through the real key
+handler leaves the archive and takes the new threshold; Ctrl+Z leaves history
+and archive alone).
+
+**Public contract:** `filar_core::Session` gains a field. Additive and
+`#[serde(default)]`, but embedders constructing it with a struct literal must
+add it. `ChatBlock`, `CommandExecutor` and `LlmClient` are untouched, and
+nothing in `crates/agent/src/**` changed, so `eval-smoke` should not be
+triggered by this.
+
+**Verification:** `cargo build --workspace`, `cargo test --workspace` (789
+passed, 0 failed, 8 ignored — the docker-sshd tests) and `cargo build
+--release`. The TUI was not driven: no interactive terminal here, so the three
+manual DoD checks are the human's and are written out in the PR.
+
+**Environment note:** the container disk filled to 99% mid-task and `lld` began
+crashing with a stack dump on the final link. It reads as a compiler bug and is
+not one; clearing the release artifacts fixed it. Worth knowing before anyone
+files it upstream.
+
+**Review (PR #392).** Two findings taken. The manual `Ctrl+S` export still ran
+off `messages`, so an export taken after a compaction would have had the same
+hole this issue is about — only the silent transcript save had been switched.
+Both save paths now go through `full_history()`, which is the point of having
+the accessor. And `session_snapshot`, made `pub(crate)` for a test, had no doc
+comment. The changelog entry was condensed as well.
+
+Declined: a blocker claiming `apply_loaded_session` sets `App::messages` without
+touching `Session::messages`, leaving a restored session with its old context.
+`App` derefs to the active session, so those are one field and the suggested fix
+is the same assignment written twice. The review was right that the round-trip
+test could not have caught such a divergence, though — it snapshotted the
+session it then loaded — so there is now a test that loads a session whose
+content differs from the current one.
+
+**Next steps:** both loose ends now have issues in 1.0.6. #393 covers
+`docs/ENGINE_API.md`, which documents neither `ChatBlock::Summary` (noted in
+#377), nor `summarise_history`, whose signature #387 changed, nor this field —
+it blocks `engine-v1.0.6`. #394 covers the summarising call ignoring the
+cancellation token, so Ctrl+Z during compaction leaves the user paying for a
+request whose result is thrown away: the history is safe, the money is not.
+`prepare-release` after those.
+
 ## Release v1.0.5 (2026-08-27)
 
 **Scope:** milestone 1.0.5 — regression fixes for 1.0.4: Unicode export topic slug

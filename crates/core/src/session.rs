@@ -55,6 +55,20 @@ pub struct Session {
     pub llm_profile: Option<String>,
     /// Chat history blocks.
     pub messages: Vec<ChatBlock>,
+    /// Heads folded away by compaction, oldest first (#379).
+    ///
+    /// Compaction replaces the head of [`Self::messages`] with a
+    /// [`ChatBlock::Summary`], because what the model is sent and what the feed
+    /// shows are deliberately the same list (#377). The blocks it replaced are
+    /// kept here so nothing is actually lost: the transcript is written from
+    /// this followed by `messages`, and a reopened session still holds every
+    /// turn it ever had. Repeated compactions append, so this stays in order
+    /// and a summary of a summary still has the original turns behind it.
+    ///
+    /// `#[serde(default)]` for backward compat: sessions saved before this
+    /// existed simply have none.
+    #[serde(default)]
+    pub folded_history: Vec<ChatBlock>,
     /// History of user prompts in agent mode (for Up/Down navigation).
     /// Limited to [`MAX_INPUT_HISTORY`] entries when saved.
     #[serde(default)]
@@ -413,6 +427,7 @@ mod tests {
     #[test]
     fn session_meta_from_session() {
         let session = Session {
+            folded_history: Vec::new(),
             id: "123".into(),
             timestamp: "2026-06-21 12:00:00".into(),
             target: "local".into(),
@@ -443,6 +458,7 @@ mod tests {
     #[test]
     fn session_meta_empty_messages() {
         let session = Session {
+            folded_history: Vec::new(),
             id: "1".into(),
             timestamp: "t".into(),
             target: "t".into(),
@@ -471,6 +487,7 @@ mod tests {
 
         let store = SessionStore { dir: tmp.clone() };
         let session = Session {
+            folded_history: Vec::new(),
             id: "777".into(),
             timestamp: "2026-01-01 00:00:00".into(),
             target: "test".into(),
@@ -515,6 +532,7 @@ mod tests {
         };
 
         let session = Session {
+            folded_history: Vec::new(),
             id: "999".into(),
             timestamp: "2026-01-01 00:00:00".into(),
             target: "test".into(),
@@ -566,6 +584,7 @@ mod tests {
         // Save 5 sessions with different IDs (timestamps).
         for i in 1..=5u64 {
             let session = Session {
+                folded_history: Vec::new(),
                 id: format!("{i:010}"),
                 timestamp: format!("t{i}"),
                 target: "t".into(),
@@ -692,6 +711,7 @@ mod tests {
     #[test]
     fn tokens_in_out_roundtrip() {
         let s = Session {
+            folded_history: Vec::new(),
             id: "1".into(), timestamp: "t".into(), target: "t".into(),
             llm_profile: Some("glm".into()), messages: vec![], input_history: vec![],
             tokens_in: 150, tokens_out: 300,
@@ -725,6 +745,7 @@ mod tests {
     #[test]
     fn input_history_serialize_roundtrip() {
         let session = Session {
+            folded_history: Vec::new(),
             id: "1".into(),
             timestamp: "t".into(),
             target: "t".into(),
@@ -767,8 +788,64 @@ mod tests {
     }
 
     #[test]
+    fn folded_history_survives_a_save_and_load() {
+        // The compacted context and the head it replaced are stored side by
+        // side, so reopening a session that has been compacted does not
+        // quietly shorten it (#379).
+        let session = Session {
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "t".into(),
+            llm_profile: None,
+            messages: vec![
+                ChatBlock::Summary { text: "earlier turns".into(), replaced_blocks: 2 },
+                ChatBlock::User("still here".into()),
+            ],
+            folded_history: vec![
+                ChatBlock::User("the very first question".into()),
+                ChatBlock::Agent("the answer to it".into()),
+            ],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        let loaded: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.folded_history.len(), 2);
+        assert!(
+            matches!(&loaded.folded_history[0], ChatBlock::User(t) if t == "the very first question"),
+            "the folded head comes back verbatim"
+        );
+        assert_eq!(loaded.messages.len(), 2, "and the context is unchanged by it");
+    }
+
+    #[test]
+    fn a_session_saved_before_folded_history_still_loads() {
+        // Files written by any earlier version simply have no archive.
+        let json = r#"{
+            "id":"123",
+            "timestamp":"2026-01-01 00:00:00",
+            "target":"test",
+            "llm_profile":"glm",
+            "messages":[{"User":"hello"},{"Agent":"world"}]
+        }"#;
+        let session: Session = serde_json::from_str(json).unwrap();
+        assert!(session.folded_history.is_empty(), "missing field → empty archive");
+        assert_eq!(session.messages.len(), 2, "and the history is untouched");
+    }
+
+    #[test]
     fn truncate_input_history_keeps_last_entries() {
         let mut session = Session {
+            folded_history: Vec::new(),
             id: "1".into(),
             timestamp: "t".into(),
             target: "t".into(),
@@ -813,6 +890,7 @@ mod tests {
     #[test]
     fn model_per_profile_survives_roundtrip() {
         let mut session = Session {
+            folded_history: Vec::new(),
             id: "1".into(), timestamp: "t".into(), target: "t".into(),
             llm_profile: None, messages: vec![], input_history: vec![],
             tokens_in: 0, tokens_out: 0,
@@ -843,6 +921,7 @@ mod tests {
     #[test]
     fn launch_context_roundtrip() {
         let session = Session {
+            folded_history: Vec::new(),
             id: "1".into(),
             timestamp: "t".into(),
             target: "prod".into(),
@@ -888,6 +967,7 @@ mod tests {
     #[test]
     fn session_meta_includes_launch_context() {
         let session = Session {
+            folded_history: Vec::new(),
             id: "1".into(),
             timestamp: "t".into(),
             target: "prod".into(),
