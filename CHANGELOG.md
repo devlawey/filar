@@ -43,6 +43,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- `docs/ENGINE_API.md` now documents the three contract changes in this release
+  — `ChatBlock::Summary`, the `summarise_history` signature, and
+  `Session::folded_history` — with an upgrade table for embedders
+  ([#393](https://github.com/devlawey/filar/issues/393)).
+
 - `Ctrl+Z` during compaction now cancels the summarising request itself instead
   of leaving it to finish and be discarded, so a cancelled fold stops costing
   tokens ([#394](https://github.com/devlawey/filar/issues/394)).
