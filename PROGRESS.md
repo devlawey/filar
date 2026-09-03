@@ -6335,7 +6335,7 @@ of the milestone.
 
 **Problem.** Compaction shipped across four issues and reached the user-facing
 docs unevenly. `README.md` described it in detail but had been written against
-#376–#378 and predated three later changes. `USER_GUIDE.md` — 555 lines, the
+issues 376–378 and predated three later changes. `USER_GUIDE.md` — 555 lines, the
 Russian-language document — did not mention it once: no `compact_at_tokens` in
 the `config.toml` reference, no `Ctrl+K` in the hotkey table, no section. A
 reader of the guide would meet "compacting the first N blocks" in the feed, see
@@ -6385,6 +6385,22 @@ earlier session that was not carried to a commit: the README paragraphs and four
 of the guide's smaller edits. They were correct and were kept, but they
 referenced a section 4.6 that did not exist — the guide stopped at 4.5. Anyone
 who had run with that tree would have shipped two dangling references.
+
+**Review (PR #398).** Two taken. The cancellation wording overclaimed: `Ctrl+Z`
+was described as making a fold "stop costing tokens the moment you say so",
+which filar cannot promise — the request may already be in flight and billed
+upstream. What cancelling actually guarantees is that nothing waits on the
+result and nothing enters the session's figures, and both documents now say that
+instead. Also an MD018 hit in this entry, from a line beginning with `#376`.
+
+Two declined. A qualification that cost accounting depends on provider-reported
+usage: true, but true of every token figure filar shows, not of summaries in
+particular, so putting the caveat only in the compaction paragraph would imply
+summary costs are less reliable than the rest. Belongs in a general note about
+the figures, if anywhere. And the branch prefix `docs/`, against a rule reading
+`fix/<номер-issue>-<слаг>` (или `feat/`, `refactor/` по характеру) — the list
+reads as illustrative and #397 merged under the same prefix, so the record was
+left truthful rather than renamed to a branch that never existed.
 
 **Next steps:** milestone 1.0.6 has no open issues left. `prepare-release`,
 which will also rewrite the `engine-v1.0.5` tag references in

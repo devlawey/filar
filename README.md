@@ -230,9 +230,12 @@ entirely, so it still works when automatic compaction is off.
 
 If the summary request fails, the history is left alone and your turn still goes
 out on the full history; the feed says so. `Ctrl+Z` while a fold is in progress
-cancels the summarising request itself rather than letting it finish and be
-thrown away, so a compaction you change your mind about stops costing tokens the
-moment you say so. The history is untouched and the session carries on.
+cancels the summarising request itself rather than waiting for it to finish and
+then discarding the result: filar stops there and counts nothing for it. Whether
+the provider had already begun the request, and billed for it, is past filar's
+reach — what cancelling guarantees is that nothing keeps waiting on it and
+nothing lands in your session's figures. The history is untouched and the
+session carries on.
 
 The threshold is per-profile because context windows differ — a figure that
 suits a 1M-token model is meaningless for a 128k one. Set it comfortably below
