@@ -6407,6 +6407,26 @@ which will also rewrite the `engine-v1.0.5` tag references in
 `docs/ENGINE_API.md`. The `$FILAR_SECRET_N` documentation gap above wants an
 issue.
 
+## Release v1.0.6 (2026-09-04)
+
+**Scope:** milestone 1.0.6 — history compaction: context-fill tracking and
+`compact_at_tokens` (#376), proactive compaction with `Ctrl+K` (#377), reactive
+compaction on context overflow (#378), folded head kept in the transcript
+(#379), summary token usage counted (#387), cancelled folds stop billing
+(#394), plus profile-deletion/GUI settings-preservation fixes (#385) and doc
+catch-up (#393, #395).
+
+**Preflight:** `cargo build --workspace` and `cargo test --workspace` green on
+main before bump.
+
+**Tags:** `v1.0.6`, `engine-v1.0.6` (core + transport + agent changed;
+contract changes documented under "Upgrading to `engine-v1.0.6`" in
+`docs/ENGINE_API.md`).
+
+**Manual smoke:** `docs/SMOKE.md` on Windows + macOS (#298 tracking):
+`Ctrl+K` fold + expand, overflow-triggered reactive compaction, `Ctrl+Z`
+during summarising stops the request, cost bar includes summary usage.
+
 ## Release v1.0.5 (2026-08-27)
 
 **Scope:** milestone 1.0.5 — regression fixes for 1.0.4: Unicode export topic slug
