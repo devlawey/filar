@@ -114,8 +114,9 @@ fn context_indicator_text(
     format!("ctx [{bar}] {used_text}/{threshold_text}")
 }
 
-/// The context-fill segment for the status bar, including the two-space gap
-/// that separates it from `confirm_mode`.
+/// The context-fill segment for the status bar, including a one-column
+/// trailing gap; with the leading space of `confirm_text` the indicator
+/// stands two columns clear of `confirm_mode`, matching the toast gap.
 ///
 /// Yields before `confirm_mode` and the toast do: the bar is tried at 8 and
 /// 4 cells, then as an absolute pair without a scale, and finally dropped
@@ -129,7 +130,7 @@ fn context_indicator_segment(
     let tiers: &[usize] = if threshold == 0 { &[0] } else { &[8, 4, 0] };
     for &bar_cells in tiers {
         let text = context_indicator_text(used, threshold, glyphs, bar_cells);
-        let segment = format!("{text}  ");
+        let segment = format!("{text} ");
         if segment.chars().count() <= max_len {
             return Some(segment);
         }
