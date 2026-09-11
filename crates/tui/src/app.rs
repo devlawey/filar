@@ -1392,6 +1392,11 @@ impl App {
         self.active_session_mut().folded_history.extend(folded);
         self.active_session_mut().messages = compacted;
         self.active_session_mut().pending_compaction = None;
+        // The stored figure described the context that was just folded away.
+        // Left in place, the status bar would show the pre-compaction fill —
+        // and its warning colour — until the next response; `None` reads as
+        // "not measured since the fold" (#399).
+        self.active_session_mut().last_prompt_tokens = None;
         // Re-arm the threshold. The flag records that the notice was shown for
         // one crossing; leaving it set after a compaction that did not bring
         // the context back under the threshold — a large tail, a long summary —
@@ -7766,6 +7771,33 @@ mod tests {
     }
 
     #[test]
+    fn applying_a_summary_clears_the_pre_compaction_measurement() {
+        // The stored figure describes the context that was folded away: the
+        // status bar must show "not measured yet" until the next response
+        // measures the compacted history (#399).
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        for i in 0..8 {
+            app.push_message(ChatBlock::User(format!("q{i}")));
+            app.push_message(ChatBlock::Agent(format!("a{i}")));
+        }
+        let boundary = filar_core::compaction_boundary(
+            &app.active_session().messages,
+            filar_core::DEFAULT_KEEP_TURNS,
+        );
+        assert!(boundary > 0, "fixture must have something to compact");
+        app.active_session_mut().pending_compaction = Some(boundary);
+        app.active_session_mut().last_prompt_tokens = Some(250_000);
+
+        app.apply_compaction(boundary, "earlier turns, briefly".into());
+
+        assert_eq!(
+            app.active_session().last_prompt_tokens,
+            None,
+            "the pre-compaction figure must not survive the fold"
+        );
+    }
+
+    #[test]
     fn a_failed_summary_leaves_the_history_untouched() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         for i in 0..8 {
@@ -7794,11 +7826,17 @@ mod tests {
         app.push_message(ChatBlock::User("one".into()));
         let before = app.active_session().messages.len();
         app.active_session_mut().pending_compaction = Some(99);
+        app.active_session_mut().last_prompt_tokens = Some(250_000);
 
         app.apply_compaction(99, "summary of a history that no longer exists".into());
 
         assert_eq!(app.active_session().messages.len(), before);
         assert_eq!(app.active_session().pending_compaction, None);
+        assert_eq!(
+            app.active_session().last_prompt_tokens,
+            Some(250_000),
+            "a discarded result must not clear the measurement"
+        );
     }
 
     #[test]
@@ -8031,19 +8069,30 @@ mod tests {
         // head being folded, in a request of its own, so letting it in there
         // would move the trigger for reasons unrelated to how full the
         // session's context is — the same reason arbiter usage is excluded.
+        // The accounting is exercised directly: a successful fold clears the
+        // figure (#399) and would mask a leak through the event path.
         let (mut app, sid, boundary) = app_awaiting_summary();
         let before = app.active_session().last_prompt_tokens;
 
+        app.record_summary_usage(&summary_usage(9_000, 120, None), "p".into());
+
+        assert_eq!(app.active_session().last_prompt_tokens, before);
+        assert_eq!(app.active_session().tokens_in, 9_000, "but it is still counted");
+
+        // The fold itself drops the stale figure instead of keeping it.
         app.handle_agent_event(TuiEvent::HistoryCompacted {
             session_id: sid,
             boundary,
             summary: Ok("A real summary of the earlier turns of this session.".into()),
-            usage: Some(summary_usage(9_000, 120, None)),
+            usage: None,
             profile: "p".into(),
         });
 
-        assert_eq!(app.active_session().last_prompt_tokens, before);
-        assert_eq!(app.active_session().tokens_in, 9_000, "but it is still counted");
+        assert_eq!(
+            app.active_session().last_prompt_tokens,
+            None,
+            "the fold clears it rather than leaving a stale fill"
+        );
     }
 
     #[test]

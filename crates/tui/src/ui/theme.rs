@@ -37,11 +37,15 @@ pub struct Glyphs {
     pub bullet: &'static str,
     /// Target separator in status bar: `▸` or `>`.
     pub target_sep: &'static str,
+    /// Filled cell of the context-fill bar in the status bar: `█` or `#`.
+    pub bar_full: &'static str,
+    /// Empty cell of the context-fill bar in the status bar: `░` or `-`.
+    pub bar_empty: &'static str,
 }
 
 impl Glyphs {
     /// Unicode glyphs for modern terminals.
-    const UNICODE: Self = Self {
+    pub(crate) const UNICODE: Self = Self {
         prompt: "❯",
         gutter: "│",
         separator: "─",
@@ -52,10 +56,12 @@ impl Glyphs {
         expand_arrow: "▾",
         bullet: "•",
         target_sep: "▸",
+        bar_full: "█",
+        bar_empty: "░",
     };
 
     /// ASCII fallback for conhost and legacy terminals.
-    const ASCII: Self = Self {
+    pub(crate) const ASCII: Self = Self {
         prompt: ">",
         gutter: "|",
         separator: "-",
@@ -66,6 +72,8 @@ impl Glyphs {
         expand_arrow: "-",
         bullet: "*",
         target_sep: ">",
+        bar_full: "#",
+        bar_empty: "-",
     };
 
     /// Detect terminal capabilities and return the appropriate glyph set.

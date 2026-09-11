@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- The TUI status bar now shows the context fill: the latest request's
+  measured prompt tokens against the active profile's `compact_at_tokens`
+  ([#399](https://github.com/devlawey/filar/issues/399)).
+
 ## [1.0.6] - 2026-09-04
 
 ### Added
