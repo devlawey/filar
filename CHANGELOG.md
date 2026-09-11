@@ -17,6 +17,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   measured prompt tokens against the active profile's `compact_at_tokens`
   ([#399](https://github.com/devlawey/filar/issues/399)).
 
+### Changed
+
+- Ctrl+S exports and Explain-mode transcripts now go into a per-target
+  subfolder of `save_dir` — the sanitized target alias, or `local/` for local
+  tabs — instead of the export root, so sessions of different hosts no longer
+  mix in one directory ([#400](https://github.com/devlawey/filar/issues/400)).
+
 ## [1.0.6] - 2026-09-04
 
 ### Added

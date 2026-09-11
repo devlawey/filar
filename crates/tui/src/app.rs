@@ -653,7 +653,10 @@ impl App {
                     &session.ssh_info,
                     &messages,
                 );
-                let path = base_dir.join(&filename);
+                // Inside the per-target folder (#400); the file stays there
+                // even if the tab's host changes mid-session.
+                let dir_name = export_dir_name(&session.target_name, &session.ssh_info);
+                let path = base_dir.join(&dir_name).join(&filename);
                 session.transcript_path = Some(path.clone());
                 session.transcript_error_shown = false;
                 self.push_message(ChatBlock::System(format!(
@@ -905,7 +908,7 @@ impl Session {
 pub enum SaveProgress {
     Started,
     Writing,
-    Done(String),   // display filename
+    Done(String),   // display path relative to the export root (`folder/file.md`, #400)
     Error(String),  // error message
     /// Silent transcript save completed. `None` = success, `Some` = error.
     TranscriptDone(SessionId, Option<String>),
@@ -971,6 +974,69 @@ fn slugify_max(s: &str, max: usize) -> String {
 /// Slugify a string for use in a filename (max 80 chars).
 fn slugify(s: &str) -> String {
     slugify_max(s, 80)
+}
+
+/// Folder for local (non-SSH) tabs inside the export directory (#400).
+const LOCAL_EXPORT_DIR: &str = "local";
+
+/// Folder name used when sanitization leaves nothing usable (#400).
+const FALLBACK_EXPORT_DIR: &str = "target";
+
+/// Whether `stem` is a Windows-reserved device name (`CON`, `COM1`, …).
+///
+/// Reserved with or without an extension (`CON.txt` is equally unusable), so
+/// the caller passes the part before the first dot. Case-insensitive: NTFS
+/// does not distinguish `nul` from `NUL`.
+fn is_windows_reserved_name(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
+            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    )
+}
+
+/// Sanitize a target display name into a single directory-name component
+/// for the per-target export folder (#400).
+///
+/// Stricter than [`slugify_max`] on purpose: the result becomes a path
+/// segment, not a filename. `.` and `..` would walk out of `save_dir`;
+/// trailing dots and spaces are unusable as directory names on NTFS; the
+/// reserved Windows device names cannot be created at all. A slug of only
+/// dots or symbols trims away to nothing and falls back to
+/// [`FALLBACK_EXPORT_DIR`].
+fn sanitize_dir_segment(name: &str) -> String {
+    let slug = slugify_max(name, 80);
+    // `.` and `..` are nothing but trailing dots, so the trim rejects them
+    // whole — and, with the fallback below, no all-dots name can survive.
+    let trimmed = slug.trim_end_matches(|c| c == '.' || c == ' ');
+    let mut cleaned = if trimmed.is_empty() {
+        FALLBACK_EXPORT_DIR.to_string()
+    } else {
+        trimmed.to_string()
+    };
+    if is_windows_reserved_name(cleaned.split('.').next().unwrap_or("")) {
+        // `CON` → `CON_`, `lpt9.log` → `lpt9_.log`: Windows resolves a device
+        // name by the part before the first dot, so the `_` must break that
+        // stem — a trailing `lpt9.log_` would still hit the `lpt9` device.
+        let stem_end = cleaned.find('.').unwrap_or(cleaned.len());
+        cleaned.insert(stem_end, '_');
+    }
+    cleaned
+}
+
+/// Name of the export subfolder for a session (#400): `local` for local tabs
+/// (`ssh_info == None`), otherwise the sanitized display name of the target —
+/// its alias, or `SSH{n}` for an unnamed launcher slot.
+///
+/// Resolved from the session state *at save time*, so a tab that reconnected
+/// elsewhere exports to the folder of the host it is on now.
+fn export_dir_name(target_name: &str, ssh_info: &Option<String>) -> String {
+    if ssh_info.is_none() {
+        LOCAL_EXPORT_DIR.to_string()
+    } else {
+        sanitize_dir_segment(target_name)
+    }
 }
 
 /// Short hash for emoji-only / symbol-only topics (#358).
@@ -1948,6 +2014,10 @@ impl App {
             .save_dir
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+        // One folder per target (#400), decided from the host the tab is on
+        // *now*: the sanitized display name, or `local` for local tabs.
+        let dir_name = export_dir_name(&session_name, &ssh_info);
+        let target_dir = base_dir.join(&dir_name);
 
         tokio::spawn(async move {
             tx.send(SaveProgress::Started).ok();
@@ -1955,8 +2025,17 @@ impl App {
             // Small delay so the overlay has time to render the 0% state.
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
+            // Lazy per-target folder: created on the first save into it (#400).
+            if let Err(e) = tokio::fs::create_dir_all(&target_dir).await {
+                tx.send(SaveProgress::Error(format!(
+                    "Failed to create folder '{dir_name}': {e}"
+                )))
+                .ok();
+                return;
+            }
+
             let filename =
-                generate_save_filename(&session_name, &ssh_info, &messages, &base_dir).await;
+                generate_save_filename(&session_name, &ssh_info, &messages, &target_dir).await;
             let md_content = messages_to_markdown(&messages, &session_name, &ssh_info);
 
             tx.send(SaveProgress::Writing).ok();
@@ -1964,11 +2043,12 @@ impl App {
             // Let the progress bar sit at 50% before jumping to 100%.
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
-            let filepath = base_dir.join(&filename);
+            let filepath = target_dir.join(&filename);
 
             match tokio::fs::write(&filepath, &md_content).await {
                 Ok(_) => {
-                    tx.send(SaveProgress::Done(filename)).ok();
+                    // Show the folder too — the layout is the point (#400).
+                    tx.send(SaveProgress::Done(format!("{dir_name}/{filename}"))).ok();
                 }
                 Err(e) => {
                     tx.send(SaveProgress::Error(format!("Failed to write file: {e}"))).ok();
@@ -2050,6 +2130,19 @@ impl App {
         let tx = tx.clone();
 
         tokio::spawn(async move {
+            // The per-target folder is created lazily on the first write into
+            // it (#400); the transcript may well be that first write.
+            if let Some(parent) = path.parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    tracing::warn!(path = %parent.display(), error = %e, "transcript folder create failed");
+                    tx.send(SaveProgress::TranscriptDone(
+                        sid,
+                        Some(format!("cannot create {}: {e}", parent.display())),
+                    ))
+                    .ok();
+                    return;
+                }
+            }
             let md = messages_to_markdown(&messages, &session_name, &ssh_info);
             let result = tokio::fs::write(&path, &md).await;
             match result {
@@ -9404,6 +9497,186 @@ mod tests {
         assert!(
             after_host.as_bytes().get(..4).is_some_and(|b| b.iter().all(u8::is_ascii_digit)),
             "expected date after host when no topic, got: {name}"
+        );
+    }
+
+    // ── Per-target export folders (#400) ─────────────────────────────
+
+    /// Drive one Ctrl+S save to completion and return the `Done` payload.
+    async fn run_save_to_completion(app: &mut App) -> String {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.save_tx = Some(tx);
+        app.start_save();
+        loop {
+            match rx.recv().await.expect("save task must report progress") {
+                SaveProgress::Done(name) => return name,
+                SaveProgress::Error(e) => panic!("save failed: {e}"),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_aliases_cannot_escape_the_save_dir() {
+        let base = std::path::Path::new("exports");
+        let ssh = Some("root@10.0.0.5".to_string());
+        for alias in ["..", "../../etc", "..\\..\\Windows", "CON", ".", "  ", "///", "", "***"] {
+            let segment = export_dir_name(alias, &ssh);
+            assert!(!segment.is_empty(), "alias {alias:?} gave an empty folder name");
+            assert!(
+                !segment.contains('/') && !segment.contains('\\'),
+                "alias {alias:?} leaked a separator into {segment:?}"
+            );
+            assert!(
+                segment != "." && segment != "..",
+                "alias {alias:?} kept a dot-name {segment:?}"
+            );
+            // Exactly one normal component directly below the export root.
+            let joined = base.join(&segment);
+            assert_eq!(
+                joined.parent(),
+                Some(base),
+                "alias {alias:?} must stay one level below save_dir, got {joined:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_name_falls_back_when_nothing_survives() {
+        // `.`, `..` and other all-dot or all-symbol names trim to nothing.
+        for alias in [".", "..", "...", "  ", "///", "***", ""] {
+            assert_eq!(sanitize_dir_segment(alias), "target", "alias {alias:?}");
+        }
+        // Trailing dots are invalid directory names on NTFS and are stripped.
+        assert_eq!(sanitize_dir_segment("prod."), "prod");
+        assert_eq!(sanitize_dir_segment("prod.."), "prod");
+        assert_eq!(sanitize_dir_segment("prod-web"), "prod-web");
+    }
+
+    #[test]
+    fn windows_reserved_names_are_escaped_in_folder_names() {
+        assert_eq!(sanitize_dir_segment("CON"), "CON_");
+        assert_eq!(sanitize_dir_segment("nul"), "nul_");
+        assert_eq!(sanitize_dir_segment("COM1"), "COM1_");
+        // Reserved even with an extension — and the escape must break the
+        // stem itself, not trail the whole name (a `lpt9.log_` folder would
+        // still resolve to the `lpt9` device on Windows).
+        assert_eq!(sanitize_dir_segment("lpt9.log"), "lpt9_.log");
+        // Lookalikes are not reserved.
+        assert_eq!(sanitize_dir_segment("console"), "console");
+        assert_eq!(sanitize_dir_segment("com10"), "com10");
+    }
+
+    #[test]
+    fn local_tabs_share_one_local_folder() {
+        assert_eq!(export_dir_name("local-1", &None), "local");
+        assert_eq!(export_dir_name("local", &None), "local");
+        let ssh = Some("root@10.0.0.5".to_string());
+        assert_eq!(export_dir_name("prod-web", &ssh), "prod-web");
+        assert_eq!(export_dir_name("SSH2", &ssh), "SSH2");
+        // A hostile SSH alias is sanitized, not used raw.
+        assert_eq!(export_dir_name("..", &ssh), "target");
+    }
+
+    #[tokio::test]
+    async fn ctrl_s_export_lands_in_the_per_target_subfolder() {
+        let base = std::env::temp_dir().join(format!("filar_export_dir_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.sessions[0].ssh_info = Some("root@10.0.0.5".into());
+        app.save_dir = Some(base.clone());
+
+        let done = run_save_to_completion(&mut app).await;
+        let filename = done
+            .strip_prefix("prod-web/")
+            .unwrap_or_else(|| panic!("Done must name the target folder, got: {done}"));
+        let file = base.join("prod-web").join(filename);
+        assert!(
+            tokio::fs::try_exists(&file).await.unwrap_or(false),
+            "export must be written to {file:?}"
+        );
+        // The export root itself stays clean — no flat .md files (#400).
+        assert!(
+            !tokio::fs::try_exists(base.join(filename)).await.unwrap_or(false),
+            "export must not land flat in the export root"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn local_tabs_export_into_the_local_folder() {
+        let base = std::env::temp_dir().join(format!("filar_export_local_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+
+        // A local tab: no ssh_info, `local-1` display name (#400).
+        let mut app = App::new("local-1".into(), CommandConfirmMode::Always);
+        app.save_dir = Some(base.clone());
+
+        let done = run_save_to_completion(&mut app).await;
+        let filename = done
+            .strip_prefix("local/")
+            .unwrap_or_else(|| panic!("Done must name the local folder, got: {done}"));
+        let file = base.join("local").join(filename);
+        assert!(
+            tokio::fs::try_exists(&file).await.unwrap_or(false),
+            "export must be written to {file:?}"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn save_collision_within_the_target_folder_gets_a_suffix() {
+        let base = std::env::temp_dir().join(format!("filar_save_suffix_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let ssh = Some("root@10.0.0.5".to_string());
+        let dir = base.join(export_dir_name("db-replica", &ssh));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let msgs = vec![ChatBlock::User("disk full on replica".into())];
+
+        // The stem carries a one-second timestamp, so the pair is retried if a
+        // second boundary fell between the two calls — that looks like a
+        // fresh, non-colliding name rather than a bug.
+        let mut last = (String::new(), String::new());
+        let mut suffixed = false;
+        for _ in 0..5 {
+            let first = generate_save_filename("db-replica", &ssh, &msgs, &dir).await;
+            tokio::fs::write(dir.join(&first), "occupied").await.unwrap();
+            let second = generate_save_filename("db-replica", &ssh, &msgs, &dir).await;
+            let ok = first
+                .strip_suffix(".md")
+                .is_some_and(|stem| second == format!("{stem}-1.md"));
+            last = (first, second);
+            if ok {
+                suffixed = true;
+                break;
+            }
+        }
+        assert!(suffixed, "a colliding name must get the -1 suffix, last pair: {last:?}");
+        // The resolution happened inside the target folder, not the root.
+        assert!(dir.starts_with(&base));
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[test]
+    fn explain_transcript_lands_in_the_target_folder() {
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.sessions[0].ssh_info = Some("root@10.0.0.5".into());
+        app.save_dir = Some(std::path::PathBuf::from("exports"));
+
+        app.toggle_explain_mode();
+        let path = app.sessions[0]
+            .transcript_path
+            .clone()
+            .expect("F2 must create the transcript path");
+        let expected_parent = std::path::Path::new("exports").join("prod-web");
+        assert_eq!(
+            path.parent(),
+            Some(expected_parent.as_path()),
+            "transcript must sit in the per-target folder"
         );
     }
 

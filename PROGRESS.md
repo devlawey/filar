@@ -6462,6 +6462,53 @@ see the PR.
 **Next steps:** none specific; #400 and #401 build on the export and context
 surfaces next.
 
+## Issue #400: feat(tui) — per-target export folders
+
+**Milestone:** 1.0.7. **Branch:** `feat/400-export-target-folders`.
+
+**Problem.** Both export paths — the Ctrl+S Markdown dump and the F2 Explain
+transcript — wrote flat into `save_dir`. With several targets in the tab bar
+the directory turned into a pile where sessions of different hosts mixed,
+told apart only by the filename prefix.
+
+**Change.** `export_dir_name(target_name, ssh_info)` resolves the folder at
+save time: `local` for local tabs (`ssh_info == None`), otherwise the
+sanitized display name of the target (alias or `SSH{n}`). `start_save` creates
+the folder lazily — a `create_dir_all` failure becomes a save error in the
+feed, not a panic — and `SaveProgress::Done` now carries `folder/file.md`, so
+the toast and the system log show where the export landed. The F2 transcript
+path is joined with the same folder; the file stays where it was created even
+if the tab's host changes, and `save_transcript_silent` creates the folder on
+its first write. The existing `-1`, `-2`, … collision suffix now resolves
+within the target folder.
+
+**Path-segment sanitization.** `sanitize_dir_segment` is deliberately
+stricter than `slugify_max`, because the alias becomes a path segment: `.` and
+`..` trim away to nothing (a slug of only dots or symbols falls back to
+`target`), trailing dots and spaces — invalid NTFS directory names — are
+stripped, and Windows reserved device names (`CON`, `COM1`–`COM9`,
+`LPT1`–`LPT9`, extension or not) get an `_` breaking the stem itself
+(`CON_`, `lpt9_.log`). Containment is pinned by
+a test with hostile aliases (`..`, `../../etc`, `..\..\Windows`, `CON`, `.`,
+`  `, `///`, empty, `***`): one normal component, always directly under
+`save_dir`.
+
+**Tests.** Eight new tests in `app.rs`: two end-to-end saves driving
+`start_save` into a temp directory (SSH → `<root>/prod-web/`, local →
+`<root>/local/`, with `Done` naming the folder), collision resolution inside
+the target folder, the F2 transcript path, the hostile-alias containment
+sweep, the trimming/fallback edges, and the reserved-name escapes.
+
+**Verification:** `cargo build --workspace`, `cargo test --workspace`. The
+issue's manual run (two sessions to different targets, Ctrl+S in each, files
+in different folders on Windows) cannot be driven from the agent environment —
+stated in the PR.
+
+**Next steps:** merge PR; before the 1.0.7 release a human should run the
+issue scenario interactively on Windows (two sessions to different targets,
+Ctrl+S in each, files land in different folders) — the agent environment
+cannot drive the TUI.
+
 ## Release v1.0.6 (2026-09-04)
 
 **Scope:** milestone 1.0.6 — history compaction: context-fill tracking and
