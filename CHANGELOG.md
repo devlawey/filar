@@ -17,6 +17,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   measured prompt tokens against the active profile's `compact_at_tokens`
   ([#399](https://github.com/devlawey/filar/issues/399)).
 
+- An explicit `Ctrl+S` can now also write a runbook beside the export: the
+  session folded into a generalised, reusable procedure
+  (`{stem}.runbook.md`, same target folder). The call is cancellable with
+  `Ctrl+Z`, its cost is charged to the session, secrets are redacted from
+  both the prompt and the written file, and the silent F2/exit transcript
+  saves never make it. Opt out with `save_runbook = false`
+  ([#401](https://github.com/devlawey/filar/issues/401)).
+
 ### Changed
 
 - Ctrl+S exports and Explain-mode transcripts now go into a per-target

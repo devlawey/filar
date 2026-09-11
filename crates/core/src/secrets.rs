@@ -216,6 +216,81 @@ pub fn redact(s: &str) -> String {
     format!("{prefix}… (len {len})")
 }
 
+/// Replace every known secret value in `text` with its placeholder.
+///
+/// The complement of [`redact`]: where that hides a name in an error message,
+/// this removes *values* from free-form text that is about to leave the
+/// machine — a transcript handed to an LLM so it can write a runbook (#401).
+/// Command output is already sanitised by the executor, but a value the user
+/// typed into the chat directly never passed through it.
+///
+/// A `$`-prefixed slot (`$FILAR_SECRET_N`) is restored to its own name — the
+/// same form the operator sees in a command line, and the form the executor
+/// substitutes. A plain name (an API key) is internal configuration with no
+/// place in a document meant to be shared: both its value and occurrences of
+/// the bare name itself become `<secret>` (#404 review).
+///
+/// Plain names and slot placeholders can overlap (`SECRET` inside
+/// `$FILAR_SECRET_1`), so slot occurrences leave the text as control-character
+/// markers first and come back once every pattern has run — a blind pass
+/// would rewrite the placeholder itself (#404 review). Markers are built from
+/// `\u{0}`/`\u{1}` precisely because patterns are printable strings: even a
+/// marker like `__SECRET_SLOT_0__` would be eaten by the example above.
+///
+/// Patterns are replaced longest first, so one that contains another (`abc`
+/// inside `abcdef`) cannot be rewritten before its own match is tried. Empty
+/// values are skipped — replacing the empty string would mangle the text
+/// outright.
+pub fn redact_secrets(text: &str, provider: &dyn SecretProvider) -> String {
+    let mut patterns: Vec<(usize, String, String)> = Vec::new();
+    let mut slots: Vec<(String, String)> = Vec::new();
+    for name in provider.secret_names() {
+        let Ok(value) = provider.get(&name) else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        if name.starts_with('$') {
+            slots.push((name, value));
+        } else {
+            // A plain name: neither the value nor the bare name may reach a
+            // shared document — both are masked the same way. The name takes
+            // part in the longest-first pass, so a value that overlaps it
+            // cannot leave a mangled hybrid behind.
+            patterns.push((value.len(), value, "<secret>".to_string()));
+            patterns.push((name.len(), name, "<secret>".to_string()));
+        }
+    }
+
+    // Mask slot occurrences longest-name-first — `$FILAR_SECRET_1` is a
+    // prefix of `$FILAR_SECRET_11`, and the shorter name must not eat into
+    // the longer one.
+    slots.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    let mut markers: Vec<(String, String)> = Vec::new();
+    let mut out = text.to_string();
+    for (name, value) in slots {
+        // The `\u{0}` runs break containment, so no marker is a substring of
+        // another and each restore is exact.
+        let marker = format!(
+            "\u{0}\u{0}\u{0}{}\u{0}\u{0}\u{0}",
+            "\u{1}".repeat(markers.len() + 1)
+        );
+        out = out.replace(&name, &marker);
+        patterns.push((value.len(), value, marker.clone()));
+        markers.push((marker, name));
+    }
+
+    patterns.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, pattern, placeholder) in patterns {
+        out = out.replace(&pattern, &placeholder);
+    }
+    for (marker, name) in markers {
+        out = out.replace(&marker, &name);
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Legacy convenience functions (delegates to EnvSecretProvider)
 // ---------------------------------------------------------------------------
@@ -513,6 +588,99 @@ mod tests {
         let expected_prefix = redact(name);
         assert!(!msg.contains(name));
         assert!(msg.contains(&expected_prefix));
+    }
+
+    // ── redact_secrets (value redaction for outgoing text, #401) ──────
+
+    #[test]
+    fn redact_secrets_replaces_values_with_their_placeholders() {
+        let provider = StaticSecretProvider::new();
+        provider.insert("$FILAR_SECRET_1", "hunter2");
+        let text = "Step 1: ssh with password hunter2 and check disks.";
+        let out = redact_secrets(text, &provider);
+        assert!(!out.contains("hunter2"), "value must be gone: {out}");
+        assert!(
+            out.contains("$FILAR_SECRET_1"),
+            "placeholder must stand in for the value: {out}"
+        );
+        assert!(out.contains("Step 1:"), "the rest of the text survives: {out}");
+    }
+
+    #[test]
+    fn redact_secrets_masks_plain_names_and_values_as_secret() {
+        // An API key is stored without a `$` prefix; neither its value nor
+        // the bare name may leak into a shared document (#404 review).
+        let provider = StaticSecretProvider::new();
+        provider.insert("GLM_API_KEY", "sk-or-v1-abcdef");
+        let out = redact_secrets("export GLM_API_KEY=sk-or-v1-abcdef", &provider);
+        assert!(!out.contains("sk-or-v1-abcdef"), "value must be gone: {out}");
+        assert!(!out.contains("GLM_API_KEY"), "the name must not leak: {out}");
+        assert_eq!(out, "export <secret>=<secret>");
+    }
+
+    #[test]
+    fn redact_secrets_masks_a_plain_name_referenced_as_a_variable() {
+        // `$GLM_API_KEY` names the variable, not the value — the name itself
+        // must not survive into the shared document either.
+        let provider = StaticSecretProvider::new();
+        provider.insert("GLM_API_KEY", "sk-or-v1-abcdef");
+        let out = redact_secrets("echo $GLM_API_KEY", &provider);
+        assert_eq!(out, "echo $<secret>");
+    }
+
+    #[test]
+    fn redact_secrets_keeps_placeholders_out_of_the_plain_name_pass() {
+        // A plain name can be a substring of a slot name (`SECRET` inside
+        // `$FILAR_SECRET_1`): the placeholder must survive intact while the
+        // standalone occurrences of the name are still masked (#404 review).
+        let provider = StaticSecretProvider::new();
+        provider.insert("$FILAR_SECRET_1", "hunter2");
+        provider.insert("SECRET", "zzz");
+        let out = redact_secrets("SECRET=zzz and ssh with hunter2, keep $FILAR_SECRET_1", &provider);
+        assert_eq!(
+            out,
+            "<secret>=<secret> and ssh with $FILAR_SECRET_1, keep $FILAR_SECRET_1"
+        );
+    }
+
+    #[test]
+    fn redact_secrets_masks_slot_names_longest_first() {
+        // `$FILAR_SECRET_1` is a prefix of `$FILAR_SECRET_11`; the shorter
+        // name must not eat into the longer one's placeholder.
+        let provider = StaticSecretProvider::new();
+        provider.insert("$FILAR_SECRET_1", "first");
+        provider.insert("$FILAR_SECRET_11", "eleventh");
+        let out = redact_secrets("use $FILAR_SECRET_11 then $FILAR_SECRET_1", &provider);
+        assert_eq!(out, "use $FILAR_SECRET_11 then $FILAR_SECRET_1");
+    }
+
+    #[test]
+    fn redact_secrets_prefers_the_longer_overlapping_value() {
+        // Replacing `abc` first would also rewrite the inside of `abcdef`
+        // and leave a mangled hybrid behind.
+        let provider = StaticSecretProvider::new();
+        provider.insert("$FILAR_SECRET_1", "abc");
+        provider.insert("$FILAR_SECRET_2", "abcdef");
+        let out = redact_secrets("value abcdef", &provider);
+        assert_eq!(out, "value $FILAR_SECRET_2");
+    }
+
+    #[test]
+    fn redact_secrets_leaves_text_without_secrets_alone() {
+        let provider = StaticSecretProvider::new();
+        provider.insert("$FILAR_SECRET_1", "hunter2");
+        let text = "User: check disk usage on the replica";
+        assert_eq!(redact_secrets(text, &provider), text);
+    }
+
+    #[test]
+    fn redact_secrets_keeps_existing_placeholders() {
+        // The transcript normally contains the placeholder, not the value:
+        // the executor substitutes at run time. Redaction must not touch it.
+        let provider = StaticSecretProvider::new();
+        provider.insert("$FILAR_SECRET_1", "hunter2");
+        let text = "mysql -u root -p$FILAR_SECRET_1";
+        assert_eq!(redact_secrets(text, &provider), text);
     }
 
     // ── SSH keyring naming (#290) ─────────────────────────────────────
