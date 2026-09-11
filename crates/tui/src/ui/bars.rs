@@ -237,11 +237,10 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // pushed afterwards, start at column == width and get clipped by ratatui
     // (the original bug: the toast was never visible).
     //
-    // The leading space below is deliberate: together with the one-column
-    // trailing gap of the context indicator it holds the two-column
-    // separation before `confirm_mode` (#399 review), and it keeps a
-    // separator when the indicator is dropped and the padding collapses
-    // to zero.
+    // The leading space below is deliberate: with the one-column trailing
+    // gap of the context indicator it makes the two-column separation
+    // before `confirm_mode`; when the indicator is dropped, the space stays
+    // and keeps `confirm_mode` apart from the preceding text.
     let confirm_text = format!(" {:?}", app.confirm_mode);
     let confirm_style = if app.confirm_mode == filar_core::CommandConfirmMode::Explain {
         app.theme.muted().fg(app.theme.accent)
@@ -381,9 +380,8 @@ mod tests {
     use ratatui::Terminal;
     use std::time::{Duration, Instant};
 
-    /// Render the status bar into a `width`×1 test buffer and return the visible
-    /// text of the single row.
-    fn render_status_row(app: &mut App, width: u16) -> String {
+    /// Render the status bar into a `width`×1 test buffer.
+    fn render_status_buffer(app: &mut App, width: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, 1);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -392,7 +390,12 @@ mod tests {
                 render_status_bar(f, app, area);
             })
             .unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Render the status bar and return the visible text of the single row.
+    fn render_status_row(app: &mut App, width: u16) -> String {
+        let buffer = render_status_buffer(app, width);
         (0..width).map(|x| buffer[(x, 0)].symbol()).collect()
     }
 
@@ -705,6 +708,29 @@ mod tests {
         let g = Glyphs::detect();
         let full: String = std::iter::repeat_n(g.bar_full, 8).collect();
         assert!(row.contains(&format!("ctx [{full}] 250k/200k")), "got: {row}");
+    }
+
+    #[test]
+    fn context_indicator_warns_at_threshold_and_stays_muted_below() {
+        // The colour is part of the contract, not just the text: the fill
+        // flips to the warning tone the moment the measurement reaches the
+        // threshold, and back below it.
+        let mut app = app_with_threshold(200_000);
+        for (used, expected, what) in [
+            (200_000, app.theme.warning_fg().fg, "at the threshold"),
+            (100_000, app.theme.muted().fg, "below the threshold"),
+        ] {
+            app.active_session_mut().last_prompt_tokens = Some(used);
+            let buffer = render_status_buffer(&mut app, 120);
+            let row: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
+            let byte = row.find("ctx").unwrap_or_else(|| panic!("indicator shown: {row}"));
+            let x = row[..byte].chars().count() as u16;
+            assert_eq!(
+                buffer[(x, 0)].style().fg,
+                expected,
+                "{what} the fill must paint the right colour, got: {row}"
+            );
+        }
     }
 
     #[test]

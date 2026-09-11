@@ -13,13 +13,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
-- The TUI status bar now shows how full the model's context is — a compact
-  `ctx [####----] 78k/200k` indicator (with an ASCII fallback) sitting before
-  the confirmation mode. The fill is the most recent request's measured prompt
-  tokens against the active profile's `compact_at_tokens`, so it drops
-  visibly after a `Ctrl+K` fold; with no measurement yet it shows an empty
-  scale and a dash, and with compaction disabled (threshold `0`) the absolute
-  figure only ([#399](https://github.com/devlawey/filar/issues/399)).
+- The TUI status bar now shows the context fill: the latest request's
+  measured prompt tokens against the active profile's `compact_at_tokens`
+  ([#399](https://github.com/devlawey/filar/issues/399)).
 
 ## [1.0.6] - 2026-09-04
 

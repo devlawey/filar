@@ -6426,6 +6426,10 @@ restored session — the value is not persisted) renders an empty scale and
 `—`, not `0`; a threshold of `0` (compaction disabled) renders the absolute
 figure only. The fill floors, so the bar reads full only at the threshold,
 and flips to the warning tone once the measured size has reached it.
+A successful fold clears the measurement — the indicator reads `—` rather
+than a stale pre-fold figure until the next response measures the compacted
+history — and the segment keeps a two-column gap before `confirm_mode`
+(review follow-ups).
 
 **Rendering decisions.** Cells are `█`/`░` in the Unicode glyph set and
 `#`/`-` in the ASCII fallback (new `bar_full`/`bar_empty` pairs in `Glyphs` —
@@ -6437,14 +6441,18 @@ each step needing one column of clearance from the left text, while
 `confirm_mode` and the toast stay put. Token figures are rounded to whole
 thousands (`78k/200k`) to keep the form readable at 80 columns.
 
-**Tests.** Nine new unit tests in `bars.rs`: the four states the issue asks
+**Tests.** Ten new unit tests in `bars.rs`: the four states the issue asks
 for — unknown usage (empty scale + `—`, never `0`), proportional fill,
 near-threshold (7/8 cells at 190k/200k — visibly close, honestly not full),
 `compact_at_tokens = 0` (absolute figure, no scale) — plus over-threshold
 saturation, right-alignment of `confirm_mode` and the toast with the 
 indicator on, dropping before `confirm_mode` on a 45-column terminal, tier
-shrinking at 66 columns, and a builder test pinning both glyph sets. Display
-only: no threshold or trigger behaviour touched.
+shrinking at 66 columns, a builder test pinning both glyph sets, and a
+style test pinning the warning tone at the threshold (muted below it). One
+`app.rs` test covers the cleared measurement; the discarded-result test
+also asserts the figure survives a stale fold. Display only: no threshold
+or trigger decisions changed — the fold's clearing of the stale figure is
+invisible to the trigger, which only reads fresh measurements.
 
 **Verification:** `cargo build --workspace`, `cargo test --workspace`.
 The live TUI run from the issue's DoD (growing indicator, `Ctrl+K` reset on a
