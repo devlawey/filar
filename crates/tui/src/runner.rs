@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{EnableBracketedPaste, DisableBracketedPaste, EnableMouseCapture, DisableMouseCapture, Event, EventStream};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -1776,6 +1776,9 @@ fn apply_save_progress(
         SaveProgress::RunbookDone { sid, outcome, usage, profile } => {
             app.finish_runbook(sid, outcome, usage, profile);
         }
+        SaveProgress::RunbookCancelled { sid } => {
+            app.finish_runbook_cancelled(sid);
+        }
     }
 }
 
@@ -1831,23 +1834,39 @@ fn spawn_runbook_generation(
     let profile = armed.profile.clone();
     let tx = save_tx.clone();
     tokio::spawn(async move {
-        if let Some((outcome, usage)) = build_runbook_file(
+        // A panic inside the call (a client's `unwrap`, say) would otherwise
+        // strand the runbook in `Generating` with a live token — tokio parks
+        // the panic in a `JoinHandle` nobody awaits. Report it like any
+        // other failure instead (review follow-up).
+        let outcome = std::panic::AssertUnwindSafe(build_runbook_file(
             llm.as_ref(),
             &token,
             &transcript,
             &path,
             &display,
             provider.as_ref(),
-        )
-        .await
-        {
-            let _ = tx.send(SaveProgress::RunbookDone {
+        ))
+        .catch_unwind()
+        .await;
+        let report = match outcome {
+            Ok(Some((outcome, usage))) => SaveProgress::RunbookDone {
                 sid,
                 outcome,
                 usage,
                 profile,
-            });
-        }
+            },
+            // Cancelled mid-call: acknowledge the token so the note lands
+            // in the session that started the job, not the active tab
+            // (review follow-up).
+            Ok(None) => SaveProgress::RunbookCancelled { sid },
+            Err(_) => SaveProgress::RunbookDone {
+                sid,
+                outcome: Err("the runbook task panicked — see the log".into()),
+                usage: None,
+                profile,
+            },
+        };
+        let _ = tx.send(report);
     });
 }
 
@@ -1874,11 +1893,11 @@ fn runbook_path(target_dir: &std::path::Path, markdown_name: &str) -> (std::path
 
 /// Generate the runbook and write it, as one cancellable step (#401).
 ///
-/// Returns `None` when the user cancelled: `cancel_work` already explained
-/// that in the feed, and a second line would be noise about the thing the
-/// user just stopped. Otherwise the outcome for the feed (display path or
-/// reason) and the usage — billed either way, since the provider answered
-/// before the reply was judged.
+/// Returns `None` when the user cancelled; the spawner then reports
+/// [`SaveProgress::RunbookCancelled`], so the stop is named in the session
+/// the job was armed from. Otherwise the outcome for the feed (display path
+/// or reason) and the usage — billed either way, since the provider
+/// answered before the reply was judged.
 ///
 /// Redaction covers both doors: the transcript is the input, and the model's
 /// own reply is the output. The executor sanitises command output, but a
@@ -2726,6 +2745,20 @@ mod tests {
         }
     }
 
+    /// An `LlmClient` that panics inside the call — a stand-in for a client
+    /// bug, which must not strand the runbook in `Generating`.
+    struct PanickingLlm;
+
+    #[async_trait::async_trait]
+    impl LlmClient for PanickingLlm {
+        async fn chat(
+            &self,
+            _request: &filar_agent::ChatRequest,
+        ) -> filar_core::Result<filar_agent::ChatResponse> {
+            panic!("client bug");
+        }
+    }
+
     /// A runbook long enough for `MIN_RUNBOOK_CHARS`; `with` is interpolated.
     fn long_runbook(with: &str) -> String {
         format!(
@@ -2826,8 +2859,9 @@ mod tests {
     #[tokio::test]
     async fn cancelling_mid_runbook_writes_nothing_and_stays_silent() {
         // Ctrl+Z must abort the request itself (#394 precedent): the reply
-        // is abandoned, no file appears, and the feed stays quiet —
-        // cancel_work already explained the stop.
+        // is abandoned and no file appears. The function stays silent by
+        // design — the spawner turns the `None` into `RunbookCancelled`,
+        // the one line that names how the job ended.
         let dir = runbook_temp_dir("cancel");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
@@ -3057,5 +3091,140 @@ mod tests {
 
         assert!(app.runbook_armed.is_none(), "a failed export must drop the job");
         assert!(app.save_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_runbook_acknowledges_through_the_channel() {
+        // The stop settles when the task says so, not when the key is
+        // pressed: the ack carries the session id, so the note lands in
+        // the tab the job was armed from even after a tab switch, and a
+        // `RunbookDone` already in flight is never overwritten (review
+        // follow-up).
+        let dir = runbook_temp_dir("cancelled");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let provider = Arc::new(filar_core::StaticSecretProvider::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let llm: Arc<dyn LlmClient> = Arc::new(HangingLlm {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let config = test_tui_config(llm, Arc::clone(&provider));
+
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.profiles = config.profiles.clone();
+        app.push_message(ChatBlock::Command {
+            command: "uptime".into(),
+            explanation: "check load".into(),
+            output: Some("0.1".into()),
+            approved: true,
+        });
+        app.runbook_armed = Some(crate::app::RunbookArmed {
+            session_id: app.sessions[0].id,
+            target_dir: dir.clone(),
+            messages: app.sessions[0].messages.clone(),
+            session_name: "prod-web".into(),
+            ssh_info: None,
+            profile: "glm".into(),
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        apply_save_progress(
+            &mut app,
+            SaveProgress::Done("prod-web/db-1.md".into()),
+            &config.llm_factory,
+            &config.secret_provider,
+            &tx,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .expect("the call must start before it can be cancelled");
+
+        app.cancel_work();
+
+        let report = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the stopped task must acknowledge")
+            .expect("channel is open");
+        match &report {
+            SaveProgress::RunbookCancelled { sid } => assert_eq!(*sid, app.sessions[0].id),
+            other => panic!("expected RunbookCancelled, got {other:?}"),
+        }
+        apply_save_progress(&mut app, report, &config.llm_factory, &config.secret_provider, &tx);
+        release.notify_waiters();
+
+        assert_eq!(app.runbook_state, Some(RunbookState::Cancelled));
+        assert!(app.runbook_cancel.is_none(), "the in-flight token is cleared");
+        let last = app.sessions[0].messages.last().expect("the stop must be named");
+        match last {
+            ChatBlock::System(text) => {
+                assert!(text.contains("Runbook generation cancelled"), "got: {text}")
+            }
+            other => panic!("expected a system note, got {other:?}"),
+        }
+        assert!(
+            !tokio::fs::try_exists(dir.join("db-1.runbook.md")).await.unwrap_or(false),
+            "a cancelled runbook leaves no file"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_panicking_runbook_task_still_reports_back() {
+        // A panic inside the call would otherwise strand the runbook in
+        // `Generating` with a live token — the `JoinHandle` is never
+        // awaited, so nothing would ever clear it (review follow-up).
+        let dir = runbook_temp_dir("panic");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let provider = Arc::new(filar_core::StaticSecretProvider::new());
+        let llm: Arc<dyn LlmClient> = Arc::new(PanickingLlm);
+        let config = test_tui_config(llm, Arc::clone(&provider));
+
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.profiles = config.profiles.clone();
+        app.push_message(ChatBlock::Command {
+            command: "uptime".into(),
+            explanation: "check load".into(),
+            output: Some("0.1".into()),
+            approved: true,
+        });
+        app.runbook_armed = Some(crate::app::RunbookArmed {
+            session_id: app.sessions[0].id,
+            target_dir: dir.clone(),
+            messages: app.sessions[0].messages.clone(),
+            session_name: "prod-web".into(),
+            ssh_info: None,
+            profile: "glm".into(),
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        apply_save_progress(
+            &mut app,
+            SaveProgress::Done("prod-web/db-1.md".into()),
+            &config.llm_factory,
+            &config.secret_provider,
+            &tx,
+        );
+
+        let report = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a panicking task must still report back")
+            .expect("channel is open");
+        match &report {
+            SaveProgress::RunbookDone { outcome, usage, .. } => {
+                let err = outcome.as_ref().expect_err("a panic is not a runbook");
+                assert!(err.contains("panicked"), "got: {err}");
+                assert!(usage.is_none(), "nothing was billed through the panic");
+            }
+            other => panic!("expected RunbookDone, got {other:?}"),
+        }
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

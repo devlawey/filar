@@ -6539,15 +6539,22 @@ text the export is written from) passed through `redact_secrets`, and the
 reply passes `redact_secrets` again before it is written, so a
 `$FILAR_SECRET_N` value cannot reach `{stem}.runbook.md` through either door.
 
-**Cancellation and cost.** Ctrl+Z cancels the token and the in-flight request
-itself (`tokio::select!`, the #394 pattern); the `.md` is kept and the feed
-says so. One generation at a time — a second Ctrl+S while one runs says so and
-still saves the export. Usage is charged to the owning session via
-`record_summary_usage_for` (it survives a tab switch, and a rejected reply is
-still billed). A provider or write failure is a feed note
+**Cancellation and cost.** Ctrl+Z fires the token and the in-flight request
+dies (`tokio::select!`, the #394 pattern); the `.md` is kept. The task
+acknowledges the stop through the channel (`RunbookCancelled`), so the note
+lands in the session the job was armed from — not in whichever tab is active
+— and a `RunbookDone` already in flight is never overwritten by a stale
+"cancelled". A panic inside the task is caught and reported like any other
+failure, so the runbook can never be stranded in `Generating` with a live
+token (review follow-ups). One generation at a time — a second Ctrl+S while
+one runs says so and still saves the export. Usage is charged to the owning
+session via `record_summary_usage_for` (it survives a tab switch, and a
+rejected reply is still billed). A provider or write failure is a feed note
 (`RunbookState::Failed`) and never a broken save. The overlay's status row
 distinguishes `Generating runbook...` / `Runbook skipped (no commands)` /
-`Runbook cancelled` / `Runbook failed` from `Done!`.
+`Runbook cancelled` / `Runbook failed` from `Done!`, and a new save clears
+the previous runbook's status instead of showing it in the new overlay
+(review follow-up).
 
 **Config.** `save_runbook` (root key, default `true`, opt-out) is carried
 through `TuiConfig` into `App::runbook_enabled`; when off, Ctrl+S behaves
@@ -6558,14 +6565,16 @@ select-loop drain now runs the same `apply_save_progress` as the blocking
 branch, so a `TranscriptDone` queued behind another event can no longer be
 swallowed by the drain.
 
-**Tests.** Ten `app.rs` tests (arming snapshot, silent path never arms, skip/
-accept on commands, disabled config, one-at-a-time, Ctrl+Z, both
-`finish_runbook` outcomes, vanished tab), eight `runner.rs` tests driving
-`apply_save_progress`/`build_runbook_file` into a temp dir (path naming, the
-secret sweep, write-and-report, cancellation writes nothing, failure leaves
-the `.md` untouched, short reply reported with usage, `Done` starts, `Error`
-drops), four new `save_overlay` status tests, plus `redact_secrets` tests in
-`filar-core` and the `generate_runbook` suite in `filar-agent`.
+**Tests.** Eleven `app.rs` tests (arming snapshot, silent path never arms,
+skip/accept on commands, disabled config, one-at-a-time, Ctrl+Z ack in the
+owning tab, stale-status reset, both `finish_runbook` outcomes, vanished tab),
+ten `runner.rs` tests driving `apply_save_progress`/`build_runbook_file` into
+a temp dir (path naming, the secret sweep, write-and-report, cancellation
+acknowledged through the channel with no file, a panicking client reported
+instead of stranded, failure leaves the `.md` untouched, short reply reported
+with usage, `Done` starts, `Error` drops), four new `save_overlay` status
+tests, plus `redact_secrets` tests in `filar-core` and the `generate_runbook`
+suite in `filar-agent`.
 
 **Verification:** `cargo build --workspace`, `cargo test --workspace`. The
 issue's manual TUI run (Ctrl+S on a live session, Ctrl+Z mid-generation)

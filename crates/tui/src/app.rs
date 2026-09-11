@@ -933,6 +933,11 @@ pub enum SaveProgress {
         usage: Option<filar_agent::TokenUsage>,
         profile: String,
     },
+    /// The runbook task stopped on the cancellation token (#401): no file
+    /// was written and nothing more is being paid for. Sent by the task
+    /// itself, so the note reaches the session the job started from even
+    /// after the user has moved to another tab.
+    RunbookCancelled { sid: SessionId },
 }
 
 /// A runbook job armed by an explicit Ctrl+S, handed to the runner when the
@@ -1981,18 +1986,19 @@ impl App {
     ///   answer stays) and return to Normal.
     /// - Confirming: deny the pending command (stay in the app).
     /// - Other modes: no-op.
-    fn cancel_work(&mut self) {
+    ///
+    /// `pub(crate)` so the runner can drive the same path the key handler
+    /// does when a runbook generation is in flight (#401).
+    pub(crate) fn cancel_work(&mut self) {
         // A runbook generation may be in flight whatever brought the user
         // here: it outlives the export that spawned it, so Ctrl+Z is the
-        // one way to stop paying for it (#401). Cancel before the mode
-        // dispatch, and say so — without a note the abandoned call would
-        // look like it had failed instead of being stopped on purpose.
+        // one way to stop paying for it (#401). Fire the token and stop —
+        // the task acknowledges with `RunbookCancelled` addressed to its
+        // own session. Settling here would put the note in whichever tab
+        // is active and could overwrite a `RunbookDone` already in flight
+        // (review follow-up).
         if let Some(token) = self.runbook_cancel.take() {
             token.cancel();
-            self.runbook_state = Some(RunbookState::Cancelled);
-            self.push_message(ChatBlock::System(
-                "Runbook generation cancelled — the session export is saved.".into(),
-            ));
         }
         match self.mode {
             AppMode::Thinking => {
@@ -2082,6 +2088,13 @@ impl App {
         self.save_overlay_visible = true;
         self.save_progress = 0;
         self.save_error = None;
+        // A new export is a new runbook story (review follow-up): a
+        // Failed/Skipped/Cancelled status from the previous save must not
+        // leak into this overlay. `Generating` survives — that runbook is
+        // still in flight, and the one-at-a-time guard depends on it.
+        if self.runbook_state != Some(RunbookState::Generating) {
+            self.runbook_state = None;
+        }
 
         let Some(ref tx) = self.save_tx else {
             return;
@@ -2233,6 +2246,23 @@ impl App {
                 self.record_summary_usage_for(idx, &u, profile);
             }
             self.sessions[idx].messages.push(ChatBlock::System(note));
+            self.sessions[idx].message_rev = self.sessions[idx].message_rev.wrapping_add(1);
+        }
+    }
+
+    /// Settle a runbook generation the user stopped with Ctrl+Z (#401).
+    ///
+    /// The task acknowledges the stop through the channel; this puts the
+    /// note in the session the job was armed from — the user may be in
+    /// another tab by now — and clears the in-flight token. The `.md` is
+    /// untouched: the stop is the runbook's, never the export's.
+    pub fn finish_runbook_cancelled(&mut self, sid: SessionId) {
+        self.runbook_cancel = None;
+        self.runbook_state = Some(RunbookState::Cancelled);
+        if let Some(idx) = self.find_session_idx(sid) {
+            self.sessions[idx].messages.push(ChatBlock::System(
+                "Runbook generation cancelled — the session export is saved.".into(),
+            ));
             self.sessions[idx].message_rev = self.sessions[idx].message_rev.wrapping_add(1);
         }
     }
@@ -9991,6 +10021,11 @@ mod tests {
 
         let _ = run_save_to_completion(&mut app).await;
         assert!(app.runbook_armed.is_none(), "one generation at a time");
+        assert_eq!(
+            app.runbook_state,
+            Some(RunbookState::Generating),
+            "the in-flight runbook keeps its status through the new save"
+        );
         let last = app.sessions[0].messages.last().expect("must explain the omission");
         match last {
             ChatBlock::System(text) => assert!(text.contains("already being generated"), "got: {text}"),
@@ -10003,14 +10038,26 @@ mod tests {
     #[test]
     fn ctrl_z_cancels_an_in_flight_runbook() {
         let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
         let token = tokio_util::sync::CancellationToken::new();
         app.runbook_cancel = Some(token.clone());
         app.runbook_state = Some(RunbookState::Generating);
+        // The user has moved to another tab: the note is owed to the
+        // session whose runbook was stopped, not to the active one.
+        app.new_tab();
 
         app.cancel_work();
 
         assert!(token.is_cancelled(), "Ctrl+Z must abort the request itself");
         assert!(app.runbook_cancel.is_none(), "the token is consumed");
+        assert_eq!(
+            app.runbook_state,
+            Some(RunbookState::Generating),
+            "the state settles when the task acknowledges the stop, not here"
+        );
+
+        app.finish_runbook_cancelled(sid);
+
         assert_eq!(app.runbook_state, Some(RunbookState::Cancelled));
         let last = app.sessions[0].messages.last().expect("cancellation must be visible");
         match last {
@@ -10020,6 +10067,31 @@ mod tests {
             }
             other => panic!("expected a system note, got {other:?}"),
         }
+        assert!(
+            matches!(app.sessions[1].messages.last().unwrap(), ChatBlock::System(s) if s.contains("Connected to")),
+            "the active tab stays untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_save_clears_a_stale_runbook_status() {
+        // A Failed/Skipped/Cancelled from the previous export must not sit
+        // in the next overlay: the new save is a new story. `Generating`
+        // is the one survivor — that runbook is still in flight, and the
+        // one-at-a-time guard reads this very field (review follow-up).
+        let base = std::env::temp_dir().join(format!("filar_runbook_stale_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.save_dir = Some(base.clone());
+        app.runbook_enabled = false;
+        app.runbook_state = Some(RunbookState::Failed);
+
+        let _ = run_save_to_completion(&mut app).await;
+
+        assert_eq!(app.runbook_state, None, "stale status must not leak into the new save");
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
     #[test]
