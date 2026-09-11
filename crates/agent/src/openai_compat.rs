@@ -82,6 +82,15 @@ fn describe_error_chain(err: &dyn std::error::Error) -> String {
     parts.join(": ")
 }
 
+/// Placeholder for a response body that could not be read, carrying the
+/// unwrapped cause. On an error status the status itself stays the
+/// classification — a retry cannot fix a 4xx — while the read failure is
+/// named beside it instead of being silently swapped for an empty string
+/// (#405 review).
+fn unreadable_body(e: &reqwest::Error) -> String {
+    format!("<body could not be read: {}>", describe_error_chain(e))
+}
+
 /// Outcome of reading one streaming response body.
 enum StreamOutcome {
     /// The stream ended on its own; carries the assembled response.
@@ -141,7 +150,12 @@ impl OpenAiCompatClient {
     /// disabled so request bodies cannot be forwarded to another host.
     pub fn new_with_key(config: &LlmConfig, timeout: Duration, api_key: &str) -> Result<Self> {
         // Non-streaming calls keep a total request timeout: the whole response
-        // arrives at once, so bounding the whole call is the right shape.
+        // arrives at once, so bounding the whole call is the right shape. It
+        // also bounds generation time, so a long utility call over a big
+        // transcript must go through `chat_stream` instead — a runbook that
+        // outlives the timeout dies mid-read and surfaces as a read error,
+        // not as a partial answer (#405). `chat` stays the shape for ordinary
+        // turns, which the user watches and can cancel.
         let http = build_http_client(api_key, |b| b.timeout(timeout))?;
 
         // Streaming deliberately does NOT use a total timeout. In reqwest,
@@ -371,7 +385,7 @@ impl OpenAiCompatClient {
                     }
                 }
                 Some(Err(e)) => {
-                    let error = self.classify_stream_error(&e);
+                    let error = self.classify_body_read_error(&e);
                     warn!(
                         cause = %describe_error_chain(&e),
                         emitted_any,
@@ -431,8 +445,11 @@ impl OpenAiCompatClient {
     ///
     /// Both a dropped connection and an elapsed read timeout are reported by
     /// reqwest as `error decoding response body`; only the source chain tells
-    /// them apart. Both are transient and worth retrying.
-    fn classify_stream_error(&self, e: &reqwest::Error) -> ApiError {
+    /// them apart. Both are transient and worth retrying. Shared by the
+    /// streaming loop and `send_request`: on the non-streaming path the
+    /// total timeout fires while the body is being read, and swallowing that
+    /// failure turns the timeout into a misleading parse error (#405).
+    fn classify_body_read_error(&self, e: &reqwest::Error) -> ApiError {
         if e.is_timeout() {
             ApiError::Timeout(self.timeout)
         } else {
@@ -463,7 +480,18 @@ impl OpenAiCompatClient {
             // Capture the body as text first, then parse as JSON.
             // This way if parsing fails, we can include the actual response
             // body in the error message for debugging.
-            let body_text = response.text().await.unwrap_or_default();
+            //
+            // A failure to read the body must not be folded into an empty
+            // string: the total timeout fires here when a generation runs
+            // long, and `""` used to surface as "failed to parse API
+            // response" instead of the timeout it was (#405).
+            let body_text = match response.text().await {
+                Ok(text) => text,
+                Err(e) => {
+                    warn!(cause = %describe_error_chain(&e), "failed to read response body");
+                    return Err(self.classify_body_read_error(&e));
+                }
+            };
             debug!(status = %status, body_len = body_text.len(), "OpenAI-compatible API success response");
             let api_response: ApiResponse = serde_json::from_str(&body_text)
                 .map_err(|e| {
@@ -478,7 +506,17 @@ impl OpenAiCompatClient {
             Ok(api_response)
         } else {
             let status_code = status.as_u16();
-            let body_text = response.text().await.unwrap_or_default();
+            // The status is already known and stays the classification; a
+            // body that cannot be read is named beside it rather than
+            // silently swapped for an empty string. 5xx and 429 stay
+            // retryable exactly as they were (#405 review).
+            let body_text = match response.text().await {
+                Ok(text) => text,
+                Err(e) => {
+                    warn!(cause = %describe_error_chain(&e), "failed to read error response body");
+                    unreadable_body(&e)
+                }
+            };
             info!(status_code, body = %body_text, "OpenAI-compatible API returned error status");
             Err(ApiError::from_http_status(status_code, body_text))
         }
@@ -510,7 +548,13 @@ impl OpenAiCompatClient {
             Ok(response)
         } else {
             let status_code = status.as_u16();
-            let body_text = response.text().await.unwrap_or_default();
+            let body_text = match response.text().await {
+                Ok(text) => text,
+                Err(e) => {
+                    warn!(cause = %describe_error_chain(&e), "failed to read error response body");
+                    unreadable_body(&e)
+                }
+            };
             info!(status_code, body = %body_text, "OpenAI-compatible API returned error status");
             Err(ApiError::from_http_status(status_code, body_text))
         }
@@ -2203,6 +2247,95 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
 
         assert_eq!(response.text, "abcd");
         assert_eq!(served.load(Ordering::SeqCst), 1, "no retry expected");
+    }
+
+    // ── Non-streaming body read (#405) ───────────────────────────────────
+
+    /// A provider that answers with headers but never sends the body — what a
+    /// non-streaming generation outliving the total timeout looks like on the
+    /// wire. `status_line` is the HTTP status to answer with, e.g. `"200 OK"`.
+    async fn spawn_stalling_provider(status_line: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_line = status_line.to_string();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            drain_request(&mut socket).await;
+            let head = format!(
+                "HTTP/1.1 {status_line}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: 512\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.flush().await;
+            // Hold the connection open, bodyless, until the client's total
+            // timeout fires and it hangs up: the read then sees EOF and the
+            // task ends on its own, with nothing left sleeping behind the
+            // test.
+            let mut buf = [0u8; 1];
+            let _ = socket.read(&mut buf).await;
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// A body that never arrives is reported as the timeout it is, not as a
+    /// JSON parse error over an empty body. Regression test for #405: the
+    /// read failure was swallowed with `unwrap_or_default()`, so a runbook
+    /// that outlived `[timeouts].llm_secs` surfaced as "failed to parse API
+    /// response: EOF while parsing a value at line 1 column 0".
+    #[tokio::test]
+    async fn chat_reports_a_body_read_timeout_as_a_timeout() {
+        let url = spawn_stalling_provider("200 OK").await;
+        let client = stream_test_client(&url, 0, Duration::from_millis(300));
+
+        let err = client
+            .chat(&simple_request())
+            .await
+            .expect_err("a stalling body must fail the call");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("request timed out"),
+            "the timeout must be named: {msg}"
+        );
+        assert!(
+            !msg.contains("failed to parse"),
+            "a read failure must not be reported as a parse failure: {msg}"
+        );
+        assert!(
+            !msg.contains("Response body:"),
+            "nothing was read, so there is no body to echo: {msg}"
+        );
+    }
+
+    /// An error response whose body never arrives must not lose the status it
+    /// already carries: the status keeps its classification, and the
+    /// unreadable body is named beside it instead of posing as an empty body
+    /// (review of #405).
+    #[tokio::test]
+    async fn an_error_status_with_an_unreadable_body_keeps_the_status() {
+        let url = spawn_stalling_provider("500 Internal Server Error").await;
+        let client = stream_test_client(&url, 0, Duration::from_millis(300));
+
+        let err = client
+            .chat(&simple_request())
+            .await
+            .expect_err("a stalling error body must fail the call");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("server error 500"),
+            "the status must survive the read failure: {msg}"
+        );
+        assert!(
+            msg.contains("body could not be read"),
+            "the unreadable body must be named: {msg}"
+        );
     }
 }
 

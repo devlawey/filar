@@ -65,10 +65,13 @@ pub struct RunbookOutcome {
 
 /// Ask the model to turn `transcript` into a runbook.
 ///
-/// A plain [`LlmClient::chat`] rather than a streaming call: nothing renders
-/// the partial text, and the caller only needs the finished document. It
-/// carries no tool definitions, so the runbook writer cannot propose
-/// commands.
+/// A streaming call even though nothing renders the partial text: the
+/// non-streaming path is bounded by the client's *total* timeout, and a
+/// runbook over a long transcript routinely outlives it — observed on a
+/// 77 KB session at the default `[timeouts].llm_secs` (#405). The streaming
+/// path bounds only the silence between chunks, so a long generation
+/// survives while it keeps sending. The call carries no tool definitions, so
+/// the runbook writer cannot propose commands.
 ///
 /// A reply shorter than [`MIN_RUNBOOK_CHARS`] — an empty string included — is
 /// reported as an error rather than written out; its usage still comes back,
@@ -82,7 +85,7 @@ pub async fn generate_runbook(llm: &dyn LlmClient, transcript: &str) -> RunbookO
         tools: Vec::new(),
     };
 
-    let response = match llm.chat(&request).await {
+    let response = match llm.chat_stream(&request, &|_| {}).await {
         Ok(response) => response,
         // No response, so nothing was billed that we know of.
         Err(e) => return RunbookOutcome { usage: None, runbook: Err(e) },
@@ -205,5 +208,42 @@ mod tests {
         let outcome = generate_runbook(&FailingLlm, "User: hi\n").await;
         assert!(outcome.runbook.is_err());
         assert!(outcome.usage.is_none());
+    }
+
+    /// Fails every non-streaming call: a runbook must go through the
+    /// streaming path, where the timeout bounds chunk silence rather than the
+    /// total generation (#405).
+    struct StreamOnlyLlm(String);
+
+    #[async_trait::async_trait]
+    impl crate::LlmClient for StreamOnlyLlm {
+        async fn chat(&self, _request: &crate::ChatRequest) -> Result<crate::ChatResponse> {
+            Err(CoreError::Other(
+                "runbook generation must use the streaming path".into(),
+            ))
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &crate::ChatRequest,
+            _on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<crate::ChatResponse> {
+            Ok(crate::ChatResponse::text(self.0.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_runbook_is_generated_through_the_streaming_path() {
+        // Regression test for #405: with a non-streaming call, the total
+        // request timeout capped the whole generation and a runbook over a
+        // long transcript died at `[timeouts].llm_secs`.
+        let llm = StreamOnlyLlm(REAL_RUNBOOK.to_string());
+        let outcome = generate_runbook(&llm, "User: replica lag\n").await;
+        assert_eq!(
+            outcome
+                .runbook
+                .expect("the streaming call must produce the runbook"),
+            REAL_RUNBOOK
+        );
     }
 }

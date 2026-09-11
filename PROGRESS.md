@@ -6588,6 +6588,50 @@ cannot be driven from the agent environment — stated in the PR. The
 `prepare-release` for 1.0.7 follows, with a human interactive pass over the
 export scenarios from #400/#401 in the `docs/SMOKE.md` checklist.
 
+## Issue #405: fix(agent) — runbook and compaction survive long generations
+
+**Milestone:** 1.0.7. **Branch:** `fix/405-runbook-llm-timeout`.
+
+**Problem.** A runbook over a 77 KB transcript died at exactly
+`[timeouts].llm_secs` (60 s): the generation ran on the non-streaming
+`LlmClient::chat`, whose HTTP client is bounded by `Client::timeout` — a
+*total* timeout that also covers reading the body. The read failure was then
+swallowed by `response.text().await.unwrap_or_default()`, so an unread body
+became an empty string and serde reported "failed to parse API response: EOF
+while parsing a value at line 1 column 0" — a parse error where the truth was
+a timeout. Found in the human SMOKE pass over #401: export written at
+21:07:15, warning at 21:08:15.587 (+60.6 s).
+
+**Change.** `generate_runbook` and `summarise_history` now call
+`chat_stream`: the streaming client bounds connect time and the silence
+between chunks, not the total generation, so a long runbook or summary
+survives while the provider keeps sending (usage still comes back via
+`SseState.streamed_usage`). No trait change — `chat_stream` already existed
+with a default fallback to `chat`. On the non-streaming path `send_request`
+no longer discards body-read failures: they are classified by the same helper
+the streaming loop uses (`classify_body_read_error`, renamed from
+`classify_stream_error`), so a timeout reads as a timeout and a dropped
+connection as a network error — both retryable. Ordinary chat turns keep the
+total-timeout bound.
+
+**Tests.** A fake provider that answers non-streaming with headers but never
+a body: `chat_reports_a_body_read_timeout_as_a_timeout` pins the honest error
+(on the old code it failed with "failed to parse API response"). Two
+`StreamOnlyLlm` mocks whose `chat()` always fails and `chat_stream()` serves
+the answer pin the runbook and the summary to the streaming path. The fake
+provider waits for the client to hang up after the timeout (read to EOF, no
+fixed sleep), so the helper task ends immediately once the test is done
+(review follow-up). On an error status the swallowed body-read failure was
+fixed too (`an_error_status_with_an_unreadable_body_keeps_the_status`): the
+status keeps its classification and the unreadable body is named beside it
+instead of posing as an empty one — in both `send_request` and
+`send_stream_request` (review follow-up).
+
+**Verification:** `cargo build --workspace`, `cargo test --workspace`. The
+manual run from the issue's DoD (Ctrl+S on a long live session produces the
+runbook next to the export) cannot be driven from the agent environment —
+stated in the PR; the `crates/agent/src/**` change triggers eval-smoke.
+
 ## Release v1.0.6 (2026-09-04)
 
 **Scope:** milestone 1.0.6 — history compaction: context-fill tracking and
