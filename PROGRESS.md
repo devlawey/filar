@@ -6538,8 +6538,9 @@ secret ban). The transcript handed over is `messages_to_markdown` (the exact
 text the export is written from) passed through `redact_secrets`, and the
 reply passes `redact_secrets` again before it is written, so no secret value
 can reach `{stem}.runbook.md` through either door. A plain-named secret is
-masked as `<secret>` wherever it appears — value and bare name alike
-(review follow-up).
+masked as `<secret>` wherever it appears — value and bare name alike — while
+slot placeholders stay intact even when a plain name is a substring of them
+(review follow-ups).
 
 **Cancellation and cost.** Ctrl+Z fires the token and the in-flight request
 dies (`tokio::select!`, the #394 pattern); the `.md` is kept. The task

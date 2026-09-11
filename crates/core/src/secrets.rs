@@ -230,12 +230,20 @@ pub fn redact(s: &str) -> String {
 /// place in a document meant to be shared: both its value and occurrences of
 /// the bare name itself become `<secret>` (#404 review).
 ///
+/// Plain names and slot placeholders can overlap (`SECRET` inside
+/// `$FILAR_SECRET_1`), so slot occurrences leave the text as control-character
+/// markers first and come back once every pattern has run — a blind pass
+/// would rewrite the placeholder itself (#404 review). Markers are built from
+/// `\u{0}`/`\u{1}` precisely because patterns are printable strings: even a
+/// marker like `__SECRET_SLOT_0__` would be eaten by the example above.
+///
 /// Patterns are replaced longest first, so one that contains another (`abc`
 /// inside `abcdef`) cannot be rewritten before its own match is tried. Empty
 /// values are skipped — replacing the empty string would mangle the text
 /// outright.
 pub fn redact_secrets(text: &str, provider: &dyn SecretProvider) -> String {
     let mut patterns: Vec<(usize, String, String)> = Vec::new();
+    let mut slots: Vec<(String, String)> = Vec::new();
     for name in provider.secret_names() {
         let Ok(value) = provider.get(&name) else {
             continue;
@@ -244,9 +252,7 @@ pub fn redact_secrets(text: &str, provider: &dyn SecretProvider) -> String {
             continue;
         }
         if name.starts_with('$') {
-            // A placeholder slot: put back the form the operator sees in a
-            // command line and the executor substitutes at run time.
-            patterns.push((value.len(), value, name));
+            slots.push((name, value));
         } else {
             // A plain name: neither the value nor the bare name may reach a
             // shared document — both are masked the same way. The name takes
@@ -256,10 +262,31 @@ pub fn redact_secrets(text: &str, provider: &dyn SecretProvider) -> String {
             patterns.push((name.len(), name, "<secret>".to_string()));
         }
     }
-    patterns.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // Mask slot occurrences longest-name-first — `$FILAR_SECRET_1` is a
+    // prefix of `$FILAR_SECRET_11`, and the shorter name must not eat into
+    // the longer one.
+    slots.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    let mut markers: Vec<(String, String)> = Vec::new();
     let mut out = text.to_string();
+    for (name, value) in slots {
+        // The `\u{0}` runs break containment, so no marker is a substring of
+        // another and each restore is exact.
+        let marker = format!(
+            "\u{0}\u{0}\u{0}{}\u{0}\u{0}\u{0}",
+            "\u{1}".repeat(markers.len() + 1)
+        );
+        out = out.replace(&name, &marker);
+        patterns.push((value.len(), value, marker.clone()));
+        markers.push((marker, name));
+    }
+
+    patterns.sort_by(|a, b| b.0.cmp(&a.0));
     for (_, pattern, placeholder) in patterns {
         out = out.replace(&pattern, &placeholder);
+    }
+    for (marker, name) in markers {
+        out = out.replace(&marker, &name);
     }
     out
 }
@@ -599,6 +626,32 @@ mod tests {
         provider.insert("GLM_API_KEY", "sk-or-v1-abcdef");
         let out = redact_secrets("echo $GLM_API_KEY", &provider);
         assert_eq!(out, "echo $<secret>");
+    }
+
+    #[test]
+    fn redact_secrets_keeps_placeholders_out_of_the_plain_name_pass() {
+        // A plain name can be a substring of a slot name (`SECRET` inside
+        // `$FILAR_SECRET_1`): the placeholder must survive intact while the
+        // standalone occurrences of the name are still masked (#404 review).
+        let provider = StaticSecretProvider::new();
+        provider.insert("$FILAR_SECRET_1", "hunter2");
+        provider.insert("SECRET", "zzz");
+        let out = redact_secrets("SECRET=zzz and ssh with hunter2, keep $FILAR_SECRET_1", &provider);
+        assert_eq!(
+            out,
+            "<secret>=<secret> and ssh with $FILAR_SECRET_1, keep $FILAR_SECRET_1"
+        );
+    }
+
+    #[test]
+    fn redact_secrets_masks_slot_names_longest_first() {
+        // `$FILAR_SECRET_1` is a prefix of `$FILAR_SECRET_11`; the shorter
+        // name must not eat into the longer one's placeholder.
+        let provider = StaticSecretProvider::new();
+        provider.insert("$FILAR_SECRET_1", "first");
+        provider.insert("$FILAR_SECRET_11", "eleventh");
+        let out = redact_secrets("use $FILAR_SECRET_11 then $FILAR_SECRET_1", &provider);
+        assert_eq!(out, "use $FILAR_SECRET_11 then $FILAR_SECRET_1");
     }
 
     #[test]
