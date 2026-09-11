@@ -6407,6 +6407,53 @@ which will also rewrite the `engine-v1.0.5` tag references in
 `docs/ENGINE_API.md`. The `$FILAR_SECRET_N` documentation gap above wants an
 issue.
 
+## Issue #399: feat(tui) — context fill is now visible in the status bar
+
+**Milestone:** 1.0.7. **Branch:** `feat/399-context-fill-indicator`.
+
+**Problem.** The bar showed only `toks: N↑ N↓` — the session's cumulative
+sum, which keeps growing regardless of the context — next to a threshold
+(`compact_at_tokens`, set in the launcher) that no on-screen figure corresponded
+to. The one measurement that drives compaction, `Session::last_prompt_tokens`,
+was invisible outside logs and tests.
+
+**Change.** `render_status_bar` draws `ctx [####----] 78k/200k` immediately
+before `confirm_mode`: the numerator is `last_prompt_tokens` of the active
+session, the denominator `compact_at_tokens_for(active_profile)` —
+deliberately the same pair `maybe_request_compaction` compares, so the figures
+shown are the ones the fold will fire on. `None` (no usage carried yet, or a
+restored session — the value is not persisted) renders an empty scale and
+`—`, not `0`; a threshold of `0` (compaction disabled) renders the absolute
+figure only. The fill floors, so the bar reads full only at the threshold,
+and flips to the warning tone once the measured size has reached it.
+
+**Rendering decisions.** Cells are `█`/`░` in the Unicode glyph set and
+`#`/`-` in the ASCII fallback (new `bar_full`/`bar_empty` pairs in `Glyphs` —
+the report's console runs the ASCII set). The indicator sits in what used to
+be padding, right-aligned before `confirm_mode`; its width is reserved in
+`right_len` *before* padding, like the toast. On a narrow terminal it yields
+first, per the issue: 8 cells → 4 cells → numbers without a scale → dropped,
+each step needing one column of clearance from the left text, while
+`confirm_mode` and the toast stay put. Token figures are rounded to whole
+thousands (`78k/200k`) to keep the form readable at 80 columns.
+
+**Tests.** Nine new unit tests in `bars.rs`: the four states the issue asks
+for — unknown usage (empty scale + `—`, never `0`), proportional fill,
+near-threshold (7/8 cells at 190k/200k — visibly close, honestly not full),
+`compact_at_tokens = 0` (absolute figure, no scale) — plus over-threshold
+saturation, right-alignment of `confirm_mode` and the toast with the 
+indicator on, dropping before `confirm_mode` on a 45-column terminal, tier
+shrinking at 66 columns, and a builder test pinning both glyph sets. Display
+only: no threshold or trigger behaviour touched.
+
+**Verification:** `cargo build --workspace`, `cargo test --workspace`.
+The live TUI run from the issue's DoD (growing indicator, `Ctrl+K` reset on a
+live SSH session) is manual — it cannot be driven from the agent environment,
+see the PR.
+
+**Next steps:** none specific; #400 and #401 build on the export and context
+surfaces next.
+
 ## Release v1.0.6 (2026-09-04)
 
 **Scope:** milestone 1.0.6 — history compaction: context-fill tracking and

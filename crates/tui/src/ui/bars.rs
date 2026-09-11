@@ -9,6 +9,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, AppMode, HelpAction};
+use crate::ui::theme::Glyphs;
 
 /// One clickable item in the help bar.
 struct HelpItem {
@@ -63,11 +64,84 @@ fn help_items(mode: AppMode) -> Vec<HelpItem> {
     }
 }
 
+/// Compact token figure for the status bar: `200000` → `200k`.
+///
+/// Rounds to the nearest thousand so a near-threshold reading does not
+/// understate the fill (`199600` → `200k`).
+fn format_tokens_compact(n: u64) -> String {
+    if n >= 1000 {
+        format!("{}k", n.saturating_add(500) / 1000)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Text of the context-fill indicator: `ctx [####----] 78k/200k`.
+///
+/// `used` is `last_prompt_tokens` — the measured prompt size of the most
+/// recent request; `None` renders an empty scale and `—`, never `0` (#399).
+/// A `threshold` of `0` (compaction disabled) has no denominator to draw a
+/// scale against, so only the absolute figure is shown.
+fn context_indicator_text(
+    used: Option<u64>,
+    threshold: u64,
+    glyphs: &Glyphs,
+    bar_cells: usize,
+) -> String {
+    let used_text = used
+        .map(format_tokens_compact)
+        .unwrap_or_else(|| "—".to_string());
+    if threshold == 0 {
+        return format!("ctx {used_text}");
+    }
+    let threshold_text = format_tokens_compact(threshold);
+    if bar_cells == 0 {
+        return format!("ctx {used_text}/{threshold_text}");
+    }
+    let filled = match used {
+        // Floors, so the bar reads full only at the threshold. `u128` keeps a
+        // pathological `threshold` from overflowing the product.
+        Some(n) => {
+            let n = n.min(threshold) as u128;
+            (n * bar_cells as u128 / threshold as u128) as usize
+        }
+        None => 0,
+    };
+    let mut bar = String::with_capacity(bar_cells * 3);
+    for i in 0..bar_cells {
+        bar.push_str(if i < filled { glyphs.bar_full } else { glyphs.bar_empty });
+    }
+    format!("ctx [{bar}] {used_text}/{threshold_text}")
+}
+
+/// The context-fill segment for the status bar, including the two-space gap
+/// that separates it from `confirm_mode`.
+///
+/// Yields before `confirm_mode` and the toast do: the bar is tried at 8 and
+/// 4 cells, then as an absolute pair without a scale, and finally dropped
+/// (`None`) when even that does not fit `max_len`.
+fn context_indicator_segment(
+    used: Option<u64>,
+    threshold: u64,
+    glyphs: &Glyphs,
+    max_len: usize,
+) -> Option<String> {
+    let tiers: &[usize] = if threshold == 0 { &[0] } else { &[8, 4, 0] };
+    for &bar_cells in tiers {
+        let text = context_indicator_text(used, threshold, glyphs, bar_cells);
+        let segment = format!("{text}  ");
+        if segment.chars().count() <= max_len {
+            return Some(segment);
+        }
+    }
+    None
+}
+
 /// Render the status bar (top line).
 ///
 /// Layout: `filar ▸ {alias host pwd}` on the left for SSH (`name pwd` when
 /// local), mode indicator in the center (only for non-Normal modes),
-/// `confirm_mode` on the right (muted).
+/// context-fill indicator and `confirm_mode` on the right (muted).
 pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let glyphs = app.theme.glyphs();
 
@@ -155,11 +229,12 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     };
     spans.push(Span::styled(truncated, app.theme.dim()));
 
-    // Right side: `confirm_mode`, then an optional toast (e.g. "· copied")
-    // pinned to the far right. Space for the toast is reserved *before* the
-    // padding is computed — otherwise the padding fills the whole line and the
-    // toast, pushed afterwards, starts at column == width and gets clipped by
-    // ratatui (the original bug: the toast was never visible).
+    // Right side: an optional context-fill indicator, `confirm_mode`, then an
+    // optional toast (e.g. "· copied") pinned to the far right. Space for the
+    // indicator and the toast is reserved *before* the padding is computed —
+    // otherwise the padding fills the whole line and the trailing spans,
+    // pushed afterwards, start at column == width and get clipped by ratatui
+    // (the original bug: the toast was never visible).
     let confirm_text = format!(" {:?}", app.confirm_mode);
     let confirm_style = if app.confirm_mode == filar_core::CommandConfirmMode::Explain {
         app.theme.muted().fg(app.theme.accent)
@@ -170,7 +245,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // must NOT add mode_len again — that would double-count and break
     // the right-alignment in non-Normal modes.
     let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let right_len = confirm_text.chars().count();
+    let available = area.width as usize;
 
     // Owned copy drops the borrow on `app` immediately. The rendered toast is
     // a 2-space gap + `· <text>`.
@@ -182,12 +257,38 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|s| s.chars().count())
         .unwrap_or(0);
 
-    let available = area.width as usize;
+    // Context fill — the measured prompt size against the active profile's
+    // compaction threshold, the same pair `maybe_request_compaction` compares
+    // (#399). Display only: it neither arms nor fires compaction. Space for
+    // the indicator is reserved before padding, exactly like the toast; on a
+    // narrow terminal it yields first — needing one column of clearance from
+    // the left text, it shrinks and then drops rather than crowd
+    // `confirm_mode` or the toast.
+    let used = app.active_session().last_prompt_tokens;
+    let threshold = app.compact_at_tokens_for(&active);
+    let confirm_len = confirm_text.chars().count();
+    let ctx_max = available.saturating_sub(left_len + confirm_len + toast_len + 1);
+    let ctx_segment = context_indicator_segment(used, threshold, glyphs, ctx_max);
+    let ctx_style = if used.is_some_and(|n| threshold > 0 && n >= threshold) {
+        // The next request will compact — worth the warning colour.
+        app.theme.warning_fg()
+    } else {
+        app.theme.muted()
+    };
+
+    let right_len = ctx_segment
+        .as_ref()
+        .map(|s| s.chars().count())
+        .unwrap_or(0)
+        + confirm_len;
     // Toast has priority over padding on a narrow terminal (saturating — no
     // panic, toast may be clipped by ratatui if the line is too short).
     let padding = available.saturating_sub(left_len + right_len + toast_len);
     if padding > 0 {
         spans.push(Span::raw(" ".repeat(padding)));
+    }
+    if let Some(text) = ctx_segment {
+        spans.push(Span::styled(text, ctx_style));
     }
     spans.push(Span::styled(confirm_text, confirm_style));
     if let Some(text) = toast_span_text {
@@ -525,5 +626,150 @@ mod tests {
         let items = help_items(AppMode::Normal);
         let has_f2 = items.iter().any(|i| i.key == "F2" && i.desc == "safe");
         assert!(has_f2, "Normal mode help must include F2 safe");
+    }
+
+    /// A profile with the given compaction threshold, for status-bar tests.
+    fn profile_with_threshold(name: &str, compact_at_tokens: u64) -> filar_core::LlmProfile {
+        filar_core::LlmProfile {
+            name: name.into(), model: "test-model".into(), api_base_url: "".into(),
+            max_tokens: 1024, key_env: "K".into(),
+            temperature: None, top_p: None, extra_body: None,
+            compact_at_tokens,
+        }
+    }
+
+    /// Configure `app` with one active profile at `threshold` tokens.
+    ///
+    /// `cwd` is cleared so the left side of the bar is deterministic (the
+    /// process cwd would otherwise leak in via `App::new`).
+    fn app_with_threshold(threshold: u64) -> App {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.cwd = None;
+        app.profiles = vec![profile_with_threshold("glm", threshold)];
+        app.active_session_mut().llm_profile = Some("glm".into());
+        app
+    }
+
+    #[test]
+    fn context_indicator_unknown_usage_shows_dash_and_empty_scale() {
+        // `last_prompt_tokens = None` (no usage yet, or a restored session)
+        // must render an empty scale and a dash — never 0% (#399).
+        let mut app = app_with_threshold(200_000);
+        app.active_session_mut().last_prompt_tokens = None;
+        let row = render_status_row(&mut app, 120);
+        let g = Glyphs::detect();
+        let empty: String = std::iter::repeat_n(g.bar_empty, 8).collect();
+        assert!(row.contains(&format!("ctx [{empty}] —/200k")), "got: {row}");
+        assert!(!row.contains("0/200k"), "unknown usage is not zero, got: {row}");
+    }
+
+    #[test]
+    fn context_indicator_fills_proportionally() {
+        // 50k of 200k on an 8-cell bar → exactly 2 filled cells.
+        let mut app = app_with_threshold(200_000);
+        app.active_session_mut().last_prompt_tokens = Some(50_000);
+        let row = render_status_row(&mut app, 120);
+        let g = Glyphs::detect();
+        let bar: String = std::iter::repeat_n(g.bar_full, 2)
+            .chain(std::iter::repeat_n(g.bar_empty, 6))
+            .collect();
+        assert!(row.contains(&format!("ctx [{bar}] 50k/200k")), "got: {row}");
+    }
+
+    #[test]
+    fn context_indicator_near_threshold_is_nearly_full() {
+        // 190k of 200k → 7 of 8 cells: visibly close to the fold, but the bar
+        // floors, so it reads full only once the threshold is reached.
+        let mut app = app_with_threshold(200_000);
+        app.active_session_mut().last_prompt_tokens = Some(190_000);
+        let row = render_status_row(&mut app, 120);
+        let g = Glyphs::detect();
+        let bar: String = std::iter::repeat_n(g.bar_full, 7)
+            .chain(std::iter::repeat_n(g.bar_empty, 1))
+            .collect();
+        assert!(row.contains(&format!("ctx [{bar}] 190k/200k")), "got: {row}");
+    }
+
+    #[test]
+    fn context_indicator_over_threshold_stays_full() {
+        let mut app = app_with_threshold(200_000);
+        app.active_session_mut().last_prompt_tokens = Some(250_000);
+        let row = render_status_row(&mut app, 120);
+        let g = Glyphs::detect();
+        let full: String = std::iter::repeat_n(g.bar_full, 8).collect();
+        assert!(row.contains(&format!("ctx [{full}] 250k/200k")), "got: {row}");
+    }
+
+    #[test]
+    fn context_indicator_without_scale_when_compaction_disabled() {
+        // `compact_at_tokens = 0` → no denominator, absolute figure only.
+        let mut app = app_with_threshold(0);
+        app.active_session_mut().last_prompt_tokens = Some(15_235);
+        let row = render_status_row(&mut app, 120);
+        assert!(row.contains("ctx 15k"), "got: {row}");
+        assert!(!row.contains("ctx ["), "no scale when there is no denominator, got: {row}");
+        assert!(!row.contains("15k/"), "got: {row}");
+    }
+
+    #[test]
+    fn context_indicator_keeps_confirm_mode_and_toast_right_aligned() {
+        // With the indicator on, the reserved-width maths must still pin
+        // `confirm_mode` and the toast to the right edge (#399).
+        let mut app = app_with_threshold(200_000);
+        app.active_session_mut().last_prompt_tokens = Some(50_000);
+        app.toast = Some((
+            "copied".to_string(),
+            Instant::now() + Duration::from_secs(10),
+        ));
+        let row = render_status_row(&mut app, 120);
+        let g = Glyphs::detect();
+        assert!(row.contains("ctx ["), "indicator shown, got: {row}");
+        let toast = format!("  {} copied", g.middle_dot);
+        assert!(row.ends_with(&toast), "toast stays pinned to the right edge, got: {row}");
+        let confirm = " Always";
+        let expected = 120 - toast.chars().count() - confirm.chars().count();
+        // `find` answers in bytes and the row holds multi-byte `—`, so
+        // compare in characters.
+        let byte_pos = row.find(confirm).expect("confirm_mode present");
+        let char_pos = row[..byte_pos].chars().count();
+        assert_eq!(char_pos, expected, "confirm_mode right-aligned before the toast, got: {row}");
+    }
+
+    #[test]
+    fn context_indicator_dropped_before_confirm_on_narrow_terminal() {
+        // Width 45: not even the shortest tier fits next to the left text and
+        // `confirm_mode`, so the indicator yields — while `confirm_mode`
+        // keeps its right-alignment.
+        let mut app = app_with_threshold(200_000);
+        app.active_session_mut().last_prompt_tokens = Some(150_000);
+        let row = render_status_row(&mut app, 45);
+        assert!(!row.contains("ctx"), "indicator must yield on a narrow terminal, got: {row}");
+        assert!(row.ends_with(" Always"), "confirm_mode still right-aligned, got: {row}");
+        assert_eq!(row.chars().count(), 45);
+    }
+
+    #[test]
+    fn context_indicator_shrinks_tiers_to_fit() {
+        // Width 66 leaves room for the 4-cell tier but not for the 8-cell
+        // one, which is tried first and must give way before the indicator
+        // drops entirely.
+        let mut app = app_with_threshold(200_000);
+        app.active_session_mut().last_prompt_tokens = Some(150_000);
+        let row = render_status_row(&mut app, 66);
+        let g = Glyphs::detect();
+        let bar: String = std::iter::repeat_n(g.bar_full, 3)
+            .chain(std::iter::repeat_n(g.bar_empty, 1))
+            .collect();
+        assert!(row.contains(&format!("ctx [{bar}] 150k/200k")), "4-cell tier expected, got: {row}");
+    }
+
+    #[test]
+    fn context_indicator_renders_in_both_glyph_sets() {
+        // The ASCII fallback and the Unicode set draw the same bar from their
+        // own cells (explicitly, independent of terminal detection).
+        let ascii = context_indicator_text(Some(50_000), 200_000, &Glyphs::ASCII, 8);
+        assert_eq!(ascii, "ctx [##------] 50k/200k");
+        let unicode = context_indicator_text(Some(50_000), 200_000, &Glyphs::UNICODE, 8);
+        assert_eq!(unicode, "ctx [██░░░░░░] 50k/200k");
     }
 }
