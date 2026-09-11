@@ -236,6 +236,12 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // otherwise the padding fills the whole line and the trailing spans,
     // pushed afterwards, start at column == width and get clipped by ratatui
     // (the original bug: the toast was never visible).
+    //
+    // The leading space below is deliberate: together with the one-column
+    // trailing gap of the context indicator it holds the two-column
+    // separation before `confirm_mode` (#399 review), and it keeps a
+    // separator when the indicator is dropped and the padding collapses
+    // to zero.
     let confirm_text = format!(" {:?}", app.confirm_mode);
     let confirm_style = if app.confirm_mode == filar_core::CommandConfirmMode::Explain {
         app.theme.muted().fg(app.theme.accent)
