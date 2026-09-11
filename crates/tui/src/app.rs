@@ -1016,8 +1016,11 @@ fn sanitize_dir_segment(name: &str) -> String {
         trimmed.to_string()
     };
     if is_windows_reserved_name(cleaned.split('.').next().unwrap_or("")) {
-        // `CON` → `CON_`: keeps the name recognisable and valid.
-        cleaned.push('_');
+        // `CON` → `CON_`, `lpt9.log` → `lpt9_.log`: Windows resolves a device
+        // name by the part before the first dot, so the `_` must break that
+        // stem — a trailing `lpt9.log_` would still hit the `lpt9` device.
+        let stem_end = cleaned.find('.').unwrap_or(cleaned.len());
+        cleaned.insert(stem_end, '_');
     }
     cleaned
 }
@@ -9555,8 +9558,10 @@ mod tests {
         assert_eq!(sanitize_dir_segment("CON"), "CON_");
         assert_eq!(sanitize_dir_segment("nul"), "nul_");
         assert_eq!(sanitize_dir_segment("COM1"), "COM1_");
-        // Reserved even with an extension — the stem decides.
-        assert_eq!(sanitize_dir_segment("lpt9.log"), "lpt9.log_");
+        // Reserved even with an extension — and the escape must break the
+        // stem itself, not trail the whole name (a `lpt9.log_` folder would
+        // still resolve to the `lpt9` device on Windows).
+        assert_eq!(sanitize_dir_segment("lpt9.log"), "lpt9_.log");
         // Lookalikes are not reserved.
         assert_eq!(sanitize_dir_segment("console"), "console");
         assert_eq!(sanitize_dir_segment("com10"), "com10");

@@ -6487,7 +6487,8 @@ stricter than `slugify_max`, because the alias becomes a path segment: `.` and
 `..` trim away to nothing (a slug of only dots or symbols falls back to
 `target`), trailing dots and spaces — invalid NTFS directory names — are
 stripped, and Windows reserved device names (`CON`, `COM1`–`COM9`,
-`LPT1`–`LPT9`, extension or not) get a trailing `_`. Containment is pinned by
+`LPT1`–`LPT9`, extension or not) get an `_` breaking the stem itself
+(`CON_`, `lpt9_.log`). Containment is pinned by
 a test with hostile aliases (`..`, `../../etc`, `..\..\Windows`, `CON`, `.`,
 `  `, `///`, empty, `***`): one normal component, always directly under
 `save_dir`.
@@ -6502,6 +6503,11 @@ sweep, the trimming/fallback edges, and the reserved-name escapes.
 issue's manual run (two sessions to different targets, Ctrl+S in each, files
 in different folders on Windows) cannot be driven from the agent environment —
 stated in the PR.
+
+**Next steps:** merge PR; before the 1.0.7 release a human should run the
+issue scenario interactively on Windows (two sessions to different targets,
+Ctrl+S in each, files land in different folders) — the agent environment
+cannot drive the TUI.
 
 ## Release v1.0.6 (2026-09-04)
 
