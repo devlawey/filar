@@ -226,16 +226,16 @@ pub fn redact(s: &str) -> String {
 ///
 /// A `$`-prefixed slot (`$FILAR_SECRET_N`) is restored to its own name — the
 /// same form the operator sees in a command line, and the form the executor
-/// substitutes. A value stored under a plain name (an API key) becomes
-/// `<secret>`: the name itself is internal configuration with no place in a
-/// document meant to be shared.
+/// substitutes. A plain name (an API key) is internal configuration with no
+/// place in a document meant to be shared: both its value and occurrences of
+/// the bare name itself become `<secret>` (#404 review).
 ///
-/// Values are replaced longest first, so one value that contains another
-/// (`abc` inside `abcdef`) cannot be rewritten before its own match is tried.
-/// Empty values are skipped — replacing the empty string would mangle the
-/// text outright.
+/// Patterns are replaced longest first, so one that contains another (`abc`
+/// inside `abcdef`) cannot be rewritten before its own match is tried. Empty
+/// values are skipped — replacing the empty string would mangle the text
+/// outright.
 pub fn redact_secrets(text: &str, provider: &dyn SecretProvider) -> String {
-    let mut values: Vec<(usize, String, String)> = Vec::new();
+    let mut patterns: Vec<(usize, String, String)> = Vec::new();
     for name in provider.secret_names() {
         let Ok(value) = provider.get(&name) else {
             continue;
@@ -243,17 +243,23 @@ pub fn redact_secrets(text: &str, provider: &dyn SecretProvider) -> String {
         if value.is_empty() {
             continue;
         }
-        let placeholder = if name.starts_with('$') {
-            name.clone()
+        if name.starts_with('$') {
+            // A placeholder slot: put back the form the operator sees in a
+            // command line and the executor substitutes at run time.
+            patterns.push((value.len(), value, name));
         } else {
-            "<secret>".to_string()
-        };
-        values.push((value.len(), value, placeholder));
+            // A plain name: neither the value nor the bare name may reach a
+            // shared document — both are masked the same way. The name takes
+            // part in the longest-first pass, so a value that overlaps it
+            // cannot leave a mangled hybrid behind.
+            patterns.push((value.len(), value, "<secret>".to_string()));
+            patterns.push((name.len(), name, "<secret>".to_string()));
+        }
     }
-    values.sort_by(|a, b| b.0.cmp(&a.0));
+    patterns.sort_by(|a, b| b.0.cmp(&a.0));
     let mut out = text.to_string();
-    for (_, value, placeholder) in values {
-        out = out.replace(&value, &placeholder);
+    for (_, pattern, placeholder) in patterns {
+        out = out.replace(&pattern, &placeholder);
     }
     out
 }
@@ -574,15 +580,25 @@ mod tests {
     }
 
     #[test]
-    fn redact_secrets_masks_plain_named_values_as_secret() {
-        // An API key is stored without a `$` prefix; its name is internal
-        // configuration and must not leak into a shared document either.
+    fn redact_secrets_masks_plain_names_and_values_as_secret() {
+        // An API key is stored without a `$` prefix; neither its value nor
+        // the bare name may leak into a shared document (#404 review).
         let provider = StaticSecretProvider::new();
         provider.insert("GLM_API_KEY", "sk-or-v1-abcdef");
-        let out = redact_secrets("token: sk-or-v1-abcdef here", &provider);
+        let out = redact_secrets("export GLM_API_KEY=sk-or-v1-abcdef", &provider);
         assert!(!out.contains("sk-or-v1-abcdef"), "value must be gone: {out}");
-        assert!(out.contains("<secret>"), "masked form expected: {out}");
         assert!(!out.contains("GLM_API_KEY"), "the name must not leak: {out}");
+        assert_eq!(out, "export <secret>=<secret>");
+    }
+
+    #[test]
+    fn redact_secrets_masks_a_plain_name_referenced_as_a_variable() {
+        // `$GLM_API_KEY` names the variable, not the value — the name itself
+        // must not survive into the shared document either.
+        let provider = StaticSecretProvider::new();
+        provider.insert("GLM_API_KEY", "sk-or-v1-abcdef");
+        let out = redact_secrets("echo $GLM_API_KEY", &provider);
+        assert_eq!(out, "echo $<secret>");
     }
 
     #[test]

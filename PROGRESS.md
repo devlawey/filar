@@ -6534,10 +6534,12 @@ runbook }` with usage owed even when the reply is rejected (under
 `MIN_RUNBOOK_CHARS` = 80). The system prompt demands a procedure — symptom,
 preconditions, steps with output reading, exit criteria, next actions —
 generalised to placeholders (`<host>`, `<user>`, `<service>`) with an explicit
-secret ban. The transcript handed over is `messages_to_markdown` (the exact
+secret ban). The transcript handed over is `messages_to_markdown` (the exact
 text the export is written from) passed through `redact_secrets`, and the
-reply passes `redact_secrets` again before it is written, so a
-`$FILAR_SECRET_N` value cannot reach `{stem}.runbook.md` through either door.
+reply passes `redact_secrets` again before it is written, so no secret value
+can reach `{stem}.runbook.md` through either door. A plain-named secret is
+masked as `<secret>` wherever it appears — value and bare name alike
+(review follow-up).
 
 **Cancellation and cost.** Ctrl+Z fires the token and the in-flight request
 dies (`tokio::select!`, the #394 pattern); the `.md` is kept. The task
