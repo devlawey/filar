@@ -78,9 +78,10 @@ pub struct SummaryOutcome {
 ///
 /// Returns the brief that will replace the compacted head, together with what
 /// the call cost. The call carries no tool definitions, so the summariser
-/// cannot propose commands, and it is a plain [`LlmClient::chat`] rather than a
-/// streaming call: nothing renders the partial text, and the caller only needs
-/// the finished brief.
+/// cannot propose commands. It is a streaming call even though nothing
+/// renders the partial text: the non-streaming path is bounded by the
+/// client's *total* timeout, and summarising a long history can outlive it,
+/// while the streaming path bounds only the silence between chunks (#405).
 ///
 /// A reply shorter than [`MIN_SUMMARY_CHARS`] — an empty string included — is
 /// reported as an error rather than silently accepted: replacing the head with
@@ -95,7 +96,7 @@ pub async fn summarise_history(llm: &dyn LlmClient, transcript: &str) -> Summary
         tools: Vec::new(),
     };
 
-    let response = match llm.chat(&request).await {
+    let response = match llm.chat_stream(&request, &|_| {}).await {
         Ok(response) => response,
         // No response, so nothing was billed that we know of.
         Err(e) => return SummaryOutcome { usage: None, summary: Err(e) },
@@ -226,5 +227,41 @@ mod tests {
         let real = "User asked for disk usage; agent ran df -h; root is 82% full.";
         assert!(real.chars().count() >= MIN_SUMMARY_CHARS);
         assert_eq!(summarise(real).await.unwrap(), real);
+    }
+
+    /// Fails every non-streaming call: a summary must go through the
+    /// streaming path, where the timeout bounds chunk silence rather than the
+    /// total generation (#405).
+    struct StreamOnlyLlm(String);
+
+    #[async_trait::async_trait]
+    impl crate::LlmClient for StreamOnlyLlm {
+        async fn chat(&self, _request: &crate::ChatRequest) -> Result<crate::ChatResponse> {
+            Err(CoreError::Other(
+                "history compaction must use the streaming path".into(),
+            ))
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: &crate::ChatRequest,
+            _on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<crate::ChatResponse> {
+            Ok(crate::ChatResponse::text(self.0.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_summary_is_generated_through_the_streaming_path() {
+        // Regression test for #405: with a non-streaming call, the total
+        // request timeout capped the whole generation and summarising a long
+        // history died at `[timeouts].llm_secs`.
+        let real = "User asked for disk usage; agent ran df -h; root is 82% full.";
+        let llm = StreamOnlyLlm(real.to_string());
+        let outcome = summarise_history(&llm, "User: hi\n").await;
+        assert_eq!(
+            outcome.summary.expect("the streaming call must succeed"),
+            real
+        );
     }
 }

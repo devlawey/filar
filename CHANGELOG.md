@@ -32,6 +32,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   tabs — instead of the export root, so sessions of different hosts no longer
   mix in one directory ([#400](https://github.com/devlawey/filar/issues/400)).
 
+### Fixed
+
+- Runbook and compaction generation now go through the streaming API: on the
+  non-streaming path the total request timeout capped the whole generation,
+  so a runbook over a large transcript died at `[timeouts].llm_secs` — and
+  the swallowed body-read failure was reported as a JSON parse error instead
+  of the timeout it was ([#405](https://github.com/devlawey/filar/issues/405)).
+
 ## [1.0.6] - 2026-09-04
 
 ### Added
