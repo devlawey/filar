@@ -25,6 +25,6 @@ pub use config::{
 pub use error::{CoreError, Result};
 pub use secrets::{
     ssh_cred_name, ssh_target_display_name, EnvSecretProvider, KeyringSecretProvider,
-    SecretProvider, StaticSecretProvider, redact,
+    SecretProvider, StaticSecretProvider, redact, redact_secrets,
 };
 pub use session::{default_base_dir, ProfileUsage, Session, SessionMeta, SessionStore};

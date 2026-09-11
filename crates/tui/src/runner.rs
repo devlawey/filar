@@ -25,7 +25,7 @@ use filar_transport::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::app::{App, AppMode, SaveProgress, SessionId};
+use crate::app::{messages_to_markdown, App, AppMode, RunbookState, SaveProgress, SessionId};
 use crate::confirmer::TuiConfirmer;
 use crate::event::TuiEvent;
 use crate::path_picker::{self, PathEntry};
@@ -372,6 +372,9 @@ pub struct TuiConfig {
     pub log_rx: Option<mpsc::UnboundedReceiver<String>>,
     /// Directory where Ctrl+S session exports are written (`None` = CWD).
     pub save_dir: Option<std::path::PathBuf>,
+    /// When true, an explicit Ctrl+S also asks the session's LLM for a
+    /// runbook, written next to the export as `{stem}.runbook.md` (#401).
+    pub save_runbook: bool,
     /// Per-command execution timeout from `[timeouts].command_secs`.
     /// Applied to SSH marker wait and local subprocess execution.
     pub command_timeout: Duration,
@@ -489,13 +492,16 @@ async fn run_app(
     // agent's SecretSubstitutingExecutor, so Ctrl+P inserts are visible to
     // command substitution and output sanitisation.
     app.secrets = config.secret_provider.clone();
+    app.runbook_enabled = config.save_runbook;
 
     // Channel for agent → UI events.
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<TuiEvent>();
 
     // Channel for session-save progress (Ctrl+S, #234/#235).
     let (save_tx, mut save_rx) = tokio::sync::mpsc::unbounded_channel::<SaveProgress>();
-    app.save_tx = Some(save_tx);
+    // The runner keeps a clone of its own: the runbook task it spawns after a
+    // `Done` reports back through this same channel (#401).
+    app.save_tx = Some(save_tx.clone());
 
     // Channel for in-TUI path picker directory listings (#351).
     let (path_picker_tx, mut path_picker_rx) =
@@ -614,75 +620,25 @@ async fn run_app(
 
             // Save progress updates (Ctrl+S, #235). Must be inside the
             // select so the progress bar updates even when the user is idle.
+            // The drain runs the same handler as the branch: a `Done` that
+            // queued up behind another event still has to start its runbook,
+            // and no `TranscriptDone` may be dropped to the drain (#401).
             Some(progress) = save_rx.recv() => {
-                match progress {
-                    SaveProgress::Started => {
-                        app.save_progress = 0;
-                        app.save_error = None;
-                    }
-                    SaveProgress::Writing => {
-                        app.save_progress = 50;
-                    }
-                    SaveProgress::Done(filename) => {
-                        app.save_progress = 100;
-                        if !app.save_overlay_visible {
-                            app.save_overlay_visible = true;
-                        }
-                        app.finish_save();
-                        let msg = format!("Saved to {filename}");
-                        app.toast = Some((msg, Instant::now() + Duration::from_secs(3)));
-                        app.push_system_log(format!("Session saved to {filename}"));
-                    }
-                    SaveProgress::Error(err) => {
-                        app.save_error = Some(err.clone());
-                        app.save_progress = 0;
-                        if !app.save_overlay_visible {
-                            app.save_overlay_visible = true;
-                        }
-                        app.finish_save();
-                    }
-                    SaveProgress::TranscriptDone(sid, result) => {
-                        if let Some(idx) = app.find_session_idx(sid) {
-                            app.sessions[idx].transcript_saving = false;
-                            if let Some(err) = result {
-                                if !app.sessions[idx].transcript_error_shown {
-                                    app.sessions[idx].transcript_error_shown = true;
-                                    app.sessions[idx].messages.push(filar_core::ChatBlock::Error(
-                                        format!("Transcript write failed: {err}")
-                                    ));
-                                    app.sessions[idx].message_rev =
-                                        app.sessions[idx].message_rev.wrapping_add(1);
-                                }
-                            }
-                        }
-                    }
-                }
-                // Drain any remaining messages delivered during this iteration.
+                apply_save_progress(
+                    &mut app,
+                    progress,
+                    &config.llm_factory,
+                    &config.secret_provider,
+                    &save_tx,
+                );
                 while let Ok(p) = save_rx.try_recv() {
-                    match p {
-                        SaveProgress::Done(filename) => {
-                            app.save_progress = 100;
-                            if !app.save_overlay_visible {
-                                app.save_overlay_visible = true;
-                            }
-                            let msg = format!("Saved to {filename}");
-                            app.toast = Some((msg, Instant::now() + Duration::from_secs(3)));
-                            app.push_system_log(format!("Session saved to {filename}"));
-                            app.finish_save();
-                        }
-                        SaveProgress::Error(err) => {
-                            app.save_error = Some(err);
-                            app.save_progress = 0;
-                            if !app.save_overlay_visible {
-                                app.save_overlay_visible = true;
-                            }
-                            app.finish_save();
-                        }
-                        SaveProgress::Writing => {
-                            app.save_progress = 50;
-                        }
-                        _ => {}
-                    }
+                    apply_save_progress(
+                        &mut app,
+                        p,
+                        &config.llm_factory,
+                        &config.secret_provider,
+                        &save_tx,
+                    );
                 }
                 needs_redraw = true;
             }
@@ -1752,6 +1708,208 @@ fn history_to_messages(blocks: &[ChatBlock]) -> Vec<filar_agent::ChatMessage> {
         .collect()
 }
 
+/// Apply one save-progress event to the app (#235, #401).
+///
+/// Shared by the select branch and its drain: a `Done` that queued up behind
+/// another event still starts the runbook, and a `TranscriptDone` arriving in
+/// a burst still clears `transcript_saving` — the old drain matched only
+/// three variants and silently swallowed the rest.
+///
+/// Takes the LLM plumbing as separate borrows rather than `&TuiConfig`:
+/// `run_app` has already moved `config`'s launch fields into the app, so the
+/// struct itself is not borrowable there.
+fn apply_save_progress(
+    app: &mut App,
+    progress: SaveProgress,
+    llm_factory: &RunbookLlmFactory,
+    secret_provider: &Arc<StaticSecretProvider>,
+    save_tx: &mpsc::UnboundedSender<SaveProgress>,
+) {
+    match progress {
+        SaveProgress::Started => {
+            app.save_progress = 0;
+            app.save_error = None;
+        }
+        SaveProgress::Writing => {
+            app.save_progress = 50;
+        }
+        SaveProgress::Done(filename) => {
+            app.save_progress = 100;
+            if !app.save_overlay_visible {
+                app.save_overlay_visible = true;
+            }
+            app.finish_save();
+            let msg = format!("Saved to {filename}");
+            app.toast = Some((msg, Instant::now() + Duration::from_secs(3)));
+            app.push_system_log(format!("Session saved to {filename}"));
+            // The `.md` is on disk — only now may the runbook start (#401):
+            // a failed export must never spend a call on a session whose
+            // record was never written.
+            spawn_runbook_generation(app, &filename, llm_factory, secret_provider, save_tx);
+        }
+        SaveProgress::Error(err) => {
+            // The export failed: drop the armed job (#401) so a later save
+            // cannot fold a session whose `.md` was never written.
+            app.runbook_armed = None;
+            app.save_error = Some(err);
+            app.save_progress = 0;
+            if !app.save_overlay_visible {
+                app.save_overlay_visible = true;
+            }
+            app.finish_save();
+        }
+        SaveProgress::TranscriptDone(sid, result) => {
+            if let Some(idx) = app.find_session_idx(sid) {
+                app.sessions[idx].transcript_saving = false;
+                if let Some(err) = result {
+                    if !app.sessions[idx].transcript_error_shown {
+                        app.sessions[idx].transcript_error_shown = true;
+                        app.sessions[idx].messages.push(filar_core::ChatBlock::Error(
+                            format!("Transcript write failed: {err}"),
+                        ));
+                        app.sessions[idx].message_rev =
+                            app.sessions[idx].message_rev.wrapping_add(1);
+                    }
+                }
+            }
+        }
+        SaveProgress::RunbookDone { sid, outcome, usage, profile } => {
+            app.finish_runbook(sid, outcome, usage, profile);
+        }
+    }
+}
+
+/// The LLM-client factory the runner uses, spelled once for the runbook
+/// helpers that must borrow it out of a partially moved [`TuiConfig`].
+type RunbookLlmFactory = Arc<
+    dyn Fn(&filar_core::LlmProfile, &StaticSecretProvider) -> std::result::Result<Arc<dyn LlmClient>, CoreError>
+        + Send
+        + Sync,
+>;
+
+/// Start the runbook the export armed, if the session earned one (#401).
+///
+/// Reached only from `SaveProgress::Done` — the `.md` is already on disk, so
+/// nothing here can cost the record. A session with no executed commands is
+/// refused without a call ([`App::take_runbook_job`]); the LLM is resolved
+/// for the profile captured when Ctrl+S was pressed, not the current one —
+/// the runbook is part of that export.
+fn spawn_runbook_generation(
+    app: &mut App,
+    markdown_name: &str,
+    llm_factory: &RunbookLlmFactory,
+    secret_provider: &Arc<StaticSecretProvider>,
+    save_tx: &mpsc::UnboundedSender<SaveProgress>,
+) {
+    let Some(armed) = app.take_runbook_job() else {
+        return;
+    };
+
+    let llm = match app.profiles.iter().find(|p| p.name == armed.profile) {
+        Some(profile) => match (llm_factory)(profile, secret_provider) {
+            Ok(client) => client,
+            Err(e) => {
+                app.finish_runbook(armed.session_id, Err(e.to_string()), None, armed.profile.clone());
+                return;
+            }
+        },
+        None => {
+            let reason = format!("profile '{}' not found", armed.profile);
+            app.finish_runbook(armed.session_id, Err(reason), None, armed.profile.clone());
+            return;
+        }
+    };
+
+    let (path, display) = runbook_path(&armed.target_dir, markdown_name);
+    let transcript = messages_to_markdown(&armed.messages, &armed.session_name, &armed.ssh_info);
+    let token = CancellationToken::new();
+    app.runbook_cancel = Some(token.clone());
+    app.runbook_state = Some(RunbookState::Generating);
+
+    let provider = Arc::clone(secret_provider);
+    let sid = armed.session_id;
+    let profile = armed.profile.clone();
+    let tx = save_tx.clone();
+    tokio::spawn(async move {
+        if let Some((outcome, usage)) = build_runbook_file(
+            llm.as_ref(),
+            &token,
+            &transcript,
+            &path,
+            &display,
+            provider.as_ref(),
+        )
+        .await
+        {
+            let _ = tx.send(SaveProgress::RunbookDone {
+                sid,
+                outcome,
+                usage,
+                profile,
+            });
+        }
+    });
+}
+
+/// Path and display name for the runbook beside a just-written export.
+///
+/// `{stem}.md` becomes `{stem}.runbook.md` in the same per-target folder
+/// (#400), sharing the export's timestamped stem so the pair sorts together.
+/// `markdown_name` is the folder-relative form `Done` carries (`folder/file.md`).
+fn runbook_path(target_dir: &std::path::Path, markdown_name: &str) -> (std::path::PathBuf, String) {
+    let (folder, file_name) = match markdown_name.rsplit_once('/') {
+        Some((folder, file)) => (Some(folder), file),
+        None => (None, markdown_name),
+    };
+    let runbook_name = match file_name.strip_suffix(".md") {
+        Some(stem) => format!("{stem}.runbook.md"),
+        None => format!("{file_name}.runbook.md"),
+    };
+    let display = match folder {
+        Some(folder) => format!("{folder}/{runbook_name}"),
+        None => runbook_name.clone(),
+    };
+    (target_dir.join(&runbook_name), display)
+}
+
+/// Generate the runbook and write it, as one cancellable step (#401).
+///
+/// Returns `None` when the user cancelled: `cancel_work` already explained
+/// that in the feed, and a second line would be noise about the thing the
+/// user just stopped. Otherwise the outcome for the feed (display path or
+/// reason) and the usage — billed either way, since the provider answered
+/// before the reply was judged.
+///
+/// Redaction covers both doors: the transcript is the input, and the model's
+/// own reply is the output. The executor sanitises command output, but a
+/// value the user typed into the chat, and anything the model writes back,
+/// never passed through it.
+async fn build_runbook_file(
+    llm: &dyn LlmClient,
+    cancellation: &CancellationToken,
+    transcript: &str,
+    path: &std::path::Path,
+    display: &str,
+    provider: &dyn SecretProvider,
+) -> Option<(std::result::Result<String, String>, Option<filar_agent::TokenUsage>)> {
+    let redacted = filar_core::redact_secrets(transcript, provider);
+    let outcome = tokio::select! {
+        outcome = filar_agent::generate_runbook(llm, &redacted) => outcome,
+        _ = cancellation.cancelled() => return None,
+    };
+    let result = match outcome.runbook {
+        Ok(text) => {
+            let text = filar_core::redact_secrets(&text, provider);
+            match tokio::fs::write(path, text).await {
+                Ok(()) => Ok(display.to_string()),
+                Err(e) => Err(format!("cannot write the runbook file: {e}")),
+            }
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    Some((result, outcome.usage))
+}
+
 /// Spawn the agent in a tokio task to process the user's input.
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent(
@@ -2508,5 +2666,396 @@ mod tests {
         let rev1 = app.active_session().message_rev;
         assert!(session_changed(&app, rev1, sid0));
         assert!(!session_changed(&app, rev1, sid1));
+    }
+
+    // ── Runbook generation (#401) ─────────────────────────────────────
+
+    /// An `LlmClient` that answers with a fixed text and records the request,
+    /// so a test can inspect what would have gone over the wire.
+    struct ScriptedLlm {
+        reply: String,
+        usage: Option<filar_agent::TokenUsage>,
+        captured: std::sync::Mutex<Option<filar_agent::ChatRequest>>,
+    }
+
+    impl ScriptedLlm {
+        fn answering(reply: &str) -> Self {
+            Self {
+                reply: reply.to_string(),
+                usage: Some(filar_agent::TokenUsage {
+                    prompt_tokens: Some(200),
+                    completion_tokens: Some(90),
+                    total_tokens: Some(290),
+                    cost: Some(0.0007),
+                }),
+                captured: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn captured_prompt(&self) -> String {
+            let request = self.captured.lock().unwrap().clone().expect("request captured");
+            request.messages.into_iter().map(|m| m.content).collect::<Vec<_>>().join("\n")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for ScriptedLlm {
+        async fn chat(
+            &self,
+            request: &filar_agent::ChatRequest,
+        ) -> filar_core::Result<filar_agent::ChatResponse> {
+            *self.captured.lock().unwrap() = Some(request.clone());
+            let response = filar_agent::ChatResponse::text(self.reply.clone());
+            Ok(match &self.usage {
+                Some(usage) => response.with_usage(usage.clone()),
+                None => response,
+            })
+        }
+    }
+
+    /// An `LlmClient` that always fails, standing in for a provider outage.
+    struct FailingLlm;
+
+    #[async_trait::async_trait]
+    impl LlmClient for FailingLlm {
+        async fn chat(
+            &self,
+            _request: &filar_agent::ChatRequest,
+        ) -> filar_core::Result<filar_agent::ChatResponse> {
+            Err(filar_core::CoreError::Other("provider is down".into()))
+        }
+    }
+
+    /// A runbook long enough for `MIN_RUNBOOK_CHARS`; `with` is interpolated.
+    fn long_runbook(with: &str) -> String {
+        format!(
+            "1. Symptom: the service answers with 502 after a deploy. \
+             2. Preconditions: root on <host>. \
+             3. Steps: systemctl status nginx, read the error log. {with} \
+             4. Exit criteria: 200 responses return. \
+             5. Next actions: restart the unit or escalate."
+        )
+    }
+
+    fn runbook_temp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("filar_runbook_{tag}_{}", std::process::id()))
+    }
+
+    #[test]
+    fn runbook_path_names_the_sibling_of_the_export() {
+        let dir = std::path::Path::new("exports/prod-web");
+        let (path, display) = runbook_path(dir, "prod-web/db-1.md");
+        assert_eq!(path, dir.join("db-1.runbook.md"));
+        assert_eq!(display, "prod-web/db-1.runbook.md");
+        // A bare name (defensive — `Done` normally carries the folder) still
+        // gets the suffix and a usable path.
+        let (path, display) = runbook_path(dir, "db-1.md");
+        assert_eq!(path, dir.join("db-1.runbook.md"));
+        assert_eq!(display, "db-1.runbook.md");
+    }
+
+    #[tokio::test]
+    async fn a_secret_in_the_transcript_never_reaches_the_runbook() {
+        // The user typed the password into the chat, so the executor never
+        // saw it — redaction at the runbook door is the only thing that can
+        // keep it out of a file meant to be shared (#401).
+        let dir = runbook_temp_dir("secret");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let provider = filar_core::StaticSecretProvider::new();
+        provider.insert("$FILAR_SECRET_1", "hunter2-password");
+        let transcript = "User: поменяй пароль hunter2-password на базе\n\
+                          $ mysql -p'hunter2-password' -e 'select 1'";
+        // The model echoes the secret back — the output door must catch it too.
+        let llm = ScriptedLlm::answering(&long_runbook(
+            "Never type hunter2-password into a shared file; take it from the vault.",
+        ));
+
+        let path = dir.join("db-1.runbook.md");
+        let outcome = build_runbook_file(
+            &llm,
+            &CancellationToken::new(),
+            transcript,
+            &path,
+            "prod-web/db-1.runbook.md",
+            &provider,
+        )
+        .await;
+        let (result, usage) = outcome.expect("no cancellation — must return");
+        result.expect("the write must succeed");
+        assert!(usage.is_some(), "usage rides back for billing");
+
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(!written.contains("hunter2-password"), "the secret must not reach the file");
+        assert!(written.contains("$FILAR_SECRET_1"), "the placeholder is kept instead");
+        let sent = llm.captured_prompt();
+        assert!(!sent.contains("hunter2-password"), "the secret must not leave the machine");
+        assert!(sent.contains("$FILAR_SECRET_1"), "the placeholder replaces it in the request");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn the_runbook_is_written_beside_the_export_and_reports_its_path() {
+        let dir = runbook_temp_dir("write");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let provider = filar_core::StaticSecretProvider::new();
+        let llm = ScriptedLlm::answering(&long_runbook(""));
+        let path = dir.join("db-1.runbook.md");
+        let outcome = build_runbook_file(
+            &llm,
+            &CancellationToken::new(),
+            "User: почини nginx",
+            &path,
+            "prod-web/db-1.runbook.md",
+            &provider,
+        )
+        .await;
+        let (result, usage) = outcome.expect("no cancellation — must return");
+        assert_eq!(result.unwrap(), "prod-web/db-1.runbook.md", "the feed gets the display path");
+        assert!(usage.is_some());
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(written.contains("Symptom"), "the file lands on disk");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_mid_runbook_writes_nothing_and_stays_silent() {
+        // Ctrl+Z must abort the request itself (#394 precedent): the reply
+        // is abandoned, no file appears, and the feed stays quiet —
+        // cancel_work already explained the stop.
+        let dir = runbook_temp_dir("cancel");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let token = CancellationToken::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let llm = HangingLlm {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let provider = filar_core::StaticSecretProvider::new();
+        let path = dir.join("db-1.runbook.md");
+
+        let cancel = token.clone();
+        let waiter = tokio::spawn(async move {
+            started.notified().await;
+            cancel.cancel();
+        });
+
+        // Bounded: without the guard this never returns, and a hung suite is
+        // a much worse regression signal than a failed assertion.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            build_runbook_file(&llm, &token, "t", &path, "d", &provider),
+        )
+        .await
+        .expect("cancellation must abandon the request, not wait it out");
+        waiter.await.unwrap();
+        release.notify_waiters();
+
+        assert!(outcome.is_none(), "cancelled — nothing to report");
+        assert!(
+            !tokio::fs::try_exists(&path).await.unwrap_or(false),
+            "a cancelled runbook must not leave a file"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_runbook_failure_leaves_the_markdown_untouched() {
+        // The export is already on disk when generation starts; whatever the
+        // call does, that file must be exactly as it was.
+        let dir = runbook_temp_dir("fail");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let markdown = dir.join("db-1.md");
+        tokio::fs::write(&markdown, "# Session: db-1").await.unwrap();
+
+        let provider = filar_core::StaticSecretProvider::new();
+        let path = dir.join("db-1.runbook.md");
+        let outcome = build_runbook_file(
+            &FailingLlm,
+            &CancellationToken::new(),
+            "t",
+            &path,
+            "d",
+            &provider,
+        )
+        .await;
+        let (result, usage) = outcome.expect("failure is still reported, not cancelled");
+        let err = result.expect_err("the provider error must come back");
+        assert!(err.contains("provider is down"), "got: {err}");
+        assert!(usage.is_none(), "no reply, no usage");
+        assert_eq!(
+            tokio::fs::read_to_string(&markdown).await.unwrap(),
+            "# Session: db-1",
+            "the export is untouched"
+        );
+        assert!(!tokio::fs::try_exists(&path).await.unwrap_or(false));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_short_runbook_reply_is_a_reported_failure() {
+        let dir = runbook_temp_dir("short");
+        let provider = filar_core::StaticSecretProvider::new();
+        let llm = ScriptedLlm::answering("too short");
+        let path = dir.join("db-1.runbook.md");
+        let outcome = build_runbook_file(
+            &llm,
+            &CancellationToken::new(),
+            "t",
+            &path,
+            "d",
+            &provider,
+        )
+        .await;
+        let (result, usage) = outcome.expect("not cancelled");
+        let err = result.expect_err("a stub reply must not be written");
+        assert!(err.contains("too short"), "got: {err}");
+        assert!(usage.is_some(), "the call was billed even though the reply was unusable");
+        assert!(!tokio::fs::try_exists(&path).await.unwrap_or(false), "nothing written");
+    }
+
+    /// A `TuiConfig` with one `glm` profile served by `llm`, for tests that
+    /// exercise the runner's own wiring (never `run_app` itself).
+    fn test_tui_config(
+        llm: Arc<dyn LlmClient>,
+        secret_provider: Arc<StaticSecretProvider>,
+    ) -> TuiConfig {
+        TuiConfig {
+            target_name: "prod-web".into(),
+            confirm_mode: CommandConfirmMode::Always,
+            llm_profile: "glm".into(),
+            initial_messages: Vec::new(),
+            initial_input_history: Vec::new(),
+            initial_llm_profile: None,
+            initial_tokens_in: 0,
+            initial_tokens_out: 0,
+            initial_cost_usd: None,
+            initial_per_profile: HashMap::new(),
+            initial_last_served_model: None,
+            initial_model_per_profile: HashMap::new(),
+            ssh_target: None,
+            initial_ssh_info: None,
+            is_local: true,
+            secret_provider,
+            profiles: vec![filar_core::LlmProfile {
+                name: "glm".into(),
+                model: "glm-5.1".into(),
+                api_base_url: "http://localhost".into(),
+                max_tokens: 1024,
+                key_env: String::new(),
+                temperature: None,
+                top_p: None,
+                extra_body: None,
+                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
+            }],
+            default_profile_name: "glm".into(),
+            llm_factory: Arc::new(move |_, _| Ok(Arc::clone(&llm))),
+            key_checker: Arc::new(|_| None),
+            ssh_targets: Vec::new(),
+            log_rx: None,
+            save_dir: None,
+            save_runbook: true,
+            command_timeout: std::time::Duration::from_secs(30),
+            arbiter_enabled: false,
+            arbiter_profile: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_done_export_starts_the_runbook_and_reports_through_the_channel() {
+        let dir = runbook_temp_dir("done");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let provider = Arc::new(filar_core::StaticSecretProvider::new());
+        let llm: Arc<dyn LlmClient> = Arc::new(ScriptedLlm::answering(&long_runbook("")));
+        let config = test_tui_config(llm, Arc::clone(&provider));
+
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        // The runner wires these from the config after construction; the
+        // runbook resolves its LLM through `app.profiles`.
+        app.profiles = config.profiles.clone();
+        app.push_message(ChatBlock::Command {
+            command: "systemctl status nginx".into(),
+            explanation: "check the service".into(),
+            output: Some("active (running)".into()),
+            approved: true,
+        });
+        app.runbook_armed = Some(crate::app::RunbookArmed {
+            session_id: app.sessions[0].id,
+            target_dir: dir.clone(),
+            messages: app.sessions[0].messages.clone(),
+            session_name: "prod-web".into(),
+            ssh_info: None,
+            profile: "glm".into(),
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        apply_save_progress(
+            &mut app,
+            SaveProgress::Done("prod-web/db-1.md".into()),
+            &config.llm_factory,
+            &config.secret_provider,
+            &tx,
+        );
+
+        assert_eq!(app.runbook_state, Some(RunbookState::Generating), "the call is in flight");
+        let report = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the runbook must report back")
+            .expect("channel is open");
+        match report {
+            SaveProgress::RunbookDone { sid, outcome, usage, profile } => {
+                assert_eq!(sid, app.sessions[0].id);
+                assert_eq!(outcome.unwrap(), "prod-web/db-1.runbook.md");
+                assert!(usage.is_some(), "billing data rides along");
+                assert_eq!(profile, "glm");
+            }
+            other => panic!("expected RunbookDone, got {other:?}"),
+        }
+        let written = tokio::fs::read_to_string(dir.join("db-1.runbook.md")).await.unwrap();
+        assert!(written.contains("Symptom"), "the runbook lands beside the export");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_export_drops_the_armed_runbook() {
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.runbook_armed = Some(crate::app::RunbookArmed {
+            session_id: app.sessions[0].id,
+            target_dir: std::path::PathBuf::from("exports/prod-web"),
+            messages: app.sessions[0].messages.clone(),
+            session_name: "prod-web".into(),
+            ssh_info: None,
+            profile: "glm".into(),
+        });
+        let provider = Arc::new(filar_core::StaticSecretProvider::new());
+        let llm: Arc<dyn LlmClient> = Arc::new(ScriptedLlm::answering(&long_runbook("")));
+        let config = test_tui_config(llm, provider);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        apply_save_progress(
+            &mut app,
+            SaveProgress::Error("disk full".into()),
+            &config.llm_factory,
+            &config.secret_provider,
+            &tx,
+        );
+
+        assert!(app.runbook_armed.is_none(), "a failed export must drop the job");
+        assert!(app.save_error.is_some());
     }
 }

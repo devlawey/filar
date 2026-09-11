@@ -269,6 +269,30 @@ if let Ok(summary) = outcome.summary {
 If you drive the summarising call from a task the user can cancel, guard it —
 otherwise a cancelled fold keeps billing for a result you are going to discard.
 
+### `generate_runbook` — folding a session into a procedure
+
+```rust
+pub async fn generate_runbook(llm: &dyn LlmClient, transcript: &str) -> RunbookOutcome;
+
+pub struct RunbookOutcome {
+    pub usage: Option<TokenUsage>,
+    pub runbook: Result<String>,
+}
+```
+
+Same shape as `summarise_history`, and for the same reason: the request is
+billed before the reply can be judged, so `usage` comes back even when
+`runbook` is `Err`. `Err` covers both transport failures and replies shorter
+than `MIN_RUNBOOK_CHARS` (80) — treat them alike: write no document and leave
+the caller's files alone.
+
+Two differences matter when you build on it. The runbook is meant to be
+*shared*, so run both the transcript you hand over and the reply, before
+writing it, through `filar_core::redact_secrets(text, &provider)` — a
+`$FILAR_SECRET_N` value must not reach the document through either door. And
+the call carries no tool definitions: the model writing a procedure must not
+be able to run anything, the same rule as the summary writer.
+
 ### `Session::folded_history` — where the folded turns live
 
 ```rust

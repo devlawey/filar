@@ -42,6 +42,15 @@ pub struct Config {
     #[serde(default)]
     pub save_dir: Option<PathBuf>,
 
+    /// When `true` (the default), an explicit Ctrl+S in the TUI also asks the
+    /// session's LLM for a **runbook** — the session folded into a reusable
+    /// procedure — written next to the export as `{stem}.runbook.md`. Set to
+    /// `false` to keep Ctrl+S purely local: no network call, only the `.md`.
+    /// The silent Explain-mode transcript save never generates runbooks,
+    /// regardless of this setting (#401).
+    #[serde(default = "default_save_runbook")]
+    pub save_runbook: bool,
+
     /// Optional named LLM profile used as the command arbiter.
     /// When unset or invalid, the session profile is used instead.
     #[serde(default)]
@@ -64,6 +73,7 @@ impl Default for Config {
             timeouts: TimeoutConfig::default(),
             confirm_mode: CommandConfirmMode::Allowlist,
             save_dir: None,
+            save_runbook: default_save_runbook(),
             arbiter_profile: None,
             arbiter_enabled: default_arbiter_enabled(),
         }
@@ -71,6 +81,13 @@ impl Default for Config {
 }
 
 fn default_arbiter_enabled() -> bool {
+    true
+}
+
+/// Runbook generation alongside the Ctrl+S export is on by default: the
+/// export is already an explicit user action, and the feature is what the
+/// second file is for. Opt-out, like the arbiter (#401).
+fn default_save_runbook() -> bool {
     true
 }
 
@@ -560,6 +577,25 @@ api_base_url = "https://open.bigmodel.cn/api/paas/v4"
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.arbiter_enabled);
         assert!(cfg.arbiter_profile.is_none());
+    }
+
+    #[test]
+    fn runbook_generation_is_on_by_default_and_optout_parses() {
+        // A config that predates the setting gets runbooks; an explicit
+        // `false` turns Ctrl+S back into a purely local save (#401).
+        let minimal = r#"
+[llm]
+model = "glm-5.1"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+"#;
+        let cfg: Config = toml::from_str(minimal).unwrap();
+        assert!(cfg.save_runbook, "runbook generation must default to on");
+
+        // The key must sit at the document root — after a `[llm]` header it
+        // would land inside that table and the setting would not parse.
+        let opted_out = format!("save_runbook = false\n{minimal}");
+        let cfg: Config = toml::from_str(&opted_out).unwrap();
+        assert!(!cfg.save_runbook);
     }
 
     #[test]

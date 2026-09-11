@@ -6509,6 +6509,73 @@ issue scenario interactively on Windows (two sessions to different targets,
 Ctrl+S in each, files land in different folders) — the agent environment
 cannot drive the TUI.
 
+## Issue #401: feat(tui) — a runbook written next to the Ctrl+S export
+
+**Milestone:** 1.0.7. **Branch:** `feat/401-runbook-export`.
+
+**Problem.** Ctrl+S wrote the protocol — the linear transcript — but the
+procedure folded out of the session (what was done, in what order, how to read
+each output) stayed in the user's head. The ask: a second `.md` with the
+session turned into a reusable procedure, without the save path ever reaching
+the network on a save the user did not trigger.
+
+**Change.** An explicit Ctrl+S arms a runbook job in `App::start_save` from
+the same snapshot the export is written from (messages, session name,
+`ssh_info`, target folder, resolved profile); generation starts in the runner
+only when `SaveProgress::Done` arrives — the `.md` is on disk before any call.
+The silent path (`save_transcript_silent`: F2, tab close, quit, Explain exit)
+never arms anything and makes no network call. `take_runbook_job` skips a
+session without an approved command — no call, `RunbookState::Skipped` plus a
+feed note; a failed export drops the armed job.
+
+**Generation.** `filar_agent::generate_runbook` mirrors `summarise_history`:
+one non-streaming `LlmClient::chat`, no tools, `RunbookOutcome { usage,
+runbook }` with usage owed even when the reply is rejected (under
+`MIN_RUNBOOK_CHARS` = 80). The system prompt demands a procedure — symptom,
+preconditions, steps with output reading, exit criteria, next actions —
+generalised to placeholders (`<host>`, `<user>`, `<service>`) with an explicit
+secret ban. The transcript handed over is `messages_to_markdown` (the exact
+text the export is written from) passed through `redact_secrets`, and the
+reply passes `redact_secrets` again before it is written, so a
+`$FILAR_SECRET_N` value cannot reach `{stem}.runbook.md` through either door.
+
+**Cancellation and cost.** Ctrl+Z cancels the token and the in-flight request
+itself (`tokio::select!`, the #394 pattern); the `.md` is kept and the feed
+says so. One generation at a time — a second Ctrl+S while one runs says so and
+still saves the export. Usage is charged to the owning session via
+`record_summary_usage_for` (it survives a tab switch, and a rejected reply is
+still billed). A provider or write failure is a feed note
+(`RunbookState::Failed`) and never a broken save. The overlay's status row
+distinguishes `Generating runbook...` / `Runbook skipped (no commands)` /
+`Runbook cancelled` / `Runbook failed` from `Done!`.
+
+**Config.** `save_runbook` (root key, default `true`, opt-out) is carried
+through `TuiConfig` into `App::runbook_enabled`; when off, Ctrl+S behaves
+exactly as before.
+
+Unifying the save-progress handling closed a latent hole as a side effect: the
+select-loop drain now runs the same `apply_save_progress` as the blocking
+branch, so a `TranscriptDone` queued behind another event can no longer be
+swallowed by the drain.
+
+**Tests.** Ten `app.rs` tests (arming snapshot, silent path never arms, skip/
+accept on commands, disabled config, one-at-a-time, Ctrl+Z, both
+`finish_runbook` outcomes, vanished tab), eight `runner.rs` tests driving
+`apply_save_progress`/`build_runbook_file` into a temp dir (path naming, the
+secret sweep, write-and-report, cancellation writes nothing, failure leaves
+the `.md` untouched, short reply reported with usage, `Done` starts, `Error`
+drops), four new `save_overlay` status tests, plus `redact_secrets` tests in
+`filar-core` and the `generate_runbook` suite in `filar-agent`.
+
+**Verification:** `cargo build --workspace`, `cargo test --workspace`. The
+issue's manual TUI run (Ctrl+S on a live session, Ctrl+Z mid-generation)
+cannot be driven from the agent environment — stated in the PR. The
+`crates/agent/src/**` change triggers the eval-smoke workflow.
+
+**Next steps:** with #401 merged, milestone 1.0.7 has no open issues left;
+`prepare-release` for 1.0.7 follows, with a human interactive pass over the
+export scenarios from #400/#401 in the `docs/SMOKE.md` checklist.
+
 ## Release v1.0.6 (2026-09-04)
 
 **Scope:** milestone 1.0.6 — history compaction: context-fill tracking and

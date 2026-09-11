@@ -32,6 +32,13 @@ command_secs = 300
 llm_secs = 60
 connect_secs = 15
 
+# ── Session export (Ctrl+S) ──────────────────────────────────────────
+# An explicit Ctrl+S also writes a runbook next to the .md — the session
+# folded into a generalised procedure ({stem}.runbook.md, same folder).
+# The call is cancellable with Ctrl+Z and its cost is charged to the
+# session. Silent saves (Explain F2, exit) never call the model.
+# save_runbook = true
+
 # ── SSH targets ──────────────────────────────────────────────────────
 # "local" (built-in) = commands run on your machine, no SSH needed.
 # Add your servers below. To connect, select the name in the GUI Target dropdown

@@ -14,6 +14,7 @@ pub mod events;
 pub mod long_wait;
 pub mod openai_compat;
 pub mod password_prompt;
+pub mod runbook;
 pub mod security;
 pub mod tools;
 
@@ -23,6 +24,7 @@ pub use arbiter::{ArbiterContext, ArbiterVerdict, ARBITER_TIMEOUT_SECS};
 pub use compaction::{summarise_history, SummaryOutcome, COMPACTION_SYSTEM_PROMPT};
 pub use events::{AgentEvent, EventSink};
 pub use openai_compat::OpenAiCompatClient;
+pub use runbook::{generate_runbook, RunbookOutcome, RUNBOOK_SYSTEM_PROMPT};
 pub use security::{CliConfirmer, CommandConfirmer, ConfirmDecision};
 pub use tools::{tool_definitions, ToolKind};
 

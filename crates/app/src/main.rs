@@ -639,6 +639,7 @@ async fn run() -> anyhow::Result<()> {
         },
         ssh_targets: launch_ssh_targets,
         save_dir: launch_save_dir,
+        save_runbook: config.save_runbook,
         command_timeout,
         arbiter_enabled: config.arbiter_enabled,
         // GUI: from pending_launch (including explicit None = same as session).

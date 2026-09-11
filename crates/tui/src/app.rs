@@ -285,6 +285,14 @@ pub struct App {
     pub save_tx: Option<tokio::sync::mpsc::UnboundedSender<SaveProgress>>,
     /// Directory where Ctrl+S session exports are written (`None` = CWD).
     pub save_dir: Option<std::path::PathBuf>,
+    /// Whether Ctrl+S also generates a runbook (#401, `save_runbook`).
+    pub runbook_enabled: bool,
+    /// Runbook job armed by the save currently in flight, if any.
+    pub runbook_armed: Option<RunbookArmed>,
+    /// Status of the current/last runbook, shown in the save overlay.
+    pub runbook_state: Option<RunbookState>,
+    /// Cancellation token for an in-flight runbook generation (Ctrl+Z).
+    pub runbook_cancel: Option<tokio_util::sync::CancellationToken>,
     /// Whether the session-selection overlay is visible (F3).
     pub session_select_visible: bool,
     /// Cursor position in the session-selection overlay.
@@ -554,6 +562,10 @@ impl App {
             save_in_flight: false,
             save_tx: None,
             save_dir: None,
+            runbook_enabled: true,
+            runbook_armed: None,
+            runbook_state: None,
+            runbook_cancel: None,
             session_select_visible: false,
             session_select_index: 0,
             session_select_metas: Vec::new(),
@@ -912,6 +924,54 @@ pub enum SaveProgress {
     Error(String),  // error message
     /// Silent transcript save completed. `None` = success, `Some` = error.
     TranscriptDone(SessionId, Option<String>),
+    /// Runbook generation finished (#401). `outcome` is the runbook's path
+    /// relative to the export root on success, or the reason to show in the
+    /// feed. `usage` is charged either way — the call was billed.
+    RunbookDone {
+        sid: SessionId,
+        outcome: std::result::Result<String, String>,
+        usage: Option<filar_agent::TokenUsage>,
+        profile: String,
+    },
+}
+
+/// A runbook job armed by an explicit Ctrl+S, handed to the runner when the
+/// `.md` has been written (#401).
+///
+/// Only [`App::start_save`] creates one, and it does so before the save task
+/// is spawned: everything the generation needs — the transcript snapshot, the
+/// folder, the profile — is captured from the state the export was made from,
+/// so the runbook and the `.md` can never describe different sessions. A
+/// failure of the export itself drops the job ([`SaveProgress::Error`]).
+pub struct RunbookArmed {
+    /// Tab the export belongs to — its feed gets the outcome.
+    pub session_id: SessionId,
+    /// Folder the `.md` was written into; the runbook lands beside it.
+    pub target_dir: std::path::PathBuf,
+    /// The same session snapshot the `.md` was written from.
+    pub messages: Vec<ChatBlock>,
+    /// Session / SSH labels for the transcript header.
+    pub session_name: String,
+    pub ssh_info: Option<String>,
+    /// The LLM profile the user was on when Ctrl+S was pressed.
+    pub profile: String,
+}
+
+/// State of the runbook that accompanies a Ctrl+S export, shown in the save
+/// overlay and announced in the feed (#401).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunbookState {
+    /// The LLM call is in flight.
+    Generating,
+    /// `{stem}.runbook.md` is on disk.
+    Saved,
+    /// The session had no executed commands — nothing to fold into a
+    /// procedure, and no call was made.
+    Skipped,
+    /// The user cancelled with Ctrl+Z; the `.md` is untouched.
+    Cancelled,
+    /// The call or the write failed; the `.md` is untouched.
+    Failed,
 }
 
 /// Convert a Unix timestamp (seconds) to broken-down UTC time.
@@ -1131,7 +1191,10 @@ async fn generate_save_filename(
 }
 
 /// Convert a list of [`ChatBlock`] messages into a Markdown string.
-fn messages_to_markdown(messages: &[ChatBlock], session_name: &str, ssh_info: &Option<String>) -> String {
+///
+/// `pub(crate)` because the runbook task (#401) hands the LLM the exact
+/// transcript conversion the `.md` export is written from.
+pub(crate) fn messages_to_markdown(messages: &[ChatBlock], session_name: &str, ssh_info: &Option<String>) -> String {
     let mut md = String::new();
     md.push_str(&format!("# Session: {session_name}\n\n"));
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z").to_string();
@@ -1502,10 +1565,21 @@ impl App {
     /// summariser from the #377 spec a place to plug into: it would set this
     /// field and nothing here would change.
     fn record_summary_usage(&mut self, usage: &filar_agent::TokenUsage, profile: String) {
+        let idx = self.active;
+        self.record_summary_usage_for(idx, usage, profile);
+    }
+
+    /// Charge `usage` to session `idx` as `profile` computed it (#391).
+    ///
+    /// Split out of [`Self::record_summary_usage`] so a runbook completing
+    /// for a background tab is billed to *that* tab even though the user has
+    /// since switched away — the call was made on its session, and the
+    /// outcome lands in its feed (#401).
+    fn record_summary_usage_for(&mut self, idx: usize, usage: &filar_agent::TokenUsage, profile: String) {
         let tokens_in = usage.prompt_tokens.unwrap_or(0);
         let tokens_out = usage.completion_tokens.unwrap_or(0);
         let cost = usage.cost;
-        let s = self.active_session_mut();
+        let s = &mut self.sessions[idx];
         s.tokens_in += tokens_in;
         s.tokens_out += tokens_out;
         if let Some(c) = cost {
@@ -1908,6 +1982,18 @@ impl App {
     /// - Confirming: deny the pending command (stay in the app).
     /// - Other modes: no-op.
     fn cancel_work(&mut self) {
+        // A runbook generation may be in flight whatever brought the user
+        // here: it outlives the export that spawned it, so Ctrl+Z is the
+        // one way to stop paying for it (#401). Cancel before the mode
+        // dispatch, and say so — without a note the abandoned call would
+        // look like it had failed instead of being stopped on purpose.
+        if let Some(token) = self.runbook_cancel.take() {
+            token.cancel();
+            self.runbook_state = Some(RunbookState::Cancelled);
+            self.push_message(ChatBlock::System(
+                "Runbook generation cancelled — the session export is saved.".into(),
+            ));
+        }
         match self.mode {
             AppMode::Thinking => {
                 if let Some(ref token) = self.cancellation {
@@ -2019,6 +2105,33 @@ impl App {
         let dir_name = export_dir_name(&session_name, &ssh_info);
         let target_dir = base_dir.join(&dir_name);
 
+        // Arm the runbook before the save task is spawned (#401): the job
+        // carries the same snapshot the `.md` is written from, so the two
+        // files can never describe different sessions. The runner starts it
+        // only once the `.md` is on disk (`SaveProgress::Done`); an export
+        // failure drops it. One generation at a time: a second Ctrl+S while
+        // the previous runbook is still in flight exports without one.
+        if self.runbook_enabled {
+            if self.runbook_state == Some(RunbookState::Generating) {
+                self.push_message(ChatBlock::System(
+                    "A runbook is already being generated — this export is saved without one.".into(),
+                ));
+            } else {
+                let profile = self
+                    .llm_profile
+                    .clone()
+                    .unwrap_or_else(|| self.default_profile_name.clone());
+                self.runbook_armed = Some(RunbookArmed {
+                    session_id: self.sessions[self.active].id,
+                    target_dir: target_dir.clone(),
+                    messages: messages.clone(),
+                    session_name: session_name.clone(),
+                    ssh_info: ssh_info.clone(),
+                    profile,
+                });
+            }
+        }
+
         tokio::spawn(async move {
             tx.send(SaveProgress::Started).ok();
 
@@ -2065,6 +2178,63 @@ impl App {
     /// Esc while the task was still running.
     pub fn finish_save(&mut self) {
         self.save_in_flight = false;
+    }
+
+    /// Hand the armed runbook job to the runner, or settle it here (#401).
+    ///
+    /// Called once the export's `.md` is on disk. A session with no approved
+    /// commands folds into nothing worth calling an LLM for — the issue is
+    /// explicit that it is skipped without a request — so the job is dropped,
+    /// the state settles on `Skipped`, and the tab's feed says why.
+    pub fn take_runbook_job(&mut self) -> Option<RunbookArmed> {
+        let armed = self.runbook_armed.take()?;
+        let has_commands = armed
+            .messages
+            .iter()
+            .any(|b| matches!(b, ChatBlock::Command { approved: true, .. }));
+        if !has_commands {
+            self.runbook_state = Some(RunbookState::Skipped);
+            if let Some(idx) = self.find_session_idx(armed.session_id) {
+                self.sessions[idx].messages.push(ChatBlock::System(
+                    "Runbook not created: the session has no executed commands to fold into a procedure.".into(),
+                ));
+                self.sessions[idx].message_rev = self.sessions[idx].message_rev.wrapping_add(1);
+            }
+            return None;
+        }
+        Some(armed)
+    }
+
+    /// Apply the outcome of a runbook generation (#401): overlay status, a
+    /// note in the owning tab's feed, and the call's cost.
+    ///
+    /// `usage` is charged even on failure — a call that produced a too-short
+    /// reply was still billed (#377 precedent). The note goes to the tab the
+    /// export belonged to, which may no longer be the active one; a since
+    /// closed tab changes nothing but the state.
+    pub fn finish_runbook(
+        &mut self,
+        sid: SessionId,
+        outcome: std::result::Result<String, String>,
+        usage: Option<filar_agent::TokenUsage>,
+        profile: String,
+    ) {
+        self.runbook_cancel = None;
+        let (state, note) = match &outcome {
+            Ok(path) => (RunbookState::Saved, format!("Runbook saved to {path}")),
+            Err(e) => (
+                RunbookState::Failed,
+                format!("Runbook not generated ({e}). The session export is saved."),
+            ),
+        };
+        self.runbook_state = Some(state);
+        if let Some(idx) = self.find_session_idx(sid) {
+            if let Some(u) = usage {
+                self.record_summary_usage_for(idx, &u, profile);
+            }
+            self.sessions[idx].messages.push(ChatBlock::System(note));
+            self.sessions[idx].message_rev = self.sessions[idx].message_rev.wrapping_add(1);
+        }
     }
 
     /// Silently save the transcript for the active session (Explain mode only).
@@ -9678,6 +9848,253 @@ mod tests {
             Some(expected_parent.as_path()),
             "transcript must sit in the per-target folder"
         );
+    }
+
+    // ── Runbook beside the Ctrl+S export (#401) ──────────────────────
+
+    /// A command block; only `approved: true` means it actually ran.
+    fn command_block(command: &str, approved: bool) -> ChatBlock {
+        ChatBlock::Command {
+            command: command.into(),
+            explanation: "explain".into(),
+            output: approved.then(|| "ok".to_string()),
+            approved,
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_s_arms_a_runbook_from_the_snapshot_the_export_uses() {
+        let base = std::env::temp_dir().join(format!("filar_runbook_arm_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.save_dir = Some(base.clone());
+        // An SSH tab: the folder comes from the target name (#400).
+        app.sessions[0].ssh_info = Some("root@10.0.0.5".into());
+        app.sessions[0].llm_profile = Some("glm".into());
+        app.push_message(command_block("systemctl restart nginx", true));
+
+        let done = run_save_to_completion(&mut app).await;
+        assert!(done.starts_with("prod-web/"), "export goes to the target folder, got {done}");
+
+        let armed = app.runbook_armed.as_ref().expect("Ctrl+S must arm a runbook");
+        assert_eq!(armed.session_id, app.sessions[0].id);
+        assert_eq!(armed.profile, "glm", "the runbook uses the session's profile");
+        assert_eq!(armed.target_dir, base.join("prod-web"));
+        assert_eq!(armed.session_name, "prod-web");
+        // Folded from the same full history the `.md` was written from (#379).
+        let md = messages_to_markdown(&armed.messages, &armed.session_name, &armed.ssh_info);
+        assert!(md.contains("systemctl restart nginx"), "snapshot must carry the session");
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn explain_transcript_save_never_arms_a_runbook() {
+        let base = std::env::temp_dir().join(format!("filar_runbook_silent_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Explain);
+        app.save_dir = Some(base.clone());
+        app.sessions[0].transcript_path = Some(base.join("prod-web").join("t.md"));
+        app.push_message(command_block("df -h", true));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.save_tx = Some(tx);
+
+        app.save_transcript_silent();
+        loop {
+            match rx.recv().await.expect("silent save must report its outcome") {
+                SaveProgress::TranscriptDone(..) => break,
+                other => panic!("the silent path must send nothing but TranscriptDone, got {other:?}"),
+            }
+        }
+
+        // The silent save does no network work: no runbook job is armed
+        // (the only thing that starts an LLM call) and no status appears.
+        assert!(app.runbook_armed.is_none(), "the silent path must not arm a runbook");
+        assert!(app.runbook_state.is_none(), "and must not touch the overlay status");
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[test]
+    fn take_runbook_job_skips_a_session_without_executed_commands() {
+        let mut app = App::new("local-1".into(), CommandConfirmMode::Always);
+        // Small talk and a denied command — nothing was run, nothing to fold.
+        app.sessions[0].messages.push(ChatBlock::User("привет".into()));
+        app.sessions[0].messages.push(command_block("rm -rf /", false));
+        app.runbook_armed = Some(RunbookArmed {
+            session_id: app.sessions[0].id,
+            target_dir: std::path::PathBuf::from("exports/local"),
+            messages: app.sessions[0].messages.clone(),
+            session_name: "local-1".into(),
+            ssh_info: None,
+            profile: "glm".into(),
+        });
+
+        assert!(app.take_runbook_job().is_none(), "no executed commands — no LLM call");
+        assert_eq!(app.runbook_state, Some(RunbookState::Skipped));
+        assert!(app.runbook_armed.is_none(), "the job is consumed either way");
+        let last = app.sessions[0].messages.last().expect("skip must be explained");
+        match last {
+            ChatBlock::System(text) => assert!(text.contains("no executed commands"), "got: {text}"),
+            other => panic!("expected a system note, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn take_runbook_job_accepts_a_session_with_an_approved_command() {
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.sessions[0].messages.push(command_block("systemctl restart nginx", true));
+        app.runbook_armed = Some(RunbookArmed {
+            session_id: app.sessions[0].id,
+            target_dir: std::path::PathBuf::from("exports/prod-web"),
+            messages: app.sessions[0].messages.clone(),
+            session_name: "prod-web".into(),
+            ssh_info: None,
+            profile: "glm".into(),
+        });
+
+        let job = app.take_runbook_job().expect("an approved command must pass the gate");
+        assert_eq!(job.profile, "glm");
+        assert_eq!(job.messages.len(), 2, "greeting + command");
+        assert_eq!(app.runbook_state, None, "the runner owns the state once the job is taken");
+    }
+
+    #[tokio::test]
+    async fn runbook_is_not_armed_when_disabled() {
+        let base = std::env::temp_dir().join(format!("filar_runbook_off_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.save_dir = Some(base.clone());
+        app.runbook_enabled = false;
+        app.push_message(command_block("uptime", true));
+
+        // The export still happens — the setting only turns off the LLM part.
+        let _ = run_save_to_completion(&mut app).await;
+        assert!(app.runbook_armed.is_none(), "save_runbook = false must not call the LLM");
+        assert!(app.runbook_state.is_none());
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn a_second_export_does_not_arm_while_a_runbook_is_generating() {
+        let base = std::env::temp_dir().join(format!("filar_runbook_busy_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.save_dir = Some(base.clone());
+        app.push_message(command_block("uptime", true));
+        app.runbook_state = Some(RunbookState::Generating);
+
+        let _ = run_save_to_completion(&mut app).await;
+        assert!(app.runbook_armed.is_none(), "one generation at a time");
+        let last = app.sessions[0].messages.last().expect("must explain the omission");
+        match last {
+            ChatBlock::System(text) => assert!(text.contains("already being generated"), "got: {text}"),
+            other => panic!("expected a system note, got {other:?}"),
+        }
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[test]
+    fn ctrl_z_cancels_an_in_flight_runbook() {
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        let token = tokio_util::sync::CancellationToken::new();
+        app.runbook_cancel = Some(token.clone());
+        app.runbook_state = Some(RunbookState::Generating);
+
+        app.cancel_work();
+
+        assert!(token.is_cancelled(), "Ctrl+Z must abort the request itself");
+        assert!(app.runbook_cancel.is_none(), "the token is consumed");
+        assert_eq!(app.runbook_state, Some(RunbookState::Cancelled));
+        let last = app.sessions[0].messages.last().expect("cancellation must be visible");
+        match last {
+            ChatBlock::System(text) => {
+                assert!(text.contains("Runbook generation cancelled"), "got: {text}");
+                assert!(text.contains("export is saved"), "the .md is kept: {text}");
+            }
+            other => panic!("expected a system note, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_runbook_reports_the_path_and_charges_the_call() {
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        // The user has since switched tabs; the cost must still land on the
+        // session that made the call, and the note in its feed.
+        app.new_tab();
+        app.finish_runbook(
+            sid,
+            Ok("prod-web/db-2026.runbook.md".into()),
+            Some(filar_agent::TokenUsage {
+                prompt_tokens: Some(1200),
+                completion_tokens: Some(300),
+                total_tokens: Some(1500),
+                cost: Some(0.0042),
+            }),
+            "glm".into(),
+        );
+
+        assert_eq!(app.runbook_state, Some(RunbookState::Saved));
+        assert_eq!(app.sessions[0].tokens_in, 1200);
+        assert_eq!(app.sessions[0].tokens_out, 300);
+        assert!((app.sessions[0].cost_usd.unwrap() - 0.0042).abs() < 1e-9);
+        assert_eq!(app.sessions[0].per_profile["glm"].tokens_in, 1200);
+        match app.sessions[0].messages.last().unwrap() {
+            ChatBlock::System(text) => {
+                assert!(text.contains("Runbook saved to prod-web/db-2026.runbook.md"), "got: {text}")
+            }
+            other => panic!("expected a system note, got {other:?}"),
+        }
+        assert!(
+            matches!(app.sessions[1].messages.last().unwrap(), ChatBlock::System(s) if s.contains("Connected to")),
+            "the other tab stays untouched"
+        );
+    }
+
+    #[test]
+    fn finish_runbook_failure_names_the_reason_and_keeps_the_export() {
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        app.runbook_state = Some(RunbookState::Generating);
+        app.runbook_cancel = Some(tokio_util::sync::CancellationToken::new());
+        app.finish_runbook(
+            sid,
+            Err("provider timeout".into()),
+            Some(filar_agent::TokenUsage {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(0),
+                total_tokens: Some(100),
+                cost: None,
+            }),
+            "glm".into(),
+        );
+
+        assert_eq!(app.runbook_state, Some(RunbookState::Failed));
+        assert!(app.runbook_cancel.is_none(), "the in-flight token is cleared");
+        assert_eq!(app.sessions[0].tokens_in, 100, "a billed failure is still billed");
+        match app.sessions[0].messages.last().unwrap() {
+            ChatBlock::System(text) => {
+                assert!(text.contains("provider timeout"), "got: {text}");
+                assert!(text.contains("export is saved"), "the .md is kept: {text}");
+            }
+            other => panic!("expected a system note, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_runbook_for_a_vanished_tab_settles_the_state_only() {
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        // A tab closed while its runbook was generating: the file (if it was
+        // written) stays, and nothing panics over the missing session.
+        app.finish_runbook(SessionId::next(), Ok("local/x.runbook.md".into()), None, "glm".into());
+        assert_eq!(app.runbook_state, Some(RunbookState::Saved));
     }
 
     #[test]

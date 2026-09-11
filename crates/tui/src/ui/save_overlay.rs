@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, RunbookState};
 
 const OVERLAY_WIDTH: u16 = 50;
 const OVERLAY_HEIGHT: u16 = 8;
@@ -64,13 +64,21 @@ pub(crate) fn render_save_overlay(f: &mut Frame, app: &App, area: Rect) {
         .ratio((f64::from(progress) / 100.0).clamp(0.0, 1.0));
     f.render_widget(gauge, bar_area);
 
-    // Row 3: status text.
+    // Row 3: status text. At 100% the runbook may still be generating or
+    // have ended in a state worth naming; its failure never breaks the
+    // export, so the overlay distinguishes the two (#401).
     let status = if let Some(ref err) = app.save_error {
         format!("Error: {err}")
     } else if progress < 100 {
         "Saving...".to_string()
     } else {
-        "Done!".to_string()
+        match app.runbook_state {
+            Some(RunbookState::Generating) => "Generating runbook...".to_string(),
+            Some(RunbookState::Skipped) => "Runbook skipped (no commands)".to_string(),
+            Some(RunbookState::Cancelled) => "Runbook cancelled".to_string(),
+            Some(RunbookState::Failed) => "Runbook failed".to_string(),
+            Some(RunbookState::Saved) | None => "Done!".to_string(),
+        }
     };
     let status_area = Rect::new(inner.x, inner.y + 3, inner.width, 1);
     f.render_widget(
@@ -154,5 +162,52 @@ mod tests {
         app.save_error = Some("disk full".into());
         let text = render_save_text(&app);
         assert!(text.contains("Error: disk full"), "must show error message");
+    }
+
+    #[test]
+    fn overlay_shows_runbook_generating_when_in_flight() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.save_overlay_visible = true;
+        app.save_progress = 100;
+        app.runbook_state = Some(RunbookState::Generating);
+        let text = render_save_text(&app);
+        assert!(
+            text.contains("Generating runbook..."),
+            "must show the in-flight runbook, not Done!"
+        );
+    }
+
+    #[test]
+    fn overlay_shows_runbook_skipped_when_no_commands() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.save_overlay_visible = true;
+        app.save_progress = 100;
+        app.runbook_state = Some(RunbookState::Skipped);
+        let text = render_save_text(&app);
+        assert!(
+            text.contains("Runbook skipped (no commands)"),
+            "must explain why no runbook was written"
+        );
+    }
+
+    #[test]
+    fn overlay_shows_runbook_cancelled_and_failed() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.save_overlay_visible = true;
+        app.save_progress = 100;
+        app.runbook_state = Some(RunbookState::Cancelled);
+        assert!(render_save_text(&app).contains("Runbook cancelled"));
+        app.runbook_state = Some(RunbookState::Failed);
+        assert!(render_save_text(&app).contains("Runbook failed"));
+    }
+
+    #[test]
+    fn overlay_renders_done_when_runbook_saved() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.save_overlay_visible = true;
+        app.save_progress = 100;
+        app.runbook_state = Some(RunbookState::Saved);
+        let text = render_save_text(&app);
+        assert!(text.contains("Done!"), "a saved runbook is still a done save");
     }
 }
