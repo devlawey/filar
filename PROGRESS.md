@@ -6618,7 +6618,10 @@ total-timeout bound.
 a body: `chat_reports_a_body_read_timeout_as_a_timeout` pins the honest error
 (on the old code it failed with "failed to parse API response"). Two
 `StreamOnlyLlm` mocks whose `chat()` always fails and `chat_stream()` serves
-the answer pin the runbook and the summary to the streaming path.
+the answer pin the runbook and the summary to the streaming path. The fake
+provider waits for the client to hang up after the timeout (read to EOF, no
+fixed sleep), so the helper task ends immediately once the test is done
+(review follow-up).
 
 **Verification:** `cargo build --workspace`, `cargo test --workspace`. The
 manual run from the issue's DoD (Ctrl+S on a long live session produces the

@@ -2244,9 +2244,12 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
                         Connection: close\r\n\r\n";
             let _ = socket.write_all(head.as_bytes()).await;
             let _ = socket.flush().await;
-            // Hold the connection open, bodyless, long past the client's
-            // timeout.
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            // Hold the connection open, bodyless, until the client's total
+            // timeout fires and it hangs up: the read then sees EOF and the
+            // task ends on its own, with nothing left sleeping behind the
+            // test.
+            let mut buf = [0u8; 1];
+            let _ = socket.read(&mut buf).await;
         });
 
         format!("http://{addr}")
