@@ -6621,7 +6621,11 @@ a body: `chat_reports_a_body_read_timeout_as_a_timeout` pins the honest error
 the answer pin the runbook and the summary to the streaming path. The fake
 provider waits for the client to hang up after the timeout (read to EOF, no
 fixed sleep), so the helper task ends immediately once the test is done
-(review follow-up).
+(review follow-up). On an error status the swallowed body-read failure was
+fixed too (`an_error_status_with_an_unreadable_body_keeps_the_status`): the
+status keeps its classification and the unreadable body is named beside it
+instead of posing as an empty one — in both `send_request` and
+`send_stream_request` (review follow-up).
 
 **Verification:** `cargo build --workspace`, `cargo test --workspace`. The
 manual run from the issue's DoD (Ctrl+S on a long live session produces the
