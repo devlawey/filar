@@ -287,9 +287,13 @@ fn deduplicate_profiles(profiles: &mut Vec<LlmProfileData>) {
 /// the OS credential store. See `filar_core::secrets::KeyringSecretProvider`.
 #[derive(Serialize, Deserialize)]
 pub struct LaunchConfig {
-    /// `"local"` or `"ssh"`.
+    /// Session label: `"local"` for local launches, otherwise the SSH
+    /// target's display name — the alias, or `SSH{n}` when the alias is
+    /// empty (#406). Never infer the transport from this string: use
+    /// `ssh.is_some()` — an alias may even be `"local"`.
     pub target: String,
-    /// SSH connection details (when target is "ssh").
+    /// SSH connection details; `Some` identifies an SSH launch and drives
+    /// the executor choice in `main` (#406).
     pub ssh: Option<SshConnection>,
     /// Model name (e.g. `"glm-5.1"`).
     pub model: String,
