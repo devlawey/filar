@@ -6663,6 +6663,39 @@ manual GUI run from the issue's DoD (SSH launch with an alias → Ctrl+S lands
 in the alias folder, the first line shows the alias, not `ssh`) cannot be
 driven from the agent environment — stated in the PR.
 
+## Issue #409: feat(tui) — a second progress bar for the runbook in the Ctrl+S overlay
+
+**Milestone:** 1.0.7. **Branch:** `feat/409-runbook-progress-bar`.
+
+**Problem.** The save overlay had a single bar for the raw `.md`; the
+runbook — a separate background job started once the `.md` is on disk — was
+announced only by a text line that swapped out the export's own status.
+
+**Change.** `save_overlay.rs` renders a second, captioned bar whenever the
+export has a runbook story (`runbook_bar`): `waiting for export` while
+armed, an animated indeterminate sweep while `Generating` (the LLM call has
+no measurable percentage), a full success bar on `Saved`, calm grey empty
+bars for `Skipped`/`Cancelled` and a red one for `Failed` — drawn with the
+theme's `bar_full`/`bar_empty` glyphs. The export's status line keeps
+`Saving...`/`Done!`/`Error` only; runbook states moved to the caption so
+nothing is announced twice. The overlay is 11 rows when the bar is present
+and the pre-#409 8 otherwise, and it claims that height up to the terminal's
+own: the old `2 * V_MARGIN` reservation squeezed the two-bar layout below
+its runbook rows at 30×12 (review follow-up). Every row is clipped to the
+inner area, so tiny terminals cannot panic. The runner's render-tick guard
+now also ticks while `App::runbook_bar_animating()` (overlay visible, call
+in flight) and stops once the runbook settles — idle CPU unchanged.
+
+**Tests.** `save_overlay.rs`: waiting / generating / saved / skipped /
+cancelled / failed captions, no second bar without a runbook or after an
+export error, the tick moves the indeterminate window; on 30×12 the runbook
+caption, its bar, and the export's status stay visible (review follow-up),
+and 20×6 still renders without panic.
+
+**Verification:** `cargo build --workspace`, `cargo test --workspace`. The
+manual TUI run from the issue's DoD cannot be driven from the agent
+environment — stated in the PR.
+
 ## Release v1.0.6 (2026-09-04)
 
 **Scope:** milestone 1.0.6 — history compaction: context-fill tracking and

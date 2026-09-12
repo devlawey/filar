@@ -1430,9 +1430,11 @@ async fn run_app(
             }
 
             // Render at most 60fps — batches multiple events into one draw.
-            // Also tick when in Thinking mode so the spinner animates, and while
+            // Also tick when in Thinking mode so the spinner animates, while
             // a toast is pending so it disappears on its own timer (~1.5s)
-            // without requiring further input.
+            // without requiring further input, and while the save overlay's
+            // runbook bar animates (#409) so its indeterminate window keeps
+            // moving.
             //
             // NB: the guard tests `app.toast.is_some()` (the field), not
             // `toast_text()` (which already applies the expiry). Gating on
@@ -1444,9 +1446,10 @@ async fn run_app(
             // guard is then false and ticking stops (CPU idle stays at zero).
             _ = render_interval.tick(), if needs_redraw
                 || app.mode == AppMode::Thinking
-                || app.toast.is_some() => {
+                || app.toast.is_some()
+                || app.runbook_bar_animating() => {
                 let tab_changed = prev_session != app.sessions[app.active].id;
-                if app.mode == AppMode::Thinking {
+                if app.mode == AppMode::Thinking || app.runbook_bar_animating() {
                     app.tick = app.tick.wrapping_add(1);
                 }
                 if prev_mode != app.mode || tab_changed {

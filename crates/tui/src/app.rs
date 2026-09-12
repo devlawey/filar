@@ -2193,6 +2193,17 @@ impl App {
         self.save_in_flight = false;
     }
 
+    /// Whether the save overlay is animating its runbook bar right now (#409).
+    ///
+    /// True while the overlay is visible and the runbook's LLM call is in
+    /// flight: the indeterminate bar needs frames, so the runner's render
+    /// tick keeps ticking until the runbook settles. A hidden overlay needs
+    /// none, and after a terminal state the TUI returns to event-driven
+    /// redraws (idle CPU stays at zero).
+    pub fn runbook_bar_animating(&self) -> bool {
+        self.save_overlay_visible && self.runbook_state == Some(RunbookState::Generating)
+    }
+
     /// Hand the armed runbook job to the runner, or settle it here (#401).
     ///
     /// Called once the export's `.md` is on disk. A session with no approved

@@ -25,6 +25,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   saves never make it. Opt out with `save_runbook = false`
   ([#401](https://github.com/devlawey/filar/issues/401)).
 
+- The `Ctrl+S` overlay now shows the runbook's progress as its own second
+  bar: waiting while the export is still being written, an indeterminate
+  sweep while the model works, then a settled saved / skipped / cancelled /
+  failed state — with the export's status line no longer standing in for it
+  ([#409](https://github.com/devlawey/filar/issues/409)).
+
 ### Changed
 
 - Ctrl+S exports and Explain-mode transcripts now go into a per-target
