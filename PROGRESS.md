@@ -6632,6 +6632,37 @@ manual run from the issue's DoD (Ctrl+S on a long live session produces the
 runbook next to the export) cannot be driven from the agent environment —
 stated in the PR; the `crates/agent/src/**` change triggers eval-smoke.
 
+## Issue #406: fix(tui) — GUI SSH sessions named after the alias, not `ssh`
+
+**Milestone:** 1.0.7. **Branch:** `fix/406-gui-target-alias`.
+
+**Problem.** The GUI launcher wrote the transport literal into the session
+label (`do_launch`: `target = if target_mode == 0 { "local" } else { "ssh" }`),
+so the TUI showed `Connected to: ssh`, saved sessions stored `target = "ssh"`
+and — since #400 — every Ctrl+S / explain export from any host landed in the
+same `save_dir/ssh/` folder. Found in the manual SMOKE pass following #401.
+
+**Change.** The launcher now derives the label with
+`filar_core::ssh_target_display_name` (alias, or `SSH{n}` when empty) via a
+testable `launch_target_name` helper; `crates/app` prefers the resolved
+`SshTarget.name` (`gui_launch_target_name`) with the launcher string as the
+fallback for local. Executor selection was decoupled from the label: it
+checks `ssh_target` first, so even a slot aliased `local` connects over SSH;
+the remaining `"local"` comparison only tells the local default apart from an
+unknown CLI target, which still bails with the same message.
+`launch.ssh.is_some()` remains the transport flag; the label is free to be an
+alias. No public contract changes.
+
+**Tests.** `launch_target_name_uses_the_alias_or_slot_number_not_the_literal_ssh`
+(GUI: `local`, alias, `SSH{n}`, never `ssh`) and
+`gui_launch_target_name_prefers_the_resolved_target_name` (app: alias,
+`SSH{n}`, local fallback).
+
+**Verification:** `cargo build --workspace`, `cargo test --workspace`. The
+manual GUI run from the issue's DoD (SSH launch with an alias → Ctrl+S lands
+in the alias folder, the first line shows the alias, not `ssh`) cannot be
+driven from the agent environment — stated in the PR.
+
 ## Release v1.0.6 (2026-09-04)
 
 **Scope:** milestone 1.0.6 — history compaction: context-fill tracking and

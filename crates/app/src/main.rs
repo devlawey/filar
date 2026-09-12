@@ -145,6 +145,24 @@ fn resolve_gui_ssh_target(s: &filar_gui::SshConnection) -> filar_core::SshTarget
     }
 }
 
+/// Session label for a GUI launch (#406).
+///
+/// Prefers the name already resolved from the SSH slot
+/// ([`resolve_gui_ssh_target`] → [`filar_core::ssh_target_display_name`]:
+/// alias, or `SSH{n}` for an empty alias), falling back to the launcher's
+/// own `target` string (plain `"local"`). Keeps the session label free of
+/// the transport literal while the executor choice — keyed off the SSH
+/// target itself — stays independent of it.
+fn gui_launch_target_name(
+    ssh_target: Option<&filar_core::SshTarget>,
+    launch_target: &str,
+) -> String {
+    match ssh_target {
+        Some(target) => target.name.clone(),
+        None => launch_target.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LLM client factory
 // ---------------------------------------------------------------------------
@@ -418,6 +436,9 @@ async fn run() -> anyhow::Result<()> {
                 let ssh_target = launch.ssh.map(|s| {
                     resolve_gui_ssh_target(&s)
                 });
+                // Session label: the alias (or SSH{n}) for SSH, `local`
+                // otherwise — never the transport literal (#406).
+                let target_name = gui_launch_target_name(ssh_target.as_ref(), &launch.target);
 
                 // Empty key_env = keyless local profile (#320): skip keyring lookup.
                 let key_env_name = launch.key_env.clone();
@@ -433,7 +454,7 @@ async fn run() -> anyhow::Result<()> {
                 };
 
                 (
-                    launch.target,
+                    target_name,
                     launch.session_id,
                     llm_config,
                     api_key,
@@ -524,14 +545,12 @@ async fn run() -> anyhow::Result<()> {
     info!(model = %llm_config.model, keyless = api_key.is_empty(), "LLM client initialised");
 
     // ── Create executor (local or SSH) ─────────────────────────────────
+    // Executor selection keys off `ssh_target` first: the session label can
+    // be an arbitrary alias (even `local`), so the transport must not be
+    // chosen by name. The name check below only separates the local default
+    // from an unknown CLI target, which still bails (#406).
     let command_timeout = Duration::from_secs(config.timeouts.command_secs);
-    let executor: Arc<dyn filar_transport::CommandExecutor> = if target_name == "local" {
-        info!("initialising local command executor");
-        Arc::new(LocalExecutor::with_timeout(command_timeout).await.map_err(|e| {
-            warn!(error = %e, "failed to create local executor");
-            anyhow::anyhow!(e)
-        })?)
-    } else if let Some(ref target) = ssh_target {
+    let executor: Arc<dyn filar_transport::CommandExecutor> = if let Some(ref target) = ssh_target {
         info!(host = %target.host, port = target.port, user = %target.user, "connecting via SSH");
         let ssh = SshExecutor::connect_with_config(
             target,
@@ -543,6 +562,12 @@ async fn run() -> anyhow::Result<()> {
             anyhow::anyhow!(e)
         })?;
         Arc::new(ssh)
+    } else if target_name == "local" {
+        info!("initialising local command executor");
+        Arc::new(LocalExecutor::with_timeout(command_timeout).await.map_err(|e| {
+            warn!(error = %e, "failed to create local executor");
+            anyhow::anyhow!(e)
+        })?)
     } else {
         anyhow::bail!(
             "SSH target '{target_name}' not found. Use the GUI launcher to enter SSH connection details."
@@ -664,7 +689,8 @@ mod tests {
     use filar_core::{LlmProfile, SecretProvider, StaticSecretProvider};
 
     use super::{
-        build_llm_client_from_profile, check_profile_api_key, resolve_gui_ssh_target,
+        build_llm_client_from_profile, check_profile_api_key, gui_launch_target_name,
+        resolve_gui_ssh_target,
     };
 
     // ── GUI→TUI SSH keyring handoff (#290) ──────────────────────────────
@@ -719,6 +745,26 @@ mod tests {
             }
             other => panic!("expected Password auth, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gui_launch_target_name_prefers_the_resolved_target_name() {
+        let aliased = filar_core::SshTarget {
+            name: "VPS DE".into(),
+            host: "10.0.0.1".into(),
+            port: 22,
+            user: "root".into(),
+            auth: filar_core::SshAuth::Password { password: None },
+            host_key_policy: filar_core::HostKeyPolicy::Tofu,
+        };
+        assert_eq!(gui_launch_target_name(Some(&aliased), "ssh"), "VPS DE");
+        let numbered = filar_core::SshTarget {
+            name: "SSH2".into(),
+            ..aliased
+        };
+        assert_eq!(gui_launch_target_name(Some(&numbered), "ssh"), "SSH2");
+        // Local launch keeps the launcher's own label.
+        assert_eq!(gui_launch_target_name(None, "local"), "local");
     }
 
     // ── Key resolution tests ────────────────────────────────────────────

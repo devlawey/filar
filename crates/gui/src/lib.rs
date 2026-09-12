@@ -287,9 +287,13 @@ fn deduplicate_profiles(profiles: &mut Vec<LlmProfileData>) {
 /// the OS credential store. See `filar_core::secrets::KeyringSecretProvider`.
 #[derive(Serialize, Deserialize)]
 pub struct LaunchConfig {
-    /// `"local"` or `"ssh"`.
+    /// Session label: `"local"` for local launches, otherwise the SSH
+    /// target's display name — the alias, or `SSH{n}` when the alias is
+    /// empty (#406). Never infer the transport from this string: use
+    /// `ssh.is_some()` — an alias may even be `"local"`.
     pub target: String,
-    /// SSH connection details (when target is "ssh").
+    /// SSH connection details; `Some` identifies an SSH launch and drives
+    /// the executor choice in `main` (#406).
     pub ssh: Option<SshConnection>,
     /// Model name (e.g. `"glm-5.1"`).
     pub model: String,
@@ -625,6 +629,23 @@ impl SshSlot {
             alias: self.alias.trim().chars().take(32).collect(),
             save_password: self.save_password,
         }
+    }
+}
+
+/// Session label for a GUI launch (#406).
+///
+/// `target_mode == 0` → `"local"`; an SSH slot → its display name via
+/// [`filar_core::ssh_target_display_name`] (alias, or `SSH{n}` for an empty
+/// one) — the same name as the keyring entry and the saved config target, so
+/// the session line, `SessionMeta.target` and the per-target export folder
+/// (#400) all read the alias. The transport literal `"ssh"` must never leak
+/// into the label again.
+fn launch_target_name(target_mode: usize, slots: &[SshSlot]) -> String {
+    if target_mode == 0 {
+        "local".to_string()
+    } else {
+        let idx = target_mode - 1;
+        filar_core::ssh_target_display_name(idx, &slots[idx].alias)
     }
 }
 
@@ -1283,7 +1304,7 @@ impl LauncherApp {
         let Some(p) = self.profiles.get(self.selected_profile) else {
             return;
         };
-        let target = if self.target_mode == 0 { "local" } else { "ssh" };
+        let target = launch_target_name(self.target_mode, &self.ssh_slots);
         let ssh = if self.target_mode > 0 {
             let slot = &self.ssh_slots[self.target_mode - 1];
             Some(SshConnection {
@@ -1322,7 +1343,7 @@ impl LauncherApp {
             &self.ssh_slots.iter().map(|s| s.to_profile()).collect::<Vec<_>>(),
         );
         let cfg = LaunchConfig {
-            target: target.to_string(), ssh,
+            target, ssh,
             model: p.model.clone(), api_base_url: p.api_base_url.clone(),
             api_key: sanitize_secret_clipboard(&p.api_key), session_id,
             temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
@@ -1577,6 +1598,23 @@ mod tests {
         // Secrets must be absent after deserialization (serde(skip) → default).
         assert!(loaded.api_key.is_empty());
         assert!(loaded.ssh.as_ref().unwrap().password.is_empty());
+    }
+
+    #[test]
+    fn launch_target_name_uses_the_alias_or_slot_number_not_the_literal_ssh() {
+        let slot = |alias: &str| SshSlot {
+            host: "10.0.0.1".into(),
+            port: "22".into(),
+            user: "root".into(),
+            alias: alias.into(),
+            password: String::new(),
+            save_password: false,
+        };
+        let slots = vec![slot("VPS DE"), slot("")];
+        assert_eq!(launch_target_name(0, &slots), "local");
+        assert_eq!(launch_target_name(1, &slots), "VPS DE");
+        assert_eq!(launch_target_name(2, &slots), "SSH2");
+        assert_ne!(launch_target_name(1, &slots), "ssh");
     }
 
     #[test]

@@ -40,6 +40,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   the swallowed body-read failure was reported as a JSON parse error instead
   of the timeout it was ([#405](https://github.com/devlawey/filar/issues/405)).
 
+- GUI SSH launches are now labelled with the target alias (or `SSH{n}`
+  without one) instead of the transport literal `ssh` — the session first
+  line, the saved session `target` and the per-target export folder from
+  #400 all carry the alias, and the executor is chosen by the SSH target
+  itself, so an alias named `local` no longer selects the local executor
+  ([#406](https://github.com/devlawey/filar/issues/406)).
+
 ## [1.0.6] - 2026-09-04
 
 ### Added
