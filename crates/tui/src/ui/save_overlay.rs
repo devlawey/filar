@@ -21,7 +21,6 @@ const OVERLAY_HEIGHT: u16 = 8;
 /// Height once the runbook takes part: a caption and a bar join the layout.
 const OVERLAY_HEIGHT_RUNBOOK: u16 = 11;
 const H_MARGIN: u16 = 6;
-const V_MARGIN: u16 = 4;
 
 /// What the runbook bar of the save overlay shows (#409).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,9 +58,14 @@ impl RunbookBar {
 ///
 /// `None` means the export has no runbook story at all — the feature is off,
 /// no job was armed, and no runbook is in flight — and the overlay renders
-/// exactly as it did before #409. A runbook still `Generating` outranks an
-/// armed job: the one-at-a-time guard means a second Ctrl+S exports without
-/// a fresh job, and the bar keeps showing the runbook already running.
+/// exactly as it did before #409.
+///
+/// The state outranks `armed`, and the two never disagree: while a job is
+/// merely armed, `runbook_state` is `None` by construction — `start_save`
+/// clears the previous story before arming, and nothing writes a state until
+/// the runner has taken the job. A second Ctrl+S while a runbook is
+/// `Generating` arms nothing (the one-at-a-time guard), so its bar keeps
+/// showing the runbook already running.
 fn runbook_bar(app: &App) -> Option<RunbookBar> {
     if let Some(state) = app.runbook_state {
         return Some(match state {
@@ -84,7 +88,10 @@ pub(crate) fn render_save_overlay(f: &mut Frame, app: &App, area: Rect) {
         OVERLAY_HEIGHT
     };
     let width = OVERLAY_WIDTH.min(area.width.saturating_sub(2 * H_MARGIN));
-    let height = base_height.min(area.height.saturating_sub(2 * V_MARGIN));
+    // The base layout caps the height, but a short terminal is not made
+    // shorter on purpose: reserving `2 * V_MARGIN` rows used to squeeze the
+    // two-bar layout below its runbook rows at 30×12 (review follow-up).
+    let height = base_height.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
 
@@ -414,14 +421,34 @@ mod tests {
     }
 
     #[test]
-    fn overlay_does_not_panic_on_a_tiny_terminal() {
-        // 30×12 clips the two-bar layout; 20×6 degenerates the overlay itself.
+    fn overlay_fits_its_runbook_rows_on_a_30x12_terminal() {
+        // Review follow-up: a `2 * V_MARGIN` row reservation used to squeeze
+        // the two-bar modal below its runbook caption, bar, and export status.
         let mut app = app_with_overlay(100);
         app.runbook_state = Some(RunbookState::Generating);
-        let _ = render_save_text_sized(&app, 30, 12);
-        let _ = render_save_text_sized(&app, 20, 6);
+        app.tick = 30; // a non-empty sweep, so the bar itself is on screen
+        let text = render_save_text_sized(&app, 30, 12);
+        assert!(text.contains("Export 100%"), "export row must fit, got: {text}");
+        assert!(text.contains("Runbook:"), "caption must fit, got: {text}");
+        assert!(
+            text.contains(crate::ui::theme::Glyphs::detect().bar_full),
+            "the runbook bar must fit, got: {text}"
+        );
+        assert!(text.contains("Done!"), "status row must fit, got: {text}");
         let mut app = app_with_overlay(50);
         arm_runbook(&mut app);
-        let _ = render_save_text_sized(&app, 30, 12);
+        let text = render_save_text_sized(&app, 30, 12);
+        assert!(
+            text.contains("Runbook:"),
+            "an armed job's bar must fit too, got: {text}"
+        );
+    }
+
+    #[test]
+    fn overlay_does_not_panic_on_a_tiny_terminal() {
+        // 20×6 degenerates the overlay itself: rows and bars must clip away.
+        let mut app = app_with_overlay(100);
+        app.runbook_state = Some(RunbookState::Generating);
+        let _ = render_save_text_sized(&app, 20, 6);
     }
 }

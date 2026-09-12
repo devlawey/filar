@@ -6679,15 +6679,18 @@ bars for `Skipped`/`Cancelled` and a red one for `Failed` — drawn with the
 theme's `bar_full`/`bar_empty` glyphs. The export's status line keeps
 `Saving...`/`Done!`/`Error` only; runbook states moved to the caption so
 nothing is announced twice. The overlay is 11 rows when the bar is present
-and the pre-#409 8 otherwise, with every row clipped to the inner area so
-tiny terminals cannot panic. The runner's render-tick guard now also ticks
-while `App::runbook_bar_animating()` (overlay visible, call in flight) and
-stops once the runbook settles — idle CPU unchanged.
+and the pre-#409 8 otherwise, and it claims that height up to the terminal's
+own: the old `2 * V_MARGIN` reservation squeezed the two-bar layout below
+its runbook rows at 30×12 (review follow-up). Every row is clipped to the
+inner area, so tiny terminals cannot panic. The runner's render-tick guard
+now also ticks while `App::runbook_bar_animating()` (overlay visible, call
+in flight) and stops once the runbook settles — idle CPU unchanged.
 
 **Tests.** `save_overlay.rs`: waiting / generating / saved / skipped /
 cancelled / failed captions, no second bar without a runbook or after an
-export error, the tick moves the indeterminate window, 30×12 and 20×6
-terminals render without panic.
+export error, the tick moves the indeterminate window; on 30×12 the runbook
+caption, its bar, and the export's status stay visible (review follow-up),
+and 20×6 still renders without panic.
 
 **Verification:** `cargo build --workspace`, `cargo test --workspace`. The
 manual TUI run from the issue's DoD cannot be driven from the agent
