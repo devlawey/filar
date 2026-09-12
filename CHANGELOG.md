@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-09-12
+
 ### Added
 
 - The TUI status bar now shows the context fill: the latest request's
@@ -879,7 +881,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v1.0.6...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v1.0.7...HEAD
+[1.0.7]: https://github.com/devlawey/filar/compare/v1.0.6...v1.0.7
 [1.0.6]: https://github.com/devlawey/filar/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/devlawey/filar/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/devlawey/filar/compare/v1.0.3...v1.0.4

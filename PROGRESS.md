@@ -6696,6 +6696,24 @@ and 20×6 still renders without panic.
 manual TUI run from the issue's DoD cannot be driven from the agent
 environment — stated in the PR.
 
+## Release v1.0.7 (2026-09-12)
+
+**Scope:** milestone 1.0.7 — the measured context fill in the status bar
+(#399), Ctrl+S exports and transcripts in per-target folders (#400), the
+runbook generated beside the export and cancellable with Ctrl+Z (#401),
+runbook/compaction calls on the streaming API so long generations survive
+`llm_secs` (#405), GUI SSH sessions labelled with the target alias (#406),
+and the runbook's own progress bar in the Ctrl+S overlay (#409).
+
+**Preflight:** `cargo build --workspace` and `cargo test --workspace` green
+on main before bump (tui 514, agent 153, core 90, gui 44, transport 38 + 7
+ignored/docker-sshd).
+
+**Tags:** `v1.0.7`, `engine-v1.0.7` (core + agent changed; additive-only pub
+surface — `filar_agent::runbook`, `filar_core::redact_secrets` — no breaking
+API changes). Dependency examples in `docs/ENGINE_API.md` point at the new
+tag.
+
 ## Release v1.0.6 (2026-09-04)
 
 **Scope:** milestone 1.0.6 — history compaction: context-fill tracking and
