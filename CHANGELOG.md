@@ -11,6 +11,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- The GUI launcher's five fixed SSH slots are now an open-ended host list:
+  hosts can be added, removed and reordered, and every saved host carries a
+  mandatory alias that names its keyring entry. Pre-existing unnamed slots
+  are migrated once to their `SSH1`–`SSH5` names as real aliases, so saved
+  passwords survive ([#411](https://github.com/devlawey/filar/issues/411)).
+
 ## [1.0.7] - 2026-09-12
 
 ### Added

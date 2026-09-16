@@ -2,7 +2,7 @@
 //!
 //! Shows a simple window where the user can:
 //! - Pick a previous session (up to 10) to restore.
-//! - Select a target: `Local` or `SSH1`–`SSH5` (up to 5 saved SSH profiles).
+//! - Select a target: `Local` or a host from the saved SSH list (#411).
 //! - Enter model, API URL, and API key.
 //!
 //! **Security:** Sensitive data (API keys, SSH passwords) is stored in the
@@ -21,8 +21,13 @@ use serde::{Deserialize, Serialize};
 
 use filar_core::{Config, SessionMeta, SessionStore};
 
-/// Number of SSH profile slots.
-const SSH_SLOTS: usize = 5;
+/// Current SSH host-list format version (#411).
+///
+/// Version 0 (the field absent from `settings.json`) is the pre-#411 fixed
+/// layout: exactly five slots, where a nameless host's display name — and its
+/// keyring key — came from its position (`SSH{slot+1}`). Version 1 is the
+/// open-ended host list where every real host carries its own alias.
+const SSH_LIST_VERSION: u32 = 1;
 
 /// Service name used for the OS credential store.
 const CRED_SERVICE: &str = "filar";
@@ -277,6 +282,49 @@ fn deduplicate_profiles(profiles: &mut Vec<LlmProfileData>) {
     }
 }
 
+/// Migrate the pre-#411 fixed-slot layout to the open-ended host list.
+///
+/// Unnamed hosts get their positional display name (`SSH{slot+1}`) as a real
+/// alias: names do not change, so the keyring keys (`ssh_target:SSH3`) stay
+/// valid and no saved password is orphaned (#411). Blank placeholder slots —
+/// the old layout always carried exactly five — are dropped *after* the alias
+/// pass, so the survivors keep the positions they were named from. Returns
+/// `true` when anything changed.
+fn migrate_ssh_profiles(profiles: &mut Vec<SshProfile>) -> bool {
+    let mut changed = false;
+
+    // Aliases first, while the positions are still those of the old list.
+    for (i, p) in profiles.iter_mut().enumerate() {
+        if p.host.trim().is_empty() || !p.alias.trim().is_empty() {
+            continue;
+        }
+        p.alias = format!("SSH{}", i + 1);
+        changed = true;
+    }
+
+    // A blank entry was a placeholder, not a host.
+    let before = profiles.len();
+    profiles.retain(|p| !p.host.trim().is_empty());
+    changed |= profiles.len() != before;
+
+    // The alias names the keyring entry, the Ctrl+O list and the per-target
+    // export folder; a duplicate silently hides one of two hosts, so rename.
+    let mut seen = std::collections::HashSet::new();
+    for p in profiles.iter_mut() {
+        let mut alias = p.alias.trim().to_string();
+        while !seen.insert(alias.clone()) {
+            alias = format!("{alias}_dup");
+        }
+        if alias != p.alias {
+            tracing::warn!(old = %p.alias, new = %alias, "renamed colliding SSH host alias on load");
+            p.alias = alias;
+            changed = true;
+        }
+    }
+
+    changed
+}
+
 // ---------------------------------------------------------------------------
 // LaunchConfig — returned to main.rs
 // ---------------------------------------------------------------------------
@@ -422,6 +470,10 @@ struct Settings {
     api_base_url: String,
     #[serde(default)]
     ssh_profiles: Vec<SshProfile>,
+    /// SSH host-list format version (#411). Absent in pre-#411 files, which
+    /// is what triggers the one-time migration in [`Settings::load`].
+    #[serde(default)]
+    ssh_list_version: u32,
     #[serde(default)]
     last_ssh: usize,
     #[serde(default)]
@@ -449,21 +501,39 @@ impl Settings {
     }
 
     fn load() -> Self {
-        let mut settings = match Self::path() {
-            Some(p) if p.exists() => {
-                let data = std::fs::read_to_string(&p).unwrap_or_default();
-                serde_json::from_str(&data).unwrap_or_default()
-            }
-            _ => Self::default(),
+        let path = Self::path();
+        let exists = path.as_ref().map(|p| p.exists()).unwrap_or(false);
+        let mut settings = if exists {
+            let data = path
+                .as_ref()
+                .map(|p| std::fs::read_to_string(p))
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            serde_json::from_str(&data).unwrap_or_default()
+        } else {
+            Self::default()
         };
-        while settings.ssh_profiles.len() < SSH_SLOTS {
-            settings.ssh_profiles.push(SshProfile::default());
-        }
-        settings.ssh_profiles.truncate(SSH_SLOTS);
-        if settings.last_ssh >= SSH_SLOTS {
-            settings.last_ssh = 0;
+        if settings.apply_ssh_list_migration() && exists {
+            // Persist right away so the migration happens once, not on every
+            // start (the same pattern as the profile-dedup repair below).
+            settings.save();
         }
         settings
+    }
+
+    /// Bring a loaded host list up to the current format (#411).
+    ///
+    /// Returns `true` when the settings file must be re-saved: the version
+    /// marker itself is the durable part — a repeated alias pass is only ever
+    /// wrong to run, never wrong to skip.
+    fn apply_ssh_list_migration(&mut self) -> bool {
+        if self.ssh_list_version >= SSH_LIST_VERSION {
+            return false;
+        }
+        let migrated = migrate_ssh_profiles(&mut self.ssh_profiles);
+        self.ssh_list_version = SSH_LIST_VERSION;
+        tracing::info!(migrated, "SSH host list migrated to the open-ended format");
+        true
     }
 
     fn save(&self) {
@@ -630,6 +700,26 @@ impl SshSlot {
             save_password: self.save_password,
         }
     }
+
+    /// A blank entry backing the "Add host" button.
+    fn blank() -> Self {
+        Self {
+            host: String::new(),
+            port: "22".to_string(),
+            user: String::new(),
+            alias: String::new(),
+            password: String::new(),
+            save_password: false,
+        }
+    }
+}
+
+/// Row actions from the SSH host list, applied after the render pass so the
+/// list is not mutated while it is being drawn.
+enum HostAction {
+    Up(usize),
+    Down(usize),
+    Remove(usize),
 }
 
 /// Session label for a GUI launch (#406).
@@ -902,21 +992,89 @@ impl LauncherApp {
     }
 
     fn render_target_selector(&mut self, ui: &mut egui::Ui) {
+        ui.label("Target:");
+        ui.radio_value(&mut self.target_mode, 0, "Local");
+
         ui.horizontal(|ui| {
-            ui.label("Target:");
-            ui.radio_value(&mut self.target_mode, 0, "Local");
-            for i in 1..=SSH_SLOTS {
-                let alias = self.ssh_slots[i - 1].alias.trim();
-                let label = if alias.is_empty() {
-                    format!("SSH{i}")
-                } else if alias.chars().count() > 32 {
-                    format!("{}…", alias.chars().take(31).collect::<String>())
-                } else {
-                    alias.to_string()
-                };
-                ui.radio_value(&mut self.target_mode, i, label);
+            ui.label(format!("SSH hosts ({}):", self.ssh_slots.len()));
+            if ui
+                .button("+ Add host")
+                .on_hover_text("Add a host to the list")
+                .clicked()
+            {
+                self.add_host();
             }
         });
+        if self.ssh_slots.is_empty() {
+            ui.label(egui::RichText::new("  (no saved hosts yet)").weak());
+            return;
+        }
+
+        // The rows live in their own scroll area: the list is open-ended
+        // (#411), so it must not push the form off the window. The explicit
+        // salt keeps it distinct from the session list, the other scroll area
+        // under the same parent (without it both share one auto-ID and thus
+        // one scroll offset).
+        let mut mode = self.target_mode;
+        let mut action: Option<HostAction> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("ssh_host_list")
+            .max_height(140.0)
+            .show(ui, |ui| {
+                for (i, slot) in self.ssh_slots.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut mode, i + 1, "");
+                        let alias = slot.alias.trim();
+                        let label = if alias.is_empty() {
+                            egui::RichText::new("(no alias)").weak()
+                        } else if alias.chars().count() > 32 {
+                            egui::RichText::new(format!(
+                                "{}…",
+                                alias.chars().take(31).collect::<String>()
+                            ))
+                        } else {
+                            egui::RichText::new(alias.to_string())
+                        };
+                        ui.label(label);
+                        let host = slot.host.trim();
+                        let detail = if host.is_empty() {
+                            "(no address)".to_string()
+                        } else if slot.user.trim().is_empty() {
+                            host.to_string()
+                        } else {
+                            format!("{}@{}", slot.user.trim(), host)
+                        };
+                        ui.label(egui::RichText::new(detail).weak());
+                        if ui
+                            .add_enabled(i > 0, egui::Button::new("⬆").small())
+                            .on_hover_text("Move up")
+                            .clicked()
+                        {
+                            action = Some(HostAction::Up(i));
+                        }
+                        if ui
+                            .add_enabled(
+                                i + 1 < self.ssh_slots.len(),
+                                egui::Button::new("⬇").small(),
+                            )
+                            .on_hover_text("Move down")
+                            .clicked()
+                        {
+                            action = Some(HostAction::Down(i));
+                        }
+                        if ui.button("X").on_hover_text("Remove host").clicked() {
+                            action = Some(HostAction::Remove(i));
+                        }
+                    });
+                }
+            });
+        self.target_mode = mode;
+        match action {
+            Some(HostAction::Up(i)) => self.move_host_up(i),
+            Some(HostAction::Down(i)) => self.move_host_down(i),
+            Some(HostAction::Remove(i)) => self.remove_host(i),
+            None => {}
+        }
     }
 
     fn render_ssh_fields(&mut self, ui: &mut egui::Ui) {
@@ -952,7 +1110,7 @@ impl LauncherApp {
                     ui.label("Alias:");
                     ui.add(
                         egui::TextEdit::singleline(&mut slot.alias)
-                            .hint_text("deploy")
+                            .hint_text("deploy (required)")
                             .desired_width(120.0),
                     );
                     ui.end_row();
@@ -1239,7 +1397,8 @@ impl LauncherApp {
         Settings {
             model: p.map_or_else(String::new, |x| x.model.clone()),
             api_base_url: p.map_or_else(String::new, |x| x.api_base_url.clone()),
-            ssh_profiles: self.ssh_slots.iter().map(|s| s.to_profile()).collect(),
+            ssh_profiles: self.persistable_ssh_profiles(),
+            ssh_list_version: SSH_LIST_VERSION,
             last_ssh: if self.target_mode > 0 { self.target_mode - 1 } else { 0 },
             temperature: p.map_or_else(String::new, |x| x.temperature.clone()),
             extra_body: p.map_or_else(String::new, |x| x.extra_body.clone()),
@@ -1294,7 +1453,104 @@ impl LauncherApp {
             ));
             return false;
         }
+        if let Err(msg) = self.validate_ssh_slots() {
+            self.set_other_error(msg);
+            return false;
+        }
         true
+    }
+
+    /// Every configured host must be launchable as written (#411).
+    ///
+    /// A blank row is an in-UI scratch entry and may stay — only the selected
+    /// target must be complete. A row with an address but no alias is not
+    /// fine: the alias names the keyring entry and the per-target export
+    /// folder, and a name shared by two hosts silently hides one of them
+    /// from the Ctrl+O list.
+    fn validate_ssh_slots(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for (i, slot) in self.ssh_slots.iter().enumerate() {
+            let host = slot.host.trim();
+            if host.is_empty() {
+                if self.target_mode == i + 1 {
+                    return Err("Host is required for the selected SSH target.".to_string());
+                }
+                continue;
+            }
+            // Checked in the same truncated form `to_profile` persists: the
+            // stored alias — not the typed one — names the keyring entry.
+            let alias: String = slot.alias.trim().chars().take(32).collect();
+            if alias.is_empty() {
+                return Err(format!(
+                    "SSH host '{host}' needs an alias — it names the keyring entry and the export folder."
+                ));
+            }
+            if !seen.insert(alias.clone()) {
+                return Err(format!(
+                    "Duplicate SSH host alias \"{alias}\". Aliases must be unique."
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// SSH profiles worth persisting: blank scratch rows never reach the
+    /// disk (#411) — the saved list holds real hosts only.
+    fn persistable_ssh_profiles(&self) -> Vec<SshProfile> {
+        self.ssh_slots
+            .iter()
+            .filter(|s| !s.host.trim().is_empty())
+            .map(SshSlot::to_profile)
+            .collect()
+    }
+
+    /// Append a blank host and select it, so its fields open below.
+    fn add_host(&mut self) {
+        self.ssh_slots.push(SshSlot::blank());
+        self.target_mode = self.ssh_slots.len();
+    }
+
+    /// Remove a host; a saved password goes with it. The selection falls
+    /// back to Local — never silently to another host.
+    fn remove_host(&mut self, idx: usize) {
+        if idx >= self.ssh_slots.len() {
+            return;
+        }
+        let slot = self.ssh_slots.remove(idx);
+        if slot.save_password && !slot.alias.trim().is_empty() {
+            delete_secret(&ssh_cred_name(idx, &slot.alias));
+        }
+        if self.target_mode == idx + 1 {
+            self.target_mode = 0;
+        } else if self.target_mode > idx + 1 {
+            self.target_mode -= 1;
+        }
+    }
+
+    /// Move a host one row up, keeping the selection on the same host.
+    fn move_host_up(&mut self, idx: usize) {
+        if idx == 0 || idx >= self.ssh_slots.len() {
+            return;
+        }
+        self.ssh_slots.swap(idx - 1, idx);
+        if self.target_mode == idx + 1 {
+            self.target_mode = idx;
+        } else if self.target_mode == idx {
+            self.target_mode = idx + 1;
+        }
+    }
+
+    /// Move a host one row down, keeping the selection on the same host.
+    fn move_host_down(&mut self, idx: usize) {
+        if idx + 1 >= self.ssh_slots.len() {
+            return;
+        }
+        self.ssh_slots.swap(idx, idx + 1);
+        if self.target_mode == idx + 1 {
+            self.target_mode = idx + 2;
+        } else if self.target_mode == idx + 2 {
+            self.target_mode = idx + 1;
+        }
     }
 
     fn do_launch(&mut self) {
@@ -1319,7 +1575,8 @@ impl LauncherApp {
 
         let settings = Settings {
             model: p.model.clone(), api_base_url: p.api_base_url.clone(),
-            ssh_profiles: self.ssh_slots.iter().map(|s| s.to_profile()).collect(),
+            ssh_profiles: self.persistable_ssh_profiles(),
+            ssh_list_version: SSH_LIST_VERSION,
             last_ssh: if self.target_mode > 0 { self.target_mode - 1 } else { 0 },
             temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
             profiles: self.profiles.iter().map(LlmProfileData::to_profile).collect(),
@@ -1339,9 +1596,7 @@ impl LauncherApp {
             else { delete_secret(&ssh_cred_name(i, &slot.alias)); }
         }
         let session_id = self.selected_session.map(|i| self.sessions[i].id.clone());
-        let ssh_targets = build_ssh_targets_from_profiles(
-            &self.ssh_slots.iter().map(|s| s.to_profile()).collect::<Vec<_>>(),
-        );
+        let ssh_targets = build_ssh_targets_from_profiles(&self.persistable_ssh_profiles());
         let cfg = LaunchConfig {
             target, ssh,
             model: p.model.clone(), api_base_url: p.api_base_url.clone(),
@@ -1466,6 +1721,7 @@ pub fn run_launcher(config: &Config) {
             model: settings.model.clone(),
             api_base_url: settings.api_base_url.clone(),
             ssh_profiles: settings.ssh_profiles.clone(),
+            ssh_list_version: SSH_LIST_VERSION,
             last_ssh: settings.last_ssh,
             temperature: settings.temperature.clone(),
             extra_body: settings.extra_body.clone(),
@@ -1482,7 +1738,7 @@ pub fn run_launcher(config: &Config) {
     let app = LauncherApp {
         sessions,
         selected_session: None,
-        target_mode: if settings.last_ssh > 0 && settings.last_ssh < SSH_SLOTS {
+        target_mode: if settings.last_ssh > 0 && settings.last_ssh < ssh_slots.len() {
             settings.last_ssh + 1
         } else {
             0
@@ -2040,7 +2296,7 @@ mod tests {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         let s = Settings {
             model: "test-model".into(), api_base_url: "https://example.com".into(),
-            ssh_profiles: vec![], last_ssh: 0, temperature: "0.5".into(),
+            ssh_profiles: vec![], ssh_list_version: SSH_LIST_VERSION, last_ssh: 0, temperature: "0.5".into(),
             extra_body: String::new(),
             profiles: vec![],
             selected_profile: 0,
@@ -2143,7 +2399,7 @@ mod tests {
     #[test]
     fn build_clears_when_all_profiles_empty() {
         // All profiles cleared (empty).
-        let profiles = vec![SshProfile::default(); SSH_SLOTS];
+        let profiles = vec![SshProfile::default(); 5];
         let result = build_ssh_targets_from_profiles(&profiles);
         assert!(result.is_empty(), "all launcher targets must be removed when slots are cleared");
     }
@@ -2228,7 +2484,7 @@ mod tests {
                 host: "10.0.0.5".into(),
                 port: "22".into(),
                 user: "root".into(),
-                alias: String::new(),
+                alias: "SSH1".into(),
                 password: String::new(),
                 save_password: false,
             }],
@@ -2370,9 +2626,232 @@ mod tests {
         app.on_session_selected(0);
         assert_eq!(app.target_mode, 1, "whitespace around port must be trimmed");
     }
+
+    // ── SSH host list (#411) ─────────────────────────────────────────
+
+    fn ssh_profile(host: &str, alias: &str) -> SshProfile {
+        SshProfile {
+            host: host.into(),
+            port: "22".into(),
+            user: "root".into(),
+            alias: alias.into(),
+            save_password: false,
+        }
+    }
+
+    #[test]
+    fn migration_gives_unnamed_slots_their_positional_aliases() {
+        // The pre-#411 layout: five slots, all nameless. Each display name
+        // must become a real alias unchanged — the keyring keys
+        // (`ssh_target:SSH3`) rely on it, and an orphaned key silently
+        // drops the saved password (#411).
+        let mut profiles: Vec<SshProfile> = (1..=5)
+            .map(|i| ssh_profile(&format!("10.0.0.1{i}"), ""))
+            .collect();
+        assert!(migrate_ssh_profiles(&mut profiles));
+        assert_eq!(profiles.len(), 5);
+        let aliases: Vec<&str> = profiles.iter().map(|p| p.alias.as_str()).collect();
+        assert_eq!(aliases, ["SSH1", "SSH2", "SSH3", "SSH4", "SSH5"]);
+        for (i, p) in profiles.iter().enumerate() {
+            assert_eq!(
+                ssh_cred_name(i, &p.alias),
+                format!("ssh_target:SSH{}", i + 1),
+                "slot {i} keyring key must not change"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_drops_blank_slots_and_keeps_positions_of_the_rest() {
+        // The old layout padded to exactly five; blank entries were
+        // placeholders, not hosts. Alias assignment must happen before the
+        // drop, or the survivors would be renumbered.
+        let mut profiles = vec![
+            ssh_profile("10.0.0.11", ""),
+            SshProfile::default(),
+            ssh_profile("10.0.0.13", ""),
+            ssh_profile("10.0.0.14", "prod-web"),
+            SshProfile::default(),
+        ];
+        assert!(migrate_ssh_profiles(&mut profiles));
+        assert_eq!(profiles.len(), 3);
+        assert_eq!(profiles[0].alias, "SSH1");
+        assert_eq!(profiles[1].alias, "SSH3", "the third slot keeps its name");
+        assert_eq!(profiles[2].alias, "prod-web", "an explicit alias stays");
+    }
+
+    #[test]
+    fn migration_renames_a_collision_and_the_second_run_is_a_no_op() {
+        let mut profiles = vec![
+            ssh_profile("10.0.0.11", ""),
+            ssh_profile("10.0.0.12", "SSH1"),
+        ];
+        assert!(migrate_ssh_profiles(&mut profiles));
+        assert_eq!(profiles[0].alias, "SSH1");
+        assert_eq!(profiles[1].alias, "SSH1_dup", "a duplicate hides a host from Ctrl+O");
+        assert!(!migrate_ssh_profiles(&mut profiles), "second run must change nothing");
+    }
+
+    #[test]
+    fn the_version_marker_stops_a_second_migration() {
+        let mut settings = Settings {
+            ssh_profiles: vec![ssh_profile("10.0.0.11", "")],
+            ..Settings::default()
+        };
+        assert!(settings.apply_ssh_list_migration());
+        assert_eq!(settings.ssh_profiles[0].alias, "SSH1");
+        assert_eq!(settings.ssh_list_version, SSH_LIST_VERSION);
+
+        // A later load (marker present) must leave a new-format list alone —
+        // even a host whose alias is temporarily empty while it is edited:
+        // renumbering it would change its keyring key under the user's hands.
+        settings.ssh_profiles = vec![ssh_profile("10.0.0.12", "")];
+        assert!(!settings.apply_ssh_list_migration());
+        assert_eq!(settings.ssh_profiles[0].alias, "");
+    }
+
+    fn app_with_hosts(hosts: &[(&str, &str)]) -> LauncherApp {
+        let mut app = make_app(make_meta(None, None, None, None));
+        app.ssh_slots = hosts
+            .iter()
+            .map(|(host, alias)| SshSlot {
+                host: (*host).into(),
+                port: "22".into(),
+                user: "root".into(),
+                alias: (*alias).into(),
+                password: String::new(),
+                save_password: false,
+            })
+            .collect();
+        app.target_mode = 0;
+        app
+    }
+
+    #[test]
+    fn add_host_appends_a_blank_row_and_selects_it() {
+        let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
+        app.add_host();
+        assert_eq!(app.ssh_slots.len(), 2);
+        assert_eq!(app.target_mode, 2, "the new row becomes the edited target");
+        assert!(app.ssh_slots[1].host.is_empty());
+        assert_eq!(app.ssh_slots[1].port, "22", "a fresh row defaults to port 22");
+    }
+
+    #[test]
+    fn move_host_up_keeps_the_selection_on_the_moved_host() {
+        let mut app = app_with_hosts(&[("a", "one"), ("b", "two"), ("c", "three")]);
+        app.target_mode = 2; // "two"
+        app.move_host_up(1);
+        let aliases: Vec<&str> = app.ssh_slots.iter().map(|s| s.alias.as_str()).collect();
+        assert_eq!(aliases, ["two", "one", "three"]);
+        assert_eq!(app.target_mode, 1, "the selection must follow the host");
+    }
+
+    #[test]
+    fn move_host_adjusts_the_selection_of_a_passed_over_row() {
+        let mut app = app_with_hosts(&[("a", "one"), ("b", "two"), ("c", "three")]);
+        app.target_mode = 3; // "three"
+        app.move_host_down(1);
+        let aliases: Vec<&str> = app.ssh_slots.iter().map(|s| s.alias.as_str()).collect();
+        assert_eq!(aliases, ["one", "three", "two"]);
+        assert_eq!(app.target_mode, 2, "the passed-over row moved one position up");
+    }
+
+    #[test]
+    fn removing_the_selected_host_falls_back_to_local() {
+        let mut app = app_with_hosts(&[("a", "one"), ("b", "two")]);
+        app.target_mode = 2;
+        app.remove_host(1);
+        assert_eq!(app.ssh_slots.len(), 1);
+        assert_eq!(app.target_mode, 0, "never silently switch to another host");
+    }
+
+    #[test]
+    fn removing_an_earlier_host_shifts_the_selection() {
+        let mut app = app_with_hosts(&[("a", "one"), ("b", "two"), ("c", "three")]);
+        app.target_mode = 3;
+        app.remove_host(0);
+        let aliases: Vec<&str> = app.ssh_slots.iter().map(|s| s.alias.as_str()).collect();
+        assert_eq!(aliases, ["two", "three"]);
+        assert_eq!(app.target_mode, 2, "the selection still points at 'three'");
+    }
+
+    #[test]
+    fn launch_refuses_a_host_without_an_alias() {
+        let mut app = app_with_hosts(&[("10.0.0.11", "web-1"), ("10.0.0.12", "")]);
+        assert!(!app.validate_launch());
+        assert!(
+            app.validation_error.contains("needs an alias"),
+            "got {:?}",
+            app.validation_error
+        );
+    }
+
+    #[test]
+    fn launch_refuses_duplicate_host_aliases() {
+        let mut app = app_with_hosts(&[("10.0.0.11", "web"), ("10.0.0.12", "web")]);
+        assert!(!app.validate_launch());
+        assert!(
+            app.validation_error.contains("Duplicate SSH host alias"),
+            "got {:?}",
+            app.validation_error
+        );
+    }
+
+    #[test]
+    fn launch_refuses_aliases_that_only_differ_after_the_stored_cutoff() {
+        // `to_profile` stores at most 32 chars; two longer aliases sharing the
+        // first 32 would persist as one keyring key, so they collide now.
+        let long_a = format!("{}a", "x".repeat(32));
+        let long_b = format!("{}b", "x".repeat(32));
+        let mut app = app_with_hosts(&[("10.0.0.11", &long_a), ("10.0.0.12", &long_b)]);
+        assert!(!app.validate_launch());
+        assert!(
+            app.validation_error.contains("Duplicate SSH host alias"),
+            "got {:?}",
+            app.validation_error
+        );
+    }
+
+    #[test]
+    fn a_blank_scratch_row_only_blocks_its_own_selection() {
+        let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
+        app.add_host(); // blank row, selected
+        assert!(!app.validate_launch());
+        assert!(
+            app.validation_error.contains("Host is required"),
+            "got {:?}",
+            app.validation_error
+        );
+        app.target_mode = 1; // deselect the blank row
+        assert!(
+            app.validate_launch(),
+            "a blank scratch row must not block launching another target: {:?}",
+            app.validation_error
+        );
+    }
+
+    #[test]
+    fn launch_accepts_a_full_host_list() {
+        let hosts: Vec<(String, String)> = (1..=12)
+            .map(|i| (format!("10.0.0.{i}"), format!("web-{i}")))
+            .collect();
+        let refs: Vec<(&str, &str)> = hosts
+            .iter()
+            .map(|(h, a)| (h.as_str(), a.as_str()))
+            .collect();
+        let mut app = app_with_hosts(&refs);
+        assert!(app.validate_launch(), "got {:?}", app.validation_error);
+        app.target_mode = 12;
+        assert!(app.validate_launch(), "the last host must launch too");
+    }
+
+    #[test]
+    fn blank_rows_are_not_persisted() {
+        let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
+        app.add_host();
+        let persisted = app.persistable_ssh_profiles();
+        assert_eq!(persisted.len(), 1, "the scratch row must not reach settings.json");
+        assert_eq!(persisted[0].alias, "web-1");
+    }
 }
-
-
-
-
-

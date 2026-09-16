@@ -6696,6 +6696,59 @@ and 20×6 still renders without panic.
 manual TUI run from the issue's DoD cannot be driven from the agent
 environment — stated in the PR.
 
+## Issue #411: feat(gui) — an open-ended SSH host list instead of five slots
+
+**Milestone:** 2.0.0. **Branch:** `feat/411-ssh-host-list`.
+
+**Problem.** The launcher kept exactly five SSH profiles (`Settings::load`
+padded/truncated `ssh_profiles` to `SSH_SLOTS`), and the slot number leaked
+into the keyring key: `ssh_target_display_name` renders `SSH{slot+1}` for an
+unnamed host. A dozen-machine fleet did not fit the model.
+
+**Change.** `crates/gui/src/lib.rs`: the fixed slots became a scrollable list
+of arbitrary length with per-row add / remove / reorder (`HostAction` applied
+after the render pass). A host with an empty address is a scratch row — it
+may exist while editing, is never persisted (`persistable_ssh_profiles`) and
+only blocks Launch when selected. The alias is mandatory for every host that
+has an address: it names the keyring entry, the Ctrl+O list and the export
+folder. The host-list `ScrollArea` got an explicit `id_salt` — without it
+egui 0.29 derives the same auto-ID for every scroll area under one parent
+(the session list and the host list shared one scroll offset, plus red
+duplicate-ID warnings in debug builds; caught by the real GUI run).
+
+**Migration.** `ssh_list_version: u32` (serde default 0) marks the old
+format; on first load `migrate_ssh_profiles` assigns each unnamed host its
+positional display name (`SSH{slot+1}`) as a real alias — names do not
+change, so keyring keys stay valid and no saved password is orphaned — then
+drops the blank placeholders the old layout always carried and renames
+duplicate aliases (`_dup`). The migrated file is saved immediately; the
+version marker stops a second pass, so a new-format host with a temporarily
+empty alias is never silently renumbered.
+
+**Tests.** gui (15 new, 44 → 59): migration naming/drop/collision/idempotence
+and the version gate (per slot asserts `ssh_cred_name(i, alias) ==
+ssh_target:SSH{i+1}` — the keyring key is unchanged), add/reorder/remove
+selection arithmetic, alias-required and duplicate-alias launch refusal —
+including two aliases that only differ after the 32-char storage cutoff, a
+blank scratch row blocking only its own selection, a full 12-host list
+launching from the last row, blank rows never persisted.
+
+**Verification:** `cargo build --workspace`, `cargo test --workspace` green.
+Real Windows run: (1) old-format `settings.json` (5 slots, unnamed hosts) →
+`filar --gui-only` → the file came back with `SSH1`/`SSH3`/`prod-web` kept
+and the blanks dropped, `ssh_list_version: 1`; (2) the real user settings
+(`VPS DE` + 4 blanks) migrated the same way, the alias untouched; (3) a
+12-host new-format list rendered as a scrollable block, and a driven GUI
+session verified select (the fields below showed the row's host), reorder
+(the row moves, the selection follows), `+ Add host` (a 13th blank row,
+selected) and remove (the row disappears, the count drops) — screenshots
+taken locally, not attached to the PR (they contain the private session
+list). Also confirmed: interactive edits are in-memory only and a second
+launch never re-migrates the file.
+
+**Next:** #412 — the launcher's `config.toml` rewrite must stop wiping
+manual `[[ssh_targets]]` edits.
+
 ## Release v1.0.7 (2026-09-12)
 
 **Scope:** milestone 1.0.7 — the measured context fill in the status bar
