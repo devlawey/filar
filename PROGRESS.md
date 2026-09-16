@@ -6725,15 +6725,17 @@ duplicate aliases (`_dup`). The migrated file is saved immediately; the
 version marker stops a second pass, so a new-format host with a temporarily
 empty alias is never silently renumbered.
 
-**Tests.** gui (17 new, 44 → 61): migration naming/drop/collision/idempotence
+**Tests.** gui (21 new, 44 → 63): migration naming/drop/collision/idempotence
 and the version gate (per slot asserts `ssh_cred_name(i, alias) ==
 ssh_target:SSH{i+1}` — the keyring key is unchanged), add/reorder/remove
 selection arithmetic, alias-required and duplicate-alias launch refusal —
 including two aliases that only differ after the 32-char storage cutoff, a
 blank scratch row blocking only its own selection, a full 12-host list
-launching from the last row, blank rows never persisted, and the two
+launching from the last row, blank rows never persisted, the two
 `Settings::load_from` temp-file cases (valid pre-#411 file migrated and
-persisted; corrupt file left byte-for-byte untouched).
+persisted; corrupt file left byte-for-byte untouched), and the
+`persisted_last_ssh` slot-vs-saved-index pair (positions with a blank row
+before the selection; the selected host survives a save/load round trip).
 
 **Verification:** `cargo build --workspace`, `cargo test --workspace` green.
 Real Windows run: (1) old-format `settings.json` (5 slots, unnamed hosts) →
@@ -6754,6 +6756,11 @@ never be rewritten by the migration save — a parse failure reads as
 copy of the host list and LLM profiles. `Settings::load_from` now takes an
 explicit path and skips both the migration and the save for anything that
 did not parse (temp-file tests cover the valid and the corrupt case).
+`last_ssh` is now written as the selected host's position in the *persisted*
+list (`persisted_last_ssh`) instead of the raw slot index: blank scratch
+rows are dropped from `ssh_profiles`, so the old value preselected a
+different host — or none — after a restart when a blank row preceded the
+selection.
 
 **Next:** #412 — the launcher's `config.toml` rewrite must stop wiping
 manual `[[ssh_targets]]` edits.

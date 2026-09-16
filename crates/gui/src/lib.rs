@@ -1416,7 +1416,7 @@ impl LauncherApp {
             api_base_url: p.map_or_else(String::new, |x| x.api_base_url.clone()),
             ssh_profiles: self.persistable_ssh_profiles(),
             ssh_list_version: SSH_LIST_VERSION,
-            last_ssh: if self.target_mode > 0 { self.target_mode - 1 } else { 0 },
+            last_ssh: self.persisted_last_ssh(),
             temperature: p.map_or_else(String::new, |x| x.temperature.clone()),
             extra_body: p.map_or_else(String::new, |x| x.extra_body.clone()),
             profiles: self.profiles.iter().map(LlmProfileData::to_profile).collect(),
@@ -1521,6 +1521,33 @@ impl LauncherApp {
             .collect()
     }
 
+    /// The selected host's position in the persisted list — the value stored
+    /// as `Settings::last_ssh` (review of #445).
+    ///
+    /// A raw slot index is not stable across a save/load round trip: blank
+    /// scratch rows are dropped from `ssh_profiles`, so a blank row *before*
+    /// the selected host shifts every later position and a restart would
+    /// preselect the wrong host (`run_launcher` maps `last_ssh` back against
+    /// the saved list). A selected blank row itself has no persisted
+    /// counterpart: it restores as Local, the same way `target_mode == 0`
+    /// does.
+    fn persisted_last_ssh(&self) -> usize {
+        if self.target_mode == 0 {
+            return 0;
+        }
+        let idx = self.target_mode - 1;
+        let Some(slot) = self.ssh_slots.get(idx) else {
+            return 0;
+        };
+        if slot.host.trim().is_empty() {
+            return 0;
+        }
+        self.ssh_slots[..idx]
+            .iter()
+            .filter(|s| !s.host.trim().is_empty())
+            .count()
+    }
+
     /// Append a blank host and select it, so its fields open below.
     fn add_host(&mut self) {
         self.ssh_slots.push(SshSlot::blank());
@@ -1594,7 +1621,7 @@ impl LauncherApp {
             model: p.model.clone(), api_base_url: p.api_base_url.clone(),
             ssh_profiles: self.persistable_ssh_profiles(),
             ssh_list_version: SSH_LIST_VERSION,
-            last_ssh: if self.target_mode > 0 { self.target_mode - 1 } else { 0 },
+            last_ssh: self.persisted_last_ssh(),
             temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
             profiles: self.profiles.iter().map(LlmProfileData::to_profile).collect(),
             selected_profile: self.selected_profile,
@@ -2913,5 +2940,48 @@ mod tests {
         let persisted = app.persistable_ssh_profiles();
         assert_eq!(persisted.len(), 1, "the scratch row must not reach settings.json");
         assert_eq!(persisted[0].alias, "web-1");
+    }
+
+    #[test]
+    fn persisted_last_ssh_is_the_position_in_the_persisted_list() {
+        // Review of #445: blank scratch rows are dropped from the saved
+        // list, so storing a raw slot index would preselect a different
+        // host after a restart.
+        let mut app =
+            app_with_hosts(&[("", ""), ("10.0.0.11", "web-1"), ("10.0.0.12", "web-2")]);
+        assert_eq!(app.persisted_last_ssh(), 0, "Local remembers no host");
+        app.target_mode = 1; // the blank scratch row itself
+        assert_eq!(app.persisted_last_ssh(), 0, "a blank row has no persisted counterpart");
+        app.target_mode = 2; // web-1: first persisted position
+        assert_eq!(app.persisted_last_ssh(), 0);
+        app.target_mode = 3; // web-2: one host precedes it in the saved list
+        assert_eq!(app.persisted_last_ssh(), 1);
+    }
+
+    #[test]
+    fn the_selected_host_survives_a_save_load_round_trip_past_a_blank_row() {
+        let mut app =
+            app_with_hosts(&[("", ""), ("10.0.0.11", "web-1"), ("10.0.0.12", "web-2")]);
+        app.target_mode = 3; // web-2
+        let persisted = app.persistable_ssh_profiles();
+        let last_ssh = app.persisted_last_ssh();
+
+        // The restore side of `run_launcher`, against the saved list.
+        let pairs: Vec<(&str, &str)> = persisted
+            .iter()
+            .map(|p| (p.host.as_str(), p.alias.as_str()))
+            .collect();
+        let restored = app_with_hosts(&pairs);
+        let target_mode = if last_ssh > 0 && last_ssh < restored.ssh_slots.len() {
+            last_ssh + 1
+        } else {
+            0
+        };
+        assert_eq!(target_mode, 2);
+        assert_eq!(
+            restored.ssh_slots[target_mode - 1].alias,
+            "web-2",
+            "the same host as before the restart, not the row at the old slot index"
+        );
     }
 }
