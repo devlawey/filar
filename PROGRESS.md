@@ -6725,7 +6725,7 @@ duplicate aliases (`_dup`). The migrated file is saved immediately; the
 version marker stops a second pass, so a new-format host with a temporarily
 empty alias is never silently renumbered.
 
-**Tests.** gui (20 new, 44 → 64): migration naming/drop/collision/idempotence
+**Tests.** gui (21 new, 44 → 65): migration naming/drop/collision/idempotence
 and the version gate (per slot asserts `ssh_cred_name(i, alias) ==
 ssh_target:SSH{i+1}` — the keyring key is unchanged), add/reorder/remove
 selection arithmetic, alias-required and duplicate-alias launch refusal —
@@ -6733,10 +6733,12 @@ including two aliases that only differ after the 32-char storage cutoff, a
 blank scratch row blocking only its own selection, a full 12-host list
 launching from the last row, blank rows never persisted, the two
 `Settings::load_from` temp-file cases (valid pre-#411 file migrated and
-persisted; corrupt file left byte-for-byte untouched), and the three
+persisted; corrupt file left byte-for-byte untouched), the three
 `last_ssh` cases (1-based positions with a blank row before the selection;
 the first and second persisted hosts survive a save/load round trip; the
-old slot-index value is re-encoded during migration).
+old slot-index value is re-encoded during migration), and the
+credential-pass guard (a blank scratch row never touches the index-derived
+`ssh_target:SSH{i+1}` key a migrated host may own).
 
 **Verification:** `cargo build --workspace`, `cargo test --workspace` green.
 Real Windows run: (1) old-format `settings.json` (5 slots, unnamed hosts) →
@@ -6763,7 +6765,11 @@ blank scratch rows are dropped from `ssh_profiles`, so the old value
 preselected a different host — or none — after a restart, and sharing `0`
 between Local and the first position left `SSH1` unrestorable (a pre-#411
 gap too). `migrate_last_ssh` re-encodes pre-#411 values during the one-time
-migration, so the user's last selection survives the upgrade.
+migration, so the user's last selection survives the upgrade. `do_launch`
+touches the keyring only for persisted rows (`ssh_credential_ops`): a blank
+scratch row's empty alias resolves to the index-derived `ssh_target:SSH{i+1}`
+— an alias a migrated host can own — and its delete pass would drop that
+host's saved password.
 
 **Next:** #412 — the launcher's `config.toml` rewrite must stop wiping
 manual `[[ssh_targets]]` edits.

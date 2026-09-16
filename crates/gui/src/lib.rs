@@ -1580,6 +1580,32 @@ impl LauncherApp {
             + 1
     }
 
+    /// The keyring operations `do_launch` performs for the SSH rows, as
+    /// `(key, Some(password))` to save and `(key, None)` to clear — PR #445
+    /// review.
+    ///
+    /// Only persisted rows are touched: a blank scratch row has an empty
+    /// alias, and `ssh_cred_name(i, "")` falls back to the index-derived
+    /// `ssh_target:SSH{i+1}` — a name a migrated host may legitimately own
+    /// (positional aliases survive the migration even when earlier blank
+    /// slots are dropped). Deleting through that key would silently drop
+    /// the host's saved password.
+    fn ssh_credential_ops(&self) -> Vec<(String, Option<String>)> {
+        self.ssh_slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.host.trim().is_empty() && !s.alias.trim().is_empty())
+            .map(|(i, s)| {
+                let key = ssh_cred_name(i, &s.alias);
+                if s.save_password && !s.password.is_empty() {
+                    (key, Some(s.password.clone()))
+                } else {
+                    (key, None)
+                }
+            })
+            .collect()
+    }
+
     /// Append a blank host and select it, so its fields open below.
     fn add_host(&mut self) {
         self.ssh_slots.push(SshSlot::blank());
@@ -1667,9 +1693,11 @@ impl LauncherApp {
                 save_secret(&prof.key_env, &prof.api_key);
             }
         }
-        for (i, slot) in self.ssh_slots.iter().enumerate() {
-            if slot.save_password && !slot.password.is_empty() { save_secret(&ssh_cred_name(i, &slot.alias), &slot.password); }
-            else { delete_secret(&ssh_cred_name(i, &slot.alias)); }
+        for (key, password) in self.ssh_credential_ops() {
+            match password {
+                Some(p) => save_secret(&key, &p),
+                None => delete_secret(&key),
+            }
         }
         let session_id = self.selected_session.map(|i| self.sessions[i].id.clone());
         let ssh_targets = build_ssh_targets_from_profiles(&self.persistable_ssh_profiles());
@@ -2972,6 +3000,28 @@ mod tests {
         let persisted = app.persistable_ssh_profiles();
         assert_eq!(persisted.len(), 1, "the scratch row must not reach settings.json");
         assert_eq!(persisted[0].alias, "web-1");
+    }
+
+    #[test]
+    fn a_blank_scratch_row_never_touches_the_keyring() {
+        // A migrated host can hold the positional alias `SSH2` at any index;
+        // a blank row's empty alias would resolve to `ssh_target:SSH{i+1}`
+        // and delete that host's password (review of PR #445).
+        let mut app = app_with_hosts(&[("10.0.0.11", "SSH2")]);
+        app.ssh_slots[0].save_password = true;
+        app.ssh_slots[0].password = "s3cret".into();
+        app.add_host(); // blank scratch row at index 1
+
+        let ops = app.ssh_credential_ops();
+        assert_eq!(ops.len(), 1, "only the persisted host may touch the keyring");
+        assert_eq!(ops[0].0, "ssh_target:SSH2");
+        assert_eq!(ops[0].1.as_deref(), Some("s3cret"));
+
+        // Without the save flag the same host's key is cleared — still the
+        // host's key, never the scratch row's index-derived one.
+        app.ssh_slots[0].save_password = false;
+        let ops = app.ssh_credential_ops();
+        assert_eq!(ops, vec![("ssh_target:SSH2".to_string(), None)]);
     }
 
     #[test]
