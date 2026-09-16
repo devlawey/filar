@@ -657,6 +657,29 @@ fn merge_manual_ssh_targets(
     merged
 }
 
+/// Drop passwords from the launcher's copy of the manual `[[ssh_targets]]`
+/// (#412).
+///
+/// `pending_launch.json` is a plain-text handoff and must never carry
+/// secrets (#255) — [`load_pending_launch`] even refuses a file that
+/// contains a `"password"` key. A password hand-written into `config.toml`
+/// stays in the user's file, but it is not copied into the launch payload:
+/// the entry keeps its `Password` auth with the value removed, so the
+/// session resolves the credential from the keyring or the password prompt,
+/// exactly like a launcher target.
+fn strip_manual_ssh_passwords(targets: &[filar_core::SshTarget]) -> Vec<filar_core::SshTarget> {
+    targets
+        .iter()
+        .cloned()
+        .map(|mut target| {
+            if let filar_core::SshAuth::Password { .. } = target.auth {
+                target.auth = filar_core::SshAuth::Password { password: None };
+            }
+            target
+        })
+        .collect()
+}
+
 /// Write `[llm]` settings to `{OS data dir}/filar/config.toml` so `filar`
 /// invoked without the GUI launcher still picks them up.
 ///
@@ -809,7 +832,8 @@ struct LauncherApp {
     target_mode: usize,
     ssh_slots: Vec<SshSlot>,
     /// Manual `[[ssh_targets]]` from the `config.toml` the GUI process
-    /// loaded — merged after the launcher's own targets at launch (#412).
+    /// loaded, passwords stripped ([`strip_manual_ssh_passwords`]) — merged
+    /// after the launcher's own targets at launch (#412).
     manual_targets: Vec<filar_core::SshTarget>,
     /// All configured profiles.
     profiles: Vec<LlmProfileData>,
@@ -1877,7 +1901,7 @@ pub fn run_launcher(config: &Config) {
             0
         },
         ssh_slots,
-        manual_targets: config.ssh_targets.clone(),
+        manual_targets: strip_manual_ssh_passwords(&config.ssh_targets),
         profiles,
         selected_profile,
         validation_error: String::new(),
@@ -2650,6 +2674,22 @@ mod tests {
         assert!(after.iter().all(|t| t.name != "web-1"), "removed launcher host must be gone");
         assert!(after.iter().any(|t| t.name == "web-2"));
         assert!(after.iter().any(|t| t.name == "fleet-01"), "the manual host stays");
+    }
+
+    #[test]
+    fn a_manual_password_never_reaches_the_launch_payload() {
+        let mut target = config_target("pw-host", "10.9.0.88");
+        target.auth = filar_core::SshAuth::Password { password: Some("hunter2".into()) };
+        let merged = merge_manual_ssh_targets(Vec::new(), &strip_manual_ssh_passwords(&[target]));
+
+        // `pending_launch.json` is plain text and `load_pending_launch`
+        // rejects any file that carries a password key — the secret must be
+        // gone while the auth variant survives (the keyring/prompt resolves
+        // the credential).
+        let json = serde_json::to_string(&merged).expect("launch payload must serialize");
+        assert!(!json.contains("\"password\":"), "no password key in the payload: {json}");
+        assert!(!json.contains("hunter2"), "no password value in the payload: {json}");
+        assert!(json.contains("\"type\":\"password\""), "password auth stays: {json}");
     }
 
     #[test]

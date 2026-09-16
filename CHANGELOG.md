@@ -23,7 +23,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 - GUI launcher: manual `[[ssh_targets]]` entries in `config.toml` are no
   longer hidden by the full rebuild of the launcher's own targets — they are
-  merged into the launched session, after the launcher's hosts
+  merged into the launched session, after the launcher's hosts, with any
+  inline password stripped before the payload is written
   ([#412](https://github.com/devlawey/filar/issues/412)).
 
 ## [1.0.7] - 2026-09-12

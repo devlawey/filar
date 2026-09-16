@@ -6798,15 +6798,17 @@ and the host configured in the GUI is the one that connects. No config
 duplication, no new files; `save_config_toml` still touches only
 `[llm]`/`arbiter_profile`.
 
-**Tests.** gui (3 new, 65 → 68): a manual config host survives a launcher
+**Tests.** gui (4 new, 65 → 69): a manual config host survives a launcher
 save (launcher targets first, the manual entry's own fields — port 2222,
 Strict — untouched); a manual host never shadows a launcher target (the
 collision keeps the launcher's host, a non-colliding manual entry still gets
 through); a host removed in the launcher disappears from the merged list
-while the manual host stays.
+while the manual host stays; a hand-written password never reaches the
+serialized launch payload (no `"password":` key, no value, the `Password`
+variant survives).
 
 **Verification:** `cargo build --workspace`, `cargo test --workspace` green
-(gui 68, tui 514, agent 153, core 20 + 90, transport 38 + 7
+(gui 69, tui 514, agent 153, core 20 + 90, transport 38 + 7
 ignored/docker-sshd). Real Windows run: a hand-added `[[ssh_targets]]`
 `fleet-manual-01` (10.9.0.77, ops, agent) in the app-data `config.toml` →
 `filar --gui-only` → Launch → `pending_launch.json` carried both the
@@ -6815,6 +6817,17 @@ launcher's `VPS DE` and the manual `fleet-manual-01` (a manual duplicate of
 `[[ssh_targets]]` in place, and that session's Ctrl+O host list showed
 `local`, `VPS DE`, `fleet-manual-01`. The real config files were restored
 byte-identical after the run.
+
+**Review follow-up (PR #446):** a password hand-written into a manual
+`[[ssh_targets]]` entry (`auth = { type = "password", password = "..." }`)
+would have been cloned into `manual_targets` and serialized into
+`pending_launch.json` — a plain-text file that must never carry secrets
+(#255), and one `load_pending_launch` rejects (it deletes any file with a
+`"password"` key), so the launch would silently have lost its payload too.
+`run_launcher` now captures the list through `strip_manual_ssh_passwords`:
+the `Password` variant survives with the value removed — the keyring or the
+prompt resolves the credential, exactly as for a launcher target — while
+`Key`/`Agent` entries pass through untouched.
 
 **Next:** the 2.0.0 fleet build-out (33 open) — SSH target tags (#413) and
 the GUI/TUI fleet layer on top of them.
