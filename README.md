@@ -285,7 +285,7 @@ launcher appears.
 From the GUI you can:
 - Enter your LLM API key (saved in Windows Credential Manager or macOS Keychain)
 - Choose Local or SSH mode
-- Configure up to 5 SSH profiles
+- Manage the SSH host list (add, remove, reorder) — every saved host needs an alias
 - Start a session
 
 Or via command line (reads `config.toml`, no GUI):
@@ -496,11 +496,12 @@ port = 22
 type = "agent"
 ```
 
-**Launcher-generated targets** use the alias (or `SSH1`–`SSH5` if no alias is set):
+**Launcher-generated targets** are named by their alias (required). Hosts migrated
+from the old five-slot layout keep their `SSH1`–`SSH5` slot names as aliases:
 
 ```toml
 [[ssh_targets]]
-name = "SSH1"
+name = "prod-web"
 host = "10.0.0.5"
 port = 22
 user = "admin"
