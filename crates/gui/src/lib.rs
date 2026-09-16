@@ -1522,7 +1522,7 @@ impl LauncherApp {
     }
 
     /// The selected host's position in the persisted list — the value stored
-    /// as `Settings::last_ssh` (review of #445).
+    /// as `Settings::last_ssh` (PR #445 review).
     ///
     /// A raw slot index is not stable across a save/load round trip: blank
     /// scratch rows are dropped from `ssh_profiles`, so a blank row *before*
@@ -1531,11 +1531,20 @@ impl LauncherApp {
     /// the saved list). A selected blank row itself has no persisted
     /// counterpart: it restores as Local, the same way `target_mode == 0`
     /// does.
+    ///
+    /// `0` is also returned for the *first* persisted position: the restore
+    /// gate is `last_ssh > 0`, so it reads as Local. That matches the
+    /// pre-#411 launcher — the old five slots never restored `SSH1` either.
+    /// Telling "Local" and "host 0" apart would need a changed persisted
+    /// encoding, deliberately left out of this issue's scope.
     fn persisted_last_ssh(&self) -> usize {
         if self.target_mode == 0 {
             return 0;
         }
         let idx = self.target_mode - 1;
+        // Defensive: the add/remove/move invariants keep `target_mode` at
+        // most `len()`. The early return is what guarantees `idx < len`
+        // for the slice below.
         let Some(slot) = self.ssh_slots.get(idx) else {
             return 0;
         };

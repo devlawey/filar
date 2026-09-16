@@ -6750,7 +6750,7 @@ taken locally, not attached to the PR (they contain the private session
 list). Also confirmed: interactive edits are in-memory only and a second
 launch never re-migrates the file.
 
-**Review follow-up (#445):** a corrupt or unreadable `settings.json` must
+**Review follow-up (PR #445):** a corrupt or unreadable `settings.json` must
 never be rewritten by the migration save — a parse failure reads as
 "version 0, empty list", and the save would drop defaults over the only
 copy of the host list and LLM profiles. `Settings::load_from` now takes an
