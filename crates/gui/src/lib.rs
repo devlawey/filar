@@ -1549,7 +1549,7 @@ impl LauncherApp {
 
     /// The value to store as `Settings::last_ssh`: the selection encoded as
     /// 1 + its position in the persisted list (0 = Local, nothing to
-    /// restore) — PR #445 review.
+    /// restore) (#411).
     ///
     /// A raw slot index is not stable across a save/load round trip: blank
     /// scratch rows are dropped from `ssh_profiles`, so a blank row *before*
@@ -1581,8 +1581,7 @@ impl LauncherApp {
     }
 
     /// The keyring operations `do_launch` performs for the SSH rows, as
-    /// `(key, Some(password))` to save and `(key, None)` to clear — PR #445
-    /// review.
+    /// `(key, Some(password))` to save and `(key, None)` to clear (#411).
     ///
     /// Only persisted rows are touched: a blank scratch row has an empty
     /// alias, and `ssh_cred_name(i, "")` falls back to the index-derived
@@ -3006,7 +3005,7 @@ mod tests {
     fn a_blank_scratch_row_never_touches_the_keyring() {
         // A migrated host can hold the positional alias `SSH2` at any index;
         // a blank row's empty alias would resolve to `ssh_target:SSH{i+1}`
-        // and delete that host's password (review of PR #445).
+        // and delete that host's password (#411).
         let mut app = app_with_hosts(&[("10.0.0.11", "SSH2")]);
         app.ssh_slots[0].save_password = true;
         app.ssh_slots[0].password = "s3cret".into();
@@ -3026,10 +3025,10 @@ mod tests {
 
     #[test]
     fn last_ssh_is_one_plus_the_persisted_position() {
-        // Review of #445: blank scratch rows are dropped from the saved
-        // list, so a raw slot index would preselect a different host after
-        // a restart. The 1-based encoding keeps Local (0) apart from the
-        // first persisted host (1).
+        // Blank scratch rows are dropped from the saved list (#411), so a
+        // raw slot index would preselect a different host after a restart.
+        // The 1-based encoding keeps Local (0) apart from the first
+        // persisted host (1).
         let mut app =
             app_with_hosts(&[("", ""), ("10.0.0.11", "web-1"), ("10.0.0.12", "web-2")]);
         assert_eq!(app.persisted_last_ssh(), 0, "Local remembers no host");
