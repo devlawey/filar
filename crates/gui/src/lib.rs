@@ -325,6 +325,27 @@ fn migrate_ssh_profiles(profiles: &mut Vec<SshProfile>) -> bool {
     changed
 }
 
+/// Re-encode the pre-#411 `last_ssh` from a padded-list slot index into the
+/// 1-based persisted position used by the open-ended list (#411).
+///
+/// The old encoding could not tell "Local" from the first slot (both `0`)
+/// and knew nothing about the blank placeholders the migration drops. A
+/// selected placeholder — or an index that names nothing — has no host to
+/// restore: `0`.
+fn migrate_last_ssh(last_ssh: usize, profiles: &[SshProfile]) -> usize {
+    if last_ssh == 0 || last_ssh >= profiles.len() {
+        return 0;
+    }
+    if profiles[last_ssh].host.trim().is_empty() {
+        return 0;
+    }
+    profiles[..last_ssh]
+        .iter()
+        .filter(|p| !p.host.trim().is_empty())
+        .count()
+        + 1
+}
+
 // ---------------------------------------------------------------------------
 // LaunchConfig — returned to main.rs
 // ---------------------------------------------------------------------------
@@ -474,6 +495,9 @@ struct Settings {
     /// is what triggers the one-time migration in [`Settings::load`].
     #[serde(default)]
     ssh_list_version: u32,
+    /// Last selected SSH target: 1 + its position in `ssh_profiles`
+    /// (0 = Local). Pre-#411 files store the raw slot index here; the
+    /// one-time migration re-encodes it (#411).
     #[serde(default)]
     last_ssh: usize,
     #[serde(default)]
@@ -534,11 +558,13 @@ impl Settings {
     ///
     /// Returns `true` when the settings file must be re-saved: the version
     /// marker itself is the durable part — a repeated alias pass is only ever
-    /// wrong to run, never wrong to skip.
+    /// wrong to run, never wrong to skip. Also re-encodes the pre-#411
+    /// `last_ssh` slot index ([`migrate_last_ssh`]).
     fn apply_ssh_list_migration(&mut self) -> bool {
         if self.ssh_list_version >= SSH_LIST_VERSION {
             return false;
         }
+        self.last_ssh = migrate_last_ssh(self.last_ssh, &self.ssh_profiles);
         let migrated = migrate_ssh_profiles(&mut self.ssh_profiles);
         self.ssh_list_version = SSH_LIST_VERSION;
         tracing::info!(migrated, "SSH host list migrated to the open-ended format");
@@ -1521,22 +1547,18 @@ impl LauncherApp {
             .collect()
     }
 
-    /// The selected host's position in the persisted list — the value stored
-    /// as `Settings::last_ssh` (PR #445 review).
+    /// The value to store as `Settings::last_ssh`: the selection encoded as
+    /// 1 + its position in the persisted list (0 = Local, nothing to
+    /// restore) — PR #445 review.
     ///
     /// A raw slot index is not stable across a save/load round trip: blank
     /// scratch rows are dropped from `ssh_profiles`, so a blank row *before*
     /// the selected host shifts every later position and a restart would
-    /// preselect the wrong host (`run_launcher` maps `last_ssh` back against
-    /// the saved list). A selected blank row itself has no persisted
-    /// counterpart: it restores as Local, the same way `target_mode == 0`
-    /// does.
-    ///
-    /// `0` is also returned for the *first* persisted position: the restore
-    /// gate is `last_ssh > 0`, so it reads as Local. That matches the
-    /// pre-#411 launcher — the old five slots never restored `SSH1` either.
-    /// Telling "Local" and "host 0" apart would need a changed persisted
-    /// encoding, deliberately left out of this issue's scope.
+    /// preselect a different host (`run_launcher` maps `last_ssh` back
+    /// against the saved list). The 1-based encoding keeps Local (`0`) apart
+    /// from the first persisted host (`1`): every host, `SSH1` included,
+    /// survives a restart. A selected blank row has no persisted counterpart
+    /// and restores as Local, the same way `target_mode == 0` does.
     fn persisted_last_ssh(&self) -> usize {
         if self.target_mode == 0 {
             return 0;
@@ -1555,6 +1577,7 @@ impl LauncherApp {
             .iter()
             .filter(|s| !s.host.trim().is_empty())
             .count()
+            + 1
     }
 
     /// Append a blank host and select it, so its fields open below.
@@ -1791,8 +1814,8 @@ pub fn run_launcher(config: &Config) {
     let app = LauncherApp {
         sessions,
         selected_session: None,
-        target_mode: if settings.last_ssh > 0 && settings.last_ssh < ssh_slots.len() {
-            settings.last_ssh + 1
+        target_mode: if settings.last_ssh > 0 && settings.last_ssh <= ssh_slots.len() {
+            settings.last_ssh
         } else {
             0
         },
@@ -2952,45 +2975,79 @@ mod tests {
     }
 
     #[test]
-    fn persisted_last_ssh_is_the_position_in_the_persisted_list() {
+    fn last_ssh_is_one_plus_the_persisted_position() {
         // Review of #445: blank scratch rows are dropped from the saved
-        // list, so storing a raw slot index would preselect a different
-        // host after a restart.
+        // list, so a raw slot index would preselect a different host after
+        // a restart. The 1-based encoding keeps Local (0) apart from the
+        // first persisted host (1).
         let mut app =
             app_with_hosts(&[("", ""), ("10.0.0.11", "web-1"), ("10.0.0.12", "web-2")]);
         assert_eq!(app.persisted_last_ssh(), 0, "Local remembers no host");
         app.target_mode = 1; // the blank scratch row itself
         assert_eq!(app.persisted_last_ssh(), 0, "a blank row has no persisted counterpart");
         app.target_mode = 2; // web-1: first persisted position
-        assert_eq!(app.persisted_last_ssh(), 0);
-        app.target_mode = 3; // web-2: one host precedes it in the saved list
         assert_eq!(app.persisted_last_ssh(), 1);
+        app.target_mode = 3; // web-2: second persisted position
+        assert_eq!(app.persisted_last_ssh(), 2);
     }
 
     #[test]
     fn the_selected_host_survives_a_save_load_round_trip_past_a_blank_row() {
-        let mut app =
-            app_with_hosts(&[("", ""), ("10.0.0.11", "web-1"), ("10.0.0.12", "web-2")]);
-        app.target_mode = 3; // web-2
-        let persisted = app.persistable_ssh_profiles();
-        let last_ssh = app.persisted_last_ssh();
+        // Both hosts sit behind a blank row; the first one must not
+        // degrade to Local and the second must not shift onto the first.
+        for (slot, expected_mode, alias) in [(2usize, 1usize, "web-1"), (3, 2, "web-2")] {
+            let mut app =
+                app_with_hosts(&[("", ""), ("10.0.0.11", "web-1"), ("10.0.0.12", "web-2")]);
+            app.target_mode = slot;
+            let persisted = app.persistable_ssh_profiles();
+            let last_ssh = app.persisted_last_ssh();
 
-        // The restore side of `run_launcher`, against the saved list.
-        let pairs: Vec<(&str, &str)> = persisted
-            .iter()
-            .map(|p| (p.host.as_str(), p.alias.as_str()))
-            .collect();
-        let restored = app_with_hosts(&pairs);
-        let target_mode = if last_ssh > 0 && last_ssh < restored.ssh_slots.len() {
-            last_ssh + 1
-        } else {
-            0
+            // The restore side of `run_launcher`, against the saved list.
+            let pairs: Vec<(&str, &str)> = persisted
+                .iter()
+                .map(|p| (p.host.as_str(), p.alias.as_str()))
+                .collect();
+            let restored = app_with_hosts(&pairs);
+            let target_mode = if last_ssh > 0 && last_ssh <= restored.ssh_slots.len() {
+                last_ssh
+            } else {
+                0
+            };
+            assert_eq!(target_mode, expected_mode, "mode for {alias}");
+            assert_eq!(
+                restored.ssh_slots[target_mode - 1].alias,
+                alias,
+                "the same host as before the restart"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_re_encodes_last_ssh_from_a_slot_index_to_a_persisted_position() {
+        // Pre-#411 `last_ssh` was the raw slot index in the padded list and
+        // shared 0 with Local. [A, B, C, blank, blank] with C selected
+        // (slot 2) must become position 3: two hosts precede C.
+        let mut settings = Settings {
+            ssh_profiles: vec![
+                ssh_profile("10.0.0.11", ""),
+                ssh_profile("10.0.0.12", ""),
+                ssh_profile("10.0.0.13", ""),
+                SshProfile::default(),
+                SshProfile::default(),
+            ],
+            last_ssh: 2,
+            ..Settings::default()
         };
-        assert_eq!(target_mode, 2);
-        assert_eq!(
-            restored.ssh_slots[target_mode - 1].alias,
-            "web-2",
-            "the same host as before the restart, not the row at the old slot index"
-        );
+        assert!(settings.apply_ssh_list_migration());
+        assert_eq!(settings.last_ssh, 3);
+
+        // A selected placeholder slot has no host to restore: Local.
+        let mut settings = Settings {
+            ssh_profiles: vec![ssh_profile("10.0.0.11", ""), SshProfile::default()],
+            last_ssh: 1,
+            ..Settings::default()
+        };
+        assert!(settings.apply_ssh_list_migration());
+        assert_eq!(settings.last_ssh, 0);
     }
 }
