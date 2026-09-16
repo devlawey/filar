@@ -6725,7 +6725,7 @@ duplicate aliases (`_dup`). The migrated file is saved immediately; the
 version marker stops a second pass, so a new-format host with a temporarily
 empty alias is never silently renumbered.
 
-**Tests.** gui (21 new, 44 → 63): migration naming/drop/collision/idempotence
+**Tests.** gui (19 new, 44 → 63): migration naming/drop/collision/idempotence
 and the version gate (per slot asserts `ssh_cred_name(i, alias) ==
 ssh_target:SSH{i+1}` — the keyring key is unchanged), add/reorder/remove
 selection arithmetic, alias-required and duplicate-alias launch refusal —
