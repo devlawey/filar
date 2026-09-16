@@ -6725,13 +6725,15 @@ duplicate aliases (`_dup`). The migrated file is saved immediately; the
 version marker stops a second pass, so a new-format host with a temporarily
 empty alias is never silently renumbered.
 
-**Tests.** gui (15 new, 44 → 59): migration naming/drop/collision/idempotence
+**Tests.** gui (17 new, 44 → 61): migration naming/drop/collision/idempotence
 and the version gate (per slot asserts `ssh_cred_name(i, alias) ==
 ssh_target:SSH{i+1}` — the keyring key is unchanged), add/reorder/remove
 selection arithmetic, alias-required and duplicate-alias launch refusal —
 including two aliases that only differ after the 32-char storage cutoff, a
 blank scratch row blocking only its own selection, a full 12-host list
-launching from the last row, blank rows never persisted.
+launching from the last row, blank rows never persisted, and the two
+`Settings::load_from` temp-file cases (valid pre-#411 file migrated and
+persisted; corrupt file left byte-for-byte untouched).
 
 **Verification:** `cargo build --workspace`, `cargo test --workspace` green.
 Real Windows run: (1) old-format `settings.json` (5 slots, unnamed hosts) →
@@ -6745,6 +6747,13 @@ selected) and remove (the row disappears, the count drops) — screenshots
 taken locally, not attached to the PR (they contain the private session
 list). Also confirmed: interactive edits are in-memory only and a second
 launch never re-migrates the file.
+
+**Review follow-up (#445):** a corrupt or unreadable `settings.json` must
+never be rewritten by the migration save — a parse failure reads as
+"version 0, empty list", and the save would drop defaults over the only
+copy of the host list and LLM profiles. `Settings::load_from` now takes an
+explicit path and skips both the migration and the save for anything that
+did not parse (temp-file tests cover the valid and the corrupt case).
 
 **Next:** #412 — the launcher's `config.toml` rewrite must stop wiping
 manual `[[ssh_targets]]` edits.

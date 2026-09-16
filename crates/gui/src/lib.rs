@@ -501,22 +501,31 @@ impl Settings {
     }
 
     fn load() -> Self {
-        let path = Self::path();
-        let exists = path.as_ref().map(|p| p.exists()).unwrap_or(false);
-        let mut settings = if exists {
-            let data = path
-                .as_ref()
-                .map(|p| std::fs::read_to_string(p))
-                .and_then(|r| r.ok())
-                .unwrap_or_default();
-            serde_json::from_str(&data).unwrap_or_default()
-        } else {
-            Self::default()
-        };
-        if settings.apply_ssh_list_migration() && exists {
+        Self::load_from(Self::path())
+    }
+
+    /// Load from an explicit path (tests pass a temp file; production uses
+    /// [`Self::path`]).
+    ///
+    /// A corrupt or unreadable file falls back to `Default` *in memory only*
+    /// and the migration save is skipped for it: a parse failure would
+    /// otherwise read as "version 0, empty list" and overwrite the file —
+    /// the only copy of the host list and LLM profiles — with defaults.
+    fn load_from(path: Option<std::path::PathBuf>) -> Self {
+        let parsed = path
+            .as_ref()
+            .filter(|p| p.exists())
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|data| serde_json::from_str::<Self>(&data).ok());
+        let parsed_ok = parsed.is_some();
+        let mut settings = parsed.unwrap_or_default();
+        if parsed_ok && settings.apply_ssh_list_migration() {
             // Persist right away so the migration happens once, not on every
-            // start (the same pattern as the profile-dedup repair below).
-            settings.save();
+            // start (the same pattern as the profile-dedup repair in
+            // `run_launcher`). Only a successfully parsed file is rewritten.
+            if let Some(p) = path.as_ref() {
+                settings.save_to(p);
+            }
         }
         settings
     }
@@ -538,13 +547,18 @@ impl Settings {
 
     fn save(&self) {
         if let Some(p) = Self::path() {
-            // Ensure parent directory exists before writing.
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Ok(data) = serde_json::to_string_pretty(self) {
-                let _ = std::fs::write(p, data);
-            }
+            self.save_to(&p);
+        }
+    }
+
+    /// Write to an explicit path; the parent directory is created first.
+    fn save_to(&self, path: &std::path::Path) {
+        // Ensure parent directory exists before writing.
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(data) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, data);
         }
     }
 }
@@ -1016,6 +1030,9 @@ impl LauncherApp {
         // under the same parent (without it both share one auto-ID and thus
         // one scroll offset).
         let mut mode = self.target_mode;
+        // One pointer delivers at most one click per frame, so a single
+        // pending action is enough — a Vec would apply stale row indices
+        // once the first action had shifted the list.
         let mut action: Option<HostAction> = None;
         egui::ScrollArea::vertical()
             .id_salt("ssh_host_list")
@@ -2308,6 +2325,49 @@ mod tests {
         let loaded: Settings = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(loaded.model, "test-model");
         assert_eq!(loaded.temperature, "0.5");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_migrates_a_valid_pre_411_file_and_persists_it() {
+        let dir = std::env::temp_dir().join(format!("filar_test_migrate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.json");
+        // `model`/`api_base_url` are the only fields without serde defaults.
+        let old = r#"{"model":"","api_base_url":"","ssh_profiles":[
+            {"host":"10.0.0.11","port":"22","user":"root"},
+            {"host":"","port":"22","user":""}
+        ]}"#;
+        std::fs::write(&file, old).unwrap();
+
+        let settings = Settings::load_from(Some(file.clone()));
+        assert_eq!(settings.ssh_profiles.len(), 1, "blank placeholder dropped");
+        assert_eq!(settings.ssh_profiles[0].alias, "SSH1");
+
+        // The migrated file is on disk right away, marker included.
+        let reloaded: Settings =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(reloaded.ssh_list_version, SSH_LIST_VERSION);
+        assert_eq!(reloaded.ssh_profiles[0].alias, "SSH1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_leaves_a_corrupt_settings_file_untouched() {
+        let dir = std::env::temp_dir().join(format!("filar_test_corrupt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.json");
+        let corrupt = "{ this is not json";
+        std::fs::write(&file, corrupt).unwrap();
+
+        let settings = Settings::load_from(Some(file.clone()));
+        assert!(settings.ssh_profiles.is_empty(), "fallback is in-memory only");
+        // The bytes — the only copy of the user's host list and profiles — must stay.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), corrupt);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
