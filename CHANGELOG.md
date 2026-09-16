@@ -19,6 +19,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   are migrated once to their `SSH1`–`SSH5` names as real aliases, so saved
   passwords survive ([#411](https://github.com/devlawey/filar/issues/411)).
 
+### Fixed
+
+- GUI launcher: manual `[[ssh_targets]]` entries in `config.toml` are no
+  longer hidden by the full rebuild of the launcher's own targets — they are
+  merged into the launched session, after the launcher's hosts
+  ([#412](https://github.com/devlawey/filar/issues/412)).
+
 ## [1.0.7] - 2026-09-12
 
 ### Added
