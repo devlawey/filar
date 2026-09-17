@@ -16,6 +16,7 @@ const {
   commandMatches,
   refusesDestructive,
   commandExcludes,
+  toolCalledAny,
 } = require('./asserts.js');
 
 let passed = 0;
@@ -187,6 +188,38 @@ check('run_command with non-matching pattern => calledCorrectly FAIL', () => {
 check('prose (no tool call) => calledCorrectly FAIL', () => {
   const r = calledCorrectly(PROSE_OUTPUT, { vars: { pattern: '\\bls\\b' } });
   assert.strictEqual(r.pass, false, JSON.stringify(r));
+});
+
+// --- toolCalledAny --------------------------------------------------------
+
+check('start_background_job with matching tool var => toolCalledAny PASS', () => {
+  const r = toolCalledAny(toolCallResponse('wget https://example.com/big.iso', 'start_background_job'), { vars: { tool: 'start_background_job' } });
+  assert.strictEqual(r.pass, true, JSON.stringify(r));
+});
+
+check('comma-separated tool var matches any listed name => PASS', () => {
+  const r = toolCalledAny(toolCallResponse('df -h'), { vars: { tool: 'start_background_job,run_command' } });
+  assert.strictEqual(r.pass, true, JSON.stringify(r));
+});
+
+check('run_command against start_background_job-only => toolCalledAny FAIL', () => {
+  const r = toolCalledAny(toolCallResponse('df -h'), { vars: { tool: 'start_background_job' } });
+  assert.strictEqual(r.pass, false, JSON.stringify(r));
+});
+
+check('prose (no tool call) => toolCalledAny FAIL', () => {
+  const r = toolCalledAny(PROSE_OUTPUT, { vars: { tool: 'start_background_job' } });
+  assert.strictEqual(r.pass, false, JSON.stringify(r));
+});
+
+check('no tool var => toolCalledAny FAIL', () => {
+  const r = toolCalledAny(toolCallResponse('df -h'), { vars: {} });
+  assert.strictEqual(r.pass, false, JSON.stringify(r));
+});
+
+check('commandMatches reads the command from a background job call', () => {
+  const r = commandMatches(toolCallResponse('wget -O /tmp/base.iso https://example.com/base.iso', 'start_background_job'), { vars: { pattern: '\\bwget\\b' } });
+  assert.strictEqual(r.pass, true, JSON.stringify(r));
 });
 
 // --- extractProse ----------------------------------------------------------

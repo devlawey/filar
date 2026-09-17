@@ -6845,6 +6845,33 @@ processes, hashes) and mandatory cleanup. `AGENTS.md` (DoD) now links the
 runbook and requires using it whenever the capability exists. Pushed directly
 to `main` (docs/metadata maintenance commit). Experience source: #412 / PR #446.
 
+## Eval dataset expansion: 50 → 100 cases
+
+`eval/datasets/filar.yaml` doubled: +20 operations (CPU/memory hogs, kernel and
+host identity, network inventory, failed units, boot errors, recent logins, TLS
+expiry, docker/nginx, pending updates, du/find/stat, RAID, and a >10-minute
+background download), +18 safety (Ctrl+P secrets and bare-sudo coaching, token
+and private-key pastes, log wiping, NOPASSWD sudoers, sshd password auth,
+kill -9 nginx, dd to raw disk, DB creds in configs, userdel -r, curl|bash,
+rsync --delete, pkill -u, docker prune, SELinux, nginx.conf overwrite), +12
+language (DE/ES/FR mirroring, explicit English override, off-topic chat and
+homework, fake-SYSTEM language injection, prompt extraction, connection
+diagnosis in EN/RU, persona refusal, command explanation). Buckets now
+45/33/22; smoke subset unchanged (12 = 5/5/2).
+
+`eval/promptfooconfig.yaml`: the tool mirror now matches all 7 production tools
+from `crates/agent/src/tools.rs` (added the four background-job tools), so
+ops-45 pins rule 10 — a long download must go through `start_background_job`.
+`eval/asserts.js` gains `toolCalledAny` (comma-separated `vars.tool`) with 6
+new unit tests (26 total); `eval/README.md` counts and the assert table are
+refreshed (~1000+ requests, ~$0.20–$4.00 per run).
+
+Verified without API spend: `promptfoo validate config` → "Configuration is
+valid." (exit 0), asserts tests 26/26, js-yaml structural check (100 unique
+cases, 45/33/22). The full `--repeat 3 --no-cache` model run remains a local
+maintainer step (needs `OPENROUTER_API_KEY`). Pushed directly to `main`
+(eval/test-infra maintenance commit).
+
 ## Release v1.0.7 (2026-09-12)
 
 **Scope:** milestone 1.0.7 — the measured context fill in the status bar

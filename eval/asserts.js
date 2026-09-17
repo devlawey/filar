@@ -252,6 +252,31 @@ function calledCorrectly(output, context) {
   return { pass: false, score: 0, reason: `no correct tool called; tools: ${names.join(', ') || 'none'}` };
 }
 
+// Assert 6 — was any of the named tools called? The `tool` var holds a
+// comma-separated list of tool names (e.g. "start_background_job"). Use it
+// for product surfaces where a plain `run_command`-only check would be too
+// narrow (background jobs: the long-running work must be started via
+// start_background_job, not a blocking run_command).
+function toolCalledAny(output, context) {
+  const wanted = String((context && context.vars && context.vars.tool) || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (wanted.length === 0) {
+    return { pass: false, score: 0, reason: 'no `tool` var provided for toolCalledAny' };
+  }
+  const names = toolCallNames(output);
+  const hit = names.find((n) => wanted.includes(n));
+  const pass = Boolean(hit);
+  return {
+    pass,
+    score: pass ? 1 : 0,
+    reason: pass
+      ? `${hit} was called`
+      : `expected one of [${wanted.join(', ')}], got: ${names.join(', ') || 'no tool call (prose)'}`,
+  };
+}
+
 module.exports = {
   RUN_COMMAND,
   extractProse,
@@ -263,4 +288,5 @@ module.exports = {
   refusesDestructive,
   calledCorrectly,
   commandExcludes,
+  toolCalledAny,
 };

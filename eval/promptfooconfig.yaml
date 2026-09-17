@@ -1,4 +1,4 @@
-description: "filar agent eval — tool-calling on filar tasks (milestone v0.4.1)"
+description: "filar agent eval — tool-calling on filar tasks"
 
 # Prompt under test = filar's real agent system prompt (SSH/POSIX remote
 # variant), synced with crates/agent/src/agent.rs via the
@@ -8,13 +8,14 @@ prompts:
   - file://prompts/agent-chat.json
 
 # Global throttling — limits parallelism to avoid 429 Too Many Requests from
-# OpenRouter. A full run is ~500+ requests (50 cases × 10 models + judge calls).
-# Free models (`:free`) have per-provider stricter limits below.
+# OpenRouter. A full run is ~1000+ requests (100 cases × 10 models + judge
+# calls). Free models (`:free`) have per-provider stricter limits below.
 maxConcurrency: 4
 
 # Tool schema mirrors crates/agent/src/tools.rs::tool_definitions(). It is a
 # manual mirror (single-source sharing from Rust would need an export step);
-# the asserts target the stable tool name `run_command`. The schema is defined
+# the asserts target the stable tool names (run_command, read_file, list_dir,
+# start_background_job, …). The schema is defined
 # once here (anchor &filar_tools) and attached to each provider's `config.tools`
 # — promptfoo's OpenRouter/OpenAI provider sends `config.tools` to the API.
 tools: &filar_tools
@@ -54,6 +55,62 @@ tools: &filar_tools
             type: string
             description: "Absolute or relative path to the directory."
         required: ["path"]
+  - type: function
+    function:
+      name: start_background_job
+      description: "Start a long-running command in the background and return a job_id immediately. Use background_job_status to poll progress with short calls; the job keeps running beyond the normal command timeout. Prefer this over run_command for downloads, builds, pulls, and other work that may take many minutes."
+      parameters:
+        type: object
+        properties:
+          command:
+            type: string
+            description: "The shell command to run in the background."
+          explanation:
+            type: string
+            description: "A brief explanation of what this command does and why."
+        required: ["command"]
+  - type: function
+    function:
+      name: background_job_status
+      description: "Poll a background job started with start_background_job. Returns running/done/failed/cancelled status and recent output. This call is short — it does not wait for the job to finish."
+      parameters:
+        type: object
+        properties:
+          job_id:
+            type: string
+            description: "Job id returned by start_background_job."
+          tail_lines:
+            type: integer
+            description: "How many lines of output to include (default 50)."
+          explanation:
+            type: string
+            description: "A brief explanation of what this command does and why."
+        required: ["job_id"]
+  - type: function
+    function:
+      name: cancel_background_job
+      description: "Cancel a background job by job_id. Stops the underlying process."
+      parameters:
+        type: object
+        properties:
+          job_id:
+            type: string
+            description: "Job id returned by start_background_job."
+          explanation:
+            type: string
+            description: "A brief explanation of what this command does and why."
+        required: ["job_id"]
+  - type: function
+    function:
+      name: list_background_jobs
+      description: "List background jobs for the current session with their status."
+      parameters:
+        type: object
+        properties:
+          explanation:
+            type: string
+            description: "A brief explanation of what this command does and why."
+        required: []
 
 # Providers — ten models via OpenRouter. The key is read automatically from
 # the OPENROUTER_API_KEY environment variable (methodology §6: no secrets in
@@ -136,7 +193,7 @@ providers:
     maxConcurrency: 1
     delay: 3000
 
-# Dataset — 50 cases in three buckets (operations / safety / language), see
+# Dataset — 100 cases in three buckets (operations / safety / language), see
 # eval/datasets/filar.yaml. Each case carries vars.bucket + vars.priority for
 # filtering runs (e.g. only `operations`). The #72 smoke cases are now part of
 # the dataset.
