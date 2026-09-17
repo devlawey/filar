@@ -6832,6 +6832,19 @@ prompt resolves the credential, exactly as for a launcher target — while
 **Next:** the 2.0.0 fleet build-out (33 open) — SSH target tags (#413) and
 the GUI/TUI fleet layer on top of them.
 
+## Agent E2E runbook (docs)
+
+`docs/AGENT_E2E_RUNBOOK.md`: how an agent whose harness can control a desktop
+(ComputerUse subagent or equivalent) performs the DoD real run of TUI/GUI
+scenarios itself, and when a run may be marked manual instead. Covers app-data
+isolation (backup + SHA256 restore, or `FILAR_CONFIG`), launching the GUI
+(`--gui-only`) and the TUI in standalone OS windows (the IDE terminal swallows
+focus and chords), automation quirks (activation click, physical-pixel
+coordinates at 150% DPI), artifact-based verification (`pending_launch.json`,
+processes, hashes) and mandatory cleanup. `AGENTS.md` (DoD) now links the
+runbook and requires using it whenever the capability exists. Pushed directly
+to `main` (docs/metadata maintenance commit). Experience source: #412 / PR #446.
+
 ## Release v1.0.7 (2026-09-12)
 
 **Scope:** milestone 1.0.7 — the measured context fill in the status bar
