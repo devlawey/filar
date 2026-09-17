@@ -159,15 +159,13 @@ providers:
       max_tokens: 1024
       timeoutMs: 300000
       tools: *filar_tools
-  - id: openrouter:tencent/hy3:free
+  - id: openrouter:tencent/hy3
     label: HY3 (OpenRouter)
     config:
       temperature: 0
       max_tokens: 1024
       timeoutMs: 300000
       tools: *filar_tools
-    maxConcurrency: 1
-    delay: 3000
 
   - id: openrouter:deepseek/deepseek-v4-pro
     label: DeepSeek-V4-Pro (OpenRouter)

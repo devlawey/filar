@@ -6872,6 +6872,14 @@ cases, 45/33/22). The full `--repeat 3 --no-cache` model run remains a local
 maintainer step (needs `OPENROUTER_API_KEY`). Pushed directly to `main`
 (eval/test-infra maintenance commit).
 
+**Follow-up (2026-09-17):** the `tencent/hy3:free` slug was retired upstream
+(404 "unavailable for free"); replaced with the paid `tencent/hy3` (the
+free-tier throttle went away with it). A single-case check of ops-45 across all
+10 models confirmed the background-job path end-to-end: the tools reach the
+models and the asserts catch the calls (7/10 chose `start_background_job`;
+GPT-5.6-SOL and Gemini-3.5-Flash issued a blocking `run_command` instead).
+Pushed directly to `main`.
+
 ## Release v1.0.7 (2026-09-12)
 
 **Scope:** milestone 1.0.7 — the measured context fill in the status bar

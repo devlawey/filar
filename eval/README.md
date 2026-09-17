@@ -79,8 +79,8 @@ buckets B and C.
 | Setting | Value | Applies to |
 |---|---|---|
 | `maxConcurrency` | 4 (global) | All paid models |
-| Per-provider `maxConcurrency` | 1 | `:free` models only (HY3, Nemotron) |
-| Per-provider `delay` | 3000 ms | `:free` models only |
+| Per-provider `maxConcurrency` | 1 | `:free` model only (Nemotron) |
+| Per-provider `delay` | 3000 ms | `:free` model only (Nemotron) |
 
 > **Note on judge load:** every rubric case in buckets B and C triggers a second
 > API call to the judge model, roughly doubling the load for those cases. The
@@ -95,7 +95,7 @@ additional daily caps. On a full run, a `:free` model hits the daily limit
 after ~2 minutes. If you need consistent results for free models:
 
 - Run them separately: comment out all but one `:free` model, then repeat.
-- Use `--filter-providers 'hy3'` to run a single model.
+- Use `--filter-providers 'nemotron'` to run a single model.
 - Increase per-provider `delay` to 10000 for very tight limits.
 
 ### Retry wrapper (`eval/scripts/run-eval.js`)
