@@ -10,7 +10,7 @@ working example.
 | Crate            | Role                                           | Required? |
 |------------------|------------------------------------------------|-----------|
 | `filar-core`     | Shared types, config, errors, secrets, sessions | Yes       |
-| `filar-transport`| `CommandExecutor` (SSH), `SecretSubstitutingExecutor` | Yes  |
+| `filar-transport`| `CommandExecutor` (SSH), `SecretSubstitutingExecutor`, `ReadOnlyExecutor` | Yes  |
 | `filar-agent`    | `Agent`, `AgentBuilder`, `LlmClient` trait     | Yes       |
 
 > **Note:** `filar-tui`, `filar-gui`, and `filar-app` are desktop-only and

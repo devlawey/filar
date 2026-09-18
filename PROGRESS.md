@@ -7260,6 +7260,82 @@ functions stay undocumented like the rest of the suite.
 
 **Next:** #419 — read-only executor: the `read-only` policy gets teeth.
 
+## Issue #419: feat(transport) — ReadOnlyExecutor: the ban on writes enforced by transport
+
+**Milestone:** 2.0.0. **Branch:** `feat/419-read-only-executor`.
+
+**Problem.** The `read-only` policy of host groups (#418) existed as data
+only — nothing enforced it. The fleet promise "read-only" rested on the
+model's behaviour and on the user reading the group definition.
+
+**Decision.** `filar_transport::ReadOnlyExecutor` — a `CommandExecutor`
+wrapper (`crates/transport/src/readonly.rs`) that refuses every command
+outside a **hardcoded** allowlist before the inner executor is called:
+nothing is sent to the host. The list is `pub const ALLOWED_COMMANDS`
+(pure readers only; `find`/`sed`/`awk`/`env`/`xargs`/`sudo`/`tee`/`ip` are
+deliberately absent), plus `FORBIDDEN_ARGS` guards for readers with an
+opt-in write/exec flag (`sort -o`/`--compress-program`, `date -s`,
+`file -C`). A command passes only when **every** `;`/`&&`/`||`/`|`/newline
+segment starts with an allowlisted binary (a `/bin/`-style prefix is
+tolerated, any other path is not) and there is no command/process
+substitution, heredoc, input redirection or background `&`; output
+redirection is allowed only to exactly `/dev/null` (a `/dev/nullx` prefix
+trick is rejected) or as fd duplication (`2>&1`). The parser
+validates literal text only and is deliberately over-strict — a quoted
+`;`, a `$`-expansion or a glob is refused rather than interpreted
+(fail-closed). The gate sits directly around the
+SSH executor, so it sees the final text that reaches the wire; secret
+substitution happens above it and sanitises refusals of substituted
+commands, so a secret value can never ride out through a refusal message.
+
+**Wiring.** The wrap decision is `filar_core::is_read_only_target(groups,
+target)` (any matching group with `HostGroupPolicy::ReadOnly` — the most
+restrictive policy wins; a target with no tags, e.g. an ad-hoc `!ssh`
+connect, never matches). Applied at every session swap in the TUI runner
+(Ctrl+O select, Ctrl+O password connect, `!ssh` dynamic) and to the
+initial executor in `app/main.rs`; `TuiConfig` now carries `host_groups`.
+Boundaries: the agent path, the `!` shell escape and `run_streaming` go
+through the gate; the Ctrl+T interactive terminal does not pass through
+`CommandExecutor` — it is the user's own direct input and stays out of
+scope, as does the user's own shell.
+
+**Tests.** 17 tests in `readonly.rs`: refusal before the inner call
+(call counter on a mock inner), the `;`/`&&`/`||`/`|`/newline bypass
+suite, substitution and expansion refusals (`$(...)`, backticks,
+`process substitution`, `${X:---compile}`, `$'--compile'`, quotes,
+backslash, braces, globs), redirect rules (incl. the spaced `>& 1`),
+bin-prefix spoofing (`/tmp/ls`, `./ls`, `/usr/bin/../sbin/rm`),
+write-flag guards in getopt spellings (`-o`, `-ro`, `-oFILE`, `--out=`,
+`date -us`, `file -Cb`), empty commands, plus a real `LocalExecutor` run
+proving allowed commands execute and a write is refused before
+execution. In `core/config.rs` — target-group membership (all tags
+required, an empty rule matches nobody) and the read-only verdict.
+
+**Review round (PR #453).** CodeRabbit's critical find was real and is
+closed in the same branch: validation sees literal text, but the host
+shell expands **after** the gate — `file ${X:---compile}` would have
+passed and become `file --compile` remotely. The gate now refuses every
+re-lexed or expanded character (`$`, `\`, quotes, braces, pathname-glob
+brackets) outright, and the flag guard covers the getopt spellings that
+beat exact-token checks (clusters `-ro`, attached values `-oFILE`,
+abbreviations like `--out=`, `date --se=`). The spaced `>& 1` stays
+refused (non-portable; the compact `2>&1` is the recognised form) and is
+now documented together with the wrapping contract: the gate must stay
+under the secret layer so refusals keep being scrubbed.
+
+**DoD real run (manual).** The SSH leg of the scenario — "read-only
+target, write attempt refused" — could not be run on this machine: no
+Docker (no `docker/sshd` container), no WSL distro, no OpenSSH server
+(client tools only), and the runbook forbids the agent raising the
+infrastructure itself. Procedure for the manual check (docker-sshd):
+`[[ssh_targets]]` entry with `tags = ["ro"]`, a `[[host_groups]]` with
+`match = ["ro"]`, connect via Ctrl+O, then `!ls` (executes) and
+`!touch /tmp/x` (refused with "read-only policy", nothing on the host).
+The transport `#[ignore]` sshd tests remain manual for the same reason.
+
+**Next:** #420 — output preprocessor framework (trait + registry +
+fallback), the next 2.0.0 fleet block.
+
 ## Agent E2E runbook (docs)
 
 `docs/AGENT_E2E_RUNBOOK.md`: how an agent whose harness can control a desktop
