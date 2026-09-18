@@ -1403,6 +1403,8 @@ struct HostGroupDraft {
 }
 
 impl HostGroupDraft {
+    /// Build an editable row from a persisted group: tags are joined with
+    /// `, ` like the host tag fields, limits become their text form.
     fn from_group(group: &filar_core::HostGroup) -> Self {
         Self {
             name: group.name.clone(),
@@ -2791,18 +2793,21 @@ impl LauncherApp {
         self.active_tab = 1;
     }
 
+    /// Remove a group row by index; out-of-range indices are ignored.
     fn remove_group(&mut self, idx: usize) {
         if idx < self.host_groups.len() {
             self.host_groups.remove(idx);
         }
     }
 
+    /// Move a group row one position up; the first row stays put.
     fn move_group_up(&mut self, idx: usize) {
         if idx > 0 && idx < self.host_groups.len() {
             self.host_groups.swap(idx - 1, idx);
         }
     }
 
+    /// Move a group row one position down; the last row stays put.
     fn move_group_down(&mut self, idx: usize) {
         if idx + 1 < self.host_groups.len() {
             self.host_groups.swap(idx, idx + 1);

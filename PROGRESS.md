@@ -7242,6 +7242,22 @@ keyring entries unchanged. Note: `Config::load_default` prefers
 another config reads that one — observed during the first check run from the
 repo root (no groups shown), expected behavior rather than a groups bug.
 
+**Review rounds.** ai-review round 1: three notes — a claimed `clean_tag`
+divergence between `validate_host_groups` and persistence (rejected: the
+duplicate check inserts the cleaned `group.name` produced by the same
+`to_group()` whose results are persisted; the reviewer's copy of
+gui/src/lib.rs was truncated to 25 000 chars), the `u64 → u32` limit
+conversion (acknowledged; zero and `> u32::MAX` both fail loudly), and the
+throwaway `HostGroup { name: "" }` in the preview helper (kept: the helper
+is pure and reusing `select_hosts_for_group` is what keeps the preview and
+the real selection from diverging). CodeRabbit round 1: the "group edits can
+appear lost when `./config.toml` overrides the loaded file" finding —
+accepted; the read/write asymmetry is now spelled out in USER_GUIDE §2.5
+and §3.3 (the same trap the E2E relaunch check hit). The docstring-coverage
+warning: all new public items are documented per AGENTS.md; the four private
+Groups row helpers gained doc comments to match the file's style, test
+functions stay undocumented like the rest of the suite.
+
 **Next:** #419 — read-only executor: the `read-only` policy gets teeth.
 
 ## Agent E2E runbook (docs)

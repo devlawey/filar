@@ -537,6 +537,9 @@ fn default_per_host_timeout_secs() -> u64 {
     30
 }
 
+/// Manual `Default` matching the serde defaults — a derived one would
+/// give zero limits and diverge from a group parsed out of an empty
+/// `[[host_groups]]` entry.
 impl Default for HostGroup {
     fn default() -> Self {
         Self {
