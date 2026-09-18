@@ -7280,9 +7280,10 @@ segment starts with an allowlisted binary (a `/bin/`-style prefix is
 tolerated, any other path is not) and there is no command/process
 substitution, heredoc, input redirection or background `&`; output
 redirection is allowed only to exactly `/dev/null` (a `/dev/nullx` prefix
-trick is rejected) or as fd duplication (`2>&1`). The parser is
-deliberately quote-unaware and over-strict — a quoted `;` is refused
-rather than interpreted (fail-closed). The gate sits directly around the
+trick is rejected) or as fd duplication (`2>&1`). The parser
+validates literal text only and is deliberately over-strict — a quoted
+`;`, a `$`-expansion or a glob is refused rather than interpreted
+(fail-closed). The gate sits directly around the
 SSH executor, so it sees the final text that reaches the wire; secret
 substitution happens above it and sanitises refusals of substituted
 commands, so a secret value can never ride out through a refusal message.
@@ -7298,15 +7299,29 @@ through the gate; the Ctrl+T interactive terminal does not pass through
 `CommandExecutor` — it is the user's own direct input and stays out of
 scope, as does the user's own shell.
 
-**Tests.** 16 tests in `readonly.rs`: refusal before the inner call
+**Tests.** 17 tests in `readonly.rs`: refusal before the inner call
 (call counter on a mock inner), the `;`/`&&`/`||`/`|`/newline bypass
-suite, substitution (`$(...)`, backticks, `process substitution`),
-variable-as-command-name (`$CMD ls`, `"ls"`, `FOO=1 ls`), redirect rules,
+suite, substitution and expansion refusals (`$(...)`, backticks,
+`process substitution`, `${X:---compile}`, `$'--compile'`, quotes,
+backslash, braces, globs), redirect rules (incl. the spaced `>& 1`),
 bin-prefix spoofing (`/tmp/ls`, `./ls`, `/usr/bin/../sbin/rm`),
-write-flag guards, empty commands, plus a real `LocalExecutor` run
+write-flag guards in getopt spellings (`-o`, `-ro`, `-oFILE`, `--out=`,
+`date -us`, `file -Cb`), empty commands, plus a real `LocalExecutor` run
 proving allowed commands execute and a write is refused before
 execution. In `core/config.rs` — target-group membership (all tags
 required, an empty rule matches nobody) and the read-only verdict.
+
+**Review round (PR #453).** CodeRabbit's critical find was real and is
+closed in the same branch: validation sees literal text, but the host
+shell expands **after** the gate — `file ${X:---compile}` would have
+passed and become `file --compile` remotely. The gate now refuses every
+re-lexed or expanded character (`$`, `\`, quotes, braces, pathname-glob
+brackets) outright, and the flag guard covers the getopt spellings that
+beat exact-token checks (clusters `-ro`, attached values `-oFILE`,
+abbreviations like `--out=`, `date --se=`). The spaced `>& 1` stays
+refused (non-portable; the compact `2>&1` is the recognised form) and is
+now documented together with the wrapping contract: the gate must stay
+under the secret layer so refusals keep being scrubbed.
 
 **DoD real run (manual).** The SSH leg of the scenario — "read-only
 target, write attempt refused" — could not be run on this machine: no

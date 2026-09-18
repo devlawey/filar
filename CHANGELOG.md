@@ -18,8 +18,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   target matches a read-only group and refuses any command outside a
   built-in allowlist of pure readers before it is sent. Segment separators
   (`;`, `&&`, `|`), command/process substitution, heredocs, input
-  redirection and background execution cannot smuggle a write past the
-  gate; output redirection is limited to `/dev/null` and fd duplication
+  redirection, background execution and shell metacharacters the host would
+  re-expand (`$`, quotes, backslash, braces, globs) cannot smuggle a write
+  past the gate; output redirection is limited to `/dev/null` and fd
+  duplication, and the write flags of `sort`/`date`/`file` are refused in
+  every getopt spelling (`-ro`, `-oFILE`, `--out=`)
   ([#419](https://github.com/devlawey/filar/issues/419)).
 
 - Host groups (`[[host_groups]]` in `config.toml`): a named tag rule where

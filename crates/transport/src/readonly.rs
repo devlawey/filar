@@ -10,6 +10,16 @@
 //! background execution — and no output redirection to anything but
 //! `/dev/null` or a bare file descriptor.
 //!
+//! The gate validates *literal text only*: characters the remote shell
+//! would re-lex or expand are refused outright, because these checks see
+//! the command **before** the host shell does — `$X`, `${X}`, `$'…'`
+//! (parameter and ANSI-C expansion), `\` (escape removal), `'`/`"` (quote
+//! removal), `{`/`}` (brace expansion) and `*`/`?`/`[`/`]` (pathname
+//! expansion) can each turn an argument that passed the checks into a
+//! different one remotely (`file ${X:---compile}` and `file --compil{e,}`
+//! both become `file --compile`). `~` is tolerated: it expands to a path,
+//! never to a flag.
+//!
 //! Refusal happens *before* the command reaches the wrapped executor, so
 //! nothing is ever sent to the host.
 //!
@@ -20,9 +30,9 @@
 //! (Ctrl+T) does not pass through `CommandExecutor` — it is the user's own
 //! direct input and is intentionally out of scope here.
 //!
-//! The parser is deliberately quote-unaware and over-strict: a quoted
-//! separator (`grep "a;b"`) is split like a real one and the command is
-//! refused rather than interpreted. Fail-closed is the point.
+//! Over-strictness is intentional (fail-closed): a quoted `;` is refused
+//! rather than interpreted, and fd duplication must be spelled compactly
+//! (`2>&1`) — a spaced `>& 1` is not recognised and is refused.
 
 use std::sync::Arc;
 
@@ -39,7 +49,9 @@ use crate::{CommandExecutor, CommandResult, StreamEvent};
 /// Every entry is a pure reader: no file writes, no process execution, no
 /// signal delivery under any of its flags. The few readers that have an
 /// opt-in write/execute flag (`sort -o`/`--compress-program`, `date -s`,
-/// `file -C`) are covered by [`FORBIDDEN_ARGS`].
+/// `file -C`) are covered by [`FORBIDDEN_ARGS`] in every spelling getopt
+/// accepts: clusters (`sort -ro`), attached values (`sort -oFILE`) and
+/// abbreviated long options (`sort --out=FILE`).
 ///
 /// Deliberately absent, with intent: `find` (`-delete`, `-exec`), `sed`/`awk`
 /// (`-i`, `system()`), `env`/`nice`/`timeout`/`xargs` (execute code),
@@ -54,15 +66,25 @@ pub const ALLOWED_COMMANDS: &[&str] = &[
     "strings", "tac", "tail", "tr", "uname", "uniq", "uptime", "wc", "which", "who", "whoami",
 ];
 
-/// Argument prefixes that turn an otherwise read-only binary into a writer or
-/// an execution vector. Checked against every argument of the segment.
-const FORBIDDEN_ARGS: &[(&str, &[&str])] = &[
+/// Arguments that turn an otherwise read-only binary into a writer or an
+/// execution vector: `(binary, long option names, short option letters)`,
+/// checked against every argument of the segment.
+///
+/// Long options are matched by *name* (the part before `=`), and the token
+/// is refused when the name or the stored option is an abbreviation of the
+/// other — GNU getopt accepts unambiguous abbreviations (`sort --out=`),
+/// so the match cannot be one-sided. Short options are matched per letter,
+/// not per exact token: in a cluster (`sort -ro`) the letter is a real
+/// option, getopt treats the rest as its argument, and the attached form
+/// (`sort -oFILE`) is covered by the same scan. Both rules over-refuse a
+/// few exotic-but-valid spellings (`sort -k2o`); fail-closed.
+const FORBIDDEN_ARGS: &[(&str, &[&str], &[char])] = &[
     // `sort -o FILE` / `--output` write; `--compress-program` executes a helper.
-    ("sort", &["-o", "--output", "--compress-program"]),
+    ("sort", &["--output", "--compress-program"], &['o']),
     // `date -s` / `--set` sets the system clock.
-    ("date", &["-s", "--set"]),
+    ("date", &["--set"], &['s']),
     // `file -C` / `--compile` writes a compiled magic database.
-    ("file", &["-C", "--compile"]),
+    ("file", &["--compile"], &['C']),
 ];
 
 /// Standard binary directories whose prefix is stripped before the allowlist
@@ -97,6 +119,7 @@ pub fn check_read_only(command: &str) -> std::result::Result<(), String> {
     if cmd.contains("<(") || cmd.contains(">(") {
         return Err("process substitution is not allowed".into());
     }
+    check_reinterpretable_characters(cmd)?;
 
     check_ampersands(cmd)?;
     check_redirections(cmd)?;
@@ -112,6 +135,22 @@ pub fn check_read_only(command: &str) -> std::result::Result<(), String> {
     }
     if segments_checked == 0 {
         return Err("empty command".into());
+    }
+    Ok(())
+}
+
+/// Refuse every character the remote shell would re-lex or expand (see the
+/// module docs). These checks run on literal text, so any of these
+/// characters would make them meaningless: after validation the host shell
+/// can still turn a checked argument into a write flag. `~` is not listed —
+/// tilde expansion yields a path, never a flag.
+fn check_reinterpretable_characters(cmd: &str) -> std::result::Result<(), String> {
+    for c in ['$', '\\', '\'', '"', '{', '}', '*', '?', '[', ']'] {
+        if cmd.contains(c) {
+            return Err(format!(
+                "shell metacharacter `{c}` is not allowed in read-only commands (literal text only)"
+            ));
+        }
     }
     Ok(())
 }
@@ -138,9 +177,16 @@ fn check_ampersands(cmd: &str) -> std::result::Result<(), String> {
             }
             let after_gt = i > 0 && bytes[i - 1] == b'>';
             let digit_follows = bytes.get(i + 1).is_some_and(|b| b.is_ascii_digit());
-            if after_gt && digit_follows {
-                i += 1;
-                continue;
+            if after_gt {
+                if digit_follows {
+                    i += 1;
+                    continue;
+                }
+                // `>& 1` (spaced) is not a portable spelling across shells;
+                // only the compact `2>&1` form is recognised by the gate.
+                return Err(
+                    "`>&` must be followed directly by a file descriptor digit (`2>&1`)".into(),
+                );
             }
             return Err("background execution (&) is not allowed".into());
         }
@@ -205,14 +251,46 @@ fn check_segment(segment: &str) -> std::result::Result<(), String> {
     if !ALLOWED_COMMANDS.contains(&base) {
         return Err(format!("\"{token}\" is not in the read-only allowlist"));
     }
-    if let Some((_, forbidden)) = FORBIDDEN_ARGS.iter().find(|(bin, _)| *bin == base) {
+    if let Some((_, long_opts, short_chars)) =
+        FORBIDDEN_ARGS.iter().find(|(bin, _, _)| *bin == base)
+    {
         for arg in segment.split_whitespace().skip(1) {
-            if let Some(bad) = forbidden.iter().find(|f| arg.starts_with(**f)) {
+            if let Some(bad) = forbidden_flag(arg, long_opts, short_chars) {
                 return Err(format!("\"{base} {bad}\" is not read-only"));
             }
         }
     }
     Ok(())
+}
+
+/// Detect a write/execute flag in one argument of a guarded binary, in the
+/// spellings getopt accepts (see [`FORBIDDEN_ARGS`]): long options are
+/// compared by name with the abbreviation rule, short options by letter
+/// anywhere in a cluster (or in an attached value, `-oFILE`).
+fn forbidden_flag(arg: &str, long_opts: &[&str], short_chars: &[char]) -> Option<String> {
+    if let Some(body) = arg.strip_prefix("--") {
+        // A bare `--` ends option parsing; what follows is an operand.
+        if body.is_empty() {
+            return None;
+        }
+        let name = body.split('=').next().unwrap_or(body);
+        if name.is_empty() {
+            return None;
+        }
+        return long_opts
+            .iter()
+            .find(|opt| {
+                let bare = opt.trim_start_matches('-');
+                bare.starts_with(name) || name.starts_with(bare)
+            })
+            .map(|opt| (*opt).to_string());
+    }
+    if arg.starts_with('-') && arg.len() > 1 {
+        if let Some(c) = short_chars.iter().find(|c| arg[1..].contains(**c)) {
+            return Some(format!("-{c}"));
+        }
+    }
+    None
 }
 
 /// Strip one of the standard binary-directory prefixes, if present.
@@ -236,6 +314,13 @@ fn strip_bin_prefix(token: &str) -> &str {
 ///
 /// Forbidden commands are refused *before* the inner executor is called —
 /// they never reach the host.
+///
+/// Wrapping contract (security): this gate belongs **under** the secret
+/// layer — `SecretSubstitutingExecutor` wraps it, never the other way
+/// round. Two things rely on that order: the gate validates the text as
+/// it will go to the wire (secrets already substituted), and the refusal
+/// message — which echoes the command — passes back out through the
+/// secret layer, which scrubs secret values from error strings. Keep it.
 pub struct ReadOnlyExecutor {
     inner: Arc<dyn CommandExecutor>,
 }
@@ -248,6 +333,10 @@ impl ReadOnlyExecutor {
 }
 
 /// Build the refusal error for a command that failed [`check_read_only`].
+///
+/// The command text is echoed by design (the user must see what was not
+/// sent); the secret layer above scrubs substituted values out of error
+/// strings — see the wrapping contract on [`ReadOnlyExecutor`].
 fn refuse(command: &str, reason: &str) -> CoreError {
     CoreError::Other(format!(
         "read-only policy: {reason} — command not sent to the host: {}",
@@ -450,15 +539,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn variable_in_command_position_is_refused_args_may_expand() {
+    async fn shell_expansion_is_refused_everywhere() {
         let (exec, inner) = gated();
         assert_refused(&exec, &inner, "$CMD ls").await;
         assert_refused(&exec, &inner, "\"ls\"").await;
         assert_refused(&exec, &inner, "FOO=1 ls").await;
-        // Variables in *arguments* are fine — the binary itself is a literal.
-        exec.run("ls $HOME/dir").await.unwrap();
-        exec.run("grep -r pattern ${HOME}/dir").await.unwrap();
-        assert_eq!(inner.calls(), 2);
+        // The gate runs *before* the host shell: variables in arguments are
+        // expanded remotely, so a literal check means nothing — a checked
+        // `${X:---compile}` becomes `--compile` on the other side.
+        assert_refused(&exec, &inner, "ls $HOME/dir").await;
+        assert_refused(&exec, &inner, "grep -r pattern ${HOME}/dir").await;
+        assert_refused(&exec, &inner, "file ${X:---compile}").await;
+        assert_eq!(inner.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn reinterpreted_characters_are_refused() {
+        let (exec, inner) = gated();
+        // Quote removal, escape processing, brace and pathname expansion all
+        // happen on the host *after* this gate, so they are refused outright.
+        for cmd in [
+            "file $'--compile'",
+            "file \"--compile\"",
+            "file --compil\\e",
+            "file --compil{e,}",
+            "sort {-o,/tmp/x} file",
+            "ls /var/log/*.log",
+            "cat /etc/hosts?",
+            "grep -E cho[rm]x /etc/hosts",
+            "echo back\\slash",
+        ] {
+            assert_refused(&exec, &inner, cmd).await;
+        }
     }
 
     #[tokio::test]
@@ -475,6 +587,7 @@ mod tests {
             "ls &",
             "ls &> /tmp/x",
             "echo hi >& /tmp/x",
+            "ls >& 1",
         ] {
             assert_refused(&exec, &inner, cmd).await;
         }
@@ -503,12 +616,24 @@ mod tests {
         assert_refused(&exec, &inner, "sort -o /tmp/x file").await;
         assert_refused(&exec, &inner, "sort --output=/tmp/x file").await;
         assert_refused(&exec, &inner, "sort --compress-program=evil file").await;
+        // Getopt spellings that would defeat an exact-token check: a short
+        // cluster, the attached-value form, and abbreviated long options.
+        assert_refused(&exec, &inner, "sort -ro /tmp/x file").await;
+        assert_refused(&exec, &inner, "sort -o/tmp/x file").await;
+        assert_refused(&exec, &inner, "sort --out=/tmp/x file").await;
         assert_refused(&exec, &inner, "date -s 12:00").await;
+        assert_refused(&exec, &inner, "date -us 12:00").await;
+        assert_refused(&exec, &inner, "date -s2026-12-31").await;
+        assert_refused(&exec, &inner, "date --se=2026-12-31").await;
         assert_refused(&exec, &inner, "file -C").await;
+        assert_refused(&exec, &inner, "file -Cb").await;
         exec.run("sort file").await.unwrap();
+        exec.run("sort -k2 -n file").await.unwrap();
         exec.run("date +%H:%M").await.unwrap();
+        exec.run("date -u").await.unwrap();
         exec.run("file /etc/passwd").await.unwrap();
-        assert_eq!(inner.calls(), 3);
+        exec.run("file -b /etc/hosts").await.unwrap();
+        assert_eq!(inner.calls(), 6);
     }
 
     #[tokio::test]
@@ -529,11 +654,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quote_unaware_splitting_is_fail_closed() {
+    async fn quotes_are_refused_outright() {
         let (exec, inner) = gated();
-        // A quoted separator is split like a real one and the trailing
-        // fragment fails the allowlist — over-strict by design.
+        // Quotes are refused by the metacharacter rule (quote removal could
+        // change an argument), and a quoted separator would additionally be
+        // split like a real one — over-strict by design either way.
         assert_refused(&exec, &inner, "grep \"a;b\" file").await;
+        assert_refused(&exec, &inner, "echo 'a|b'").await;
     }
 
     #[tokio::test]
