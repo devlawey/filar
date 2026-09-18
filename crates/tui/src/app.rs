@@ -201,6 +201,34 @@ impl PendingConfirm {
 // App
 // ---------------------------------------------------------------------------
 
+/// One line of the host-selection overlay view (#415).
+///
+/// Targets are grouped under their primary tag; this is the plain view
+/// model the overlay renders and navigation walks (headers are skipped).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HostSelectRow {
+    /// Non-selectable group header. `tag: None` is the trailing untagged
+    /// bucket; `count` is the group's host count.
+    Header { tag: Option<String>, count: usize },
+    /// The local machine (flat selection index 0).
+    Local,
+    /// SSH target at `ssh_targets[i]` (flat selection index `i + 1`).
+    Target(usize),
+}
+
+impl HostSelectRow {
+    /// Flat selection index (0 = local, `i + 1` = `ssh_targets[i]`) if the
+    /// row is selectable — the contract `ctrl_o_selection` and the runner
+    /// expect.
+    pub(crate) fn selection_index(&self) -> Option<usize> {
+        match self {
+            HostSelectRow::Header { .. } => None,
+            HostSelectRow::Local => Some(0),
+            HostSelectRow::Target(i) => Some(i + 1),
+        }
+    }
+}
+
 /// The main application state.
 pub struct App {
     /// All open sessions (tabs). The first session is created on startup.
@@ -290,6 +318,12 @@ pub struct App {
     pub host_select_visible: bool,
     /// Cursor position in the host-selection overlay.
     pub host_select_index: usize,
+    /// Substring filter typed in the host-selection overlay (#415): matches
+    /// name, `user@host:port`, or tags, case-insensitively.
+    pub host_select_query: String,
+    /// Active tag filter in the host-selection overlay (#415), cycled with
+    /// `Tab`. `None` = no tag filter.
+    pub host_select_tag_filter: Option<String>,
     /// Whether the session-save progress overlay is visible (Ctrl+S).
     pub save_overlay_visible: bool,
     /// Save progress percentage (0-100).
@@ -576,6 +610,8 @@ impl App {
             ctrl_o_pending_session_id: None,
             host_select_visible: false,
             host_select_index: 0,
+            host_select_query: String::new(),
+            host_select_tag_filter: None,
             save_overlay_visible: false,
             save_progress: 0,
             save_error: None,
@@ -1734,6 +1770,10 @@ impl App {
     /// Open the host-selection overlay. The cursor starts on the currently
     /// active SSH target (or `local` if not connected via SSH).
     fn open_host_select(&mut self) {
+        // Fresh filters on every open (#415): the overlay always starts as
+        // the full grouped list.
+        self.host_select_query.clear();
+        self.host_select_tag_filter = None;
         if self.ssh_targets.is_empty() {
             self.push_message(ChatBlock::System("No [[ssh_targets]] configured. Add targets in config.toml, then restart filar.\nSyntax: [[ssh_targets]] + name/host/user + [ssh_targets.auth] type = \"agent\"".into()));
         }
@@ -1751,12 +1791,155 @@ impl App {
         self.host_select_visible = true;
     }
 
+    /// Distinct tags across configured targets, in first-appearance order.
+    ///
+    /// Drives the `Tab` tag-filter cycle in the host-selection overlay (#415).
+    fn host_select_tags(&self) -> Vec<String> {
+        let mut tags: Vec<String> = Vec::new();
+        for t in &self.ssh_targets {
+            for tag in &t.tags {
+                if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+                    tags.push(tag.clone());
+                }
+            }
+        }
+        tags
+    }
+
+    /// Build the filtered, grouped host-selection view (#415).
+    ///
+    /// `query` matches case-insensitively against a target's name,
+    /// `user@host:port`, or any tag; the `local` row matches the literal
+    /// `local` and hides under an active tag filter (local carries no tags).
+    /// Targets group under their primary tag (first entry of `tags`), in
+    /// first-appearance order; untagged hosts form the trailing group.
+    pub(crate) fn host_select_rows_filtered(&self, query: &str, tag: Option<&str>) -> Vec<HostSelectRow> {
+        let q = query.trim().to_lowercase();
+        let mut rows = Vec::new();
+        if tag.is_none() && (q.is_empty() || "local".contains(&q)) {
+            rows.push(HostSelectRow::Local);
+        }
+        let mut tagged: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut untagged: Vec<usize> = Vec::new();
+        for (i, t) in self.ssh_targets.iter().enumerate() {
+            if let Some(tf) = tag {
+                if !t.tags.iter().any(|x| x.eq_ignore_ascii_case(tf)) {
+                    continue;
+                }
+            }
+            if !q.is_empty() {
+                let name = t.name.to_lowercase();
+                let info = format!("{}@{}:{}", t.user, t.host, t.port).to_lowercase();
+                let hit = name.contains(&q)
+                    || info.contains(&q)
+                    || t.tags.iter().any(|x| x.to_lowercase().contains(&q));
+                if !hit {
+                    continue;
+                }
+            }
+            match t.tags.first() {
+                Some(tag) => match tagged.iter_mut().find(|(g, _)| g.eq_ignore_ascii_case(tag)) {
+                    Some((_, idxs)) => idxs.push(i),
+                    None => tagged.push((tag.clone(), vec![i])),
+                },
+                None => untagged.push(i),
+            }
+        }
+        for (tag, idxs) in tagged {
+            rows.push(HostSelectRow::Header { tag: Some(tag), count: idxs.len() });
+            rows.extend(idxs.into_iter().map(HostSelectRow::Target));
+        }
+        if !untagged.is_empty() {
+            rows.push(HostSelectRow::Header { tag: None, count: untagged.len() });
+            rows.extend(untagged.into_iter().map(HostSelectRow::Target));
+        }
+        rows
+    }
+
+    /// The overlay view under the current search/tag filters (#415).
+    pub(crate) fn host_select_rows(&self) -> Vec<HostSelectRow> {
+        self.host_select_rows_filtered(&self.host_select_query, self.host_select_tag_filter.as_deref())
+    }
+
+    /// Position of the row matching the flat `host_select_index`, if visible.
+    pub(crate) fn host_select_visible_pos(&self, rows: &[HostSelectRow]) -> Option<usize> {
+        rows.iter().position(|r| r.selection_index() == Some(self.host_select_index))
+    }
+
+    /// After a filter change: keep the cursor on a visible row — snap to the
+    /// first selectable row when the selected target fell out of the view.
+    fn host_select_ensure_visible(&mut self) {
+        let rows = self.host_select_rows();
+        if self.host_select_visible_pos(&rows).is_some() {
+            return;
+        }
+        if let Some(idx) = rows.iter().find_map(HostSelectRow::selection_index) {
+            self.host_select_index = idx;
+        }
+    }
+
+    /// Move the overlay cursor by `delta` selectable rows.
+    ///
+    /// Group headers are skipped; the cursor clamps at both ends (no wrap,
+    /// matching the pre-#415 behavior).
+    fn host_select_move(&mut self, delta: isize) {
+        let rows = self.host_select_rows();
+        let selectable: Vec<usize> =
+            rows.iter().filter_map(HostSelectRow::selection_index).collect();
+        let Some(pos) = selectable.iter().position(|&i| i == self.host_select_index) else {
+            // Defensive: a filtered-out cursor snaps to the first row
+            // (ensure_visible normally keeps this from happening).
+            if let Some(&first) = selectable.first() {
+                self.host_select_index = first;
+            }
+            return;
+        };
+        let new_pos = if delta < 0 {
+            pos.saturating_sub(1)
+        } else {
+            (pos + 1).min(selectable.len() - 1)
+        };
+        self.host_select_index = selectable[new_pos];
+    }
+
+    /// Cycle the overlay's tag filter: `None → tags[0] → … → None` (or the
+    /// reverse for `forward == false`). Snaps the cursor into the new view.
+    fn host_select_cycle_tag(&mut self, forward: bool) {
+        let tags = self.host_select_tags();
+        self.host_select_tag_filter = if tags.is_empty() {
+            None
+        } else {
+            let cur = self
+                .host_select_tag_filter
+                .as_ref()
+                .and_then(|c| tags.iter().position(|t| t.eq_ignore_ascii_case(c)));
+            match (cur, forward) {
+                (None, true) => Some(tags[0].clone()),
+                (None, false) => Some(tags[tags.len() - 1].clone()),
+                (Some(i), true) => tags.get(i + 1).cloned(),
+                (Some(i), false) => {
+                    if i == 0 {
+                        None
+                    } else {
+                        Some(tags[i - 1].clone())
+                    }
+                }
+            }
+        };
+        self.host_select_ensure_visible();
+    }
+
     /// Confirm the host selection from the overlay: close it and trigger
     /// a delayed connection to the chosen target.
     ///
     /// Tears down any interactive PTY for this tab first (#339) so Ctrl+T
     /// cannot reuse the previous host's shell after the executor swaps.
     fn select_host(&mut self) {
+        // Rows are filtered by search/tag (#415); Enter with no visible
+        // match must not select a filtered-out host.
+        if self.host_select_visible_pos(&self.host_select_rows()).is_none() {
+            return;
+        }
         let idx = self.host_select_index;
         self.host_select_visible = false;
         self.ctrl_o_selection = Some(idx);
@@ -2640,24 +2823,36 @@ impl App {
             return;
         }
 
-        // When the host-selection overlay is visible, only navigation and
-        // select/cancel keys are processed; all other keys are consumed.
+        // When the host-selection overlay is visible, only overlay keys are
+        // processed; printable characters feed the substring search (#415).
         if self.host_select_visible {
-            let list_size = 1 + self.ssh_targets.len();
             match key.code {
                 KeyCode::Esc => {
-                    self.host_select_visible = false;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.host_select_index = self.host_select_index.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if self.host_select_index + 1 < list_size {
-                        self.host_select_index += 1;
+                    // First Esc clears an active search/tag filter, second
+                    // closes the overlay (#415).
+                    if !self.host_select_query.is_empty() || self.host_select_tag_filter.is_some() {
+                        self.host_select_query.clear();
+                        self.host_select_tag_filter = None;
+                        self.host_select_ensure_visible();
+                    } else {
+                        self.host_select_visible = false;
                     }
                 }
-                KeyCode::Enter => {
-                    self.select_host();
+                KeyCode::Up => self.host_select_move(-1),
+                KeyCode::Down => self.host_select_move(1),
+                KeyCode::Tab => self.host_select_cycle_tag(true),
+                KeyCode::BackTab => self.host_select_cycle_tag(false),
+                KeyCode::Backspace => {
+                    if self.host_select_query.pop().is_some() {
+                        self.host_select_ensure_visible();
+                    }
+                }
+                KeyCode::Enter => self.select_host(),
+                KeyCode::Char(c)
+                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.host_select_query.push(c);
+                    self.host_select_ensure_visible();
                 }
                 _ => {}
             }
@@ -9100,6 +9295,28 @@ mod tests {
         }
     }
 
+    fn make_ssh_target_tagged(name: &str, tags: &[&str]) -> filar_core::SshTarget {
+        let mut t = make_ssh_target(name);
+        t.tags = tags.iter().map(|s| (*s).to_string()).collect();
+        t
+    }
+
+    /// Type `s` into the open host-selection overlay (#415).
+    fn host_select_type(app: &mut App, s: &str) {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for c in s.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    /// Press one unmodified key in the host-selection overlay (#415).
+    fn host_select_press(app: &mut App, code: crossterm::event::KeyCode) {
+        app.handle_key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+
     #[test]
     fn ctrl_o_opens_host_select_overlay() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
@@ -9235,6 +9452,198 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.target_name, "~local");
+    }
+
+    #[test]
+    fn host_select_search_filters_and_selects_target() {
+        use crossterm::event::KeyCode;
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![
+            make_ssh_target("srv-alpha"),
+            make_ssh_target("web-beta"),
+            make_ssh_target("db-gamma"),
+        ];
+        app.open_host_select();
+        host_select_type(&mut app, "WEB"); // case-insensitive substring
+        assert_eq!(
+            app.host_select_rows(),
+            vec![
+                HostSelectRow::Header { tag: None, count: 1 },
+                HostSelectRow::Target(1),
+            ],
+            "only web-beta must survive the filter"
+        );
+        assert_eq!(app.host_select_index, 2, "cursor snaps to the only visible target");
+        host_select_press(&mut app, KeyCode::Enter);
+        assert!(!app.host_select_visible);
+        assert_eq!(app.target_name, "~web-beta");
+        assert_eq!(app.ctrl_o_selection, Some(2), "flat index contract (0 = local)");
+    }
+
+    #[test]
+    fn host_select_search_matches_host_port_and_tags() {
+        use crossterm::event::KeyCode;
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let mut box1 = make_ssh_target_tagged("box-1", &["prod"]);
+        box1.host = "10.9.9.9".into();
+        box1.port = 2222;
+        app.ssh_targets = vec![box1, make_ssh_target("web-2")];
+        app.open_host_select();
+        host_select_type(&mut app, "10.9");
+        assert_eq!(
+            app.host_select_rows(),
+            vec![
+                HostSelectRow::Header { tag: Some("prod".into()), count: 1 },
+                HostSelectRow::Target(0),
+            ],
+            "query must match the host field"
+        );
+        host_select_press(&mut app, KeyCode::Esc); // clears the query
+        assert!(app.host_select_query.is_empty());
+        assert!(app.host_select_visible, "Esc only clears when a filter is set");
+        host_select_type(&mut app, "prod");
+        assert_eq!(
+            app.host_select_rows(),
+            vec![
+                HostSelectRow::Header { tag: Some("prod".into()), count: 1 },
+                HostSelectRow::Target(0),
+            ],
+            "query must match tags"
+        );
+    }
+
+    #[test]
+    fn host_select_tab_cycles_tag_filter() {
+        use crossterm::event::KeyCode;
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![
+            make_ssh_target_tagged("a", &["prod"]),
+            make_ssh_target_tagged("b", &["web"]),
+            make_ssh_target("c"),
+        ];
+        app.open_host_select();
+        host_select_press(&mut app, KeyCode::Tab);
+        assert_eq!(app.host_select_tag_filter.as_deref(), Some("prod"));
+        assert_eq!(
+            app.host_select_rows(),
+            vec![
+                HostSelectRow::Header { tag: Some("prod".into()), count: 1 },
+                HostSelectRow::Target(0),
+            ],
+            "local hides, only the tagged host remains"
+        );
+        assert_eq!(app.host_select_index, 1, "cursor snaps out of the hidden local row");
+        host_select_press(&mut app, KeyCode::Tab);
+        assert_eq!(app.host_select_tag_filter.as_deref(), Some("web"));
+        host_select_press(&mut app, KeyCode::Tab);
+        assert_eq!(app.host_select_tag_filter, None, "cycle wraps back to no filter");
+        assert_eq!(app.host_select_rows().len(), 7, "full grouped view returns");
+        host_select_press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.host_select_tag_filter.as_deref(), Some("web"), "BackTab cycles backwards");
+    }
+
+    #[test]
+    fn host_select_navigation_skips_group_headers() {
+        use crossterm::event::KeyCode;
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![
+            make_ssh_target_tagged("a", &["prod"]),
+            make_ssh_target_tagged("b", &["web"]),
+            make_ssh_target("c"),
+        ];
+        app.open_host_select(); // local
+        host_select_press(&mut app, KeyCode::Down);
+        assert_eq!(app.host_select_index, 1, "down skips the prod header");
+        host_select_press(&mut app, KeyCode::Down);
+        assert_eq!(app.host_select_index, 2, "down skips the web header");
+        host_select_press(&mut app, KeyCode::Down);
+        assert_eq!(app.host_select_index, 3, "down skips the untagged header");
+        host_select_press(&mut app, KeyCode::Down);
+        assert_eq!(app.host_select_index, 3, "no wrap at the end");
+        host_select_press(&mut app, KeyCode::Up);
+        host_select_press(&mut app, KeyCode::Up);
+        host_select_press(&mut app, KeyCode::Up);
+        assert_eq!(app.host_select_index, 0);
+        host_select_press(&mut app, KeyCode::Up);
+        assert_eq!(app.host_select_index, 0, "no wrap at the top");
+    }
+
+    #[test]
+    fn host_select_no_matches_blocks_enter_until_cleared() {
+        use crossterm::event::KeyCode;
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![make_ssh_target("srv")];
+        app.open_host_select();
+        host_select_type(&mut app, "zzz");
+        assert!(app.host_select_rows().is_empty());
+        host_select_press(&mut app, KeyCode::Enter);
+        assert!(app.host_select_visible, "Enter with no visible match must be a no-op");
+        assert!(!app.ctrl_o_needs_connect);
+        host_select_press(&mut app, KeyCode::Esc); // clears the query, keeps the overlay
+        assert!(app.host_select_visible);
+        assert!(app.host_select_query.is_empty());
+        assert_eq!(app.host_select_rows().len(), 3, "local + header + srv return");
+        host_select_press(&mut app, KeyCode::Esc); // closes
+        assert!(!app.host_select_visible);
+    }
+
+    #[test]
+    fn host_select_backspace_edits_query_and_restores_view() {
+        use crossterm::event::KeyCode;
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![make_ssh_target("srv"), make_ssh_target("db")];
+        app.open_host_select();
+        host_select_type(&mut app, "sr");
+        assert_eq!(app.host_select_rows().len(), 2, "header + srv only");
+        host_select_press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.host_select_query, "s");
+        host_select_press(&mut app, KeyCode::Backspace);
+        assert!(app.host_select_query.is_empty());
+        assert_eq!(app.host_select_rows().len(), 4, "local + header + both hosts return");
+    }
+
+    #[test]
+    fn host_select_groups_by_primary_tag_with_untagged_last() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![
+            make_ssh_target_tagged("a", &["prod", "db"]),
+            make_ssh_target_tagged("b", &["prod"]),
+            make_ssh_target("c"),
+            make_ssh_target_tagged("d", &["web", "prod"]),
+        ];
+        app.open_host_select();
+        assert_eq!(
+            app.host_select_rows(),
+            vec![
+                HostSelectRow::Local,
+                HostSelectRow::Header { tag: Some("prod".into()), count: 2 },
+                HostSelectRow::Target(0),
+                HostSelectRow::Target(1),
+                HostSelectRow::Header { tag: Some("web".into()), count: 1 },
+                HostSelectRow::Target(3),
+                HostSelectRow::Header { tag: None, count: 1 },
+                HostSelectRow::Target(2),
+            ],
+            "primary-tag groups in first-appearance order, untagged last"
+        );
+    }
+
+    #[test]
+    fn host_select_reopen_resets_filters() {
+        use crossterm::event::KeyCode;
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![make_ssh_target_tagged("a", &["prod"])];
+        app.open_host_select();
+        host_select_type(&mut app, "a");
+        host_select_press(&mut app, KeyCode::Tab);
+        assert!(!app.host_select_query.is_empty());
+        assert!(app.host_select_tag_filter.is_some());
+        host_select_press(&mut app, KeyCode::Esc); // clears filters
+        host_select_press(&mut app, KeyCode::Esc); // closes
+        assert!(!app.host_select_visible);
+        app.open_host_select();
+        assert!(app.host_select_query.is_empty(), "reopen starts from a fresh query");
+        assert_eq!(app.host_select_tag_filter, None, "reopen starts with no tag filter");
     }
 
     #[test]

@@ -13,6 +13,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- `Ctrl+O` host selection gained a substring search over target names,
+  `user@host:port` and tags, a tag filter cycled with `Tab`, and grouping
+  of the configured targets under non-selectable tag headers (untagged
+  hosts last). The search line shows the cursor position among the
+  matches, and the overlay renders entirely from the terminal glyph set,
+  so conhost ASCII mode shows no box characters
+  ([#415](https://github.com/devlawey/filar/issues/415)).
+
 - Tag-bound confirmation policies (`[[tag_policies]]`): a policy may only
   tighten `confirm_mode` for targets carrying its tag — the effective mode is
   the strictest of the tab's own mode, the global mode and all matching

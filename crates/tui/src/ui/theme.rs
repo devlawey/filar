@@ -41,6 +41,14 @@ pub struct Glyphs {
     pub bar_full: &'static str,
     /// Empty cell of the context-fill bar in the status bar: `░` or `-`.
     pub bar_empty: &'static str,
+    /// Selection cursor in list overlays: `▶` or `>`.
+    pub cursor: &'static str,
+    /// Marker of the currently active item: `●` or `*`.
+    pub current: &'static str,
+    /// Up arrow in key hints: `↑` or `^`.
+    pub arrow_up: &'static str,
+    /// Down arrow in key hints: `↓` or `v`.
+    pub arrow_down: &'static str,
 }
 
 impl Glyphs {
@@ -58,6 +66,10 @@ impl Glyphs {
         target_sep: "▸",
         bar_full: "█",
         bar_empty: "░",
+        cursor: "▶",
+        current: "●",
+        arrow_up: "↑",
+        arrow_down: "↓",
     };
 
     /// ASCII fallback for conhost and legacy terminals.
@@ -74,6 +86,10 @@ impl Glyphs {
         target_sep: ">",
         bar_full: "#",
         bar_empty: "-",
+        cursor: ">",
+        current: "*",
+        arrow_up: "^",
+        arrow_down: "v",
     };
 
     /// Detect terminal capabilities and return the appropriate glyph set.
@@ -301,6 +317,19 @@ mod tests {
         // Interactive and PasswordInput both use accent (was Magenta).
         assert_eq!(t.mode_color(AppMode::Interactive), Color::Cyan);
         assert_eq!(t.mode_color(AppMode::PasswordInput), Color::Cyan);
+    }
+
+    #[test]
+    fn ascii_glyph_set_is_pure_ascii() {
+        let g = Glyphs::ASCII;
+        let fields = [
+            g.prompt, g.gutter, g.separator, g.success, g.danger, g.middle_dot,
+            g.collapse_arrow, g.expand_arrow, g.bullet, g.target_sep, g.bar_full,
+            g.bar_empty, g.cursor, g.current, g.arrow_up, g.arrow_down,
+        ];
+        for f in fields {
+            assert!(f.is_ascii(), "ASCII fallback must stay ASCII, got {f:?}");
+        }
     }
 
     #[test]
