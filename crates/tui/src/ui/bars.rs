@@ -696,6 +696,42 @@ mod tests {
     }
 
     #[test]
+    fn status_bar_shows_policy_tightened_mode() {
+        // #414: the bar renders the effective (policy-clamped) mode, not the
+        // tab's own one. A tab on Allowlist over a `prod`-tagged target with
+        // a prod→Always policy must show `Always` in the bar.
+        let mut app = app_with_tagged_target(&["prod"]);
+        app.global_confirm_mode = CommandConfirmMode::Allowlist;
+        app.active_session_mut().confirm_mode = CommandConfirmMode::Allowlist;
+        app.tag_policies = vec![filar_core::TagPolicy {
+            tag: "prod".into(),
+            confirm_mode: CommandConfirmMode::Always,
+        }];
+        app.sync_confirm_mode();
+        let row = render_status_row(&mut app, 120);
+        assert!(
+            row.ends_with(" Always"),
+            "policy-tightened mode must show in the bar, got: {row}"
+        );
+
+        // Counter-check: a non-matching tag leaves the tab's own mode in
+        // place — the floor never opens nor closes anything by itself.
+        let mut app = app_with_tagged_target(&["work"]);
+        app.global_confirm_mode = CommandConfirmMode::Allowlist;
+        app.active_session_mut().confirm_mode = CommandConfirmMode::Allowlist;
+        app.tag_policies = vec![filar_core::TagPolicy {
+            tag: "prod".into(),
+            confirm_mode: CommandConfirmMode::Always,
+        }];
+        app.sync_confirm_mode();
+        let row = render_status_row(&mut app, 120);
+        assert!(
+            row.ends_with(" Allowlist"),
+            "without a matching policy the tab's own mode must stand, got: {row}"
+        );
+    }
+
+    #[test]
     fn status_bar_without_tags_is_unchanged() {
         // A tagged-built app stripped of the target match renders exactly like
         // the pre-#413 bar: no tags segment anywhere.

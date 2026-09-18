@@ -324,6 +324,12 @@ impl Drop for PanicHookGuard {
 pub struct TuiConfig {
     pub target_name: String,
     pub confirm_mode: CommandConfirmMode,
+    /// Confirmation mode from config.toml — the baseline tag policies fold
+    /// against (#414). Distinct from `confirm_mode`, which a restored
+    /// session may override.
+    pub global_confirm_mode: CommandConfirmMode,
+    /// Tag-bound confirmation policies from `[[tag_policies]]` (#414).
+    pub tag_policies: Vec<filar_core::TagPolicy>,
     pub llm_profile: String,
     pub initial_messages: Vec<ChatBlock>,
     /// Initial agent input history (for session restore).
@@ -486,6 +492,11 @@ async fn run_app(
         }
         a
     };
+    // Tag-policy state (#414): the global baseline is the config's own
+    // `confirm_mode` (not the possibly session-restored one), and policies
+    // come from config only — the GUI has no editor for them.
+    app.global_confirm_mode = config.global_confirm_mode;
+    app.tag_policies = config.tag_policies.clone();
     // Load available LLM profiles and default profile name.
     app.key_checker = Some(config.key_checker.clone());
     // Wire the App to the same StaticSecretProvider instance used by the
@@ -543,6 +554,9 @@ async fn run_app(
         app.sessions[0].ssh_info = Some(info.clone());
         app.sessions[0].cwd = None;
     }
+    // The startup target may carry policy tags — tighten before the first
+    // render so the bar and the confirm gate agree from the start (#414).
+    app.sync_confirm_mode();
 
     // Crossterm event stream for async keyboard input.
     let mut events = EventStream::new();
@@ -1151,6 +1165,7 @@ async fn run_app(
                                 session_id: sid,
                                 event: filar_agent::AgentEvent::Error(format!("SSH connection failed: {e}")),
                             });
+                            let _ = tx.send(TuiEvent::TransportSwapFailed { session_id: sid });
                         }
                     }
                 });
@@ -1189,6 +1204,7 @@ async fn run_app(
                                     session_id: sid,
                                     event: filar_agent::AgentEvent::Error(format!("Failed to create local executor: {e}")),
                                 });
+                                let _ = tx.send(TuiEvent::TransportSwapFailed { session_id: sid });
                                 return;
                             }
                         };
@@ -1249,6 +1265,7 @@ async fn run_app(
                                     session_id: sid,
                                     event: filar_agent::AgentEvent::Error(format!("SSH connection failed: {e}")),
                                 });
+                                let _ = tx.send(TuiEvent::TransportSwapFailed { session_id: sid });
                             }
                         }
                     }
@@ -1354,6 +1371,16 @@ async fn run_app(
                                 app.sessions[idx].cwd = None;
                             }
                         }
+                        // The actual swap happened: the pending target's
+                        // floor (if any) settles here — only now may the
+                        // mode release, recomputed from the transport that
+                        // is actually active (#414 review).
+                        app.settle_pending_swap();
+                    }
+                    if let TuiEvent::TransportSwapFailed { .. } = &event {
+                        // The connect died without a swap: stop folding the
+                        // abandoned target's floor (#414 review).
+                        app.settle_pending_swap();
                     }
                     if let TuiEvent::Agent {
                         session_id,
@@ -2975,6 +3002,8 @@ mod tests {
         TuiConfig {
             target_name: "prod-web".into(),
             confirm_mode: CommandConfirmMode::Always,
+            global_confirm_mode: CommandConfirmMode::Always,
+            tag_policies: Vec::new(),
             llm_profile: "glm".into(),
             initial_messages: Vec::new(),
             initial_input_history: Vec::new(),

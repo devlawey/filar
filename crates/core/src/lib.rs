@@ -18,9 +18,9 @@ pub use compaction::{
     DEFAULT_KEEP_TURNS,
 };
 pub use config::{
-    Config, SshTarget, SshAuth, LlmConfig, LlmProfile, CommandConfirmMode, TimeoutConfig,
-    HostKeyPolicy, DEFAULT_COMMAND_TIMEOUT_SECS, DEFAULT_COMPACT_AT_TOKENS,
-    DEFAULT_MAX_TOKENS,
+    tag_policy_floor, Config, SshTarget, SshAuth, TagPolicy, LlmConfig, LlmProfile,
+    CommandConfirmMode, TimeoutConfig, HostKeyPolicy, DEFAULT_COMMAND_TIMEOUT_SECS,
+    DEFAULT_COMPACT_AT_TOKENS, DEFAULT_MAX_TOKENS,
 };
 pub use error::{CoreError, Result};
 pub use secrets::{

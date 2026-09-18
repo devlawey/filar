@@ -6894,6 +6894,88 @@ char-count budget and displaced the right-aligned counters on a narrow bar.
 **Next:** #414 — a tag policy may only tighten `confirm_mode`, never
 loosen it.
 
+## Issue #414: feat(core) — a tag policy tightens `confirm_mode`, never loosens it
+
+**Milestone:** 2.0.0. **Branch:** `feat/414-tag-policy-confirm-floor`.
+
+**Problem.** `confirm_mode` was one mode for the whole run: working on a
+test VM in `allowlist`, switching `Ctrl+O` to a prod host kept the same
+mode. #413 gave targets machine-readable tags; #414 turns them into
+constraints via `[[tag_policies]]` (`tag`, `confirm_mode`).
+
+**Decision.** "Tighten only" is enforced by an explicit strictness order —
+`Explain > Always > Allowlist > Never` (`CommandConfirmMode::strictness`)
+— and one resolver: `tag_policy_floor(global, policies, tags)` returns
+`Some(strictest(global, all matching policies))` when at least one policy
+matches the target's tags and `None` otherwise
+(`crates/core/src/config.rs`). So a tag can never open more than the
+global mode allows, the global wins when it is stricter than a policy, and
+with several matched policies/tags the strictest wins. `None` matters:
+targets without a matching policy keep the tab's own mode untouched — the
+F2 Explain toggle stays free on them (the pre-existing F2 tests pin this;
+an unconditional global clamp made F2 unable to leave Explain). In the TUI,
+`App.confirm_mode` (bar + agent confirm gate) is the effective mirror:
+`strictest(tab's own mode, floor)` recomputed by `sync_confirm_mode()` at
+every site that changes the active tab, its target, or the tab's own mode;
+`Session::confirm_mode` stays the user's own choice. `Ctrl+O` cannot apply
+the chosen host's mode outright — the #414 review blocker: choosing a
+*looser* target would release the active host's floor while commands still
+run on it. Instead `select_host` arms `App.ctrl_o_pending_tags` and
+`sync_confirm_mode()` folds the active transport's tags **together with**
+the pending ones, so any sync in the pre-swap window can only tighten; the
+floor is released exactly when the attempt settles via
+`settle_pending_swap()`: `TransportChanged` lands (runner interception),
+the connect dies (`TuiEvent::TransportSwapFailed`, sent by every Ctrl+O
+failure branch of the runner), or password entry for the pending connect
+is cancelled with Esc. Mid-window syncs — F2, tab switch, session restore
+— fold both tag sets, where the previous `active_ssh_tags()`-only sync
+would have silently reset the tightening (review major). The manual `!ssh`
+path gets a one-shot tighten-only clamp instead: it never arms a pending
+floor because it already overwrote `ssh_info` optimistically (pre-existing
+behaviour), so later syncs recompute from the new target anyway.
+`TuiConfig` gained `global_confirm_mode` (config's own mode, distinct from
+the possibly session-restored `confirm_mode`) and `tag_policies`.
+
+**Tests.** core (6): policy stricter than global applies; looser than
+global is ignored; several matched policies → strictest; no matching policy →
+`None` (no floor); `strictness`/`strictest` ordering; `[[tag_policies]]`
+TOML parse. tui app (7): the Ctrl+O DoD scenario — switching test ↔ prod
+tightens and releases; a looser-than-global policy cannot open the host; a
+tab's own looser mode is lifted to the floor;
+`select_host_tightens_immediately_and_holds_until_settled` (the chosen
+host's floor raises the mode at once and holds it until the swap settles);
+`pending_swap_floor_survives_mid_window_syncs` (F2/tab syncs while the
+connect is in flight keep the floor — the review major);
+`aborted_swap_keeps_the_active_transport_floor` (a failed connect settles
+on the old transport's tags); `cancelling_password_entry_settles_the_pending_swap`.
+tui event (1): `TransportSwapFailed` carries the session id. bars (1): the
+status bar shows the policy-tightened mode; untagged counter-check keeps
+the tab's own mode.
+
+**Verification:** `cargo build --workspace` and `cargo test --workspace`
+green (core 20 + 98, gui 73, tui 534, agent 153, transport 38 + 7
+ignored/docker-sshd). Real TUI run (DoD, ComputerUse on Windows) against
+the real binary with `FILAR_CONFIG` on a scratch config
+(`confirm_mode = "allowlist"`, `[[tag_policies]] prod → always`, targets
+`prod-box`/`test-box` tagged `prod`/`test`, RFC 5737 addresses so the
+connect can only fail). Starting local in `allowlist`: `Ctrl+O` →
+`prod-box` flipped the bar to `Always` at once, before the connect
+finished; `F2` → `Explain`, `F2` again → back to `Always` (the mid-window
+sync kept the pending floor instead of resetting to `Allowlist` — the
+review major, now covered live); the doomed connect failed after ~21 s
+(the OS TCP connect timeout) → the bar settled back to `Allowlist` with an
+SSH error in the feed; `Ctrl+O` → `test-box` (no matching policy) left
+`Allowlist` untouched; `Ctrl+Q` exited cleanly. Screenshots confirmed each
+state; app-data touched by the run was restored byte-identical (SHA256).
+Not exercised live: a successful swap (`TransportChanged` landing — needs
+a live sshd) and the password-prompt Esc cancel (not staged in this run);
+both are covered by unit tests only. Found meanwhile:
+`timeouts.connect_secs` is documented as the SSH connect timeout but read
+nowhere in the code — the practical bound is the OS TCP timeout; worth its
+own issue.
+
+**Next:** #415 — Ctrl+O filter/grouping by tags.
+
 ## Agent E2E runbook (docs)
 
 `docs/AGENT_E2E_RUNBOOK.md`: how an agent whose harness can control a desktop

@@ -50,6 +50,14 @@ pub enum TuiEvent {
         alias: Option<String>,
     },
 
+    /// A pending transport swap ended without changing the transport — the
+    /// Ctrl+O connect failed. The runner stops folding the abandoned
+    /// target's tag-policy floor and settles on the active transport
+    /// (#414 review).
+    TransportSwapFailed {
+        session_id: SessionId,
+    },
+
     /// Working directory for a tab (OSC 7 / later sync). Status bar only.
     CwdChanged {
         session_id: SessionId,
@@ -156,6 +164,16 @@ mod tests {
             assert_eq!(ssh_info.as_deref(), Some("root@10.0.0.5:22"));
         } else {
             panic!("expected TransportChanged");
+        }
+    }
+
+    #[test]
+    fn transport_swap_failed_carries_session_id() {
+        let event = TuiEvent::TransportSwapFailed { session_id: SessionId(7) };
+        if let TuiEvent::TransportSwapFailed { session_id } = event {
+            assert_eq!(session_id, SessionId(7));
+        } else {
+            panic!("expected TransportSwapFailed");
         }
     }
 }
