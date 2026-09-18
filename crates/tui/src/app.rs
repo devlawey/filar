@@ -266,6 +266,15 @@ pub struct App {
     pub ssh_targets: Vec<filar_core::SshTarget>,
     /// Index of the last selection made in the Ctrl+O host-selection overlay.
     pub ctrl_o_selection: Option<usize>,
+    /// Tags of a Ctrl+O target whose swap is still in flight (#414 review).
+    ///
+    /// While `Some`, [`sync_confirm_mode`](Self::sync_confirm_mode) folds
+    /// these tags next to the active transport's: until `TransportChanged`
+    /// lands, commands still run on the previous host, so a pending connect
+    /// may tighten the mode but never release it. Cleared by
+    /// [`settle_pending_swap`](Self::settle_pending_swap) once the attempt
+    /// lands, dies, or is cancelled.
+    pub ctrl_o_pending_tags: Option<Vec<String>>,
     /// Whether a delayed Ctrl+O connection is pending (runner picks this up).
     pub ctrl_o_needs_connect: bool,
     /// Cancellation token for an in-flight Ctrl+O connection attempt.
@@ -559,6 +568,7 @@ impl App {
             key_checker: None,
             ssh_targets: Vec::new(),
             ctrl_o_selection: None,
+            ctrl_o_pending_tags: None,
             ctrl_o_needs_connect: false,
             ctrl_o_cancel: None,
             ctrl_o_handle: None,
@@ -1668,9 +1678,32 @@ impl App {
     /// changes. The tab's stored mode is the user's own choice (F2-editable)
     /// and stays untouched; the mirror is the value shown in the status bar
     /// and handed to the agent's confirm gate.
+    ///
+    /// A swap still in flight
+    /// ([`ctrl_o_pending_tags`](Self::ctrl_o_pending_tags)) folds its
+    /// target's tags next to the active transport's: until the transport
+    /// actually changes, commands keep running on the old host, so a
+    /// mid-window sync (F2, tab switch) must neither drop the new target's
+    /// floor nor release the old one (#414 review).
     pub fn sync_confirm_mode(&mut self) {
-        let tags = self.active_ssh_tags();
+        let mut tags = self.active_ssh_tags();
+        if let Some(pending) = &self.ctrl_o_pending_tags {
+            tags.extend(pending.iter().cloned());
+        }
         self.confirm_mode = self.confirm_mode_for_tags(&tags);
+    }
+
+    /// The in-flight Ctrl+O swap is over: stop folding the pending target's
+    /// tag-policy floor and recompute from the transport that is actually
+    /// active now (#414 review).
+    ///
+    /// Called by the runner when `TransportChanged` lands or the connect
+    /// dies (`TransportSwapFailed`), and by the app when password entry for
+    /// the pending connect is cancelled. This is the only moment a policy
+    /// floor may be released.
+    pub fn settle_pending_swap(&mut self) {
+        self.ctrl_o_pending_tags = None;
+        self.sync_confirm_mode();
     }
 
     /// Render the active target's tags as a `[a,b]` status-bar segment, or
@@ -1728,11 +1761,6 @@ impl App {
         self.host_select_visible = false;
         self.ctrl_o_selection = Some(idx);
 
-        // A policy-tagged chosen host tightens the mode at once — before
-        // the connect completes — so the confirm gate never runs under the
-        // previous host's looser mode during the swap (#414). A failed
-        // connect leaves the stricter mode in place: erring strict is the
-        // safe direction, and the alias is already shown optimistically.
         let tags = if idx == 0 {
             Vec::new()
         } else {
@@ -1741,8 +1769,6 @@ impl App {
                 .map(|t| t.tags.clone())
                 .unwrap_or_default()
         };
-        self.confirm_mode = self.confirm_mode_for_tags(&tags);
-
         let alias = if idx == 0 {
             "~local".to_string()
         } else {
@@ -1751,6 +1777,14 @@ impl App {
                 None => return, // index out of range — shouldn't happen, safe no-op
             }
         };
+        // The chosen target's floor applies from now on — as a pending floor
+        // that can only tighten: until the connect swaps the transport,
+        // commands still run on the previous host, so this must never
+        // release an existing floor (#414 review). The release lands in
+        // `settle_pending_swap` when the attempt is over.
+        self.ctrl_o_pending_tags = Some(tags);
+        self.sync_confirm_mode();
+
         self.target_name = alias;
         self.tear_down_interactive_on_target_change();
         self.ctrl_o_needs_connect = true;
@@ -1890,6 +1924,9 @@ impl App {
         }
         self.ctrl_o_pending_target = None;
         self.ctrl_o_pending_session_id = None;
+        // A swap pending for the replaced context dies with it: the floors
+        // are recomputed from what this restore sets up below (#414 review).
+        self.ctrl_o_pending_tags = None;
         self.confirm_button_areas.clear();
         self.hovered_button = None;
         self.collapsed_overrides.clear();
@@ -1979,9 +2016,12 @@ impl App {
                 self.ctrl_o_selection = Some(pos + 1); // 0 is reserved for "local"
                 self.target_name = format!("~{}", self.ssh_targets[pos].name);
                 self.ctrl_o_needs_connect = true;
-                // Tighten immediately, like `select_host` (#414).
-                let tags = self.ssh_targets[pos].tags.clone();
-                self.confirm_mode = self.confirm_mode_for_tags(&tags);
+                // Same pending-floor contract as `select_host` (#414 review):
+                // the restored target's tags fold from now on, and a release
+                // (the tab may have been on a policy host) waits for the
+                // reconnect to settle.
+                self.ctrl_o_pending_tags = Some(self.ssh_targets[pos].tags.clone());
+                self.sync_confirm_mode();
             } else {
                 self.pending_ssh = Some((user.clone(), host.clone(), port));
                 // Do not touch `ssh_info`/`target_name` yet: the tab is still
@@ -2783,8 +2823,17 @@ impl App {
                                     self.ssh_info =
                                         Some(format!("{user}@{host}:{port}"));
                                     // A host matching a configured, policy-tagged
-                                    // target tightens the mode at once (#414).
-                                    self.sync_confirm_mode();
+                                    // target folds its floor at once — but only
+                                    // upward: the old transport keeps running
+                                    // until the swap's `TransportChanged`, so
+                                    // this clamp must not release an existing
+                                    // floor. No pending floor is armed here
+                                    // (unlike Ctrl+O): `ssh_info` above is
+                                    // already the new target, so later syncs
+                                    // recompute from it anyway (#414 review).
+                                    let tags = self.active_ssh_tags();
+                                    let fold = self.confirm_mode_for_tags(&tags);
+                                    self.confirm_mode = self.confirm_mode.strictest(fold);
                                     self.push_message(ChatBlock::System(format!(
                                         "Connecting to {user}@{host}:{port} via SSH. \
                                          Press Ctrl+P to enter the password."
@@ -3087,9 +3136,16 @@ impl App {
                 KeyCode::Esc => {
                     self.input.clear();
                     self.cursor_pos = 0;
+                    let was_ctrl_o = self.ctrl_o_pending_target.is_some();
                     self.ctrl_o_pending_target = None;
                     self.ctrl_o_pending_session_id = None;
                     self.mode = AppMode::Normal;
+                    if was_ctrl_o {
+                        // Cancelling password entry aborts the pending Ctrl+O
+                        // connect: its floor stops being folded and only the
+                        // active transport's tags hold (#414 review).
+                        self.settle_pending_swap();
+                    }
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.insert_char(c);
@@ -4003,6 +4059,7 @@ impl App {
             TuiEvent::Thinking => self.sessions[self.active].id,
             TuiEvent::ConfirmationRequest { session_id, .. } => *session_id,
             TuiEvent::TransportChanged { session_id, .. } => *session_id,
+            TuiEvent::TransportSwapFailed { session_id } => *session_id,
             TuiEvent::CwdChanged { session_id, .. } => *session_id,
             TuiEvent::PasswordNeeded { session_id, .. } => *session_id,
             TuiEvent::HistoryCompacted { session_id, .. } => *session_id,
@@ -4209,6 +4266,9 @@ impl App {
                 self.confirm_selected = false;
             }
             TuiEvent::TransportChanged { .. } => {
+                // Handled by the runner before reaching here — no-op.
+            }
+            TuiEvent::TransportSwapFailed { .. } => {
                 // Handled by the runner before reaching here — no-op.
             }
             TuiEvent::CwdChanged { session_id, cwd } => {
@@ -9352,17 +9412,114 @@ mod tests {
     }
 
     #[test]
-    fn select_host_tightens_immediately_before_connect() {
+    fn select_host_tightens_immediately_and_holds_until_settled() {
         // Choosing a policy-tagged host in Ctrl+O raises the mode at once,
         // without waiting for the (possibly failing) connect (#414).
         let mut app = app_with_prod_policy();
+        app.ssh_info = Some("user@10.0.0.7:22".into()); // on prod-box
+        app.sync_confirm_mode();
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Always);
+
+        // Selecting a target without restrictive tags must not release the
+        // floor before the transport switches: until `TransportChanged` the
+        // commands still run on prod-box (#414 review).
         app.open_host_select();
-        app.host_select_index = 1; // first target = prod-box
+        app.host_select_index = 0; // local
         app.select_host();
         assert_eq!(app.confirm_mode, CommandConfirmMode::Always);
-        // Choosing local releases the floor again.
-        app.host_select_index = 0;
+
+        // The swap lands on local (the runner updates the per-session info
+        // before settling) → the floor releases.
+        app.ssh_info = None;
+        app.settle_pending_swap();
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Allowlist);
+
+        // And the other direction: a policy host tightens at once and keeps
+        // its floor once the connect lands.
+        app.open_host_select();
+        app.host_select_index = 1; // prod-box
         app.select_host();
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Always);
+        app.ssh_info = Some("user@10.0.0.7:22".into());
+        app.settle_pending_swap();
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Always);
+    }
+
+    #[test]
+    fn pending_swap_floor_survives_mid_window_syncs() {
+        // F2 or a tab switch while the connect is in flight must not reset
+        // the pre-swap tightening: sync folds the pending target next to
+        // the active transport (#414 review).
+        let mut app = app_with_prod_policy();
+        app.open_host_select();
+        app.host_select_index = 1; // prod-box
+        app.select_host();
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Always);
+
+        app.sync_confirm_mode(); // e.g. a tab switch while connecting
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Always);
+
+        app.toggle_explain_mode(); // F2 on …
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Explain);
+        app.toggle_explain_mode(); // … and off again
+        assert_eq!(
+            app.confirm_mode,
+            CommandConfirmMode::Always,
+            "the pending floor must survive the toggle"
+        );
+
+        // The connect dies without a swap: the pending floor drops and the
+        // active (unchanged) transport's fold governs again.
+        app.settle_pending_swap();
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Allowlist);
+    }
+
+    #[test]
+    fn aborted_swap_keeps_the_active_transport_floor() {
+        // A failed connect leaves the tab on the old transport: after the
+        // attempt settles, that transport's floor — not the abandoned
+        // target's — governs (#414 review).
+        let mut app = app_with_prod_policy();
+        app.ssh_info = Some("user@10.0.0.7:22".into()); // on prod-box
+        app.sync_confirm_mode();
+        app.open_host_select();
+        app.host_select_index = 0; // local pending
+        app.select_host();
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Always);
+
+        app.settle_pending_swap(); // connect failed — no swap happened
+        assert_eq!(
+            app.confirm_mode,
+            CommandConfirmMode::Always,
+            "still on prod-box"
+        );
+
+        // Leaving the policy host later releases the floor.
+        app.ssh_info = None;
+        app.sync_confirm_mode();
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Allowlist);
+    }
+
+    #[test]
+    fn cancelling_password_entry_settles_the_pending_swap() {
+        // Esc at the password prompt cancels the pending Ctrl+O connect:
+        // its floor stops being folded and only the active transport's
+        // tags hold (#414 review).
+        let mut app = app_with_prod_policy();
+        app.open_host_select();
+        app.host_select_index = 1; // prod-box
+        app.select_host();
+        app.ctrl_o_pending_target = Some(make_ssh_target("prod-box"));
+        app.mode = AppMode::PasswordInput;
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Always);
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(
+            app.ctrl_o_pending_tags.is_none(),
+            "the pending floor must settle"
+        );
         assert_eq!(app.confirm_mode, CommandConfirmMode::Allowlist);
     }
 

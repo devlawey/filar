@@ -1165,6 +1165,7 @@ async fn run_app(
                                 session_id: sid,
                                 event: filar_agent::AgentEvent::Error(format!("SSH connection failed: {e}")),
                             });
+                            let _ = tx.send(TuiEvent::TransportSwapFailed { session_id: sid });
                         }
                     }
                 });
@@ -1203,6 +1204,7 @@ async fn run_app(
                                     session_id: sid,
                                     event: filar_agent::AgentEvent::Error(format!("Failed to create local executor: {e}")),
                                 });
+                                let _ = tx.send(TuiEvent::TransportSwapFailed { session_id: sid });
                                 return;
                             }
                         };
@@ -1263,6 +1265,7 @@ async fn run_app(
                                     session_id: sid,
                                     event: filar_agent::AgentEvent::Error(format!("SSH connection failed: {e}")),
                                 });
+                                let _ = tx.send(TuiEvent::TransportSwapFailed { session_id: sid });
                             }
                         }
                     }
@@ -1368,11 +1371,16 @@ async fn run_app(
                                 app.sessions[idx].cwd = None;
                             }
                         }
-                        // The actual swap happened: recompute the active
-                        // tab's effective mode under the new target's tag
-                        // policies — this may tighten or (on leaving a
-                        // policy host) release the floor (#414).
-                        app.sync_confirm_mode();
+                        // The actual swap happened: the pending target's
+                        // floor (if any) settles here — only now may the
+                        // mode release, recomputed from the transport that
+                        // is actually active (#414 review).
+                        app.settle_pending_swap();
+                    }
+                    if let TuiEvent::TransportSwapFailed { .. } = &event {
+                        // The connect died without a swap: stop folding the
+                        // abandoned target's floor (#414 review).
+                        app.settle_pending_swap();
                     }
                     if let TuiEvent::Agent {
                         session_id,

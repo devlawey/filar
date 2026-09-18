@@ -18,7 +18,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   the strictest of the tab's own mode, the global mode and all matching
   policies, so a tag can never open more than the global mode allows and the
   strictest of several matched policies wins. The effective mode is shown in
-  the status bar and applies from the moment a host is chosen in `Ctrl+O`
+  the status bar; choosing a host in `Ctrl+O` tightens it immediately, and
+  while the connect is in flight the strictest of the old and the new
+  target's policies stays in force — the mode is recomputed from the
+  actually active transport only when the attempt settles (swap landed,
+  failed, or cancelled)
   ([#414](https://github.com/devlawey/filar/issues/414)).
 
 - SSH targets can carry free-form tags: the GUI launcher edits them per host
