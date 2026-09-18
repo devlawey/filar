@@ -2070,6 +2070,8 @@ impl LauncherApp {
     /// format `Import…` reads back, safe to commit and share. Secrets are
     /// never written (invariant #3).
     fn start_host_export(&mut self) {
+        // The last file operation's verdict does not survive a new attempt.
+        self.file_status.clear();
         // Serialize in its own scope: the borrow of `ssh_slots` must end
         // before the status fields are written.
         let prepared = {
