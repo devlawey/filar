@@ -7070,16 +7070,17 @@ is the alias); Rename takes the first free `{alias}-N` (N from 2, inside the
 32-char alias budget). Imported rows always carry `save_password = false`.
 Result line: `Import: N added, N overwritten, N renamed, N skipped`.
 
-**Tests.** gui (16, 73 → 89): 20 hosts in one TOML; foreign config keys
+**Tests.** gui (17, 73 → 90): 20 hosts in one TOML; foreign config keys
 ignored; target-less / invalid / duplicate-name files rejected; CSV quotes
-and CRLF; shuffled case-insensitive headers; line numbers in CSV errors;
+and CRLF; shuffled case-insensitive headers; line numbers in CSV errors,
+absolute through blank lines;
 append without collisions; Skip keeps the existing host; Overwrite keeps the
 password; Rename picks the first free suffix; blank scratch rows are not
 collisions; a broken file changes nothing; a colliding import defers to the
 user; extension selects the format; the status line counts every decision.
 
 **Verification:** `cargo build --workspace` / `cargo test --workspace`
-green (agent 153, app 20, core 98, gui 89, transport 38 + 7
+green (agent 153, app 20, core 98, gui 90, transport 38 + 7
 ignored/docker-sshd, tui 549, doctests 2). Real GUI run (DoD, ComputerUse on
 Windows, `--gui-only` standalone window against app-data with backup):
 `collide.toml` → `Import: 2 added, …`; the same file again → dialog `2 of 2
@@ -7092,6 +7093,14 @@ ones (26 targets total, ports 2222 and tags included; no password values, no
 `api_key` — #255 holds). App-data restored byte-identical (SHA256, 41/41),
 no filar processes left. The TUI leg (pending_launch → Ctrl+O) is
 #412-proven and was not re-run.
+
+**Review round 1 (ai-review).** Host-list edits are locked while the
+collision dialog is open — "+ Add host" / "Import…", the row actions and
+the connection fields are disabled, Launch waits for the decision, and
+`start_host_import` has a guard — so a staged import cannot be replaced or
+invalidated under the dialog. CSV error line numbers are absolute and
+survive blank lines (the header is the first non-blank row; row iteration
+keeps the file's own indices).
 
 **Next:** #417 — fleet export without secrets (the counterpart format), then
 the rest of the 2.0.0 fleet build-out.

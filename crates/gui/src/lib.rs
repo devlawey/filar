@@ -905,15 +905,16 @@ fn split_csv_rows(text: &str) -> Result<Vec<Vec<String>>, String> {
 /// `user` and `tags` columns. Tags are `;`-separated — `,` is the CSV
 /// separator itself.
 fn parse_import_csv(text: &str) -> Result<Vec<SshSlot>, String> {
-    let mut rows = split_csv_rows(text)?
-        .into_iter()
-        // A blank line is not a host.
-        .filter(|r| !(r.len() == 1 && r[0].trim().is_empty()))
-        .collect::<Vec<_>>()
-        .into_iter();
-    let Some(header) = rows.next() else {
-        return Err("empty CSV file".to_string());
-    };
+    let all_rows = split_csv_rows(text)?;
+    let is_blank = |r: &Vec<String>| r.len() == 1 && r[0].trim().is_empty();
+    // The header is the first non-blank row. Blank lines keep their place in
+    // the numbering below, so an error carries the file's own line number
+    // even when the file has gaps (#416 review).
+    let header_idx = all_rows
+        .iter()
+        .position(|r| !is_blank(r))
+        .ok_or("empty CSV file")?;
+    let header = &all_rows[header_idx];
     let column = |name: &str| header.iter().position(|h| h.trim().eq_ignore_ascii_case(name));
     let name_col = column("name").ok_or("CSV header must include a \"name\" column")?;
     let host_col = column("host").ok_or("CSV header must include a \"host\" column")?;
@@ -922,9 +923,12 @@ fn parse_import_csv(text: &str) -> Result<Vec<SshSlot>, String> {
     let tags_col = column("tags");
 
     let mut out = Vec::new();
-    for (i, row) in rows.enumerate() {
-        // 1-based, counting the header: the number the user's editor shows.
-        let line = i + 2;
+    for (idx, row) in all_rows.iter().enumerate().skip(header_idx + 1) {
+        if is_blank(row) {
+            continue;
+        }
+        // 1-based: the number the user's editor shows.
+        let line = idx + 1;
         let field = |col: Option<usize>| {
             col.and_then(|c| row.get(c)).map(String::as_str).unwrap_or("")
         };
@@ -1491,17 +1495,22 @@ impl LauncherApp {
         ui.label("Target:");
         ui.radio_value(&mut self.target_mode, 0, "Local");
 
+        // While the collision dialog is open the host list must not change
+        // under it — a second import would replace the staged one and
+        // `apply_import` matches rows by alias (#416 review).
+        let editing_locked = self.import_dialog.is_some();
+
         ui.horizontal(|ui| {
             ui.label(format!("SSH hosts ({}):", self.ssh_slots.len()));
             if ui
-                .button("+ Add host")
+                .add_enabled(!editing_locked, egui::Button::new("+ Add host"))
                 .on_hover_text("Add a host to the list")
                 .clicked()
             {
                 self.add_host();
             }
             if ui
-                .button("Import…")
+                .add_enabled(!editing_locked, egui::Button::new("Import…"))
                 .on_hover_text(
                     "Import addresses, ports, users and tags from a TOML or CSV file — secrets are never imported",
                 )
@@ -1557,7 +1566,10 @@ impl LauncherApp {
                         };
                         ui.label(egui::RichText::new(detail).weak());
                         if ui
-                            .add_enabled(i > 0, egui::Button::new("⬆").small())
+                            .add_enabled(
+                                !editing_locked && i > 0,
+                                egui::Button::new("⬆").small(),
+                            )
                             .on_hover_text("Move up")
                             .clicked()
                         {
@@ -1565,7 +1577,7 @@ impl LauncherApp {
                         }
                         if ui
                             .add_enabled(
-                                i + 1 < self.ssh_slots.len(),
+                                !editing_locked && i + 1 < self.ssh_slots.len(),
                                 egui::Button::new("⬇").small(),
                             )
                             .on_hover_text("Move down")
@@ -1573,7 +1585,11 @@ impl LauncherApp {
                         {
                             action = Some(HostAction::Down(i));
                         }
-                        if ui.button("X").on_hover_text("Remove host").clicked() {
+                        if ui
+                            .add_enabled(!editing_locked, egui::Button::new("X"))
+                            .on_hover_text("Remove host")
+                            .clicked()
+                        {
                             action = Some(HostAction::Remove(i));
                         }
                     });
@@ -1592,9 +1608,13 @@ impl LauncherApp {
         if self.target_mode == 0 {
             return;
         }
+        // Editing connection fields is also a host-list mutation: a renamed
+        // alias would make `apply_import` match different rows than the ones
+        // the dialog is asking about (#416 review).
+        let locked = self.import_dialog.is_some();
         let idx = self.target_mode - 1;
         let mut show = self.show_ssh_password;
-        {
+        ui.add_enabled_ui(!locked, |ui| {
             let slot = &mut self.ssh_slots[idx];
             egui::Grid::new("ssh_grid")
                 .num_columns(2)
@@ -1639,12 +1659,14 @@ impl LauncherApp {
                     });
                     ui.end_row();
                 });
-        }
+        });
         self.show_ssh_password = show;
-        ui.checkbox(
-            &mut self.ssh_slots[idx].save_password,
-            "Save password (encrypted in OS credential store)",
-        );
+        ui.add_enabled_ui(!locked, |ui| {
+            ui.checkbox(
+                &mut self.ssh_slots[idx].save_password,
+                "Save password (encrypted in OS credential store)",
+            );
+        });
     }
 
     fn render_llm_settings(&mut self, ui: &mut egui::Ui) {
@@ -1870,6 +1892,11 @@ impl LauncherApp {
     /// apply it directly or open the collision dialog. A failed parse shows
     /// an error and changes nothing.
     fn start_host_import(&mut self) {
+        // Belt-and-braces: the Import button is disabled while a staged
+        // decision is pending — a second file must not replace it (#416 review).
+        if self.import_dialog.is_some() {
+            return;
+        }
         // The last import's verdict does not survive a new attempt.
         self.import_status.clear();
         let Some(path) = rfd::FileDialog::new()
@@ -2311,7 +2338,16 @@ impl eframe::App for LauncherApp {
             .resizable(false)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Launch").clicked() {
+                    // A pending collision decision must be answered first:
+                    // launching now would drop the staged import silently
+                    // (#416 review).
+                    if ui
+                        .add_enabled(
+                            self.import_dialog.is_none(),
+                            egui::Button::new("Launch"),
+                        )
+                        .clicked()
+                    {
                         self.do_launch();
                     }
                 if ui.button("Cancel").clicked() {
@@ -3962,6 +3998,16 @@ host_key_policy = \"strict\"
 
         let err = parse_import_csv("").unwrap_err();
         assert!(err.contains("empty CSV"), "got {err}");
+    }
+
+    #[test]
+    fn import_csv_blank_lines_keep_the_file_line_number() {
+        // The empty rows must not shift the number in the error message
+        // (#416 review): "web-2" sits on file line 5.
+        let csv = "name,host,port\n\nweb-1,192.0.2.1,22\n\nweb-2,192.0.2.2,notaport\n";
+        let err = parse_import_csv(csv).unwrap_err();
+        assert!(err.contains("line 5"), "got {err}");
+        assert!(err.contains("invalid port"), "got {err}");
     }
 
     #[test]

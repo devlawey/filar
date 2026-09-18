@@ -17,7 +17,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   `[[ssh_targets]]` shape) or CSV file — addresses, ports, users and tags;
   secrets are never imported. Name collisions are resolved explicitly: one
   Skip / Overwrite / Rename policy, chosen in the dialog, applies to all
-  colliding rows, and a broken file leaves the existing list untouched
+  colliding rows (the host list is locked until the decision is made), and
+  a broken file leaves the existing list untouched
   ([#416](https://github.com/devlawey/filar/issues/416)).
 
 - `Ctrl+O` host selection gained a substring search over target names,
