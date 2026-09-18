@@ -7044,6 +7044,82 @@ start without a dummy key; worth its own issue.
 **Next:** release preparation per `prepare-release` once the 2.0.0
 milestone closes.
 
+## Issue #416: feat(gui) — host list import from a TOML/CSV file
+
+**Milestone:** 2.0.0. **Branch:** `feat/416-import-hosts`.
+
+**Problem.** The launcher's host list (#411) is edited one row at a time; a
+fleet arriving as an inventory dump meant retyping 20+ rows. #416 adds an
+`Import…` button next to `+ Add host`: addresses, ports, users and tags come
+from one file; secrets are never imported (the keyring is filled on first
+connect, as before).
+
+**Decisions.** Both formats, chosen by extension: `.csv` → CSV, everything
+else → TOML in the config's own `[[ssh_targets]]` shape (unknown keys and
+sections ignored, so a ready `config.toml` imports as-is; `auth` and
+passwords never enter the slots). CSV: case-insensitive header (`name`,
+`host` required; `port`/`user`/`tags` optional in any order), tags
+`;`-separated, RFC-4180 quotes, CRLF and BOM tolerated, errors carry the
+line number. Parsing is all-or-nothing: `stage_import` parses before
+mutating, so a broken file leaves the list untouched (red `Import failed: …`
+under the bottom buttons). Collisions are never resolved silently: a
+centered dialog lists every colliding alias and one policy — Skip /
+Overwrite / Rename / Cancel — applies to all of them. Overwrite replaces
+host/port/user/tags in place; the saved password stays only while the
+connection identity (host, port, user) is unchanged (the keyring key is the
+alias) — a changed identity drops the credential, and the launch path
+deletes its keyring entry. Rename takes the first free `{alias}-N` (N from
+2, inside the 32-char alias budget). Imported rows always carry
+`save_password = false`.
+Result line: `Import: N added, N overwritten, N renamed, N skipped`.
+
+**Tests.** gui (20, 73 → 93): 20 hosts in one TOML; foreign config keys
+ignored; target-less / invalid / duplicate-name files rejected; CSV quotes
+and CRLF; shuffled case-insensitive headers; line numbers in CSV errors,
+absolute through blank lines; control characters stripped from imported
+names;
+append without collisions; Skip keeps the existing host; Overwrite keeps
+the password on an unchanged identity and clears it on a changed one;
+`Debug` redacts the password; Rename picks the first free suffix; blank
+scratch rows are not collisions; a broken file changes nothing; a colliding
+import defers to the user; extension selects the format; the status line
+counts every decision.
+
+**Verification:** `cargo build --workspace` / `cargo test --workspace`
+green (agent 153, app 20, core 98, gui 93, transport 38 + 7
+ignored/docker-sshd, tui 549, doctests 2). Real GUI run (DoD, ComputerUse on
+Windows, `--gui-only` standalone window against app-data with backup):
+`collide.toml` → `Import: 2 added, …`; the same file again → dialog `2 of 2
+imported hosts use a name that already exists: test-vm, test-vm-2` → Rename
+→ `2 renamed`, rows `test-vm-3`/`test-vm-2-2`; `fleet20.toml` → `20 added`,
+header `SSH hosts (25)`; `broken.toml` → red `Import failed: not valid TOML:
+… expected '.' or '='`, list unchanged, no crash; Launch →
+`pending_launch.json` carries the 24 imported hosts plus the pre-existing
+ones (26 targets total, ports 2222 and tags included; no password values, no
+`api_key` — #255 holds). App-data restored byte-identical (SHA256, 41/41),
+no filar processes left. The TUI leg (pending_launch → Ctrl+O) is
+#412-proven and was not re-run.
+
+**Review round 1 (ai-review).** Host-list edits are locked while the
+collision dialog is open — "+ Add host" / "Import…", the row actions and
+the connection fields are disabled, Launch waits for the decision, and
+`start_host_import` has a guard — so a staged import cannot be replaced or
+invalidated under the dialog. CSV error line numbers are absolute and
+survive blank lines (the header is the first non-blank row; row iteration
+keeps the file's own indices).
+
+**Review round 2 (CodeRabbit).** Imported names go through `clean_tag`
+before storage, like the tag fields — control characters cannot reach the
+TUI status bar. An Overwrite that changes host, port or user drops the
+saved password (the keyring key is the alias): the credential belonged to
+the old identity, and the launch path deletes the keyring entry because
+`save_password` is off. `SshSlot`'s derived `Debug` is replaced with a
+manual impl that redacts the password — `ImportStaged` can put a slot into
+test-failure output.
+
+**Next:** #417 — fleet export without secrets (the counterpart format), then
+the rest of the 2.0.0 fleet build-out.
+
 ## Agent E2E runbook (docs)
 
 `docs/AGENT_E2E_RUNBOOK.md`: how an agent whose harness can control a desktop
