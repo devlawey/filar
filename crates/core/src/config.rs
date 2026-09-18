@@ -45,6 +45,11 @@ pub struct Config {
     #[serde(default)]
     pub tag_policies: Vec<TagPolicy>,
 
+    /// Named host groups from `[[host_groups]]` (#418): a tag-intersection
+    /// selection plus the policy, limits and LLM profile its members share.
+    #[serde(default)]
+    pub host_groups: Vec<HostGroup>,
+
     /// Directory where Ctrl+S session exports (`.md`) are written.
     /// `None` means the process working directory at startup.
     #[serde(default)]
@@ -81,6 +86,7 @@ impl Default for Config {
             timeouts: TimeoutConfig::default(),
             confirm_mode: CommandConfirmMode::Allowlist,
             tag_policies: Vec::new(),
+            host_groups: Vec::new(),
             save_dir: None,
             save_runbook: default_save_runbook(),
             arbiter_profile: None,
@@ -475,6 +481,128 @@ pub fn tag_policy_floor(
 }
 
 // ---------------------------------------------------------------------------
+// Host groups (#418)
+// ---------------------------------------------------------------------------
+
+/// What a host group permits its members to do (#418).
+///
+/// Only read-only exists so far — the fleet mode is defined as "one dialogue
+/// session with N executors, read-only". An unknown value in the config is a
+/// parse error, not a silently loosened policy: a typo must not turn a ban
+/// into permission.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostGroupPolicy {
+    /// Members are read-only: write commands are refused by the transport.
+    #[default]
+    ReadOnly,
+}
+
+/// A named selection of SSH targets, from `[[host_groups]]` (#418).
+///
+/// The selection is a tag **intersection**: a target belongs to the group
+/// when **all** of [`match_tags`](Self::match_tags) are present among its
+/// [`SshTarget::tags`]. An empty `match` selects nothing — deliberately not
+/// the whole fleet: an unfinished rule must never widen the blast radius.
+///
+/// The group carries more than the selection — a policy, a parallelism
+/// limit, a per-host deadline and an optional LLM profile — which is what
+/// makes it a group rather than a convenience list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostGroup {
+    /// Human-readable group name.
+    pub name: String,
+    /// Tags a target must **all** carry, e.g. `match = ["work", "prod"]`.
+    #[serde(default, rename = "match")]
+    pub match_tags: Vec<String>,
+    /// Policy the group imposes on its members (default: read-only).
+    #[serde(default)]
+    pub policy: HostGroupPolicy,
+    /// Upper bound on executors running at the same time (default: 3).
+    #[serde(default = "default_max_parallel")]
+    pub max_parallel: u32,
+    /// Deadline for one command on one host, in seconds (default: 30).
+    #[serde(default = "default_per_host_timeout_secs")]
+    pub per_host_timeout_secs: u64,
+    /// LLM profile for the group's dialogue; `None` = the session profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_profile: Option<String>,
+}
+
+fn default_max_parallel() -> u32 {
+    3
+}
+
+fn default_per_host_timeout_secs() -> u64 {
+    30
+}
+
+/// Manual `Default` matching the serde defaults — a derived one would
+/// give zero limits and diverge from a group parsed out of an empty
+/// `[[host_groups]]` entry.
+impl Default for HostGroup {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            match_tags: Vec::new(),
+            policy: HostGroupPolicy::default(),
+            max_parallel: default_max_parallel(),
+            per_host_timeout_secs: default_per_host_timeout_secs(),
+            llm_profile: None,
+        }
+    }
+}
+
+impl HostGroup {
+    /// Reject definitions that cannot mean anything (#418): an empty name or
+    /// zero limits. An empty rule is deliberately allowed — it selects
+    /// nobody, and the Groups tab states that explicitly.
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(CoreError::Config(
+                "host_groups: name must not be empty".into(),
+            ));
+        }
+        if self.max_parallel == 0 {
+            return Err(CoreError::Config(format!(
+                "host_groups: \"{}\": max_parallel must be greater than 0",
+                self.name
+            )));
+        }
+        if self.per_host_timeout_secs == 0 {
+            return Err(CoreError::Config(format!(
+                "host_groups: \"{}\": per_host_timeout_secs must be greater than 0",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The targets a group selects: those carrying **all** of its
+/// [`match_tags`](HostGroup::match_tags) (#418).
+///
+/// An empty rule selects nothing — not everything. Tag comparison is exact,
+/// like [`tag_policy_floor`].
+pub fn select_hosts_for_group<'a>(
+    group: &HostGroup,
+    targets: &'a [SshTarget],
+) -> Vec<&'a SshTarget> {
+    if group.match_tags.is_empty() {
+        return Vec::new();
+    }
+    targets
+        .iter()
+        .filter(|t| {
+            group
+                .match_tags
+                .iter()
+                .all(|tag| t.tags.iter().any(|t| t == tag))
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
 
@@ -500,6 +628,9 @@ impl Config {
             LlmConfig::from(p).validate()?;
         }
         cfg.timeouts.validate()?;
+        for group in &cfg.host_groups {
+            group.validate()?;
+        }
         Ok(cfg)
     }
 
@@ -1112,6 +1243,176 @@ temperature = 5.0
         let result = Config::load(&tmp);
         let _ = std::fs::remove_file(&tmp);
         assert!(result.is_err(), "Config::load should reject temperature=5.0");
+    }
+
+    // ── Host groups (#418) ─────────────────────────────────────
+
+    fn group(name: &str, tags: &[&str]) -> HostGroup {
+        HostGroup {
+            name: name.into(),
+            match_tags: tags.iter().map(|t| t.to_string()).collect(),
+            ..HostGroup::default()
+        }
+    }
+
+    fn target_with_tags(name: &str, tags: &[&str]) -> SshTarget {
+        SshTarget {
+            name: name.into(),
+            host: "10.0.0.1".into(),
+            port: 22,
+            user: "root".into(),
+            auth: SshAuth::default(),
+            host_key_policy: HostKeyPolicy::default(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn host_group_round_trip() {
+        // The exact shape from #418.
+        let text = r#"
+[[host_groups]]
+name = "Рабочий прод"
+match = ["work", "prod"]
+policy = "read-only"
+max_parallel = 3
+per_host_timeout_secs = 30
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        let g = &cfg.host_groups[0];
+        assert_eq!(g.name, "Рабочий прод");
+        assert_eq!(g.match_tags, ["work", "prod"]);
+        assert_eq!(g.policy, HostGroupPolicy::ReadOnly);
+        assert_eq!(g.max_parallel, 3);
+        assert_eq!(g.per_host_timeout_secs, 30);
+        assert_eq!(g.llm_profile, None);
+
+        // Round trip: serialize and parse back — the definition survives.
+        let serialized = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(back.host_groups, cfg.host_groups);
+        assert!(
+            !serialized.contains("llm_profile ="),
+            "an unset profile must stay out of the file"
+        );
+    }
+
+    #[test]
+    fn host_group_defaults_fill_missing_fields() {
+        let text = r#"
+[[host_groups]]
+name = "prod"
+match = ["prod"]
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        let g = &cfg.host_groups[0];
+        assert_eq!(
+            g.policy,
+            HostGroupPolicy::ReadOnly,
+            "read-only is the only policy and the default"
+        );
+        assert_eq!(g.max_parallel, 3);
+        assert_eq!(g.per_host_timeout_secs, 30);
+        assert_eq!(g.llm_profile, None);
+    }
+
+    #[test]
+    fn host_group_unknown_policy_is_rejected() {
+        let text = r#"
+[[host_groups]]
+name = "prod"
+match = ["prod"]
+policy = "read-write"
+"#;
+        assert!(
+            toml::from_str::<Config>(text).is_err(),
+            "a policy typo must fail the parse, not silently loosen the ban"
+        );
+    }
+
+    #[test]
+    fn host_group_selects_the_tag_intersection() {
+        let targets = [
+            target_with_tags("both", &["work", "prod"]),
+            target_with_tags("work-only", &["work"]),
+            target_with_tags("prod-only", &["prod"]),
+            target_with_tags("none", &[]),
+        ];
+        let selected: Vec<&str> =
+            select_hosts_for_group(&group("prod", &["work", "prod"]), &targets)
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect();
+        assert_eq!(selected, ["both"], "only the host carrying every tag matches");
+    }
+
+    #[test]
+    fn host_group_empty_match_selects_nothing() {
+        let targets = [
+            target_with_tags("a", &["prod"]),
+            target_with_tags("b", &[]),
+        ];
+        // Not "the whole fleet": an unfinished rule must not widen the list.
+        assert!(select_hosts_for_group(&group("everything?", &[]), &targets).is_empty());
+    }
+
+    #[test]
+    fn host_group_with_no_matches_selects_nothing() {
+        let targets = [target_with_tags("a", &["dev"])];
+        assert!(select_hosts_for_group(&group("prod", &["prod"]), &targets).is_empty());
+    }
+
+    #[test]
+    fn host_group_validation_rejects_empty_name_and_zero_limits() {
+        assert!(HostGroup {
+            name: "  ".into(),
+            ..HostGroup::default()
+        }
+        .validate()
+        .is_err());
+        assert!(HostGroup {
+            name: "prod".into(),
+            max_parallel: 0,
+            ..HostGroup::default()
+        }
+        .validate()
+        .is_err());
+        assert!(HostGroup {
+            name: "prod".into(),
+            per_host_timeout_secs: 0,
+            ..HostGroup::default()
+        }
+        .validate()
+        .is_err());
+        // An empty rule is legal — it selects nobody, and the UI says so.
+        assert!(HostGroup {
+            name: "prod".into(),
+            ..HostGroup::default()
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn config_load_rejects_a_zero_group_limit() {
+        let toml = r#"
+[[host_groups]]
+name = "prod"
+match = ["prod"]
+max_parallel = 0
+"#;
+        let tmp = std::env::temp_dir().join(format!(
+            "filar_config_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&tmp, toml).unwrap();
+        let result = Config::load(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(result.is_err(), "Config::load should reject max_parallel = 0");
     }
 
     /// The only test in this crate that touches `FILAR_CONFIG`.

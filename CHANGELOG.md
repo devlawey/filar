@@ -13,6 +13,15 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Host groups (`[[host_groups]]` in `config.toml`): a named tag rule where
+  a host joins only when it carries **all** the listed tags, carrying the
+  group's `read-only` policy, parallelism limit, per-host timeout and an
+  optional LLM profile. The launcher's Groups tab edits groups and shows the
+  effective composition live ("Effective now: N hosts — …"), so the blast
+  radius of a rule is visible while it is written; an empty rule selects
+  nothing, and empty/no-match states are stated explicitly, not as errors
+  ([#418](https://github.com/devlawey/filar/issues/418)).
+
 - The GUI launcher exports the host list to a secret-free TOML — the same
   `[[ssh_targets]]` shape `Import…` reads, one entry per host with the auth
   type (`password`/`key`) and no passwords, keys or key paths — so the
