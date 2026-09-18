@@ -6937,7 +6937,17 @@ tab's own mode.
 
 **Verification:** `cargo build --workspace` and `cargo test --workspace`
 green (core 20 + 98, gui 73, tui 530, agent 153, transport 38 + 7
-ignored/docker-sshd).
+ignored/docker-sshd). Real TUI run (DoD, ComputerUse on Windows): no live
+sshd in the environment, so the scenario ran against the real binary with
+`FILAR_CONFIG` on a scratch config (`confirm_mode = "allowlist"`,
+`[[tag_policies]] prod → always`, targets `prod-box`/`test-box` tagged
+`prod`/`test`). Starting local in `allowlist`, selecting `prod-box` via
+`Ctrl+O` flipped the status-bar mode to `Always` at once — before the
+connect finished; after the connect timed out the mode stayed `Always`
+(erring strict is the safe direction); selecting `local` released it back
+to `Allowlist`, and selecting `test-box` (no matching policy) left
+`Allowlist` unchanged. Screenshots confirmed each state; app-data touched
+by the run was restored byte-identical (SHA256).
 
 **Next:** #415 — Ctrl+O filter/grouping by tags.
 
