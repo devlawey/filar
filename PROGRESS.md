@@ -7065,22 +7065,28 @@ mutating, so a broken file leaves the list untouched (red `Import failed: …`
 under the bottom buttons). Collisions are never resolved silently: a
 centered dialog lists every colliding alias and one policy — Skip /
 Overwrite / Rename / Cancel — applies to all of them. Overwrite replaces
-host/port/user/tags in place and keeps the saved password (the keyring key
-is the alias); Rename takes the first free `{alias}-N` (N from 2, inside the
-32-char alias budget). Imported rows always carry `save_password = false`.
+host/port/user/tags in place; the saved password stays only while the
+connection identity (host, port, user) is unchanged (the keyring key is the
+alias) — a changed identity drops the credential, and the launch path
+deletes its keyring entry. Rename takes the first free `{alias}-N` (N from
+2, inside the 32-char alias budget). Imported rows always carry
+`save_password = false`.
 Result line: `Import: N added, N overwritten, N renamed, N skipped`.
 
-**Tests.** gui (17, 73 → 90): 20 hosts in one TOML; foreign config keys
+**Tests.** gui (20, 73 → 93): 20 hosts in one TOML; foreign config keys
 ignored; target-less / invalid / duplicate-name files rejected; CSV quotes
 and CRLF; shuffled case-insensitive headers; line numbers in CSV errors,
-absolute through blank lines;
-append without collisions; Skip keeps the existing host; Overwrite keeps the
-password; Rename picks the first free suffix; blank scratch rows are not
-collisions; a broken file changes nothing; a colliding import defers to the
-user; extension selects the format; the status line counts every decision.
+absolute through blank lines; control characters stripped from imported
+names;
+append without collisions; Skip keeps the existing host; Overwrite keeps
+the password on an unchanged identity and clears it on a changed one;
+`Debug` redacts the password; Rename picks the first free suffix; blank
+scratch rows are not collisions; a broken file changes nothing; a colliding
+import defers to the user; extension selects the format; the status line
+counts every decision.
 
 **Verification:** `cargo build --workspace` / `cargo test --workspace`
-green (agent 153, app 20, core 98, gui 90, transport 38 + 7
+green (agent 153, app 20, core 98, gui 93, transport 38 + 7
 ignored/docker-sshd, tui 549, doctests 2). Real GUI run (DoD, ComputerUse on
 Windows, `--gui-only` standalone window against app-data with backup):
 `collide.toml` → `Import: 2 added, …`; the same file again → dialog `2 of 2
@@ -7101,6 +7107,15 @@ the connection fields are disabled, Launch waits for the decision, and
 invalidated under the dialog. CSV error line numbers are absolute and
 survive blank lines (the header is the first non-blank row; row iteration
 keeps the file's own indices).
+
+**Review round 2 (CodeRabbit).** Imported names go through `clean_tag`
+before storage, like the tag fields — control characters cannot reach the
+TUI status bar. An Overwrite that changes host, port or user drops the
+saved password (the keyring key is the alias): the credential belonged to
+the old identity, and the launch path deletes the keyring entry because
+`save_password` is off. `SshSlot`'s derived `Debug` is replaced with a
+manual impl that redacts the password — `ImportStaged` can put a slot into
+test-failure output.
 
 **Next:** #417 — fleet export without secrets (the counterpart format), then
 the rest of the 2.0.0 fleet build-out.

@@ -769,7 +769,10 @@ fn make_import_slot(
     user: &str,
     tags: &[String],
 ) -> Result<SshSlot, String> {
-    let alias: String = name.trim().chars().take(32).collect();
+    // The alias is rendered in the TUI status bar verbatim; `clean_tag`
+    // keeps imported control characters out, like the tag fields do
+    // (#416 review).
+    let alias: String = clean_tag(name).chars().take(32).collect();
     if alias.is_empty() {
         return Err(format!("{where_}: name must not be empty"));
     }
@@ -1009,8 +1012,10 @@ fn unique_alias(existing: &[SshSlot], base: &str) -> String {
 /// Apply parsed rows to the launcher's host list under the chosen policy.
 ///
 /// The policy only affects colliding rows; fresh names are appended.
-/// Overwrite replaces the connection fields in place and keeps the entry's
-/// saved password: the alias — and with it the keyring key — does not change.
+/// Overwrite replaces the connection fields in place; the saved password
+/// survives only while the connection identity (host, port, user) is
+/// unchanged — a credential belonging to another machine must not follow
+/// the alias to a new one (#416 review).
 fn apply_import(
     existing: &mut Vec<SshSlot>,
     imported: Vec<SshSlot>,
@@ -1029,6 +1034,18 @@ fn apply_import(
             (Some(_), CollisionPolicy::Skip) => outcome.skipped += 1,
             (Some(i), CollisionPolicy::Overwrite) => {
                 let slot = &mut existing[i];
+                // The saved password belongs to the old connection
+                // identity: on a changed host/port/user it is dropped (the
+                // launch path then deletes the keyring entry), otherwise a
+                // credential for another machine silently follows the
+                // unchanged alias — and TOFU may not warn (#416 review).
+                if slot.host.trim() != row.host.trim()
+                    || slot.port.trim() != row.port.trim()
+                    || slot.user.trim() != row.user.trim()
+                {
+                    slot.password.clear();
+                    slot.save_password = false;
+                }
                 slot.host = row.host;
                 slot.port = row.port;
                 slot.user = row.user;
@@ -1139,7 +1156,6 @@ fn save_config_toml(settings: &Settings) {
 // LauncherApp
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
 struct SshSlot {
     host: String,
     port: String,
@@ -1149,6 +1165,22 @@ struct SshSlot {
     tags: String,
     password: String,
     save_password: bool,
+}
+
+/// Redacts `password`: `Debug` output can reach a test failure message via
+/// `ImportStaged`, and a slot must never print its secret (#416 review).
+impl std::fmt::Debug for SshSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshSlot")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("alias", &self.alias)
+            .field("tags", &self.tags)
+            .field("password", &"<redacted>")
+            .field("save_password", &self.save_password)
+            .finish()
+    }
 }
 
 impl SshSlot {
@@ -4042,7 +4074,27 @@ host_key_policy = \"strict\"
     }
 
     #[test]
-    fn import_overwrite_replaces_fields_in_place_and_keeps_the_password() {
+    fn import_overwrite_keeps_the_password_when_the_identity_is_unchanged() {
+        let mut app = app_with_hosts(&[("10.0.0.11", "web-1"), ("10.0.0.12", "db-1")]);
+        app.ssh_slots[0].save_password = true;
+        app.ssh_slots[0].password = "s3cret".into();
+        let rows = parse_import_toml(
+            "[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.11\"\nport = 22\nuser = \"root\"\ntags = [\"prod\"]\n",
+        )
+        .unwrap();
+        let outcome = apply_import(&mut app.ssh_slots, rows, CollisionPolicy::Overwrite);
+        assert_eq!(outcome.overwritten, 1);
+        assert_eq!(app.ssh_slots.len(), 2, "no new row appears");
+        let slot = &app.ssh_slots[0];
+        assert_eq!(slot.tags, "prod", "tags are still overwritten");
+        assert!(
+            slot.save_password && slot.password == "s3cret",
+            "same host/port/user: the credential still belongs here"
+        );
+    }
+
+    #[test]
+    fn import_overwrite_clears_the_password_when_the_identity_changes() {
         let mut app = app_with_hosts(&[("10.0.0.11", "web-1"), ("10.0.0.12", "db-1")]);
         app.ssh_slots[0].save_password = true;
         app.ssh_slots[0].password = "s3cret".into();
@@ -4060,9 +4112,32 @@ host_key_policy = \"strict\"
         );
         assert_eq!(slot.tags, "prod");
         assert!(
-            slot.save_password && slot.password == "s3cret",
-            "the keyring password stays with the unchanged name"
+            !slot.save_password && slot.password.is_empty(),
+            "a credential must not follow the alias to another machine"
         );
+    }
+
+    #[test]
+    fn import_alias_strips_control_characters() {
+        // The TOML escape decodes to a raw BEL (U+0007) inside the name.
+        let rows = parse_import_toml(
+            "[[ssh_targets]]\nname = \"web\\u0007-1\"\nhost = \"10.0.0.9\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            rows[0].alias, "web-1",
+            "a control character must not reach the TUI status bar"
+        );
+    }
+
+    #[test]
+    fn ssh_slot_debug_redacts_the_password() {
+        let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
+        app.ssh_slots[0].save_password = true;
+        app.ssh_slots[0].password = "s3cret".into();
+        let rendered = format!("{:?}", app.ssh_slots[0]);
+        assert!(rendered.contains("<redacted>"), "got {rendered}");
+        assert!(!rendered.contains("s3cret"), "got {rendered}");
     }
 
     #[test]

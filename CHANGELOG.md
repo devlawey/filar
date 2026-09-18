@@ -18,7 +18,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   secrets are never imported. Name collisions are resolved explicitly: one
   Skip / Overwrite / Rename policy, chosen in the dialog, applies to all
   colliding rows (the host list is locked until the decision is made), and
-  a broken file leaves the existing list untouched
+  a broken file leaves the existing list untouched; an overwrite keeps the
+  saved password only while the address, port and user are unchanged
   ([#416](https://github.com/devlawey/filar/issues/416)).
 
 - `Ctrl+O` host selection gained a substring search over target names,
