@@ -634,6 +634,11 @@ async fn run() -> anyhow::Result<()> {
     let tui_config = TuiConfig {
         target_name: target_name.clone(),
         confirm_mode: loaded.confirm_mode.unwrap_or(config.confirm_mode),
+        // The global baseline for tag policies stays the config's own mode
+        // even when a restored session overrides the starting tab's mode
+        // (#414).
+        global_confirm_mode: config.confirm_mode,
+        tag_policies: config.tag_policies.clone(),
         llm_profile: default_profile_name.clone(),
         initial_messages: loaded.messages,
         initial_input_history: loaded.input_history,

@@ -13,6 +13,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Tag-bound confirmation policies (`[[tag_policies]]`): a policy may only
+  tighten `confirm_mode` for targets carrying its tag — the effective mode is
+  the strictest of the tab's own mode, the global mode and all matching
+  policies, so a tag can never open more than the global mode allows and the
+  strictest of several matched policies wins. The effective mode is shown in
+  the status bar and applies from the moment a host is chosen in `Ctrl+O`
+  ([#414](https://github.com/devlawey/filar/issues/414)).
+
 - SSH targets can carry free-form tags: the GUI launcher edits them per host
   (comma-separated `Tags` field) and the TUI status bar shows the active
   target's tags between host and path (`alias host [prod,web] pwd`), yielding

@@ -207,8 +207,16 @@ pub struct App {
     pub sessions: Vec<Session>,
     /// Index of the currently active session in `sessions`.
     pub active: usize,
-    /// Command confirmation mode.
+    /// Effective confirmation mode for the active tab: the tab's own mode
+    /// ([`Session::confirm_mode`]) tightened by the matching [`tag_policies`]
+    /// floor (#414). Shown in the status bar and handed to the agent's
+    /// confirm gate.
     pub confirm_mode: CommandConfirmMode,
+    /// Confirmation mode from config.toml — the baseline no tag policy can
+    /// go below (#414).
+    pub global_confirm_mode: CommandConfirmMode,
+    /// Tag-bound confirmation policies from `[[tag_policies]]` (#414).
+    pub tag_policies: Vec<filar_core::TagPolicy>,
     /// Set to true when the user wants to quit.
     pub should_quit: bool,
     /// Shared secret provider: $FILAR_SECRET_N → actual value.
@@ -529,6 +537,8 @@ impl App {
             sessions: vec![session],
             active: 0,
             confirm_mode,
+            global_confirm_mode: confirm_mode,
+            tag_policies: Vec::new(),
             should_quit: false,
             secrets: Arc::new(StaticSecretProvider::new()),
             pending_ssh: None,
@@ -588,11 +598,13 @@ impl App {
     /// [`pending_local_executors`](Self::pending_local_executors).
     pub fn new_tab(&mut self) {
         let name = format!("local-{}", self.sessions.len() + 1);
-        let session = Session::new(name, self.confirm_mode);
+        // Inherit the active tab's own mode (not the policy-clamped mirror),
+        // so the new local tab starts from the user's choice (#414).
+        let session = Session::new(name, self.sessions[self.active].confirm_mode);
         self.pending_local_executors.push(session.id);
         self.sessions.push(session);
         self.active = self.sessions.len() - 1;
-        self.confirm_mode = self.sessions[self.active].confirm_mode;
+        self.sync_confirm_mode();
     }
 
     /// Close the active tab. If it's the last tab, set should_quit.
@@ -616,7 +628,7 @@ impl App {
         if self.active >= self.sessions.len() {
             self.active = self.sessions.len() - 1;
         }
-        self.confirm_mode = self.sessions[self.active].confirm_mode;
+        self.sync_confirm_mode();
         self.closed_ids.push(sid);
     }
 
@@ -635,8 +647,8 @@ impl App {
                 session.confirm_mode = CommandConfirmMode::Explain;
             }
         }
-        // Sync App-level mirror.
-        self.confirm_mode = self.sessions[self.active].confirm_mode;
+        // Sync App-level mirror (with the tag-policy floor applied).
+        self.sync_confirm_mode();
 
         // Abort pending confirmation if any — toggle must not block.
         if let Some(confirm) = self.pending_confirm.take() {
@@ -721,7 +733,7 @@ impl App {
         };
         self.sessions[prev].has_new = false;
         self.active = prev;
-        self.confirm_mode = self.sessions[self.active].confirm_mode;
+        self.sync_confirm_mode();
     }
 
     /// Switch to the next tab (wraps around).
@@ -729,7 +741,7 @@ impl App {
         let next = (self.active + 1) % self.sessions.len();
         self.sessions[next].has_new = false;
         self.active = next;
-        self.confirm_mode = self.sessions[self.active].confirm_mode;
+        self.sync_confirm_mode();
     }
 
     /// Switch to tab at index (1-based from user, clamped).
@@ -740,7 +752,7 @@ impl App {
             self.sessions[idx].has_new = false;
         }
         self.active = idx;
-        self.confirm_mode = self.sessions[self.active].confirm_mode;
+        self.sync_confirm_mode();
     }
 
     /// Find the index of a session by its stable id.
@@ -1636,6 +1648,31 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Effective confirmation mode for a target with the given `tags` (#414).
+    ///
+    /// When at least one `[[tag_policies]]` entry matches, the tab's own mode
+    /// is tightened to the strictest of the tab's mode, the global mode and
+    /// all matching policies — only ever raised, never lowered. Without a
+    /// matching policy the tab's own mode stands (the F2 toggle stays free).
+    fn confirm_mode_for_tags(&self, tags: &[String]) -> CommandConfirmMode {
+        let own = self.sessions[self.active].confirm_mode;
+        match filar_core::tag_policy_floor(self.global_confirm_mode, &self.tag_policies, tags) {
+            Some(floor) => own.strictest(floor),
+            None => own,
+        }
+    }
+
+    /// Re-apply the tag-policy floor to the App-level mode mirror (#414).
+    ///
+    /// Called whenever the active tab, its SSH target, or the tab's own mode
+    /// changes. The tab's stored mode is the user's own choice (F2-editable)
+    /// and stays untouched; the mirror is the value shown in the status bar
+    /// and handed to the agent's confirm gate.
+    pub fn sync_confirm_mode(&mut self) {
+        let tags = self.active_ssh_tags();
+        self.confirm_mode = self.confirm_mode_for_tags(&tags);
+    }
+
     /// Render the active target's tags as a `[a,b]` status-bar segment, or
     /// `None` when the target has no tags or the segment does not fit into
     /// `max_len` terminal cells (`max_len` is a column budget: a
@@ -1690,6 +1727,21 @@ impl App {
         let idx = self.host_select_index;
         self.host_select_visible = false;
         self.ctrl_o_selection = Some(idx);
+
+        // A policy-tagged chosen host tightens the mode at once — before
+        // the connect completes — so the confirm gate never runs under the
+        // previous host's looser mode during the swap (#414). A failed
+        // connect leaves the stricter mode in place: erring strict is the
+        // safe direction, and the alias is already shown optimistically.
+        let tags = if idx == 0 {
+            Vec::new()
+        } else {
+            self.ssh_targets
+                .get(idx - 1)
+                .map(|t| t.tags.clone())
+                .unwrap_or_default()
+        };
+        self.confirm_mode = self.confirm_mode_for_tags(&tags);
 
         let alias = if idx == 0 {
             "~local".to_string()
@@ -1927,6 +1979,9 @@ impl App {
                 self.ctrl_o_selection = Some(pos + 1); // 0 is reserved for "local"
                 self.target_name = format!("~{}", self.ssh_targets[pos].name);
                 self.ctrl_o_needs_connect = true;
+                // Tighten immediately, like `select_host` (#414).
+                let tags = self.ssh_targets[pos].tags.clone();
+                self.confirm_mode = self.confirm_mode_for_tags(&tags);
             } else {
                 self.pending_ssh = Some((user.clone(), host.clone(), port));
                 // Do not touch `ssh_info`/`target_name` yet: the tab is still
@@ -1943,6 +1998,7 @@ impl App {
         } else {
             self.ssh_info = None;
             self.target_name = session.target.clone();
+            self.sync_confirm_mode();
         }
     }
 
@@ -2726,6 +2782,9 @@ impl App {
                                     // even before TransportChanged arrives.
                                     self.ssh_info =
                                         Some(format!("{user}@{host}:{port}"));
+                                    // A host matching a configured, policy-tagged
+                                    // target tightens the mode at once (#414).
+                                    self.sync_confirm_mode();
                                     self.push_message(ChatBlock::System(format!(
                                         "Connecting to {user}@{host}:{port} via SSH. \
                                          Press Ctrl+P to enter the password."
@@ -9219,6 +9278,92 @@ mod tests {
 
         app.ssh_info = None;
         assert!(app.active_ssh_tags().is_empty(), "local session has no tags");
+    }
+
+    // ── Tag policies tighten confirm_mode (#414) ────────────────
+
+    /// App with global allowlist, a `prod → always` policy, and a
+    /// prod-tagged plus a test-tagged target.
+    fn app_with_prod_policy() -> App {
+        let mut app = App::new("local".into(), CommandConfirmMode::Allowlist);
+        app.global_confirm_mode = CommandConfirmMode::Allowlist;
+        app.tag_policies = vec![filar_core::TagPolicy {
+            tag: "prod".into(),
+            confirm_mode: CommandConfirmMode::Always,
+        }];
+        let mut prod = make_ssh_target("prod-box");
+        prod.host = "10.0.0.7".into();
+        prod.tags = vec!["prod".into()];
+        let mut test = make_ssh_target("test-box");
+        test.host = "10.0.0.9".into();
+        test.tags = vec!["test".into()];
+        app.ssh_targets = vec![prod, test];
+        app
+    }
+
+    #[test]
+    fn tag_policy_tightens_and_releases_on_target_switch() {
+        // The DoD scenario (#414): switching between a test- and a prod-tagged
+        // host changes the effective mode — and back.
+        let mut app = app_with_prod_policy();
+        app.ssh_info = Some("user@10.0.0.9:22".into()); // test host
+        app.sync_confirm_mode();
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Allowlist);
+
+        app.ssh_info = Some("user@10.0.0.7:22".into()); // prod host
+        app.sync_confirm_mode();
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Always);
+
+        app.ssh_info = Some("user@10.0.0.9:22".into()); // back to test
+        app.sync_confirm_mode();
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Allowlist);
+    }
+
+    #[test]
+    fn tag_policy_looser_than_global_cannot_open_the_host() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.global_confirm_mode = CommandConfirmMode::Always;
+        app.tag_policies = vec![filar_core::TagPolicy {
+            tag: "prod".into(),
+            confirm_mode: CommandConfirmMode::Never,
+        }];
+        let mut prod = make_ssh_target("prod-box");
+        prod.host = "10.0.0.7".into();
+        prod.tags = vec!["prod".into()];
+        app.ssh_targets = vec![prod];
+        app.ssh_info = Some("user@10.0.0.7:22".into());
+        app.sync_confirm_mode();
+        assert_eq!(
+            app.confirm_mode,
+            CommandConfirmMode::Always,
+            "a tag policy must never loosen the global mode"
+        );
+    }
+
+    #[test]
+    fn tab_own_mode_is_lifted_to_the_policy_floor() {
+        // A tab whose own mode is looser than the floor (e.g. restored from
+        // an older session) is lifted on sync — the floor is not optional.
+        let mut app = app_with_prod_policy();
+        app.active_session_mut().confirm_mode = CommandConfirmMode::Never;
+        app.ssh_info = Some("user@10.0.0.7:22".into());
+        app.sync_confirm_mode();
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Always);
+    }
+
+    #[test]
+    fn select_host_tightens_immediately_before_connect() {
+        // Choosing a policy-tagged host in Ctrl+O raises the mode at once,
+        // without waiting for the (possibly failing) connect (#414).
+        let mut app = app_with_prod_policy();
+        app.open_host_select();
+        app.host_select_index = 1; // first target = prod-box
+        app.select_host();
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Always);
+        // Choosing local releases the floor again.
+        app.host_select_index = 0;
+        app.select_host();
+        assert_eq!(app.confirm_mode, CommandConfirmMode::Allowlist);
     }
 
     #[test]

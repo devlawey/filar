@@ -6894,6 +6894,53 @@ char-count budget and displaced the right-aligned counters on a narrow bar.
 **Next:** #414 — a tag policy may only tighten `confirm_mode`, never
 loosen it.
 
+## Issue #414: feat(core) — a tag policy tightens `confirm_mode`, never loosens it
+
+**Milestone:** 2.0.0. **Branch:** `feat/414-tag-policy-confirm-floor`.
+
+**Problem.** `confirm_mode` was one mode for the whole run: working on a
+test VM in `allowlist`, switching `Ctrl+O` to a prod host kept the same
+mode. #413 gave targets machine-readable tags; #414 turns them into
+constraints via `[[tag_policies]]` (`tag`, `confirm_mode`).
+
+**Decision.** "Tighten only" is enforced by an explicit strictness order —
+`Explain > Always > Allowlist > Never` (`CommandConfirmMode::strictness`)
+— and one resolver: `tag_policy_floor(global, policies, tags)` returns
+`Some(strictest(global, all matching policies))` when at least one policy
+matches the target's tags and `None` otherwise
+(`crates/core/src/config.rs`). So a tag can never open more than the
+global mode allows, the global wins when it is stricter than a policy, and
+with several matched policies/tags the strictest wins. `None` matters:
+targets without a matching policy keep the tab's own mode untouched — the
+F2 Explain toggle stays free on them (the pre-existing F2 tests pin this;
+an unconditional global clamp made F2 unable to leave Explain). In the TUI,
+`App.confirm_mode` (bar + agent confirm gate) is the effective mirror:
+`strictest(tab's own mode, floor)` recomputed by `sync_confirm_mode()` at
+every site that changes the active tab, its target, or the tab's own mode;
+`Session::confirm_mode` stays the user's own choice. `Ctrl+O` clamps
+eagerly at selection — a policy-tagged host raises the mode before the
+connect completes, and a failed connect leaves the stricter mode (erring
+strict is the safe direction) — while the `TransportChanged` interception
+recomputes once the swap lands. `TuiConfig` gained `global_confirm_mode`
+(config's own mode, distinct from the possibly session-restored
+`confirm_mode`) and `tag_policies`.
+
+**Tests.** core (6): policy stricter than global applies; looser than
+global is ignored; several matched policies → strictest; no matching policy →
+`None` (no floor); `strictness`/`strictest` ordering; `[[tag_policies]]`
+TOML parse. tui app (4): the Ctrl+O DoD scenario — switching test ↔ prod
+tightens and releases; a looser-than-global policy cannot open the host; a
+tab's own looser mode is lifted to the floor; `select_host` tightens
+immediately before the connect (local releases it). bars (1): the status
+bar shows the policy-tightened mode; untagged counter-check keeps the
+tab's own mode.
+
+**Verification:** `cargo build --workspace` and `cargo test --workspace`
+green (core 20 + 98, gui 73, tui 530, agent 153, transport 38 + 7
+ignored/docker-sshd).
+
+**Next:** #415 — Ctrl+O filter/grouping by tags.
+
 ## Agent E2E runbook (docs)
 
 `docs/AGENT_E2E_RUNBOOK.md`: how an agent whose harness can control a desktop

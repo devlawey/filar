@@ -37,6 +37,14 @@ pub struct Config {
     #[serde(default)]
     pub confirm_mode: CommandConfirmMode,
 
+    /// Tag-bound confirmation policies from `[[tag_policies]]` (#414). A
+    /// policy may only **tighten** the effective mode of targets carrying the
+    /// tag: whenever any policy matches, the floor is the strictest of the
+    /// global mode and all matching policies — a tag can never open more than
+    /// the global mode allows. Targets with no matching policy are unaffected.
+    #[serde(default)]
+    pub tag_policies: Vec<TagPolicy>,
+
     /// Directory where Ctrl+S session exports (`.md`) are written.
     /// `None` means the process working directory at startup.
     #[serde(default)]
@@ -72,6 +80,7 @@ impl Default for Config {
             llm_profiles: Vec::new(),
             timeouts: TimeoutConfig::default(),
             confirm_mode: CommandConfirmMode::Allowlist,
+            tag_policies: Vec::new(),
             save_dir: None,
             save_runbook: default_save_runbook(),
             arbiter_profile: None,
@@ -407,6 +416,64 @@ pub enum CommandConfirmMode {
     Explain,
 }
 
+impl CommandConfirmMode {
+    /// Strictness rank used by tag-policy resolution (#414):
+    /// `Explain` > `Always` > `Allowlist` > `Never`.
+    pub fn strictness(self) -> u8 {
+        match self {
+            CommandConfirmMode::Never => 0,
+            CommandConfirmMode::Allowlist => 1,
+            CommandConfirmMode::Always => 2,
+            CommandConfirmMode::Explain => 3,
+        }
+    }
+
+    /// The stricter of the two modes (#414).
+    pub fn strictest(self, other: CommandConfirmMode) -> CommandConfirmMode {
+        if other.strictness() > self.strictness() {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+/// A tag-bound confirmation policy (#414), from `[[tag_policies]]`.
+///
+/// A policy may only **tighten** `confirm_mode` for targets whose
+/// [`SshTarget::tags`] contain [`tag`](Self::tag) — never loosen it. When no
+/// policy matches the target, no floor is applied (see [`tag_policy_floor`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TagPolicy {
+    /// Tag name, matched exactly against `SshTarget::tags`.
+    pub tag: String,
+    /// Mode this tag forces (subject to the global floor).
+    pub confirm_mode: CommandConfirmMode,
+}
+
+/// The confirmation-mode floor imposed by tag policies for a target with
+/// `tags` (#414).
+///
+/// `Some(mode)` = the strictest of the global mode and every matching policy:
+/// a tag can never open more than the global mode allows, and with several
+/// matching policies the strictest one wins. `None` = no policy matches, so
+/// there is no floor to apply.
+pub fn tag_policy_floor(
+    global: CommandConfirmMode,
+    policies: &[TagPolicy],
+    tags: &[String],
+) -> Option<CommandConfirmMode> {
+    let mut matching = policies
+        .iter()
+        .filter(|p| tags.iter().any(|t| t == &p.tag));
+    let first = matching.next()?;
+    Some(
+        matching.fold(global.strictest(first.confirm_mode), |acc, p| {
+            acc.strictest(p.confirm_mode)
+        }),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
@@ -570,6 +637,95 @@ api_base_url = "https://open.bigmodel.cn/api/paas/v4"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.confirm_mode, CommandConfirmMode::Explain);
+    }
+
+    // ── Tag policies (#414) ─────────────────────────────────────
+
+    fn policy(tag: &str, mode: CommandConfirmMode) -> TagPolicy {
+        TagPolicy { tag: tag.into(), confirm_mode: mode }
+    }
+
+    #[test]
+    fn tag_policy_stricter_than_global_applies() {
+        // Global allowlist + a prod policy of `always`: the policy wins.
+        let policies = [policy("prod", CommandConfirmMode::Always)];
+        let tags = vec!["prod".to_string()];
+        assert_eq!(
+            tag_policy_floor(CommandConfirmMode::Allowlist, &policies, &tags),
+            Some(CommandConfirmMode::Always)
+        );
+    }
+
+    #[test]
+    fn tag_policy_looser_than_global_is_ignored() {
+        // Global always + a `never` policy: the global mode wins — a tag can
+        // never open more than the global allows.
+        let policies = [policy("prod", CommandConfirmMode::Never)];
+        let tags = vec!["prod".to_string()];
+        assert_eq!(
+            tag_policy_floor(CommandConfirmMode::Always, &policies, &tags),
+            Some(CommandConfirmMode::Always)
+        );
+    }
+
+    #[test]
+    fn several_matching_tag_policies_pick_the_strictest() {
+        let policies = [
+            policy("web", CommandConfirmMode::Always),
+            policy("prod", CommandConfirmMode::Explain),
+            policy("db", CommandConfirmMode::Never),
+        ];
+        let tags = vec!["web".to_string(), "prod".to_string(), "db".to_string()];
+        assert_eq!(
+            tag_policy_floor(CommandConfirmMode::Allowlist, &policies, &tags),
+            Some(CommandConfirmMode::Explain)
+        );
+    }
+
+    #[test]
+    fn no_matching_policy_has_no_floor() {
+        // Targets without a matching policy keep the tab's own mode: the
+        // F2 Explain toggle must stay able to move freely on them.
+        let policies = [policy("prod", CommandConfirmMode::Explain)];
+        let tags = vec!["test".to_string()];
+        assert_eq!(
+            tag_policy_floor(CommandConfirmMode::Allowlist, &policies, &tags),
+            None
+        );
+        assert_eq!(tag_policy_floor(CommandConfirmMode::Allowlist, &[], &tags), None);
+    }
+
+    #[test]
+    fn strictest_orders_modes_and_never_loosens() {
+        use CommandConfirmMode::*;
+        assert_eq!(Allowlist.strictest(Always), Always);
+        assert_eq!(Always.strictest(Allowlist), Always);
+        assert_eq!(Explain.strictest(Never), Explain);
+        assert_eq!(Never.strictest(Never), Never);
+        assert!(Explain.strictness() > Always.strictness());
+        assert!(Always.strictness() > Allowlist.strictness());
+        assert!(Allowlist.strictness() > Never.strictness());
+    }
+
+    #[test]
+    fn tag_policies_parse_from_toml() {
+        let toml = r#"
+confirm_mode = "allowlist"
+
+[[tag_policies]]
+tag = "prod"
+confirm_mode = "always"
+
+[[tag_policies]]
+tag = "db"
+confirm_mode = "explain"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.tag_policies.len(), 2);
+        assert_eq!(cfg.tag_policies[0].tag, "prod");
+        assert_eq!(cfg.tag_policies[0].confirm_mode, CommandConfirmMode::Always);
+        assert_eq!(cfg.tag_policies[1].tag, "db");
+        assert_eq!(cfg.tag_policies[1].confirm_mode, CommandConfirmMode::Explain);
     }
 
     #[test]
