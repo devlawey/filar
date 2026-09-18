@@ -330,6 +330,10 @@ pub struct TuiConfig {
     pub global_confirm_mode: CommandConfirmMode,
     /// Tag-bound confirmation policies from `[[tag_policies]]` (#414).
     pub tag_policies: Vec<filar_core::TagPolicy>,
+    /// Host groups from `[[host_groups]]` (#418). Targets that are members
+    /// of a read-only group get a [`filar_transport::ReadOnlyExecutor`]
+    /// around every SSH executor swapped in for their session (#419).
+    pub host_groups: Vec<filar_core::HostGroup>,
     pub llm_profile: String,
     pub initial_messages: Vec<ChatBlock>,
     /// Initial agent input history (for session restore).
@@ -395,6 +399,21 @@ fn ssh_transport_config(command_timeout: Duration) -> SshTransportConfig {
     SshTransportConfig::default().with_command_timeout(command_timeout)
 }
 
+/// Wrap `exec` in a [`filar_transport::ReadOnlyExecutor`] when `target` is a
+/// member of a read-only [`filar_core::HostGroup`] (#419); return it
+/// untouched otherwise. Ad-hoc targets carry no tags and never match.
+fn wrap_if_read_only(
+    exec: Arc<dyn CommandExecutor>,
+    target: &filar_core::SshTarget,
+    host_groups: &[filar_core::HostGroup],
+) -> Arc<dyn CommandExecutor> {
+    if filar_core::is_read_only_target(host_groups, target) {
+        Arc::new(filar_transport::ReadOnlyExecutor::new(exec))
+    } else {
+        exec
+    }
+}
+
 /// Run the TUI with the given LLM client, executor, and configuration.
 pub async fn run(
     _llm: Arc<dyn LlmClient>,
@@ -453,6 +472,9 @@ async fn run_app(
     snapshot: SessionSnapshot,
 ) -> Result<()> {
     let command_timeout = config.command_timeout;
+    // Read-only wrap decisions need the groups for every session swap (#419),
+    // captured before the config is partially consumed below.
+    let host_groups = config.host_groups.clone();
     let profiles_for_restore = std::mem::take(&mut config.profiles);
     let default_for_restore = std::mem::take(&mut config.default_profile_name);
     let has_history = !config.initial_messages.is_empty()
@@ -1047,6 +1069,8 @@ async fn run_app(
                         }
                         let token = CancellationToken::new();
                         app.pending_ssh_cancel = Some(token.clone());
+                        // Read-only wrap targets for this session (#419).
+                        let host_groups = host_groups.clone();
                         let handle = tokio::spawn(async move {
                             let _ = tx.send(TuiEvent::Thinking);
                             let target = filar_core::SshTarget {
@@ -1075,10 +1099,15 @@ async fn run_app(
                                         return;
                                     }
                                     // Swap the executor for this session only.
+                                    // Ad-hoc `!ssh` targets carry no tags, so the
+                                    // read-only wrap can't fire here — routed
+                                    // through the helper regardless (#419).
                                     if let Some((ref exec, ref st)) = exec_entry {
-                                        exec.swap_executor(Arc::new(ssh_exec)
-                                            as Arc<dyn CommandExecutor>)
-                                            .await;
+                                        let exec_arc: Arc<dyn CommandExecutor> =
+                                            Arc::new(ssh_exec);
+                                        let exec_arc =
+                                            wrap_if_read_only(exec_arc, &target, &host_groups);
+                                        exec.swap_executor(exec_arc).await;
                                         // Store the SshTarget so Ctrl+T can open a PTY
                                         // on the same host for this tab.
                                         *st.write().await = Some(target.clone());
@@ -1128,6 +1157,8 @@ async fn run_app(
                     .map(|e| (e.executor.clone(), e.ssh_target.clone()));
                 let tx = agent_tx.clone();
                 let alias = target.name.clone();
+                // Read-only wrap targets for this session (#419).
+                let host_groups = host_groups.clone();
                 if let Some(handle) = app.ctrl_o_handle.take() {
                     handle.abort();
                 }
@@ -1149,7 +1180,10 @@ async fn run_app(
                     .await {
                         Ok(ssh_exec) => {
                             if let Some((ref exec, ref st)) = exec_entry {
-                                exec.swap_executor(Arc::new(ssh_exec) as Arc<dyn CommandExecutor>).await;
+                                let exec_arc: Arc<dyn CommandExecutor> = Arc::new(ssh_exec);
+                                let exec_arc =
+                                    wrap_if_read_only(exec_arc, &target, &host_groups);
+                                exec.swap_executor(exec_arc).await;
                                 *st.write().await = Some(target);
                             }
                             let _ = tx.send(TuiEvent::TransportChanged {
@@ -1182,6 +1216,8 @@ async fn run_app(
             app.ctrl_o_cancel = Some(token.clone());
             let selection = app.ctrl_o_selection;
             let targets = app.ssh_targets.clone();
+            // Read-only wrap targets for this session (#419).
+            let host_groups = host_groups.clone();
             let sid = app.sessions[app.active].id;
             let exec_entry = executors.get(&sid)
                 .map(|e| (e.executor.clone(), e.ssh_target.clone()));
@@ -1248,7 +1284,10 @@ async fn run_app(
                         .await {
                             Ok(ssh_exec) => {
                                 if let Some((ref exec, ref st)) = exec_entry {
-                                    exec.swap_executor(Arc::new(ssh_exec) as Arc<dyn CommandExecutor>).await;
+                                    let exec_arc: Arc<dyn CommandExecutor> = Arc::new(ssh_exec);
+                                    let exec_arc =
+                                        wrap_if_read_only(exec_arc, &target, &host_groups);
+                                    exec.swap_executor(exec_arc).await;
                                     *st.write().await = Some(target);
                                 }
                                 let alias = t.name.clone();
@@ -3004,6 +3043,7 @@ mod tests {
             confirm_mode: CommandConfirmMode::Always,
             global_confirm_mode: CommandConfirmMode::Always,
             tag_policies: Vec::new(),
+            host_groups: Vec::new(),
             llm_profile: "glm".into(),
             initial_messages: Vec::new(),
             initial_input_history: Vec::new(),

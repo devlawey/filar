@@ -588,18 +588,34 @@ pub fn select_hosts_for_group<'a>(
     group: &HostGroup,
     targets: &'a [SshTarget],
 ) -> Vec<&'a SshTarget> {
-    if group.match_tags.is_empty() {
-        return Vec::new();
-    }
     targets
         .iter()
-        .filter(|t| {
-            group
-                .match_tags
-                .iter()
-                .all(|tag| t.tags.iter().any(|t| t == tag))
-        })
+        .filter(|t| target_matches_group(group, t))
         .collect()
+}
+
+/// Whether `target` is a member of `group`: it carries **all** of the
+/// group's [`match_tags`](HostGroup::match_tags).
+///
+/// An empty rule matches nothing — an unfinished rule must never widen the
+/// blast radius (#418).
+pub fn target_matches_group(group: &HostGroup, target: &SshTarget) -> bool {
+    !group.match_tags.is_empty()
+        && group
+            .match_tags
+            .iter()
+            .all(|tag| target.tags.iter().any(|t| t == tag))
+}
+
+/// Whether `target` falls under a read-only policy: it is a member of at
+/// least one [`HostGroupPolicy::ReadOnly`] group (#419).
+///
+/// The most restrictive policy wins — a target that is also a member of a
+/// (future) less restrictive group stays read-only.
+pub fn is_read_only_target(groups: &[HostGroup], target: &SshTarget) -> bool {
+    groups
+        .iter()
+        .any(|g| g.policy == HostGroupPolicy::ReadOnly && target_matches_group(g, target))
 }
 
 // ---------------------------------------------------------------------------
@@ -1327,6 +1343,25 @@ policy = "read-write"
         assert!(
             toml::from_str::<Config>(text).is_err(),
             "a policy typo must fail the parse, not silently loosen the ban"
+        );
+    }
+
+    #[test]
+    fn read_only_target_is_detected_via_group_membership() {
+        let groups = [group("prod", &["work", "prod"])];
+        let member = target_with_tags("both", &["work", "prod"]);
+        let outsider = target_with_tags("partial", &["work"]);
+        let untagged = target_with_tags("adhoc", &[]);
+        assert!(is_read_only_target(&groups, &member));
+        assert!(!is_read_only_target(&groups, &outsider), "all tags are required");
+        assert!(
+            !is_read_only_target(&groups, &untagged),
+            "a tagless ad-hoc target matches nothing"
+        );
+        assert!(!is_read_only_target(&[], &member), "no groups = no read-only policy");
+        assert!(
+            !is_read_only_target(&[group("draft", &[])], &member),
+            "an empty rule must not silently cover everyone"
         );
     }
 

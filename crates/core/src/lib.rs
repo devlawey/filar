@@ -18,7 +18,8 @@ pub use compaction::{
     DEFAULT_KEEP_TURNS,
 };
 pub use config::{
-    tag_policy_floor, select_hosts_for_group, Config, SshTarget, SshAuth, TagPolicy, HostGroup,
+    tag_policy_floor, select_hosts_for_group, target_matches_group, is_read_only_target,
+    Config, SshTarget, SshAuth, TagPolicy, HostGroup,
     HostGroupPolicy, LlmConfig, LlmProfile, CommandConfirmMode, TimeoutConfig, HostKeyPolicy,
     DEFAULT_COMMAND_TIMEOUT_SECS,
     DEFAULT_COMPACT_AT_TOKENS, DEFAULT_MAX_TOKENS,

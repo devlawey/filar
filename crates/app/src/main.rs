@@ -562,7 +562,14 @@ async fn run() -> anyhow::Result<()> {
             warn!(error = %e, "SSH connection failed");
             anyhow::anyhow!(e)
         })?;
-        Arc::new(ssh)
+        let ssh: Arc<dyn filar_transport::CommandExecutor> = Arc::new(ssh);
+        // Read-only host groups (#419): the transport refuses every
+        // non-allowlisted command before it reaches the wire.
+        if filar_core::is_read_only_target(&config.host_groups, target) {
+            Arc::new(filar_transport::ReadOnlyExecutor::new(ssh))
+        } else {
+            ssh
+        }
     } else if target_name == "local" {
         info!("initialising local command executor");
         Arc::new(LocalExecutor::with_timeout(command_timeout).await.map_err(|e| {
@@ -639,6 +646,7 @@ async fn run() -> anyhow::Result<()> {
         // (#414).
         global_confirm_mode: config.confirm_mode,
         tag_policies: config.tag_policies.clone(),
+        host_groups: config.host_groups.clone(),
         llm_profile: default_profile_name.clone(),
         initial_messages: loaded.messages,
         initial_input_history: loaded.input_history,

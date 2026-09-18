@@ -13,6 +13,15 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- A host-group `read-only` policy is now enforced by the transport, not the
+  prompt: `ReadOnlyExecutor` wraps the SSH executor of every session whose
+  target matches a read-only group and refuses any command outside a
+  built-in allowlist of pure readers before it is sent. Segment separators
+  (`;`, `&&`, `|`), command/process substitution, heredocs, input
+  redirection and background execution cannot smuggle a write past the
+  gate; output redirection is limited to `/dev/null` and fd duplication
+  ([#419](https://github.com/devlawey/filar/issues/419)).
+
 - Host groups (`[[host_groups]]` in `config.toml`): a named tag rule where
   a host joins only when it carries **all** the listed tags, carrying the
   group's `read-only` policy, parallelism limit, per-host timeout and an
