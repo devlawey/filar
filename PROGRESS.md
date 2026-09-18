@@ -7183,6 +7183,67 @@ posted only a "review in progress" note and no review within 35+ minutes.
 
 **Next:** #418 — host groups.
 
+## Issue #418: feat(core,gui) — host groups: tag rule, policy, limits, live preview
+
+**Milestone:** 2.0.0. **Branch:** `feat/418-host-groups`.
+
+**Problem.** The fleet build-out had per-host tags (#413 policies, #416/#417
+import/export) but no named sets: "the prod web hosts" could not be named
+once, and the parameters such a set should carry (policy, parallelism,
+per-host deadline, LLM profile) had nowhere to live. #418 adds
+`[[host_groups]]` — a tag rule plus those parameters — and a Groups tab
+showing the effective composition while the rule is being written: the blast
+radius of a rule must be visible at creation time, not at first launch.
+
+**Decisions.** A group is `name`, `match = ["work", "prod"]`, `policy`
+(`read-only`, the only value for now; enforcement is #419), `max_parallel`
+(default 3), `per_host_timeout_secs` (default 30) and an optional
+`llm_profile` (key omitted while unset). Membership is the tag intersection —
+a host joins only when it carries all the listed tags
+(`select_hosts_for_group`, a pure helper). An empty rule selects **nothing**:
+an unfinished definition must never read as "the whole fleet".
+`HostGroupPolicy` is a kebab-case enum with a single variant, so an unknown
+value (`read-write`) is a config parse error, never a silent widening.
+`Config::load` validates groups (empty name, zero limits) like every other
+section. In the launcher, rows are edited as string drafts (a half-typed
+number must not snap to the default under the user's fingers, as with the
+LLM profile fields); blank rows are not persisted; an empty or duplicate
+name refuses the launch with a duplicate/row message. On Launch the GUI
+replaces the `[[host_groups]]` section wholesale — a removed group stays
+removed — while the launch-specific sections (llm_profiles, ssh_targets)
+stay untouched (#255). The preview reuses the same target list a launch
+would use (`launch_ssh_targets`), so tag edits on the Hosts tab are
+reflected live. Scope is definition and preview only.
+
+**Tests.** core (98 → 106): the exact TOML shape from the issue round-trips
+(including a non-ASCII name; `llm_profile` omitted when unset), defaults fill
+missing fields, an unknown policy value is rejected at parse time, the
+intersection selects only the host carrying all tags, an empty rule and a
+no-match rule both select nothing, validation rejects an empty name and zero
+limits, `Config::load` refuses a zero group limit. gui (101 → 108): draft
+round trip, empty limit fields restore the defaults, malformed/zero limits
+and empty names are refused, blank rows are not persisted, duplicate names
+block `validate_launch`, the preview follows tag edits (1 → 2 → 1 hosts),
+an empty rule is stated explicitly.
+
+**Verification.** `cargo build --workspace` / `cargo test --workspace` green
+(agent 153, app 20, core 106, gui 108, transport 38 + 7 ignored/docker-sshd,
+tui 549, doctests 2). Real GUI run (DoD, ComputerUse on Windows, app-data
+backed up first): two scratch hosts tagged `work, prod`; the new Groups tab
+preview showed `Effective now: 1 host(s) — web-1` for the first tag set,
+stated "no host carries all of these tags" explicitly for a non-matching
+rule, and recalculated to `2 host(s) — web-1, db-1` once the second host got
+the remaining tag — screenshot-verified. Launch wrote `[[host_groups]]` with
+the typed values into the app-data `config.toml`; a restart from a neutral
+working directory restored the group and the same 2-host preview. Closed via
+Cancel, no processes left; app-data restored byte-identical (SHA256, 41/41),
+keyring entries unchanged. Note: `Config::load_default` prefers
+`./config.toml` (§2.5), so a launcher started in a directory that holds
+another config reads that one — observed during the first check run from the
+repo root (no groups shown), expected behavior rather than a groups bug.
+
+**Next:** #419 — read-only executor: the `read-only` policy gets teeth.
+
 ## Agent E2E runbook (docs)
 
 `docs/AGENT_E2E_RUNBOOK.md`: how an agent whose harness can control a desktop

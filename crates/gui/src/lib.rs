@@ -1194,12 +1194,12 @@ fn export_hosts_toml(slots: &[&SshSlot]) -> Result<String, String> {
     ))
 }
 
-/// Write `[llm]` settings to `{OS data dir}/filar/config.toml` so `filar`
-/// invoked without the GUI launcher still picks them up.
+/// Write the `[llm]` settings and the `[[host_groups]]` definitions to
+/// `{OS data dir}/filar/config.toml` so `filar` invoked without the GUI
+/// launcher still picks them up.
 ///
-/// If a `config.toml` already exists, the `[llm]` and `[[ssh_targets]]`
-/// sections are merged; unrelated sections are preserved.
-fn save_config_toml(settings: &Settings) {
+/// If a `config.toml` already exists, unrelated sections are preserved.
+fn save_config_toml(settings: &Settings, host_groups: &[filar_core::HostGroup]) {
     let base = match filar_core::default_base_dir() {
         Ok(b) => b,
         Err(_) => return,
@@ -1236,11 +1236,13 @@ fn save_config_toml(settings: &Settings) {
         config.llm.extra_body = serde_json::from_str(&settings.extra_body).ok();
     }
     config.arbiter_profile = settings.arbiter_profile.clone();
-    // The primary `[llm]` section above is the ONLY section the GUI still
-    // writes to config.toml (backward-compat). Launch-specific sections
-    // (llm_profiles, ssh_targets, save_dir) are intentionally left untouched:
-    // the GUI passes them via `pending_launch.json` (#255) and must NOT clear
-    // them, because direct-TUI launches read them from config.toml as fallback.
+    // `[[host_groups]]` is written too (#418): the Groups tab owns the
+    // definitions, so the section is replaced wholesale — a removed group
+    // must stay removed. The launch-specific sections (llm_profiles,
+    // ssh_targets, save_dir) are intentionally left untouched: the GUI
+    // passes them via `pending_launch.json` (#255) and must NOT clear them,
+    // because direct-TUI launches read them from config.toml as fallback.
+    config.host_groups = host_groups.to_vec();
 
     if let Err(e) = std::fs::create_dir_all(&app_dir) {
         tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");
@@ -1344,6 +1346,14 @@ enum HostAction {
     Remove(usize),
 }
 
+/// Row actions from the Groups tab (#418), applied after the render pass
+/// like [`HostAction`]: one pointer delivers at most one click per frame.
+enum GroupAction {
+    Up(usize),
+    Down(usize),
+    Remove(usize),
+}
+
 /// A staged host import waiting for the collision choice (#416).
 struct ImportDialog {
     /// Parsed rows (colliding and fresh ones), auth type included (#417).
@@ -1367,6 +1377,127 @@ fn launch_target_name(target_mode: usize, slots: &[SshSlot]) -> String {
         let idx = target_mode - 1;
         filar_core::ssh_target_display_name(idx, &slots[idx].alias)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Host groups (#418)
+// ---------------------------------------------------------------------------
+
+/// Editable host group in the Groups tab (#418).
+///
+/// Numeric limits are kept as typed strings, like the LLM profile fields: a
+/// half-typed value must not be normalised to the default under the user's
+/// fingers.
+#[derive(Clone, Debug)]
+struct HostGroupDraft {
+    name: String,
+    /// Comma-separated tags; a host must carry **all** of them to match.
+    match_tags: String,
+    policy: filar_core::HostGroupPolicy,
+    /// Parallelism limit; empty = the built-in default.
+    max_parallel: String,
+    /// Per-host command deadline in seconds; empty = the built-in default.
+    per_host_timeout_secs: String,
+    /// LLM profile name; empty = the session profile.
+    llm_profile: String,
+}
+
+impl HostGroupDraft {
+    fn from_group(group: &filar_core::HostGroup) -> Self {
+        Self {
+            name: group.name.clone(),
+            match_tags: group.match_tags.join(", "),
+            policy: group.policy,
+            max_parallel: group.max_parallel.to_string(),
+            per_host_timeout_secs: group.per_host_timeout_secs.to_string(),
+            llm_profile: group.llm_profile.clone().unwrap_or_default(),
+        }
+    }
+
+    /// A row with neither a name nor a rule is an in-UI scratch entry: it is
+    /// not persisted, like a blank host row (#411/#418).
+    fn is_blank(&self) -> bool {
+        self.name.trim().is_empty() && self.match_tags.trim().is_empty()
+    }
+
+    /// Convert into the config form, validating it (#418).
+    ///
+    /// Empty limit fields mean "use the default"; a typed value must be a
+    /// positive integer — silently coercing a typo into a limit would be
+    /// worse than refusing the launch.
+    fn to_group(&self) -> Result<filar_core::HostGroup, String> {
+        let defaults = filar_core::HostGroup::default();
+        let name = clean_tag(&self.name);
+        if name.is_empty() {
+            return Err("name must not be empty".to_string());
+        }
+        let max_parallel = match parse_group_limit(&self.max_parallel, "max_parallel")? {
+            None => defaults.max_parallel,
+            Some(v) => u32::try_from(v).map_err(|_| "max_parallel is too large".to_string())?,
+        };
+        let per_host_timeout_secs =
+            parse_group_limit(&self.per_host_timeout_secs, "per_host_timeout_secs")?
+                .unwrap_or(defaults.per_host_timeout_secs);
+        let llm_profile = clean_tag(&self.llm_profile);
+        Ok(filar_core::HostGroup {
+            name,
+            match_tags: parse_tags(&self.match_tags),
+            policy: self.policy,
+            max_parallel,
+            per_host_timeout_secs,
+            llm_profile: if llm_profile.is_empty() {
+                None
+            } else {
+                Some(llm_profile)
+            },
+        })
+    }
+}
+
+/// Parse an optional positive limit from a Groups-tab text field (#418):
+/// empty = the group default; a positive integer = the typed value; anything
+/// else (zero included) is an error.
+fn parse_group_limit(raw: &str, field: &str) -> Result<Option<u64>, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    match t.parse::<u64>() {
+        Ok(v) if v > 0 => Ok(Some(v)),
+        _ => Err(format!("{field} must be a positive integer")),
+    }
+}
+
+/// The composition preview shown under a group rule (#418): which hosts the
+/// rule selects right now, against the same target list a launch would use.
+///
+/// An empty rule and a rule that matches nobody are stated explicitly, not
+/// as errors — they are facts about the current tag picture, not mistakes.
+/// An empty rule selects **nothing** (`select_hosts_for_group`): an
+/// unfinished definition must never look like the whole fleet.
+fn group_preview_line(match_tags: &str, targets: &[filar_core::SshTarget]) -> String {
+    let tags = parse_tags(match_tags);
+    if tags.is_empty() {
+        return "Effective now: 0 hosts — the rule lists no tags yet.".to_string();
+    }
+    let group = filar_core::HostGroup {
+        match_tags: tags,
+        ..Default::default()
+    };
+    let matched = filar_core::select_hosts_for_group(&group, targets);
+    if matched.is_empty() {
+        return "Effective now: 0 hosts — no host carries all of these tags.".to_string();
+    }
+    let shown: Vec<&str> = matched.iter().map(|t| t.name.as_str()).take(6).collect();
+    let mut line = format!(
+        "Effective now: {} host(s) — {}",
+        matched.len(),
+        shown.join(", ")
+    );
+    if matched.len() > shown.len() {
+        line.push_str(&format!(", +{} more", matched.len() - shown.len()));
+    }
+    line
 }
 
 struct LauncherApp {
@@ -1402,6 +1533,10 @@ struct LauncherApp {
     /// Result of the last host-file operation — import or export (#416/#417),
     /// shown under the host list.
     file_status: String,
+    /// Working copies of the `[[host_groups]]` definitions (#418).
+    host_groups: Vec<HostGroupDraft>,
+    /// Active central tab: 0 = session & hosts, 1 = groups (#418).
+    active_tab: usize,
 }
 
 /// Local copy of an LLM profile for GUI editing.
@@ -2108,6 +2243,142 @@ impl LauncherApp {
         }
     }
 
+    /// Groups tab (#418): name, tag rule, policy, limits and a live preview
+    /// of the current composition. The preview is the point — the blast
+    /// radius must be visible while the rule is written, not at the first
+    /// run.
+    fn render_groups(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(format!("Groups ({}):", self.host_groups.len()));
+            if ui
+                .button("+ Add group")
+                .on_hover_text("Define a group by tag intersection")
+                .clicked()
+            {
+                self.add_group();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "A host joins the group when it carries all of the tags below. \
+                 The group carries the policy and limits for the fleet dialogue.",
+            )
+            .small()
+            .weak(),
+        );
+        if self.host_groups.is_empty() {
+            ui.label(egui::RichText::new("  (no groups yet)").weak());
+            return;
+        }
+        // One pointer delivers at most one click per frame: a single pending
+        // action applied after the loop, like the host list (#411).
+        let mut action: Option<GroupAction> = None;
+        // The preview reads the same merged list a launch would use, built
+        // once before the loop — current tag edits included (#418).
+        let targets = self.launch_ssh_targets();
+        let profile_names: Vec<String> = self.profiles.iter().map(|p| p.name.clone()).collect();
+        let count = self.host_groups.len();
+        for i in 0..count {
+            let draft = &mut self.host_groups[i];
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut draft.name)
+                            .hint_text("Work prod")
+                            .desired_width(150.0),
+                    );
+                    if ui
+                        .add_enabled(i > 0, egui::Button::new("⬆").small())
+                        .on_hover_text("Move up")
+                        .clicked()
+                    {
+                        action = Some(GroupAction::Up(i));
+                    }
+                    if ui
+                        .add_enabled(i + 1 < count, egui::Button::new("⬇").small())
+                        .on_hover_text("Move down")
+                        .clicked()
+                    {
+                        action = Some(GroupAction::Down(i));
+                    }
+                    if ui.button("X").on_hover_text("Remove group").clicked() {
+                        action = Some(GroupAction::Remove(i));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Match tags (all must match):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut draft.match_tags)
+                            .hint_text("work, prod (comma-separated)")
+                            .desired_width(200.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Policy:");
+                    egui::ComboBox::from_id_salt(format!("group_policy_{i}"))
+                        .selected_text(match draft.policy {
+                            filar_core::HostGroupPolicy::ReadOnly => "read-only",
+                        })
+                        .show_ui(ui, |ui| {
+                            // The only choice today — the fleet dialogue is
+                            // read-only by definition (#418). The combo keeps
+                            // the binding visible and extendable.
+                            ui.selectable_value(
+                                &mut draft.policy,
+                                filar_core::HostGroupPolicy::ReadOnly,
+                                "read-only",
+                            );
+                        });
+                    ui.label("Max parallel:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut draft.max_parallel).desired_width(40.0),
+                    )
+                    .on_hover_text("Upper bound on executors running at the same time");
+                    ui.label("Per-host timeout (s):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut draft.per_host_timeout_secs)
+                            .desired_width(48.0),
+                    )
+                    .on_hover_text("Deadline for one command on one host");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("LLM profile:");
+                    egui::ComboBox::from_id_salt(format!("group_llm_{i}"))
+                        .selected_text(if draft.llm_profile.trim().is_empty() {
+                            "(session profile)"
+                        } else {
+                            draft.llm_profile.as_str()
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut draft.llm_profile,
+                                String::new(),
+                                "(session profile)",
+                            );
+                            for name in &profile_names {
+                                ui.selectable_value(&mut draft.llm_profile, name.clone(), name);
+                            }
+                        });
+                });
+                // Live preview (#418): recomputed every frame, so a tag edit
+                // in the Hosts tab shows up here immediately.
+                ui.label(
+                    egui::RichText::new(group_preview_line(&draft.match_tags, &targets))
+                        .weak()
+                        .small(),
+                );
+            });
+            ui.add_space(4.0);
+        }
+        match action {
+            Some(GroupAction::Up(i)) => self.move_group_up(i),
+            Some(GroupAction::Down(i)) => self.move_group_down(i),
+            Some(GroupAction::Remove(i)) => self.remove_group(i),
+            None => {}
+        }
+    }
+
     /// Collision-choice window of a staged import (#416). Skip/overwrite/
     /// rename is the user's call — the launcher never decides silently.
     fn render_import_dialog(&mut self, ctx: &egui::Context) {
@@ -2300,6 +2571,10 @@ impl LauncherApp {
             self.set_other_error(msg);
             return false;
         }
+        if let Err(msg) = self.validate_host_groups() {
+            self.set_other_error(msg);
+            return false;
+        }
         true
     }
 
@@ -2337,6 +2612,39 @@ impl LauncherApp {
         Ok(())
     }
 
+    /// Every non-blank group must be definable as written (#418): a name, a
+    /// well-formed limit, and a name nobody else uses — later features
+    /// address groups by name.
+    fn validate_host_groups(&self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for (i, draft) in self.host_groups.iter().enumerate() {
+            if draft.is_blank() {
+                continue;
+            }
+            let group = draft
+                .to_group()
+                .map_err(|e| format!("Group #{}: {e}", i + 1))?;
+            if !seen.insert(group.name.clone()) {
+                return Err(format!(
+                    "Duplicate group name \"{}\". Names must be unique.",
+                    group.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Group drafts worth the config file: blank scratch rows never reach
+    /// `config.toml`, like blank host rows never reach `settings.json`
+    /// (#418).
+    fn persistable_host_groups(&self) -> Result<Vec<filar_core::HostGroup>, String> {
+        self.host_groups
+            .iter()
+            .filter(|d| !d.is_blank())
+            .map(HostGroupDraft::to_group)
+            .collect()
+    }
+
     /// SSH profiles worth persisting: blank scratch rows never reach the
     /// disk (#411) — the saved list holds real hosts only.
     fn persistable_ssh_profiles(&self) -> Vec<SshProfile> {
@@ -2345,6 +2653,19 @@ impl LauncherApp {
             .filter(|s| !s.host.trim().is_empty())
             .map(SshSlot::to_profile)
             .collect()
+    }
+
+    /// The merged SSH target list a launch hands to the TUI (#412): the
+    /// launcher's profiles rebuilt from the current fields, plus the manual
+    /// `[[ssh_targets]]` entries.
+    ///
+    /// The Groups tab previews over the same list (#418): the composition it
+    /// shows is exactly what would launch, manual hosts included.
+    fn launch_ssh_targets(&self) -> Vec<filar_core::SshTarget> {
+        merge_manual_ssh_targets(
+            build_ssh_targets_from_profiles(&self.persistable_ssh_profiles()),
+            &self.manual_targets,
+        )
     }
 
     /// The value to store as `Settings::last_ssh`: the selection encoded as
@@ -2454,6 +2775,40 @@ impl LauncherApp {
         }
     }
 
+    /// Add a blank group row and switch to the Groups tab so the new row is
+    /// visible. Limits start at the built-in defaults, like a fresh host row
+    /// starts at port 22.
+    fn add_group(&mut self) {
+        let defaults = filar_core::HostGroup::default();
+        self.host_groups.push(HostGroupDraft {
+            name: String::new(),
+            match_tags: String::new(),
+            policy: filar_core::HostGroupPolicy::default(),
+            max_parallel: defaults.max_parallel.to_string(),
+            per_host_timeout_secs: defaults.per_host_timeout_secs.to_string(),
+            llm_profile: String::new(),
+        });
+        self.active_tab = 1;
+    }
+
+    fn remove_group(&mut self, idx: usize) {
+        if idx < self.host_groups.len() {
+            self.host_groups.remove(idx);
+        }
+    }
+
+    fn move_group_up(&mut self, idx: usize) {
+        if idx > 0 && idx < self.host_groups.len() {
+            self.host_groups.swap(idx - 1, idx);
+        }
+    }
+
+    fn move_group_down(&mut self, idx: usize) {
+        if idx + 1 < self.host_groups.len() {
+            self.host_groups.swap(idx, idx + 1);
+        }
+    }
+
     fn do_launch(&mut self) {
         if !self.validate_launch() {
             return;
@@ -2486,8 +2841,17 @@ impl LauncherApp {
             save_dir: self.save_dir.clone(),
             arbiter_profile: self.arbiter_profile.clone(),
         };
+        let host_groups = match self.persistable_host_groups() {
+            Ok(groups) => groups,
+            // validate_launch already refused invalid rows; never write a
+            // half-defined fleet.
+            Err(msg) => {
+                self.set_other_error(msg);
+                return;
+            }
+        };
         settings.save();
-        save_config_toml(&settings);
+        save_config_toml(&settings, &host_groups);
         for prof in &self.profiles {
             if !prof.key_env.trim().is_empty() && !prof.api_key.is_empty() {
                 save_secret(&prof.key_env, &prof.api_key);
@@ -2500,10 +2864,7 @@ impl LauncherApp {
             }
         }
         let session_id = self.selected_session.map(|i| self.sessions[i].id.clone());
-        let ssh_targets = merge_manual_ssh_targets(
-            build_ssh_targets_from_profiles(&self.persistable_ssh_profiles()),
-            &self.manual_targets,
-        );
+        let ssh_targets = self.launch_ssh_targets();
         let cfg = LaunchConfig {
             target, ssh,
             model: p.model.clone(), api_base_url: p.api_base_url.clone(),
@@ -2559,15 +2920,28 @@ impl eframe::App for LauncherApp {
                 ui.label("Terminal with an AI agent over SSH");
                 ui.separator();
 
-                self.render_session_list(ui);
+                // Two tabs: the launch setup and the group definitions
+                // (#418). The bottom Launch/Cancel panel stays outside, so
+                // it is visible on both.
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.active_tab, 0, "Hosts");
+                    ui.selectable_value(&mut self.active_tab, 1, "Groups");
+                });
                 ui.separator();
-                self.render_target_selector(ui);
-                ui.separator();
-                self.render_ssh_fields(ui);
-                ui.separator();
-                self.render_llm_settings(ui);
-                ui.separator();
-                self.render_save_dir_field(ui);
+
+                if self.active_tab == 1 {
+                    self.render_groups(ui);
+                } else {
+                    self.render_session_list(ui);
+                    ui.separator();
+                    self.render_target_selector(ui);
+                    ui.separator();
+                    self.render_ssh_fields(ui);
+                    ui.separator();
+                    self.render_llm_settings(ui);
+                    ui.separator();
+                    self.render_save_dir_field(ui);
+                }
             });
         });
 
@@ -2675,6 +3049,8 @@ pub fn run_launcher(config: &Config) {
         arbiter_profile: settings.arbiter_profile.clone(),
         import_dialog: None,
         file_status: String::new(),
+        host_groups: config.host_groups.iter().map(HostGroupDraft::from_group).collect(),
+        active_tab: 0,
     };
 
     let options = eframe::NativeOptions {
@@ -3575,6 +3951,8 @@ mod tests {
             arbiter_profile: None,
             import_dialog: None,
             file_status: String::new(),
+            host_groups: Vec::new(),
+            active_tab: 0,
         }
     }
 
@@ -4549,5 +4927,123 @@ host_key_policy = \"strict\"
         let text = export_hosts_toml(&refs).unwrap();
         assert!(!text.contains("scratch"), "got {text}");
         assert!(text.contains("web-1"), "got {text}");
+    }
+
+    // ── Host groups (#418) ─────────────────────────────────────
+
+    fn group_draft(name: &str, match_tags: &str) -> HostGroupDraft {
+        HostGroupDraft {
+            name: name.into(),
+            match_tags: match_tags.into(),
+            policy: filar_core::HostGroupPolicy::ReadOnly,
+            max_parallel: "3".into(),
+            per_host_timeout_secs: "30".into(),
+            llm_profile: String::new(),
+        }
+    }
+
+    #[test]
+    fn group_draft_round_trips_a_definition() {
+        let group = filar_core::HostGroup {
+            name: "Рабочий прод".into(),
+            match_tags: vec!["work".into(), "prod".into()],
+            policy: filar_core::HostGroupPolicy::ReadOnly,
+            max_parallel: 5,
+            per_host_timeout_secs: 45,
+            llm_profile: Some("glm".into()),
+        };
+        let draft = HostGroupDraft::from_group(&group);
+        assert_eq!(draft.match_tags, "work, prod");
+        assert_eq!(draft.to_group().unwrap(), group);
+    }
+
+    #[test]
+    fn group_draft_empty_limits_fall_back_to_defaults() {
+        let mut draft = group_draft("prod", "prod");
+        draft.max_parallel = String::new();
+        draft.per_host_timeout_secs = String::new();
+        let group = draft.to_group().unwrap();
+        assert_eq!(group.max_parallel, 3);
+        assert_eq!(group.per_host_timeout_secs, 30);
+        assert_eq!(
+            group.llm_profile, None,
+            "an empty profile means the session one"
+        );
+    }
+
+    #[test]
+    fn group_draft_refuses_a_malformed_or_zero_limit() {
+        for bad in ["0", "abc", "-1"] {
+            let mut draft = group_draft("prod", "prod");
+            draft.max_parallel = bad.into();
+            let err = draft.to_group().unwrap_err();
+            assert!(err.contains("max_parallel"), "{bad}: {err}");
+            let mut draft = group_draft("prod", "prod");
+            draft.per_host_timeout_secs = bad.into();
+            let err = draft.to_group().unwrap_err();
+            assert!(err.contains("per_host_timeout_secs"), "{bad}: {err}");
+        }
+        let mut draft = group_draft("prod", "prod");
+        draft.name = "   ".into();
+        assert!(draft.to_group().is_err(), "a named group may not lose its name");
+    }
+
+    #[test]
+    fn blank_group_rows_are_not_persisted() {
+        let mut app = make_app(make_meta(None, None, None, None));
+        app.host_groups = vec![
+            group_draft("prod", "prod"),
+            // A scratch row: no name, no rule.
+            group_draft("", ""),
+        ];
+        let groups = app.persistable_host_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "prod");
+    }
+
+    #[test]
+    fn validate_launch_refuses_duplicate_group_names() {
+        let mut app = make_app(make_meta(None, None, None, None));
+        app.host_groups = vec![group_draft("prod", "prod"), group_draft("prod", "work")];
+        assert!(!app.validate_launch());
+        assert!(
+            app.validation_error.contains("Duplicate group name"),
+            "{}",
+            app.validation_error
+        );
+    }
+
+    #[test]
+    fn group_preview_follows_tag_edits() {
+        let mut app = app_with_hosts(&[("10.0.0.1", "web-1"), ("10.0.0.2", "db-1")]);
+        let targets = app.launch_ssh_targets();
+        // Nobody carries "prod" yet: the preview says so, weakly.
+        assert!(group_preview_line("prod", &targets).contains("0 hosts"));
+        // Tag web-1 in the Hosts tab — the preview recalculates.
+        app.ssh_slots[0].tags = "work, prod".into();
+        let targets = app.launch_ssh_targets();
+        let line = group_preview_line("prod", &targets);
+        assert!(line.contains("1 host(s)") && line.contains("web-1"), "{line}");
+        // db-1 joins once it carries every tag of the rule...
+        app.ssh_slots[1].tags = "work, prod".into();
+        let targets = app.launch_ssh_targets();
+        let line = group_preview_line("work, prod", &targets);
+        assert!(
+            line.contains("2 host(s)") && line.contains("web-1") && line.contains("db-1"),
+            "{line}"
+        );
+        // ...and leaves again when a tag is removed.
+        app.ssh_slots[0].tags = "work".into();
+        let targets = app.launch_ssh_targets();
+        let line = group_preview_line("work, prod", &targets);
+        assert!(line.contains("1 host(s)") && line.contains("db-1"), "{line}");
+    }
+
+    #[test]
+    fn group_preview_states_an_empty_rule_explicitly() {
+        let app = app_with_hosts(&[("10.0.0.1", "web-1")]);
+        let targets = app.launch_ssh_targets();
+        let line = group_preview_line("", &targets);
+        assert!(line.contains("0 hosts") && line.contains("no tags"), "{line}");
     }
 }
