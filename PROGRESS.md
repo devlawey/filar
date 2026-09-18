@@ -6832,6 +6832,54 @@ prompt resolves the credential, exactly as for a launcher target — while
 **Next:** the 2.0.0 fleet build-out (33 open) — SSH target tags (#413) and
 the GUI/TUI fleet layer on top of them.
 
+## Issue #413: feat(core) — tags on SSH targets: model, launcher editing, status bar
+
+**Milestone:** 2.0.0. **Branch:** `feat/413-ssh-target-tags`.
+
+**Problem.** A target's role and environment (work/prod/web) lived only in
+host-list naming; nothing machine-readable followed a host from the launcher
+into a session. The costliest misreading there is "I thought this was the
+test box" — the status bar is where the active host's tags must be visible.
+
+**Decision.** `SshTarget.tags: Vec<String>` in `crates/core/src/config.rs`
+(`#[serde(default, skip_serializing_if = "Vec::is_empty")]`: absent in old
+files, absent from serialized output when empty). The launcher edits them
+per host as one comma-separated `Tags` row (`parse_tags` trims, drops
+empties); they persist in `settings.json` and travel to the TUI in the
+`pending_launch.json` payload (`resolve_gui_ssh_target`). The status bar
+shows the active target's tags between host and path (`alias host [prod,web]
+pwd`): `active_ssh_tags` resolves them from `ssh_targets` by the same
+`user@host:port` match as Ctrl+O; `format_tags_segment` renders an
+all-or-nothing segment — a truncated list could silently hide `prod`, the
+one tag it exists to surface — and yields as a whole when the bar is too
+narrow, so the right-hand counter never shifts. The segment is plain ASCII,
+so ASCII-mode rendering is unaffected.
+
+**Tests.** core (2): TOML parse with/without tags; round-trip — one tag
+serializes, an emptied list keeps the key out of the JSON entirely.
+gui (3): `parse_tags` splits/trims/drops empties; profile tags survive JSON
+and old files default to empty; slot round-trip preserves them (the
+launcher-save test asserts "  " → empty, "prod, web" → `["prod","web"]`).
+app (extended): the GUI→`SshTarget` handoff carries tags. tui (8): the five
+`app` tests (lookup by `user@host:port`, empty for local/unmatched host,
+segment between host and pwd, all-or-nothing budget, none without tags)
+and three status-bar renders (segment at width 120; whole-segment drop at
+the 58/57 boundary with the right side unmoved; no-tag rows unchanged).
+
+**Verification:** `cargo build --workspace`, `cargo test --workspace` green
+(core 20 + 92, gui 72, tui 522, agent 153, transport 38 + 7
+ignored/docker-sshd). Real Windows run: Part A (GUI) — the launcher was
+driven with `Tags: e2e-a, e2e-b` on a host; `settings.json` stored
+"e2e-a, e2e-b" and the launched payload carried
+`"tags":["e2e-a","e2e-b"]`. Part B (TUI) — no live sshd existed in the
+environment, so a tagged target was staged via a session restore
+(`--session`, local executor, no SSH connect): the real binary rendered
+`filar > local 127.0.0.1 [prod,web]` in the status bar (screenshot
+verified). App-data files were restored byte-identical after the runs.
+
+**Next:** #414 — a tag policy may only tighten `confirm_mode`, never
+loosen it.
+
 ## Agent E2E runbook (docs)
 
 `docs/AGENT_E2E_RUNBOOK.md`: how an agent whose harness can control a desktop

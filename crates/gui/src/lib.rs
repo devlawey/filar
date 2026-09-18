@@ -424,6 +424,10 @@ pub struct SshConnection {
     /// [`filar_core::ssh_cred_name`].
     #[serde(default)]
     pub alias: String,
+    /// Tags of the target the launcher connected with (#413). Not a secret —
+    /// persisted so the TUI can show them in the status bar.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +483,10 @@ struct SshProfile {
     /// Optional alias shown in the target selector instead of `SSHn`.
     #[serde(default)]
     alias: String,
+    /// Comma-separated free-form tags (e.g. `"prod, web"`) — shown in the
+    /// TUI status bar and usable for per-tag policies (#413).
+    #[serde(default)]
+    tags: String,
     /// Whether the user checked "Save password" for this slot.
     #[serde(default)]
     save_password: bool,
@@ -593,6 +601,17 @@ impl Settings {
 // SSH target merge
 // ---------------------------------------------------------------------------
 
+/// Split the launcher's comma-separated tag field into tags (#413).
+///
+/// Empty items and surrounding whitespace are dropped; order is preserved.
+fn parse_tags(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Build the launcher-owned part of the SSH target list from its profiles.
 ///
 /// A full rebuild of the launcher's own records: each non-empty profile
@@ -625,6 +644,7 @@ fn build_ssh_targets_from_profiles(profiles: &[SshProfile]) -> Vec<filar_core::S
                 false => filar_core::SshAuth::Key { path: None },
             },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            tags: parse_tags(&profile.tags),
         });
     }
     targets
@@ -753,6 +773,8 @@ struct SshSlot {
     port: String,
     user: String,
     alias: String,
+    /// Comma-separated tags as typed in the Tags field (#413).
+    tags: String,
     password: String,
     save_password: bool,
 }
@@ -773,6 +795,7 @@ impl SshSlot {
             },
             user: p.user.clone(),
             alias: p.alias.clone(),
+            tags: p.tags.clone(),
             password,
             save_password: p.save_password,
         }
@@ -784,6 +807,7 @@ impl SshSlot {
             port: self.port.clone(),
             user: self.user.clone(),
             alias: self.alias.trim().chars().take(32).collect(),
+            tags: self.tags.trim().to_string(),
             save_password: self.save_password,
         }
     }
@@ -795,6 +819,7 @@ impl SshSlot {
             port: "22".to_string(),
             user: String::new(),
             alias: String::new(),
+            tags: String::new(),
             password: String::new(),
             save_password: false,
         }
@@ -1206,6 +1231,13 @@ impl LauncherApp {
                         egui::TextEdit::singleline(&mut slot.alias)
                             .hint_text("deploy (required)")
                             .desired_width(120.0),
+                    );
+                    ui.end_row();
+                    ui.label("Tags:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut slot.tags)
+                            .hint_text("prod, web (comma-separated)")
+                            .desired_width(160.0),
                     );
                     ui.end_row();
                     ui.label("Password:");
@@ -1722,6 +1754,7 @@ impl LauncherApp {
                 password: sanitize_secret_clipboard(&slot.password),
                 slot: self.target_mode.saturating_sub(1),
                 alias: slot.alias.clone(),
+                tags: parse_tags(&slot.tags),
             })
         } else { None };
 
@@ -1983,6 +2016,7 @@ mod tests {
                 password: "supersecret".into(),
                 slot: 0,
                 alias: "prod".into(),
+                tags: vec!["prod".into()],
             }),
             model: "glm".into(),
             api_base_url: "https://api.example.com".into(),
@@ -2009,6 +2043,7 @@ mod tests {
         assert!(loaded.ssh.is_some());
         assert_eq!(loaded.ssh.as_ref().unwrap().slot, 0);
         assert_eq!(loaded.ssh.as_ref().unwrap().alias, "prod");
+        assert_eq!(loaded.ssh.as_ref().unwrap().tags, vec!["prod"]);
         // Secrets must be absent after deserialization (serde(skip) → default).
         assert!(loaded.api_key.is_empty());
         assert!(loaded.ssh.as_ref().unwrap().password.is_empty());
@@ -2021,6 +2056,7 @@ mod tests {
             port: "22".into(),
             user: "root".into(),
             alias: alias.into(),
+            tags: String::new(),
             password: String::new(),
             save_password: false,
         };
@@ -2040,6 +2076,7 @@ mod tests {
             password: "p@ssw0rd".into(),
             slot: 2,
             alias: String::new(),
+            tags: Vec::new(),
         };
         let json = serde_json::to_string(&conn).unwrap();
         assert!(!json.contains("p@ssw0rd"));
@@ -2060,6 +2097,7 @@ mod tests {
             password: "secret".into(),
             slot: 1,
             alias: "VPS DE".into(),
+            tags: Vec::new(),
         };
         let json = serde_json::to_string(&conn).unwrap();
         assert!(json.contains("VPS DE"));
@@ -2097,6 +2135,7 @@ mod tests {
                 user: "root".into(),
                 auth: filar_core::SshAuth::Password { password: None },
                 host_key_policy: filar_core::HostKeyPolicy::Tofu,
+                tags: Vec::new(),
             }],
             arbiter_profile: None,
         };
@@ -2542,8 +2581,8 @@ mod tests {
     #[test]
     fn config_save_writes_launcher_ssh_profiles() {
         let profiles = vec![
-            SshProfile { host: "10.0.0.1".into(), port: "2222".into(), user: "admin".into(), alias: String::new(), save_password: false },
-            SshProfile { host: "10.0.0.2".into(), port: "22".into(), user: "root".into(), alias: "prod-web".into(), save_password: true },
+            SshProfile { host: "10.0.0.1".into(), port: "2222".into(), user: "admin".into(), alias: String::new(), tags: "  ".into(), save_password: false },
+            SshProfile { host: "10.0.0.2".into(), port: "22".into(), user: "root".into(), alias: "prod-web".into(), tags: "prod, web".into(), save_password: true },
             SshProfile::default(), // empty slot — skipped
             SshProfile::default(),
             SshProfile::default(),
@@ -2559,12 +2598,16 @@ mod tests {
         // Auth type follows save_password flag from the profile.
         assert!(matches!(result[0].auth, filar_core::SshAuth::Key { .. }), "save_password=false → Key auth");
         assert!(matches!(result[1].auth, filar_core::SshAuth::Password { .. }), "save_password=true → Password auth");
+        // Tags pass through the launcher profile → SshTarget conversion; a
+        // whitespace-only tag field is simply empty (#413).
+        assert!(result[0].tags.is_empty(), "blank tag field → no tags");
+        assert_eq!(result[1].tags, vec!["prod", "web"]);
     }
 
     #[test]
     fn build_rewrites_all_targets_no_preservation() {
         let profiles = vec![
-            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: String::new(), save_password: false },
+            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: String::new(), tags: String::new(), save_password: false },
             SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
         ];
         let result = build_ssh_targets_from_profiles(&profiles);
@@ -2575,7 +2618,7 @@ mod tests {
     #[test]
     fn build_removes_old_target_when_alias_changes() {
         let profiles = vec![
-            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: "prod-api".into(), save_password: false },
+            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: "prod-api".into(), tags: String::new(), save_password: false },
             SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
         ];
         let result = build_ssh_targets_from_profiles(&profiles);
@@ -2589,7 +2632,7 @@ mod tests {
         // Profile with no alias — uses slot name SSH1. Old stale target
         // with same host/port/user but different name must be removed.
         let profiles = vec![
-            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: String::new(), save_password: false },
+            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: String::new(), tags: String::new(), save_password: false },
             SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
         ];
         let result = build_ssh_targets_from_profiles(&profiles);
@@ -2615,6 +2658,7 @@ mod tests {
             user: "ops".into(),
             auth: filar_core::SshAuth::Agent,
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            tags: Vec::new(),
         }
     }
 
@@ -2773,6 +2817,7 @@ mod tests {
                 port: "22".into(),
                 user: "root".into(),
                 alias: "SSH1".into(),
+                tags: String::new(),
                 password: String::new(),
                 save_password: false,
             }],
@@ -2924,6 +2969,7 @@ mod tests {
             port: "22".into(),
             user: "root".into(),
             alias: alias.into(),
+            tags: String::new(),
             save_password: false,
         }
     }
@@ -2999,6 +3045,49 @@ mod tests {
         assert_eq!(settings.ssh_profiles[0].alias, "");
     }
 
+    // ── Tags (#413) ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_tags_splits_trims_and_drops_empties() {
+        assert_eq!(parse_tags("prod, web"), vec!["prod", "web"]);
+        assert_eq!(parse_tags(" prod ,web ,, "), vec!["prod", "web"]);
+        assert_eq!(parse_tags(""), Vec::<String>::new());
+        assert_eq!(parse_tags("  ,  "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn ssh_profile_tags_survive_json_and_old_files_default_empty() {
+        let profile = SshProfile {
+            host: "10.0.0.5".into(),
+            port: "22".into(),
+            user: "root".into(),
+            alias: "web-1".into(),
+            tags: "prod, web".into(),
+            save_password: false,
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(json.contains("\"tags\":\"prod, web\""), "json: {json}");
+        let back: SshProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tags, "prod, web");
+
+        // A pre-#413 settings file has no `tags` key — the field defaults.
+        let old = r#"{"host":"10.0.0.11","port":"22","user":"root","alias":"SSH1"}"#;
+        let back: SshProfile = serde_json::from_str(old).unwrap();
+        assert!(back.tags.is_empty());
+    }
+
+    #[test]
+    fn slot_round_trip_preserves_tags() {
+        let mut slot = SshSlot::blank();
+        slot.host = "10.0.0.5".into();
+        slot.alias = "web-1".into();
+        slot.tags = "prod, web".into();
+        let profile = slot.to_profile();
+        assert_eq!(profile.tags, "prod, web");
+        let back = SshSlot::from_profile(&profile, 0);
+        assert_eq!(back.tags, "prod, web");
+    }
+
     fn app_with_hosts(hosts: &[(&str, &str)]) -> LauncherApp {
         let mut app = make_app(make_meta(None, None, None, None));
         app.ssh_slots = hosts
@@ -3008,6 +3097,7 @@ mod tests {
                 port: "22".into(),
                 user: "root".into(),
                 alias: (*alias).into(),
+                tags: String::new(),
                 password: String::new(),
                 save_password: false,
             })

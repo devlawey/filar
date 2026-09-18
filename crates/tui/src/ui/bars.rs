@@ -273,6 +273,26 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let used = app.active_session().last_prompt_tokens;
     let threshold = app.compact_at_tokens_for(&active);
     let confirm_len = confirm_text.chars().count();
+
+    // Tags of the configured SSH target (#413), inserted into the target span
+    // (spans[3], built above) between host and path. Their space is reserved
+    // before padding, exactly like the indicator and the toast — and the
+    // whole `[a,b]` segment yields when the line is too narrow: a truncated
+    // list could silently hide a `prod` tag. When tags fit, `left_len` grows
+    // so the indicator (the lowest-priority right-side element) shrinks to
+    // compensate.
+    let tags_budget = available.saturating_sub(left_len + confirm_len + toast_len + 1);
+    let tags_segment = app.format_tags_segment(tags_budget);
+    let left_len = if let Some(segment) = tags_segment {
+        spans[3] = Span::styled(
+            app.status_target_with_tags(Some(&segment)),
+            app.theme.user_style(),
+        );
+        spans.iter().map(|s| s.content.chars().count()).sum()
+    } else {
+        left_len
+    };
+
     let ctx_max = available.saturating_sub(left_len + confirm_len + toast_len + 1);
     let ctx_segment = context_indicator_segment(used, threshold, glyphs, ctx_max);
     let ctx_style = if used.is_some_and(|n| threshold > 0 && n >= threshold) {
@@ -569,6 +589,71 @@ mod tests {
         assert!(row.contains("prod"), "alias, got: {row}");
         assert!(row.contains("10.0.0.5"), "host, got: {row}");
         assert!(row.contains("/srv"), "pwd, got: {row}");
+    }
+
+    /// App with the active SSH session `root@10.0.0.5:22`, an explicit cwd,
+    /// and one configured target carrying tags (#413).
+    fn app_with_tagged_target(tags: &[&str]) -> App {
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.ssh_info = Some("root@10.0.0.5:22".into());
+        app.cwd = Some("/srv".into());
+        app.ssh_targets = vec![filar_core::SshTarget {
+            name: "prod".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            user: "root".into(),
+            auth: filar_core::SshAuth::Agent,
+            host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        }];
+        app
+    }
+
+    #[test]
+    fn status_bar_shows_tags_between_host_and_pwd() {
+        let mut app = app_with_tagged_target(&["work", "prod"]);
+        let row = render_status_row(&mut app, 120);
+        assert!(
+            row.contains("10.0.0.5 [work,prod] /srv"),
+            "tags segment must sit between host and pwd, got: {row}"
+        );
+        assert!(row.ends_with(" Always"), "right side must stay right-aligned, got: {row}");
+    }
+
+    #[test]
+    fn status_bar_drops_tags_at_the_width_boundary_not_the_right_side() {
+        // 58 = exact fit of the tag segment into the leftover budget;
+        // 57 = one cell short — the whole segment must yield, the padded
+        // confirm_mode must stay pinned to the right edge.
+        let mut app = app_with_tagged_target(&["work", "prod"]);
+        let row_fit = render_status_row(&mut app, 58);
+        assert!(
+            row_fit.contains("10.0.0.5 [work,prod] /srv"),
+            "tags must appear when they exactly fit, got: {row_fit}"
+        );
+        assert!(row_fit.ends_with(" Always"), "got: {row_fit}");
+
+        let mut app = app_with_tagged_target(&["work", "prod"]);
+        let row_narrow = render_status_row(&mut app, 57);
+        assert!(
+            !row_narrow.contains("[work,prod]"),
+            "tags must fully yield when they do not fit, got: {row_narrow}"
+        );
+        assert!(
+            row_narrow.ends_with(" Always"),
+            "confirm_mode must stay at the right edge after the drop, got: {row_narrow}"
+        );
+        assert_eq!(row_narrow.chars().count(), 57, "row must fill exactly 57 columns");
+    }
+
+    #[test]
+    fn status_bar_without_tags_is_unchanged() {
+        // A tagged-built app stripped of the target match renders exactly like
+        // the pre-#413 bar: no tags segment anywhere.
+        let mut app = app_with_tagged_target(&["work"]);
+        app.ssh_info = Some("root@10.0.0.9:22".into());
+        let row = render_status_row(&mut app, 120);
+        assert!(!row.contains("[work]"), "no tags segment for an unmatched host, got: {row}");
     }
 
     #[test]

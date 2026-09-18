@@ -13,6 +13,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- SSH targets can carry free-form tags: the GUI launcher edits them per host
+  (comma-separated `Tags` field) and the TUI status bar shows the active
+  target's tags between host and path (`alias host [prod,web] pwd`), yielding
+  the whole segment first when the bar is too narrow
+  ([#413](https://github.com/devlawey/filar/issues/413)).
+
 - The GUI launcher's five fixed SSH slots are now an open-ended host list:
   hosts can be added, removed and reordered, and every saved host carries a
   mandatory alias that names its keyring entry. Pre-existing unnamed slots
