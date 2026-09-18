@@ -7120,6 +7120,69 @@ test-failure output.
 **Next:** #417 — fleet export without secrets (the counterpart format), then
 the rest of the 2.0.0 fleet build-out.
 
+## Issue #417: feat(gui) — fleet export as a secret-free host list
+
+**Milestone:** 2.0.0. **Branch:** `feat/417-fleet-export`.
+
+**Problem.** #416 gave the launcher an importer but no exporter: the fleet
+could not be produced by filar itself — sharing or versioning a host list
+meant hand-writing the TOML. #417 adds `Export…` next to `Import…`: one
+TOML file shaped exactly like the import format — addresses, ports, users,
+tags, auth types — and no secrets (invariant #3).
+
+**Decisions.** `export_hosts_toml` writes `[[ssh_targets]]` entries: `name`
+via `ssh_target_display_name` (the same keyring-compatible name the launch
+path computes), `[ssh_targets.auth]` carrying only `type = "password" |
+"key"` (from `save_password`), `port` defaulting to 22, tags via
+`parse_tags`; blank scratch rows are skipped, result line `Export: N
+hosts → path`. The import side learns the counterpart semantics: `ImportRow`
+carries a tri-state auth — `Some(true)` password, `Some(false)` key/agent,
+`None` the file stayed silent; an unknown `type` rejects the file; an
+inline `password` or key `path` in the `auth` table is dropped unread
+(secrets stay in the keyring, invariant #3). On Overwrite the file's auth
+type wins when present; without it a changed identity still drops password
+auth (the keyring key is the alias). CSV rows are always `None` (auth is
+TOML-only). The round trip is honest: export → import restores hosts, tags
+and the password flag; `[[host_groups]]` / per-host policies stay out of
+the format (#418).
+
+**Tests.** gui (93 → 101): inline `auth.password` never reaches the slot;
+unknown auth type rejected; `key` auth drops an imported key path;
+overwrite switches a host to key auth; password auth after an identity
+change keeps the prompt; export never contains secrets or key paths (both
+auth types); export → import round trip restores the fleet; blank scratch
+rows are not exported.
+
+**Verification.** `cargo build --workspace` / `cargo test --workspace`
+green (agent 153, app 20, core 98, gui 101, transport 38 + 7
+ignored/docker-sshd, tui 549, doctests 2). Real GUI run (DoD, ComputerUse
+on Windows, app-data backed up first): a host with Save password →
+`Export…` → the file holds the list entries with auth types only — no
+password, key or path values. Clean-machine leg: profiles wiped → empty
+launcher → `Import…` (of a pruned copy, see below) → `Import: 1 added, 0
+overwritten, 0 renamed, 0 skipped`, row restored; relaunch → TUI `Ctrl+O`
+shows the host `[Password]`, selecting it opens the pre-connect password
+prompt (screenshot-verified), `Esc` cancels, `Ctrl+Q` exits. The plain
+`Launch`-with-host path connects immediately and never prompts — the
+prompt lives in the `Ctrl+O` path (#412 behavior, not changed here).
+Safety note: a re-imported `save_password = true` row with an empty
+password makes `ssh_credential_ops` delete the keyring entry of that alias
+at launch, so the clean-machine leg used a pruned copy — a pre-existing
+credential was never on a destructive path. App-data restored
+byte-identical (SHA256, 41/41); keyring entries unchanged; no processes
+left.
+
+**Review rounds.** ai-review round 1: three minor notes — the export keeps
+`ssh_target_display_name` (alias verbatim; the `SSH{n}` fallback applies
+only to unnamed rows and is exactly the keyring-compatible name the launch
+path computes — rejected), `start_host_export` now clears `file_status` at
+entry like the import does (accepted, `f589a72`), and the empty-list early
+return stays silent (unreachable — the button is disabled without hosts;
+rejected). The incremental ai-review on `f589a72` is clean. CodeRabbit
+posted only a "review in progress" note and no review within 35+ minutes.
+
+**Next:** #418 — host groups.
+
 ## Agent E2E runbook (docs)
 
 `docs/AGENT_E2E_RUNBOOK.md`: how an agent whose harness can control a desktop

@@ -718,7 +718,8 @@ fn strip_manual_ssh_passwords(targets: &[filar_core::SshTarget]) -> Vec<filar_co
 enum CollisionPolicy {
     /// Keep the existing host, drop the imported one.
     Skip,
-    /// Replace host/port/user/tags of the existing entry in place.
+    /// Replace the existing entry in place: connection fields, tags, and
+    /// — when the file carries one — the auth type (#417).
     Overwrite,
     /// Import under a free `name-N` alias.
     Rename,
@@ -741,9 +742,20 @@ enum ImportStaged {
     Applied(ImportOutcome),
     /// Colliding names found — the user must pick a policy first.
     NeedsDecision {
-        rows: Vec<SshSlot>,
+        rows: Vec<ImportRow>,
         collisions: Vec<String>,
     },
+}
+
+/// One parsed import row: the candidate slot plus the auth type the file
+/// specified, if any (#417).
+#[derive(Debug)]
+struct ImportRow {
+    slot: SshSlot,
+    /// `Some(true)` — `auth = { type = "password" }`; `Some(false)` —
+    /// `key`/`agent`; `None` — the file did not say, so an overwrite keeps
+    /// the existing host's auth.
+    auth: Option<bool>,
 }
 
 /// Clean a list of imported tags like the launcher's own field does (#413).
@@ -760,7 +772,8 @@ fn clean_tags(tags: &[String]) -> Vec<String> {
 /// `host entry #2`). The alias is stored in the same truncated form
 /// [`SshSlot::to_profile`] persists, so collision checks and the 32-char
 /// uniqueness rule ([`LauncherApp::validate_ssh_slots`]) see exactly what
-/// would be saved.
+/// would be saved. `password_auth` is the file's auth type, if it had one
+/// (#417).
 fn make_import_slot(
     where_: &str,
     name: &str,
@@ -768,6 +781,7 @@ fn make_import_slot(
     port: u16,
     user: &str,
     tags: &[String],
+    password_auth: Option<bool>,
 ) -> Result<SshSlot, String> {
     // The alias is rendered in the TUI status bar verbatim; `clean_tag`
     // keeps imported control characters out, like the tag fields do
@@ -790,20 +804,20 @@ fn make_import_slot(
         alias,
         tags: clean_tags(tags).join(", "),
         password: String::new(),
-        save_password: false,
+        save_password: password_auth.unwrap_or(false),
     })
 }
 
 /// A duplicate alias would silently hide one of two hosts on launch
 /// (`validate_ssh_slots` refuses it), so the import file is rejected as a
 /// whole rather than half-applied (#416).
-fn ensure_unique_aliases(rows: &[SshSlot]) -> Result<(), String> {
+fn ensure_unique_aliases(rows: &[ImportRow]) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
     for row in rows {
-        if !seen.insert(row.alias.clone()) {
+        if !seen.insert(row.slot.alias.clone()) {
             return Err(format!(
                 "duplicate host name \"{}\" in the import file",
-                row.alias
+                row.slot.alias
             ));
         }
     }
@@ -811,9 +825,13 @@ fn ensure_unique_aliases(rows: &[SshSlot]) -> Result<(), String> {
 }
 
 /// Parse a TOML host list — the same `[[ssh_targets]]` shape `config.toml`
-/// uses. Unknown keys (`auth`, `host_key_policy`, other sections) are
-/// ignored; secrets are never read from the file (#416).
-fn parse_import_toml(text: &str) -> Result<Vec<SshSlot>, String> {
+/// uses. Unknown keys (`host_key_policy`, other sections) are ignored.
+///
+/// `auth` contributes only its `type` (#417): `password` marks the host
+/// for the connect password prompt, `key`/`agent` clear it. An inline
+/// `password` or key `path` is never read — secrets stay in the keyring
+/// (invariant #3).
+fn parse_import_toml(text: &str) -> Result<Vec<ImportRow>, String> {
     #[derive(serde::Deserialize)]
     struct File {
         #[serde(default)]
@@ -829,6 +847,16 @@ fn parse_import_toml(text: &str) -> Result<Vec<SshSlot>, String> {
         user: String,
         #[serde(default)]
         tags: Vec<String>,
+        #[serde(default)]
+        auth: Option<Auth>,
+    }
+    /// The config's `auth = { type = "…" }` table. Only the type is
+    /// declared: a `password` or key `path` field, if present, is dropped
+    /// unread (invariant #3).
+    #[derive(serde::Deserialize)]
+    struct Auth {
+        #[serde(rename = "type")]
+        kind: String,
     }
     fn default_import_port() -> u16 {
         22
@@ -840,14 +868,25 @@ fn parse_import_toml(text: &str) -> Result<Vec<SshSlot>, String> {
     }
     let mut rows = Vec::with_capacity(file.ssh_targets.len());
     for (i, entry) in file.ssh_targets.iter().enumerate() {
-        rows.push(make_import_slot(
-            &format!("host entry #{}", i + 1),
-            &entry.name,
-            &entry.host,
-            entry.port,
-            &entry.user,
-            &entry.tags,
-        )?);
+        let where_ = format!("host entry #{}", i + 1);
+        let password_auth = match entry.auth.as_ref().map(|a| a.kind.as_str()) {
+            None => None,
+            Some("password") => Some(true),
+            Some("key") | Some("agent") => Some(false),
+            Some(other) => return Err(format!("{where_}: unknown auth type \"{other}\"")),
+        };
+        rows.push(ImportRow {
+            slot: make_import_slot(
+                &where_,
+                &entry.name,
+                &entry.host,
+                entry.port,
+                &entry.user,
+                &entry.tags,
+                password_auth,
+            )?,
+            auth: password_auth,
+        });
     }
     ensure_unique_aliases(&rows)?;
     Ok(rows)
@@ -906,8 +945,9 @@ fn split_csv_rows(text: &str) -> Result<Vec<Vec<String>>, String> {
 /// Parse a CSV host list for foreign inventories (#416): a header row with
 /// `name` and `host` columns (case-insensitive, any order), optional `port`,
 /// `user` and `tags` columns. Tags are `;`-separated — `,` is the CSV
-/// separator itself.
-fn parse_import_csv(text: &str) -> Result<Vec<SshSlot>, String> {
+/// separator itself. Auth types are a TOML-only field (#417); CSV rows
+/// default to key auth.
+fn parse_import_csv(text: &str) -> Result<Vec<ImportRow>, String> {
     let all_rows = split_csv_rows(text)?;
     let is_blank = |r: &Vec<String>| r.len() == 1 && r[0].trim().is_empty();
     // The header is the first non-blank row. Blank lines keep their place in
@@ -942,14 +982,18 @@ fn parse_import_csv(text: &str) -> Result<Vec<SshSlot>, String> {
                 .map_err(|_| format!("line {line}: invalid port \"{v}\""))?,
         };
         let tags: Vec<String> = field(tags_col).split(';').map(str::to_string).collect();
-        out.push(make_import_slot(
-            &format!("line {line}"),
-            field(Some(name_col)),
-            field(Some(host_col)),
-            port,
-            field(user_col),
-            &tags,
-        )?);
+        out.push(ImportRow {
+            slot: make_import_slot(
+                &format!("line {line}"),
+                field(Some(name_col)),
+                field(Some(host_col)),
+                port,
+                field(user_col),
+                &tags,
+                None,
+            )?,
+            auth: None,
+        });
     }
     ensure_unique_aliases(&out)?;
     Ok(out)
@@ -958,7 +1002,7 @@ fn parse_import_csv(text: &str) -> Result<Vec<SshSlot>, String> {
 /// Read and parse an import file. The format follows the extension: `.csv`
 /// → CSV, anything else → TOML (#416). Nothing is applied here — a parse
 /// failure leaves every existing host untouched.
-fn parse_import_file(path: &std::path::Path) -> Result<Vec<SshSlot>, String> {
+fn parse_import_file(path: &std::path::Path) -> Result<Vec<ImportRow>, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let is_csv = path
@@ -975,14 +1019,14 @@ fn parse_import_file(path: &std::path::Path) -> Result<Vec<SshSlot>, String> {
 /// Imported names that already belong to a persisted host. Blank scratch
 /// rows do not count: they are dropped before anything is saved (#411), so
 /// an alias typed into one is not a name on disk yet.
-fn find_import_collisions(existing: &[SshSlot], imported: &[SshSlot]) -> Vec<String> {
+fn find_import_collisions(existing: &[SshSlot], imported: &[ImportRow]) -> Vec<String> {
     let mut collisions = Vec::new();
     for row in imported {
         let collides = existing
             .iter()
-            .any(|e| !e.host.trim().is_empty() && e.alias == row.alias);
-        if collides && !collisions.contains(&row.alias) {
-            collisions.push(row.alias.clone());
+            .any(|e| !e.host.trim().is_empty() && e.alias == row.slot.alias);
+        if collides && !collisions.contains(&row.slot.alias) {
+            collisions.push(row.slot.alias.clone());
         }
     }
     collisions
@@ -1014,49 +1058,56 @@ fn unique_alias(existing: &[SshSlot], base: &str) -> String {
 /// The policy only affects colliding rows; fresh names are appended.
 /// Overwrite replaces the connection fields in place; the saved password
 /// survives only while the connection identity (host, port, user) is
-/// unchanged — a credential belonging to another machine must not follow
-/// the alias to a new one (#416 review).
+/// unchanged and both the host and the file stay on password auth — a
+/// credential belonging to another machine, or to key auth, must not
+/// linger. The file's auth type wins when it carries one; without it, a
+/// changed identity drops password auth, like a changed identity drops
+/// the password (#416/#417 reviews).
 fn apply_import(
     existing: &mut Vec<SshSlot>,
-    imported: Vec<SshSlot>,
+    imported: Vec<ImportRow>,
     policy: CollisionPolicy,
 ) -> ImportOutcome {
     let mut outcome = ImportOutcome::default();
     for row in imported {
+        let mut candidate = row.slot;
         let collision = existing
             .iter()
-            .position(|e| !e.host.trim().is_empty() && e.alias == row.alias);
+            .position(|e| !e.host.trim().is_empty() && e.alias == candidate.alias);
         match (collision, policy) {
             (None, _) => {
                 outcome.added += 1;
-                existing.push(row);
+                existing.push(candidate);
             }
             (Some(_), CollisionPolicy::Skip) => outcome.skipped += 1,
             (Some(i), CollisionPolicy::Overwrite) => {
                 let slot = &mut existing[i];
-                // The saved password belongs to the old connection
-                // identity: on a changed host/port/user it is dropped (the
-                // launch path then deletes the keyring entry), otherwise a
-                // credential for another machine silently follows the
-                // unchanged alias — and TOFU may not warn (#416 review).
-                if slot.host.trim() != row.host.trim()
-                    || slot.port.trim() != row.port.trim()
-                    || slot.user.trim() != row.user.trim()
-                {
+                let identity_changed = slot.host.trim() != candidate.host.trim()
+                    || slot.port.trim() != candidate.port.trim()
+                    || slot.user.trim() != candidate.user.trim();
+                // The file's auth type wins when specified; without one the
+                // host keeps its own — except a changed identity drops
+                // password auth, like a changed identity drops the password.
+                let password_auth = row.auth.unwrap_or(!identity_changed && slot.save_password);
+                // The credential survives only while it still belongs to
+                // this host: same identity, password auth on both sides.
+                // The launch path deletes the keyring entry of a cleared
+                // password, so a credential for another machine does not
+                // silently follow the alias (and TOFU may not warn).
+                if identity_changed || !slot.save_password || !password_auth {
                     slot.password.clear();
-                    slot.save_password = false;
                 }
-                slot.host = row.host;
-                slot.port = row.port;
-                slot.user = row.user;
-                slot.tags = row.tags;
+                slot.save_password = password_auth;
+                slot.host = candidate.host;
+                slot.port = candidate.port;
+                slot.user = candidate.user;
+                slot.tags = candidate.tags;
                 outcome.overwritten += 1;
             }
             (Some(_), CollisionPolicy::Rename) => {
-                let mut row = row;
-                row.alias = unique_alias(existing, &row.alias);
+                candidate.alias = unique_alias(existing, &candidate.alias);
                 outcome.renamed += 1;
-                existing.push(row);
+                existing.push(candidate);
             }
         }
     }
@@ -1086,6 +1137,61 @@ fn import_status_line(outcome: &ImportOutcome) -> String {
         "Import: {} added, {} overwritten, {} renamed, {} skipped",
         outcome.added, outcome.overwritten, outcome.renamed, outcome.skipped
     )
+}
+
+/// Serialize a host list to the import format (#417) — one `[[ssh_targets]]`
+/// entry per host, shaped exactly like the launcher's `Import…` and
+/// `config.toml` read it, so the file can be committed, shared, and
+/// imported back as-is.
+///
+/// Secrets are never written (invariant #3): the auth block carries only
+/// its `type`, and neither `password` nor a key `path` has any
+/// representation in the format.
+fn export_hosts_toml(slots: &[&SshSlot]) -> Result<String, String> {
+    #[derive(serde::Serialize)]
+    struct File {
+        ssh_targets: Vec<Entry>,
+    }
+    #[derive(serde::Serialize)]
+    struct Entry {
+        name: String,
+        host: String,
+        port: u16,
+        user: String,
+        tags: Vec<String>,
+        auth: Auth,
+    }
+    #[derive(serde::Serialize)]
+    struct Auth {
+        #[serde(rename = "type")]
+        kind: &'static str,
+    }
+    let file = File {
+        ssh_targets: slots
+            .iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                let port = slot.port.trim().parse::<u16>().unwrap_or(22);
+                Entry {
+                    name: filar_core::ssh_target_display_name(i, &slot.alias),
+                    host: slot.host.trim().to_string(),
+                    port: if port == 0 { 22 } else { port },
+                    user: slot.user.trim().to_string(),
+                    tags: parse_tags(&slot.tags),
+                    auth: Auth {
+                        kind: if slot.save_password { "password" } else { "key" },
+                    },
+                }
+            })
+            .collect(),
+    };
+    let body = toml::to_string(&file).map_err(|e| format!("cannot serialize host list: {e}"))?;
+    Ok(format!(
+        "# Filar host list — addresses, ports, users, tags and auth types.\n\
+         # Safe to commit and share: no passwords, no keys, no key paths.\n\
+         # Import it back with the launcher's \"Import…\" button.\n\
+         {body}"
+    ))
 }
 
 /// Write `[llm]` settings to `{OS data dir}/filar/config.toml` so `filar`
@@ -1240,8 +1346,8 @@ enum HostAction {
 
 /// A staged host import waiting for the collision choice (#416).
 struct ImportDialog {
-    /// Parsed rows (both colliding and fresh ones).
-    rows: Vec<SshSlot>,
+    /// Parsed rows (colliding and fresh ones), auth type included (#417).
+    rows: Vec<ImportRow>,
     /// Imported names that already exist in the host list.
     collisions: Vec<String>,
 }
@@ -1293,8 +1399,9 @@ struct LauncherApp {
     arbiter_profile: Option<String>,
     /// Staged import waiting for the collision policy choice (#416).
     import_dialog: Option<ImportDialog>,
-    /// Result of the last host import, shown under the host list (#416).
-    import_status: String,
+    /// Result of the last host-file operation — import or export (#416/#417),
+    /// shown under the host list.
+    file_status: String,
 }
 
 /// Local copy of an LLM profile for GUI editing.
@@ -1544,15 +1651,25 @@ impl LauncherApp {
             if ui
                 .add_enabled(!editing_locked, egui::Button::new("Import…"))
                 .on_hover_text(
-                    "Import addresses, ports, users and tags from a TOML or CSV file — secrets are never imported",
+                    "Import addresses, ports, users, tags and auth types from a TOML or CSV file — secrets are never imported",
                 )
                 .clicked()
             {
                 self.start_host_import();
             }
+            let has_hosts = self.ssh_slots.iter().any(|s| !s.host.trim().is_empty());
+            if ui
+                .add_enabled(!editing_locked && has_hosts, egui::Button::new("Export…"))
+                .on_hover_text(
+                    "Save the host list to a TOML file for git and the team — no passwords, no keys",
+                )
+                .clicked()
+            {
+                self.start_host_export();
+            }
         });
-        if !self.import_status.is_empty() {
-            ui.label(egui::RichText::new(&self.import_status).weak().small());
+        if !self.file_status.is_empty() {
+            ui.label(egui::RichText::new(&self.file_status).weak().small());
         }
         if self.ssh_slots.is_empty() {
             ui.label(egui::RichText::new("  (no saved hosts yet)").weak());
@@ -1929,8 +2046,8 @@ impl LauncherApp {
         if self.import_dialog.is_some() {
             return;
         }
-        // The last import's verdict does not survive a new attempt.
-        self.import_status.clear();
+        // The last file operation's verdict does not survive a new attempt.
+        self.file_status.clear();
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Host list", &["toml", "csv"])
             .pick_file()
@@ -1941,11 +2058,53 @@ impl LauncherApp {
             Err(msg) => self.set_other_error(format!("Import failed: {msg}")),
             Ok(ImportStaged::Applied(outcome)) => {
                 self.clear_error();
-                self.import_status = import_status_line(&outcome);
+                self.file_status = import_status_line(&outcome);
             }
             Ok(ImportStaged::NeedsDecision { rows, collisions }) => {
                 self.import_dialog = Some(ImportDialog { rows, collisions });
             }
+        }
+    }
+
+    /// Export the host list to a TOML file the user picks (#417) — the very
+    /// format `Import…` reads back, safe to commit and share. Secrets are
+    /// never written (invariant #3).
+    fn start_host_export(&mut self) {
+        // The last file operation's verdict does not survive a new attempt.
+        self.file_status.clear();
+        // Serialize in its own scope: the borrow of `ssh_slots` must end
+        // before the status fields are written.
+        let prepared = {
+            let rows: Vec<&SshSlot> = self
+                .ssh_slots
+                .iter()
+                .filter(|s| !s.host.trim().is_empty())
+                .collect();
+            if rows.is_empty() {
+                return;
+            }
+            export_hosts_toml(&rows).map(|text| (text, rows.len()))
+        };
+        let (text, count) = match prepared {
+            Ok(prepared) => prepared,
+            Err(msg) => {
+                self.set_other_error(format!("Export failed: {msg}"));
+                return;
+            }
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Host list", &["toml"])
+            .set_file_name("filar-hosts.toml")
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&path, text) {
+            Ok(()) => {
+                self.clear_error();
+                self.file_status = format!("Export: {count} hosts → {}", path.display());
+            }
+            Err(e) => self.set_other_error(format!("Export failed: {e}")),
         }
     }
 
@@ -1992,7 +2151,9 @@ impl LauncherApp {
                     }
                     if ui
                         .button("Overwrite")
-                        .on_hover_text("Replace host/port/user/tags of the existing entry")
+                        .on_hover_text(
+                            "Replace connection fields, tags and auth type of the existing entry",
+                        )
                         .clicked()
                     {
                         decision = Some(Decision::Apply(CollisionPolicy::Overwrite));
@@ -2014,10 +2175,10 @@ impl LauncherApp {
             Some(Decision::Apply(policy)) => {
                 let outcome = apply_import(&mut self.ssh_slots, dialog.rows, policy);
                 self.clear_error();
-                self.import_status = import_status_line(&outcome);
+                self.file_status = import_status_line(&outcome);
             }
             Some(Decision::Cancel) => {
-                self.import_status = "Import cancelled.".to_string();
+                self.file_status = "Import cancelled.".to_string();
             }
             None if open => {
                 // No choice yet — keep the window for the next frame.
@@ -2025,7 +2186,7 @@ impl LauncherApp {
             }
             None => {
                 // Closed with the X — same as Cancel.
-                self.import_status = "Import cancelled.".to_string();
+                self.file_status = "Import cancelled.".to_string();
             }
         }
     }
@@ -2513,7 +2674,7 @@ pub fn run_launcher(config: &Config) {
         show_api_key: false,
         arbiter_profile: settings.arbiter_profile.clone(),
         import_dialog: None,
-        import_status: String::new(),
+        file_status: String::new(),
     };
 
     let options = eframe::NativeOptions {
@@ -3413,7 +3574,7 @@ mod tests {
             show_api_key: false,
             arbiter_profile: None,
             import_dialog: None,
-            import_status: String::new(),
+            file_status: String::new(),
         }
     }
 
@@ -3932,15 +4093,17 @@ mod tests {
     fn import_toml_reads_twenty_hosts_in_one_file() {
         let rows = parse_import_toml(&import_toml_text(20)).unwrap();
         assert_eq!(rows.len(), 20);
-        assert_eq!(rows[0].alias, "fleet-01");
-        assert_eq!(rows[0].host, "192.0.2.1");
-        assert_eq!(rows[0].port, "2222");
-        assert_eq!(rows[0].user, "admin");
-        assert_eq!(rows[0].tags, "prod, fleet");
-        assert_eq!(rows[19].alias, "fleet-20");
-        assert_eq!(rows[19].host, "192.0.2.20");
+        assert_eq!(rows[0].slot.alias, "fleet-01");
+        assert_eq!(rows[0].slot.host, "192.0.2.1");
+        assert_eq!(rows[0].slot.port, "2222");
+        assert_eq!(rows[0].slot.user, "admin");
+        assert_eq!(rows[0].slot.tags, "prod, fleet");
+        assert_eq!(rows[19].slot.alias, "fleet-20");
+        assert_eq!(rows[19].slot.host, "192.0.2.20");
         // Secrets are never part of an import.
-        assert!(rows.iter().all(|r| r.password.is_empty() && !r.save_password));
+        assert!(rows.iter().all(|r| r.slot.password.is_empty() && !r.slot.save_password));
+        // No auth table in the file — the rows carry no auth verdict (#417).
+        assert!(rows.iter().all(|r| r.auth.is_none()));
     }
 
     #[test]
@@ -3955,8 +4118,13 @@ host_key_policy = \"strict\"
 ";
         let rows = parse_import_toml(text).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].port, "22", "an omitted port defaults to 22");
-        assert_eq!(rows[0].tags, "");
+        assert_eq!(rows[0].slot.port, "22", "an omitted port defaults to 22");
+        assert_eq!(rows[0].slot.tags, "");
+        assert_eq!(rows[0].auth, Some(true), "the auth type is read (#417)");
+        assert!(
+            rows[0].slot.save_password && rows[0].slot.password.is_empty(),
+            "password auth means the connect prompt, never a stored secret"
+        );
     }
 
     #[test]
@@ -3965,6 +4133,45 @@ host_key_policy = \"strict\"
         assert!(err.contains("no [[ssh_targets]]"), "got {err}");
         let err = parse_import_toml("this is not toml {{{").unwrap_err();
         assert!(err.contains("not valid TOML"), "got {err}");
+    }
+
+    #[test]
+    fn import_auth_must_not_take_the_inline_password() {
+        // The file may carry a password (config.toml shape); it must be
+        // dropped unread — secrets stay in the keyring (invariant #3).
+        let rows = parse_import_toml(
+            "[[ssh_targets]]\nname = \"web-1\"\nhost = \"192.0.2.1\"\nauth = { type = \"password\", password = \"hunter2\" }\n",
+        )
+        .unwrap();
+        assert_eq!(rows[0].auth, Some(true));
+        assert!(
+            rows[0].slot.password.is_empty(),
+            "an inline secret must not be read"
+        );
+    }
+
+    #[test]
+    fn import_unknown_auth_type_is_rejected() {
+        let err = parse_import_toml(
+            "[[ssh_targets]]\nname = \"web-1\"\nhost = \"192.0.2.1\"\nauth = { type = \"knock\" }\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown auth type \"knock\""), "got {err}");
+    }
+
+    #[test]
+    fn import_auth_key_drops_an_inline_key_path() {
+        let rows = parse_import_toml(
+            "[[ssh_targets]]\nname = \"web-1\"\nhost = \"192.0.2.1\"\nauth = { type = \"key\", path = \"/root/.ssh/id_rsa\" }\n",
+        )
+        .unwrap();
+        assert_eq!(rows[0].auth, Some(false));
+        // Nothing remembers the path, and the export format has no field
+        // for one (DoD of #417).
+        let refs: Vec<&SshSlot> = rows.iter().map(|r| &r.slot).collect();
+        let text = export_hosts_toml(&refs).unwrap();
+        assert!(!text.contains("path = "), "got {text}");
+        assert!(!text.contains("id_rsa"), "got {text}");
     }
 
     #[test]
@@ -4006,14 +4213,16 @@ host_key_policy = \"strict\"
                    192.0.2.2,db-1,,,\n";
         let rows = parse_import_csv(csv).unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].alias, "web,1");
-        assert_eq!(rows[0].host, "192.0.2.1");
-        assert_eq!(rows[0].port, "2222");
-        assert_eq!(rows[0].user, "admin");
-        assert_eq!(rows[0].tags, "prod, web");
-        assert_eq!(rows[1].alias, "db-1");
-        assert_eq!(rows[1].port, "22", "an empty port defaults to 22");
-        assert_eq!(rows[1].tags, "");
+        assert_eq!(rows[0].slot.alias, "web,1");
+        assert_eq!(rows[0].slot.host, "192.0.2.1");
+        assert_eq!(rows[0].slot.port, "2222");
+        assert_eq!(rows[0].slot.user, "admin");
+        assert_eq!(rows[0].slot.tags, "prod, web");
+        assert_eq!(rows[1].slot.alias, "db-1");
+        assert_eq!(rows[1].slot.port, "22", "an empty port defaults to 22");
+        assert_eq!(rows[1].slot.tags, "");
+        // CSV has no auth column: rows default to key auth (#417).
+        assert!(rows.iter().all(|r| r.auth.is_none() && !r.slot.save_password));
     }
 
     #[test]
@@ -4118,6 +4327,41 @@ host_key_policy = \"strict\"
     }
 
     #[test]
+    fn import_auth_key_switches_an_overwritten_host_to_key_auth() {
+        let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
+        app.ssh_slots[0].save_password = true;
+        app.ssh_slots[0].password = "s3cret".into();
+        let rows = parse_import_toml(
+            "[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.11\"\nport = 22\nuser = \"root\"\nauth = { type = \"key\" }\n",
+        )
+        .unwrap();
+        let outcome = apply_import(&mut app.ssh_slots, rows, CollisionPolicy::Overwrite);
+        assert_eq!(outcome.overwritten, 1);
+        let slot = &app.ssh_slots[0];
+        assert!(
+            !slot.save_password && slot.password.is_empty(),
+            "the file says key auth: the stored password must not linger"
+        );
+    }
+
+    #[test]
+    fn import_auth_password_after_an_identity_change_keeps_the_prompt() {
+        let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
+        app.ssh_slots[0].save_password = true;
+        app.ssh_slots[0].password = "s3cret".into();
+        let rows = parse_import_toml(
+            "[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.99\"\nport = 2222\nuser = \"admin\"\nauth = { type = \"password\" }\n",
+        )
+        .unwrap();
+        apply_import(&mut app.ssh_slots, rows, CollisionPolicy::Overwrite);
+        let slot = &app.ssh_slots[0];
+        assert!(
+            slot.save_password && slot.password.is_empty(),
+            "the new machine keeps the prompt but not the old machine's secret"
+        );
+    }
+
+    #[test]
     fn import_alias_strips_control_characters() {
         // The TOML escape decodes to a raw BEL (U+0007) inside the name.
         let rows = parse_import_toml(
@@ -4125,7 +4369,7 @@ host_key_policy = \"strict\"
         )
         .unwrap();
         assert_eq!(
-            rows[0].alias, "web-1",
+            rows[0].slot.alias, "web-1",
             "a control character must not reach the TUI status bar"
         );
     }
@@ -4215,7 +4459,7 @@ host_key_policy = \"strict\"
         let csv = dir.join("hosts.csv");
         std::fs::write(&csv, "name,host\nweb-1,10.0.0.11\n").unwrap();
         let rows = parse_import_file(&csv).unwrap();
-        assert_eq!(rows[0].alias, "web-1");
+        assert_eq!(rows[0].slot.alias, "web-1");
 
         // TOML content under a .csv name fails as CSV (explicit, not guessed).
         let lying = dir.join("lying.csv");
@@ -4239,5 +4483,71 @@ host_key_policy = \"strict\"
             skipped: 4,
         });
         assert_eq!(line, "Import: 3 added, 1 overwritten, 2 renamed, 4 skipped");
+    }
+
+    // ── Host list export (#417) ─────────────────────────────────────
+
+    #[test]
+    fn export_never_writes_secrets_or_key_paths() {
+        let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
+        app.ssh_slots[0].save_password = true;
+        app.ssh_slots[0].password = "s3cret".into();
+        let refs: Vec<&SshSlot> = app.ssh_slots.iter().collect();
+        let text = export_hosts_toml(&refs).unwrap();
+        assert!(!text.contains("s3cret"), "got {text}");
+        assert!(!text.contains("password = "), "got {text}");
+        assert!(!text.contains("path = "), "got {text}");
+        // The auth *type* is the only credential-related field in the file.
+        assert!(text.contains("type = \"password\""), "got {text}");
+    }
+
+    #[test]
+    fn export_import_round_trip_restores_the_fleet() {
+        let mut app = app_with_hosts(&[("10.0.0.11", "web-1"), ("10.0.0.12", "db-1")]);
+        app.ssh_slots[0].save_password = true;
+        app.ssh_slots[0].port = "2222".into();
+        app.ssh_slots[0].user = "admin".into();
+        app.ssh_slots[0].tags = "prod, fleet".into();
+        let refs: Vec<&SshSlot> = app.ssh_slots.iter().collect();
+        let text = export_hosts_toml(&refs).unwrap();
+
+        let rows = parse_import_toml(&text).expect("the export must parse as an import");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].slot.alias, "web-1");
+        assert_eq!(rows[0].slot.host, "10.0.0.11");
+        assert_eq!(rows[0].slot.port, "2222");
+        assert_eq!(rows[0].slot.user, "admin");
+        assert_eq!(rows[0].slot.tags, "prod, fleet");
+        assert_eq!(rows[0].auth, Some(true), "password auth survives the trip");
+        assert_eq!(rows[1].slot.alias, "db-1");
+        assert_eq!(rows[1].auth, Some(false), "key auth survives the trip");
+
+        // A clean machine gets the very same fleet back.
+        let mut clean = app_with_hosts(&[]);
+        let outcome = apply_import(&mut clean.ssh_slots, rows, CollisionPolicy::Skip);
+        assert_eq!(outcome.added, 2);
+        assert_eq!(clean.ssh_slots.len(), 2);
+        assert_eq!(clean.ssh_slots[0].host, "10.0.0.11");
+        assert!(clean.ssh_slots[0].save_password);
+        assert!(!clean.ssh_slots[1].save_password);
+        assert!(
+            clean.ssh_slots[0].password.is_empty(),
+            "the round trip restores the prompt, not the secret"
+        );
+    }
+
+    #[test]
+    fn export_skips_blank_scratch_rows() {
+        // start_host_export passes only rows with a host to the serializer —
+        // a scratch row must not reach the file (#411).
+        let app = app_with_hosts(&[("10.0.0.11", "web-1"), ("", "scratch")]);
+        let refs: Vec<&SshSlot> = app
+            .ssh_slots
+            .iter()
+            .filter(|s| !s.host.trim().is_empty())
+            .collect();
+        let text = export_hosts_toml(&refs).unwrap();
+        assert!(!text.contains("scratch"), "got {text}");
+        assert!(text.contains("web-1"), "got {text}");
     }
 }

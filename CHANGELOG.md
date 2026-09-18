@@ -13,6 +13,15 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- The GUI launcher exports the host list to a secret-free TOML — the same
+  `[[ssh_targets]]` shape `Import…` reads, one entry per host with the auth
+  type (`password`/`key`) and no passwords, keys or key paths — so the
+  fleet can be committed and shared; the TOML import reads the auth type
+  back (unknown types are rejected, inline secrets are ignored) and an
+  overwrite keeps the saved password only while the connection identity
+  and password auth are unchanged
+  ([#417](https://github.com/devlawey/filar/issues/417)).
+
 - The GUI launcher imports a host list from one TOML (the config's own
   `[[ssh_targets]]` shape) or CSV file — addresses, ports, users and tags;
   secrets are never imported. Name collisions are resolved explicitly: one
