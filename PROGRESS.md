@@ -6976,6 +6976,74 @@ own issue.
 
 **Next:** #415 — Ctrl+O filter/grouping by tags.
 
+## Issue #415: feat(tui) — filter and tag grouping in the Ctrl+O host selection
+
+**Milestone:** 2.0.0. **Branch:** `feat/415-tag-filter-grouping`.
+
+**Problem.** With #413 tags in place, the `Ctrl+O` overlay was still a flat
+list of every target in config order: no way to find a host by name in a
+20+ fleet, no way to see which hosts belong to a tag. #415 adds substring
+search, a tag filter and grouping under tag headers — while the runner
+contract (`ctrl_o_selection` = flat index) stays untouched.
+
+**Decision.** A view model `HostSelectRow` (Header / Local / Target) sits
+on top of the flat `host_select_index`: hosts group by primary tag (first
+in `tags`, groups in first-appearance order, case-insensitive merge),
+untagged last; `selection_index()` returns `None` for headers, so Up/Down
+step over them and Enter is a no-op while the filtered view is empty.
+Typing filters by substring over name, `user@host:port` and tags;
+`Tab`/`BackTab` cycle the tag filter (None → tags in first-appearance
+order); Esc clears the active filter first, a second press closes; every
+filter mutation runs `host_select_ensure_visible()`, snapping the
+selection to the first selectable row when the selected host falls out of
+view. The render was rewritten: width is measured on the unfiltered view
+(the frame does not follow the rows while typing), the inner area is
+split search line / list / footer, the search line carries the
+right-aligned `n/visible` cursor counter and `fit_tail()` scrolls a long
+query from the left by display width. Two defects were found by the live
+DoD run and fixed: the counter was laid out against the outer width
+(`1/25` rendered as `1/2` — now the inner width), and the empty state
+collapsed the footer hints out of the frame (the height now reserves the
+`(no matches)` row). The overlay draws entirely from the glyph set
+(`▶`/`>`, `●`/`*`, `↑↓`/`^v`), so ASCII mode stays box-free.
+
+**Tests.** tui app (8): search filters and selects; search matches
+host/port and tags; Tab cycles the tag filter; navigation skips group
+headers; no-matches blocks Enter until cleared; Backspace edits the query
+and restores the view; grouping by primary tag with the untagged bucket
+last; reopening resets the filters. tui ui (6): ASCII render is box-free
+(`^v`, `#prod`); group headers + untagged bucket; 24 hosts scroll keeping
+the selection visible; the counter renders fully inside the borders; the
+empty state keeps the footer hints; `fit_tail` keeps trailing columns.
+theme (1): the ASCII glyph set is pure ASCII.
+
+**Verification:** `cargo build --workspace` and `cargo test --workspace`
+green (agent 153, app 20, core 98, gui 73, transport 38 + 7
+ignored/docker-sshd, tui 549, doctests 2). Real TUI run (DoD, ComputerUse
+on Windows) with `FILAR_CONFIG` on a scratch config with 24 hosts
+(`fleet-01..24` on RFC 5737 addresses; tags prod×6, web×5, db×4,
+staging×3, untagged×6). Overlay: grouped headers `prod (6)` / `web (5)` /
+`db (4)` / … with `no tags` last; typing `web` → `1/5`, one `web (5)`
+group, selection snaps to fleet-07; `Tab` → footer `Tab: prod`, `7/12`,
+groups prod(6)/web(4)/db(2); Tab×5 cycles web/db/staging back to no
+filter; Down×30 → bottom, `25/25`, cursor fleet-24 under `no tags (6)`,
+nothing cut off; `zzz` → `(no matches)`, `0/0`; Backspace×3 → list
+restored, `25/25`; Up×30 → top, `1/25`; Enter → overlay closes (local),
+`Ctrl+Q` → clean exit. ASCII run (WT_SESSION cleared): cursor `>`, `*`,
+`^v`, `-- prod (6)`, `#prod` — zero box glyphs; the empty state keeps
+`Esc clear` (the live fix). App-data touched by the runs was restored
+byte-identical (SHA256, 41/41). On a spoofed `WT_SESSION` conhost the
+Unicode `▶` cursor renders as a box — a conhost font limitation, not the
+path real conhost takes (ASCII detection); Windows Terminal draws it.
+Found meanwhile: with a single `[[llm_profiles]]` entry and no `[llm]`
+section, `--llm <name>` folds the first profile into the default `[llm]`
+slot and demands `GLM_API_KEY` (`resolve_startup_profile` + the
+first-profile→`None` mapping in `main`) — a keyless-only config cannot
+start without a dummy key; worth its own issue.
+
+**Next:** release preparation per `prepare-release` once the 2.0.0
+milestone closes.
+
 ## Agent E2E runbook (docs)
 
 `docs/AGENT_E2E_RUNBOOK.md`: how an agent whose harness can control a desktop
