@@ -150,6 +150,9 @@ name = "my-server"
 host = "192.168.1.100"
 port = 22
 user = "admin"
+# tags = ["prod", "web"]   # свободные метки хоста; видны в статусной строке
+#                          # TUI как `host [prod,web]`. В лаунчере — поле
+#                          # Tags (через запятую).
 
 [ssh_targets.auth]
 type = "agent"        # agent | key | password

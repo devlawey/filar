@@ -848,16 +848,34 @@ impl Session {
     /// Alias falls back to empty (host + pwd only) when `target_name` is just
     /// the raw `user@host` ssh_info. Missing cwd omits the path.
     pub fn status_target(&self) -> String {
+        self.status_target_with_tags(None)
+    }
+
+    /// Status-bar location with an optional pre-rendered tags segment (#413):
+    /// SSH `alias host [tags] pwd`. The segment is measured by the caller
+    /// (see [`App::format_tags_segment`]) — an empty string renders as if
+    /// there were no tags.
+    pub fn status_target_with_tags(&self, tags_segment: Option<&str>) -> String {
         let pwd = self.cwd.as_deref().map(|p| truncate_pwd(p, 24)).unwrap_or_default();
+        let tags = tags_segment.unwrap_or("");
         match self.ssh_info.as_deref().and_then(parse_ssh_info) {
             Some((_, host, _)) => {
                 let alias = self.alias_for_status();
-                match (alias.is_empty(), pwd.is_empty()) {
-                    (true, true) => host,
-                    (true, false) => format!("{host} {pwd}"),
-                    (false, true) => format!("{alias} {host}"),
-                    (false, false) => format!("{alias} {host} {pwd}"),
+                let mut out = String::new();
+                if !alias.is_empty() {
+                    out.push_str(&alias);
+                    out.push(' ');
                 }
+                out.push_str(&host);
+                if !tags.is_empty() {
+                    out.push(' ');
+                    out.push_str(tags);
+                }
+                if !pwd.is_empty() {
+                    out.push(' ');
+                    out.push_str(&pwd);
+                }
+                out
             }
             None => {
                 if pwd.is_empty() {
@@ -1601,6 +1619,46 @@ impl App {
         self.push_message(ChatBlock::System(format!(
             "History compaction failed ({error}). Continuing with the full history."
         )));
+    }
+
+    /// Tags of the currently active SSH target (#413), resolved from the
+    /// configured target list by the `user@host:port` key — the same match
+    /// the Ctrl+O overlay uses. Ad-hoc `!ssh` sessions and hosts absent from
+    /// the config have no tags.
+    pub fn active_ssh_tags(&self) -> Vec<String> {
+        let Some(info) = self.ssh_info.as_deref() else {
+            return Vec::new();
+        };
+        self.ssh_targets
+            .iter()
+            .find(|t| format!("{}@{}:{}", t.user, t.host, t.port) == info)
+            .map(|t| t.tags.clone())
+            .unwrap_or_default()
+    }
+
+    /// Render the active target's tags as a `[a,b]` status-bar segment, or
+    /// `None` when the target has no tags or the segment does not fit into
+    /// `max_len` terminal cells (`max_len` is a column budget: a
+    /// double-width tag must not overshoot it).
+    ///
+    /// All-or-nothing on purpose: a truncated list could silently hide a
+    /// `prod` tag — the one thing the segment exists to surface (#413).
+    ///
+    /// Control characters are stripped before rendering: config-sourced
+    /// tags never pass through the launcher's `parse_tags`, and the segment
+    /// is written to the terminal verbatim (#413 review).
+    pub fn format_tags_segment(&self, max_len: usize) -> Option<String> {
+        let tags: Vec<String> = self
+            .active_ssh_tags()
+            .iter()
+            .map(|t| t.chars().filter(|c| !c.is_control()).collect::<String>())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tags.is_empty() {
+            return None;
+        }
+        let segment = format!("[{}]", tags.join(","));
+        (unicode_width::UnicodeWidthStr::width(segment.as_str()) <= max_len).then_some(segment)
     }
 
     /// Open the host-selection overlay. The cursor starts on the currently
@@ -8919,6 +8977,7 @@ mod tests {
             name: name.into(), host: "host".into(), port: 22, user: "user".into(),
             auth: filar_core::SshAuth::Agent,
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            tags: Vec::new(),
         }
     }
 
@@ -9132,6 +9191,106 @@ mod tests {
         app.ssh_info = Some("root@10.0.0.5:22".into());
         app.cwd = None;
         assert_eq!(app.status_target(), "prod 10.0.0.5");
+    }
+
+    #[test]
+    fn active_ssh_tags_matches_by_user_host_port() {
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.ssh_info = Some("root@10.0.0.5:22".into());
+        let mut t = make_ssh_target("prod");
+        t.user = "root".into();
+        t.host = "10.0.0.5".into();
+        t.tags = vec!["prod".into(), "web".into()];
+        app.ssh_targets = vec![t];
+        assert_eq!(app.active_ssh_tags(), vec!["prod", "web"]);
+    }
+
+    #[test]
+    fn active_ssh_tags_empty_for_unmatched_host_and_local() {
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        // Same host but a different port must not match.
+        app.ssh_info = Some("root@10.0.0.5:2222".into());
+        let mut t = make_ssh_target("prod");
+        t.user = "root".into();
+        t.host = "10.0.0.5".into();
+        t.tags = vec!["prod".into()];
+        app.ssh_targets = vec![t];
+        assert!(app.active_ssh_tags().is_empty());
+
+        app.ssh_info = None;
+        assert!(app.active_ssh_tags().is_empty(), "local session has no tags");
+    }
+
+    #[test]
+    fn status_target_with_tags_places_segment_between_host_and_pwd() {
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.ssh_info = Some("root@10.0.0.5:22".into());
+        app.cwd = Some("/home/deploy".into());
+        assert_eq!(
+            app.status_target_with_tags(Some("[prod]")),
+            "prod 10.0.0.5 [prod] /home/deploy"
+        );
+    }
+
+    #[test]
+    fn format_tags_segment_is_all_or_nothing() {
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.ssh_info = Some("root@10.0.0.5:22".into());
+        let mut t = make_ssh_target("prod");
+        t.user = "root".into();
+        t.host = "10.0.0.5".into();
+        t.tags = vec!["work".into(), "prod".into()];
+        app.ssh_targets = vec![t];
+        assert_eq!(app.format_tags_segment(80).as_deref(), Some("[work,prod]"));
+        // One cell short: the whole segment drops, never a partial list.
+        assert_eq!(app.format_tags_segment("[work,prod]".len() - 1), None);
+    }
+
+    #[test]
+    fn format_tags_segment_none_without_tags() {
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.ssh_info = Some("root@10.0.0.5:22".into());
+        let mut t = make_ssh_target("prod");
+        t.user = "root".into();
+        t.host = "10.0.0.5".into();
+        app.ssh_targets = vec![t];
+        assert_eq!(app.format_tags_segment(80), None);
+    }
+
+    #[test]
+    fn format_tags_segment_strips_control_characters() {
+        // Config-sourced tags never pass through the launcher's parse_tags;
+        // the render sink must strip escape sequences on its own
+        // (#413 review).
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.ssh_info = Some("root@10.0.0.5:22".into());
+        let mut t = make_ssh_target("prod");
+        t.user = "root".into();
+        t.host = "10.0.0.5".into();
+        t.tags = vec!["prod\u{1b}]0;x".into(), "\u{7}".into(), "web".into()];
+        app.ssh_targets = vec![t];
+        assert_eq!(
+            app.format_tags_segment(80).as_deref(),
+            Some("[prod]0;x,web]")
+        );
+
+        // Nothing printable left → no segment at all.
+        app.ssh_targets[0].tags = vec!["\u{1b}\u{7}".into()];
+        assert_eq!(app.format_tags_segment(80), None);
+    }
+
+    #[test]
+    fn format_tags_segment_measures_cells_not_chars() {
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.ssh_info = Some("root@10.0.0.5:22".into());
+        let mut t = make_ssh_target("prod");
+        t.user = "root".into();
+        t.host = "10.0.0.5".into();
+        t.tags = vec!["中".into()];
+        app.ssh_targets = vec![t];
+        // "[中]" is 3 chars but 4 terminal cells — the budget is in cells.
+        assert_eq!(app.format_tags_segment(3), None);
+        assert_eq!(app.format_tags_segment(4).as_deref(), Some("[中]"));
     }
 
     #[test]
@@ -9456,6 +9615,7 @@ mod tests {
             user: "root".into(),
             auth: filar_core::SshAuth::Password { password: None },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            tags: Vec::new(),
         }];
         let session = filar_core::Session {
             folded_history: Vec::new(),
@@ -9532,6 +9692,7 @@ mod tests {
             name: "srv".into(), host: "h".into(), port: 22, user: "u".into(),
             auth: filar_core::SshAuth::Password { password: None },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            tags: Vec::new(),
         };
         app.handle_agent_event(TuiEvent::PasswordNeeded {
             session_id: app.sessions[0].id,
@@ -9549,6 +9710,7 @@ mod tests {
             name: "srv".into(), host: "h".into(), port: 22, user: "u".into(),
             auth: filar_core::SshAuth::Password { password: None },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            tags: Vec::new(),
         });
         app.mode = AppMode::PasswordInput;
         app.input = "test-pw".to_string();

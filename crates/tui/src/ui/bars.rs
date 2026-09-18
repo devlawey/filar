@@ -7,6 +7,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, AppMode, HelpAction};
 use crate::ui::theme::Glyphs;
@@ -250,7 +251,13 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // left_len already includes mode-badge spans (pushed above), so we
     // must NOT add mode_len again — that would double-count and break
     // the right-alignment in non-Normal modes.
-    let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    // Widths count terminal cells, not Unicode chars: a double-width glyph
+    // (CJK) occupies two columns and must be budgeted as such, or the
+    // right-aligned tail would be displaced on narrow terminals.
+    let left_len: usize = spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
     let available = area.width as usize;
 
     // Owned copy drops the borrow on `app` immediately. The rendered toast is
@@ -260,7 +267,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|t| format!("  {} {}", glyphs.middle_dot, t));
     let toast_len = toast_span_text
         .as_ref()
-        .map(|s| s.chars().count())
+        .map(|s| UnicodeWidthStr::width(s.as_str()))
         .unwrap_or(0);
 
     // Context fill — the measured prompt size against the active profile's
@@ -272,7 +279,30 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // `confirm_mode` or the toast.
     let used = app.active_session().last_prompt_tokens;
     let threshold = app.compact_at_tokens_for(&active);
-    let confirm_len = confirm_text.chars().count();
+    let confirm_len = UnicodeWidthStr::width(confirm_text.as_str());
+
+    // Tags of the configured SSH target (#413), inserted into the target span
+    // (spans[3], built above) between host and path. Their space is reserved
+    // before padding, exactly like the indicator and the toast — and the
+    // whole `[a,b]` segment yields when the line is too narrow: a truncated
+    // list could silently hide a `prod` tag. When tags fit, `left_len` grows
+    // so the indicator (the lowest-priority right-side element) shrinks to
+    // compensate.
+    let tags_budget = available.saturating_sub(left_len + confirm_len + toast_len + 1);
+    let tags_segment = app.format_tags_segment(tags_budget);
+    let left_len = if let Some(segment) = tags_segment {
+        spans[3] = Span::styled(
+            app.status_target_with_tags(Some(&segment)),
+            app.theme.user_style(),
+        );
+        spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum()
+    } else {
+        left_len
+    };
+
     let ctx_max = available.saturating_sub(left_len + confirm_len + toast_len + 1);
     let ctx_segment = context_indicator_segment(used, threshold, glyphs, ctx_max);
     let ctx_style = if used.is_some_and(|n| threshold > 0 && n >= threshold) {
@@ -284,7 +314,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     let right_len = ctx_segment
         .as_ref()
-        .map(|s| s.chars().count())
+        .map(|s| UnicodeWidthStr::width(s.as_str()))
         .unwrap_or(0)
         + confirm_len;
     // Toast has priority over padding on a narrow terminal (saturating — no
@@ -569,6 +599,110 @@ mod tests {
         assert!(row.contains("prod"), "alias, got: {row}");
         assert!(row.contains("10.0.0.5"), "host, got: {row}");
         assert!(row.contains("/srv"), "pwd, got: {row}");
+    }
+
+    /// App with the active SSH session `root@10.0.0.5:22`, an explicit cwd,
+    /// and one configured target carrying tags (#413).
+    fn app_with_tagged_target(tags: &[&str]) -> App {
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.ssh_info = Some("root@10.0.0.5:22".into());
+        app.cwd = Some("/srv".into());
+        app.ssh_targets = vec![filar_core::SshTarget {
+            name: "prod".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            user: "root".into(),
+            auth: filar_core::SshAuth::Agent,
+            host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        }];
+        app
+    }
+
+    #[test]
+    fn status_bar_shows_tags_between_host_and_pwd() {
+        let mut app = app_with_tagged_target(&["work", "prod"]);
+        let row = render_status_row(&mut app, 120);
+        assert!(
+            row.contains("10.0.0.5 [work,prod] /srv"),
+            "tags segment must sit between host and pwd, got: {row}"
+        );
+        assert!(row.ends_with(" Always"), "right side must stay right-aligned, got: {row}");
+    }
+
+    #[test]
+    fn status_bar_drops_tags_at_the_width_boundary_not_the_right_side() {
+        // 58 = exact fit of the tag segment into the leftover budget;
+        // 57 = one cell short — the whole segment must yield, the padded
+        // confirm_mode must stay pinned to the right edge.
+        let mut app = app_with_tagged_target(&["work", "prod"]);
+        let row_fit = render_status_row(&mut app, 58);
+        assert!(
+            row_fit.contains("10.0.0.5 [work,prod] /srv"),
+            "tags must appear when they exactly fit, got: {row_fit}"
+        );
+        assert!(row_fit.ends_with(" Always"), "got: {row_fit}");
+
+        let mut app = app_with_tagged_target(&["work", "prod"]);
+        let row_narrow = render_status_row(&mut app, 57);
+        assert!(
+            !row_narrow.contains("[work,prod]"),
+            "tags must fully yield when they do not fit, got: {row_narrow}"
+        );
+        assert!(
+            row_narrow.ends_with(" Always"),
+            "confirm_mode must stay at the right edge after the drop, got: {row_narrow}"
+        );
+        assert_eq!(row_narrow.chars().count(), 57, "row must fill exactly 57 columns");
+    }
+
+    #[test]
+    fn status_bar_wide_tag_budget_is_counted_in_cells() {
+        // "[中]" is 3 chars but 4 terminal cells: the exact-fit boundary is
+        // one column wider than for a 3-cell segment (the 11-cell
+        // "[work,prod]" fits at 58, so a 4-cell segment fits at 58 − 11 + 4
+        // = 51). At 50 a char-count budget (3 chars ≤ 3 cells) would have
+        // admitted the segment and pushed the right side off the edge.
+        let mut app = app_with_tagged_target(&["中"]);
+        let row_fit = render_status_row(&mut app, 51);
+        // One symbol per buffer cell: the second cell of the wide `中`
+        // appears as a blank cell, hence `[中 ]` in the collected row.
+        assert!(
+            row_fit.contains("10.0.0.5 [中 ] /srv"),
+            "tags must appear when they fit by cells, got: {row_fit}"
+        );
+        assert!(row_fit.ends_with(" Always"), "got: {row_fit}");
+        assert_eq!(
+            row_fit.chars().count(),
+            51,
+            "row must fill exactly 51 cells, got: {row_fit}"
+        );
+
+        let mut app = app_with_tagged_target(&["中"]);
+        let row_narrow = render_status_row(&mut app, 50);
+        assert!(
+            !row_narrow.contains('中'),
+            "wide tags must yield when a cell short, got: {row_narrow}"
+        );
+        assert!(
+            row_narrow.ends_with(" Always"),
+            "confirm_mode must stay at the right edge after the drop, got: {row_narrow}"
+        );
+        assert_eq!(
+            row_narrow.chars().count(),
+            50,
+            "row must fill exactly 50 cells, got: {row_narrow}"
+        );
+    }
+
+    #[test]
+    fn status_bar_without_tags_is_unchanged() {
+        // A tagged-built app stripped of the target match renders exactly like
+        // the pre-#413 bar: no tags segment anywhere.
+        let mut app = app_with_tagged_target(&["work"]);
+        app.ssh_info = Some("root@10.0.0.9:22".into());
+        let row = render_status_row(&mut app, 120);
+        assert!(!row.contains("[work]"), "no tags segment for an unmatched host, got: {row}");
     }
 
     #[test]

@@ -1140,6 +1140,7 @@ mod tests {
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
             host_key_policy: HostKeyPolicy::Tofu,
+            tags: Vec::new(),
         };
         std::env::var("SSH_PASSWORD")
             .expect("set SSH_PASSWORD to run ignored SSH integration tests");
@@ -1166,6 +1167,7 @@ mod tests {
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
             host_key_policy: HostKeyPolicy::Tofu,
+            tags: Vec::new(),
         };
         std::env::var("SSH_PASSWORD")
             .expect("set SSH_PASSWORD to run ignored SSH integration tests");
@@ -1191,6 +1193,7 @@ mod tests {
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
             host_key_policy: HostKeyPolicy::Tofu,
+            tags: Vec::new(),
         };
         std::env::var("SSH_PASSWORD")
             .expect("set SSH_PASSWORD to run ignored SSH integration tests");
@@ -1225,6 +1228,7 @@ mod tests {
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
             host_key_policy: HostKeyPolicy::Tofu,
+            tags: Vec::new(),
         };
         std::env::var("SSH_PASSWORD")
             .expect("set SSH_PASSWORD to run ignored SSH integration tests");
@@ -1269,6 +1273,7 @@ mod tests {
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
             host_key_policy: HostKeyPolicy::Tofu,
+            tags: Vec::new(),
         };
         std::env::var("SSH_PASSWORD")
             .expect("set SSH_PASSWORD to run ignored SSH integration tests");
@@ -1463,6 +1468,7 @@ mod tests {
             user: "testuser".into(),
             auth: SshAuth::Password { password: None },
             host_key_policy: HostKeyPolicy::Tofu,
+            tags: Vec::new(),
         }
     }
 

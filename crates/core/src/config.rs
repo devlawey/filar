@@ -114,6 +114,11 @@ pub struct SshTarget {
     /// Host key verification policy (default: TOFU).
     #[serde(default)]
     pub host_key_policy: HostKeyPolicy,
+
+    /// Free-form tags (e.g. `"prod"`, `"web"`) for grouping and policies.
+    /// Empty list = no tags; omitted from serialisation when empty (#413).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 fn default_ssh_port() -> u16 {
@@ -723,6 +728,53 @@ type = "agent"
         assert_eq!(cfg.confirm_mode, CommandConfirmMode::Allowlist);
         assert_eq!(cfg.ssh_targets.len(), 2);
         assert_eq!(cfg.ssh_target("staging").unwrap().host, "10.0.0.6");
+    }
+
+    #[test]
+    fn parse_ssh_target_tags() {
+        let toml = r#"
+[llm]
+model = "glm-5.1"
+api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+
+[[ssh_targets]]
+name = "prod"
+host = "10.0.0.5"
+user = "deploy"
+tags = ["prod", "web"]
+
+[[ssh_targets]]
+name = "dev"
+host = "10.0.0.6"
+user = "dev"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.ssh_targets[0].tags, vec!["prod", "web"]);
+        // Omitted tags deserialise to an empty list.
+        assert!(cfg.ssh_targets[1].tags.is_empty());
+    }
+
+    #[test]
+    fn ssh_target_tags_round_trip_skips_empty() {
+        let mut target = SshTarget {
+            name: "prod".into(),
+            host: "10.0.0.5".into(),
+            port: 22,
+            user: "deploy".into(),
+            auth: SshAuth::Agent,
+            host_key_policy: HostKeyPolicy::Tofu,
+            tags: vec!["prod".into()],
+        };
+        let json = serde_json::to_string(&target).unwrap();
+        assert!(json.contains("\"tags\":[\"prod\"]"), "json: {json}");
+        let back: SshTarget = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tags, vec!["prod"]);
+
+        // Empty tags are not serialised at all — old and new files stay
+        // byte-compatible for untagged hosts.
+        target.tags.clear();
+        let json = serde_json::to_string(&target).unwrap();
+        assert!(!json.contains("tags"), "json: {json}");
     }
 
     #[test]

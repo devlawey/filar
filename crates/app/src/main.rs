@@ -142,6 +142,7 @@ fn resolve_gui_ssh_target(s: &filar_gui::SshConnection) -> filar_core::SshTarget
         user: s.user.clone(),
         auth: filar_core::SshAuth::Password { password },
         host_key_policy: filar_core::HostKeyPolicy::Tofu,
+        tags: s.tags.clone(),
     }
 }
 
@@ -705,6 +706,7 @@ mod tests {
             password: String::new(),
             slot: 0,
             alias: String::new(),
+            tags: Vec::new(),
         };
         let target = resolve_gui_ssh_target(&conn);
         assert_eq!(target.name, "SSH1", "empty alias → SSH{{slot+1}}");
@@ -729,12 +731,16 @@ mod tests {
             password: "in-memory".into(),
             slot: 2,
             alias: "prod-web".into(),
+            tags: vec!["prod".into(), "web".into()],
         };
         let target = resolve_gui_ssh_target(&conn);
         assert_eq!(target.name, "prod-web");
         assert_eq!(target.host, "example.com");
         assert_eq!(target.port, 2222);
         assert_eq!(target.user, "admin");
+        // Tags travel with the GUI→TUI handoff so the status bar can show
+        // them on the very first frame (#413).
+        assert_eq!(target.tags, vec!["prod", "web"]);
         assert_eq!(
             filar_core::ssh_cred_name(conn.slot, &conn.alias),
             "ssh_target:prod-web"
@@ -756,6 +762,7 @@ mod tests {
             user: "root".into(),
             auth: filar_core::SshAuth::Password { password: None },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            tags: Vec::new(),
         };
         assert_eq!(gui_launch_target_name(Some(&aliased), "ssh"), "VPS DE");
         let numbered = filar_core::SshTarget {

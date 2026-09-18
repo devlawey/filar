@@ -1044,6 +1044,9 @@ async fn run_app(
                                     password: Some(password),
                                 },
                                 host_key_policy: filar_core::HostKeyPolicy::Tofu,
+                                // Ad-hoc `!ssh` connections are not a configured
+                                // target, so they carry no tags (#413).
+                                tags: Vec::new(),
                             };
                             let new_ssh_info = format!("{user}@{host}:{port}");
                             match SshExecutor::connect_with_config(
