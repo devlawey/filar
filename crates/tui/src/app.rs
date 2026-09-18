@@ -1638,7 +1638,8 @@ impl App {
 
     /// Render the active target's tags as a `[a,b]` status-bar segment, or
     /// `None` when the target has no tags or the segment does not fit into
-    /// `max_len`.
+    /// `max_len` terminal cells (`max_len` is a column budget: a
+    /// double-width tag must not overshoot it).
     ///
     /// All-or-nothing on purpose: a truncated list could silently hide a
     /// `prod` tag — the one thing the segment exists to surface (#413).
@@ -1657,7 +1658,7 @@ impl App {
             return None;
         }
         let segment = format!("[{}]", tags.join(","));
-        (segment.chars().count() <= max_len).then_some(segment)
+        (unicode_width::UnicodeWidthStr::width(segment.as_str()) <= max_len).then_some(segment)
     }
 
     /// Open the host-selection overlay. The cursor starts on the currently
@@ -9276,6 +9277,20 @@ mod tests {
         // Nothing printable left → no segment at all.
         app.ssh_targets[0].tags = vec!["\u{1b}\u{7}".into()];
         assert_eq!(app.format_tags_segment(80), None);
+    }
+
+    #[test]
+    fn format_tags_segment_measures_cells_not_chars() {
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.ssh_info = Some("root@10.0.0.5:22".into());
+        let mut t = make_ssh_target("prod");
+        t.user = "root".into();
+        t.host = "10.0.0.5".into();
+        t.tags = vec!["中".into()];
+        app.ssh_targets = vec![t];
+        // "[中]" is 3 chars but 4 terminal cells — the budget is in cells.
+        assert_eq!(app.format_tags_segment(3), None);
+        assert_eq!(app.format_tags_segment(4).as_deref(), Some("[中]"));
     }
 
     #[test]

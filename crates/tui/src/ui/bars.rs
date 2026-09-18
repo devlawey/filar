@@ -7,6 +7,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, AppMode, HelpAction};
 use crate::ui::theme::Glyphs;
@@ -250,7 +251,13 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // left_len already includes mode-badge spans (pushed above), so we
     // must NOT add mode_len again — that would double-count and break
     // the right-alignment in non-Normal modes.
-    let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    // Widths count terminal cells, not Unicode chars: a double-width glyph
+    // (CJK) occupies two columns and must be budgeted as such, or the
+    // right-aligned tail would be displaced on narrow terminals.
+    let left_len: usize = spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
     let available = area.width as usize;
 
     // Owned copy drops the borrow on `app` immediately. The rendered toast is
@@ -260,7 +267,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|t| format!("  {} {}", glyphs.middle_dot, t));
     let toast_len = toast_span_text
         .as_ref()
-        .map(|s| s.chars().count())
+        .map(|s| UnicodeWidthStr::width(s.as_str()))
         .unwrap_or(0);
 
     // Context fill — the measured prompt size against the active profile's
@@ -272,7 +279,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // `confirm_mode` or the toast.
     let used = app.active_session().last_prompt_tokens;
     let threshold = app.compact_at_tokens_for(&active);
-    let confirm_len = confirm_text.chars().count();
+    let confirm_len = UnicodeWidthStr::width(confirm_text.as_str());
 
     // Tags of the configured SSH target (#413), inserted into the target span
     // (spans[3], built above) between host and path. Their space is reserved
@@ -288,7 +295,10 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
             app.status_target_with_tags(Some(&segment)),
             app.theme.user_style(),
         );
-        spans.iter().map(|s| s.content.chars().count()).sum()
+        spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum()
     } else {
         left_len
     };
@@ -304,7 +314,7 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     let right_len = ctx_segment
         .as_ref()
-        .map(|s| s.chars().count())
+        .map(|s| UnicodeWidthStr::width(s.as_str()))
         .unwrap_or(0)
         + confirm_len;
     // Toast has priority over padding on a narrow terminal (saturating — no
@@ -644,6 +654,45 @@ mod tests {
             "confirm_mode must stay at the right edge after the drop, got: {row_narrow}"
         );
         assert_eq!(row_narrow.chars().count(), 57, "row must fill exactly 57 columns");
+    }
+
+    #[test]
+    fn status_bar_wide_tag_budget_is_counted_in_cells() {
+        // "[中]" is 3 chars but 4 terminal cells: the exact-fit boundary is
+        // one column wider than for a 3-cell segment (the 11-cell
+        // "[work,prod]" fits at 58, so a 4-cell segment fits at 58 − 11 + 4
+        // = 51). At 50 a char-count budget (3 chars ≤ 3 cells) would have
+        // admitted the segment and pushed the right side off the edge.
+        let mut app = app_with_tagged_target(&["中"]);
+        let row_fit = render_status_row(&mut app, 51);
+        // One symbol per buffer cell: the second cell of the wide `中`
+        // appears as a blank cell, hence `[中 ]` in the collected row.
+        assert!(
+            row_fit.contains("10.0.0.5 [中 ] /srv"),
+            "tags must appear when they fit by cells, got: {row_fit}"
+        );
+        assert!(row_fit.ends_with(" Always"), "got: {row_fit}");
+        assert_eq!(
+            row_fit.chars().count(),
+            51,
+            "row must fill exactly 51 cells, got: {row_fit}"
+        );
+
+        let mut app = app_with_tagged_target(&["中"]);
+        let row_narrow = render_status_row(&mut app, 50);
+        assert!(
+            !row_narrow.contains('中'),
+            "wide tags must yield when a cell short, got: {row_narrow}"
+        );
+        assert!(
+            row_narrow.ends_with(" Always"),
+            "confirm_mode must stay at the right edge after the drop, got: {row_narrow}"
+        );
+        assert_eq!(
+            row_narrow.chars().count(),
+            50,
+            "row must fill exactly 50 cells, got: {row_narrow}"
+        );
     }
 
     #[test]

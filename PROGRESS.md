@@ -6885,6 +6885,11 @@ have driven the terminal. The guard now sits at both ends — `parse_tags`
 strips control characters before anything is persisted and
 `format_tags_segment` strips them again at the render sink, dropping tags
 that are nothing but control characters (tests in both crates).
+CodeRabbit then flagged that the width budget counted Unicode chars, not
+terminal cells: a double-width tag (`[中]` = 3 chars, 4 cells) passed a
+char-count budget and displaced the right-aligned counters on a narrow bar.
+`render_status_bar` and `format_tags_segment` now measure with
+`unicode_width::UnicodeWidthStr::width` (boundary tests at 51/50 cells).
 
 **Next:** #414 — a tag policy may only tighten `confirm_mode`, never
 loosen it.
