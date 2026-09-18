@@ -13,6 +13,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- The GUI launcher imports a host list from one TOML (the config's own
+  `[[ssh_targets]]` shape) or CSV file — addresses, ports, users and tags;
+  secrets are never imported. Name collisions are resolved explicitly: one
+  Skip / Overwrite / Rename policy, chosen in the dialog, applies to all
+  colliding rows, and a broken file leaves the existing list untouched
+  ([#416](https://github.com/devlawey/filar/issues/416)).
+
 - `Ctrl+O` host selection gained a substring search over target names,
   `user@host:port` and tags, a tag filter cycled with `Tab`, and grouping
   of the configured targets under non-selectable tag headers (untagged
