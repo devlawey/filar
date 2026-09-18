@@ -7172,6 +7172,15 @@ credential was never on a destructive path. App-data restored
 byte-identical (SHA256, 41/41); keyring entries unchanged; no processes
 left.
 
+**Review rounds.** ai-review round 1: three minor notes — the export keeps
+`ssh_target_display_name` (alias verbatim; the `SSH{n}` fallback applies
+only to unnamed rows and is exactly the keyring-compatible name the launch
+path computes — rejected), `start_host_export` now clears `file_status` at
+entry like the import does (accepted, `f589a72`), and the empty-list early
+return stays silent (unreachable — the button is disabled without hosts;
+rejected). The incremental ai-review on `f589a72` is clean. CodeRabbit
+posted only a "review in progress" note and no review within 35+ minutes.
+
 **Next:** #418 — host groups.
 
 ## Agent E2E runbook (docs)
