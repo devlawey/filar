@@ -603,12 +603,15 @@ impl Settings {
 
 /// Split the launcher's comma-separated tag field into tags (#413).
 ///
-/// Empty items and surrounding whitespace are dropped; order is preserved.
+/// Empty items, surrounding whitespace and control characters are dropped;
+/// order is preserved. Control characters are filtered here and again at the
+/// TUI render sink: the tags segment reaches the terminal verbatim, and a
+/// launcher value must not be able to inject escape sequences.
 fn parse_tags(raw: &str) -> Vec<String> {
     raw.split(',')
-        .map(str::trim)
+        .map(|t| t.chars().filter(|c| !c.is_control()).collect::<String>())
+        .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
-        .map(str::to_string)
         .collect()
 }
 
@@ -3053,6 +3056,15 @@ mod tests {
         assert_eq!(parse_tags(" prod ,web ,, "), vec!["prod", "web"]);
         assert_eq!(parse_tags(""), Vec::<String>::new());
         assert_eq!(parse_tags("  ,  "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_tags_strips_control_characters() {
+        // Escape sequences must not survive into the persisted field: the
+        // tags are rendered verbatim in the TUI status bar (#413 review).
+        assert_eq!(parse_tags("a\u{1b}b, c\u{7}d"), vec!["ab", "cd"]);
+        // A tag that is nothing but control characters (or blanks) drops.
+        assert_eq!(parse_tags("\u{1b}\u{7}, \u{1b}"), Vec::<String>::new());
     }
 
     #[test]

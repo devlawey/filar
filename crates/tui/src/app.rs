@@ -1642,8 +1642,17 @@ impl App {
     ///
     /// All-or-nothing on purpose: a truncated list could silently hide a
     /// `prod` tag — the one thing the segment exists to surface (#413).
+    ///
+    /// Control characters are stripped before rendering: config-sourced
+    /// tags never pass through the launcher's `parse_tags`, and the segment
+    /// is written to the terminal verbatim (#413 review).
     pub fn format_tags_segment(&self, max_len: usize) -> Option<String> {
-        let tags = self.active_ssh_tags();
+        let tags: Vec<String> = self
+            .active_ssh_tags()
+            .iter()
+            .map(|t| t.chars().filter(|c| !c.is_control()).collect::<String>())
+            .filter(|t| !t.is_empty())
+            .collect();
         if tags.is_empty() {
             return None;
         }
@@ -9244,6 +9253,28 @@ mod tests {
         t.user = "root".into();
         t.host = "10.0.0.5".into();
         app.ssh_targets = vec![t];
+        assert_eq!(app.format_tags_segment(80), None);
+    }
+
+    #[test]
+    fn format_tags_segment_strips_control_characters() {
+        // Config-sourced tags never pass through the launcher's parse_tags;
+        // the render sink must strip escape sequences on its own
+        // (#413 review).
+        let mut app = App::new("prod".into(), CommandConfirmMode::Always);
+        app.ssh_info = Some("root@10.0.0.5:22".into());
+        let mut t = make_ssh_target("prod");
+        t.user = "root".into();
+        t.host = "10.0.0.5".into();
+        t.tags = vec!["prod\u{1b}]0;x".into(), "\u{7}".into(), "web".into()];
+        app.ssh_targets = vec![t];
+        assert_eq!(
+            app.format_tags_segment(80).as_deref(),
+            Some("[prod]0;x,web]")
+        );
+
+        // Nothing printable left → no segment at all.
+        app.ssh_targets[0].tags = vec!["\u{1b}\u{7}".into()];
         assert_eq!(app.format_tags_segment(80), None);
     }
 

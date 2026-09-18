@@ -6877,6 +6877,15 @@ environment, so a tagged target was staged via a session restore
 `filar > local 127.0.0.1 [prod,web]` in the status bar (screenshot
 verified). App-data files were restored byte-identical after the runs.
 
+**Review follow-up (PR #447):** ai-review flagged that `parse_tags` kept
+control characters: tags from a shared or hand-edited `config.toml` never
+pass through the launcher and reach the status bar through
+`format_tags_segment`, so an escape sequence masquerading as a tag could
+have driven the terminal. The guard now sits at both ends — `parse_tags`
+strips control characters before anything is persisted and
+`format_tags_segment` strips them again at the render sink, dropping tags
+that are nothing but control characters (tests in both crates).
+
 **Next:** #414 — a tag policy may only tighten `confirm_mode`, never
 loosen it.
 
