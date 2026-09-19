@@ -7746,3 +7746,109 @@ flagged manual in the PR, per `AGENTS.md`.
 
 **Next:** #423 — service, process and socket preprocessors (`systemctl`,
 `ps`, `ss`, `journalctl`, `ip`), then #424's fleet check catalog.
+
+## Service, process, socket, journal and network preprocessors
+
+**Milestone:** 2.0.0. **Branch:** `feat/423-service-process-socket-preprocessors`.
+
+**Problem.** #423, the third and largest command family on the #420
+framework: what is running (`systemctl`, `ps`), what is listening
+(`ss`), what the journal says (`journalctl`) and how the host is addressed
+(`ip`).
+
+**Decision.** `crates/agent/src/preprocess.rs`, five preprocessors, each
+pinning one canonical invocation like the earlier families:
+
+- `SystemctlPreprocessor` — `systemctl list-units --output=json` → a JSON
+  array of units → `unit/load/active/sub/description`. `description` is free
+  text, so absent becomes an empty cell; the four state fields are required.
+- `PsPreprocessor` — `ps -eo pid,ppid,user,rss,pcpu,comm` →
+  `pid/ppid/user/rss/pcpu/comm`. `ps` has no machine format, but an explicit
+  `-o` list pins both the columns and their order, so the positional parse
+  reads a layout we chose rather than a default that varies with the build and
+  `$COLUMNS`. Fail-closed: header must start with `PID`, `pid`/`ppid`/`rss`
+  all digits, `pcpu` a decimal; `comm` is `fields[5..]` joined, so a command
+  name with spaces survives.
+- `SsPreprocessor` — `ss -H -n` → `netid/state/recv_q/send_q/local/peer`.
+  Field counts differ by family, which real output confirmed: internet
+  sockets print **six** fields (address and port already joined), unix
+  sockets **eight** (address and inode separate). Both are read, and the
+  eight-field pairs are rejoined with `:` so a column means the same thing in
+  every row. Any other count fails closed.
+- `JournalctlPreprocessor` — `journalctl --output=json` →
+  `timestamp/unit/priority/message`. journald's JSON is **JSON Lines**, one
+  object per line, not an array, so it is parsed line by line. Claimed with
+  `--output=json` / `-o json`, optionally bounded by `-n`/`--lines` and
+  `--no-pager` (these change how much is printed, not a line's shape); other
+  flags are declined, since another `--output=` mode is a different format and
+  free-text filters (`--since="2 hours ago"`) cannot be recognised by word.
+  `MESSAGE` must be a string — journald renders a non-UTF-8 message as an
+  array of byte values, and there is no faithful text cell for that.
+- `IpPreprocessor` — `ip -j addr` → `ifname/ifindex/operstate/family/address`,
+  one row per address, `local` and `prefixlen` rejoined as CIDR. An interface
+  with **no** addresses still gets a row (real output has them: a `DOWN`
+  interface reports `addr_info: []`), because dropping it would hide the
+  interface and its `operstate` — often the very difference worth seeing.
+
+Shared helpers extracted rather than repeated five times: `parse_json_array`,
+`json_string`, `is_all_digits`, `table`.
+
+**No systemd degrades to raw** (the issue's DoD), verified on real output:
+on this container `systemctl` exists but refuses with `System has not been
+booted with systemd as init system (PID 1). Can't operate.`, and on
+Alpine/OpenRC the binary is absent so the shell answers `systemctl: not
+found`. Neither is JSON, so the parse fails and the caller falls back to the
+raw text — which is exactly the message a reader needs. Covered by tests for
+all three shapes.
+
+**Live run (real, four of five).** iproute2 was installed into the agent's
+container to get genuine `ss`/`ip` output, and the captured output was fed
+back through `PreprocessorRegistry::default()`:
+
+- `ps -eo pid,ppid,user,rss,pcpu,comm` → 75 real processes into a 6-column
+  table, kernel-thread names (`kworker/R-rcu_gp`) intact.
+- `ss -H -n` on **stdout only** → 17 real sockets (13 internet + 4 unix).
+- `ip -j addr` → 4 real interfaces flattened to 4 rows, including the
+  address-less `DOWN` interface.
+- `systemctl list-units --output=json` → graceful raw fallback, as above.
+- `journalctl --output=json` → empty here (no journal in the container), so
+  the raw fallback path is what was exercised; the JSON-Lines parse itself is
+  covered by fixtures only, not by live output.
+
+**Finding worth a decision (not fixed here).** `ss` wrote `RTNETLINK answers:
+Invalid argument` to **stderr** while its stdout stayed clean. filar captures
+stderr alongside stdout by design (`AGENTS.md`: the SSH channel must capture
+`ExtendedData`), so in real use a preprocessor can receive a tool's
+diagnostic interleaved with its data — and then fails closed to raw, losing
+the table for a host whose data was actually fine. Tested both ways
+(`ss_diagnostic_line_degrades_to_raw`). Fixing it means deciding whether the
+fleet pipeline feeds preprocessors the streams separately, which belongs to
+the pipeline issue (#424+), not here. Raised in the PR rather than decided
+unilaterally.
+
+**Tests.** 19 new (52 → 71 in `preprocess.rs`): real-shape samples for all
+five commands; the no-systemd fallback in three shapes; `ps` with a
+space-bearing command name, no header, truncation, non-numeric `pid`/`pcpu`,
+header-only; `ss` across both field shapes including IPv6 bracket notation
+and the stderr diagnostic line; `journalctl` bounded invocations claimed
+(`-n 100`, `--lines=100`, `-n50`, `-o json`, `--no-pager`) versus other modes
+and free-text filters declined, plus the binary-`MESSAGE` and
+array-instead-of-JSON-Lines cases; `ip` flattening with the address-less
+interface, and missing `ifname`/`ifindex`/`local` and a non-array `addr_info`
+declined; shell substitution in the program word and compound forms declined;
+an adversarial sweep of 15 malformed outputs across all five commands plus a
+20 000-character line and 200-deep nesting — no panics.
+
+**DoD.** Additive change to `preprocess.rs`; nothing in the agent loop or
+fleet catalog calls these preprocessors yet (#424+), so no user-visible
+behaviour changed and the TUI/GUI real-host-run requirement does not apply.
+`cargo build -p filar-agent` and `cargo test -p filar-agent --lib` (224
+tests) are green; `cargo clippy -p filar-agent --lib --all-targets` is clean
+on `preprocess.rs`. Full `cargo build --workspace` still cannot run here (the
+`gui` crate needs `libdbus-1-dev`, absent and not installable); CI covers the
+workspace on Windows and macOS. Not executed live: `journalctl` against a
+real journal, and all five against a real RHEL-family and Alpine host —
+flagged manual in the PR.
+
+**Next:** #424 — the fleet check catalog, the first consumer of these
+preprocessors.
