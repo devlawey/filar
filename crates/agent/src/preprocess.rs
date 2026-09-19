@@ -665,11 +665,20 @@ const DPKG_CANONICAL_ARGS: &str = r"-W -f='${Package}\t${Version}\n'";
 /// (issue #422).
 ///
 /// Same reasoning as [`DPKG_CANONICAL_ARGS`]: one pinned `--qf` template,
-/// tab-separated, one package per line. The version field carries
-/// `%{RELEASE}` as well, because on RPM distributions the release is where
-/// the distribution's own patch level lives (`1.20.1-14.el9`) — comparing
-/// bare `%{VERSION}` across a fleet would call two different builds equal.
-const RPM_CANONICAL_ARGS: &str = r"-qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\n'";
+/// tab-separated, one package per line.
+///
+/// The version field is the package's full identity, `EPOCH:VERSION-RELEASE`,
+/// because every component of it distinguishes real builds. The release is
+/// where the distribution's own patch level lives (`1.20.1-14.el9`), and the
+/// epoch is the component RPM compares *first* — it exists precisely to
+/// order releases whose version numbering changed, so `1:2.0-3` and
+/// `2:2.0-3` are different packages that a bare `VERSION-RELEASE` would
+/// report as equal across a fleet. `%{EPOCHNUM}` rather than `%{EPOCH}`
+/// because it renders an unset epoch as `0` instead of the literal
+/// `(none)`, which keeps every row comparable. (`dpkg`'s `${Version}`
+/// already includes the epoch when a package has one, so only rpm needs
+/// this spelled out.)
+const RPM_CANONICAL_ARGS: &str = r"-qa --qf='%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n'";
 
 /// Reads `dpkg-query`'s pinned template into `package`/`version` rows.
 ///
@@ -737,12 +746,20 @@ impl OutputPreprocessor for RpmPreprocessor {
 /// whitespace between words are normalised on both sides; anything else —
 /// an extra argument, a missing one, a trailing pipeline — is not this
 /// invocation.
+///
+/// The program word is additionally held to the same no-shell-syntax rule
+/// the other preprocessors apply to the whole command: `base_name` alone
+/// would read `$(pwd)/dpkg-query` as `dpkg-query`, and a substitution in
+/// the program position is neither the literal nor the path-qualified
+/// invocation this matcher stands for — what it would actually run is
+/// decided by the shell, not visible here. Only the pinned argument
+/// template is exempt, since it necessarily contains `$` and quotes.
 fn is_canonical_invocation(command: &str, program: &str, args: &str) -> bool {
     let mut words = command.split_whitespace();
     let Some(first) = words.next() else {
         return false;
     };
-    if base_name(first) != program {
+    if first.contains(SHELL_META) || base_name(first) != program {
         return false;
     }
     words.eq(args.split_whitespace())
@@ -869,10 +886,16 @@ impl OutputPreprocessor for VersionPreprocessor {
 
 /// The version in one application's `-v` banner, or `None` when the line is
 /// not the banner this program prints.
+/// Each arm requires the banner's **full** prefix, not just the marker
+/// inside it: an error message that merely mentions a path like
+/// `/etc/nginx/1.24.0.bak` is not a version report, and reading one out of
+/// it would be exactly the wrong-value-presented-as-right this module
+/// refuses. Anything that is not the real banner returns `None` and is
+/// reported as unparsed instead.
 fn parse_version_banner<'a>(program: &str, line: &'a str) -> Option<&'a str> {
     match program {
         // `nginx version: nginx/1.24.0`, sometimes with a `(Ubuntu)` suffix.
-        "nginx" => leading_version(line.split("nginx/").nth(1)?),
+        "nginx" => leading_version(line.strip_prefix("nginx version: nginx/")?),
         // `PHP 8.2.7 (cli) (built: ...) (NTS)`.
         "php" => leading_version(line.strip_prefix("PHP ")?.trim_start()),
         _ => None,
@@ -1672,7 +1695,7 @@ tmpfs                    65536         0     65536   0% /dev
     // --- dpkg-query / rpm package inventories (issue #422) ---
 
     const DPKG_COMMAND: &str = r"dpkg-query -W -f='${Package}\t${Version}\n'";
-    const RPM_COMMAND: &str = r"rpm -qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\n'";
+    const RPM_COMMAND: &str = r"rpm -qa --qf='%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n'";
 
     /// Real Debian 12 output: an epoch in one version, a `+deb12u1` distro
     /// suffix, a `~` pre-release separator, and a package whose name carries
@@ -1686,14 +1709,16 @@ util-linux\t2.38.1-5+deb12u1
 zlib1g-dev\t1:1.2.13.dfsg-1
 ";
 
-    /// Real RHEL 9 output: `%{VERSION}-%{RELEASE}` with `.el9` releases and
-    /// a module-build release.
+    /// Real RHEL 9 output: `%{EPOCHNUM}:%{VERSION}-%{RELEASE}`, with `.el9`
+    /// releases, a module-build release, an unset epoch normalised to `0`
+    /// and the non-zero epochs `nginx` and `grub2-tools` really carry there.
     const RPM_SAMPLE: &str = "\
-bash\t5.1.8-9.el9
-glibc\t2.34-100.el9_4.2
-nginx\t1.20.1-20.el9_4.1
-openssl-libs\t3.0.7-27.el9
-util-linux\t2.37.4-18.el9
+bash\t0:5.1.8-9.el9
+glibc\t0:2.34-100.el9_4.2
+grub2-tools\t1:2.06-80.el9
+nginx\t1:1.20.1-20.el9_4.1
+openssl-libs\t0:3.0.7-27.el9
+util-linux\t0:2.37.4-18.el9
 ";
 
     #[test]
@@ -1720,9 +1745,25 @@ util-linux\t2.37.4-18.el9
             PreprocessOutcome::Structured { preprocessor, table } => {
                 assert_eq!(preprocessor, "rpm");
                 assert_eq!(table.columns(), ["package", "version"]);
-                assert_eq!(table.row_count(), 5);
-                assert_eq!(table.rows()[1], ["glibc", "2.34-100.el9_4.2"]);
-                assert_eq!(table.rows()[2], ["nginx", "1.20.1-20.el9_4.1"]);
+                assert_eq!(table.row_count(), 6);
+                assert_eq!(table.rows()[1], ["glibc", "0:2.34-100.el9_4.2"]);
+                assert_eq!(table.rows()[2], ["grub2-tools", "1:2.06-80.el9"]);
+                assert_eq!(table.rows()[3], ["nginx", "1:1.20.1-20.el9_4.1"]);
+            }
+            other => panic!("expected a structured rpm table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rpm_versions_differing_only_by_epoch_stay_distinct() {
+        // RPM compares the epoch first, so these are different packages —
+        // a template without it would report both as `2.0-3`.
+        let output = "app\t1:2.0-3\nother\t2:2.0-3\n";
+        match PreprocessorRegistry::default().preprocess(RPM_COMMAND, output) {
+            PreprocessOutcome::Structured { table, .. } => {
+                assert_eq!(table.rows()[0][1], "1:2.0-3");
+                assert_eq!(table.rows()[1][1], "2:2.0-3");
+                assert_ne!(table.rows()[0][1], table.rows()[1][1]);
             }
             other => panic!("expected a structured rpm table, got {other:?}"),
         }
@@ -1736,7 +1777,7 @@ util-linux\t2.37.4-18.el9
             registry.preprocess(dpkg_by_path, DPKG_SAMPLE).is_structured(),
             "a path-qualified dpkg-query with extra spacing must still be claimed"
         );
-        let rpm_by_path = r"/usr/bin/rpm -qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\n'";
+        let rpm_by_path = r"/usr/bin/rpm -qa --qf='%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n'";
         assert!(
             registry.preprocess(rpm_by_path, RPM_SAMPLE).is_structured(),
             "a path-qualified rpm must still be claimed"
@@ -1746,7 +1787,7 @@ util-linux\t2.37.4-18.el9
     #[test]
     fn non_canonical_package_commands_are_not_claimed() {
         let registry = PreprocessorRegistry::default();
-        let cases: [(&str, &str); 8] = [
+        let cases = [
             // No template at all: the default output is not two fields.
             ("dpkg-query -W", DPKG_SAMPLE),
             ("dpkg -l", DPKG_SAMPLE),
@@ -1758,6 +1799,15 @@ util-linux\t2.37.4-18.el9
                 DPKG_SAMPLE,
             ),
             (r"rpm -qa --qf='%{NAME}\n'", RPM_SAMPLE),
+            // The pre-epoch template is not kept as an alternative: it
+            // cannot tell `1:2.0-3` from `2:2.0-3`.
+            (r"rpm -qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\n'", RPM_SAMPLE),
+            // `%{EPOCH}` renders an unset epoch as the literal `(none)`,
+            // which is not comparable across hosts.
+            (
+                r"rpm -qa --qf='%{NAME}\t%{EPOCH}:%{VERSION}-%{RELEASE}\n'",
+                RPM_SAMPLE,
+            ),
             // An appended pipeline is an extra word, so the match fails.
             (
                 r"dpkg-query -W -f='${Package}\t${Version}\n' | head",
@@ -1765,6 +1815,37 @@ util-linux\t2.37.4-18.el9
             ),
             (
                 r"rpm -qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\n' > /tmp/pkgs",
+                RPM_SAMPLE,
+            ),
+        ];
+        for (command, output) in cases {
+            assert_eq!(
+                registry.preprocess(command, output),
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::NoPreprocessor
+                },
+                "{command} must not be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_syntax_in_the_program_word_is_not_claimed() {
+        // `base_name` alone would read these as `dpkg-query` / `rpm`, but
+        // what a substitution actually runs is the shell's decision, not
+        // something this matcher can stand behind.
+        let registry = PreprocessorRegistry::default();
+        let cases = [
+            (
+                r"$(pwd)/dpkg-query -W -f='${Package}\t${Version}\n'",
+                DPKG_SAMPLE,
+            ),
+            (
+                r"`which dpkg-query` -W -f='${Package}\t${Version}\n'",
+                DPKG_SAMPLE,
+            ),
+            (
+                r"$HOME/bin/rpm -qa --qf='%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n'",
                 RPM_SAMPLE,
             ),
         ];
@@ -1883,6 +1964,16 @@ Zend Engine v4.2.7, Copyright (c) Zend Technologies
             ("php -v", "php: error while loading shared libraries: libx.so"),
             ("php -v", "PHP built from git"),
             ("nginx -v", "Segmentation fault"),
+            // A line that merely mentions a version-shaped path is not a
+            // version report: the banner's full prefix is required, so this
+            // must not be read as `1.24.0`.
+            (
+                "nginx -v",
+                "nginx: [emerg] cannot load /etc/nginx/1.24.0.bak",
+            ),
+            ("nginx -v", "error loading nginx/1.24.0"),
+            // ... and the real banner must be at the start of the line.
+            ("nginx -v", "note: nginx version: nginx/1.24.0"),
         ];
         for (command, output) in cases {
             match registry.preprocess(command, output) {

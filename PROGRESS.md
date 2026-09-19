@@ -7671,7 +7671,7 @@ was not worth the tree, given this workspace's dependency hygiene
 the maintainer, who left the call to me. If a later family needs genuinely
 variable patterns, that is the point to reconsider.
 
-**Tests.** 13 new (37 → 50 in `preprocess.rs`): real Debian 12 `dpkg-query`
+**Tests.** 16 new (37 → 53 in `preprocess.rs`): real Debian 12 `dpkg-query`
 output (epoch `1:`, `+deb12u5`, `~deb12u2` suffixes) and real RHEL 9 `rpm`
 output (`.el9`, `2.34-100.el9_4.2`); path-qualified and extra-spaced
 invocations claimed; non-canonical commands declined (`dpkg -l`, `rpm -qa`
@@ -7684,11 +7684,59 @@ DoD's unparsed-is-reported case across five shapes; empty output → raw;
 tabs, NUL bytes, four fields, Cyrillic, `nginx/` with no digits, a
 20 000-character package name) — no panics.
 
+**Review round (PR #456).** Three of CodeRabbit's four findings were real and
+are closed in the same branch:
+
+- **rpm epoch (major).** `%{VERSION}-%{RELEASE}` omitted the epoch, which RPM
+  compares *first* — `1:2.0-3` and `2:2.0-3` are different packages that the
+  old template reported as the same `2.0-3` row. Exactly the mistake the
+  entry above argued against one level down when it justified including
+  `%{RELEASE}`. The pinned template is now
+  `%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}`; `%{EPOCHNUM}` rather than
+  `%{EPOCH}` because it renders an unset epoch as `0` instead of `(none)`, so
+  every row stays comparable. The pre-epoch template is *not* kept as an
+  alternative (test), and `dpkg`'s `${Version}` already carries the epoch.
+- **Shell syntax in the program word (minor).** `base_name` alone read
+  `$(pwd)/dpkg-query` as `dpkg-query`, so a substitution in the program
+  position was claimed — neither the literal nor the path-qualified
+  invocation the matcher documents, and what it runs is the shell's decision.
+  `is_canonical_invocation` now rejects `SHELL_META` in the program word,
+  keeping only the pinned argument template exempt.
+- **nginx banner prefix (minor).** `line.split("nginx/")` accepted any line
+  merely containing the marker, so `nginx: [emerg] cannot load
+  /etc/nginx/1.24.0.bak` was reported as version `1.24.0` — a wrong value
+  presented as right, the one thing this module refuses. Both arms now
+  require the banner's full prefix (`nginx version: nginx/`, `PHP `) at the
+  start of the line, and anything else falls into the unparsed row.
+
+The fourth (complete the live-host run) was not a code defect but a request
+for work the environment could not do — and partly it could, see below.
+
+**Live run (partial, real).** The agent's own container is Ubuntu 24.04 with
+real `dpkg-query` and `php`, so the Debian side was genuinely executed rather
+than only simulated, and the captured output was fed back through
+`PreprocessorRegistry::default()`:
+
+- `dpkg-query -W -f='${Package}\t${Version}\n'` → 686 packages, **zero**
+  lines deviating from exactly two non-empty tab-separated fields (checked
+  with `awk -F'\t' 'NF!=2 || $1=="" || $2==""'`), parsed into a 686-row
+  `package`/`version` table.
+- `php -v` → `["php", "8.4.19", "PHP 8.4.19 (cli) (built: Mar 30 2026
+  19:28:35) (NTS)"]`, version taken from the first of five real banner lines.
+- `nginx -v` on a host without nginx → `["nginx", "", "/bin/bash: line 11:
+  nginx: command not found"]` — the unparsed-is-reported path, on real shell
+  output.
+
+Still unverified: `rpm` (no RPM-based host reachable from here, so the epoch
+template is reasoned from RPM semantics and tested against fixtures, not
+executed) and `nginx -v` on a host that *has* nginx. Both are flagged manual
+in the PR.
+
 **DoD.** Additive change to `preprocess.rs`; still nothing in the agent loop
 or fleet catalog calls these preprocessors (that wiring is #424+), so no
 user-visible behaviour changed and the TUI/GUI real-host-run requirement does
 not apply. `cargo build -p filar-agent` and `cargo test -p filar-agent --lib`
-(203 tests) are green; `cargo clippy -p filar-agent --lib --all-targets` is
+(205 tests) are green; `cargo clippy -p filar-agent --lib --all-targets` is
 clean on `preprocess.rs` (the two pre-existing `security.rs` findings are a
 clippy 1.94 vs. pinned 1.85 mismatch, unrelated). Full
 `cargo build --workspace` still cannot run here — the `gui` crate needs

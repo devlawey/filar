@@ -15,12 +15,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 - Package and application-version output preprocessors: `dpkg-query` and
   `rpm` each claim one pinned template
-  (`-W -f='${Package}\t${Version}\n'`, `-qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\n'`)
-  and yield `package`/`version` rows, while `nginx -v` and `php -v` banners
-  yield `program`/`version`/`raw`. A banner whose version cannot be read is
-  reported with an empty `version` and its original line in `raw` rather than
-  dropped, so an odd host stays visible in a fleet comparison instead of
-  falling back to raw output
+  (`-W -f='${Package}\t${Version}\n'`,
+  `-qa --qf='%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n'` — the rpm version
+  carries the full `EPOCH:VERSION-RELEASE` identity, since RPM compares the
+  epoch first and `1:2.0-3` is not `2:2.0-3`) and yield `package`/`version`
+  rows, while `nginx -v` and `php -v` banners yield `program`/`version`/`raw`.
+  A banner whose version cannot be read is reported with an empty `version`
+  and its original line in `raw` rather than dropped, so an odd host stays
+  visible in a fleet comparison instead of falling back to raw output
   ([#422](https://github.com/devlawey/filar/issues/422)).
 
 - Two more output preprocessors on top of the framework: `df` also claims
