@@ -5,6 +5,8 @@
 //! - The agent loop that orchestrates LLM ↔ tool execution (Stage 5).
 //! - Tool definitions (`run_command`, `read_file`, `list_dir`, background jobs) (Stage 5).
 //! - Security layer: confirmation, destructive command detection (Stage 5).
+//! - Output preprocessors: machine-format command output → typed tables; raw
+//!   text remains the fallback (Stage 2.0, fleet).
 
 pub mod agent;
 pub mod arbiter;
@@ -14,6 +16,7 @@ pub mod events;
 pub mod long_wait;
 pub mod openai_compat;
 pub mod password_prompt;
+pub mod preprocess;
 pub mod runbook;
 pub mod security;
 pub mod tools;
@@ -24,6 +27,10 @@ pub use arbiter::{ArbiterContext, ArbiterVerdict, ARBITER_TIMEOUT_SECS};
 pub use compaction::{summarise_history, SummaryOutcome, COMPACTION_SYSTEM_PROMPT};
 pub use events::{AgentEvent, EventSink};
 pub use openai_compat::OpenAiCompatClient;
+pub use preprocess::{
+    DfPreprocessor, OutputPreprocessor, PreprocessError, PreprocessOutcome,
+    PreprocessedOutput, PreprocessorRegistry, RawFallback,
+};
 pub use runbook::{generate_runbook, RunbookOutcome, RUNBOOK_SYSTEM_PROMPT};
 pub use security::{CliConfirmer, CommandConfirmer, ConfirmDecision};
 pub use tools::{tool_definitions, ToolKind};

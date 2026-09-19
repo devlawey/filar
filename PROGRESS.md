@@ -7336,6 +7336,63 @@ The transport `#[ignore]` sshd tests remain manual for the same reason.
 **Next:** #420 — output preprocessor framework (trait + registry +
 fallback), the next 2.0.0 fleet block.
 
+## Issue #420: feat(agent) — output preprocessor framework: typed tables instead of raw text
+
+**Milestone:** 2.0.0. **Branch:** `feat/420-preprocessor-framework`.
+
+**Problem.** Twelve fleet hosts × output truncated at 10 000 chars ≈ tens of
+thousands of tokens per step — the context dies on the model's second
+question. The fleet design (decisions 34/36) moves comparison into code and
+hands the model one condensed difference table; in single-host mode the
+model likewise pays for parsing output that already has a machine format.
+
+**Decision.** `filar_agent::preprocess` (`crates/agent/src/preprocess.rs`) —
+the framework, deliberately free of command-specific families (#421+):
+
+- `OutputPreprocessor` trait (`name`, `matches`, `preprocess`) with the
+  contract in its docs: a **pure function of its arguments** — no network,
+  no FS, no env, no logging — and never a panic on arbitrary (truncated,
+  empty, garbage) input.
+- `PreprocessedOutput` — a validated table (columns + rows, one field per
+  column); ragged tables are rejected at construction, never indexed
+  blindly.
+- `PreprocessorRegistry` — `new()` / `with_builtins()` / `register()`,
+  `Default` = `with_builtins`. Claimants are consulted in registration
+  order: the first that claims the command and parses the output wins; a
+  failing claimant falls through to the next, and only when every claimant
+  fails is `Raw { Unparseable(last error) }` returned. No claimant →
+  `Raw { NoPreprocessor }`. `preprocess()` itself never fails.
+- `PreprocessError` + `RawFallback` (`NoPreprocessor` / `Unparseable`) —
+  the degradation reason travels with the outcome.
+- One built-in reference preprocessor, `DfPreprocessor`: GNU `df` parsed
+  into `filesystem/size/used/avail/use_percent/mount`. Claimed only as a
+  single simple command (pipelines/compound/redirected forms are not a pure
+  `df` table) and only in the six-column shape — `-i`/`--inodes`,
+  `-T`/`--print-type` and `--output` change the columns and are not
+  claimed. The parse is fail-closed: header starts with `Filesystem`, each
+  data row ≥ 6 fields, use-percent ends in `%` (GNU prints `-` for
+  sizeless filesystems), mount starts with `/` and is
+  `fields[5..].join(" ")`, so mount points with spaces survive; truncation
+  mid-line → error → raw.
+
+**Tests.** 18 in `preprocess.rs`: empty registry → raw; unknown command →
+raw; df happy path (columns, `column_index`, values); mount with spaces;
+`-` use-percent; truncated mid-line → raw; header-only → raw; empty and
+garbage output → raw; `-i`/`-hi`/`-T`/`--print-type`/`--output=…` not
+claimed; `|`, `;`, `&&`, `>` forms not claimed; `/bin/df` claimed; custom
+registration consulted; failing claimant falls through; all-claimants-fail
+→ last error; ragged table rejected; table without columns rejected;
+adversarial suite (empty, whitespace, NUL bytes, 10 000-char row) — no
+panic. Crate docs and clippy clean on the new module.
+
+**DoD.** The issue's checklist is tests-only; the module is additive API
+and nothing calls it yet, so no user-visible behaviour changed — the
+TUI/GUI run requirement does not apply (build + tests green; note in PR).
+Wiring lands with the fleet pipeline and its own scenarios.
+
+**Next:** #421 — disk and block-device preprocessors (`df`, `lsblk`) on
+top of this framework.
+
 ## Agent E2E runbook (docs)
 
 `docs/AGENT_E2E_RUNBOOK.md`: how an agent whose harness can control a desktop
