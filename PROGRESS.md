@@ -7617,3 +7617,84 @@ and `#[ignore]`d docker-sshd tests are flagged manual in the PR, per
 
 **Next:** #422–424 — package/version and service/process/socket
 preprocessors, then the fleet check catalog that invokes these commands.
+
+## Package and application-version preprocessors: `dpkg-query`, `rpm`, `nginx -v`, `php -v`
+
+**Milestone:** 2.0.0. **Branch:** `feat/422-package-version-preprocessors`.
+
+**Problem.** #422, the second command family on the #420 framework: what is
+installed (deb and rpm inventories) and which version an application reports.
+Package managers have a real template language; application banners do not,
+but have been stable for years.
+
+**Decision.** `crates/agent/src/preprocess.rs`:
+
+- `DpkgPreprocessor` and `RpmPreprocessor` pin **one** template each and
+  claim only that exact invocation:
+  `dpkg-query -W -f='${Package}\t${Version}\n'` and
+  `rpm -qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\n'`. Both produce
+  `package`/`version` rows through one shared `parse_package_table`.
+  The rpm version carries `%{RELEASE}` because on RPM distributions that is
+  where the distro patch level lives (`1.20.1-14.el9`) — bare `%{VERSION}`
+  would call two different builds equal across a fleet.
+- Exact matching replaces the `SHELL_META` scan the `df`/`lsblk`
+  preprocessors run, and this is deliberate: a `dpkg-query` template
+  necessarily contains `$` and quotes, so the metacharacter scan would
+  reject every valid invocation. Requiring equality with one known-safe
+  literal is stricter, not looser — an appended `| head` is just an extra
+  word and is declined. The single quotes are part of the contract: an
+  unquoted or double-quoted `${Package}` is expanded by the shell before
+  `dpkg-query` sees it, and the template arrives empty.
+- `VersionPreprocessor` claims `nginx -v` and `php -v` (single simple
+  command, no other arguments — `nginx -V` prints the whole configure line)
+  and emits `program`/`version`/`raw`.
+
+**Unparsed versions are reported, not dropped** (the issue's DoD). Unlike the
+rest of the module, an unrecognised banner does *not* degrade to raw: the row
+carries an empty `version` and the original line in `raw`. This does not
+weaken the fail-closed rule — what that rule protects against is a wrong
+value presented as right, and an explicitly empty version is its opposite.
+It matters for the fleet: with eleven hosts parsed and one not, the
+difference table should show eleven versions plus one unparsed host, not lose
+that host's row or fall back to twelve raw dumps. A host missing the program
+lands here too, its `raw` holding the shell's own `command not found` — which
+is exactly the difference worth seeing. Only genuinely empty output has
+nothing to report and degrades to raw.
+
+**No new dependency.** The issue describes the banners as parsed "регуляркой".
+`regex` is not in the workspace (absent from `Cargo.toml` and `Cargo.lock`),
+and both patterns are "find the marker, take the leading digits-and-dots
+token" — `parse_version_banner` plus `leading_version`, about fifteen lines.
+Adding `regex` (with `regex-syntax` and `aho-corasick` behind it) for that
+was not worth the tree, given this workspace's dependency hygiene
+(`reqwest`/`keyring` are both pinned with `default-features = false`). Asked
+the maintainer, who left the call to me. If a later family needs genuinely
+variable patterns, that is the point to reconsider.
+
+**Tests.** 13 new (37 → 50 in `preprocess.rs`): real Debian 12 `dpkg-query`
+output (epoch `1:`, `+deb12u5`, `~deb12u2` suffixes) and real RHEL 9 `rpm`
+output (`.el9`, `2.34-100.el9_4.2`); path-qualified and extra-spaced
+invocations claimed; non-canonical commands declined (`dpkg -l`, `rpm -qa`
+bare, other templates, appended pipeline/redirect); truncated package output
+→ raw (line cut before or after its tab, a third field, empty, garbage);
+nginx banner with and without a `(Ubuntu)` suffix; php banner read from the
+first of four lines, packaging suffix reduced to the upstream version; the
+DoD's unparsed-is-reported case across five shapes; empty output → raw;
+`nginx -V`/`php --version`/pipelines not claimed; adversarial suite (bare
+tabs, NUL bytes, four fields, Cyrillic, `nginx/` with no digits, a
+20 000-character package name) — no panics.
+
+**DoD.** Additive change to `preprocess.rs`; still nothing in the agent loop
+or fleet catalog calls these preprocessors (that wiring is #424+), so no
+user-visible behaviour changed and the TUI/GUI real-host-run requirement does
+not apply. `cargo build -p filar-agent` and `cargo test -p filar-agent --lib`
+(203 tests) are green; `cargo clippy -p filar-agent --lib --all-targets` is
+clean on `preprocess.rs` (the two pre-existing `security.rs` findings are a
+clippy 1.94 vs. pinned 1.85 mismatch, unrelated). Full
+`cargo build --workspace` still cannot run here — the `gui` crate needs
+`libdbus-1-dev`, absent and not installable in this environment; CI covers it
+on Windows and macOS. Real-host run against live Debian/RHEL machines is
+flagged manual in the PR, per `AGENTS.md`.
+
+**Next:** #423 — service, process and socket preprocessors (`systemctl`,
+`ps`, `ss`, `journalctl`, `ip`), then #424's fleet check catalog.
