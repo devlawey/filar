@@ -40,9 +40,10 @@
 //! the set explicitly.
 //!
 //! **Scope.** This module is the framework — the trait, the registry, the
-//! fallback and the disk / block-device family (`df`, `lsblk`, issue #421)
-//! built on top of it. Further command families and the agent-loop / fleet
-//! integration come in later issues.
+//! fallback — plus the command families built on top of it: disk and block
+//! devices (`df`, `lsblk`, issue #421) and packages and application versions
+//! (`dpkg-query`, `rpm`, `nginx -v`, `php -v`, issue #422). Further families
+//! and the agent-loop / fleet integration come in later issues.
 
 use std::fmt;
 
@@ -215,6 +216,9 @@ impl PreprocessorRegistry {
         let mut registry = Self::new();
         registry.register(Box::new(DfPreprocessor));
         registry.register(Box::new(LsblkPreprocessor));
+        registry.register(Box::new(DpkgPreprocessor));
+        registry.register(Box::new(RpmPreprocessor));
+        registry.register(Box::new(VersionPreprocessor));
         registry
     }
 
@@ -640,6 +644,278 @@ fn lsblk_scalar(value: Option<&serde_json::Value>) -> Option<String> {
     }
 }
 
+/// Columns produced by [`DpkgPreprocessor`] and [`RpmPreprocessor`] — the
+/// installed-package inventory both package managers answer with.
+const PACKAGE_COLUMNS: [&str; 2] = ["package", "version"];
+
+/// The argument list [`DpkgPreprocessor`] claims, after the program word
+/// (issue #422).
+///
+/// `dpkg-query`'s `-f` template language *is* the machine format here, so
+/// this preprocessor pins one template instead of trying to read an
+/// arbitrary one: `${Package}` and `${Version}`, tab-separated, one package
+/// per line. The single quotes are part of the contract rather than
+/// decoration — unquoted (or double-quoted) `${Package}` is expanded by the
+/// shell before `dpkg-query` ever sees it and the template arrives empty.
+/// `\t` and `\n` are `dpkg-query`'s own escapes, so in the command text they
+/// travel as the two-character sequences they look like.
+const DPKG_CANONICAL_ARGS: &str = r"-W -f='${Package}\t${Version}\n'";
+
+/// The argument list [`RpmPreprocessor`] claims, after the program word
+/// (issue #422).
+///
+/// Same reasoning as [`DPKG_CANONICAL_ARGS`]: one pinned `--qf` template,
+/// tab-separated, one package per line.
+///
+/// The version field is the package's full identity, `EPOCH:VERSION-RELEASE`,
+/// because every component of it distinguishes real builds. The release is
+/// where the distribution's own patch level lives (`1.20.1-14.el9`), and the
+/// epoch is the component RPM compares *first* — it exists precisely to
+/// order releases whose version numbering changed, so `1:2.0-3` and
+/// `2:2.0-3` are different packages that a bare `VERSION-RELEASE` would
+/// report as equal across a fleet. `%{EPOCHNUM}` rather than `%{EPOCH}`
+/// because it renders an unset epoch as `0` instead of the literal
+/// `(none)`, which keeps every row comparable. (`dpkg`'s `${Version}`
+/// already includes the epoch when a package has one, so only rpm needs
+/// this spelled out.)
+const RPM_CANONICAL_ARGS: &str = r"-qa --qf='%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n'";
+
+/// Reads `dpkg-query`'s pinned template into `package`/`version` rows.
+///
+/// Claims exactly one invocation — `dpkg-query` (optionally as a path) with
+/// [`DPKG_CANONICAL_ARGS`] and nothing else. Exact matching replaces the
+/// shell-metacharacter scan the other preprocessors run: the template itself
+/// necessarily contains `$` and quotes, so scanning for those would reject
+/// every valid invocation, while demanding equality with one known-safe
+/// literal leaves a pipeline or a redirect nowhere to hide (an appended
+/// `| head` is simply an extra word, and declined).
+///
+/// The parse is fail-closed like the rest of the module: every non-empty
+/// line must be exactly two tab-separated fields, both non-empty. A line cut
+/// mid-way by the fleet's output truncation therefore degrades to raw text
+/// rather than entering the table as a package with no version.
+pub struct DpkgPreprocessor;
+
+impl OutputPreprocessor for DpkgPreprocessor {
+    fn name(&self) -> &'static str {
+        "dpkg-query"
+    }
+
+    fn matches(&self, command: &str) -> bool {
+        is_canonical_invocation(command, "dpkg-query", DPKG_CANONICAL_ARGS)
+    }
+
+    fn preprocess(
+        &self,
+        _command: &str,
+        output: &str,
+    ) -> Result<PreprocessedOutput, PreprocessError> {
+        parse_package_table(output)
+    }
+}
+
+/// Reads `rpm -qa`'s pinned template into `package`/`version` rows.
+///
+/// The `dpkg-query` counterpart: claims exactly `rpm` (optionally as a path)
+/// with [`RPM_CANONICAL_ARGS`], and shares the same fail-closed
+/// two-field-per-line parse. See [`DpkgPreprocessor`] for why the match is
+/// an exact one.
+pub struct RpmPreprocessor;
+
+impl OutputPreprocessor for RpmPreprocessor {
+    fn name(&self) -> &'static str {
+        "rpm"
+    }
+
+    fn matches(&self, command: &str) -> bool {
+        is_canonical_invocation(command, "rpm", RPM_CANONICAL_ARGS)
+    }
+
+    fn preprocess(
+        &self,
+        _command: &str,
+        output: &str,
+    ) -> Result<PreprocessedOutput, PreprocessError> {
+        parse_package_table(output)
+    }
+}
+
+/// Does `command` invoke `program` with exactly `args`?
+///
+/// The program may be written as a path (`/usr/bin/rpm`), and runs of
+/// whitespace between words are normalised on both sides; anything else —
+/// an extra argument, a missing one, a trailing pipeline — is not this
+/// invocation.
+///
+/// The program word is additionally held to the same no-shell-syntax rule
+/// the other preprocessors apply to the whole command: `base_name` alone
+/// would read `$(pwd)/dpkg-query` as `dpkg-query`, and a substitution in
+/// the program position is neither the literal nor the path-qualified
+/// invocation this matcher stands for — what it would actually run is
+/// decided by the shell, not visible here. Only the pinned argument
+/// template is exempt, since it necessarily contains `$` and quotes.
+fn is_canonical_invocation(command: &str, program: &str, args: &str) -> bool {
+    let mut words = command.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    if first.contains(SHELL_META) || base_name(first) != program {
+        return false;
+    }
+    words.eq(args.split_whitespace())
+}
+
+/// Parse tab-separated `name<TAB>version` lines into a package table.
+///
+/// Shared by [`DpkgPreprocessor`] and [`RpmPreprocessor`], whose pinned
+/// templates produce the same two-field shape.
+fn parse_package_table(output: &str) -> Result<PreprocessedOutput, PreprocessError> {
+    let mut rows = Vec::new();
+    for (index, line) in output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+    {
+        let mut fields = line.split('\t');
+        let package = fields.next().unwrap_or("").trim();
+        let version = fields.next().unwrap_or("").trim();
+        if fields.next().is_some() {
+            return Err(PreprocessError::new(format!(
+                "line {} has more than the two tab-separated fields the template prints: {}",
+                index + 1,
+                preview(line)
+            )));
+        }
+        if package.is_empty() || version.is_empty() {
+            return Err(PreprocessError::new(format!(
+                "line {} is not a `name<TAB>version` pair (truncated output?): {}",
+                index + 1,
+                preview(line)
+            )));
+        }
+        rows.push(vec![package.to_string(), version.to_string()]);
+    }
+    if rows.is_empty() {
+        return Err(PreprocessError::new(
+            "no package lines in the output (truncated or empty?)",
+        ));
+    }
+    let columns = PACKAGE_COLUMNS
+        .iter()
+        .map(|column| column.to_string())
+        .collect();
+    PreprocessedOutput::new(columns, rows)
+}
+
+/// Columns produced by [`VersionPreprocessor`].
+///
+/// `raw` always carries the line the version was read from, so a version
+/// this preprocessor could not parse is visible rather than lost: such a row
+/// has an empty `version` and the original text in `raw`.
+const VERSION_COLUMNS: [&str; 3] = ["program", "version", "raw"];
+
+/// Programs whose `-v` output [`VersionPreprocessor`] knows how to read.
+const VERSION_PROGRAMS: [&str; 2] = ["nginx", "php"];
+
+/// Reads an application's `-v` banner into a `program`/`version`/`raw` row.
+///
+/// Application version banners have no machine format, but these have been
+/// stable for years, so reading them by pattern is the honest solution here
+/// rather than a workaround (issue #422). Claims `nginx -v` and `php -v`
+/// only — as a single simple command, with no other arguments, since any
+/// further flag changes what is printed (`nginx -V` adds the whole configure
+/// line).
+///
+/// **Unparsed versions are reported, not dropped.** Unlike the rest of the
+/// module, an unrecognised banner does *not* degrade to raw text: the row is
+/// emitted with an empty `version` and the original line in `raw`. That is
+/// not a guess — the distinction fail-closed protects against is a wrong
+/// value presented as right, and an explicitly empty version is the
+/// opposite. It matters for the fleet: when eleven hosts parse and one does
+/// not, the difference table should show eleven versions and one unparsed
+/// host, not lose that host's row or fall back to twelve raw dumps. A host
+/// without the program at all lands here too, its `raw` carrying the shell's
+/// own `command not found` — which is exactly the difference worth seeing.
+/// Only genuinely empty output has nothing to report and degrades to raw.
+pub struct VersionPreprocessor;
+
+impl OutputPreprocessor for VersionPreprocessor {
+    fn name(&self) -> &'static str {
+        "app-version"
+    }
+
+    fn matches(&self, command: &str) -> bool {
+        if command.contains(SHELL_META) {
+            return false;
+        }
+        let mut words = command.split_whitespace();
+        let Some(program) = words.next() else {
+            return false;
+        };
+        if !VERSION_PROGRAMS.contains(&base_name(program)) {
+            return false;
+        }
+        words.eq(["-v"])
+    }
+
+    fn preprocess(
+        &self,
+        command: &str,
+        output: &str,
+    ) -> Result<PreprocessedOutput, PreprocessError> {
+        let program = command
+            .split_whitespace()
+            .next()
+            .map(base_name)
+            .unwrap_or_default();
+        let Some(line) = output.lines().find(|line| !line.trim().is_empty()) else {
+            return Err(PreprocessError::new("output is empty"));
+        };
+        let line = line.trim();
+        let version = parse_version_banner(program, line).unwrap_or_default();
+        let columns = VERSION_COLUMNS
+            .iter()
+            .map(|column| column.to_string())
+            .collect();
+        PreprocessedOutput::new(
+            columns,
+            vec![vec![program.to_string(), version.to_string(), line.to_string()]],
+        )
+    }
+}
+
+/// The version in one application's `-v` banner, or `None` when the line is
+/// not the banner this program prints.
+/// Each arm requires the banner's **full** prefix, not just the marker
+/// inside it: an error message that merely mentions a path like
+/// `/etc/nginx/1.24.0.bak` is not a version report, and reading one out of
+/// it would be exactly the wrong-value-presented-as-right this module
+/// refuses. Anything that is not the real banner returns `None` and is
+/// reported as unparsed instead.
+fn parse_version_banner<'a>(program: &str, line: &'a str) -> Option<&'a str> {
+    match program {
+        // `nginx version: nginx/1.24.0`, sometimes with a `(Ubuntu)` suffix.
+        "nginx" => leading_version(line.strip_prefix("nginx version: nginx/")?),
+        // `PHP 8.2.7 (cli) (built: ...) (NTS)`.
+        "php" => leading_version(line.strip_prefix("PHP ")?.trim_start()),
+        _ => None,
+    }
+}
+
+/// The leading version number of `text` — the run of digits and dots it
+/// starts with, so `1.24.0` from `1.24.0 (Ubuntu)` and `8.2.7` from
+/// `8.2.7-1ubuntu2`. `None` unless `text` starts with a digit.
+fn leading_version(text: &str) -> Option<&str> {
+    let end = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let candidate = text[..end].trim_end_matches('.');
+    if !candidate.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(candidate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,7 +987,7 @@ tmpfs            3986548       0   3986548   0% /dev/shm
     #[test]
     fn df_output_becomes_a_typed_table() {
         let registry = PreprocessorRegistry::default();
-        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.len(), 5);
         let outcome = registry.preprocess("/bin/df -h", DF_SAMPLE);
         match outcome {
             PreprocessOutcome::Structured { preprocessor, table } => {
@@ -1414,5 +1690,379 @@ tmpfs                    65536         0     65536   0% /dev
         nested.push('}');
         nested.push_str("]}");
         let _ = registry.preprocess("lsblk --json", &nested);
+    }
+
+    // --- dpkg-query / rpm package inventories (issue #422) ---
+
+    const DPKG_COMMAND: &str = r"dpkg-query -W -f='${Package}\t${Version}\n'";
+    const RPM_COMMAND: &str = r"rpm -qa --qf='%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n'";
+
+    /// Real Debian 12 output: an epoch in one version, a `+deb12u1` distro
+    /// suffix, a `~` pre-release separator, and a package whose name carries
+    /// a `-dev` suffix.
+    const DPKG_SAMPLE: &str = "\
+base-files\t12.4+deb12u5
+libc6\t2.36-9+deb12u7
+libssl3\t3.0.11-1~deb12u2
+nginx\t1.22.1-9
+util-linux\t2.38.1-5+deb12u1
+zlib1g-dev\t1:1.2.13.dfsg-1
+";
+
+    /// Real RHEL 9 output: `%{EPOCHNUM}:%{VERSION}-%{RELEASE}`, with `.el9`
+    /// releases, a module-build release, an unset epoch normalised to `0`
+    /// and the non-zero epochs `nginx` and `grub2-tools` really carry there.
+    const RPM_SAMPLE: &str = "\
+bash\t0:5.1.8-9.el9
+glibc\t0:2.34-100.el9_4.2
+grub2-tools\t1:2.06-80.el9
+nginx\t1:1.20.1-20.el9_4.1
+openssl-libs\t0:3.0.7-27.el9
+util-linux\t0:2.37.4-18.el9
+";
+
+    #[test]
+    fn dpkg_output_becomes_a_package_table() {
+        let registry = PreprocessorRegistry::default();
+        match registry.preprocess(DPKG_COMMAND, DPKG_SAMPLE) {
+            PreprocessOutcome::Structured { preprocessor, table } => {
+                assert_eq!(preprocessor, "dpkg-query");
+                assert_eq!(table.columns(), ["package", "version"]);
+                assert_eq!(table.row_count(), 6);
+                assert_eq!(table.rows()[0], ["base-files", "12.4+deb12u5"]);
+                assert_eq!(table.rows()[2], ["libssl3", "3.0.11-1~deb12u2"]);
+                // An epoch is part of the version string, kept verbatim.
+                assert_eq!(table.rows()[5], ["zlib1g-dev", "1:1.2.13.dfsg-1"]);
+            }
+            other => panic!("expected a structured dpkg table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rpm_output_becomes_a_package_table() {
+        let registry = PreprocessorRegistry::default();
+        match registry.preprocess(RPM_COMMAND, RPM_SAMPLE) {
+            PreprocessOutcome::Structured { preprocessor, table } => {
+                assert_eq!(preprocessor, "rpm");
+                assert_eq!(table.columns(), ["package", "version"]);
+                assert_eq!(table.row_count(), 6);
+                assert_eq!(table.rows()[1], ["glibc", "0:2.34-100.el9_4.2"]);
+                assert_eq!(table.rows()[2], ["grub2-tools", "1:2.06-80.el9"]);
+                assert_eq!(table.rows()[3], ["nginx", "1:1.20.1-20.el9_4.1"]);
+            }
+            other => panic!("expected a structured rpm table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rpm_versions_differing_only_by_epoch_stay_distinct() {
+        // RPM compares the epoch first, so these are different packages —
+        // a template without it would report both as `2.0-3`.
+        let output = "app\t1:2.0-3\nother\t2:2.0-3\n";
+        match PreprocessorRegistry::default().preprocess(RPM_COMMAND, output) {
+            PreprocessOutcome::Structured { table, .. } => {
+                assert_eq!(table.rows()[0][1], "1:2.0-3");
+                assert_eq!(table.rows()[1][1], "2:2.0-3");
+                assert_ne!(table.rows()[0][1], table.rows()[1][1]);
+            }
+            other => panic!("expected a structured rpm table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn package_commands_are_claimed_as_a_path_and_with_extra_spacing() {
+        let registry = PreprocessorRegistry::default();
+        let dpkg_by_path = r"/usr/bin/dpkg-query -W  -f='${Package}\t${Version}\n'";
+        assert!(
+            registry.preprocess(dpkg_by_path, DPKG_SAMPLE).is_structured(),
+            "a path-qualified dpkg-query with extra spacing must still be claimed"
+        );
+        let rpm_by_path = r"/usr/bin/rpm -qa --qf='%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n'";
+        assert!(
+            registry.preprocess(rpm_by_path, RPM_SAMPLE).is_structured(),
+            "a path-qualified rpm must still be claimed"
+        );
+    }
+
+    #[test]
+    fn non_canonical_package_commands_are_not_claimed() {
+        let registry = PreprocessorRegistry::default();
+        let cases = [
+            // No template at all: the default output is not two fields.
+            ("dpkg-query -W", DPKG_SAMPLE),
+            ("dpkg -l", DPKG_SAMPLE),
+            ("rpm -qa", RPM_SAMPLE),
+            // A different template, whose columns we do not know.
+            (r"dpkg-query -W -f='${Package}\n'", DPKG_SAMPLE),
+            (
+                r"dpkg-query -W -f='${Package}\t${Version}\t${Status}\n'",
+                DPKG_SAMPLE,
+            ),
+            (r"rpm -qa --qf='%{NAME}\n'", RPM_SAMPLE),
+            // The pre-epoch template is not kept as an alternative: it
+            // cannot tell `1:2.0-3` from `2:2.0-3`.
+            (r"rpm -qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\n'", RPM_SAMPLE),
+            // `%{EPOCH}` renders an unset epoch as the literal `(none)`,
+            // which is not comparable across hosts.
+            (
+                r"rpm -qa --qf='%{NAME}\t%{EPOCH}:%{VERSION}-%{RELEASE}\n'",
+                RPM_SAMPLE,
+            ),
+            // An appended pipeline is an extra word, so the match fails.
+            (
+                r"dpkg-query -W -f='${Package}\t${Version}\n' | head",
+                DPKG_SAMPLE,
+            ),
+            (
+                r"rpm -qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\n' > /tmp/pkgs",
+                RPM_SAMPLE,
+            ),
+        ];
+        for (command, output) in cases {
+            assert_eq!(
+                registry.preprocess(command, output),
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::NoPreprocessor
+                },
+                "{command} must not be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_syntax_in_the_program_word_is_not_claimed() {
+        // `base_name` alone would read these as `dpkg-query` / `rpm`, but
+        // what a substitution actually runs is the shell's decision, not
+        // something this matcher can stand behind.
+        let registry = PreprocessorRegistry::default();
+        let cases = [
+            (
+                r"$(pwd)/dpkg-query -W -f='${Package}\t${Version}\n'",
+                DPKG_SAMPLE,
+            ),
+            (
+                r"`which dpkg-query` -W -f='${Package}\t${Version}\n'",
+                DPKG_SAMPLE,
+            ),
+            (
+                r"$HOME/bin/rpm -qa --qf='%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n'",
+                RPM_SAMPLE,
+            ),
+        ];
+        for (command, output) in cases {
+            assert_eq!(
+                registry.preprocess(command, output),
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::NoPreprocessor
+                },
+                "{command} must not be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_package_output_degrades_to_raw() {
+        let registry = PreprocessorRegistry::default();
+        let cases = [
+            // The fleet truncation cut the last line before its tab.
+            "base-files\t12.4+deb12u5\nlibc6\n",
+            // ... or right after it, leaving an empty version.
+            "base-files\t12.4+deb12u5\nlibc6\t\n",
+            // A third field means this is not the pinned template's output.
+            "base-files\t12.4+deb12u5\tinstalled\n",
+            // Nothing usable at all.
+            "",
+            "\n\n  \n",
+            "dpkg-query: no packages found matching nosuchpkg\n",
+        ];
+        for output in cases {
+            let outcome = registry.preprocess(DPKG_COMMAND, output);
+            assert!(
+                matches!(
+                    outcome,
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a raw fallback for {output:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    // --- application version banners (issue #422) ---
+
+    #[test]
+    fn nginx_version_banner_is_parsed() {
+        let registry = PreprocessorRegistry::default();
+        match registry.preprocess("nginx -v", "nginx version: nginx/1.24.0\n") {
+            PreprocessOutcome::Structured { preprocessor, table } => {
+                assert_eq!(preprocessor, "app-version");
+                assert_eq!(table.columns(), ["program", "version", "raw"]);
+                assert_eq!(
+                    table.rows()[0],
+                    ["nginx", "1.24.0", "nginx version: nginx/1.24.0"]
+                );
+            }
+            other => panic!("expected a structured version row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nginx_version_with_distro_suffix_is_parsed() {
+        let outcome = PreprocessorRegistry::default()
+            .preprocess("/usr/sbin/nginx -v", "nginx version: nginx/1.18.0 (Ubuntu)\n");
+        match outcome {
+            PreprocessOutcome::Structured { table, .. } => {
+                assert_eq!(table.rows()[0][0], "nginx");
+                assert_eq!(table.rows()[0][1], "1.18.0");
+            }
+            other => panic!("expected a structured version row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn php_version_banner_is_parsed_from_the_first_line() {
+        // `php -v` prints four lines; the version is on the first.
+        let output = "\
+PHP 8.2.7 (cli) (built: Jun  9 2023 06:52:52) (NTS)
+Copyright (c) The PHP Group
+Zend Engine v4.2.7, Copyright (c) Zend Technologies
+    with Zend OPcache v8.2.7, Copyright (c) Zend Technologies
+";
+        match PreprocessorRegistry::default().preprocess("php -v", output) {
+            PreprocessOutcome::Structured { table, .. } => {
+                assert_eq!(table.row_count(), 1);
+                assert_eq!(table.rows()[0][0], "php");
+                assert_eq!(table.rows()[0][1], "8.2.7");
+                assert!(table.rows()[0][2].starts_with("PHP 8.2.7 (cli)"));
+            }
+            other => panic!("expected a structured version row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn php_version_with_packaging_suffix_keeps_the_upstream_version() {
+        let outcome = PreprocessorRegistry::default()
+            .preprocess("php -v", "PHP 8.2.7-1ubuntu2 (cli) (built: ...)\n");
+        match outcome {
+            PreprocessOutcome::Structured { table, .. } => {
+                assert_eq!(table.rows()[0][1], "8.2.7");
+            }
+            other => panic!("expected a structured version row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unparsed_version_is_reported_not_dropped() {
+        // The DoD of #422: an unknown version format must not be lost
+        // silently — it lands in the result marked as unparsed (empty
+        // `version`) with the original line preserved in `raw`.
+        let registry = PreprocessorRegistry::default();
+        let cases = [
+            ("nginx -v", "nginx: command not found"),
+            ("nginx -v", "nginx version: rolling"),
+            ("php -v", "php: error while loading shared libraries: libx.so"),
+            ("php -v", "PHP built from git"),
+            ("nginx -v", "Segmentation fault"),
+            // A line that merely mentions a version-shaped path is not a
+            // version report: the banner's full prefix is required, so this
+            // must not be read as `1.24.0`.
+            (
+                "nginx -v",
+                "nginx: [emerg] cannot load /etc/nginx/1.24.0.bak",
+            ),
+            ("nginx -v", "error loading nginx/1.24.0"),
+            // ... and the real banner must be at the start of the line.
+            ("nginx -v", "note: nginx version: nginx/1.24.0"),
+        ];
+        for (command, output) in cases {
+            match registry.preprocess(command, output) {
+                PreprocessOutcome::Structured { preprocessor, table } => {
+                    assert_eq!(preprocessor, "app-version", "{output:?}");
+                    assert_eq!(table.row_count(), 1, "{output:?}");
+                    assert_eq!(
+                        table.rows()[0][1],
+                        "",
+                        "an unparsed version must be empty, not guessed: {output:?}"
+                    );
+                    assert_eq!(
+                        table.rows()[0][2], output,
+                        "the raw line must be preserved: {output:?}"
+                    );
+                }
+                other => panic!("an unparsed banner must still be reported, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn empty_version_output_degrades_to_raw() {
+        // Nothing was printed at all, so there is no row to report.
+        let registry = PreprocessorRegistry::default();
+        for output in ["", "\n\n", "   \n  "] {
+            let outcome = registry.preprocess("nginx -v", output);
+            assert!(
+                matches!(
+                    outcome,
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a raw fallback for {output:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_version_commands_are_not_claimed() {
+        let registry = PreprocessorRegistry::default();
+        for command in [
+            // `-V` prints the whole configure line, a different shape.
+            "nginx -V",
+            "nginx",
+            "nginx -t",
+            "php --version",
+            "php -v -a",
+            "nginx -v | tail -1",
+            "nginx -v; php -v",
+            "nginx -v > /tmp/v",
+            "httpd -v",
+        ] {
+            assert_eq!(
+                registry.preprocess(command, "nginx version: nginx/1.24.0\n"),
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::NoPreprocessor
+                },
+                "{command} must not be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn package_and_version_adversarial_outputs_do_not_panic() {
+        let registry = PreprocessorRegistry::default();
+        let tough = [
+            "",
+            "\n\n\n",
+            "\t",
+            "\t\t\t",
+            "\u{0}\t\u{0}",
+            "a\tb\tc\td",
+            "пакет\tверсия",
+            "nginx version: nginx/",
+            "nginx version: nginx/...",
+            "PHP ",
+            "PHP .",
+        ];
+        for output in tough {
+            // Any outcome is acceptable here — the point is no panic.
+            let _ = registry.preprocess(DPKG_COMMAND, output);
+            let _ = registry.preprocess(RPM_COMMAND, output);
+            let _ = registry.preprocess("nginx -v", output);
+            let _ = registry.preprocess("php -v", output);
+        }
+        let huge = format!("{}\t1.0\n", "p".repeat(20_000));
+        let _ = registry.preprocess(DPKG_COMMAND, &huge);
+        let _ = registry.preprocess("php -v", &huge);
     }
 }
