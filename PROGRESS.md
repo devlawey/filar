@@ -7583,11 +7583,28 @@ not claimed, compound/redirected forms not claimed, old-lsblk-without-json
 degrading to raw across nine malformed/non-JSON shapes, and an adversarial
 suite (null fields, wrong types, 200-level-deep nesting) — no panics.
 
+**Review round (PR #455).** CodeRabbit's find was real and is closed in the
+same branch: `collect_lsblk_rows` read `device.get("children").and_then(|v|
+v.as_array())` and `lsblk_mountpoint` used `filter_map` over `mountpoints` —
+both silently treated a present-but-wrong-shape field (a string/number/object
+instead of an array, a non-string/non-null array entry) as if the field were
+absent, rather than failing closed. A truncated or corrupted-but-still-valid-
+JSON blob could therefore produce a structured table quietly missing real
+partitions or mount points instead of degrading to raw — exactly the
+silent-misparse risk this module's own doc comment warns against. Fixed:
+`lsblk_mountpoint` now returns `Result` and rejects a `mountpoints` field
+that isn't an array, an entry that is neither string nor null, and a
+singular `mountpoint` that is neither string nor null; `collect_lsblk_rows`
+rejects a present `children` that isn't an array (including bare `null`)
+instead of treating it as "no children". 6 new tests cover each malformed
+shape (18 → 37 tests total in `preprocess.rs`). ai-review found no
+correctness risks.
+
 **DoD.** Framework-only change to `preprocess.rs`; nothing in the agent
 loop or fleet catalog calls these preprocessors yet (that wiring is a later
 issue), so no user-visible behaviour changed — the TUI/GUI real-host-run
 requirement does not apply. `cargo build -p filar-agent` and
-`cargo test -p filar-agent --lib` (188 tests) are green; `cargo clippy -p
+`cargo test -p filar-agent --lib` (190 tests) are green; `cargo clippy -p
 filar-agent --lib` is clean on `preprocess.rs` (two pre-existing findings
 in `security.rs` are unrelated to this change — a clippy 1.94 vs. the
 workspace's pinned 1.85 toolchain mismatch surfaces lints not present under

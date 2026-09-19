@@ -572,14 +572,20 @@ fn collect_lsblk_rows(
         .get("type")
         .and_then(|value| value.as_str())
         .ok_or_else(|| PreprocessError::new(format!("block device `{name}` is missing `type`")))?;
-    let mountpoint = lsblk_mountpoint(device);
+    let mountpoint = lsblk_mountpoint(device)
+        .map_err(|error| PreprocessError::new(format!("block device `{name}`: {error}")))?;
     rows.push(vec![
         name.to_string(),
         size,
         device_type.to_string(),
         mountpoint,
     ]);
-    if let Some(children) = device.get("children").and_then(|value| value.as_array()) {
+    if let Some(children_value) = device.get("children") {
+        let Some(children) = children_value.as_array() else {
+            return Err(PreprocessError::new(format!(
+                "block device `{name}` has a `children` field that is not an array"
+            )));
+        };
         for child in children {
             collect_lsblk_rows(child, rows)?;
         }
@@ -590,17 +596,37 @@ fn collect_lsblk_rows(
 /// One or more mount points for a device, joined with `, `; empty when the
 /// device is not mounted or the field is absent. Reads the newer
 /// `mountpoints` array first (falling back to the older singular
-/// `mountpoint` string), tolerating `null` entries either way.
-fn lsblk_mountpoint(device: &serde_json::Value) -> String {
-    if let Some(list) = device.get("mountpoints").and_then(|value| value.as_array()) {
-        let points: Vec<&str> = list.iter().filter_map(|value| value.as_str()).collect();
-        return points.join(", ");
+/// `mountpoint` string). A present field of the wrong shape — `mountpoints`
+/// not an array, an entry that is neither a string nor `null`, or a
+/// `mountpoint` that is neither a string nor `null` — is a parse error
+/// rather than silently treated as absent: a table that quietly drops a
+/// real mount point is worse than falling back to raw text.
+fn lsblk_mountpoint(device: &serde_json::Value) -> Result<String, PreprocessError> {
+    if let Some(value) = device.get("mountpoints") {
+        let Some(list) = value.as_array() else {
+            return Err(PreprocessError::new("`mountpoints` is not an array"));
+        };
+        let mut points = Vec::with_capacity(list.len());
+        for entry in list {
+            match entry {
+                serde_json::Value::Null => {}
+                serde_json::Value::String(text) => points.push(text.clone()),
+                other => {
+                    return Err(PreprocessError::new(format!(
+                        "a `mountpoints` entry is neither a string nor null: {other}"
+                    )));
+                }
+            }
+        }
+        return Ok(points.join(", "));
     }
-    device
-        .get("mountpoint")
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .to_string()
+    match device.get("mountpoint") {
+        None | Some(serde_json::Value::Null) => Ok(String::new()),
+        Some(serde_json::Value::String(text)) => Ok(text.clone()),
+        Some(other) => Err(PreprocessError::new(format!(
+            "`mountpoint` is neither a string nor null: {other}"
+        ))),
+    }
 }
 
 /// A JSON string or number rendered as a plain string (`size` is a string by
@@ -1300,6 +1326,60 @@ tmpfs                    65536         0     65536   0% /dev
                     }
                 ),
                 "expected a graceful raw fallback for {output:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lsblk_malformed_children_is_rejected_not_silently_dropped() {
+        // `children` present but not an array must fail closed rather than
+        // silently behave as "no children" and omit real partitions.
+        let registry = PreprocessorRegistry::default();
+        for output in [
+            r#"{"blockdevices": [{"name": "sda", "size": "1G", "type": "disk", "children": "sda1"}]}"#,
+            r#"{"blockdevices": [{"name": "sda", "size": "1G", "type": "disk", "children": 1}]}"#,
+            r#"{"blockdevices": [{"name": "sda", "size": "1G", "type": "disk", "children": null}]}"#,
+            r#"{"blockdevices": [{"name": "sda", "size": "1G", "type": "disk", "children": {}}]}"#,
+        ] {
+            assert!(
+                matches!(
+                    registry.preprocess("lsblk --json", output),
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a malformed `children` to be rejected for {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lsblk_malformed_mountpoints_is_rejected_not_silently_dropped() {
+        // A `mountpoints` array entry that is neither a string nor null, or
+        // a `mountpoints`/`mountpoint` field of the wrong shape entirely,
+        // must fail closed rather than be silently filtered out of the
+        // joined mount-point string.
+        let registry = PreprocessorRegistry::default();
+        for output in [
+            // Entry is a number, not a string or null.
+            r#"{"blockdevices": [{"name": "sda1", "size": "1G", "type": "part", "mountpoints": [1]}]}"#,
+            // Entry is an object.
+            r#"{"blockdevices": [{"name": "sda1", "size": "1G", "type": "part", "mountpoints": [{}]}]}"#,
+            // `mountpoints` itself is not an array.
+            r#"{"blockdevices": [{"name": "sda1", "size": "1G", "type": "part", "mountpoints": "/"}]}"#,
+            r#"{"blockdevices": [{"name": "sda1", "size": "1G", "type": "part", "mountpoints": null}]}"#,
+            // Singular `mountpoint` is not a string or null.
+            r#"{"blockdevices": [{"name": "sda1", "size": "1G", "type": "part", "mountpoint": 1}]}"#,
+            r#"{"blockdevices": [{"name": "sda1", "size": "1G", "type": "part", "mountpoint": {}}]}"#,
+        ] {
+            assert!(
+                matches!(
+                    registry.preprocess("lsblk --json", output),
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a malformed mountpoint field to be rejected for {output:?}"
             );
         }
     }
