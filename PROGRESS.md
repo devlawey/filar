@@ -7671,7 +7671,7 @@ was not worth the tree, given this workspace's dependency hygiene
 the maintainer, who left the call to me. If a later family needs genuinely
 variable patterns, that is the point to reconsider.
 
-**Tests.** 16 new (37 → 53 in `preprocess.rs`): real Debian 12 `dpkg-query`
+**Tests.** 15 new (37 → 52 in `preprocess.rs`): real Debian 12 `dpkg-query`
 output (epoch `1:`, `+deb12u5`, `~deb12u2` suffixes) and real RHEL 9 `rpm`
 output (`.el9`, `2.34-100.el9_4.2`); path-qualified and extra-spaced
 invocations claimed; non-canonical commands declined (`dpkg -l`, `rpm -qa`
