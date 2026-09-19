@@ -7369,21 +7369,37 @@ the framework, deliberately free of command-specific families (#421+):
   single simple command (pipelines/compound/redirected forms are not a pure
   `df` table) and only in the six-column shape — `-i`/`--inodes`,
   `-T`/`--print-type` and `--output` change the columns and are not
-  claimed. The parse is fail-closed: header starts with `Filesystem`, each
+  claimed, exact names or (per GNU getopt) unambiguous abbreviations alike
+  (`--ino`, `--out=…`; the short guard scans clusters like `-hi`/`-hT`).
+  The parse is fail-closed: header starts with `Filesystem`, each
   data row ≥ 6 fields, use-percent ends in `%` (GNU prints `-` for
   sizeless filesystems), mount starts with `/` and is
   `fields[5..].join(" ")`, so mount points with spaces survive; truncation
   mid-line → error → raw.
 
 **Tests.** 18 in `preprocess.rs`: empty registry → raw; unknown command →
-raw; df happy path (columns, `column_index`, values); mount with spaces;
-`-` use-percent; truncated mid-line → raw; header-only → raw; empty and
-garbage output → raw; `-i`/`-hi`/`-T`/`--print-type`/`--output=…` not
-claimed; `|`, `;`, `&&`, `>` forms not claimed; `/bin/df` claimed; custom
-registration consulted; failing claimant falls through; all-claimants-fail
-→ last error; ragged table rejected; table without columns rejected;
-adversarial suite (empty, whitespace, NUL bytes, 10 000-char row) — no
-panic. Crate docs and clippy clean on the new module.
+raw; df happy path (columns, `column_index`, values, `/bin/df` prefix);
+mount with spaces; `-` use-percent; truncated mid-line → raw; header-only →
+raw; empty and garbage output → raw; `-i`/`-hi`/`-T`/`--print-type`/
+`--output=…` not claimed — abbreviated `--ino`/`--print-t`/`--o`/`--out=…`
+too, while harmless long options (`--no-sync`, `--block-size=…`,
+`--portability`, `--type=…`) stay claimed; `|`, `;`, `&&`, `>` forms not
+claimed; custom registration consulted; failing claimant falls through;
+all-claimants-fail → last error; ragged table rejected; table without
+columns rejected; adversarial suite (empty, whitespace, NUL bytes,
+10 000-char row) — no panic. Crate docs and clippy clean on the new
+module.
+
+**Review round (PR #454).** CodeRabbit's find was real and is closed in
+the same branch: GNU `df` accepts unambiguous long-option abbreviations,
+so `--ino` / `--out=FIELD_LIST` slipped past the exact-name check — and
+`df --ino /` prints a six-field table with a `Filesystem` header whose
+percentage and mount fields line up like the block table, so inode counts
+would have been labelled `size`/`used`. The check now refuses any
+non-empty prefix of `inodes`/`print-type`/`output` (a prefix those options
+answer to is theirs — getopt requires uniqueness; the only shared spelling
+`--p` is ambiguous for `df` itself). Harmless long options are unaffected
+(test). ai-review found no correctness risks.
 
 **DoD.** The issue's checklist is tests-only; the module is additive API
 and nothing calls it yet, so no user-visible behaviour changed — the

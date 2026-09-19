@@ -305,9 +305,10 @@ const SHELL_META: &[char] = &[
 /// segment or a redirect has output that is not a pure `df` table. Options
 /// that change the column set are not claimed either: inode mode
 /// (`-i`/`--inodes`, and `i` in a short cluster), type mode
-/// (`-T`/`--print-type`) and custom field lists (`--output`). Everything else
-/// — filters (`-x`, `-t`, `-l`, `-a`), display sizes (`-h`, `-H`, `-k`,
-/// `-B`), `-P` — keeps the six-column shape and is accepted.
+/// (`-T`/`--print-type`) and custom field lists (`--output`) — long options
+/// under any unambiguous abbreviation as well (`--ino`, `--out=…`).
+/// Everything else — filters (`-x`, `-t`, `-l`, `-a`), display sizes (`-h`,
+/// `-H`, `-k`, `-B`), `-P` — keeps the six-column shape and is accepted.
 ///
 /// The parse is strict by design: the header must start with `Filesystem`,
 /// every data line must have at least six whitespace-separated fields with
@@ -404,10 +405,23 @@ fn base_name(program: &str) -> &str {
 
 /// Does this option word change `df`'s column set (inodes, types, custom
 /// field lists)?
+///
+/// Long options are matched by prefix: GNU getopt accepts any unambiguous
+/// abbreviation, so `--ino` means `--inodes` and `--out=…` means
+/// `--output`. An exact-name check would let an inode or custom-field table
+/// through under the six-column labels — the percentage and mount fields
+/// line up the same. Every non-empty prefix of the three format-changing
+/// names is refused: a prefix they answer to is theirs (getopt requires
+/// uniqueness to accept it), and the only name they share with a harmless
+/// option (`--p`: portability vs print-type) makes `df` itself refuse the
+/// input, so refusing costs nothing valid.
 fn option_changes_format(token: &str) -> bool {
     if let Some(long) = token.strip_prefix("--") {
         let name = long.split('=').next().unwrap_or(long);
-        return matches!(name, "inodes" | "print-type" | "output");
+        return !name.is_empty()
+            && ["inodes", "print-type", "output"]
+                .iter()
+                .any(|option| option.starts_with(name));
     }
     if token.starts_with('-') && token.len() > 1 {
         // Short options cluster: `-i`, `-hT`, ... The letters are distinct.
@@ -624,7 +638,17 @@ tmpfs            3986548       0   3986548
     #[test]
     fn df_format_changing_options_are_not_claimed() {
         let registry = PreprocessorRegistry::default();
-        for command in ["df -T", "df -hT", "df --print-type", "df --output=source,size"] {
+        for command in [
+            "df -T",
+            "df -hT",
+            "df --print-type",
+            "df --output=source,size",
+            // GNU getopt accepts unambiguous long-option abbreviations.
+            "df --ino /",
+            "df --print-t /",
+            "df --o",
+            "df --out=source,itotal,iused,iavail,ipcent,target",
+        ] {
             assert_eq!(
                 registry.preprocess(command, DF_SAMPLE),
                 PreprocessOutcome::Raw {
@@ -632,6 +656,26 @@ tmpfs            3986548       0   3986548
                 },
                 "{command} must not be claimed"
             );
+        }
+    }
+
+    #[test]
+    fn df_harmless_long_options_are_claimed() {
+        let registry = PreprocessorRegistry::default();
+        for command in [
+            "df --no-sync",
+            "df --block-size=1M",
+            "df --all",
+            "df --portability",
+            "df --type=ext4",
+            "df --si",
+        ] {
+            match registry.preprocess(command, DF_SAMPLE) {
+                PreprocessOutcome::Structured { preprocessor, .. } => {
+                    assert_eq!(preprocessor, "df", "{command}");
+                }
+                other => panic!("expected {command} to be claimed, got {other:?}"),
+            }
         }
     }
 
