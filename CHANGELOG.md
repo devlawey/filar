@@ -13,6 +13,18 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Two more output preprocessors on top of the framework: `df` also claims
+  `--output=source,size,used,avail,pcent,target` (the same six columns its
+  positional parse already reads, requested explicitly for a guaranteed
+  column set), and a new `lsblk --json`/`-J` preprocessor flattens block
+  devices and their `children` partitions into `name/size/type/mountpoint`
+  rows, reading either the older singular `mountpoint` field or the newer
+  `mountpoints` array. Busybox `df`/`lsblk` (Alpine), which reject
+  `--output`/`--json` outright, are still claimed syntactically but degrade
+  to raw text instead of panicking, since their output no longer matches
+  the expected shape
+  ([#421](https://github.com/devlawey/filar/issues/421)).
+
 - The agent crate gains an output-preprocessor framework: an
   `OutputPreprocessor` is a pure function from a command's output to a typed
   table (columns + rows), a `PreprocessorRegistry` consults its claimants in

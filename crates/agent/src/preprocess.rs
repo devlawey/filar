@@ -40,9 +40,9 @@
 //! the set explicitly.
 //!
 //! **Scope.** This module is the framework — the trait, the registry, the
-//! fallback and one built-in reference preprocessor (`df`) proving the path
-//! end to end. Command families (disk, packages, services) and the
-//! agent-loop / fleet integration come in later issues.
+//! fallback and the disk / block-device family (`df`, `lsblk`, issue #421)
+//! built on top of it. Further command families and the agent-loop / fleet
+//! integration come in later issues.
 
 use std::fmt;
 
@@ -214,6 +214,7 @@ impl PreprocessorRegistry {
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(DfPreprocessor));
+        registry.register(Box::new(LsblkPreprocessor));
         registry
     }
 
@@ -299,6 +300,16 @@ const SHELL_META: &[char] = &[
     ';', '|', '&', '<', '>', '`', '$', '(', ')', '"', '\'', '\n', '\r',
 ];
 
+/// The one `--output` field list [`DfPreprocessor`] also accepts (issue
+/// #421): the same six fields, in the same order, that its positional parse
+/// already produces. Requesting exactly this list gets a caller a
+/// guaranteed column set — immune to whatever extra columns a given `df`
+/// build defaults to — while still parsing with the existing positional
+/// logic, since the header and field shape it produces are byte-for-byte
+/// the plain, un-flagged `df` output. Any other field list still changes
+/// the columns and is declined, as before.
+const DF_CANONICAL_OUTPUT: &str = "source,size,used,avail,pcent,target";
+
 /// Reference preprocessor for GNU coreutils `df`.
 ///
 /// Claims `df` only as a single simple command — a pipeline, a compound
@@ -306,7 +317,10 @@ const SHELL_META: &[char] = &[
 /// that change the column set are not claimed either: inode mode
 /// (`-i`/`--inodes`, and `i` in a short cluster), type mode
 /// (`-T`/`--print-type`) and custom field lists (`--output`) — long options
-/// under any unambiguous abbreviation as well (`--ino`, `--out=…`).
+/// under any unambiguous abbreviation as well (`--ino`, `--out=…`) — with
+/// one exception: `--output=`[`DF_CANONICAL_OUTPUT`] requests the same
+/// six columns this preprocessor already knows how to read, so it is
+/// claimed rather than declined (see [`DF_CANONICAL_OUTPUT`]).
 /// Everything else — filters (`-x`, `-t`, `-l`, `-a`), display sizes (`-h`,
 /// `-H`, `-k`, `-B`), `-P` — keeps the six-column shape and is accepted.
 ///
@@ -316,7 +330,8 @@ const SHELL_META: &[char] = &[
 /// have no size) and the mount field starting with `/`. The mount point is
 /// the last field group ([`fields[5..]`] joined), so mount points with spaces
 /// survive. Any mismatch — truncation cuts mid-line, another locale or
-/// `df` flavour — returns an error and the caller degrades to raw text.
+/// `df` flavour (e.g. busybox on Alpine rejecting `--output` outright) —
+/// returns an error and the caller degrades to raw text.
 pub struct DfPreprocessor;
 
 impl OutputPreprocessor for DfPreprocessor {
@@ -410,16 +425,24 @@ fn base_name(program: &str) -> &str {
 /// abbreviation, so `--ino` means `--inodes` and `--out=…` means
 /// `--output`. An exact-name check would let an inode or custom-field table
 /// through under the six-column labels — the percentage and mount fields
-/// line up the same. Every non-empty prefix of the three format-changing
-/// names is refused: a prefix they answer to is theirs (getopt requires
+/// line up the same. Every non-empty prefix of `inodes`/`print-type` is
+/// refused outright: a prefix they answer to is theirs (getopt requires
 /// uniqueness to accept it), and the only name they share with a harmless
 /// option (`--p`: portability vs print-type) makes `df` itself refuse the
-/// input, so refusing costs nothing valid.
+/// input, so refusing costs nothing valid. A prefix of `output` is refused
+/// too, *unless* its value is exactly [`DF_CANONICAL_OUTPUT`] — that one
+/// field list keeps the six-column shape this preprocessor parses, so it is
+/// let through instead of declined.
 fn option_changes_format(token: &str) -> bool {
     if let Some(long) = token.strip_prefix("--") {
-        let name = long.split('=').next().unwrap_or(long);
+        let mut parts = long.splitn(2, '=');
+        let name = parts.next().unwrap_or("");
+        let value = parts.next();
+        if !name.is_empty() && "output".starts_with(name) {
+            return value != Some(DF_CANONICAL_OUTPUT);
+        }
         return !name.is_empty()
-            && ["inodes", "print-type", "output"]
+            && ["inodes", "print-type"]
                 .iter()
                 .any(|option| option.starts_with(name));
     }
@@ -439,6 +462,156 @@ fn preview(line: &str) -> String {
     }
     let head: String = trimmed.chars().take(MAX).collect();
     format!("`{head}…`")
+}
+
+/// Columns produced by [`LsblkPreprocessor`].
+const LSBLK_COLUMNS: [&str; 4] = ["name", "size", "type", "mountpoint"];
+
+/// Reference preprocessor for `lsblk --json` (util-linux), issue #421.
+///
+/// Unlike `df`'s plain-text table, `--json` output is self-describing: each
+/// object carries its own field names, so there is no column-order or
+/// locale ambiguity to guard against. The two things that do vary across
+/// util-linux releases are handled explicitly: older versions report a
+/// single `mountpoint` string (or `null`), newer ones a `mountpoints` array
+/// (`null` entries included, for a device with no mount) to support
+/// multiple mount points on one device (e.g. bind mounts, btrfs
+/// subvolumes); this preprocessor reads either key and joins multiple
+/// mount points with `, `. Partitions nested under a whole-disk entry
+/// (`children`) are flattened into their own rows, recursively, so a
+/// `sda` + `sda1` + `sda2` layout becomes three table rows.
+///
+/// Claims `lsblk` only as a single simple command carrying `--json` or
+/// `-J`; a pipeline, compound segment or redirect is not a pure JSON
+/// document, and a custom `-o`/`--output` field list is not claimed either,
+/// since it is not known which fields such a list would include. Busybox
+/// `lsblk` (Alpine) does not understand `--json` at all: it is still
+/// claimed syntactically, but its output is not valid JSON, so parsing
+/// fails and the caller degrades to raw text rather than panicking.
+pub struct LsblkPreprocessor;
+
+impl OutputPreprocessor for LsblkPreprocessor {
+    fn name(&self) -> &'static str {
+        "lsblk"
+    }
+
+    fn matches(&self, command: &str) -> bool {
+        if command.contains(SHELL_META) {
+            return false;
+        }
+        let mut tokens = command.split_whitespace();
+        let Some(program) = tokens.next() else {
+            return false;
+        };
+        if base_name(program) != "lsblk" {
+            return false;
+        }
+        let tokens: Vec<&str> = tokens.collect();
+        let has_json = tokens
+            .iter()
+            .any(|token| *token == "--json" || *token == "-J");
+        has_json && !tokens.iter().any(|token| lsblk_option_changes_format(token))
+    }
+
+    fn preprocess(
+        &self,
+        _command: &str,
+        output: &str,
+    ) -> Result<PreprocessedOutput, PreprocessError> {
+        let trimmed = output.trim();
+        if trimmed.is_empty() {
+            return Err(PreprocessError::new("output is empty"));
+        }
+        let root: serde_json::Value = serde_json::from_str(trimmed)
+            .map_err(|error| PreprocessError::new(format!("not valid JSON: {error}")))?;
+        let devices = root
+            .get("blockdevices")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| PreprocessError::new("missing a `blockdevices` array"))?;
+        let mut rows = Vec::new();
+        for device in devices {
+            collect_lsblk_rows(device, &mut rows)?;
+        }
+        if rows.is_empty() {
+            return Err(PreprocessError::new("lsblk reported no block devices"));
+        }
+        let columns = LSBLK_COLUMNS.iter().map(|column| column.to_string()).collect();
+        PreprocessedOutput::new(columns, rows)
+    }
+}
+
+/// Does this option word change `lsblk`'s field set (`-o`/`--output`, any
+/// unambiguous abbreviation of the latter, attached or clustered)?
+fn lsblk_option_changes_format(token: &str) -> bool {
+    if let Some(long) = token.strip_prefix("--") {
+        let name = long.split('=').next().unwrap_or(long);
+        return !name.is_empty() && "output".starts_with(name);
+    }
+    if let Some(short) = token.strip_prefix('-') {
+        // `-o` takes a value, attached or not (`-oNAME`, `-o NAME`); `o`
+        // never means anything else in a short cluster.
+        return short.contains('o');
+    }
+    false
+}
+
+/// Read one `lsblk --json` block-device object into a row, recursing into
+/// `children` (partitions under a whole disk) depth-first.
+fn collect_lsblk_rows(
+    device: &serde_json::Value,
+    rows: &mut Vec<Vec<String>>,
+) -> Result<(), PreprocessError> {
+    let name = device
+        .get("name")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| PreprocessError::new("a block device is missing `name`"))?;
+    let size = lsblk_scalar(device.get("size")).ok_or_else(|| {
+        PreprocessError::new(format!("block device `{name}` is missing `size`"))
+    })?;
+    let device_type = device
+        .get("type")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| PreprocessError::new(format!("block device `{name}` is missing `type`")))?;
+    let mountpoint = lsblk_mountpoint(device);
+    rows.push(vec![
+        name.to_string(),
+        size,
+        device_type.to_string(),
+        mountpoint,
+    ]);
+    if let Some(children) = device.get("children").and_then(|value| value.as_array()) {
+        for child in children {
+            collect_lsblk_rows(child, rows)?;
+        }
+    }
+    Ok(())
+}
+
+/// One or more mount points for a device, joined with `, `; empty when the
+/// device is not mounted or the field is absent. Reads the newer
+/// `mountpoints` array first (falling back to the older singular
+/// `mountpoint` string), tolerating `null` entries either way.
+fn lsblk_mountpoint(device: &serde_json::Value) -> String {
+    if let Some(list) = device.get("mountpoints").and_then(|value| value.as_array()) {
+        let points: Vec<&str> = list.iter().filter_map(|value| value.as_str()).collect();
+        return points.join(", ");
+    }
+    device
+        .get("mountpoint")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A JSON string or number rendered as a plain string (`size` is a string by
+/// default, a number under `--bytes`); anything else (missing, `null`,
+/// object, array) is not a scalar `lsblk` would have printed.
+fn lsblk_scalar(value: Option<&serde_json::Value>) -> Option<String> {
+    match value {
+        Some(serde_json::Value::String(text)) => Some(text.clone()),
+        Some(serde_json::Value::Number(number)) => Some(number.to_string()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -512,7 +685,7 @@ tmpfs            3986548       0   3986548   0% /dev/shm
     #[test]
     fn df_output_becomes_a_typed_table() {
         let registry = PreprocessorRegistry::default();
-        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.len(), 2);
         let outcome = registry.preprocess("/bin/df -h", DF_SAMPLE);
         match outcome {
             PreprocessOutcome::Structured { preprocessor, table } => {
@@ -812,5 +985,354 @@ tmpfs            3986548       0   3986548
             "x ".repeat(5_000)
         );
         let _ = registry.preprocess("df", &long_row);
+    }
+
+    // --- df --output=<canonical> (issue #421) ---
+
+    #[test]
+    fn df_canonical_output_flag_is_claimed_and_parsed() {
+        let registry = PreprocessorRegistry::default();
+        let outcome = registry.preprocess(
+            "df --output=source,size,used,avail,pcent,target",
+            DF_SAMPLE,
+        );
+        match outcome {
+            PreprocessOutcome::Structured { preprocessor, table } => {
+                assert_eq!(preprocessor, "df");
+                assert_eq!(table.row_count(), 2);
+                assert_eq!(table.rows()[0][0], "/dev/sda1");
+            }
+            other => panic!("expected the canonical --output form to be claimed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn df_canonical_output_combines_with_harmless_flags() {
+        let registry = PreprocessorRegistry::default();
+        let outcome = registry.preprocess(
+            "df -h --output=source,size,used,avail,pcent,target",
+            DF_SAMPLE,
+        );
+        assert!(
+            outcome.is_structured(),
+            "canonical --output plus -h must still be claimed, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn df_non_canonical_output_field_lists_stay_declined() {
+        let registry = PreprocessorRegistry::default();
+        for command in [
+            // Same fields, different order: not the exact layout this
+            // preprocessor's positional parse assumes.
+            "df --output=target,source,size,used,avail,pcent",
+            // A subset of the canonical fields.
+            "df --output=source,size",
+            // The canonical fields plus one more.
+            "df --output=source,fstype,size,used,avail,pcent,target",
+        ] {
+            assert_eq!(
+                registry.preprocess(command, DF_SAMPLE),
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::NoPreprocessor
+                },
+                "{command} must not be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn busybox_df_rejecting_output_flag_degrades_to_raw_not_panic() {
+        // Alpine's busybox df does not understand --output: it errors out
+        // instead of printing a table. The command still looks like our
+        // canonical invocation, so it is claimed, but the output isn't a df
+        // table, so parsing must fail closed rather than panic.
+        let registry = PreprocessorRegistry::default();
+        let busybox_error = "df: unrecognized option '--output'\n\
+             BusyBox v1.36.1 (2024-03-05 09:00:00 UTC) multi-call binary.\n";
+        let outcome = registry.preprocess(
+            "df --output=source,size,used,avail,pcent,target",
+            busybox_error,
+        );
+        assert!(
+            matches!(
+                outcome,
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::Unparseable(_)
+                }
+            ),
+            "expected a graceful raw fallback, got {outcome:?}"
+        );
+    }
+
+    // --- Real-world df samples across distros (issue #421 DoD) ---
+
+    #[test]
+    fn debian_df_output_parses() {
+        let output = "\
+Filesystem     1K-blocks    Used Available Use% Mounted on
+udev             4030716       0   4030716   0% /dev
+tmpfs             811772    1512    810260   1% /run
+/dev/sda1       20509268 6421104  12994700  34% /
+tmpfs            4058848       0   4058848   0% /dev/shm
+overlay          20509268 6421104  12994700  34% /var/lib/docker/overlay2/abc123/merged
+";
+        let outcome = PreprocessorRegistry::default().preprocess("df", output);
+        match outcome {
+            PreprocessOutcome::Structured { table, .. } => {
+                assert_eq!(table.row_count(), 5);
+                assert_eq!(table.rows()[2][0], "/dev/sda1");
+                assert_eq!(table.rows()[4][5], "/var/lib/docker/overlay2/abc123/merged");
+            }
+            other => panic!("expected a structured Debian table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rhel_family_df_output_parses() {
+        let output = "\
+Filesystem                  1K-blocks    Used Available Use% Mounted on
+devtmpfs                       4030716       0   4030716   0% /dev
+/dev/mapper/rhel-root          52403200 8912340  43490860  17% /
+/dev/sda1                       1038336  345678    692658  34% /boot
+tmpfs                            811772       0    811772   0% /dev/shm
+";
+        let outcome = PreprocessorRegistry::default().preprocess("df", output);
+        match outcome {
+            PreprocessOutcome::Structured { table, .. } => {
+                assert_eq!(table.row_count(), 4);
+                assert_eq!(table.rows()[1][0], "/dev/mapper/rhel-root");
+                assert_eq!(table.rows()[2][5], "/boot");
+            }
+            other => panic!("expected a structured RHEL-family table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alpine_busybox_plain_df_output_parses() {
+        // Busybox df's default (no-flags) output matches the same six-column
+        // GNU shape; only its flag support (no --output) differs.
+        let output = "\
+Filesystem           1K-blocks      Used Available Use% Mounted on
+overlay               10188088   1234560   8425000  13% /
+tmpfs                    65536         0     65536   0% /dev
+/dev/sda1              1998672    89012   1786000   5% /etc/resolv.conf
+";
+        let outcome = PreprocessorRegistry::default().preprocess("df", output);
+        match outcome {
+            PreprocessOutcome::Structured { table, .. } => {
+                assert_eq!(table.row_count(), 3);
+                assert_eq!(table.rows()[0][0], "overlay");
+            }
+            other => panic!("expected a structured Alpine/busybox table, got {other:?}"),
+        }
+    }
+
+    // --- lsblk --json (issue #421) ---
+
+    const LSBLK_SAMPLE_SINGULAR: &str = r#"{
+   "blockdevices": [
+      {"name": "sda", "size": "20G", "type": "disk", "mountpoint": null,
+       "children": [
+          {"name": "sda1", "size": "1G", "type": "part", "mountpoint": "/boot"},
+          {"name": "sda2", "size": "19G", "type": "part", "mountpoint": "/"}
+       ]
+      },
+      {"name": "sr0", "size": "1024M", "type": "rom", "mountpoint": null}
+   ]
+}"#;
+
+    const LSBLK_SAMPLE_PLURAL: &str = r#"{
+   "blockdevices": [
+      {"name": "vda", "size": "40G", "type": "disk", "mountpoints": [null],
+       "children": [
+          {"name": "vda1", "size": "40G", "type": "part", "mountpoints": ["/"]}
+       ]
+      }
+   ]
+}"#;
+
+    #[test]
+    fn lsblk_json_flattens_children_into_rows() {
+        let registry = PreprocessorRegistry::default();
+        let outcome = registry.preprocess("lsblk --json", LSBLK_SAMPLE_SINGULAR);
+        match outcome {
+            PreprocessOutcome::Structured { preprocessor, table } => {
+                assert_eq!(preprocessor, "lsblk");
+                assert_eq!(table.columns(), ["name", "size", "type", "mountpoint"]);
+                assert_eq!(table.row_count(), 4);
+                assert_eq!(table.rows()[0], ["sda", "20G", "disk", ""]);
+                assert_eq!(table.rows()[1], ["sda1", "1G", "part", "/boot"]);
+                assert_eq!(table.rows()[2], ["sda2", "19G", "part", "/"]);
+                assert_eq!(table.rows()[3], ["sr0", "1024M", "rom", ""]);
+            }
+            other => panic!("expected a structured lsblk table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lsblk_json_short_flag_is_claimed() {
+        let outcome = PreprocessorRegistry::default().preprocess("lsblk -J", LSBLK_SAMPLE_SINGULAR);
+        assert!(outcome.is_structured(), "{outcome:?}");
+    }
+
+    #[test]
+    fn lsblk_plural_mountpoints_array_is_read() {
+        // Newer util-linux reports `mountpoints` (an array, `null` entries
+        // for an unmounted device) instead of the older singular field.
+        let outcome =
+            PreprocessorRegistry::default().preprocess("lsblk --json", LSBLK_SAMPLE_PLURAL);
+        match outcome {
+            PreprocessOutcome::Structured { table, .. } => {
+                assert_eq!(table.rows()[0], ["vda", "40G", "disk", ""]);
+                assert_eq!(table.rows()[1], ["vda1", "40G", "part", "/"]);
+            }
+            other => panic!("expected a structured table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lsblk_multiple_mountpoints_are_joined() {
+        let output = r#"{"blockdevices": [
+            {"name": "sdb1", "size": "5G", "type": "part",
+             "mountpoints": ["/mnt/a", "/mnt/b"]}
+        ]}"#;
+        let outcome = PreprocessorRegistry::default().preprocess("lsblk --json", output);
+        match outcome {
+            PreprocessOutcome::Structured { table, .. } => {
+                assert_eq!(table.rows()[0][3], "/mnt/a, /mnt/b");
+            }
+            other => panic!("expected a structured table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lsblk_numeric_bytes_size_is_stringified() {
+        // `--bytes` turns `size` into a JSON number instead of a string.
+        let output = r#"{"blockdevices": [
+            {"name": "sda", "size": 21474836480, "type": "disk", "mountpoint": null}
+        ]}"#;
+        let outcome = PreprocessorRegistry::default().preprocess("lsblk --json -b", output);
+        match outcome {
+            PreprocessOutcome::Structured { table, .. } => {
+                assert_eq!(table.rows()[0][1], "21474836480");
+            }
+            other => panic!("expected a structured table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lsblk_without_json_flag_is_not_claimed() {
+        let registry = PreprocessorRegistry::default();
+        for command in ["lsblk", "lsblk -a", "lsblk --all"] {
+            assert_eq!(
+                registry.preprocess(command, LSBLK_SAMPLE_SINGULAR),
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::NoPreprocessor
+                },
+                "{command} must not be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn lsblk_custom_output_flag_is_not_claimed() {
+        let registry = PreprocessorRegistry::default();
+        for command in [
+            "lsblk --json --output NAME,SIZE",
+            "lsblk --json -oNAME,SIZE",
+            "lsblk -J -o NAME",
+        ] {
+            assert_eq!(
+                registry.preprocess(command, LSBLK_SAMPLE_SINGULAR),
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::NoPreprocessor
+                },
+                "{command} must not be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn compound_and_redirected_lsblks_are_not_claimed() {
+        let registry = PreprocessorRegistry::default();
+        for command in [
+            "lsblk --json | jq .",
+            "lsblk --json; uptime",
+            "lsblk --json > /tmp/lsblk.json",
+        ] {
+            assert_eq!(
+                registry.preprocess(command, LSBLK_SAMPLE_SINGULAR),
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::NoPreprocessor
+                },
+                "{command} must not be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn old_lsblk_without_json_support_degrades_to_raw_not_panic() {
+        // Busybox (and some very old util-linux builds) don't support
+        // --json at all: the flag is rejected and plain text (or an error)
+        // comes back instead of JSON. The command is still claimed
+        // syntactically, but parsing must fail closed, not panic.
+        let registry = PreprocessorRegistry::default();
+        let not_json_outputs = [
+            "lsblk: unrecognized option '--json'\n",
+            "NAME   MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT\nsda      8:0    0   20G  0 disk \n",
+            "",
+            "   \n",
+            "{not valid json",
+            "null",
+            "[]",
+            "{\"blockdevices\": \"not an array\"}",
+            "{\"blockdevices\": []}",
+            "{\"blockdevices\": [{\"name\": \"sda\"}]}",
+        ];
+        for output in not_json_outputs {
+            let outcome = registry.preprocess("lsblk --json", output);
+            assert!(
+                matches!(
+                    outcome,
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a graceful raw fallback for {output:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lsblk_adversarial_outputs_do_not_panic() {
+        let registry = PreprocessorRegistry::default();
+        let tough = [
+            "",
+            "\n\n\n",
+            "{",
+            "{}",
+            "{\"blockdevices\": null}",
+            "{\"blockdevices\": [null]}",
+            "{\"blockdevices\": [{\"name\": null, \"size\": \"1G\", \"type\": \"disk\"}]}",
+            "{\"blockdevices\": [{\"name\": \"a\", \"size\": {}, \"type\": \"disk\"}]}",
+            "\u{0}\u{0}\u{0}",
+        ];
+        for output in tough {
+            let _ = registry.preprocess("lsblk --json", output);
+        }
+        // Deeply nested children must not blow the stack in a normal test run.
+        let mut nested = String::from(r#"{"blockdevices": [{"name": "d0", "size": "1G", "type": "disk""#);
+        for i in 1..200 {
+            nested.push_str(&format!(
+                r#", "children": [{{"name": "d{i}", "size": "1G", "type": "part""#
+            ));
+        }
+        for _ in 1..200 {
+            nested.push_str("}]");
+        }
+        nested.push('}');
+        nested.push_str("]}");
+        let _ = registry.preprocess("lsblk --json", &nested);
     }
 }
