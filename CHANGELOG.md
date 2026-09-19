@@ -13,6 +13,17 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- The agent crate gains an output-preprocessor framework: an
+  `OutputPreprocessor` is a pure function from a command's output to a typed
+  table (columns + rows), a `PreprocessorRegistry` consults its claimants in
+  order, and any output no preprocessor claims — or that the claiming one
+  cannot parse, e.g. truncated — falls back to the raw text untouched. The
+  first built-in reads GNU `df` into
+  `filesystem/size/used/avail/use_percent/mount` rows; the modes that change
+  the column set (inode, type, custom fields) are not claimed, exact names
+  or getopt abbreviations alike (`--ino`, `--out=…`), and fall back to raw
+  ([#420](https://github.com/devlawey/filar/issues/420)).
+
 - A host-group `read-only` policy is now enforced by the transport, not the
   prompt: `ReadOnlyExecutor` wraps the SSH executor of every session whose
   target matches a read-only group and refuses any command outside a

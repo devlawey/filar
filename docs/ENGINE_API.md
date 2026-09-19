@@ -11,7 +11,7 @@ working example.
 |------------------|------------------------------------------------|-----------|
 | `filar-core`     | Shared types, config, errors, secrets, sessions | Yes       |
 | `filar-transport`| `CommandExecutor` (SSH), `SecretSubstitutingExecutor`, `ReadOnlyExecutor` | Yes  |
-| `filar-agent`    | `Agent`, `AgentBuilder`, `LlmClient` trait     | Yes       |
+| `filar-agent`    | `Agent`, `AgentBuilder`, `LlmClient` trait, `OutputPreprocessor` | Yes |
 
 > **Note:** `filar-tui`, `filar-gui`, and `filar-app` are desktop-only and
 > should NOT be used as dependencies by external consumers.
@@ -331,6 +331,47 @@ say the ones where it matters.
 
 `folded_history` is `#[serde(default)]`, so sessions written before it existed
 load with an empty archive.
+
+## Output preprocessors — typed tables instead of raw text
+
+Machine-format command output does not have to reach the model as raw text.
+An `OutputPreprocessor` maps one command family's output to a typed table, so
+aggregating code can compare rows and the model can receive a condensed
+table instead of a dump:
+
+```rust
+pub trait OutputPreprocessor: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn matches(&self, command: &str) -> bool;
+    fn preprocess(&self, command: &str, output: &str)
+        -> Result<PreprocessedOutput, PreprocessError>;
+}
+
+pub enum PreprocessOutcome {
+    Structured { preprocessor: &'static str, table: PreprocessedOutput },
+    Raw { reason: RawFallback }, // NoPreprocessor | Unparseable(PreprocessError)
+}
+
+let registry = filar_agent::PreprocessorRegistry::default(); // built-ins
+match registry.preprocess(&command, &output) {
+    filar_agent::PreprocessOutcome::Structured { table, .. } => { /* use the table */ }
+    filar_agent::PreprocessOutcome::Raw { .. } => { /* send the output as before */ }
+}
+```
+
+Two rules define an implementation. It is a **pure function of its
+arguments** — no network, no filesystem, no environment — so it can run on
+every command without side effects. And it **fails closed**: when the output
+does not look exactly like the expected format (truncated, another locale,
+another `df` flavour), it returns `Err` and the caller gets `Raw` — a wrong
+table is worse than raw text. `PreprocessedOutput` is validated at
+construction (one field per column), and neither method panics on arbitrary
+input.
+
+Register your own preprocessors with `register()`; claimants are consulted
+in registration order and the first that claims the command and parses its
+output wins. The built-in set (`with_builtins()`, the `Default`) is
+registered first.
 
 ## Upgrading to `engine-v1.0.6`
 
