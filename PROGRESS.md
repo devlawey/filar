@@ -7534,3 +7534,86 @@ main before bump.
 **Tags:** `v1.0.3`, `engine-v1.0.3` (agent crate changed).
 
 **Manual smoke:** `docs/SMOKE.md` on Windows + macOS (#298 tracking).
+
+## Disk and block-device preprocessors: `df --output=`, `lsblk --json`
+
+**Milestone:** 2.0.0. **Branch:** `feat/421-disk-block-preprocessors`.
+
+**Problem.** #420 shipped the preprocessor framework and one reference
+built-in (`df`, positional parse). #421 asks for the disk/block-device
+family the fleet catalog needs: `df` with a fixed `--output=` field list
+(deterministic columns, independent of whatever a given `df` build defaults
+to) and `lsblk --json` (self-describing, no column-order guesswork).
+
+**Decision.** `crates/agent/src/preprocess.rs`:
+
+- `DfPreprocessor.matches()` now also accepts
+  `--output=source,size,used,avail,pcent,target` — the exact six fields, in
+  the exact order, its existing positional parse already produces, so no
+  new parsing logic is needed. Any other field list (subset, superset,
+  reordering) still changes the columns and is declined, as before.
+- New `LsblkPreprocessor`, claiming `lsblk` with `--json`/`-J` as a single
+  simple command (no pipe/redirect/compound, no `-o`/`--output` — a custom
+  field list is not known to include what we need). Parses the JSON with
+  `serde_json`, walks `blockdevices` and recurses into `children`
+  (partitions under a disk) depth-first, and reads either the newer
+  `mountpoints` array (util-linux ≥ 2.33, `null` entries and multiple
+  mount points supported, joined with `, `) or the older singular
+  `mountpoint` string — the one real schema difference across util-linux
+  releases. `name`/`size`/`type` missing on any device is a parse error
+  (fail closed), matching `df`'s philosophy.
+- Both are registered in `PreprocessorRegistry::with_builtins()`.
+
+**Alpine/busybox.** Neither busybox `df` nor busybox `lsblk` understands
+`--output`/`--json`; both are still claimed syntactically (the command text
+looks right) but their output isn't a `df` table or valid JSON, so parsing
+fails and the registry degrades to raw — never a panic. Plain `df` (no
+flags) already works identically on busybox, since its default six-column
+layout matches GNU's.
+
+**Tests.** 17 new tests (18 → 35 in `preprocess.rs`): canonical `--output=`
+claimed/parsed, combined
+with a harmless flag (`-h`), non-canonical field lists (subset, superset,
+reordered) still declined, busybox's `--output` rejection degrading to raw;
+realistic Debian/RHEL-family/Alpine `df` sample outputs (bind mount,
+overlayfs, LVM device mapper path, long device names); `lsblk` children
+flattening, `-J` short flag, both mountpoint schemas, multiple mount
+points joined, numeric `size` under `--bytes`, no-`--json`/custom-`--output`
+not claimed, compound/redirected forms not claimed, old-lsblk-without-json
+degrading to raw across nine malformed/non-JSON shapes, and an adversarial
+suite (null fields, wrong types, 200-level-deep nesting) — no panics.
+
+**Review round (PR #455).** CodeRabbit's find was real and is closed in the
+same branch: `collect_lsblk_rows` read `device.get("children").and_then(|v|
+v.as_array())` and `lsblk_mountpoint` used `filter_map` over `mountpoints` —
+both silently treated a present-but-wrong-shape field (a string/number/object
+instead of an array, a non-string/non-null array entry) as if the field were
+absent, rather than failing closed. A truncated or corrupted-but-still-valid-
+JSON blob could therefore produce a structured table quietly missing real
+partitions or mount points instead of degrading to raw — exactly the
+silent-misparse risk this module's own doc comment warns against. Fixed:
+`lsblk_mountpoint` now returns `Result` and rejects a `mountpoints` field
+that isn't an array, an entry that is neither string nor null, and a
+singular `mountpoint` that is neither string nor null; `collect_lsblk_rows`
+rejects a present `children` that isn't an array (including bare `null`)
+instead of treating it as "no children". 6 new tests cover each malformed
+shape (18 → 37 tests total in `preprocess.rs`). ai-review found no
+correctness risks.
+
+**DoD.** Framework-only change to `preprocess.rs`; nothing in the agent
+loop or fleet catalog calls these preprocessors yet (that wiring is a later
+issue), so no user-visible behaviour changed — the TUI/GUI real-host-run
+requirement does not apply. `cargo build -p filar-agent` and
+`cargo test -p filar-agent --lib` (190 tests) are green; `cargo clippy -p
+filar-agent --lib` is clean on `preprocess.rs` (two pre-existing findings
+in `security.rs` are unrelated to this change — a clippy 1.94 vs. the
+workspace's pinned 1.85 toolchain mismatch surfaces lints not present under
+1.85). Full `cargo build --workspace`/`cargo test --workspace` could not be
+run in this environment: the `gui` crate's `libdbus-1-dev` system
+dependency isn't installed and can't be added here — pre-existing, unrelated
+to this change. Real-host run against actual Debian/RHEL/Alpine machines
+and `#[ignore]`d docker-sshd tests are flagged manual in the PR, per
+`AGENTS.md`.
+
+**Next:** #422–424 — package/version and service/process/socket
+preprocessors, then the fleet check catalog that invokes these commands.

@@ -28,7 +28,7 @@ pub use compaction::{summarise_history, SummaryOutcome, COMPACTION_SYSTEM_PROMPT
 pub use events::{AgentEvent, EventSink};
 pub use openai_compat::OpenAiCompatClient;
 pub use preprocess::{
-    DfPreprocessor, OutputPreprocessor, PreprocessError, PreprocessOutcome,
+    DfPreprocessor, LsblkPreprocessor, OutputPreprocessor, PreprocessError, PreprocessOutcome,
     PreprocessedOutput, PreprocessorRegistry, RawFallback,
 };
 pub use runbook::{generate_runbook, RunbookOutcome, RUNBOOK_SYSTEM_PROMPT};
