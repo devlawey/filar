@@ -41,9 +41,11 @@
 //!
 //! **Scope.** This module is the framework — the trait, the registry, the
 //! fallback — plus the command families built on top of it: disk and block
-//! devices (`df`, `lsblk`, issue #421) and packages and application versions
-//! (`dpkg-query`, `rpm`, `nginx -v`, `php -v`, issue #422). Further families
-//! and the agent-loop / fleet integration come in later issues.
+//! devices (`df`, `lsblk`, issue #421), packages and application versions
+//! (`dpkg-query`, `rpm`, `nginx -v`, `php -v`, issue #422), and services,
+//! processes, sockets, the journal and network addresses (`systemctl`, `ps`,
+//! `ss`, `journalctl`, `ip`, issue #423). The agent-loop / fleet integration
+//! comes in later issues.
 
 use std::fmt;
 
@@ -219,6 +221,11 @@ impl PreprocessorRegistry {
         registry.register(Box::new(DpkgPreprocessor));
         registry.register(Box::new(RpmPreprocessor));
         registry.register(Box::new(VersionPreprocessor));
+        registry.register(Box::new(SystemctlPreprocessor));
+        registry.register(Box::new(PsPreprocessor));
+        registry.register(Box::new(SsPreprocessor));
+        registry.register(Box::new(JournalctlPreprocessor));
+        registry.register(Box::new(IpPreprocessor));
         registry
     }
 
@@ -916,6 +923,599 @@ fn leading_version(text: &str) -> Option<&str> {
     Some(candidate)
 }
 
+/// Columns produced by [`SystemctlPreprocessor`].
+const SYSTEMCTL_COLUMNS: [&str; 5] = ["unit", "load", "active", "sub", "description"];
+
+/// The argument list [`SystemctlPreprocessor`] claims (issue #423).
+const SYSTEMCTL_CANONICAL_ARGS: &str = "list-units --output=json";
+
+/// Reads `systemctl list-units --output=json` into unit rows.
+///
+/// systemd's own JSON output is the machine format, so the shape is fixed:
+/// a top-level array of unit objects. Every row needs `unit`, `load`,
+/// `active` and `sub`; `description` is optional (absent becomes empty)
+/// because it is free text rather than state.
+///
+/// **A host without systemd degrades to raw, not to an error** (issue #423's
+/// DoD). On Alpine/OpenRC `systemctl` is usually absent entirely, and on a
+/// container it exists but refuses: the real output is
+/// `System has not been booted with systemd as init system (PID 1). Can't
+/// operate.` Neither is JSON, so the parse fails and the caller falls back
+/// to the raw text — which is exactly the message a reader needs.
+pub struct SystemctlPreprocessor;
+
+impl OutputPreprocessor for SystemctlPreprocessor {
+    fn name(&self) -> &'static str {
+        "systemctl"
+    }
+
+    fn matches(&self, command: &str) -> bool {
+        is_canonical_invocation(command, "systemctl", SYSTEMCTL_CANONICAL_ARGS)
+    }
+
+    fn preprocess(
+        &self,
+        _command: &str,
+        output: &str,
+    ) -> Result<PreprocessedOutput, PreprocessError> {
+        let units = parse_json_array(output, "systemctl")?;
+        let mut rows = Vec::new();
+        for unit in &units {
+            let name = json_string(unit.get("unit"))
+                .ok_or_else(|| PreprocessError::new("a unit entry is missing `unit`"))?;
+            let mut row = vec![name.clone()];
+            for field in ["load", "active", "sub"] {
+                let value = json_string(unit.get(field)).ok_or_else(|| {
+                    PreprocessError::new(format!("unit `{name}` is missing `{field}`"))
+                })?;
+                row.push(value);
+            }
+            // Free text, not state: absent or null is an empty cell, but a
+            // non-string value means this is not systemd's own output.
+            let description = match unit.get("description") {
+                None | Some(serde_json::Value::Null) => String::new(),
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(other) => {
+                    return Err(PreprocessError::new(format!(
+                        "unit `{name}` has a non-string `description`: {other}"
+                    )))
+                }
+            };
+            row.push(description);
+            rows.push(row);
+        }
+        table(&SYSTEMCTL_COLUMNS, rows, "systemctl listed no units")
+    }
+}
+
+/// Columns produced by [`PsPreprocessor`].
+const PS_COLUMNS: [&str; 6] = ["pid", "ppid", "user", "rss", "pcpu", "comm"];
+
+/// The argument list [`PsPreprocessor`] claims (issue #423).
+///
+/// `ps` has no machine format, but `-o` with an explicit field list is the
+/// next best thing: it pins both which columns appear and their order, so
+/// the positional parse below is reading a layout this preprocessor chose
+/// rather than guessing at a default that varies between builds and
+/// `$COLUMNS` widths.
+const PS_CANONICAL_ARGS: &str = "-eo pid,ppid,user,rss,pcpu,comm";
+
+/// Reads `ps -eo pid,ppid,user,rss,pcpu,comm` into process rows.
+///
+/// The parse is fail-closed: the header must start with `PID`, every data
+/// line needs at least six whitespace-separated fields, and `pid`, `ppid`
+/// and `rss` must be all digits with `pcpu` a decimal number — a line the
+/// fleet's truncation cut mid-way fails those checks instead of entering the
+/// table with shifted columns. `comm` is the last field group
+/// (`fields[5..]` joined), so a command name containing spaces survives.
+pub struct PsPreprocessor;
+
+impl OutputPreprocessor for PsPreprocessor {
+    fn name(&self) -> &'static str {
+        "ps"
+    }
+
+    fn matches(&self, command: &str) -> bool {
+        is_canonical_invocation(command, "ps", PS_CANONICAL_ARGS)
+    }
+
+    fn preprocess(
+        &self,
+        _command: &str,
+        output: &str,
+    ) -> Result<PreprocessedOutput, PreprocessError> {
+        let mut lines = output.lines().filter(|line| !line.trim().is_empty());
+        let Some(header) = lines.next() else {
+            return Err(PreprocessError::new("output is empty"));
+        };
+        if !header.trim_start().starts_with("PID") {
+            return Err(PreprocessError::new(format!(
+                "first non-empty line is not a ps header: {}",
+                preview(header)
+            )));
+        }
+        let mut rows = Vec::new();
+        for (index, line) in lines.enumerate() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < PS_COLUMNS.len() {
+                return Err(PreprocessError::new(format!(
+                    "data line {} has {} field(s), fewer than the {} a ps row has (truncated output?)",
+                    index + 1,
+                    fields.len(),
+                    PS_COLUMNS.len()
+                )));
+            }
+            for (position, name) in [(0, "pid"), (1, "ppid"), (3, "rss")] {
+                if !is_all_digits(fields[position]) {
+                    return Err(PreprocessError::new(format!(
+                        "data line {} has a non-numeric `{name}`: {}",
+                        index + 1,
+                        preview(line)
+                    )));
+                }
+            }
+            if !is_decimal(fields[4]) {
+                return Err(PreprocessError::new(format!(
+                    "data line {} has a non-numeric `pcpu`: {}",
+                    index + 1,
+                    preview(line)
+                )));
+            }
+            rows.push(vec![
+                fields[0].to_string(),
+                fields[1].to_string(),
+                fields[2].to_string(),
+                fields[3].to_string(),
+                fields[4].to_string(),
+                fields[5..].join(" "),
+            ]);
+        }
+        table(&PS_COLUMNS, rows, "ps printed a header but no process rows")
+    }
+}
+
+/// Columns produced by [`SsPreprocessor`].
+const SS_COLUMNS: [&str; 6] = ["netid", "state", "recv_q", "send_q", "local", "peer"];
+
+/// The flags [`SsPreprocessor`] accepts.
+///
+/// `-H` and `-n` are required: `-H` drops the header so every line is a
+/// socket, and `-n` keeps addresses and ports numeric so no resolver runs
+/// and no name lookup varies the output. `-l` and `-a` are optional and
+/// select *which* sockets are listed without changing a line's shape, so
+/// they are accepted rather than declined — `ss` with neither lists only
+/// non-listening sockets, and a fleet check that wants listening ports
+/// needs one of them.
+const SS_REQUIRED_FLAGS: [&str; 2] = ["-H", "-n"];
+
+/// Flags accepted alongside [`SS_REQUIRED_FLAGS`] (see its docs).
+const SS_OPTIONAL_FLAGS: [&str; 2] = ["-l", "-a"];
+
+/// Reads `ss -H -n` into socket rows.
+///
+/// **Which sockets appear is the caller's choice, not this parser's.** Bare
+/// `ss` lists only *non-listening* sockets, so `ss -H -n` alone answers
+/// "what is connected", not "what is listening" — for the latter the caller
+/// adds `-l` (listening only) or `-a` (both), which this preprocessor
+/// therefore accepts: they change the selection, never a line's shape.
+///
+/// Field counts differ by address family, which real output confirms: an
+/// internet socket prints six fields, because its address and port are
+/// joined (`tcp ESTAB 0 0 192.0.2.2:44438 198.51.100.7:443`), while a unix
+/// socket prints eight, address and "port" (its inode) being separate
+/// (`u_str ESTAB 0 0 * 896 * 0`). Both are read; for the eight-field shape
+/// the pairs are rejoined with `:` so the `local` and `peer` columns mean
+/// the same thing in every row.
+///
+/// Anything else fails closed — and that is not hypothetical: real `ss`
+/// output can carry a diagnostic line of its own (`RTNETLINK answers:
+/// Invalid argument`) mixed in with the sockets. A line that is not a socket
+/// row means the output is not purely socket rows, so the raw text is the
+/// honest answer rather than a table quietly missing entries.
+pub struct SsPreprocessor;
+
+impl OutputPreprocessor for SsPreprocessor {
+    fn name(&self) -> &'static str {
+        "ss"
+    }
+
+    fn matches(&self, command: &str) -> bool {
+        if command.contains(SHELL_META) {
+            return false;
+        }
+        let mut words = command.split_whitespace();
+        let Some(program) = words.next() else {
+            return false;
+        };
+        if base_name(program) != "ss" {
+            return false;
+        }
+        let flags: Vec<&str> = words.collect();
+        if !flags
+            .iter()
+            .all(|flag| SS_REQUIRED_FLAGS.contains(flag) || SS_OPTIONAL_FLAGS.contains(flag))
+        {
+            return false;
+        }
+        SS_REQUIRED_FLAGS
+            .iter()
+            .all(|required| flags.contains(required))
+    }
+
+    fn preprocess(
+        &self,
+        _command: &str,
+        output: &str,
+    ) -> Result<PreprocessedOutput, PreprocessError> {
+        let mut rows = Vec::new();
+        for (index, line) in output
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .enumerate()
+        {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let (local, peer) = match fields.len() {
+                6 => (fields[4].to_string(), fields[5].to_string()),
+                8 => (
+                    format!("{}:{}", fields[4], fields[5]),
+                    format!("{}:{}", fields[6], fields[7]),
+                ),
+                other => {
+                    return Err(PreprocessError::new(format!(
+                        "line {} has {other} field(s); a socket row has 6 (internet) or 8 (unix): {}",
+                        index + 1,
+                        preview(line)
+                    )))
+                }
+            };
+            if !is_all_digits(fields[2]) || !is_all_digits(fields[3]) {
+                return Err(PreprocessError::new(format!(
+                    "line {} has a non-numeric queue length: {}",
+                    index + 1,
+                    preview(line)
+                )));
+            }
+            rows.push(vec![
+                fields[0].to_string(),
+                fields[1].to_string(),
+                fields[2].to_string(),
+                fields[3].to_string(),
+                local,
+                peer,
+            ]);
+        }
+        table(&SS_COLUMNS, rows, "no socket rows in the output")
+    }
+}
+
+/// Columns produced by [`JournalctlPreprocessor`].
+const JOURNALCTL_COLUMNS: [&str; 4] = ["timestamp", "unit", "priority", "message"];
+
+/// Reads `journalctl --output=json` into log rows.
+///
+/// journald's JSON output is **JSON Lines** — one object per line, not an
+/// array — so it is parsed line by line. Of the many fields an entry can
+/// carry, four are read: `__REALTIME_TIMESTAMP`, `_SYSTEMD_UNIT` (absent for
+/// entries that did not come from a unit, which becomes an empty cell),
+/// `PRIORITY` and `MESSAGE`.
+///
+/// `MESSAGE` must be a string. journald represents a non-UTF-8 message as an
+/// array of byte values instead, and there is no faithful way to put that in
+/// a text cell, so such output fails closed to raw rather than inventing a
+/// rendering for it.
+///
+/// Claimed with `--output=json` or `-o json`, optionally bounded by
+/// `-n`/`--lines` and `--no-pager`, which change how much is printed but not
+/// the shape of a line. Any other flag is not claimed: `--output=` in
+/// another mode is a different format, and filters that take free-text
+/// values (`--since="2 hours ago"`) cannot be recognised by word.
+pub struct JournalctlPreprocessor;
+
+impl OutputPreprocessor for JournalctlPreprocessor {
+    fn name(&self) -> &'static str {
+        "journalctl"
+    }
+
+    fn matches(&self, command: &str) -> bool {
+        if command.contains(SHELL_META) {
+            return false;
+        }
+        let mut words = command.split_whitespace();
+        let Some(program) = words.next() else {
+            return false;
+        };
+        if base_name(program) != "journalctl" {
+            return false;
+        }
+        let args: Vec<&str> = words.collect();
+        let mut json = false;
+        let mut index = 0;
+        while index < args.len() {
+            match args[index] {
+                "--output=json" => json = true,
+                "-o" | "--output" => {
+                    if args.get(index + 1) != Some(&"json") {
+                        return false;
+                    }
+                    json = true;
+                    index += 1;
+                }
+                "--no-pager" => {}
+                "-n" | "--lines" => match args.get(index + 1) {
+                    Some(value) if is_all_digits(value) => index += 1,
+                    _ => return false,
+                },
+                other => {
+                    let bounded = other
+                        .strip_prefix("--lines=")
+                        .or_else(|| other.strip_prefix("-n"))
+                        .is_some_and(is_all_digits);
+                    if !bounded {
+                        return false;
+                    }
+                }
+            }
+            index += 1;
+        }
+        json
+    }
+
+    fn preprocess(
+        &self,
+        _command: &str,
+        output: &str,
+    ) -> Result<PreprocessedOutput, PreprocessError> {
+        let mut rows = Vec::new();
+        for (index, line) in output
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .enumerate()
+        {
+            let entry: serde_json::Value = serde_json::from_str(line.trim()).map_err(|error| {
+                PreprocessError::new(format!("line {} is not valid JSON: {error}", index + 1))
+            })?;
+            let timestamp = json_string(entry.get("__REALTIME_TIMESTAMP")).ok_or_else(|| {
+                PreprocessError::new(format!(
+                    "entry {} is missing `__REALTIME_TIMESTAMP`",
+                    index + 1
+                ))
+            })?;
+            let unit = match entry.get("_SYSTEMD_UNIT") {
+                None | Some(serde_json::Value::Null) => String::new(),
+                Some(value) => json_string(Some(value)).ok_or_else(|| {
+                    PreprocessError::new(format!(
+                        "entry {} has a non-scalar `_SYSTEMD_UNIT`",
+                        index + 1
+                    ))
+                })?,
+            };
+            let priority = json_string(entry.get("PRIORITY")).unwrap_or_default();
+            let message = match entry.get("MESSAGE") {
+                Some(serde_json::Value::String(text)) => text.clone(),
+                // journald renders a non-UTF-8 message as an array of byte
+                // values; there is no faithful text cell for that.
+                other => {
+                    return Err(PreprocessError::new(format!(
+                        "entry {} has no string `MESSAGE` (binary payload?): {}",
+                        index + 1,
+                        other.map(|value| preview(&value.to_string())).unwrap_or_default()
+                    )))
+                }
+            };
+            rows.push(vec![timestamp, unit, priority, message]);
+        }
+        table(&JOURNALCTL_COLUMNS, rows, "no journal entries in the output")
+    }
+}
+
+/// Columns produced by [`IpPreprocessor`].
+const IP_COLUMNS: [&str; 5] = ["ifname", "ifindex", "operstate", "family", "address"];
+
+/// The argument list [`IpPreprocessor`] claims (issue #423).
+const IP_CANONICAL_ARGS: &str = "-j addr";
+
+/// Reads `ip -j addr` into one row per address.
+///
+/// `ip`'s `-j` gives a top-level array of interface objects, each carrying
+/// an `addr_info` array of the addresses configured on it. Rows are
+/// flattened the way [`LsblkPreprocessor`] flattens partitions: one row per
+/// address, with `local` and `prefixlen` rejoined into CIDR notation.
+///
+/// **An interface with no addresses still gets a row**, with empty `family`
+/// and `address` — real output has them (a `DOWN` interface reports
+/// `addr_info: []`), and dropping the row would hide the interface's
+/// existence and its `operstate`, which is often the very difference worth
+/// seeing across a fleet. That is `addr_info: []` specifically: an
+/// interface with **no** `addr_info` key is not `ip addr` output (`ip -j
+/// link` prints interfaces without one) and is refused, since reading it as
+/// "no addresses" would render an address table that silently holds none.
+///
+/// Each address must carry a string `family`, a string `local` and a
+/// numeric `prefixlen`, and each interface a string `operstate`. iproute2's
+/// schema marks `family` and `operstate` mutually exclusive with
+/// `family_index` / `operstate_index`, emitted when the value is unknown to
+/// it; this table has no such column, so an absent one is refused rather
+/// than defaulted to an empty cell that would read as "none".
+pub struct IpPreprocessor;
+
+impl OutputPreprocessor for IpPreprocessor {
+    fn name(&self) -> &'static str {
+        "ip"
+    }
+
+    fn matches(&self, command: &str) -> bool {
+        is_canonical_invocation(command, "ip", IP_CANONICAL_ARGS)
+    }
+
+    fn preprocess(
+        &self,
+        _command: &str,
+        output: &str,
+    ) -> Result<PreprocessedOutput, PreprocessError> {
+        let interfaces = parse_json_array(output, "ip")?;
+        let mut rows = Vec::new();
+        for interface in &interfaces {
+            let ifname = json_string(interface.get("ifname"))
+                .ok_or_else(|| PreprocessError::new("an interface is missing `ifname`"))?;
+            let ifindex = json_string(interface.get("ifindex")).ok_or_else(|| {
+                PreprocessError::new(format!("interface `{ifname}` is missing `ifindex`"))
+            })?;
+            // `operstate` and `family` below are both fields iproute2's
+            // schema marks mutually exclusive with an `*_index` variant it
+            // emits when the value is unknown to it. This table has no such
+            // column, so an absent one is refused rather than defaulted:
+            // an empty cell would read as "no state" / "no family" instead
+            // of "a value we cannot render".
+            let operstate = interface
+                .get("operstate")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    PreprocessError::new(format!(
+                        "interface `{ifname}` is missing a string `operstate`"
+                    ))
+                })?
+                .to_string();
+            // Every `ip addr` interface carries `addr_info`, empty when the
+            // interface has no addresses. Absent entirely means this is not
+            // `ip addr` output at all — `ip -j link` prints interfaces
+            // without it — and treating that as "no addresses" would render
+            // a whole address table that silently contains none.
+            let addresses = interface
+                .get("addr_info")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    PreprocessError::new(format!(
+                        "interface `{ifname}` has no `addr_info` array (not `ip addr` output?)"
+                    ))
+                })?;
+            if addresses.is_empty() {
+                rows.push(vec![
+                    ifname,
+                    ifindex,
+                    operstate,
+                    String::new(),
+                    String::new(),
+                ]);
+                continue;
+            }
+            for address in addresses {
+                let family = address
+                    .get("family")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        PreprocessError::new(format!(
+                            "an address of `{ifname}` is missing a string `family`"
+                        ))
+                    })?;
+                let local = address
+                    .get("local")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        PreprocessError::new(format!(
+                            "an address of `{ifname}` is missing a string `local`"
+                        ))
+                    })?;
+                // iproute2 prints `prefixlen` as a number. Requiring it
+                // keeps the column one format: without it a row would carry
+                // a bare address while its neighbours carry CIDR, and the
+                // two would compare as different across a fleet.
+                let prefix = address
+                    .get("prefixlen")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        PreprocessError::new(format!(
+                            "an address of `{ifname}` is missing a numeric `prefixlen`"
+                        ))
+                    })?;
+                let cidr = format!("{local}/{prefix}");
+                let family = family.to_string();
+                rows.push(vec![
+                    ifname.clone(),
+                    ifindex.clone(),
+                    operstate.clone(),
+                    family,
+                    cidr,
+                ]);
+            }
+        }
+        table(&IP_COLUMNS, rows, "no interfaces in the output")
+    }
+}
+
+/// Parse `output` as a top-level JSON array, naming `tool` in the error.
+///
+/// Shared by the preprocessors whose command prints one (`systemctl`, `ip`).
+/// A tool that is missing, or refuses to run, prints prose rather than JSON,
+/// and that is the ordinary path to [`RawFallback::Unparseable`].
+fn parse_json_array(output: &str, tool: &str) -> Result<Vec<serde_json::Value>, PreprocessError> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Err(PreprocessError::new("output is empty"));
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|error| PreprocessError::new(format!("not valid JSON: {error}")))?;
+    match value {
+        serde_json::Value::Array(items) => Ok(items),
+        other => Err(PreprocessError::new(format!(
+            "{tool} output is not a JSON array but {}",
+            match other {
+                serde_json::Value::Object(_) => "an object",
+                serde_json::Value::String(_) => "a string",
+                serde_json::Value::Null => "null",
+                _ => "a scalar",
+            }
+        ))),
+    }
+}
+
+/// A JSON string or number as a plain string; `None` for anything else
+/// (missing, `null`, bool, object, array).
+fn json_string(value: Option<&serde_json::Value>) -> Option<String> {
+    match value {
+        Some(serde_json::Value::String(text)) => Some(text.clone()),
+        Some(serde_json::Value::Number(number)) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+/// Is `text` a non-empty run of ASCII digits?
+fn is_all_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Is `text` a plain decimal number, the way `ps` prints a percentage
+/// (`0.0`, `1.3`, `100`)?
+///
+/// Deliberately stricter than `f64::from_str`, which also accepts `NaN`,
+/// `inf`, `-inf` and exponent forms: those parse successfully and would
+/// have slipped through a check that only asked whether parsing worked,
+/// putting a value `ps` never prints into a numeric column.
+fn is_decimal(text: &str) -> bool {
+    let mut digits = 0usize;
+    let mut dots = 0usize;
+    for byte in text.bytes() {
+        match byte {
+            b'0'..=b'9' => digits += 1,
+            b'.' => dots += 1,
+            _ => return false,
+        }
+    }
+    digits > 0 && dots <= 1
+}
+
+/// Build a table from `columns` and `rows`, refusing an empty row set with
+/// `empty_reason` — the shape every preprocessor here ends with.
+fn table(
+    columns: &[&str],
+    rows: Vec<Vec<String>>,
+    empty_reason: &str,
+) -> Result<PreprocessedOutput, PreprocessError> {
+    if rows.is_empty() {
+        return Err(PreprocessError::new(empty_reason.to_string()));
+    }
+    PreprocessedOutput::new(columns.iter().map(|column| column.to_string()).collect(), rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -987,7 +1587,7 @@ tmpfs            3986548       0   3986548   0% /dev/shm
     #[test]
     fn df_output_becomes_a_typed_table() {
         let registry = PreprocessorRegistry::default();
-        assert_eq!(registry.len(), 5);
+        assert_eq!(registry.len(), 10);
         let outcome = registry.preprocess("/bin/df -h", DF_SAMPLE);
         match outcome {
             PreprocessOutcome::Structured { preprocessor, table } => {
@@ -2064,5 +2664,623 @@ Zend Engine v4.2.7, Copyright (c) Zend Technologies
         let huge = format!("{}\t1.0\n", "p".repeat(20_000));
         let _ = registry.preprocess(DPKG_COMMAND, &huge);
         let _ = registry.preprocess("php -v", &huge);
+    }
+
+    // --- services, processes, sockets, journal, network (issue #423) ---
+
+    const SYSTEMCTL_COMMAND: &str = "systemctl list-units --output=json";
+    const PS_COMMAND: &str = "ps -eo pid,ppid,user,rss,pcpu,comm";
+    const SS_COMMAND: &str = "ss -H -n";
+    const JOURNALCTL_COMMAND: &str = "journalctl --output=json";
+    const IP_COMMAND: &str = "ip -j addr";
+
+    /// Real `systemctl list-units --output=json` shape (Debian 12, systemd
+    /// 252): a top-level array, one object per unit.
+    const SYSTEMCTL_SAMPLE: &str = r#"[
+  {"unit":"dbus.service","load":"loaded","active":"active","sub":"running","description":"D-Bus System Message Bus"},
+  {"unit":"nginx.service","load":"loaded","active":"active","sub":"running","description":"A high performance web server"},
+  {"unit":"ssh.service","load":"loaded","active":"active","sub":"running","description":"OpenBSD Secure Shell server"},
+  {"unit":"unattended-upgrades.service","load":"loaded","active":"inactive","sub":"dead","description":"Unattended Upgrades Shutdown"}
+]"#;
+
+    /// Real `ps -eo pid,ppid,user,rss,pcpu,comm` output, captured on the
+    /// agent's own host — note the right-aligned numeric columns and the
+    /// kernel-thread names carrying `/` and `-`.
+    const PS_SAMPLE: &str = "\
+  PID  PPID USER       RSS %CPU COMMAND
+    1     0 root      4760  1.3 process_api
+    2     0 root         0  0.0 kthreadd
+    4     2 root         0  0.0 kworker/R-rcu_gp
+  914   870 www-data  8321  0.4 nginx
+";
+
+    /// Real `ss -H -n` shape: internet sockets print six fields, unix
+    /// sockets eight. Addresses are from the documentation ranges.
+    const SS_SAMPLE: &str = "\
+tcp   ESTAB 0      0      192.0.2.2:44438 198.51.100.7:443
+tcp   LISTEN 0     128    0.0.0.0:22      0.0.0.0:*
+tcp   ESTAB 0      0      [2001:db8::1]:8080 [2001:db8::2]:51234
+u_str ESTAB 0      0              * 896               * 0
+u_str ESTAB 0      0      /run/systemd/journal/stdout 21456 * 21455
+";
+
+    /// Real `journalctl --output=json` shape: JSON Lines, one object per
+    /// entry, not an array.
+    const JOURNALCTL_SAMPLE: &str = concat!(
+        r#"{"__REALTIME_TIMESTAMP":"1789837304171000","PRIORITY":"6","_SYSTEMD_UNIT":"ssh.service","MESSAGE":"Server listening on 0.0.0.0 port 22."}"#,
+        "\n",
+        r#"{"__REALTIME_TIMESTAMP":"1789837305002000","PRIORITY":"3","_SYSTEMD_UNIT":"nginx.service","MESSAGE":"bind() to 0.0.0.0:80 failed (98: Address already in use)"}"#,
+        "\n",
+        // A kernel entry carries no _SYSTEMD_UNIT.
+        r#"{"__REALTIME_TIMESTAMP":"1789837306500000","PRIORITY":"4","MESSAGE":"TCP: request_sock_TCP: Possible SYN flooding"}"#,
+        "\n"
+    );
+
+    /// Real `ip -j addr` shape, captured on the agent's own host: `ifindex`
+    /// is a JSON number, and a `DOWN` interface reports `addr_info: []`.
+    const IP_SAMPLE: &str = r#"[
+  {"ifindex":1,"ifname":"lo","operstate":"UNKNOWN","mtu":65536,
+   "addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":8},
+                {"family":"inet6","local":"::1","prefixlen":128}]},
+  {"ifindex":2,"ifname":"ifb0","operstate":"DOWN","mtu":1500,"addr_info":[]},
+  {"ifindex":3,"ifname":"eth0","operstate":"UP","mtu":1500,
+   "addr_info":[{"family":"inet","local":"192.0.2.2","prefixlen":24}]}
+]"#;
+
+    #[test]
+    fn the_builtin_registry_holds_every_family() {
+        assert_eq!(PreprocessorRegistry::default().len(), 10);
+    }
+
+    #[test]
+    fn systemctl_json_becomes_unit_rows() {
+        match PreprocessorRegistry::default().preprocess(SYSTEMCTL_COMMAND, SYSTEMCTL_SAMPLE) {
+            PreprocessOutcome::Structured { preprocessor, table } => {
+                assert_eq!(preprocessor, "systemctl");
+                assert_eq!(
+                    table.columns(),
+                    ["unit", "load", "active", "sub", "description"]
+                );
+                assert_eq!(table.row_count(), 4);
+                assert_eq!(
+                    table.rows()[1],
+                    [
+                        "nginx.service",
+                        "loaded",
+                        "active",
+                        "running",
+                        "A high performance web server"
+                    ]
+                );
+                assert_eq!(table.rows()[3][2], "inactive");
+            }
+            other => panic!("expected a structured systemctl table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_host_without_systemd_degrades_to_raw() {
+        // The issue's DoD. Two real shapes: the container message (systemctl
+        // present but systemd is not PID 1) and Alpine/OpenRC, where the
+        // binary is absent and the shell answers instead.
+        let registry = PreprocessorRegistry::default();
+        let cases = [
+            "System has not been booted with systemd as init system (PID 1). Can't operate.\n\
+             Failed to connect to bus: Host is down\n",
+            "/bin/sh: systemctl: not found\n",
+            "-ash: systemctl: not found\n",
+        ];
+        for output in cases {
+            let outcome = registry.preprocess(SYSTEMCTL_COMMAND, output);
+            assert!(
+                matches!(
+                    outcome,
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a raw fallback for {output:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn systemctl_missing_state_fields_degrade_to_raw() {
+        let registry = PreprocessorRegistry::default();
+        for output in [
+            r#"[{"unit":"a.service","load":"loaded","active":"active"}]"#,
+            r#"[{"load":"loaded","active":"active","sub":"running"}]"#,
+            r#"[{"unit":"a.service","load":"loaded","active":"active","sub":"running","description":{}}]"#,
+            "[]",
+            r#"{"units":[]}"#,
+        ] {
+            let outcome = registry.preprocess(SYSTEMCTL_COMMAND, output);
+            assert!(
+                matches!(
+                    outcome,
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a raw fallback for {output:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ps_output_becomes_process_rows() {
+        match PreprocessorRegistry::default().preprocess(PS_COMMAND, PS_SAMPLE) {
+            PreprocessOutcome::Structured { preprocessor, table } => {
+                assert_eq!(preprocessor, "ps");
+                assert_eq!(table.columns(), ["pid", "ppid", "user", "rss", "pcpu", "comm"]);
+                assert_eq!(table.row_count(), 4);
+                assert_eq!(table.rows()[0], ["1", "0", "root", "4760", "1.3", "process_api"]);
+                assert_eq!(table.rows()[2][5], "kworker/R-rcu_gp");
+                assert_eq!(table.rows()[3], ["914", "870", "www-data", "8321", "0.4", "nginx"]);
+            }
+            other => panic!("expected a structured ps table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ps_command_name_with_spaces_is_kept_whole() {
+        let output = "  PID  PPID USER       RSS %CPU COMMAND\n  \
+                      42     1 root      1024  0.1 my helper\n";
+        match PreprocessorRegistry::default().preprocess(PS_COMMAND, output) {
+            PreprocessOutcome::Structured { table, .. } => {
+                assert_eq!(table.rows()[0][5], "my helper");
+            }
+            other => panic!("expected a structured ps table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_ps_output_degrades_to_raw() {
+        let registry = PreprocessorRegistry::default();
+        let cases = [
+            // No header.
+            "    1     0 root      4760  1.3 init\n",
+            // Truncated mid-line: too few fields.
+            "  PID  PPID USER       RSS %CPU COMMAND\n    1     0 root\n",
+            // A non-numeric pid means the columns are not what we think.
+            "  PID  PPID USER       RSS %CPU COMMAND\n  one     0 root  4760  1.3 init\n",
+            // A non-numeric pcpu likewise.
+            "  PID  PPID USER       RSS %CPU COMMAND\n    1     0 root  4760  n/a init\n",
+            // Header only.
+            "  PID  PPID USER       RSS %CPU COMMAND\n",
+            "",
+            "ps: unrecognized option '-eo'\n",
+        ];
+        for output in cases {
+            let outcome = registry.preprocess(PS_COMMAND, output);
+            assert!(
+                matches!(
+                    outcome,
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a raw fallback for {output:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ss_reads_both_internet_and_unix_socket_shapes() {
+        match PreprocessorRegistry::default().preprocess(SS_COMMAND, SS_SAMPLE) {
+            PreprocessOutcome::Structured { preprocessor, table } => {
+                assert_eq!(preprocessor, "ss");
+                assert_eq!(
+                    table.columns(),
+                    ["netid", "state", "recv_q", "send_q", "local", "peer"]
+                );
+                assert_eq!(table.row_count(), 5);
+                // Six-field internet row: address and port already joined.
+                assert_eq!(
+                    table.rows()[0],
+                    ["tcp", "ESTAB", "0", "0", "192.0.2.2:44438", "198.51.100.7:443"]
+                );
+                assert_eq!(table.rows()[1][4], "0.0.0.0:22");
+                assert_eq!(table.rows()[2][4], "[2001:db8::1]:8080");
+                // Eight-field unix rows: the pairs are rejoined with `:`.
+                assert_eq!(table.rows()[3][4], "*:896");
+                assert_eq!(table.rows()[3][5], "*:0");
+                assert_eq!(table.rows()[4][4], "/run/systemd/journal/stdout:21456");
+            }
+            other => panic!("expected a structured ss table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ss_listening_selections_are_claimed() {
+        // Bare `ss` lists only non-listening sockets, so a check that wants
+        // listening ports adds `-l` or `-a`. Both select which sockets are
+        // listed without changing a line's shape — verified against real
+        // output, where every netid still prints 6 fields (8 for unix).
+        let registry = PreprocessorRegistry::default();
+        for command in [
+            "ss -H -n",
+            "ss -H -n -l",
+            "ss -H -l -n",
+            "ss -H -n -a",
+            "ss -a -H -n",
+            "/usr/bin/ss -H -n -l",
+        ] {
+            assert!(
+                registry.preprocess(command, SS_SAMPLE).is_structured(),
+                "{command} must be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn ss_without_the_required_flags_is_not_claimed() {
+        let registry = PreprocessorRegistry::default();
+        for command in [
+            // Without `-H` the header line would be misread as a socket.
+            "ss -n",
+            "ss -n -l",
+            // Without `-n` names and ports resolve, so the output varies.
+            "ss -H",
+            "ss -H -l",
+            // Flags outside the accepted set change what the columns mean.
+            "ss -H -n -p",
+            "ss -H -n -t",
+            "ss -Hln",
+        ] {
+            assert_eq!(
+                registry.preprocess(command, SS_SAMPLE),
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::NoPreprocessor
+                },
+                "{command} must not be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn ps_rejects_special_float_values_in_pcpu() {
+        // `"NaN".parse::<f64>()` succeeds, as do `inf` and `-inf`, so a
+        // check that only asked whether parsing worked would have let a
+        // value `ps` never prints into the numeric column.
+        let registry = PreprocessorRegistry::default();
+        for pcpu in ["NaN", "nan", "inf", "-inf", "infinity", "1e5", "-1.0", "+1.0", "1.2.3"] {
+            let output = format!(
+                "  PID  PPID USER       RSS %CPU COMMAND\n    1     0 root      4760  {pcpu} init\n"
+            );
+            let outcome = registry.preprocess(PS_COMMAND, &output);
+            assert!(
+                matches!(
+                    outcome,
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a raw fallback for pcpu {pcpu:?}, got {outcome:?}"
+            );
+        }
+        // ... while the shapes `ps` does print stay accepted.
+        for pcpu in ["0.0", "1.3", "100", "99.9"] {
+            let output = format!(
+                "  PID  PPID USER       RSS %CPU COMMAND\n    1     0 root      4760  {pcpu} init\n"
+            );
+            assert!(
+                registry.preprocess(PS_COMMAND, &output).is_structured(),
+                "pcpu {pcpu:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn ss_diagnostic_line_degrades_to_raw() {
+        // Real `ss -H -n` output can carry its own error line among the
+        // sockets; a line that is not a socket row means the output is not
+        // purely socket rows, so raw is the honest answer.
+        let output = "tcp   ESTAB 0      0      192.0.2.2:44438 198.51.100.7:443\n\
+                      RTNETLINK answers: Invalid argument\n";
+        let outcome = PreprocessorRegistry::default().preprocess(SS_COMMAND, output);
+        assert!(
+            matches!(
+                outcome,
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::Unparseable(_)
+                }
+            ),
+            "expected a raw fallback, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_ss_output_degrades_to_raw() {
+        let registry = PreprocessorRegistry::default();
+        for output in [
+            // Seven fields: neither the internet nor the unix shape.
+            "tcp ESTAB 0 0 a b c\ntcp ESTAB 0 0 a b c d\n",
+            // Non-numeric queue length.
+            "tcp ESTAB x 0 192.0.2.2:22 192.0.2.3:1234\n",
+            "",
+            "ss: unrecognized option\n",
+        ] {
+            let outcome = registry.preprocess(SS_COMMAND, output);
+            assert!(
+                matches!(
+                    outcome,
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a raw fallback for {output:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn journalctl_json_lines_become_log_rows() {
+        match PreprocessorRegistry::default().preprocess(JOURNALCTL_COMMAND, JOURNALCTL_SAMPLE) {
+            PreprocessOutcome::Structured { preprocessor, table } => {
+                assert_eq!(preprocessor, "journalctl");
+                assert_eq!(table.columns(), ["timestamp", "unit", "priority", "message"]);
+                assert_eq!(table.row_count(), 3);
+                assert_eq!(table.rows()[0][1], "ssh.service");
+                assert_eq!(table.rows()[1][2], "3");
+                assert_eq!(
+                    table.rows()[1][3],
+                    "bind() to 0.0.0.0:80 failed (98: Address already in use)"
+                );
+                // A kernel entry has no unit: an empty cell, not a dropped row.
+                assert_eq!(table.rows()[2][1], "");
+                assert_eq!(table.rows()[2][0], "1789837306500000");
+            }
+            other => panic!("expected a structured journalctl table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn journalctl_bounded_invocations_are_claimed() {
+        let registry = PreprocessorRegistry::default();
+        for command in [
+            "journalctl --output=json",
+            "journalctl -o json",
+            "journalctl -n 100 --output=json",
+            "journalctl --lines=100 --output=json",
+            "journalctl --output=json --no-pager",
+            "/usr/bin/journalctl -n50 -o json",
+        ] {
+            assert!(
+                registry
+                    .preprocess(command, JOURNALCTL_SAMPLE)
+                    .is_structured(),
+                "{command} must be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn journalctl_other_invocations_are_not_claimed() {
+        let registry = PreprocessorRegistry::default();
+        for command in [
+            // Another output mode is a different format entirely.
+            "journalctl --output=short",
+            "journalctl -o cat",
+            "journalctl",
+            // A free-text filter cannot be recognised word by word.
+            "journalctl --output=json --since=yesterday",
+            "journalctl --output=json -u ssh",
+            // `-n` without a count is not the bounded form we accept.
+            "journalctl -n --output=json",
+            "journalctl --output=json | head",
+        ] {
+            assert_eq!(
+                registry.preprocess(command, JOURNALCTL_SAMPLE),
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::NoPreprocessor
+                },
+                "{command} must not be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn journalctl_binary_message_degrades_to_raw() {
+        // journald renders a non-UTF-8 message as an array of byte values;
+        // there is no faithful text cell for that, so it fails closed.
+        let output = r#"{"__REALTIME_TIMESTAMP":"1789837304171000","PRIORITY":"6","MESSAGE":[104,105,0,255]}"#;
+        let outcome = PreprocessorRegistry::default().preprocess(JOURNALCTL_COMMAND, output);
+        assert!(
+            matches!(
+                outcome,
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::Unparseable(_)
+                }
+            ),
+            "expected a raw fallback, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_journalctl_output_degrades_to_raw() {
+        let registry = PreprocessorRegistry::default();
+        for output in [
+            // Truncation cuts the last line mid-object.
+            "{\"__REALTIME_TIMESTAMP\":\"1\",\"MESSAGE\":\"a\"}\n{\"__REALTIME\n",
+            // An entry with no timestamp.
+            r#"{"MESSAGE":"a"}"#,
+            // An array instead of JSON Lines: journalctl does not print one.
+            r#"[{"__REALTIME_TIMESTAMP":"1","MESSAGE":"a"}]"#,
+            // Empty, as on a host with no journal at all.
+            "",
+            "-- No entries --\n",
+        ] {
+            let outcome = registry.preprocess(JOURNALCTL_COMMAND, output);
+            assert!(
+                matches!(
+                    outcome,
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a raw fallback for {output:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ip_json_flattens_addresses_into_rows() {
+        match PreprocessorRegistry::default().preprocess(IP_COMMAND, IP_SAMPLE) {
+            PreprocessOutcome::Structured { preprocessor, table } => {
+                assert_eq!(preprocessor, "ip");
+                assert_eq!(
+                    table.columns(),
+                    ["ifname", "ifindex", "operstate", "family", "address"]
+                );
+                // Two addresses on lo, one row for the address-less ifb0, one
+                // for eth0.
+                assert_eq!(table.row_count(), 4);
+                assert_eq!(
+                    table.rows()[0],
+                    ["lo", "1", "UNKNOWN", "inet", "127.0.0.1/8"]
+                );
+                assert_eq!(table.rows()[1], ["lo", "1", "UNKNOWN", "inet6", "::1/128"]);
+                // An interface with no addresses keeps its row, and its state.
+                assert_eq!(table.rows()[2], ["ifb0", "2", "DOWN", "", ""]);
+                assert_eq!(table.rows()[3][4], "192.0.2.2/24");
+            }
+            other => panic!("expected a structured ip table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ip_incomplete_records_are_rejected() {
+        // Every field this table renders must be present and of the shape
+        // iproute2 documents; an absent one is refused rather than filled
+        // with an empty cell that would read as "none".
+        let registry = PreprocessorRegistry::default();
+        for output in [
+            // `addr_info` absent entirely: this is `ip -j link` output, not
+            // `ip addr`, and must not become an address-less address table.
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP"}]"#,
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP","addr_info":null}]"#,
+            // `operstate` absent (iproute2 would send `operstate_index`).
+            r#"[{"ifname":"lo","ifindex":1,"addr_info":[]}]"#,
+            // `family` absent (iproute2 would send `family_index`).
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP","addr_info":[{"local":"127.0.0.1","prefixlen":8}]}]"#,
+            // `prefixlen` absent, or a string rather than a number: either
+            // would leave this row's address in a different format from its
+            // neighbours'.
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP","addr_info":[{"family":"inet","local":"127.0.0.1"}]}]"#,
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP","addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":"8"}]}]"#,
+            // `local` as a number is not an address iproute2 would print.
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP","addr_info":[{"family":"inet","local":1,"prefixlen":8}]}]"#,
+        ] {
+            let outcome = registry.preprocess(IP_COMMAND, output);
+            assert!(
+                matches!(
+                    outcome,
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a raw fallback for {output:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_ip_output_degrades_to_raw() {
+        let registry = PreprocessorRegistry::default();
+        for output in [
+            r#"[{"ifindex":1,"operstate":"UP","addr_info":[]}]"#,
+            r#"[{"ifname":"lo","operstate":"UP","addr_info":[]}]"#,
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP","addr_info":"none"}]"#,
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP","addr_info":[{"family":"inet","prefixlen":8}]}]"#,
+            "[]",
+            "",
+            "/bin/sh: ip: not found\n",
+            "Object \"addr\" is unknown, try \"ip help\".\n",
+        ] {
+            let outcome = registry.preprocess(IP_COMMAND, output);
+            assert!(
+                matches!(
+                    outcome,
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a raw fallback for {output:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_canonical_service_family_commands_are_not_claimed() {
+        let registry = PreprocessorRegistry::default();
+        let cases = [
+            // Other output modes / no explicit format.
+            ("systemctl list-units", SYSTEMCTL_SAMPLE),
+            ("systemctl list-units --output=short", SYSTEMCTL_SAMPLE),
+            ("systemctl status nginx", SYSTEMCTL_SAMPLE),
+            // A different ps field list is a different column layout.
+            ("ps aux", PS_SAMPLE),
+            ("ps -eo pid,comm", PS_SAMPLE),
+            ("ps -eo pid,ppid,user,rss,pcpu,args", PS_SAMPLE),
+            // `ss` without `-H` prints a header this parse would misread.
+            ("ss -n", SS_SAMPLE),
+            ("ss -tuln", SS_SAMPLE),
+            // `ip` in another object or without `-j`.
+            ("ip addr", IP_SAMPLE),
+            ("ip -j link", IP_SAMPLE),
+            // Shell syntax in the program word, and compound forms.
+            ("$(which ps) -eo pid,ppid,user,rss,pcpu,comm", PS_SAMPLE),
+            ("ss -H -n | wc -l", SS_SAMPLE),
+            ("systemctl list-units --output=json > /tmp/u", SYSTEMCTL_SAMPLE),
+        ];
+        for (command, output) in cases {
+            assert_eq!(
+                registry.preprocess(command, output),
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::NoPreprocessor
+                },
+                "{command} must not be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn service_family_adversarial_outputs_do_not_panic() {
+        let registry = PreprocessorRegistry::default();
+        let commands = [
+            SYSTEMCTL_COMMAND,
+            PS_COMMAND,
+            SS_COMMAND,
+            JOURNALCTL_COMMAND,
+            IP_COMMAND,
+        ];
+        let tough = [
+            "",
+            "\n\n\n",
+            "   ",
+            "{",
+            "[",
+            "[]",
+            "null",
+            "[null]",
+            "[[]]",
+            "{\"a\":1}",
+            "\u{0}\u{0}",
+            "PID\n",
+            "tcp\n",
+            "пример вывода\n",
+            "[{\"ifname\":null,\"ifindex\":null}]",
+        ];
+        for command in commands {
+            for output in tough {
+                // Any outcome is acceptable here — the point is no panic.
+                let _ = registry.preprocess(command, output);
+            }
+        }
+        let huge_line = format!("tcp ESTAB 0 0 {} b\n", "x".repeat(20_000));
+        let _ = registry.preprocess(SS_COMMAND, &huge_line);
+        let deep = format!("[{}]", "[".repeat(200) + &"]".repeat(200));
+        let _ = registry.preprocess(IP_COMMAND, &deep);
     }
 }
