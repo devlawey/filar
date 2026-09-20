@@ -1291,7 +1291,17 @@ const IP_CANONICAL_ARGS: &str = "-j addr";
 /// and `address` — real output has them (a `DOWN` interface reports
 /// `addr_info: []`), and dropping the row would hide the interface's
 /// existence and its `operstate`, which is often the very difference worth
-/// seeing across a fleet.
+/// seeing across a fleet. That is `addr_info: []` specifically: an
+/// interface with **no** `addr_info` key is not `ip addr` output (`ip -j
+/// link` prints interfaces without one) and is refused, since reading it as
+/// "no addresses" would render an address table that silently holds none.
+///
+/// Each address must carry a string `family`, a string `local` and a
+/// numeric `prefixlen`, and each interface a string `operstate`. iproute2's
+/// schema marks `family` and `operstate` mutually exclusive with
+/// `family_index` / `operstate_index`, emitted when the value is unknown to
+/// it; this table has no such column, so an absent one is refused rather
+/// than defaulted to an empty cell that would read as "none".
 pub struct IpPreprocessor;
 
 impl OutputPreprocessor for IpPreprocessor {
@@ -1316,16 +1326,34 @@ impl OutputPreprocessor for IpPreprocessor {
             let ifindex = json_string(interface.get("ifindex")).ok_or_else(|| {
                 PreprocessError::new(format!("interface `{ifname}` is missing `ifindex`"))
             })?;
-            let operstate = json_string(interface.get("operstate")).unwrap_or_default();
-            let addresses = match interface.get("addr_info") {
-                None | Some(serde_json::Value::Null) => &[][..],
-                Some(serde_json::Value::Array(list)) => list.as_slice(),
-                Some(_) => {
-                    return Err(PreprocessError::new(format!(
-                        "interface `{ifname}` has an `addr_info` that is not an array"
-                    )))
-                }
-            };
+            // `operstate` and `family` below are both fields iproute2's
+            // schema marks mutually exclusive with an `*_index` variant it
+            // emits when the value is unknown to it. This table has no such
+            // column, so an absent one is refused rather than defaulted:
+            // an empty cell would read as "no state" / "no family" instead
+            // of "a value we cannot render".
+            let operstate = interface
+                .get("operstate")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    PreprocessError::new(format!(
+                        "interface `{ifname}` is missing a string `operstate`"
+                    ))
+                })?
+                .to_string();
+            // Every `ip addr` interface carries `addr_info`, empty when the
+            // interface has no addresses. Absent entirely means this is not
+            // `ip addr` output at all — `ip -j link` prints interfaces
+            // without it — and treating that as "no addresses" would render
+            // a whole address table that silently contains none.
+            let addresses = interface
+                .get("addr_info")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    PreprocessError::new(format!(
+                        "interface `{ifname}` has no `addr_info` array (not `ip addr` output?)"
+                    ))
+                })?;
             if addresses.is_empty() {
                 rows.push(vec![
                     ifname,
@@ -1337,16 +1365,36 @@ impl OutputPreprocessor for IpPreprocessor {
                 continue;
             }
             for address in addresses {
-                let family = json_string(address.get("family")).unwrap_or_default();
-                let local = json_string(address.get("local")).ok_or_else(|| {
-                    PreprocessError::new(format!(
-                        "an address of `{ifname}` is missing `local`"
-                    ))
-                })?;
-                let cidr = match json_string(address.get("prefixlen")) {
-                    Some(prefix) => format!("{local}/{prefix}"),
-                    None => local,
-                };
+                let family = address
+                    .get("family")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        PreprocessError::new(format!(
+                            "an address of `{ifname}` is missing a string `family`"
+                        ))
+                    })?;
+                let local = address
+                    .get("local")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        PreprocessError::new(format!(
+                            "an address of `{ifname}` is missing a string `local`"
+                        ))
+                    })?;
+                // iproute2 prints `prefixlen` as a number. Requiring it
+                // keeps the column one format: without it a row would carry
+                // a bare address while its neighbours carry CIDR, and the
+                // two would compare as different across a fleet.
+                let prefix = address
+                    .get("prefixlen")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        PreprocessError::new(format!(
+                            "an address of `{ifname}` is missing a numeric `prefixlen`"
+                        ))
+                    })?;
+                let cidr = format!("{local}/{prefix}");
+                let family = family.to_string();
                 rows.push(vec![
                     ifname.clone(),
                     ifindex.clone(),
@@ -2968,13 +3016,49 @@ u_str ESTAB 0      0      /run/systemd/journal/stdout 21456 * 21455
     }
 
     #[test]
+    fn ip_incomplete_records_are_rejected() {
+        // Every field this table renders must be present and of the shape
+        // iproute2 documents; an absent one is refused rather than filled
+        // with an empty cell that would read as "none".
+        let registry = PreprocessorRegistry::default();
+        for output in [
+            // `addr_info` absent entirely: this is `ip -j link` output, not
+            // `ip addr`, and must not become an address-less address table.
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP"}]"#,
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP","addr_info":null}]"#,
+            // `operstate` absent (iproute2 would send `operstate_index`).
+            r#"[{"ifname":"lo","ifindex":1,"addr_info":[]}]"#,
+            // `family` absent (iproute2 would send `family_index`).
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP","addr_info":[{"local":"127.0.0.1","prefixlen":8}]}]"#,
+            // `prefixlen` absent, or a string rather than a number: either
+            // would leave this row's address in a different format from its
+            // neighbours'.
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP","addr_info":[{"family":"inet","local":"127.0.0.1"}]}]"#,
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP","addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":"8"}]}]"#,
+            // `local` as a number is not an address iproute2 would print.
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP","addr_info":[{"family":"inet","local":1,"prefixlen":8}]}]"#,
+        ] {
+            let outcome = registry.preprocess(IP_COMMAND, output);
+            assert!(
+                matches!(
+                    outcome,
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a raw fallback for {output:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_ip_output_degrades_to_raw() {
         let registry = PreprocessorRegistry::default();
         for output in [
             r#"[{"ifindex":1,"operstate":"UP","addr_info":[]}]"#,
             r#"[{"ifname":"lo","operstate":"UP","addr_info":[]}]"#,
-            r#"[{"ifname":"lo","ifindex":1,"addr_info":"none"}]"#,
-            r#"[{"ifname":"lo","ifindex":1,"addr_info":[{"family":"inet","prefixlen":8}]}]"#,
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP","addr_info":"none"}]"#,
+            r#"[{"ifname":"lo","ifindex":1,"operstate":"UP","addr_info":[{"family":"inet","prefixlen":8}]}]"#,
             "[]",
             "",
             "/bin/sh: ip: not found\n",

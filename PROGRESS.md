@@ -7826,7 +7826,7 @@ fleet pipeline feeds preprocessors the streams separately, which belongs to
 the pipeline issue (#424+), not here. Raised in the PR rather than decided
 unilaterally.
 
-**Tests.** 19 new (52 → 71 in `preprocess.rs`): real-shape samples for all
+**Tests.** 20 new (52 → 72 in `preprocess.rs`): real-shape samples for all
 five commands; the no-systemd fallback in three shapes; `ps` with a
 space-bearing command name, no header, truncation, non-numeric `pid`/`pcpu`,
 header-only; `ss` across both field shapes including IPv6 bracket notation
@@ -7839,10 +7839,42 @@ declined; shell substitution in the program word and compound forms declined;
 an adversarial sweep of 15 malformed outputs across all five commands plus a
 20 000-character line and 200-deep nesting — no panics.
 
+**Review round (PR #457).** CodeRabbit's find was real and is closed in the
+same branch: `IpPreprocessor` filled absent fields with empty cells instead
+of refusing them.
+
+- `addr_info` missing or `null` was read as "no addresses". But every
+  `ip addr` interface carries the key (empty when it has none) — absent
+  entirely means the output is not `ip addr` at all: `ip -j link` prints
+  interfaces without it, and the old code would have rendered a whole
+  address table that silently held no addresses. Now refused; the
+  `addr_info: []` address-less-interface row is unchanged.
+- `family` and `operstate` were defaulted to an empty string. iproute2's
+  schema marks both mutually exclusive with `family_index` /
+  `operstate_index`, which it emits when the value is unknown to it; this
+  table has no such column, so an empty cell would read as "no family" /
+  "no state" rather than "a value we cannot render". Both are now required
+  strings. (`operstate` was not in the finding, but it is the same field
+  pattern two lines away and the same schema note covers it — fixing one and
+  leaving the other would only invite the next round.)
+- `prefixlen` was optional and accepted a string. A missing one left a bare
+  address in a column whose other rows carry CIDR, so two equal addresses
+  would compare as different across a fleet. Now a required number.
+- `local` accepted a number; iproute2 prints an address string.
+
+Verified against the live capture from this host: all 4 interfaces and both
+addresses satisfy the tightened requirements, so real output still parses.
+1 new test (71 → 72) covering each rejected shape.
+
+**ai-review did not land on this PR.** Its `review` check-run ended
+`cancelled` after ~15 minutes, alongside `eval smoke`, matching the
+OpenRouter rate-limit/timeout pattern recorded under #455 — so only
+CodeRabbit's half of the review has been answered so far.
+
 **DoD.** Additive change to `preprocess.rs`; nothing in the agent loop or
 fleet catalog calls these preprocessors yet (#424+), so no user-visible
 behaviour changed and the TUI/GUI real-host-run requirement does not apply.
-`cargo build -p filar-agent` and `cargo test -p filar-agent --lib` (224
+`cargo build -p filar-agent` and `cargo test -p filar-agent --lib` (225
 tests) are green; `cargo clippy -p filar-agent --lib --all-targets` is clean
 on `preprocess.rs`. Full `cargo build --workspace` still cannot run here (the
 `gui` crate needs `libdbus-1-dev`, absent and not installable); CI covers the
