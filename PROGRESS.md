@@ -7752,7 +7752,7 @@ flagged manual in the PR, per `AGENTS.md`.
 **Milestone:** 2.0.0. **Branch:** `feat/423-service-process-socket-preprocessors`.
 
 **Problem.** #423, the third and largest command family on the #420
-framework: what is running (`systemctl`, `ps`), what is listening
+framework: what is running (`systemctl`, `ps`), what the sockets are doing
 (`ss`), what the journal says (`journalctl`) and how the host is addressed
 (`ip`).
 
@@ -7770,6 +7770,10 @@ pinning one canonical invocation like the earlier families:
   all digits, `pcpu` a decimal; `comm` is `fields[5..]` joined, so a command
   name with spaces survives.
 - `SsPreprocessor` — `ss -H -n` → `netid/state/recv_q/send_q/local/peer`.
+  `-H` and `-n` are required; `-l` and `-a` are accepted alongside them,
+  because bare `ss` lists only *non-listening* sockets and a check that
+  wants listening ports needs one of them — they change the selection, not
+  a line's shape (see the review round).
   Field counts differ by family, which real output confirmed: internet
   sockets print **six** fields (address and port already joined), unix
   sockets **eight** (address and inode separate). Both are read, and the
@@ -7826,7 +7830,8 @@ fleet pipeline feeds preprocessors the streams separately, which belongs to
 the pipeline issue (#424+), not here. Raised in the PR rather than decided
 unilaterally.
 
-**Tests.** 20 new (52 → 72 in `preprocess.rs`): real-shape samples for all
+**Tests.** 23 new in total across this branch, review rounds included
+(52 → 75 in `preprocess.rs`); the original push added 19 (52 → 71): real-shape samples for all
 five commands; the no-systemd fallback in three shapes; `ps` with a
 space-bearing command name, no header, truncation, non-numeric `pid`/`pcpu`,
 header-only; `ss` across both field shapes including IPv6 bracket notation
@@ -7864,17 +7869,41 @@ of refusing them.
 
 Verified against the live capture from this host: all 4 interfaces and both
 addresses satisfy the tightened requirements, so real output still parses.
-1 new test (71 → 72) covering each rejected shape.
+1 test (71 → 72) covering each rejected shape.
 
 **ai-review did not land on this PR.** Its `review` check-run ended
 `cancelled` after ~15 minutes, alongside `eval smoke`, matching the
 OpenRouter rate-limit/timeout pattern recorded under #455 — so only
 CodeRabbit's half of the review has been answered so far.
 
+**Review round 2 — ai-review (PR #457).** It landed on the second run (its
+first attempt was cancelled, below) with three findings; all three accepted.
+
+- **`ss -H -n` never shows listening sockets** (major, and correct):
+  bare `ss` lists only *non-listening* sockets, while this entry and the PR
+  described the preprocessor as "what is listening". Verified on the live
+  host: all 25 rows of `ss -H -n` are `ESTAB`, none `LISTEN`. Fixed on both
+  sides — the wording no longer claims listening coverage, and `-l`/`-a` are
+  now accepted alongside the required `-H -n`, since they select *which*
+  sockets are listed without changing a line's shape. That too was verified
+  rather than assumed: real `ss -H -a -n` (42 rows) and `ss -H -l -n` (17)
+  parse with zero rejected lines, every netid printing 6 fields and `u_str`
+  8. Keeping the issue's pinned `-H -n` while refusing `-l`/`-a` would have
+  left the family unable to answer the question it exists for.
+- **`pcpu` validation was weaker than claimed** (minor, and real):
+  `"NaN".parse::<f64>()` returns `Ok(NaN)`, as do `inf` and `-inf`, so the
+  `is_err()` check admitted values `ps` never prints into a numeric column —
+  a hole in the fail-closed contract this module advertises. Replaced with
+  `is_decimal`, which accepts only digits and at most one dot.
+- **Test tally read as self-contradictory** (minor): the numbers were in
+  fact consistent — 19 in the original push, +1 in the first review round,
+  20 cumulative — but the prose put a cumulative total next to a per-round
+  one with nothing marking the difference. Reworded rather than renumbered.
+
 **DoD.** Additive change to `preprocess.rs`; nothing in the agent loop or
 fleet catalog calls these preprocessors yet (#424+), so no user-visible
 behaviour changed and the TUI/GUI real-host-run requirement does not apply.
-`cargo build -p filar-agent` and `cargo test -p filar-agent --lib` (225
+`cargo build -p filar-agent` and `cargo test -p filar-agent --lib` (228
 tests) are green; `cargo clippy -p filar-agent --lib --all-targets` is clean
 on `preprocess.rs`. Full `cargo build --workspace` still cannot run here (the
 `gui` crate needs `libdbus-1-dev`, absent and not installable); CI covers the

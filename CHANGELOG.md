@@ -16,7 +16,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Service, process, socket, journal and network output preprocessors, each
   pinning one canonical invocation: `systemctl list-units --output=json` →
   `unit/load/active/sub/description`, `ps -eo pid,ppid,user,rss,pcpu,comm` →
-  process rows, `ss -H -n` → `netid/state/recv_q/send_q/local/peer` (reading
+  process rows, `ss -H -n` — optionally with `-l` or `-a`, which select which
+  sockets are listed — → `netid/state/recv_q/send_q/local/peer` (reading
   both the six-field internet and eight-field unix socket shapes),
   `journalctl --output=json` → `timestamp/unit/priority/message` from
   journald's JSON Lines, and `ip -j addr` → one

@@ -1054,7 +1054,7 @@ impl OutputPreprocessor for PsPreprocessor {
                     )));
                 }
             }
-            if fields[4].parse::<f64>().is_err() {
+            if !is_decimal(fields[4]) {
                 return Err(PreprocessError::new(format!(
                     "data line {} has a non-numeric `pcpu`: {}",
                     index + 1,
@@ -1077,12 +1077,27 @@ impl OutputPreprocessor for PsPreprocessor {
 /// Columns produced by [`SsPreprocessor`].
 const SS_COLUMNS: [&str; 6] = ["netid", "state", "recv_q", "send_q", "local", "peer"];
 
-/// The argument list [`SsPreprocessor`] claims (issue #423): `-H` drops the
-/// header so every line is a socket, `-n` keeps addresses and ports numeric
-/// so no resolver runs and no name lookup varies the output.
-const SS_CANONICAL_ARGS: &str = "-H -n";
+/// The flags [`SsPreprocessor`] accepts.
+///
+/// `-H` and `-n` are required: `-H` drops the header so every line is a
+/// socket, and `-n` keeps addresses and ports numeric so no resolver runs
+/// and no name lookup varies the output. `-l` and `-a` are optional and
+/// select *which* sockets are listed without changing a line's shape, so
+/// they are accepted rather than declined — `ss` with neither lists only
+/// non-listening sockets, and a fleet check that wants listening ports
+/// needs one of them.
+const SS_REQUIRED_FLAGS: [&str; 2] = ["-H", "-n"];
+
+/// Flags accepted alongside [`SS_REQUIRED_FLAGS`] (see its docs).
+const SS_OPTIONAL_FLAGS: [&str; 2] = ["-l", "-a"];
 
 /// Reads `ss -H -n` into socket rows.
+///
+/// **Which sockets appear is the caller's choice, not this parser's.** Bare
+/// `ss` lists only *non-listening* sockets, so `ss -H -n` alone answers
+/// "what is connected", not "what is listening" — for the latter the caller
+/// adds `-l` (listening only) or `-a` (both), which this preprocessor
+/// therefore accepts: they change the selection, never a line's shape.
 ///
 /// Field counts differ by address family, which real output confirms: an
 /// internet socket prints six fields, because its address and port are
@@ -1105,7 +1120,26 @@ impl OutputPreprocessor for SsPreprocessor {
     }
 
     fn matches(&self, command: &str) -> bool {
-        is_canonical_invocation(command, "ss", SS_CANONICAL_ARGS)
+        if command.contains(SHELL_META) {
+            return false;
+        }
+        let mut words = command.split_whitespace();
+        let Some(program) = words.next() else {
+            return false;
+        };
+        if base_name(program) != "ss" {
+            return false;
+        }
+        let flags: Vec<&str> = words.collect();
+        if !flags
+            .iter()
+            .all(|flag| SS_REQUIRED_FLAGS.contains(flag) || SS_OPTIONAL_FLAGS.contains(flag))
+        {
+            return false;
+        }
+        SS_REQUIRED_FLAGS
+            .iter()
+            .all(|required| flags.contains(required))
     }
 
     fn preprocess(
@@ -1447,6 +1481,26 @@ fn json_string(value: Option<&serde_json::Value>) -> Option<String> {
 /// Is `text` a non-empty run of ASCII digits?
 fn is_all_digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Is `text` a plain decimal number, the way `ps` prints a percentage
+/// (`0.0`, `1.3`, `100`)?
+///
+/// Deliberately stricter than `f64::from_str`, which also accepts `NaN`,
+/// `inf`, `-inf` and exponent forms: those parse successfully and would
+/// have slipped through a check that only asked whether parsing worked,
+/// putting a value `ps` never prints into a numeric column.
+fn is_decimal(text: &str) -> bool {
+    let mut digits = 0usize;
+    let mut dots = 0usize;
+    for byte in text.bytes() {
+        match byte {
+            b'0'..=b'9' => digits += 1,
+            b'.' => dots += 1,
+            _ => return false,
+        }
+    }
+    digits > 0 && dots <= 1
 }
 
 /// Build a table from `columns` and `rows`, refusing an empty row set with
@@ -2834,6 +2888,86 @@ u_str ESTAB 0      0      /run/systemd/journal/stdout 21456 * 21455
                 assert_eq!(table.rows()[4][4], "/run/systemd/journal/stdout:21456");
             }
             other => panic!("expected a structured ss table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ss_listening_selections_are_claimed() {
+        // Bare `ss` lists only non-listening sockets, so a check that wants
+        // listening ports adds `-l` or `-a`. Both select which sockets are
+        // listed without changing a line's shape — verified against real
+        // output, where every netid still prints 6 fields (8 for unix).
+        let registry = PreprocessorRegistry::default();
+        for command in [
+            "ss -H -n",
+            "ss -H -n -l",
+            "ss -H -l -n",
+            "ss -H -n -a",
+            "ss -a -H -n",
+            "/usr/bin/ss -H -n -l",
+        ] {
+            assert!(
+                registry.preprocess(command, SS_SAMPLE).is_structured(),
+                "{command} must be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn ss_without_the_required_flags_is_not_claimed() {
+        let registry = PreprocessorRegistry::default();
+        for command in [
+            // Without `-H` the header line would be misread as a socket.
+            "ss -n",
+            "ss -n -l",
+            // Without `-n` names and ports resolve, so the output varies.
+            "ss -H",
+            "ss -H -l",
+            // Flags outside the accepted set change what the columns mean.
+            "ss -H -n -p",
+            "ss -H -n -t",
+            "ss -Hln",
+        ] {
+            assert_eq!(
+                registry.preprocess(command, SS_SAMPLE),
+                PreprocessOutcome::Raw {
+                    reason: RawFallback::NoPreprocessor
+                },
+                "{command} must not be claimed"
+            );
+        }
+    }
+
+    #[test]
+    fn ps_rejects_special_float_values_in_pcpu() {
+        // `"NaN".parse::<f64>()` succeeds, as do `inf` and `-inf`, so a
+        // check that only asked whether parsing worked would have let a
+        // value `ps` never prints into the numeric column.
+        let registry = PreprocessorRegistry::default();
+        for pcpu in ["NaN", "nan", "inf", "-inf", "infinity", "1e5", "-1.0", "+1.0", "1.2.3"] {
+            let output = format!(
+                "  PID  PPID USER       RSS %CPU COMMAND\n    1     0 root      4760  {pcpu} init\n"
+            );
+            let outcome = registry.preprocess(PS_COMMAND, &output);
+            assert!(
+                matches!(
+                    outcome,
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::Unparseable(_)
+                    }
+                ),
+                "expected a raw fallback for pcpu {pcpu:?}, got {outcome:?}"
+            );
+        }
+        // ... while the shapes `ps` does print stay accepted.
+        for pcpu in ["0.0", "1.3", "100", "99.9"] {
+            let output = format!(
+                "  PID  PPID USER       RSS %CPU COMMAND\n    1     0 root      4760  {pcpu} init\n"
+            );
+            assert!(
+                registry.preprocess(PS_COMMAND, &output).is_structured(),
+                "pcpu {pcpu:?} must be accepted"
+            );
         }
     }
 
