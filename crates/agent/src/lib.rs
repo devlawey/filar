@@ -7,6 +7,7 @@
 //! - Security layer: confirmation, destructive command detection (Stage 5).
 //! - Output preprocessors: machine-format command output → typed tables; raw
 //!   text remains the fallback (Stage 2.0, fleet).
+//! - OS-family detection per host, cached for the session (Stage 2.0, fleet).
 
 pub mod agent;
 pub mod arbiter;
@@ -15,6 +16,7 @@ pub mod compaction;
 pub mod events;
 pub mod long_wait;
 pub mod openai_compat;
+pub mod os_probe;
 pub mod password_prompt;
 pub mod preprocess;
 pub mod runbook;
@@ -27,6 +29,7 @@ pub use arbiter::{ArbiterContext, ArbiterVerdict, ARBITER_TIMEOUT_SECS};
 pub use compaction::{summarise_history, SummaryOutcome, COMPACTION_SYSTEM_PROMPT};
 pub use events::{AgentEvent, EventSink};
 pub use openai_compat::OpenAiCompatClient;
+pub use os_probe::OsFamilyProbe;
 pub use preprocess::{
     DfPreprocessor, DpkgPreprocessor, IpPreprocessor, JournalctlPreprocessor, LsblkPreprocessor,
     OutputPreprocessor, PreprocessError, PreprocessOutcome, PreprocessedOutput,

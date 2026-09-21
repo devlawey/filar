@@ -14,6 +14,10 @@
 //!   gate refuses would be dead weight);
 //! - a user check declaring a write is *refused* by the gate, with the inner
 //!   executor never touched.
+//!
+//! Since #425 a check may carry one command per OS family, so the audit
+//! covers **every variant**: a shipped Alpine command the gate refuses
+//! would be invisible on any other runner.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use filar_core::fleet_checks::FleetCheckCatalog;
-use filar_core::Result;
+use filar_core::{OsFamily, Result};
 use filar_transport::readonly::check_read_only;
 use filar_transport::{CommandExecutor, CommandResult, ReadOnlyExecutor};
 
@@ -109,17 +113,34 @@ fn every_builtin_check_passes_the_read_only_gate() {
     let catalog = FleetCheckCatalog::builtin();
     assert!(!catalog.is_empty(), "built-in catalog must not be empty");
 
+    let mut audited = 0;
     for check in catalog.checks() {
-        if let Err(reason) = check_read_only(check.command()) {
-            panic!(
-                "built-in check '{}' declares a command the read-only gate refuses: \
-                 {} — command was: {}",
-                check.name(),
-                reason,
-                check.command()
-            );
+        for command in check.commands() {
+            if let Err(reason) = check_read_only(command) {
+                panic!(
+                    "built-in check '{}' declares a command the read-only gate refuses: \
+                     {reason} — command was: {command}",
+                    check.name()
+                );
+            }
+            audited += 1;
         }
     }
+    // More commands than checks: at least one check carries OS variants.
+    assert!(
+        audited > catalog.checks().len(),
+        "expected at least one built-in with OS variants, audited {audited} \
+         commands over {} checks",
+        catalog.checks().len()
+    );
+}
+
+/// The detection command for the OS family (#425) runs on fleet hosts under
+/// the same gate, so it has to pass it too.
+#[test]
+fn the_os_detection_command_passes_the_read_only_gate() {
+    check_read_only(filar_core::OS_RELEASE_COMMAND)
+        .unwrap_or_else(|reason| panic!("OS detection command is refused: {reason}"));
 }
 
 /// The same set, through the real executor rather than the predicate.
@@ -128,15 +149,19 @@ async fn every_builtin_check_is_forwarded_by_the_executor() {
     let catalog = FleetCheckCatalog::builtin();
     let (exec, inner) = gated();
 
+    let mut expected = 0;
     for check in catalog.checks() {
-        exec.run(check.command())
-            .await
-            .unwrap_or_else(|e| panic!("built-in check '{}' was refused: {e}", check.name()));
+        for command in check.commands() {
+            exec.run(command)
+                .await
+                .unwrap_or_else(|e| panic!("built-in check '{}' was refused: {e}", check.name()));
+            expected += 1;
+        }
     }
     assert_eq!(
         inner.calls(),
-        catalog.checks().len(),
-        "every built-in check should have reached the inner executor"
+        expected,
+        "every built-in command should have reached the inner executor"
     );
 }
 
@@ -172,8 +197,12 @@ command = "cat /etc/hostname; rm -rf /var/log"
     let (exec, inner) = gated();
     for name in ["wipe-logs", "smuggled"] {
         let check = catalog.get(name).expect("check missing from catalog");
+        let command = check
+            .command_for(OsFamily::Debian)
+            .command()
+            .expect("a single-command check runs everywhere");
         let error = exec
-            .run(check.command())
+            .run(command)
             .await
             .expect_err("the read-only gate must refuse this command");
         let rendered = error.to_string();
@@ -211,7 +240,11 @@ command = "cat /etc/ssh/sshd_config"
     let catalog = FleetCheckCatalog::load(Some(&file.path));
 
     let check = catalog.get("sshd-config").expect("user check missing");
+    let command = check
+        .command_for(OsFamily::Debian)
+        .command()
+        .expect("a single-command check runs everywhere");
     let (exec, inner) = gated();
-    exec.run(check.command()).await.expect("should be forwarded");
+    exec.run(command).await.expect("should be forwarded");
     assert_eq!(inner.calls(), 1);
 }

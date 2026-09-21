@@ -16,16 +16,27 @@
 #      claims, so the output becomes a comparable table rather than raw text.
 #      `crates/agent/src/preprocess.rs` asserts this for every entry.
 #
+# A `command` is either one string, used everywhere, or a table of variants
+# keyed by OS family (`debian`, `rhel`, `alpine`) plus an optional
+# `default`. A host whose family no variant covers is *not applicable* to
+# that check — a state, not an error (#425).
+#
 # Several preprocessors shipped by #421–#423 (`dpkg-query`, `rpm`,
 # `systemctl`, `journalctl`, `ip`, `nginx -v`, `php -v`) target binaries the
 # read-only allowlist deliberately excludes, so no built-in check can use
 # them yet. That gap is recorded in PROGRESS.md, not worked around here: the
 # allowlist is a security boundary, not a default to widen.
 
+# The one built-in that genuinely needs an OS variant (#425). GNU coreutils
+# `df` accepts `--output=`, which pins the six columns regardless of what a
+# given build defaults to; busybox `df` on Alpine rejects the flag outright.
+# Plain `df` prints those same six columns, and the `df` preprocessor reads
+# both spellings, so the Alpine variant produces an identical table rather
+# than a second shape to compare against.
 [[check]]
 name = "disk-usage"
 description = "Filesystem sizes and utilisation per mount point"
-command = "df --output=source,size,used,avail,pcent,target"
+command = { default = "df --output=source,size,used,avail,pcent,target", alpine = "df" }
 preprocessor = "df"
 compare = ["mount", "filesystem", "size"]
 
