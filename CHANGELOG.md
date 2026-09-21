@@ -13,6 +13,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Fleet operations: the layer above a session, pairing one question with a
+  set of hosts. A group's tag rule is resolved once, when the operation is
+  opened, and the hosts, policy and limits are frozen there — so output from
+  a host can never change the set of hosts, and a host taking part stays
+  available to a normal tab at the same time
+  ([#426](https://github.com/devlawey/filar/issues/426)).
+
 - Per-OS command variants for fleet checks, with the host's family detected
   once per session from `/etc/os-release`; a check with no variant for a
   host is reported as not applicable rather than failed
