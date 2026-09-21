@@ -13,11 +13,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
-- Declarative fleet-check catalog: six checks are compiled into the binary
-  and a `fleet_checks.toml` next to `config.toml` (or at
-  `FILAR_FLEET_CHECKS`) augments them. A malformed entry is rejected with a
-  reason and the rest keep working; a declared command is still bound by the
-  compiled-in read-only allowlist
+- Declarative fleet-check catalog: six built-in checks plus user-defined ones
+  from `fleet_checks.toml`, all bound by the read-only allowlist
   ([#424](https://github.com/devlawey/filar/issues/424)).
 
 - Service, process, socket, journal and network output preprocessors, each
