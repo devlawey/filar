@@ -21,4 +21,7 @@ futures = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` (not part of tokio's `full`) gives the fleet fan-out tests a
+# paused clock: a per-host deadline can then be proven to fire without a
+# test that actually waits 30 seconds (#427).
+tokio = { workspace = true, features = ["test-util"] }

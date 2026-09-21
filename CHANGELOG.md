@@ -13,6 +13,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Fleet fan-out: one command per host across an operation, with at most the
+  group's `max_parallel` hosts in flight at a time and a deadline **per
+  host** rather than one for the whole operation, so a wedged machine
+  becomes a single timed-out cell instead of holding up the summary for
+  everyone else. A timed-out command is cancelled rather than left running
+  on the host, and the freed slot goes straight to the next host in the
+  queue ([#427](https://github.com/devlawey/filar/issues/427)).
+
 - Fleet operations: the layer above a session, pairing one question with a
   set of hosts. A group's tag rule is resolved once, when the operation is
   opened, and the hosts, policy and limits are frozen there — so output from
