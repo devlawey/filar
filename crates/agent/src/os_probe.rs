@@ -13,30 +13,38 @@
 //! under us within a session: a host does not become Alpine halfway
 //! through.
 //!
-//! # Which executor to pass, and why the confirmation gate is not here
+//! # Which executor to pass
 //!
 //! Pass the host's own executor — the same one its session runs commands
 //! through. For a fleet host that is the `ReadOnlyExecutor`-wrapped one
 //! (#419), so the probe inherits exactly the transport gating that host
-//! already has; nothing is bypassed and nothing special is granted.
-//!
-//! The confirmation gate (AGENTS.md invariant 2) is deliberately *not*
-//! applied here, because it is not an executor wrapper: it lives in the
-//! agent loop (`agent.rs`), where it gates the command **the model
-//! proposed** before that command reaches any executor. This probe is
-//! transport bookkeeping, not an LLM tool call — the same category as the
-//! OSC 7 cwd sync, whose contract on
-//! [`CommandExecutor::set_cwd`][filar_transport::CommandExecutor::set_cwd]
-//! says so in as many words and which likewise runs `cd` on the channel
-//! without asking.
-//!
-//! What keeps that safe is not a prompt but the command's provenance:
-//! [`OS_RELEASE_COMMAND`] is a `const` in `filar-core`, never model-
-//! supplied and never assembled from input, and it sits inside the
+//! already has. [`OS_RELEASE_COMMAND`] is a `const` in `filar-core`, never
+//! model-supplied and never assembled from input, and it is inside the
 //! compiled-in read-only allowlist —
 //! `crates/transport/tests/fleet_catalog_readonly.rs` asserts that, and
 //! the tests below assert the probe issues that constant and nothing else.
 //!
+//! # Open question: the confirmation gate (#425 review, unresolved)
+//!
+//! **Nothing calls [`detect`][OsFamilyProbe::detect] yet**, so no command
+//! reaches a host today. Before a caller is wired up — in the fleet
+//! operation layer (#426) — one question has to be settled by the project
+//! owners, not here:
+//!
+//! Does AGENTS.md invariant 2 ("in confirm mode no command runs on the
+//! remote machine without explicit user approval; do not weaken this gate
+//! and do not add bypasses") cover an automatic probe like this one?
+//!
+//! The gate as built is not an executor wrapper: it lives in the agent
+//! loop, gating the command the model proposed. Other transport
+//! bookkeeping — the OSC 7 cwd sync, whose `set_cwd` contract calls itself
+//! "not an LLM tool call" — already runs unprompted on the same channel.
+//! But an existing pattern is not a licence to extend it, and the
+//! invariant is written without an exception for read-only or
+//! infrastructure commands. This module therefore does **not** claim an
+//! exception: whether the first probe per host needs a user gate is open,
+//! and #426 must answer it before calling `detect`.
+
 //! # A failure to reach the host is not an answer
 //!
 //! Two failures look alike and must not be treated alike. A command that
@@ -85,7 +93,8 @@ impl OsFamilyProbe {
     /// together still costs one command.
     ///
     /// `exec` must be the host's own executor, so the probe runs under
-    /// whatever gating that host already has — see the module docs.
+    /// whatever gating that host already has — see the module docs,
+    /// including the open question about the confirmation gate.
     ///
     /// Returns `Err` only when the command could not be run at all — see
     /// the module docs on why that case is not cached.
@@ -292,9 +301,11 @@ mod tests {
     }
 
     /// The executor a fleet host actually gets is wrapped in
-    /// `ReadOnlyExecutor`. The probe has to work through it — and it does,
-    /// because its command is in the allowlist rather than because anything
-    /// exempts it.
+    /// `ReadOnlyExecutor`, so the probe has to work through it. It does,
+    /// because its command is in the allowlist — not because anything
+    /// exempts it. This pins allowlist compatibility only; it says nothing
+    /// about the confirmation gate, which is the open question in the
+    /// module docs.
     #[tokio::test]
     async fn the_probe_works_through_the_read_only_gate() {
         let host = FakeHost::new(Behaviour::Prints(ALPINE));
