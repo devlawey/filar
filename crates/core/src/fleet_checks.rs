@@ -105,20 +105,57 @@ pub enum CommandSpec {
     Same(String),
     /// Per-family variants, with an optional catch-all.
     ///
-    /// `variants` is keyed by family and never holds
-    /// [`OsFamily::Unknown`] — a catalog cannot write a command "for hosts
-    /// we failed to identify", so an unidentified host takes `default` or
-    /// nothing.
+    /// `variants` is keyed by family, holds at least one entry and never
+    /// holds [`OsFamily::Unknown`] — a catalog cannot write a command "for
+    /// hosts we failed to identify", so an unidentified host takes
+    /// `default` or nothing.
+    ///
+    /// `#[non_exhaustive]` so those invariants are not merely documented:
+    /// outside this crate the variant can be read and matched but not
+    /// built, and inside it [`CommandSpec::per_os`] is the only way to make
+    /// one. Found in review — the fields were public, so an empty map or an
+    /// `Unknown` key was constructible and would have made `commands()`
+    /// return nothing or `for_os(Unknown)` answer with a command.
+    #[non_exhaustive]
     PerOs {
         /// Used for a family `variants` does not name. `None` means the
         /// check simply does not apply to those hosts.
         default: Option<String>,
-        /// Family-specific commands, at least one.
+        /// Family-specific commands, at least one, never keyed by
+        /// [`OsFamily::Unknown`].
         variants: BTreeMap<OsFamily, String>,
     },
 }
 
 impl CommandSpec {
+    /// Build a per-family spec, enforcing the variant's invariants.
+    ///
+    /// The only construction path for [`PerOs`][Self::PerOs]. A `variants`
+    /// map that is empty, or that keys [`OsFamily::Unknown`], is rejected
+    /// rather than silently producing a spec whose documented behaviour
+    /// does not hold. A map with no family entries but a `default` is not
+    /// an error: it means the same thing as a bare command, so it collapses
+    /// to [`Same`][Self::Same] — one shape per meaning.
+    pub fn per_os(
+        default: Option<String>,
+        variants: BTreeMap<OsFamily, String>,
+    ) -> std::result::Result<Self, String> {
+        if variants.contains_key(&OsFamily::Unknown) {
+            return Err(
+                "a command variant cannot be keyed by the unknown OS family: \
+                 an unidentified host takes 'default' or nothing"
+                    .into(),
+            );
+        }
+        if variants.is_empty() {
+            return match default {
+                Some(command) => Ok(Self::Same(command)),
+                None => Err("a command spec must name at least one command".into()),
+            };
+        }
+        Ok(Self::PerOs { default, variants })
+    }
+
     /// The command for a host of `family`.
     pub fn for_os(&self, family: OsFamily) -> CommandForOs<'_> {
         match self {
@@ -643,7 +680,10 @@ fn validate_command(raw: &RawCommand) -> std::result::Result<CommandSpec, String
             let mut default = None;
             let mut variants = BTreeMap::new();
             for (key, command) in table {
-                let key = key.trim();
+                // The key is matched exactly, never trimmed: TOML keeps
+                // `alpine` and `" alpine "` as two distinct keys, so
+                // trimming would fold them together and `insert` would drop
+                // one command without a word. Found in review.
                 let label = format!("command variant '{key}'");
                 if key == DEFAULT_COMMAND_KEY {
                     default = Some(validate_one_command(command, &label)?);
@@ -658,14 +698,9 @@ fn validate_command(raw: &RawCommand) -> std::result::Result<CommandSpec, String
                 };
                 variants.insert(family, validate_one_command(command, &label)?);
             }
-            if variants.is_empty() {
-                // A table holding only `default` is a single command wearing
-                // a costume; collapsing it keeps one shape per meaning.
-                return Ok(CommandSpec::Same(default.expect(
-                    "a non-empty table with no family variants must hold default",
-                )));
-            }
-            Ok(CommandSpec::PerOs { default, variants })
+            // The constructor owns the invariants, including collapsing a
+            // default-only table to a single command.
+            CommandSpec::per_os(default, variants)
         }
     }
 }
@@ -1436,6 +1471,78 @@ command = { rhel = "uptime" }
         let catalog = FleetCheckCatalog::load(Some(&file.path));
         assert!(catalog.rejected().is_empty());
         assert!(catalog.get("x").is_some());
+    }
+
+    /// The invariants the `PerOs` variant documents are now enforced by its
+    /// constructor, not left to callers. Found in review: the fields were
+    /// public, so an empty map or an `Unknown` key was constructible.
+    #[test]
+    fn per_os_rejects_specs_its_docs_forbid() {
+        let mut unknown_keyed = BTreeMap::new();
+        unknown_keyed.insert(OsFamily::Unknown, "uptime".to_string());
+        let err = CommandSpec::per_os(None, unknown_keyed).unwrap_err();
+        assert!(err.contains("unknown OS family"), "{err}");
+
+        let err = CommandSpec::per_os(None, BTreeMap::new()).unwrap_err();
+        assert!(err.contains("at least one command"), "{err}");
+
+        // A default with no family entries is the single-command case.
+        assert_eq!(
+            CommandSpec::per_os(Some("uptime".into()), BTreeMap::new()).unwrap(),
+            CommandSpec::Same("uptime".into())
+        );
+
+        let mut ok = BTreeMap::new();
+        ok.insert(OsFamily::Alpine, "df".to_string());
+        let spec = CommandSpec::per_os(None, ok).unwrap();
+        assert!(!spec.is_same_everywhere());
+        assert!(!spec.commands().is_empty());
+        assert_eq!(spec.for_os(OsFamily::Unknown), CommandForOs::NotApplicable);
+    }
+
+    /// Every spec the catalog produces satisfies them too.
+    #[test]
+    fn every_catalog_spec_holds_the_invariants() {
+        let catalog = FleetCheckCatalog::builtin();
+        for check in catalog.checks() {
+            assert!(
+                !check.commands().is_empty(),
+                "check '{}' has no command at all",
+                check.name()
+            );
+            if let CommandSpec::PerOs { variants, .. } = check.command_spec() {
+                assert!(!variants.is_empty(), "check '{}'", check.name());
+                assert!(
+                    !variants.contains_key(&OsFamily::Unknown),
+                    "check '{}' keys a variant by the unknown family",
+                    check.name()
+                );
+            }
+        }
+    }
+
+    /// TOML keeps `alpine` and `" alpine "` as two distinct keys. Trimming
+    /// folded them together and `insert` dropped one command silently —
+    /// exactly the failure variants exist to prevent. Found in review.
+    #[test]
+    fn a_variant_key_with_whitespace_is_rejected_not_folded() {
+        let file = TempCatalog::new(
+            "padded-key",
+            r#"
+[[check]]
+name = "x"
+description = "d"
+command = { alpine = "df", " alpine " = "df -h" }
+"#,
+        );
+        let catalog = FleetCheckCatalog::load(Some(&file.path));
+        assert!(catalog.get("x").is_none(), "the entry must not load");
+        assert_eq!(catalog.rejected().len(), 1);
+        let reason = catalog.rejected()[0].reason();
+        assert!(
+            reason.contains("unknown command variant"),
+            "the padded key should be named as unknown, got: {reason}"
+        );
     }
 
     /// A check may declare a command the read-only gate will refuse — the

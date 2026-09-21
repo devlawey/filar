@@ -113,7 +113,6 @@ fn every_builtin_check_passes_the_read_only_gate() {
     let catalog = FleetCheckCatalog::builtin();
     assert!(!catalog.is_empty(), "built-in catalog must not be empty");
 
-    let mut audited = 0;
     for check in catalog.checks() {
         for command in check.commands() {
             if let Err(reason) = check_read_only(command) {
@@ -123,15 +122,19 @@ fn every_builtin_check_passes_the_read_only_gate() {
                     check.name()
                 );
             }
-            audited += 1;
         }
     }
-    // More commands than checks: at least one check carries OS variants.
+
+    // The audit is only meaningful while some check actually carries
+    // variants, so that is asserted directly. Counting commands against
+    // checks was a proxy for it and a wrong one: `command = { alpine = "df" }`
+    // is a variant-carrying check with exactly one command. Found in review.
     assert!(
-        audited > catalog.checks().len(),
-        "expected at least one built-in with OS variants, audited {audited} \
-         commands over {} checks",
-        catalog.checks().len()
+        catalog
+            .checks()
+            .iter()
+            .any(|check| !check.command_spec().is_same_everywhere()),
+        "no built-in carries OS variants, so this audit no longer covers them"
     );
 }
 

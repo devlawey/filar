@@ -51,14 +51,15 @@
 //! *ran* and produced nothing placeable — no `/etc/os-release`, an exotic
 //! distribution — is a real answer of [`OsFamily::Unknown`], and it is
 //! cached: asking again would produce the same nothing. A command that
-//! never ran, because the connection dropped, is not an answer at all: it
-//! is reported as an error and **not** cached, so a later call can try
-//! again once the host is back. Caching that one would quietly mark every
-//! check on the host "not applicable" for the rest of the session.
+//! never *completed* — the connection dropped, or it was killed and
+//! `CommandResult::exit_code` is `None` — is not an answer at all: it is
+//! reported as an error and **not** cached, so a later call can try again.
+//! Caching one of those would quietly mark every check on the host "not
+//! applicable" for the rest of the session.
 
 use tokio::sync::OnceCell;
 
-use filar_core::{OsFamily, Result, OS_RELEASE_COMMAND};
+use filar_core::{CoreError, OsFamily, Result, OS_RELEASE_COMMAND};
 use filar_transport::CommandExecutor;
 
 /// Detects and remembers one host's OS family.
@@ -102,14 +103,29 @@ impl OsFamilyProbe {
         self.cached
             .get_or_try_init(|| async {
                 let result = exec.run(OS_RELEASE_COMMAND).await?;
-                // A non-zero exit means the command ran and the host has no
-                // readable os-release. That is an answer: Unknown, cached.
-                if result.exit_code != Some(0) {
-                    tracing::debug!(
-                        exit_code = ?result.exit_code,
-                        "os-release unreadable; treating the OS family as unknown"
-                    );
-                    return Ok(OsFamily::Unknown);
+                match result.exit_code {
+                    Some(0) => {}
+                    // The command ran and the host has no readable
+                    // os-release. That is an answer: Unknown, and it sticks.
+                    Some(code) => {
+                        tracing::debug!(
+                            exit_code = code,
+                            "os-release unreadable; treating the OS family as unknown"
+                        );
+                        return Ok(OsFamily::Unknown);
+                    }
+                    // `None` means killed or exited abnormally — per the
+                    // `CommandResult` contract, the command did not complete.
+                    // That is the "not an answer" case from the module docs,
+                    // so it must not be cached: a signal-terminated probe
+                    // would otherwise mark the host Unknown for the whole
+                    // session.
+                    None => {
+                        return Err(CoreError::Other(format!(
+                            "OS detection command did not complete on the host \
+                             (killed or abnormal exit): {OS_RELEASE_COMMAND}"
+                        )))
+                    }
                 }
                 let family = OsFamily::from_os_release(&result.stdout);
                 tracing::debug!(%family, "detected OS family");
@@ -146,6 +162,8 @@ mod tests {
         Prints(&'static str),
         /// The command ran and failed (no such file).
         Fails,
+        /// The command was killed — no exit code at all.
+        Killed,
         /// The command never ran — the connection is gone.
         Unreachable,
     }
@@ -193,6 +211,13 @@ mod tests {
                     stdout: String::new(),
                     stderr: "cat: /etc/os-release: No such file or directory".into(),
                     exit_code: Some(1),
+                    duration: Duration::from_millis(0),
+                    cwd: None,
+                }),
+                Behaviour::Killed => Ok(CommandResult {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
                     duration: Duration::from_millis(0),
                     cwd: None,
                 }),
@@ -268,6 +293,23 @@ mod tests {
         assert_eq!(probe.detect(host.as_ref()).await.unwrap(), OsFamily::Unknown);
         assert_eq!(host.calls(), 1, "a real answer is not re-asked");
         assert_eq!(probe.cached(), Some(OsFamily::Unknown));
+    }
+
+    /// `exit_code: None` means killed or abnormal, per the `CommandResult`
+    /// contract — the command did not complete, so it is not an answer and
+    /// must not stick. Found in review: the first cut cached it as
+    /// `Unknown`, contradicting this module's own docs.
+    #[tokio::test]
+    async fn an_abnormally_terminated_probe_is_an_error_and_is_not_cached() {
+        let host = FakeHost::new(Behaviour::Killed);
+        let probe = OsFamilyProbe::new();
+
+        assert!(probe.detect(host.as_ref()).await.is_err());
+        assert_eq!(probe.cached(), None, "a killed probe must not be cached");
+
+        host.set(Behaviour::Prints(ALPINE));
+        assert_eq!(probe.detect(host.as_ref()).await.unwrap(), OsFamily::Alpine);
+        assert_eq!(host.calls(), 2, "the retry happened because nothing was cached");
     }
 
     /// A command that never ran is not an answer: caching it would mark
