@@ -24,6 +24,22 @@
 //! radius on the network, and prod and test deserve different treatment
 //! (#418).
 //!
+//! # What dropping the fan-out does, and what it does not
+//!
+//! The fan-out is structured: the host futures live inside
+//! [`run_on_fleet`]'s own future, never in a [`tokio::spawn`], so dropping
+//! it drops them and leaves no orphaned task still talking to hosts. That
+//! is where the guarantee ends. A drop cannot `await`, so **no
+//! cancellation is sent**: a command already written to a host's shell
+//! keeps running there, and that shell stays busy with it. Only the
+//! per-host deadline path below cancels remotely.
+//!
+//! So dropping this future is a *local* stop, not a fleet-wide one.
+//! Cancelling a whole operation, including cleaning up on the hosts, is
+//! #437 — and it needs a design, since a `Drop` that wanted to cancel
+//! would have to detach a task to do the awaiting, which is the very thing
+//! this structure avoids.
+//!
 //! # What this module deliberately does not decide
 //!
 //! **The command is an input.** Resolving a check's per-OS variant (#425)
@@ -211,6 +227,12 @@ impl FleetRunReport {
 /// [`Running`][HostProgress::Running] when a slot opens for it and
 /// [`Done`][HostProgress::Done] when its run ends, so a member that the
 /// fan-out never reached stays `Pending` and says so.
+///
+/// A `max_parallel` of zero is read as one, not as none: the field is
+/// public and a group that never went through
+/// [`HostGroup::validate`][filar_core::config::HostGroup::validate] can
+/// carry a zero, and taking it literally would launch nothing at all and
+/// return an empty report for a group full of hosts.
 ///
 /// Returns an error, before running anything, for a task list this
 /// operation cannot own: a handle from another operation, or two tasks for
