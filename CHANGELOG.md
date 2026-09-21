@@ -154,6 +154,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- `SshAuth`'s `Debug` no longer prints an inline SSH password in clear.
+  Whether one is set stays visible, the value does not, so a `{target:?}`
+  in a log line or a panic message can no longer leak it — including
+  through every type that holds an `SshTarget`
+  ([#426](https://github.com/devlawey/filar/issues/426)).
+
 - GUI launcher: manual `[[ssh_targets]]` entries in `config.toml` are no
   longer hidden by the full rebuild of the launcher's own targets — they are
   merged into the launched session, after the launcher's hosts, with any

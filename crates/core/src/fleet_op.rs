@@ -114,12 +114,27 @@ pub enum HostProgress {
 
 /// Handle to one member of an operation.
 ///
-/// Positional, and only meaningful for the operation that handed it out: the
-/// composition never changes, so a handle stays valid for the whole life of
-/// the operation. Positional rather than by name because target names are
-/// not guaranteed unique — see [`FleetOperation::handle_for`].
+/// Positional rather than by name, because target names are not guaranteed
+/// unique — see [`FleetOperation::handle_for`] — and the composition never
+/// changes, so a handle stays valid for the whole life of its operation.
+///
+/// It carries the id of the operation that handed it out, and the operation
+/// checks it before touching a member. Found in review: with the index
+/// alone, a handle to the second member of one operation addressed the
+/// second member of *any* operation, so a runner holding handles from two
+/// operations at once could have written progress into the wrong one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct HostHandle(usize);
+pub struct HostHandle {
+    operation: OperationId,
+    index: usize,
+}
+
+impl HostHandle {
+    /// The operation this handle belongs to.
+    pub fn operation(&self) -> OperationId {
+        self.operation
+    }
+}
 
 /// One host taking part in an operation, with its progress.
 #[derive(Debug, Clone)]
@@ -252,15 +267,20 @@ impl FleetOperation {
 
     /// Handles to every member, in composition order.
     pub fn handles(&self) -> impl Iterator<Item = HostHandle> {
-        (0..self.members.len()).map(HostHandle)
+        let operation = self.id;
+        (0..self.members.len()).map(move |index| HostHandle { operation, index })
     }
 
     /// The member `handle` refers to.
     ///
-    /// `None` only for a handle from a different operation — one this
-    /// operation handed out never goes stale.
+    /// `None` exactly for a handle from a different operation — one this
+    /// operation handed out never goes stale, because the composition never
+    /// changes.
     pub fn member(&self, handle: HostHandle) -> Option<&FleetMember> {
-        self.members.get(handle.0)
+        if handle.operation != self.id {
+            return None;
+        }
+        self.members.get(handle.index)
     }
 
     /// Handle of the first member named `name`, if any.
@@ -273,7 +293,10 @@ impl FleetOperation {
         self.members
             .iter()
             .position(|m| m.target.name == name)
-            .map(HostHandle)
+            .map(|index| HostHandle {
+                operation: self.id,
+                index,
+            })
     }
 
     /// Whether a host of this name takes part.
@@ -288,7 +311,10 @@ impl FleetOperation {
     /// from `Running` straight to `Done` and a host the runner never reaches
     /// stays `Pending`. A handle from another operation is ignored.
     pub fn set_progress(&mut self, handle: HostHandle, progress: HostProgress) {
-        if let Some(member) = self.members.get_mut(handle.0) {
+        if handle.operation != self.id {
+            return;
+        }
+        if let Some(member) = self.members.get_mut(handle.index) {
             member.progress = progress;
         }
     }
@@ -475,6 +501,37 @@ mod tests {
         small.set_progress(foreign, HostProgress::Done);
         assert_eq!(small.count_at(HostProgress::Done), 0);
         assert_eq!(small.count_at(HostProgress::Pending), 1);
+    }
+
+    #[test]
+    fn a_foreign_handle_with_a_valid_index_touches_nothing() {
+        // The case a size mismatch hides, and the one a runner juggling two
+        // operations would actually hit: both hold a member at index 0, so
+        // an index-only handle would have resolved in the wrong operation.
+        let targets = vec![target("web-1", &["prod"])];
+        let rule = group("prod", &["prod"]);
+
+        let mut first = FleetOperation::open(&rule, &targets);
+        let mut second = FleetOperation::open(&rule, &targets);
+
+        let mine = first.handles().next().expect("member");
+        let theirs = second.handles().next().expect("member");
+        assert_ne!(mine, theirs);
+        assert_eq!(mine.operation(), first.id());
+
+        assert!(first.member(theirs).is_none());
+        assert!(second.member(mine).is_none());
+
+        first.set_progress(theirs, HostProgress::Done);
+        second.set_progress(mine, HostProgress::Running);
+
+        assert_eq!(first.count_at(HostProgress::Pending), 1);
+        assert_eq!(second.count_at(HostProgress::Pending), 1);
+
+        // The operation's own handle still works, so the guard rejects only
+        // what it should.
+        first.set_progress(mine, HostProgress::Done);
+        assert_eq!(first.count_at(HostProgress::Done), 1);
     }
 
     #[test]
