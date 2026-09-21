@@ -13,6 +13,30 @@
 //! under us within a session: a host does not become Alpine halfway
 //! through.
 //!
+//! # Which executor to pass, and why the confirmation gate is not here
+//!
+//! Pass the host's own executor — the same one its session runs commands
+//! through. For a fleet host that is the `ReadOnlyExecutor`-wrapped one
+//! (#419), so the probe inherits exactly the transport gating that host
+//! already has; nothing is bypassed and nothing special is granted.
+//!
+//! The confirmation gate (AGENTS.md invariant 2) is deliberately *not*
+//! applied here, because it is not an executor wrapper: it lives in the
+//! agent loop (`agent.rs`), where it gates the command **the model
+//! proposed** before that command reaches any executor. This probe is
+//! transport bookkeeping, not an LLM tool call — the same category as the
+//! OSC 7 cwd sync, whose contract on
+//! [`CommandExecutor::set_cwd`][filar_transport::CommandExecutor::set_cwd]
+//! says so in as many words and which likewise runs `cd` on the channel
+//! without asking.
+//!
+//! What keeps that safe is not a prompt but the command's provenance:
+//! [`OS_RELEASE_COMMAND`] is a `const` in `filar-core`, never model-
+//! supplied and never assembled from input, and it sits inside the
+//! compiled-in read-only allowlist —
+//! `crates/transport/tests/fleet_catalog_readonly.rs` asserts that, and
+//! the tests below assert the probe issues that constant and nothing else.
+//!
 //! # A failure to reach the host is not an answer
 //!
 //! Two failures look alike and must not be treated alike. A command that
@@ -59,6 +83,9 @@ impl OsFamilyProbe {
     /// Concurrent callers share one probe: `OnceCell` runs the initialiser
     /// once and the rest await its result, so a burst of checks starting
     /// together still costs one command.
+    ///
+    /// `exec` must be the host's own executor, so the probe runs under
+    /// whatever gating that host already has — see the module docs.
     ///
     /// Returns `Err` only when the command could not be run at all — see
     /// the module docs on why that case is not cached.
@@ -262,6 +289,20 @@ mod tests {
         assert_eq!(probe.cached(), Some(OsFamily::Debian));
         assert_eq!(probe.detect(host.as_ref()).await.unwrap(), OsFamily::Debian);
         assert_eq!(host.calls(), 0);
+    }
+
+    /// The executor a fleet host actually gets is wrapped in
+    /// `ReadOnlyExecutor`. The probe has to work through it — and it does,
+    /// because its command is in the allowlist rather than because anything
+    /// exempts it.
+    #[tokio::test]
+    async fn the_probe_works_through_the_read_only_gate() {
+        let host = FakeHost::new(Behaviour::Prints(ALPINE));
+        let gated = filar_transport::ReadOnlyExecutor::new(host.clone());
+        let probe = OsFamilyProbe::new();
+
+        assert_eq!(probe.detect(&gated).await.unwrap(), OsFamily::Alpine);
+        assert_eq!(host.calls(), 1, "the gate forwarded the probe");
     }
 
     /// The probe and the catalog have to agree end to end: detect, then
