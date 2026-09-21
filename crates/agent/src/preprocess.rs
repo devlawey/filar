@@ -3313,64 +3313,68 @@ u_str ESTAB 0      0      /run/systemd/journal/stdout 21456 * 21455
         ];
 
         for check in catalog.checks() {
-            let Some(expected) = check.preprocessor() else {
-                // A check that declares no preprocessor must also not be
-                // claimed by one: the two would disagree about whether its
-                // output is a table, and `compare` would be empty either way.
-                assert_eq!(
-                    registry.preprocess(check.command(), ""),
-                    PreprocessOutcome::Raw {
-                        reason: RawFallback::NoPreprocessor
-                    },
-                    "check '{}' declares no preprocessor, yet one claims '{}'",
-                    check.name(),
-                    check.command()
-                );
-                continue;
-            };
-
-            let sample = samples
-                .iter()
-                .find(|(name, _)| *name == check.name())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "built-in check '{}' names preprocessor '{expected}' but this \
-                         test has no sample output for it — add one",
-                        check.name()
-                    )
-                })
-                .1;
-
-            match registry.preprocess(check.command(), sample) {
-                PreprocessOutcome::Structured {
-                    preprocessor,
-                    table,
-                } => {
+            // Since #425 a check may carry one command per OS family. Every
+            // variant has to satisfy the same contract: a shipped Alpine
+            // command the preprocessor declines would silently degrade that
+            // family's hosts to raw text while the others compared fine.
+            for command in check.commands() {
+                let Some(expected) = check.preprocessor() else {
+                    // A check that declares no preprocessor must also not be
+                    // claimed by one: the two would disagree about whether its
+                    // output is a table, and `compare` would be empty either way.
                     assert_eq!(
-                        preprocessor,
-                        expected,
-                        "check '{}' declares preprocessor '{expected}' but '{}' claimed \
-                         its command",
-                        check.name(),
-                        preprocessor
+                        registry.preprocess(command, ""),
+                        PreprocessOutcome::Raw {
+                            reason: RawFallback::NoPreprocessor
+                        },
+                        "check '{}' declares no preprocessor, yet one claims '{command}'",
+                        check.name()
                     );
-                    assert!(!check.compare().is_empty());
-                    for column in check.compare() {
-                        assert!(
-                            table.column_index(column).is_some(),
-                            "check '{}' compares column '{column}', which '{preprocessor}' \
-                             does not produce; it produces {:?}",
+                    continue;
+                };
+
+                let sample = samples
+                    .iter()
+                    .find(|(name, _)| *name == check.name())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "built-in check '{}' names preprocessor '{expected}' but this \
+                             test has no sample output for it — add one",
+                            check.name()
+                        )
+                    })
+                    .1;
+
+                match registry.preprocess(command, sample) {
+                    PreprocessOutcome::Structured {
+                        preprocessor,
+                        table,
+                    } => {
+                        assert_eq!(
+                            preprocessor,
+                            expected,
+                            "check '{}' declares preprocessor '{expected}' but '{}' claimed \
+                             '{command}'",
                             check.name(),
-                            table.columns()
+                            preprocessor
                         );
+                        assert!(!check.compare().is_empty());
+                        for column in check.compare() {
+                            assert!(
+                                table.column_index(column).is_some(),
+                                "check '{}' compares column '{column}', which '{preprocessor}' \
+                                 does not produce for '{command}'; it produces {:?}",
+                                check.name(),
+                                table.columns()
+                            );
+                        }
                     }
+                    PreprocessOutcome::Raw { reason } => panic!(
+                        "check '{}' declares preprocessor '{expected}', but its command \
+                         '{command}' fell back to raw: {reason:?}",
+                        check.name()
+                    ),
                 }
-                PreprocessOutcome::Raw { reason } => panic!(
-                    "check '{}' declares preprocessor '{expected}', but its command '{}' \
-                     fell back to raw: {reason:?}",
-                    check.name(),
-                    check.command()
-                ),
             }
         }
     }

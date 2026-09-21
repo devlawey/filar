@@ -28,6 +28,14 @@
 //! is possible; *executing* it is not — the gate refuses the command before
 //! it reaches the host. Editability buys expressiveness, not privilege.
 //!
+//! # One check, several operating systems
+//!
+//! A fleet is not one distribution, so a check declares either one command
+//! or a command per OS family (#425) — see [`CommandSpec`]. A host whose
+//! family no variant covers is **not applicable** to that check
+//! ([`CommandForOs::NotApplicable`]), which is a state, not an error: the
+//! host is neither failed nor silently skipped.
+//!
 //! # Partial failure is the normal case
 //!
 //! Loading never returns `Err` for a bad *entry*. A malformed check is
@@ -37,11 +45,13 @@
 //! all is rejected as a unit, by the same mechanism, and the built-ins
 //! survive it.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use crate::os_family::OsFamily;
 
 /// The built-in catalog, compiled into the binary. Never read from disk.
 const BUILTIN_CATALOG_TOML: &str = include_str!("builtin_fleet_checks.toml");
@@ -79,6 +89,138 @@ impl fmt::Display for CheckSource {
 }
 
 // ---------------------------------------------------------------------------
+// Command variants
+// ---------------------------------------------------------------------------
+
+/// The key a catalog uses for the command that applies to every family it
+/// does not name explicitly.
+pub const DEFAULT_COMMAND_KEY: &str = "default";
+
+/// What a check runs, which may depend on the host's OS family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandSpec {
+    /// One command, on every host. The common case, and the one a catalog
+    /// should prefer: a variant that is not needed is a variant that can
+    /// drift.
+    Same(String),
+    /// Per-family variants, with an optional catch-all.
+    ///
+    /// `variants` is keyed by family, holds at least one entry and never
+    /// holds [`OsFamily::Unknown`] — a catalog cannot write a command "for
+    /// hosts we failed to identify", so an unidentified host takes
+    /// `default` or nothing.
+    ///
+    /// `#[non_exhaustive]` so those invariants are not merely documented:
+    /// outside this crate the variant can be read and matched but not
+    /// built, and inside it [`CommandSpec::per_os`] is the only way to make
+    /// one. Found in review — the fields were public, so an empty map or an
+    /// `Unknown` key was constructible and would have made `commands()`
+    /// return nothing or `for_os(Unknown)` answer with a command.
+    #[non_exhaustive]
+    PerOs {
+        /// Used for a family `variants` does not name. `None` means the
+        /// check simply does not apply to those hosts.
+        default: Option<String>,
+        /// Family-specific commands, at least one, never keyed by
+        /// [`OsFamily::Unknown`].
+        variants: BTreeMap<OsFamily, String>,
+    },
+}
+
+impl CommandSpec {
+    /// Build a per-family spec, enforcing the variant's invariants.
+    ///
+    /// The only construction path for [`PerOs`][Self::PerOs]. A `variants`
+    /// map that is empty, or that keys [`OsFamily::Unknown`], is rejected
+    /// rather than silently producing a spec whose documented behaviour
+    /// does not hold. A map with no family entries but a `default` is not
+    /// an error: it means the same thing as a bare command, so it collapses
+    /// to [`Same`][Self::Same] — one shape per meaning.
+    pub fn per_os(
+        default: Option<String>,
+        variants: BTreeMap<OsFamily, String>,
+    ) -> std::result::Result<Self, String> {
+        if variants.contains_key(&OsFamily::Unknown) {
+            return Err(
+                "a command variant cannot be keyed by the unknown OS family: \
+                 an unidentified host takes 'default' or nothing"
+                    .into(),
+            );
+        }
+        if variants.is_empty() {
+            return match default {
+                Some(command) => Ok(Self::Same(command)),
+                None => Err("a command spec must name at least one command".into()),
+            };
+        }
+        Ok(Self::PerOs { default, variants })
+    }
+
+    /// The command for a host of `family`.
+    pub fn for_os(&self, family: OsFamily) -> CommandForOs<'_> {
+        match self {
+            Self::Same(command) => CommandForOs::Runnable(command),
+            Self::PerOs { default, variants } => variants
+                .get(&family)
+                .or(default.as_ref())
+                .map(|command| CommandForOs::Runnable(command))
+                .unwrap_or(CommandForOs::NotApplicable),
+        }
+    }
+
+    /// Every command this spec can issue, in a stable order.
+    ///
+    /// For auditing the whole catalog — the read-only gate has to accept
+    /// each variant, not just the one this host happens to take.
+    pub fn commands(&self) -> Vec<&str> {
+        match self {
+            Self::Same(command) => vec![command.as_str()],
+            Self::PerOs { default, variants } => default
+                .iter()
+                .map(String::as_str)
+                .chain(variants.values().map(String::as_str))
+                .collect(),
+        }
+    }
+
+    /// `true` when the same command runs everywhere.
+    pub fn is_same_everywhere(&self) -> bool {
+        matches!(self, Self::Same(_))
+    }
+}
+
+/// The result of asking a check what to run on a given host.
+///
+/// A named state rather than an `Option`, because the empty case is not a
+/// lookup miss to be handled: "this check does not apply to this host" is
+/// an outcome the fleet result is expected to carry and show (#428), on
+/// equal footing with a command that ran.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandForOs<'a> {
+    /// Run this.
+    Runnable(&'a str),
+    /// No variant covers this host's family. Not an error, and not a
+    /// failure of the host: the question does not apply to it.
+    NotApplicable,
+}
+
+impl<'a> CommandForOs<'a> {
+    /// The command, when there is one.
+    pub fn command(self) -> Option<&'a str> {
+        match self {
+            Self::Runnable(command) => Some(command),
+            Self::NotApplicable => None,
+        }
+    }
+
+    /// `true` when the check does not apply to this host.
+    pub fn is_not_applicable(self) -> bool {
+        matches!(self, Self::NotApplicable)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // A single check
 // ---------------------------------------------------------------------------
 
@@ -92,7 +234,7 @@ impl fmt::Display for CheckSource {
 pub struct FleetCheck {
     name: String,
     description: String,
-    command: String,
+    command: CommandSpec,
     preprocessor: Option<String>,
     compare: Vec<String>,
     source: CheckSource,
@@ -109,12 +251,23 @@ impl FleetCheck {
         &self.description
     }
 
-    /// The command sent to each host, verbatim.
+    /// What this check runs, as declared.
     ///
-    /// Still subject to `filar_transport::check_read_only` — this string is
-    /// a declaration, not a permission.
-    pub fn command(&self) -> &str {
+    /// Still subject to `filar_transport::check_read_only` — these strings
+    /// are a declaration, not a permission.
+    pub fn command_spec(&self) -> &CommandSpec {
         &self.command
+    }
+
+    /// The command for a host of `family`, or
+    /// [`NotApplicable`][CommandForOs::NotApplicable].
+    pub fn command_for(&self, family: OsFamily) -> CommandForOs<'_> {
+        self.command.for_os(family)
+    }
+
+    /// Every command this check can issue, across all OS variants.
+    pub fn commands(&self) -> Vec<&str> {
+        self.command.commands()
     }
 
     /// Name of the preprocessor that turns the output into a table, if any.
@@ -222,11 +375,24 @@ struct CatalogFile {
 struct RawCheck {
     name: String,
     description: String,
-    command: String,
+    command: RawCommand,
     #[serde(default)]
     preprocessor: Option<String>,
     #[serde(default)]
     compare: Vec<String>,
+}
+
+/// `command` as written: either a bare string or a table of variants.
+///
+/// Untagged so both spellings read naturally in TOML —
+/// `command = "uptime"` and
+/// `command = { default = "df ...", alpine = "df" }` — rather than forcing
+/// every check, variants or not, through a wrapper key.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawCommand {
+    Single(String),
+    PerOs(BTreeMap<String, String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -423,15 +589,7 @@ impl FleetCheckCatalog {
             return Err("description must not be empty".into());
         }
 
-        let command = raw.command.trim();
-        if command.is_empty() {
-            return Err("command must not be empty".into());
-        }
-        // A newline in a declared command would mean two commands, only the
-        // first of which anything downstream reasons about.
-        if command.chars().any(|c| c.is_control()) {
-            return Err("command must be a single line without control characters".into());
-        }
+        let command = validate_command(&raw.command)?;
 
         let preprocessor = match raw.preprocessor.as_deref().map(str::trim) {
             None => None,
@@ -482,6 +640,76 @@ impl FleetCheckCatalog {
             source,
         })
     }
+}
+
+/// Check one declared command string.
+///
+/// `label` names which variant is at fault, so an error on a five-variant
+/// check says which one rather than making the author bisect it.
+fn validate_one_command(command: &str, label: &str) -> std::result::Result<String, String> {
+    let command = command.trim();
+    if command.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    // A newline in a declared command would mean two commands, only the
+    // first of which anything downstream reasons about.
+    if command.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "{label} must be a single line without control characters"
+        ));
+    }
+    Ok(command.to_owned())
+}
+
+/// Turn a declared `command` into a validated [`CommandSpec`].
+///
+/// A variant table must name only `default` and the keys in
+/// [`OsFamily::KEYS`]. An unknown key is refused rather than ignored: a
+/// typo like `alpine3` would otherwise mean "this check silently does not
+/// apply to Alpine", which is precisely the failure this feature exists to
+/// prevent.
+fn validate_command(raw: &RawCommand) -> std::result::Result<CommandSpec, String> {
+    match raw {
+        RawCommand::Single(command) => {
+            Ok(CommandSpec::Same(validate_one_command(command, "command")?))
+        }
+        RawCommand::PerOs(table) => {
+            if table.is_empty() {
+                return Err("command table must name at least one variant".into());
+            }
+            let mut default = None;
+            let mut variants = BTreeMap::new();
+            for (key, command) in table {
+                // The key is matched exactly, never trimmed: TOML keeps
+                // `alpine` and `" alpine "` as two distinct keys, so
+                // trimming would fold them together and `insert` would drop
+                // one command without a word. Found in review.
+                let label = format!("command variant '{key}'");
+                if key == DEFAULT_COMMAND_KEY {
+                    default = Some(validate_one_command(command, &label)?);
+                    continue;
+                }
+                let Some(family) = family_for_key(key) else {
+                    return Err(format!(
+                        "unknown command variant '{key}': expected one of \
+                         '{DEFAULT_COMMAND_KEY}', {}",
+                        OsFamily::KEYS.join(", ")
+                    ));
+                };
+                variants.insert(family, validate_one_command(command, &label)?);
+            }
+            // The constructor owns the invariants, including collapsing a
+            // default-only table to a single command.
+            CommandSpec::per_os(default, variants)
+        }
+    }
+}
+
+/// The family a catalog key names. Inverse of [`OsFamily::key`].
+fn family_for_key(key: &str) -> Option<OsFamily> {
+    [OsFamily::Debian, OsFamily::Rhel, OsFamily::Alpine]
+        .into_iter()
+        .find(|family: &OsFamily| family.key() == Some(key))
 }
 
 // ---------------------------------------------------------------------------
@@ -575,7 +803,8 @@ mod tests {
         for check in catalog.checks() {
             assert!(names.insert(check.name()), "duplicate name {}", check.name());
             assert!(!check.description().is_empty());
-            assert!(!check.command().is_empty());
+            assert!(!check.commands().is_empty());
+            assert!(check.commands().iter().all(|c| !c.is_empty()));
             // The invariant the schema exists to carry.
             assert_eq!(
                 check.preprocessor().is_some(),
@@ -628,7 +857,10 @@ command = "cat /etc/ssh/sshd_config"
         let user = catalog.get("sshd-config").expect("user check missing");
         assert!(!user.is_builtin());
         assert_eq!(user.source(), &CheckSource::User(file.path.clone()));
-        assert_eq!(user.command(), "cat /etc/ssh/sshd_config");
+        assert_eq!(
+            user.command_for(OsFamily::Debian),
+            CommandForOs::Runnable("cat /etc/ssh/sshd_config")
+        );
     }
 
     #[test]
@@ -969,6 +1201,350 @@ compare = ["mount", "mount"]
         assert!(catalog.rejected().is_empty());
     }
 
+    // -- OS command variants (#425) ---------------------------------------
+
+    #[test]
+    fn a_single_command_runs_on_every_family() {
+        let file = TempCatalog::new(
+            "same",
+            r#"
+[[check]]
+name = "uptime-check"
+description = "Same everywhere"
+command = "uptime"
+"#,
+        );
+        let catalog = FleetCheckCatalog::load(Some(&file.path));
+        let check = catalog.get("uptime-check").unwrap();
+        assert!(check.command_spec().is_same_everywhere());
+        for family in [
+            OsFamily::Debian,
+            OsFamily::Rhel,
+            OsFamily::Alpine,
+            OsFamily::Unknown,
+        ] {
+            assert_eq!(
+                check.command_for(family),
+                CommandForOs::Runnable("uptime"),
+                "family {family}"
+            );
+        }
+    }
+
+    /// The DoD case: the right variant is picked per family.
+    #[test]
+    fn the_matching_variant_is_chosen() {
+        let file = TempCatalog::new(
+            "variants",
+            r#"
+[[check]]
+name = "per-os"
+description = "One command per family"
+command = { debian = "cat /etc/debian_version", rhel = "cat /etc/redhat-release", alpine = "cat /etc/alpine-release" }
+"#,
+        );
+        let catalog = FleetCheckCatalog::load(Some(&file.path));
+        assert!(catalog.rejected().is_empty(), "{:?}", catalog.rejected());
+        let check = catalog.get("per-os").unwrap();
+        assert!(!check.command_spec().is_same_everywhere());
+
+        assert_eq!(
+            check.command_for(OsFamily::Debian),
+            CommandForOs::Runnable("cat /etc/debian_version")
+        );
+        assert_eq!(
+            check.command_for(OsFamily::Rhel),
+            CommandForOs::Runnable("cat /etc/redhat-release")
+        );
+        assert_eq!(
+            check.command_for(OsFamily::Alpine),
+            CommandForOs::Runnable("cat /etc/alpine-release")
+        );
+    }
+
+    /// The other DoD case: no variant is "not applicable", not an error.
+    #[test]
+    fn a_family_with_no_variant_is_not_applicable_rather_than_an_error() {
+        let file = TempCatalog::new(
+            "gap",
+            r#"
+[[check]]
+name = "debian-only"
+description = "Only makes sense on Debian"
+command = { debian = "cat /etc/debian_version" }
+"#,
+        );
+        let catalog = FleetCheckCatalog::load(Some(&file.path));
+        // Loading is clean: a gap in coverage is not a malformed entry.
+        assert!(catalog.rejected().is_empty(), "{:?}", catalog.rejected());
+        let check = catalog.get("debian-only").unwrap();
+
+        assert_eq!(
+            check.command_for(OsFamily::Debian),
+            CommandForOs::Runnable("cat /etc/debian_version")
+        );
+        for family in [OsFamily::Rhel, OsFamily::Alpine, OsFamily::Unknown] {
+            let outcome = check.command_for(family);
+            assert_eq!(outcome, CommandForOs::NotApplicable, "family {family}");
+            assert!(outcome.is_not_applicable());
+            assert_eq!(outcome.command(), None);
+        }
+    }
+
+    #[test]
+    fn default_covers_the_families_no_variant_names() {
+        let file = TempCatalog::new(
+            "default",
+            r#"
+[[check]]
+name = "with-default"
+description = "A catch-all plus one exception"
+command = { default = "df --output=source,size,used,avail,pcent,target", alpine = "df" }
+"#,
+        );
+        let catalog = FleetCheckCatalog::load(Some(&file.path));
+        let check = catalog.get("with-default").unwrap();
+
+        assert_eq!(check.command_for(OsFamily::Alpine), CommandForOs::Runnable("df"));
+        for family in [OsFamily::Debian, OsFamily::Rhel, OsFamily::Unknown] {
+            assert_eq!(
+                check.command_for(family),
+                CommandForOs::Runnable("df --output=source,size,used,avail,pcent,target"),
+                "family {family}"
+            );
+        }
+    }
+
+    /// An unidentified host is exactly the case `default` exists for, so it
+    /// must never be satisfiable by a family key.
+    #[test]
+    fn unknown_family_takes_default_or_nothing() {
+        let without = TempCatalog::new(
+            "unknown-no-default",
+            r#"
+[[check]]
+name = "x"
+description = "d"
+command = { debian = "uptime" }
+"#,
+        );
+        let catalog = FleetCheckCatalog::load(Some(&without.path));
+        assert_eq!(
+            catalog.get("x").unwrap().command_for(OsFamily::Unknown),
+            CommandForOs::NotApplicable
+        );
+        assert_eq!(OsFamily::Unknown.key(), None);
+    }
+
+    /// A misspelled family key would silently mean "this check does not
+    /// apply there" — the exact failure the feature exists to prevent.
+    #[test]
+    fn an_unknown_variant_key_is_rejected_by_name() {
+        let file = TempCatalog::new(
+            "bad-key",
+            r#"
+[[check]]
+name = "x"
+description = "d"
+command = { alpine3 = "df" }
+"#,
+        );
+        let catalog = FleetCheckCatalog::load(Some(&file.path));
+        assert!(catalog.get("x").is_none());
+        assert_eq!(catalog.rejected().len(), 1);
+        let reason = catalog.rejected()[0].reason();
+        assert!(reason.contains("alpine3"), "{reason}");
+        assert!(reason.contains("default"), "{reason}");
+        assert!(reason.contains("alpine"), "{reason}");
+    }
+
+    #[test]
+    fn a_bad_variant_is_named_in_the_error() {
+        let file = TempCatalog::new(
+            "empty-variant",
+            r#"
+[[check]]
+name = "x"
+description = "d"
+command = { debian = "uptime", rhel = "  " }
+"#,
+        );
+        let catalog = FleetCheckCatalog::load(Some(&file.path));
+        assert_eq!(catalog.rejected().len(), 1);
+        let reason = catalog.rejected()[0].reason();
+        assert!(reason.contains("'rhel'"), "should name the variant: {reason}");
+        assert!(reason.contains("must not be empty"), "{reason}");
+    }
+
+    #[test]
+    fn an_empty_command_table_is_rejected() {
+        let file = TempCatalog::new(
+            "empty-table",
+            r#"
+[[check]]
+name = "x"
+description = "d"
+command = {}
+"#,
+        );
+        let catalog = FleetCheckCatalog::load(Some(&file.path));
+        assert_eq!(catalog.rejected().len(), 1);
+        assert!(catalog.rejected()[0].reason().contains("at least one variant"));
+    }
+
+    /// A table holding only `default` means the same thing as a bare
+    /// string, so it collapses — one shape per meaning.
+    #[test]
+    fn a_table_with_only_default_collapses_to_a_single_command() {
+        let file = TempCatalog::new(
+            "only-default",
+            r#"
+[[check]]
+name = "x"
+description = "d"
+command = { default = "uptime" }
+"#,
+        );
+        let catalog = FleetCheckCatalog::load(Some(&file.path));
+        let check = catalog.get("x").unwrap();
+        assert_eq!(check.command_spec(), &CommandSpec::Same("uptime".into()));
+        assert_eq!(
+            check.command_for(OsFamily::Unknown),
+            CommandForOs::Runnable("uptime")
+        );
+    }
+
+    #[test]
+    fn commands_lists_every_variant_for_auditing() {
+        let file = TempCatalog::new(
+            "audit",
+            r#"
+[[check]]
+name = "x"
+description = "d"
+command = { default = "a", debian = "b", alpine = "c" }
+"#,
+        );
+        let catalog = FleetCheckCatalog::load(Some(&file.path));
+        let mut commands = catalog.get("x").unwrap().commands();
+        commands.sort_unstable();
+        assert_eq!(commands, ["a", "b", "c"]);
+    }
+
+    /// The built-in Alpine variant is the reason this feature exists, so it
+    /// is pinned rather than left to drift.
+    #[test]
+    fn the_builtin_disk_check_varies_only_on_alpine() {
+        let catalog = FleetCheckCatalog::builtin();
+        let disk = catalog.get("disk-usage").unwrap();
+        assert_eq!(disk.command_for(OsFamily::Alpine), CommandForOs::Runnable("df"));
+        for family in [OsFamily::Debian, OsFamily::Rhel, OsFamily::Unknown] {
+            assert_eq!(
+                disk.command_for(family),
+                CommandForOs::Runnable("df --output=source,size,used,avail,pcent,target"),
+                "family {family}"
+            );
+        }
+        // Every other built-in is the same everywhere, so far.
+        for check in catalog.checks().iter().filter(|c| c.name() != "disk-usage") {
+            assert!(
+                check.command_spec().is_same_everywhere(),
+                "check '{}' grew a variant without this test being updated",
+                check.name()
+            );
+        }
+    }
+
+    /// A check that applies nowhere is still a well-formed check; whether
+    /// it is useful is the author's call, not the loader's.
+    #[test]
+    fn applicability_is_per_host_not_a_load_time_verdict() {
+        let file = TempCatalog::new(
+            "narrow",
+            r#"
+[[check]]
+name = "x"
+description = "d"
+command = { rhel = "uptime" }
+"#,
+        );
+        let catalog = FleetCheckCatalog::load(Some(&file.path));
+        assert!(catalog.rejected().is_empty());
+        assert!(catalog.get("x").is_some());
+    }
+
+    /// The invariants the `PerOs` variant documents are now enforced by its
+    /// constructor, not left to callers. Found in review: the fields were
+    /// public, so an empty map or an `Unknown` key was constructible.
+    #[test]
+    fn per_os_rejects_specs_its_docs_forbid() {
+        let mut unknown_keyed = BTreeMap::new();
+        unknown_keyed.insert(OsFamily::Unknown, "uptime".to_string());
+        let err = CommandSpec::per_os(None, unknown_keyed).unwrap_err();
+        assert!(err.contains("unknown OS family"), "{err}");
+
+        let err = CommandSpec::per_os(None, BTreeMap::new()).unwrap_err();
+        assert!(err.contains("at least one command"), "{err}");
+
+        // A default with no family entries is the single-command case.
+        assert_eq!(
+            CommandSpec::per_os(Some("uptime".into()), BTreeMap::new()).unwrap(),
+            CommandSpec::Same("uptime".into())
+        );
+
+        let mut ok = BTreeMap::new();
+        ok.insert(OsFamily::Alpine, "df".to_string());
+        let spec = CommandSpec::per_os(None, ok).unwrap();
+        assert!(!spec.is_same_everywhere());
+        assert!(!spec.commands().is_empty());
+        assert_eq!(spec.for_os(OsFamily::Unknown), CommandForOs::NotApplicable);
+    }
+
+    /// Every spec the catalog produces satisfies them too.
+    #[test]
+    fn every_catalog_spec_holds_the_invariants() {
+        let catalog = FleetCheckCatalog::builtin();
+        for check in catalog.checks() {
+            assert!(
+                !check.commands().is_empty(),
+                "check '{}' has no command at all",
+                check.name()
+            );
+            if let CommandSpec::PerOs { variants, .. } = check.command_spec() {
+                assert!(!variants.is_empty(), "check '{}'", check.name());
+                assert!(
+                    !variants.contains_key(&OsFamily::Unknown),
+                    "check '{}' keys a variant by the unknown family",
+                    check.name()
+                );
+            }
+        }
+    }
+
+    /// TOML keeps `alpine` and `" alpine "` as two distinct keys. Trimming
+    /// folded them together and `insert` dropped one command silently —
+    /// exactly the failure variants exist to prevent. Found in review.
+    #[test]
+    fn a_variant_key_with_whitespace_is_rejected_not_folded() {
+        let file = TempCatalog::new(
+            "padded-key",
+            r#"
+[[check]]
+name = "x"
+description = "d"
+command = { alpine = "df", " alpine " = "df -h" }
+"#,
+        );
+        let catalog = FleetCheckCatalog::load(Some(&file.path));
+        assert!(catalog.get("x").is_none(), "the entry must not load");
+        assert_eq!(catalog.rejected().len(), 1);
+        let reason = catalog.rejected()[0].reason();
+        assert!(
+            reason.contains("unknown command variant"),
+            "the padded key should be named as unknown, got: {reason}"
+        );
+    }
+
     /// A check may declare a command the read-only gate will refuse — the
     /// catalog is a declaration, not a permission. The refusal happens in
     /// `filar-transport`, which this crate cannot reach; the matching test
@@ -986,6 +1562,9 @@ command = "rm -rf /var/log"
         );
         let catalog = FleetCheckCatalog::load(Some(&file.path));
         assert!(catalog.rejected().is_empty());
-        assert_eq!(catalog.get("dangerous").unwrap().command(), "rm -rf /var/log");
+        assert_eq!(
+            catalog.get("dangerous").unwrap().commands(),
+            ["rm -rf /var/log"]
+        );
     }
 }

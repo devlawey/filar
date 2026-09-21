@@ -13,6 +13,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Per-OS command variants for fleet checks, with the host's family detected
+  once per session from `/etc/os-release`; a check with no variant for a
+  host is reported as not applicable rather than failed
+  ([#425](https://github.com/devlawey/filar/issues/425)).
+
 - Declarative fleet-check catalog: six built-in checks plus user-defined ones
   from `fleet_checks.toml`, all bound by the read-only allowlist
   ([#424](https://github.com/devlawey/filar/issues/424)).

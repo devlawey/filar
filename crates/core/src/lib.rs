@@ -5,12 +5,14 @@
 //! - [`config`]: Configuration loading from TOML files and environment variables.
 //! - [`secrets`]: Secure reading of API keys and other secrets from the environment.
 //! - [`fleet_checks`]: The declarative catalog of fleet checks (built-in + user).
+//! - [`os_family`]: Which family of OS a host belongs to, for command variants.
 
 pub mod chat;
 pub mod compaction;
 pub mod config;
 pub mod error;
 pub mod fleet_checks;
+pub mod os_family;
 pub mod secrets;
 pub mod session;
 
@@ -28,9 +30,10 @@ pub use config::{
 };
 pub use error::{CoreError, Result};
 pub use fleet_checks::{
-    user_catalog_path, CheckSource, FleetCheck, FleetCheckCatalog, RejectedCheck,
-    USER_CATALOG_ENV, USER_CATALOG_FILE,
+    user_catalog_path, CheckSource, CommandForOs, CommandSpec, FleetCheck, FleetCheckCatalog,
+    RejectedCheck, DEFAULT_COMMAND_KEY, USER_CATALOG_ENV, USER_CATALOG_FILE,
 };
+pub use os_family::{OsFamily, OS_RELEASE_COMMAND};
 pub use secrets::{
     ssh_cred_name, ssh_target_display_name, EnvSecretProvider, KeyringSecretProvider,
     SecretProvider, StaticSecretProvider, redact, redact_secrets,
