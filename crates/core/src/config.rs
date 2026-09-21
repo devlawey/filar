@@ -1267,26 +1267,58 @@ options = { num_ctx = 8192 }
         assert!(llm_cfg.extra_body.is_some());
     }
 
+    /// A uniquely named config file, removed when the value is dropped.
+    ///
+    /// The name carries a per-test label and a process-wide counter, not a
+    /// timestamp. Two tests that build a name from the pid and
+    /// `SystemTime::now()` alone collide whenever the clock's resolution is
+    /// coarser than the gap between them — and they then race on one path,
+    /// where `std::fs::write` truncates before it writes. The loser observes
+    /// a zero-length file, which parses as an all-default `Config` and
+    /// passes validation, so a test asserting `is_err()` sees `Ok`. That is
+    /// not hypothetical: it is how `config_load_rejects_out_of_range_temperature`
+    /// failed on the macOS runner while passing everywhere else. A counter
+    /// cannot collide, so the shape is gone rather than made less likely.
+    struct TempConfig(PathBuf);
+
+    impl TempConfig {
+        fn new(label: &str, contents: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "filar_config_test_{label}_{}_{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     #[test]
     fn config_load_rejects_out_of_range_temperature() {
-        let toml = r#"
+        let file = TempConfig::new(
+            "temperature",
+            r#"
 [llm]
 model = "glm-5.1"
 api_base_url = "https://open.bigmodel.cn/api/paas/v4"
 temperature = 5.0
-"#;
-        let tmp = std::env::temp_dir().join(format!(
-            "filar_config_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::write(&tmp, toml).unwrap();
-        let result = Config::load(&tmp);
-        let _ = std::fs::remove_file(&tmp);
-        assert!(result.is_err(), "Config::load should reject temperature=5.0");
+"#,
+        );
+        assert!(
+            Config::load(file.path()).is_err(),
+            "Config::load should reject temperature=5.0"
+        );
     }
 
     // ── Host groups (#418) ─────────────────────────────────────
@@ -1458,24 +1490,40 @@ policy = "read-write"
 
     #[test]
     fn config_load_rejects_a_zero_group_limit() {
-        let toml = r#"
+        let file = TempConfig::new(
+            "group-limit",
+            r#"
 [[host_groups]]
 name = "prod"
 match = ["prod"]
 max_parallel = 0
-"#;
-        let tmp = std::env::temp_dir().join(format!(
-            "filar_config_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::write(&tmp, toml).unwrap();
-        let result = Config::load(&tmp);
-        let _ = std::fs::remove_file(&tmp);
-        assert!(result.is_err(), "Config::load should reject max_parallel = 0");
+"#,
+        );
+        assert!(
+            Config::load(file.path()).is_err(),
+            "Config::load should reject max_parallel = 0"
+        );
+    }
+
+    /// The collision that made the two tests above flaky is a property of
+    /// the name, so it is worth asserting on the name rather than hoping a
+    /// scheduler reproduces the race.
+    #[test]
+    fn temp_config_names_never_collide() {
+        let a = TempConfig::new("same", "");
+        let b = TempConfig::new("same", "");
+        assert_ne!(a.path(), b.path());
+    }
+
+    /// Why the race was silent rather than loud: an empty config is valid.
+    /// A truncation window during a concurrent write therefore looked like
+    /// a well-formed default config to whichever test read it.
+    #[test]
+    fn an_empty_config_file_loads_as_defaults() {
+        let file = TempConfig::new("empty", "");
+        let cfg = Config::load(file.path()).expect("an empty config is all defaults");
+        assert!(cfg.ssh_targets.is_empty());
+        assert_eq!(cfg.confirm_mode, CommandConfirmMode::Allowlist);
     }
 
     /// The only test in this crate that touches `FILAR_CONFIG`.
