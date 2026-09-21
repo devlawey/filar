@@ -44,7 +44,7 @@
 //! infrastructure commands. This module therefore does **not** claim an
 //! exception: whether the first probe per host needs a user gate is open,
 //! and #426 must answer it before calling `detect`.
-
+//!
 //! # A failure to reach the host is not an answer
 //!
 //! Two failures look alike and must not be treated alike. A command that
