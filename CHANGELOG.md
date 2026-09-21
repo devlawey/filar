@@ -13,6 +13,18 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Declarative fleet-check catalog: a check names a command, an optional
+  output preprocessor and the columns compared across hosts. Six checks
+  (`disk-usage`, `block-devices`, `processes`, `listening-sockets`,
+  `kernel-version`, `os-release`) are compiled into the binary and need no
+  file on disk; a `fleet_checks.toml` next to `config.toml` (or at
+  `FILAR_FLEET_CHECKS`) augments them. A malformed entry is rejected with a
+  reason naming it and every other check keeps working, an unparseable file
+  is rejected as a unit, and a user entry may not reuse a built-in name. A
+  declared command is still subject to the compiled-in read-only allowlist,
+  so a catalog can express a write but never perform one
+  ([#424](https://github.com/devlawey/filar/issues/424)).
+
 - Service, process, socket, journal and network output preprocessors, each
   pinning one canonical invocation: `systemctl list-units --output=json` →
   `unit/load/active/sub/description`, `ps -eo pid,ppid,user,rss,pcpu,comm` →

@@ -3283,4 +3283,95 @@ u_str ESTAB 0      0      /run/systemd/journal/stdout 21456 * 21455
         let deep = format!("[{}]", "[".repeat(200) + &"]".repeat(200));
         let _ = registry.preprocess(IP_COMMAND, &deep);
     }
+
+    // -----------------------------------------------------------------
+    // Fleet-check catalog (#424) <-> preprocessor registry
+    // -----------------------------------------------------------------
+
+    /// `filar-core` stores a check's `preprocessor` and `compare` columns as
+    /// plain strings: it is the crate that owns the catalog, and it cannot
+    /// see a single implementation in this module. So nothing there can
+    /// catch a built-in check that names a preprocessor which does not
+    /// exist, spells its command in a way that preprocessor declines, or
+    /// compares a column the resulting table has no room for. This test is
+    /// that check, run against the same shipped catalog and the same sample
+    /// outputs the parsers are tested with.
+    #[test]
+    fn builtin_fleet_checks_agree_with_the_preprocessors_they_name() {
+        let registry = PreprocessorRegistry::with_builtins();
+        let catalog = filar_core::fleet_checks::FleetCheckCatalog::builtin();
+        assert!(catalog.rejected().is_empty(), "{:?}", catalog.rejected());
+
+        // One representative output per parsed built-in check. A new parsed
+        // check with no entry here fails the test rather than slipping
+        // through unverified.
+        let samples: &[(&str, &str)] = &[
+            ("disk-usage", DF_SAMPLE),
+            ("block-devices", LSBLK_SAMPLE_SINGULAR),
+            ("processes", PS_SAMPLE),
+            ("listening-sockets", SS_SAMPLE),
+        ];
+
+        for check in catalog.checks() {
+            let Some(expected) = check.preprocessor() else {
+                // A check that declares no preprocessor must also not be
+                // claimed by one: the two would disagree about whether its
+                // output is a table, and `compare` would be empty either way.
+                assert_eq!(
+                    registry.preprocess(check.command(), ""),
+                    PreprocessOutcome::Raw {
+                        reason: RawFallback::NoPreprocessor
+                    },
+                    "check '{}' declares no preprocessor, yet one claims '{}'",
+                    check.name(),
+                    check.command()
+                );
+                continue;
+            };
+
+            let sample = samples
+                .iter()
+                .find(|(name, _)| *name == check.name())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "built-in check '{}' names preprocessor '{expected}' but this \
+                         test has no sample output for it — add one",
+                        check.name()
+                    )
+                })
+                .1;
+
+            match registry.preprocess(check.command(), sample) {
+                PreprocessOutcome::Structured {
+                    preprocessor,
+                    table,
+                } => {
+                    assert_eq!(
+                        preprocessor,
+                        expected,
+                        "check '{}' declares preprocessor '{expected}' but '{}' claimed \
+                         its command",
+                        check.name(),
+                        preprocessor
+                    );
+                    assert!(!check.compare().is_empty());
+                    for column in check.compare() {
+                        assert!(
+                            table.column_index(column).is_some(),
+                            "check '{}' compares column '{column}', which '{preprocessor}' \
+                             does not produce; it produces {:?}",
+                            check.name(),
+                            table.columns()
+                        );
+                    }
+                }
+                PreprocessOutcome::Raw { reason } => panic!(
+                    "check '{}' declares preprocessor '{expected}', but its command '{}' \
+                     fell back to raw: {reason:?}",
+                    check.name(),
+                    check.command()
+                ),
+            }
+        }
+    }
 }

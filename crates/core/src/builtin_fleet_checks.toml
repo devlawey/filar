@@ -1,0 +1,61 @@
+# Built-in fleet-check catalog (#424).
+#
+# This file is compiled into the binary with `include_str!` — it is NEVER
+# read from disk and NEVER downloaded. Editing it here changes the shipped
+# catalog; to add checks without rebuilding, write your own
+# `fleet_checks.toml` next to `config.toml` (see USER_GUIDE.md §2.6).
+#
+# Every `command` below must satisfy two independent constraints:
+#
+#   1. It must pass `filar_transport::check_read_only` — the compiled-in
+#      read-only allowlist a fleet group runs under. A command that does not
+#      is refused before it reaches any host, so a check declaring one would
+#      be dead weight. `crates/transport/tests/fleet_catalog_readonly.rs`
+#      asserts this for every entry.
+#   2. When `preprocessor` is set, the command must be one that preprocessor
+#      claims, so the output becomes a comparable table rather than raw text.
+#      `crates/agent/src/preprocess.rs` asserts this for every entry.
+#
+# Several preprocessors shipped by #421–#423 (`dpkg-query`, `rpm`,
+# `systemctl`, `journalctl`, `ip`, `nginx -v`, `php -v`) target binaries the
+# read-only allowlist deliberately excludes, so no built-in check can use
+# them yet. That gap is recorded in PROGRESS.md, not worked around here: the
+# allowlist is a security boundary, not a default to widen.
+
+[[check]]
+name = "disk-usage"
+description = "Filesystem sizes and utilisation per mount point"
+command = "df --output=source,size,used,avail,pcent,target"
+preprocessor = "df"
+compare = ["mount", "filesystem", "size"]
+
+[[check]]
+name = "block-devices"
+description = "Block devices, their sizes, types and mount points"
+command = "lsblk --json"
+preprocessor = "lsblk"
+compare = ["name", "size", "type", "mountpoint"]
+
+[[check]]
+name = "processes"
+description = "Running processes by owner and executable name"
+command = "ps -eo pid,ppid,user,rss,pcpu,comm"
+preprocessor = "ps"
+compare = ["user", "comm"]
+
+[[check]]
+name = "listening-sockets"
+description = "Sockets in the listening state, by protocol and local address"
+command = "ss -H -l -n"
+preprocessor = "ss"
+compare = ["netid", "local"]
+
+[[check]]
+name = "kernel-version"
+description = "Running kernel release"
+command = "uname -r"
+
+[[check]]
+name = "os-release"
+description = "Distribution identity as the host reports it"
+command = "cat /etc/os-release"
