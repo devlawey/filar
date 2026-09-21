@@ -255,21 +255,27 @@ impl FleetCheckCatalog {
 
     /// The built-in catalog augmented with a user file.
     ///
-    /// `user_path` of `None`, or a path that does not exist, yields the
+    /// `user_path` of `None`, or a path with no file at it, yields the
     /// built-ins unchanged — an absent user catalog is the normal case, not
     /// an error. A file that exists but cannot be read or parsed is recorded
     /// in [`rejected`](Self::rejected) and changes nothing else.
+    ///
+    /// The open is attempted rather than guarded by `Path::exists`, which
+    /// answers `false` for *any* failed metadata lookup — a catalog the
+    /// process may not stat (say, `o-x` on a parent directory) would be
+    /// indistinguishable from one that was never written, and the operator
+    /// would get silence where the contract above promises a reason. Only
+    /// [`NotFound`][std::io::ErrorKind::NotFound] means "no user catalog";
+    /// every other error is reported.
     pub fn load(user_path: Option<&Path>) -> Self {
         let mut catalog = Self::builtin();
         let Some(path) = user_path else {
             return catalog;
         };
-        if !path.exists() {
-            return catalog;
-        }
         let source = CheckSource::User(path.to_path_buf());
         match std::fs::read_to_string(path) {
             Ok(text) => catalog.extend_from_toml(&text, source),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => catalog.rejected.push(RejectedCheck {
                 source,
                 index: None,
@@ -635,6 +641,98 @@ command = "cat /etc/ssh/sshd_config"
     #[test]
     fn no_user_path_yields_the_builtins() {
         let catalog = FleetCheckCatalog::load(None);
+        assert_eq!(catalog.len(), FleetCheckCatalog::builtin().len());
+    }
+
+    /// An unreadable catalog must be *reported*, not mistaken for an absent
+    /// one. Reading a directory fails with a non-`NotFound` error on every
+    /// supported platform (`IsADirectory` on Unix, `PermissionDenied` on
+    /// Windows), which is the portable half of the contract.
+    #[test]
+    fn an_unreadable_user_catalog_is_reported() {
+        let dir = std::env::temp_dir().join(format!(
+            "filar_fleet_unreadable_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        struct Guard(PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(dir.clone());
+
+        // The catalog "path" is the directory itself.
+        let catalog = FleetCheckCatalog::load(Some(&dir));
+        assert_eq!(catalog.len(), FleetCheckCatalog::builtin().len());
+        assert_eq!(catalog.rejected().len(), 1);
+        assert!(
+            catalog.rejected()[0]
+                .reason()
+                .contains("failed to read user catalog"),
+            "got: {}",
+            catalog.rejected()[0].reason()
+        );
+    }
+
+    /// The case `Path::exists` used to swallow: a path whose *parent*
+    /// component is a regular file. `exists()` answers `false` (the stat
+    /// fails with `ENOTDIR`), so the old guard treated a real I/O fault as
+    /// "no user catalog" and logged nothing. Unix-only because the error a
+    /// non-directory component produces is `ENOTDIR` there and `NotFound`
+    /// on Windows, where the distinction this test makes does not exist.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_under_a_regular_file_is_reported_not_treated_as_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "filar_fleet_notadir_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        struct Guard(PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = Guard(dir.clone());
+
+        let regular = dir.join("not-a-directory");
+        std::fs::write(&regular, "x").unwrap();
+        let path = regular.join(USER_CATALOG_FILE);
+        assert!(!path.exists(), "precondition: exists() must answer false");
+
+        let catalog = FleetCheckCatalog::load(Some(&path));
+        assert_eq!(catalog.len(), FleetCheckCatalog::builtin().len());
+        assert_eq!(
+            catalog.rejected().len(),
+            1,
+            "an I/O fault must not be silently read as an absent catalog"
+        );
+    }
+
+    /// The other half: a path with genuinely nothing at it stays silent.
+    #[test]
+    fn a_not_found_catalog_stays_silent() {
+        let path = std::env::temp_dir().join(format!(
+            "filar_fleet_absent_{}_{}/{USER_CATALOG_FILE}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let catalog = FleetCheckCatalog::load(Some(&path));
+        assert!(catalog.rejected().is_empty(), "{:?}", catalog.rejected());
         assert_eq!(catalog.len(), FleetCheckCatalog::builtin().len());
     }
 

@@ -15,6 +15,7 @@
 //! - a user check declaring a write is *refused* by the gate, with the inner
 //!   executor never touched.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,6 +65,42 @@ fn gated() -> (ReadOnlyExecutor, Arc<RecordingExecutor>) {
     (exec, inner)
 }
 
+/// A catalog file in a uniquely named temp directory, removed when the
+/// value is dropped.
+///
+/// The guard matters more here than the tidiness suggests: a failing
+/// assertion unwinds, and without `Drop` the cleanup line never runs, so the
+/// run that most needs re-running is also the one that leaves litter behind.
+/// `unwrap` on the setup itself stays — in a test a panic *is* the failure
+/// report, and it is what the rest of this workspace's tests do.
+struct TempCatalog {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl TempCatalog {
+    fn new(label: &str, contents: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "filar_fleet_readonly_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fleet_checks.toml");
+        std::fs::write(&path, contents).unwrap();
+        Self { dir, path }
+    }
+}
+
+impl Drop for TempCatalog {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Every command the shipped catalog declares must survive the gate — as a
 /// pure predicate first, so a failure names the command rather than an
 /// executor error.
@@ -108,18 +145,8 @@ async fn every_builtin_check_is_forwarded_by_the_executor() {
 /// host sees anything.
 #[tokio::test]
 async fn a_check_declaring_a_forbidden_command_is_refused_by_the_transport() {
-    let dir = std::env::temp_dir().join(format!(
-        "filar_fleet_readonly_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("fleet_checks.toml");
-    std::fs::write(
-        &path,
+    let file = TempCatalog::new(
+        "forbidden",
         r#"
 [[check]]
 name = "wipe-logs"
@@ -131,11 +158,9 @@ name = "smuggled"
 description = "A reader with a write smuggled in behind a separator"
 command = "cat /etc/hostname; rm -rf /var/log"
 "#,
-    )
-    .unwrap();
+    );
 
-    let catalog = FleetCheckCatalog::load(Some(&path));
-    let _ = std::fs::remove_dir_all(&dir);
+    let catalog = FleetCheckCatalog::load(Some(&file.path));
 
     // The catalog itself accepts both: it validates shape, not policy.
     assert!(
@@ -173,29 +198,17 @@ command = "cat /etc/hostname; rm -rf /var/log"
 /// user checks second-class.
 #[tokio::test]
 async fn a_read_only_user_check_is_forwarded() {
-    let dir = std::env::temp_dir().join(format!(
-        "filar_fleet_readonly_ok_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("fleet_checks.toml");
-    std::fs::write(
-        &path,
+    let file = TempCatalog::new(
+        "allowed",
         r#"
 [[check]]
 name = "sshd-config"
 description = "Effective sshd configuration"
 command = "cat /etc/ssh/sshd_config"
 "#,
-    )
-    .unwrap();
+    );
 
-    let catalog = FleetCheckCatalog::load(Some(&path));
-    let _ = std::fs::remove_dir_all(&dir);
+    let catalog = FleetCheckCatalog::load(Some(&file.path));
 
     let check = catalog.get("sshd-config").expect("user check missing");
     let (exec, inner) = gated();
