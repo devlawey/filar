@@ -680,7 +680,8 @@ impl Config {
         (session_profile, Some(warning))
     }
 
-    /// Convenience: load from `config.toml`.
+    /// Resolve the path [`load_default`][Self::load_default] would read,
+    /// without reading it.
     ///
     /// Search order:
     /// 1. `FILAR_CONFIG` environment variable (explicit path)
@@ -688,17 +689,64 @@ impl Config {
     /// 3. `{OS data dir}/filar/config.toml` (shared system-wide config)
     /// 4. `config.toml` next to the executable
     ///
-    /// Falls back to built-in defaults if no file is found anywhere.
-    pub fn load_default() -> Result<Self> {
+    /// `None` means no config file exists anywhere in that order, and
+    /// `load_default` falls back to built-in defaults.
+    ///
+    /// Split out so callers that need the config *directory* — the fleet
+    /// check catalog looks for `fleet_checks.toml` next to the config file
+    /// (#424) — resolve the same file `load_default` would, instead of
+    /// re-implementing the order and drifting from it.
+    ///
+    /// Only the `FILAR_CONFIG` branch returns a path that may not exist: an
+    /// explicit request is honoured so the caller sees the real error
+    /// (`load` reports which file it could not read) rather than a silent
+    /// fallback to a different config.
+    ///
+    /// Deliberately silent. It is called more than once per startup — once
+    /// to load the config, again to find the fleet catalog beside it — and a
+    /// resolver that logs would print the same line each time. Reporting is
+    /// `load_default`'s job, which runs once.
+    pub fn default_path() -> Option<PathBuf> {
         // 1. FILAR_CONFIG env var.
         if let Ok(explicit) = std::env::var("FILAR_CONFIG") {
-            let p = std::path::PathBuf::from(explicit);
-            tracing::info!(path = %p.display(), "loading config from FILAR_CONFIG");
-            return Self::load(&p);
+            return Some(PathBuf::from(explicit));
         }
         // 2. Current working directory (local override for development).
-        if std::path::Path::new("config.toml").exists() {
-            // Warn if app-data config is also present — local file overrides.
+        if Path::new("config.toml").exists() {
+            return Some(PathBuf::from("config.toml"));
+        }
+        // 3. App-data directory (unified config location).
+        if let Ok(base) = crate::default_base_dir() {
+            let app_config = base.join("filar").join("config.toml");
+            if app_config.exists() {
+                return Some(app_config);
+            }
+        }
+        // 4. Next to the executable.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                let exe_config = exe_dir.join("config.toml");
+                if exe_config.exists() {
+                    return Some(exe_config);
+                }
+            }
+        }
+        None
+    }
+
+    /// Convenience: load from `config.toml`.
+    ///
+    /// Reads the file [`default_path`][Self::default_path] resolves, and
+    /// falls back to built-in defaults if no file is found anywhere.
+    pub fn load_default() -> Result<Self> {
+        let Some(path) = Self::default_path() else {
+            tracing::info!("no config.toml found, using built-in defaults");
+            return Ok(Self::default());
+        };
+        // A local file silently outranking the one the launcher writes is the
+        // single most confusing outcome of the search order (see USER_GUIDE
+        // 3.3), so it is called out rather than merely logged as a path.
+        if path == Path::new("config.toml") {
             if let Ok(base) = crate::default_base_dir() {
                 let app_config = base.join("filar").join("config.toml");
                 if app_config.exists() {
@@ -708,29 +756,9 @@ impl Config {
                     );
                 }
             }
-            tracing::info!("loading config.toml from current directory");
-            return Self::load("config.toml");
         }
-        // 3. App-data directory (unified config location).
-        if let Ok(base) = crate::default_base_dir() {
-            let app_config = base.join("filar").join("config.toml");
-            if app_config.exists() {
-                tracing::info!(path = %app_config.display(), "loading config from app-data dir");
-                return Self::load(&app_config);
-            }
-        }
-        // 4. Next to the executable.
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
-                let exe_config = exe_dir.join("config.toml");
-                if exe_config.exists() {
-                    tracing::info!(path = %exe_config.display(), "loading config from exe directory");
-                    return Self::load(&exe_config);
-                }
-            }
-        }
-        tracing::info!("no config.toml found, using built-in defaults");
-        Ok(Self::default())
+        tracing::info!(path = %path.display(), "loading config");
+        Self::load(&path)
     }
 
     /// Look up an SSH target by name.
@@ -1239,26 +1267,58 @@ options = { num_ctx = 8192 }
         assert!(llm_cfg.extra_body.is_some());
     }
 
+    /// A uniquely named config file, removed when the value is dropped.
+    ///
+    /// The name carries a per-test label and a process-wide counter, not a
+    /// timestamp. Two tests that build a name from the pid and
+    /// `SystemTime::now()` alone collide whenever the clock's resolution is
+    /// coarser than the gap between them — and they then race on one path,
+    /// where `std::fs::write` truncates before it writes. The loser observes
+    /// a zero-length file, which parses as an all-default `Config` and
+    /// passes validation, so a test asserting `is_err()` sees `Ok`. That is
+    /// not hypothetical: it is how `config_load_rejects_out_of_range_temperature`
+    /// failed on the macOS runner while passing everywhere else. A counter
+    /// cannot collide, so the shape is gone rather than made less likely.
+    struct TempConfig(PathBuf);
+
+    impl TempConfig {
+        fn new(label: &str, contents: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "filar_config_test_{label}_{}_{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     #[test]
     fn config_load_rejects_out_of_range_temperature() {
-        let toml = r#"
+        let file = TempConfig::new(
+            "temperature",
+            r#"
 [llm]
 model = "glm-5.1"
 api_base_url = "https://open.bigmodel.cn/api/paas/v4"
 temperature = 5.0
-"#;
-        let tmp = std::env::temp_dir().join(format!(
-            "filar_config_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::write(&tmp, toml).unwrap();
-        let result = Config::load(&tmp);
-        let _ = std::fs::remove_file(&tmp);
-        assert!(result.is_err(), "Config::load should reject temperature=5.0");
+"#,
+        );
+        assert!(
+            Config::load(file.path()).is_err(),
+            "Config::load should reject temperature=5.0"
+        );
     }
 
     // ── Host groups (#418) ─────────────────────────────────────
@@ -1430,24 +1490,40 @@ policy = "read-write"
 
     #[test]
     fn config_load_rejects_a_zero_group_limit() {
-        let toml = r#"
+        let file = TempConfig::new(
+            "group-limit",
+            r#"
 [[host_groups]]
 name = "prod"
 match = ["prod"]
 max_parallel = 0
-"#;
-        let tmp = std::env::temp_dir().join(format!(
-            "filar_config_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::write(&tmp, toml).unwrap();
-        let result = Config::load(&tmp);
-        let _ = std::fs::remove_file(&tmp);
-        assert!(result.is_err(), "Config::load should reject max_parallel = 0");
+"#,
+        );
+        assert!(
+            Config::load(file.path()).is_err(),
+            "Config::load should reject max_parallel = 0"
+        );
+    }
+
+    /// The collision that made the two tests above flaky is a property of
+    /// the name, so it is worth asserting on the name rather than hoping a
+    /// scheduler reproduces the race.
+    #[test]
+    fn temp_config_names_never_collide() {
+        let a = TempConfig::new("same", "");
+        let b = TempConfig::new("same", "");
+        assert_ne!(a.path(), b.path());
+    }
+
+    /// Why the race was silent rather than loud: an empty config is valid.
+    /// A truncation window during a concurrent write therefore looked like
+    /// a well-formed default config to whichever test read it.
+    #[test]
+    fn an_empty_config_file_loads_as_defaults() {
+        let file = TempConfig::new("empty", "");
+        let cfg = Config::load(file.path()).expect("an empty config is all defaults");
+        assert!(cfg.ssh_targets.is_empty());
+        assert_eq!(cfg.confirm_mode, CommandConfirmMode::Allowlist);
     }
 
     /// The only test in this crate that touches `FILAR_CONFIG`.

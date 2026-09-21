@@ -22,3 +22,9 @@ portable-pty = { workspace = true, optional = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }
+
+[dev-dependencies]
+# Integration tests in `tests/` do not inherit the regular dependencies, and
+# `fleet_catalog_readonly.rs` needs both the test runtime and the trait macro.
+tokio = { workspace = true }
+async-trait = { workspace = true }

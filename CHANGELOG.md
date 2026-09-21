@@ -13,6 +13,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Declarative fleet-check catalog: six built-in checks plus user-defined ones
+  from `fleet_checks.toml`, all bound by the read-only allowlist
+  ([#424](https://github.com/devlawey/filar/issues/424)).
+
 - Service, process, socket, journal and network output preprocessors, each
   pinning one canonical invocation: `systemctl list-units --output=json` →
   `unit/load/active/sub/description`, `ps -eo pid,ppid,user,rss,pcpu,comm` →

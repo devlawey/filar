@@ -358,6 +358,24 @@ async fn run() -> anyhow::Result<()> {
         "configuration loaded"
     );
 
+    // ── Fleet check catalog (#424) ─────────────────────────────────────
+    // Loaded at startup purely so a malformed user catalog is *reported*.
+    // Validation that reaches nobody is not validation: the file is
+    // hand-edited, a rejected entry silently disappears from the picker,
+    // and the log is the only place that can say which entry and why until
+    // the fleet UI exists (#431+).
+    let fleet_catalog_path = filar_core::user_catalog_path();
+    let fleet_checks = filar_core::FleetCheckCatalog::load(fleet_catalog_path.as_deref());
+    info!(
+        checks = fleet_checks.len(),
+        rejected = fleet_checks.rejected().len(),
+        path = ?fleet_catalog_path,
+        "fleet check catalog loaded"
+    );
+    for rejected in fleet_checks.rejected() {
+        tracing::warn!("fleet check rejected: {rejected}");
+    }
+
     // ── Parse CLI args ─────────────────────────────────────────────────
     let args = parse_args();
     let cli_llm_name = args.llm.clone();
