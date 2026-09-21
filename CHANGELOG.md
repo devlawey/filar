@@ -13,6 +13,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Fleet operations: the layer above a session, pairing one question with a
+  set of hosts. A group's tag rule is resolved once, when the operation is
+  opened, and the hosts, policy and limits are frozen there — so output from
+  a host can never change the set of hosts, and a host taking part stays
+  available to a normal tab at the same time
+  ([#426](https://github.com/devlawey/filar/issues/426)).
+
 - Per-OS command variants for fleet checks, with the host's family detected
   once per session from `/etc/os-release`; a check with no variant for a
   host is reported as not applicable rather than failed
@@ -146,6 +153,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   passwords survive ([#411](https://github.com/devlawey/filar/issues/411)).
 
 ### Fixed
+
+- `SshAuth`'s `Debug` no longer prints an inline SSH password in clear.
+  Whether one is set stays visible, the value does not, so a `{target:?}`
+  in a log line or a panic message can no longer leak it — including
+  through every type that holds an `SshTarget`
+  ([#426](https://github.com/devlawey/filar/issues/426)).
 
 - GUI launcher: manual `[[ssh_targets]]` entries in `config.toml` are no
   longer hidden by the full rebuild of the launcher's own targets — they are

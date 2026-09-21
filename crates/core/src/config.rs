@@ -4,6 +4,7 @@
 //! the GLM API key are **not** stored in the config file — they are read from
 //! the environment via the [`crate::secrets`] module.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -141,7 +142,14 @@ fn default_ssh_port() -> u16 {
 }
 
 /// SSH authentication method.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+///
+/// [`Debug`] is written by hand, not derived: a derived one printed
+/// [`Password::password`][Self::Password] in clear, and every type that
+/// holds an [`SshTarget`] — `FleetMember`, `FleetOperation`, a launch
+/// context — leaked it transitively through its own derived `Debug`. A
+/// single `{target:?}` in a log line or a panic message was enough, which
+/// invariant 3 of `AGENTS.md` forbids outright. Found in review of #426.
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SshAuth {
     /// Use a key file from disk (e.g. `~/.ssh/id_ed25519`).
@@ -158,6 +166,25 @@ pub enum SshAuth {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         password: Option<String>,
     },
+}
+
+/// Hand-written so a password never reaches a log, a panic message or an
+/// error string. Whether one is set stays visible — that is what makes the
+/// output useful for debugging — but the value itself is replaced, not
+/// shortened: a prefix of a password is still a leak, so
+/// [`redact`](crate::secrets::redact), which keeps four characters of a
+/// *name*, is the wrong tool here.
+impl fmt::Debug for SshAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Key { path } => f.debug_struct("Key").field("path", path).finish(),
+            Self::Agent => f.write_str("Agent"),
+            Self::Password { password } => f
+                .debug_struct("Password")
+                .field("password", &password.as_ref().map(|_| "<redacted>"))
+                .finish(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,6 +1449,66 @@ policy = "read-write"
         assert!(
             !is_read_only_target(&[group("draft", &[])], &member),
             "an empty rule must not silently cover everyone"
+        );
+    }
+
+    #[test]
+    fn debug_for_password_auth_hides_the_password() {
+        let auth = SshAuth::Password {
+            password: Some("hunter2".into()),
+        };
+        let printed = format!("{auth:?}");
+
+        assert!(
+            !printed.contains("hunter2"),
+            "a password must never reach a log or a panic message, got: {printed}"
+        );
+        assert!(
+            printed.contains("<redacted>"),
+            "whether a password is set stays visible, got: {printed}"
+        );
+    }
+
+    #[test]
+    fn debug_for_a_target_hides_a_nested_password() {
+        // The leak path this closes: every type holding an `SshTarget`
+        // printed the password through its own derived `Debug`.
+        let mut target = target_with_tags("prod-web", &["prod"]);
+        target.auth = SshAuth::Password {
+            password: Some("hunter2".into()),
+        };
+
+        let printed = format!("{target:?}");
+
+        assert!(
+            !printed.contains("hunter2"),
+            "nested password leaked through SshTarget, got: {printed}"
+        );
+        assert!(printed.contains("prod-web"), "the rest stays debuggable");
+    }
+
+    #[test]
+    fn debug_for_the_other_auth_variants_stays_informative() {
+        assert_eq!(
+            format!(
+                "{:?}",
+                SshAuth::Password {
+                    password: Option::<String>::None
+                }
+            ),
+            "Password { password: None }",
+            "no password set must read differently from one that is"
+        );
+        assert_eq!(format!("{:?}", SshAuth::Agent), "Agent");
+        assert_eq!(
+            format!(
+                "{:?}",
+                SshAuth::Key {
+                    path: Some(PathBuf::from("/home/me/.ssh/id_ed25519"))
+                }
+            ),
+            "Key { path: Some(\"/home/me/.ssh/id_ed25519\") }",
+            "a key path is not a secret and stays readable"
         );
     }
 
