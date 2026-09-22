@@ -17,9 +17,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   group's `max_parallel` hosts in flight at a time and a deadline **per
   host** rather than one for the whole operation, so a wedged machine
   becomes a single timed-out cell instead of holding up the summary for
-  everyone else. A timed-out command is cancelled rather than left running
-  on the host, and the freed slot goes straight to the next host in the
-  queue ([#427](https://github.com/devlawey/filar/issues/427)).
+  everyone else. A timed-out command gets a bounded, best-effort
+  cancellation attempt — so the host's shell is not left waiting on it
+  whenever the host still answers — and the slot then goes to the next host
+  in the queue ([#427](https://github.com/devlawey/filar/issues/427)).
 
 - Fleet operations: the layer above a session, pairing one question with a
   set of hosts. A group's tag rule is resolved once, when the operation is

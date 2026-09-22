@@ -301,8 +301,22 @@ pub async fn run_on_fleet(
 }
 
 /// Ask one host, under its own deadline.
+///
+/// The `run` future is pinned and polled *through* the timeout rather than
+/// handed to it, so that it outlives the deadline. That is not a style
+/// choice: an executor registers its cancellation waiter inside `run`
+/// (`LocalExecutor` selects on a `Notify`), and a `timeout` that owns the
+/// future drops that waiter when the deadline fires. `cancel()` would then
+/// find nobody listening, `Notify::notify_one` would store a permit
+/// instead, and the *next* command on that host would consume it and come
+/// back as "cancelled by user" though nothing cancelled it — a timed-out
+/// host poisoning its own next check, and its retry (#429) with it. Found
+/// in review.
 async fn run_one(index: usize, task: HostTask, deadline: Duration) -> (usize, HostRun) {
-    let run = match tokio::time::timeout(deadline, task.executor.run(&task.command)).await {
+    let run_future = task.executor.run(&task.command);
+    tokio::pin!(run_future);
+
+    let run = match tokio::time::timeout(deadline, &mut run_future).await {
         Ok(Ok(result)) => HostRun::Answered(result),
         Ok(Err(error)) => HostRun::Failed(error),
         Err(_) => {
@@ -323,6 +337,19 @@ async fn run_one(index: usize, task: HostTask, deadline: Duration) -> (usize, Ho
                     handle = ?task.handle,
                     "fleet host timed out and did not answer the cancellation either"
                 ),
+            }
+            // Let the run future observe the cancellation it was sent.
+            // Keeping it alive is only half the fix: a notified waiter that
+            // is dropped before it is polled hands the notification on, and
+            // with no other waiter it lands back as a stored permit — the
+            // same poisoning by a longer route. Polling here consumes it.
+            // Bounded by the same deadline, and its answer is discarded:
+            // whatever it says now, this host's cell is a timeout.
+            if tokio::time::timeout(deadline, &mut run_future).await.is_err() {
+                tracing::warn!(
+                    handle = ?task.handle,
+                    "fleet host did not finish even after being cancelled"
+                );
             }
             HostRun::TimedOut(deadline)
         }
@@ -638,6 +665,87 @@ mod tests {
         );
         assert_eq!(op.count_at(HostProgress::Done), 6);
         assert_eq!(concurrency.in_flight(), 0);
+    }
+
+    /// A host whose cancellation works the way the real executors' does:
+    /// `run` selects on a `Notify`, `cancel` notifies it.
+    ///
+    /// Mirrors `LocalExecutor` (`crates/transport/src/local.rs`), whose
+    /// `run` holds `cancel_notify.notified()` in a `tokio::select!` and
+    /// whose `cancel` calls `notify_one`. The point of the mirror is the
+    /// permit: `notify_one` with no waiter registered *stores* one, and the
+    /// next `notified()` consumes it immediately.
+    struct NotifyHost {
+        cancel_notify: tokio::sync::Notify,
+        work: Duration,
+        runs: AtomicUsize,
+        cancels: AtomicUsize,
+    }
+
+    impl NotifyHost {
+        fn new(work: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                cancel_notify: tokio::sync::Notify::new(),
+                work,
+                runs: AtomicUsize::new(0),
+                cancels: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[filar_transport::async_trait]
+    impl CommandExecutor for NotifyHost {
+        async fn run(&self, _command: &str) -> Result<CommandResult> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            tokio::select! {
+                _ = tokio::time::sleep(self.work) => Ok(answer("ok")),
+                _ = self.cancel_notify.notified() => {
+                    Err(CoreError::Other("command cancelled by user".into()))
+                }
+            }
+        }
+
+        async fn cancel(&self) -> Result<()> {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            self.cancel_notify.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_host_does_not_poison_its_next_command() {
+        // The bug this pins down: if the `run` future is dropped when the
+        // deadline fires, `cancel()` finds no waiter, the notification is
+        // stored as a permit, and the *next* command on the same host
+        // consumes it and reports itself cancelled though nothing
+        // cancelled it. On a fleet host that is the next check — and, once
+        // #429 lands, the retry of this very one.
+        let targets = targets(1);
+        let mut op = FleetOperation::open(&group(1, 30), &targets);
+        let host = NotifyHost::new(Duration::from_secs(3600));
+
+        let handle = op.handles().next().expect("member");
+        let report = run_on_fleet(
+            &mut op,
+            vec![HostTask::new(
+                handle,
+                host.clone() as Arc<dyn CommandExecutor>,
+                "uptime",
+            )],
+        )
+        .await
+        .expect("valid tasks");
+
+        assert_eq!(report.timed_out(), 1);
+        assert_eq!(host.cancels.load(Ordering::SeqCst), 1);
+
+        // The same executor, asked again — the next check on that host.
+        let second = host.run("uname -r").await;
+        assert!(
+            second.is_ok(),
+            "a command after a timeout must not inherit the cancellation, got: {second:?}"
+        );
+        assert_eq!(host.runs.load(Ordering::SeqCst), 2);
     }
 
     // ── Everything else ────────────────────────────────────────
