@@ -31,28 +31,26 @@
 //! restated here as a match on [`HostRun`][crate::fleet_run::HostRun]: two
 //! copies of the same rule are two things to drift apart.
 //!
-//! # Two layers of retry, and why both earn their place
+//! # What a round here adds over the executor's own recovery
 //!
-//! The transport already retries once on its own: `SshExecutor::run`
-//! re-dials and repeats the command when the connection was lost **before
-//! dispatch** (`CoreError::ConnectionLost`), under
-//! `SshTransportConfig::auto_reconnect`, which defaults to on. It
-//! deliberately does not do that for an error that could mean the command
-//! had started — that would be a silent re-execution.
+//! The licence to repeat comes from the error contract, not from any one
+//! transport: [`CoreError::ConnectionLost`] means the connection went
+//! before the command was dispatched, so nothing ran remotely and a
+//! repeat is safe. An executor is free to act on that itself — some
+//! re-dial once inside a single [`run`][filar_transport::CommandExecutor::run]
+//! call — and whether a particular one does is its own business, behind
+//! the trait (AGENTS.md invariant 4). This module never asks.
 //!
-//! So the two layers answer different questions. The transport's re-dial
-//! handles "the socket died just now"; a round here, after a pause,
-//! handles "the machine is coming back in a few seconds" — a reboot
-//! outlives any immediate reconnect, and no number of instant re-dials
-//! will reach a host that is still booting.
+//! What it adds is time. An executor's own recovery answers "the socket
+//! died just now"; a round here, **after a pause**, answers "the machine
+//! is coming back in a few seconds", which no amount of instant re-dialling
+//! reaches — a reboot outlives them all.
 //!
-//! This does mean a retry for [`NoContact`][HostState::NoContact] is only
-//! as useful as the executor's willingness to re-dial: an executor that
-//! caches a dead connection and never reconnects would fail identically on
-//! every round. With `auto_reconnect` off, that is exactly what happens,
-//! and the extra rounds cost a pause each for nothing. Raised in review,
-//! and worth stating rather than assuming — this module asks the executor
-//! again, it does not reach into its connection.
+//! The flip side is worth stating rather than discovering: this module
+//! asks the executor again, it does not reach into its connection. Given
+//! an executor that holds a dead connection and never renews it, every
+//! round fails identically and the extra rounds cost a pause each for
+//! nothing. Raised in review.
 //!
 //! # The operation cannot hang on retries
 //!
