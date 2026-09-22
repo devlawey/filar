@@ -79,6 +79,12 @@ use futures::stream::{FuturesUnordered, StreamExt};
 /// A task per *participating* host, not necessarily one per member: a host
 /// with no credentials, or one no variant of the check applies to, simply
 /// has no task and stays [`HostProgress::Pending`].
+///
+/// `Clone` is cheap — an `Arc` bump and a command string — and it exists
+/// so a retry round can ask the same host the same thing again (#429)
+/// without the caller rebuilding the task from parts and risking a
+/// different command the second time.
+#[derive(Clone)]
 pub struct HostTask {
     handle: HostHandle,
     executor: Arc<dyn CommandExecutor>,
@@ -179,6 +185,37 @@ impl FleetRunReport {
     /// The operation this report is about.
     pub fn operation(&self) -> OperationId {
         self.operation
+    }
+
+    /// Take `later`'s rows in place of this report's, host by host.
+    ///
+    /// For a retry round (#429): the hosts asked again keep their new row,
+    /// the hosts that were not asked again keep the row they had, and the
+    /// order stays the order of the first round. A host in `later` that
+    /// this report has no row for is added at the end, so nothing is
+    /// silently dropped.
+    ///
+    /// Refuses a report for a different operation. Merging rows across
+    /// operations would file one fleet's answers under another's hosts —
+    /// the same mistake #428's `build` refuses on its own input.
+    pub fn absorb(&mut self, later: FleetRunReport) -> Result<()> {
+        if later.operation != self.operation {
+            return Err(CoreError::Other(format!(
+                "fleet run: cannot absorb a report for operation {} into {}",
+                later.operation, self.operation
+            )));
+        }
+        for outcome in later.outcomes {
+            match self
+                .outcomes
+                .iter_mut()
+                .find(|existing| existing.handle == outcome.handle)
+            {
+                Some(existing) => *existing = outcome,
+                None => self.outcomes.push(outcome),
+            }
+        }
+        Ok(())
     }
 
     /// Every row, in task order.

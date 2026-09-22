@@ -13,6 +13,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Bounded auto-retry for fleet hosts that stayed silent: only a timeout or a
+  lost connection is asked again, an execution error never is, and a host
+  answering on a later round replaces its earlier row in the summary
+  ([#429](https://github.com/devlawey/filar/issues/429)).
+
 - Per-host states in a fleet operation's result, so an unreachable host is
   a cell in the table rather than a failed operation: the operation fails
   only when no asked host answered, and the summary always names how many

@@ -12,6 +12,8 @@
 //!   group's parallelism limit and a deadline per host (Stage 2.0, fleet).
 //! - Fleet result: where each host ended up, including "no contact", and the
 //!   summary that always names the silent ones (Stage 2.0, fleet).
+//! - Fleet retry: asking the silent hosts again, bounded, and only the silent
+//!   ones — safe because fleet work is read-only (Stage 2.0, fleet).
 
 pub mod agent;
 pub mod arbiter;
@@ -19,6 +21,7 @@ pub mod background;
 pub mod compaction;
 pub mod events;
 pub mod fleet_result;
+pub mod fleet_retry;
 pub mod fleet_run;
 pub mod long_wait;
 pub mod openai_compat;
