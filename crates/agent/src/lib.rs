@@ -10,12 +10,15 @@
 //! - OS-family detection per host, cached for the session (Stage 2.0, fleet).
 //! - Fleet fan-out: one command per host across an operation, bounded by the
 //!   group's parallelism limit and a deadline per host (Stage 2.0, fleet).
+//! - Fleet result: where each host ended up, including "no contact", and the
+//!   summary that always names the silent ones (Stage 2.0, fleet).
 
 pub mod agent;
 pub mod arbiter;
 pub mod background;
 pub mod compaction;
 pub mod events;
+pub mod fleet_result;
 pub mod fleet_run;
 pub mod long_wait;
 pub mod openai_compat;

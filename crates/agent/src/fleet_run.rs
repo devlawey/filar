@@ -65,7 +65,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use filar_core::error::{CoreError, Result};
-use filar_core::fleet_op::{FleetOperation, HostHandle, HostProgress};
+use filar_core::fleet_op::{FleetOperation, HostHandle, HostProgress, OperationId};
 use filar_transport::{CommandExecutor, CommandResult};
 use futures::stream::{FuturesUnordered, StreamExt};
 
@@ -163,12 +163,24 @@ impl HostOutcome {
 /// Rows keep the order of the tasks handed in, not the order the hosts
 /// happened to answer in: a summary that reshuffles itself by network
 /// timing is unreadable next to the panel (#431).
+///
+/// The report names the operation it came from, so a consumer can refuse
+/// one that belongs to somebody else. Checking the rows is not enough for
+/// that: an **empty** foreign report has no row to catch it on, and
+/// reading it as "nobody was asked" would be a false summary about an
+/// operation that ran (#428 review).
 #[derive(Debug)]
 pub struct FleetRunReport {
+    operation: OperationId,
     outcomes: Vec<HostOutcome>,
 }
 
 impl FleetRunReport {
+    /// The operation this report is about.
+    pub fn operation(&self) -> OperationId {
+        self.operation
+    }
+
     /// Every row, in task order.
     pub fn outcomes(&self) -> &[HostOutcome] {
         &self.outcomes
@@ -297,7 +309,10 @@ pub async fn run_on_fleet(
         })
         .collect();
 
-    Ok(FleetRunReport { outcomes })
+    Ok(FleetRunReport {
+        operation: op.id(),
+        outcomes,
+    })
 }
 
 /// Ask one host, under its own deadline.
