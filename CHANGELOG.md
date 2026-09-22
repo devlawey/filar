@@ -13,6 +13,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Fleet operation results: every member of an operation gets a state —
+  success, differs, error, timeout, no contact, not applicable or skipped —
+  so an unreachable host is a cell in the table rather than a failed
+  operation. The operation counts as failed only when nobody answered while
+  at least one host was asked, and the summary line always names how many
+  hosts stayed silent, including when that number is zero
+  ([#428](https://github.com/devlawey/filar/issues/428)).
+
 - Fleet fan-out: one command per host across an operation, with at most the
   group's `max_parallel` hosts in flight at a time and a deadline **per
   host** rather than one for the whole operation, so a wedged machine
