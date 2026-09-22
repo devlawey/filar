@@ -271,25 +271,31 @@ impl OperationResult {
             reasons.insert(*handle, *reason);
         }
 
-        let mut rows = Vec::with_capacity(op.len());
-        for handle in op.handles() {
-            let state = match report.run_for(handle) {
-                Some(run) => HostState::from_run(run),
-                None => reasons
-                    .get(&handle)
-                    .copied()
-                    .map_or(HostState::Skipped, HostState::from),
-            };
-            let host = op
-                .member(handle)
-                .map(|member| member.name().to_string())
-                .unwrap_or_default();
-            rows.push(HostStateRow {
-                handle,
-                host,
-                state,
-            });
-        }
+        // Handles and members are both in composition order, so zipping
+        // them pairs each handle with its own member. Taking the name from
+        // the member directly rather than looking the handle back up
+        // leaves no "member not found" branch to decide what to do with:
+        // an `unwrap_or_default` there would have put a nameless host in
+        // the summary, and an `expect` would have added a panic path for a
+        // case the types already rule out. Found in review.
+        let rows = op
+            .handles()
+            .zip(op.members())
+            .map(|(handle, member)| {
+                let state = match report.run_for(handle) {
+                    Some(run) => HostState::from_run(run),
+                    None => reasons
+                        .get(&handle)
+                        .copied()
+                        .map_or(HostState::Skipped, HostState::from),
+                };
+                HostStateRow {
+                    handle,
+                    host: member.name().to_string(),
+                    state,
+                }
+            })
+            .collect();
 
         Ok(Self {
             operation: op.id(),
@@ -852,6 +858,52 @@ mod tests {
             error.to_string().contains("both asked and not asked"),
             "got: {error}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_row_carries_its_own_hosts_name() {
+        // The pairing of handle to name is done by zipping two iterators
+        // of the operation, so it is worth proving rather than assuming:
+        // a row that names the wrong host would misattribute a state, and
+        // one host's timeout would be read as another's.
+        let targets = targets(4);
+        let mut op = FleetOperation::open(&group(4), &targets);
+        let handles: Vec<HostHandle> = op.handles().collect();
+
+        // Give the hosts different states so a shifted pairing cannot
+        // pass by looking the same everywhere.
+        let behaviours = [
+            Behaviour::Answers(Some(0)),
+            Behaviour::Unreachable,
+            Behaviour::Answers(Some(1)),
+            Behaviour::Hangs,
+        ];
+        let tasks = handles
+            .iter()
+            .zip(behaviours)
+            .map(|(handle, behaviour)| HostTask::new(*handle, host(behaviour), "uname -r"))
+            .collect();
+        let report = run_on_fleet(&mut op, tasks).await.expect("valid tasks");
+        let result = OperationResult::build(&op, &report, &[]).expect("valid result");
+
+        let named: Vec<(&str, HostState)> = result
+            .rows()
+            .iter()
+            .map(|row| (row.host(), row.state()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("host-1", HostState::Success),
+                ("host-2", HostState::NoContact),
+                ("host-3", HostState::ExecutionError),
+                ("host-4", HostState::TimedOut),
+            ]
+        );
+        for (row, member) in result.rows().iter().zip(op.members()) {
+            assert_eq!(row.host(), member.name());
+            assert_eq!(row.handle(), op.handle_for(member.name()).expect("member"));
+        }
     }
 
     #[test]
