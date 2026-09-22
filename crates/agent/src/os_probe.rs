@@ -27,9 +27,11 @@
 //! # Open question: the confirmation gate (#425 review, unresolved)
 //!
 //! **Nothing calls [`detect`][OsFamilyProbe::detect] yet**, so no command
-//! reaches a host today. Before a caller is wired up — in the fleet
-//! operation layer (#426) — one question has to be settled by the project
-//! owners, not here:
+//! reaches a host today. The fleet operation layer (#426) landed as pure
+//! model and asks nobody anything, and the fan-out over a group (#427)
+//! takes the command it runs as an **input** — resolving a check's per-OS
+//! variant is its caller's job — so neither wired a probe up. Before one
+//! is, a question has to be settled by the project owners, not here:
 //!
 //! Does AGENTS.md invariant 2 ("in confirm mode no command runs on the
 //! remote machine without explicit user approval; do not weaken this gate
@@ -43,7 +45,10 @@
 //! invariant is written without an exception for read-only or
 //! infrastructure commands. This module therefore does **not** claim an
 //! exception: whether the first probe per host needs a user gate is open,
-//! and #426 must answer it before calling `detect`.
+//! and it must be answered by whoever first calls `detect` — the code that
+//! decides to probe, which on the fleet side is the confirmation gate in
+//! the UI (#435: "one approval for a read-only operation"), not a library
+//! underneath it.
 //!
 //! # A failure to reach the host is not an answer
 //!

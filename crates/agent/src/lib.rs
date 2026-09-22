@@ -8,12 +8,15 @@
 //! - Output preprocessors: machine-format command output → typed tables; raw
 //!   text remains the fallback (Stage 2.0, fleet).
 //! - OS-family detection per host, cached for the session (Stage 2.0, fleet).
+//! - Fleet fan-out: one command per host across an operation, bounded by the
+//!   group's parallelism limit and a deadline per host (Stage 2.0, fleet).
 
 pub mod agent;
 pub mod arbiter;
 pub mod background;
 pub mod compaction;
 pub mod events;
+pub mod fleet_run;
 pub mod long_wait;
 pub mod openai_compat;
 pub mod os_probe;
