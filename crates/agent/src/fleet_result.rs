@@ -246,11 +246,14 @@ impl OperationResult {
     /// was given.
     ///
     /// Returns an error for input this operation cannot own, and checks
-    /// **both** sides of it — the report as well as `not_asked`. A report
-    /// belonging to another operation would otherwise match no member at
-    /// all (handles carry their operation's id since #426) and every host
-    /// would come out [`Skipped`][HostState::Skipped]: a result that says
-    /// "nobody was asked" about an operation that ran. Found in review.
+    /// **both** sides of it — the report as well as `not_asked`.
+    ///
+    /// The report is refused by its operation id, not by scanning its
+    /// rows. Scanning was the first fix and it was incomplete: an
+    /// **empty** foreign report has no row to catch it on, so every host
+    /// came out [`Skipped`][HostState::Skipped] and the result claimed
+    /// "nobody was asked" about an operation that ran. Both rounds of that
+    /// were found in review.
     ///
     /// The other three refusals are contradictions about one host — a
     /// `not_asked` handle from elsewhere, a member that is both in
@@ -263,13 +266,12 @@ impl OperationResult {
         report: &FleetRunReport,
         not_asked: &[(HostHandle, NotAsked)],
     ) -> Result<Self> {
-        for outcome in report.outcomes() {
-            if op.member(outcome.handle()).is_none() {
-                return Err(CoreError::Other(format!(
-                    "fleet result: report covers a host that is not in operation {}",
-                    op.id()
-                )));
-            }
+        if report.operation() != op.id() {
+            return Err(CoreError::Other(format!(
+                "fleet result: report is for operation {}, not {}",
+                report.operation(),
+                op.id()
+            )));
         }
 
         let mut reasons: BTreeMap<HostHandle, NotAsked> = BTreeMap::new();
@@ -917,8 +919,23 @@ mod tests {
         let error = OperationResult::build(&mine, &their_report, &[])
             .expect_err("a report from another operation must not be accepted");
         assert!(
-            error.to_string().contains("not in operation"),
+            error.to_string().contains("is for operation"),
             "the error must name the problem, got: {error}"
+        );
+
+        // And the case scanning the rows could never catch: a foreign
+        // report with nothing in it. Reading it as "nobody was asked"
+        // would be a false summary about an operation that ran.
+        let mut empty_op = FleetOperation::open(&group(2), &targets);
+        let empty_foreign = run_on_fleet(&mut empty_op, Vec::new())
+            .await
+            .expect("no tasks");
+        assert!(empty_foreign.is_empty());
+        let error = OperationResult::build(&mine, &empty_foreign, &[])
+            .expect_err("an empty report from another operation must not be accepted either");
+        assert!(
+            error.to_string().contains("is for operation"),
+            "got: {error}"
         );
     }
 
