@@ -31,6 +31,29 @@
 //! restated here as a match on [`HostRun`][crate::fleet_run::HostRun]: two
 //! copies of the same rule are two things to drift apart.
 //!
+//! # Two layers of retry, and why both earn their place
+//!
+//! The transport already retries once on its own: `SshExecutor::run`
+//! re-dials and repeats the command when the connection was lost **before
+//! dispatch** (`CoreError::ConnectionLost`), under
+//! `SshTransportConfig::auto_reconnect`, which defaults to on. It
+//! deliberately does not do that for an error that could mean the command
+//! had started — that would be a silent re-execution.
+//!
+//! So the two layers answer different questions. The transport's re-dial
+//! handles "the socket died just now"; a round here, after a pause,
+//! handles "the machine is coming back in a few seconds" — a reboot
+//! outlives any immediate reconnect, and no number of instant re-dials
+//! will reach a host that is still booting.
+//!
+//! This does mean a retry for [`NoContact`][HostState::NoContact] is only
+//! as useful as the executor's willingness to re-dial: an executor that
+//! caches a dead connection and never reconnects would fail identically on
+//! every round. With `auto_reconnect` off, that is exactly what happens,
+//! and the extra rounds cost a pause each for nothing. Raised in review,
+//! and worth stating rather than assuming — this module asks the executor
+//! again, it does not reach into its connection.
+//!
 //! # The operation cannot hang on retries
 //!
 //! [`RetryPolicy::attempts`] counts *total* attempts, not extra ones, and
