@@ -33,13 +33,27 @@
 //!
 //! # What a round here adds over the executor's own recovery
 //!
-//! The licence to repeat comes from the error contract, not from any one
-//! transport: [`CoreError::ConnectionLost`] means the connection went
-//! before the command was dispatched, so nothing ran remotely and a
-//! repeat is safe. An executor is free to act on that itself — some
-//! re-dial once inside a single [`run`][filar_transport::CommandExecutor::run]
-//! call — and whether a particular one does is its own business, behind
-//! the trait (AGENTS.md invariant 4). This module never asks.
+//! Which states to repeat comes from the error contract:
+//! [`CoreError::ConnectionLost`] is documented as the connection going
+//! *before* the command was dispatched, with "no side effect has happened
+//! remotely yet", and failures after a command may have started are
+//! required not to use it. That is what makes it the signal to ask again,
+//! rather than a guess about what a dead socket meant.
+//!
+//! It is a contract an executor must honour, though, not something the
+//! type enforces — and the safety of repeating does **not** rest on it.
+//! Read-only does. An executor that mislabelled a post-dispatch failure
+//! as lost-before-dispatch would get its command run twice here, and that
+//! still changes nothing on the host, because the allowlist above lets
+//! nothing through that could. The contract picks *which* hosts to ask
+//! again; read-only is why asking is harmless either way. Raised in
+//! review, where the first draft of this section had it the other way
+//! round.
+//!
+//! An executor is also free to recover on its own — some re-dial once
+//! inside a single [`run`][filar_transport::CommandExecutor::run] call —
+//! and whether a particular one does is its own business, behind the
+//! trait (AGENTS.md invariant 4). This module never asks.
 //!
 //! What it adds is time. An executor's own recovery answers "the socket
 //! died just now"; a round here, **after a pause**, answers "the machine
