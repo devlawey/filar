@@ -245,15 +245,33 @@ impl OperationResult {
     /// [`Skipped`][HostState::Skipped]: it was not asked, and no reason
     /// was given.
     ///
-    /// Returns an error for input the operation cannot own — a handle from
-    /// another operation, or a member that is both in `report` and in
-    /// `not_asked`. The second is a contradiction about one host, and
-    /// resolving it by preference would make the summary quietly wrong.
+    /// Returns an error for input this operation cannot own, and checks
+    /// **both** sides of it — the report as well as `not_asked`. A report
+    /// belonging to another operation would otherwise match no member at
+    /// all (handles carry their operation's id since #426) and every host
+    /// would come out [`Skipped`][HostState::Skipped]: a result that says
+    /// "nobody was asked" about an operation that ran. Found in review.
+    ///
+    /// The other three refusals are contradictions about one host — a
+    /// `not_asked` handle from elsewhere, a member that is both in
+    /// `report` and in `not_asked`, and the same member named twice in
+    /// `not_asked` with two reasons. Resolving any of them by preference
+    /// (last wins, asked wins) would make the summary quietly wrong
+    /// instead of loudly refused.
     pub fn build(
         op: &FleetOperation,
         report: &FleetRunReport,
         not_asked: &[(HostHandle, NotAsked)],
     ) -> Result<Self> {
+        for outcome in report.outcomes() {
+            if op.member(outcome.handle()).is_none() {
+                return Err(CoreError::Other(format!(
+                    "fleet result: report covers a host that is not in operation {}",
+                    op.id()
+                )));
+            }
+        }
+
         let mut reasons: BTreeMap<HostHandle, NotAsked> = BTreeMap::new();
         for (handle, reason) in not_asked {
             if op.member(*handle).is_none() {
@@ -268,7 +286,12 @@ impl OperationResult {
                     op.id()
                 )));
             }
-            reasons.insert(*handle, *reason);
+            if reasons.insert(*handle, *reason).is_some() {
+                return Err(CoreError::Other(format!(
+                    "fleet result: duplicate not-asked host in operation {}",
+                    op.id()
+                )));
+            }
         }
 
         // Handles and members are both in composition order, so zipping
@@ -857,6 +880,45 @@ mod tests {
         assert!(
             error.to_string().contains("both asked and not asked"),
             "got: {error}"
+        );
+
+        let error = OperationResult::build(
+            &mine,
+            &report,
+            &[
+                (handles[1], NotAsked::NotApplicable),
+                (handles[1], NotAsked::Skipped),
+            ],
+        )
+        .expect_err("one host cannot have two reasons for not being asked");
+        assert!(
+            error.to_string().contains("duplicate not-asked host"),
+            "got: {error}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_report_from_another_operation_is_refused() {
+        // The quiet failure this closes: handles carry their operation's
+        // id (#426), so a foreign report matches no member — every host
+        // would come out `Skipped` and `build` would return `Ok`. A result
+        // claiming "nobody was asked" about an operation that ran is worse
+        // than an error, because nothing about it looks wrong.
+        let targets = targets(2);
+        let mut theirs = FleetOperation::open(&group(2), &targets);
+        let mine = FleetOperation::open(&group(2), &targets);
+
+        let tasks = theirs
+            .handles()
+            .map(|handle| HostTask::new(handle, host(Behaviour::Answers(Some(0))), "uname -r"))
+            .collect();
+        let their_report = run_on_fleet(&mut theirs, tasks).await.expect("valid tasks");
+
+        let error = OperationResult::build(&mine, &their_report, &[])
+            .expect_err("a report from another operation must not be accepted");
+        assert!(
+            error.to_string().contains("not in operation"),
+            "the error must name the problem, got: {error}"
         );
     }
 
