@@ -13,6 +13,15 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Fleet results folded into one difference table, which is the only thing
+  about an operation the model is given: the comparison is done in code, and
+  no host's raw output reaches the context — a check with a preprocessor is
+  compared on its declared columns, one without is compared by digest with
+  only the agreement structure reported. A compromised host can therefore
+  corrupt the contents of its own cell and nothing else: not the command,
+  not the host list, not the actions taken about the other hosts
+  ([#430](https://github.com/devlawey/filar/issues/430)).
+
 - Bounded auto-retry for fleet hosts that stayed silent: only a timeout or a
   lost connection is asked again, an execution error never is, and a host
   answering on a later round replaces its earlier row in the summary
