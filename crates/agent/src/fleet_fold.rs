@@ -324,10 +324,19 @@ impl FoldedTable {
 // ---------------------------------------------------------------------------
 
 /// One answered host on the way to a group.
+///
+/// The value lives on the host rather than in a vector beside it. A
+/// second vector paired by position is a way to lose a host silently,
+/// and "a host missing from the table is a host whose absence nobody
+/// notices" is the thing #428 exists to prevent. It starts as the
+/// digest of the output — the fallback every path can always fall back
+/// *to* — and [`compare_answers`] upgrades it to rows only when the
+/// whole fleet produced them. Raised in review.
 struct Answered {
     handle: HostHandle,
     host: String,
     output: String,
+    value: ComparedValue,
 }
 
 /// A group under construction, before the host handles are dropped.
@@ -389,11 +398,16 @@ pub fn fold(
             continue;
         }
         match report.run_for(handle) {
-            Some(HostRun::Answered(command_result)) => answered.push(Answered {
-                handle,
-                host,
-                output: command_result.stdout.clone(),
-            }),
+            Some(HostRun::Answered(command_result)) => {
+                let output = command_result.stdout.clone();
+                let value = ComparedValue::digest(&output);
+                answered.push(Answered {
+                    handle,
+                    host,
+                    output,
+                    value,
+                });
+            }
             // A row that says the host answered while the report has no
             // answer for it is a contradiction between the two inputs,
             // not a state to interpret. Refusing beats folding a value
@@ -406,12 +420,13 @@ pub fn fold(
         }
     }
 
-    let (comparison, values) = compare_answers(check, tasks, &answered, registry);
+    let comparison = compare_answers(check, tasks, &mut answered, registry);
 
     // Group in composition order, so the hosts inside a group and the
     // groups themselves come out in an order the reader can predict.
     let mut groupings: Vec<Grouping> = Vec::new();
-    for (answer, value) in answered.iter().zip(values) {
+    for answer in &answered {
+        let value = answer.value.clone();
         match groupings.iter_mut().find(|group| group.value == value) {
             Some(group) => {
                 group.handles.push(answer.handle);
@@ -476,38 +491,27 @@ pub fn fold(
 fn compare_answers(
     check: &FleetCheck,
     tasks: &[HostTask],
-    answered: &[Answered],
+    answered: &mut [Answered],
     registry: &PreprocessorRegistry,
-) -> (Comparison, Vec<ComparedValue>) {
-    let digests = || {
-        answered
-            .iter()
-            .map(|answer| ComparedValue::digest(&answer.output))
-            .collect::<Vec<_>>()
+) -> Comparison {
+    let declined = Comparison::RawText {
+        reason: RawReason::PreprocessorDeclined,
     };
 
     let Some(named) = check.preprocessor() else {
-        return (
-            Comparison::RawText {
-                reason: RawReason::NoPreprocessor,
-            },
-            digests(),
-        );
+        return Comparison::RawText {
+            reason: RawReason::NoPreprocessor,
+        };
     };
 
     let mut rows = Vec::with_capacity(answered.len());
-    for answer in answered {
+    for answer in answered.iter() {
         let Some(command) = tasks
             .iter()
             .find(|task| task.handle() == answer.handle)
             .map(HostTask::command)
         else {
-            return (
-                Comparison::RawText {
-                    reason: RawReason::PreprocessorDeclined,
-                },
-                digests(),
-            );
+            return declined;
         };
         match registry.preprocess(command, &answer.output) {
             // The registry answers with whichever preprocessor claimed
@@ -516,38 +520,46 @@ fn compare_answers(
             // projection would be a guess.
             PreprocessOutcome::Structured { preprocessor, table } if preprocessor == named => {
                 let Some(indices) = column_indices(&table, check.compare()) else {
-                    return (
-                        Comparison::RawText {
-                            reason: RawReason::PreprocessorDeclined,
-                        },
-                        digests(),
-                    );
+                    return declined;
                 };
-                rows.push(ComparedValue::rows(
-                    table
-                        .rows()
-                        .iter()
-                        .map(|row| indices.iter().map(|index| row[*index].clone()).collect())
-                        .collect(),
-                ));
+                let Some(projected) = project(&table, &indices) else {
+                    return declined;
+                };
+                rows.push(ComparedValue::rows(projected));
             }
-            _ => {
-                return (
-                    Comparison::RawText {
-                        reason: RawReason::PreprocessorDeclined,
-                    },
-                    digests(),
-                )
-            }
+            _ => return declined,
         }
     }
 
-    (
-        Comparison::Typed {
-            columns: check.compare().to_vec(),
-        },
-        rows,
-    )
+    // The loop above pushes exactly one value per host or returns for the
+    // whole check, so this pairs each host with its own; and were it ever
+    // to fall short, the host would keep the digest it came in with
+    // rather than drop out of the fold.
+    for (answer, value) in answered.iter_mut().zip(rows) {
+        answer.value = value;
+    }
+
+    Comparison::Typed {
+        columns: check.compare().to_vec(),
+    }
+}
+
+/// Project every row onto `indices`, or `None` if a row is too short.
+///
+/// A short row cannot occur through any public path today:
+/// [`PreprocessedOutput::new`] refuses a ragged table, its fields are
+/// private, and `indices` come from that same table's columns — so a
+/// custom preprocessor cannot produce one either. It is written to
+/// degrade rather than index because this module is where output from a
+/// possibly hostile host crosses into the model's context, and a panic
+/// there would be a worse answer than a digest. Raised in review, where
+/// the first draft indexed.
+fn project(table: &PreprocessedOutput, indices: &[usize]) -> Option<Vec<Vec<String>>> {
+    table
+        .rows()
+        .iter()
+        .map(|row| indices.iter().map(|index| row.get(*index).cloned()).collect())
+        .collect()
 }
 
 /// Positions of the compared columns, or `None` if any is missing.
@@ -822,6 +834,7 @@ mod tests {
 
     use crate::fleet_result::NotAsked;
     use crate::fleet_run::run_on_fleet;
+    use crate::preprocess::OutputPreprocessor;
 
     use super::*;
 
@@ -934,6 +947,16 @@ mod tests {
         hosts: &[Says],
         not_asked: &[usize],
     ) -> (FoldedTable, OperationResult, Vec<HostTask>, FleetOperation) {
+        fold_hosts_with(check, hosts, not_asked, &PreprocessorRegistry::with_builtins()).await
+    }
+
+    /// As [`fold_hosts`], with the registry under the caller's control.
+    async fn fold_hosts_with(
+        check: &FleetCheck,
+        hosts: &[Says],
+        not_asked: &[usize],
+        registry: &PreprocessorRegistry,
+    ) -> (FoldedTable, OperationResult, Vec<HostTask>, FleetOperation) {
         let targets = targets(hosts.len());
         let mut op = FleetOperation::open(&group(), &targets);
         let handles: Vec<_> = op.handles().collect();
@@ -967,14 +990,8 @@ mod tests {
             .collect();
         let mut result = OperationResult::build(&op, &report, &skipped)
             .expect("result builds from its own report");
-        let table = fold(
-            check,
-            &tasks,
-            &report,
-            &mut result,
-            &PreprocessorRegistry::with_builtins(),
-        )
-        .expect("fold accepts a result and its own report");
+        let table = fold(check, &tasks, &report, &mut result, registry)
+            .expect("fold accepts a result and its own report");
 
         (table, result, tasks, op)
     }
@@ -1429,6 +1446,88 @@ mod tests {
         for (host, state) in dropped {
             assert!(rendered.contains(&format!("{host} \u{2014} {}", state.label())), "{rendered}");
         }
+    }
+
+    /// A preprocessor under the test's control, so the paths a built-in
+    /// never takes can be reached on purpose.
+    struct Custom {
+        name: &'static str,
+        columns: Vec<String>,
+    }
+
+    impl OutputPreprocessor for Custom {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn matches(&self, command: &str) -> bool {
+            command.starts_with("df")
+        }
+
+        fn preprocess(
+            &self,
+            _command: &str,
+            _output: &str,
+        ) -> std::result::Result<PreprocessedOutput, crate::preprocess::PreprocessError> {
+            let row = self.columns.iter().map(|_| "x".to_string()).collect();
+            PreprocessedOutput::new(self.columns.clone(), vec![row])
+        }
+    }
+
+    fn registry_with(first: Custom) -> PreprocessorRegistry {
+        // Registered ahead of the built-ins, so it is the claimant that
+        // wins for the `df` command.
+        let mut registry = PreprocessorRegistry::new();
+        registry.register(Box::new(first));
+        registry
+    }
+
+    #[tokio::test]
+    async fn a_table_without_a_compared_column_degrades_to_digests() {
+        // Parses fine, and is not ragged — it simply has no `mount`,
+        // which the check compares. Projecting it would be a guess.
+        let registry = registry_with(Custom {
+            name: "df",
+            columns: vec!["filesystem".into(), "size".into()],
+        });
+        let hosts = vec![Says::Ok(df_normal()), Says::Ok(df_normal())];
+        let (table, _, _, _) = fold_hosts_with(&disk_usage(), &hosts, &[], &registry).await;
+
+        assert!(
+            matches!(
+                table.comparison(),
+                Comparison::RawText {
+                    reason: RawReason::PreprocessorDeclined
+                }
+            ),
+            "{:?}",
+            table.comparison()
+        );
+        assert!(table.render().contains("digest"), "{}", table.render());
+    }
+
+    #[tokio::test]
+    async fn a_table_from_a_preprocessor_the_check_did_not_declare_degrades_to_digests() {
+        // It claims the command and parses it, and even has the compared
+        // columns — but the check declared `df`, and columns that happen
+        // to share a name are not the same columns.
+        let registry = registry_with(Custom {
+            name: "not-df",
+            columns: vec!["mount".into(), "filesystem".into(), "size".into()],
+        });
+        let hosts = vec![Says::Ok(df_normal()), Says::Ok(df_normal())];
+        let (table, _, _, _) = fold_hosts_with(&disk_usage(), &hosts, &[], &registry).await;
+
+        assert!(
+            matches!(
+                table.comparison(),
+                Comparison::RawText {
+                    reason: RawReason::PreprocessorDeclined
+                }
+            ),
+            "{:?}",
+            table.comparison()
+        );
     }
 
     #[tokio::test]
