@@ -244,7 +244,7 @@ mod tests {
     use ratatui::Terminal;
 
     fn host(name: &str, state: HostOpState, exit: Option<i32>, tail: &str) -> OpHost {
-        OpHost { name: name.into(), state, exit_code: exit, tail: tail.into(), stale: false }
+        OpHost { name: name.into(), state, exit_code: exit, tail: tail.into(), stale: false, settled: true }
     }
 
     fn app_with_ops() -> App {

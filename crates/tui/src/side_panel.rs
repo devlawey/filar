@@ -134,6 +134,7 @@ mod tests {
                     exit_code: None,
                     tail: String::new(),
                     stale: false,
+                    settled: true,
                 })
                 .collect(),
         }

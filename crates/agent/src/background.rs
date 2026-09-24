@@ -13,6 +13,7 @@
 //! cancelled.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use filar_core::{CoreError, Result};
@@ -53,6 +54,10 @@ struct JobRecord {
     log_path: Option<String>,
     local_child: Option<tokio::process::Child>,
     output_buf: Option<Arc<Mutex<String>>>,
+    /// Local jobs: stdout/stderr readers that have not reached EOF yet. The
+    /// child can be reaped before its last output is read, so "exited" and
+    /// "output complete" are separate facts (#431).
+    readers_open: Option<Arc<AtomicUsize>>,
 }
 
 /// Per-session job table.
@@ -124,8 +129,20 @@ fn detach_from_controlling_tty(cmd: &mut tokio::process::Command) {
 #[allow(dead_code)]
 fn detach_from_controlling_tty(_cmd: &mut tokio::process::Command) {}
 
-async fn spawn_local_job(command: &str) -> Result<(tokio::process::Child, Arc<Mutex<String>>)> {
+/// Decrements the open-reader count when a reader task ends, however it ends.
+struct ReaderGuard(Arc<AtomicUsize>);
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, AtomicOrdering::AcqRel);
+    }
+}
+
+type LocalJob = (tokio::process::Child, Arc<Mutex<String>>, Arc<AtomicUsize>);
+
+async fn spawn_local_job(command: &str) -> Result<LocalJob> {
     let output_buf = Arc::new(Mutex::new(String::new()));
+    let readers_open = Arc::new(AtomicUsize::new(0));
 
     #[cfg(windows)]
     let mut cmd = {
@@ -155,7 +172,10 @@ async fn spawn_local_job(command: &str) -> Result<(tokio::process::Child, Arc<Mu
 
     if let Some(mut stdout) = child.stdout.take() {
         let buf = output_buf.clone();
+        readers_open.fetch_add(1, AtomicOrdering::AcqRel);
+        let guard = ReaderGuard(readers_open.clone());
         tokio::spawn(async move {
+            let _guard = guard;
             use tokio::io::AsyncReadExt;
             let mut chunk = [0u8; 4096];
             loop {
@@ -174,7 +194,10 @@ async fn spawn_local_job(command: &str) -> Result<(tokio::process::Child, Arc<Mu
 
     if let Some(mut stderr) = child.stderr.take() {
         let buf = output_buf.clone();
+        readers_open.fetch_add(1, AtomicOrdering::AcqRel);
+        let guard = ReaderGuard(readers_open.clone());
         tokio::spawn(async move {
+            let _guard = guard;
             use tokio::io::AsyncReadExt;
             let mut chunk = [0u8; 4096];
             loop {
@@ -194,7 +217,7 @@ async fn spawn_local_job(command: &str) -> Result<(tokio::process::Child, Arc<Mu
         });
     }
 
-    Ok((child, output_buf))
+    Ok((child, output_buf, readers_open))
 }
 
 fn refresh_local_job(record: &mut JobRecord) {
@@ -335,7 +358,7 @@ pub async fn start_job(
     let job_id = with_session(session_id, |session| Ok(job_id_for(session)))?;
 
     let pid = if is_local {
-        let (child, output_buf) = spawn_local_job(command).await?;
+        let (child, output_buf, readers_open) = spawn_local_job(command).await?;
         let pid = child.id();
         with_session(session_id, |session| {
             session.jobs.insert(
@@ -348,6 +371,7 @@ pub async fn start_job(
                     log_path: None,
                     local_child: Some(child),
                     output_buf: Some(output_buf),
+                    readers_open: Some(readers_open),
                 },
             );
             Ok(())
@@ -367,6 +391,7 @@ pub async fn start_job(
                     log_path: Some(log_path),
                     local_child: None,
                     output_buf: None,
+                    readers_open: None,
                 },
             );
             Ok(())
@@ -596,6 +621,11 @@ pub struct JobSnapshot {
     pub output_tail: String,
     /// `true` for a job on a remote host (state as of the last poll).
     pub remote: bool,
+    /// `false` while a local job's output may still grow: its stdout/stderr
+    /// readers have not reached EOF, even if the process already exited.
+    /// A frontend keeps refreshing until this is `true`. Always `true` for
+    /// remote jobs (their output is whatever the last poll returned).
+    pub output_settled: bool,
 }
 
 /// Snapshot every job of `session_id`, oldest first (#431).
@@ -614,7 +644,11 @@ pub fn snapshot(session_id: &str, tail_lines: usize) -> Vec<JobSnapshot> {
         .iter_mut()
         .map(|(id, record)| {
             refresh_local_job(record);
-            let output = local_output_snapshot(record);
+            let output_tail = local_output_tail(record, tail_lines);
+            let output_settled = record
+                .readers_open
+                .as_ref()
+                .is_none_or(|open| open.load(AtomicOrdering::Acquire) == 0);
             let num = id
                 .strip_prefix("job-")
                 .and_then(|n| n.parse().ok())
@@ -625,8 +659,9 @@ pub fn snapshot(session_id: &str, tail_lines: usize) -> Vec<JobSnapshot> {
                     job_id: id.clone(),
                     command: record.command.clone(),
                     state: record.state.clone(),
-                    output_tail: last_lines(&output, tail_lines),
+                    output_tail,
                     remote: record.log_path.is_some(),
+                    output_settled,
                 },
             )
         })
@@ -635,10 +670,34 @@ pub fn snapshot(session_id: &str, tail_lines: usize) -> Vec<JobSnapshot> {
     jobs.into_iter().map(|(_, snap)| snap).collect()
 }
 
+/// Last `tail_lines` lines of a job's output, read under the buffer lock
+/// without copying the whole buffer.
+fn local_output_tail(record: &JobRecord, tail_lines: usize) -> String {
+    if let Some(ref buf) = record.output_buf {
+        if let Ok(guard) = buf.lock() {
+            return last_lines(&guard, tail_lines);
+        }
+    }
+    last_lines(&record.output, tail_lines)
+}
+
 /// Last `n` lines of `text` (without a trailing newline).
+///
+/// Scans backwards from the end, so the cost is the size of the tail, not
+/// of the whole text — a noisy job's buffer only grows.
 fn last_lines(text: &str, n: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(n)..].join("\n")
+    if n == 0 {
+        return String::new();
+    }
+    let body = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(text);
+    let start = body
+        .rmatch_indices('\n')
+        .nth(n - 1)
+        .map_or(0, |(i, _)| i + 1);
+    body[start..].lines().collect::<Vec<_>>().join("\n")
 }
 
 /// Human-readable command string for confirm dialog / events.
@@ -799,6 +858,9 @@ mod tests {
         assert_eq!(last_lines("a\nb\nc\n", 2), "b\nc");
         assert_eq!(last_lines("a", 5), "a");
         assert_eq!(last_lines("", 5), "");
+        assert_eq!(last_lines("a\r\nb\r\n", 1), "b");
+        assert_eq!(last_lines("a\n\nb", 2), "\nb");
+        assert_eq!(last_lines("a\nb", 0), "");
     }
 
     #[tokio::test]
@@ -823,6 +885,30 @@ mod tests {
         assert_eq!(snaps[0].command, "sleep 100");
         assert_eq!(snaps[0].state, JobState::Running);
         assert!(snaps[0].remote);
+        assert!(snaps[0].output_settled, "remote output is whatever was polled");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_output_is_settled_only_after_the_readers_finish() {
+        let sid = test_session();
+        let exec = MockExecutor {
+            responses: StdMutex::new(vec![]),
+            commands: StdMutex::new(vec![]),
+        };
+        start_job(&sid, "printf 'one\\ntwo\\n'", true, &exec).await.unwrap();
+        // Wait (bounded) for exit and EOF on both pipes.
+        let mut snap = snapshot(&sid, 10).remove(0);
+        for _ in 0..200 {
+            if snap.output_settled && snap.state != JobState::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            snap = snapshot(&sid, 10).remove(0);
+        }
+        assert_eq!(snap.state, JobState::Done { exit_code: 0 });
+        assert!(snap.output_settled);
+        assert_eq!(snap.output_tail, "one\ntwo", "final output is complete once settled");
     }
 
     #[tokio::test]

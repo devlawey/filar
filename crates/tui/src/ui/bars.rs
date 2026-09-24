@@ -457,6 +457,7 @@ mod tests {
                 state: filar_agent::background::JobState::Running,
                 output_tail: String::new(),
                 remote: false,
+                output_settled: true,
             }]
         });
         assert!(!app.side_panel.open);

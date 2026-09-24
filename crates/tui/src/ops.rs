@@ -52,6 +52,9 @@ pub struct OpHost {
     pub tail: String,
     /// `true` when the state is only as fresh as the agent's last poll.
     pub stale: bool,
+    /// `false` while the output may still grow (a local job's pipes are not
+    /// drained yet, even after the process exited).
+    pub settled: bool,
 }
 
 /// A unit of work shown in the panel: a label and the hosts it runs on.
@@ -138,6 +141,7 @@ pub fn from_background_jobs(
                     exit_code,
                     tail: job.output_tail,
                     stale: job.remote && state == HostOpState::Running,
+                    settled: job.output_settled,
                 }],
             }
         })
@@ -155,11 +159,12 @@ mod tests {
             state,
             output_tail: "out".into(),
             remote,
+            output_settled: true,
         }
     }
 
     fn host(state: HostOpState) -> OpHost {
-        OpHost { name: "h".into(), state, exit_code: None, tail: String::new(), stale: false }
+        OpHost { name: "h".into(), state, exit_code: None, tail: String::new(), stale: false, settled: true }
     }
 
     #[test]
