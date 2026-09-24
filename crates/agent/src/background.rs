@@ -575,6 +575,72 @@ pub fn list_jobs(session_id: &str) -> Result<String> {
     })
 }
 
+/// Read-only view of one background job, for frontends (#431).
+///
+/// The job table lives inside the agent and the model only sees it through
+/// tool results; [`snapshot`] is the channel a UI reads it through. Taking a
+/// snapshot never sends anything to a host: a local job's state and output
+/// come from the in-process child and buffer, a remote job's from the
+/// agent's **last** `background_job_status` poll (hence [`JobSnapshot::remote`]
+/// — its state may be stale, and polling on the UI's behalf would be a
+/// command on the host outside the confirm gate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobSnapshot {
+    /// Job id within its session (`job-N`).
+    pub job_id: String,
+    /// Command the job runs.
+    pub command: String,
+    /// Lifecycle state (for remote jobs: as of the last poll).
+    pub state: JobState,
+    /// Last `tail_lines` lines of output.
+    pub output_tail: String,
+    /// `true` for a job on a remote host (state as of the last poll).
+    pub remote: bool,
+}
+
+/// Snapshot every job of `session_id`, oldest first (#431).
+///
+/// Unknown sessions yield an empty list. Only the in-memory registry is
+/// read — see [`JobSnapshot`] for why no host is ever contacted here.
+pub fn snapshot(session_id: &str, tail_lines: usize) -> Vec<JobSnapshot> {
+    let Ok(mut guard) = registry().lock() else {
+        return Vec::new();
+    };
+    let Some(session) = guard.get_mut(session_id) else {
+        return Vec::new();
+    };
+    let mut jobs: Vec<(u32, JobSnapshot)> = session
+        .jobs
+        .iter_mut()
+        .map(|(id, record)| {
+            refresh_local_job(record);
+            let output = local_output_snapshot(record);
+            let num = id
+                .strip_prefix("job-")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(u32::MAX);
+            (
+                num,
+                JobSnapshot {
+                    job_id: id.clone(),
+                    command: record.command.clone(),
+                    state: record.state.clone(),
+                    output_tail: last_lines(&output, tail_lines),
+                    remote: record.log_path.is_some(),
+                },
+            )
+        })
+        .collect();
+    jobs.sort_by_key(|(num, _)| *num);
+    jobs.into_iter().map(|(_, snap)| snap).collect()
+}
+
+/// Last `n` lines of `text` (without a trailing newline).
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
 /// Human-readable command string for confirm dialog / events.
 pub fn confirm_command_for_start(command: &str) -> String {
     format!("start_background_job: {command}")
@@ -721,6 +787,66 @@ mod tests {
         let cmds = exec.commands.lock().unwrap();
         assert!(cmds[0].contains("nohup sh -c"));
         assert!(cmds.iter().any(|c| c.contains("rm -f")));
+    }
+
+    #[test]
+    fn snapshot_of_unknown_session_is_empty() {
+        assert!(snapshot(&test_session(), 10).is_empty());
+    }
+
+    #[test]
+    fn last_lines_keeps_the_tail() {
+        assert_eq!(last_lines("a\nb\nc\n", 2), "b\nc");
+        assert_eq!(last_lines("a", 5), "a");
+        assert_eq!(last_lines("", 5), "");
+    }
+
+    #[tokio::test]
+    async fn snapshot_reflects_remote_jobs_without_touching_the_host() {
+        let sid = test_session();
+        let exec = MockExecutor {
+            responses: StdMutex::new(vec![CommandResult {
+                stdout: "4242\n".into(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                duration: Duration::from_millis(1),
+                cwd: None,
+            }]),
+            commands: StdMutex::new(vec![]),
+        };
+        start_job(&sid, "sleep 100", false, &exec).await.unwrap();
+        let sent_before = exec.commands.lock().unwrap().len();
+
+        let snaps = snapshot(&sid, 10);
+        assert_eq!(exec.commands.lock().unwrap().len(), sent_before, "snapshot must not run commands");
+        assert_eq!(snaps[0].job_id, "job-1");
+        assert_eq!(snaps[0].command, "sleep 100");
+        assert_eq!(snaps[0].state, JobState::Running);
+        assert!(snaps[0].remote);
+    }
+
+    #[tokio::test]
+    async fn snapshot_orders_jobs_numerically() {
+        let sid = test_session();
+        let exec = MockExecutor {
+            responses: StdMutex::new(vec![]),
+            commands: StdMutex::new(vec![]),
+        };
+        #[cfg(unix)]
+        let cmd = "sleep 60";
+        #[cfg(windows)]
+        let cmd = "Start-Sleep -Seconds 60";
+        for _ in 0..11 {
+            start_job(&sid, cmd, true, &exec).await.unwrap();
+        }
+        let ids: Vec<String> = snapshot(&sid, 1).into_iter().map(|s| s.job_id).collect();
+        assert_eq!(ids.first().map(String::as_str), Some("job-1"));
+        assert_eq!(ids.get(1).map(String::as_str), Some("job-2"));
+        assert_eq!(ids.last().map(String::as_str), Some("job-11"));
+        assert!(snapshot(&sid, 1).iter().all(|s| !s.remote));
+        for id in ids {
+            cancel_job(&sid, &id, true, &exec).await.unwrap();
+        }
     }
 
     #[test]

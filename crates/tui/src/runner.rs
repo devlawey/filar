@@ -633,6 +633,12 @@ async fn run_app(
     auto_save_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_saved_rev = app.active_session().message_rev;
     let mut last_saved_session = app.active_session().id;
+    // Side-panel refresh (#431): re-read the background-job registry while a
+    // job runs, so local output and completion show up without an agent turn.
+    // In-memory only — nothing is sent to a host — and gated on a running
+    // job, so an idle TUI keeps sleeping.
+    let mut ops_interval = tokio::time::interval(Duration::from_millis(500));
+    ops_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         let in_interactive = app.mode == AppMode::Interactive;
@@ -1438,6 +1444,15 @@ async fn run_app(
                     // layout handles transitions cleanly without full clear.
                     // Full clear is only needed on mode change (see below).
                     app.handle_agent_event(event);
+                    // A background-job tool call may have started, polled or
+                    // cancelled a job: pick that up for the side panel.
+                    app.refresh_operations();
+                    needs_redraw = true;
+                }
+            }
+
+            _ = ops_interval.tick(), if app.operations_running() => {
+                if app.refresh_operations() {
                     needs_redraw = true;
                 }
             }

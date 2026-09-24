@@ -13,6 +13,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- A side panel for background operations in the TUI: an "operation → hosts"
+  tree with the selected host's output tail, docked on terminals 120+ columns
+  wide and a `Ctrl+J` drawer below that, plus an `ops ▸2 ✓1` counter in the
+  status bar that stays visible with the panel closed and on every tab
+  ([#431](https://github.com/devlawey/filar/issues/431)).
+
 - Fleet results folded into one difference table, which is the only thing
   about an operation the model is given: the comparison is done in code, and
   no host's raw output reaches the context — a check with a preprocessor is
