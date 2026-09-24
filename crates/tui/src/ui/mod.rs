@@ -37,6 +37,7 @@ mod input;
 mod path_picker_overlay;
 mod save_overlay;
 mod session_select;
+mod side_panel;
 #[allow(unused_imports)]
 pub(crate) use chat::scrollbar_content_len;
 pub mod layout_cache;
@@ -107,11 +108,17 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
     bars::render_status_bar(f, app, chunks[idx]);
     bars::render_separator(f, app, chunks[idx + 1]);
-    chat::render_chat_history(f, app, chunks[idx + 2]);
+    let (chat_rect, panel_rect) = side_panel_layout(app, chunks[idx + 2], f.area().width);
+    chat::render_chat_history(f, app, chat_rect);
     bars::render_separator(f, app, chunks[idx + 3]);
     input::render_input_area(f, app, chunks[idx + 4]);
     bars::render_separator(f, app, chunks[idx + 5]);
     bars::render_help_bar(f, app, chunks[idx + 6]);
+
+    // Side panel (#431): docked beside the feed, or a drawer over it.
+    if let Some(rect) = panel_rect {
+        side_panel::render_side_panel(f, app, rect);
+    }
 
     // Render confirmation modal on top of chat if in Confirming mode.
     if app.mode == AppMode::Confirming {
@@ -147,6 +154,30 @@ pub fn render(f: &mut Frame, app: &mut App) {
         let full = f.area();
         save_overlay::render_save_overlay(f, app, full);
     }
+}
+
+/// Split the feed area for the side panel (#431).
+///
+/// Returns the feed rectangle and, when the panel is visible, the panel's.
+/// On a wide terminal the panel docks: the feed narrows to make room. On a
+/// narrow one the feed keeps its full width and the panel is a drawer drawn
+/// over its right edge, only while opened with `^J`.
+fn side_panel_layout(app: &App, feed: Rect, term_width: u16) -> (Rect, Option<Rect>) {
+    use crate::side_panel::{docks, SIDE_PANEL_WIDTH};
+    if !app.side_panel.visible(term_width, !app.operations.is_empty()) {
+        return (feed, None);
+    }
+    if docks(term_width) {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(20), Constraint::Length(SIDE_PANEL_WIDTH)])
+            .split(feed);
+        return (chunks[0], Some(chunks[1]));
+    }
+    // Drawer: leave a strip of the feed visible so it reads as an overlay.
+    let width = SIDE_PANEL_WIDTH.min(feed.width.saturating_sub(8)).max(feed.width.min(20));
+    let drawer = Rect::new(feed.x + feed.width - width, feed.y, width, feed.height);
+    (feed, Some(drawer))
 }
 
 /// Render the interactive terminal mode.
@@ -280,6 +311,49 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn app_with_op() -> App {
+        let mut app = App::new("t".into(), filar_core::CommandConfirmMode::Always);
+        app.operations = vec![crate::ops::Operation {
+            session: app.sessions[0].id,
+            id: "job-1".into(),
+            label: "sleep 5".into(),
+            hosts: vec![],
+        }];
+        app
+    }
+
+    #[test]
+    fn wide_terminal_docks_the_panel_beside_the_feed() {
+        let app = app_with_op();
+        let feed = Rect::new(0, 2, 160, 30);
+        let (chat, panel) = side_panel_layout(&app, feed, 160);
+        let panel = panel.expect("docked");
+        assert_eq!(chat.width + panel.width, 160);
+        assert_eq!(panel.width, crate::side_panel::SIDE_PANEL_WIDTH);
+        assert!(panel.x >= chat.x + chat.width, "panel does not cover the feed");
+    }
+
+    #[test]
+    fn eighty_columns_keep_the_feed_whole_until_ctrl_j() {
+        let mut app = app_with_op();
+        let feed = Rect::new(0, 2, 80, 20);
+        let (chat, panel) = side_panel_layout(&app, feed, 80);
+        assert_eq!(chat, feed);
+        assert!(panel.is_none());
+        app.side_panel.toggle();
+        let (chat, panel) = side_panel_layout(&app, feed, 80);
+        assert_eq!(chat, feed, "drawer overlays, the feed is not reflowed");
+        let panel = panel.expect("drawer");
+        assert!(panel.width < 80 && panel.x + panel.width == 80);
+    }
+
+    #[test]
+    fn nothing_to_show_takes_no_space() {
+        let app = App::new("t".into(), filar_core::CommandConfirmMode::Always);
+        let feed = Rect::new(0, 2, 160, 30);
+        assert_eq!(side_panel_layout(&app, feed, 160), (feed, None));
+    }
 
     #[test]
     fn interactive_grid_reserves_four_chrome_lines() {

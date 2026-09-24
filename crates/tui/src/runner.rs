@@ -633,6 +633,13 @@ async fn run_app(
     auto_save_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_saved_rev = app.active_session().message_rev;
     let mut last_saved_session = app.active_session().id;
+    // Side-panel refresh (#431): re-read the background-job registry while a
+    // job runs, so local output and completion show up without an agent turn.
+    // In-memory only — nothing is sent to a host — and gated on a running
+    // job (or a finished one whose output is still draining), so an idle TUI
+    // keeps sleeping.
+    let mut ops_interval = tokio::time::interval(Duration::from_millis(500));
+    ops_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         let in_interactive = app.mode == AppMode::Interactive;
@@ -1437,7 +1444,24 @@ async fn run_app(
                     // All agent events just need a redraw — the borderless
                     // layout handles transitions cleanly without full clear.
                     // Full clear is only needed on mode change (see below).
+                    // A streamed token cannot start, poll or cancel a job;
+                    // skip the registry read for it.
+                    let may_touch_jobs = !matches!(
+                        &event,
+                        TuiEvent::Agent { event: filar_agent::AgentEvent::TextDelta(_), .. }
+                    );
                     app.handle_agent_event(event);
+                    // A background-job tool call may have started, polled or
+                    // cancelled a job: pick that up for the side panel.
+                    if may_touch_jobs {
+                        app.refresh_operations();
+                    }
+                    needs_redraw = true;
+                }
+            }
+
+            _ = ops_interval.tick(), if app.operations_need_refresh() => {
+                if app.refresh_operations() {
                     needs_redraw = true;
                 }
             }

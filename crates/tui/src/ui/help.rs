@@ -84,6 +84,12 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
             section: "Modes",
             available: |m| m == AppMode::Normal,
         },
+        HelpEntry {
+            key: "^J",
+            desc: "Side panel: background operations → hosts, output tail.\n             Up/Down select, Esc closes. Docked when the terminal\n             is 120+ columns wide, a drawer below that",
+            section: "Modes",
+            available: |m| !matches!(m, AppMode::Interactive | AppMode::PasswordInput),
+        },
         // ── Status bar ───────────────────────────────────────────────
         HelpEntry {
             key: "mode",

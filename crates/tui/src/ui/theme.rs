@@ -49,6 +49,14 @@ pub struct Glyphs {
     pub arrow_up: &'static str,
     /// Down arrow in key hints: `↓` or `v`.
     pub arrow_down: &'static str,
+    /// Operation/host still running (side panel, #431): `▸` or `>`.
+    pub op_running: &'static str,
+    /// Operation/host finished cleanly: `✓` or `+`.
+    pub op_done: &'static str,
+    /// Operation/host failed: `✗` or `!`.
+    pub op_failed: &'static str,
+    /// Operation/host cancelled: `■` or `~`.
+    pub op_cancelled: &'static str,
 }
 
 impl Glyphs {
@@ -70,6 +78,10 @@ impl Glyphs {
         current: "●",
         arrow_up: "↑",
         arrow_down: "↓",
+        op_running: "▸",
+        op_done: "✓",
+        op_failed: "✗",
+        op_cancelled: "■",
     };
 
     /// ASCII fallback for conhost and legacy terminals.
@@ -90,6 +102,10 @@ impl Glyphs {
         current: "*",
         arrow_up: "^",
         arrow_down: "v",
+        op_running: ">",
+        op_done: "+",
+        op_failed: "!",
+        op_cancelled: "~",
     };
 
     /// Detect terminal capabilities and return the appropriate glyph set.
@@ -320,12 +336,25 @@ mod tests {
     }
 
     #[test]
+    fn operation_state_glyphs_are_distinct_in_both_sets() {
+        for g in [&Glyphs::UNICODE, &Glyphs::ASCII] {
+            let set = [g.op_running, g.op_done, g.op_failed, g.op_cancelled];
+            for (i, a) in set.iter().enumerate() {
+                for b in &set[i + 1..] {
+                    assert_ne!(a, b, "states must differ without colour");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ascii_glyph_set_is_pure_ascii() {
         let g = Glyphs::ASCII;
         let fields = [
             g.prompt, g.gutter, g.separator, g.success, g.danger, g.middle_dot,
             g.collapse_arrow, g.expand_arrow, g.bullet, g.target_sep, g.bar_full,
             g.bar_empty, g.cursor, g.current, g.arrow_up, g.arrow_down,
+            g.op_running, g.op_done, g.op_failed, g.op_cancelled,
         ];
         for f in fields {
             assert!(f.is_ascii(), "ASCII fallback must stay ASCII, got {f:?}");

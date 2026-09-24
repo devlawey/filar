@@ -139,6 +139,26 @@ fn context_indicator_segment(
     None
 }
 
+/// Status-bar counter of operations (#431): `ops ▸2 ✓1 ✗1`, zero states
+/// omitted; `None` when there are no operations at all.
+fn operations_counter(c: crate::ops::OpCounts, glyphs: &Glyphs) -> Option<String> {
+    if c.total() == 0 {
+        return None;
+    }
+    let mut out = String::from("ops");
+    for (n, g) in [
+        (c.running, glyphs.op_running),
+        (c.done, glyphs.op_done),
+        (c.failed, glyphs.op_failed),
+        (c.cancelled, glyphs.op_cancelled),
+    ] {
+        if n > 0 {
+            out.push_str(&format!(" {g}{n}"));
+        }
+    }
+    Some(out)
+}
+
 /// Render the status bar (top line).
 ///
 /// Layout: `filar ▸ {alias host pwd}` on the left for SSH (`name pwd` when
@@ -176,6 +196,13 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         let mode_color = app.theme.mode_color(app.mode);
         spans.push(Span::raw("   "));
         spans.push(Span::styled(mt, app.theme.mode_badge_style(mode_color)));
+    }
+
+    // Operations counter (#431): visible with the side panel closed and on
+    // every tab, so a background job is not lost by switching away from it.
+    if let Some(counter) = operations_counter(app.operation_counts(), glyphs) {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(counter, app.theme.dim()));
     }
 
     // Token counter — per-profile breakdown from per_profile, not total.
@@ -409,6 +436,34 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn operations_counter_omits_zero_states_and_hides_when_empty() {
+        use crate::ops::OpCounts;
+        assert_eq!(operations_counter(OpCounts::default(), &Glyphs::UNICODE), None);
+        let c = OpCounts { running: 2, done: 1, failed: 0, cancelled: 3 };
+        assert_eq!(operations_counter(c, &Glyphs::UNICODE).as_deref(), Some("ops ▸2 ✓1 ■3"));
+        let c = OpCounts { running: 1, done: 1, failed: 1, cancelled: 1 };
+        assert_eq!(operations_counter(c, &Glyphs::ASCII).as_deref(), Some("ops >1 +1 !1 ~1"));
+    }
+
+    #[test]
+    fn operations_counter_shows_on_the_status_bar_with_the_panel_closed() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.refresh_operations_with(|_| {
+            vec![filar_agent::background::JobSnapshot {
+                job_id: "job-1".into(),
+                command: "sleep 5".into(),
+                state: filar_agent::background::JobState::Running,
+                output_tail: String::new(),
+                remote: false,
+                output_settled: true,
+            }]
+        });
+        assert!(!app.side_panel.open);
+        let text = render_status_row(&mut app, 120);
+        assert!(text.contains("ops"), "{text}");
+    }
 
     /// Render the status bar into a `width`×1 test buffer.
     fn render_status_buffer(app: &mut App, width: u16) -> ratatui::buffer::Buffer {

@@ -365,6 +365,11 @@ pub struct App {
     pub path_picker_remote: bool,
     /// Bumped to request (re)load of `path_picker_dir` in the runner.
     pub path_picker_load_token: u64,
+    /// Operations shown in the side panel, across all tabs (#431).
+    /// Refreshed from the agent's background-job registry.
+    pub operations: Vec<crate::ops::Operation>,
+    /// The shared side panel (#431).
+    pub side_panel: crate::side_panel::SidePanel,
 }
 
 /// Stable identifier for a session tab. Assigned once on creation, never
@@ -636,6 +641,8 @@ impl App {
             path_picker_truncated: false,
             path_picker_remote: false,
             path_picker_load_token: 0,
+            operations: Vec::new(),
+            side_panel: crate::side_panel::SidePanel::default(),
         }
     }
 
@@ -2902,6 +2909,12 @@ impl App {
             return;
         }
 
+        // Side panel (#431): ^J, and Esc/Up/Down while it is open. After
+        // the overlays, so an overlay's Esc stays the overlay's.
+        if self.handle_side_panel_key(&key) {
+            return;
+        }
+
         // Ctrl+K — compact the history on request, without waiting for the
         // threshold (#377). ЙЦУКЕН: K = л.
         if ctrl_key('k', 'л') && self.mode == AppMode::Normal {
@@ -4763,6 +4776,124 @@ impl App {
     }
 }
 
+// ── Side panel: operations → hosts (#431) ───────────────────────────
+
+/// Lines of output tail kept per host for the side panel.
+const OPS_TAIL_LINES: usize = 200;
+
+impl App {
+    /// Refresh [`App::operations`] from the agent's background-job registry.
+    ///
+    /// Reads in-memory state only — no command reaches any host (see
+    /// [`filar_agent::background::JobSnapshot`]). Returns whether anything
+    /// changed, so the caller redraws only then.
+    pub fn refresh_operations(&mut self) -> bool {
+        self.refresh_operations_with(|sid| {
+            filar_agent::background::snapshot(&sid.0.to_string(), OPS_TAIL_LINES)
+        })
+    }
+
+    /// [`App::refresh_operations`] with the job source injected (tests).
+    ///
+    /// The agent's session id for a tab is the tab's [`SessionId`] as a
+    /// string (see the runner's agent builder); operations are listed in
+    /// tab order, oldest job first within a tab.
+    pub fn refresh_operations_with<F>(&mut self, mut fetch: F) -> bool
+    where
+        F: FnMut(SessionId) -> Vec<filar_agent::background::JobSnapshot>,
+    {
+        let mut ops = Vec::new();
+        for (i, s) in self.sessions.iter().enumerate() {
+            let host = s.tab_label(i);
+            ops.extend(crate::ops::from_background_jobs(s.id, &host, fetch(s.id)));
+        }
+        if ops == self.operations {
+            return false;
+        }
+        // Keep the selection on the same host of the same operation: a job
+        // appearing in an earlier tab inserts rows above it, and following
+        // the numeric index would silently switch the tail being watched.
+        let selected_key = self.selected_row_key();
+        self.operations = ops;
+        let rows = crate::side_panel::tree_rows(&self.operations);
+        match selected_key.and_then(|key| rows.iter().position(|r| self.row_key(*r) == key)) {
+            Some(i) => self.side_panel.selected = i,
+            None => self.side_panel.clamp(rows.len()),
+        }
+        true
+    }
+
+    /// Identity of the selected tree row: tab, operation id and — for a host
+    /// row — the host's position in the operation.
+    fn selected_row_key(&self) -> Option<(SessionId, String, Option<usize>)> {
+        let rows = crate::side_panel::tree_rows(&self.operations);
+        rows.get(self.side_panel.selected).map(|r| self.row_key(*r))
+    }
+
+    fn row_key(&self, row: crate::side_panel::TreeRow) -> (SessionId, String, Option<usize>) {
+        use crate::side_panel::TreeRow;
+        let (op, host) = match row {
+            TreeRow::Operation(op) => (op, None),
+            TreeRow::Host(op, host) => (op, Some(host)),
+        };
+        let op = &self.operations[op];
+        (op.session, op.id.clone(), host)
+    }
+
+    /// Whether the side panel still needs refreshing: an operation is
+    /// running, or a finished local job's output is still being drained. The
+    /// runner polls the registry only then, so an idle TUI stays idle.
+    pub fn operations_need_refresh(&self) -> bool {
+        self.operations.iter().any(|op| {
+            op.state() == crate::ops::HostOpState::Running
+                || op.hosts.iter().any(|h| !h.settled)
+        })
+    }
+
+    /// Operation counts for the status-bar counter.
+    pub fn operation_counts(&self) -> crate::ops::OpCounts {
+        crate::ops::OpCounts::of(&self.operations)
+    }
+
+    /// Keys of the side panel. Returns `true` when the key was consumed.
+    ///
+    /// `^J` toggles the panel in every mode but Interactive (where keys
+    /// belong to the remote PTY) and PasswordInput. While the panel is
+    /// open it owns `Esc` (close) and `Up`/`Down` (selection); everything
+    /// else falls through, so typing continues while jobs are watched.
+    fn handle_side_panel_key(&mut self, key: &crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        if matches!(self.mode, AppMode::Interactive | AppMode::PasswordInput) {
+            return false;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // ЙЦУКЕН: J = о.
+        // A raw-mode terminal delivers Ctrl+J as LF, which crossterm reports
+        // as `Char('j')` + CONTROL; accept a literal `'\n'` too in case a
+        // console hands the control character through unmapped.
+        if ctrl && matches!(key.code, KeyCode::Char('j' | 'о' | '\n')) {
+            self.side_panel.toggle();
+            return true;
+        }
+        if !self.side_panel.open {
+            return false;
+        }
+        let rows = crate::side_panel::tree_rows(&self.operations).len();
+        match key.code {
+            KeyCode::Esc => self.side_panel.close(),
+            KeyCode::Up => {
+                self.side_panel.move_selection(-1, rows);
+                true
+            }
+            KeyCode::Down => {
+                self.side_panel.move_selection(1, rows);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SSH command parser
 // ---------------------------------------------------------------------------
@@ -5003,6 +5134,142 @@ mod tests {
             &app.messages[1],
             ChatBlock::User(s) if s == "hello world"
         ));
+    }
+
+    // ── Side panel (#431) ───────────────────────────────────────────
+
+    fn job(id: &str, state: filar_agent::background::JobState) -> filar_agent::background::JobSnapshot {
+        filar_agent::background::JobSnapshot {
+            job_id: id.into(),
+            command: format!("run {id}"),
+            state,
+            output_tail: String::new(),
+            remote: false,
+            output_settled: true,
+        }
+    }
+
+    #[test]
+    fn operations_come_from_every_tab_in_tab_order() {
+        use filar_agent::background::JobState;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.new_tab();
+        app.sessions[1].ssh_info = Some("root@web-01:22".into());
+        let second = app.sessions[1].id;
+        let changed = app.refresh_operations_with(|sid| {
+            if sid == second {
+                vec![job("job-1", JobState::Running)]
+            } else {
+                vec![job("job-1", JobState::Done { exit_code: 0 })]
+            }
+        });
+        assert!(changed);
+        assert_eq!(app.operations.len(), 2);
+        assert_eq!(app.operations[0].hosts[0].name, "local");
+        assert_eq!(app.operations[1].hosts[0].name, "root@web-01");
+        assert!(app.operations_need_refresh());
+        // Switching tabs does not lose the job: the list spans all tabs.
+        app.switch_to_tab(0);
+        assert_eq!(app.operation_counts().running, 1);
+        // Same data again: no redraw needed.
+        assert!(!app.refresh_operations_with(|sid| {
+            if sid == second {
+                vec![job("job-1", JobState::Running)]
+            } else {
+                vec![job("job-1", JobState::Done { exit_code: 0 })]
+            }
+        }));
+    }
+
+    #[test]
+    fn refresh_clamps_the_panel_selection() {
+        use filar_agent::background::JobState;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.refresh_operations_with(|_| {
+            vec![job("job-1", JobState::Running), job("job-2", JobState::Running)]
+        });
+        app.side_panel.selected = 3;
+        app.refresh_operations_with(|_| vec![job("job-1", JobState::Cancelled)]);
+        assert_eq!(app.side_panel.selected, 1);
+        assert!(!app.operations_need_refresh());
+    }
+
+    #[test]
+    fn selection_follows_the_job_when_rows_are_inserted_above_it() {
+        use filar_agent::background::JobState;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.new_tab();
+        let first = app.sessions[0].id;
+        app.refresh_operations_with(|sid| {
+            if sid == first { vec![] } else { vec![job("job-1", JobState::Running)] }
+        });
+        app.side_panel.selected = 1; // host row of the second tab's job-1
+        // A job starts in the first tab too: two rows appear above the selection.
+        app.refresh_operations_with(|_| vec![job("job-1", JobState::Running)]);
+        assert_eq!(app.side_panel.selected, 3);
+        let rows = crate::side_panel::tree_rows(&app.operations);
+        let (op, _) = rows[app.side_panel.selected].target();
+        assert_ne!(app.operations[op].session, first, "still the second tab's job");
+    }
+
+    #[test]
+    fn a_finished_job_is_refreshed_until_its_output_is_drained() {
+        use filar_agent::background::JobState;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.refresh_operations_with(|_| {
+            let mut j = job("job-1", JobState::Done { exit_code: 0 });
+            j.output_settled = false;
+            vec![j]
+        });
+        assert!(app.operations_need_refresh(), "pipes not drained yet");
+        app.refresh_operations_with(|_| vec![job("job-1", JobState::Done { exit_code: 0 })]);
+        assert!(!app.operations_need_refresh());
+    }
+
+    #[test]
+    fn ctrl_j_toggles_the_panel_and_esc_closes_it() {
+        use crossterm::event::KeyCode;
+        use filar_agent::background::JobState;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.refresh_operations_with(|_| {
+            vec![job("job-1", JobState::Running), job("job-2", JobState::Running)]
+        });
+        app.handle_key(ctrl_key('j'));
+        assert!(app.side_panel.open);
+        app.handle_key(key_event(KeyCode::Down));
+        app.handle_key(key_event(KeyCode::Down));
+        assert_eq!(app.side_panel.selected, 2);
+        // Other keys keep going to the input while the panel is open.
+        app.handle_key(key_event(KeyCode::Char('x')));
+        assert_eq!(app.input, "x");
+        app.handle_key(key_event(KeyCode::Esc));
+        assert!(!app.side_panel.open);
+        // Russian layout: Ctrl+о is the same physical key.
+        app.handle_key(ctrl_key('о'));
+        assert!(app.side_panel.open);
+        app.handle_key(ctrl_key('j'));
+        assert!(!app.side_panel.open);
+    }
+
+    #[test]
+    fn ctrl_j_is_left_to_the_remote_pty_in_interactive_mode() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.mode = AppMode::Interactive;
+        app.handle_key(ctrl_key('j'));
+        assert!(!app.side_panel.open);
+    }
+
+    #[test]
+    fn overlay_esc_stays_the_overlays() {
+        use crossterm::event::KeyCode;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.handle_key(ctrl_key('j'));
+        app.toggle_help_overlay();
+        app.handle_key(key_event(KeyCode::Esc));
+        assert!(!app.help_overlay_visible);
+        assert!(app.side_panel.open, "Esc closed the overlay on top, not the panel");
+        app.handle_key(key_event(KeyCode::Esc));
+        assert!(!app.side_panel.open);
     }
 
     fn ctrl_key(c: char) -> crossterm::event::KeyEvent {
