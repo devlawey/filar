@@ -520,12 +520,13 @@ impl SshSession {
     ///
     /// Opens a short-lived `exec` channel on the same connection; it does
     /// **not** acquire any lock that `run()` holds, so it works even while
-    /// a command is executing. With no command running it is a no-op.
+    /// a command is executing. With no command running there is nothing to
+    /// signal, and it succeeds.
     ///
-    /// Returns an error when the interrupt could not be confirmed: a `kill`
-    /// failed, the `exec` exited non-zero or without a status, or it did not
-    /// finish in time — so a caller never takes a failed interrupt for a
-    /// stopped command.
+    /// Returns an error when the interrupt could not be confirmed: the shell
+    /// never reported its PID at connect, a `kill` failed, the `exec` exited
+    /// non-zero or without a status, or it did not finish in time — so a
+    /// caller never takes a failed interrupt for a stopped command.
     pub async fn cancel(&self) -> Result<()> {
         let pid = self.shell_pid.ok_or_else(|| {
             CoreError::Other("cannot interrupt: the remote shell did not report its PID".into())
