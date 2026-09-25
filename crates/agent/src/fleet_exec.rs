@@ -77,8 +77,8 @@ use filar_transport::{is_connection_lost, CommandExecutor, CommandResult};
 use crate::fleet_creds::FleetCredentials;
 use crate::fleet_fold::fold;
 use crate::fleet_result::{NotAsked, OperationResult};
-use crate::fleet_run::{run_on_fleet_until, HostRun, HostTask};
-use crate::fleet_view::FleetView;
+use crate::fleet_run::{run_on_fleet_observed, HostRun, HostTask};
+use crate::fleet_view::{FleetStatus, FleetView};
 use crate::preprocess::PreprocessorRegistry;
 
 /// Opens a connection to one fleet host.
@@ -110,7 +110,13 @@ pub struct FleetExecutor {
     runs: std::sync::atomic::AtomicU64,
     /// Receives the person-facing view of every operation (#438).
     observer: Option<FleetObserver>,
+    /// Receives the answering count as an operation progresses (#439).
+    status: Option<FleetStatusObserver>,
 }
+
+/// Receives the [`FleetStatus`] of an operation: at its start, after every
+/// host that answers, and at its end (#439).
+pub type FleetStatusObserver = Arc<dyn Fn(FleetStatus) + Send + Sync>;
 
 /// Receives the [`FleetView`] of every operation — for the UI, never the
 /// model.
@@ -159,7 +165,15 @@ impl FleetExecutor {
             current: std::sync::Mutex::new(None),
             runs: std::sync::atomic::AtomicU64::new(0),
             observer: None,
+            status: None,
         })
+    }
+
+    /// Report how many hosts are answering, as each operation progresses
+    /// (#439). Carries counts only — no host output.
+    pub fn with_status(mut self, status: FleetStatusObserver) -> Self {
+        self.status = Some(status);
+        self
     }
 
     /// Hand the person-facing view of every operation to `observer` (#438).
@@ -314,7 +328,24 @@ impl CommandExecutor for FleetExecutor {
             }
         }
 
-        let report = run_on_fleet_until(&mut op, tasks.clone(), &cancel).await?;
+        let total = op.len();
+        let operation = op.id();
+        let status = self.status.clone();
+        let emit = |answering: usize, running: bool| {
+            if let Some(status) = &status {
+                status(FleetStatus { operation, answering, total, running });
+            }
+        };
+        emit(0, true);
+        let mut answering = 0;
+        let report = run_on_fleet_observed(&mut op, tasks.clone(), &cancel, &mut |_, run| {
+            if matches!(run, HostRun::Answered(_)) {
+                answering += 1;
+                emit(answering, true);
+            }
+        })
+        .await?;
+        emit(report.answered(), false);
         self.evict_lost(&handles, &executors, &report).await;
         let mut result = OperationResult::build(&op, &report, &not_asked)?;
         let registry = PreprocessorRegistry::with_builtins();
@@ -757,5 +788,27 @@ mod tests {
 
         // The model's copy still has digests only.
         assert!(!out.stdout.contains("6.1.0-other"), "{}", out.stdout);
+    }
+
+    #[tokio::test]
+    async fn the_answering_count_grows_as_hosts_answer() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let seen: Arc<std::sync::Mutex<Vec<FleetStatus>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let exec = executor(
+            &fleet(&["web-1", "web-2", "web-3"]),
+            connector(&["web-3"], &[], attempts, runs),
+        )
+        .with_status(Arc::new(move |status| sink.lock().expect("lock").push(status)));
+
+        exec.run("uptime").await.expect("fleet run");
+        let seen = seen.lock().expect("lock");
+        let counts: Vec<(usize, bool)> = seen.iter().map(|s| (s.answering, s.running)).collect();
+        // Starts at zero, counts each answer as it arrives, ends with the
+        // total — the unreachable host is not alive.
+        assert_eq!(counts, [(0, true), (1, true), (2, true), (2, false)]);
+        assert!(seen.iter().all(|s| s.total == 3));
+        assert!(seen.windows(2).all(|w| w[0].operation == w[1].operation));
     }
 }

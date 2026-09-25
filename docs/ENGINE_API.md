@@ -187,7 +187,13 @@ bound it). `FleetExecutor::with_observer(observer)` hands the person-facing
 output for a raw comparison, the compared rows for a typed one) and the hosts
 without a value, with their `HostState`. It carries host output — route it to
 your UI only, never into a tool result or the model's context; `run`'s own
-result stays the fold. `FleetExecutor::built_from()` returns the id of
+result stays the fold. `FleetExecutor::with_status(status)` reports
+`fleet_view::FleetStatus` — how many hosts answered out of the fleet's
+members, and whether the operation still runs — as the operation starts
+(`0`), each time a host answers, and when it ends; it carries no host output.
+The per-host hook underneath is `fleet_run::run_on_fleet_observed`, which
+calls `on_host` as each host finishes (`run_on_fleet_until` is it with a
+no-op hook). `FleetExecutor::built_from()` returns the id of
 the operation it was built from; if you cache executors, reuse one only while
 that id matches the fleet on screen.
 

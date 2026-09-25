@@ -13,6 +13,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- The status bar in the fleet shows the group, how many of its hosts answered
+  (`fleet web · 11/12 live`, counting up live during an operation) and the
+  session cost; on a narrow terminal its segments give way in one documented
+  order (context fill, model, tokens, operations, tags), and the essentials
+  stay visible at 80 columns
+  ([#439](https://github.com/devlawey/filar/issues/439)).
+
 - The fleet's difference table lives in the side panel (`^J`): one entry per
   group of hosts that answered the same, with a sample answer clamped to one
   line and expandable with `Enter`, and the hosts without an answer (no
