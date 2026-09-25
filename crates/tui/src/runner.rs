@@ -334,6 +334,9 @@ pub struct TuiConfig {
     /// of a read-only group get a [`filar_transport::ReadOnlyExecutor`]
     /// around every SSH executor swapped in for their session (#419).
     pub host_groups: Vec<filar_core::HostGroup>,
+    /// Group to open the fleet layer over at start-up (`--group`, #432).
+    /// `None` starts on the single target, exactly as before.
+    pub initial_group: Option<String>,
     pub llm_profile: String,
     pub initial_messages: Vec<ChatBlock>,
     /// Initial agent input history (for session restore).
@@ -526,6 +529,12 @@ async fn run_app(
     // command substitution and output sanitisation.
     app.secrets = config.secret_provider.clone();
     app.runbook_enabled = config.save_runbook;
+    // Host groups are fleet entry points in Ctrl+O; `--group` opens the fleet
+    // layer straight away, over the start-up tab (#432).
+    app.host_groups = config.host_groups.clone();
+    if let Some(group) = config.initial_group.take() {
+        app.enter_fleet(&group);
+    }
 
     // Channel for agent → UI events.
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<TuiEvent>();
@@ -1634,7 +1643,9 @@ async fn run_app(
         handle.abort();
     }
 
-    // Save session to disk for future restore.
+    // Save session to disk for future restore — an ordinary tab, never the
+    // fleet dialogue (#432).
+    app.leave_fleet_view();
     let session = session_snapshot(&app, &config.target_name, &session_id, &session_timestamp);
     let msg_count = session.messages.len();
     match save_session_async(session, snapshot.clone()).await {
@@ -1721,6 +1732,11 @@ pub(crate) fn session_snapshot(
 /// Whether the active session changed since the last auto-save: either its
 /// message revision advanced or the user switched to a different tab.
 fn session_changed(app: &App, last_rev: u64, last_session: crate::app::SessionId) -> bool {
+    // The fleet dialogue is not a restorable single-host session (#432):
+    // saving it here would overwrite the tab's own save with it.
+    if app.in_fleet() {
+        return false;
+    }
     app.active_session().message_rev != last_rev || app.active_session().id != last_session
 }
 
@@ -2762,6 +2778,23 @@ mod tests {
     }
 
     #[test]
+    fn auto_save_skips_the_fleet_layer() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("t0".into(), CommandConfirmMode::Allowlist);
+        app.host_groups = vec![filar_core::HostGroup {
+            name: "g".into(),
+            match_tags: vec!["x".into()],
+            ..Default::default()
+        }];
+        let sid0 = app.active_session().id;
+        let rev0 = app.active_session().message_rev;
+        app.enter_fleet("g");
+        assert!(!session_changed(&app, rev0, sid0), "the fleet never overwrites the tab's save");
+        app.leave_fleet_view();
+        assert!(!session_changed(&app, rev0, sid0));
+    }
+
+    #[test]
     fn session_changed_detects_rev_and_tab() {
         use filar_core::CommandConfirmMode;
         let mut app = App::new("t0".into(), CommandConfirmMode::Allowlist);
@@ -3068,6 +3101,7 @@ mod tests {
             global_confirm_mode: CommandConfirmMode::Always,
             tag_policies: Vec::new(),
             host_groups: Vec::new(),
+            initial_group: None,
             llm_profile: "glm".into(),
             initial_messages: Vec::new(),
             initial_input_history: Vec::new(),

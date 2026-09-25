@@ -13,6 +13,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- The fleet layer in the TUI: one dialogue over a host group, entered with
+  `--group <name>` or a group row in `Ctrl+O`, kept apart from the tab row
+  and closed with `Ctrl+W`; `Ctrl+N` inside it opens an ordinary tab, and
+  the single-target mode is unchanged. The group's hosts are fixed on entry;
+  running the agent across them is not wired yet, so nothing is sent
+  ([#432](https://github.com/devlawey/filar/issues/432)).
+
 - A side panel for background operations in the TUI: an "operation → hosts"
   tree with the selected host's output tail, docked on terminals 120+ columns
   wide and a `Ctrl+J` drawer below that, plus an `ops ▸2 ✓1` counter in the

@@ -28,6 +28,7 @@ use filar_tui::TuiConfig;
 #[derive(Default)]
 struct Args {
     target: Option<String>,
+    group: Option<String>,
     llm: Option<String>,
     session: Option<String>,
     gui_only: bool,
@@ -36,11 +37,15 @@ struct Args {
 impl Args {
     /// Returns `true` if no arguments were provided (triggers GUI launcher).
     fn is_empty(&self) -> bool {
-        self.target.is_none() && self.llm.is_none() && self.session.is_none() && !self.gui_only
+        self.target.is_none()
+            && self.group.is_none()
+            && self.llm.is_none()
+            && self.session.is_none()
+            && !self.gui_only
     }
 }
 
-/// Parse `--target`, `--llm`, `--session` from `std::env::args`.
+/// Parse `--target`, `--group`, `--llm`, `--session` from `std::env::args`.
 fn parse_args() -> Args {
     let mut args = Args::default();
     let mut iter = std::env::args().skip(1);
@@ -48,6 +53,9 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--target" => {
                 args.target = iter.next();
+            }
+            "--group" => {
+                args.group = iter.next();
             }
             "--llm" => {
                 args.llm = iter.next();
@@ -59,12 +67,13 @@ fn parse_args() -> Args {
                 args.gui_only = true;
             }
             "--help" | "-h" => {
-                eprintln!("Usage: filar [--target <name>] [--llm <profile>] [--session <id>]");
+                eprintln!("Usage: filar [--target <name>] [--group <name>] [--llm <profile>] [--session <id>]");
                 eprintln!();
                 eprintln!("With no arguments, launches the GUI launcher.");
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --target <name>   Connect to this target ('local' or an SSH target name)");
+                eprintln!("  --group <name>    Open the fleet layer over this host group ([[host_groups]])");
                 eprintln!("  --llm <profile>   Use this LLM profile ('default' or a name from config)");
                 eprintln!("  --session <id>    Restore a previous session by ID");
                 eprintln!("  -h, --help        Show this help message");
@@ -379,6 +388,7 @@ async fn run() -> anyhow::Result<()> {
     // ── Parse CLI args ─────────────────────────────────────────────────
     let args = parse_args();
     let cli_llm_name = args.llm.clone();
+    let cli_group = args.group.clone();
 
     // ── GUI-only mode (subprocess) ──────────────────────────────────
     if args.gui_only {
@@ -665,6 +675,7 @@ async fn run() -> anyhow::Result<()> {
         global_confirm_mode: config.confirm_mode,
         tag_policies: config.tag_policies.clone(),
         host_groups: config.host_groups.clone(),
+        initial_group: cli_group,
         llm_profile: default_profile_name.clone(),
         initial_messages: loaded.messages,
         initial_input_history: loaded.input_history,

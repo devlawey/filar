@@ -195,7 +195,7 @@ fn row_line(app: &App, row: &HostSelectRow, glyphs: &Glyphs) -> Line<'static> {
         HostSelectRow::Local => {
             Line::from(vec![
                 cursor_span(app, glyphs, 0),
-                current_span(glyphs, app.ssh_info.is_none()),
+                current_span(glyphs, app.ssh_info.is_none() && !app.in_fleet()),
                 Span::raw(" "),
                 Span::styled(
                     "local",
@@ -209,11 +209,12 @@ fn row_line(app: &App, row: &HostSelectRow, glyphs: &Glyphs) -> Line<'static> {
             let Some(t) = app.ssh_targets.get(*i) else {
                 return Line::default();
             };
-            let is_current = app
-                .ssh_info
-                .as_ref()
-                .map(|info| *info == format!("{}@{}:{}", t.user, t.host, t.port))
-                .unwrap_or(false);
+            let is_current = !app.in_fleet()
+                && app
+                    .ssh_info
+                    .as_ref()
+                    .map(|info| *info == format!("{}@{}:{}", t.user, t.host, t.port))
+                    .unwrap_or(false);
             let auth_label = match &t.auth {
                 filar_core::SshAuth::Agent => "Agent",
                 filar_core::SshAuth::Key { .. } => "Key",
@@ -236,6 +237,34 @@ fn row_line(app: &App, row: &HostSelectRow, glyphs: &Glyphs) -> Line<'static> {
                 spans.push(Span::styled(format!("  #{}", tag), app.theme.dim()));
             }
             Line::from(spans)
+        }
+        HostSelectRow::GroupsHeader { count } => Line::from(vec![
+            Span::raw(format!(" {}{} ", glyphs.separator, glyphs.separator)),
+            Span::styled(
+                format!("groups — fleet ({count})"),
+                Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        HostSelectRow::Group { group, selection } => {
+            let Some(g) = app.host_groups.get(*group) else {
+                return Line::default();
+            };
+            let is_current = app.in_fleet() && app.fleet().map(|f| f.group_name()) == Some(g.name.as_str());
+            let members = filar_core::select_hosts_for_group(g, &app.ssh_targets).len();
+            let rule: Vec<String> = g.match_tags.iter().map(|t| format!("#{t}")).collect();
+            Line::from(vec![
+                cursor_span(app, glyphs, *selection),
+                current_span(glyphs, is_current),
+                Span::raw(" "),
+                Span::styled(
+                    g.name.clone(),
+                    Style::default().fg(app.theme.fg).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(format!("{members} host(s)"), app.theme.muted()),
+                Span::raw("  "),
+                Span::styled(rule.join(" "), app.theme.dim()),
+            ])
         }
     }
 }
