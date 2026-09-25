@@ -5636,6 +5636,33 @@ mod tests {
     }
 
     #[test]
+    fn a_filtered_overlay_still_enters_the_group_it_shows() {
+        let mut app = app_with_groups();
+        app.open_host_select();
+        app.host_select_query = "db".into(); // hides `web`, keeps `db`
+        app.host_select_ensure_visible();
+        let rows = app.host_select_rows();
+        let shown: Vec<usize> = rows
+            .iter()
+            .filter_map(|r| match r {
+                HostSelectRow::Group { group, .. } => Some(*group),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, [1], "only the db group is visible");
+        let sel = rows
+            .iter()
+            .find_map(|r| match r {
+                HostSelectRow::Group { selection, .. } => Some(*selection),
+                _ => None,
+            })
+            .expect("db row");
+        app.host_select_index = sel;
+        app.select_host();
+        assert_eq!(app.fleet().map(|f| f.group_name()), Some("db"));
+    }
+
+    #[test]
     fn a_single_target_from_the_fleet_switches_the_origin_tab() {
         let mut app = app_with_groups();
         let origin = app.sessions[app.active].id;

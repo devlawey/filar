@@ -277,13 +277,13 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
     let mut spans: Vec<Span> = Vec::with_capacity(app.sessions.len() * 4);
     // The fleet layer (#432) is not a numbered tab: it leads the row as its
     // own chip, and tab numbers count ordinary tabs only.
-    if let Some(fi) = app.fleet_index() {
-        let s = &app.sessions[fi];
-        let (name, n) = s
-            .fleet
-            .as_ref()
-            .map(|f| (f.group_name().to_string(), f.len()))
-            .unwrap_or_default();
+    if let Some((fi, fleet)) = app
+        .sessions
+        .iter()
+        .enumerate()
+        .find_map(|(i, s)| s.fleet.as_ref().map(|f| (i, f)))
+    {
+        let (name, n) = (fleet.group_name(), fleet.len());
         let style = if fi == active {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
