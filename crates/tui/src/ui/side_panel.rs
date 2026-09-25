@@ -15,7 +15,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::App;
 use crate::ops::{HostOpState, Operation};
 use crate::side_panel::{summary_rows, tree_rows, PanelContent, SummaryRow, TreeRow};
-use crate::ui::text::{strip_emoji, wrap_text};
+use crate::ui::text::{sanitize_output, strip_emoji, wrap_text};
 use crate::ui::theme::Glyphs;
 
 /// Render the side panel into `area`.
@@ -105,7 +105,10 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
                     GroupRole::Split => (glyphs.fleet_split, "split, group of", app.theme.warning_fg()),
                 };
                 let expanded = app.side_panel.expanded.contains(&g);
-                let lines: Vec<String> = strip_emoji(&group.sample)
+                // Host output: control characters and escapes go, like in the
+                // feed's command blocks — but every script stays. `strip_emoji`
+                // would drop CJK and report a real answer as empty.
+                let lines: Vec<String> = sanitize_output(&group.sample)
                     .replace('\t', "    ")
                     .lines()
                     .map(str::to_string)
@@ -171,7 +174,7 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
     let hint = Line::from(Span::styled(
         fit(
             &format!(
-                " {}{} select {d} Enter expand {d} Esc close",
+ " {}{} select {d} Enter expand {d} PgUp/PgDn scroll {d} Esc close",
                 glyphs.arrow_up,
                 glyphs.arrow_down,
                 d = glyphs.middle_dot
@@ -181,10 +184,14 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
         app.theme.muted(),
     ));
 
-    // Scroll the body so the selected row's first line stays visible.
+    // Scroll the body so the selected row's first line stays visible, then
+    // by `PgUp`/`PgDn` on top — so an expanded answer taller than the panel
+    // can be read line by line rather than skipped past.
     let body_h = (area.height as usize).saturating_sub(head.len() + 1);
     let anchor = starts.get(selected).copied().unwrap_or(0);
-    let offset = anchor.saturating_sub(body_h.saturating_sub(2));
+    let max_offset = body.len().saturating_sub(body_h);
+    let offset = (anchor.saturating_sub(body_h.saturating_sub(2)) + app.side_panel.scroll)
+        .min(max_offset);
     let mut lines = head;
     lines.extend(body.into_iter().skip(offset).take(body_h));
     while lines.len() + 1 < area.height as usize {
@@ -560,5 +567,36 @@ mod tests {
         assert!(text.contains("= +") && text.contains("same on"), "{text}");
         assert!(text.contains("!=") && text.contains("differs on"), "{text}");
         assert!(text.contains("no contact"), "{text}");
+    }
+
+    #[test]
+    fn a_non_latin_answer_is_shown_not_reported_empty() {
+        let mut view = crate::app::test_fleet_view();
+        view.groups[0].sample = "你好，世界".into();
+        let app = crate::app::test_fleet_app(view);
+        let text = render(&app, 72, 24, Glyphs::detect());
+        assert!(!text.contains("(empty output)"), "{text}");
+        assert!(text.contains('你') && text.contains('界'), "{text}");
+    }
+
+    #[test]
+    fn a_tall_expanded_answer_can_be_read_to_the_end() {
+        let mut view = crate::app::test_fleet_view();
+        view.groups[1].sample = (1..=60).map(|i| format!("line-{i:02}")).collect::<Vec<_>>().join("\n");
+        let mut app = crate::app::test_fleet_app(view);
+        app.side_panel.open = true;
+        app.side_panel.selected = 1;
+        app.side_panel.expanded.insert(1);
+        let text = render(&app, 72, 20, Glyphs::detect());
+        assert!(text.contains("line-01") && !text.contains("line-30"), "{text}");
+        // PgDn scrolls the body: the middle of the answer comes into view,
+        // and past it the end, without moving to the next row.
+        app.side_panel.scroll = 25;
+        let text = render(&app, 72, 20, Glyphs::detect());
+        assert!(text.contains("line-30"), "{text}");
+        app.side_panel.scroll = 1000;
+        let text = render(&app, 72, 20, Glyphs::detect());
+        assert!(text.contains("line-60"), "{text}");
+        assert!(text.contains("PgUp/PgDn"), "the hint names the keys: {text}");
     }
 }

@@ -4727,10 +4727,21 @@ impl App {
                 // the selection goes back to the top and nothing is expanded.
                 // The feed gets nothing — its command block already has the
                 // headline — and neither does the model.
-                self.active_session_mut().fleet_view = Some(view);
-                if !is_background {
-                    self.side_panel.selected = 0;
-                    self.side_panel.expanded.clear();
+                // Operation ids only grow, so an older one arriving late — a
+                // cancelled run still winding down (#437) while the next one
+                // already reported — never replaces the newer summary.
+                let stale = self
+                    .active_session()
+                    .fleet_view
+                    .as_ref()
+                    .is_some_and(|current| current.operation > view.operation);
+                if !stale {
+                    self.active_session_mut().fleet_view = Some(view);
+                    if !is_background {
+                        self.side_panel.selected = 0;
+                        self.side_panel.expanded.clear();
+                        self.side_panel.scroll = 0;
+                    }
                 }
                 auto_scroll = false;
             }
@@ -5535,6 +5546,19 @@ impl App {
             // Expand / collapse the selected group of the fleet summary
             // (#438). Only there: in the operations tree these keys are not
             // the panel's and fall through to the input line.
+            // Scroll the summary's body by a few lines (#438).
+            KeyCode::PageDown
+                if self.panel_content() == crate::side_panel::PanelContent::FleetSummary =>
+            {
+                self.side_panel.scroll = self.side_panel.scroll.saturating_add(5);
+                true
+            }
+            KeyCode::PageUp
+                if self.panel_content() == crate::side_panel::PanelContent::FleetSummary =>
+            {
+                self.side_panel.scroll = self.side_panel.scroll.saturating_sub(5);
+                true
+            }
             KeyCode::Enter | KeyCode::Right | KeyCode::Left
                 if self.panel_content() == crate::side_panel::PanelContent::FleetSummary =>
             {
@@ -5884,6 +5908,35 @@ mod tests {
         // Outside the fleet the panel keeps showing operations.
         app.leave_fleet_view();
         assert_eq!(app.panel_content(), crate::side_panel::PanelContent::Operations);
+    }
+
+    #[test]
+    fn a_late_summary_of_an_older_operation_does_not_replace_a_newer_one() {
+        let older = test_fleet_view();
+        let mut newer = test_fleet_view();
+        newer.command = "uname -r".into();
+        assert!(newer.operation > older.operation, "ids grow");
+        let mut app = test_fleet_app(newer);
+        let sid = app.sessions[app.active].id;
+        // A cancelled run winding down reports after the next one did (#437).
+        app.handle_agent_event(TuiEvent::FleetSummary { session_id: sid, view: older });
+        let shown = app.active_session().fleet_view.as_ref().expect("view");
+        assert_eq!(shown.command, "uname -r", "the newer summary stays");
+    }
+
+    #[test]
+    fn page_keys_scroll_the_summary_and_moving_resets_it() {
+        let mut app = test_fleet_app(test_fleet_view());
+        let key = |c| crossterm::event::KeyEvent::new(c, crossterm::event::KeyModifiers::NONE);
+        app.side_panel.open = true;
+        app.handle_key(key(crossterm::event::KeyCode::PageDown));
+        assert_eq!(app.side_panel.scroll, 5);
+        app.handle_key(key(crossterm::event::KeyCode::PageUp));
+        app.handle_key(key(crossterm::event::KeyCode::PageUp));
+        assert_eq!(app.side_panel.scroll, 0);
+        app.handle_key(key(crossterm::event::KeyCode::PageDown));
+        app.handle_key(key(crossterm::event::KeyCode::Down));
+        assert_eq!(app.side_panel.scroll, 0, "a new selection starts at its own row");
     }
 
     #[test]

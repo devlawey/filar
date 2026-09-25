@@ -101,6 +101,10 @@ pub struct SidePanel {
     /// Fleet-summary groups shown in full rather than as one clamped line
     /// (#438). Cleared when a new operation's summary arrives.
     pub expanded: std::collections::BTreeSet<usize>,
+    /// Extra lines the fleet summary is scrolled by (`PgUp`/`PgDn`), on top
+    /// of keeping the selected row in view — so an expanded answer taller
+    /// than the panel can be read to the end. Reset when the selection moves.
+    pub scroll: usize,
 }
 
 impl SidePanel {
@@ -117,6 +121,7 @@ impl SidePanel {
 
     /// Move the selection by `delta` rows within `rows` rows.
     pub fn move_selection(&mut self, delta: isize, rows: usize) {
+        self.scroll = 0;
         if rows == 0 {
             self.selected = 0;
             return;
