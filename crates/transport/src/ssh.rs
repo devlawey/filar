@@ -521,6 +521,11 @@ impl SshSession {
     /// Opens a short-lived `exec` channel on the same connection; it does
     /// **not** acquire any lock that `run()` holds, so it works even while
     /// a command is executing. With no command running it is a no-op.
+    ///
+    /// Returns an error when the interrupt could not be confirmed: a `kill`
+    /// failed, the `exec` exited non-zero or without a status, or it did not
+    /// finish in time — so a caller never takes a failed interrupt for a
+    /// stopped command.
     pub async fn cancel(&self) -> Result<()> {
         let pid = self.shell_pid.ok_or_else(|| {
             CoreError::Other("cannot interrupt: the remote shell did not report its PID".into())
@@ -539,14 +544,30 @@ impl SshSession {
         // Wait for the `kill` to finish, bounded: the interrupt must not
         // become a second thing to wait on.
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut exit_status = None;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match tokio::time::timeout(remaining, channel.wait()).await {
-                Ok(Some(ChannelMsg::Close)) | Ok(None) | Err(_) => break,
+                Ok(Some(ChannelMsg::ExitStatus { exit_status: code })) => exit_status = Some(code),
+                Ok(Some(ChannelMsg::Close)) | Ok(None) => break,
                 Ok(Some(_)) => {}
+                Err(_) => {
+                    return Err(CoreError::Other(
+                        "interrupt did not finish in time — the command may still be running".into(),
+                    ))
+                }
             }
         }
-        Ok(())
+        match exit_status {
+            Some(0) => Ok(()),
+            Some(code) => Err(CoreError::Other(format!(
+                "interrupt failed on the host (exit {code}) — the command may still be running"
+            ))),
+            None => Err(CoreError::Other(
+                "interrupt channel closed without an exit status — the command may still be running"
+                    .into(),
+            )),
+        }
     }
 
     /// Mark this session as intentionally shutting down.
@@ -961,10 +982,14 @@ fn check_host_key(
 /// The remote command that interrupts whatever the shell `pid` is running:
 /// `SIGINT` to each of its direct children. POSIX `ps -A -o` and `awk`, so
 /// it works on any POSIX host without `pkill`; it writes nothing to disk.
+///
+/// Exits non-zero if `ps` fails or any `kill` fails. No children at all is
+/// success: nothing is running, so there is nothing to interrupt — a
+/// timeout that fires as the command finishes must not report a failure.
 fn interrupt_command(pid: u32) -> String {
     format!(
-        "for p in $(ps -A -o pid= -o ppid= | awk -v pp={pid} '$2 == pp {{ print $1 }}'); \
-         do kill -INT \"$p\" 2>/dev/null; done; true"
+        "pids=$(ps -A -o pid= -o ppid= | awk -v pp={pid} '$2 == pp {{ print $1 }}') || exit 1; \
+         rc=0; for p in $pids; do kill -INT \"$p\" 2>/dev/null || rc=1; done; exit $rc"
     )
 }
 
@@ -1236,6 +1261,8 @@ mod tests {
         let cmd = interrupt_command(4242);
         assert!(cmd.contains("awk -v pp=4242"), "{cmd}");
         assert!(cmd.contains("kill -INT"), "{cmd}");
+        // A failed `ps` or `kill` is reported, not swallowed.
+        assert!(cmd.contains("|| exit 1") && cmd.contains("|| rc=1") && cmd.ends_with("exit $rc"), "{cmd}");
         // Zero-install: the only redirection is stderr to /dev/null.
         assert_eq!(cmd.matches('>').count(), 1, "{cmd}");
         assert!(cmd.contains("2>/dev/null"), "{cmd}");

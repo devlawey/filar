@@ -50,8 +50,7 @@
 //! cancellation, and the rest marked `cancelled`. A caller that wants the
 //! partial result keeps awaiting `run` after calling `cancel` instead of
 //! dropping it. With no `run` in flight (one that was dropped, say) it
-//! falls back to forwarding Ctrl-C to every connected host. [`cancel`](CommandExecutor::cancel)
-//! here forwards Ctrl-C to every connected host, no more.
+//! falls back to forwarding Ctrl-C to every connected host.
 
 use std::sync::Arc;
 
