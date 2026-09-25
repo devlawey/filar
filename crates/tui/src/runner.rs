@@ -420,11 +420,19 @@ fn wrap_if_read_only(
 /// How the fleet executor reaches one host (#435): the same SSH transport
 /// as a tab, always behind [`filar_transport::ReadOnlyExecutor`] — a fleet
 /// is read-only whatever the group's tags say (#419).
+///
+/// The target arrives with its own password already filled in (#436). The
+/// transport gets an empty secret provider, so the shared `SSH_PASSWORD`
+/// fallback a tab uses can never be sent to a fleet host.
 fn fleet_connector(command_timeout: Duration) -> filar_agent::fleet_exec::HostConnector {
     Arc::new(move |target: filar_core::SshTarget| {
         Box::pin(async move {
-            let ssh = SshExecutor::connect_with_config(&target, ssh_transport_config(command_timeout))
-                .await?;
+            let ssh = SshExecutor::connect_with_provider(
+                &target,
+                ssh_transport_config(command_timeout),
+                Arc::new(StaticSecretProvider::new()),
+            )
+            .await?;
             Ok(Arc::new(filar_transport::ReadOnlyExecutor::new(Arc::new(ssh)))
                 as Arc<dyn CommandExecutor>)
         })
@@ -437,18 +445,26 @@ fn fleet_connector(command_timeout: Duration) -> filar_agent::fleet_exec::HostCo
 /// built from any other composition is replaced, so the hosts a command runs
 /// on are always the ones the gate shows as the radius — whatever the
 /// session lifecycle around it does.
+///
+/// `credentials` are the ones resolved when the fleet was entered (#436);
+/// credentials of any other operation are refused.
 fn fleet_executor_for(
     map: &mut HashMap<SessionId, Arc<filar_agent::fleet_exec::FleetExecutor>>,
     sid: SessionId,
     fleet: &filar_core::FleetOperation,
+    credentials: &filar_agent::fleet_creds::FleetCredentials,
     connector: impl FnOnce() -> filar_agent::fleet_exec::HostConnector,
-) -> Arc<filar_agent::fleet_exec::FleetExecutor> {
+) -> filar_core::Result<Arc<filar_agent::fleet_exec::FleetExecutor>> {
     match map.get(&sid) {
-        Some(exec) if exec.built_from() == fleet.id() => Arc::clone(exec),
+        Some(exec) if exec.built_from() == fleet.id() => Ok(Arc::clone(exec)),
         _ => {
-            let exec = Arc::new(filar_agent::fleet_exec::FleetExecutor::new(fleet, connector()));
+            let exec = Arc::new(filar_agent::fleet_exec::FleetExecutor::new(
+                fleet,
+                credentials.clone(),
+                connector(),
+            )?);
             map.insert(sid, Arc::clone(&exec));
-            exec
+            Ok(exec)
         }
     }
 }
@@ -564,6 +580,8 @@ async fn run_app(
     // agent's SecretSubstitutingExecutor, so Ctrl+P inserts are visible to
     // command substitution and output sanitisation.
     app.secrets = config.secret_provider.clone();
+    // Fleet hosts' own passwords come from the OS credential store (#436).
+    app.credential_store = Arc::new(filar_core::KeyringSecretProvider::new());
     app.runbook_enabled = config.save_runbook;
     // Host groups are fleet entry points in Ctrl+O; `--group` opens the fleet
     // layer straight away, over the start-up tab (#432).
@@ -1015,15 +1033,26 @@ async fn run_app(
                     } else {
                         let sid = app.sessions[app.active].id;
                         let in_fleet = app.in_fleet();
-                        let (agent_exec, is_local, ssh_info) = if let Some(fleet) =
-                            app.sessions[app.active].fleet.as_ref()
+                        let session = &app.sessions[app.active];
+                        let (agent_exec, is_local, ssh_info) = if let (Some(fleet), Some(creds)) =
+                            (session.fleet.as_ref(), session.fleet_credentials.as_ref())
                         {
                             // The fleet agent runs over the group-level
                             // executor and nothing else (#434, #435): a tab
                             // executor would be one host behind a fleet label.
-                            let exec = fleet_executor_for(&mut fleet_executors, sid, fleet, || {
-                                fleet_connector(command_timeout)
-                            });
+                            let exec = match fleet_executor_for(
+                                &mut fleet_executors,
+                                sid,
+                                fleet,
+                                creds,
+                                || fleet_connector(command_timeout),
+                            ) {
+                                Ok(exec) => exec,
+                                Err(e) => {
+                                    app.push_error(format!("Fleet not ready: {e}"));
+                                    continue;
+                                }
+                            };
                             let info = format!("fleet {} ({} hosts)", fleet.group_name(), fleet.len());
                             (exec as Arc<dyn CommandExecutor>, false, Some(info))
                         } else {
@@ -2464,7 +2493,7 @@ mod tests {
                 host: format!("{n}.example"),
                 port: 22,
                 user: "admin".into(),
-                auth: Default::default(),
+                auth: filar_core::SshAuth::Key { path: None },
                 host_key_policy: Default::default(),
                 tags: vec![if n.starts_with("web") { "web".into() } else { "db".into() }],
             })
@@ -2480,15 +2509,24 @@ mod tests {
         let mut map = HashMap::new();
         let sid = SessionId(7);
 
+        let store = StaticSecretProvider::new();
+        let creds = |op: &filar_core::FleetOperation| {
+            filar_agent::fleet_creds::FleetCredentials::resolve(op, &store)
+        };
         let web = filar_core::FleetOperation::open(&group("web"), &targets);
-        let first = fleet_executor_for(&mut map, sid, &web, connector);
-        let again = fleet_executor_for(&mut map, sid, &web, connector);
+        let web_creds = creds(&web);
+        let first = fleet_executor_for(&mut map, sid, &web, &web_creds, connector).expect("web");
+        let again = fleet_executor_for(&mut map, sid, &web, &web_creds, connector).expect("web");
         assert!(Arc::ptr_eq(&first, &again), "same fleet: connections are kept");
 
         // Any other operation under the same key — however it got there —
         // gets its own executor over its own composition.
         let db = filar_core::FleetOperation::open(&group("db"), &targets);
-        let swapped = fleet_executor_for(&mut map, sid, &db, connector);
+        assert!(
+            fleet_executor_for(&mut map, sid, &db, &web_creds, connector).is_err(),
+            "another fleet's credentials are refused"
+        );
+        let swapped = fleet_executor_for(&mut map, sid, &db, &creds(&db), connector).expect("db");
         assert!(!Arc::ptr_eq(&first, &swapped));
         assert_eq!(swapped.radius(), ["db-1"], "runs where the gate says it runs");
         assert_eq!(map.len(), 1, "the stale executor is dropped with its connections");

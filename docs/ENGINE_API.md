@@ -151,8 +151,17 @@ that path is closed. The confirmer is not told the radius: a frontend knows its
 own fleet (the TUI shows the group's frozen composition).
 
 Build a fleet agent only over a group-level executor, never over one host's:
-`fleet_exec::FleetExecutor::new(&operation, connector)` implements
-`CommandExecutor` for a `FleetOperation`. Each `run` refuses non-read-only
+`fleet_exec::FleetExecutor::new(&operation, credentials, connector)?`
+implements `CommandExecutor` for a `FleetOperation`. `credentials` is
+`fleet_creds::FleetCredentials::resolve(&operation, &store)`: each host's own
+secret, looked up once under `ssh_target:<name>` in `store` (never the shared
+`SSH_PASSWORD`). A host without credentials gets no task, is never contacted,
+is left out of `radius()` and is reported as `skipped`; credentials resolved
+for another operation are refused. The connector receives each host's target
+with its password already filled in — pass the transport an empty
+`SecretProvider` so it cannot fall back to a shared one. An agent built with
+`fleet(true)` ignores `secret_provider`: `$FILAR_SECRET_N` values are never
+substituted into fleet commands. Each `run` refuses non-read-only
 commands before any host is contacted, opens a fresh operation over the frozen
 composition (`FleetOperation::reopen`), fans the command out under the group's
 limits, and returns the summary headline plus the fold
