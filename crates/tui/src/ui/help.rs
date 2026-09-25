@@ -234,7 +234,7 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
         },
         HelpEntry {
             key: "^O",
-            desc: "Open host selection overlay (local, [[ssh_targets]],\n             [[host_groups]] — a group enters the fleet layer)",
+            desc: "Open host selection overlay (local, [[ssh_targets]],\n             [[host_groups]] — a group enters the fleet layer).\n             In the fleet: open one of its hosts in a new tab",
             section: "Input",
             available: |m| m == AppMode::Normal,
         },

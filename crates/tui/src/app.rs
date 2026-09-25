@@ -408,6 +408,11 @@ pub struct Session {
     /// host group, kept apart from the tab row. Its composition is frozen at
     /// entry. A fleet session never gets an executor of its own.
     pub fleet: Option<filar_core::FleetOperation>,
+    /// `Some(previous label)` while a Ctrl+O switch of this tab to another
+    /// host is in flight (#433). Until the transport actually swaps, the tab
+    /// still runs on its old executor, so nothing may be sent from it; on a
+    /// failed or abandoned switch the label goes back to the previous one.
+    pub connecting: Option<String>,
     /// Display name shown on the tab label.
     pub target_name: String,
     /// Chat history blocks: what the feed shows and what the model is sent.
@@ -951,6 +956,7 @@ impl Session {
             transcript_saving: false,
             transcript_error_shown: false,
             fleet: None,
+            connecting: None,
         }
     }
 
@@ -1877,12 +1883,18 @@ impl App {
     pub(crate) fn host_select_rows_filtered(&self, query: &str, tag: Option<&str>) -> Vec<HostSelectRow> {
         let q = query.trim().to_lowercase();
         let mut rows = Vec::new();
-        if tag.is_none() && (q.is_empty() || "local".contains(&q)) {
+        // In the fleet the overlay drills into the fleet's own hosts (#433):
+        // `local` and hosts outside the fleet are not offered.
+        let fleet = self.sessions[self.active].fleet.as_ref();
+        if fleet.is_none() && tag.is_none() && (q.is_empty() || "local".contains(&q)) {
             rows.push(HostSelectRow::Local);
         }
         let mut tagged: Vec<(String, Vec<usize>)> = Vec::new();
         let mut untagged: Vec<usize> = Vec::new();
         for (i, t) in self.ssh_targets.iter().enumerate() {
+            if fleet.is_some_and(|f| !f.contains(&t.name)) {
+                continue;
+            }
             if let Some(tf) = tag {
                 if !t.tags.iter().any(|x| x.eq_ignore_ascii_case(tf)) {
                     continue;
@@ -2035,9 +2047,13 @@ impl App {
             }
             return;
         }
-        // A single target from inside the fleet switches the tab the fleet
-        // was entered from — the fleet session never gets a transport.
-        self.leave_fleet_view();
+        // Drilling into a host from the fleet (#433): the host opens as a new
+        // ordinary tab with its own executor and connection; the fleet stays
+        // open and never gets a transport. A host may be in the fleet and in
+        // a tab at once — nothing is shared between the two.
+        if self.in_fleet() {
+            self.new_tab();
+        }
         self.ctrl_o_selection = Some(idx);
 
         let tags = if idx == 0 {
@@ -2064,7 +2080,11 @@ impl App {
         self.ctrl_o_pending_tags = Some(tags);
         self.sync_confirm_mode();
 
-        self.target_name = alias;
+        // A new switch aborts any switch still in flight (its handle is
+        // aborted below, so it will never report back).
+        self.abandon_pending_connects();
+        let previous = std::mem::replace(&mut self.target_name, alias);
+        self.connecting = Some(previous);
         self.tear_down_interactive_on_target_change();
         self.ctrl_o_needs_connect = true;
         if let Some(handle) = self.ctrl_o_handle.take() {
@@ -2207,6 +2227,7 @@ impl App {
         if let Some(tok) = self.ctrl_o_cancel.take() {
             tok.cancel();
         }
+        self.abandon_pending_connects();
         self.ctrl_o_pending_target = None;
         self.ctrl_o_pending_session_id = None;
         // A swap pending for the replaced context dies with it: the floors
@@ -3019,6 +3040,10 @@ impl App {
         if self.handle_fleet_key(&key) {
             return;
         }
+        // A tab mid-switch still runs on its old executor (#433).
+        if self.handle_connecting_key(&key) {
+            return;
+        }
 
         // Ctrl+K — compact the history on request, without waiting for the
         // threshold (#377). ЙЦУКЕН: K = л.
@@ -3453,6 +3478,9 @@ impl App {
                     self.input.clear();
                     self.cursor_pos = 0;
                     let was_ctrl_o = self.ctrl_o_pending_target.is_some();
+                    if let Some(sid) = self.ctrl_o_pending_session_id {
+                        self.connect_settled(sid, false);
+                    }
                     self.ctrl_o_pending_target = None;
                     self.ctrl_o_pending_session_id = None;
                     self.mode = AppMode::Normal;
@@ -3877,6 +3905,10 @@ impl App {
             HelpAction::Terminal => {
                 if self.in_fleet() {
                     self.fleet_refusal("Terminal");
+                } else if self.connecting.is_some() {
+                    self.push_message(ChatBlock::System(
+                        "Still connecting: the terminal opens once the host is switched.".into(),
+                    ));
                 } else {
                     self.toggle_interactive = true;
                 }
@@ -4891,6 +4923,60 @@ impl App {
     }
 }
 
+// ── Pending host switch (#433) ──────────────────────────────────────
+
+impl App {
+    /// A Ctrl+O switch of tab `sid` is over: `swapped` when the transport
+    /// actually changed (the runner sets the new label), otherwise the
+    /// previous label comes back — the tab still runs where it ran before.
+    pub fn connect_settled(&mut self, sid: SessionId, swapped: bool) {
+        if let Some(idx) = self.find_session_idx(sid) {
+            if let Some(previous) = self.sessions[idx].connecting.take() {
+                if !swapped {
+                    self.sessions[idx].target_name = previous;
+                }
+            }
+        }
+    }
+
+    /// Settle every switch still marked in flight as abandoned.
+    fn abandon_pending_connects(&mut self) {
+        let ids: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|s| s.connecting.is_some())
+            .map(|s| s.id)
+            .collect();
+        for id in ids {
+            self.connect_settled(id, false);
+        }
+    }
+
+    /// While the active tab is switching hosts, refuse what would run on its
+    /// old executor under the new host's name. Returns `true` when handled.
+    fn handle_connecting_key(&mut self, key: &crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        if self.connecting.is_none() || self.mode != AppMode::Normal {
+            return false;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let send = key.code == KeyCode::Enter && !ctrl && !self.input.trim().is_empty();
+        let terminal = ctrl && matches!(key.code, KeyCode::Char('t' | 'е'));
+        let picker = ctrl
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'f') || c.eq_ignore_ascii_case(&'d') || c == 'а' || c == 'в');
+        if !(send || terminal || picker) {
+            return false;
+        }
+        let host = self.target_name.trim_start_matches('~').to_string();
+        self.push_message(ChatBlock::System(format!(
+            "Still connecting to {host}: nothing was run (input kept)."
+        )));
+        self.scroll = 0;
+        true
+    }
+}
+
 // ── Fleet layer (#432) ──────────────────────────────────────────────
 
 /// Opening feed lines of a fleet session: who takes part, under which
@@ -5662,19 +5748,150 @@ mod tests {
         assert_eq!(app.fleet().map(|f| f.group_name()), Some("db"));
     }
 
+    fn fleet_host_selection(app: &App, name: &str) -> usize {
+        1 + app.ssh_targets.iter().position(|t| t.name == name).expect("target")
+    }
+
     #[test]
-    fn a_single_target_from_the_fleet_switches_the_origin_tab() {
+    fn ctrl_o_in_the_fleet_drills_into_a_host_as_a_new_tab() {
         let mut app = app_with_groups();
         let origin = app.sessions[app.active].id;
         app.enter_fleet("web");
+        app.take_pending_local_executors();
         app.open_host_select();
-        app.host_select_index = 3; // db-1
+        app.host_select_index = fleet_host_selection(&app, "web-2");
         app.select_host();
-        assert!(!app.in_fleet(), "back on the tabs");
-        assert_eq!(app.sessions[app.active].id, origin);
+        // A new ordinary tab, on screen, pointed at the host.
+        assert!(!app.in_fleet());
+        let tab = app.sessions[app.active].id;
+        assert_ne!(tab, origin);
+        assert_eq!(app.sessions[app.active].target_name, "~web-2");
         assert!(app.ctrl_o_needs_connect);
-        assert_eq!(app.sessions[app.active].target_name, "~db-1");
-        assert!(app.fleet().is_some(), "the fleet stays open");
+        assert_eq!(app.take_pending_local_executors(), vec![tab], "its own executor");
+        // The fleet stays open, and the origin tab is untouched.
+        assert!(app.fleet().is_some());
+        let origin_idx = app.find_session_idx(origin).expect("origin tab");
+        assert_eq!(app.sessions[origin_idx].target_name, "local");
+        assert_eq!(app.tab_indices().len(), 2);
+    }
+
+    #[test]
+    fn the_same_host_in_two_places_gets_two_executors_and_the_fleet_none() {
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        app.take_pending_local_executors();
+        let fleet_id = app.sessions[app.fleet_index().expect("fleet")].id;
+        let mut tabs = Vec::new();
+        for _ in 0..2 {
+            // Back to the fleet, then drill into web-1 again.
+            app.enter_fleet("web");
+            app.open_host_select();
+            app.host_select_index = fleet_host_selection(&app, "web-1");
+            app.select_host();
+            tabs.push(app.sessions[app.active].id);
+        }
+        let pending = app.take_pending_local_executors();
+        assert_eq!(pending, tabs, "each tab asks for an executor of its own");
+        assert_ne!(tabs[0], tabs[1]);
+        assert!(!pending.contains(&fleet_id), "the fleet never asks for one");
+        // Membership is not exclusive (#426): web-1 is still in the fleet.
+        assert!(app.fleet().is_some_and(|f| f.contains("web-1")));
+    }
+
+    #[test]
+    fn a_tab_mid_switch_runs_nothing_until_the_transport_swaps() {
+        use crossterm::event::KeyCode;
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        app.open_host_select();
+        app.host_select_index = fleet_host_selection(&app, "web-2");
+        app.select_host(); // drill-in: a fresh local tab labelled ~web-2
+        let tab = app.sessions[app.active].id;
+        assert_eq!(app.connecting.as_deref(), Some("local-2"));
+        for c in "uptime".chars() {
+            app.handle_key(key_event(KeyCode::Char(c)));
+        }
+        app.handle_key(key_event(KeyCode::Enter));
+        assert_eq!(app.take_input(), None, "nothing runs on the local executor");
+        assert_eq!(app.input, "uptime");
+        app.handle_key(ctrl_key('t'));
+        assert!(!app.take_toggle_interactive(), "no terminal on the old executor");
+        // The swap lands: sending works again, the label stays.
+        app.connect_settled(tab, true);
+        assert!(app.connecting.is_none());
+        assert_eq!(app.target_name, "~web-2");
+        app.handle_key(key_event(KeyCode::Enter));
+        assert_eq!(app.take_input().as_deref(), Some("uptime"));
+    }
+
+    #[test]
+    fn a_failed_switch_gives_the_tab_back_its_real_label() {
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        app.open_host_select();
+        app.host_select_index = fleet_host_selection(&app, "web-1");
+        app.select_host();
+        let tab = app.sessions[app.active].id;
+        app.connect_settled(tab, false); // TransportSwapFailed
+        assert!(app.connecting.is_none());
+        assert_eq!(app.target_name, "local-2", "the tab runs locally and says so");
+    }
+
+    #[test]
+    fn a_new_switch_abandons_the_one_in_flight() {
+        let mut app = app_with_groups();
+        app.open_host_select();
+        app.host_select_index = fleet_host_selection(&app, "db-1");
+        app.select_host(); // tab 1 → db-1, in flight
+        let first = app.sessions[app.active].id;
+        app.new_tab();
+        app.open_host_select();
+        app.host_select_index = fleet_host_selection(&app, "web-1");
+        app.select_host(); // aborts the first connect
+        let idx = app.find_session_idx(first).expect("first tab");
+        assert!(app.sessions[idx].connecting.is_none(), "never left blocked");
+        assert_eq!(app.sessions[idx].target_name, "local");
+        assert!(app.connecting.is_some(), "the new switch is the one in flight");
+    }
+
+    #[test]
+    fn cancelling_the_password_settles_the_switch() {
+        use crossterm::event::KeyCode;
+        let mut app = app_with_groups();
+        app.open_host_select();
+        app.host_select_index = fleet_host_selection(&app, "db-1");
+        app.select_host();
+        let tab = app.sessions[app.active].id;
+        app.handle_agent_event(TuiEvent::PasswordNeeded {
+            session_id: tab,
+            target: app.ssh_targets[2].clone(),
+        });
+        assert_eq!(app.mode, AppMode::PasswordInput);
+        app.handle_key(key_event(KeyCode::Esc));
+        assert!(app.connecting.is_none());
+        assert_eq!(app.target_name, "local");
+    }
+
+    #[test]
+    fn the_fleet_overlay_offers_only_the_fleet_s_hosts() {
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        app.open_host_select();
+        let rows = app.host_select_rows();
+        assert!(!rows.contains(&HostSelectRow::Local), "no local in the fleet overlay");
+        let targets: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                HostSelectRow::Target(i) => Some(app.ssh_targets[*i].name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, ["web-1", "web-2"], "db-1 is not in the fleet");
+        // Outside the fleet the overlay is unchanged.
+        app.leave_fleet_view();
+        let rows = app.host_select_rows();
+        assert!(rows.contains(&HostSelectRow::Local));
+        assert!(rows.contains(&HostSelectRow::Target(2)));
     }
 
     #[test]

@@ -13,6 +13,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- `Ctrl+O` inside the fleet drills into one of its hosts: the host opens as a
+  new ordinary tab with its own connection while the fleet stays open, and
+  the overlay there lists only the fleet's hosts
+  ([#433](https://github.com/devlawey/filar/issues/433)).
+
 - The fleet layer in the TUI: one dialogue over a host group, entered with
   `--group <name>` or a group row in `Ctrl+O`, kept apart from the tab row
   and closed with `Ctrl+W`; `Ctrl+N` inside it opens an ordinary tab, and
@@ -194,6 +199,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   passwords survive ([#411](https://github.com/devlawey/filar/issues/411)).
 
 ### Fixed
+
+- A tab switching hosts with `Ctrl+O` refuses to send anything until the new
+  connection is in place, and gets its previous label back if the switch
+  fails — nothing runs on the old executor under the new host's name
+  ([#433](https://github.com/devlawey/filar/issues/433)).
 
 - `SshAuth`'s `Debug` no longer prints an inline SSH password in clear.
   Whether one is set stays visible, the value does not, so a `{target:?}`
