@@ -19,6 +19,19 @@ struct HelpItem {
     action: Option<HelpAction>,
 }
 
+/// Help-bar items in the fleet layer (#434): what works there, with `^O`
+/// leading — it is the way to every single-host feature.
+fn fleet_help_items() -> Vec<HelpItem> {
+    vec![
+        HelpItem { key: "^O", desc: "open host", action: None },
+        HelpItem { key: "^N", desc: "tab", action: None },
+        HelpItem { key: "^W", desc: "close fleet", action: None },
+        HelpItem { key: "^Tab", desc: "tabs", action: None },
+        HelpItem { key: "F1", desc: "help", action: None },
+        HelpItem { key: "^Q", desc: "quit", action: Some(HelpAction::Quit) },
+    ]
+}
+
 /// Return the help-bar items for the current mode.
 fn help_items(mode: AppMode) -> Vec<HelpItem> {
     match mode {
@@ -383,7 +396,12 @@ pub(crate) fn render_help_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // Clear previous zones.
     app.helpbar_zones.clear();
 
-    let items = help_items(app.mode);
+    // The fleet layer does not advertise single-host keys it refuses (#434).
+    let items = if app.in_fleet() && app.mode == AppMode::Normal {
+        fleet_help_items()
+    } else {
+        help_items(app.mode)
+    };
     let mut spans: Vec<Span> = Vec::new();
     let mut col = area.x;
 
@@ -463,6 +481,15 @@ mod tests {
         assert!(!app.side_panel.open);
         let text = render_status_row(&mut app, 120);
         assert!(text.contains("ops"), "{text}");
+    }
+
+    #[test]
+    fn the_fleet_help_bar_leads_with_ctrl_o_and_hides_refused_keys() {
+        let items = fleet_help_items();
+        assert_eq!(items[0].key, "^O");
+        for refused in ["^T", "!", "^P"] {
+            assert!(items.iter().all(|i| i.key != refused), "{refused} is refused in the fleet");
+        }
     }
 
     /// Render the status bar into a `width`×1 test buffer.

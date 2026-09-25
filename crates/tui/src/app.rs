@@ -2156,7 +2156,7 @@ impl App {
         // The overlay can outlive the switch into the fleet (F3, then Ctrl+O
         // on a group): refuse where the restore happens, not only at F3.
         if self.in_fleet() {
-            self.fleet_refusal("Session restore");
+            self.fleet_refusal(FleetRefusal::SessionRestore);
             return;
         }
 
@@ -2870,7 +2870,7 @@ impl App {
         // F3 toggles the session-selection overlay — same availability as F1/F2.
         if key.code == KeyCode::F(3) && self.mode != AppMode::PasswordInput {
             if self.in_fleet() && !self.session_select_visible {
-                self.fleet_refusal("Session restore");
+                self.fleet_refusal(FleetRefusal::SessionRestore);
                 return;
             }
             if self.session_select_visible {
@@ -3904,7 +3904,7 @@ impl App {
             }
             HelpAction::Terminal => {
                 if self.in_fleet() {
-                    self.fleet_refusal("Terminal");
+                    self.fleet_refusal(FleetRefusal::Terminal);
                 } else if self.connecting.is_some() {
                     self.push_message(ChatBlock::System(
                         "Still connecting: the terminal opens once the host is switched.".into(),
@@ -3914,7 +3914,7 @@ impl App {
                 }
             }
             HelpAction::Password if self.in_fleet() => {
-                self.fleet_refusal("Password input");
+                self.fleet_refusal(FleetRefusal::Password);
             }
             HelpAction::Password => {
                 if self.mode == AppMode::Normal {
@@ -4979,6 +4979,44 @@ impl App {
 
 // ── Fleet layer (#432) ──────────────────────────────────────────────
 
+/// A single-host feature the fleet refuses (#434), each with its reason and
+/// the way to get it anyway — never a silent no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FleetRefusal {
+    /// `Ctrl+T`: a PTY on twelve machines is meaningless.
+    Terminal,
+    /// `!cmd`: a shell escape runs on one host.
+    ShellEscape,
+    /// `Ctrl+P`: a password belongs to one host's login.
+    Password,
+    /// `Ctrl+Shift+F/D`, `/`-picker: whose directory to browse?
+    PathPicker,
+    /// `F3`: a saved session is one tab's conversation.
+    SessionRestore,
+}
+
+impl FleetRefusal {
+    /// One-line explanation with the alternative. Kept under 80 columns: a
+    /// system block renders as one line.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            FleetRefusal::Terminal => {
+                "Terminal is per host: open one with Ctrl+O, then Ctrl+T there."
+            }
+            FleetRefusal::ShellEscape => {
+                "!cmd runs on one host: open it with Ctrl+O and run it there."
+            }
+            FleetRefusal::Password => "Password input is per host: open one with Ctrl+O.",
+            FleetRefusal::PathPicker => {
+                "Paths differ per host: open one with Ctrl+O to browse it."
+            }
+            FleetRefusal::SessionRestore => {
+                "Session restore is per tab: press F3 on an ordinary tab."
+            }
+        }
+    }
+}
+
 /// Opening feed lines of a fleet session: who takes part, under which
 /// limits, and what the layer can and cannot do yet. One system block per
 /// line — a system block renders as a single line.
@@ -5126,11 +5164,8 @@ impl App {
     }
 
     /// Explain that a single-host feature is not available in the fleet.
-    fn fleet_refusal(&mut self, what: &str) {
-        // Kept under 80 columns: a system block renders as one line.
-        self.push_message(ChatBlock::System(format!(
-            "{what}: single-host, not available in the fleet. Ctrl+N opens a tab."
-        )));
+    fn fleet_refusal(&mut self, feature: FleetRefusal) {
+        self.push_message(ChatBlock::System(feature.explanation().into()));
         self.scroll = 0;
     }
 
@@ -5146,6 +5181,10 @@ impl App {
         let is = |en: char, ru: char| {
             ctrl && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&en) || c == ru)
         };
+        if key.code == KeyCode::Enter && !ctrl && self.input.trim_start().starts_with('!') {
+            self.fleet_refusal(FleetRefusal::ShellEscape);
+            return true;
+        }
         if key.code == KeyCode::Enter && !ctrl && !self.input.trim().is_empty() {
             self.push_message(ChatBlock::System(
                 "Not sent: the fleet cannot run the agent yet (message kept in the input)."
@@ -5155,15 +5194,15 @@ impl App {
             return true;
         }
         if is('t', 'е') && !shift {
-            self.fleet_refusal("Terminal");
+            self.fleet_refusal(FleetRefusal::Terminal);
             return true;
         }
         if is('p', 'з') && !shift {
-            self.fleet_refusal("Password input");
+            self.fleet_refusal(FleetRefusal::Password);
             return true;
         }
         if shift && (is('f', 'а') || is('d', 'в')) {
-            self.fleet_refusal("Path picker");
+            self.fleet_refusal(FleetRefusal::PathPicker);
             return true;
         }
         false
@@ -5699,6 +5738,59 @@ mod tests {
     }
 
     #[test]
+    fn every_single_host_feature_explains_itself_in_the_fleet() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        let last = |app: &App| match app.messages.last() {
+            Some(ChatBlock::System(m)) => m.clone(),
+            other => panic!("expected a system block, got {other:?}"),
+        };
+        app.handle_key(ctrl_key('t'));
+        assert_eq!(last(&app), FleetRefusal::Terminal.explanation());
+        app.handle_key(ctrl_key('p'));
+        assert_eq!(last(&app), FleetRefusal::Password.explanation());
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('F'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(last(&app), FleetRefusal::PathPicker.explanation());
+        app.handle_key(key_event(KeyCode::F(3)));
+        assert_eq!(last(&app), FleetRefusal::SessionRestore.explanation());
+        for c in "!ls".chars() {
+            app.handle_key(key_event(KeyCode::Char(c)));
+        }
+        app.handle_key(key_event(KeyCode::Enter));
+        assert_eq!(last(&app), FleetRefusal::ShellEscape.explanation());
+        assert_eq!(app.take_input(), None);
+    }
+
+    #[test]
+    fn refusals_fit_eighty_columns_and_name_the_way_out() {
+        for r in [
+            FleetRefusal::Terminal,
+            FleetRefusal::ShellEscape,
+            FleetRefusal::Password,
+            FleetRefusal::PathPicker,
+            FleetRefusal::SessionRestore,
+        ] {
+            let text = r.explanation();
+            // A system block is one line, indented by four columns.
+            assert!(text.chars().count() <= 76, "{text:?}");
+            assert!(text.contains("Ctrl+O") || text.contains("F3"), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_fleet_has_no_working_directory_to_sync() {
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        // OSC 7 cwd sync needs one terminal on one host; the fleet has none.
+        assert!(app.cwd.is_none());
+        assert!(app.terminal.is_none());
+    }
+
+    #[test]
     fn ctrl_o_lists_groups_and_a_group_row_enters_the_fleet() {
         let mut app = app_with_groups();
         app.open_host_select();
@@ -5906,7 +5998,7 @@ mod tests {
         app.select_session();
         assert!(app.in_fleet());
         assert!(app.ssh_info.is_none() && !app.ctrl_o_needs_connect);
-        assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m.starts_with("Session restore")));
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m == FleetRefusal::SessionRestore.explanation()));
     }
 
     #[test]

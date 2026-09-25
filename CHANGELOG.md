@@ -13,6 +13,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Single-host features in the fleet are refused with a reason and the way to
+  get them (`Ctrl+O` into the host): terminal, `!cmd`, password input, path
+  picker, session restore; the fleet's help bar shows only what works there,
+  and an agent built with `AgentBuilder::fleet(true)` is not offered
+  `read_file`/`list_dir` at all
+  ([#434](https://github.com/devlawey/filar/issues/434)).
+
 - `Ctrl+O` inside the fleet drills into one of its hosts: the host opens as a
   new ordinary tab with its own connection while the fleet stays open, and
   the overlay there lists only the fleet's hosts

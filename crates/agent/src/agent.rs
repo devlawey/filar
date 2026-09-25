@@ -37,6 +37,11 @@ const DEFAULT_MAX_OUTPUT_CHARS: usize = 10_000;
 /// Maximum number of retries for missing explanation in Explain mode.
 const MAX_MISSING_EXPLANATION_RETRIES: u32 = 2;
 
+/// Appended to the system prompt when the agent works over a fleet (#434).
+const FLEET_PROMPT: &str = "FLEET: you are working over a group of hosts, not one host. \
+read_file and list_dir are not available: there is no single host to read from. \
+If one host needs a closer look, ask the user to open it in its own tab.";
+
 /// System prompt block appended when `CommandConfirmMode::Explain` is active.
 const SAFE_MODE_PROMPT: &str = r#"
 
@@ -173,6 +178,9 @@ pub struct Agent {
     session_id: String,
     /// True when commands run on the local machine (vs SSH).
     is_local: bool,
+    /// Working over a fleet (#434): single-host tools are neither offered
+    /// nor executed.
+    fleet: bool,
 }
 
 /// Builder for [`Agent`].
@@ -196,6 +204,7 @@ pub struct AgentBuilder {
     arbiter_model_name: Option<String>,
     session_id: Option<String>,
     is_local: bool,
+    fleet: bool,
 }
 
 impl AgentBuilder {
@@ -221,6 +230,7 @@ impl AgentBuilder {
             arbiter_model_name: None,
             session_id: None,
             is_local: false,
+            fleet: false,
         }
     }
 
@@ -355,6 +365,14 @@ impl AgentBuilder {
         self
     }
 
+    /// Run the agent over a fleet (#434): `read_file` and `list_dir` are left
+    /// out of the tool set, refused if called anyway, and the system prompt
+    /// says so.
+    pub fn fleet(mut self, fleet: bool) -> Self {
+        self.fleet = fleet;
+        self
+    }
+
     /// Mark whether the executor targets the local machine (affects background spawn).
     pub fn is_local(mut self, is_local: bool) -> Self {
         self.is_local = is_local;
@@ -401,6 +419,11 @@ impl AgentBuilder {
         let mut system_prompt = self.system_prompt.unwrap_or_else(||
             build_system_prompt(false, None, cfg!(windows))
         );
+        // The prompt must match the tool set the model is given (AGENTS.md).
+        if self.fleet {
+            system_prompt.push('\n');
+            system_prompt.push_str(FLEET_PROMPT);
+        }
         // Append SAFE MODE block in Explain mode.
         if self.confirm_mode == CommandConfirmMode::Explain {
             system_prompt.push('\n');
@@ -433,6 +456,7 @@ impl AgentBuilder {
                 .session_id
                 .unwrap_or_else(|| "default".into()),
             is_local: self.is_local,
+            fleet: self.fleet,
         })
     }
 }
@@ -576,7 +600,11 @@ impl Agent {
         messages.extend_from_slice(history);
         messages.push(ChatMessage::user(user_prompt));
 
-        let tool_defs = tools::tool_definitions(self.confirm_mode);
+        let tool_defs = if self.fleet {
+            tools::fleet_tool_definitions(self.confirm_mode)
+        } else {
+            tools::tool_definitions(self.confirm_mode)
+        };
 
         info!(prompt = %user_prompt, "agent loop started");
 
@@ -701,6 +729,15 @@ impl Agent {
         };
 
         info!(tool = ?parsed.kind, command = %parsed.command, "processing tool call");
+
+        // A single-host tool called in a fleet anyway (#434): nothing runs,
+        // the model is told why and what to use instead.
+        if self.fleet && matches!(parsed.kind, tools::ToolKind::ReadFile | tools::ToolKind::ListDir) {
+            return Ok(ChatMessage::tool(
+                &tc.id,
+                tools::fleet_single_host_refusal(&tc.name),
+            ));
+        }
 
         let display_command = match parsed.kind {
             tools::ToolKind::StartBackgroundJob => {
@@ -1896,6 +1933,84 @@ mod tests {
             agent.system_prompt.contains("SAFE MODE IS ACTIVE"),
             "system prompt must contain SAFE MODE block in Explain mode"
         );
+    }
+
+    // ── Fleet tool set (#434) ─────────────────────────────────────────
+
+    /// LLM mock that also records every request it was sent.
+    struct RecordingLlm {
+        inner: MockLlm,
+        requests: std::sync::Mutex<Vec<ChatRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for RecordingLlm {
+        async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
+            self.requests.lock().unwrap().push(request.clone());
+            self.inner.chat(request).await
+        }
+    }
+
+    fn fleet_agent(llm: Arc<RecordingLlm>, executor: Arc<MockExecutor>, fleet: bool) -> Agent {
+        Agent::builder()
+            .llm(llm)
+            .executor(executor)
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .confirm_mode(CommandConfirmMode::Always)
+            .fleet(fleet)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_fleet_agent_is_never_offered_single_host_tools() {
+        let llm = Arc::new(RecordingLlm {
+            inner: MockLlm::new(vec![ChatResponse::text("ok")]),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        fleet_agent(llm.clone(), executor, true).run("check the fleet", &[]).await.unwrap();
+        let requests = llm.requests.lock().unwrap();
+        let names: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(!names.contains(&"read_file"), "{names:?}");
+        assert!(!names.contains(&"list_dir"), "{names:?}");
+        assert!(names.contains(&"run_command"));
+        // The prompt says so, matching the tool set.
+        assert!(requests[0].messages[0].content.contains("read_file and list_dir are not available"));
+    }
+
+    #[tokio::test]
+    async fn a_single_host_agent_keeps_its_tools_and_prompt() {
+        let llm = Arc::new(RecordingLlm {
+            inner: MockLlm::new(vec![ChatResponse::text("ok")]),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        fleet_agent(llm.clone(), executor, false).run("hi", &[]).await.unwrap();
+        let requests = llm.requests.lock().unwrap();
+        let names: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"read_file") && names.contains(&"list_dir"));
+        assert!(!requests[0].messages[0].content.contains("FLEET:"));
+    }
+
+    #[tokio::test]
+    async fn a_single_host_tool_called_in_a_fleet_runs_nothing_and_says_why() {
+        let call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "/etc/nginx/nginx.conf" }),
+        }]);
+        let llm = Arc::new(RecordingLlm {
+            inner: MockLlm::new(vec![call, ChatResponse::text("understood")]),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        fleet_agent(llm.clone(), executor.clone(), true).run("read nginx.conf", &[]).await.unwrap();
+        assert!(executor.last_command.lock().unwrap().is_empty(), "nothing executed");
+        let requests = llm.requests.lock().unwrap();
+        let reply = requests[1].messages.last().expect("tool result");
+        assert_eq!(reply.tool_call_id.as_deref(), Some("call_1"));
+        assert!(reply.content.starts_with("Error: read_file is not available in a fleet"), "{}", reply.content);
     }
 
     #[test]
