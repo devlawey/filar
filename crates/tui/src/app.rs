@@ -423,6 +423,9 @@ pub struct Session {
     /// entered (#436). Hosts without them take no part. `Some` exactly when
     /// `fleet` is.
     pub fleet_credentials: Option<filar_agent::fleet_creds::FleetCredentials>,
+    /// The last fleet operation's person-facing view (#438), shown in the
+    /// side panel. Never part of `messages`: it carries host output.
+    pub fleet_view: Option<filar_agent::fleet_view::FleetView>,
     /// `Some(previous label)` while a Ctrl+O switch of this tab to another
     /// host is in flight (#433). Until the transport actually swaps, the tab
     /// still runs on its old executor, so nothing may be sent from it; on a
@@ -973,6 +976,7 @@ impl Session {
             transcript_error_shown: false,
             fleet: None,
             fleet_credentials: None,
+            fleet_view: None,
             connecting: None,
         }
     }
@@ -4384,8 +4388,13 @@ impl App {
     /// A Command block is collapsed by default if its output has more than 6 lines.
     /// A Summary block is always collapsed by default: it is there to be
     /// auditable, not to push the conversation off the screen.
-    fn default_collapsed_for(msg: &ChatBlock) -> bool {
+    ///
+    /// In the fleet (#438) any command block with more than its headline is
+    /// collapsed: the difference table lives in the side panel, and the feed
+    /// keeps one line per operation rather than a sheet of text.
+    fn default_collapsed_for(msg: &ChatBlock, fleet: bool) -> bool {
         match msg {
+            ChatBlock::Command { output: Some(out), .. } if fleet => out.lines().count() > 1,
             ChatBlock::Command { output: Some(out), .. } => out.lines().count() > 6,
             ChatBlock::Summary { .. } => true,
             _ => false,
@@ -4395,6 +4404,7 @@ impl App {
     /// Compute the set of collapsed block indices from `collapsed_overrides`
     /// and defaults.  `collapsed_overrides` can force either state.
     pub fn collapsed_set(&self) -> HashSet<usize> {
+        let fleet = self.in_fleet();
         self.messages
             .iter()
             .enumerate()
@@ -4403,7 +4413,7 @@ impl App {
                     .collapsed_overrides
                     .get(&idx)
                     .copied()
-                    .unwrap_or_else(|| Self::default_collapsed_for(msg));
+                    .unwrap_or_else(|| Self::default_collapsed_for(msg, fleet));
                 if is_collapsed { Some(idx) } else { None }
             })
             .collect()
@@ -4412,6 +4422,7 @@ impl App {
     /// Toggle the collapse state of a command block.
     /// Bumps `message_rev` so the layout cache rebuilds.
     fn toggle_collapse(&mut self, block_idx: usize) {
+        let fleet = self.in_fleet();
         let is_collapsed = self
             .collapsed_overrides
             .get(&block_idx)
@@ -4419,7 +4430,7 @@ impl App {
             .unwrap_or_else(|| {
                 self.messages
                     .get(block_idx)
-                    .is_some_and(Self::default_collapsed_for)
+                    .is_some_and(|m| Self::default_collapsed_for(m, fleet))
             });
         self.collapsed_overrides.insert(block_idx, !is_collapsed);
         self.message_rev = self.message_rev.wrapping_add(1);
@@ -4451,6 +4462,7 @@ impl App {
             TuiEvent::PasswordNeeded { session_id, .. } => *session_id,
             TuiEvent::HistoryCompacted { session_id, .. } => *session_id,
             TuiEvent::Notice { session_id, .. } => *session_id,
+            TuiEvent::FleetSummary { session_id, .. } => *session_id,
             TuiEvent::CompactionStarted { session_id, .. } => *session_id,
         };
 
@@ -4709,6 +4721,29 @@ impl App {
                 // Feed-only: the run continues, so `agent_running`, the mode
                 // and the cancellation token are all left alone.
                 self.push_message(ChatBlock::System(text));
+            }
+            TuiEvent::FleetSummary { view, .. } => {
+                // Panel-only (#438): the summary replaces the previous one,
+                // the selection goes back to the top and nothing is expanded.
+                // The feed gets nothing — its command block already has the
+                // headline — and neither does the model.
+                // Operation ids only grow, so an older one arriving late — a
+                // cancelled run still winding down (#437) while the next one
+                // already reported — never replaces the newer summary.
+                let stale = self
+                    .active_session()
+                    .fleet_view
+                    .as_ref()
+                    .is_some_and(|current| current.operation > view.operation);
+                if !stale {
+                    self.active_session_mut().fleet_view = Some(view);
+                    if !is_background {
+                        self.side_panel.selected = 0;
+                        self.side_panel.expanded.clear();
+                        self.side_panel.scroll = 0;
+                    }
+                }
+                auto_scroll = false;
             }
             TuiEvent::HistoryCompacted { boundary, summary, usage, profile, .. } => {
                 // Counted here, before the summary is judged: the tokens were
@@ -5027,6 +5062,64 @@ impl App {
         )));
         self.scroll = 0;
         true
+    }
+}
+
+/// An app in the fleet layer over three `web` hosts, with `view` as the
+/// last operation's summary (#438). For tests across the crate.
+#[cfg(test)]
+pub(crate) fn test_fleet_app(view: filar_agent::fleet_view::FleetView) -> App {
+    let target = |name: &str| filar_core::SshTarget {
+        name: name.into(),
+        host: format!("{name}.example"),
+        port: 22,
+        user: "ops".into(),
+        auth: filar_core::SshAuth::Key { path: None },
+        host_key_policy: filar_core::HostKeyPolicy::Tofu,
+        tags: vec!["web".into()],
+    };
+    let mut app = App::new("local".into(), CommandConfirmMode::Always);
+    app.ssh_targets = vec![target("web-1"), target("web-2"), target("web-3")];
+    app.host_groups = vec![filar_core::HostGroup {
+        name: "web".into(),
+        match_tags: vec!["web".into()],
+        ..Default::default()
+    }];
+    app.enter_fleet("web");
+    app.active_session_mut().fleet_view = Some(view);
+    app
+}
+
+/// A summary of four hosts: two agree, one differs with a long multi-line
+/// answer, one never answered, one is not applicable. For tests (#438).
+#[cfg(test)]
+pub(crate) fn test_fleet_view() -> filar_agent::fleet_view::FleetView {
+    use filar_agent::fleet_result::HostState;
+    use filar_agent::fleet_view::{FleetView, GroupRole, ViewDropped, ViewGroup};
+    FleetView {
+        operation: filar_core::FleetOperation::open(
+            &filar_core::HostGroup::default(),
+            &[],
+        )
+        .id(),
+        command: "cat /etc/os-release".into(),
+        headline: "operation #9: 3 of 5 hosts answered, 1 did not answer — 2 ok, 1 differs, 1 no contact, 1 n/a".into(),
+        groups: vec![
+            ViewGroup {
+                hosts: vec!["web-1".into(), "web-2".into()],
+                sample: "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"".into(),
+                role: GroupRole::Baseline,
+            },
+            ViewGroup {
+                hosts: vec!["web-3".into()],
+                sample: format!("PRETTY_NAME=\"Ubuntu {}\"\nVERSION_ID=\"22.04\"\nID=ubuntu", "x".repeat(120)),
+                role: GroupRole::Differs,
+            },
+        ],
+        dropped: vec![
+            ViewDropped { host: "db-1".into(), state: HostState::NoContact },
+            ViewDropped { host: "win-1".into(), state: HostState::NotApplicable },
+        ],
     }
 }
 
@@ -5390,6 +5483,35 @@ impl App {
         })
     }
 
+    /// What the side panel shows right now (#438): the fleet's difference
+    /// table in the fleet layer once an operation has run there, the
+    /// operations tree everywhere else.
+    pub fn panel_content(&self) -> crate::side_panel::PanelContent {
+        if self.in_fleet() && self.active_session().fleet_view.is_some() {
+            crate::side_panel::PanelContent::FleetSummary
+        } else {
+            crate::side_panel::PanelContent::Operations
+        }
+    }
+
+    /// Whether the panel has something to show, so a wide terminal docks it.
+    pub fn panel_has_content(&self) -> bool {
+        match self.panel_content() {
+            crate::side_panel::PanelContent::FleetSummary => true,
+            crate::side_panel::PanelContent::Operations => !self.operations.is_empty(),
+        }
+    }
+
+    /// Selectable rows of what the panel shows.
+    fn panel_rows(&self) -> usize {
+        match (self.panel_content(), self.active_session().fleet_view.as_ref()) {
+            (crate::side_panel::PanelContent::FleetSummary, Some(view)) => {
+                crate::side_panel::summary_rows(view).len()
+            }
+            _ => crate::side_panel::tree_rows(&self.operations).len(),
+        }
+    }
+
     /// Operation counts for the status-bar counter.
     pub fn operation_counts(&self) -> crate::ops::OpCounts {
         crate::ops::OpCounts::of(&self.operations)
@@ -5418,9 +5540,48 @@ impl App {
         if !self.side_panel.open {
             return false;
         }
-        let rows = crate::side_panel::tree_rows(&self.operations).len();
+        let rows = self.panel_rows();
         match key.code {
             KeyCode::Esc => self.side_panel.close(),
+            // Expand / collapse the selected group of the fleet summary
+            // (#438). Only there: in the operations tree these keys are not
+            // the panel's and fall through to the input line.
+            // Scroll the summary's body by a few lines (#438).
+            KeyCode::PageDown
+                if self.panel_content() == crate::side_panel::PanelContent::FleetSummary =>
+            {
+                self.side_panel.scroll = self.side_panel.scroll.saturating_add(5);
+                true
+            }
+            KeyCode::PageUp
+                if self.panel_content() == crate::side_panel::PanelContent::FleetSummary =>
+            {
+                self.side_panel.scroll = self.side_panel.scroll.saturating_sub(5);
+                true
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Left
+                if self.panel_content() == crate::side_panel::PanelContent::FleetSummary =>
+            {
+                let selected = self.side_panel.selected;
+                let group = self.active_session().fleet_view.as_ref().and_then(|view| {
+                    match crate::side_panel::summary_rows(view).get(selected) {
+                        Some(crate::side_panel::SummaryRow::Group(g)) => Some(*g),
+                        _ => None,
+                    }
+                });
+                if let Some(g) = group {
+                    match key.code {
+                        KeyCode::Right => {
+                            self.side_panel.expanded.insert(g);
+                        }
+                        KeyCode::Left => {
+                            self.side_panel.expanded.remove(&g);
+                        }
+                        _ => self.side_panel.toggle_expanded(g),
+                    }
+                }
+                true
+            }
             KeyCode::Up => {
                 self.side_panel.move_selection(-1, rows);
                 true
@@ -5729,6 +5890,83 @@ mod tests {
         assert_eq!(tabs_after, tabs_before);
         assert!(app.take_pending_local_executors().is_empty());
         assert_eq!(executors_before, 1);
+    }
+
+    // ── Fleet summary panel (#438) ──────────────────────────────────
+
+    #[test]
+    fn a_fleet_summary_goes_to_the_panel_and_never_to_the_feed() {
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        let before = app.messages.len();
+        assert_eq!(app.panel_content(), crate::side_panel::PanelContent::Operations);
+        let sid = app.sessions[app.active].id;
+        app.handle_agent_event(TuiEvent::FleetSummary { session_id: sid, view: test_fleet_view() });
+        assert_eq!(app.messages.len(), before, "host output never enters the feed or history");
+        assert_eq!(app.panel_content(), crate::side_panel::PanelContent::FleetSummary);
+        assert!(app.panel_has_content(), "a wide terminal docks the table");
+        // Outside the fleet the panel keeps showing operations.
+        app.leave_fleet_view();
+        assert_eq!(app.panel_content(), crate::side_panel::PanelContent::Operations);
+    }
+
+    #[test]
+    fn a_late_summary_of_an_older_operation_does_not_replace_a_newer_one() {
+        let older = test_fleet_view();
+        let mut newer = test_fleet_view();
+        newer.command = "uname -r".into();
+        assert!(newer.operation > older.operation, "ids grow");
+        let mut app = test_fleet_app(newer);
+        let sid = app.sessions[app.active].id;
+        // A cancelled run winding down reports after the next one did (#437).
+        app.handle_agent_event(TuiEvent::FleetSummary { session_id: sid, view: older });
+        let shown = app.active_session().fleet_view.as_ref().expect("view");
+        assert_eq!(shown.command, "uname -r", "the newer summary stays");
+    }
+
+    #[test]
+    fn page_keys_scroll_the_summary_and_moving_resets_it() {
+        let mut app = test_fleet_app(test_fleet_view());
+        let key = |c| crossterm::event::KeyEvent::new(c, crossterm::event::KeyModifiers::NONE);
+        app.side_panel.open = true;
+        app.handle_key(key(crossterm::event::KeyCode::PageDown));
+        assert_eq!(app.side_panel.scroll, 5);
+        app.handle_key(key(crossterm::event::KeyCode::PageUp));
+        app.handle_key(key(crossterm::event::KeyCode::PageUp));
+        assert_eq!(app.side_panel.scroll, 0);
+        app.handle_key(key(crossterm::event::KeyCode::PageDown));
+        app.handle_key(key(crossterm::event::KeyCode::Down));
+        assert_eq!(app.side_panel.scroll, 0, "a new selection starts at its own row");
+    }
+
+    #[test]
+    fn enter_in_the_open_panel_expands_the_selected_group() {
+        let mut app = test_fleet_app(test_fleet_view());
+        let key = |c| crossterm::event::KeyEvent::new(c, crossterm::event::KeyModifiers::NONE);
+        app.side_panel.open = true;
+        app.handle_key(key(crossterm::event::KeyCode::Down));
+        assert_eq!(app.side_panel.selected, 1);
+        app.handle_key(key(crossterm::event::KeyCode::Enter));
+        assert!(app.side_panel.expanded.contains(&1), "Enter expands the second group");
+        app.handle_key(key(crossterm::event::KeyCode::Enter));
+        assert!(!app.side_panel.expanded.contains(&1), "and collapses it again");
+        // A dropped host has nothing to expand.
+        app.handle_key(key(crossterm::event::KeyCode::Down));
+        app.handle_key(key(crossterm::event::KeyCode::Enter));
+        assert!(app.side_panel.expanded.is_empty());
+    }
+
+    #[test]
+    fn a_fleet_command_block_shows_one_line_in_the_feed() {
+        let mut app = test_fleet_app(test_fleet_view());
+        app.push_message(ChatBlock::Command {
+            command: "uname -r".into(),
+            explanation: String::new(),
+            output: Some("operation #3: 3 of 3 hosts answered\noperation #3 · ad-hoc\nsame on 3".into()),
+            approved: true,
+        });
+        let idx = app.messages.len() - 1;
+        assert!(app.collapsed_set().contains(&idx), "collapsed to its headline in the fleet");
     }
 
     // ── Fleet cancellation (#437) ───────────────────────────────────

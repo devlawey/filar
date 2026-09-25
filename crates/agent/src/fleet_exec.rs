@@ -51,6 +51,14 @@
 //! partial result keeps awaiting `run` after calling `cancel` instead of
 //! dropping it. With no `run` in flight (one that was dropped, say) it
 //! falls back to forwarding Ctrl-C to every connected host.
+//!
+//! # What the person sees
+//!
+//! Besides the fold for the model, every operation — a cancelled one too —
+//! is turned into a [`FleetView`]: groups with a sample of what the hosts
+//! answered, and the hosts without a value (#438). It goes to the observer
+//! set with [`FleetExecutor::with_observer`], i.e. to the UI only. That
+//! path carries host output; nothing on it reaches the tool result.
 
 use std::sync::Arc;
 
@@ -70,6 +78,7 @@ use crate::fleet_creds::FleetCredentials;
 use crate::fleet_fold::fold;
 use crate::fleet_result::{NotAsked, OperationResult};
 use crate::fleet_run::{run_on_fleet_until, HostRun, HostTask};
+use crate::fleet_view::FleetView;
 use crate::preprocess::PreprocessorRegistry;
 
 /// Opens a connection to one fleet host.
@@ -99,7 +108,13 @@ pub struct FleetExecutor {
     current: std::sync::Mutex<Option<(u64, CancellationToken)>>,
     /// Numbers the runs for `current`.
     runs: std::sync::atomic::AtomicU64,
+    /// Receives the person-facing view of every operation (#438).
+    observer: Option<FleetObserver>,
 }
+
+/// Receives the [`FleetView`] of every operation — for the UI, never the
+/// model.
+pub type FleetObserver = Arc<dyn Fn(FleetView) + Send + Sync>;
 
 /// Clears [`FleetExecutor::current`] when its `run` ends — returned or
 /// dropped — so a later `cancel` does not fire a token nobody watches.
@@ -143,7 +158,15 @@ impl FleetExecutor {
             connect,
             current: std::sync::Mutex::new(None),
             runs: std::sync::atomic::AtomicU64::new(0),
+            observer: None,
         })
+    }
+
+    /// Hand the person-facing view of every operation to `observer` (#438).
+    /// The view carries host output: route it to the UI, never the model.
+    pub fn with_observer(mut self, observer: FleetObserver) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Register a new run as the one `cancel` stops.
@@ -297,6 +320,9 @@ impl CommandExecutor for FleetExecutor {
         let registry = PreprocessorRegistry::with_builtins();
         let table = fold(&check, &tasks, &report, &mut result, &registry)?;
         let summary = result.summary();
+        if let Some(observer) = &self.observer {
+            observer(FleetView::build(&op, command, &report, &table, &summary));
+        }
 
         Ok(CommandResult {
             stdout: format!("{}\n{}", summary.headline(), table),
@@ -694,5 +720,42 @@ mod tests {
         exec.run("uptime").await.expect("run");
         assert!(exec.current.lock().expect("lock").is_none(), "the finished run cleared itself");
         exec.cancel().await.expect("cancel with no run in flight");
+    }
+
+    #[tokio::test]
+    async fn the_person_gets_samples_the_model_never_does() {
+        use crate::fleet_result::HostState;
+        use crate::fleet_view::GroupRole;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let seen: Arc<std::sync::Mutex<Vec<FleetView>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let exec = executor(
+            &fleet(&["web-1", "web-2", "web-3", "web-4"]),
+            connector(&["web-4"], &[("web-3", "6.1.0-other")], attempts, runs),
+        )
+        .with_observer(Arc::new(move |view| sink.lock().expect("lock").push(view)));
+
+        let out = exec.run("uname -r").await.expect("fleet run");
+        let views = seen.lock().expect("lock");
+        let view = views.first().expect("one view per operation");
+        assert_eq!(view.command, "uname -r");
+        assert_eq!(view.headline, out.stdout.lines().next().expect("headline"));
+
+        // Aggregate: one sample per group, not one output per host.
+        assert_eq!(view.groups.len(), 2);
+        assert_eq!(view.groups[0].hosts, ["web-1", "web-2"]);
+        assert_eq!(view.groups[0].role, GroupRole::Baseline);
+        assert_eq!(view.groups[0].sample, "same");
+        assert_eq!(view.groups[1].hosts, ["web-3"]);
+        assert_eq!(view.groups[1].role, GroupRole::Differs);
+        assert_eq!(view.groups[1].sample, "6.1.0-other");
+        // The silent host is listed apart, not lost.
+        assert_eq!(view.dropped.len(), 1);
+        assert_eq!(view.dropped[0].host, "web-4");
+        assert_eq!(view.dropped[0].state, HostState::NoContact);
+
+        // The model's copy still has digests only.
+        assert!(!out.stdout.contains("6.1.0-other"), "{}", out.stdout);
     }
 }

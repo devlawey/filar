@@ -22,6 +22,9 @@
 //!   command out and returns the fold (Stage 2.0, fleet).
 //! - Fleet credentials: each host's own secret, resolved at fleet entry; a
 //!   host without one drops out as skipped (Stage 2.0, fleet).
+//! - Fleet view: the person-facing aggregate of an operation — groups of
+//!   agreeing hosts with a sample answer, and the hosts without one — for
+//!   the UI only, never the model (Stage 2.0, fleet).
 
 pub mod agent;
 pub mod arbiter;
@@ -35,6 +38,7 @@ pub mod fleet_gate;
 pub mod fleet_result;
 pub mod fleet_retry;
 pub mod fleet_run;
+pub mod fleet_view;
 pub mod long_wait;
 pub mod openai_compat;
 pub mod os_probe;

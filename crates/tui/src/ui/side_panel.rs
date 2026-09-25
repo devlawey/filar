@@ -14,8 +14,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::App;
 use crate::ops::{HostOpState, Operation};
-use crate::side_panel::{tree_rows, PanelContent, TreeRow};
-use crate::ui::text::strip_emoji;
+use crate::side_panel::{summary_rows, tree_rows, PanelContent, SummaryRow, TreeRow};
+use crate::ui::text::{sanitize_output, strip_emoji, wrap_text};
 use crate::ui::theme::Glyphs;
 
 /// Render the side panel into `area`.
@@ -32,8 +32,10 @@ fn render_side_panel_with_glyphs(f: &mut Frame, app: &App, area: Rect, glyphs: &
     } else {
         app.theme.muted()
     };
-    let title = match app.side_panel.content {
+    let content = app.panel_content();
+    let title = match content {
         PanelContent::Operations => " operations ",
+        PanelContent::FleetSummary => " fleet summary ",
     };
     let block = Block::default()
         .borders(Borders::LEFT)
@@ -41,8 +43,174 @@ fn render_side_panel_with_glyphs(f: &mut Frame, app: &App, area: Rect, glyphs: &
         .title(Span::styled(title, app.theme.dim()));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    match app.side_panel.content {
+    match content {
         PanelContent::Operations => render_operations(f, app, inner, glyphs),
+        PanelContent::FleetSummary => render_fleet_summary(f, app, inner, glyphs),
+    }
+}
+
+/// Most lines an expanded group shows; the rest are counted, not drawn.
+const MAX_EXPANDED_SAMPLE_LINES: usize = 200;
+
+/// The fleet's difference table (#438): an aggregate, not twelve streams.
+///
+/// One entry per group of hosts that answered the same — its hosts and a
+/// sample answer, one clamped line until expanded — then every host with
+/// no value (`no contact`, `n/a`, `cancelled`, …) in a block of its own,
+/// so none of them is lost among the groups. Every mark comes with a word,
+/// and the ASCII glyph set draws the same table.
+fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
+    use filar_agent::fleet_view::GroupRole;
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let Some(view) = app.active_session().fleet_view.as_ref() else {
+        return;
+    };
+    let width = area.width as usize;
+    let rows = summary_rows(view);
+    let selected = app.side_panel.selected.min(rows.len().saturating_sub(1));
+
+    // Header: the command and the headline, which always says how many
+    // hosts did not answer (#428).
+    let mut head: Vec<Line> = vec![Line::from(Span::styled(
+        fit(&format!(" $ {}", one_line(&view.command)), width),
+        app.theme.command_style(),
+    ))];
+    for l in wrap_text(&view.headline, width.saturating_sub(1).max(1)) {
+        head.push(Line::from(Span::styled(format!(" {l}"), app.theme.dim())));
+    }
+    let sep = glyphs.separator.repeat(width / glyphs.separator.width().max(1));
+    head.push(Line::from(Span::styled(sep.clone(), app.theme.muted())));
+
+    // Body: one block of lines per selectable row, remembering where each
+    // row starts so the selection can be scrolled into view.
+    let mut body: Vec<Line> = Vec::new();
+    let mut starts: Vec<usize> = Vec::with_capacity(rows.len());
+    if view.groups.is_empty() {
+        body.push(Line::from(Span::styled(" no host answered", app.theme.muted())));
+    }
+    for (i, row) in rows.iter().enumerate() {
+        if let SummaryRow::Dropped(0) = row {
+            body.push(Line::from(Span::styled(" not compared:", app.theme.dim())));
+        }
+        starts.push(body.len());
+        let highlight = i == selected && app.side_panel.open;
+        match *row {
+            SummaryRow::Group(g) => {
+                let group = &view.groups[g];
+                let (mark, word, style) = match group.role {
+                    GroupRole::Baseline => (glyphs.fleet_same, "same on", app.theme.success_fg()),
+                    GroupRole::Differs => (glyphs.fleet_differs, "differs on", Style::default().fg(app.theme.danger)),
+                    GroupRole::Split => (glyphs.fleet_split, "split, group of", app.theme.warning_fg()),
+                };
+                let expanded = app.side_panel.expanded.contains(&g);
+                // Host output: control characters and escapes go, like in the
+                // feed's command blocks — but every script stays. `strip_emoji`
+                // would drop CJK and report a real answer as empty.
+                let lines: Vec<String> = sanitize_output(&group.sample)
+                    .replace('\t', "    ")
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                let arrow = if expanded { glyphs.expand_arrow } else { glyphs.collapse_arrow };
+                let title = format!(
+                    " {} {} {}",
+                    word,
+                    group.hosts.len(),
+                    group.hosts.join(", ")
+                );
+                let mut line = Line::from(vec![
+                    Span::styled(format!("{mark} "), style),
+                    Span::styled(arrow, app.theme.muted()),
+                    Span::raw(fit(&title, width.saturating_sub(mark.width() + 1 + arrow.width()))),
+                ]);
+                if highlight {
+                    line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+                body.push(line);
+                if lines.is_empty() {
+                    body.push(Line::from(Span::styled("   (empty output)", app.theme.muted())));
+                } else if expanded {
+                    for l in lines.iter().take(MAX_EXPANDED_SAMPLE_LINES) {
+                        for w in wrap_text(l, width.saturating_sub(3).max(1)) {
+                            body.push(Line::from(Span::raw(format!("   {w}"))));
+                        }
+                    }
+                    if lines.len() > MAX_EXPANDED_SAMPLE_LINES {
+                        body.push(Line::from(Span::styled(
+                            format!("   … {} more lines", lines.len() - MAX_EXPANDED_SAMPLE_LINES),
+                            app.theme.muted(),
+                        )));
+                    }
+                } else {
+                    // One line, clamped; more is said, not hidden.
+                    let first = if lines.len() > 1 {
+                        format!("{} (+{} lines)", lines[0], lines.len() - 1)
+                    } else {
+                        lines[0].clone()
+                    };
+                    body.push(Line::from(Span::raw(fit(&format!("   {first}"), width))));
+                }
+            }
+            SummaryRow::Dropped(d) => {
+                let host = &view.dropped[d];
+                let (mark, style) = dropped_mark(app, host.state, glyphs);
+                let mut line = Line::from(vec![
+                    Span::styled(format!(" {mark}"), style),
+                    Span::raw(fit(
+                        &format!(" {} {} {}", host.host, glyphs.middle_dot, host.state.label()),
+                        width.saturating_sub(mark.width() + 1),
+                    )),
+                ]);
+                if highlight {
+                    line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+                body.push(line);
+            }
+        }
+    }
+
+    let hint = Line::from(Span::styled(
+        fit(
+            &format!(
+ " {}{} select {d} Enter expand {d} PgUp/PgDn scroll {d} Esc close",
+                glyphs.arrow_up,
+                glyphs.arrow_down,
+                d = glyphs.middle_dot
+            ),
+            width,
+        ),
+        app.theme.muted(),
+    ));
+
+    // Scroll the body so the selected row's first line stays visible, then
+    // by `PgUp`/`PgDn` on top — so an expanded answer taller than the panel
+    // can be read line by line rather than skipped past.
+    let body_h = (area.height as usize).saturating_sub(head.len() + 1);
+    let anchor = starts.get(selected).copied().unwrap_or(0);
+    let max_offset = body.len().saturating_sub(body_h);
+    let offset = (anchor.saturating_sub(body_h.saturating_sub(2)) + app.side_panel.scroll)
+        .min(max_offset);
+    let mut lines = head;
+    lines.extend(body.into_iter().skip(offset).take(body_h));
+    while lines.len() + 1 < area.height as usize {
+        lines.push(Line::from(""));
+    }
+    lines.push(hint);
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Mark for a host without a value: silence and errors stand out, a host
+/// nobody asked (or the user stopped) does not.
+fn dropped_mark(app: &App, state: filar_agent::fleet_result::HostState, glyphs: &Glyphs) -> (&'static str, Style) {
+    use filar_agent::fleet_result::HostState;
+    match state {
+        HostState::NoContact | HostState::TimedOut | HostState::ExecutionError => {
+            (glyphs.op_failed, Style::default().fg(app.theme.danger))
+        }
+        HostState::Cancelled => (glyphs.op_cancelled, app.theme.muted()),
+        _ => (glyphs.middle_dot, app.theme.muted()),
     }
 }
 
@@ -354,5 +522,81 @@ mod tests {
         assert_eq!(fit("abc", 4), "abc");
         assert_eq!(fit("абвгд", 3), "аб…");
         assert_eq!(fit("x", 0), "");
+    }
+
+    // ── Fleet summary (#438) ───────────────────────────────────────
+
+    #[test]
+    fn the_fleet_table_reads_at_eighty_columns() {
+        // At 80 columns the drawer is the feed minus an 8-column strip.
+        let app = crate::app::test_fleet_app(crate::app::test_fleet_view());
+        let text = render(&app, 72, 24, Glyphs::detect());
+        assert!(text.contains("fleet summary"), "{text}");
+        assert!(text.contains("$ cat /etc/os-release"), "{text}");
+        assert!(text.contains("same on 2 web-1, web-2"), "{text}");
+        assert!(text.contains("differs on 1 web-3"), "{text}");
+        // The long answer is clamped to one line, and says there is more.
+        assert!(text.contains("…"), "{text}");
+        assert!(!text.contains("VERSION_ID"), "collapsed: only the first line: {text}");
+        // Hosts without a value are listed apart, each with its reason.
+        assert!(text.contains("not compared:"), "{text}");
+        assert!(text.contains("db-1") && text.contains("no contact"), "{text}");
+        assert!(text.contains("win-1") && text.contains("n/a"), "{text}");
+        for line in text.lines() {
+            assert!(line.chars().count() <= 72, "nothing spills past the panel: {line:?}");
+        }
+    }
+
+    #[test]
+    fn an_expanded_group_shows_its_whole_answer() {
+        let mut app = crate::app::test_fleet_app(crate::app::test_fleet_view());
+        app.side_panel.expanded.insert(1);
+        let text = render(&app, 72, 30, Glyphs::detect());
+        assert!(text.contains("VERSION_ID=\"22.04\""), "{text}");
+        assert!(text.contains("ID=ubuntu"), "{text}");
+    }
+
+    #[test]
+    fn the_fleet_table_is_drawn_in_ascii_mode() {
+        let app = crate::app::test_fleet_app(crate::app::test_fleet_view());
+        let text = render(&app, 72, 24, &Glyphs::ASCII);
+        for bad in ["≠", "≈", "▸", "▾", "·", "─", "✗", "↑", "↓"] {
+            assert!(!text.contains(bad), "ASCII mode must not draw {bad:?}:\n{text}");
+        }
+        // Marks keep their words, so nothing depends on a glyph or colour.
+        assert!(text.contains("= +") && text.contains("same on"), "{text}");
+        assert!(text.contains("!=") && text.contains("differs on"), "{text}");
+        assert!(text.contains("no contact"), "{text}");
+    }
+
+    #[test]
+    fn a_non_latin_answer_is_shown_not_reported_empty() {
+        let mut view = crate::app::test_fleet_view();
+        view.groups[0].sample = "你好，世界".into();
+        let app = crate::app::test_fleet_app(view);
+        let text = render(&app, 72, 24, Glyphs::detect());
+        assert!(!text.contains("(empty output)"), "{text}");
+        assert!(text.contains('你') && text.contains('界'), "{text}");
+    }
+
+    #[test]
+    fn a_tall_expanded_answer_can_be_read_to_the_end() {
+        let mut view = crate::app::test_fleet_view();
+        view.groups[1].sample = (1..=60).map(|i| format!("line-{i:02}")).collect::<Vec<_>>().join("\n");
+        let mut app = crate::app::test_fleet_app(view);
+        app.side_panel.open = true;
+        app.side_panel.selected = 1;
+        app.side_panel.expanded.insert(1);
+        let text = render(&app, 72, 20, Glyphs::detect());
+        assert!(text.contains("line-01") && !text.contains("line-30"), "{text}");
+        // PgDn scrolls the body: the middle of the answer comes into view,
+        // and past it the end, without moving to the next row.
+        app.side_panel.scroll = 25;
+        let text = render(&app, 72, 20, Glyphs::detect());
+        assert!(text.contains("line-30"), "{text}");
+        app.side_panel.scroll = 1000;
+        let text = render(&app, 72, 20, Glyphs::detect());
+        assert!(text.contains("line-60"), "{text}");
+        assert!(text.contains("PgUp/PgDn"), "the hint names the keys: {text}");
     }
 }

@@ -30,6 +30,7 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
         // split-borrow analysis sees distinct field borrows instead of
         // clashing through DerefMut.
         let s = &mut app.sessions[app.active];
+        s.layout_cache.fleet = s.fleet.is_some();
         s.layout_cache.rebuild(
             &s.messages,
             inner_width,

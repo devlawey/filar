@@ -181,7 +181,13 @@ in the report) — keep awaiting `run` after `cancel` to get it. An agent built
 with `fleet(true)` does exactly that on its cancellation token: it shows the
 partial result as the command's `CommandFinished`, then reports `Cancelled`,
 and it applies no `command_timeout` to a fleet command (the per-host deadlines
-bound it). `FleetExecutor::built_from()` returns the id of
+bound it). `FleetExecutor::with_observer(observer)` hands the person-facing
+`fleet_view::FleetView` of every operation (cancelled ones included) to
+`observer`: groups of agreeing hosts with a sample answer (the first host's
+output for a raw comparison, the compared rows for a typed one) and the hosts
+without a value, with their `HostState`. It carries host output — route it to
+your UI only, never into a tool result or the model's context; `run`'s own
+result stays the fold. `FleetExecutor::built_from()` returns the id of
 the operation it was built from; if you cache executors, reuse one only while
 that id matches the fleet on screen.
 
