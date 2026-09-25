@@ -214,6 +214,12 @@ pub(crate) enum HostSelectRow {
     Local,
     /// SSH target at `ssh_targets[i]` (flat selection index `i + 1`).
     Target(usize),
+    /// Non-selectable header of the host-group section (#432).
+    GroupsHeader { count: usize },
+    /// Host group at `host_groups[group]` — enters the fleet layer (#432).
+    /// `selection` is its flat index, `1 + ssh_targets.len() + group`: after
+    /// every target, so the target indices keep their meaning.
+    Group { group: usize, selection: usize },
 }
 
 impl HostSelectRow {
@@ -222,9 +228,10 @@ impl HostSelectRow {
     /// expect.
     pub(crate) fn selection_index(&self) -> Option<usize> {
         match self {
-            HostSelectRow::Header { .. } => None,
+            HostSelectRow::Header { .. } | HostSelectRow::GroupsHeader { .. } => None,
             HostSelectRow::Local => Some(0),
             HostSelectRow::Target(i) => Some(i + 1),
+            HostSelectRow::Group { selection, .. } => Some(*selection),
         }
     }
 }
@@ -292,6 +299,11 @@ pub struct App {
     pub key_checker: Option<Arc<dyn Fn(&filar_core::LlmProfile) -> Option<String> + Send + Sync>>,
     /// Named SSH targets from config, selectable via the Ctrl+O overlay.
     pub ssh_targets: Vec<filar_core::SshTarget>,
+    /// Host groups from `[[host_groups]]`, listed in the Ctrl+O overlay as
+    /// fleet entry points (#432).
+    pub host_groups: Vec<filar_core::HostGroup>,
+    /// The tab to return to when the fleet layer is left (#432).
+    fleet_return: Option<SessionId>,
     /// Index of the last selection made in the Ctrl+O host-selection overlay.
     pub ctrl_o_selection: Option<usize>,
     /// Tags of a Ctrl+O target whose swap is still in flight (#414 review).
@@ -392,6 +404,10 @@ impl SessionId {
 pub struct Session {
     /// Stable session identifier (never reused).
     pub id: SessionId,
+    /// `Some` for the fleet layer's session (#432): the one dialogue over a
+    /// host group, kept apart from the tab row. Its composition is frozen at
+    /// entry. A fleet session never gets an executor of its own.
+    pub fleet: Option<filar_core::FleetOperation>,
     /// Display name shown on the tab label.
     pub target_name: String,
     /// Chat history blocks: what the feed shows and what the model is sent.
@@ -597,6 +613,8 @@ impl App {
             status_bar_area: Rect::default(),
             help_bar_area: Rect::default(),
             closed_ids: Vec::new(),
+            host_groups: Vec::new(),
+            fleet_return: None,
             pending_term_teardown: Vec::new(),
             pending_cwd_sync: Vec::new(),
             pending_local_executors: Vec::new(),
@@ -649,8 +667,11 @@ impl App {
     /// Create a new session tab in local mode, inheriting target_name display.
     /// Signals the runner to create a new LocalExecutor for this tab via
     /// [`pending_local_executors`](Self::pending_local_executors).
+    ///
+    /// Always an ordinary tab — `Ctrl+N` inside the fleet leaves the fleet
+    /// layer open in the background and does not start a second fleet (#432).
     pub fn new_tab(&mut self) {
-        let name = format!("local-{}", self.sessions.len() + 1);
+        let name = format!("local-{}", self.tab_indices().len() + 1);
         // Inherit the active tab's own mode (not the policy-clamped mirror),
         // so the new local tab starts from the user's choice (#414).
         let session = Session::new(name, self.sessions[self.active].confirm_mode);
@@ -663,8 +684,14 @@ impl App {
     /// Close the active tab. If it's the last tab, set should_quit.
     /// Pushes the closed session's SessionId into `closed_ids` so the
     /// runner can teardown its interactive backend (PTY/reader task).
+    ///
+    /// In the fleet layer this closes the fleet, not a tab (#432).
     pub fn close_tab(&mut self) {
-        if self.sessions.len() <= 1 {
+        if self.in_fleet() {
+            self.exit_fleet();
+            return;
+        }
+        if self.tab_indices().len() <= 1 {
             self.save_transcript_silent();
             self.should_quit = true;
             return;
@@ -677,10 +704,16 @@ impl App {
         if let Some(ref token) = self.sessions[self.active].cancellation {
             token.cancel();
         }
-        self.sessions.remove(self.active);
-        if self.active >= self.sessions.len() {
-            self.active = self.sessions.len() - 1;
-        }
+        let closed = self.active;
+        self.sessions.remove(closed);
+        // Land on the neighbouring ordinary tab, never on the fleet session.
+        let tabs = self.tab_indices();
+        self.active = tabs
+            .iter()
+            .copied()
+            .find(|&i| i >= closed)
+            .or_else(|| tabs.last().copied())
+            .unwrap_or(0);
         self.sync_confirm_mode();
         self.closed_ids.push(sid);
     }
@@ -777,29 +810,41 @@ impl App {
         std::mem::take(&mut self.pending_local_executors)
     }
 
-    /// Switch to the previous tab (wraps around).
+    /// Switch to the previous tab (wraps around). Ordinary tabs only: from
+    /// the fleet layer this leaves the fleet for the tab it was entered from.
     pub fn prev_tab(&mut self) {
-        let prev = if self.active == 0 {
-            self.sessions.len() - 1
-        } else {
-            self.active - 1
-        };
-        self.sessions[prev].has_new = false;
-        self.active = prev;
-        self.sync_confirm_mode();
+        self.step_tab(-1);
     }
 
-    /// Switch to the next tab (wraps around).
+    /// Switch to the next tab (wraps around). Ordinary tabs only: from the
+    /// fleet layer this leaves the fleet for the tab it was entered from.
     pub fn next_tab(&mut self) {
-        let next = (self.active + 1) % self.sessions.len();
-        self.sessions[next].has_new = false;
-        self.active = next;
+        self.step_tab(1);
+    }
+
+    fn step_tab(&mut self, delta: isize) {
+        if self.in_fleet() {
+            self.leave_fleet_view();
+            return;
+        }
+        let tabs = self.tab_indices();
+        let Some(pos) = tabs.iter().position(|&i| i == self.active) else {
+            return;
+        };
+        let len = tabs.len() as isize;
+        let target = tabs[(pos as isize + delta).rem_euclid(len) as usize];
+        self.sessions[target].has_new = false;
+        self.active = target;
         self.sync_confirm_mode();
     }
 
-    /// Switch to tab at index (1-based from user, clamped).
+    /// Switch to tab at index (1-based from user, clamped). Numbers count
+    /// ordinary tabs only — the fleet layer is not a numbered tab (#432).
     pub fn switch_to_tab(&mut self, index: usize) {
-        let idx = index.saturating_sub(1).min(self.sessions.len().saturating_sub(1));
+        let tabs = self.tab_indices();
+        let Some(&idx) = tabs.get(index.saturating_sub(1).min(tabs.len().saturating_sub(1))) else {
+            return;
+        };
         if idx != self.active {
             // Clear "has new" flag on the tab being switched to.
             self.sessions[idx].has_new = false;
@@ -905,6 +950,7 @@ impl Session {
             transcript_path: None,
             transcript_saving: false,
             transcript_error_shown: false,
+            fleet: None,
         }
     }
 
@@ -1784,9 +1830,17 @@ impl App {
         if self.ssh_targets.is_empty() {
             self.push_message(ChatBlock::System("No [[ssh_targets]] configured. Add targets in config.toml, then restart filar.\nSyntax: [[ssh_targets]] + name/host/user + [ssh_targets.auth] type = \"agent\"".into()));
         }
-        let list_size = 1 + self.ssh_targets.len();
-        // Derive current position from the active SSH target.
-        let current = if let Some(ref info) = self.ssh_info {
+        let list_size = 1 + self.ssh_targets.len() + self.host_groups.len();
+        // Derive current position from the active SSH target — or, in the
+        // fleet layer, from the fleet's group (#432).
+        let fleet_group = self
+            .sessions[self.active]
+            .fleet
+            .as_ref()
+            .and_then(|f| self.host_groups.iter().position(|g| g.name == f.group_name()));
+        let current = if let Some(g) = fleet_group {
+            1 + self.ssh_targets.len() + g
+        } else if let Some(ref info) = self.ssh_info {
             self.ssh_targets.iter()
                 .position(|t| format!("{}@{}:{}", t.user, t.host, t.port) == *info)
                 .map(|i| i + 1)
@@ -1859,6 +1913,30 @@ impl App {
         if !untagged.is_empty() {
             rows.push(HostSelectRow::Header { tag: None, count: untagged.len() });
             rows.extend(untagged.into_iter().map(HostSelectRow::Target));
+        }
+        // Host groups (#432): fleet entry points, after every target. The
+        // search matches the group name or its rule's tags; a tag filter
+        // keeps the groups whose rule names that tag.
+        let groups: Vec<usize> = self
+            .host_groups
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| {
+                tag.is_none_or(|tf| g.match_tags.iter().any(|t| t.eq_ignore_ascii_case(tf)))
+                    && (q.is_empty()
+                        || g.name.to_lowercase().contains(&q)
+                        || g.match_tags.iter().any(|t| t.to_lowercase().contains(&q)))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if !groups.is_empty() {
+            rows.push(HostSelectRow::GroupsHeader { count: groups.len() });
+            let base = 1 + self.ssh_targets.len();
+            rows.extend(
+                groups
+                    .into_iter()
+                    .map(|group| HostSelectRow::Group { group, selection: base + group }),
+            );
         }
         rows
     }
@@ -1949,6 +2027,17 @@ impl App {
         }
         let idx = self.host_select_index;
         self.host_select_visible = false;
+
+        // A host group enters the fleet layer (#432).
+        if let Some(group) = idx.checked_sub(1 + self.ssh_targets.len()) {
+            if let Some(name) = self.host_groups.get(group).map(|g| g.name.clone()) {
+                self.enter_fleet(&name);
+            }
+            return;
+        }
+        // A single target from inside the fleet switches the tab the fleet
+        // was entered from — the fleet session never gets a transport.
+        self.leave_fleet_view();
         self.ctrl_o_selection = Some(idx);
 
         let tags = if idx == 0 {
@@ -2044,6 +2133,12 @@ impl App {
     fn select_session(&mut self) {
         let idx = self.session_select_index;
         self.session_select_visible = false;
+        // The overlay can outlive the switch into the fleet (F3, then Ctrl+O
+        // on a group): refuse where the restore happens, not only at F3.
+        if self.in_fleet() {
+            self.fleet_refusal("Session restore");
+            return;
+        }
 
         let meta = match self.session_select_metas.get(idx).cloned() {
             Some(m) => m,
@@ -2753,6 +2848,10 @@ impl App {
 
         // F3 toggles the session-selection overlay — same availability as F1/F2.
         if key.code == KeyCode::F(3) && self.mode != AppMode::PasswordInput {
+            if self.in_fleet() && !self.session_select_visible {
+                self.fleet_refusal("Session restore");
+                return;
+            }
             if self.session_select_visible {
                 self.session_select_visible = false;
             } else {
@@ -2912,6 +3011,12 @@ impl App {
         // Side panel (#431): ^J, and Esc/Up/Down while it is open. After
         // the overlays, so an overlay's Esc stays the overlay's.
         if self.handle_side_panel_key(&key) {
+            return;
+        }
+
+        // Fleet layer (#432): single-host features are refused, not run on
+        // whatever executor happens to be around.
+        if self.handle_fleet_key(&key) {
             return;
         }
 
@@ -3107,7 +3212,10 @@ impl App {
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     // Any char input cancels history browsing.
                     self.history_pos = None;
+                    // In the fleet `/` is just a character: the picker
+                    // browses one host (#432).
                     if c == '/'
+                        && !self.in_fleet()
                         && crate::path_picker::path_token_starts_at_cursor(
                             &self.input,
                             self.cursor_pos,
@@ -3241,7 +3349,7 @@ impl App {
                 // Tab navigation when multiple tabs are open: switch the active
                 // tab while preserving per-tab terminal state. PTY stays alive
                 // in the background — no teardown, no toggle_interactive.
-                if self.sessions.len() > 1 {
+                if self.tab_indices().len() > 1 {
                     let switch = match (key.code, key.modifiers) {
                         (KeyCode::Tab, m) if m.contains(KeyModifiers::CONTROL) => {
                             if m.contains(KeyModifiers::SHIFT) {
@@ -3767,7 +3875,14 @@ impl App {
                 }
             }
             HelpAction::Terminal => {
-                self.toggle_interactive = true;
+                if self.in_fleet() {
+                    self.fleet_refusal("Terminal");
+                } else {
+                    self.toggle_interactive = true;
+                }
+            }
+            HelpAction::Password if self.in_fleet() => {
+                self.fleet_refusal("Password input");
             }
             HelpAction::Password => {
                 if self.mode == AppMode::Normal {
@@ -4776,6 +4891,199 @@ impl App {
     }
 }
 
+// ── Fleet layer (#432) ──────────────────────────────────────────────
+
+/// Opening feed lines of a fleet session: who takes part, under which
+/// limits, and what the layer can and cannot do yet. One system block per
+/// line — a system block renders as a single line.
+fn fleet_intro(op: &filar_core::FleetOperation) -> Vec<String> {
+    let policy = match op.policy() {
+        filar_core::HostGroupPolicy::ReadOnly => "read-only",
+    };
+    let mut lines = vec![format!(
+        "Fleet: {} — {} host(s), {policy}, up to {} at a time, {}s per host.",
+        op.group_name(),
+        op.len(),
+        op.max_parallel(),
+        op.per_host_timeout().as_secs(),
+    )];
+    if op.is_empty() {
+        lines.push("The group matches no hosts right now.".into());
+    } else {
+        let names: Vec<&str> = op.members().iter().map(|m| m.name()).collect();
+        lines.push(format!("Hosts: {}", names.join(", ")));
+        lines.push("Fixed at entry: retagging does not change the fleet.".into());
+    }
+    lines.push("Not wired yet: messages here are not sent to any host.".into());
+    lines.push("Ctrl+W: close fleet · Ctrl+N: new tab · Ctrl+Tab: back to tabs".into());
+    lines
+}
+
+impl App {
+    /// Indices of the ordinary tabs — every session but the fleet's — in
+    /// tab order. These are what tab numbers and `Ctrl+Tab` walk.
+    pub fn tab_indices(&self) -> Vec<usize> {
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.fleet.is_none())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Index of the fleet session, if a fleet is open (shown or not).
+    pub fn fleet_index(&self) -> Option<usize> {
+        self.sessions.iter().position(|s| s.fleet.is_some())
+    }
+
+    /// Whether the fleet layer is on screen.
+    pub fn in_fleet(&self) -> bool {
+        self.sessions[self.active].fleet.is_some()
+    }
+
+    /// The open fleet operation, shown or not.
+    pub fn fleet(&self) -> Option<&filar_core::FleetOperation> {
+        self.fleet_index().and_then(|i| self.sessions[i].fleet.as_ref())
+    }
+
+    /// Enter the fleet layer over the group `group_name` (#432).
+    ///
+    /// The group's hosts are selected here, once (#426): the fleet keeps the
+    /// composition it was entered with. Re-entering the same group resumes
+    /// the open fleet; another group replaces it — one fleet at a time.
+    /// Returns whether the fleet layer is now on screen.
+    pub fn enter_fleet(&mut self, group_name: &str) -> bool {
+        let Some(group) = self.host_groups.iter().find(|g| g.name == group_name).cloned() else {
+            self.push_message(ChatBlock::System(format!("Unknown host group: {group_name}")));
+            return false;
+        };
+        self.remember_return_tab();
+        // Single-host overlays opened on a tab must not act on the fleet.
+        self.session_select_visible = false;
+        if self.path_picker_visible {
+            self.close_path_picker();
+        }
+        if let Some(fi) = self.fleet_index() {
+            if self.fleet().map(|f| f.group_name()) == Some(group_name) {
+                self.active = fi;
+                self.sync_confirm_mode();
+                return true;
+            }
+            self.close_fleet_session(fi);
+        }
+        let op = filar_core::FleetOperation::open(&group, &self.ssh_targets);
+        let base = &self.sessions[self.active];
+        let mut session = Session::new(format!("fleet:{}", group.name), base.confirm_mode);
+        session.llm_profile = op
+            .llm_profile()
+            .map(str::to_string)
+            .or_else(|| base.llm_profile.clone());
+        session.messages = fleet_intro(&op).into_iter().map(ChatBlock::System).collect();
+        session.cwd = None;
+        session.fleet = Some(op);
+        self.sessions.push(session);
+        self.active = self.sessions.len() - 1;
+        self.sync_confirm_mode();
+        true
+    }
+
+    /// Leave the fleet layer for the tab it was entered from, keeping the
+    /// fleet open in the background.
+    pub fn leave_fleet_view(&mut self) {
+        if self.in_fleet() {
+            self.active = self.return_tab_index();
+            self.sessions[self.active].has_new = false;
+            self.sync_confirm_mode();
+        }
+    }
+
+    /// Close the fleet and return to the tab it was entered from. The tabs
+    /// are left exactly as they were.
+    pub fn exit_fleet(&mut self) {
+        if let Some(fi) = self.fleet_index() {
+            self.close_fleet_session(fi);
+        }
+    }
+
+    fn remember_return_tab(&mut self) {
+        if !self.in_fleet() {
+            self.fleet_return = Some(self.sessions[self.active].id);
+        }
+    }
+
+    /// The tab to come back to: the one the fleet was entered from if it is
+    /// still open, else the first ordinary tab.
+    fn return_tab_index(&self) -> usize {
+        let tabs = self.tab_indices();
+        self.fleet_return
+            .and_then(|id| self.find_session_idx(id))
+            .filter(|i| tabs.contains(i))
+            .or_else(|| tabs.first().copied())
+            .unwrap_or(0)
+    }
+
+    fn close_fleet_session(&mut self, fi: usize) {
+        let was_active = self.active == fi;
+        let active_id = self.sessions[self.active].id;
+        if let Some(ref token) = self.sessions[fi].cancellation {
+            token.cancel();
+        }
+        let sid = self.sessions[fi].id;
+        self.sessions.remove(fi);
+        self.closed_ids.push(sid);
+        self.active = if was_active {
+            self.return_tab_index()
+        } else {
+            self.find_session_idx(active_id).unwrap_or(0)
+        };
+        self.sync_confirm_mode();
+    }
+
+    /// Explain that a single-host feature is not available in the fleet.
+    fn fleet_refusal(&mut self, what: &str) {
+        // Kept under 80 columns: a system block renders as one line.
+        self.push_message(ChatBlock::System(format!(
+            "{what}: single-host, not available in the fleet. Ctrl+N opens a tab."
+        )));
+        self.scroll = 0;
+    }
+
+    /// Keys the fleet layer refuses (#432): nothing here may run on a host
+    /// until the fleet has its own executor. Returns `true` when handled.
+    fn handle_fleet_key(&mut self, key: &crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        if !self.in_fleet() || self.mode != AppMode::Normal {
+            return false;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let is = |en: char, ru: char| {
+            ctrl && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&en) || c == ru)
+        };
+        if key.code == KeyCode::Enter && !ctrl && !self.input.trim().is_empty() {
+            self.push_message(ChatBlock::System(
+                "Not sent: the fleet cannot run the agent yet (message kept in the input)."
+                    .into(),
+            ));
+            self.scroll = 0;
+            return true;
+        }
+        if is('t', 'е') && !shift {
+            self.fleet_refusal("Terminal");
+            return true;
+        }
+        if is('p', 'з') && !shift {
+            self.fleet_refusal("Password input");
+            return true;
+        }
+        if shift && (is('f', 'а') || is('d', 'в')) {
+            self.fleet_refusal("Path picker");
+            return true;
+        }
+        false
+    }
+}
+
 // ── Side panel: operations → hosts (#431) ───────────────────────────
 
 /// Lines of output tail kept per host for the side panel.
@@ -5134,6 +5442,301 @@ mod tests {
             &app.messages[1],
             ChatBlock::User(s) if s == "hello world"
         ));
+    }
+
+    // ── Fleet layer (#432) ──────────────────────────────────────────
+
+    fn fleet_target(name: &str, tags: &[&str]) -> filar_core::SshTarget {
+        filar_core::SshTarget {
+            name: name.into(),
+            host: format!("{name}.example"),
+            port: 22,
+            user: "ops".into(),
+            auth: filar_core::SshAuth::Agent,
+            host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            tags: tags.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    fn app_with_groups() -> App {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![
+            fleet_target("web-1", &["web"]),
+            fleet_target("web-2", &["web"]),
+            fleet_target("db-1", &["db"]),
+        ];
+        app.host_groups = vec![
+            filar_core::HostGroup {
+                name: "web".into(),
+                match_tags: vec!["web".into()],
+                ..Default::default()
+            },
+            filar_core::HostGroup {
+                name: "db".into(),
+                match_tags: vec!["db".into()],
+                ..Default::default()
+            },
+        ];
+        app
+    }
+
+    #[test]
+    fn entering_the_fleet_adds_a_layer_and_leaves_the_tabs_alone() {
+        let mut app = app_with_groups();
+        app.new_tab();
+        let tabs_before: Vec<SessionId> = app.sessions.iter().map(|s| s.id).collect();
+        let executors_before = app.take_pending_local_executors().len();
+        assert!(app.enter_fleet("web"));
+        assert!(app.in_fleet());
+        let fleet = app.fleet().expect("fleet open");
+        assert_eq!(fleet.group_name(), "web");
+        let names: Vec<&str> = fleet.members().iter().map(|m| m.name()).collect();
+        assert_eq!(names, ["web-1", "web-2"]);
+        // Ordinary tabs are untouched and the fleet gets no executor.
+        let tabs_after: Vec<SessionId> = app.tab_indices().iter().map(|&i| app.sessions[i].id).collect();
+        assert_eq!(tabs_after, tabs_before);
+        assert!(app.take_pending_local_executors().is_empty());
+        assert_eq!(executors_before, 1);
+    }
+
+    #[test]
+    fn ctrl_w_leaves_the_fleet_back_to_the_tab_it_was_entered_from() {
+        let mut app = app_with_groups();
+        app.new_tab();
+        app.switch_to_tab(1);
+        let origin = app.sessions[app.active].id;
+        app.enter_fleet("web");
+        app.handle_key(ctrl_key('w'));
+        assert!(app.fleet().is_none(), "fleet closed");
+        assert!(!app.should_quit, "closing the fleet never quits");
+        assert_eq!(app.sessions[app.active].id, origin);
+        assert_eq!(app.sessions.len(), 2);
+    }
+
+    #[test]
+    fn ctrl_n_in_the_fleet_opens_an_ordinary_tab_not_a_second_fleet() {
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        app.handle_key(ctrl_key('n'));
+        assert!(!app.in_fleet(), "the new tab is on screen");
+        assert!(app.sessions[app.active].fleet.is_none());
+        assert_eq!(app.tab_indices().len(), 2);
+        assert_eq!(
+            app.sessions.iter().filter(|s| s.fleet.is_some()).count(),
+            1,
+            "the fleet stays open in the background, and stays one"
+        );
+        assert_eq!(app.take_pending_local_executors().len(), 1, "an ordinary local tab");
+        assert_eq!(app.sessions[app.active].target_name, "local-2");
+    }
+
+    #[test]
+    fn tab_navigation_leaves_the_fleet_and_re_entering_resumes_it() {
+        let mut app = app_with_groups();
+        app.new_tab();
+        let origin = app.sessions[app.active].id;
+        app.enter_fleet("web");
+        let op_id = app.fleet().map(|f| f.id());
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Tab,
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert!(!app.in_fleet());
+        assert_eq!(app.sessions[app.active].id, origin);
+        assert!(app.fleet().is_some(), "left, not closed");
+        // Retagging after entry does not change the open fleet (#426).
+        app.ssh_targets.push(fleet_target("web-3", &["web"]));
+        assert!(app.enter_fleet("web"));
+        assert_eq!(app.fleet().map(|f| f.id()), op_id, "resumed, not reopened");
+        assert_eq!(app.fleet().map(|f| f.len()), Some(2));
+    }
+
+    #[test]
+    fn another_group_replaces_the_open_fleet() {
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        app.enter_fleet("db");
+        assert_eq!(app.sessions.iter().filter(|s| s.fleet.is_some()).count(), 1);
+        assert_eq!(app.fleet().map(|f| f.group_name()), Some("db"));
+        app.exit_fleet();
+        assert_eq!(app.sessions.len(), 1);
+        assert!(!app.in_fleet());
+    }
+
+    #[test]
+    fn tab_numbers_count_ordinary_tabs_only() {
+        let mut app = app_with_groups();
+        app.new_tab();
+        app.enter_fleet("web");
+        app.switch_to_tab(2);
+        assert_eq!(app.sessions[app.active].target_name, "local-2");
+        app.switch_to_tab(1);
+        assert_eq!(app.sessions[app.active].target_name, "local");
+        // Walking the tabs never lands on the fleet.
+        for _ in 0..4 {
+            app.next_tab();
+            assert!(!app.in_fleet());
+        }
+    }
+
+    #[test]
+    fn nothing_reaches_a_host_from_the_fleet() {
+        use crossterm::event::KeyCode;
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        for c in "uptime".chars() {
+            app.handle_key(key_event(KeyCode::Char(c)));
+        }
+        app.handle_key(key_event(KeyCode::Enter));
+        assert_eq!(app.take_input(), None, "no agent run");
+        assert_eq!(app.input, "uptime", "the message stays in the input");
+        assert_eq!(app.mode, AppMode::Normal);
+        app.input.clear();
+        app.cursor_pos = 0;
+        app.handle_key(key_event(KeyCode::Char('!')));
+        for c in "ls".chars() {
+            app.handle_key(key_event(KeyCode::Char(c)));
+        }
+        app.handle_key(key_event(KeyCode::Enter));
+        assert_eq!(app.take_input(), None, "no shell escape");
+        app.handle_key(ctrl_key('t'));
+        assert!(!app.take_toggle_interactive(), "no interactive terminal");
+        app.handle_key(ctrl_key('p'));
+        assert_eq!(app.mode, AppMode::Normal, "no password input");
+        app.input.clear();
+        app.cursor_pos = 0;
+        app.handle_key(key_event(KeyCode::Char('/')));
+        assert!(app.pending_path_picker.is_none(), "no path picker");
+        assert_eq!(app.input, "/");
+        app.handle_key(key_event(KeyCode::F(3)));
+        assert!(!app.session_select_visible, "no session restore into the fleet");
+    }
+
+    #[test]
+    fn ctrl_o_lists_groups_and_a_group_row_enters_the_fleet() {
+        let mut app = app_with_groups();
+        app.open_host_select();
+        let rows = app.host_select_rows();
+        assert!(rows.contains(&HostSelectRow::GroupsHeader { count: 2 }));
+        let web = rows
+            .iter()
+            .find_map(|r| match r {
+                HostSelectRow::Group { group: 0, selection } => Some(*selection),
+                _ => None,
+            })
+            .expect("web group row");
+        assert_eq!(web, 1 + app.ssh_targets.len(), "after every target");
+        app.host_select_index = web;
+        app.select_host();
+        assert!(app.in_fleet());
+        assert!(!app.ctrl_o_needs_connect, "a group never reconnects a tab");
+        // The overlay reopened in the fleet starts on the fleet's group.
+        app.open_host_select();
+        assert_eq!(app.host_select_index, web);
+    }
+
+    #[test]
+    fn a_filtered_overlay_still_enters_the_group_it_shows() {
+        let mut app = app_with_groups();
+        app.open_host_select();
+        app.host_select_query = "db".into(); // hides `web`, keeps `db`
+        app.host_select_ensure_visible();
+        let rows = app.host_select_rows();
+        let shown: Vec<usize> = rows
+            .iter()
+            .filter_map(|r| match r {
+                HostSelectRow::Group { group, .. } => Some(*group),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, [1], "only the db group is visible");
+        let sel = rows
+            .iter()
+            .find_map(|r| match r {
+                HostSelectRow::Group { selection, .. } => Some(*selection),
+                _ => None,
+            })
+            .expect("db row");
+        app.host_select_index = sel;
+        app.select_host();
+        assert_eq!(app.fleet().map(|f| f.group_name()), Some("db"));
+    }
+
+    #[test]
+    fn a_single_target_from_the_fleet_switches_the_origin_tab() {
+        let mut app = app_with_groups();
+        let origin = app.sessions[app.active].id;
+        app.enter_fleet("web");
+        app.open_host_select();
+        app.host_select_index = 3; // db-1
+        app.select_host();
+        assert!(!app.in_fleet(), "back on the tabs");
+        assert_eq!(app.sessions[app.active].id, origin);
+        assert!(app.ctrl_o_needs_connect);
+        assert_eq!(app.sessions[app.active].target_name, "~db-1");
+        assert!(app.fleet().is_some(), "the fleet stays open");
+    }
+
+    #[test]
+    fn a_restore_overlay_left_open_never_restores_into_the_fleet() {
+        let mut app = app_with_groups();
+        app.session_select_visible = true; // F3 on the tab
+        app.session_select_metas = vec![];
+        app.enter_fleet("web"); // then Ctrl+O on a group
+        assert!(!app.session_select_visible, "entering the fleet closes it");
+        // Even if it were still up, the restore itself refuses.
+        app.session_select_visible = true;
+        app.select_session();
+        assert!(app.in_fleet());
+        assert!(app.ssh_info.is_none() && !app.ctrl_o_needs_connect);
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m.starts_with("Session restore")));
+    }
+
+    #[test]
+    fn a_lone_interactive_tab_keeps_its_keys_with_a_fleet_open() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        app.leave_fleet_view();
+        app.mode = AppMode::Interactive;
+        app.terminal = Some(TerminalModel::new(80, 24));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
+        assert!(!app.in_fleet());
+        assert!(app.take_term_input().is_some(), "Ctrl+Tab goes to the PTY, as with one tab");
+    }
+
+    #[test]
+    fn the_last_tab_still_quits_with_a_fleet_open() {
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        app.handle_key(ctrl_key('w')); // closes the fleet
+        assert!(!app.should_quit);
+        app.handle_key(ctrl_key('w')); // the only tab
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn an_unknown_group_changes_nothing() {
+        let mut app = app_with_groups();
+        assert!(!app.enter_fleet("nope"));
+        assert!(app.fleet().is_none());
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m.contains("nope")));
+    }
+
+    #[test]
+    fn an_empty_group_opens_an_empty_fleet_and_says_so() {
+        let mut app = app_with_groups();
+        app.host_groups.push(filar_core::HostGroup {
+            name: "none".into(),
+            match_tags: vec!["absent".into()],
+            ..Default::default()
+        });
+        assert!(app.enter_fleet("none"));
+        assert_eq!(app.fleet().map(|f| f.len()), Some(0));
+        assert!(app
+            .messages
+            .iter()
+            .any(|b| matches!(b, ChatBlock::System(m) if m.contains("matches no hosts"))));
     }
 
     // ── Side panel (#431) ───────────────────────────────────────────

@@ -106,7 +106,7 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
         },
         HelpEntry {
             key: "^W",
-            desc: "Close active tab",
+            desc: "Close active tab (in the fleet layer: close the fleet)",
             section: "Tabs",
             available: |m| m != AppMode::Interactive,
         },
@@ -234,7 +234,7 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
         },
         HelpEntry {
             key: "^O",
-            desc: "Open host selection overlay (local + [[ssh_targets]])",
+            desc: "Open host selection overlay (local, [[ssh_targets]],\n             [[host_groups]] — a group enters the fleet layer)",
             section: "Input",
             available: |m| m == AppMode::Normal,
         },

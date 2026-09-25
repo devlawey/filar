@@ -275,8 +275,29 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
 fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
     let active = app.active;
     let mut spans: Vec<Span> = Vec::with_capacity(app.sessions.len() * 4);
+    // The fleet layer (#432) is not a numbered tab: it leads the row as its
+    // own chip, and tab numbers count ordinary tabs only.
+    if let Some((fi, fleet)) = app
+        .sessions
+        .iter()
+        .enumerate()
+        .find_map(|(i, s)| s.fleet.as_ref().map(|f| (i, f)))
+    {
+        let (name, n) = (fleet.group_name(), fleet.len());
+        let style = if fi == active {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        spans.push(Span::styled(format!("[fleet: {name} ({n})]"), style));
+    }
+    let mut number = 0usize;
     for (i, s) in app.sessions.iter().enumerate() {
-        if i > 0 {
+        if s.fleet.is_some() {
+            continue;
+        }
+        number += 1;
+        if !spans.is_empty() {
             spans.push(Span::raw(" "));
         }
         // Activity marker: spinner char for agent running, dot for new output,
@@ -295,7 +316,7 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
         } else {
             ""
         };
-        let label = format!("{}{}. {}", marker, i + 1, s.tab_label(i));
+        let label = format!("{}{}. {}", marker, number, s.tab_label(i));
         let style = if i == active {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
@@ -353,6 +374,32 @@ mod tests {
         let app = App::new("t".into(), filar_core::CommandConfirmMode::Always);
         let feed = Rect::new(0, 2, 160, 30);
         assert_eq!(side_panel_layout(&app, feed, 160), (feed, None));
+    }
+
+    #[test]
+    fn tab_bar_shows_the_fleet_as_a_chip_and_numbers_tabs_only() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new("local".into(), filar_core::CommandConfirmMode::Always);
+        app.ssh_targets = vec![filar_core::SshTarget {
+            name: "web-1".into(),
+            host: "w".into(),
+            port: 22,
+            user: "u".into(),
+            auth: filar_core::SshAuth::Agent,
+            host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            tags: vec!["web".into()],
+        }];
+        app.host_groups = vec![filar_core::HostGroup {
+            name: "web".into(),
+            match_tags: vec!["web".into()],
+            ..Default::default()
+        }];
+        app.new_tab();
+        app.enter_fleet("web");
+        let mut t = Terminal::new(TestBackend::new(80, 1)).unwrap();
+        t.draw(|f| render_tab_bar(f, &app, f.area())).unwrap();
+        let row: String = (0..80).map(|x| t.backend().buffer()[(x, 0)].symbol().to_string()).collect();
+        assert!(row.starts_with("[fleet: web (1)] 1. local 2. local-2"), "{row:?}");
     }
 
     #[test]
