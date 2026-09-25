@@ -50,6 +50,11 @@ and so are secrets from Ctrl+P and sudo. These FLEET rules take precedence over 
 anything above about a single host or a persistent shell. \
 If one host needs a closer look, ask the user to open it in its own tab.";
 
+/// How long a cancelled fleet command may take to wind down and hand back
+/// its partial result (#437). Each host's interruption is already bounded
+/// by its own deadline; this is the backstop above them.
+const FLEET_CANCEL_GRACE: Duration = Duration::from_secs(60);
+
 /// System prompt block appended when `CommandConfirmMode::Explain` is active.
 const SAFE_MODE_PROMPT: &str = r#"
 
@@ -880,8 +885,18 @@ impl Agent {
         }
 
         // Execute the tool, with optional cancellation and command timeout.
-        let exec_fut = self.execute_parsed_tool(&parsed);
-        let output = if let Some(ct) = self.command_timeout {
+        // A fleet command is never dropped mid-run (#437): see
+        // `run_fleet_command`.
+        let output = if self.fleet {
+            match self.run_fleet_command(&parsed, &display_command).await {
+                Ok(o) => o,
+                Err(e) if e.to_string() == "cancelled" => return Err(e),
+                Err(e) => {
+                    return Ok(self.tool_failure(&tc.id, &parsed.command, display_command, e));
+                }
+            }
+        } else if let Some(ct) = self.command_timeout {
+            let exec_fut = self.execute_parsed_tool(&parsed);
             match tokio::time::timeout(ct, with_cancellation(self.cancellation.as_ref(), exec_fut)).await {
                 Ok(Ok(o)) => o,
                 Ok(Err(e)) if e.to_string() == "cancelled" => {
@@ -898,22 +913,7 @@ impl Agent {
                     return Err(e);
                 }
                 Ok(Err(e)) => {
-                    warn!(command = %display_command, error = %e, "tool execution failed");
-                    let detail = e.to_string();
-                    let mut output = if detail.to_ascii_lowercase().contains("timed out") {
-                        crate::long_wait::enrich_timeout_message(&format!("Error: {detail}"))
-                    } else {
-                        format!("Error: {detail}")
-                    };
-                    output = crate::password_prompt::enrich_password_prompt_message_for_command(
-                        &parsed.command, &output,
-                    );
-                    self.emit(AgentEvent::CommandFinished {
-                        command: display_command.clone(),
-                        output: output.clone(),
-                        denied: false,
-                    });
-                    return Ok(ChatMessage::tool(&tc.id, output));
+                    return Ok(self.tool_failure(&tc.id, &parsed.command, display_command, e));
                 }
                 Err(_) => {
                     warn!(command = %display_command, "command timed out");
@@ -936,6 +936,7 @@ impl Agent {
                 }
             }
         } else {
+            let exec_fut = self.execute_parsed_tool(&parsed);
             match with_cancellation(self.cancellation.as_ref(), exec_fut).await {
                 Ok(o) => o,
                 Err(e) if e.to_string() == "cancelled" => {
@@ -951,22 +952,7 @@ impl Agent {
                     return Err(e);
                 }
                 Err(e) => {
-                    warn!(command = %display_command, error = %e, "tool execution failed");
-                    let detail = e.to_string();
-                    let mut output = if detail.to_ascii_lowercase().contains("timed out") {
-                        crate::long_wait::enrich_timeout_message(&format!("Error: {detail}"))
-                    } else {
-                        format!("Error: {detail}")
-                    };
-                    output = crate::password_prompt::enrich_password_prompt_message_for_command(
-                        &parsed.command, &output,
-                    );
-                    self.emit(AgentEvent::CommandFinished {
-                        command: display_command.clone(),
-                        output: output.clone(),
-                        denied: false,
-                    });
-                    return Ok(ChatMessage::tool(&tc.id, output));
+                    return Ok(self.tool_failure(&tc.id, &parsed.command, display_command, e));
                 }
             }
         };
@@ -984,6 +970,82 @@ impl Agent {
         });
 
         Ok(ChatMessage::tool(&tc.id, truncated))
+    }
+
+    /// The tool result for a command whose execution failed: the error,
+    /// with the timeout and password-prompt hints the model acts on.
+    fn tool_failure(
+        &self,
+        tool_call_id: &str,
+        command: &str,
+        display_command: String,
+        e: CoreError,
+    ) -> ChatMessage {
+        warn!(command = %display_command, error = %e, "tool execution failed");
+        let detail = e.to_string();
+        let mut output = if detail.to_ascii_lowercase().contains("timed out") {
+            crate::long_wait::enrich_timeout_message(&format!("Error: {detail}"))
+        } else {
+            format!("Error: {detail}")
+        };
+        output = crate::password_prompt::enrich_password_prompt_message_for_command(command, &output);
+        self.emit(AgentEvent::CommandFinished {
+            command: display_command,
+            output: output.clone(),
+            denied: false,
+        });
+        ChatMessage::tool(tool_call_id, output)
+    }
+
+    /// Run a command over the fleet, stopping the whole operation on
+    /// cancellation (#437).
+    ///
+    /// Unlike a single host's command, the run is not dropped when the
+    /// token fires: dropping it would stop only the *wait* — the commands
+    /// would keep running on every host, and the answers already collected
+    /// would be thrown away. Instead the executor is told to cancel (no
+    /// queued host starts, running ones get a Ctrl-C) and the run is
+    /// awaited for its partial result, which is shown as the command's
+    /// output before the cancellation is reported. The wait is bounded by
+    /// [`FLEET_CANCEL_GRACE`]; past it the run is dropped after all.
+    ///
+    /// No `command_timeout` here: every host already runs under the
+    /// group's own per-host deadline, which bounds the operation, and a
+    /// timeout that dropped the run would leave the hosts' shells busy.
+    async fn run_fleet_command(
+        &self,
+        parsed: &tools::ParsedToolCall,
+        display_command: &str,
+    ) -> Result<String> {
+        let exec_fut = self.execute_parsed_tool(parsed);
+        tokio::pin!(exec_fut);
+        let Some(token) = self.cancellation.as_ref() else {
+            return exec_fut.await;
+        };
+        tokio::select! {
+            biased;
+            result = &mut exec_fut => result,
+            _ = token.cancelled() => {
+                let _ = self.executor.cancel().await;
+                match tokio::time::timeout(FLEET_CANCEL_GRACE, &mut exec_fut).await {
+                    Ok(Ok(partial)) => {
+                        let partial = self.truncate_output(&partial);
+                        self.emit(AgentEvent::CommandFinished {
+                            command: display_command.to_string(),
+                            output: partial,
+                            denied: false,
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        warn!(command = %display_command, error = %e, "fleet run failed while cancelling");
+                    }
+                    Err(_) => {
+                        warn!(command = %display_command, "fleet run did not stop within the grace period");
+                    }
+                }
+                Err(CoreError::Other("cancelled".into()))
+            }
+        }
     }
 
     async fn execute_parsed_tool(&self, parsed: &tools::ParsedToolCall) -> Result<String> {
@@ -2055,6 +2117,83 @@ mod tests {
         agent.executor.run(command).await.unwrap();
         let executed = executor.last_command.lock().unwrap().clone();
         assert_eq!(executed, command, "the placeholder is sent as is, never the secret");
+    }
+
+    // ── Fleet cancellation (#437) ─────────────────────────────────────
+
+    /// A fleet stand-in: `run` blocks until `cancel`, then returns the
+    /// partial summary — as `FleetExecutor` does.
+    struct CancellableFleet {
+        started: tokio::sync::Notify,
+        cancelled: tokio::sync::Notify,
+        cancels: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandExecutor for CancellableFleet {
+        async fn run(&self, _command: &str) -> Result<CommandResult> {
+            self.started.notify_one();
+            self.cancelled.notified().await;
+            Ok(CommandResult {
+                stdout: "operation #1: 1 of 3 hosts answered, 0 did not answer — 1 ok, 2 cancelled".into(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                duration: Duration::ZERO,
+                cwd: None,
+            })
+        }
+        async fn cancel(&self) -> Result<()> {
+            self.cancels.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.cancelled.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_fleet_command_shows_the_partial_result_then_cancels() {
+        let call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({ "command": "uname -r", "explanation": "why" }),
+        }]);
+        let llm = Arc::new(MockLlm::new(vec![call, ChatResponse::text("never reached")]));
+        let executor = Arc::new(CancellableFleet {
+            started: tokio::sync::Notify::new(),
+            cancelled: tokio::sync::Notify::new(),
+            cancels: Default::default(),
+        });
+        let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> = Arc::default();
+        let sink_events = Arc::clone(&events);
+        let sink: EventSink = Arc::new(move |e| sink_events.lock().unwrap().push(e));
+        let token = CancellationToken::new();
+        let agent = Agent::builder()
+            .llm(llm)
+            .executor(executor.clone())
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .confirm_mode(CommandConfirmMode::Always)
+            .event_sink(sink)
+            .cancellation(token.clone())
+            .fleet(true)
+            .build()
+            .unwrap();
+
+        let run = tokio::spawn(async move { agent.run("what kernel", &[]).await });
+        executor.started.notified().await;
+        token.cancel();
+        let result = run.await.expect("join");
+
+        assert!(result.is_err(), "the run reports the cancellation");
+        assert_eq!(
+            executor.cancels.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the operation itself is cancelled, not only the wait for it"
+        );
+        let events = events.lock().unwrap();
+        let partial = events.iter().position(|e| matches!(e,
+            AgentEvent::CommandFinished { output, denied: false, .. } if output.contains("2 cancelled")));
+        let cancelled = events.iter().position(|e| matches!(e, AgentEvent::Cancelled));
+        assert!(partial.is_some(), "the partial result is shown: {events:?}");
+        assert!(partial < cancelled, "shown before the cancellation is reported");
     }
 
     // ── Fleet gate (#435) ─────────────────────────────────────────────

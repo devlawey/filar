@@ -13,6 +13,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- `Ctrl+Z` in the fleet cancels the whole operation: queued hosts are not
+  started, running commands are interrupted on the hosts themselves (Ctrl-C),
+  and the answers collected before the cancel are kept and shown, the rest
+  marked `cancelled` — a state that neither fails the operation nor gets
+  retried ([#437](https://github.com/devlawey/filar/issues/437)).
+
 - Fleet credentials are per host: each host connects with its own secret
   (key, config password, or `ssh_target:<name>` in the OS credential store),
   resolved on entry; a host without them drops out, is left out of the gate's
@@ -228,6 +234,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   ([#435](https://github.com/devlawey/filar/issues/435)).
 
 ### Fixed
+
+- Cancelling an SSH command (`Ctrl+Z`, or a command timeout) now actually
+  stops it on the host: the shell runs without a PTY, so the Ctrl-C byte it
+  used to send interrupted nothing and was glued to the front of the next
+  command, which then failed. The session learns its shell's PID on connect
+  and cancel sends `SIGINT` to that shell's children over a separate `exec`
+  channel — nothing is written to the remote host
+  ([#437](https://github.com/devlawey/filar/issues/437)).
 
 - A tab switching hosts with `Ctrl+O` refuses to send anything until the new
   connection is in place, and gets its previous label back if the switch

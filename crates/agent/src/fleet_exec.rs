@@ -41,14 +41,23 @@
 //! does not name it. The connector is handed the host's own target and
 //! nothing else, so one host's secret cannot reach another.
 //!
-//! Cancelling the operation on the hosts is #437. [`cancel`](CommandExecutor::cancel)
-//! here forwards Ctrl-C to every connected host, no more.
+//! # Cancellation
+//!
+//! [`cancel`](CommandExecutor::cancel) during a `run` cancels **the
+//! operation** (#437): no queued host is started, every running host gets a
+//! Ctrl-C and is drained ([`run_on_fleet_until`]), and the `run` still
+//! returns — with the summary and fold of whatever answered before the
+//! cancellation, and the rest marked `cancelled`. A caller that wants the
+//! partial result keeps awaiting `run` after calling `cancel` instead of
+//! dropping it. With no `run` in flight (one that was dropped, say) it
+//! falls back to forwarding Ctrl-C to every connected host.
 
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use filar_core::config::SshTarget;
 use filar_core::error::{CoreError, Result};
@@ -60,7 +69,7 @@ use filar_transport::{is_connection_lost, CommandExecutor, CommandResult};
 use crate::fleet_creds::FleetCredentials;
 use crate::fleet_fold::fold;
 use crate::fleet_result::{NotAsked, OperationResult};
-use crate::fleet_run::{run_on_fleet, HostRun, HostTask};
+use crate::fleet_run::{run_on_fleet_until, HostRun, HostTask};
 use crate::preprocess::PreprocessorRegistry;
 
 /// Opens a connection to one fleet host.
@@ -84,6 +93,28 @@ pub struct FleetExecutor {
     /// never across a command, so [`cancel`](CommandExecutor::cancel) is
     /// never blocked by a running fan-out.
     hosts: Mutex<Vec<Option<Arc<dyn CommandExecutor>>>>,
+    /// The cancellation of the `run` in flight, tagged with its number so a
+    /// finished run clears only its own entry. A plain `std` mutex: it is
+    /// never held across an `.await`.
+    current: std::sync::Mutex<Option<(u64, CancellationToken)>>,
+    /// Numbers the runs for `current`.
+    runs: std::sync::atomic::AtomicU64,
+}
+
+/// Clears [`FleetExecutor::current`] when its `run` ends — returned or
+/// dropped — so a later `cancel` does not fire a token nobody watches.
+struct CurrentRun<'a> {
+    slot: &'a std::sync::Mutex<Option<(u64, CancellationToken)>>,
+    id: u64,
+}
+
+impl Drop for CurrentRun<'_> {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_some_and(|(id, _)| *id == self.id) {
+            *slot = None;
+        }
+    }
 }
 
 impl FleetExecutor {
@@ -110,7 +141,17 @@ impl FleetExecutor {
             fleet: fleet.reopen(),
             credentials,
             connect,
+            current: std::sync::Mutex::new(None),
+            runs: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Register a new run as the one `cancel` stops.
+    fn begin_run(&self) -> (CurrentRun<'_>, CancellationToken) {
+        let id = self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let token = CancellationToken::new();
+        *self.current.lock().unwrap_or_else(|p| p.into_inner()) = Some((id, token.clone()));
+        (CurrentRun { slot: &self.current, id }, token)
     }
 
     /// The operation this executor was built from. A caller holding one
@@ -224,8 +265,22 @@ impl CommandExecutor for FleetExecutor {
         let check = FleetCheck::ad_hoc(command).map_err(CoreError::Other)?;
 
         let started = std::time::Instant::now();
+        let (_current, cancel) = self.begin_run();
         let mut op = self.fleet.reopen();
-        let executors = self.executors().await;
+        // Cancelled while still connecting: nobody is asked. The hosts with
+        // credentials get a stand-in and the fan-out, handed a cancelled
+        // token, marks them all `cancelled` without contacting any.
+        let executors = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => (0..op.len())
+                .map(|i| {
+                    self.credentials
+                        .ready(i)
+                        .map(|_| Arc::new(Unreachable(String::new())) as Arc<dyn CommandExecutor>)
+                })
+                .collect(),
+            executors = self.executors() => executors,
+        };
         let handles: Vec<_> = op.handles().collect();
         let mut tasks = Vec::new();
         let mut not_asked = Vec::new();
@@ -236,7 +291,7 @@ impl CommandExecutor for FleetExecutor {
             }
         }
 
-        let report = run_on_fleet(&mut op, tasks.clone()).await?;
+        let report = run_on_fleet_until(&mut op, tasks.clone(), &cancel).await?;
         self.evict_lost(&handles, &executors, &report).await;
         let mut result = OperationResult::build(&op, &report, &not_asked)?;
         let registry = PreprocessorRegistry::with_builtins();
@@ -254,6 +309,12 @@ impl CommandExecutor for FleetExecutor {
     }
 
     async fn cancel(&self) -> Result<()> {
+        // A run in flight stops as an operation, and returns what it has.
+        let current = self.current.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some((_, token)) = current {
+            token.cancel();
+            return Ok(());
+        }
         let connected: Vec<_> = self.hosts.lock().await.iter().flatten().cloned().collect();
         for exec in connected {
             let _ = exec.cancel().await;
@@ -568,5 +629,70 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         let refused = FleetExecutor::new(&second, creds, connector(&[], &[], attempts, runs));
         assert!(refused.is_err());
+    }
+
+    /// Answers right away, or — with `hang` — only once cancelled.
+    struct UntilCancelled {
+        hang: bool,
+        cancelled: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandExecutor for UntilCancelled {
+        async fn run(&self, _command: &str) -> Result<CommandResult> {
+            if self.hang {
+                self.cancelled.notified().await;
+                return Err(CoreError::Other("interrupted".into()));
+            }
+            Ok(CommandResult {
+                stdout: "5.15.0".into(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                duration: std::time::Duration::ZERO,
+                cwd: None,
+            })
+        }
+        async fn cancel(&self) -> Result<()> {
+            self.cancelled.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_the_operation_and_run_returns_the_partial_summary() {
+        let op = fleet(&["web-1", "web-2", "web-3"]);
+        let connect: HostConnector = Arc::new(|target: SshTarget| {
+            Box::pin(async move {
+                Ok(Arc::new(UntilCancelled {
+                    hang: target.name != "web-1",
+                    cancelled: tokio::sync::Notify::new(),
+                }) as Arc<dyn CommandExecutor>)
+            })
+        });
+        let exec = Arc::new(executor(&op, connect));
+
+        let running = tokio::spawn({
+            let exec = Arc::clone(&exec);
+            async move { exec.run("uname -r").await }
+        });
+        // web-1 answers, web-2 starts and hangs; web-3 waits in the queue
+        // (max_parallel is 2).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        exec.cancel().await.expect("cancel");
+
+        let out = running.await.expect("join").expect("run returns after a cancel");
+        assert!(out.stdout.contains("1 of 3 hosts answered"), "{}", out.stdout);
+        assert!(out.stdout.contains("1 ok, 2 cancelled"), "{}", out.stdout);
+        assert_eq!(out.exit_code, Some(0), "a cancelled operation is not a failed one");
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_leaves_nothing_for_cancel_to_stop() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let exec = executor(&fleet(&["web-1"]), connector(&[], &[], attempts, runs));
+        exec.run("uptime").await.expect("run");
+        assert!(exec.current.lock().expect("lock").is_none(), "the finished run cleared itself");
+        exec.cancel().await.expect("cancel with no run in flight");
     }
 }
