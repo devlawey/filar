@@ -5091,6 +5091,14 @@ fn fleet_intro(
             .collect();
         if !skipped.is_empty() {
             lines.push(format!("Skipped, no credentials: {}", skipped.join(", ")));
+        }
+        // Saving a password helps only a host whose password is missing,
+        // not one whose credential store could not be consulted.
+        let missing_password = creds
+            .skipped(op)
+            .iter()
+            .any(|(_, why)| *why == filar_agent::fleet_creds::MissingCredentials::NoPassword);
+        if missing_password {
             lines.push(format!(
                 "Save a password in the launcher (keyring {}), then reopen.",
                 filar_agent::fleet_creds::target_secret_name("<host>")

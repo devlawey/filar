@@ -367,10 +367,11 @@ Windows консоль отдаёт событие клавиши с вирту�
 |---|---|---|
 | Windows | Credential Manager — есть всегда | — |
 | macOS | Keychain — есть всегда | — |
-| Linux | Secret Service через D-Bus | `get` возвращает ошибку |
+| Linux | Secret Service через D-Bus | `get` → `CoreError::Other` (не `Secret`) |
 
 На Linux без D-Bus-сессии (headless, контейнер, SSH без агента keyring)
-каждый password-хост флота выпадает как `skipped` с причиной `no password in
-the OS credential store`. Флот при этом работает на key-хостах. Это
+каждый password-хост флота выпадает как `skipped` с причиной `OS credential
+store unavailable` — не «пароля нет»: пароль там может лежать, и совет
+сохранить его заново был бы ложным. Флот при этом работает на key-хостах. Это
 ожидаемо, а не баг: подставить общий `SSH_PASSWORD` значило бы отдать один
 секрет всем хостам группы. Проверено живым прогоном в Linux-контейнере.

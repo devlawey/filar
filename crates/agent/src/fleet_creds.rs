@@ -22,6 +22,11 @@
 //! | `key` | always — a key that fails to load is "no contact", not "skipped" |
 //! | `password` with a value | always (the config warns about plain text elsewhere) |
 //! | `password` without a value | the OS credential store has `ssh_target:<name>` |
+//!
+//! A store that cannot be consulted at all (no Secret Service on a headless
+//! Linux, a locked keychain) is its own reason, not "no password": the
+//! password may well be stored, and telling the user to save it again would
+//! send them the wrong way.
 //! | `agent` | never — SSH agent auth is not implemented by the transport |
 //!
 //! The resolution is made once, when the fleet opens, like the composition
@@ -31,6 +36,7 @@
 use std::fmt;
 
 use filar_core::config::{SshAuth, SshTarget};
+use filar_core::error::CoreError;
 use filar_core::fleet_op::{FleetOperation, HostHandle, OperationId};
 use filar_core::secrets::SecretProvider;
 
@@ -48,6 +54,10 @@ pub enum MissingCredentials {
     /// Password auth, and neither the config nor the OS credential store
     /// holds a password for this host.
     NoPassword,
+    /// Password auth, and the OS credential store could not be consulted.
+    /// The store's error is not kept: nothing about a lookup reaches the
+    /// transcript but the fact that it failed.
+    StoreUnavailable,
     /// SSH agent auth, which the transport does not implement.
     AgentUnsupported,
 }
@@ -56,6 +66,7 @@ impl fmt::Display for MissingCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::NoPassword => "no password in the OS credential store",
+            Self::StoreUnavailable => "OS credential store unavailable",
             Self::AgentUnsupported => "SSH agent auth is not supported",
         })
     }
@@ -131,11 +142,13 @@ fn resolve_one(target: &SshTarget, store: &dyn SecretProvider) -> Result<SshTarg
         SshAuth::Key { .. } => Ok(target.clone()),
         SshAuth::Password { password: Some(_) } => Ok(target.clone()),
         SshAuth::Password { password: None } => {
-            let password = store
-                .get(&target_secret_name(&target.name))
-                .ok()
-                .filter(|p| !p.is_empty())
-                .ok_or(MissingCredentials::NoPassword)?;
+            // `Secret` is the provider's "not stored"; any other error means
+            // the store itself could not be used.
+            let password = match store.get(&target_secret_name(&target.name)) {
+                Ok(p) if !p.is_empty() => p,
+                Ok(_) | Err(CoreError::Secret(_)) => return Err(MissingCredentials::NoPassword),
+                Err(_) => return Err(MissingCredentials::StoreUnavailable),
+            };
             let mut ready = target.clone();
             ready.auth = SshAuth::Password {
                 password: Some(password),
@@ -226,6 +239,31 @@ mod tests {
         store.insert("ssh_target:web-1", "");
         let creds = FleetCredentials::resolve(&op, &store);
         assert!(creds.ready(0).is_none());
+    }
+
+    /// A store that cannot be consulted at all.
+    struct BrokenStore;
+
+    impl SecretProvider for BrokenStore {
+        fn get(&self, _name: &str) -> filar_core::Result<String> {
+            Err(CoreError::Other("Secret Service unreachable".into()))
+        }
+        fn secret_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn an_unreachable_store_is_not_reported_as_a_missing_password() {
+        let op = fleet(&[
+            target("web-1", SshAuth::Password { password: None }),
+            target("web-2", SshAuth::Key { path: None }),
+        ]);
+        let creds = FleetCredentials::resolve(&op, &BrokenStore);
+        assert_eq!(creds.skipped(&op), [("web-1", MissingCredentials::StoreUnavailable)]);
+        assert_eq!(creds.participants(&op), ["web-2"]);
+        let reason = MissingCredentials::StoreUnavailable.to_string();
+        assert!(!reason.contains("Secret Service unreachable"), "no store error text: {reason}");
     }
 
     #[test]
