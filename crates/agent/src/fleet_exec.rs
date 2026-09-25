@@ -29,7 +29,9 @@
 //! crate does not open SSH sessions itself, and the connector is where the
 //! read-only wrapper goes on. A host that cannot be reached comes out as
 //! "no contact" in the summary and is tried again on the next command; the
-//! failure is not cached.
+//! failure is not cached. A cached connection that is lost mid-command is
+//! dropped the same way, so the next command reconnects instead of reusing
+//! a dead session.
 //!
 //! Credentials policy (a host without them drops out) is #436; cancelling
 //! the operation on the hosts is #437. [`cancel`](CommandExecutor::cancel)
@@ -46,11 +48,11 @@ use filar_core::error::{CoreError, Result};
 use filar_core::fleet_checks::FleetCheck;
 use filar_core::fleet_op::{FleetOperation, OperationId};
 use filar_transport::readonly::check_read_only;
-use filar_transport::{CommandExecutor, CommandResult};
+use filar_transport::{is_connection_lost, CommandExecutor, CommandResult};
 
 use crate::fleet_fold::fold;
 use crate::fleet_result::OperationResult;
-use crate::fleet_run::{run_on_fleet, HostTask};
+use crate::fleet_run::{run_on_fleet, HostRun, HostTask};
 use crate::preprocess::PreprocessorRegistry;
 
 /// Opens a connection to one fleet host.
@@ -152,6 +154,33 @@ impl FleetExecutor {
     }
 }
 
+impl FleetExecutor {
+    /// Drop the cached connection of every host whose command failed with
+    /// a lost connection, so the next command connects afresh through the
+    /// [`HostConnector`] instead of reusing a dead session. Only the exact
+    /// executor this run used is dropped — a slot refilled meanwhile keeps
+    /// its newer connection.
+    async fn evict_lost(
+        &self,
+        handles: &[filar_core::fleet_op::HostHandle],
+        used: &[Arc<dyn CommandExecutor>],
+        report: &crate::fleet_run::FleetRunReport,
+    ) {
+        let mut slots = self.hosts.lock().await;
+        for outcome in report.outcomes() {
+            if !matches!(outcome.run(), HostRun::Failed(e) if is_connection_lost(e)) {
+                continue;
+            }
+            let Some(i) = handles.iter().position(|h| *h == outcome.handle()) else {
+                continue;
+            };
+            if slots[i].as_ref().is_some_and(|cached| Arc::ptr_eq(cached, &used[i])) {
+                slots[i] = None;
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl CommandExecutor for FleetExecutor {
     async fn run(&self, command: &str) -> Result<CommandResult> {
@@ -165,13 +194,15 @@ impl CommandExecutor for FleetExecutor {
         let started = std::time::Instant::now();
         let mut op = self.fleet.reopen();
         let executors = self.executors().await;
-        let tasks: Vec<HostTask> = op
-            .handles()
-            .zip(executors)
-            .map(|(handle, exec)| HostTask::new(handle, exec, command))
+        let handles: Vec<_> = op.handles().collect();
+        let tasks: Vec<HostTask> = handles
+            .iter()
+            .zip(executors.iter())
+            .map(|(handle, exec)| HostTask::new(*handle, Arc::clone(exec), command))
             .collect();
 
         let report = run_on_fleet(&mut op, tasks.clone()).await?;
+        self.evict_lost(&handles, &executors, &report).await;
         let mut result = OperationResult::build(&op, &report, &[])?;
         let registry = PreprocessorRegistry::with_builtins();
         let table = fold(&check, &tasks, &report, &mut result, &registry)?;
@@ -325,6 +356,54 @@ mod tests {
 
         exec.run("uptime").await.expect("second run");
         assert_eq!(attempts.load(Ordering::SeqCst), 3, "the failed host is tried again");
+    }
+
+    /// Answers once, then behaves like a dropped SSH session.
+    struct DropsAfterFirst {
+        runs: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandExecutor for DropsAfterFirst {
+        async fn run(&self, _command: &str) -> Result<CommandResult> {
+            if self.runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(CommandResult {
+                    stdout: "ok".into(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                    duration: std::time::Duration::ZERO,
+                    cwd: None,
+                })
+            } else {
+                Err(CoreError::ConnectionLost("session closed".into()))
+            }
+        }
+        async fn cancel(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_is_reopened_on_the_next_command() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let connect: HostConnector = Arc::new(move |_t: SshTarget| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Arc::new(DropsAfterFirst { runs: Arc::new(AtomicUsize::new(0)) })
+                    as Arc<dyn CommandExecutor>)
+            })
+        });
+        let exec = FleetExecutor::new(&fleet(&["web-1"]), connect);
+
+        exec.run("uptime").await.expect("first run answers");
+        let lost = exec.run("uptime").await.expect("second run reports");
+        assert!(lost.stdout.contains("no contact"), "{}", lost.stdout);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "the dead session is still cached here");
+
+        let back = exec.run("uptime").await.expect("third run");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "the lost host was reconnected");
+        assert!(back.stdout.contains("1 of 1 hosts answered"), "{}", back.stdout);
     }
 
     #[tokio::test]
