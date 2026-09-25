@@ -200,6 +200,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- A tab switching hosts with `Ctrl+O` refuses to send anything until the new
+  connection is in place, and gets its previous label back if the switch
+  fails — nothing runs on the old executor under the new host's name
+  ([#433](https://github.com/devlawey/filar/issues/433)).
+
 - `SshAuth`'s `Debug` no longer prints an inline SSH password in clear.
   Whether one is set stays visible, the value does not, so a `{target:?}`
   in a log line or a panic message can no longer leak it — including

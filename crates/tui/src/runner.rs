@@ -1208,6 +1208,8 @@ async fn run_app(
                 // label (#433). Refuse instead.
                 if exec_entry.is_none() {
                     app.push_error("Tab executor not ready yet — host not switched".into());
+                    app.settle_pending_swap();
+                    app.connect_settled(sid, false);
                     continue;
                 }
                 let tx = agent_tx.clone();
@@ -1279,6 +1281,7 @@ async fn run_app(
             if exec_entry.is_none() {
                 app.push_error("Tab executor not ready yet — host not switched".into());
                 app.settle_pending_swap();
+                app.connect_settled(sid, false);
                 continue;
             }
             let tx = agent_tx.clone();
@@ -1449,11 +1452,14 @@ async fn run_app(
                         // mode release, recomputed from the transport that
                         // is actually active (#414 review).
                         app.settle_pending_swap();
+                        app.connect_settled(*session_id, true);
                     }
-                    if let TuiEvent::TransportSwapFailed { .. } = &event {
+                    if let TuiEvent::TransportSwapFailed { session_id } = &event {
                         // The connect died without a swap: stop folding the
-                        // abandoned target's floor (#414 review).
+                        // abandoned target's floor (#414 review), and give
+                        // the tab back the label of where it still runs.
                         app.settle_pending_swap();
+                        app.connect_settled(*session_id, false);
                     }
                     if let TuiEvent::Agent {
                         session_id,
