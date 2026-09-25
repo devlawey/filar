@@ -165,6 +165,12 @@ pub struct PendingConfirm {
     pub audit_model: Option<String>,
     /// `true` when the arbiter audit was unavailable.
     pub audit_unavailable: bool,
+    /// Fleet hosts the command runs on (#435); empty outside a fleet. One
+    /// approval covers all of them — the dialog shows the count, and the
+    /// names on `l`.
+    pub radius: Vec<String>,
+    /// The host list is expanded in the dialog.
+    pub radius_expanded: bool,
 }
 
 /// Pending arbiter audit result, stored until `ConfirmationRequest` merges it.
@@ -193,6 +199,8 @@ impl PendingConfirm {
             audit_reason: String::new(),
             audit_model: None,
             audit_unavailable: false,
+            radius: Vec::new(),
+            radius_expanded: false,
         }
     }
 }
@@ -3345,6 +3353,12 @@ impl App {
                 | KeyCode::Char('в') | KeyCode::Char('т') => {
                     self.respond_to_confirmation(false);
                 }
+                // Expand / collapse the fleet radius (#435).
+                KeyCode::Char('l') | KeyCode::Char('д') => {
+                    if let Some(p) = self.pending_confirm.as_mut().filter(|p| !p.radius.is_empty()) {
+                        p.radius_expanded = !p.radius_expanded;
+                    }
+                }
                 KeyCode::End => {
                     self.scroll = 0;
                 }
@@ -4457,6 +4471,7 @@ impl App {
                     auto_scroll = self.scroll == 0;
                 }
                 filar_agent::AgentEvent::CommandProposed { command, explanation, .. } => {
+                    let explanation = self.with_fleet_radius(explanation);
                     self.pending_proposal = Some((command, explanation));
                 }
                 filar_agent::AgentEvent::CommandAudited {
@@ -4506,7 +4521,15 @@ impl App {
                             });
                         }
                     } else {
-                        self.push_message(ChatBlock::System(format!("Denied: {command}")));
+                        // A denial the user did not make carries its reason
+                        // (the fleet gate refusing a write, #435; a timed-out
+                        // confirmation) — say it, or it reads as the user's.
+                        let line = if output.is_empty() {
+                            format!("Denied: {command}")
+                        } else {
+                            format!("Denied: {command} — {output}")
+                        };
+                        self.push_message(ChatBlock::System(line));
                         auto_scroll = self.scroll == 0;
                     }
                     self.pending_proposal = None;
@@ -4615,6 +4638,11 @@ impl App {
                     pending.audit_model = a.arbiter_model;
                     pending.audit_unavailable = a.unavailable;
                 }
+                // The fleet gate (#435): the radius is the fleet's frozen
+                // composition — the same snapshot the fleet executor runs
+                // the command on.
+                pending.radius = self.fleet_radius();
+                pending.explanation = self.with_fleet_radius(pending.explanation);
                 self.pending_confirm = Some(pending);
                 self.mode = AppMode::Confirming;
                 // Reset selection to safe default (Deny).
@@ -5038,7 +5066,7 @@ fn fleet_intro(op: &filar_core::FleetOperation) -> Vec<String> {
         lines.push(format!("Hosts: {}", names.join(", ")));
         lines.push("Fixed at entry: retagging does not change the fleet.".into());
     }
-    lines.push("Not wired yet: messages here are not sent to any host.".into());
+    lines.push("Ask read-only questions: one approval runs a command on every host.".into());
     lines.push("Ctrl+W: close fleet · Ctrl+N: new tab · Ctrl+Tab: back to tabs".into());
     lines
 }
@@ -5163,6 +5191,32 @@ impl App {
         self.sync_confirm_mode();
     }
 
+    /// Hosts a command in the active session runs on: the fleet's members,
+    /// or nothing outside a fleet (#435).
+    pub fn fleet_radius(&self) -> Vec<String> {
+        self.active_session()
+            .fleet
+            .as_ref()
+            .map(|f| f.members().iter().map(|m| m.name().to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// In Explain mode (F2) in a fleet, the explanation names the radius
+    /// (#435): what is explained is the command on these hosts, and the
+    /// transcript keeps that. Unchanged anywhere else.
+    fn with_fleet_radius(&self, explanation: String) -> String {
+        let radius = self.fleet_radius();
+        if radius.is_empty() || self.active_session().confirm_mode != CommandConfirmMode::Explain {
+            return explanation;
+        }
+        let line = filar_agent::fleet_gate::radius_line(&radius);
+        if explanation.is_empty() {
+            format!("Runs {line}.")
+        } else {
+            format!("{explanation} (runs {line})")
+        }
+    }
+
     /// Explain that a single-host feature is not available in the fleet.
     fn fleet_refusal(&mut self, feature: FleetRefusal) {
         self.push_message(ChatBlock::System(feature.explanation().into()));
@@ -5183,14 +5237,6 @@ impl App {
         };
         if key.code == KeyCode::Enter && !ctrl && self.input.trim_start().starts_with('!') {
             self.fleet_refusal(FleetRefusal::ShellEscape);
-            return true;
-        }
-        if key.code == KeyCode::Enter && !ctrl && !self.input.trim().is_empty() {
-            self.push_message(ChatBlock::System(
-                "Not sent: the fleet cannot run the agent yet (message kept in the input)."
-                    .into(),
-            ));
-            self.scroll = 0;
             return true;
         }
         if is('t', 'е') && !shift {
@@ -5705,17 +5751,20 @@ mod tests {
     }
 
     #[test]
-    fn nothing_reaches_a_host_from_the_fleet() {
+    fn in_the_fleet_only_the_agent_reaches_hosts() {
         use crossterm::event::KeyCode;
         let mut app = app_with_groups();
         app.enter_fleet("web");
+        // A prompt goes to the fleet agent (#435), whose every command
+        // passes the fleet gate.
         for c in "uptime".chars() {
             app.handle_key(key_event(KeyCode::Char(c)));
         }
         app.handle_key(key_event(KeyCode::Enter));
-        assert_eq!(app.take_input(), None, "no agent run");
-        assert_eq!(app.input, "uptime", "the message stays in the input");
-        assert_eq!(app.mode, AppMode::Normal);
+        assert_eq!(app.take_input().as_deref(), Some("uptime"), "sent to the fleet agent");
+        app.mode = AppMode::Normal;
+        app.agent_running = false;
+        // Everything that would reach a host around the agent is refused.
         app.input.clear();
         app.cursor_pos = 0;
         app.handle_key(key_event(KeyCode::Char('!')));
@@ -5735,6 +5784,115 @@ mod tests {
         assert_eq!(app.input, "/");
         app.handle_key(key_event(KeyCode::F(3)));
         assert!(!app.session_select_visible, "no session restore into the fleet");
+    }
+
+    /// Deliver a confirmation request for `command` to the active session.
+    fn request_confirmation(app: &mut App, command: &str, explanation: &str) -> oneshot::Receiver<bool> {
+        let (tx, rx) = oneshot::channel();
+        let session_id = app.sessions[app.active].id;
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id,
+            event: filar_agent::AgentEvent::CommandProposed {
+                command: command.into(),
+                explanation: explanation.into(),
+                destructive: false,
+            },
+        });
+        app.handle_agent_event(TuiEvent::ConfirmationRequest {
+            session_id,
+            command: command.into(),
+            explanation: explanation.into(),
+            destructive: false,
+            respond_to: tx,
+        });
+        rx
+    }
+
+    #[test]
+    fn the_fleet_gate_shows_the_radius_and_one_approval_answers_it() {
+        use crossterm::event::KeyCode;
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        let mut rx = request_confirmation(&mut app, "uname -r", "kernel version");
+        assert_eq!(app.mode, AppMode::Confirming);
+        let pending = app.pending_confirm.as_ref().expect("gate open");
+        assert_eq!(pending.radius, ["web-1", "web-2"], "the radius is the fleet's frozen composition");
+        assert!(!pending.radius_expanded, "a counter first, the list on demand");
+        assert_eq!(pending.explanation, "kernel version", "only F2 rewrites the explanation");
+
+        app.handle_key(key_event(KeyCode::Char('l')));
+        assert!(app.pending_confirm.as_ref().is_some_and(|p| p.radius_expanded));
+        app.handle_key(key_event(KeyCode::Char('д')));
+        assert!(app.pending_confirm.as_ref().is_some_and(|p| !p.radius_expanded), "l toggles back");
+        assert_eq!(app.mode, AppMode::Confirming, "expanding never answers the gate");
+
+        app.handle_key(key_event(KeyCode::Char('a')));
+        assert_eq!(rx.try_recv(), Ok(true), "one approval for both hosts");
+        assert!(app.pending_confirm.is_none());
+    }
+
+    #[test]
+    fn f2_in_the_fleet_names_the_radius_in_the_explanation() {
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        app.toggle_explain_mode();
+        let _rx = request_confirmation(&mut app, "uptime", "load average");
+        let pending = app.pending_confirm.as_ref().expect("gate open");
+        assert_eq!(pending.explanation, "load average (runs on 2 hosts: web-1, web-2)");
+        // The feed (and so the Explain transcript) keeps the same text.
+        assert_eq!(
+            app.pending_proposal.as_ref().map(|(_, e)| e.as_str()),
+            Some("load average (runs on 2 hosts: web-1, web-2)")
+        );
+    }
+
+    #[test]
+    fn a_write_refused_by_the_fleet_gate_reads_as_a_denial_with_its_reason() {
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        let session_id = app.sessions[app.active].id;
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id,
+            event: filar_agent::AgentEvent::CommandFinished {
+                command: "systemctl restart nginx".into(),
+                output: filar_agent::fleet_gate::FLEET_WRITE_DENIED.into(),
+                denied: true,
+            },
+        });
+        match app.messages.last() {
+            Some(ChatBlock::System(line)) => assert_eq!(
+                line,
+                "Denied: systemctl restart nginx — the fleet is read-only, nothing was sent to any host"
+            ),
+            other => panic!("expected a denial line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closing_the_fleet_releases_its_session_and_reentry_is_a_new_one() {
+        // The runner drops the fleet's executor (and its host connections)
+        // on the ids in `closed_ids`; re-entering must never reuse the id.
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        let first = app.sessions[app.active].id;
+        app.take_closed_ids();
+        app.exit_fleet();
+        assert_eq!(app.take_closed_ids(), vec![first], "closing the fleet releases its id");
+        app.enter_fleet("web");
+        assert_ne!(app.sessions[app.active].id, first, "re-entry is a new fleet session");
+    }
+
+    #[test]
+    fn a_single_host_gate_has_no_radius() {
+        use crossterm::event::KeyCode;
+        let mut app = app_with_groups();
+        app.toggle_explain_mode();
+        let _rx = request_confirmation(&mut app, "uptime", "load average");
+        let pending = app.pending_confirm.as_ref().expect("gate open");
+        assert!(pending.radius.is_empty());
+        assert_eq!(pending.explanation, "load average");
+        app.handle_key(key_event(KeyCode::Char('l')));
+        assert!(app.pending_confirm.as_ref().is_some_and(|p| !p.radius_expanded));
     }
 
     #[test]

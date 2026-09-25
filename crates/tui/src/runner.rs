@@ -417,6 +417,42 @@ fn wrap_if_read_only(
     }
 }
 
+/// How the fleet executor reaches one host (#435): the same SSH transport
+/// as a tab, always behind [`filar_transport::ReadOnlyExecutor`] — a fleet
+/// is read-only whatever the group's tags say (#419).
+fn fleet_connector(command_timeout: Duration) -> filar_agent::fleet_exec::HostConnector {
+    Arc::new(move |target: filar_core::SshTarget| {
+        Box::pin(async move {
+            let ssh = SshExecutor::connect_with_config(&target, ssh_transport_config(command_timeout))
+                .await?;
+            Ok(Arc::new(filar_transport::ReadOnlyExecutor::new(Arc::new(ssh)))
+                as Arc<dyn CommandExecutor>)
+        })
+    })
+}
+
+/// The group-level executor for the fleet session `sid` (#435).
+///
+/// Reused only while it was built from this very `fleet` operation: an entry
+/// built from any other composition is replaced, so the hosts a command runs
+/// on are always the ones the gate shows as the radius — whatever the
+/// session lifecycle around it does.
+fn fleet_executor_for(
+    map: &mut HashMap<SessionId, Arc<filar_agent::fleet_exec::FleetExecutor>>,
+    sid: SessionId,
+    fleet: &filar_core::FleetOperation,
+    connector: impl FnOnce() -> filar_agent::fleet_exec::HostConnector,
+) -> Arc<filar_agent::fleet_exec::FleetExecutor> {
+    match map.get(&sid) {
+        Some(exec) if exec.built_from() == fleet.id() => Arc::clone(exec),
+        _ => {
+            let exec = Arc::new(filar_agent::fleet_exec::FleetExecutor::new(fleet, connector()));
+            map.insert(sid, Arc::clone(&exec));
+            exec
+        }
+    }
+}
+
 /// Run the TUI with the given LLM client, executor, and configuration.
 pub async fn run(
     _llm: Arc<dyn LlmClient>,
@@ -560,6 +596,14 @@ async fn run_app(
         inner: Arc::new(tokio::sync::RwLock::new(executor)),
     });
     let initial_sid = app.sessions[0].id;
+    // The fleet's group-level executor (#435), one per fleet session. Kept
+    // apart from `executors` on purpose: a fleet never has a tab executor,
+    // so nothing that looks one up (terminal, cwd sync, host switch) can
+    // reach the fleet's hosts through it.
+    let mut fleet_executors: HashMap<
+        crate::app::SessionId,
+        Arc<filar_agent::fleet_exec::FleetExecutor>,
+    > = HashMap::new();
     let mut executors: std::collections::HashMap<
         crate::app::SessionId,
         ExecutorEntry,
@@ -970,14 +1014,28 @@ async fn run_app(
                         }
                     } else {
                         let sid = app.sessions[app.active].id;
-                        let (agent_exec, is_local, ssh_info) = match executors.get(&sid) {
-                            Some(e) => {
-                                let info = app.sessions[app.active].ssh_info.clone();
-                                (e.executor.clone() as Arc<dyn CommandExecutor>, info.is_none(), info)
-                            }
-                            None => {
-                                app.push_error("Tab executor not ready yet".into());
-                                continue;
+                        let in_fleet = app.in_fleet();
+                        let (agent_exec, is_local, ssh_info) = if let Some(fleet) =
+                            app.sessions[app.active].fleet.as_ref()
+                        {
+                            // The fleet agent runs over the group-level
+                            // executor and nothing else (#434, #435): a tab
+                            // executor would be one host behind a fleet label.
+                            let exec = fleet_executor_for(&mut fleet_executors, sid, fleet, || {
+                                fleet_connector(command_timeout)
+                            });
+                            let info = format!("fleet {} ({} hosts)", fleet.group_name(), fleet.len());
+                            (exec as Arc<dyn CommandExecutor>, false, Some(info))
+                        } else {
+                            match executors.get(&sid) {
+                                Some(e) => {
+                                    let info = app.sessions[app.active].ssh_info.clone();
+                                    (e.executor.clone() as Arc<dyn CommandExecutor>, info.is_none(), info)
+                                }
+                                None => {
+                                    app.push_error("Tab executor not ready yet".into());
+                                    continue;
+                                }
                             }
                         };
                         // Create a cancellation token for this agent run.
@@ -1056,6 +1114,7 @@ async fn run_app(
                             profile_name.clone(),
                             app.active_session().compaction_exhausted,
                             pending_compaction,
+                            in_fleet,
                         );
                         // Consumed by this run: the summary comes back as an
                         // event, and a leftover flag would fold the history a
@@ -1385,6 +1444,9 @@ async fn run_app(
             }
             // Release the tab's executor so SSH connections don't leak.
             executors.remove(&sid);
+            // A closed fleet drops its group-level executor and with it
+            // every host connection it held (#435).
+            fleet_executors.remove(&sid);
         }
 
         // Teardown interactive backends for tabs reset by session restore
@@ -2095,6 +2157,9 @@ fn spawn_agent(
     // Boundary index when the history must be compacted before this request
     // (#377). `None` means send it as is.
     pending_compaction: Option<usize>,
+    // The run is the fleet's (#435): `executor` is the group-level one and
+    // the agent gets the fleet tool set, prompt and gate.
+    fleet: bool,
 ) {
     let tx = event_tx.clone();
     let confirmer = Arc::new(TuiConfirmer::new(event_tx.clone(), sid)) as Arc<dyn CommandConfirmer>;
@@ -2166,7 +2231,7 @@ fn spawn_agent(
                     .ssh_mode(ssh_info.as_deref())
                     .arbiter_ssh_context(ssh_info.clone());
             }
-            builder = builder.session_id(sid.0.to_string());
+            builder = builder.session_id(sid.0.to_string()).fleet(fleet);
 
             let agent = match builder.build() {
                 Ok(a) => a,
@@ -2389,6 +2454,45 @@ async fn load_path_picker_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fleet_executor_is_reused_only_for_the_operation_it_was_built_from() {
+        let targets: Vec<filar_core::SshTarget> = ["web-1", "web-2", "db-1"]
+            .iter()
+            .map(|n| filar_core::SshTarget {
+                name: (*n).into(),
+                host: format!("{n}.example"),
+                port: 22,
+                user: "admin".into(),
+                auth: Default::default(),
+                host_key_policy: Default::default(),
+                tags: vec![if n.starts_with("web") { "web".into() } else { "db".into() }],
+            })
+            .collect();
+        let group = |tag: &str| filar_core::HostGroup {
+            name: tag.into(),
+            match_tags: vec![tag.into()],
+            ..Default::default()
+        };
+        let connector = || -> filar_agent::fleet_exec::HostConnector {
+            Arc::new(|_t| Box::pin(async { Err(CoreError::Other("unused".into())) }))
+        };
+        let mut map = HashMap::new();
+        let sid = SessionId(7);
+
+        let web = filar_core::FleetOperation::open(&group("web"), &targets);
+        let first = fleet_executor_for(&mut map, sid, &web, connector);
+        let again = fleet_executor_for(&mut map, sid, &web, connector);
+        assert!(Arc::ptr_eq(&first, &again), "same fleet: connections are kept");
+
+        // Any other operation under the same key — however it got there —
+        // gets its own executor over its own composition.
+        let db = filar_core::FleetOperation::open(&group("db"), &targets);
+        let swapped = fleet_executor_for(&mut map, sid, &db, connector);
+        assert!(!Arc::ptr_eq(&first, &swapped));
+        assert_eq!(swapped.radius(), ["db-1"], "runs where the gate says it runs");
+        assert_eq!(map.len(), 1, "the stale executor is dropped with its connections");
+    }
 
     #[test]
     fn an_overflow_is_retried_exactly_once() {

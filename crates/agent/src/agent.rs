@@ -37,9 +37,17 @@ const DEFAULT_MAX_OUTPUT_CHARS: usize = 10_000;
 /// Maximum number of retries for missing explanation in Explain mode.
 const MAX_MISSING_EXPLANATION_RETRIES: u32 = 2;
 
-/// Appended to the system prompt when the agent works over a fleet (#434).
+/// Appended to the system prompt when the agent works over a fleet (#434,
+/// #435). Must match what the fleet agent actually does: only run_command,
+/// every command on every host, read-only, a fold back instead of output.
 const FLEET_PROMPT: &str = "FLEET: you are working over a group of hosts, not one host. \
-read_file and list_dir are not available: there is no single host to read from. \
+Only run_command is available: each command runs on every host of the group, after \
+one approval from the user. The fleet is read-only: a command that is not on the \
+read-only allowlist is refused before it reaches any host. The result is a summary \
+of which hosts answered and which agree with each other, never the hosts' output. \
+read_file, list_dir and background jobs work on one host and are not available, \
+and so are secrets from Ctrl+P and sudo. These FLEET rules take precedence over \
+anything above about a single host or a persistent shell. \
 If one host needs a closer look, ask the user to open it in its own tab.";
 
 /// System prompt block appended when `CommandConfirmMode::Explain` is active.
@@ -732,7 +740,7 @@ impl Agent {
 
         // A single-host tool called in a fleet anyway (#434): nothing runs,
         // the model is told why and what to use instead.
-        if self.fleet && matches!(parsed.kind, tools::ToolKind::ReadFile | tools::ToolKind::ListDir) {
+        if self.fleet && !matches!(parsed.kind, tools::ToolKind::RunCommand) {
             return Ok(ChatMessage::tool(
                 &tc.id,
                 tools::fleet_single_host_refusal(&tc.name),
@@ -752,11 +760,22 @@ impl Agent {
         };
 
         // Check security / confirmation.
-        let decision = security::tool_needs_confirmation(
+        let mut decision = security::tool_needs_confirmation(
             parsed.kind,
             &parsed.command,
             self.confirm_mode,
         );
+        // The fleet gate (#435). A read-only command is always put to the
+        // user, whatever the mode would auto-approve: one approval covers
+        // every host, so the radius must be seen before it is given. A write
+        // would need an approval per host, and that path is closed — it is
+        // refused below, before anyone is asked.
+        let fleet_gate = self.fleet.then(|| crate::fleet_gate::fleet_gate(&parsed.command));
+        if matches!(fleet_gate, Some(crate::fleet_gate::FleetGate::Ask(_)))
+            && decision == ConfirmDecision::AutoApproved
+        {
+            decision = ConfirmDecision::NeedsConfirmation;
+        }
 
         let destructive = security::is_destructive(&parsed.command)
             || matches!(parsed.kind, tools::ToolKind::CancelBackgroundJob);
@@ -767,6 +786,18 @@ impl Agent {
             explanation: parsed.explanation.clone(),
             destructive,
         });
+
+        if let Some(crate::fleet_gate::FleetGate::Refuse(msg)) = fleet_gate {
+            info!(command = %parsed.command, "write refused by the fleet gate");
+            // Shown as a denial — nothing ran — with the reason, since the
+            // user was never asked.
+            self.emit(AgentEvent::CommandFinished {
+                command: display_command.clone(),
+                output: crate::fleet_gate::FLEET_WRITE_DENIED.to_string(),
+                denied: true,
+            });
+            return Ok(ChatMessage::tool(&tc.id, msg));
+        }
 
         // Reject long sleep/wait patterns before confirm/execute — they only
         // burn the command timeout and never finish usefully (#323).
@@ -1972,11 +2003,111 @@ mod tests {
         fleet_agent(llm.clone(), executor, true).run("check the fleet", &[]).await.unwrap();
         let requests = llm.requests.lock().unwrap();
         let names: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(!names.contains(&"read_file"), "{names:?}");
-        assert!(!names.contains(&"list_dir"), "{names:?}");
-        assert!(names.contains(&"run_command"));
+        assert_eq!(names, ["run_command"], "only run_command in a fleet (#435)");
         // The prompt says so, matching the tool set.
-        assert!(requests[0].messages[0].content.contains("read_file and list_dir are not available"));
+        let prompt = &requests[0].messages[0].content;
+        assert!(prompt.contains("Only run_command is available"), "{prompt}");
+        assert!(prompt.contains("read_file, list_dir and background jobs"), "{prompt}");
+    }
+
+    // ── Fleet gate (#435) ─────────────────────────────────────────────
+
+    /// Confirmer that approves everything and counts how often it was asked.
+    struct CountingConfirmer {
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandConfirmer for CountingConfirmer {
+        async fn confirm(&self, _command: &str, _explanation: &str, _destructive: bool) -> Result<bool> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
+    /// Run a fleet agent in `mode` that proposes `command` once, approving
+    /// everything; returns (times asked, command executed, tool result).
+    async fn run_fleet_command(mode: CommandConfirmMode, command: &str) -> (usize, String, String) {
+        let call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({ "command": command, "explanation": "why" }),
+        }]);
+        let llm = Arc::new(RecordingLlm {
+            inner: MockLlm::new(vec![call, ChatResponse::text("done")]),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        let confirmer = Arc::new(CountingConfirmer { asked: Default::default() });
+        Agent::builder()
+            .llm(llm.clone())
+            .executor(executor.clone())
+            .confirmer(confirmer.clone())
+            .confirm_mode(mode)
+            .fleet(true)
+            .build()
+            .unwrap()
+            .run("go", &[])
+            .await
+            .unwrap();
+        let asked = confirmer.asked.load(std::sync::atomic::Ordering::SeqCst);
+        let executed = executor.last_command.lock().unwrap().clone();
+        let requests = llm.requests.lock().unwrap();
+        let reply = requests[1].messages.last().expect("tool result").content.clone();
+        (asked, executed, reply)
+    }
+
+    #[tokio::test]
+    async fn a_read_only_fleet_command_takes_exactly_one_approval_in_every_mode() {
+        // Even the modes that would auto-approve a read-only command ask in a
+        // fleet: one approval covers every host, so it must be given seeing
+        // the radius.
+        for mode in [
+            CommandConfirmMode::Always,
+            CommandConfirmMode::Allowlist,
+            CommandConfirmMode::Never,
+            CommandConfirmMode::Explain,
+        ] {
+            let (asked, executed, _) = run_fleet_command(mode, "uname -r").await;
+            assert_eq!(asked, 1, "{mode:?}: one approval for the whole fleet");
+            assert_eq!(executed, "uname -r", "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_changing_command_in_a_fleet_passes_under_no_approval() {
+        for mode in [
+            CommandConfirmMode::Always,
+            CommandConfirmMode::Allowlist,
+            CommandConfirmMode::Never,
+            CommandConfirmMode::Explain,
+        ] {
+            for cmd in ["systemctl restart nginx", "rm -rf /var/cache/x", "uname -r; reboot"] {
+                let (asked, executed, reply) = run_fleet_command(mode, cmd).await;
+                assert_eq!(asked, 0, "{mode:?} {cmd}: refused before anyone is asked");
+                assert!(executed.is_empty(), "{mode:?} {cmd}: nothing reached the executor");
+                assert!(reply.starts_with("Error: the fleet is read-only"), "{reply}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_background_job_in_a_fleet_runs_nothing() {
+        let call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "start_background_job".into(),
+            arguments: serde_json::json!({ "command": "sleep 100" }),
+        }]);
+        let llm = Arc::new(RecordingLlm {
+            inner: MockLlm::new(vec![call, ChatResponse::text("ok")]),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        fleet_agent(llm.clone(), executor.clone(), true).run("go", &[]).await.unwrap();
+        assert!(executor.last_command.lock().unwrap().is_empty());
+        let requests = llm.requests.lock().unwrap();
+        let reply = &requests[1].messages.last().expect("tool result").content;
+        assert!(reply.starts_with("Error: start_background_job is not available in a fleet"), "{reply}");
     }
 
     #[tokio::test]

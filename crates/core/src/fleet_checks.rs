@@ -77,6 +77,9 @@ pub enum CheckSource {
     Builtin,
     /// A user catalog file at this path.
     User(PathBuf),
+    /// Not from any catalog: a command the agent put to a fleet directly
+    /// (#435), wrapped by [`FleetCheck::ad_hoc`] so it folds like a check.
+    AdHoc,
 }
 
 impl fmt::Display for CheckSource {
@@ -84,6 +87,7 @@ impl fmt::Display for CheckSource {
         match self {
             Self::Builtin => f.write_str("built-in catalog"),
             Self::User(path) => write!(f, "{}", path.display()),
+            Self::AdHoc => f.write_str("ad-hoc command"),
         }
     }
 }
@@ -241,6 +245,28 @@ pub struct FleetCheck {
 }
 
 impl FleetCheck {
+    /// Name every [`ad_hoc`](Self::ad_hoc) check carries.
+    pub const AD_HOC_NAME: &'static str = "ad-hoc";
+
+    /// Wrap a command the agent put to a fleet directly (#435) as a check,
+    /// so its answers fold like any other: the same command on every host,
+    /// no preprocessor, so the whole output is compared by digest and none
+    /// of it reaches the model (#430).
+    ///
+    /// The command passes the same line validation as a catalog entry. It is
+    /// still subject to `filar_transport::check_read_only` — this is a
+    /// declaration, not a permission.
+    pub fn ad_hoc(command: &str) -> std::result::Result<Self, String> {
+        Ok(Self {
+            name: Self::AD_HOC_NAME.to_owned(),
+            description: "command put to the fleet by the agent".to_owned(),
+            command: CommandSpec::Same(validate_one_command(command, "command")?),
+            preprocessor: None,
+            compare: Vec::new(),
+            source: CheckSource::AdHoc,
+        })
+    }
+
     /// Stable identifier, unique across the merged catalog.
     pub fn name(&self) -> &str {
         &self.name
@@ -581,6 +607,8 @@ impl FleetCheckCatalog {
                 CheckSource::User(path) => {
                     format!("name '{name}' is already used by a check from {}", path.display())
                 }
+                // Ad-hoc checks are never put into a catalog.
+                CheckSource::AdHoc => format!("name '{name}' is already used"),
             });
         }
 
@@ -1566,5 +1594,19 @@ command = "rm -rf /var/log"
             catalog.get("dangerous").unwrap().commands(),
             ["rm -rf /var/log"]
         );
+    }
+
+    #[test]
+    fn an_ad_hoc_command_folds_as_a_raw_check() {
+        let check = FleetCheck::ad_hoc("  uname -r ").expect("a plain command is accepted");
+        assert_eq!(check.name(), FleetCheck::AD_HOC_NAME);
+        assert_eq!(check.command_for(OsFamily::Debian).command(), Some("uname -r"));
+        assert_eq!(check.command_for(OsFamily::Unknown).command(), Some("uname -r"));
+        assert_eq!(check.preprocessor(), None, "compared by digest: no text reaches the model");
+        assert!(check.compare().is_empty());
+        assert_eq!(check.source(), &CheckSource::AdHoc);
+
+        assert!(FleetCheck::ad_hoc("   ").is_err());
+        assert!(FleetCheck::ad_hoc("uname\nreboot").is_err(), "two lines are two commands");
     }
 }

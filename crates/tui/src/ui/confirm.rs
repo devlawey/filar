@@ -5,6 +5,8 @@
 //! - explanation text (if any),
 //! - a destructive warning (if applicable),
 //! - the command with `$ ` prefix,
+//! - in a fleet (#435), the radius first: `Runs on 12 hosts — l: list`, and
+//!   with `l` the host names themselves — seen before Approve, not after,
 //! - two buttons: `[ Approve (a) ]` and `[ Deny (d) ]`.
 //!
 //! The selected button (default: Deny — safe) is highlighted with inverted
@@ -55,6 +57,8 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let audit_reason = confirm.audit_reason.clone();
     let audit_model = confirm.audit_model.clone();
     let audit_unavailable = confirm.audit_unavailable;
+    let radius = confirm.radius.clone();
+    let radius_expanded = confirm.radius_expanded;
 
     // `audit_model` holds the arbiter *profile* name from `CommandAudited`
     // (runner passes `LlmProfile.name` as `arbiter_model_name`).
@@ -86,8 +90,14 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let warning_rows = if destructive { 1 } else { 0 };
     let command_rows = estimate_wrapped_rows(&command_text, inner_width);
     let empty_rows = 1; // separator line before buttons
+    let radius_rows = match radius_lines(&radius, radius_expanded) {
+        None => 0,
+        Some((_, None)) => 1,
+        Some((_, Some(list))) => 1 + estimate_wrapped_rows(&list, inner_width),
+    };
 
-    let natural_content = (explanation_rows + audit_rows + warning_rows + command_rows + empty_rows) as u16;
+    let natural_content =
+        (radius_rows + explanation_rows + audit_rows + warning_rows + command_rows + empty_rows) as u16;
     // +2 borders +1 buttons
     let natural_height = natural_content.saturating_add(3);
 
@@ -96,6 +106,7 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let max_content_rows = modal_height.saturating_sub(3) as usize;
 
     let lines = build_modal_lines(
+        radius_lines(&radius, radius_expanded),
         &explanation,
         &command_text,
         destructive,
@@ -141,7 +152,11 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(Span::styled(
-            " Confirm command ",
+            match radius.len() {
+                0 => " Confirm command ".to_string(),
+                1 => " Confirm command on 1 host ".to_string(),
+                n => format!(" Confirm command on {n} hosts "),
+            },
             Style::default()
                 .fg(border_color)
                 .add_modifier(Modifier::BOLD),
@@ -196,8 +211,25 @@ fn audit_display_rows(
     rows
 }
 
+/// The fleet radius as modal text (#435): the counter line, and the host
+/// list when expanded. `None` outside a fleet.
+fn radius_lines(radius: &[String], expanded: bool) -> Option<(String, Option<String>)> {
+    if radius.is_empty() {
+        return None;
+    }
+    let noun = if radius.len() == 1 { "host" } else { "hosts" };
+    let key = if expanded { "l: hide" } else { "l: list" };
+    let header = format!("Runs on {} {noun} — {key}", radius.len());
+    Some((header, expanded.then(|| radius.join(", "))))
+}
+
 /// Build modal body lines, truncating so wrapped height ≤ `max_rows`.
+///
+/// The fleet radius comes first and its counter line is never truncated
+/// away: approving without seeing how many hosts it covers is exactly what
+/// the gate exists to prevent.
 fn build_modal_lines(
+    radius: Option<(String, Option<String>)>,
     explanation: &str,
     command_text: &str,
     destructive: bool,
@@ -233,8 +265,20 @@ fn build_modal_lines(
         true
     };
 
-    if !explanation.is_empty() {
-        let truncated = truncate_to_rows(explanation, inner_width, max_rows.saturating_sub(2).max(1));
+    if let Some((header, list)) = radius {
+        let header = truncate_to_rows(&header, inner_width, 1);
+        let _ = push(&mut lines, &mut used, header, warning.add_modifier(Modifier::BOLD));
+        if let Some(list) = list {
+            // Leave room for the command line and the separator.
+            let budget = max_rows.saturating_sub(used).saturating_sub(2).max(1);
+            let shown = truncate_to_rows(&list, inner_width, budget);
+            let _ = push(&mut lines, &mut used, shown, fg);
+        }
+    }
+
+    if !explanation.is_empty() && used < max_rows {
+        let budget = max_rows.saturating_sub(used).saturating_sub(2).max(1);
+        let truncated = truncate_to_rows(explanation, inner_width, budget);
         if !push(&mut lines, &mut used, truncated, fg) && max_rows > 0 {
             lines.push(Line::from(Span::styled(
                 "… (explanation truncated)".to_string(),
@@ -602,7 +646,7 @@ mod tests {
     use ratatui::Terminal;
     use tokio::sync::oneshot;
 
-    fn render_confirm(app: &mut App, width: u16, height: u16) {
+    fn render_confirm(app: &mut App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -613,6 +657,66 @@ mod tests {
                 render_confirm_modal(f, app, chat);
             })
             .expect("confirm render must not panic");
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn fleet_pending(hosts: usize, expanded: bool) -> PendingConfirm {
+        let mut p = pending("uname -r", false);
+        p.radius = (1..=hosts).map(|i| format!("web-{i:02}")).collect();
+        p.radius_expanded = expanded;
+        p
+    }
+
+    #[test]
+    fn the_fleet_gate_shows_the_host_count_before_approval() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(fleet_pending(12, false));
+        app.mode = AppMode::Confirming;
+        let screen = render_confirm(&mut app, 80, 24);
+        assert!(screen.contains("Confirm command on 12 hosts"), "{screen}");
+        assert!(screen.contains("Runs on 12 hosts — l: list"), "{screen}");
+        assert!(!screen.contains("web-01"), "collapsed: a count, not a list\n{screen}");
+        assert!(screen.contains("$ uname -r"), "{screen}");
+    }
+
+    #[test]
+    fn the_expanded_radius_names_the_hosts() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(fleet_pending(12, true));
+        app.mode = AppMode::Confirming;
+        let screen = render_confirm(&mut app, 80, 24);
+        assert!(screen.contains("Runs on 12 hosts — l: hide"), "{screen}");
+        assert!(screen.contains("web-01") && screen.contains("web-12"), "{screen}");
+        assert!(screen.contains("$ uname -r"), "the command stays visible\n{screen}");
+        assert!(!app.confirm_button_areas.is_empty(), "buttons stay on screen");
+    }
+
+    #[test]
+    fn the_host_count_survives_a_cramped_modal() {
+        // A long explanation and a hundred hosts on a small terminal: the
+        // explanation and the list give way, the count does not.
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let mut p = fleet_pending(100, true);
+        p.explanation = "why ".repeat(200);
+        app.pending_confirm = Some(p);
+        app.mode = AppMode::Confirming;
+        let screen = render_confirm(&mut app, 60, 12);
+        assert!(screen.contains("Runs on 100 hosts"), "{screen}");
+        assert!(!app.confirm_button_areas.is_empty(), "buttons stay on screen");
+    }
+
+    #[test]
+    fn a_single_host_gate_has_no_radius_line() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(pending("uname -r", false));
+        app.mode = AppMode::Confirming;
+        let screen = render_confirm(&mut app, 80, 24);
+        assert!(!screen.contains("Runs on"), "{screen}");
+        assert!(screen.contains(" Confirm command "), "{screen}");
     }
 
     fn pending(command: &str, destructive: bool) -> PendingConfirm {

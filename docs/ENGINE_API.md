@@ -134,11 +134,35 @@ ephemeral `/tmp/filar-job-*` logs removed on completion; local jobs capture
 output in memory only.
 
 **Fleet mode.** `AgentBuilder::fleet(true)` marks an agent that works over a
-group of hosts: `read_file` and `list_dir` are left out of the tool set (the
-model never sees them), a call to either is refused with an explanation instead
-of running, and the system prompt says so. The same set is available as
+group of hosts. Only `run_command` is offered: `read_file`, `list_dir` and the
+background-job tools are left out of the tool set (the model never sees them),
+a call to any of them is refused with an explanation instead of running, and
+the system prompt says so. The same set is available as
 `tools::fleet_tool_definitions(mode)`; `tools::SINGLE_HOST_TOOLS` names the
 tools it drops.
+
+A fleet agent also runs the **fleet gate** (`fleet_gate`, #435): a command on
+the transport's read-only allowlist is always put to the confirmer — once, for
+every host, even in modes that would auto-approve it — and anything else is
+refused before the confirmer is called
+(`CommandFinished { denied: true, output: fleet_gate::FLEET_WRITE_DENIED }`).
+`fleet_gate::ApprovalScope` models the per-host approval a write would need;
+that path is closed. The confirmer is not told the radius: a frontend knows its
+own fleet (the TUI shows the group's frozen composition).
+
+Build a fleet agent only over a group-level executor, never over one host's:
+`fleet_exec::FleetExecutor::new(&operation, connector)` implements
+`CommandExecutor` for a `FleetOperation`. Each `run` refuses non-read-only
+commands before any host is contacted, opens a fresh operation over the frozen
+composition (`FleetOperation::reopen`), fans the command out under the group's
+limits, and returns the summary headline plus the fold
+(`FleetCheck::ad_hoc` — compared by digest, **no host output**). The
+`HostConnector` you pass opens one host's executor and must wrap it in
+`ReadOnlyExecutor`; a host it fails to connect is reported as "no contact" and
+retried on the next `run`; so is a cached host whose connection is lost
+during a `run`. `FleetExecutor::built_from()` returns the id of
+the operation it was built from; if you cache executors, reuse one only while
+that id matches the fleet on screen.
 
 ## SSH credentials (password auth)
 

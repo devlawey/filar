@@ -13,6 +13,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- The fleet runs the agent: each command goes to every host of the group
+  behind one confirm gate that shows the host count (`l` lists the hosts),
+  takes one approval for a read-only command in every confirm mode, names the
+  radius in the `F2` explanation, and refuses any changing command before
+  asking; the model gets the summary and fold, never host output
+  ([#435](https://github.com/devlawey/filar/issues/435)).
+
 - Single-host features in the fleet are refused with a reason and the way to
   get them (`Ctrl+O` into the host): terminal, `!cmd`, password input, path
   picker, session restore; the fleet's help bar shows only what works there,
@@ -204,6 +211,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   mandatory alias that names its keyring entry. Pre-existing unnamed slots
   are migrated once to their `SSH1`–`SSH5` names as real aliases, so saved
   passwords survive ([#411](https://github.com/devlawey/filar/issues/411)).
+
+### Changed
+
+- `AgentEvent::CommandFinished` with `denied: true` may carry a short reason in
+  `output` when the command was stopped without the user's answer (timed-out
+  confirmation, the fleet gate refusing a write); the TUI shows it as
+  `Denied: <command> — <reason>`
+  ([#435](https://github.com/devlawey/filar/issues/435)).
 
 ### Fixed
 

@@ -17,13 +17,18 @@
 //! - Fleet fold: the hosts' answers compared in code into one difference
 //!   table, which is the only thing about an operation the model is given —
 //!   no host output ever is (Stage 2.0, fleet).
+//! - Fleet gate and executor: one approval for a read-only question over the
+//!   whole radius, writes refused before anyone is asked; one `run` fans a
+//!   command out and returns the fold (Stage 2.0, fleet).
 
 pub mod agent;
 pub mod arbiter;
 pub mod background;
 pub mod compaction;
 pub mod events;
+pub mod fleet_exec;
 pub mod fleet_fold;
+pub mod fleet_gate;
 pub mod fleet_result;
 pub mod fleet_retry;
 pub mod fleet_run;

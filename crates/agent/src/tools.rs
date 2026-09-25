@@ -106,22 +106,33 @@ pub struct ListBackgroundJobsParams {
 // ---------------------------------------------------------------------------
 
 /// Tools that address exactly one host and have no meaning over a fleet
-/// (#434): whose file would `read_file` read on twelve machines?
-pub const SINGLE_HOST_TOOLS: &[&str] = &[TOOL_READ_FILE, TOOL_LIST_DIR];
+/// (#434): whose file would `read_file` read on twelve machines? Background
+/// jobs belong here too (#435): a job is one process with one pid and one
+/// log file on one host, and starting it writes that log — a fleet is
+/// read-only.
+pub const SINGLE_HOST_TOOLS: &[&str] = &[
+    TOOL_READ_FILE,
+    TOOL_LIST_DIR,
+    TOOL_START_BACKGROUND_JOB,
+    TOOL_BACKGROUND_JOB_STATUS,
+    TOOL_CANCEL_BACKGROUND_JOB,
+    TOOL_LIST_BACKGROUND_JOBS,
+];
 
 /// Why a single-host tool is refused in a fleet, and what to do instead.
 /// Given to the model as the tool result if it calls one anyway.
 pub fn fleet_single_host_refusal(tool: &str) -> String {
     format!(
-        "Error: {tool} is not available in a fleet: there is no single host to read from. \
-         If one host needs a closer look, ask the user to open it in its own tab."
+        "Error: {tool} is not available in a fleet: it works on one host, and a fleet \
+         has no single host to use. In a fleet only run_command is available. If one \
+         host needs a closer look, ask the user to open it in its own tab."
     )
 }
 
 /// Tool definitions offered to the model in a fleet (#434): the ordinary set
-/// without [`SINGLE_HOST_TOOLS`]. They are not offered at all rather than
-/// offered and refused — a tool the model never sees is one it never plans
-/// around.
+/// without [`SINGLE_HOST_TOOLS`] — which leaves `run_command` alone. They
+/// are not offered at all rather than offered and refused — a tool the
+/// model never sees is one it never plans around.
 pub fn fleet_tool_definitions(mode: CommandConfirmMode) -> Vec<ToolDef> {
     tool_definitions(mode)
         .into_iter()
@@ -598,12 +609,13 @@ mod tests {
             let all: Vec<String> = tool_definitions(mode).into_iter().map(|d| d.name).collect();
             let fleet: Vec<String> =
                 fleet_tool_definitions(mode).into_iter().map(|d| d.name).collect();
-            assert!(!fleet.iter().any(|n| n == TOOL_READ_FILE), "{fleet:?}");
-            assert!(!fleet.iter().any(|n| n == TOOL_LIST_DIR), "{fleet:?}");
+            for single in SINGLE_HOST_TOOLS {
+                assert!(!fleet.iter().any(|n| n == single), "{single} offered: {fleet:?}");
+            }
             // Everything else is kept, in the same order.
             let expected: Vec<String> = all
                 .into_iter()
-                .filter(|n| n != TOOL_READ_FILE && n != TOOL_LIST_DIR)
+                .filter(|n| !SINGLE_HOST_TOOLS.contains(&n.as_str()))
                 .collect();
             assert_eq!(fleet, expected);
             assert!(fleet.iter().any(|n| n == TOOL_RUN_COMMAND));

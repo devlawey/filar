@@ -55,13 +55,17 @@ pub enum AgentEvent {
         unavailable: bool,
     },
 
-    /// A command was executed (or denied by the user).
+    /// A command was executed (or did not run — see `denied`).
     CommandFinished {
         /// The command that was processed.
         command: String,
-        /// Command output (empty if denied).
+        /// Command output. When `denied`: empty if the user said no, or a
+        /// short reason if the command was stopped without the user's
+        /// answer (confirmation timed out; the fleet gate refused a write —
+        /// #435).
         output: String,
-        /// `true` if the user denied the command.
+        /// `true` if the command did not run: denied by the user, or refused
+        /// before the user could be asked.
         denied: bool,
     },
 
