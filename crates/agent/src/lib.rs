@@ -20,12 +20,15 @@
 //! - Fleet gate and executor: one approval for a read-only question over the
 //!   whole radius, writes refused before anyone is asked; one `run` fans a
 //!   command out and returns the fold (Stage 2.0, fleet).
+//! - Fleet credentials: each host's own secret, resolved at fleet entry; a
+//!   host without one drops out as skipped (Stage 2.0, fleet).
 
 pub mod agent;
 pub mod arbiter;
 pub mod background;
 pub mod compaction;
 pub mod events;
+pub mod fleet_creds;
 pub mod fleet_exec;
 pub mod fleet_fold;
 pub mod fleet_gate;

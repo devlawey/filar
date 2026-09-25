@@ -13,6 +13,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Fleet credentials are per host: each host connects with its own secret
+  (key, config password, or `ssh_target:<name>` in the OS credential store),
+  resolved on entry; a host without them drops out, is left out of the gate's
+  radius and is marked `skipped` in every summary, while the fleet runs on the
+  rest; the shared `SSH_PASSWORD` and `Ctrl+P` secrets never reach fleet hosts
+  ([#436](https://github.com/devlawey/filar/issues/436)).
+
 - The fleet runs the agent: each command goes to every host of the group
   behind one confirm gate that shows the host count (`l` lists the hosts),
   takes one approval for a read-only command in every confirm mode, names the

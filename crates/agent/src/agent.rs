@@ -419,7 +419,11 @@ impl AgentBuilder {
     pub fn build(self) -> Result<Agent> {
         let executor = self.executor.ok_or_else(|| CoreError::Other("executor not set".into()))?;
         // Wrap the executor in SecretSubstitutingExecutor if a provider is set.
-        let secret_provider = self.secret_provider;
+        // Never in a fleet (#436): a `$FILAR_SECRET_N` was typed for the host
+        // of one tab, and substituting it here would send it to every host of
+        // the group. The fleet prompt already says Ctrl+P secrets are not
+        // available; this is what makes that true.
+        let secret_provider = if self.fleet { None } else { self.secret_provider };
         let executor: Arc<dyn CommandExecutor> = match &secret_provider {
             Some(provider) => Arc::new(SecretSubstitutingExecutor::new(executor, provider.clone())),
             None => executor,
@@ -2008,6 +2012,49 @@ mod tests {
         let prompt = &requests[0].messages[0].content;
         assert!(prompt.contains("Only run_command is available"), "{prompt}");
         assert!(prompt.contains("read_file, list_dir and background jobs"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn a_ctrl_p_secret_is_never_substituted_into_a_fleet_command() {
+        // #436: a `$FILAR_SECRET_N` was typed for one tab's host; in a fleet
+        // it would go to every host of the group. Two layers keep it out.
+        let command = "grep -c '$FILAR_SECRET_1' /etc/hostname";
+        let call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({ "command": command, "explanation": "why" }),
+        }]);
+        let llm = Arc::new(RecordingLlm {
+            inner: MockLlm::new(vec![call, ChatResponse::text("done")]),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        let provider = Arc::new(filar_core::StaticSecretProvider::new());
+        provider.insert("$FILAR_SECRET_1", "hunter2-of-one-host");
+        let agent = Agent::builder()
+            .llm(llm.clone())
+            .executor(executor.clone())
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .confirm_mode(CommandConfirmMode::Always)
+            .secret_provider(provider as Arc<dyn filar_core::SecretProvider>)
+            .fleet(true)
+            .build()
+            .unwrap();
+
+        // The gate refuses the placeholder before any host is asked.
+        agent.run("go", &[]).await.unwrap();
+        assert!(executor.last_command.lock().unwrap().is_empty(), "nothing reached the fleet");
+        for request in llm.requests.lock().unwrap().iter() {
+            for message in &request.messages {
+                assert!(!message.content.contains("hunter2"), "secret reached the context");
+            }
+        }
+
+        // And the fleet agent's executor substitutes nothing even if a
+        // command got past the gate.
+        agent.executor.run(command).await.unwrap();
+        let executed = executor.last_command.lock().unwrap().clone();
+        assert_eq!(executed, command, "the placeholder is sent as is, never the secret");
     }
 
     // ── Fleet gate (#435) ─────────────────────────────────────────────

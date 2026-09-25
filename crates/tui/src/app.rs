@@ -264,6 +264,9 @@ pub struct App {
     pub should_quit: bool,
     /// Shared secret provider: $FILAR_SECRET_N → actual value.
     pub secrets: Arc<StaticSecretProvider>,
+    /// Where fleet hosts' passwords are looked up on entry (#436): the OS
+    /// credential store in the app, an in-memory store in tests.
+    pub credential_store: Arc<dyn filar_core::SecretProvider>,
     /// Pending SSH connection: (user, host, port) parsed from `!ssh user@host`.
     pub pending_ssh: Option<(String, String, u16)>,
     /// Pending SSH password entered by the user via Ctrl+P.
@@ -416,6 +419,10 @@ pub struct Session {
     /// host group, kept apart from the tab row. Its composition is frozen at
     /// entry. A fleet session never gets an executor of its own.
     pub fleet: Option<filar_core::FleetOperation>,
+    /// Each fleet host's own credentials, resolved when the fleet was
+    /// entered (#436). Hosts without them take no part. `Some` exactly when
+    /// `fleet` is.
+    pub fleet_credentials: Option<filar_agent::fleet_creds::FleetCredentials>,
     /// `Some(previous label)` while a Ctrl+O switch of this tab to another
     /// host is in flight (#433). Until the transport actually swaps, the tab
     /// still runs on its old executor, so nothing may be sent from it; on a
@@ -618,6 +625,7 @@ impl App {
             tag_policies: Vec::new(),
             should_quit: false,
             secrets: Arc::new(StaticSecretProvider::new()),
+            credential_store: Arc::new(StaticSecretProvider::new()),
             pending_ssh: None,
             pending_ssh_password: None,
             pending_ssh_cancel: None,
@@ -964,6 +972,7 @@ impl Session {
             transcript_saving: false,
             transcript_error_shown: false,
             fleet: None,
+            fleet_credentials: None,
             connecting: None,
         }
     }
@@ -5034,7 +5043,9 @@ impl FleetRefusal {
             FleetRefusal::ShellEscape => {
                 "!cmd runs on one host: open it with Ctrl+O and run it there."
             }
-            FleetRefusal::Password => "Password input is per host: open one with Ctrl+O.",
+            FleetRefusal::Password => {
+                "Passwords are per host: store it in the OS keyring, or use Ctrl+O."
+            }
             FleetRefusal::PathPicker => {
                 "Paths differ per host: open one with Ctrl+O to browse it."
             }
@@ -5048,7 +5059,10 @@ impl FleetRefusal {
 /// Opening feed lines of a fleet session: who takes part, under which
 /// limits, and what the layer can and cannot do yet. One system block per
 /// line — a system block renders as a single line.
-fn fleet_intro(op: &filar_core::FleetOperation) -> Vec<String> {
+fn fleet_intro(
+    op: &filar_core::FleetOperation,
+    creds: &filar_agent::fleet_creds::FleetCredentials,
+) -> Vec<String> {
     let policy = match op.policy() {
         filar_core::HostGroupPolicy::ReadOnly => "read-only",
     };
@@ -5062,8 +5076,34 @@ fn fleet_intro(op: &filar_core::FleetOperation) -> Vec<String> {
     if op.is_empty() {
         lines.push("The group matches no hosts right now.".into());
     } else {
-        let names: Vec<&str> = op.members().iter().map(|m| m.name()).collect();
-        lines.push(format!("Hosts: {}", names.join(", ")));
+        let names = creds.participants(op);
+        if names.is_empty() {
+            lines.push("No host has credentials: nothing will run.".into());
+        } else {
+            lines.push(format!("Hosts: {}", names.join(", ")));
+        }
+        // A host without its own credentials drops out rather than asking
+        // for twelve passwords in a row (#436).
+        let skipped: Vec<String> = creds
+            .skipped(op)
+            .into_iter()
+            .map(|(name, why)| format!("{name} ({why})"))
+            .collect();
+        if !skipped.is_empty() {
+            lines.push(format!("Skipped, no credentials: {}", skipped.join(", ")));
+        }
+        // Saving a password helps only a host whose password is missing,
+        // not one whose credential store could not be consulted.
+        let missing_password = creds
+            .skipped(op)
+            .iter()
+            .any(|(_, why)| *why == filar_agent::fleet_creds::MissingCredentials::NoPassword);
+        if missing_password {
+            lines.push(format!(
+                "Save a password in the launcher (keyring {}), then reopen.",
+                filar_agent::fleet_creds::target_secret_name("<host>")
+            ));
+        }
         lines.push("Fixed at entry: retagging does not change the fleet.".into());
     }
     lines.push("Ask read-only questions: one approval runs a command on every host.".into());
@@ -5130,9 +5170,12 @@ impl App {
             .llm_profile()
             .map(str::to_string)
             .or_else(|| base.llm_profile.clone());
-        session.messages = fleet_intro(&op).into_iter().map(ChatBlock::System).collect();
+        // Each host's own secret, looked up once, now (#436).
+        let creds = filar_agent::fleet_creds::FleetCredentials::resolve(&op, &*self.credential_store);
+        session.messages = fleet_intro(&op, &creds).into_iter().map(ChatBlock::System).collect();
         session.cwd = None;
         session.fleet = Some(op);
+        session.fleet_credentials = Some(creds);
         self.sessions.push(session);
         self.active = self.sessions.len() - 1;
         self.sync_confirm_mode();
@@ -5191,14 +5234,16 @@ impl App {
         self.sync_confirm_mode();
     }
 
-    /// Hosts a command in the active session runs on: the fleet's members,
-    /// or nothing outside a fleet (#435).
+    /// Hosts a command in the active session runs on: the fleet's members
+    /// that have credentials (#436), or nothing outside a fleet (#435).
     pub fn fleet_radius(&self) -> Vec<String> {
-        self.active_session()
-            .fleet
-            .as_ref()
-            .map(|f| f.members().iter().map(|m| m.name().to_string()).collect())
-            .unwrap_or_default()
+        let session = self.active_session();
+        match (&session.fleet, &session.fleet_credentials) {
+            (Some(op), Some(creds)) => {
+                creds.participants(op).into_iter().map(str::to_string).collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// In Explain mode (F2) in a fleet, the explanation names the radius
@@ -5623,7 +5668,7 @@ mod tests {
             host: format!("{name}.example"),
             port: 22,
             user: "ops".into(),
-            auth: filar_core::SshAuth::Agent,
+            auth: filar_core::SshAuth::Key { path: None },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
             tags: tags.iter().map(|s| (*s).to_string()).collect(),
         }
@@ -5668,6 +5713,72 @@ mod tests {
         assert_eq!(tabs_after, tabs_before);
         assert!(app.take_pending_local_executors().is_empty());
         assert_eq!(executors_before, 1);
+    }
+
+    // ── Fleet credentials (#436) ────────────────────────────────────
+
+    /// `web-1` by key, `web-2` and `web-3` by password; only `web-3` has a
+    /// password in the credential store.
+    fn app_with_password_hosts() -> App {
+        let mut app = app_with_groups();
+        let password = |name: &str| filar_core::SshTarget {
+            auth: filar_core::SshAuth::Password { password: None },
+            ..fleet_target(name, &["web"])
+        };
+        app.ssh_targets = vec![fleet_target("web-1", &["web"]), password("web-2"), password("web-3")];
+        let store = StaticSecretProvider::new();
+        store.insert("ssh_target:web-3", "hunter2-of-web-3");
+        // A shared password is not a fleet credential.
+        store.insert("SSH_PASSWORD", "hunter2-shared");
+        app.credential_store = Arc::new(store);
+        app
+    }
+
+    fn feed_text(app: &App) -> String {
+        app.messages
+            .iter()
+            .map(|b| match b {
+                ChatBlock::System(s) | ChatBlock::User(s) => s.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_host_without_credentials_drops_out_and_is_named_at_entry() {
+        let mut app = app_with_password_hosts();
+        assert!(app.enter_fleet("web"));
+        assert_eq!(app.fleet_radius(), ["web-1", "web-3"], "web-2 is not asked");
+        let feed = feed_text(&app);
+        assert!(feed.contains("Hosts: web-1, web-3"), "{feed}");
+        assert!(feed.contains("Skipped, no credentials: web-2"), "{feed}");
+        assert!(feed.contains("ssh_target:<host>"), "{feed}");
+        // The composition itself is unchanged: web-2 is still a member, so
+        // every summary names it as skipped.
+        assert_eq!(app.fleet().expect("fleet").len(), 3);
+    }
+
+    #[test]
+    fn no_secret_reaches_the_fleet_transcript() {
+        let mut app = app_with_password_hosts();
+        app.enter_fleet("web");
+        let feed = feed_text(&app);
+        assert!(!feed.contains("hunter2"), "{feed}");
+        assert!(!messages_to_markdown(&app.messages, "fleet:web", &None).contains("hunter2"));
+    }
+
+    #[test]
+    fn ctrl_p_in_the_fleet_takes_no_group_wide_secret() {
+        let mut app = app_with_password_hosts();
+        app.enter_fleet("web");
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert_eq!(app.mode, AppMode::Normal, "no masked prompt for the whole group");
+        assert!(filar_core::SecretProvider::secret_names(&*app.secrets).is_empty());
+        assert!(feed_text(&app).contains("Passwords are per host"));
     }
 
     #[test]

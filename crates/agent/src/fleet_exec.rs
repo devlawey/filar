@@ -33,8 +33,15 @@
 //! dropped the same way, so the next command reconnects instead of reusing
 //! a dead session.
 //!
-//! Credentials policy (a host without them drops out) is #436; cancelling
-//! the operation on the hosts is #437. [`cancel`](CommandExecutor::cancel)
+//! # Credentials
+//!
+//! Each host connects with its own credentials, resolved when the fleet
+//! opened ([`FleetCredentials`], #436). A host without them has no task:
+//! it is never contacted, the summary marks it skipped, and the radius
+//! does not name it. The connector is handed the host's own target and
+//! nothing else, so one host's secret cannot reach another.
+//!
+//! Cancelling the operation on the hosts is #437. [`cancel`](CommandExecutor::cancel)
 //! here forwards Ctrl-C to every connected host, no more.
 
 use std::sync::Arc;
@@ -50,8 +57,9 @@ use filar_core::fleet_op::{FleetOperation, OperationId};
 use filar_transport::readonly::check_read_only;
 use filar_transport::{is_connection_lost, CommandExecutor, CommandResult};
 
+use crate::fleet_creds::FleetCredentials;
 use crate::fleet_fold::fold;
-use crate::fleet_result::OperationResult;
+use crate::fleet_result::{NotAsked, OperationResult};
 use crate::fleet_run::{run_on_fleet, HostRun, HostTask};
 use crate::preprocess::PreprocessorRegistry;
 
@@ -69,6 +77,8 @@ pub struct FleetExecutor {
     source: OperationId,
     /// The composition frozen when the fleet was entered.
     fleet: FleetOperation,
+    /// Who takes part and with which target, resolved at fleet entry.
+    credentials: FleetCredentials,
     connect: HostConnector,
     /// Live connections by member index. Held only to read or fill slots,
     /// never across a command, so [`cancel`](CommandExecutor::cancel) is
@@ -77,14 +87,30 @@ pub struct FleetExecutor {
 }
 
 impl FleetExecutor {
-    /// An executor over `fleet`'s hosts, connecting each through `connect`.
-    pub fn new(fleet: &FleetOperation, connect: HostConnector) -> Self {
-        Self {
+    /// An executor over `fleet`'s hosts, connecting each through `connect`
+    /// with the target `credentials` resolved for it.
+    ///
+    /// Refuses credentials resolved for another operation: pairing them by
+    /// position would hand one fleet's secrets to another fleet's hosts.
+    pub fn new(
+        fleet: &FleetOperation,
+        credentials: FleetCredentials,
+        connect: HostConnector,
+    ) -> Result<Self> {
+        if credentials.operation() != fleet.id() {
+            return Err(CoreError::Other(format!(
+                "fleet credentials are for operation {}, not {}",
+                credentials.operation(),
+                fleet.id()
+            )));
+        }
+        Ok(Self {
             source: fleet.id(),
             hosts: Mutex::new(vec![None; fleet.len()]),
             fleet: fleet.reopen(),
+            credentials,
             connect,
-        }
+        })
     }
 
     /// The operation this executor was built from. A caller holding one
@@ -96,18 +122,23 @@ impl FleetExecutor {
     }
 
     /// Names of the hosts every command goes to — the radius the gate shows.
+    /// A host without credentials is not in it: nothing is sent there.
     pub fn radius(&self) -> Vec<String> {
-        self.fleet.members().iter().map(|m| m.name().to_string()).collect()
+        self.credentials
+            .participants(&self.fleet)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
     }
 
-    /// An executor per member: cached ones, fresh connections for the rest.
-    /// A host that cannot be connected gets a stand-in that reports the
-    /// connection error, so it lands in the summary as "no contact".
-    async fn executors(&self) -> Vec<Arc<dyn CommandExecutor>> {
+    /// An executor per member with credentials, `None` for the rest: cached
+    /// ones, fresh connections for the others. A host that cannot be
+    /// connected gets a stand-in that reports the connection error, so it
+    /// lands in the summary as "no contact".
+    async fn executors(&self) -> Vec<Option<Arc<dyn CommandExecutor>>> {
         let cached = self.hosts.lock().await.clone();
         let limit = self.fleet.max_parallel().max(1) as usize;
         let deadline = self.fleet.per_host_timeout();
-        let members = self.fleet.members();
 
         let fresh: Vec<(usize, Result<Arc<dyn CommandExecutor>>)> = stream::iter(
             cached
@@ -115,10 +146,10 @@ impl FleetExecutor {
                 .enumerate()
                 .filter(|(_, slot)| slot.is_none())
                 .map(|(i, _)| i)
+                .filter_map(|i| self.credentials.ready(i).map(|t| (i, t.clone())))
                 .collect::<Vec<_>>(),
         )
-        .map(|i| {
-            let target = members[i].target().clone();
+        .map(|(i, target)| {
             let connect = Arc::clone(&self.connect);
             async move {
                 let name = target.name.clone();
@@ -137,17 +168,14 @@ impl FleetExecutor {
         .await;
 
         let mut slots = self.hosts.lock().await;
-        let mut out: Vec<Arc<dyn CommandExecutor>> = cached
-            .into_iter()
-            .map(|slot| slot.unwrap_or_else(|| Arc::new(Unreachable(String::new()))))
-            .collect();
+        let mut out = cached;
         for (i, conn) in fresh {
             match conn {
                 Ok(exec) => {
                     slots[i] = Some(Arc::clone(&exec));
-                    out[i] = exec;
+                    out[i] = Some(exec);
                 }
-                Err(e) => out[i] = Arc::new(Unreachable(e.to_string())),
+                Err(e) => out[i] = Some(Arc::new(Unreachable(e.to_string()))),
             }
         }
         out
@@ -163,7 +191,7 @@ impl FleetExecutor {
     async fn evict_lost(
         &self,
         handles: &[filar_core::fleet_op::HostHandle],
-        used: &[Arc<dyn CommandExecutor>],
+        used: &[Option<Arc<dyn CommandExecutor>>],
         report: &crate::fleet_run::FleetRunReport,
     ) {
         let mut slots = self.hosts.lock().await;
@@ -174,7 +202,11 @@ impl FleetExecutor {
             let Some(i) = handles.iter().position(|h| *h == outcome.handle()) else {
                 continue;
             };
-            if slots[i].as_ref().is_some_and(|cached| Arc::ptr_eq(cached, &used[i])) {
+            let same = match (&slots[i], &used[i]) {
+                (Some(cached), Some(used)) => Arc::ptr_eq(cached, used),
+                _ => false,
+            };
+            if same {
                 slots[i] = None;
             }
         }
@@ -195,15 +227,18 @@ impl CommandExecutor for FleetExecutor {
         let mut op = self.fleet.reopen();
         let executors = self.executors().await;
         let handles: Vec<_> = op.handles().collect();
-        let tasks: Vec<HostTask> = handles
-            .iter()
-            .zip(executors.iter())
-            .map(|(handle, exec)| HostTask::new(*handle, Arc::clone(exec), command))
-            .collect();
+        let mut tasks = Vec::new();
+        let mut not_asked = Vec::new();
+        for (handle, exec) in handles.iter().zip(executors.iter()) {
+            match exec {
+                Some(exec) => tasks.push(HostTask::new(*handle, Arc::clone(exec), command)),
+                None => not_asked.push((*handle, NotAsked::Skipped)),
+            }
+        }
 
         let report = run_on_fleet(&mut op, tasks.clone()).await?;
         self.evict_lost(&handles, &executors, &report).await;
-        let mut result = OperationResult::build(&op, &report, &[])?;
+        let mut result = OperationResult::build(&op, &report, &not_asked)?;
         let registry = PreprocessorRegistry::with_builtins();
         let table = fold(&check, &tasks, &report, &mut result, &registry)?;
         let summary = result.summary();
@@ -247,6 +282,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use filar_core::config::{HostGroup, SshAuth};
+    use filar_core::secrets::StaticSecretProvider;
 
     use super::*;
 
@@ -287,12 +323,18 @@ mod tests {
                 host: format!("{n}.example"),
                 port: 22,
                 user: "admin".into(),
-                auth: SshAuth::default(),
+                auth: SshAuth::Key { path: None },
                 host_key_policy: Default::default(),
                 tags: vec!["web".into()],
             })
             .collect();
         FleetOperation::open(&group, &targets)
+    }
+
+    /// An executor over `op` where every host has credentials (key auth).
+    fn executor(op: &FleetOperation, connect: HostConnector) -> FleetExecutor {
+        let creds = FleetCredentials::resolve(op, &StaticSecretProvider::new());
+        FleetExecutor::new(op, creds, connect).expect("credentials match the fleet")
     }
 
     /// Connector: `down` hosts refuse, the rest answer `stdout`; counts
@@ -324,7 +366,7 @@ mod tests {
     async fn one_run_asks_every_host_and_returns_the_fold_not_the_output() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let runs = Arc::new(AtomicUsize::new(0));
-        let exec = FleetExecutor::new(
+        let exec = executor(
             &fleet(&["web-1", "web-2", "web-3"]),
             connector(&[], &[("web-3", "SECRET-LOOKING TEXT")], attempts.clone(), runs.clone()),
         );
@@ -346,7 +388,7 @@ mod tests {
     async fn an_unreachable_host_is_no_contact_and_is_retried_next_time() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let runs = Arc::new(AtomicUsize::new(0));
-        let exec = FleetExecutor::new(
+        let exec = executor(
             &fleet(&["web-1", "web-2"]),
             connector(&["web-2"], &[], attempts.clone(), runs.clone()),
         );
@@ -394,7 +436,7 @@ mod tests {
                     as Arc<dyn CommandExecutor>)
             })
         });
-        let exec = FleetExecutor::new(&fleet(&["web-1"]), connect);
+        let exec = executor(&fleet(&["web-1"]), connect);
 
         exec.run("uptime").await.expect("first run answers");
         let lost = exec.run("uptime").await.expect("second run reports");
@@ -410,7 +452,7 @@ mod tests {
     async fn a_write_reaches_no_host() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let runs = Arc::new(AtomicUsize::new(0));
-        let exec = FleetExecutor::new(
+        let exec = executor(
             &fleet(&["web-1", "web-2"]),
             connector(&[], &[], attempts.clone(), runs.clone()),
         );
@@ -420,5 +462,111 @@ mod tests {
         }
         assert_eq!(attempts.load(Ordering::SeqCst), 0, "no host was even contacted");
         assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    fn password_target(name: &str) -> SshTarget {
+        SshTarget {
+            name: name.into(),
+            host: format!("{name}.example"),
+            port: 22,
+            user: "admin".into(),
+            auth: SshAuth::Password { password: None },
+            host_key_policy: Default::default(),
+            tags: vec!["web".into()],
+        }
+    }
+
+    fn password_fleet(names: &[&str]) -> FleetOperation {
+        let group = HostGroup {
+            name: "web".into(),
+            match_tags: vec!["web".into()],
+            max_parallel: 4,
+            per_host_timeout_secs: 5,
+            ..HostGroup::default()
+        };
+        let targets: Vec<SshTarget> = names.iter().map(|n| password_target(n)).collect();
+        FleetOperation::open(&group, &targets)
+    }
+
+    /// `(host, password)` of every connection a connector opened.
+    type Seen = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
+    /// Records `(host, password)` for every connection it opens.
+    fn recording_connector(seen: Seen) -> HostConnector {
+        Arc::new(move |target: SshTarget| {
+            let password = match &target.auth {
+                SshAuth::Password { password } => password.clone(),
+                _ => None,
+            };
+            seen.lock().expect("lock").push((target.name.clone(), password));
+            Box::pin(async {
+                Ok(Arc::new(Fixed { stdout: "same", runs: Arc::new(AtomicUsize::new(0)) })
+                    as Arc<dyn CommandExecutor>)
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn a_host_without_credentials_is_skipped_and_the_fleet_runs_on_the_rest() {
+        let op = password_fleet(&["web-1", "web-2", "web-3"]);
+        let store = StaticSecretProvider::new();
+        store.insert("ssh_target:web-1", "pw-1");
+        store.insert("ssh_target:web-3", "pw-3");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let exec = FleetExecutor::new(
+            &op,
+            FleetCredentials::resolve(&op, &store),
+            recording_connector(Arc::clone(&seen)),
+        )
+        .expect("executor");
+        assert_eq!(exec.radius(), ["web-1", "web-3"], "the radius names only who is asked");
+
+        let out = exec.run("uname -r").await.expect("fleet run");
+        assert!(out.stdout.contains("2 of 3 hosts answered"), "{}", out.stdout);
+        assert!(out.stdout.contains("1 skipped"), "{}", out.stdout);
+        assert_eq!(out.exit_code, Some(0), "a skipped host does not fail the fleet");
+        let contacted: Vec<String> = seen.lock().expect("lock").iter().map(|(n, _)| n.clone()).collect();
+        assert!(!contacted.contains(&"web-2".to_string()), "web-2 was never contacted");
+    }
+
+    #[tokio::test]
+    async fn each_host_is_connected_with_its_own_secret_only() {
+        let op = password_fleet(&["web-1", "web-2"]);
+        let store = StaticSecretProvider::new();
+        store.insert("ssh_target:web-1", "secret-of-web-1");
+        store.insert("ssh_target:web-2", "secret-of-web-2");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let exec = FleetExecutor::new(
+            &op,
+            FleetCredentials::resolve(&op, &store),
+            recording_connector(Arc::clone(&seen)),
+        )
+        .expect("executor");
+
+        let out = exec.run("uptime").await.expect("fleet run");
+        let mut seen = seen.lock().expect("lock").clone();
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                ("web-1".to_string(), Some("secret-of-web-1".to_string())),
+                ("web-2".to_string(), Some("secret-of-web-2".to_string())),
+            ]
+        );
+        // What goes back to the agent (and so to the transcript and the
+        // model's context) carries no secret.
+        assert!(!out.stdout.contains("secret-of"), "{}", out.stdout);
+        assert!(!out.stderr.contains("secret-of"), "{}", out.stderr);
+    }
+
+    #[test]
+    fn credentials_of_another_fleet_are_refused() {
+        let first = password_fleet(&["web-1"]);
+        let second = password_fleet(&["web-1"]);
+        let creds = FleetCredentials::resolve(&first, &StaticSecretProvider::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let refused = FleetExecutor::new(&second, creds, connector(&[], &[], attempts, runs));
+        assert!(refused.is_err());
     }
 }

@@ -345,8 +345,11 @@ pub fn ssh_cred_name(slot: usize, alias: &str) -> String {
 /// Secret names are used directly as the credential entry username; the service
 /// name is always `"filar"`.
 ///
-/// On platforms without a credential store, `get()` returns
-/// [`CoreError::Secret`] and `secret_names()` returns an empty list.
+/// `get()` returns [`CoreError::Secret`] when the store has no such entry,
+/// and [`CoreError::Other`] when the store itself cannot be used (no
+/// credential store on the platform, Secret Service unreachable, keychain
+/// locked) — so a caller can tell "not stored" from "could not look" (#436).
+/// Neither error carries the secret. `secret_names()` returns an empty list.
 /// The provider never panics on keyring errors.
 ///
 /// # Examples
@@ -377,11 +380,20 @@ impl Default for KeyringSecretProvider {
 
 impl SecretProvider for KeyringSecretProvider {
     fn get(&self, name: &str) -> Result<String> {
-        let entry = keyring::Entry::new("filar", name)
-            .map_err(|e| CoreError::Secret(format!("keyring entry error: {e}")))?;
-        entry
-            .get_password()
-            .map_err(|e| CoreError::Secret(format!("keyring get failed for {}: {e}", redact(name))))
+        // Failing to even build the entry (an invalid name, no backend) says
+        // nothing about whether the secret is stored: not `Secret`.
+        let entry = keyring::Entry::new("filar", name).map_err(|e| {
+            CoreError::Other(format!("OS credential store entry error for {}: {e}", redact(name)))
+        })?;
+        entry.get_password().map_err(|e| match e {
+            keyring::Error::NoEntry => {
+                CoreError::Secret(format!("{} not in the OS credential store", redact(name)))
+            }
+            other => CoreError::Other(format!(
+                "OS credential store unavailable for {}: {other}",
+                redact(name)
+            )),
+        })
     }
 
     fn secret_names(&self) -> Vec<String> {
