@@ -327,6 +327,20 @@ pub async fn run_on_fleet_until(
     tasks: Vec<HostTask>,
     cancel: &CancellationToken,
 ) -> Result<FleetRunReport> {
+    run_on_fleet_observed(op, tasks, cancel, &mut |_, _| {}).await
+}
+
+/// [`run_on_fleet_until`] that also reports every host the moment its run
+/// ends (#439), so a status line can count answers while the operation is
+/// still going rather than only once it is over. `on_host` sees each
+/// finished host exactly once; hosts the cancellation kept from starting
+/// are not reported (they never ran).
+pub async fn run_on_fleet_observed(
+    op: &mut FleetOperation,
+    tasks: Vec<HostTask>,
+    cancel: &CancellationToken,
+    on_host: &mut (dyn FnMut(HostHandle, &HostRun) + Send),
+) -> Result<FleetRunReport> {
     validate_tasks(op, &tasks)?;
 
     let deadline = op.per_host_timeout();
@@ -361,6 +375,7 @@ pub async fn run_on_fleet_until(
         match in_flight.next().await {
             Some((index, run)) => {
                 op.set_progress(handles[index], HostProgress::Done);
+                on_host(handles[index], &run);
                 finished.push((index, run));
             }
             // Nothing in flight and nothing left to launch.

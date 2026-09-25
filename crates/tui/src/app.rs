@@ -426,6 +426,9 @@ pub struct Session {
     /// The last fleet operation's person-facing view (#438), shown in the
     /// side panel. Never part of `messages`: it carries host output.
     pub fleet_view: Option<filar_agent::fleet_view::FleetView>,
+    /// How many hosts answered the last (or the running) fleet operation
+    /// (#439), for the status bar. `None` before the first operation.
+    pub fleet_status: Option<filar_agent::fleet_view::FleetStatus>,
     /// `Some(previous label)` while a Ctrl+O switch of this tab to another
     /// host is in flight (#433). Until the transport actually swaps, the tab
     /// still runs on its old executor, so nothing may be sent from it; on a
@@ -977,6 +980,7 @@ impl Session {
             fleet: None,
             fleet_credentials: None,
             fleet_view: None,
+            fleet_status: None,
             connecting: None,
         }
     }
@@ -4463,6 +4467,7 @@ impl App {
             TuiEvent::HistoryCompacted { session_id, .. } => *session_id,
             TuiEvent::Notice { session_id, .. } => *session_id,
             TuiEvent::FleetSummary { session_id, .. } => *session_id,
+            TuiEvent::FleetStatus { session_id, .. } => *session_id,
             TuiEvent::CompactionStarted { session_id, .. } => *session_id,
         };
 
@@ -4721,6 +4726,18 @@ impl App {
                 // Feed-only: the run continues, so `agent_running`, the mode
                 // and the cancellation token are all left alone.
                 self.push_message(ChatBlock::System(text));
+            }
+            TuiEvent::FleetStatus { status, .. } => {
+                // Same ordering rule as the summary: a cancelled operation
+                // winding down never overwrites the count of a newer one.
+                let stale = self
+                    .active_session()
+                    .fleet_status
+                    .is_some_and(|current| current.operation > status.operation);
+                if !stale {
+                    self.active_session_mut().fleet_status = Some(status);
+                }
+                auto_scroll = false;
             }
             TuiEvent::FleetSummary { view, .. } => {
                 // Panel-only (#438): the summary replaces the previous one,

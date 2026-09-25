@@ -455,7 +455,10 @@ fn fleet_executor_for(
     fleet: &filar_core::FleetOperation,
     credentials: &filar_agent::fleet_creds::FleetCredentials,
     connector: impl FnOnce() -> filar_agent::fleet_exec::HostConnector,
-    observer: impl FnOnce() -> Option<filar_agent::fleet_exec::FleetObserver>,
+    observer: impl FnOnce() -> Option<(
+        filar_agent::fleet_exec::FleetObserver,
+        filar_agent::fleet_exec::FleetStatusObserver,
+    )>,
 ) -> filar_core::Result<Arc<filar_agent::fleet_exec::FleetExecutor>> {
     match map.get(&sid) {
         Some(exec) if exec.built_from() == fleet.id() => Ok(Arc::clone(exec)),
@@ -465,8 +468,8 @@ fn fleet_executor_for(
                 credentials.clone(),
                 connector(),
             )?;
-            if let Some(observer) = observer() {
-                exec = exec.with_observer(observer);
+            if let Some((view, status)) = observer() {
+                exec = exec.with_observer(view).with_status(status);
             }
             let exec = Arc::new(exec);
             map.insert(sid, Arc::clone(&exec));
@@ -1056,9 +1059,15 @@ async fn run_app(
                                 // on the UI's own event — never through the agent.
                                 || {
                                     let tx = agent_tx.clone();
-                                    Some(Arc::new(move |view| {
-                                        let _ = tx.send(TuiEvent::FleetSummary { session_id: sid, view });
-                                    }) as filar_agent::fleet_exec::FleetObserver)
+                                    let view_tx = tx.clone();
+                                    Some((
+                                        Arc::new(move |view| {
+                                            let _ = view_tx.send(TuiEvent::FleetSummary { session_id: sid, view });
+                                        }) as filar_agent::fleet_exec::FleetObserver,
+                                        Arc::new(move |status| {
+                                            let _ = tx.send(TuiEvent::FleetStatus { session_id: sid, status });
+                                        }) as filar_agent::fleet_exec::FleetStatusObserver,
+                                    ))
                                 },
                             ) {
                                 Ok(exec) => exec,

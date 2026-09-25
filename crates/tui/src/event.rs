@@ -132,6 +132,12 @@ pub enum TuiEvent {
         session_id: SessionId,
         view: filar_agent::fleet_view::FleetView,
     },
+    /// How many hosts of the fleet are answering, as an operation runs
+    /// (#439), for the status bar. Counts only.
+    FleetStatus {
+        session_id: SessionId,
+        status: filar_agent::fleet_view::FleetStatus,
+    },
 }
 
 #[cfg(test)]

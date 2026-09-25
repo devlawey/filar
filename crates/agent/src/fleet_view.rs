@@ -21,6 +21,24 @@ use crate::fleet_fold::{ComparedValue, FoldedTable};
 use crate::fleet_result::{HostState, OperationSummary};
 use crate::fleet_run::{FleetRunReport, HostRun};
 
+/// How many hosts of a fleet are answering (#439) — for the status bar.
+///
+/// "Answering" means the host answered its last command, well or badly: a
+/// host that ran the command and exited non-zero is alive; one that timed
+/// out, could not be reached, was skipped or was cancelled is not. While an
+/// operation runs the count starts at zero and grows as answers arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FleetStatus {
+    /// The operation the count is about.
+    pub operation: OperationId,
+    /// Hosts that answered in it so far.
+    pub answering: usize,
+    /// Every member of the fleet, skipped ones included.
+    pub total: usize,
+    /// Whether the operation is still running.
+    pub running: bool,
+}
+
 /// Longest sample kept per group, in characters. The panel shows a line
 /// or a few; this only bounds memory for a host that printed megabytes.
 pub const MAX_SAMPLE_CHARS: usize = 16 * 1024;

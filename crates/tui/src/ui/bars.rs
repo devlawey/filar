@@ -172,6 +172,58 @@ fn operations_counter(c: crate::ops::OpCounts, glyphs: &Glyphs) -> Option<String
     Some(out)
 }
 
+/// Status-bar segments that give way when the line is too narrow (#439),
+/// **first to go first**.
+///
+/// The bar used to decide this implicitly — each segment subtracted the
+/// others from its own budget — which held for two flexible segments and
+/// not for five. Now there is one order:
+///
+/// 1. the context-fill indicator: shrinks (8-cell bar, 4-cell, figures
+///    only) and then goes — it is a gauge, not a fact to act on;
+/// 2. the model slug;
+/// 3. the token counter;
+/// 4. the operations counter;
+/// 5. the SSH target's tags — last to go, since a hidden `prod` tag is the
+///    one omission that can mislead.
+///
+/// Never evicted: the target (in the fleet: the group and how many hosts
+/// are answering), the mode badge, the session cost, `confirm_mode` and the
+/// toast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Evictable {
+    Context,
+    Model,
+    Tokens,
+    Ops,
+    Tags,
+}
+
+/// See [`Evictable`].
+const EVICTION_ORDER: [Evictable; 5] = [
+    Evictable::Context,
+    Evictable::Model,
+    Evictable::Tokens,
+    Evictable::Ops,
+    Evictable::Tags,
+];
+
+/// The fleet's target in the status bar (#439): `fleet <group>`, and how
+/// many of its hosts answered — ` · 3/12 live`, or `?/12` before the first
+/// operation reports. Only glyphs of `glyphs`, so ASCII mode stays ASCII.
+fn fleet_segment(
+    group: &str,
+    total: usize,
+    status: Option<filar_agent::fleet_view::FleetStatus>,
+    glyphs: &Glyphs,
+) -> (String, String) {
+    let count = match status {
+        Some(st) => format!("{}/{}", st.answering, st.total),
+        None => format!("?/{total}"),
+    };
+    (format!("fleet {group}"), format!(" {} {count} live", glyphs.middle_dot))
+}
+
 /// Render the status bar (top line).
 ///
 /// Layout: `filar ▸ {alias host pwd}` on the left for SSH (`name pwd` when
@@ -183,15 +235,35 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // Store area for hit-testing.
     app.status_bar_area = area;
 
-    let mut spans = vec![
-        Span::raw("filar "),
-        Span::styled(glyphs.target_sep, app.theme.muted()),
-        Span::raw(" "),
-        Span::styled(
-            app.status_target(),
-            app.theme.user_style(),
-        ),
-    ];
+    let width = |s: &str| UnicodeWidthStr::width(s);
+    let available = area.width as usize;
+
+    // ── Every segment first, placed later ───────────────────────────
+    // Which segment gives way on a narrow terminal is decided in one place
+    // below (`EVICTION_ORDER`, #439), not by each segment's own formula.
+
+    // Target: the host, or in the fleet the group and how many of its hosts
+    // are answering (#439) — both kept to the last.
+    // Only the fleet on screen: an open fleet in the background must not
+    // label an ordinary tab, whose commands go to its own host.
+    let fleet_target = app
+        .active_session()
+        .fleet
+        .as_ref()
+        .map(|f| (f.group_name().to_string(), f.len()));
+    let (target, live) = match &fleet_target {
+        Some((group, total)) => {
+            let status = app.active_session().fleet_status;
+            let (target, live) = fleet_segment(group, *total, status, glyphs);
+            let style = match status {
+                Some(st) if !st.running && st.answering < st.total => app.theme.warning_fg(),
+                Some(st) if !st.running => app.theme.success_fg(),
+                _ => app.theme.dim(),
+            };
+            (target, Some((live, style)))
+        }
+        None => (app.status_target(), None),
+    };
 
     // Mode indicator — only shown for non-Normal modes.
     let mode_text = match app.mode {
@@ -205,78 +277,45 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         AppMode::PasswordInput => Some("password".to_string()),
     };
 
-    if let Some(mt) = mode_text {
-        let mode_color = app.theme.mode_color(app.mode);
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled(mt, app.theme.mode_badge_style(mode_color)));
-    }
-
     // Operations counter (#431): visible with the side panel closed and on
     // every tab, so a background job is not lost by switching away from it.
-    if let Some(counter) = operations_counter(app.operation_counts(), glyphs) {
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled(counter, app.theme.dim()));
-    }
+    let ops = operations_counter(app.operation_counts(), glyphs);
 
     // Token counter — per-profile breakdown from per_profile, not total.
     // Cost — total session sum. Model slug follows active profile.
     let active = app.llm_profile.clone().unwrap_or_else(|| app.default_profile_name.clone());
-    let profile_usage = app.per_profile.get(&active);
-    let served = app.model_per_profile.get(&active);
-    spans.push(Span::raw("   "));
-    if let Some(pu) = profile_usage {
-        if pu.tokens_in > 0 || pu.tokens_out > 0 {
-            spans.push(Span::styled(
-                format!("toks: {}↑ {}↓", pu.tokens_in, pu.tokens_out),
-                app.theme.muted(),
-            ));
-        } else {
-            spans.push(Span::styled(
-                "toks: —",
-                app.theme.muted(),
-            ));
+    let tokens = match app.per_profile.get(&active) {
+        Some(pu) if pu.tokens_in > 0 || pu.tokens_out > 0 => {
+            format!("toks: {}↑ {}↓", pu.tokens_in, pu.tokens_out)
         }
-    } else {
-        spans.push(Span::styled(
-            "toks: —",
-            app.theme.muted(),
-        ));
-    }
-    if let Some(cost) = app.cost_usd {
-        spans.push(Span::raw(" "));
-        if cost > 0.0 {
-            spans.push(Span::styled(
-                format!("${:.4}", cost),
-                app.theme.success_fg(),
-            ));
-        } else {
-            spans.push(Span::styled("—", app.theme.muted()));
-        }
-    }
+        _ => "toks: —".to_string(),
+    };
+    // The session's cost: in the fleet always shown (#439), `$?` until the
+    // provider reports one; elsewhere only once the provider reported one.
+    let cost = match app.cost_usd {
+        Some(c) if c > 0.0 => Some((format!("${c:.4}"), app.theme.success_fg())),
+        Some(_) => Some(("—".to_string(), app.theme.muted())),
+        None if fleet_target.is_some() => Some(("$?".to_string(), app.theme.muted())),
+        None => None,
+    };
     // Model: per-profile served model if known, else configured model with ~ prefix.
-    let model_display = if let Some(sm) = served {
-        sm.to_string()
-    } else {
-        let configured = app.profiles.iter()
+    let model_display = match app.model_per_profile.get(&active) {
+        Some(sm) => sm.to_string(),
+        None => app
+            .profiles
+            .iter()
             .find(|p| p.name == active)
             .map(|p| format!("~{}", p.model))
-            .unwrap_or_else(|| "~?".into());
-        configured
+            .unwrap_or_else(|| "~?".into()),
     };
-    spans.push(Span::raw(" "));
-    let truncated: String = if model_display.len() > 24 {
+    let model: String = if model_display.len() > 24 {
         model_display.chars().take(23).chain("…".chars()).collect()
     } else {
         model_display
     };
-    spans.push(Span::styled(truncated, app.theme.dim()));
 
     // Right side: an optional context-fill indicator, `confirm_mode`, then an
-    // optional toast (e.g. "· copied") pinned to the far right. Space for the
-    // indicator and the toast is reserved *before* the padding is computed —
-    // otherwise the padding fills the whole line and the trailing spans,
-    // pushed afterwards, start at column == width and get clipped by ratatui
-    // (the original bug: the toast was never visible).
+    // optional toast (e.g. "· copied") pinned to the far right.
     //
     // The leading space below is deliberate: with the one-column trailing
     // gap of the context indicator it makes the two-column separation
@@ -288,63 +327,83 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         app.theme.muted()
     };
-    // left_len already includes mode-badge spans (pushed above), so we
-    // must NOT add mode_len again — that would double-count and break
-    // the right-alignment in non-Normal modes.
-    // Widths count terminal cells, not Unicode chars: a double-width glyph
-    // (CJK) occupies two columns and must be budgeted as such, or the
-    // right-aligned tail would be displaced on narrow terminals.
-    let left_len: usize = spans
-        .iter()
-        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-        .sum();
-    let available = area.width as usize;
-
     // Owned copy drops the borrow on `app` immediately. The rendered toast is
     // a 2-space gap + `· <text>`.
     let toast_span_text = app
         .toast_text()
         .map(|t| format!("  {} {}", glyphs.middle_dot, t));
-    let toast_len = toast_span_text
-        .as_ref()
-        .map(|s| UnicodeWidthStr::width(s.as_str()))
-        .unwrap_or(0);
 
-    // Context fill — the measured prompt size against the active profile's
-    // compaction threshold, the same pair `maybe_request_compaction` compares
-    // (#399). Display only: it neither arms nor fires compaction. Space for
-    // the indicator is reserved before padding, exactly like the toast; on a
-    // narrow terminal it yields first — needing one column of clearance from
-    // the left text, it shrinks and then drops rather than crowd
-    // `confirm_mode` or the toast.
+    // ── What stays and what goes ────────────────────────────────────
+    // Widths count terminal cells, not Unicode chars: a double-width glyph
+    // (CJK) occupies two columns and must be budgeted as such, or the
+    // right-aligned tail would be displaced on narrow terminals.
+    //
+    // Never evicted: the brand and target (in the fleet: the group and its
+    // answering count), the mode badge, the session cost, `confirm_mode`
+    // and the toast. Everything else gives way in `EVICTION_ORDER`.
+    let required = width("filar ")
+        + width(glyphs.target_sep)
+        + 1
+        + width(&target)
+        + live.as_ref().map_or(0, |(t, _)| width(t))
+        + mode_text.as_ref().map_or(0, |m| 3 + width(m))
+        + cost.as_ref().map_or(0, |(c, _)| width(c))
+        + 3 // the gap that opens the usage group (tokens, cost, model)
+        + width(&confirm_text)
+        + toast_span_text.as_ref().map_or(0, |t| width(t));
+    let mut budget = available.saturating_sub(required);
+
+    // Kept in the reverse of `EVICTION_ORDER`: the most important optional
+    // segment claims its room first. Each one is all-or-nothing, except the
+    // context indicator, which shrinks before it goes. A segment that does
+    // not fit gives way; a smaller, less important one may still take the
+    // room that is left.
+    let mut kept = std::collections::BTreeSet::new();
+    let mut tags_segment = None;
+    for segment in EVICTION_ORDER.iter().rev() {
+        match segment {
+            // Tags of the configured SSH target (#413), between host and
+            // path. All or nothing: a truncated list could hide a `prod` tag.
+            Evictable::Tags => {
+                if let Some(t) = app.format_tags_segment(budget.saturating_sub(1)) {
+                    budget -= width(&t) + 1;
+                    tags_segment = Some(t);
+                }
+            }
+            Evictable::Ops => {
+                if let Some(o) = &ops {
+                    let need = width(o) + 3;
+                    if need <= budget {
+                        budget -= need;
+                        kept.insert(Evictable::Ops);
+                    }
+                }
+            }
+            Evictable::Tokens => {
+                // Opens the usage group, whose gap is part of `required`;
+                // a cost after it needs one more column to stand apart.
+                let need = width(&tokens) + usize::from(cost.is_some());
+                if need <= budget {
+                    budget -= need;
+                    kept.insert(Evictable::Tokens);
+                }
+            }
+            Evictable::Model => {
+                let need = width(&model) + 1;
+                if need <= budget {
+                    budget -= need;
+                    kept.insert(Evictable::Model);
+                }
+            }
+            // Context fill — the measured prompt size against the active
+            // profile's compaction threshold (#399). Display only. It takes
+            // whatever room is left, shrinking before it is dropped.
+            Evictable::Context => {}
+        }
+    }
     let used = app.active_session().last_prompt_tokens;
     let threshold = app.compact_at_tokens_for(&active);
-    let confirm_len = UnicodeWidthStr::width(confirm_text.as_str());
-
-    // Tags of the configured SSH target (#413), inserted into the target span
-    // (spans[3], built above) between host and path. Their space is reserved
-    // before padding, exactly like the indicator and the toast — and the
-    // whole `[a,b]` segment yields when the line is too narrow: a truncated
-    // list could silently hide a `prod` tag. When tags fit, `left_len` grows
-    // so the indicator (the lowest-priority right-side element) shrinks to
-    // compensate.
-    let tags_budget = available.saturating_sub(left_len + confirm_len + toast_len + 1);
-    let tags_segment = app.format_tags_segment(tags_budget);
-    let left_len = if let Some(segment) = tags_segment {
-        spans[3] = Span::styled(
-            app.status_target_with_tags(Some(&segment)),
-            app.theme.user_style(),
-        );
-        spans
-            .iter()
-            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-            .sum()
-    } else {
-        left_len
-    };
-
-    let ctx_max = available.saturating_sub(left_len + confirm_len + toast_len + 1);
-    let ctx_segment = context_indicator_segment(used, threshold, glyphs, ctx_max);
+    let ctx_segment = context_indicator_segment(used, threshold, glyphs, budget.saturating_sub(1));
     let ctx_style = if used.is_some_and(|n| threshold > 0 && n >= threshold) {
         // The next request will compact — worth the warning colour.
         app.theme.warning_fg()
@@ -352,13 +411,56 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         app.theme.muted()
     };
 
-    let right_len = ctx_segment
-        .as_ref()
-        .map(|s| UnicodeWidthStr::width(s.as_str()))
-        .unwrap_or(0)
-        + confirm_len;
-    // Toast has priority over padding on a narrow terminal (saturating — no
-    // panic, toast may be clipped by ratatui if the line is too short).
+    // ── Assemble, left to right ─────────────────────────────────────
+    let target = match (&fleet_target, &tags_segment) {
+        (None, Some(t)) => app.status_target_with_tags(Some(t)),
+        _ => target,
+    };
+    let mut spans = vec![
+        Span::raw("filar "),
+        Span::styled(glyphs.target_sep, app.theme.muted()),
+        Span::raw(" "),
+        Span::styled(target, app.theme.user_style()),
+    ];
+    if let Some((text, style)) = live {
+        spans.push(Span::styled(text, style));
+    }
+    if let Some(mt) = mode_text {
+        let mode_color = app.theme.mode_color(app.mode);
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(mt, app.theme.mode_badge_style(mode_color)));
+    }
+    if let (Some(counter), true) = (ops, kept.contains(&Evictable::Ops)) {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(counter, app.theme.dim()));
+    }
+    spans.push(Span::raw("   "));
+    let mut usage_started = false;
+    if kept.contains(&Evictable::Tokens) {
+        spans.push(Span::styled(tokens, app.theme.muted()));
+        usage_started = true;
+    }
+    if let Some((text, style)) = cost {
+        if usage_started {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(text, style));
+        usage_started = true;
+    }
+    if kept.contains(&Evictable::Model) {
+        if usage_started {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(model, app.theme.dim()));
+    }
+
+    let left_len: usize = spans.iter().map(|s| width(s.content.as_ref())).sum();
+    let right_len = ctx_segment.as_ref().map_or(0, |s| width(s)) + width(&confirm_text);
+    let toast_len = toast_span_text.as_ref().map_or(0, |t| width(t));
+    // Space for the right side is reserved before the padding is computed —
+    // otherwise the padding fills the whole line and the trailing spans,
+    // pushed afterwards, start at column == width and get clipped by
+    // ratatui (the original bug: the toast was never visible).
     let padding = available.saturating_sub(left_len + right_len + toast_len);
     if padding > 0 {
         spans.push(Span::raw(" ".repeat(padding)));
@@ -701,6 +803,123 @@ mod tests {
         app
     }
 
+    // ── Fleet (#439) ────────────────────────────────────────────────
+
+    fn fleet_status(answering: usize, running: bool) -> filar_agent::fleet_view::FleetStatus {
+        filar_agent::fleet_view::FleetStatus {
+            operation: crate::app::test_fleet_view().operation,
+            answering,
+            total: 3,
+            running,
+        }
+    }
+
+    #[test]
+    fn fleet_status_bar_shows_group_live_count_and_cost() {
+        let mut app = crate::app::test_fleet_app(crate::app::test_fleet_view());
+        let row = render_status_row(&mut app, 120);
+        assert!(row.contains("fleet web"), "group, got: {row}");
+        assert!(row.contains("?/3 live"), "no operation yet, got: {row}");
+        assert!(row.contains("$?"), "cost is shown before it is known, got: {row}");
+        assert!(row.ends_with(" Always"), "right side stays right-aligned, got: {row}");
+        assert_eq!(row.chars().count(), 120);
+
+        app.cost_usd = Some(0.0123);
+        let sid = app.sessions[app.active].id;
+        for (answering, running) in [(0, true), (2, true), (2, false)] {
+            app.handle_agent_event(crate::event::TuiEvent::FleetStatus {
+                session_id: sid,
+                status: fleet_status(answering, running),
+            });
+            let row = render_status_row(&mut app, 120);
+            assert!(row.contains(&format!("{answering}/3 live")), "live count, got: {row}");
+            assert!(row.contains("$0.0123"), "cost, got: {row}");
+            assert!(row.ends_with(" Always"), "got: {row}");
+        }
+    }
+
+    #[test]
+    fn fleet_status_bar_keeps_the_essentials_at_80_columns() {
+        let mut app = crate::app::test_fleet_app(crate::app::test_fleet_view());
+        app.cost_usd = Some(1.5);
+        app.mode = AppMode::Confirming;
+        let profile = app.default_profile_name.clone();
+        app.per_profile.insert(profile, Default::default());
+        let sid = app.sessions[app.active].id;
+        app.handle_agent_event(crate::event::TuiEvent::FleetStatus {
+            session_id: sid,
+            status: fleet_status(1, true),
+        });
+        for width in [80u16, 60, 55] {
+            let row = render_status_row(&mut app, width);
+            for essential in ["fleet web", "1/3 live", "confirm", "$1.5000"] {
+                assert!(row.contains(essential), "{essential} at {width}, got: {row}");
+            }
+            assert!(row.ends_with(" Always"), "at {width}, got: {row}");
+            assert_eq!(row.chars().count(), width as usize);
+        }
+        // 55 is exactly the essentials: the model and the token counter
+        // have given way, the group, count, mode badge, cost and confirm mode stay.
+        let row = render_status_row(&mut app, 55);
+        assert!(!row.contains("toks"), "tokens yield before the essentials, got: {row}");
+    }
+
+    #[test]
+    fn an_ordinary_tab_is_not_labelled_with_a_background_fleet() {
+        let mut app = crate::app::test_fleet_app(crate::app::test_fleet_view());
+        assert!(render_status_row(&mut app, 120).contains("fleet web"));
+        app.leave_fleet_view();
+        let row = render_status_row(&mut app, 120);
+        assert!(!row.contains("fleet web"), "the tab's own target, got: {row}");
+        assert!(!row.contains("live"), "no fleet count on a host tab, got: {row}");
+        assert!(!row.contains("$?"), "no fleet cost placeholder, got: {row}");
+    }
+
+    #[test]
+    fn a_late_count_of_an_older_operation_is_ignored() {
+        let mut app = crate::app::test_fleet_app(crate::app::test_fleet_view());
+        let sid = app.sessions[app.active].id;
+        // Each helper call opens a fresh operation, so the later id is newer.
+        let older = fleet_status(0, true);
+        let newer = fleet_status(3, false);
+        assert!(newer.operation > older.operation, "ids grow");
+        app.handle_agent_event(crate::event::TuiEvent::FleetStatus { session_id: sid, status: newer });
+        app.handle_agent_event(crate::event::TuiEvent::FleetStatus { session_id: sid, status: older });
+        assert_eq!(app.active_session().fleet_status, Some(newer));
+    }
+
+    #[test]
+    fn the_fleet_segment_is_ascii_in_ascii_mode() {
+        let (target, live) = fleet_segment("web", 12, None, &Glyphs::ASCII);
+        assert_eq!(format!("{target}{live}"), "fleet web - ?/12 live");
+        let (_, live) = fleet_segment(
+            "web",
+            12,
+            Some(filar_agent::fleet_view::FleetStatus {
+                answering: 11,
+                total: 12,
+                ..fleet_status(0, false)
+            }),
+            &Glyphs::ASCII,
+        );
+        assert!(live.is_ascii(), "{live}");
+        assert_eq!(live, " - 11/12 live");
+    }
+
+    #[test]
+    fn the_eviction_order_is_the_documented_one() {
+        assert_eq!(
+            EVICTION_ORDER,
+            [
+                Evictable::Context,
+                Evictable::Model,
+                Evictable::Tokens,
+                Evictable::Ops,
+                Evictable::Tags,
+            ]
+        );
+    }
+
     #[test]
     fn status_bar_shows_tags_between_host_and_pwd() {
         let mut app = app_with_tagged_target(&["work", "prod"]);
@@ -714,11 +933,12 @@ mod tests {
 
     #[test]
     fn status_bar_drops_tags_at_the_width_boundary_not_the_right_side() {
-        // 58 = exact fit of the tag segment into the leftover budget;
-        // 57 = one cell short — the whole segment must yield, the padded
+        // 48 = exact fit of the tag segment next to the never-evicted
+        // segments (tags are the last optional segment to go, #439);
+        // 47 = one cell short — the whole segment must yield, the padded
         // confirm_mode must stay pinned to the right edge.
         let mut app = app_with_tagged_target(&["work", "prod"]);
-        let row_fit = render_status_row(&mut app, 58);
+        let row_fit = render_status_row(&mut app, 48);
         assert!(
             row_fit.contains("10.0.0.5 [work,prod] /srv"),
             "tags must appear when they exactly fit, got: {row_fit}"
@@ -726,7 +946,7 @@ mod tests {
         assert!(row_fit.ends_with(" Always"), "got: {row_fit}");
 
         let mut app = app_with_tagged_target(&["work", "prod"]);
-        let row_narrow = render_status_row(&mut app, 57);
+        let row_narrow = render_status_row(&mut app, 47);
         assert!(
             !row_narrow.contains("[work,prod]"),
             "tags must fully yield when they do not fit, got: {row_narrow}"
@@ -735,18 +955,18 @@ mod tests {
             row_narrow.ends_with(" Always"),
             "confirm_mode must stay at the right edge after the drop, got: {row_narrow}"
         );
-        assert_eq!(row_narrow.chars().count(), 57, "row must fill exactly 57 columns");
+        assert_eq!(row_narrow.chars().count(), 47, "row must fill exactly 47 columns");
     }
 
     #[test]
     fn status_bar_wide_tag_budget_is_counted_in_cells() {
         // "[中]" is 3 chars but 4 terminal cells: the exact-fit boundary is
         // one column wider than for a 3-cell segment (the 11-cell
-        // "[work,prod]" fits at 58, so a 4-cell segment fits at 58 − 11 + 4
-        // = 51). At 50 a char-count budget (3 chars ≤ 3 cells) would have
+        // "[work,prod]" fits at 48, so a 4-cell segment fits at 48 − 11 + 4
+        // = 41). At 40 a char-count budget (3 chars ≤ 3 cells) would have
         // admitted the segment and pushed the right side off the edge.
         let mut app = app_with_tagged_target(&["中"]);
-        let row_fit = render_status_row(&mut app, 51);
+        let row_fit = render_status_row(&mut app, 41);
         // One symbol per buffer cell: the second cell of the wide `中`
         // appears as a blank cell, hence `[中 ]` in the collected row.
         assert!(
@@ -756,12 +976,12 @@ mod tests {
         assert!(row_fit.ends_with(" Always"), "got: {row_fit}");
         assert_eq!(
             row_fit.chars().count(),
-            51,
-            "row must fill exactly 51 cells, got: {row_fit}"
+            41,
+            "row must fill exactly 41 cells, got: {row_fit}"
         );
 
         let mut app = app_with_tagged_target(&["中"]);
-        let row_narrow = render_status_row(&mut app, 50);
+        let row_narrow = render_status_row(&mut app, 40);
         assert!(
             !row_narrow.contains('中'),
             "wide tags must yield when a cell short, got: {row_narrow}"
@@ -772,8 +992,8 @@ mod tests {
         );
         assert_eq!(
             row_narrow.chars().count(),
-            50,
-            "row must fill exactly 50 cells, got: {row_narrow}"
+            40,
+            "row must fill exactly 40 cells, got: {row_narrow}"
         );
     }
 
