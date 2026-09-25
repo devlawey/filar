@@ -62,6 +62,10 @@ pub struct ChatLayoutCache {
     message_count: usize,
     /// `message_rev` at build time.
     last_block_rev: u64,
+    /// The fleet layer's feed (#438): a collapsed command block previews
+    /// only its headline and points at the side panel for the table. Set
+    /// once per session — a session is a fleet or it is not.
+    pub fleet: bool,
 }
 
 /// Maximum number of rendered lines to cache.
@@ -79,6 +83,7 @@ impl ChatLayoutCache {
             width: 0,
             message_count: 0,
             last_block_rev: 0,
+            fleet: false,
         }
     }
 
@@ -190,17 +195,19 @@ impl ChatLayoutCache {
                         let total = all_lines.len();
 
                         if is_collapsed {
-                            for line in all_lines.iter().take(5) {
+                            let preview = if self.fleet { 1 } else { 5 };
+                            for line in all_lines.iter().take(preview) {
                                 for wrapped in wrap_text(line, output_width) {
                                     self.push_output(idx, format!("  {} {}", glyphs.gutter, wrapped));
                                 }
                             }
-                            if total > 5 {
-                                let remaining = total - 5;
+                            if total > preview {
+                                let remaining = total - preview;
+                                let panel = if self.fleet { " · table: ^J" } else { "" };
                                 self.push_output_toggle(
                                     idx,
                                     format!(
-                                        "  {} ... {} more lines - click to expand",
+                                        "  {} ... {} more lines - click to expand{panel}",
                                         glyphs.collapse_arrow, remaining
                                     ),
                                 );

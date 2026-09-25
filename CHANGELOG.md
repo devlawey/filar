@@ -13,6 +13,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- The fleet's difference table lives in the side panel (`^J`): one entry per
+  group of hosts that answered the same, with a sample answer clamped to one
+  line and expandable with `Enter`, and the hosts without an answer (no
+  contact, n/a, …) listed apart with their reason; readable at 80 columns
+  and in ASCII mode. The feed keeps one headline line per fleet command, and
+  the samples never reach the model
+  ([#438](https://github.com/devlawey/filar/issues/438)).
+
 - `Ctrl+Z` in the fleet cancels the whole operation: queued hosts are not
   started, running commands are interrupted on the hosts themselves (Ctrl-C),
   and the answers collected before the cancel are kept and shown, the rest

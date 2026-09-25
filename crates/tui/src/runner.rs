@@ -447,22 +447,28 @@ fn fleet_connector(command_timeout: Duration) -> filar_agent::fleet_exec::HostCo
 /// session lifecycle around it does.
 ///
 /// `credentials` are the ones resolved when the fleet was entered (#436);
-/// credentials of any other operation are refused.
+/// credentials of any other operation are refused. `observer` receives the
+/// person-facing view of every operation, for the side panel (#438).
 fn fleet_executor_for(
     map: &mut HashMap<SessionId, Arc<filar_agent::fleet_exec::FleetExecutor>>,
     sid: SessionId,
     fleet: &filar_core::FleetOperation,
     credentials: &filar_agent::fleet_creds::FleetCredentials,
     connector: impl FnOnce() -> filar_agent::fleet_exec::HostConnector,
+    observer: impl FnOnce() -> Option<filar_agent::fleet_exec::FleetObserver>,
 ) -> filar_core::Result<Arc<filar_agent::fleet_exec::FleetExecutor>> {
     match map.get(&sid) {
         Some(exec) if exec.built_from() == fleet.id() => Ok(Arc::clone(exec)),
         _ => {
-            let exec = Arc::new(filar_agent::fleet_exec::FleetExecutor::new(
+            let mut exec = filar_agent::fleet_exec::FleetExecutor::new(
                 fleet,
                 credentials.clone(),
                 connector(),
-            )?);
+            )?;
+            if let Some(observer) = observer() {
+                exec = exec.with_observer(observer);
+            }
+            let exec = Arc::new(exec);
             map.insert(sid, Arc::clone(&exec));
             Ok(exec)
         }
@@ -1046,6 +1052,14 @@ async fn run_app(
                                 fleet,
                                 creds,
                                 || fleet_connector(command_timeout),
+                                // The view goes straight to this fleet's panel,
+                                // on the UI's own event — never through the agent.
+                                || {
+                                    let tx = agent_tx.clone();
+                                    Some(Arc::new(move |view| {
+                                        let _ = tx.send(TuiEvent::FleetSummary { session_id: sid, view });
+                                    }) as filar_agent::fleet_exec::FleetObserver)
+                                },
                             ) {
                                 Ok(exec) => exec,
                                 Err(e) => {
@@ -2515,18 +2529,18 @@ mod tests {
         };
         let web = filar_core::FleetOperation::open(&group("web"), &targets);
         let web_creds = creds(&web);
-        let first = fleet_executor_for(&mut map, sid, &web, &web_creds, connector).expect("web");
-        let again = fleet_executor_for(&mut map, sid, &web, &web_creds, connector).expect("web");
+        let first = fleet_executor_for(&mut map, sid, &web, &web_creds, connector, || None).expect("web");
+        let again = fleet_executor_for(&mut map, sid, &web, &web_creds, connector, || None).expect("web");
         assert!(Arc::ptr_eq(&first, &again), "same fleet: connections are kept");
 
         // Any other operation under the same key — however it got there —
         // gets its own executor over its own composition.
         let db = filar_core::FleetOperation::open(&group("db"), &targets);
         assert!(
-            fleet_executor_for(&mut map, sid, &db, &web_creds, connector).is_err(),
+            fleet_executor_for(&mut map, sid, &db, &web_creds, connector, || None).is_err(),
             "another fleet's credentials are refused"
         );
-        let swapped = fleet_executor_for(&mut map, sid, &db, &creds(&db), connector).expect("db");
+        let swapped = fleet_executor_for(&mut map, sid, &db, &creds(&db), connector, || None).expect("db");
         assert!(!Arc::ptr_eq(&first, &swapped));
         assert_eq!(swapped.radius(), ["db-1"], "runs where the gate says it runs");
         assert_eq!(map.len(), 1, "the stale executor is dropped with its connections");

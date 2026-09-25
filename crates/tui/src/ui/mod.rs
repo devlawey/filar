@@ -163,19 +163,24 @@ pub fn render(f: &mut Frame, app: &mut App) {
 /// narrow one the feed keeps its full width and the panel is a drawer drawn
 /// over its right edge, only while opened with `^J`.
 fn side_panel_layout(app: &App, feed: Rect, term_width: u16) -> (Rect, Option<Rect>) {
-    use crate::side_panel::{docks, SIDE_PANEL_WIDTH};
-    if !app.side_panel.visible(term_width, !app.operations.is_empty()) {
+    use crate::side_panel::{docks, PanelContent, FLEET_PANEL_WIDTH, SIDE_PANEL_WIDTH};
+    if !app.side_panel.visible(term_width, app.panel_has_content()) {
         return (feed, None);
     }
+    let fleet = app.panel_content() == PanelContent::FleetSummary;
     if docks(term_width) {
+        let panel = if fleet { FLEET_PANEL_WIDTH } else { SIDE_PANEL_WIDTH };
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(20), Constraint::Length(SIDE_PANEL_WIDTH)])
+            .constraints([Constraint::Min(20), Constraint::Length(panel)])
             .split(feed);
         return (chunks[0], Some(chunks[1]));
     }
     // Drawer: leave a strip of the feed visible so it reads as an overlay.
-    let width = SIDE_PANEL_WIDTH.min(feed.width.saturating_sub(8)).max(feed.width.min(20));
+    // The fleet's table takes all but that strip — at 80 columns a 40-wide
+    // drawer would clamp every value to a stub (#438).
+    let wanted = if fleet { feed.width } else { SIDE_PANEL_WIDTH };
+    let width = wanted.min(feed.width.saturating_sub(8)).max(feed.width.min(20));
     let drawer = Rect::new(feed.x + feed.width - width, feed.y, width, feed.height);
     (feed, Some(drawer))
 }
@@ -367,6 +372,16 @@ mod tests {
         assert_eq!(chat, feed, "drawer overlays, the feed is not reflowed");
         let panel = panel.expect("drawer");
         assert!(panel.width < 80 && panel.x + panel.width == 80);
+    }
+
+    #[test]
+    fn the_fleet_table_gets_a_wider_panel() {
+        let mut app = crate::app::test_fleet_app(crate::app::test_fleet_view());
+        let (_, docked) = side_panel_layout(&app, Rect::new(0, 2, 160, 30), 160);
+        assert_eq!(docked.expect("docked").width, crate::side_panel::FLEET_PANEL_WIDTH);
+        app.side_panel.toggle();
+        let (_, drawer) = side_panel_layout(&app, Rect::new(0, 2, 80, 20), 80);
+        assert_eq!(drawer.expect("drawer").width, 72, "all but an 8-column strip of the feed");
     }
 
     #[test]

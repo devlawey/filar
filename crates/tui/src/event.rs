@@ -125,6 +125,13 @@ pub enum TuiEvent {
         session_id: SessionId,
         text: String,
     },
+    /// The person-facing view of a fleet operation (#438), for the side
+    /// panel. It carries host output, so it only ever reaches the panel —
+    /// never the feed's command block, the transcript or the model.
+    FleetSummary {
+        session_id: SessionId,
+        view: filar_agent::fleet_view::FleetView,
+    },
 }
 
 #[cfg(test)]

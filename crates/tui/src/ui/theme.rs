@@ -57,6 +57,12 @@ pub struct Glyphs {
     pub op_failed: &'static str,
     /// Operation/host cancelled: `■` or `~`.
     pub op_cancelled: &'static str,
+    /// Fleet summary: the baseline group — `=` in both sets (#438).
+    pub fleet_same: &'static str,
+    /// Fleet summary: a group that differs from the baseline: `≠` or `!=`.
+    pub fleet_differs: &'static str,
+    /// Fleet summary: a group of a split fleet (no majority): `≈` or `~`.
+    pub fleet_split: &'static str,
 }
 
 impl Glyphs {
@@ -82,6 +88,9 @@ impl Glyphs {
         op_done: "✓",
         op_failed: "✗",
         op_cancelled: "■",
+        fleet_same: "=",
+        fleet_differs: "≠",
+        fleet_split: "≈",
     };
 
     /// ASCII fallback for conhost and legacy terminals.
@@ -106,6 +115,9 @@ impl Glyphs {
         op_done: "+",
         op_failed: "!",
         op_cancelled: "~",
+        fleet_same: "=",
+        fleet_differs: "!=",
+        fleet_split: "~",
     };
 
     /// Detect terminal capabilities and return the appropriate glyph set.

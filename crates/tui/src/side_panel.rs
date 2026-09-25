@@ -21,12 +21,39 @@ pub const SIDE_PANEL_MIN_TOTAL_WIDTH: u16 = 120;
 /// Width of the docked panel.
 pub const SIDE_PANEL_WIDTH: u16 = 40;
 
+/// Width of the docked panel when it shows the fleet summary (#438): a
+/// difference table needs more room than a job tree, and on a terminal
+/// wide enough to dock the feed still keeps 64+ columns.
+pub const FLEET_PANEL_WIDTH: u16 = 56;
+
 /// What the side panel currently shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelContent {
     /// Operations → hosts tree with the selected host's output tail.
     #[default]
     Operations,
+    /// The fleet's difference table (#438): groups of agreeing hosts with
+    /// a sample answer, then the hosts without one. Shown in the fleet
+    /// layer once an operation has run.
+    FleetSummary,
+}
+
+/// One selectable row of the fleet summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryRow {
+    /// A group of agreeing hosts (index into the view's groups).
+    Group(usize),
+    /// A host without a value (index into the view's dropped hosts).
+    Dropped(usize),
+}
+
+/// Selectable rows of a fleet summary: every group, then every host that
+/// has no value — listed apart, so "no contact" or "n/a" is never lost.
+pub fn summary_rows(view: &filar_agent::fleet_view::FleetView) -> Vec<SummaryRow> {
+    (0..view.groups.len())
+        .map(SummaryRow::Group)
+        .chain((0..view.dropped.len()).map(SummaryRow::Dropped))
+        .collect()
 }
 
 /// One selectable row of the operations tree.
@@ -71,6 +98,9 @@ pub struct SidePanel {
     pub open: bool,
     /// Selected tree row.
     pub selected: usize,
+    /// Fleet-summary groups shown in full rather than as one clamped line
+    /// (#438). Cleared when a new operation's summary arrives.
+    pub expanded: std::collections::BTreeSet<usize>,
 }
 
 impl SidePanel {
@@ -93,6 +123,13 @@ impl SidePanel {
         }
         let max = rows as isize - 1;
         self.selected = (self.selected as isize + delta).clamp(0, max) as usize;
+    }
+
+    /// Expand a collapsed fleet-summary group, or collapse an expanded one.
+    pub fn toggle_expanded(&mut self, group: usize) {
+        if !self.expanded.remove(&group) {
+            self.expanded.insert(group);
+        }
     }
 
     /// Keep the selection within `rows` after the content changed.
