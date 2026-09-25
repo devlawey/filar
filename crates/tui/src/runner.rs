@@ -431,6 +431,28 @@ fn fleet_connector(command_timeout: Duration) -> filar_agent::fleet_exec::HostCo
     })
 }
 
+/// The group-level executor for the fleet session `sid` (#435).
+///
+/// Reused only while it was built from this very `fleet` operation: an entry
+/// built from any other composition is replaced, so the hosts a command runs
+/// on are always the ones the gate shows as the radius — whatever the
+/// session lifecycle around it does.
+fn fleet_executor_for(
+    map: &mut HashMap<SessionId, Arc<filar_agent::fleet_exec::FleetExecutor>>,
+    sid: SessionId,
+    fleet: &filar_core::FleetOperation,
+    connector: impl FnOnce() -> filar_agent::fleet_exec::HostConnector,
+) -> Arc<filar_agent::fleet_exec::FleetExecutor> {
+    match map.get(&sid) {
+        Some(exec) if exec.built_from() == fleet.id() => Arc::clone(exec),
+        _ => {
+            let exec = Arc::new(filar_agent::fleet_exec::FleetExecutor::new(fleet, connector()));
+            map.insert(sid, Arc::clone(&exec));
+            exec
+        }
+    }
+}
+
 /// Run the TUI with the given LLM client, executor, and configuration.
 pub async fn run(
     _llm: Arc<dyn LlmClient>,
@@ -999,15 +1021,9 @@ async fn run_app(
                             // The fleet agent runs over the group-level
                             // executor and nothing else (#434, #435): a tab
                             // executor would be one host behind a fleet label.
-                            let exec = fleet_executors
-                                .entry(sid)
-                                .or_insert_with(|| {
-                                    Arc::new(filar_agent::fleet_exec::FleetExecutor::new(
-                                        fleet,
-                                        fleet_connector(command_timeout),
-                                    ))
-                                })
-                                .clone();
+                            let exec = fleet_executor_for(&mut fleet_executors, sid, fleet, || {
+                                fleet_connector(command_timeout)
+                            });
                             let info = format!("fleet {} ({} hosts)", fleet.group_name(), fleet.len());
                             (exec as Arc<dyn CommandExecutor>, false, Some(info))
                         } else {
@@ -2438,6 +2454,45 @@ async fn load_path_picker_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fleet_executor_is_reused_only_for_the_operation_it_was_built_from() {
+        let targets: Vec<filar_core::SshTarget> = ["web-1", "web-2", "db-1"]
+            .iter()
+            .map(|n| filar_core::SshTarget {
+                name: (*n).into(),
+                host: format!("{n}.example"),
+                port: 22,
+                user: "admin".into(),
+                auth: Default::default(),
+                host_key_policy: Default::default(),
+                tags: vec![if n.starts_with("web") { "web".into() } else { "db".into() }],
+            })
+            .collect();
+        let group = |tag: &str| filar_core::HostGroup {
+            name: tag.into(),
+            match_tags: vec![tag.into()],
+            ..Default::default()
+        };
+        let connector = || -> filar_agent::fleet_exec::HostConnector {
+            Arc::new(|_t| Box::pin(async { Err(CoreError::Other("unused".into())) }))
+        };
+        let mut map = HashMap::new();
+        let sid = SessionId(7);
+
+        let web = filar_core::FleetOperation::open(&group("web"), &targets);
+        let first = fleet_executor_for(&mut map, sid, &web, connector);
+        let again = fleet_executor_for(&mut map, sid, &web, connector);
+        assert!(Arc::ptr_eq(&first, &again), "same fleet: connections are kept");
+
+        // Any other operation under the same key — however it got there —
+        // gets its own executor over its own composition.
+        let db = filar_core::FleetOperation::open(&group("db"), &targets);
+        let swapped = fleet_executor_for(&mut map, sid, &db, connector);
+        assert!(!Arc::ptr_eq(&first, &swapped));
+        assert_eq!(swapped.radius(), ["db-1"], "runs where the gate says it runs");
+        assert_eq!(map.len(), 1, "the stale executor is dropped with its connections");
+    }
 
     #[test]
     fn an_overflow_is_retried_exactly_once() {

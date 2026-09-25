@@ -159,7 +159,9 @@ limits, and returns the summary headline plus the fold
 (`FleetCheck::ad_hoc` — compared by digest, **no host output**). The
 `HostConnector` you pass opens one host's executor and must wrap it in
 `ReadOnlyExecutor`; a host it fails to connect is reported as "no contact" and
-retried on the next `run`.
+retried on the next `run`. `FleetExecutor::built_from()` returns the id of
+the operation it was built from; if you cache executors, reuse one only while
+that id matches the fleet on screen.
 
 ## SSH credentials (password auth)
 

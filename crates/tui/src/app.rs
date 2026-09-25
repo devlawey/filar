@@ -5869,6 +5869,20 @@ mod tests {
     }
 
     #[test]
+    fn closing_the_fleet_releases_its_session_and_reentry_is_a_new_one() {
+        // The runner drops the fleet's executor (and its host connections)
+        // on the ids in `closed_ids`; re-entering must never reuse the id.
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        let first = app.sessions[app.active].id;
+        app.take_closed_ids();
+        app.exit_fleet();
+        assert_eq!(app.take_closed_ids(), vec![first], "closing the fleet releases its id");
+        app.enter_fleet("web");
+        assert_ne!(app.sessions[app.active].id, first, "re-entry is a new fleet session");
+    }
+
+    #[test]
     fn a_single_host_gate_has_no_radius() {
         use crossterm::event::KeyCode;
         let mut app = app_with_groups();

@@ -44,7 +44,7 @@ use tokio::sync::Mutex;
 use filar_core::config::SshTarget;
 use filar_core::error::{CoreError, Result};
 use filar_core::fleet_checks::FleetCheck;
-use filar_core::fleet_op::FleetOperation;
+use filar_core::fleet_op::{FleetOperation, OperationId};
 use filar_transport::readonly::check_read_only;
 use filar_transport::{CommandExecutor, CommandResult};
 
@@ -62,6 +62,9 @@ pub type HostConnector =
 
 /// One `run` = one read-only question to every host of a fleet.
 pub struct FleetExecutor {
+    /// Id of the operation this executor was built from — the one whose
+    /// composition the UI shows as the radius.
+    source: OperationId,
     /// The composition frozen when the fleet was entered.
     fleet: FleetOperation,
     connect: HostConnector,
@@ -75,10 +78,19 @@ impl FleetExecutor {
     /// An executor over `fleet`'s hosts, connecting each through `connect`.
     pub fn new(fleet: &FleetOperation, connect: HostConnector) -> Self {
         Self {
+            source: fleet.id(),
             hosts: Mutex::new(vec![None; fleet.len()]),
             fleet: fleet.reopen(),
             connect,
         }
+    }
+
+    /// The operation this executor was built from. A caller holding one
+    /// executor per fleet checks this against the fleet it is about to run
+    /// in, so a command can never go to a composition other than the one
+    /// on screen.
+    pub fn built_from(&self) -> OperationId {
+        self.source
     }
 
     /// Names of the hosts every command goes to — the radius the gate shows.
