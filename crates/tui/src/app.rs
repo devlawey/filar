@@ -4516,19 +4516,26 @@ impl App {
                             .map(|(_, expl)| expl.clone())
                             .unwrap_or_default();
                         let mut updated = false;
+                        // The block awaiting this output is usually the last
+                        // one; a cancelled fleet run (#437) delivers its
+                        // partial result after the `Cancelled` note, so look
+                        // back past system notes — never past the user's turn.
+                        let pending = self
+                            .messages
+                            .iter()
+                            .rposition(|b| !matches!(b, ChatBlock::System(_)))
+                            .filter(|&i| matches!(&self.messages[i],
+                                ChatBlock::Command { command: cmd, output: None, .. } if *cmd == command));
                         if let Some(ChatBlock::Command {
-                            command: ref cmd,
                             output: ref mut o,
                             approved: ref mut a,
                             ..
-                        }) = self.messages.last_mut()
+                        }) = pending.and_then(|i| self.messages.get_mut(i))
                         {
-                            if *cmd == command && o.is_none() {
-                                *o = Some(output.clone());
-                                *a = true;
-                                updated = true;
-                                self.message_rev = self.message_rev.wrapping_add(1);
-                            }
+                            *o = Some(output.clone());
+                            *a = true;
+                            updated = true;
+                            self.message_rev = self.message_rev.wrapping_add(1);
                         }
                         if !updated {
                             self.push_message(ChatBlock::Command {
@@ -5734,13 +5741,21 @@ mod tests {
         app.cancellation = Some(token.clone());
         app.agent_running = true;
         app.mode = AppMode::Thinking;
+        // The approved command, still waiting for its output.
+        app.push_message(ChatBlock::Command {
+            command: "uname -r".into(),
+            explanation: String::new(),
+            output: None,
+            approved: true,
+        });
 
         app.handle_key(ctrl_key('z'));
         assert!(token.is_cancelled(), "the fleet run is told to stop");
         assert_eq!(app.mode, AppMode::Normal);
         assert!(matches!(app.messages.last(), Some(ChatBlock::System(s)) if s.contains("running ones get Ctrl-C")));
 
-        // The partial summary arrives after the cancellation and is kept.
+        // The partial summary arrives after the cancellation and fills the
+        // command block that was waiting for it, not a second one.
         let sid = app.sessions[app.active].id;
         app.handle_agent_event(TuiEvent::Agent {
             session_id: sid,
@@ -5750,8 +5765,16 @@ mod tests {
                 denied: false,
             },
         });
-        assert!(matches!(app.messages.last(),
-            Some(ChatBlock::Command { output: Some(o), .. }) if o.contains("1 cancelled")));
+        let commands: Vec<_> = app
+            .messages
+            .iter()
+            .filter_map(|b| match b {
+                ChatBlock::Command { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commands.len(), 1, "one block for one command");
+        assert!(commands[0].as_deref().is_some_and(|o| o.contains("1 cancelled")));
     }
 
     // ── Fleet credentials (#436) ────────────────────────────────────

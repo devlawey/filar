@@ -191,8 +191,6 @@ impl client::Handler for SshHandler {
 enum ChannelCmd {
     /// Write raw bytes to the SSH channel (payload, sync marker, etc.).
     Write(Vec<u8>),
-    /// Send Ctrl-C (0x03) to interrupt the running command.
-    Interrupt,
 }
 
 /// Events received **from** the channel-owning reader task.
@@ -219,8 +217,22 @@ enum ChannelEvent {
 ///
 /// **Architecture:** A long-lived reader task owns the `Channel<Msg>` and is
 /// the sole reader/writer. `run()` sends commands and reads events through
-/// `mpsc` channels, while `cancel()` sends an `Interrupt` command that does
-/// **not** compete for any lock held by `run()`.
+/// `mpsc` channels, while `cancel()` interrupts the running command over a
+/// second, short-lived channel and does **not** compete for any lock held by
+/// `run()`.
+///
+/// # Interrupting a command (#437)
+///
+/// The shell runs without a PTY (clean output, no echo), so there is no
+/// terminal line discipline to turn a Ctrl-C byte into `SIGINT`: writing
+/// `0x03` to the shell's stdin interrupted nothing, and the byte was glued to
+/// the front of the *next* command, which then failed. Instead the session
+/// learns its shell's PID when it connects, and `cancel()` opens an `exec`
+/// channel on the same connection that sends `SIGINT` to that shell's child
+/// processes — the running command — with POSIX `ps`, `awk` and `kill`.
+/// Nothing is written to the remote disk. The shell itself survives, prints
+/// the command's marker with the interrupted exit code, and is ready for the
+/// next command.
 pub struct SshSession {
     /// Sender to the reader task (write data, send interrupts).
     cmd_tx: mpsc::Sender<ChannelCmd>,
@@ -235,6 +247,9 @@ pub struct SshSession {
     session: Mutex<Handle<SshHandler>>,
     /// Monotonic counter for request IDs.
     req_counter: AtomicU64,
+    /// PID of the remote shell, learned at connect (`$$`); `cancel()`
+    /// interrupts its children. `None` if the shell did not report it.
+    shell_pid: Option<u32>,
     /// Set to `true` when teardown is intentional (`close()` or being replaced
     /// on reconnect). The reader task reads this to decide whether a channel
     /// closure is expected (INFO) or unexpected (WARN).
@@ -378,6 +393,14 @@ impl SshSession {
         drain_until_marker(&mut channel, &sync_marker, Duration::from_secs(10))
             .await?;
 
+        // ── Learn the shell's PID (for `cancel`) ──────────────────────
+        // Not fatal: without it a command cannot be interrupted, but it
+        // still runs.
+        let shell_pid = read_shell_pid(&mut channel, Duration::from_secs(10)).await;
+        if shell_pid.is_none() {
+            warn!("SSH shell did not report its PID — commands cannot be interrupted");
+        }
+
         // ── Spawn reader task ──────────────────────────────────────────
         // The task is the sole owner of `Channel<Msg>` from this point on.
         let (cmd_tx, cmd_rx) = mpsc::channel::<ChannelCmd>(16);
@@ -394,6 +417,7 @@ impl SshSession {
             event_rx: Mutex::new(event_rx),
             session: Mutex::new(session),
             req_counter: AtomicU64::new(0),
+            shell_pid,
             shutdown,
             command_timeout: cfg.command_timeout,
         })
@@ -469,8 +493,10 @@ impl SshSession {
             Err(e) => {
                 // Command timed out or failed. Send Ctrl-C to interrupt
                 // any running process, then resync the shell.
-                warn!(error = %e, "command timed out, sending Ctrl-C and resyncing");
-                let _ = self.cmd_tx.send(ChannelCmd::Interrupt).await;
+                warn!(error = %e, "command timed out, interrupting it and resyncing");
+                if let Err(e) = self.cancel().await {
+                    warn!(error = %e, "could not interrupt the timed-out command");
+                }
                 // Drain any remaining output and resync.
                 let sync_id = format!("sync_{}", Uuid::new_v4().simple());
                 let sync_cmd = format!(
@@ -489,16 +515,37 @@ impl SshSession {
         }
     }
 
-    /// Send Ctrl-C to interrupt the currently running command.
+    /// Interrupt the currently running command (`SIGINT` to the shell's
+    /// children — see the type docs for why not a Ctrl-C byte).
     ///
-    /// This sends an `Interrupt` command to the reader task via `cmd_tx`.
-    /// It does **not** acquire any lock that `run()` holds, so it works
-    /// even while a command is executing.
+    /// Opens a short-lived `exec` channel on the same connection; it does
+    /// **not** acquire any lock that `run()` holds, so it works even while
+    /// a command is executing. With no command running it is a no-op.
     pub async fn cancel(&self) -> Result<()> {
-        self.cmd_tx
-            .send(ChannelCmd::Interrupt)
+        let pid = self.shell_pid.ok_or_else(|| {
+            CoreError::Other("cannot interrupt: the remote shell did not report its PID".into())
+        })?;
+        let mut channel = {
+            let session = self.session.lock().await;
+            session
+                .channel_open_session()
+                .await
+                .map_err(|e| CoreError::Other(format!("failed to open interrupt channel: {e}")))?
+        };
+        channel
+            .exec(true, interrupt_command(pid))
             .await
-            .map_err(|_| CoreError::Other("failed to send Ctrl-C: channel task closed".into()))?;
+            .map_err(|e| CoreError::Other(format!("failed to send interrupt: {e}")))?;
+        // Wait for the `kill` to finish, bounded: the interrupt must not
+        // become a second thing to wait on.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, channel.wait()).await {
+                Ok(Some(ChannelMsg::Close)) | Ok(None) | Err(_) => break,
+                Ok(Some(_)) => {}
+            }
+        }
         Ok(())
     }
 
@@ -546,14 +593,6 @@ async fn reader_task(
                     Some(ChannelCmd::Write(data)) => {
                         if let Err(e) = channel.data(&data[..]).await {
                             warn!(error = %e, "reader: failed to write to channel");
-                            let _ = event_tx.send(ChannelEvent::Closed);
-                            break;
-                        }
-                    }
-                    Some(ChannelCmd::Interrupt) => {
-                        debug!("reader: sending Ctrl-C (0x03)");
-                        if let Err(e) = channel.data(&b"\x03"[..]).await {
-                            warn!(error = %e, "reader: failed to send Ctrl-C");
                             let _ = event_tx.send(ChannelEvent::Closed);
                             break;
                         }
@@ -919,6 +958,58 @@ fn check_host_key(
     }
 }
 
+/// The remote command that interrupts whatever the shell `pid` is running:
+/// `SIGINT` to each of its direct children. POSIX `ps -A -o` and `awk`, so
+/// it works on any POSIX host without `pkill`; it writes nothing to disk.
+fn interrupt_command(pid: u32) -> String {
+    format!(
+        "for p in $(ps -A -o pid= -o ppid= | awk -v pp={pid} '$2 == pp {{ print $1 }}'); \
+         do kill -INT \"$p\" 2>/dev/null; done; true"
+    )
+}
+
+/// Ask the shell for its PID (`$$`) and read the answer, bounded by
+/// `timeout`. `None` if it does not arrive or does not parse.
+async fn read_shell_pid(channel: &mut Channel<Msg>, timeout: Duration) -> Option<u32> {
+    let tag = format!("{}pid_{}", MARKER_PREFIX, Uuid::new_v4().simple());
+    let cmd = format!("printf '\\n{tag}__%s__\\n' \"$$\"\n");
+    channel.data(cmd.as_bytes()).await.ok()?;
+    let deadline = Instant::now() + timeout;
+    let mut buf = String::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, channel.wait()).await {
+            Ok(Some(ChannelMsg::Data { ref data })) => {
+                buf.push_str(&String::from_utf8_lossy(data));
+                if let Some(pid) = parse_shell_pid(&buf, &tag) {
+                    return Some(pid);
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
+/// Parse `<tag>__<pid>__` out of `buf` — the marker line, not the echo of
+/// the `printf` that produced it (a PTY-less shell does not echo, but the
+/// parse does not rely on that).
+fn parse_shell_pid(buf: &str, tag: &str) -> Option<u32> {
+    let mut rest = buf;
+    while let Some(pos) = rest.find(tag) {
+        let after = &rest[pos + tag.len()..];
+        if let Some(digits) = after.strip_prefix("__") {
+            if let Some(end) = digits.find("__") {
+                if let Ok(pid) = digits[..end].parse() {
+                    return Some(pid);
+                }
+            }
+        }
+        rest = after;
+    }
+    None
+}
+
 /// Read from the channel until `marker` is found in the accumulated output.
 /// Returns the output *before* the marker (discarded for sync).
 ///
@@ -1129,6 +1220,63 @@ mod tests {
 
     /// Integration test — requires a running SSH server.
     /// Start one with: docker run -d -p 2222:22 --name filar-sshd filar-sshd
+    #[test]
+    fn the_shell_pid_is_read_from_its_marker_line() {
+        let tag = "__FILAR_pid_abc";
+        assert_eq!(parse_shell_pid("noise\n__FILAR_pid_abc__4242__\n", tag), Some(4242));
+        // An echo of the printf (a shell with echo on) is skipped.
+        let echoed = "printf '\\n__FILAR_pid_abc__%s__\\n' \"$$\"\n__FILAR_pid_abc__77__\n";
+        assert_eq!(parse_shell_pid(echoed, tag), Some(77));
+        assert_eq!(parse_shell_pid("__FILAR_pid_abc__", tag), None, "incomplete");
+        assert_eq!(parse_shell_pid("__FILAR_pid_other__1__", tag), None);
+    }
+
+    #[test]
+    fn the_interrupt_signals_the_shells_children_and_writes_nothing() {
+        let cmd = interrupt_command(4242);
+        assert!(cmd.contains("awk -v pp=4242"), "{cmd}");
+        assert!(cmd.contains("kill -INT"), "{cmd}");
+        // Zero-install: the only redirection is stderr to /dev/null.
+        assert_eq!(cmd.matches('>').count(), 1, "{cmd}");
+        assert!(cmd.contains("2>/dev/null"), "{cmd}");
+    }
+
+    /// Integration test (#437): `cancel()` really stops a running command
+    /// on the host, and the shell stays usable — the next command is not
+    /// corrupted by the interrupt.
+    #[tokio::test]
+    #[ignore = "requires Docker sshd container on port 2222"]
+    async fn ssh_cancel_interrupts_the_command_and_keeps_the_shell() {
+        let target = SshTarget {
+            name: "test".into(),
+            host: "127.0.0.1".into(),
+            port: 2222,
+            user: "testuser".into(),
+            auth: SshAuth::Password { password: None },
+            host_key_policy: HostKeyPolicy::Tofu,
+            tags: Vec::new(),
+        };
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
+
+        let session = Arc::new(SshSession::connect(&target).await.unwrap());
+        let started = Instant::now();
+        let running = tokio::spawn({
+            let session = Arc::clone(&session);
+            async move { session.run("sleep 30").await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        session.cancel().await.unwrap();
+        let interrupted = running.await.unwrap().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10), "the sleep was not interrupted");
+        assert_ne!(interrupted.exit_code, Some(0));
+
+        let next = session.run("echo still-here").await.unwrap();
+        assert_eq!(next.stdout.trim(), "still-here");
+        assert_eq!(next.exit_code, Some(0), "the next command is clean");
+        session.close().await.unwrap();
+    }
+
     /// Set SSH_PASSWORD env var, e.g. `set SSH_PASSWORD=testpassword`.
     #[tokio::test]
     #[ignore = "requires Docker sshd container on port 2222"]

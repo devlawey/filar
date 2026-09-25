@@ -9350,10 +9350,22 @@ web-2`; `a` → `2 of 3 hosts answered … 2 ok, 1 skipped`. В логе sshd н
   ones get Ctrl-C; answers so far follow.`; частичная сводка приходит следом
   блоком команды.
 
+- **Транспорт — найдено живым прогоном.** Отмена по SSH не прерывала
+  команду вообще: шелл без PTY, и `0x03`, записанный в stdin, не становился
+  `SIGINT` — команда доходила до конца, а байт приклеивался к следующей
+  команде, и та падала. Это касалось и обычной вкладки (Ctrl+Z, таймаут) и
+  таймаута хоста во флоте (#427). Теперь `SshSession` при подключении читает
+  `$$` шелла, а `cancel()` открывает `exec`-канал на том же соединении и шлёт
+  `SIGINT` прямым потомкам шелла (`ps -A -o pid= -o ppid=` + `awk` + `kill`,
+  POSIX, без записи на диск — zero-install не нарушен). Таймаут в `run` идёт
+  через тот же `cancel()`. `ChannelCmd::Interrupt` удалён. Встроенные циклы
+  шелла так не прерываются — записано в PLATFORM_NOTES.
+
 **Публичный контракт.** Добавлены `run_on_fleet_until`, `HostRun::Cancelled`,
 `HostState::Cancelled` (+`cancelled()`), `FleetRunReport::cancelled()`,
 `OperationSummary::cancelled()`; `HostState::ALL` — 8 состояний. Семантика
-`FleetExecutor::cancel` во время `run` изменилась (см. выше). Трейты
+`FleetExecutor::cancel` во время `run` изменилась, `SshSession`/`SshExecutor::cancel`
+теперь действительно прерывает команду (см. выше). Трейты
 `CommandExecutor`/`LlmClient` не менялись. ENGINE_API.md, USER_GUIDE.md
 обновлены.
 
@@ -9362,4 +9374,19 @@ web-2`; `a` → `2 of 3 hosts answered … 2 ok, 1 skipped`. В логе sshd н
 старта — никто не опрошен; `Cancelled` — своя группа, не повторяется;
 `FleetExecutor::cancel` → частичная сводка `1 ok, 2 cancelled`, exit 0;
 завершённый прогон очищает токен; агент показывает частичный результат до
-`Cancelled` и отменяет саму операцию); `filar-tui` 615 → 616.
+`Cancelled` и отменяет саму операцию); `filar-tui` 615 → 616 (Ctrl+Z во флоте
+отменяет прогон, частичная сводка заполняет тот же блок команды);
+`filar-transport` 59 → 61 (+1 `#[ignore]`: `cancel` прерывает `sleep 30`, шелл
+остаётся рабочим — ручной, docker-sshd).
+
+**Живой прогон** (Linux-контейнер, tmux, release). `sshd` на `127.0.0.1:2222`,
+три key-хоста, группа `max_parallel = 1`, фейковый LLM. `ping -c 4` по флоту →
+approve → Ctrl+Z через 4,5 с: до отмены на машине шёл один `ping` (второй
+хост), через 1 с — ни одного; сводка `1 of 3 hosts answered … 1 ok, 2
+cancelled` в том же блоке команды после `Cancelled: …`. Следующий `uname -r`
+по флоту → `3 ok` (до правки транспорта здесь был `1 error`: байт Ctrl-C
+приклеивался к команде). `ping -c 30` + Ctrl+Z через 3 с → процесс убит в
+пределах секунды, `3 cancelled`, не `failed`. Обычная вкладка `--target
+web-1`: `ping -c 30` + Ctrl+Z → убит, следующий `uname -r` чистый.
+
+**Next:** #438 — сводка различий таблицей в панели и агрегированный вывод.

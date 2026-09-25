@@ -169,7 +169,11 @@ limits, and returns the summary headline plus the fold
 `HostConnector` you pass opens one host's executor and must wrap it in
 `ReadOnlyExecutor`; a host it fails to connect is reported as "no contact" and
 retried on the next `run`; so is a cached host whose connection is lost
-during a `run`. `cancel()` during a `run` cancels the **operation**: queued
+during a `run`. `SshExecutor::cancel()` stops the running command on the
+host: `SIGINT` to the shell's children through a short-lived `exec` channel
+(the shell has no PTY, so a Ctrl-C byte would signal nothing), after which
+the shell prints the command's marker and is ready for the next one.
+`FleetExecutor::cancel()` during a `run` cancels the **operation**: queued
 hosts are not started, running ones get a Ctrl-C on the host and are drained
 (`fleet_run::run_on_fleet_until`), and `run` still returns the summary and fold
 of what answered first, the rest as `HostState::Cancelled` (`HostRun::Cancelled`
