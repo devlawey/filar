@@ -2133,6 +2133,12 @@ impl App {
     fn select_session(&mut self) {
         let idx = self.session_select_index;
         self.session_select_visible = false;
+        // The overlay can outlive the switch into the fleet (F3, then Ctrl+O
+        // on a group): refuse where the restore happens, not only at F3.
+        if self.in_fleet() {
+            self.fleet_refusal("Session restore");
+            return;
+        }
 
         let meta = match self.session_select_metas.get(idx).cloned() {
             Some(m) => m,
@@ -3343,7 +3349,7 @@ impl App {
                 // Tab navigation when multiple tabs are open: switch the active
                 // tab while preserving per-tab terminal state. PTY stays alive
                 // in the background — no teardown, no toggle_interactive.
-                if self.sessions.len() > 1 {
+                if self.tab_indices().len() > 1 {
                     let switch = match (key.code, key.modifiers) {
                         (KeyCode::Tab, m) if m.contains(KeyModifiers::CONTROL) => {
                             if m.contains(KeyModifiers::SHIFT) {
@@ -4952,6 +4958,11 @@ impl App {
             return false;
         };
         self.remember_return_tab();
+        // Single-host overlays opened on a tab must not act on the fleet.
+        self.session_select_visible = false;
+        if self.path_picker_visible {
+            self.close_path_picker();
+        }
         if let Some(fi) = self.fleet_index() {
             if self.fleet().map(|f| f.group_name()) == Some(group_name) {
                 self.active = fi;
@@ -5637,6 +5648,34 @@ mod tests {
         assert!(app.ctrl_o_needs_connect);
         assert_eq!(app.sessions[app.active].target_name, "~db-1");
         assert!(app.fleet().is_some(), "the fleet stays open");
+    }
+
+    #[test]
+    fn a_restore_overlay_left_open_never_restores_into_the_fleet() {
+        let mut app = app_with_groups();
+        app.session_select_visible = true; // F3 on the tab
+        app.session_select_metas = vec![];
+        app.enter_fleet("web"); // then Ctrl+O on a group
+        assert!(!app.session_select_visible, "entering the fleet closes it");
+        // Even if it were still up, the restore itself refuses.
+        app.session_select_visible = true;
+        app.select_session();
+        assert!(app.in_fleet());
+        assert!(app.ssh_info.is_none() && !app.ctrl_o_needs_connect);
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m.starts_with("Session restore")));
+    }
+
+    #[test]
+    fn a_lone_interactive_tab_keeps_its_keys_with_a_fleet_open() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        app.leave_fleet_view();
+        app.mode = AppMode::Interactive;
+        app.terminal = Some(TerminalModel::new(80, 24));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
+        assert!(!app.in_fleet());
+        assert!(app.take_term_input().is_some(), "Ctrl+Tab goes to the PTY, as with one tab");
     }
 
     #[test]

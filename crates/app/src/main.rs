@@ -389,6 +389,14 @@ async fn run() -> anyhow::Result<()> {
     let args = parse_args();
     let cli_llm_name = args.llm.clone();
     let cli_group = args.group.clone();
+    // An unknown group stops start-up, like an unknown target: silently
+    // landing on an ordinary tab after asking for a fleet is a wrong-target
+    // risk (#432 review).
+    if let Some(ref group) = cli_group {
+        if !config.host_groups.iter().any(|g| &g.name == group) {
+            anyhow::bail!("Host group '{group}' not found in [[host_groups]].");
+        }
+    }
 
     // ── GUI-only mode (subprocess) ──────────────────────────────────
     if args.gui_only {
