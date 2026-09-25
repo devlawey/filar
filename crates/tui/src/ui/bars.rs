@@ -244,7 +244,13 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Target: the host, or in the fleet the group and how many of its hosts
     // are answering (#439) — both kept to the last.
-    let fleet_target = app.fleet().map(|f| (f.group_name().to_string(), f.len()));
+    // Only the fleet on screen: an open fleet in the background must not
+    // label an ordinary tab, whose commands go to its own host.
+    let fleet_target = app
+        .active_session()
+        .fleet
+        .as_ref()
+        .map(|f| (f.group_name().to_string(), f.len()));
     let (target, live) = match &fleet_target {
         Some((group, total)) => {
             let status = app.active_session().fleet_status;
@@ -856,6 +862,17 @@ mod tests {
         // have given way, the group, count, mode badge, cost and confirm mode stay.
         let row = render_status_row(&mut app, 55);
         assert!(!row.contains("toks"), "tokens yield before the essentials, got: {row}");
+    }
+
+    #[test]
+    fn an_ordinary_tab_is_not_labelled_with_a_background_fleet() {
+        let mut app = crate::app::test_fleet_app(crate::app::test_fleet_view());
+        assert!(render_status_row(&mut app, 120).contains("fleet web"));
+        app.leave_fleet_view();
+        let row = render_status_row(&mut app, 120);
+        assert!(!row.contains("fleet web"), "the tab's own target, got: {row}");
+        assert!(!row.contains("live"), "no fleet count on a host tab, got: {row}");
+        assert!(!row.contains("$?"), "no fleet cost placeholder, got: {row}");
     }
 
     #[test]
