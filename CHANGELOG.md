@@ -13,6 +13,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- `Ctrl+O` inside the fleet drills into one of its hosts: the host opens as a
+  new ordinary tab with its own connection while the fleet stays open, and
+  the overlay there lists only the fleet's hosts
+  ([#433](https://github.com/devlawey/filar/issues/433)).
+
 - The fleet layer in the TUI: one dialogue over a host group, entered with
   `--group <name>` or a group row in `Ctrl+O`, kept apart from the tab row
   and closed with `Ctrl+W`; `Ctrl+N` inside it opens an ordinary tab, and

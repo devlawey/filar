@@ -1877,12 +1877,18 @@ impl App {
     pub(crate) fn host_select_rows_filtered(&self, query: &str, tag: Option<&str>) -> Vec<HostSelectRow> {
         let q = query.trim().to_lowercase();
         let mut rows = Vec::new();
-        if tag.is_none() && (q.is_empty() || "local".contains(&q)) {
+        // In the fleet the overlay drills into the fleet's own hosts (#433):
+        // `local` and hosts outside the fleet are not offered.
+        let fleet = self.sessions[self.active].fleet.as_ref();
+        if fleet.is_none() && tag.is_none() && (q.is_empty() || "local".contains(&q)) {
             rows.push(HostSelectRow::Local);
         }
         let mut tagged: Vec<(String, Vec<usize>)> = Vec::new();
         let mut untagged: Vec<usize> = Vec::new();
         for (i, t) in self.ssh_targets.iter().enumerate() {
+            if fleet.is_some_and(|f| !f.contains(&t.name)) {
+                continue;
+            }
             if let Some(tf) = tag {
                 if !t.tags.iter().any(|x| x.eq_ignore_ascii_case(tf)) {
                     continue;
@@ -2035,9 +2041,13 @@ impl App {
             }
             return;
         }
-        // A single target from inside the fleet switches the tab the fleet
-        // was entered from — the fleet session never gets a transport.
-        self.leave_fleet_view();
+        // Drilling into a host from the fleet (#433): the host opens as a new
+        // ordinary tab with its own executor and connection; the fleet stays
+        // open and never gets a transport. A host may be in the fleet and in
+        // a tab at once — nothing is shared between the two.
+        if self.in_fleet() {
+            self.new_tab();
+        }
         self.ctrl_o_selection = Some(idx);
 
         let tags = if idx == 0 {
@@ -5662,19 +5672,76 @@ mod tests {
         assert_eq!(app.fleet().map(|f| f.group_name()), Some("db"));
     }
 
+    fn fleet_host_selection(app: &App, name: &str) -> usize {
+        1 + app.ssh_targets.iter().position(|t| t.name == name).expect("target")
+    }
+
     #[test]
-    fn a_single_target_from_the_fleet_switches_the_origin_tab() {
+    fn ctrl_o_in_the_fleet_drills_into_a_host_as_a_new_tab() {
         let mut app = app_with_groups();
         let origin = app.sessions[app.active].id;
         app.enter_fleet("web");
+        app.take_pending_local_executors();
         app.open_host_select();
-        app.host_select_index = 3; // db-1
+        app.host_select_index = fleet_host_selection(&app, "web-2");
         app.select_host();
-        assert!(!app.in_fleet(), "back on the tabs");
-        assert_eq!(app.sessions[app.active].id, origin);
+        // A new ordinary tab, on screen, pointed at the host.
+        assert!(!app.in_fleet());
+        let tab = app.sessions[app.active].id;
+        assert_ne!(tab, origin);
+        assert_eq!(app.sessions[app.active].target_name, "~web-2");
         assert!(app.ctrl_o_needs_connect);
-        assert_eq!(app.sessions[app.active].target_name, "~db-1");
-        assert!(app.fleet().is_some(), "the fleet stays open");
+        assert_eq!(app.take_pending_local_executors(), vec![tab], "its own executor");
+        // The fleet stays open, and the origin tab is untouched.
+        assert!(app.fleet().is_some());
+        let origin_idx = app.find_session_idx(origin).expect("origin tab");
+        assert_eq!(app.sessions[origin_idx].target_name, "local");
+        assert_eq!(app.tab_indices().len(), 2);
+    }
+
+    #[test]
+    fn the_same_host_in_two_places_gets_two_executors_and_the_fleet_none() {
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        app.take_pending_local_executors();
+        let fleet_id = app.sessions[app.fleet_index().expect("fleet")].id;
+        let mut tabs = Vec::new();
+        for _ in 0..2 {
+            // Back to the fleet, then drill into web-1 again.
+            app.enter_fleet("web");
+            app.open_host_select();
+            app.host_select_index = fleet_host_selection(&app, "web-1");
+            app.select_host();
+            tabs.push(app.sessions[app.active].id);
+        }
+        let pending = app.take_pending_local_executors();
+        assert_eq!(pending, tabs, "each tab asks for an executor of its own");
+        assert_ne!(tabs[0], tabs[1]);
+        assert!(!pending.contains(&fleet_id), "the fleet never asks for one");
+        // Membership is not exclusive (#426): web-1 is still in the fleet.
+        assert!(app.fleet().is_some_and(|f| f.contains("web-1")));
+    }
+
+    #[test]
+    fn the_fleet_overlay_offers_only_the_fleet_s_hosts() {
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        app.open_host_select();
+        let rows = app.host_select_rows();
+        assert!(!rows.contains(&HostSelectRow::Local), "no local in the fleet overlay");
+        let targets: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                HostSelectRow::Target(i) => Some(app.ssh_targets[*i].name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, ["web-1", "web-2"], "db-1 is not in the fleet");
+        // Outside the fleet the overlay is unchanged.
+        app.leave_fleet_view();
+        let rows = app.host_select_rows();
+        assert!(rows.contains(&HostSelectRow::Local));
+        assert!(rows.contains(&HostSelectRow::Target(2)));
     }
 
     #[test]

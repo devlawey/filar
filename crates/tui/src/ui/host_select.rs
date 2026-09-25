@@ -53,7 +53,12 @@ fn render_host_select_with_glyphs(f: &mut Frame, app: &App, area: Rect, glyphs: 
 
     f.render_widget(Clear, overlay_area);
 
-    let title = " Select host (Ctrl+O) ";
+    // In the fleet, choosing a host opens it in a new tab (#433).
+    let title = if app.in_fleet() {
+        " Open a fleet host in a new tab (Ctrl+O) "
+    } else {
+        " Select host (Ctrl+O) "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.accent))

@@ -1162,6 +1162,38 @@ async fn run_app(
                     }
                 }
 
+        // Create local executors for new tabs signalled via new_tab().
+        // Before the Ctrl+O connect below: a tab can be created and pointed
+        // at a host in the same keypress (drilling into a host from the
+        // fleet, #433). Connecting first would find no executor to swap, and
+        // the local one created afterwards would run the tab's commands on
+        // this machine under the host's name.
+        for sid in app.take_pending_local_executors() {
+            match filar_transport::LocalExecutor::with_timeout(command_timeout).await {
+                Ok(local) => {
+                    executors.insert(
+                        sid,
+                        ExecutorEntry {
+                            executor: Arc::new(TuiExecutor {
+                                inner: Arc::new(tokio::sync::RwLock::new(Arc::new(local))),
+                            }),
+                            ssh_target: Arc::new(tokio::sync::RwLock::new(None)),
+                        },
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to create local executor for sid={sid:?}");
+                    if let Some(s) = app.sessions.iter_mut().find(|s| s.id == sid) {
+                        s.ssh_info = None;
+                    }
+                    app.push_error(format!(
+                        "Failed to create local executor for new tab: {e}"
+                    ));
+                    app.pending_local_executors.push(sid);
+                }
+            }
+        }
+
         // ── Ctrl+O delayed host connection ─────────────────────────
         if app.ctrl_o_needs_connect {
             app.ctrl_o_needs_connect = false;
@@ -1171,6 +1203,13 @@ async fn run_app(
                 let sid = app.ctrl_o_pending_session_id.take().unwrap_or(app.sessions[app.active].id);
                 let exec_entry = executors.get(&sid)
                     .map(|e| (e.executor.clone(), e.ssh_target.clone()));
+                // No executor to swap means nothing would carry the new
+                // transport: announcing the host anyway is a wrong-target
+                // label (#433). Refuse instead.
+                if exec_entry.is_none() {
+                    app.push_error("Tab executor not ready yet — host not switched".into());
+                    continue;
+                }
                 let tx = agent_tx.clone();
                 let alias = target.name.clone();
                 // Read-only wrap targets for this session (#419).
@@ -1237,6 +1276,11 @@ async fn run_app(
             let sid = app.sessions[app.active].id;
             let exec_entry = executors.get(&sid)
                 .map(|e| (e.executor.clone(), e.ssh_target.clone()));
+            if exec_entry.is_none() {
+                app.push_error("Tab executor not ready yet — host not switched".into());
+                app.settle_pending_swap();
+                continue;
+            }
             let tx = agent_tx.clone();
             let handle = tokio::spawn(async move {
                 tokio::select! {
@@ -1366,32 +1410,6 @@ async fn run_app(
             }
         }
 
-        // Create local executors for new tabs signalled via new_tab().
-        for sid in app.take_pending_local_executors() {
-            match filar_transport::LocalExecutor::with_timeout(command_timeout).await {
-                Ok(local) => {
-                    executors.insert(
-                        sid,
-                        ExecutorEntry {
-                            executor: Arc::new(TuiExecutor {
-                                inner: Arc::new(tokio::sync::RwLock::new(Arc::new(local))),
-                            }),
-                            ssh_target: Arc::new(tokio::sync::RwLock::new(None)),
-                        },
-                    );
-                }
-                Err(e) => {
-                    warn!(error = %e, "failed to create local executor for sid={sid:?}");
-                    if let Some(s) = app.sessions.iter_mut().find(|s| s.id == sid) {
-                        s.ssh_info = None;
-                    }
-                    app.push_error(format!(
-                        "Failed to create local executor for new tab: {e}"
-                    ));
-                    app.pending_local_executors.push(sid);
-                }
-            }
-        }
 
         if app.should_quit {
                     break;
