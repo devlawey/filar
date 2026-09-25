@@ -380,8 +380,11 @@ impl Default for KeyringSecretProvider {
 
 impl SecretProvider for KeyringSecretProvider {
     fn get(&self, name: &str) -> Result<String> {
-        let entry = keyring::Entry::new("filar", name)
-            .map_err(|e| CoreError::Secret(format!("keyring entry error: {e}")))?;
+        // Failing to even build the entry (an invalid name, no backend) says
+        // nothing about whether the secret is stored: not `Secret`.
+        let entry = keyring::Entry::new("filar", name).map_err(|e| {
+            CoreError::Other(format!("OS credential store entry error for {}: {e}", redact(name)))
+        })?;
         entry.get_password().map_err(|e| match e {
             keyring::Error::NoEntry => {
                 CoreError::Secret(format!("{} not in the OS credential store", redact(name)))
