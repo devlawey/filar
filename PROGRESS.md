@@ -9435,3 +9435,16 @@ web-1`: `ping -c 30` + Ctrl+Z → убит, следующий `uname -r` чис
 заголовка; таблица при 80 колонках — группы, `…`, `not compared` с `no contact`
 и `n/a`, ничего не вылезает за ширину; раскрытая группа показывает весь ответ;
 ASCII-режим без рискованных глифов; ширина панели 56/72).
+
+**Живой прогон** (Linux-контейнер, tmux, release). `sshd` на `127.0.0.1:2222`;
+флот из пяти: `web-1`/`web-2` — `root`, `web-3` — `tester` (key), `web-4` —
+закрытый порт 2299, `web-5` — agent-auth. Фейковый LLM, команда `id`. На 110
+колонках `^J` → `fleet summary`: `$ id`, заголовок `3 of 5 hosts answered, 1 did
+not answer — 2 ok, 1 differs, 1 no contact, 1 skipped`, `= ▸ same on 2 web-1,
+web-2` / `uid=0(root)…`, `≠ ▸ differs on 1 web-3` / `uid=1001(tester)…`, `not
+compared:` `✗ web-4 · no contact`, `· web-5 · skipped`. Лента: блок `$ id` — одна
+строка-заголовок и `▸ ... 9 more lines - click to expand · table: ^J`. На 80
+колонках выдвижная панель 72 колонки, значения видны целиком. Заголовок сводки
+переносится посимвольно (общий `wrap_text`) — косметика, не в скоупе.
+
+**Next:** #439 — статус-бар во флоте.
