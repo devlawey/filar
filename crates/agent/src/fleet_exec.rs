@@ -344,7 +344,17 @@ impl CommandExecutor for FleetExecutor {
                 emit(answering, true);
             }
         })
-        .await?;
+        .await;
+        // A cancelled run still returns its report; only a fan-out that
+        // could not start fails here — and the count must stop running then
+        // too, or the status bar would show a live operation until the next.
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                emit(answering, false);
+                return Err(error);
+            }
+        };
         emit(report.answered(), false);
         self.evict_lost(&handles, &executors, &report).await;
         let mut result = OperationResult::build(&op, &report, &not_asked)?;
@@ -726,7 +736,12 @@ mod tests {
                 }) as Arc<dyn CommandExecutor>)
             })
         });
-        let exec = Arc::new(executor(&op, connect));
+        let seen: Arc<std::sync::Mutex<Vec<FleetStatus>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let exec = Arc::new(
+            executor(&op, connect)
+                .with_status(Arc::new(move |status| sink.lock().expect("lock").push(status))),
+        );
 
         let running = tokio::spawn({
             let exec = Arc::clone(&exec);
@@ -741,6 +756,10 @@ mod tests {
         assert!(out.stdout.contains("1 of 3 hosts answered"), "{}", out.stdout);
         assert!(out.stdout.contains("1 ok, 2 cancelled"), "{}", out.stdout);
         assert_eq!(out.exit_code, Some(0), "a cancelled operation is not a failed one");
+        // The status bar's count stops running when the operation is
+        // cancelled (#439), with the one host that answered.
+        let last = *seen.lock().expect("lock").last().expect("a status");
+        assert_eq!((last.answering, last.running), (1, false));
     }
 
     #[tokio::test]
