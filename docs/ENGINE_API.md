@@ -133,6 +133,13 @@ for local executors (affects spawn strategy). Background jobs on SSH use
 ephemeral `/tmp/filar-job-*` logs removed on completion; local jobs capture
 output in memory only.
 
+**Fleet mode.** `AgentBuilder::fleet(true)` marks an agent that works over a
+group of hosts: `read_file` and `list_dir` are left out of the tool set (the
+model never sees them), a call to either is refused with an explanation instead
+of running, and the system prompt says so. The same set is available as
+`tools::fleet_tool_definitions(mode)`; `tools::SINGLE_HOST_TOOLS` names the
+tools it drops.
+
 ## SSH credentials (password auth)
 
 For `SshAuth::Password`, the SSH password is resolved in this order:

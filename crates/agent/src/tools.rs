@@ -105,6 +105,30 @@ pub struct ListBackgroundJobsParams {
 // Tool definitions (for the LLM)
 // ---------------------------------------------------------------------------
 
+/// Tools that address exactly one host and have no meaning over a fleet
+/// (#434): whose file would `read_file` read on twelve machines?
+pub const SINGLE_HOST_TOOLS: &[&str] = &[TOOL_READ_FILE, TOOL_LIST_DIR];
+
+/// Why a single-host tool is refused in a fleet, and what to do instead.
+/// Given to the model as the tool result if it calls one anyway.
+pub fn fleet_single_host_refusal(tool: &str) -> String {
+    format!(
+        "Error: {tool} is not available in a fleet: there is no single host to read from. \
+         If one host needs a closer look, ask the user to open it in its own tab."
+    )
+}
+
+/// Tool definitions offered to the model in a fleet (#434): the ordinary set
+/// without [`SINGLE_HOST_TOOLS`]. They are not offered at all rather than
+/// offered and refused — a tool the model never sees is one it never plans
+/// around.
+pub fn fleet_tool_definitions(mode: CommandConfirmMode) -> Vec<ToolDef> {
+    tool_definitions(mode)
+        .into_iter()
+        .filter(|d| !SINGLE_HOST_TOOLS.contains(&d.name.as_str()))
+        .collect()
+}
+
 /// Return the list of tool definitions available to the LLM.
 ///
 /// In `Explain` mode, the `explanation` field is added to `required` for all
@@ -563,6 +587,35 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fleet_tool_set_has_no_single_host_tools() {
+        for mode in [
+            CommandConfirmMode::Always,
+            CommandConfirmMode::Allowlist,
+            CommandConfirmMode::Explain,
+        ] {
+            let all: Vec<String> = tool_definitions(mode).into_iter().map(|d| d.name).collect();
+            let fleet: Vec<String> =
+                fleet_tool_definitions(mode).into_iter().map(|d| d.name).collect();
+            assert!(!fleet.iter().any(|n| n == TOOL_READ_FILE), "{fleet:?}");
+            assert!(!fleet.iter().any(|n| n == TOOL_LIST_DIR), "{fleet:?}");
+            // Everything else is kept, in the same order.
+            let expected: Vec<String> = all
+                .into_iter()
+                .filter(|n| n != TOOL_READ_FILE && n != TOOL_LIST_DIR)
+                .collect();
+            assert_eq!(fleet, expected);
+            assert!(fleet.iter().any(|n| n == TOOL_RUN_COMMAND));
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_tool_and_the_alternative() {
+        let msg = fleet_single_host_refusal(TOOL_READ_FILE);
+        assert!(msg.starts_with("Error: read_file"));
+        assert!(msg.contains("own tab"));
+    }
 
     #[test]
     fn tool_definitions_count() {
