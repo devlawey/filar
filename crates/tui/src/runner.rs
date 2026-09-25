@@ -417,6 +417,20 @@ fn wrap_if_read_only(
     }
 }
 
+/// How the fleet executor reaches one host (#435): the same SSH transport
+/// as a tab, always behind [`filar_transport::ReadOnlyExecutor`] — a fleet
+/// is read-only whatever the group's tags say (#419).
+fn fleet_connector(command_timeout: Duration) -> filar_agent::fleet_exec::HostConnector {
+    Arc::new(move |target: filar_core::SshTarget| {
+        Box::pin(async move {
+            let ssh = SshExecutor::connect_with_config(&target, ssh_transport_config(command_timeout))
+                .await?;
+            Ok(Arc::new(filar_transport::ReadOnlyExecutor::new(Arc::new(ssh)))
+                as Arc<dyn CommandExecutor>)
+        })
+    })
+}
+
 /// Run the TUI with the given LLM client, executor, and configuration.
 pub async fn run(
     _llm: Arc<dyn LlmClient>,
@@ -560,6 +574,14 @@ async fn run_app(
         inner: Arc::new(tokio::sync::RwLock::new(executor)),
     });
     let initial_sid = app.sessions[0].id;
+    // The fleet's group-level executor (#435), one per fleet session. Kept
+    // apart from `executors` on purpose: a fleet never has a tab executor,
+    // so nothing that looks one up (terminal, cwd sync, host switch) can
+    // reach the fleet's hosts through it.
+    let mut fleet_executors: HashMap<
+        crate::app::SessionId,
+        Arc<filar_agent::fleet_exec::FleetExecutor>,
+    > = HashMap::new();
     let mut executors: std::collections::HashMap<
         crate::app::SessionId,
         ExecutorEntry,
@@ -970,14 +992,34 @@ async fn run_app(
                         }
                     } else {
                         let sid = app.sessions[app.active].id;
-                        let (agent_exec, is_local, ssh_info) = match executors.get(&sid) {
-                            Some(e) => {
-                                let info = app.sessions[app.active].ssh_info.clone();
-                                (e.executor.clone() as Arc<dyn CommandExecutor>, info.is_none(), info)
-                            }
-                            None => {
-                                app.push_error("Tab executor not ready yet".into());
-                                continue;
+                        let in_fleet = app.in_fleet();
+                        let (agent_exec, is_local, ssh_info) = if let Some(fleet) =
+                            app.sessions[app.active].fleet.as_ref()
+                        {
+                            // The fleet agent runs over the group-level
+                            // executor and nothing else (#434, #435): a tab
+                            // executor would be one host behind a fleet label.
+                            let exec = fleet_executors
+                                .entry(sid)
+                                .or_insert_with(|| {
+                                    Arc::new(filar_agent::fleet_exec::FleetExecutor::new(
+                                        fleet,
+                                        fleet_connector(command_timeout),
+                                    ))
+                                })
+                                .clone();
+                            let info = format!("fleet {} ({} hosts)", fleet.group_name(), fleet.len());
+                            (exec as Arc<dyn CommandExecutor>, false, Some(info))
+                        } else {
+                            match executors.get(&sid) {
+                                Some(e) => {
+                                    let info = app.sessions[app.active].ssh_info.clone();
+                                    (e.executor.clone() as Arc<dyn CommandExecutor>, info.is_none(), info)
+                                }
+                                None => {
+                                    app.push_error("Tab executor not ready yet".into());
+                                    continue;
+                                }
                             }
                         };
                         // Create a cancellation token for this agent run.
@@ -1056,6 +1098,7 @@ async fn run_app(
                             profile_name.clone(),
                             app.active_session().compaction_exhausted,
                             pending_compaction,
+                            in_fleet,
                         );
                         // Consumed by this run: the summary comes back as an
                         // event, and a leftover flag would fold the history a
@@ -1385,6 +1428,9 @@ async fn run_app(
             }
             // Release the tab's executor so SSH connections don't leak.
             executors.remove(&sid);
+            // A closed fleet drops its group-level executor and with it
+            // every host connection it held (#435).
+            fleet_executors.remove(&sid);
         }
 
         // Teardown interactive backends for tabs reset by session restore
@@ -2095,6 +2141,9 @@ fn spawn_agent(
     // Boundary index when the history must be compacted before this request
     // (#377). `None` means send it as is.
     pending_compaction: Option<usize>,
+    // The run is the fleet's (#435): `executor` is the group-level one and
+    // the agent gets the fleet tool set, prompt and gate.
+    fleet: bool,
 ) {
     let tx = event_tx.clone();
     let confirmer = Arc::new(TuiConfirmer::new(event_tx.clone(), sid)) as Arc<dyn CommandConfirmer>;
@@ -2166,7 +2215,7 @@ fn spawn_agent(
                     .ssh_mode(ssh_info.as_deref())
                     .arbiter_ssh_context(ssh_info.clone());
             }
-            builder = builder.session_id(sid.0.to_string());
+            builder = builder.session_id(sid.0.to_string()).fleet(fleet);
 
             let agent = match builder.build() {
                 Ok(a) => a,

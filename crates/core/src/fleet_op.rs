@@ -208,6 +208,29 @@ impl FleetOperation {
         }
     }
 
+    /// A fresh operation over exactly this one's hosts and group (#435).
+    ///
+    /// Every question asked of a fleet is its own operation — a member that
+    /// is [`Done`][HostProgress::Done] "will not be asked again in this
+    /// operation" — but the composition was frozen when the fleet opened and
+    /// must stay so. This copies the snapshot instead of calling
+    /// [`open`][Self::open] again, which would re-resolve the tag rule
+    /// against whatever the config says now. New id, all progress `Pending`.
+    pub fn reopen(&self) -> Self {
+        Self {
+            id: OperationId::next(),
+            group: self.group.clone(),
+            members: self
+                .members
+                .iter()
+                .map(|m| FleetMember {
+                    target: m.target.clone(),
+                    progress: HostProgress::default(),
+                })
+                .collect(),
+        }
+    }
+
     /// This operation's id.
     pub fn id(&self) -> OperationId {
         self.id
@@ -402,6 +425,29 @@ mod tests {
             names(&FleetOperation::open(&rule, &targets)),
             vec!["lab-1", "web-9"]
         );
+    }
+
+    #[test]
+    fn reopen_keeps_the_frozen_composition_with_fresh_progress() {
+        let mut targets = vec![
+            target("web-1", &["prod"]),
+            target("web-2", &["prod"]),
+        ];
+        let rule = group("prod", &["prod"]);
+        let mut op = FleetOperation::open(&rule, &targets);
+        let first = op.handles().next().expect("two members");
+        op.set_progress(first, HostProgress::Done);
+
+        // The config moves on; a reopened operation must not follow it.
+        targets[1].tags.clear();
+        targets.push(target("web-9", &["prod"]));
+
+        let again = op.reopen();
+        assert_eq!(names(&again), vec!["web-1", "web-2"]);
+        assert_ne!(again.id(), op.id(), "a new question is a new operation");
+        assert_eq!(again.count_at(HostProgress::Pending), 2);
+        assert_eq!(again.group_name(), "prod");
+        assert!(again.member(first).is_none(), "old handles do not carry over");
     }
 
     #[test]
