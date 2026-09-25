@@ -2494,7 +2494,16 @@ impl App {
                 self.pending_ssh = None;
                 self.pending_ssh_password = None;
                 self.mode = AppMode::Normal;
-                self.push_message(ChatBlock::System("Cancelled.".into()));
+                // In the fleet the whole operation stops (#437), and what the
+                // hosts answered so far arrives as the command's output once
+                // they have wound down.
+                let note = if self.in_fleet() {
+                    "Cancelled: no queued host starts, running ones get Ctrl-C; \
+                     answers so far follow."
+                } else {
+                    "Cancelled."
+                };
+                self.push_message(ChatBlock::System(note.into()));
                 self.scroll = 0;
             }
             AppMode::Confirming => {
@@ -5713,6 +5722,36 @@ mod tests {
         assert_eq!(tabs_after, tabs_before);
         assert!(app.take_pending_local_executors().is_empty());
         assert_eq!(executors_before, 1);
+    }
+
+    // ── Fleet cancellation (#437) ───────────────────────────────────
+
+    #[test]
+    fn ctrl_z_in_the_fleet_cancels_the_operation_and_keeps_its_partial_answers() {
+        let mut app = app_with_groups();
+        app.enter_fleet("web");
+        let token = tokio_util::sync::CancellationToken::new();
+        app.cancellation = Some(token.clone());
+        app.agent_running = true;
+        app.mode = AppMode::Thinking;
+
+        app.handle_key(ctrl_key('z'));
+        assert!(token.is_cancelled(), "the fleet run is told to stop");
+        assert_eq!(app.mode, AppMode::Normal);
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(s)) if s.contains("running ones get Ctrl-C")));
+
+        // The partial summary arrives after the cancellation and is kept.
+        let sid = app.sessions[app.active].id;
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: sid,
+            event: filar_agent::AgentEvent::CommandFinished {
+                command: "uname -r".into(),
+                output: "operation #7: 1 of 2 hosts answered, 0 did not answer — 1 ok, 1 cancelled".into(),
+                denied: false,
+            },
+        });
+        assert!(matches!(app.messages.last(),
+            Some(ChatBlock::Command { output: Some(o), .. }) if o.contains("1 cancelled")));
     }
 
     // ── Fleet credentials (#436) ────────────────────────────────────

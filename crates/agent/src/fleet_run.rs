@@ -35,10 +35,18 @@
 //! per-host deadline path below cancels remotely.
 //!
 //! So dropping this future is a *local* stop, not a fleet-wide one.
-//! Cancelling a whole operation, including cleaning up on the hosts, is
-//! #437 — and it needs a design, since a `Drop` that wanted to cancel
-//! would have to detach a task to do the awaiting, which is the very thing
-//! this structure avoids.
+//!
+//! # Cancelling the operation (#437)
+//!
+//! The fleet-wide stop is [`run_on_fleet_until`]: it takes a
+//! [`CancellationToken`] and keeps running *through* the cancellation
+//! instead of being dropped. Once the token fires, no queued host is
+//! launched, and every running host gets the same treatment as one whose
+//! deadline expired — a Ctrl-C sent to its shell, and its run future polled
+//! until it observes it — so the command stops on the host, not only the
+//! wait for it (the lesson of #394, multiplied by the number of hosts).
+//! Hosts that answered before the cancellation keep their rows; the rest
+//! come out [`HostRun::Cancelled`], and the report is returned as usual.
 //!
 //! # What this module deliberately does not decide
 //!
@@ -68,6 +76,7 @@ use filar_core::error::{CoreError, Result};
 use filar_core::fleet_op::{FleetOperation, HostHandle, HostProgress, OperationId};
 use filar_transport::{CommandExecutor, CommandResult};
 use futures::stream::{FuturesUnordered, StreamExt};
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // Input
@@ -143,6 +152,9 @@ pub enum HostRun {
     /// [`CoreError::ConnectionLost`] is "no contact", anything else is an
     /// execution error, and only the first is worth retrying (#429).
     Failed(CoreError),
+    /// The operation was cancelled before this host answered (#437): it was
+    /// running and got a Ctrl-C, or it was still queued and never started.
+    Cancelled,
 }
 
 /// One host's row in the report.
@@ -257,6 +269,11 @@ impl FleetRunReport {
         self.count(|run| matches!(run, HostRun::Failed(_)))
     }
 
+    /// How many hosts the operation's cancellation stopped (#437).
+    pub fn cancelled(&self) -> usize {
+        self.count(|run| matches!(run, HostRun::Cancelled))
+    }
+
     fn count(&self, predicate: impl Fn(&HostRun) -> bool) -> usize {
         self.outcomes
             .iter()
@@ -295,6 +312,21 @@ pub async fn run_on_fleet(
     op: &mut FleetOperation,
     tasks: Vec<HostTask>,
 ) -> Result<FleetRunReport> {
+    run_on_fleet_until(op, tasks, &CancellationToken::new()).await
+}
+
+/// [`run_on_fleet`] that stops when `cancel` fires (#437).
+///
+/// After cancellation no queued host is launched, every running host is
+/// interrupted on the host itself (see the module docs), and the report
+/// still comes back: rows of hosts that finished first are kept, the rest
+/// are [`HostRun::Cancelled`]. Cancelling before the call leaves every
+/// host cancelled without contacting any.
+pub async fn run_on_fleet_until(
+    op: &mut FleetOperation,
+    tasks: Vec<HostTask>,
+    cancel: &CancellationToken,
+) -> Result<FleetRunReport> {
     validate_tasks(op, &tasks)?;
 
     let deadline = op.per_host_timeout();
@@ -314,11 +346,13 @@ pub async fn run_on_fleet(
         // Fill the free slots. The limit holds structurally: no more than
         // `limit` futures exist here at once, so no more than `limit`
         // connections are in use.
-        while in_flight.len() < limit {
+        // Nothing new starts once the operation is cancelled; the queue
+        // is drained into `Cancelled` rows below.
+        while in_flight.len() < limit && !cancel.is_cancelled() {
             match queue.next() {
                 Some((index, task)) => {
                     op.set_progress(handles[index], HostProgress::Running);
-                    in_flight.push(run_one(index, task, deadline));
+                    in_flight.push(run_one(index, task, deadline, cancel));
                 }
                 None => break,
             }
@@ -332,6 +366,12 @@ pub async fn run_on_fleet(
             // Nothing in flight and nothing left to launch.
             None => break,
         }
+    }
+
+    // Hosts the cancellation kept from ever starting.
+    for (index, _) in queue {
+        op.set_progress(handles[index], HostProgress::Done);
+        finished.push((index, HostRun::Cancelled));
     }
 
     // Answers arrive in whatever order the network allows; the report is
@@ -352,7 +392,7 @@ pub async fn run_on_fleet(
     })
 }
 
-/// Ask one host, under its own deadline.
+/// Ask one host, under its own deadline, until `cancel` fires.
 ///
 /// The `run` future is pinned and polled *through* the timeout rather than
 /// handed to it, so that it outlives the deadline. That is not a style
@@ -364,49 +404,77 @@ pub async fn run_on_fleet(
 /// back as "cancelled by user" though nothing cancelled it — a timed-out
 /// host poisoning its own next check, and its retry (#429) with it. Found
 /// in review.
-async fn run_one(index: usize, task: HostTask, deadline: Duration) -> (usize, HostRun) {
+///
+/// The operation's cancellation (#437) takes the same path for the same
+/// reason: the host is interrupted and its run future drained, and the
+/// cell reads [`HostRun::Cancelled`].
+async fn run_one(
+    index: usize,
+    task: HostTask,
+    deadline: Duration,
+    cancel: &CancellationToken,
+) -> (usize, HostRun) {
     let run_future = task.executor.run(&task.command);
     tokio::pin!(run_future);
 
-    let run = match tokio::time::timeout(deadline, &mut run_future).await {
-        Ok(Ok(result)) => HostRun::Answered(result),
-        Ok(Err(error)) => HostRun::Failed(error),
-        Err(_) => {
-            // The command is still running on the host, and the persistent
-            // shell stays busy until something interrupts it — a timeout
-            // that walks away leaves the session unusable for the next
-            // check. Cancellation is best-effort and bounded by the same
-            // deadline: a host too wedged to accept a Ctrl-C must not
-            // become a second wedge here.
-            match tokio::time::timeout(deadline, task.executor.cancel()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::warn!(
-                    handle = ?task.handle,
-                    %error,
-                    "fleet host timed out and could not be cancelled"
-                ),
-                Err(_) => tracing::warn!(
-                    handle = ?task.handle,
-                    "fleet host timed out and did not answer the cancellation either"
-                ),
-            }
-            // Let the run future observe the cancellation it was sent.
-            // Keeping it alive is only half the fix: a notified waiter that
-            // is dropped before it is polled hands the notification on, and
-            // with no other waiter it lands back as a stored permit — the
-            // same poisoning by a longer route. Polling here consumes it.
-            // Bounded by the same deadline, and its answer is discarded:
-            // whatever it says now, this host's cell is a timeout.
-            if tokio::time::timeout(deadline, &mut run_future).await.is_err() {
-                tracing::warn!(
-                    handle = ?task.handle,
-                    "fleet host did not finish even after being cancelled"
-                );
-            }
+    // `biased`: an answer that is already there wins over a cancellation
+    // that arrives in the same poll — a finished result is kept, not
+    // thrown away.
+    let outcome = tokio::select! {
+        biased;
+        finished = tokio::time::timeout(deadline, &mut run_future) => Some(finished),
+        _ = cancel.cancelled() => None,
+    };
+    let run = match outcome {
+        Some(Ok(Ok(result))) => HostRun::Answered(result),
+        Some(Ok(Err(error))) => HostRun::Failed(error),
+        Some(Err(_)) => {
+            interrupt(&task, &mut run_future, deadline, "timed out").await;
             HostRun::TimedOut(deadline)
+        }
+        None => {
+            interrupt(&task, &mut run_future, deadline, "was cancelled").await;
+            HostRun::Cancelled
         }
     };
     (index, run)
+}
+
+/// Stop a command still running on `task`'s host.
+///
+/// The command keeps running there, and the persistent shell stays busy,
+/// until something interrupts it — walking away leaves the session
+/// unusable for the next check. Cancellation is best-effort and bounded by
+/// the host's deadline: a host too wedged to accept a Ctrl-C must not
+/// become a second wedge here.
+async fn interrupt<F>(task: &HostTask, run_future: &mut std::pin::Pin<&mut F>, deadline: Duration, why: &str)
+where
+    F: std::future::Future<Output = Result<CommandResult>>,
+{
+    match tokio::time::timeout(deadline, task.executor.cancel()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            handle = ?task.handle,
+            %error,
+            "fleet host {why} and could not be cancelled"
+        ),
+        Err(_) => tracing::warn!(
+            handle = ?task.handle,
+            "fleet host {why} and did not answer the cancellation either"
+        ),
+    }
+    // Let the run future observe the cancellation it was sent. Keeping it
+    // alive is only half the fix: a notified waiter that is dropped before
+    // it is polled hands the notification on, and with no other waiter it
+    // lands back as a stored permit — the same poisoning by a longer
+    // route. Polling here consumes it. Bounded by the same deadline, and
+    // its answer is discarded: whatever it says now, the cell is decided.
+    if tokio::time::timeout(deadline, run_future.as_mut()).await.is_err() {
+        tracing::warn!(
+            handle = ?task.handle,
+            "fleet host did not finish even after being cancelled"
+        );
+    }
 }
 
 /// Reject a task list the operation cannot own, before anything runs.
@@ -579,6 +647,84 @@ mod tests {
         async fn cancel(&self) -> Result<()> {
             self.cancels.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    // ── Cancelling the operation (#437) ────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_interrupts_running_hosts_skips_the_queue_and_keeps_answers() {
+        let concurrency = Arc::new(Concurrency::default());
+        let targets = targets(6);
+        let mut op = FleetOperation::open(&group(2, 30), &targets);
+
+        // host-1 answers quickly; the rest would never finish on their own.
+        let hosts: Vec<_> = op
+            .handles()
+            .enumerate()
+            .map(|(i, handle)| {
+                let behaviour = if i == 0 {
+                    Behaviour::Answers(Duration::from_millis(10), "5.15.0")
+                } else {
+                    Behaviour::Hangs
+                };
+                (handle, FakeHost::new(behaviour, concurrency.clone()))
+            })
+            .collect();
+        let tasks = hosts
+            .iter()
+            .map(|(handle, host)| {
+                HostTask::new(*handle, host.clone() as Arc<dyn CommandExecutor>, "uname -r")
+            })
+            .collect();
+
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            trigger.cancel();
+        });
+        let report = run_on_fleet_until(&mut op, tasks, &cancel).await.expect("valid tasks");
+
+        // The answer that arrived before the cancellation is kept.
+        assert!(matches!(report.run_for(hosts[0].0), Some(HostRun::Answered(r)) if r.stdout == "5.15.0"));
+        // host-2 and host-3 were running: each got a Ctrl-C on the host.
+        for (handle, host) in &hosts[1..3] {
+            assert!(matches!(report.run_for(*handle), Some(HostRun::Cancelled)));
+            assert_eq!(host.cancels(), 1, "a running host is interrupted, not abandoned");
+        }
+        // host-4..6 were queued: never started, never contacted.
+        for (handle, host) in &hosts[3..] {
+            assert!(matches!(report.run_for(*handle), Some(HostRun::Cancelled)));
+            assert!(host.commands().is_empty(), "the queue does not start after a cancel");
+        }
+        assert_eq!(report.answered(), 1);
+        assert_eq!(report.cancelled(), 5);
+        assert_eq!(report.len(), 6, "every host has a row");
+        assert_eq!(op.count_at(HostProgress::Done), 6);
+        assert_eq!(concurrency.in_flight(), 0, "nothing is left running");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_operation_cancelled_before_it_starts_contacts_nobody() {
+        let concurrency = Arc::new(Concurrency::default());
+        let targets = targets(3);
+        let mut op = FleetOperation::open(&group(3, 30), &targets);
+        let hosts: Vec<_> = op
+            .handles()
+            .map(|h| (h, FakeHost::new(Behaviour::Answers(Duration::ZERO, "x"), concurrency.clone())))
+            .collect();
+        let tasks = hosts
+            .iter()
+            .map(|(h, host)| HostTask::new(*h, host.clone() as Arc<dyn CommandExecutor>, "uptime"))
+            .collect();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let report = run_on_fleet_until(&mut op, tasks, &cancel).await.expect("valid tasks");
+        assert_eq!(report.cancelled(), 3);
+        for (_, host) in &hosts {
+            assert!(host.commands().is_empty());
         }
     }
 

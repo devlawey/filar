@@ -23,7 +23,7 @@
 //! the same everywhere" while three machines were unreachable is a lie
 //! about those three, and the shape of the summary must not allow it.
 //!
-//! # Seven states, and what separates them
+//! # Eight states, and what separates them
 //!
 //! | State | The host… |
 //! |---|---|
@@ -34,10 +34,15 @@
 //! | [`NoContact`][HostState::NoContact] | could not be reached at all |
 //! | [`NotApplicable`][HostState::NotApplicable] | was not asked: no command variant covers its OS family (#425) |
 //! | [`Skipped`][HostState::Skipped] | was not asked, for any other reason — no credentials being the usual one |
+//! | [`Cancelled`][HostState::Cancelled] | the user cancelled the operation before it answered (#437) |
 //!
-//! They partition into three groups that the summary rules are written in
+//! They partition into four groups that the summary rules are written in
 //! terms of: **answered** (the first three — the host said something),
-//! **unanswered** (asked, said nothing) and **not asked**. "Unanswered" is
+//! **unanswered** (asked, said nothing), **not asked**, and **cancelled**.
+//! Cancelled is its own group on purpose: a host the user stopped did not
+//! go silent — counting it as unanswered would call an operation nobody
+//! let finish "failed", and would make the retry (#429) ask again what the
+//! user just stopped. "Unanswered" is
 //! deliberately the narrow set: a command that ran and exited 1 told us
 //! something real, and hiding that under the same word as a dead machine
 //! would lose the difference that matters when reading a fleet.
@@ -94,11 +99,14 @@ pub enum HostState {
     NotApplicable,
     /// Not asked for any other reason — no credentials, most often.
     Skipped,
+    /// Stopped by the operation's cancellation before it answered (#437):
+    /// interrupted while running, or never started.
+    Cancelled,
 }
 
 impl HostState {
     /// Every state, in the order a summary lists them.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Success,
         Self::Divergent,
         Self::ExecutionError,
@@ -106,6 +114,7 @@ impl HostState {
         Self::NoContact,
         Self::NotApplicable,
         Self::Skipped,
+        Self::Cancelled,
     ];
 
     /// Classify what the fan-out came back with.
@@ -122,6 +131,7 @@ impl HostState {
                 _ => Self::ExecutionError,
             },
             HostRun::TimedOut(_) => Self::TimedOut,
+            HostRun::Cancelled => Self::Cancelled,
             HostRun::Failed(error) => {
                 if is_connection_lost(error) {
                     Self::NoContact
@@ -147,6 +157,12 @@ impl HostState {
         matches!(self, Self::NotApplicable | Self::Skipped)
     }
 
+    /// Whether the user's cancellation stopped this host (#437) — the
+    /// fourth group, apart from silence and from "not asked".
+    pub fn cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+
     /// Whether a retry could change this state (#429).
     ///
     /// Only silence is worth repeating. An execution error would fail the
@@ -165,6 +181,7 @@ impl HostState {
             Self::NoContact => "no contact",
             Self::NotApplicable => "n/a",
             Self::Skipped => "skipped",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -436,6 +453,11 @@ impl OperationSummary {
         self.total_where(HostState::not_asked)
     }
 
+    /// How many hosts the user's cancellation stopped (#437).
+    pub fn cancelled(&self) -> usize {
+        self.count(HostState::Cancelled)
+    }
+
     /// Whether the operation failed.
     ///
     /// Only when **nobody** answered while at least one host was asked: a
@@ -666,9 +688,9 @@ mod tests {
     }
 
     #[test]
-    fn the_three_groups_partition_every_state() {
+    fn the_four_groups_partition_every_state() {
         for state in HostState::ALL {
-            let groups = [state.answered(), state.unanswered(), state.not_asked()]
+            let groups = [state.answered(), state.unanswered(), state.not_asked(), state.cancelled()]
                 .into_iter()
                 .filter(|in_group| *in_group)
                 .count();
@@ -762,6 +784,17 @@ mod tests {
     }
 
     // ── Everything else ────────────────────────────────────────
+
+    #[test]
+    fn a_cancelled_host_is_neither_silent_nor_retried() {
+        let state = HostState::from_run(&crate::fleet_run::HostRun::Cancelled);
+        assert_eq!(state, HostState::Cancelled);
+        assert_eq!(state.label(), "cancelled");
+        // Its own group: the user stopped it, it did not go silent — so an
+        // all-cancelled operation is not "failed" and nothing is retried.
+        assert!(state.cancelled() && !state.unanswered());
+        assert!(!state.worth_retrying());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn the_headline_names_zero_silent_hosts_too() {

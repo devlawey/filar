@@ -169,7 +169,15 @@ limits, and returns the summary headline plus the fold
 `HostConnector` you pass opens one host's executor and must wrap it in
 `ReadOnlyExecutor`; a host it fails to connect is reported as "no contact" and
 retried on the next `run`; so is a cached host whose connection is lost
-during a `run`. `FleetExecutor::built_from()` returns the id of
+during a `run`. `cancel()` during a `run` cancels the **operation**: queued
+hosts are not started, running ones get a Ctrl-C on the host and are drained
+(`fleet_run::run_on_fleet_until`), and `run` still returns the summary and fold
+of what answered first, the rest as `HostState::Cancelled` (`HostRun::Cancelled`
+in the report) — keep awaiting `run` after `cancel` to get it. An agent built
+with `fleet(true)` does exactly that on its cancellation token: it shows the
+partial result as the command's `CommandFinished`, then reports `Cancelled`,
+and it applies no `command_timeout` to a fleet command (the per-host deadlines
+bound it). `FleetExecutor::built_from()` returns the id of
 the operation it was built from; if you cache executors, reuse one only while
 that id matches the fleet on screen.
 

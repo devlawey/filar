@@ -13,6 +13,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- `Ctrl+Z` in the fleet cancels the whole operation: queued hosts are not
+  started, running commands are interrupted on the hosts themselves (Ctrl-C),
+  and the answers collected before the cancel are kept and shown, the rest
+  marked `cancelled` — a state that neither fails the operation nor gets
+  retried ([#437](https://github.com/devlawey/filar/issues/437)).
+
 - Fleet credentials are per host: each host connects with its own secret
   (key, config password, or `ssh_target:<name>` in the OS credential store),
   resolved on entry; a host without them drops out, is left out of the gate's
