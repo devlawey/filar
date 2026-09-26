@@ -1309,6 +1309,9 @@ fn fleet_summary_markdown(
             view.command.replace('`', "'").replace(['\r', '\n'], " "),
             markdown_cell(&view.headline)
         )),
+        // A status without a view means an operation was started: saying no
+        // command ran would be false — the note below says what happened.
+        None if status.is_some() => {}
         None => out.push_str("No command has been run on the fleet yet.\n\n"),
     }
     // A later operation that is still running — or was cancelled and has not
@@ -1322,7 +1325,15 @@ fn fleet_summary_markdown(
     if let Some(status) = status {
         let note = match view {
             None if status.running => Some("no operation has reported its states yet"),
-            None => None,
+            // Finished without a view: the fan-out could not start, so no
+            // host has a state to report (review).
+            None => {
+                out.push_str(&format!(
+                    "Operation {} ended without reporting any host's state.\n\n",
+                    status.operation
+                ));
+                None
+            }
             Some(view) if view.operation != status.operation => {
                 Some("the states below are from the operation before it")
             }
@@ -12612,6 +12623,10 @@ mod tests {
         let text = md(None, status(later, true));
         assert!(text.contains("no operation has reported"), "{text}");
         assert!(!text.contains("before it"), "{text}");
+        // Finished without reporting: said, and "no command ran" is not.
+        let text = md(None, status(later, false));
+        assert!(text.contains("ended without reporting any host's state"), "{text}");
+        assert!(!text.contains("No command has been run"), "{text}");
         // Finished and reported: no caveat.
         let text = md(Some(&view), status(view.operation, false));
         assert!(!text.contains("had not finished"), "{text}");
