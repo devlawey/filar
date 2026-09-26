@@ -13,6 +13,7 @@ pub mod compaction;
 pub mod config;
 pub mod error;
 pub mod fleet_checks;
+pub mod fleet_file_check;
 pub mod fleet_op;
 pub mod os_family;
 pub mod secrets;
@@ -35,6 +36,7 @@ pub use fleet_checks::{
     user_catalog_path, CheckSource, CommandForOs, CommandSpec, FleetCheck, FleetCheckCatalog,
     RejectedCheck, DEFAULT_COMMAND_KEY, USER_CATALOG_ENV, USER_CATALOG_FILE,
 };
+pub use fleet_file_check::{FileBaseline, FileProbe, FileReference};
 pub use fleet_op::{FleetMember, FleetOperation, HostHandle, HostProgress, OperationId};
 pub use os_family::{OsFamily, OS_RELEASE_COMMAND};
 pub use secrets::{

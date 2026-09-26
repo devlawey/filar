@@ -251,3 +251,30 @@ command = "cat /etc/ssh/sshd_config"
     exec.run(command).await.expect("should be forwarded");
     assert_eq!(inner.calls(), 1);
 }
+
+/// A "file against a reference" check (#440) derives its command from the
+/// path, so the derived command itself must be one the gate forwards —
+/// otherwise every such check would be refused before any host is asked.
+#[tokio::test]
+async fn a_file_check_command_passes_the_read_only_gate() {
+    let file = TempCatalog::new(
+        "file-baseline",
+        r#"
+[[check]]
+name = "nginx-conf"
+description = "nginx.conf matches the golden host"
+file = "/etc/nginx/conf.d/site-1_a+b@c:d,e=f.conf"
+reference_host = "web-1"
+"#,
+    );
+    let catalog = FleetCheckCatalog::load(Some(&file.path));
+    let check = catalog.get("nginx-conf").expect("file check loaded");
+
+    let (exec, inner) = gated();
+    for command in check.commands() {
+        exec.run(command)
+            .await
+            .unwrap_or_else(|e| panic!("file check command {command:?} was refused: {e}"));
+    }
+    assert_eq!(inner.calls(), 1);
+}

@@ -13,6 +13,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Fleet check "file against a reference": a catalog entry with `file` and
+  `reference_host` or `reference_sha256` compares the file's SHA-256 on every
+  host with the golden host's or the given digest — the content is never read
+  or shown to the model — and the summary names who matches, who differs and
+  whose file is missing (a state of its own, not an error)
+  ([#440](https://github.com/devlawey/filar/issues/440)).
+
 - The status bar in the fleet shows the group, how many of its hosts answered
   (`fleet web · 11/12 live`, counting up live during an operation) and the
   session cost; on a narrow terminal its segments give way in one documented
