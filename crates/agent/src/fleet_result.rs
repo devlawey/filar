@@ -383,6 +383,31 @@ impl OperationResult {
         }
     }
 
+    /// Re-read an answered host's state once its answer has been
+    /// interpreted — for a check whose exit code does not carry the verdict
+    /// (#440: a missing file exits non-zero, and is an answer, not an
+    /// error).
+    ///
+    /// Moves only between the answered states: a host that stayed silent or
+    /// was never asked has no answer to re-read. Returns whether the row
+    /// moved.
+    pub(crate) fn reclassify_answer(&mut self, handle: HostHandle, state: HostState) -> bool {
+        if !state.answered() {
+            return false;
+        }
+        match self
+            .rows
+            .iter_mut()
+            .find(|row| row.handle == handle && row.state.answered())
+        {
+            Some(row) if row.state != state => {
+                row.state = state;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Roll the rows up into counts and the failure verdict.
     pub fn summary(&self) -> OperationSummary {
         let mut counts = BTreeMap::new();

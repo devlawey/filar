@@ -51,6 +51,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::fleet_file_check::{FileBaseline, FileReference};
 use crate::os_family::OsFamily;
 
 /// The built-in catalog, compiled into the binary. Never read from disk.
@@ -241,6 +242,9 @@ pub struct FleetCheck {
     command: CommandSpec,
     preprocessor: Option<String>,
     compare: Vec<String>,
+    /// Set for a "file against a reference" check (#440); the command is
+    /// then derived from it and nothing else about the check is free.
+    file: Option<FileBaseline>,
     source: CheckSource,
 }
 
@@ -263,8 +267,26 @@ impl FleetCheck {
             command: CommandSpec::Same(validate_one_command(command, "command")?),
             preprocessor: None,
             compare: Vec::new(),
+            file: None,
             source: CheckSource::AdHoc,
         })
+    }
+
+    /// Name every [`for_file`](Self::for_file) check carries.
+    pub const FILE_BASELINE_NAME: &'static str = "file-baseline";
+
+    /// A "file against a reference" check built outside a catalog (#440):
+    /// the command is the baseline's hash command, the same on every host.
+    pub fn for_file(baseline: FileBaseline) -> Self {
+        Self {
+            name: Self::FILE_BASELINE_NAME.to_owned(),
+            description: format!("{} compared with {}", baseline.path(), baseline.reference()),
+            command: CommandSpec::Same(baseline.command()),
+            preprocessor: None,
+            compare: Vec::new(),
+            file: Some(baseline),
+            source: CheckSource::AdHoc,
+        }
     }
 
     /// Stable identifier, unique across the merged catalog.
@@ -311,6 +333,15 @@ impl FleetCheck {
     /// which case the whole raw output is the unit of comparison.
     pub fn compare(&self) -> &[String] {
         &self.compare
+    }
+
+    /// The file and reference of a "file against a reference" check
+    /// (#440), `None` for every other check.
+    ///
+    /// Such a check is folded by hash against the reference rather than by
+    /// agreement between hosts — see `filar_agent::fleet_file_fold`.
+    pub fn file_baseline(&self) -> Option<&FileBaseline> {
+        self.file.as_ref()
     }
 
     /// Which catalog this check came from.
@@ -401,11 +432,22 @@ struct CatalogFile {
 struct RawCheck {
     name: String,
     description: String,
-    command: RawCommand,
+    /// Required unless `file` is set; the two are mutually exclusive.
+    #[serde(default)]
+    command: Option<RawCommand>,
     #[serde(default)]
     preprocessor: Option<String>,
     #[serde(default)]
     compare: Vec<String>,
+    /// A file to compare by hash against a reference (#440).
+    #[serde(default)]
+    file: Option<String>,
+    /// The fleet host whose copy of `file` is the reference.
+    #[serde(default)]
+    reference_host: Option<String>,
+    /// A SHA-256 the file must have.
+    #[serde(default)]
+    reference_sha256: Option<String>,
 }
 
 /// `command` as written: either a bare string or a table of variants.
@@ -617,7 +659,38 @@ impl FleetCheckCatalog {
             return Err("description must not be empty".into());
         }
 
-        let command = validate_command(&raw.command)?;
+        let (command, file) = match (&raw.command, &raw.file) {
+            (Some(_), Some(_)) => {
+                return Err("command and file are mutually exclusive: a file check \
+                     derives its command from the path"
+                    .into())
+            }
+            (None, None) => return Err("a check must set either command or file".into()),
+            (Some(command), None) => {
+                if raw.reference_host.is_some() || raw.reference_sha256.is_some() {
+                    return Err("reference_host and reference_sha256 only apply to a file check".into());
+                }
+                (validate_command(command)?, None)
+            }
+            (None, Some(path)) => {
+                if raw.preprocessor.is_some() || !raw.compare.is_empty() {
+                    return Err("a file check is compared by hash: preprocessor and compare \
+                         must not be set"
+                        .into());
+                }
+                let reference = match (&raw.reference_host, &raw.reference_sha256) {
+                    (Some(host), None) => FileReference::Host(host.clone()),
+                    (None, Some(digest)) => FileReference::Sha256(digest.clone()),
+                    _ => {
+                        return Err("a file check needs exactly one of reference_host \
+                             and reference_sha256"
+                            .into())
+                    }
+                };
+                let baseline = FileBaseline::new(path, reference)?;
+                (CommandSpec::Same(baseline.command()), Some(baseline))
+            }
+        };
 
         let preprocessor = match raw.preprocessor.as_deref().map(str::trim) {
             None => None,
@@ -665,6 +738,7 @@ impl FleetCheckCatalog {
             command: command.to_owned(),
             preprocessor,
             compare,
+            file,
             source,
         })
     }
@@ -1594,6 +1668,104 @@ command = "rm -rf /var/log"
             catalog.get("dangerous").unwrap().commands(),
             ["rm -rf /var/log"]
         );
+    }
+
+    // -- file against a reference (#440) ----------------------------------
+
+    #[test]
+    fn a_file_check_derives_its_command_and_carries_the_baseline() {
+        let file = TempCatalog::new(
+            "file-check",
+            r#"
+[[check]]
+name = "nginx-conf"
+description = "nginx.conf matches the golden host"
+file = "/etc/nginx/nginx.conf"
+reference_host = "web-1"
+
+[[check]]
+name = "hosts-file"
+description = "hosts matches a known digest"
+file = "/etc/hosts"
+reference_sha256 = "3b5d5c3712955042212316173ccf37be800a0e0fa8a1b5b1e1a5b8c4b0a1f2e3"
+"#,
+        );
+        let catalog = FleetCheckCatalog::load(Some(&file.path));
+        assert!(catalog.rejected().is_empty(), "{:?}", catalog.rejected());
+
+        let nginx = catalog.get("nginx-conf").expect("file check loaded");
+        let baseline = nginx.file_baseline().expect("a file check has a baseline");
+        assert_eq!(baseline.path(), "/etc/nginx/nginx.conf");
+        assert_eq!(baseline.reference(), &FileReference::Host("web-1".into()));
+        assert_eq!(nginx.commands(), vec![baseline.command().as_str()]);
+        assert_eq!(nginx.preprocessor(), None);
+
+        let hosts = catalog.get("hosts-file").expect("file check loaded");
+        assert!(matches!(
+            hosts.file_baseline().map(FileBaseline::reference),
+            Some(FileReference::Sha256(_))
+        ));
+        assert!(FleetCheckCatalog::builtin()
+            .checks()
+            .iter()
+            .all(|check| check.file_baseline().is_none()));
+    }
+
+    #[test]
+    fn a_half_declared_file_check_is_rejected_with_a_reason() {
+        let cases: [(&str, &str, &str); 6] = [
+            (
+                "both",
+                "command = \"uptime\"\nfile = \"/etc/hosts\"\nreference_host = \"a\"",
+                "mutually exclusive",
+            ),
+            ("neither", "", "either command or file"),
+            ("no-reference", "file = \"/etc/hosts\"", "exactly one of"),
+            (
+                "two-references",
+                "file = \"/etc/hosts\"\nreference_host = \"a\"\nreference_sha256 = \"b\"",
+                "exactly one of",
+            ),
+            (
+                "reference-on-command",
+                "command = \"uptime\"\nreference_host = \"a\"",
+                "only apply to a file check",
+            ),
+            (
+                "relative",
+                "file = \"etc/hosts\"\nreference_host = \"a\"",
+                "absolute path",
+            ),
+        ];
+        for (label, body, expected) in cases {
+            let text = format!("[[check]]\nname = \"x\"\ndescription = \"d\"\n{body}\n");
+            let file = TempCatalog::new(label, &text);
+            let catalog = FleetCheckCatalog::load(Some(&file.path));
+            assert_eq!(catalog.rejected().len(), 1, "{label}");
+            assert!(
+                catalog.rejected()[0].reason().contains(expected),
+                "{label}: expected '{expected}', got '{}'",
+                catalog.rejected()[0].reason()
+            );
+        }
+
+        let with_preprocessor = TempCatalog::new(
+            "file-preprocessor",
+            "[[check]]\nname = \"x\"\ndescription = \"d\"\nfile = \"/etc/hosts\"\n\
+             reference_host = \"a\"\npreprocessor = \"df\"\ncompare = [\"mount\"]\n",
+        );
+        let catalog = FleetCheckCatalog::load(Some(&with_preprocessor.path));
+        assert!(catalog.rejected()[0].reason().contains("compared by hash"));
+    }
+
+    #[test]
+    fn a_file_check_can_be_built_outside_a_catalog() {
+        let baseline =
+            FileBaseline::new("/etc/hosts", FileReference::Host("web-1".into())).unwrap();
+        let check = FleetCheck::for_file(baseline.clone());
+        assert_eq!(check.name(), FleetCheck::FILE_BASELINE_NAME);
+        assert_eq!(check.file_baseline(), Some(&baseline));
+        assert_eq!(check.command_for(OsFamily::Unknown).command(), Some(baseline.command().as_str()));
     }
 
     #[test]

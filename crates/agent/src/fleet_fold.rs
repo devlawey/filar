@@ -800,7 +800,7 @@ fn push_rows<'a>(out: &mut String, rows: impl Iterator<Item = Line<'a>>, total: 
 /// like another host's, and the host names in a fold come from
 /// configuration, never from output. The clamp is what keeps a fleet's
 /// fold the size of a fold.
-fn escape_cell(cell: &str) -> String {
+pub(crate) fn escape_cell(cell: &str) -> String {
     let mut out = String::new();
     for (chars, ch) in cell.chars().enumerate() {
         if chars == MAX_CELL_CHARS {

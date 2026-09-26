@@ -75,6 +75,7 @@ use filar_transport::readonly::check_read_only;
 use filar_transport::{is_connection_lost, CommandExecutor, CommandResult};
 
 use crate::fleet_creds::FleetCredentials;
+use crate::fleet_file_fold::fold_file;
 use crate::fleet_fold::fold;
 use crate::fleet_result::{NotAsked, OperationResult};
 use crate::fleet_run::{run_on_fleet_observed, HostRun, HostTask};
@@ -291,15 +292,26 @@ impl FleetExecutor {
     }
 }
 
-#[async_trait::async_trait]
-impl CommandExecutor for FleetExecutor {
-    async fn run(&self, command: &str) -> Result<CommandResult> {
+/// One operation, fanned out and classified, before any fold.
+struct Operated {
+    op: FleetOperation,
+    tasks: Vec<HostTask>,
+    report: crate::fleet_run::FleetRunReport,
+    result: OperationResult,
+    started: std::time::Instant,
+}
+
+impl FleetExecutor {
+    /// Ask every host `command` as one operation and classify the answers
+    /// (#426–#428). Shared by [`run`](CommandExecutor::run) and
+    /// [`run_file_check`](Self::run_file_check), which differ only in how
+    /// they fold.
+    async fn operate(&self, command: &str) -> Result<Operated> {
         check_read_only(command).map_err(|reason| {
             CoreError::Other(format!(
                 "read-only policy: {reason} — command not sent to any host of the fleet"
             ))
         })?;
-        let check = FleetCheck::ad_hoc(command).map_err(CoreError::Other)?;
 
         let started = std::time::Instant::now();
         let (_current, cancel) = self.begin_run();
@@ -357,19 +369,53 @@ impl CommandExecutor for FleetExecutor {
         };
         emit(report.answered(), false);
         self.evict_lost(&handles, &executors, &report).await;
-        let mut result = OperationResult::build(&op, &report, &not_asked)?;
+        let result = OperationResult::build(&op, &report, &not_asked)?;
+        Ok(Operated { op, tasks, report, result, started })
+    }
+
+    /// Run a "file against a reference" check (#440) across the fleet.
+    ///
+    /// Every host is asked only for the file's SHA-256 — its content is
+    /// never read — and the answers are folded against the check's
+    /// reference ([`fold_file`]): the summary headline plus who matches,
+    /// who differs, whose file is missing. Like [`run`](CommandExecutor::run),
+    /// what comes back is safe to hand to the model.
+    ///
+    /// Refuses a check that is not a file check.
+    pub async fn run_file_check(&self, check: &FleetCheck) -> Result<CommandResult> {
+        let baseline = check.file_baseline().ok_or_else(|| {
+            CoreError::Other(format!("fleet check '{}' is not a file check", check.name()))
+        })?;
+        let mut done = self.operate(&baseline.command()).await?;
+        let table = fold_file(baseline, &done.report, &mut done.result)?;
+        let summary = done.result.summary();
+        Ok(CommandResult {
+            stdout: format!("{}\n{}", summary.headline(), table),
+            stderr: String::new(),
+            exit_code: Some(if summary.is_failed() { 1 } else { 0 }),
+            duration: done.started.elapsed(),
+            cwd: None,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for FleetExecutor {
+    async fn run(&self, command: &str) -> Result<CommandResult> {
+        let check = FleetCheck::ad_hoc(command).map_err(CoreError::Other)?;
+        let mut done = self.operate(command).await?;
         let registry = PreprocessorRegistry::with_builtins();
-        let table = fold(&check, &tasks, &report, &mut result, &registry)?;
-        let summary = result.summary();
+        let table = fold(&check, &done.tasks, &done.report, &mut done.result, &registry)?;
+        let summary = done.result.summary();
         if let Some(observer) = &self.observer {
-            observer(FleetView::build(&op, command, &report, &table, &summary));
+            observer(FleetView::build(&done.op, command, &done.report, &table, &summary));
         }
 
         Ok(CommandResult {
             stdout: format!("{}\n{}", summary.headline(), table),
             stderr: String::new(),
             exit_code: Some(if summary.is_failed() { 1 } else { 0 }),
-            duration: started.elapsed(),
+            duration: done.started.elapsed(),
             // Every host has its own working directory; the fleet has none.
             cwd: None,
         })
@@ -510,6 +556,38 @@ mod tests {
 
         exec.run("uname -r").await.expect("second run");
         assert_eq!(attempts.load(Ordering::SeqCst), 3, "connections are kept");
+    }
+
+    #[tokio::test]
+    async fn a_file_check_names_the_host_that_differs_from_the_reference() {
+        use filar_core::fleet_file_check::{FileBaseline, FileReference};
+
+        const GOLD: &str = "present\naaaaaaaaaaaa5d5c3712955042212316173ccf37be800a0e0fa8a1b5b1e1a5b8  /etc/app.conf\n";
+        const DRIFT: &str = "present\nbbbbbbbbbbbb5d5c3712955042212316173ccf37be800a0e0fa8a1b5b1e1a5b8  /etc/app.conf\n";
+        let runs = Arc::new(AtomicUsize::new(0));
+        let exec = executor(
+            &fleet(&["web-1", "web-2", "web-3"]),
+            connector(
+                &["web-3"],
+                &[("web-1", GOLD), ("web-2", DRIFT)],
+                Arc::new(AtomicUsize::new(0)),
+                runs.clone(),
+            ),
+        );
+        let baseline =
+            FileBaseline::new("/etc/app.conf", FileReference::Host("web-1".into())).unwrap();
+        let out = exec
+            .run_file_check(&FleetCheck::for_file(baseline))
+            .await
+            .expect("file check runs");
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert!(out.stdout.contains("2 of 3 hosts answered, 1 did not answer"), "{}", out.stdout);
+        assert!(out.stdout.contains("matches (1): web-1"), "{}", out.stdout);
+        assert!(out.stdout.contains("differs sha256 bbbbbbbbbbbb (1): web-2"), "{}", out.stdout);
+        assert!(out.stdout.contains("no verdict: web-3 (no contact)"), "{}", out.stdout);
+
+        let not_a_file_check = FleetCheck::ad_hoc("uname -r").unwrap();
+        assert!(exec.run_file_check(&not_a_file_check).await.is_err());
     }
 
     #[tokio::test]

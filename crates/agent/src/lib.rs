@@ -33,6 +33,7 @@ pub mod compaction;
 pub mod events;
 pub mod fleet_creds;
 pub mod fleet_exec;
+pub mod fleet_file_fold;
 pub mod fleet_fold;
 pub mod fleet_gate;
 pub mod fleet_result;
