@@ -100,8 +100,16 @@ impl FleetIdentifiers {
     ///
     /// An identifier is replaced only where it stands on its own — not
     /// inside a longer word — so `web-1` does not eat into `web-10` and the
-    /// account `admin` leaves `administrator` alone. Longer identifiers go
-    /// first, so a host's FQDN is replaced whole before its short name.
+    /// account `admin` leaves `administrator` alone. At each position the
+    /// longest identifier wins, so a host's FQDN is replaced whole before its
+    /// short name.
+    ///
+    /// One pass over the input: a placeholder already written is never read
+    /// again, and one already in the input is kept whole, so a host
+    /// literally named `host` cannot turn `<host>` into `<<host>>` — neither
+    /// in its own output nor in a reply that repeats the scrubbed
+    /// transcript. Found in review — the first version replaced identifier
+    /// by identifier over its own output.
     pub fn scrub(&self, text: &str) -> String {
         let mut pairs: Vec<(&str, &str)> = self
             .hosts
@@ -112,35 +120,51 @@ impl FleetIdentifiers {
             .collect();
         pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         pairs.dedup_by(|a, b| a.0 == b.0);
-        let mut out = text.to_string();
-        for (id, placeholder) in pairs {
-            out = replace_standalone(&out, id, placeholder);
+
+        let mut out = String::with_capacity(text.len());
+        let mut at = 0;
+        while at < text.len() {
+            // A placeholder in the input — the model repeating what the
+            // scrubbed transcript showed it — is copied whole: scrubbing the
+            // reply a second time must not turn `<host>` into `<<host>>`.
+            if let Some(kept) = PLACEHOLDERS.iter().find(|p| text[at..].starts_with(**p)) {
+                out.push_str(kept);
+                at += kept.len();
+                continue;
+            }
+            let before = text[..at].chars().next_back();
+            let found = (!before.is_some_and(is_name_char))
+                .then(|| {
+                    pairs.iter().find(|(id, _)| {
+                        text[at..].starts_with(id)
+                            && !text[at + id.len()..].chars().next().is_some_and(is_name_char)
+                    })
+                })
+                .flatten();
+            match found {
+                Some((id, placeholder)) => {
+                    out.push_str(placeholder);
+                    at += id.len();
+                }
+                None => {
+                    // Advance one character, keeping to char boundaries.
+                    let ch = text[at..].chars().next().unwrap_or_default();
+                    out.push(ch);
+                    at += ch.len_utf8().max(1);
+                }
+            }
         }
         out
     }
 }
 
+/// What [`FleetIdentifiers::scrub`] writes in place of an identifier.
+const PLACEHOLDERS: [&str; 2] = ["<host>", "<user>"];
+
 /// Whether `c` can be part of a host or account name — the characters that
 /// make an occurrence part of a longer word rather than the name itself.
 fn is_name_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '-'
-}
-
-/// Replace the occurrences of `needle` in `text` that are not part of a
-/// longer name.
-fn replace_standalone(text: &str, needle: &str, placeholder: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find(needle) {
-        let before = rest[..at].chars().next_back();
-        let after = rest[at + needle.len()..].chars().next();
-        let standalone = !before.is_some_and(is_name_char) && !after.is_some_and(is_name_char);
-        out.push_str(&rest[..at]);
-        out.push_str(if standalone { placeholder } else { needle });
-        rest = &rest[at + needle.len()..];
-    }
-    out.push_str(rest);
-    out
 }
 
 /// Shortest runbook treated as usable, in characters.
@@ -278,6 +302,18 @@ mod tests {
         assert_eq!(
             fleet_ids().scrub(text),
             "ssh <user>@<host>; <host> differs from <host> (<host>); the administrator of web-1x"
+        );
+    }
+
+    #[test]
+    fn a_placeholder_already_written_is_never_scrubbed_again() {
+        let ids = FleetIdentifiers {
+            hosts: vec!["host".into(), "db.host".into()],
+            users: vec!["user".into()],
+        };
+        assert_eq!(
+            ids.scrub("user@db.host and host, но не hostname и не <host>"),
+            "<user>@<host> and <host>, но не hostname и не <host>"
         );
     }
 
