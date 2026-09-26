@@ -1904,8 +1904,16 @@ impl FleetSaveState {
             return None;
         }
         if self.file.as_ref().map(|(sid, _)| *sid) != Some(fleet.id) {
-            self.count += 1;
-            self.file = Some((fleet.id, format!("{run_id}-fleet{}", self.count)));
+            // A restored fleet writes back to the file it came from, so a
+            // restore does not add a copy per run (review).
+            let id = match &fleet.fleet_saved_id {
+                Some(id) => id.clone(),
+                None => {
+                    self.count += 1;
+                    format!("{run_id}-fleet{}", self.count)
+                }
+            };
+            self.file = Some((fleet.id, id));
             self.saved_rev = None;
         }
         if self.saved_rev == Some(fleet.message_rev) {
@@ -3137,10 +3145,17 @@ mod tests {
         let names: Vec<_> = app.fleet().unwrap().members().iter().map(|m| m.name().to_string()).collect();
         assert_eq!(names, ["a", "b"]);
 
-        // A second fleet in the same run gets a file of its own.
+        // The restored fleet writes back to the file it came from — no copy.
         app.push_message(ChatBlock::User("again".into()));
         let (second, _) = state.due(&app, "1790", "ts").expect("the restored fleet is saved too");
-        assert_eq!(second.id, "1790-fleet2");
+        assert_eq!(second.id, "1790-fleet1");
+
+        // A fleet entered fresh in the same run gets a file of its own.
+        app.exit_fleet();
+        app.enter_fleet("g");
+        app.push_message(ChatBlock::User("third".into()));
+        let (third, _) = state.due(&app, "1790", "ts").expect("a new fleet is saved");
+        assert_eq!(third.id, "1790-fleet2");
     }
 
     #[test]

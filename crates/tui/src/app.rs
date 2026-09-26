@@ -433,6 +433,15 @@ pub struct Session {
     /// in the config (#442). Kept so a later save does not quietly forget
     /// them: the composition is the session's, not the config's.
     pub fleet_missing: Vec<String>,
+    /// A restored fleet's composition exactly as it was saved (#442), in
+    /// order, vanished hosts in their own places. What a later save writes,
+    /// so neither membership nor order drifts across restore/save rounds.
+    pub fleet_saved_hosts: Option<Vec<String>>,
+    /// The session file a restored fleet came from (#442). A later save
+    /// writes back to it instead of a new file per run — otherwise each
+    /// restore adds a copy, and the copies push older sessions out of the
+    /// store's retention.
+    pub fleet_saved_id: Option<String>,
     /// `Some(previous label)` while a Ctrl+O switch of this tab to another
     /// host is in flight (#433). Until the transport actually swaps, the tab
     /// still runs on its old executor, so nothing may be sent from it; on a
@@ -987,6 +996,8 @@ impl Session {
             fleet_view: None,
             fleet_status: None,
             fleet_missing: Vec::new(),
+            fleet_saved_hosts: None,
+            fleet_saved_id: None,
             connecting: None,
         }
     }
@@ -1078,19 +1089,19 @@ impl Session {
         &self.input_history
     }
 
-    /// The composition to persist for a fleet session (#442): the frozen
-    /// members in order, then any saved hosts a restore could not find in
-    /// the config. `None` for an ordinary tab.
+    /// The composition to persist for a fleet session (#442): for a
+    /// restored fleet, the saved list verbatim — vanished hosts included, in
+    /// their places; otherwise the frozen members in order. `None` for an
+    /// ordinary tab.
     pub fn fleet_snapshot(&self) -> Option<filar_core::FleetSnapshot> {
         let op = self.fleet.as_ref()?;
+        let hosts = match &self.fleet_saved_hosts {
+            Some(saved) => saved.clone(),
+            None => op.members().iter().map(|m| m.name().to_string()).collect(),
+        };
         Some(filar_core::FleetSnapshot {
             group: op.group_name().to_string(),
-            hosts: op
-                .members()
-                .iter()
-                .map(|m| m.name().to_string())
-                .chain(self.fleet_missing.iter().cloned())
-                .collect(),
+            hosts,
         })
     }
 }
@@ -5560,6 +5571,8 @@ impl App {
         session.fleet = Some(op);
         session.fleet_credentials = Some(creds);
         session.fleet_missing = missing;
+        session.fleet_saved_hosts = Some(snapshot.hosts);
+        session.fleet_saved_id = Some(saved.id);
         self.sessions.push(session);
         self.active = self.sessions.len() - 1;
         self.sync_confirm_mode();
@@ -12736,6 +12749,17 @@ mod tests {
         let snapshot = app.active_session().fleet_snapshot().expect("fleet session");
         assert_eq!(snapshot.hosts, ["web-1", "web-7"]);
         assert_eq!(snapshot.group, "web");
+        assert_eq!(app.active_session().fleet_saved_id.as_deref(), Some("1790000000-fleet1"));
+    }
+
+    #[test]
+    fn a_vanished_host_keeps_its_place_in_the_saved_order() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![fleet_target("web-1", &["web"]), fleet_target("web-2", &["web"])];
+        app.restore_fleet(saved_fleet("web", &["web-7", "web-1", "web-2"]));
+        assert_eq!(fleet_names(&app), ["web-1", "web-2"]);
+        let snapshot = app.active_session().fleet_snapshot().expect("fleet session");
+        assert_eq!(snapshot.hosts, ["web-7", "web-1", "web-2"], "order survives a save");
     }
 
     // ── Fleet export (#441) ─────────────────────────────────────────
