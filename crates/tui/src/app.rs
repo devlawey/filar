@@ -1329,7 +1329,7 @@ fn fleet_summary_markdown(
     group_name: &str,
     members: &[String],
     skipped: &[(String, String)],
-    gone: &[String],
+    gone: &[bool],
     view: Option<&filar_agent::fleet_view::FleetView>,
     status: Option<&filar_agent::fleet_view::FleetStatus>,
 ) -> String {
@@ -1385,7 +1385,7 @@ fn fleet_summary_markdown(
         }
     }
     out.push_str("| Host | State |\n|---|---|\n");
-    for member in members {
+    for (index, member) in members.iter().enumerate() {
         let from_view = view.and_then(|view| {
             view.groups
                 .iter()
@@ -1403,7 +1403,7 @@ fn fleet_summary_markdown(
         });
         // A restored fleet's host the config no longer has (#442): named,
         // never left out — it was never asked, and not for want of a key.
-        let from_view = if gone.contains(member) {
+        let from_view = if gone.get(index).copied().unwrap_or(false) {
             Some("no longer in config".to_string())
         } else {
             from_view
@@ -2749,6 +2749,20 @@ impl App {
         // The composition as the fleet has it — for a restored one, the saved
         // list with the hosts the config lost still in their places (#442).
         let members: Vec<String> = session.fleet_snapshot().map(|s| s.hosts).unwrap_or_default();
+        // Which places of the saved list got no target. Positional, not by
+        // name: with duplicate names only the occurrences past the ones
+        // `FleetOperation::restore` could fill are gone (review) — it fills
+        // them in saved order.
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let gone: Vec<bool> = members
+            .iter()
+            .map(|name| {
+                let nth = seen.entry(name.as_str()).or_insert(0);
+                *nth += 1;
+                let found = op.members().iter().filter(|m| m.name() == name).count();
+                *nth > found
+            })
+            .collect();
         let skipped: Vec<(String, String)> = session
             .fleet_credentials
             .as_ref()
@@ -2764,7 +2778,7 @@ impl App {
             op.group_name(),
             &members,
             &skipped,
-            &session.fleet_missing,
+            &gone,
             session.fleet_view.as_ref(),
             session.fleet_status.as_ref(),
         ))
@@ -5558,7 +5572,12 @@ impl App {
         let (op, missing) =
             filar_core::FleetOperation::restore(&group, &snapshot.hosts, &self.ssh_targets);
         let base = &self.sessions[self.active];
-        let mut session = Session::new(format!("fleet:{}", group.name), base.confirm_mode);
+        // The stricter of the saved dialogue's mode and the tab's: a restore
+        // may tighten the confirm gate, never loosen it (review).
+        let mode = saved
+            .confirm_mode
+            .map_or(base.confirm_mode, |m| m.strictest(base.confirm_mode));
+        let mut session = Session::new(format!("fleet:{}", group.name), mode);
         session.llm_profile = saved
             .llm_profile
             .clone()
@@ -12795,6 +12814,40 @@ mod tests {
             "the saved order holds in the export too:\n{text}"
         );
         let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn only_the_unfilled_occurrence_of_a_duplicate_name_is_gone() {
+        let base = std::env::temp_dir().join(format!("filar_export_dup_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        // One target named `dup` left, two saved occurrences.
+        app.ssh_targets = vec![fleet_target("dup", &["web"])];
+        app.save_dir = Some(base.clone());
+        app.restore_fleet(saved_fleet("web", &["dup", "dup"]));
+
+        let done = run_save_to_completion(&mut app).await;
+        let text = tokio::fs::read_to_string(base.join(&done)).await.expect("export written");
+        assert_eq!(text.matches("| dup | no longer in config |").count(), 1, "{text}");
+        assert_eq!(text.matches("| dup | not asked yet |").count(), 1, "{text}");
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[test]
+    fn a_restore_tightens_the_confirm_gate_but_never_loosens_it() {
+        let mut stricter = saved_fleet("web", &["web-1"]);
+        stricter.confirm_mode = Some(CommandConfirmMode::Always);
+        let mut app = App::new("local".into(), CommandConfirmMode::Never);
+        app.ssh_targets = vec![fleet_target("web-1", &["web"])];
+        app.restore_fleet(stricter);
+        assert_eq!(app.active_session().confirm_mode, CommandConfirmMode::Always);
+
+        let mut looser = saved_fleet("web", &["web-1"]);
+        looser.confirm_mode = Some(CommandConfirmMode::Never);
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![fleet_target("web-1", &["web"])];
+        app.restore_fleet(looser);
+        assert_eq!(app.active_session().confirm_mode, CommandConfirmMode::Always);
     }
 
     #[test]
