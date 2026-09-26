@@ -297,6 +297,7 @@ mod tests {
             session_name: "test".into(),
             ssh_info: None,
             profile: "p".into(),
+            fleet: None,
         });
     }
 

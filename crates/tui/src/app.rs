@@ -1121,6 +1121,10 @@ pub struct RunbookArmed {
     pub ssh_info: Option<String>,
     /// The LLM profile the user was on when Ctrl+S was pressed.
     pub profile: String,
+    /// `Some` for a fleet session (#443): the runbook is a procedure for the
+    /// group, and these host names, addresses and accounts are scrubbed from
+    /// what the model is sent and from what it writes.
+    pub fleet: Option<filar_agent::FleetIdentifiers>,
 }
 
 /// State of the runbook that accompanies a Ctrl+S export, shown in the save
@@ -2782,6 +2786,9 @@ impl App {
                     .llm_profile
                     .clone()
                     .unwrap_or_else(|| self.default_profile_name.clone());
+                let fleet = self.sessions[self.active].fleet.as_ref().map(|op| {
+                    filar_agent::FleetIdentifiers::from_targets(op.members().iter().map(|m| m.target()))
+                });
                 self.runbook_armed = Some(RunbookArmed {
                     session_id: self.sessions[self.active].id,
                     target_dir: target_dir.clone(),
@@ -2789,6 +2796,7 @@ impl App {
                     session_name: session_name.clone(),
                     ssh_info: ssh_info.clone(),
                     profile,
+                    fleet,
                 });
             }
         }
@@ -12862,12 +12870,34 @@ mod tests {
 
         let armed = app.runbook_armed.as_ref().expect("Ctrl+S must arm a runbook");
         assert_eq!(armed.session_id, app.sessions[0].id);
+        assert!(armed.fleet.is_none(), "an ordinary tab's runbook is the single-host one");
         assert_eq!(armed.profile, "glm", "the runbook uses the session's profile");
         assert_eq!(armed.target_dir, base.join("prod-web"));
         assert_eq!(armed.session_name, "prod-web");
         // Folded from the same full history the `.md` was written from (#379).
         let md = messages_to_markdown(&armed.messages, &armed.session_name, &armed.ssh_info);
         assert!(md.contains("systemctl restart nginx"), "snapshot must carry the session");
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn ctrl_s_in_the_fleet_arms_a_group_runbook_with_every_host_to_scrub() {
+        let base = std::env::temp_dir().join(format!("filar_runbook_fleet_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+
+        let mut app = test_fleet_app(test_fleet_view());
+        app.save_dir = Some(base.clone());
+        app.push_message(command_block("uname -r", true));
+        run_save_to_completion(&mut app).await;
+
+        let armed = app.runbook_armed.as_ref().expect("Ctrl+S in the fleet arms a runbook too");
+        let ids = armed.fleet.as_ref().expect("a fleet runbook carries the hosts to scrub");
+        for host in ["web-1", "web-2", "web-3", "web-1.example", "web-3.example"] {
+            assert!(ids.hosts.iter().any(|h| h == host), "{host} must be scrubbed");
+        }
+        assert!(ids.users.iter().any(|u| u == "ops"), "accounts are scrubbed too");
+        assert_eq!(armed.target_dir, base.join("web"), "beside the group's export (#441)");
 
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
@@ -12913,6 +12943,7 @@ mod tests {
             session_name: "local-1".into(),
             ssh_info: None,
             profile: "glm".into(),
+            fleet: None,
         });
 
         assert!(app.take_runbook_job().is_none(), "no executed commands — no LLM call");
@@ -12936,6 +12967,7 @@ mod tests {
             session_name: "prod-web".into(),
             ssh_info: None,
             profile: "glm".into(),
+            fleet: None,
         });
 
         let job = app.take_runbook_job().expect("an approved command must pass the gate");

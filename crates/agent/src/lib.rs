@@ -62,7 +62,10 @@ pub use preprocess::{
     PreprocessorRegistry, PsPreprocessor, RawFallback, RpmPreprocessor, SsPreprocessor,
     SystemctlPreprocessor, VersionPreprocessor,
 };
-pub use runbook::{generate_runbook, RunbookOutcome, RUNBOOK_SYSTEM_PROMPT};
+pub use runbook::{
+    generate_fleet_runbook, generate_runbook, FleetIdentifiers, RunbookOutcome, FLEET_RUNBOOK_PROMPT,
+    RUNBOOK_SYSTEM_PROMPT,
+};
 pub use security::{CliConfirmer, CommandConfirmer, ConfirmDecision};
 pub use tools::{tool_definitions, ToolKind};
 

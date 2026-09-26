@@ -13,6 +13,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- A runbook from a fleet session is a procedure for the group — which checks
+  to run across it, in which order, what counts as a divergence — and host
+  names, addresses and accounts are scrubbed in code from both the transcript
+  sent to the model and its reply
+  ([#443](https://github.com/devlawey/filar/issues/443)).
+
 - `Ctrl+S` in the fleet saves one file into `<save_dir>/<group>/` (the group
   name sanitized like a target alias) and appends a `## Fleet` section: the
   last operation's headline and every host of the composition with its state

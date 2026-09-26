@@ -40,6 +40,109 @@ be needed, and refer to credentials as something the operator obtains separately
 Do not speculate or add steps that are not in the transcript.
 Write in the language the session is conducted in.";
 
+/// Appended to [`RUNBOOK_SYSTEM_PROMPT`] when the session was a fleet
+/// dialogue (#443).
+///
+/// A fleet session asked one read-only question of a whole group at a time
+/// and read back who agreed with whom, so its procedure is one for the
+/// *group*: which checks to run across it, in which order, and what counts
+/// as a divergence — not a sequence of steps on one machine applied by hand
+/// to each. Host names are not the model's to keep: they are scrubbed from
+/// the transcript before the call and from the reply after it
+/// ([`FleetIdentifiers`]), and this block says why the placeholders are
+/// there.
+///
+/// Any change here is a change to a system prompt and requires an eval run —
+/// see `AGENTS.md`.
+pub const FLEET_RUNBOOK_PROMPT: &str = "\
+This session was run over a fleet: every command went to a whole group of hosts at once,
+and the answers came back as a comparison of which hosts agreed and which differed.
+Write the procedure for the group, not for one machine:
+- In Steps, each step is a check run across the whole group: the command, what a host's
+  answer should look like, and what counts as a divergence between hosts.
+- Put the checks in the order the session ran them, and say which divergence leads to
+  which next check.
+- In Exit criteria, say what a healthy group looks like (all hosts agree, or which
+  differences are expected) and what a problem looks like (which hosts differ, how).
+- Hosts that did not answer, were skipped or did not apply are an outcome to handle,
+  not a failure of the procedure.
+Host names, addresses and accounts have already been replaced with <host> and <user>;
+refer to hosts as <host>, to the group as \"the group\", and never name a host.";
+
+/// Everything that identifies the hosts of a fleet session (#443): their
+/// configured names, their addresses and the accounts used on them.
+///
+/// A fleet runbook is a procedure for the group; none of these may appear in
+/// it. The prompt asks for that, but a prompt is a request — so the
+/// identifiers are replaced in code, in the transcript before the call and
+/// in the reply after it, and the guarantee does not depend on the model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FleetIdentifiers {
+    /// Host names and addresses, replaced with `<host>`.
+    pub hosts: Vec<String>,
+    /// Account names, replaced with `<user>`.
+    pub users: Vec<String>,
+}
+
+impl FleetIdentifiers {
+    /// Identifiers of `targets`: each one's name, address and user.
+    pub fn from_targets<'a>(targets: impl IntoIterator<Item = &'a filar_core::SshTarget>) -> Self {
+        let mut ids = Self::default();
+        for target in targets {
+            ids.hosts.push(target.name.clone());
+            ids.hosts.push(target.host.clone());
+            ids.users.push(target.user.clone());
+        }
+        ids
+    }
+
+    /// Replace every identifier in `text` with its placeholder.
+    ///
+    /// An identifier is replaced only where it stands on its own — not
+    /// inside a longer word — so `web-1` does not eat into `web-10` and the
+    /// account `admin` leaves `administrator` alone. Longer identifiers go
+    /// first, so a host's FQDN is replaced whole before its short name.
+    pub fn scrub(&self, text: &str) -> String {
+        let mut pairs: Vec<(&str, &str)> = self
+            .hosts
+            .iter()
+            .map(|h| (h.as_str(), "<host>"))
+            .chain(self.users.iter().map(|u| (u.as_str(), "<user>")))
+            .filter(|(id, _)| !id.trim().is_empty())
+            .collect();
+        pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        pairs.dedup_by(|a, b| a.0 == b.0);
+        let mut out = text.to_string();
+        for (id, placeholder) in pairs {
+            out = replace_standalone(&out, id, placeholder);
+        }
+        out
+    }
+}
+
+/// Whether `c` can be part of a host or account name — the characters that
+/// make an occurrence part of a longer word rather than the name itself.
+fn is_name_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Replace the occurrences of `needle` in `text` that are not part of a
+/// longer name.
+fn replace_standalone(text: &str, needle: &str, placeholder: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(needle) {
+        let before = rest[..at].chars().next_back();
+        let after = rest[at + needle.len()..].chars().next();
+        let standalone = !before.is_some_and(is_name_char) && !after.is_some_and(is_name_char);
+        out.push_str(&rest[..at]);
+        out.push_str(if standalone { placeholder } else { needle });
+        rest = &rest[at + needle.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Shortest runbook treated as usable, in characters.
 ///
 /// A runbook covers symptom, preconditions, at least one step and an exit
@@ -77,9 +180,30 @@ pub struct RunbookOutcome {
 /// reported as an error rather than written out; its usage still comes back,
 /// because it was paid for like any other.
 pub async fn generate_runbook(llm: &dyn LlmClient, transcript: &str) -> RunbookOutcome {
+    generate_with(llm, RUNBOOK_SYSTEM_PROMPT, transcript).await
+}
+
+/// [`generate_runbook`] for a fleet session (#443): a procedure for the
+/// group, with every host identifier in `ids` scrubbed from the transcript
+/// before the call and from the reply after it.
+///
+/// The same rules as the single-host runbook hold — no tools, the length
+/// floor, usage reported either way.
+pub async fn generate_fleet_runbook(
+    llm: &dyn LlmClient,
+    transcript: &str,
+    ids: &FleetIdentifiers,
+) -> RunbookOutcome {
+    let prompt = format!("{RUNBOOK_SYSTEM_PROMPT}\n\n{FLEET_RUNBOOK_PROMPT}");
+    let mut outcome = generate_with(llm, &prompt, &ids.scrub(transcript)).await;
+    outcome.runbook = outcome.runbook.map(|text| ids.scrub(&text));
+    outcome
+}
+
+async fn generate_with(llm: &dyn LlmClient, system_prompt: &str, transcript: &str) -> RunbookOutcome {
     let request = ChatRequest {
         messages: vec![
-            ChatMessage::new(MessageRole::System, RUNBOOK_SYSTEM_PROMPT),
+            ChatMessage::new(MessageRole::System, system_prompt),
             ChatMessage::new(MessageRole::User, transcript),
         ],
         tools: Vec::new(),
@@ -136,6 +260,89 @@ mod tests {
     #[test]
     fn the_prompt_forbids_inventing_content() {
         assert!(RUNBOOK_SYSTEM_PROMPT.contains("Do not speculate"));
+    }
+
+    // ── Fleet runbook (#443) ───────────────────────────────────────
+
+    fn fleet_ids() -> FleetIdentifiers {
+        FleetIdentifiers {
+            hosts: vec!["web-1".into(), "10.0.0.11".into(), "web-10".into(), "web-10.prod.example".into()],
+            users: vec!["admin".into()],
+        }
+    }
+
+    #[test]
+    fn scrubbing_replaces_whole_names_only() {
+        let text = "ssh admin@web-10.prod.example; web-1 differs from web-10 (10.0.0.11); \
+                    the administrator of web-1x";
+        assert_eq!(
+            fleet_ids().scrub(text),
+            "ssh <user>@<host>; <host> differs from <host> (<host>); the administrator of web-1x"
+        );
+    }
+
+    #[test]
+    fn the_fleet_prompt_asks_for_a_group_procedure() {
+        let p = FLEET_RUNBOOK_PROMPT;
+        assert!(p.contains("for the group, not for one machine"));
+        assert!(p.contains("what counts as a divergence"));
+        assert!(p.contains("never name a host"));
+    }
+
+    /// Echoes the prompt and the transcript back, so a test sees exactly
+    /// what the model was sent — and what it could repeat.
+    struct EchoLlm;
+
+    #[async_trait::async_trait]
+    impl crate::LlmClient for EchoLlm {
+        async fn chat(&self, request: &crate::ChatRequest) -> Result<crate::ChatResponse> {
+            let text = request
+                .messages
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(crate::ChatResponse::text(text))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fleet_runbook_never_names_a_host_address_or_account() {
+        let transcript = "## Fleet: web\nHosts: web-1, web-10\n\
+            `uname -r` → web-1 (10.0.0.11) differs; login admin@web-10.prod.example\n";
+        let outcome = generate_fleet_runbook(&EchoLlm, transcript, &fleet_ids()).await;
+        let text = outcome.runbook.expect("the echo is long enough");
+        for leaked in ["web-1", "web-10", "10.0.0.11", "prod.example", "admin@"] {
+            assert!(!text.contains(leaked), "{leaked:?} reached the runbook:\n{text}");
+        }
+        assert!(text.contains("for the group, not for one machine"), "the fleet block was sent");
+    }
+
+    struct Named(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::LlmClient for Named {
+        async fn chat(&self, _request: &crate::ChatRequest) -> Result<crate::ChatResponse> {
+            Ok(crate::ChatResponse::text(self.0.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_the_model_names_anyway_is_scrubbed_from_the_reply() {
+        let reply = "## Steps\n1. Run `df -h` across the group; web-10 at 10.0.0.11 is usually the odd one. \
+                     Log in as admin if needed.";
+        let outcome = generate_fleet_runbook(&Named(reply), "t", &fleet_ids()).await;
+        let text = outcome.runbook.expect("long enough");
+        assert!(!text.contains("web-10") && !text.contains("10.0.0.11") && !text.contains("admin "), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_fleet_runbook_keeps_the_single_host_rules() {
+        let outcome = generate_fleet_runbook(&FixedLlm("OK".into(), Some(usage(10, 1))), "t", &fleet_ids()).await;
+        assert!(outcome.runbook.is_err(), "the length floor still applies");
+        assert!(outcome.usage.is_some(), "usage is reported either way");
+        let outcome = generate_fleet_runbook(&FailingLlm, "t", &fleet_ids()).await;
+        assert!(outcome.runbook.is_err() && outcome.usage.is_none());
     }
 
     struct FixedLlm(String, Option<TokenUsage>);
