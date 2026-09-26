@@ -436,12 +436,16 @@ existing traits rather than by widening them:
 
 ### Containment is the design
 
-Host output does not reach the model: under a typed comparison only parsed
-cells are carried, under a raw one only a digest. One compromised host out of
-twelve therefore has no channel to the actions taken on the other eleven. The
-composition is frozen before the first command, so no host output can widen
-it. Keep both properties if you build your own fleet front end: hand the model
-`fold(..)` / `fold_file(..)`, and route `FleetView` to people only.
+Host output does not reach the model as raw text: under a typed comparison
+only parsed cells are carried (escaped and length-clamped), under a raw one
+only a digest. That narrows what one compromised host can say, but does not
+silence it: the parsed cells are still part of the tool result, and the model
+may base its next read-only command on them. What such a host cannot do is
+turn that into a write or a wider fleet — every command passes the read-only
+policy before fan-out, and the composition is frozen before the first command,
+so no host output can widen it. Keep these properties if you build your own
+fleet front end: hand the model `fold(..)` / `fold_file(..)`, and route
+`FleetView` to people only.
 
 ### Persisted fleet sessions
 
