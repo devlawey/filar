@@ -208,6 +208,49 @@ impl FleetOperation {
         }
     }
 
+    /// Rebuild an operation over a composition saved earlier (#442), not
+    /// over whatever `group`'s tag rule selects today.
+    ///
+    /// `hosts` are the member names in their saved order. Each is looked up
+    /// by name in `targets` — the connection details come from the config
+    /// as it is now, the *membership* from the session — and the tag rule is
+    /// not consulted at all: a host retagged since keeps its place, a host
+    /// newly tagged does not gain one. That is the frozen-composition rule
+    /// of [`open`][Self::open] carried across a restart.
+    ///
+    /// A name with no target of that name any more is returned in the second
+    /// element, in saved order, rather than silently dropped: the caller has
+    /// to be able to say that the fleet it restored is smaller than the one
+    /// that was saved. When several targets share a name, saved occurrences
+    /// take them in config order, one each.
+    pub fn restore(group: &HostGroup, hosts: &[String], targets: &[SshTarget]) -> (Self, Vec<String>) {
+        let mut used = vec![false; targets.len()];
+        let mut members = Vec::with_capacity(hosts.len());
+        let mut missing = Vec::new();
+        for name in hosts {
+            let found = targets
+                .iter()
+                .enumerate()
+                .find(|(i, target)| !used[*i] && &target.name == name);
+            match found {
+                Some((i, target)) => {
+                    used[i] = true;
+                    members.push(FleetMember {
+                        target: target.clone(),
+                        progress: HostProgress::default(),
+                    });
+                }
+                None => missing.push(name.clone()),
+            }
+        }
+        let op = Self {
+            id: OperationId::next(),
+            group: group.clone(),
+            members,
+        };
+        (op, missing)
+    }
+
     /// A fresh operation over exactly this one's hosts and group (#435).
     ///
     /// Every question asked of a fleet is its own operation — a member that
@@ -609,5 +652,31 @@ mod tests {
             second.id().to_string(),
             format!("#{}", second.id().as_u64())
         );
+    }
+
+    #[test]
+    fn a_restored_operation_keeps_the_saved_composition_not_the_tags() {
+        // Since the save: web-2 lost its tag, web-9 gained it, web-3 is gone.
+        let targets = vec![target("web-1", &["web"]), target("web-2", &[]), target("web-9", &["web"])];
+        let saved = vec!["web-1".to_string(), "web-2".to_string(), "web-3".to_string()];
+
+        let (op, missing) = FleetOperation::restore(&group("web", &["web"]), &saved, &targets);
+        assert_eq!(names(&op), ["web-1", "web-2"], "membership comes from the session");
+        assert_eq!(missing, ["web-3"], "a vanished host is reported, not dropped silently");
+        assert_eq!(op.group_name(), "web");
+        assert!(!op.contains("web-9"), "a newly tagged host does not join");
+    }
+
+    #[test]
+    fn duplicate_names_are_restored_one_target_each() {
+        let mut a = target("dup", &[]);
+        a.host = "a".into();
+        let mut b = target("dup", &[]);
+        b.host = "b".into();
+        let saved = vec!["dup".to_string(), "dup".to_string(), "dup".to_string()];
+        let (op, missing) = FleetOperation::restore(&group("g", &[]), &saved, &[a, b]);
+        let hosts: Vec<_> = op.members().iter().map(|m| m.target().host.as_str()).collect();
+        assert_eq!(hosts, ["a", "b"]);
+        assert_eq!(missing, ["dup"]);
     }
 }

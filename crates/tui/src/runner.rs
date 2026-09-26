@@ -337,6 +337,10 @@ pub struct TuiConfig {
     /// Group to open the fleet layer over at start-up (`--group`, #432).
     /// `None` starts on the single target, exactly as before.
     pub initial_group: Option<String>,
+    /// A saved fleet session to reopen at start-up (`--resume` of a fleet
+    /// dialogue, #442): the fleet layer over its saved composition. Takes
+    /// precedence over `initial_group`.
+    pub initial_fleet: Option<filar_core::Session>,
     pub llm_profile: String,
     pub initial_messages: Vec<ChatBlock>,
     /// Initial agent input history (for session restore).
@@ -595,7 +599,9 @@ async fn run_app(
     // Host groups are fleet entry points in Ctrl+O; `--group` opens the fleet
     // layer straight away, over the start-up tab (#432).
     app.host_groups = config.host_groups.clone();
-    if let Some(group) = config.initial_group.take() {
+    if let Some(saved) = config.initial_fleet.take() {
+        app.restore_fleet(saved);
+    } else if let Some(group) = config.initial_group.take() {
         app.enter_fleet(&group);
     }
 
@@ -713,6 +719,8 @@ async fn run_app(
     auto_save_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_saved_rev = app.active_session().message_rev;
     let mut last_saved_session = app.active_session().id;
+    // The fleet dialogue has a file of its own (#442), next to the tab's.
+    let mut fleet_save = FleetSaveState::default();
     // Side-panel refresh (#431): re-read the background-job registry while a
     // job runs, so local output and completion show up without an agent turn.
     // In-memory only — nothing is sent to a host — and gated on a running
@@ -787,6 +795,15 @@ async fn run_app(
                         Err(e) => {
                             warn!(error = %e, "session auto-save failed");
                         }
+                    }
+                }
+                if let Some((session, mark)) = fleet_save.due(&app, &session_id, &session_timestamp) {
+                    match save_fleet_session_async(session).await {
+                        Ok(()) => {
+                            fleet_save.saved(mark);
+                            info!("fleet session auto-saved");
+                        }
+                        Err(e) => warn!(error = %e, "fleet session auto-save failed"),
                     }
                 }
             }
@@ -1781,6 +1798,14 @@ async fn run_app(
         handle.abort();
     }
 
+    // The fleet dialogue goes to its own file (#442), before the layer is
+    // left below.
+    if let Some((session, _)) = fleet_save.due(&app, &session_id, &session_timestamp) {
+        if let Err(e) = save_fleet_session_async(session).await {
+            eprintln!("\nFailed to save fleet session: {e}");
+        }
+    }
+
     // Save session to disk for future restore — an ordinary tab, never the
     // fleet dialogue (#432).
     app.leave_fleet_view();
@@ -1831,7 +1856,102 @@ pub(crate) fn session_snapshot(
     id: &str,
     timestamp: &str,
 ) -> filar_core::Session {
-    let active_profile_name = app
+    session_snapshot_of(app, app.active_session(), target_name, id, timestamp)
+}
+
+/// Snapshot of the fleet session, if one is open (#442): the same fields as
+/// an ordinary tab plus the frozen composition, so a restore rebuilds the
+/// fleet from the hosts it had rather than from today's tags. No ssh_info —
+/// a fleet has no single host.
+pub(crate) fn fleet_session_snapshot(app: &App, id: &str, timestamp: &str) -> Option<filar_core::Session> {
+    let fleet = &app.sessions[app.fleet_index()?];
+    let mut session = session_snapshot_of(app, fleet, &fleet.target_name, id, timestamp);
+    session.ssh_info = None;
+    Some(session)
+}
+
+/// Which fleet session was last written, and under which file id (#442).
+///
+/// A run has one id for its tab session; each fleet opened during the run
+/// gets its own `{run id}-fleet{n}`, so a second fleet does not overwrite
+/// the first one's file and the ids still sort by time.
+#[derive(Default)]
+struct FleetSaveState {
+    /// The fleet session the current file id belongs to, and that id.
+    file: Option<(crate::app::SessionId, String)>,
+    /// Revision of that session at its last successful save.
+    saved_rev: Option<u64>,
+    /// Fleets seen so far in this run.
+    count: u32,
+}
+
+impl FleetSaveState {
+    /// The open fleet's snapshot, when it has something worth restoring and
+    /// changed since its last save, plus the mark to pass to [`saved`].
+    ///
+    /// A fleet nobody asked anything yet is only its intro lines; saving it
+    /// would fill F3 with empty entries.
+    ///
+    /// [`saved`]: Self::saved
+    fn due(
+        &mut self,
+        app: &App,
+        run_id: &str,
+        timestamp: &str,
+    ) -> Option<(filar_core::Session, u64)> {
+        let fleet = &app.sessions[app.fleet_index()?];
+        if !fleet.messages.iter().any(|b| matches!(b, ChatBlock::User(_))) {
+            return None;
+        }
+        if self.file.as_ref().map(|(sid, _)| *sid) != Some(fleet.id) {
+            // A restored fleet writes back to the file it came from, so a
+            // restore does not add a copy per run (review).
+            let id = match &fleet.fleet_saved_id {
+                Some(id) => id.clone(),
+                None => {
+                    self.count += 1;
+                    format!("{run_id}-fleet{}", self.count)
+                }
+            };
+            self.file = Some((fleet.id, id));
+            self.saved_rev = None;
+        }
+        if self.saved_rev == Some(fleet.message_rev) {
+            return None;
+        }
+        let id = self.file.as_ref().map(|(_, id)| id.clone())?;
+        let session = fleet_session_snapshot(app, &id, timestamp)?;
+        Some((session, fleet.message_rev))
+    }
+
+    /// Record that the snapshot `due` handed out with `rev` is on disk.
+    fn saved(&mut self, rev: u64) {
+        self.saved_rev = Some(rev);
+    }
+}
+
+/// Write a fleet session off the event loop (#442). Not the panic-safe
+/// snapshot: that one slot belongs to the tab session.
+async fn save_fleet_session_async(session: filar_core::Session) -> std::result::Result<(), CoreError> {
+    tokio::task::spawn_blocking(move || {
+        let store = filar_core::SessionStore::with_default_dir()?;
+        store.save(&session)?;
+        let _ = store.prune_to(filar_core::session::MAX_SESSIONS);
+        Ok(())
+    })
+    .await
+    .map_err(|e| CoreError::Other(format!("fleet session save task panicked: {e}")))?
+}
+
+/// Build the persisted snapshot of one TUI session.
+fn session_snapshot_of(
+    app: &App,
+    tab: &crate::app::Session,
+    target_name: &str,
+    id: &str,
+    timestamp: &str,
+) -> filar_core::Session {
+    let active_profile_name = tab
         .llm_profile
         .clone()
         .unwrap_or_else(|| app.default_profile_name.clone());
@@ -1845,23 +1965,24 @@ pub(crate) fn session_snapshot(
         id: id.to_string(),
         timestamp: timestamp.to_string(),
         target: target_name.to_string(),
-        llm_profile: app.llm_profile.clone(),
-        messages: app.messages.clone(),
+        llm_profile: tab.llm_profile.clone(),
+        messages: tab.messages.clone(),
         // Persisted separately from `messages` so a reopened session keeps the
         // context compaction left it with, while still holding every turn it
         // ever had (#379).
-        folded_history: app.active_session().folded_history.clone(),
-        input_history: app.input_history().to_vec(),
-        tokens_in: app.tokens_in,
-        tokens_out: app.tokens_out,
-        cost_usd: app.cost_usd,
-        per_profile: app.per_profile.clone(),
-        last_served_model: app.last_served_model.clone(),
-        model_per_profile: app.model_per_profile.clone(),
-        ssh_info: app.ssh_info.clone(),
+        folded_history: tab.folded_history.clone(),
+        input_history: tab.input_history().to_vec(),
+        tokens_in: tab.tokens_in,
+        tokens_out: tab.tokens_out,
+        cost_usd: tab.cost_usd,
+        per_profile: tab.per_profile.clone(),
+        last_served_model: tab.last_served_model.clone(),
+        model_per_profile: tab.model_per_profile.clone(),
+        ssh_info: tab.ssh_info.clone(),
         model,
         api_base_url,
-        confirm_mode: Some(app.active_session().confirm_mode),
+        confirm_mode: Some(tab.confirm_mode),
+        fleet: tab.fleet_snapshot(),
     };
     session.truncate_history();
     session
@@ -2995,6 +3116,60 @@ mod tests {
     }
 
     #[test]
+    fn the_fleet_session_is_saved_to_its_own_file_with_its_composition() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let target = |name: &str| filar_core::SshTarget {
+            name: name.into(),
+            host: format!("{name}.example"),
+            port: 22,
+            user: "ops".into(),
+            auth: filar_core::SshAuth::Key { path: None },
+            host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            tags: vec!["g".into()],
+        };
+        app.ssh_targets = vec![target("a"), target("b")];
+        app.host_groups = vec![filar_core::HostGroup {
+            name: "g".into(),
+            match_tags: vec!["g".into()],
+            ..Default::default()
+        }];
+        let mut state = FleetSaveState::default();
+        assert!(state.due(&app, "1790", "ts").is_none(), "no fleet, nothing to save");
+
+        app.enter_fleet("g");
+        assert!(state.due(&app, "1790", "ts").is_none(), "intro lines only: not worth a file");
+
+        app.push_message(ChatBlock::User("uptime?".into()));
+        let (session, rev) = state.due(&app, "1790", "ts").expect("a fleet with a question is saved");
+        assert_eq!(session.id, "1790-fleet1");
+        assert_eq!(session.ssh_info, None);
+        let fleet = session.fleet.clone().expect("the composition is saved");
+        assert_eq!(fleet.group, "g");
+        assert_eq!(fleet.hosts, ["a", "b"]);
+        state.saved(rev);
+        assert!(state.due(&app, "1790", "ts").is_none(), "unchanged since the save");
+
+        // Retag the config, restore the saved session — same hosts.
+        app.exit_fleet();
+        app.ssh_targets[1].tags.clear();
+        app.restore_fleet(session);
+        let names: Vec<_> = app.fleet().unwrap().members().iter().map(|m| m.name().to_string()).collect();
+        assert_eq!(names, ["a", "b"]);
+
+        // The restored fleet writes back to the file it came from — no copy.
+        app.push_message(ChatBlock::User("again".into()));
+        let (second, _) = state.due(&app, "1790", "ts").expect("the restored fleet is saved too");
+        assert_eq!(second.id, "1790-fleet1");
+
+        // A fleet entered fresh in the same run gets a file of its own.
+        app.exit_fleet();
+        app.enter_fleet("g");
+        app.push_message(ChatBlock::User("third".into()));
+        let (third, _) = state.due(&app, "1790", "ts").expect("a new fleet is saved");
+        assert_eq!(third.id, "1790-fleet2");
+    }
+
+    #[test]
     fn session_changed_detects_rev_and_tab() {
         use filar_core::CommandConfirmMode;
         let mut app = App::new("t0".into(), CommandConfirmMode::Allowlist);
@@ -3345,6 +3520,7 @@ mod tests {
             tag_policies: Vec::new(),
             host_groups: Vec::new(),
             initial_group: None,
+            initial_fleet: None,
             llm_profile: "glm".into(),
             initial_messages: Vec::new(),
             initial_input_history: Vec::new(),

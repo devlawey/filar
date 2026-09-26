@@ -19,6 +19,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   sent to the model and its reply
   ([#443](https://github.com/devlawey/filar/issues/443)).
 
+- Fleet sessions are saved to a file of their own and restore (F3 or
+  `--session`) as the fleet layer over the composition they were saved with,
+  not the group's current tags; a saved host no longer in the config is named
+  in the feed instead of being dropped. `filar_core::Session` gains
+  `fleet: Option<FleetSnapshot>` and `FleetOperation::restore`
+  ([#442](https://github.com/devlawey/filar/issues/442)).
+
 - `Ctrl+S` in the fleet saves one file into `<save_dir>/<group>/` (the group
   name sanitized like a target alias) and appends a `## Fleet` section: the
   last operation's headline and every host of the composition with its state

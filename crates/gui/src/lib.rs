@@ -3917,6 +3917,7 @@ mod tests {
             model: model.map(str::to_string),
             api_base_url: api_base_url.map(str::to_string),
             preview: "hi".into(),
+            fleet_group: None,
         }
     }
 

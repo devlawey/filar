@@ -429,6 +429,19 @@ pub struct Session {
     /// How many hosts answered the last (or the running) fleet operation
     /// (#439), for the status bar. `None` before the first operation.
     pub fleet_status: Option<filar_agent::fleet_view::FleetStatus>,
+    /// Hosts of a restored fleet's saved composition that no longer exist
+    /// in the config (#442). Kept so a later save does not quietly forget
+    /// them: the composition is the session's, not the config's.
+    pub fleet_missing: Vec<String>,
+    /// A restored fleet's composition exactly as it was saved (#442), in
+    /// order, vanished hosts in their own places. What a later save writes,
+    /// so neither membership nor order drifts across restore/save rounds.
+    pub fleet_saved_hosts: Option<Vec<String>>,
+    /// The session file a restored fleet came from (#442). A later save
+    /// writes back to it instead of a new file per run — otherwise each
+    /// restore adds a copy, and the copies push older sessions out of the
+    /// store's retention.
+    pub fleet_saved_id: Option<String>,
     /// `Some(previous label)` while a Ctrl+O switch of this tab to another
     /// host is in flight (#433). Until the transport actually swaps, the tab
     /// still runs on its old executor, so nothing may be sent from it; on a
@@ -982,6 +995,9 @@ impl Session {
             fleet_credentials: None,
             fleet_view: None,
             fleet_status: None,
+            fleet_missing: Vec::new(),
+            fleet_saved_hosts: None,
+            fleet_saved_id: None,
             connecting: None,
         }
     }
@@ -1071,6 +1087,22 @@ impl Session {
     /// Reference to the input history (for persistence).
     pub fn input_history(&self) -> &[String] {
         &self.input_history
+    }
+
+    /// The composition to persist for a fleet session (#442): for a
+    /// restored fleet, the saved list verbatim — vanished hosts included, in
+    /// their places; otherwise the frozen members in order. `None` for an
+    /// ordinary tab.
+    pub fn fleet_snapshot(&self) -> Option<filar_core::FleetSnapshot> {
+        let op = self.fleet.as_ref()?;
+        let hosts = match &self.fleet_saved_hosts {
+            Some(saved) => saved.clone(),
+            None => op.members().iter().map(|m| m.name().to_string()).collect(),
+        };
+        Some(filar_core::FleetSnapshot {
+            group: op.group_name().to_string(),
+            hosts,
+        })
     }
 }
 
@@ -1297,6 +1329,7 @@ fn fleet_summary_markdown(
     group_name: &str,
     members: &[String],
     skipped: &[(String, String)],
+    gone: &[String],
     view: Option<&filar_agent::fleet_view::FleetView>,
     status: Option<&filar_agent::fleet_view::FleetStatus>,
 ) -> String {
@@ -1368,6 +1401,13 @@ fn fleet_summary_markdown(
                         .map(|dropped| dropped.state.label().to_string())
                 })
         });
+        // A restored fleet's host the config no longer has (#442): named,
+        // never left out — it was never asked, and not for want of a key.
+        let from_view = if gone.contains(member) {
+            Some("no longer in config".to_string())
+        } else {
+            from_view
+        };
         let state = from_view.unwrap_or_else(|| {
             match skipped.iter().find(|(host, _)| host == member) {
                 Some((_, why)) => format!("skipped ({why})"),
@@ -2310,6 +2350,11 @@ impl App {
         };
         match SessionStore::with_default_dir() {
             Ok(store) => match store.load(&meta.id) {
+                // A fleet dialogue reopens as the fleet layer over its saved
+                // composition, never into this tab (#442).
+                Ok(Some(session)) if session.fleet.is_some() => {
+                    self.restore_fleet(session);
+                }
                 Ok(Some(session)) => self.apply_loaded_session(session),
                 Ok(None) => {
                     self.push_error(format!("Session '{}' no longer exists.", meta.id));
@@ -2701,7 +2746,9 @@ impl App {
     fn fleet_export_section(&self, idx: usize) -> Option<String> {
         let session = &self.sessions[idx];
         let op = session.fleet.as_ref()?;
-        let members: Vec<String> = op.members().iter().map(|m| m.name().to_string()).collect();
+        // The composition as the fleet has it — for a restored one, the saved
+        // list with the hosts the config lost still in their places (#442).
+        let members: Vec<String> = session.fleet_snapshot().map(|s| s.hosts).unwrap_or_default();
         let skipped: Vec<(String, String)> = session
             .fleet_credentials
             .as_ref()
@@ -2717,6 +2764,7 @@ impl App {
             op.group_name(),
             &members,
             &skipped,
+            &session.fleet_missing,
             session.fleet_view.as_ref(),
             session.fleet_status.as_ref(),
         ))
@@ -2786,8 +2834,15 @@ impl App {
                     .llm_profile
                     .clone()
                     .unwrap_or_else(|| self.default_profile_name.clone());
-                let fleet = self.sessions[self.active].fleet.as_ref().map(|op| {
-                    filar_agent::FleetIdentifiers::from_targets(op.members().iter().map(|m| m.target()))
+                let session = &self.sessions[self.active];
+                let fleet = session.fleet.as_ref().map(|op| {
+                    let mut ids = filar_agent::FleetIdentifiers::from_targets(
+                        op.members().iter().map(|m| m.target()),
+                    );
+                    // A restored fleet's hosts the config lost are named in
+                    // the feed too (#442) — scrubbed like the others.
+                    ids.hosts.extend(session.fleet_missing.iter().cloned());
+                    ids
                 });
                 self.runbook_armed = Some(RunbookArmed {
                     session_id: self.sessions[self.active].id,
@@ -5467,6 +5522,83 @@ impl App {
         session.cwd = None;
         session.fleet = Some(op);
         session.fleet_credentials = Some(creds);
+        self.sessions.push(session);
+        self.active = self.sessions.len() - 1;
+        self.sync_confirm_mode();
+        true
+    }
+
+    /// Reopen a saved fleet session as the fleet layer (#442).
+    ///
+    /// The composition comes from the session, not from the group's tag rule
+    /// today: a host retagged since keeps its place, a newly tagged one does
+    /// not join, and a saved host the config no longer has is named in the
+    /// feed and kept in [`Session::fleet_missing`] instead of vanishing. A
+    /// group that is gone from the config still restores — with default
+    /// limits, and said so — because the hosts, not the group, are what the
+    /// saved summary is about. Returns whether the fleet layer is on screen.
+    pub fn restore_fleet(&mut self, saved: filar_core::Session) -> bool {
+        let Some(snapshot) = saved.fleet.clone() else {
+            return false;
+        };
+        let configured = self.host_groups.iter().find(|g| g.name == snapshot.group).cloned();
+        let group_gone = configured.is_none();
+        let group = configured.unwrap_or_else(|| filar_core::HostGroup {
+            name: snapshot.group.clone(),
+            ..Default::default()
+        });
+        self.remember_return_tab();
+        self.session_select_visible = false;
+        if self.path_picker_visible {
+            self.close_path_picker();
+        }
+        if let Some(fi) = self.fleet_index() {
+            self.close_fleet_session(fi);
+        }
+        let (op, missing) =
+            filar_core::FleetOperation::restore(&group, &snapshot.hosts, &self.ssh_targets);
+        let base = &self.sessions[self.active];
+        let mut session = Session::new(format!("fleet:{}", group.name), base.confirm_mode);
+        session.llm_profile = saved
+            .llm_profile
+            .clone()
+            .or_else(|| op.llm_profile().map(str::to_string))
+            .or_else(|| base.llm_profile.clone());
+        let creds = filar_agent::fleet_creds::FleetCredentials::resolve(&op, &*self.credential_store);
+
+        let mut messages = saved.messages;
+        messages.push(ChatBlock::System(format!(
+            "Fleet session restored ({}): hosts from the session, not from current tags.",
+            saved.timestamp
+        )));
+        if group_gone {
+            messages.push(ChatBlock::System(format!(
+                "Group {} is no longer in the config: default limits apply.",
+                group.name
+            )));
+        }
+        if !missing.is_empty() {
+            messages.push(ChatBlock::System(format!(
+                "No longer in the config, not asked: {}",
+                missing.join(", ")
+            )));
+        }
+        messages.extend(fleet_intro(&op, &creds).into_iter().map(ChatBlock::System));
+        session.messages = messages;
+        session.folded_history = saved.folded_history;
+        session.input_history = saved.input_history;
+        session.tokens_in = saved.tokens_in;
+        session.tokens_out = saved.tokens_out;
+        session.cost_usd = saved.cost_usd;
+        session.per_profile = saved.per_profile;
+        session.last_served_model = saved.last_served_model;
+        session.model_per_profile = saved.model_per_profile;
+        session.cwd = None;
+        session.fleet = Some(op);
+        session.fleet_credentials = Some(creds);
+        session.fleet_missing = missing;
+        session.fleet_saved_hosts = Some(snapshot.hosts);
+        session.fleet_saved_id = Some(saved.id);
         self.sessions.push(session);
         self.active = self.sessions.len() - 1;
         self.sync_confirm_mode();
@@ -11994,6 +12126,7 @@ mod tests {
             model: None,
             api_base_url: None,
             preview: String::new(),
+            fleet_group: None,
         }];
         app.session_select_visible = true;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -12034,6 +12167,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
         app.apply_loaded_session(session);
         assert!(app.messages.iter().any(|b| matches!(b, ChatBlock::User(s) if s == "hello")));
@@ -12089,6 +12223,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
         app.apply_loaded_session(session);
 
@@ -12131,6 +12266,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
         app.apply_loaded_session(session);
         assert_eq!(
@@ -12170,6 +12306,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
         app.apply_loaded_session(session);
         assert!(app.pending_ssh.is_none(), "stale pending_ssh must be cleared");
@@ -12205,6 +12342,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
         app.apply_loaded_session(session);
         assert!(app.pending_ssh_handle.is_none(), "handle must be taken on reset");
@@ -12240,6 +12378,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
         app.apply_loaded_session(session);
         assert!(app.ctrl_o_handle.is_none(), "ctrl_o handle must be taken on reset");
@@ -12276,6 +12415,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
         app.apply_loaded_session(session);
         // Matching target → routed through the Ctrl+O connect path (password
@@ -12321,6 +12461,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
         app.apply_loaded_session(session);
         assert_eq!(app.llm_profile.as_deref(), Some("glm"));
@@ -12530,6 +12671,142 @@ mod tests {
         }
     }
 
+    // ── Fleet restore (#442) ────────────────────────────────────────
+
+    fn saved_fleet(group: &str, hosts: &[&str]) -> filar_core::Session {
+        filar_core::Session {
+            id: "1790000000-fleet1".into(),
+            timestamp: "2026-09-19 10:00:00".into(),
+            target: format!("fleet:{group}"),
+            llm_profile: None,
+            messages: vec![
+                ChatBlock::User("which kernel?".into()),
+                ChatBlock::Agent("web-2 differs.".into()),
+            ],
+            folded_history: Vec::new(),
+            input_history: vec!["which kernel?".into()],
+            tokens_in: 120,
+            tokens_out: 40,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+            fleet: Some(filar_core::FleetSnapshot {
+                group: group.into(),
+                hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            }),
+        }
+    }
+
+    fn fleet_names(app: &App) -> Vec<String> {
+        app.fleet()
+            .expect("fleet open")
+            .members()
+            .iter()
+            .map(|m| m.name().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_fleet_session_restores_with_its_saved_composition() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![fleet_target("web-1", &["web"]), fleet_target("web-2", &["web"])];
+        app.host_groups = vec![filar_core::HostGroup {
+            name: "web".into(),
+            match_tags: vec!["web".into()],
+            ..Default::default()
+        }];
+
+        assert!(app.restore_fleet(saved_fleet("web", &["web-1", "web-2"])));
+        assert!(app.in_fleet());
+        assert_eq!(fleet_names(&app), ["web-1", "web-2"]);
+        assert!(matches!(app.messages.first(), Some(ChatBlock::User(q)) if q == "which kernel?"));
+        assert_eq!(app.tokens_in, 120, "the dialogue's own counters come back");
+        assert!(app.fleet_missing.is_empty());
+    }
+
+    #[test]
+    fn changed_tags_do_not_change_the_restored_composition() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        // Since the save: web-2 lost the tag, web-3 gained it.
+        app.ssh_targets = vec![
+            fleet_target("web-1", &["web"]),
+            fleet_target("web-2", &[]),
+            fleet_target("web-3", &["web"]),
+        ];
+        app.host_groups = vec![filar_core::HostGroup {
+            name: "web".into(),
+            match_tags: vec!["web".into()],
+            ..Default::default()
+        }];
+
+        app.restore_fleet(saved_fleet("web", &["web-1", "web-2"]));
+        assert_eq!(fleet_names(&app), ["web-1", "web-2"]);
+        assert!(app.messages.iter().any(|m| matches!(m, ChatBlock::System(t) if t.contains("not from current tags"))));
+
+        // Entering the group afresh is what follows today's tags.
+        app.exit_fleet();
+        app.enter_fleet("web");
+        assert_eq!(fleet_names(&app), ["web-1", "web-3"]);
+    }
+
+    #[test]
+    fn a_host_gone_from_the_config_is_named_not_dropped() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![fleet_target("web-1", &["web"])];
+        // The group itself is gone too: the fleet still restores.
+        app.restore_fleet(saved_fleet("web", &["web-1", "web-7"]));
+
+        assert_eq!(fleet_names(&app), ["web-1"]);
+        assert_eq!(app.fleet_missing, ["web-7"]);
+        let said = |needle: &str| {
+            app.messages
+                .iter()
+                .any(|m| matches!(m, ChatBlock::System(t) if t.contains(needle)))
+        };
+        assert!(said("No longer in the config, not asked: web-7"));
+        assert!(said("Group web is no longer in the config"));
+
+        // Saving again keeps the vanished host in the composition.
+        let snapshot = app.active_session().fleet_snapshot().expect("fleet session");
+        assert_eq!(snapshot.hosts, ["web-1", "web-7"]);
+        assert_eq!(snapshot.group, "web");
+        assert_eq!(app.active_session().fleet_saved_id.as_deref(), Some("1790000000-fleet1"));
+    }
+
+    #[tokio::test]
+    async fn the_export_of_a_restored_fleet_names_the_hosts_the_config_lost() {
+        let base = std::env::temp_dir().join(format!("filar_export_restored_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![fleet_target("web-1", &["web"])];
+        app.save_dir = Some(base.clone());
+        app.restore_fleet(saved_fleet("web", &["web-7", "web-1"]));
+
+        let done = run_save_to_completion(&mut app).await;
+        let text = tokio::fs::read_to_string(base.join(&done)).await.expect("export written");
+        assert!(text.contains("| web-7 | no longer in config |"), "{text}");
+        assert!(
+            text.find("| web-7 |") < text.find("| web-1 |"),
+            "the saved order holds in the export too:\n{text}"
+        );
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[test]
+    fn a_vanished_host_keeps_its_place_in_the_saved_order() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![fleet_target("web-1", &["web"]), fleet_target("web-2", &["web"])];
+        app.restore_fleet(saved_fleet("web", &["web-7", "web-1", "web-2"]));
+        assert_eq!(fleet_names(&app), ["web-1", "web-2"]);
+        let snapshot = app.active_session().fleet_snapshot().expect("fleet session");
+        assert_eq!(snapshot.hosts, ["web-7", "web-1", "web-2"], "order survives a save");
+    }
+
     // ── Fleet export (#441) ─────────────────────────────────────────
 
     #[test]
@@ -12582,7 +12859,7 @@ mod tests {
             ],
         };
 
-        let md = fleet_summary_markdown("web", &members, &skipped, Some(&view), None);
+        let md = fleet_summary_markdown("web", &members, &skipped, &[], Some(&view), None);
         assert!(md.contains("## Fleet: web"), "{md}");
         assert!(md.contains("Last operation: `uname -r`"), "{md}");
         for row in [
@@ -12599,7 +12876,7 @@ mod tests {
         assert!(!md.contains("SAMPLE-OUTPUT"), "host output is not part of the summary");
 
         // Before any operation every host is still listed.
-        let md = fleet_summary_markdown("web", &members, &skipped, None, None);
+        let md = fleet_summary_markdown("web", &members, &skipped, &[], None, None);
         assert!(md.contains("No command has been run"), "{md}");
         assert!(md.contains("| app-1 | skipped (no password) |"), "{md}");
         assert!(md.contains("| web-1 | not asked yet |"), "{md}");
@@ -12614,7 +12891,7 @@ mod tests {
         let later = filar_core::FleetOperation::open(&filar_core::HostGroup::default(), &[]).id();
         let status = |operation, running| FleetStatus { operation, answering: 1, total: 3, running };
         let md = |view: Option<&filar_agent::fleet_view::FleetView>, status: FleetStatus| {
-            fleet_summary_markdown("web", &members, &[], view, Some(&status))
+            fleet_summary_markdown("web", &members, &[], &[], view, Some(&status))
         };
 
         // A later operation, running or cancelled and not reported yet: the
@@ -12643,7 +12920,7 @@ mod tests {
     #[test]
     fn a_hostile_host_name_cannot_forge_a_table_row() {
         let members = vec!["evil | ok |\n| web-9".to_string()];
-        let md = fleet_summary_markdown("web", &members, &[], None, None);
+        let md = fleet_summary_markdown("web", &members, &[], &[], None, None);
         assert!(md.contains("| evil \\| ok \\| \\| web-9 | not asked yet |"), "{md}");
     }
 
@@ -12899,6 +13176,23 @@ mod tests {
         assert!(ids.users.iter().any(|u| u == "ops"), "accounts are scrubbed too");
         assert_eq!(armed.target_dir, base.join("web"), "beside the group's export (#441)");
 
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn a_restored_fleet_runbook_scrubs_the_hosts_the_config_lost() {
+        let base = std::env::temp_dir().join(format!("filar_runbook_restored_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![fleet_target("web-1", &["web"])];
+        app.save_dir = Some(base.clone());
+        app.restore_fleet(saved_fleet("web", &["web-1", "web-7"]));
+        app.push_message(command_block("uname -r", true));
+        run_save_to_completion(&mut app).await;
+
+        let ids = app.runbook_armed.as_ref().and_then(|a| a.fleet.as_ref()).expect("fleet runbook armed");
+        assert!(ids.hosts.iter().any(|h| h == "web-7"), "a vanished host is scrubbed too");
+        assert!(ids.hosts.iter().any(|h| h == "web-1"));
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 

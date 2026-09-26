@@ -118,7 +118,9 @@ impl FleetIdentifiers {
             .chain(self.users.iter().map(|u| (u.as_str(), "<user>")))
             .filter(|(id, _)| !id.trim().is_empty())
             .collect();
-        pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        // Longest first; equal identifiers end up adjacent, so the dedup is
+        // complete (review).
+        pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(b.0)));
         pairs.dedup_by(|a, b| a.0 == b.0);
 
         let mut out = String::with_capacity(text.len());
