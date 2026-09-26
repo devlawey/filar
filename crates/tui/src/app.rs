@@ -1153,6 +1153,10 @@ pub struct RunbookArmed {
     pub ssh_info: Option<String>,
     /// The LLM profile the user was on when Ctrl+S was pressed.
     pub profile: String,
+    /// `Some` for a fleet session (#443): the runbook is a procedure for the
+    /// group, and these host names, addresses and accounts are scrubbed from
+    /// what the model is sent and from what it writes.
+    pub fleet: Option<filar_agent::FleetIdentifiers>,
 }
 
 /// State of the runbook that accompanies a Ctrl+S export, shown in the save
@@ -1325,7 +1329,7 @@ fn fleet_summary_markdown(
     group_name: &str,
     members: &[String],
     skipped: &[(String, String)],
-    gone: &[String],
+    gone: &[bool],
     view: Option<&filar_agent::fleet_view::FleetView>,
     status: Option<&filar_agent::fleet_view::FleetStatus>,
 ) -> String {
@@ -1381,7 +1385,7 @@ fn fleet_summary_markdown(
         }
     }
     out.push_str("| Host | State |\n|---|---|\n");
-    for member in members {
+    for (index, member) in members.iter().enumerate() {
         let from_view = view.and_then(|view| {
             view.groups
                 .iter()
@@ -1399,7 +1403,7 @@ fn fleet_summary_markdown(
         });
         // A restored fleet's host the config no longer has (#442): named,
         // never left out — it was never asked, and not for want of a key.
-        let from_view = if gone.contains(member) {
+        let from_view = if gone.get(index).copied().unwrap_or(false) {
             Some("no longer in config".to_string())
         } else {
             from_view
@@ -2745,6 +2749,20 @@ impl App {
         // The composition as the fleet has it — for a restored one, the saved
         // list with the hosts the config lost still in their places (#442).
         let members: Vec<String> = session.fleet_snapshot().map(|s| s.hosts).unwrap_or_default();
+        // Which places of the saved list got no target. Positional, not by
+        // name: with duplicate names only the occurrences past the ones
+        // `FleetOperation::restore` could fill are gone (review) — it fills
+        // them in saved order.
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let gone: Vec<bool> = members
+            .iter()
+            .map(|name| {
+                let nth = seen.entry(name.as_str()).or_insert(0);
+                *nth += 1;
+                let found = op.members().iter().filter(|m| m.name() == name).count();
+                *nth > found
+            })
+            .collect();
         let skipped: Vec<(String, String)> = session
             .fleet_credentials
             .as_ref()
@@ -2760,7 +2778,7 @@ impl App {
             op.group_name(),
             &members,
             &skipped,
-            &session.fleet_missing,
+            &gone,
             session.fleet_view.as_ref(),
             session.fleet_status.as_ref(),
         ))
@@ -2830,6 +2848,16 @@ impl App {
                     .llm_profile
                     .clone()
                     .unwrap_or_else(|| self.default_profile_name.clone());
+                let session = &self.sessions[self.active];
+                let fleet = session.fleet.as_ref().map(|op| {
+                    let mut ids = filar_agent::FleetIdentifiers::from_targets(
+                        op.members().iter().map(|m| m.target()),
+                    );
+                    // A restored fleet's hosts the config lost are named in
+                    // the feed too (#442) — scrubbed like the others.
+                    ids.hosts.extend(session.fleet_missing.iter().cloned());
+                    ids
+                });
                 self.runbook_armed = Some(RunbookArmed {
                     session_id: self.sessions[self.active].id,
                     target_dir: target_dir.clone(),
@@ -2837,6 +2865,7 @@ impl App {
                     session_name: session_name.clone(),
                     ssh_info: ssh_info.clone(),
                     profile,
+                    fleet,
                 });
             }
         }
@@ -5543,7 +5572,12 @@ impl App {
         let (op, missing) =
             filar_core::FleetOperation::restore(&group, &snapshot.hosts, &self.ssh_targets);
         let base = &self.sessions[self.active];
-        let mut session = Session::new(format!("fleet:{}", group.name), base.confirm_mode);
+        // The stricter of the saved dialogue's mode and the tab's: a restore
+        // may tighten the confirm gate, never loosen it (review).
+        let mode = saved
+            .confirm_mode
+            .map_or(base.confirm_mode, |m| m.strictest(base.confirm_mode));
+        let mut session = Session::new(format!("fleet:{}", group.name), mode);
         session.llm_profile = saved
             .llm_profile
             .clone()
@@ -12782,6 +12816,40 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
+    #[tokio::test]
+    async fn only_the_unfilled_occurrence_of_a_duplicate_name_is_gone() {
+        let base = std::env::temp_dir().join(format!("filar_export_dup_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        // One target named `dup` left, two saved occurrences.
+        app.ssh_targets = vec![fleet_target("dup", &["web"])];
+        app.save_dir = Some(base.clone());
+        app.restore_fleet(saved_fleet("web", &["dup", "dup"]));
+
+        let done = run_save_to_completion(&mut app).await;
+        let text = tokio::fs::read_to_string(base.join(&done)).await.expect("export written");
+        assert_eq!(text.matches("| dup | no longer in config |").count(), 1, "{text}");
+        assert_eq!(text.matches("| dup | not asked yet |").count(), 1, "{text}");
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[test]
+    fn a_restore_tightens_the_confirm_gate_but_never_loosens_it() {
+        let mut stricter = saved_fleet("web", &["web-1"]);
+        stricter.confirm_mode = Some(CommandConfirmMode::Always);
+        let mut app = App::new("local".into(), CommandConfirmMode::Never);
+        app.ssh_targets = vec![fleet_target("web-1", &["web"])];
+        app.restore_fleet(stricter);
+        assert_eq!(app.active_session().confirm_mode, CommandConfirmMode::Always);
+
+        let mut looser = saved_fleet("web", &["web-1"]);
+        looser.confirm_mode = Some(CommandConfirmMode::Never);
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![fleet_target("web-1", &["web"])];
+        app.restore_fleet(looser);
+        assert_eq!(app.active_session().confirm_mode, CommandConfirmMode::Always);
+    }
+
     #[test]
     fn a_vanished_host_keeps_its_place_in_the_saved_order() {
         let mut app = App::new("local".into(), CommandConfirmMode::Always);
@@ -13132,6 +13200,7 @@ mod tests {
 
         let armed = app.runbook_armed.as_ref().expect("Ctrl+S must arm a runbook");
         assert_eq!(armed.session_id, app.sessions[0].id);
+        assert!(armed.fleet.is_none(), "an ordinary tab's runbook is the single-host one");
         assert_eq!(armed.profile, "glm", "the runbook uses the session's profile");
         assert_eq!(armed.target_dir, base.join("prod-web"));
         assert_eq!(armed.session_name, "prod-web");
@@ -13139,6 +13208,44 @@ mod tests {
         let md = messages_to_markdown(&armed.messages, &armed.session_name, &armed.ssh_info);
         assert!(md.contains("systemctl restart nginx"), "snapshot must carry the session");
 
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn ctrl_s_in_the_fleet_arms_a_group_runbook_with_every_host_to_scrub() {
+        let base = std::env::temp_dir().join(format!("filar_runbook_fleet_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+
+        let mut app = test_fleet_app(test_fleet_view());
+        app.save_dir = Some(base.clone());
+        app.push_message(command_block("uname -r", true));
+        run_save_to_completion(&mut app).await;
+
+        let armed = app.runbook_armed.as_ref().expect("Ctrl+S in the fleet arms a runbook too");
+        let ids = armed.fleet.as_ref().expect("a fleet runbook carries the hosts to scrub");
+        for host in ["web-1", "web-2", "web-3", "web-1.example", "web-3.example"] {
+            assert!(ids.hosts.iter().any(|h| h == host), "{host} must be scrubbed");
+        }
+        assert!(ids.users.iter().any(|u| u == "ops"), "accounts are scrubbed too");
+        assert_eq!(armed.target_dir, base.join("web"), "beside the group's export (#441)");
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn a_restored_fleet_runbook_scrubs_the_hosts_the_config_lost() {
+        let base = std::env::temp_dir().join(format!("filar_runbook_restored_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![fleet_target("web-1", &["web"])];
+        app.save_dir = Some(base.clone());
+        app.restore_fleet(saved_fleet("web", &["web-1", "web-7"]));
+        app.push_message(command_block("uname -r", true));
+        run_save_to_completion(&mut app).await;
+
+        let ids = app.runbook_armed.as_ref().and_then(|a| a.fleet.as_ref()).expect("fleet runbook armed");
+        assert!(ids.hosts.iter().any(|h| h == "web-7"), "a vanished host is scrubbed too");
+        assert!(ids.hosts.iter().any(|h| h == "web-1"));
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
@@ -13183,6 +13290,7 @@ mod tests {
             session_name: "local-1".into(),
             ssh_info: None,
             profile: "glm".into(),
+            fleet: None,
         });
 
         assert!(app.take_runbook_job().is_none(), "no executed commands — no LLM call");
@@ -13206,6 +13314,7 @@ mod tests {
             session_name: "prod-web".into(),
             ssh_info: None,
             profile: "glm".into(),
+            fleet: None,
         });
 
         let job = app.take_runbook_job().expect("an approved command must pass the gate");
