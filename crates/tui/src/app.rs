@@ -779,6 +779,7 @@ impl App {
         if !was_explain {
             // Entering Explain mode — create transcript path if not yet set.
             let messages = self.messages.clone();
+            let dir_name = self.session_export_dir(self.active);
             let session = &mut self.sessions[self.active];
             if session.transcript_path.is_none() {
                 let base_dir = self
@@ -790,9 +791,9 @@ impl App {
                     &session.ssh_info,
                     &messages,
                 );
-                // Inside the per-target folder (#400); the file stays there
-                // even if the tab's host changes mid-session.
-                let dir_name = export_dir_name(&session.target_name, &session.ssh_info);
+                // Inside the per-target folder (#400) — the group's folder in
+                // the fleet (#441); the file stays there even if the tab's
+                // host changes mid-session.
                 let path = base_dir.join(&dir_name).join(&filename);
                 session.transcript_path = Some(path.clone());
                 session.transcript_error_shown = false;
@@ -1262,6 +1263,83 @@ fn export_dir_name(target_name: &str, ssh_info: &Option<String>) -> String {
     } else {
         sanitize_dir_segment(target_name)
     }
+}
+
+/// Export subfolder of the fleet layer (#441): the group's name, through the
+/// same sanitizer as a target's alias. The name comes from `config.toml`, so
+/// it is user input that ends up in a path.
+fn fleet_export_dir_name(group_name: &str) -> String {
+    sanitize_dir_segment(group_name)
+}
+
+/// Escape a value for one cell of a Markdown table: a `|` would open a new
+/// column and a newline a new row, so neither may pass through raw.
+fn markdown_cell(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace(['\r', '\n'], " ")
+}
+
+/// The fleet section of a fleet session's export (#441): every member of
+/// the composition frozen at entry, each with where it stands after the
+/// last operation.
+///
+/// Every member gets a row — a host that could not be reached, was skipped
+/// or does not apply is named with that state, never left out: a summary
+/// that silently drops the silent hosts lies about the fleet. Host output is
+/// not in it: the file is one summary, not a folder of per-host answers.
+fn fleet_summary_markdown(
+    group_name: &str,
+    members: &[String],
+    skipped: &[(String, String)],
+    view: Option<&filar_agent::fleet_view::FleetView>,
+) -> String {
+    use filar_agent::fleet_view::GroupRole;
+
+    let mut out = format!(
+        "\n---\n\n## Fleet: {}\n\n{} host(s), composition fixed at entry.\n\n",
+        markdown_cell(group_name),
+        members.len()
+    );
+    match view {
+        Some(view) => out.push_str(&format!(
+            "Last operation: `{}`  \n{}\n\n",
+            view.command.replace('`', "'").replace(['\r', '\n'], " "),
+            markdown_cell(&view.headline)
+        )),
+        None => out.push_str("No command has been run on the fleet yet.\n\n"),
+    }
+    out.push_str("| Host | State |\n|---|---|\n");
+    for member in members {
+        let from_view = view.and_then(|view| {
+            view.groups
+                .iter()
+                .find(|group| group.hosts.iter().any(|host| host == member))
+                .map(|group| match group.role {
+                    GroupRole::Baseline => "ok".to_string(),
+                    GroupRole::Differs | GroupRole::Split => "differs".to_string(),
+                })
+                .or_else(|| {
+                    view.dropped
+                        .iter()
+                        .find(|dropped| &dropped.host == member)
+                        .map(|dropped| dropped.state.label().to_string())
+                })
+        });
+        let state = from_view.unwrap_or_else(|| {
+            match skipped.iter().find(|(host, _)| host == member) {
+                Some((_, why)) => format!("skipped ({why})"),
+                None => "not asked yet".to_string(),
+            }
+        });
+        out.push_str(&format!(
+            "| {} | {} |\n",
+            markdown_cell(member),
+            markdown_cell(&state)
+        ));
+    }
+    out
 }
 
 /// Short hash for emoji-only / symbol-only topics (#358).
@@ -2567,6 +2645,41 @@ impl App {
         }
     }
 
+    /// Export subfolder of session `idx`: the group's name in the fleet
+    /// layer (#441), otherwise the target's folder (#400).
+    fn session_export_dir(&self, idx: usize) -> String {
+        let session = &self.sessions[idx];
+        match &session.fleet {
+            Some(op) => fleet_export_dir_name(op.group_name()),
+            None => export_dir_name(&session.target_name, &session.ssh_info),
+        }
+    }
+
+    /// The fleet section appended to session `idx`'s export, or `None` for
+    /// an ordinary tab (#441).
+    fn fleet_export_section(&self, idx: usize) -> Option<String> {
+        let session = &self.sessions[idx];
+        let op = session.fleet.as_ref()?;
+        let members: Vec<String> = op.members().iter().map(|m| m.name().to_string()).collect();
+        let skipped: Vec<(String, String)> = session
+            .fleet_credentials
+            .as_ref()
+            .map(|creds| {
+                creds
+                    .skipped(op)
+                    .into_iter()
+                    .map(|(host, why)| (host.to_string(), why.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(fleet_summary_markdown(
+            op.group_name(),
+            &members,
+            &skipped,
+            session.fleet_view.as_ref(),
+        ))
+    }
+
     /// Start saving the current session as a Markdown file.
     ///
     /// Spawns a background task that converts messages to Markdown and writes
@@ -2608,8 +2721,11 @@ impl App {
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
         // One folder per target (#400), decided from the host the tab is on
-        // *now*: the sanitized display name, or `local` for local tabs.
-        let dir_name = export_dir_name(&session_name, &ssh_info);
+        // *now*: the sanitized display name, or `local` for local tabs. The
+        // fleet layer saves under its group's name (#441), with every host's
+        // state appended to the one file.
+        let dir_name = self.session_export_dir(self.active);
+        let fleet_section = self.fleet_export_section(self.active);
         let target_dir = base_dir.join(&dir_name);
 
         // Arm the runbook before the save task is spawned (#401): the job
@@ -2656,7 +2772,10 @@ impl App {
 
             let filename =
                 generate_save_filename(&session_name, &ssh_info, &messages, &target_dir).await;
-            let md_content = messages_to_markdown(&messages, &session_name, &ssh_info);
+            let mut md_content = messages_to_markdown(&messages, &session_name, &ssh_info);
+            if let Some(section) = &fleet_section {
+                md_content.push_str(section);
+            }
 
             tx.send(SaveProgress::Writing).ok();
 
@@ -12363,6 +12482,119 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    // ── Fleet export (#441) ─────────────────────────────────────────
+
+    #[test]
+    fn hostile_group_names_cannot_escape_the_save_dir() {
+        let base = std::path::Path::new("exports");
+        for name in ["..", "../../etc", "..\\..\\Windows", "CON", ".", "  ", "///", "", "a/../../b"] {
+            let segment = fleet_export_dir_name(name);
+            let path = base.join(&segment);
+            let parts: Vec<_> = path.components().collect();
+            assert_eq!(parts.len(), 2, "group {name:?} gave {segment:?}");
+            assert!(
+                matches!(parts[1], std::path::Component::Normal(_)),
+                "group {name:?} gave a non-normal component {segment:?}"
+            );
+            assert!(path.starts_with(base));
+        }
+        assert_eq!(fleet_export_dir_name("web"), "web");
+    }
+
+    #[test]
+    fn the_fleet_summary_names_every_host_with_its_state() {
+        use filar_agent::fleet_result::HostState;
+        use filar_agent::fleet_view::{FleetView, GroupRole, ViewDropped, ViewGroup};
+
+        let members: Vec<String> = ["web-1", "web-2", "web-3", "db-1", "win-1", "app-1", "app-2"]
+            .map(String::from)
+            .to_vec();
+        let skipped = vec![("app-1".to_string(), "no password".to_string())];
+        let view = FleetView {
+            operation: filar_core::FleetOperation::open(&filar_core::HostGroup::default(), &[]).id(),
+            command: "uname -r".into(),
+            headline: "operation #3: 3 of 6 hosts answered, 1 did not answer".into(),
+            groups: vec![
+                ViewGroup {
+                    hosts: vec!["web-1".into(), "web-2".into()],
+                    sample: "6.1.0 SAMPLE-OUTPUT".into(),
+                    role: GroupRole::Baseline,
+                },
+                ViewGroup {
+                    hosts: vec!["web-3".into()],
+                    sample: "5.15.0".into(),
+                    role: GroupRole::Differs,
+                },
+            ],
+            dropped: vec![
+                ViewDropped { host: "db-1".into(), state: HostState::NoContact },
+                ViewDropped { host: "win-1".into(), state: HostState::NotApplicable },
+                ViewDropped { host: "app-1".into(), state: HostState::Skipped },
+                ViewDropped { host: "app-2".into(), state: HostState::Cancelled },
+            ],
+        };
+
+        let md = fleet_summary_markdown("web", &members, &skipped, Some(&view));
+        assert!(md.contains("## Fleet: web"), "{md}");
+        assert!(md.contains("Last operation: `uname -r`"), "{md}");
+        for row in [
+            "| web-1 | ok |",
+            "| web-2 | ok |",
+            "| web-3 | differs |",
+            "| db-1 | no contact |",
+            "| win-1 | n/a |",
+            "| app-1 | skipped |",
+            "| app-2 | cancelled |",
+        ] {
+            assert!(md.contains(row), "missing {row:?} in:\n{md}");
+        }
+        assert!(!md.contains("SAMPLE-OUTPUT"), "host output is not part of the summary");
+
+        // Before any operation every host is still listed.
+        let md = fleet_summary_markdown("web", &members, &skipped, None);
+        assert!(md.contains("No command has been run"), "{md}");
+        assert!(md.contains("| app-1 | skipped (no password) |"), "{md}");
+        assert!(md.contains("| web-1 | not asked yet |"), "{md}");
+        assert_eq!(md.matches("\n| ").count(), members.len() + 1, "{md}");
+    }
+
+    #[test]
+    fn a_hostile_host_name_cannot_forge_a_table_row() {
+        let members = vec!["evil | ok |\n| web-9".to_string()];
+        let md = fleet_summary_markdown("web", &members, &[], None);
+        assert!(md.contains("| evil \\| ok \\| \\| web-9 | not asked yet |"), "{md}");
+    }
+
+    #[tokio::test]
+    async fn ctrl_s_in_the_fleet_saves_one_file_under_the_group_folder() {
+        let base = std::env::temp_dir().join(format!("filar_export_fleet_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+
+        let mut app = test_fleet_app(test_fleet_view());
+        app.save_dir = Some(base.clone());
+        let done = run_save_to_completion(&mut app).await;
+        let filename = done
+            .strip_prefix("web/")
+            .unwrap_or_else(|| panic!("Done must name the group folder, got: {done}"));
+        let file = base.join("web").join(filename);
+        let text = tokio::fs::read_to_string(&file).await.expect("export written");
+        assert!(text.contains("## Fleet: web"), "{text}");
+        for row in ["| web-1 | ok |", "| web-2 | ok |", "| web-3 | differs |"] {
+            assert!(text.contains(row), "missing {row:?} in:\n{text}");
+        }
+        // One file, no per-host subfolders.
+        let mut entries = tokio::fs::read_dir(base.join("web")).await.unwrap();
+        let mut count = 0;
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(entry.file_type().await.unwrap().is_file());
+            count += 1;
+        }
+        assert_eq!(count, 1);
+        assert!(!tokio::fs::try_exists(base.join("local")).await.unwrap_or(false));
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
     #[test]
