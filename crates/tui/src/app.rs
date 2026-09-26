@@ -1325,6 +1325,7 @@ fn fleet_summary_markdown(
     group_name: &str,
     members: &[String],
     skipped: &[(String, String)],
+    gone: &[String],
     view: Option<&filar_agent::fleet_view::FleetView>,
     status: Option<&filar_agent::fleet_view::FleetStatus>,
 ) -> String {
@@ -1396,6 +1397,13 @@ fn fleet_summary_markdown(
                         .map(|dropped| dropped.state.label().to_string())
                 })
         });
+        // A restored fleet's host the config no longer has (#442): named,
+        // never left out — it was never asked, and not for want of a key.
+        let from_view = if gone.contains(member) {
+            Some("no longer in config".to_string())
+        } else {
+            from_view
+        };
         let state = from_view.unwrap_or_else(|| {
             match skipped.iter().find(|(host, _)| host == member) {
                 Some((_, why)) => format!("skipped ({why})"),
@@ -2734,7 +2742,9 @@ impl App {
     fn fleet_export_section(&self, idx: usize) -> Option<String> {
         let session = &self.sessions[idx];
         let op = session.fleet.as_ref()?;
-        let members: Vec<String> = op.members().iter().map(|m| m.name().to_string()).collect();
+        // The composition as the fleet has it — for a restored one, the saved
+        // list with the hosts the config lost still in their places (#442).
+        let members: Vec<String> = session.fleet_snapshot().map(|s| s.hosts).unwrap_or_default();
         let skipped: Vec<(String, String)> = session
             .fleet_credentials
             .as_ref()
@@ -2750,6 +2760,7 @@ impl App {
             op.group_name(),
             &members,
             &skipped,
+            &session.fleet_missing,
             session.fleet_view.as_ref(),
             session.fleet_status.as_ref(),
         ))
@@ -12752,6 +12763,25 @@ mod tests {
         assert_eq!(app.active_session().fleet_saved_id.as_deref(), Some("1790000000-fleet1"));
     }
 
+    #[tokio::test]
+    async fn the_export_of_a_restored_fleet_names_the_hosts_the_config_lost() {
+        let base = std::env::temp_dir().join(format!("filar_export_restored_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![fleet_target("web-1", &["web"])];
+        app.save_dir = Some(base.clone());
+        app.restore_fleet(saved_fleet("web", &["web-7", "web-1"]));
+
+        let done = run_save_to_completion(&mut app).await;
+        let text = tokio::fs::read_to_string(base.join(&done)).await.expect("export written");
+        assert!(text.contains("| web-7 | no longer in config |"), "{text}");
+        assert!(
+            text.find("| web-7 |") < text.find("| web-1 |"),
+            "the saved order holds in the export too:\n{text}"
+        );
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
     #[test]
     fn a_vanished_host_keeps_its_place_in_the_saved_order() {
         let mut app = App::new("local".into(), CommandConfirmMode::Always);
@@ -12814,7 +12844,7 @@ mod tests {
             ],
         };
 
-        let md = fleet_summary_markdown("web", &members, &skipped, Some(&view), None);
+        let md = fleet_summary_markdown("web", &members, &skipped, &[], Some(&view), None);
         assert!(md.contains("## Fleet: web"), "{md}");
         assert!(md.contains("Last operation: `uname -r`"), "{md}");
         for row in [
@@ -12831,7 +12861,7 @@ mod tests {
         assert!(!md.contains("SAMPLE-OUTPUT"), "host output is not part of the summary");
 
         // Before any operation every host is still listed.
-        let md = fleet_summary_markdown("web", &members, &skipped, None, None);
+        let md = fleet_summary_markdown("web", &members, &skipped, &[], None, None);
         assert!(md.contains("No command has been run"), "{md}");
         assert!(md.contains("| app-1 | skipped (no password) |"), "{md}");
         assert!(md.contains("| web-1 | not asked yet |"), "{md}");
@@ -12846,7 +12876,7 @@ mod tests {
         let later = filar_core::FleetOperation::open(&filar_core::HostGroup::default(), &[]).id();
         let status = |operation, running| FleetStatus { operation, answering: 1, total: 3, running };
         let md = |view: Option<&filar_agent::fleet_view::FleetView>, status: FleetStatus| {
-            fleet_summary_markdown("web", &members, &[], view, Some(&status))
+            fleet_summary_markdown("web", &members, &[], &[], view, Some(&status))
         };
 
         // A later operation, running or cancelled and not reported yet: the
@@ -12875,7 +12905,7 @@ mod tests {
     #[test]
     fn a_hostile_host_name_cannot_forge_a_table_row() {
         let members = vec!["evil | ok |\n| web-9".to_string()];
-        let md = fleet_summary_markdown("web", &members, &[], None, None);
+        let md = fleet_summary_markdown("web", &members, &[], &[], None, None);
         assert!(md.contains("| evil \\| ok \\| \\| web-9 | not asked yet |"), "{md}");
     }
 
