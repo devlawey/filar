@@ -13,6 +13,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Fleet mode documentation: README feature entry, a "why no writes" overview
+  in USER_GUIDE §4.8, the engine contracts in `docs/ENGINE_API.md` (no trait
+  changed; `ReadOnlyExecutor` and `FleetExecutor` implement `CommandExecutor`)
+  with an `engine-v2.0.0` upgrade table, and fleet scenarios in
+  `docs/SMOKE.md` ([#444](https://github.com/devlawey/filar/issues/444)).
+
 - Fleet sessions are saved to a file of their own and restore (F3 or
   `--session`) as the fleet layer over the composition they were saved with,
   not the group's current tags; a saved host no longer in the config is named

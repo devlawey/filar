@@ -396,6 +396,61 @@ say the ones where it matters.
 `folded_history` is `#[serde(default)]`, so sessions written before it existed
 load with an empty archive.
 
+## Fleet mode — one question, many hosts (2.0.0)
+
+Fleet mode asks one **read-only** question of a group of hosts and hands the
+model a comparison of the answers, never the answers themselves. Everything
+below is additive except where the upgrade table says otherwise.
+
+### Contract decision: no trait changed
+
+`CommandExecutor` and `LlmClient` are unchanged. The fleet is built *on* the
+existing traits rather than by widening them:
+
+- **`filar_transport::ReadOnlyExecutor`** (#419) is a `CommandExecutor` that
+  wraps another one and refuses, before anything reaches the host, every
+  command outside a compiled-in allowlist of pure readers (and any shell
+  construct that could smuggle another one in). `check_read_only(command)`
+  is the same check as a function. The allowlist is not configurable — it is
+  a security boundary, not a default.
+- **`filar_agent::fleet_exec::FleetExecutor`** (#435) is a `CommandExecutor`
+  over a whole fleet: one `run(command)` fans the command out, classifies
+  every host and returns the summary headline plus a folded difference
+  table. `cancel()` stops the whole operation (#437). The agent loop sees one
+  executor, so nothing about groups leaks into it; `AgentBuilder::fleet(true)`
+  switches the agent to the fleet tool set and prompt.
+
+### The pieces
+
+| Item | Crate | What it is |
+|------|-------|------------|
+| `FleetOperation` (`open`, `reopen`, `restore`) | `filar-core` | The composition: which hosts, under which group limits, frozen when the operation opens (#426). `restore` rebuilds it from saved host names, not from the tag rule (#442) |
+| `FleetCheckCatalog`, `FleetCheck`, `CommandSpec` | `filar-core` | Declarative, human-authored read-only checks, built-in plus `fleet_checks.toml`, with per-OS command variants (#424, #425) |
+| `FileBaseline`, `FileReference`, `FileProbe` | `filar-core` | "File against a reference" by SHA-256 — the content is never read (#440) |
+| `fleet_run::run_on_fleet[_until\|_observed]` | `filar-agent` | Fan-out under `max_parallel`, a deadline per host, cancellation (#427, #437) |
+| `fleet_result::{OperationResult, HostState}` | `filar-agent` | Every host's state — answered, silent, not asked, cancelled (#428) |
+| `fleet_fold::fold`, `fleet_file_fold::fold_file` | `filar-agent` | The only text about an operation the model gets: groups of agreeing hosts by typed rows or digests (#430); for a file check, verdicts against the reference (#440) |
+| `fleet_creds::FleetCredentials` | `filar-agent` | One host's own credentials each; a host without them drops out (#436) |
+| `fleet_view::FleetView` | `filar-agent` | The person-facing aggregate with sample answers — for a UI, never the model (#438) |
+| `FleetIdentifiers`, `generate_fleet_runbook` | `filar-agent` | A fleet session's runbook: a procedure for the group, with host names, addresses and accounts scrubbed in code (#443) |
+
+### Containment is the design
+
+Host output does not reach the model: under a typed comparison only parsed
+cells are carried, under a raw one only a digest. One compromised host out of
+twelve therefore has no channel to the actions taken on the other eleven. The
+composition is frozen before the first command, so no host output can widen
+it. Keep both properties if you build your own fleet front end: hand the model
+`fold(..)` / `fold_file(..)`, and route `FleetView` to people only.
+
+### Persisted fleet sessions
+
+`Session::fleet: Option<FleetSnapshot>` (`#[serde(default)]`) marks a saved
+fleet dialogue and carries its group and the member host **names** in order —
+no addresses, no secrets (#442). Restore it with `FleetOperation::restore`
+against your current targets; the names it cannot find come back separately,
+so you can say that the restored fleet is smaller than the saved one.
+
 ## Output preprocessors — typed tables instead of raw text
 
 Machine-format command output does not have to reach the model as raw text.
@@ -436,6 +491,14 @@ Register your own preprocessors with `register()`; claimants are consulted
 in registration order and the first that claims the command and parses its
 output wins. The built-in set (`with_builtins()`, the `Default`) is
 registered first.
+
+## Upgrading to `engine-v2.0.0`
+
+| Change | Breaks | What to do |
+|--------|--------|------------|
+| `Session::fleet: Option<FleetSnapshot>` added | Struct literals constructing `Session` | `fleet: None` for an ordinary session. Deserialised sessions are unaffected |
+| `SessionMeta::fleet_group: Option<String>` added | Struct literals constructing `SessionMeta` | `fleet_group: None` |
+| Fleet modules, `ReadOnlyExecutor`, `FleetOperation`, fleet checks, fleet runbook | Nothing — additive | Opt in where you need a fleet |
 
 ## Upgrading to `engine-v1.0.6`
 
