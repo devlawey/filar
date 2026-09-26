@@ -27,6 +27,7 @@ Filar is a Rust-based terminal application that integrates an AI agent (LLM) wit
 - **Secure Credential Storage** — API keys and SSH passwords stored in OS Credential Manager (not in plain text files)
 - **Token Usage Counter** — real API usage data shown in the status bar per session (`toks: N↑ M↓`)
 - **Interactive Terminal** — full terminal emulation via [alacritty_terminal](https://github.com/alacritty/alacritty)
+- **Fleet Mode** — ask one read-only question of a whole group of hosts (selected by tags) with one approval: the agent sees only a comparison of who agrees and who differs — never raw host output — and the side panel shows the answers; a read-only allowlist enforced by the transport means nothing is ever written on the fleet (see [USER_GUIDE §4.8](USER_GUIDE.md))
 
 ---
 

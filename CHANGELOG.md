@@ -13,6 +13,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Fleet mode documentation: README feature entry, a "why no writes" overview
+  in USER_GUIDE §4.8, the engine contracts in `docs/ENGINE_API.md` (no trait
+  changed; `ReadOnlyExecutor` and `FleetExecutor` implement `CommandExecutor`)
+  with an `engine-v2.0.0` upgrade table, and fleet scenarios in
+  `docs/SMOKE.md` ([#444](https://github.com/devlawey/filar/issues/444)).
+
 - A runbook from a fleet session is a procedure for the group — which checks
   to run across it, in which order, what counts as a divergence — and host
   names, addresses and accounts are scrubbed in code from both the transcript
