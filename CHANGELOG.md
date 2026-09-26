@@ -20,6 +20,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   `fleet: Option<FleetSnapshot>` and `FleetOperation::restore`
   ([#442](https://github.com/devlawey/filar/issues/442)).
 
+- `Ctrl+S` in the fleet saves one file into `<save_dir>/<group>/` (the group
+  name sanitized like a target alias) and appends a `## Fleet` section: the
+  last operation's headline and every host of the composition with its state
+  — no contact, skipped, n/a and cancelled included
+  ([#441](https://github.com/devlawey/filar/issues/441)).
+
 - Fleet check "file against a reference": a catalog entry with `file` and
   `reference_host` or `reference_sha256` compares the file's SHA-256 on every
   host with the golden host's or the given digest — the content is never read
