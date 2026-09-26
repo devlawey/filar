@@ -632,11 +632,20 @@ async fn run() -> anyhow::Result<()> {
         model_per_profile: HashMap<String, String>,
         ssh_info: Option<String>,
         confirm_mode: Option<filar_core::CommandConfirmMode>,
+        /// A fleet dialogue reopens as the fleet layer, not as this tab (#442).
+        fleet: Option<filar_core::Session>,
     }
     let loaded = if let Some(ref sid) = session_id {
         info!(session_id = %sid, "loading session");
         match SessionStore::with_default_dir() {
             Ok(store) => match store.load(sid) {
+                Ok(Some(session)) if session.fleet.is_some() => {
+                    info!(messages = session.messages.len(), "fleet session loaded");
+                    LoadedSession {
+                        fleet: Some(session),
+                        ..LoadedSession::default()
+                    }
+                }
                 Ok(Some(session)) => {
                     info!(messages = session.messages.len(), "session loaded");
                     LoadedSession {
@@ -651,6 +660,7 @@ async fn run() -> anyhow::Result<()> {
                         model_per_profile: session.model_per_profile,
                         ssh_info: session.ssh_info,
                         confirm_mode: session.confirm_mode,
+                        fleet: None,
                     }
                 }
                 Ok(None) => {
@@ -684,6 +694,7 @@ async fn run() -> anyhow::Result<()> {
         tag_policies: config.tag_policies.clone(),
         host_groups: config.host_groups.clone(),
         initial_group: cli_group,
+        initial_fleet: loaded.fleet,
         llm_profile: default_profile_name.clone(),
         initial_messages: loaded.messages,
         initial_input_history: loaded.input_history,

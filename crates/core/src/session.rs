@@ -105,6 +105,26 @@ pub struct Session {
     /// Command confirmation mode at launch. `#[serde(default)]`.
     #[serde(default)]
     pub confirm_mode: Option<CommandConfirmMode>,
+    /// `Some` when the session was a fleet dialogue (#442): the group and
+    /// the hosts it was frozen over. A restore rebuilds the fleet from this
+    /// list, not from the group's tag rule. `#[serde(default)]`: sessions
+    /// saved before it existed are ordinary ones.
+    #[serde(default)]
+    pub fleet: Option<FleetSnapshot>,
+}
+
+/// The composition of a saved fleet session (#442).
+///
+/// Host **names** only, in composition order. Connection details and
+/// credentials are resolved from the config and the OS credential store at
+/// restore time — nothing about how to reach a host, and no secret, is
+/// written into the session file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetSnapshot {
+    /// The group the fleet was opened over.
+    pub group: String,
+    /// Its members when the fleet was opened, in order.
+    pub hosts: Vec<String>,
 }
 
 /// Lightweight metadata for listing sessions without loading full messages.
@@ -125,6 +145,9 @@ pub struct SessionMeta {
     pub api_base_url: Option<String>,
     /// Preview of the first user message (or system message).
     pub preview: String,
+    /// Group name when the session was a fleet dialogue (#442).
+    #[serde(default)]
+    pub fleet_group: Option<String>,
 }
 
 impl From<&Session> for SessionMeta {
@@ -145,6 +168,7 @@ impl From<&Session> for SessionMeta {
             model: s.model.clone(),
             api_base_url: s.api_base_url.clone(),
             preview,
+            fleet_group: s.fleet.as_ref().map(|f| f.group.clone()),
         }
     }
 }
@@ -448,6 +472,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
         let meta = SessionMeta::from(&session);
         assert_eq!(meta.id, "123");
@@ -475,6 +500,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
         let meta = SessionMeta::from(&session);
         assert!(meta.preview.is_empty());
@@ -504,6 +530,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
 
         store.save(&session).unwrap();
@@ -552,6 +579,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
 
         store.save(&session).unwrap();
@@ -601,6 +629,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
             };
             store.save(&session).unwrap();
         }
@@ -716,7 +745,7 @@ mod tests {
             llm_profile: Some("glm".into()), messages: vec![], input_history: vec![],
             tokens_in: 150, tokens_out: 300,
             cost_usd: None, per_profile: HashMap::new(), last_served_model: None, model_per_profile: HashMap::new(),
-            ssh_info: None, model: None, api_base_url: None, confirm_mode: None,
+            ssh_info: None, model: None, api_base_url: None, confirm_mode: None, fleet: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("tokens_in"), "must serialize tokens_in");
@@ -762,6 +791,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
         let json = serde_json::to_string_pretty(&session).unwrap();
         assert!(json.contains("input_history"), "JSON must contain input_history");
@@ -816,6 +846,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
         let json = serde_json::to_string(&session).unwrap();
         let loaded: Session = serde_json::from_str(&json).unwrap();
@@ -862,6 +893,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
         assert!(session.input_history.len() > MAX_INPUT_HISTORY);
         session.truncate_history();
@@ -900,6 +932,7 @@ mod tests {
             model: None,
             api_base_url: None,
             confirm_mode: None,
+            fleet: None,
         };
         session.model_per_profile.insert("glm".into(), "openai/gpt-4o-mini".into());
         let json = serde_json::to_string(&session).unwrap();
@@ -938,6 +971,7 @@ mod tests {
             model: Some("glm-5.1".into()),
             api_base_url: Some("https://open.bigmodel.cn/api/paas/v4".into()),
             confirm_mode: Some(CommandConfirmMode::Always),
+            fleet: None,
         };
         let json = serde_json::to_string(&session).unwrap();
         let restored: Session = serde_json::from_str(&json).unwrap();
@@ -984,6 +1018,7 @@ mod tests {
             model: Some("glm-5.1".into()),
             api_base_url: Some("https://example.com".into()),
             confirm_mode: Some(CommandConfirmMode::Allowlist),
+            fleet: None,
         };
         let meta = SessionMeta::from(&session);
         assert_eq!(meta.ssh_info.as_deref(), Some("root@10.0.0.5:22"));

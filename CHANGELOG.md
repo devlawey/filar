@@ -13,6 +13,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Fleet sessions are saved to a file of their own and restore (F3 or
+  `--session`) as the fleet layer over the composition they were saved with,
+  not the group's current tags; a saved host no longer in the config is named
+  in the feed instead of being dropped. `filar_core::Session` gains
+  `fleet: Option<FleetSnapshot>` and `FleetOperation::restore`
+  ([#442](https://github.com/devlawey/filar/issues/442)).
+
 - Fleet check "file against a reference": a catalog entry with `file` and
   `reference_host` or `reference_sha256` compares the file's SHA-256 on every
   host with the golden host's or the given digest — the content is never read
