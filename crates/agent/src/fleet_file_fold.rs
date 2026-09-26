@@ -20,7 +20,7 @@
 //! | Verdict | Host state (#428) |
 //! |---|---|
 //! | matches the reference | `ok` |
-//! | differs (another digest, or present where the reference has none) | `differs` |
+//! | differs (another digest) | `differs` |
 //! | missing while the reference has the file | `differs` |
 //! | unreadable, or an answer the command does not produce | `error` |
 //! | reference unavailable: present or missing | `ok` |
@@ -29,8 +29,9 @@
 //! error; here it is an answer — the file is not there — and is re-read as
 //! such ([`OperationResult::reclassify_answer`]).
 //!
-//! When the reference host did not answer, is not in the fleet, or could
-//! not hash its own copy, there is nothing to compare with: every host is
+//! When the reference host did not answer, is not in the fleet, reports no
+//! file (which `stat` cannot tell apart from a path it may not search), or
+//! could not hash its own copy, there is nothing to compare with: every host is
 //! listed with what it has, grouped by digest, and nobody is called
 //! divergent on a guess.
 
@@ -49,8 +50,6 @@ use crate::fleet_run::{FleetRunReport, HostRun};
 pub enum Expected {
     /// A file with this SHA-256.
     Present(String),
-    /// No file — the reference host does not have one either.
-    Absent,
     /// No reference to compare with, and why.
     Unavailable(String),
 }
@@ -58,10 +57,9 @@ pub enum Expected {
 /// One host's standing against the reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileVerdict {
-    /// Same digest as the reference, or absent like it.
+    /// Same digest as the reference.
     Matches,
-    /// Present with another digest, or present where the reference has
-    /// no file.
+    /// Present with another digest.
     Differs(String),
     /// No file, while the reference has one.
     Missing,
@@ -161,7 +159,6 @@ impl FileFoldTable {
             Expected::Present(digest) if matches!(self.reference, FileReference::Host(_)) => {
                 out.push_str(&format!(" (sha256 {})", short_digest(digest)));
             }
-            Expected::Absent => out.push_str(" (no such file there)"),
             Expected::Unavailable(why) => out.push_str(&format!(" — unavailable: {why}")),
             Expected::Present(_) => {}
         }
@@ -259,7 +256,15 @@ pub fn fold_file(
         FileReference::Sha256(digest) => Expected::Present(digest.clone()),
         FileReference::Host(name) => match answered.iter().find(|(_, host, _)| host == name) {
             Some((_, _, Some(FileProbe::Present(digest)))) => Expected::Present(digest.clone()),
-            Some((_, _, Some(FileProbe::Missing))) => Expected::Absent,
+            // `stat` fails the same way for "no such file" and for a path
+            // this account cannot search, so a reference host that reports
+            // no file may simply not be able to see it. Treating that as
+            // "the reference is: no file" would call every other host that
+            // cannot see it a match — so it is no reference at all.
+            // Raised in review.
+            Some((_, _, Some(FileProbe::Missing))) => Expected::Unavailable(format!(
+                "{name} has no such file, or cannot see it"
+            )),
             Some((_, _, _)) => {
                 Expected::Unavailable(format!("{name} could not hash its copy"))
             }
@@ -278,11 +283,10 @@ pub fn fold_file(
             (Some(FileProbe::Present(digest)), Expected::Present(want)) if &digest == want => {
                 FileVerdict::Matches
             }
-            (Some(FileProbe::Present(digest)), Expected::Present(_) | Expected::Absent) => {
+            (Some(FileProbe::Present(digest)), Expected::Present(_)) => {
                 FileVerdict::Differs(digest)
             }
             (Some(FileProbe::Missing), Expected::Present(_)) => FileVerdict::Missing,
-            (Some(FileProbe::Missing), Expected::Absent) => FileVerdict::Matches,
             (Some(FileProbe::Present(digest)), Expected::Unavailable(_)) => {
                 FileVerdict::Present(digest)
             }
@@ -429,14 +433,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_reference_makes_the_file_itself_the_drift() {
+    async fn a_reference_host_without_the_file_is_no_reference() {
+        // Its `stat` cannot tell "no file" from "cannot search the path",
+        // so hosts that also see nothing must not be called matches.
         let (table, result) = run(
             FileReference::Host("web-1".into()),
             &[Has::Missing, Has::Missing, Has::File(DRIFT)],
         )
         .await;
-        assert_eq!(table.expected(), &Expected::Absent);
-        assert_eq!(states(&result), [HostState::Success, HostState::Success, HostState::Divergent]);
+        assert!(matches!(table.expected(), Expected::Unavailable(_)));
+        assert!(table.render().contains("web-1 has no such file, or cannot see it"));
+        assert!(!table.render().contains("matches"), "{}", table.render());
+        assert_eq!(states(&result), [HostState::Success, HostState::Success, HostState::Success]);
     }
 
     #[tokio::test]

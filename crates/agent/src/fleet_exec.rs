@@ -75,7 +75,7 @@ use filar_transport::readonly::check_read_only;
 use filar_transport::{is_connection_lost, CommandExecutor, CommandResult};
 
 use crate::fleet_creds::FleetCredentials;
-use crate::fleet_file_fold::fold_file;
+use crate::fleet_file_fold::{fold_file, Expected};
 use crate::fleet_fold::fold;
 use crate::fleet_result::{NotAsked, OperationResult};
 use crate::fleet_run::{run_on_fleet_observed, HostRun, HostTask};
@@ -293,7 +293,12 @@ impl FleetExecutor {
 }
 
 /// One operation, fanned out and classified, before any fold.
-struct Operated {
+///
+/// Carries the run's [`CurrentRun`] guard so a `cancel` during the fold
+/// still targets this run's token rather than falling back to forwarding
+/// Ctrl-C to every cached host. Found in review.
+struct Operated<'a> {
+    _current: CurrentRun<'a>,
     op: FleetOperation,
     tasks: Vec<HostTask>,
     report: crate::fleet_run::FleetRunReport,
@@ -306,7 +311,7 @@ impl FleetExecutor {
     /// (#426–#428). Shared by [`run`](CommandExecutor::run) and
     /// [`run_file_check`](Self::run_file_check), which differ only in how
     /// they fold.
-    async fn operate(&self, command: &str) -> Result<Operated> {
+    async fn operate(&self, command: &str) -> Result<Operated<'_>> {
         check_read_only(command).map_err(|reason| {
             CoreError::Other(format!(
                 "read-only policy: {reason} — command not sent to any host of the fleet"
@@ -314,7 +319,7 @@ impl FleetExecutor {
         })?;
 
         let started = std::time::Instant::now();
-        let (_current, cancel) = self.begin_run();
+        let (current, cancel) = self.begin_run();
         let mut op = self.fleet.reopen();
         // Cancelled while still connecting: nobody is asked. The hosts with
         // credentials get a stand-in and the fan-out, handed a cancelled
@@ -370,7 +375,14 @@ impl FleetExecutor {
         emit(report.answered(), false);
         self.evict_lost(&handles, &executors, &report).await;
         let result = OperationResult::build(&op, &report, &not_asked)?;
-        Ok(Operated { op, tasks, report, result, started })
+        Ok(Operated {
+            _current: current,
+            op,
+            tasks,
+            report,
+            result,
+            started,
+        })
     }
 
     /// Run a "file against a reference" check (#440) across the fleet.
@@ -381,7 +393,8 @@ impl FleetExecutor {
     /// who differs, whose file is missing. Like [`run`](CommandExecutor::run),
     /// what comes back is safe to hand to the model.
     ///
-    /// Refuses a check that is not a file check.
+    /// Exits non-zero when nobody answered or when there was no reference
+    /// to compare with. Refuses a check that is not a file check.
     pub async fn run_file_check(&self, check: &FleetCheck) -> Result<CommandResult> {
         let baseline = check.file_baseline().ok_or_else(|| {
             CoreError::Other(format!("fleet check '{}' is not a file check", check.name()))
@@ -389,10 +402,13 @@ impl FleetExecutor {
         let mut done = self.operate(&baseline.command()).await?;
         let table = fold_file(baseline, &done.report, &mut done.result)?;
         let summary = done.result.summary();
+        // No reference means no comparison happened: a caller that reads
+        // only the exit code must not take that for "the fleet matches".
+        let compared = !matches!(table.expected(), Expected::Unavailable(_));
         Ok(CommandResult {
             stdout: format!("{}\n{}", summary.headline(), table),
             stderr: String::new(),
-            exit_code: Some(if summary.is_failed() { 1 } else { 0 }),
+            exit_code: Some(if summary.is_failed() || !compared { 1 } else { 0 }),
             duration: done.started.elapsed(),
             cwd: None,
         })
@@ -585,6 +601,19 @@ mod tests {
         assert!(out.stdout.contains("matches (1): web-1"), "{}", out.stdout);
         assert!(out.stdout.contains("differs sha256 bbbbbbbbbbbb (1): web-2"), "{}", out.stdout);
         assert!(out.stdout.contains("no verdict: web-3 (no contact)"), "{}", out.stdout);
+
+        assert_eq!(out.exit_code, Some(0));
+
+        // A reference that is not in the fleet means nothing was compared,
+        // and the exit code says so.
+        let elsewhere =
+            FileBaseline::new("/etc/app.conf", FileReference::Host("db-1".into())).unwrap();
+        let out = exec
+            .run_file_check(&FleetCheck::for_file(elsewhere))
+            .await
+            .expect("file check runs");
+        assert!(out.stdout.contains("db-1 is not in this fleet"), "{}", out.stdout);
+        assert_eq!(out.exit_code, Some(1));
 
         let not_a_file_check = FleetCheck::ad_hoc("uname -r").unwrap();
         assert!(exec.run_file_check(&not_a_file_check).await.is_err());
