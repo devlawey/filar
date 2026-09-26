@@ -1294,6 +1294,7 @@ fn fleet_summary_markdown(
     members: &[String],
     skipped: &[(String, String)],
     view: Option<&filar_agent::fleet_view::FleetView>,
+    status: Option<&filar_agent::fleet_view::FleetStatus>,
 ) -> String {
     use filar_agent::fleet_view::GroupRole;
 
@@ -1309,6 +1310,20 @@ fn fleet_summary_markdown(
             markdown_cell(&view.headline)
         )),
         None => out.push_str("No command has been run on the fleet yet.\n\n"),
+    }
+    // A later operation that is still running — or was cancelled and has not
+    // handed back its view yet (#437) — makes the view above an earlier
+    // one's. Said outright rather than passed off as the latest state.
+    // Raised in review.
+    if let Some(status) = status {
+        let newer = view.is_none_or(|view| view.operation != status.operation);
+        if status.running || newer {
+            out.push_str(&format!(
+                "Operation {} had not finished when this was saved: the states below are from the \
+                 operation before it.\n\n",
+                status.operation
+            ));
+        }
     }
     out.push_str("| Host | State |\n|---|---|\n");
     for member in members {
@@ -2677,6 +2692,7 @@ impl App {
             &members,
             &skipped,
             session.fleet_view.as_ref(),
+            session.fleet_status.as_ref(),
         ))
     }
 
@@ -12536,7 +12552,7 @@ mod tests {
             ],
         };
 
-        let md = fleet_summary_markdown("web", &members, &skipped, Some(&view));
+        let md = fleet_summary_markdown("web", &members, &skipped, Some(&view), None);
         assert!(md.contains("## Fleet: web"), "{md}");
         assert!(md.contains("Last operation: `uname -r`"), "{md}");
         for row in [
@@ -12553,7 +12569,7 @@ mod tests {
         assert!(!md.contains("SAMPLE-OUTPUT"), "host output is not part of the summary");
 
         // Before any operation every host is still listed.
-        let md = fleet_summary_markdown("web", &members, &skipped, None);
+        let md = fleet_summary_markdown("web", &members, &skipped, None, None);
         assert!(md.contains("No command has been run"), "{md}");
         assert!(md.contains("| app-1 | skipped (no password) |"), "{md}");
         assert!(md.contains("| web-1 | not asked yet |"), "{md}");
@@ -12561,9 +12577,29 @@ mod tests {
     }
 
     #[test]
+    fn a_summary_saved_mid_operation_says_its_states_are_the_previous_ones() {
+        use filar_agent::fleet_view::FleetStatus;
+        let view = test_fleet_view();
+        let members: Vec<String> = ["web-1", "web-2", "web-3"].map(String::from).to_vec();
+        let later = filar_core::FleetOperation::open(&filar_core::HostGroup::default(), &[]).id();
+
+        // Cancelled or still running: the view is an earlier operation's.
+        for (operation, running) in [(later, true), (later, false), (view.operation, true)] {
+            let status = FleetStatus { operation, answering: 1, total: 3, running };
+            let md = fleet_summary_markdown("web", &members, &[], Some(&view), Some(&status));
+            assert!(md.contains("had not finished when this was saved"), "{md}");
+        }
+
+        // The view is the finished operation's own: no caveat.
+        let status = FleetStatus { operation: view.operation, answering: 3, total: 3, running: false };
+        let md = fleet_summary_markdown("web", &members, &[], Some(&view), Some(&status));
+        assert!(!md.contains("had not finished"), "{md}");
+    }
+
+    #[test]
     fn a_hostile_host_name_cannot_forge_a_table_row() {
         let members = vec!["evil | ok |\n| web-9".to_string()];
-        let md = fleet_summary_markdown("web", &members, &[], None);
+        let md = fleet_summary_markdown("web", &members, &[], None, None);
         assert!(md.contains("| evil \\| ok \\| \\| web-9 | not asked yet |"), "{md}");
     }
 
