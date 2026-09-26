@@ -19,6 +19,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   with an `engine-v2.0.0` upgrade table, and fleet scenarios in
   `docs/SMOKE.md` ([#444](https://github.com/devlawey/filar/issues/444)).
 
+- A runbook from a fleet session is a procedure for the group — which checks
+  to run across it, in which order, what counts as a divergence — and host
+  names, addresses and accounts are scrubbed in code from both the transcript
+  sent to the model and its reply
+  ([#443](https://github.com/devlawey/filar/issues/443)).
+
 - Fleet sessions are saved to a file of their own and restore (F3 or
   `--session`) as the fleet layer over the composition they were saved with,
   not the group's current tags; a saved host no longer in the config is named

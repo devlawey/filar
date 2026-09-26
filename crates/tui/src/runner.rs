@@ -2203,6 +2203,7 @@ fn spawn_runbook_generation(
     let provider = Arc::clone(secret_provider);
     let sid = armed.session_id;
     let profile = armed.profile.clone();
+    let fleet = armed.fleet.clone();
     let tx = save_tx.clone();
     tokio::spawn(async move {
         // A panic inside the call (a client's `unwrap`, say) would otherwise
@@ -2216,6 +2217,7 @@ fn spawn_runbook_generation(
             &path,
             &display,
             provider.as_ref(),
+            fleet.as_ref(),
         ))
         .catch_unwind()
         .await;
@@ -2281,10 +2283,19 @@ async fn build_runbook_file(
     path: &std::path::Path,
     display: &str,
     provider: &dyn SecretProvider,
+    // A fleet session's host identifiers (#443): the runbook becomes a
+    // procedure for the group, with every one of them scrubbed.
+    fleet: Option<&filar_agent::FleetIdentifiers>,
 ) -> Option<(std::result::Result<String, String>, Option<filar_agent::TokenUsage>)> {
     let redacted = filar_core::redact_secrets(transcript, provider);
+    let generate = async {
+        match fleet {
+            Some(ids) => filar_agent::generate_fleet_runbook(llm, &redacted, ids).await,
+            None => filar_agent::generate_runbook(llm, &redacted).await,
+        }
+    };
     let outcome = tokio::select! {
-        outcome = filar_agent::generate_runbook(llm, &redacted) => outcome,
+        outcome = generate => outcome,
         _ = cancellation.cancelled() => return None,
     };
     let result = match outcome.runbook {
@@ -3306,6 +3317,7 @@ mod tests {
             &path,
             "prod-web/db-1.runbook.md",
             &provider,
+            None,
         )
         .await;
         let (result, usage) = outcome.expect("no cancellation — must return");
@@ -3318,6 +3330,45 @@ mod tests {
         let sent = llm.captured_prompt();
         assert!(!sent.contains("hunter2-password"), "the secret must not leave the machine");
         assert!(sent.contains("$FILAR_SECRET_1"), "the placeholder replaces it in the request");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_fleet_runbook_file_names_no_host_address_or_account() {
+        let dir = runbook_temp_dir("fleet");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let provider = filar_core::StaticSecretProvider::new();
+        let ids = filar_agent::FleetIdentifiers {
+            hosts: vec!["web-1".into(), "10.0.0.11".into(), "web-2".into()],
+            users: vec!["ops".into()],
+        };
+        // The model names hosts anyway — the output door scrubs them.
+        let llm = ScriptedLlm::answering(&long_runbook(
+            "Run `uname -r` across the group; web-2 (10.0.0.11) usually differs. Log in as ops.",
+        ));
+        let path = dir.join("fleet-web.runbook.md");
+        let outcome = build_runbook_file(
+            &llm,
+            &CancellationToken::new(),
+            "User: which kernel?\nweb-1 and web-2 answered; ops@10.0.0.11",
+            &path,
+            "web/fleet-web.runbook.md",
+            &provider,
+            Some(&ids),
+        )
+        .await;
+        outcome.expect("no cancellation").0.expect("the write must succeed");
+
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        let sent = llm.captured_prompt();
+        for leaked in ["web-1", "web-2", "10.0.0.11", "ops@", "as ops"] {
+            assert!(!written.contains(leaked), "{leaked:?} reached the file:\n{written}");
+            assert!(!sent.contains(leaked), "{leaked:?} reached the model:\n{sent}");
+        }
+        assert!(sent.contains("for the group, not for one machine"), "the fleet prompt was used");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -3338,6 +3389,7 @@ mod tests {
             &path,
             "prod-web/db-1.runbook.md",
             &provider,
+            None,
         )
         .await;
         let (result, usage) = outcome.expect("no cancellation — must return");
@@ -3380,7 +3432,7 @@ mod tests {
         // a much worse regression signal than a failed assertion.
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            build_runbook_file(&llm, &token, "t", &path, "d", &provider),
+            build_runbook_file(&llm, &token, "t", &path, "d", &provider, None),
         )
         .await
         .expect("cancellation must abandon the request, not wait it out");
@@ -3415,6 +3467,7 @@ mod tests {
             &path,
             "d",
             &provider,
+            None,
         )
         .await;
         let (result, usage) = outcome.expect("failure is still reported, not cancelled");
@@ -3444,6 +3497,7 @@ mod tests {
             &path,
             "d",
             &provider,
+            None,
         )
         .await;
         let (result, usage) = outcome.expect("not cancelled");
@@ -3532,6 +3586,7 @@ mod tests {
             session_name: "prod-web".into(),
             ssh_info: None,
             profile: "glm".into(),
+            fleet: None,
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -3573,6 +3628,7 @@ mod tests {
             session_name: "prod-web".into(),
             ssh_info: None,
             profile: "glm".into(),
+            fleet: None,
         });
         let provider = Arc::new(filar_core::StaticSecretProvider::new());
         let llm: Arc<dyn LlmClient> = Arc::new(ScriptedLlm::answering(&long_runbook("")));
@@ -3627,6 +3683,7 @@ mod tests {
             session_name: "prod-web".into(),
             ssh_info: None,
             profile: "glm".into(),
+            fleet: None,
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -3699,6 +3756,7 @@ mod tests {
             session_name: "prod-web".into(),
             ssh_info: None,
             profile: "glm".into(),
+            fleet: None,
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
 
