@@ -1315,12 +1315,23 @@ fn fleet_summary_markdown(
     // handed back its view yet (#437) — makes the view above an earlier
     // one's. Said outright rather than passed off as the latest state.
     // Raised in review.
+    // Three cases, three sentences (review): no view at all means no
+    // operation has reported; a view of an earlier operation is that
+    // earlier one's states; a view of this very operation, still running,
+    // may be incomplete.
     if let Some(status) = status {
-        let newer = view.is_none_or(|view| view.operation != status.operation);
-        if status.running || newer {
+        let note = match view {
+            None if status.running => Some("no operation has reported its states yet"),
+            None => None,
+            Some(view) if view.operation != status.operation => {
+                Some("the states below are from the operation before it")
+            }
+            Some(_) if status.running => Some("the states below may be incomplete"),
+            Some(_) => None,
+        };
+        if let Some(note) = note {
             out.push_str(&format!(
-                "Operation {} had not finished when this was saved: the states below are from the \
-                 operation before it.\n\n",
+                "Operation {} had not finished when this was saved: {note}.\n\n",
                 status.operation
             ));
         }
@@ -12577,23 +12588,33 @@ mod tests {
     }
 
     #[test]
-    fn a_summary_saved_mid_operation_says_its_states_are_the_previous_ones() {
+    fn a_summary_saved_mid_operation_says_what_its_states_are() {
         use filar_agent::fleet_view::FleetStatus;
         let view = test_fleet_view();
         let members: Vec<String> = ["web-1", "web-2", "web-3"].map(String::from).to_vec();
         let later = filar_core::FleetOperation::open(&filar_core::HostGroup::default(), &[]).id();
+        let status = |operation, running| FleetStatus { operation, answering: 1, total: 3, running };
+        let md = |view: Option<&filar_agent::fleet_view::FleetView>, status: FleetStatus| {
+            fleet_summary_markdown("web", &members, &[], view, Some(&status))
+        };
 
-        // Cancelled or still running: the view is an earlier operation's.
-        for (operation, running) in [(later, true), (later, false), (view.operation, true)] {
-            let status = FleetStatus { operation, answering: 1, total: 3, running };
-            let md = fleet_summary_markdown("web", &members, &[], Some(&view), Some(&status));
-            assert!(md.contains("had not finished when this was saved"), "{md}");
+        // A later operation, running or cancelled and not reported yet: the
+        // view is the earlier one's.
+        for running in [true, false] {
+            let text = md(Some(&view), status(later, running));
+            assert!(text.contains("from the operation before it"), "{text}");
         }
-
-        // The view is the finished operation's own: no caveat.
-        let status = FleetStatus { operation: view.operation, answering: 3, total: 3, running: false };
-        let md = fleet_summary_markdown("web", &members, &[], Some(&view), Some(&status));
-        assert!(!md.contains("had not finished"), "{md}");
+        // The view's own operation, still running: its states are partial.
+        let text = md(Some(&view), status(view.operation, true));
+        assert!(text.contains("may be incomplete"), "{text}");
+        assert!(!text.contains("before it"), "{text}");
+        // Nothing reported yet: there is no earlier operation to speak of.
+        let text = md(None, status(later, true));
+        assert!(text.contains("no operation has reported"), "{text}");
+        assert!(!text.contains("before it"), "{text}");
+        // Finished and reported: no caveat.
+        let text = md(Some(&view), status(view.operation, false));
+        assert!(!text.contains("had not finished"), "{text}");
     }
 
     #[test]
