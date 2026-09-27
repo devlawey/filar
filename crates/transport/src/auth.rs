@@ -100,24 +100,22 @@ pub(crate) async fn authenticate<H: client::Handler>(
 // Agent
 // ---------------------------------------------------------------------------
 
-/// Where to reach the SSH agent on this platform.
+/// Where the user pointed filar at the SSH agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AgentEndpoint {
-    /// Unix-domain socket (Unix), or a named pipe (Windows).
-    Path(String),
-    /// No agent configured: `SSH_AUTH_SOCK` unset on Unix.
+    /// `SSH_AUTH_SOCK` names it: a Unix-domain socket, or a named pipe on
+    /// Windows (OpenSSH for Windows honours the variable too). Only this
+    /// endpoint is used — no fallback to another agent.
+    Configured(String),
+    /// `SSH_AUTH_SOCK` is unset. Unix: no agent. Windows: the OpenSSH
+    /// agent's standard pipe, then Pageant.
     Unset,
 }
 
 /// Pick the agent endpoint from the value of `SSH_AUTH_SOCK`.
-///
-/// Unix: the socket named by the variable, or [`AgentEndpoint::Unset`].
-/// Windows: the variable if set (OpenSSH for Windows honours it too), else
-/// the OpenSSH agent's standard named pipe.
 fn agent_endpoint(auth_sock: Option<String>) -> AgentEndpoint {
     match auth_sock.filter(|s| !s.trim().is_empty()) {
-        Some(path) => AgentEndpoint::Path(path),
-        None if cfg!(windows) => AgentEndpoint::Path(WINDOWS_OPENSSH_AGENT_PIPE.to_string()),
+        Some(path) => AgentEndpoint::Configured(path),
         None => AgentEndpoint::Unset,
     }
 }
@@ -135,7 +133,7 @@ async fn connect_agent() -> Result<DynAgent> {
 #[cfg(unix)]
 async fn connect_agent_at(endpoint: AgentEndpoint) -> Result<DynAgent> {
     let path = match endpoint {
-        AgentEndpoint::Path(p) => p,
+        AgentEndpoint::Configured(p) => p,
         AgentEndpoint::Unset => return Err(agent_unavailable("SSH_AUTH_SOCK is not set")),
     };
     let agent = AgentClient::connect_uds(&path)
@@ -147,15 +145,20 @@ async fn connect_agent_at(endpoint: AgentEndpoint) -> Result<DynAgent> {
 
 #[cfg(windows)]
 async fn connect_agent_at(endpoint: AgentEndpoint) -> Result<DynAgent> {
-    let pipe = match endpoint {
-        AgentEndpoint::Path(p) => p,
-        AgentEndpoint::Unset => WINDOWS_OPENSSH_AGENT_PIPE.to_string(),
+    let (pipe, configured) = match endpoint {
+        AgentEndpoint::Configured(p) => (p, true),
+        AgentEndpoint::Unset => (WINDOWS_OPENSSH_AGENT_PIPE.to_string(), false),
     };
     match AgentClient::connect_named_pipe(&pipe).await {
         Ok(agent) => {
             debug!(pipe = %pipe, "connected to OpenSSH agent");
             Ok(agent.dynamic())
         }
+        // An agent the user named explicitly fails closed: switching to
+        // another agent would sign with a different set of keys.
+        Err(pipe_err) if configured => Err(agent_unavailable(&format!(
+            "cannot open agent pipe {pipe} from SSH_AUTH_SOCK ({pipe_err})"
+        ))),
         Err(pipe_err) => {
             // Fall back to PuTTY's Pageant, the other common Windows agent.
             match AgentClient::connect_pageant().await {
@@ -274,22 +277,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_set_auth_sock_is_the_agent_endpoint() {
+    fn a_set_auth_sock_is_the_configured_endpoint() {
         assert_eq!(
             agent_endpoint(Some("/tmp/ssh-X/agent.1".into())),
-            AgentEndpoint::Path("/tmp/ssh-X/agent.1".into())
+            AgentEndpoint::Configured("/tmp/ssh-X/agent.1".into())
         );
     }
 
     #[test]
-    fn an_unset_or_blank_auth_sock_falls_back_per_platform() {
-        let expected = if cfg!(windows) {
-            AgentEndpoint::Path(WINDOWS_OPENSSH_AGENT_PIPE.into())
-        } else {
-            AgentEndpoint::Unset
-        };
-        assert_eq!(agent_endpoint(None), expected);
-        assert_eq!(agent_endpoint(Some("  ".into())), expected);
+    fn an_unset_or_blank_auth_sock_is_unset() {
+        assert_eq!(agent_endpoint(None), AgentEndpoint::Unset);
+        assert_eq!(agent_endpoint(Some("  ".into())), AgentEndpoint::Unset);
     }
 
     #[test]
@@ -315,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_socket_is_an_agent_unavailable_error_with_a_hint() {
         let path = std::env::temp_dir().join(format!("filar-no-agent-{}", uuid::Uuid::new_v4()));
-        let err = connect_agent_at(AgentEndpoint::Path(path.display().to_string()))
+        let err = connect_agent_at(AgentEndpoint::Configured(path.display().to_string()))
             .await
             .err()
             .expect("error");
@@ -349,7 +347,7 @@ mod tests {
             conn.write_all(&[0, 0, 0, 5, 12, 0, 0, 0, 0]).await.expect("write");
         });
 
-        let mut agent = connect_agent_at(AgentEndpoint::Path(sock.display().to_string()))
+        let mut agent = connect_agent_at(AgentEndpoint::Configured(sock.display().to_string()))
             .await
             .expect("connect to fake agent");
         let err = agent_identities(&mut agent).await.expect_err("error");

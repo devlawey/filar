@@ -407,12 +407,16 @@ line discipline, которая превращает Ctrl-C в `SIGINT`, поэ�
 | Платформа | Куда подключается | Если не вышло |
 |---|---|---|
 | Linux / macOS | Unix-сокет из `SSH_AUTH_SOCK` | `SSH agent unavailable: SSH_AUTH_SOCK is not set` / `cannot open agent socket …` с подсказкой `eval "$(ssh-agent)" && ssh-add` |
-| Windows | named pipe из `SSH_AUTH_SOCK`, иначе `\\.\pipe\openssh-ssh-agent` (служба «OpenSSH Authentication Agent»); при неудаче — Pageant | ошибка называет pipe и просит включить службу и выполнить `ssh-add` |
+| Windows | named pipe из `SSH_AUTH_SOCK` — только он, без отката (другой агент подписал бы другим набором ключей); если переменная не задана — `\\.\pipe\openssh-ssh-agent` (служба «OpenSSH Authentication Agent»), при неудаче — Pageant | ошибка называет pipe и просит включить службу и выполнить `ssh-add` |
 
 - На macOS `SSH_AUTH_SOCK` задаёт launchd, но у приложения, запущенного не
   из терминала (Finder/Dock), его может не быть в окружении — тогда агент
   «недоступен», хотя в терминале `ssh-add -l` работает.
 - Pageant — запасной путь на Windows; вживую он не проверялся.
+- Как и OpenSSH-клиент по умолчанию, filar предлагает хосту **все** ключи
+  агента: сервер, отклонивший их, узнаёт их публичные части (не приватные).
+  Чтобы хост видел один ключ — `type = "key"` или отдельный агент с нужным
+  ключом в `SSH_AUTH_SOCK`.
 - Ключи перебираются по очереди. Сервер с маленьким `MaxAuthTries`
   (по умолчанию 6) может оборвать вход, если в агенте много ключей раньше
   нужного — как и у OpenSSH-клиента.
