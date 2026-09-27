@@ -280,6 +280,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Changed
 
+- `Ctrl+S` no longer generates a runbook unconditionally: the save overlay
+  asks "Runbook: create one? [y/n]" (`н`/`т` on the Russian layout); the
+  `.md` is written at once, `n`/Esc saves only the session without a model
+  call. No question when `save_runbook = false`, the session has no executed
+  commands, or a runbook is already generating
+  ([#481](https://github.com/devlawey/filar/issues/481)).
+
 - `AgentEvent::CommandFinished` with `denied: true` may carry a short reason in
   `output` when the command was stopped without the user's answer (timed-out
   confirmation, the fleet gate refusing a write); the TUI shows it as
