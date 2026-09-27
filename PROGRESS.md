@@ -9722,3 +9722,40 @@ engine-v2.0.0». SMOKE: блок «Флот (2.0.0)».
 
 **Next:** веха 2.0.0 по флоту закрыта; SMOKE-прогон и релиз — за человеком.
 
+## #479 — вход через SSH-агент (`SshAuth::Agent`)
+
+**Что сделано.** Новый внутренний модуль `crates/transport/src/auth.rs`:
+единая `authenticate()` для `SshSession` и `SshInteractive` (дубли веток в
+`ssh.rs`/`interactive.rs` убраны). `SshAuth::Agent` — через
+`russh::keys::agent::client::AgentClient`: ключи агента перебираются по
+очереди (`authenticate_publickey_with`), RSA — с согласованным SHA-2.
+Unix — сокет из `SSH_AUTH_SOCK`; Windows — pipe из `SSH_AUTH_SOCK` или
+`\\.\pipe\openssh-ssh-agent`, затем Pageant. Ошибки: «agent unavailable» (с
+подсказкой `eval "$(ssh-agent)" && ssh-add`), «no keys» (`ssh-add`), «accepted
+none of N key(s)». Флот: `MissingCredentials::AgentUnsupported` удалён, хосты
+с агентом участвуют; каждое подключение открывает свою сессию с агентом, так
+что параллельный fan-out не делит одно соединение.
+
+**Решения.** Сертификаты из агента предлагаются как обычные публичные ключи.
+Приватный ключ filar не видит — только запросы подписи. Отказ агента
+подписать (не подтверждённый `ssh-add -c`, аппаратный ключ) завершает вход
+понятной ошибкой с отпечатком ключа: russh на этой сессии всё ещё ждёт
+подпись, поэтому следующий ключ на ней не предложить (ревью CodeRabbit).
+Перебор оставшихся ключей через новое соединение не делали — редкий случай,
+а цена — переделка connect-пути обоих транспортов.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. Публичный enum
+`filar_agent::fleet_creds::MissingCredentials` потерял вариант
+`AgentUnsupported`.
+
+**Проверено вживую** (локальный OpenSSH `sshd` в контейнере агента, не
+docker-sshd): `#[ignore]` `ssh_agent_login_runs_a_command` — неверный ключ
+отклонён, зашифрованный ed25519 из агента принят; RSA через агент; все три
+ошибки. Бинарник: `./filar --target <host>` с `type = "agent"` подключается,
+`!echo` выполняется на хосте; без `SSH_AUTH_SOCK` — ошибка с подсказкой.
+
+**Не проверено.** Windows (OpenSSH-агент, Pageant) — только компиляция;
+macOS; живой флот с агент-хостами.
+
+**Next:** #480 — ключи с парольной фразой для `SshAuth::Key`.
+

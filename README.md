@@ -482,6 +482,13 @@ From the TUI:
   existing connections. Each tab can be connected to a different host, or stay local.
 - When using `[[ssh_targets]]`, SSH passwords are stored in the OS credential store 
   (never in `config.toml`). For key-based auth and SSH agent, no password is needed.
+- Login methods (`[ssh_targets.auth]`, default `agent`):
+
+  | `type` | How it logs in |
+  |---|---|
+  | `agent` | Keys of the running SSH agent, offered in turn until the server accepts one; the private key never leaves the agent. Unix: `eval "$(ssh-agent)" && ssh-add` (`SSH_AUTH_SOCK`). Windows: the OpenSSH Authentication Agent service (`\\.\pipe\openssh-ssh-agent`) or Pageant. Also the way to use a passphrase-protected key |
+  | `key` | An unencrypted key file at `path` (default `~/.ssh/id_ed25519`) |
+  | `password` | Password from the config, the OS credential store, or `SSH_PASSWORD` |
 - SSH profiles configured in the **GUI launcher** are automatically synced to 
   `[[ssh_targets]]` in `config.toml` on every Launch. You can also add targets 
   manually:

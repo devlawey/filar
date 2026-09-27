@@ -13,6 +13,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- SSH agent login (`type = "agent"`, the default): keys of the running agent
+  are offered in turn until the server accepts one — `SSH_AUTH_SOCK` on
+  Unix, the OpenSSH agent pipe or Pageant on Windows — with clear errors for
+  a missing agent, an empty agent and rejected keys; fleets now include agent
+  hosts ([#479](https://github.com/devlawey/filar/issues/479)).
+
 - Fleet mode documentation: README feature entry, a "why no writes" overview
   in USER_GUIDE §4.8, the engine contracts in `docs/ENGINE_API.md` (no trait
   changed; `ReadOnlyExecutor` and `FleetExecutor` implement `CommandExecutor`)

@@ -8,6 +8,7 @@
 //! - [`LocalExecutor`] — local PTY implementation using `portable-pty` (Stage 3).
 //!   Only available with the `local` feature (enabled by default).
 
+mod auth;
 pub mod cwd;
 pub mod error;
 pub mod interactive;
