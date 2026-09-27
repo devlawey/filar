@@ -25,6 +25,8 @@ const H_MARGIN: u16 = 6;
 /// What the runbook bar of the save overlay shows (#409).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunbookBar {
+    /// Ctrl+S asks whether to make one at all (#481); the export goes on.
+    Asking,
     /// Armed by Ctrl+S; the `.md` is still being written, so the runbook has
     /// not started — and never will if the export fails.
     Waiting,
@@ -44,6 +46,7 @@ impl RunbookBar {
     /// Caption following the `Runbook:` label.
     fn caption(self) -> &'static str {
         match self {
+            Self::Asking => "create one? [y/n]",
             Self::Waiting => "waiting for export",
             Self::Generating => "generating...",
             Self::Saved => "saved",
@@ -75,6 +78,9 @@ fn runbook_bar(app: &App) -> Option<RunbookBar> {
             RunbookState::Cancelled => RunbookBar::Cancelled,
             RunbookState::Failed => RunbookBar::Failed,
         });
+    }
+    if app.runbook_offer.is_some() {
+        return Some(RunbookBar::Asking);
     }
     app.runbook_armed.is_some().then_some(RunbookBar::Waiting)
 }
@@ -147,7 +153,7 @@ pub(crate) fn render_save_overlay(f: &mut Frame, app: &App, area: Rect) {
     let mut status_dy = 3;
     if let Some(bar) = bar {
         let caption_style = match bar {
-            RunbookBar::Generating => app.theme.warning_fg(),
+            RunbookBar::Generating | RunbookBar::Asking => app.theme.warning_fg(),
             RunbookBar::Saved => app.theme.success_fg(),
             RunbookBar::Failed => app.theme.danger_fg(),
             RunbookBar::Waiting | RunbookBar::Skipped | RunbookBar::Cancelled => app.theme.muted(),
@@ -186,9 +192,19 @@ pub(crate) fn render_save_overlay(f: &mut Frame, app: &App, area: Rect) {
     // Last row inside border: footer hint.
     if let Some(row) = row_area(inner, inner.height.saturating_sub(1)) {
         f.render_widget(
-            Paragraph::new(Span::styled(" Esc to close ", app.theme.muted())),
+            Paragraph::new(Span::styled(footer_hint(bar), app.theme.muted())),
             row,
         );
+    }
+}
+
+/// Footer of the overlay: the answers while the runbook question is open
+/// (#481), else how to close it.
+fn footer_hint(bar: Option<RunbookBar>) -> &'static str {
+    if bar == Some(RunbookBar::Asking) {
+        " y runbook · n session only · Esc "
+    } else {
+        " Esc to close "
     }
 }
 
@@ -222,7 +238,11 @@ fn draw_runbook_bar(f: &mut Frame, area: Rect, bar: RunbookBar, app: &App) {
     let filled = match bar {
         RunbookBar::Generating => indeterminate_window(width, app.tick),
         RunbookBar::Saved => 0..width,
-        RunbookBar::Waiting | RunbookBar::Skipped | RunbookBar::Cancelled | RunbookBar::Failed => {
+        RunbookBar::Asking
+        | RunbookBar::Waiting
+        | RunbookBar::Skipped
+        | RunbookBar::Cancelled
+        | RunbookBar::Failed => {
             0..0
         }
     };
@@ -231,7 +251,7 @@ fn draw_runbook_bar(f: &mut Frame, area: Rect, bar: RunbookBar, app: &App) {
         RunbookBar::Saved => (app.theme.success_fg(), app.theme.dim()),
         // A failure tints the whole bar red; the others stay calm grey.
         RunbookBar::Failed => (app.theme.danger_fg(), app.theme.danger_fg()),
-        RunbookBar::Waiting | RunbookBar::Skipped | RunbookBar::Cancelled => {
+        RunbookBar::Asking | RunbookBar::Waiting | RunbookBar::Skipped | RunbookBar::Cancelled => {
             (app.theme.dim(), app.theme.dim())
         }
     };
@@ -299,6 +319,17 @@ mod tests {
             profile: "p".into(),
             fleet: None,
         });
+    }
+
+    #[test]
+    fn the_runbook_question_shows_its_answers() {
+        let mut app = app_with_overlay(100);
+        arm_runbook(&mut app);
+        app.runbook_offer = app.runbook_armed.take();
+        let text = render_save_text(&app);
+        assert!(text.contains("Runbook: create one? [y/n]"), "{text}");
+        assert!(text.contains("y runbook · n session only"), "{text}");
+        assert!(!text.contains("Esc to close"), "{text}");
     }
 
     #[test]
