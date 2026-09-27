@@ -674,16 +674,22 @@ fn osc_end_skip(buf: &[u8], end: usize) -> usize {
 fn parse_osc7_payload(payload: &str) -> Option<String> {
     let uri = payload.trim();
     let rest = uri.strip_prefix("file://")?;
-    let path = if let Some(stripped) = rest.strip_prefix("//") {
+    let (host, path) = if let Some(stripped) = rest.strip_prefix("//") {
         // file:////path (unusual) — treat as path
-        format!("/{stripped}")
+        ("", format!("/{stripped}"))
     } else if rest.starts_with('/') {
-        rest.to_string()
+        ("", rest.to_string())
     } else {
         let slash = rest.find('/')?;
-        rest[slash..].to_string()
+        (&rest[..slash], rest[slash..].to_string())
     };
-    let decoded = percent_decode(&path);
+    // filar's own hooks send the raw path (#482): decoding it would turn a
+    // literal `%20` in a directory name into a space.
+    let decoded = if host == filar_transport::OSC7_RAW_HOST {
+        path
+    } else {
+        percent_decode(&path)
+    };
     let chars: Vec<char> = decoded.chars().collect();
     if chars.len() >= 3 && chars[0] == '/' && chars[1].is_ascii_alphabetic() && chars[2] == ':' {
         return Some(decoded.chars().skip(1).collect());
@@ -763,6 +769,44 @@ mod tests {
             parse_osc7_payload("file://localhost/C:/Users/me"),
             Some("C:/Users/me".into())
         );
+    }
+
+    /// What cmd.exe prints with the #482 `PROMPT`: OSC 7 with `$P` as is —
+    /// backslashes, spaces, Cyrillic, not percent-encoded — then the prompt.
+    #[test]
+    fn osc7_from_the_cmd_prompt_gives_the_windows_path() {
+        let mut model = TerminalModel::new(80, 24);
+        model.feed(
+            "\x1b]7;file://filar-raw/C:\\Users\\Иван\\My Dir\x1b\\C:\\Users\\Иван\\My Dir>"
+                .as_bytes(),
+        );
+        assert_eq!(model.take_osc7_cwd().as_deref(), Some(r"C:\Users\Иван\My Dir"));
+    }
+
+    #[test]
+    fn osc7_from_the_powershell_prompt_gives_the_windows_path() {
+        let mut model = TerminalModel::new(80, 24);
+        model.feed("\x1b]7;file://filar-raw/D:\\Проект 1\x1b\\PS D:\\Проект 1> ".as_bytes());
+        assert_eq!(model.take_osc7_cwd().as_deref(), Some(r"D:\Проект 1"));
+    }
+
+    #[test]
+    fn osc7_drive_root() {
+        assert_eq!(parse_osc7_payload(r"file://localhost/C:\"), Some(r"C:\".into()));
+    }
+
+    #[test]
+    fn osc7_from_filar_hooks_is_not_percent_decoded() {
+        assert_eq!(
+            parse_osc7_payload(r"file://filar-raw/C:\build%20final"),
+            Some(r"C:\build%20final".into())
+        );
+        assert_eq!(
+            parse_osc7_payload("file://filar-raw/srv/100%25 done"),
+            Some("/srv/100%25 done".into())
+        );
+        // A shell's own OSC 7 is still decoded.
+        assert_eq!(parse_osc7_payload("file://host/srv/my%20dir"), Some("/srv/my dir".into()));
     }
 
     #[test]

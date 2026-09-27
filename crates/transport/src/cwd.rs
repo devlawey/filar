@@ -6,12 +6,71 @@
 /// Maximum length of a cwd we will accept from OSC 7, `$PWD`, or `set_cwd`.
 pub const MAX_CWD_LEN: usize = 1024;
 
+/// Host of the OSC 7 URIs filar's own hooks emit: the path after it is the
+/// raw directory, **not** percent-encoded, so the reader must not decode it —
+/// a directory literally named `build%20final` stays that (#482 review).
+/// Shells' own OSC 7 (`localhost` or a hostname) is decoded as usual.
+pub const OSC7_RAW_HOST: &str = "filar-raw";
+
 /// Bytes written to a POSIX interactive shell to emit OSC 7 for the current pwd.
 ///
 /// No files are created. The PTY is typically closed immediately after, so the
-/// command does not stay in the user's session.
+/// command does not stay in the user's session. The path is raw, hence
+/// [`OSC7_RAW_HOST`].
 pub const OSC7_PWD_PROBE: &[u8] =
-    b"printf '\\033]7;file://localhost%s\\007' \"$(pwd)\"\n";
+    b"printf '\\033]7;file://filar-raw%s\\007' \"$(pwd)\"\n";
+
+/// How an interactive shell can tell its working directory (#482).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellFlavor {
+    /// sh, bash, zsh, …: probed on demand with [`OSC7_PWD_PROBE`].
+    Posix,
+    /// Windows `cmd.exe`: reports OSC 7 from its prompt ([`cmd_osc7_prompt`]).
+    Cmd,
+    /// Windows PowerShell 5.1 or PowerShell 7: reports OSC 7 from its prompt
+    /// function ([`POWERSHELL_OSC7_PROMPT`]).
+    PowerShell,
+}
+
+/// The flavor of the shell started as `program` — by its file name,
+/// case-insensitive, with or without `.exe`, never by the client's OS.
+pub fn shell_flavor(program: &str) -> ShellFlavor {
+    let name = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    match name {
+        "cmd" => ShellFlavor::Cmd,
+        "powershell" | "pwsh" => ShellFlavor::PowerShell,
+        _ => ShellFlavor::Posix,
+    }
+}
+
+/// `PROMPT` for `cmd.exe` that emits OSC 7 with the current directory before
+/// the visible prompt (`existing`, else cmd's default `$P$G`).
+///
+/// `$E` is ESC and `$P` the current drive and path, so every prompt reports
+/// `file://filar-raw/C:\dir` without typing anything into the session — no
+/// probe to see, nothing written to disk. The payload is not
+/// percent-encoded: spaces and non-ASCII arrive as they are, which the OSC 7
+/// reader accepts.
+pub fn cmd_osc7_prompt(existing: Option<&str>) -> String {
+    let visible = existing.map(str::trim).filter(|p| !p.is_empty()).unwrap_or("$P$G");
+    format!("$E]7;file://{OSC7_RAW_HOST}/$P$E\\{visible}")
+}
+
+/// `-Command` for PowerShell (5.1 and 7) defining a prompt that emits OSC 7
+/// with the current filesystem path, then shows `PS <path>> `.
+///
+/// `[char]27` rather than `` `e ``, which 5.1 does not know. A Unix path's
+/// leading `/` is trimmed so the URI does not read `localhost//home`. It replaces a
+/// prompt the user's profile defined — the profile runs first.
+pub const POWERSHELL_OSC7_PROMPT: &str = "function global:prompt { \
+$p = $ExecutionContext.SessionState.Path.CurrentLocation.ProviderPath; \
+[Console]::Write([char]27 + ']7;file://filar-raw/' + $p.TrimStart('/') + [char]27 + '\\'); \
+'PS ' + $p + '> ' }";
 
 /// Reject empty, oversized, or newline/NUL-containing paths.
 pub fn is_safe_cwd(path: &str) -> bool {
@@ -57,6 +116,42 @@ pub fn posix_cd_command(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shell_flavor_comes_from_the_program_name() {
+        assert_eq!(shell_flavor("cmd.exe"), ShellFlavor::Cmd);
+        assert_eq!(shell_flavor(r"C:\Windows\System32\CMD.EXE"), ShellFlavor::Cmd);
+        assert_eq!(shell_flavor("powershell.exe"), ShellFlavor::PowerShell);
+        assert_eq!(shell_flavor(r"C:\Program Files\PowerShell\7\pwsh.exe"), ShellFlavor::PowerShell);
+        assert_eq!(shell_flavor("/usr/bin/pwsh"), ShellFlavor::PowerShell);
+        assert_eq!(shell_flavor("/bin/bash"), ShellFlavor::Posix);
+        assert_eq!(shell_flavor("sh"), ShellFlavor::Posix);
+    }
+
+    #[test]
+    fn the_cmd_prompt_reports_osc7_and_keeps_the_users_prompt() {
+        assert_eq!(cmd_osc7_prompt(None), "$E]7;file://filar-raw/$P$E\\$P$G");
+        assert_eq!(cmd_osc7_prompt(Some("  ")), "$E]7;file://filar-raw/$P$E\\$P$G");
+        assert_eq!(
+            cmd_osc7_prompt(Some("[$T] $P$G")),
+            "$E]7;file://filar-raw/$P$E\\[$T] $P$G"
+        );
+    }
+
+    #[test]
+    fn the_hooks_mark_their_raw_paths() {
+        assert!(std::str::from_utf8(OSC7_PWD_PROBE).unwrap().contains("file://filar-raw%s"));
+        assert!(cmd_osc7_prompt(None).contains("file://filar-raw/$P"));
+        assert!(POWERSHELL_OSC7_PROMPT.contains("file://filar-raw/"));
+    }
+
+    #[test]
+    fn the_powershell_prompt_is_one_line_and_5_1_compatible() {
+        assert!(!POWERSHELL_OSC7_PROMPT.contains('\n'));
+        assert!(POWERSHELL_OSC7_PROMPT.contains("[char]27"));
+        assert!(!POWERSHELL_OSC7_PROMPT.contains("`e"), "PowerShell 5.1 has no `e");
+        assert!(POWERSHELL_OSC7_PROMPT.contains("ProviderPath"));
+    }
 
     #[test]
     fn rejects_empty_and_control() {

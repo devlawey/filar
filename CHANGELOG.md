@@ -302,6 +302,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- Windows, local: the directory changed in the terminal mode (`Ctrl+T`) now
+  reaches the agent mode, `!` commands and the status bar — `cmd.exe` and
+  PowerShell report it as OSC 7 from their prompt, and the `pwd` probe is
+  chosen by the PTY shell, not the client OS
+  ([#482](https://github.com/devlawey/filar/issues/482)).
+
 - Cancelling an SSH command (`Ctrl+Z`, or a command timeout) now actually
   stops it on the host: the shell runs without a PTY, so the Ctrl-C byte it
   used to send interrupted nothing and was glued to the front of the next

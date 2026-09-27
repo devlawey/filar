@@ -52,6 +52,14 @@ pub trait InteractiveTerminal: Send + Sync {
 
     /// Close the terminal session.
     async fn close(&self) -> Result<()>;
+
+    /// Whether the shell reports its working directory by itself, as OSC 7
+    /// from every prompt (#482). Such a shell is not sent the POSIX `pwd`
+    /// probe — cmd.exe and PowerShell could not run it anyway. Defaults to
+    /// `false`: probe.
+    fn reports_cwd_itself(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +82,8 @@ pub struct LocalInteractive {
     /// Child process handle (kept alive).
     #[allow(dead_code)]
     child: Arc<std::sync::Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+    /// The shell reports its cwd from its prompt (cmd.exe, PowerShell).
+    reports_cwd: bool,
 }
 
 /// Resolve the default local interactive shell when none is passed explicitly.
@@ -154,6 +164,19 @@ impl LocalInteractive {
         let shell_prog = shell.unwrap_or(default_shell.as_str());
 
         let mut cmd = CommandBuilder::new(shell_prog);
+        // Windows shells have no `pwd` probe: they report their directory
+        // themselves, from the prompt, as OSC 7 (#482).
+        let flavor = crate::shell_flavor(shell_prog);
+        match flavor {
+            crate::ShellFlavor::Cmd => {
+                let existing = std::env::var("PROMPT").ok();
+                cmd.env("PROMPT", crate::cmd_osc7_prompt(existing.as_deref()));
+            }
+            crate::ShellFlavor::PowerShell => {
+                cmd.args(["-NoLogo", "-NoExit", "-Command", crate::POWERSHELL_OSC7_PROMPT]);
+            }
+            crate::ShellFlavor::Posix => {}
+        }
         let dir = cwd
             .map(str::trim)
             .filter(|p| crate::is_safe_cwd(p))
@@ -207,6 +230,7 @@ impl LocalInteractive {
             writer: Arc::new(std::sync::Mutex::new(writer)),
             master: Arc::new(std::sync::Mutex::new(pair.master)),
             child: Arc::new(std::sync::Mutex::new(child)),
+            reports_cwd: flavor != crate::ShellFlavor::Posix,
         })
     }
 }
@@ -251,6 +275,10 @@ impl InteractiveTerminal for LocalInteractive {
         let _ = child.kill();
         let _ = child.wait();
         Ok(())
+    }
+
+    fn reports_cwd_itself(&self) -> bool {
+        self.reports_cwd
     }
 }
 
@@ -470,5 +498,62 @@ mod tests {
         assert!(output.windows(5).any(|w| w == b"hello"));
 
         term.close().await.unwrap();
+    }
+
+    /// Integration test (#482): a PowerShell PTY reports its directory as
+    /// OSC 7 from the prompt — spaces and Cyrillic included — and again
+    /// after a `Set-Location`, with nothing typed but that command.
+    #[cfg(all(unix, feature = "local"))]
+    #[tokio::test]
+    #[ignore = "requires PowerShell: set FILAR_TEST_PWSH to the pwsh binary"]
+    async fn powershell_reports_its_cwd_as_osc7() {
+        let pwsh = std::env::var("FILAR_TEST_PWSH").expect("set FILAR_TEST_PWSH");
+        let dir = std::env::temp_dir().join(format!("filar pwsh Проверка {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let osc7 = |p: &std::path::Path| {
+            format!(
+                "\x1b]7;file://filar-raw/{}\x1b\\",
+                p.to_string_lossy().trim_start_matches('/')
+            )
+        };
+        let in_dir = osc7(&dir);
+        let in_parent = osc7(dir.parent().unwrap());
+
+        let term = LocalInteractive::with_shell_size_and_cwd(
+            Some(&pwsh),
+            200,
+            30,
+            Some(&dir.to_string_lossy()),
+        )
+        .await
+        .unwrap();
+        // A stand-in for the terminal: PSReadLine asks for the cursor
+        // position (DSR) and waits for the answer.
+        let mut output = Vec::new();
+        let mut typed = false;
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Ok(Some(chunk)) = term.read_output().await {
+                let dsr = chunk.windows(4).filter(|w| w == b"\x1b[6n").count();
+                for _ in 0..dsr {
+                    term.write_input(b"\x1b[1;1R").await.unwrap();
+                }
+                output.extend_from_slice(&chunk);
+                let text = String::from_utf8_lossy(&output).into_owned();
+                if !typed && text.contains(&in_dir) {
+                    typed = true;
+                    term.write_input(b"Set-Location ..\r").await.unwrap();
+                }
+                if typed && text.contains(&in_parent) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        let _ = term.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(seen, "OSC 7 missing: {:?}", String::from_utf8_lossy(&output));
     }
 }
