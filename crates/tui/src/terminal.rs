@@ -765,6 +765,30 @@ mod tests {
         );
     }
 
+    /// What cmd.exe prints with the #482 `PROMPT`: OSC 7 with `$P` as is —
+    /// backslashes, spaces, Cyrillic, not percent-encoded — then the prompt.
+    #[test]
+    fn osc7_from_the_cmd_prompt_gives_the_windows_path() {
+        let mut model = TerminalModel::new(80, 24);
+        model.feed(
+            "\x1b]7;file://localhost/C:\\Users\\Иван\\My Dir\x1b\\C:\\Users\\Иван\\My Dir>"
+                .as_bytes(),
+        );
+        assert_eq!(model.take_osc7_cwd().as_deref(), Some(r"C:\Users\Иван\My Dir"));
+    }
+
+    #[test]
+    fn osc7_from_the_powershell_prompt_gives_the_windows_path() {
+        let mut model = TerminalModel::new(80, 24);
+        model.feed("\x1b]7;file://localhost/D:\\Проект 1\x1b\\PS D:\\Проект 1> ".as_bytes());
+        assert_eq!(model.take_osc7_cwd().as_deref(), Some(r"D:\Проект 1"));
+    }
+
+    #[test]
+    fn osc7_drive_root() {
+        assert_eq!(parse_osc7_payload(r"file://localhost/C:\"), Some(r"C:\".into()));
+    }
+
     #[test]
     fn terminal_model_feed_text() {
         let mut model = TerminalModel::new(80, 24);

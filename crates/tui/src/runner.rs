@@ -122,11 +122,28 @@ async fn drain_pty_cwd(
     }
 }
 
+/// Route the PTY output already queued, without waiting — the prompt of a
+/// self-reporting shell (#482) may still sit in the channel.
+fn drain_queued_pty(
+    app: &mut App,
+    term_rx: &mut Option<mpsc::UnboundedReceiver<(SessionId, TermChunk)>>,
+) {
+    let Some(rx) = term_rx.as_mut() else {
+        return;
+    };
+    while let Ok((chunk_sid, chunk)) = rx.try_recv() {
+        let _ = route_term_chunk(app, chunk_sid, chunk);
+    }
+}
+
 /// Probe OSC 7 on a live interactive PTY, update `session.cwd`, and `set_cwd`
 /// on the agent executor. Does not close the backend (#338).
 ///
-/// Always probes on Unix/SSH so a stale `session.cwd` from enter-time does not
-/// skip refresh. Restores the previous cwd if the probe times out.
+/// A POSIX shell (local or over SSH) is always probed, so a stale
+/// `session.cwd` from enter-time does not skip refresh; the previous cwd is
+/// restored if the probe times out. A shell that reports OSC 7 from its
+/// prompt (cmd.exe, PowerShell — #482) is not probed: its queued output is
+/// routed and the latest reported directory is used.
 async fn sync_cwd_from_interactive(
     app: &mut App,
     sid: SessionId,
@@ -134,16 +151,18 @@ async fn sync_cwd_from_interactive(
     executors: &HashMap<SessionId, ExecutorEntry>,
     term_rx: &mut Option<mpsc::UnboundedReceiver<(SessionId, TermChunk)>>,
 ) {
-    let is_ssh = match executors.get(&sid) {
-        Some(e) => e.ssh_target.read().await.is_some(),
-        None => false,
-    };
     let prev = app
         .sessions
         .iter()
         .find(|s| s.id == sid)
         .and_then(|s| s.cwd.clone());
-    if is_ssh || cfg!(unix) {
+    // The probe goes by the shell, not the client's OS (#482): a POSIX shell
+    // — local or over SSH — is asked with `printf`; cmd.exe and PowerShell
+    // report OSC 7 from every prompt, so their queued output already holds
+    // the latest directory.
+    if term.reports_cwd_itself() {
+        drain_queued_pty(app, term_rx);
+    } else {
         if let Some(idx) = app.find_session_idx(sid) {
             app.sessions[idx].cwd = None;
         }
@@ -2992,6 +3011,82 @@ mod tests {
         );
         assert!(matches!(outcome, RouteOutcome::Fed));
         assert_eq!(app.sessions[0].cwd.as_deref(), Some("/opt/app"));
+    }
+
+    /// A PTY stand-in that records what is written to it (#482).
+    struct RecordingTerm {
+        reports_cwd: bool,
+        writes: std::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl InteractiveTerminal for RecordingTerm {
+        async fn read_output(&self) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn write_input(&self, data: &[u8]) -> Result<()> {
+            self.writes.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+        async fn resize(&self, _: u16, _: u16) -> Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+        fn reports_cwd_itself(&self) -> bool {
+            self.reports_cwd
+        }
+    }
+
+    fn recording(reports_cwd: bool) -> (Arc<RecordingTerm>, Arc<dyn InteractiveTerminal>) {
+        let term = Arc::new(RecordingTerm { reports_cwd, writes: Default::default() });
+        let dyn_term: Arc<dyn InteractiveTerminal> = term.clone();
+        (term, dyn_term)
+    }
+
+    #[tokio::test]
+    async fn a_self_reporting_shell_is_not_probed_and_its_prompt_gives_the_cwd() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        app.sessions[0].terminal = Some(crate::terminal::TerminalModel::new(80, 24));
+        app.sessions[0].cwd = Some(r"C:\old".into());
+        let (tx, rx) = mpsc::unbounded_channel();
+        // cmd.exe's #482 prompt after `cd`, still queued when the user hides.
+        tx.send((
+            sid,
+            TermChunk::Bytes(
+                "\x1b]7;file://localhost/C:\\Работа\\My Dir\x1b\\C:\\Работа\\My Dir>"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ))
+        .unwrap();
+        let mut term_rx = Some(rx);
+        let (rec, term) = recording(true);
+
+        sync_cwd_from_interactive(&mut app, sid, &term, &HashMap::new(), &mut term_rx).await;
+
+        assert!(rec.writes.lock().unwrap().is_empty(), "no POSIX probe for cmd/PowerShell");
+        assert_eq!(app.sessions[0].cwd.as_deref(), Some(r"C:\Работа\My Dir"));
+    }
+
+    #[tokio::test]
+    async fn a_posix_shell_is_probed() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        app.sessions[0].cwd = Some("/srv".into());
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut term_rx = Some(rx);
+        let (rec, term) = recording(false);
+
+        sync_cwd_from_interactive(&mut app, sid, &term, &HashMap::new(), &mut term_rx).await;
+
+        assert_eq!(rec.writes.lock().unwrap().as_slice(), [OSC7_PWD_PROBE.to_vec()]);
+        // No answer within the window: the last known cwd stays.
+        assert_eq!(app.sessions[0].cwd.as_deref(), Some("/srv"));
     }
 
     #[test]

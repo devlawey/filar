@@ -31,7 +31,8 @@ pub use interactive::{InteractiveTerminal, SshInteractive};
 #[cfg(feature = "local")]
 pub use local::LocalExecutor;
 pub use cwd::{
-    is_safe_cwd, posix_cd_command, posix_cd_input, posix_shell_quote, OSC7_PWD_PROBE,
+    cmd_osc7_prompt, is_safe_cwd, posix_cd_command, posix_cd_input, posix_shell_quote,
+    shell_flavor, ShellFlavor, OSC7_PWD_PROBE, POWERSHELL_OSC7_PROMPT,
 };
 pub use readonly::ReadOnlyExecutor;
 pub use secret::SecretSubstitutingExecutor;
