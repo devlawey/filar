@@ -226,13 +226,33 @@ and `logs/` all share this single app root.
 > `sh -c`, Windows PowerShell. Only the interactive PTY follows `$SHELL`
 > ([#293](https://github.com/devlawey/filar/issues/293)).
 >
-> Cwd sync (#313, #338): on Unix/macOS and on SSH (POSIX remote), **hiding**
-> interactive (`Ctrl+T`) or fully leaving it probes OSC 7 via `printf`/`pwd`
-> and applies `CommandExecutor::set_cwd`, so the status bar and agent/`!`
-> commands share the PTY directory. A stale enter-time cwd does not skip the
-> probe. Windows **local** interactive is `cmd.exe`, which typically does not
-> emit OSC 7; sync then keeps the last known tab cwd. Entering interactive
-> still spawns `cmd.exe` with `CommandBuilder::cwd`.
+> Cwd sync (#313, #338, #482): **hiding** interactive (`Ctrl+T`) or fully
+> leaving it takes the PTY directory and applies `CommandExecutor::set_cwd`,
+> so the status bar and agent/`!` commands share it. How the directory is
+> learned depends on the **PTY shell**, not on the client OS:
+>
+> | PTY shell | How the cwd is reported |
+> |---|---|
+> | POSIX (`sh`, `bash`, `zsh`; local Unix/macOS, any SSH) | on hide, a `printf` OSC 7 probe is typed into the shell; a stale enter-time cwd does not skip it |
+> | `cmd.exe` (Windows local default) | started with `PROMPT=$E]7;file://filar-raw/$P$E\<prompt>`: every prompt emits OSC 7, nothing is typed; a user `PROMPT` is kept after the OSC part |
+> | PowerShell 5.1 / 7 (`powershell.exe`, `pwsh`) | started with `-NoLogo -NoExit -Command` defining `prompt` (`[char]27`, not `` `e ``, for 5.1) that emits OSC 7 with `ProviderPath`; it replaces a prompt from the user's profile |
+>
+> filar's own OSC 7 (these prompts and the POSIX probe) uses the host
+> `filar-raw`: its path is raw and is **not** percent-decoded, so a directory
+> literally named `build%20final` survives; a shell's own OSC 7 (`localhost`,
+> a hostname) is decoded as usual. On hide, a self-reporting shell's output is
+> read until it goes quiet (80 ms, at most 500 ms), so a prompt still on its
+> way after a last-moment `cd` is not missed.
+>
+> The OSC 7 payload of cmd/PowerShell is the raw path (`C:\dir with spaces\Кириллица`),
+> not percent-encoded; the reader accepts both. Entering interactive still
+> spawns the shell with `CommandBuilder::cwd` = the tab cwd (reverse direction).
+>
+> Known limit: the TUI terminal model does not answer cursor-position
+> queries (DSR `ESC[6n`). PSReadLine in `pwsh` on **Unix** waits for them and
+> takes no input in the PTY view; on Windows, ConPTY handles the console
+> side. The PowerShell prompt itself is verified with a real `pwsh`
+> (`#[ignore]` `powershell_reports_its_cwd_as_osc7`).
 
 ## Agent local commands and controlling TTY (#329)
 
