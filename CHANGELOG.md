@@ -280,6 +280,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Changed
 
+- Path picker (`/`, `Ctrl+Shift+F`, `Ctrl+Shift+D`): `a` (`ф`) inserts the
+  highlighted folder's path — on `..`, the folder being shown — while Enter
+  opens folders in both pickers (the folder picker used to pick on Enter and
+  could not go deeper); the footer names the keys and fits the overlay
+  ([#483](https://github.com/devlawey/filar/issues/483)).
+
 - `AgentEvent::CommandFinished` with `denied: true` may carry a short reason in
   `output` when the command was stopped without the user's answer (timed-out
   confirmation, the fleet gate refusing a write); the TUI shows it as
