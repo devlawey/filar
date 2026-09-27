@@ -12,6 +12,7 @@ mod auth;
 pub mod cwd;
 pub mod error;
 pub mod interactive;
+pub mod key;
 #[cfg(feature = "local")]
 pub mod local;
 pub mod readonly;
@@ -32,6 +33,10 @@ pub use interactive::{InteractiveTerminal, SshInteractive};
 pub use local::LocalExecutor;
 pub use cwd::{
     is_safe_cwd, posix_cd_command, posix_cd_input, posix_shell_quote, OSC7_PWD_PROBE,
+};
+pub use key::{
+    fill_key_passphrase, key_passphrase_matches, key_protection, resolve_key_path, KeyPassphrase,
+    KeyProtection,
 };
 pub use readonly::ReadOnlyExecutor;
 pub use secret::SecretSubstitutingExecutor;

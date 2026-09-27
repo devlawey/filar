@@ -19,10 +19,17 @@
 //!
 //! | Auth in config | Ready when |
 //! |---|---|
-//! | `key` | always — a key that fails to load is "no contact", not "skipped" |
+//! | `key`, not encrypted | always — a key that fails to load is "no contact", not "skipped" |
+//! | `key`, encrypted | the OS credential store has `ssh_key_passphrase:<name>` (#480) |
 //! | `password` with a value | always (the config warns about plain text elsewhere) |
 //! | `password` without a value | the OS credential store has `ssh_target:<name>` |
 //! | `agent` | always — an agent that is down or holds no accepted key is "no contact" |
+//!
+//! An encrypted key is only recognised here, not decrypted — that is slow on
+//! purpose and would stall the fleet's opening for every such host; a
+//! stored passphrase that turns out wrong fails that host's login ("no
+//! contact"). The shared `SSH_KEY_PASSPHRASE` is not used, for the same
+//! reason as `SSH_PASSWORD`.
 //!
 //! A store that cannot be consulted at all (no Secret Service on a headless
 //! Linux, a locked keychain) is its own reason, not "no password": the
@@ -58,6 +65,9 @@ pub enum MissingCredentials {
     /// The store's error is not kept: nothing about a lookup reaches the
     /// transcript but the fact that it failed.
     StoreUnavailable,
+    /// Key auth with an encrypted key, and the OS credential store holds no
+    /// passphrase for this host (#480).
+    NoPassphrase,
 }
 
 impl fmt::Display for MissingCredentials {
@@ -65,6 +75,7 @@ impl fmt::Display for MissingCredentials {
         f.write_str(match self {
             Self::NoPassword => "no password in the OS credential store",
             Self::StoreUnavailable => "OS credential store unavailable",
+            Self::NoPassphrase => "encrypted SSH key, no passphrase in the OS credential store",
         })
     }
 }
@@ -136,24 +147,49 @@ impl FleetCredentials {
 
 fn resolve_one(target: &SshTarget, store: &dyn SecretProvider) -> Result<SshTarget, MissingCredentials> {
     match &target.auth {
-        // Key files and the SSH agent need nothing resolved up front: each
-        // member's connection opens its own agent session when it logs in.
-        SshAuth::Key { .. } | SshAuth::Agent => Ok(target.clone()),
+        SshAuth::Key { path, passphrase } => {
+            let key = filar_transport::resolve_key_path(path.as_deref());
+            // Unreadable → let the login fail as "no contact", like before.
+            let encrypted = matches!(
+                filar_transport::key_protection(&key),
+                Ok(filar_transport::KeyProtection::Encrypted)
+            );
+            if !encrypted || passphrase.is_some() {
+                return Ok(target.clone());
+            }
+            let passphrase = stored(store, &filar_core::ssh_key_passphrase_name(&target.name))
+                .map_err(|missing| match missing {
+                    MissingCredentials::NoPassword => MissingCredentials::NoPassphrase,
+                    other => other,
+                })?;
+            let mut ready = target.clone();
+            ready.auth = SshAuth::Key { path: path.clone(), passphrase: Some(passphrase) };
+            Ok(ready)
+        }
+        // The SSH agent needs nothing resolved up front: each member's
+        // connection opens its own agent session when it logs in.
+        SshAuth::Agent => Ok(target.clone()),
         SshAuth::Password { password: Some(_) } => Ok(target.clone()),
         SshAuth::Password { password: None } => {
-            // `Secret` is the provider's "not stored"; any other error means
-            // the store itself could not be used.
-            let password = match store.get(&target_secret_name(&target.name)) {
-                Ok(p) if !p.is_empty() => p,
-                Ok(_) | Err(CoreError::Secret(_)) => return Err(MissingCredentials::NoPassword),
-                Err(_) => return Err(MissingCredentials::StoreUnavailable),
-            };
+            let password = stored(store, &target_secret_name(&target.name))?;
             let mut ready = target.clone();
             ready.auth = SshAuth::Password {
                 password: Some(password),
             };
             Ok(ready)
         }
+    }
+}
+
+/// The secret stored under `name`: `NoPassword` when it is not there,
+/// `StoreUnavailable` when the store could not be consulted.
+fn stored(store: &dyn SecretProvider, name: &str) -> Result<String, MissingCredentials> {
+    // `Secret` is the provider's "not stored"; any other error means the
+    // store itself could not be used.
+    match store.get(name) {
+        Ok(p) if !p.is_empty() => Ok(p),
+        Ok(_) | Err(CoreError::Secret(_)) => Err(MissingCredentials::NoPassword),
+        Err(_) => Err(MissingCredentials::StoreUnavailable),
     }
 }
 
@@ -188,7 +224,7 @@ mod tests {
     #[test]
     fn a_host_without_credentials_drops_out_and_the_rest_take_part() {
         let op = fleet(&[
-            target("web-1", SshAuth::Key { path: None }),
+            target("web-1", SshAuth::Key { path: None, passphrase: None }),
             target("web-2", SshAuth::Password { password: None }),
             target("web-3", SshAuth::Agent),
             target("web-4", SshAuth::Password { password: None }),
@@ -203,6 +239,60 @@ mod tests {
         let handles: Vec<_> = op.handles().collect();
         assert_eq!(creds.missing(&op, handles[1]), Some(MissingCredentials::NoPassword));
         assert_eq!(creds.missing(&op, handles[0]), None);
+    }
+
+    /// A throwaway ed25519 key file, encrypted with `passphrase`.
+    fn encrypted_key(passphrase: &str) -> std::path::PathBuf {
+        use russh::keys::ssh_key::private::Ed25519Keypair;
+        use russh::keys::ssh_key::{Cipher, Kdf, LineEnding, PrivateKey};
+        let key = PrivateKey::from(Ed25519Keypair::from_seed(&[4u8; 32]))
+            .encrypt_with(
+                Cipher::Aes256Ctr,
+                Kdf::Bcrypt { salt: [2u8; 16].to_vec(), rounds: 1 },
+                1,
+                passphrase,
+            )
+            .expect("encrypt");
+        let pem = key.to_openssh(LineEnding::LF).expect("encode");
+        let path = std::env::temp_dir().join(format!(
+            "filar-fleet-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::write(&path, pem.as_bytes()).expect("write");
+        path
+    }
+
+    #[test]
+    fn an_encrypted_key_takes_part_only_with_its_own_stored_passphrase() {
+        let key = encrypted_key("per-host");
+        let key_auth = || SshAuth::Key { path: Some(key.clone()), passphrase: None };
+        let op = fleet(&[target("web-1", key_auth()), target("web-2", key_auth())]);
+        let store = StaticSecretProvider::new();
+        store.insert("ssh_key_passphrase:web-1", "per-host");
+        // The tab's shared variable is not a fleet credential.
+        store.insert("SSH_KEY_PASSPHRASE", "per-host");
+        let creds = FleetCredentials::resolve(&op, &store);
+
+        assert_eq!(creds.participants(&op), ["web-1"]);
+        assert_eq!(creds.skipped(&op), [("web-2", MissingCredentials::NoPassphrase)]);
+        match &creds.ready(0).expect("web-1 ready").auth {
+            SshAuth::Key { passphrase, .. } => assert_eq!(passphrase.as_deref(), Some("per-host")),
+            other => panic!("unexpected auth {other:?}"),
+        }
+        let _ = std::fs::remove_file(key);
+    }
+
+    #[test]
+    fn an_encrypted_key_with_an_unusable_store_says_so() {
+        let key = encrypted_key("x");
+        let op = fleet(&[target("web-1", SshAuth::Key { path: Some(key.clone()), passphrase: None })]);
+        let creds = FleetCredentials::resolve(&op, &BrokenStore);
+        assert_eq!(creds.skipped(&op), [("web-1", MissingCredentials::StoreUnavailable)]);
+        let _ = std::fs::remove_file(key);
     }
 
     #[test]
@@ -250,7 +340,7 @@ mod tests {
     fn an_unreachable_store_is_not_reported_as_a_missing_password() {
         let op = fleet(&[
             target("web-1", SshAuth::Password { password: None }),
-            target("web-2", SshAuth::Key { path: None }),
+            target("web-2", SshAuth::Key { path: None, passphrase: None }),
         ]);
         let creds = FleetCredentials::resolve(&op, &BrokenStore);
         assert_eq!(creds.skipped(&op), [("web-1", MissingCredentials::StoreUnavailable)]);

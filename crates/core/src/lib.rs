@@ -40,7 +40,7 @@ pub use fleet_file_check::{FileBaseline, FileProbe, FileReference};
 pub use fleet_op::{FleetMember, FleetOperation, HostHandle, HostProgress, OperationId};
 pub use os_family::{OsFamily, OS_RELEASE_COMMAND};
 pub use secrets::{
-    ssh_cred_name, ssh_target_display_name, EnvSecretProvider, KeyringSecretProvider,
+    ssh_cred_name, ssh_key_passphrase_name, ssh_target_display_name, EnvSecretProvider, KeyringSecretProvider,
     SecretProvider, StaticSecretProvider, redact, redact_secrets,
 };
 pub use session::{default_base_dir, FleetSnapshot, ProfileUsage, Session, SessionMeta, SessionStore};

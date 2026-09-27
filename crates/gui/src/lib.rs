@@ -650,7 +650,7 @@ fn build_ssh_targets_from_profiles(profiles: &[SshProfile]) -> Vec<filar_core::S
             user: profile.user.clone(),
             auth: match profile.save_password {
                 true => filar_core::SshAuth::Password { password: None },
-                false => filar_core::SshAuth::Key { path: None },
+                false => filar_core::SshAuth::Key { path: None, passphrase: None },
             },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
             tags: parse_tags(&profile.tags),

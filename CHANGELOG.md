@@ -13,6 +13,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Passphrase-protected SSH keys (`type = "key"`): the passphrase comes from
+  the OS credential store (`ssh_key_passphrase:<target>`), `SSH_KEY_PASSPHRASE`
+  or a no-echo prompt (terminal for `--target`, masked input on `Ctrl+O`), is
+  checked locally and asked again when wrong; fleets use a stored per-host
+  passphrase only. `SshAuth::Key` gains a never-serialised `passphrase`
+  ([#480](https://github.com/devlawey/filar/issues/480)).
+
 - SSH agent login (`type = "agent"`, the default): keys of the running agent
   are offered in turn until the server accepts one — `SSH_AUTH_SOCK` on
   Unix, the OpenSSH agent pipe or Pageant on Windows — with clear errors for

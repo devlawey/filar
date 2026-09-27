@@ -20,6 +20,8 @@ use filar_core::{secrets, default_base_dir, ChatBlock, Config, CoreError, Secret
 use filar_transport::{LocalExecutor, SshExecutor, SshTransportConfig};
 use filar_tui::TuiConfig;
 
+mod passphrase;
+
 // ---------------------------------------------------------------------------
 // CLI argument parsing
 // ---------------------------------------------------------------------------
@@ -408,7 +410,7 @@ async fn run() -> anyhow::Result<()> {
     // ── Determine launch parameters ──────────────────────────────────
     // When no CLI args, check for pending launch from a previous GUI
     // session, or spawn the GUI as a subprocess.
-    let (target_name, session_id, llm_config, api_key, key_env_name, ssh_target, gui_selected_profile, launch_profiles, launch_ssh_targets, launch_save_dir, launch_arbiter_profile) = if args.is_empty() {
+    let (target_name, session_id, llm_config, api_key, key_env_name, mut ssh_target, gui_selected_profile, launch_profiles, launch_ssh_targets, launch_save_dir, launch_arbiter_profile) = if args.is_empty() {
         // Check if the GUI subprocess already saved a launch config.
         let launch = filar_gui::load_pending_launch().or_else(|| {
             // Spawn GUI subprocess.
@@ -587,6 +589,17 @@ async fn run() -> anyhow::Result<()> {
     // chosen by name. The name check below only separates the local default
     // from an unknown CLI target, which still bails (#406).
     let command_timeout = Duration::from_secs(config.timeouts.command_secs);
+    // An encrypted key needs its passphrase before the TUI takes the
+    // terminal: store → SSH_KEY_PASSPHRASE → prompt without echo (#480).
+    if let Some(ref mut target) = ssh_target {
+        let keyring = filar_core::KeyringSecretProvider::new();
+        let env = filar_core::EnvSecretProvider::new();
+        passphrase::resolve_key_passphrase(
+            target,
+            &passphrase::PassphraseSources { keyring: &keyring, env: &env },
+            &mut passphrase::TerminalPrompt,
+        )?;
+    }
     let executor: Arc<dyn filar_transport::CommandExecutor> = if let Some(ref target) = ssh_target {
         info!(host = %target.host, port = target.port, user = %target.user, "connecting via SSH");
         let ssh = SshExecutor::connect_with_config(

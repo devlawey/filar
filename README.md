@@ -487,7 +487,7 @@ From the TUI:
   | `type` | How it logs in |
   |---|---|
   | `agent` | Keys of the running SSH agent, offered in turn until the server accepts one; the private key never leaves the agent. Unix: `eval "$(ssh-agent)" && ssh-add` (`SSH_AUTH_SOCK`). Windows: the OpenSSH Authentication Agent service (`\\.\pipe\openssh-ssh-agent`) or Pageant. Also the way to use a passphrase-protected key |
-  | `key` | An unencrypted key file at `path` (default `~/.ssh/id_ed25519`) |
+  | `key` | A key file at `path` (default `~/.ssh/id_ed25519`). An encrypted key's passphrase comes from the OS credential store (`ssh_key_passphrase:<target>`), `SSH_KEY_PASSPHRASE`, or a no-echo prompt (terminal for `--target`, masked input on `Ctrl+O`) |
   | `password` | Password from the config, the OS credential store, or `SSH_PASSWORD` |
 - SSH profiles configured in the **GUI launcher** are automatically synced to 
   `[[ssh_targets]]` in `config.toml` on every Launch. You can also add targets 

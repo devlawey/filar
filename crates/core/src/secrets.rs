@@ -19,6 +19,10 @@ use crate::error::{CoreError, Result};
 pub mod env_vars {
     /// API key for the GLM LLM service.
     pub const GLM_API_KEY: &str = "GLM_API_KEY";
+    /// Passphrase of an encrypted SSH key (`SshAuth::Key`), for a single
+    /// tab or `--target` launch. Never used by the fleet: a shared secret
+    /// for every host is what per-host credentials exist to avoid (#480).
+    pub const SSH_KEY_PASSPHRASE: &str = "SSH_KEY_PASSPHRASE";
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +338,15 @@ pub fn ssh_target_display_name(slot: usize, alias: &str) -> String {
 /// on reconnect (`format!("ssh_target:{}", target.name)`).
 pub fn ssh_cred_name(slot: usize, alias: &str) -> String {
     format!("ssh_target:{}", ssh_target_display_name(slot, alias))
+}
+
+/// OS credential-store username for the passphrase of a target's encrypted
+/// key (#480): `ssh_key_passphrase:{name}`, `name` being the target name.
+///
+/// Separate from [`ssh_cred_name`] so a host's password and its key
+/// passphrase never overwrite each other.
+pub fn ssh_key_passphrase_name(target_name: &str) -> String {
+    format!("ssh_key_passphrase:{target_name}")
 }
 
 // ---------------------------------------------------------------------------
@@ -715,5 +728,11 @@ mod tests {
     fn ssh_cred_name_special_chars_preserved() {
         assert_eq!(ssh_cred_name(0, "my server!"), "ssh_target:my server!");
         assert_eq!(ssh_cred_name(1, "сервер"), "ssh_target:сервер");
+    }
+
+    #[test]
+    fn key_passphrase_entry_is_separate_from_the_password_entry() {
+        assert_eq!(ssh_key_passphrase_name("prod-web"), "ssh_key_passphrase:prod-web");
+        assert_ne!(ssh_key_passphrase_name("prod-web"), ssh_cred_name(0, "prod-web"));
     }
 }

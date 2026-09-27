@@ -25,3 +25,5 @@ tokio-util = { workspace = true }
 # paused clock: a per-host deadline can then be proven to fire without a
 # test that actually waits 30 seconds (#427).
 tokio = { workspace = true, features = ["test-util"] }
+# Encrypted test keys for the fleet credential tests (#480).
+russh = { workspace = true }
