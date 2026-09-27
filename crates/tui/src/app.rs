@@ -363,6 +363,13 @@ pub struct App {
     pub runbook_enabled: bool,
     /// Runbook job armed by the save currently in flight, if any.
     pub runbook_armed: Option<RunbookArmed>,
+    /// A runbook the overlay is asking about — "create one? y/n" (#481).
+    /// Captured at Ctrl+S like an armed job; becomes `runbook_armed` on `y`,
+    /// is dropped on `n`/Esc. The `.md` is written without waiting for it.
+    pub runbook_offer: Option<RunbookArmed>,
+    /// The `.md` name, once written while [`runbook_offer`](Self::runbook_offer)
+    /// was still unanswered: a later `y` starts the runbook for that file.
+    pub runbook_offer_md: Option<String>,
     /// Status of the current/last runbook, shown in the save overlay.
     pub runbook_state: Option<RunbookState>,
     /// Cancellation token for an in-flight runbook generation (Ctrl+Z).
@@ -683,6 +690,8 @@ impl App {
             save_dir: None,
             runbook_enabled: true,
             runbook_armed: None,
+            runbook_offer: None,
+            runbook_offer_md: None,
             runbook_state: None,
             runbook_cancel: None,
             session_select_visible: false,
@@ -1131,6 +1140,9 @@ pub enum SaveProgress {
     /// itself, so the note reaches the session the job started from even
     /// after the user has moved to another tab.
     RunbookCancelled { sid: SessionId },
+    /// The user answered `y` to the runbook question after the `.md` named
+    /// here was already written (#481): start the armed job for it now.
+    RunbookRequested(String),
 }
 
 /// A runbook job armed by an explicit Ctrl+S, handed to the runner when the
@@ -1174,6 +1186,14 @@ pub enum RunbookState {
     Cancelled,
     /// The call or the write failed; the `.md` is untouched.
     Failed,
+}
+
+/// Whether a transcript holds an approved, executed command — the only
+/// thing a runbook can be folded from (#401).
+fn has_executed_commands(messages: &[ChatBlock]) -> bool {
+    messages
+        .iter()
+        .any(|b| matches!(b, ChatBlock::Command { approved: true, .. }))
 }
 
 /// Convert a Unix timestamp (seconds) to broken-down UTC time.
@@ -2806,6 +2826,8 @@ impl App {
         if self.runbook_state != Some(RunbookState::Generating) {
             self.runbook_state = None;
         }
+        self.runbook_offer = None;
+        self.runbook_offer_md = None;
 
         let Some(ref tx) = self.save_tx else {
             return;
@@ -2858,7 +2880,7 @@ impl App {
                     ids.hosts.extend(session.fleet_missing.iter().cloned());
                     ids
                 });
-                self.runbook_armed = Some(RunbookArmed {
+                let job = RunbookArmed {
                     session_id: self.sessions[self.active].id,
                     target_dir: target_dir.clone(),
                     messages: messages.clone(),
@@ -2866,7 +2888,15 @@ impl App {
                     ssh_info: ssh_info.clone(),
                     profile,
                     fleet,
-                });
+                };
+                // A runbook costs a model call, so it is asked for, not
+                // assumed (#481). A session without executed commands would
+                // be skipped anyway: no question, the job settles as before.
+                if has_executed_commands(&job.messages) {
+                    self.runbook_offer = Some(job);
+                } else {
+                    self.runbook_armed = Some(job);
+                }
             }
         }
 
@@ -2940,11 +2970,7 @@ impl App {
     /// the state settles on `Skipped`, and the tab's feed says why.
     pub fn take_runbook_job(&mut self) -> Option<RunbookArmed> {
         let armed = self.runbook_armed.take()?;
-        let has_commands = armed
-            .messages
-            .iter()
-            .any(|b| matches!(b, ChatBlock::Command { approved: true, .. }));
-        if !has_commands {
+        if !has_executed_commands(&armed.messages) {
             self.runbook_state = Some(RunbookState::Skipped);
             if let Some(idx) = self.find_session_idx(armed.session_id) {
                 self.sessions[idx].messages.push(ChatBlock::System(
@@ -2955,6 +2981,29 @@ impl App {
             return None;
         }
         Some(armed)
+    }
+
+    /// Answer the save overlay's "create a runbook?" question (#481).
+    ///
+    /// `yes` arms the job captured at Ctrl+S. If its `.md` is already on
+    /// disk, the runner is asked to start it now
+    /// ([`SaveProgress::RunbookRequested`]); otherwise the export's `Done`
+    /// starts it as usual. `no` drops the job: the export stays, and no
+    /// model call is made. Without a pending question this does nothing.
+    pub fn answer_runbook_offer(&mut self, yes: bool) {
+        let Some(job) = self.runbook_offer.take() else {
+            return;
+        };
+        let written = self.runbook_offer_md.take();
+        if !yes {
+            return;
+        }
+        self.runbook_armed = Some(job);
+        if let Some(md) = written {
+            if let Some(tx) = &self.save_tx {
+                tx.send(SaveProgress::RunbookRequested(md)).ok();
+            }
+        }
     }
 
     /// Apply the outcome of a runbook generation (#401): overlay status, a
@@ -3113,8 +3162,16 @@ impl App {
         // When the save overlay is visible, only ESC is processed for closing —
         // all other keys (including F1, Ctrl+S, global hotkeys) are consumed.
         if self.save_overlay_visible {
+            // The runbook question (#481): y/n, also on the Russian layout
+            // (н/т). Esc answers "no" and closes, as it closes any overlay.
+            let asking = self.runbook_offer.is_some();
             match key.code {
-                KeyCode::Esc => self.save_overlay_visible = false,
+                KeyCode::Esc => {
+                    self.answer_runbook_offer(false);
+                    self.save_overlay_visible = false;
+                }
+                KeyCode::Char('y' | 'Y' | 'н' | 'Н') if asking => self.answer_runbook_offer(true),
+                KeyCode::Char('n' | 'N' | 'т' | 'Т') if asking => self.answer_runbook_offer(false),
                 _ => {}
             }
             return;
@@ -13198,7 +13255,9 @@ mod tests {
         let done = run_save_to_completion(&mut app).await;
         assert!(done.starts_with("prod-web/"), "export goes to the target folder, got {done}");
 
-        let armed = app.runbook_armed.as_ref().expect("Ctrl+S must arm a runbook");
+        // Asked for, not armed, until the user answers (#481).
+        assert!(app.runbook_armed.is_none(), "no runbook before the answer");
+        let armed = app.runbook_offer.as_ref().expect("Ctrl+S must offer a runbook");
         assert_eq!(armed.session_id, app.sessions[0].id);
         assert!(armed.fleet.is_none(), "an ordinary tab's runbook is the single-host one");
         assert_eq!(armed.profile, "glm", "the runbook uses the session's profile");
@@ -13221,7 +13280,7 @@ mod tests {
         app.push_message(command_block("uname -r", true));
         run_save_to_completion(&mut app).await;
 
-        let armed = app.runbook_armed.as_ref().expect("Ctrl+S in the fleet arms a runbook too");
+        let armed = app.runbook_offer.as_ref().expect("Ctrl+S in the fleet offers a runbook too");
         let ids = armed.fleet.as_ref().expect("a fleet runbook carries the hosts to scrub");
         for host in ["web-1", "web-2", "web-3", "web-1.example", "web-3.example"] {
             assert!(ids.hosts.iter().any(|h| h == host), "{host} must be scrubbed");
@@ -13243,9 +13302,115 @@ mod tests {
         app.push_message(command_block("uname -r", true));
         run_save_to_completion(&mut app).await;
 
-        let ids = app.runbook_armed.as_ref().and_then(|a| a.fleet.as_ref()).expect("fleet runbook armed");
+        let ids = app.runbook_offer.as_ref().and_then(|a| a.fleet.as_ref()).expect("fleet runbook offered");
         assert!(ids.hosts.iter().any(|h| h == "web-7"), "a vanished host is scrubbed too");
         assert!(ids.hosts.iter().any(|h| h == "web-1"));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// Ctrl+S on a tab with an executed command, the save channel kept open
+    /// so what the app sends after the export can be observed (#481).
+    fn app_saving_a_session_with_commands(
+        base: &std::path::Path,
+    ) -> (App, tokio::sync::mpsc::UnboundedReceiver<SaveProgress>) {
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.save_dir = Some(base.to_path_buf());
+        app.push_message(command_block("systemctl restart nginx", true));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        app.save_tx = Some(tx);
+        (app, rx)
+    }
+
+    async fn wait_for_done(rx: &mut tokio::sync::mpsc::UnboundedReceiver<SaveProgress>) -> String {
+        loop {
+            match rx.recv().await.expect("save task must report progress") {
+                SaveProgress::Done(name) => return name,
+                SaveProgress::Error(e) => panic!("save failed: {e}"),
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn y_after_the_export_asks_the_runner_to_start_the_runbook() {
+        let base = std::env::temp_dir().join(format!("filar_runbook_y_{}", std::process::id()));
+        let (mut app, mut rx) = app_saving_a_session_with_commands(&base);
+        app.start_save();
+        assert!(app.runbook_offer.is_some(), "the overlay asks");
+        // The export does not wait for the answer.
+        let md = wait_for_done(&mut rx).await;
+        app.runbook_offer_md = Some(md.clone()); // what the runner does on Done
+
+        app.handle_key(key_event(crossterm::event::KeyCode::Char('y')));
+        assert!(app.runbook_offer.is_none());
+        assert!(app.runbook_armed.is_some(), "y arms the captured job");
+        match rx.try_recv() {
+            Ok(SaveProgress::RunbookRequested(name)) => assert_eq!(name, md),
+            other => panic!("expected RunbookRequested, got {:?}", other.map(|_| "another event")),
+        }
+        assert!(app.save_overlay_visible, "the overlay stays to show the runbook");
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn y_before_the_export_finishes_leaves_the_start_to_done() {
+        let base = std::env::temp_dir().join(format!("filar_runbook_y_early_{}", std::process::id()));
+        let (mut app, mut rx) = app_saving_a_session_with_commands(&base);
+        app.start_save();
+        // Russian layout: н is y.
+        app.handle_key(key_event(crossterm::event::KeyCode::Char('н')));
+        assert!(app.runbook_armed.is_some());
+        wait_for_done(&mut rx).await;
+        assert!(
+            !matches!(rx.try_recv(), Ok(SaveProgress::RunbookRequested(_))),
+            "Done starts it; no second request"
+        );
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn n_t_and_esc_save_only_the_session() {
+        use crossterm::event::KeyCode;
+        for (answer, closes) in [(KeyCode::Char('n'), false), (KeyCode::Char('т'), false), (KeyCode::Esc, true)] {
+            let base = std::env::temp_dir()
+                .join(format!("filar_runbook_no_{}_{:?}", std::process::id(), answer).replace(['(', ')', '\'', ' '], ""));
+            let (mut app, mut rx) = app_saving_a_session_with_commands(&base);
+            app.start_save();
+            app.handle_key(key_event(answer));
+            assert!(app.runbook_offer.is_none(), "{answer:?} answers");
+            assert!(app.runbook_armed.is_none(), "{answer:?}: no runbook is armed");
+            assert_eq!(app.save_overlay_visible, !closes, "{answer:?}");
+            let md = wait_for_done(&mut rx).await;
+            assert!(md.ends_with(".md"), "the session is still saved: {md}");
+            let _ = tokio::fs::remove_dir_all(&base).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn no_question_without_commands_or_with_runbooks_off() {
+        let base = std::env::temp_dir().join(format!("filar_runbook_noq_{}", std::process::id()));
+        // No executed command: the job is armed straight away and skipped.
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.save_dir = Some(base.clone());
+        app.push_message(command_block("rm -rf /tmp/x", false));
+        run_save_to_completion(&mut app).await;
+        assert!(app.runbook_offer.is_none(), "nothing to fold — nothing to ask");
+
+        // `save_runbook = false`: neither question nor job.
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.save_dir = Some(base.clone());
+        app.runbook_enabled = false;
+        app.push_message(command_block("systemctl restart nginx", true));
+        run_save_to_completion(&mut app).await;
+        assert!(app.runbook_offer.is_none() && app.runbook_armed.is_none());
+
+        // A runbook already generating: saved without one, no question.
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.save_dir = Some(base.clone());
+        app.runbook_state = Some(RunbookState::Generating);
+        app.push_message(command_block("systemctl restart nginx", true));
+        run_save_to_completion(&mut app).await;
+        assert!(app.runbook_offer.is_none() && app.runbook_armed.is_none());
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 

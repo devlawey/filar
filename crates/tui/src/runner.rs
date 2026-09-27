@@ -2113,15 +2113,27 @@ fn apply_save_progress(
             let msg = format!("Saved to {filename}");
             app.toast = Some((msg, Instant::now() + Duration::from_secs(3)));
             app.push_system_log(format!("Session saved to {filename}"));
+            // Still asking whether to make a runbook (#481): remember the
+            // file, and a later `y` starts the runbook for it.
+            if app.runbook_offer.is_some() {
+                app.runbook_offer_md = Some(filename);
+                return;
+            }
             // The `.md` is on disk — only now may the runbook start (#401):
             // a failed export must never spend a call on a session whose
             // record was never written.
+            spawn_runbook_generation(app, &filename, llm_factory, secret_provider, save_tx);
+        }
+        SaveProgress::RunbookRequested(filename) => {
+            // `y` after the `.md` was written (#481): the job is armed now.
             spawn_runbook_generation(app, &filename, llm_factory, secret_provider, save_tx);
         }
         SaveProgress::Error(err) => {
             // The export failed: drop the armed job (#401) so a later save
             // cannot fold a session whose `.md` was never written.
             app.runbook_armed = None;
+            app.runbook_offer = None;
+            app.runbook_offer_md = None;
             app.save_error = Some(err);
             app.save_progress = 0;
             if !app.save_overlay_visible {
@@ -3615,6 +3627,64 @@ mod tests {
         let written = tokio::fs::read_to_string(dir.join("db-1.runbook.md")).await.unwrap();
         assert!(written.contains("Symptom"), "the runbook lands beside the export");
 
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_question_holds_the_runbook_until_y() {
+        let dir = runbook_temp_dir("asked");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let provider = Arc::new(filar_core::StaticSecretProvider::new());
+        let llm: Arc<dyn LlmClient> = Arc::new(ScriptedLlm::answering(&long_runbook("")));
+        let config = test_tui_config(llm, Arc::clone(&provider));
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.profiles = config.profiles.clone();
+        app.push_message(ChatBlock::Command {
+            command: "systemctl status nginx".into(),
+            explanation: "check the service".into(),
+            output: Some("active (running)".into()),
+            approved: true,
+        });
+        app.runbook_offer = Some(crate::app::RunbookArmed {
+            session_id: app.sessions[0].id,
+            target_dir: dir.clone(),
+            messages: app.sessions[0].messages.clone(),
+            session_name: "prod-web".into(),
+            ssh_info: None,
+            profile: "glm".into(),
+            fleet: None,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.save_tx = Some(tx.clone());
+
+        // The export lands while the question is open: no model call yet.
+        apply_save_progress(
+            &mut app,
+            SaveProgress::Done("prod-web/db-1.md".into()),
+            &config.llm_factory,
+            &config.secret_provider,
+            &tx,
+        );
+        assert_eq!(app.runbook_state, None, "nothing starts before the answer");
+        assert_eq!(app.runbook_offer_md.as_deref(), Some("prod-web/db-1.md"));
+
+        // `y`: the app asks the runner, which starts the runbook for that file.
+        app.answer_runbook_offer(true);
+        let request = rx.try_recv().expect("y after Done sends a request");
+        apply_save_progress(&mut app, request, &config.llm_factory, &config.secret_provider, &tx);
+        assert_eq!(app.runbook_state, Some(RunbookState::Generating));
+        let report = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the runbook must report back")
+            .expect("channel is open");
+        match report {
+            SaveProgress::RunbookDone { outcome, .. } => {
+                assert_eq!(outcome.unwrap(), "prod-web/db-1.runbook.md");
+            }
+            other => panic!("expected RunbookDone, got {other:?}"),
+        }
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
