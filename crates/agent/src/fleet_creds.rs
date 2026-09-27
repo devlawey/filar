@@ -22,12 +22,12 @@
 //! | `key` | always — a key that fails to load is "no contact", not "skipped" |
 //! | `password` with a value | always (the config warns about plain text elsewhere) |
 //! | `password` without a value | the OS credential store has `ssh_target:<name>` |
+//! | `agent` | always — an agent that is down or holds no accepted key is "no contact" |
 //!
 //! A store that cannot be consulted at all (no Secret Service on a headless
 //! Linux, a locked keychain) is its own reason, not "no password": the
 //! password may well be stored, and telling the user to save it again would
 //! send them the wrong way.
-//! | `agent` | never — SSH agent auth is not implemented by the transport |
 //!
 //! The resolution is made once, when the fleet opens, like the composition
 //! itself (#426): nothing a host prints can change who is asked, and a
@@ -58,8 +58,6 @@ pub enum MissingCredentials {
     /// The store's error is not kept: nothing about a lookup reaches the
     /// transcript but the fact that it failed.
     StoreUnavailable,
-    /// SSH agent auth, which the transport does not implement.
-    AgentUnsupported,
 }
 
 impl fmt::Display for MissingCredentials {
@@ -67,7 +65,6 @@ impl fmt::Display for MissingCredentials {
         f.write_str(match self {
             Self::NoPassword => "no password in the OS credential store",
             Self::StoreUnavailable => "OS credential store unavailable",
-            Self::AgentUnsupported => "SSH agent auth is not supported",
         })
     }
 }
@@ -139,7 +136,9 @@ impl FleetCredentials {
 
 fn resolve_one(target: &SshTarget, store: &dyn SecretProvider) -> Result<SshTarget, MissingCredentials> {
     match &target.auth {
-        SshAuth::Key { .. } => Ok(target.clone()),
+        // Key files and the SSH agent need nothing resolved up front: each
+        // member's connection opens its own agent session when it logs in.
+        SshAuth::Key { .. } | SshAuth::Agent => Ok(target.clone()),
         SshAuth::Password { password: Some(_) } => Ok(target.clone()),
         SshAuth::Password { password: None } => {
             // `Secret` is the provider's "not stored"; any other error means
@@ -155,7 +154,6 @@ fn resolve_one(target: &SshTarget, store: &dyn SecretProvider) -> Result<SshTarg
             };
             Ok(ready)
         }
-        SshAuth::Agent => Err(MissingCredentials::AgentUnsupported),
     }
 }
 
@@ -199,14 +197,9 @@ mod tests {
         store.insert("ssh_target:web-4", "pw-of-web-4");
         let creds = FleetCredentials::resolve(&op, &store);
 
-        assert_eq!(creds.participants(&op), ["web-1", "web-4"]);
-        assert_eq!(
-            creds.skipped(&op),
-            [
-                ("web-2", MissingCredentials::NoPassword),
-                ("web-3", MissingCredentials::AgentUnsupported)
-            ]
-        );
+        assert_eq!(creds.participants(&op), ["web-1", "web-3", "web-4"]);
+        assert_eq!(creds.skipped(&op), [("web-2", MissingCredentials::NoPassword)]);
+        assert!(matches!(creds.ready(2).expect("web-3 ready").auth, SshAuth::Agent));
         let handles: Vec<_> = op.handles().collect();
         assert_eq!(creds.missing(&op, handles[1]), Some(MissingCredentials::NoPassword));
         assert_eq!(creds.missing(&op, handles[0]), None);

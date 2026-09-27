@@ -9722,3 +9722,30 @@ engine-v2.0.0». SMOKE: блок «Флот (2.0.0)».
 
 **Next:** веха 2.0.0 по флоту закрыта; SMOKE-прогон и релиз — за человеком.
 
+## #479 — вход через SSH-агент (`SshAuth::Agent`)
+
+**Что сделано.** Новый внутренний модуль `crates/transport/src/auth.rs`:
+единая `authenticate()` для `SshSession` и `SshInteractive` (дубли веток в
+`ssh.rs`/`interactive.rs` убраны). `SshAuth::Agent` — через
+`russh::keys::agent::client::AgentClient`: ключи агента перебираются по
+очереди (`authenticate_publickey_with`), RSA — с согласованным SHA-2.
+Unix — сокет из `SSH_AUTH_SOCK`; Windows — pipe из `SSH_AUTH_SOCK` или
+`\\.\pipe\openssh-ssh-agent`, затем Pageant. Ошибки: «agent unavailable» (с
+подсказкой `eval "$(ssh-agent)" && ssh-add`), «no keys» (`ssh-add`), «accepted
+none of N key(s)». Флот: `MissingCredentials::AgentUnsupported` удалён, хосты
+с агентом участвуют; каждое подключение открывает свою сессию с агентом, так
+что параллельный fan-out не делит одно соединение.
+
+**Решения.** Сертификаты из агента предлагаются как обычные публичные ключи.
+Приватный ключ filar не видит — только запросы подписи.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. Публичный enum
+`filar_agent::fleet_creds::MissingCredentials` потерял вариант
+`AgentUnsupported`.
+
+**Не проверено.** Живой вход через агент (`#[ignore]`
+`ssh_agent_login_runs_a_command`, docker-sshd + ключ в агенте), Windows
+(OpenSSH-агент, Pageant), прогон бинарника `./filar --target <host>`.
+
+**Next:** #480 — ключи с парольной фразой для `SshAuth::Key`.
+

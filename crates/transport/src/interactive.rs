@@ -18,14 +18,13 @@ use std::sync::Arc;
 #[cfg(feature = "local")]
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use russh::client::{self, Handle, Msg};
-use russh::keys::*;
 use russh::{ChannelMsg, ChannelWriteHalf, Disconnect};
 use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 
-use filar_core::{CoreError, EnvSecretProvider, Result, SecretProvider, SshAuth, SshTarget};
+use filar_core::{CoreError, EnvSecretProvider, Result, SecretProvider, SshTarget};
 
-use crate::ssh::{dirs_or_default, known_hosts_path, resolve_ssh_password, SshHandler};
+use crate::ssh::{known_hosts_path, SshHandler};
 
 // ---------------------------------------------------------------------------
 // InteractiveTerminal trait
@@ -325,7 +324,7 @@ impl SshInteractive {
             .map_err(|e| CoreError::Other(format!("SSH connect failed: {e}")))?;
 
         // ── Authenticate ───────────────────────────────────────────────
-        authenticate(&mut session, target, secrets).await?;
+        crate::auth::authenticate(&mut session, target, secrets).await?;
 
         // ── Open channel and request PTY + shell ───────────────────────
         let channel = session
@@ -414,64 +413,6 @@ impl InteractiveTerminal for SshInteractive {
         info!("SSH interactive session closed");
         Ok(())
     }
-}
-
-// ---------------------------------------------------------------------------
-// Shared authentication helper
-// ---------------------------------------------------------------------------
-
-/// Authenticate an SSH session using the target's configured auth method.
-///
-/// `secrets` supplies the SSH password (`"SSH_PASSWORD"`) for password auth when
-/// no explicit password is set on the target — no direct env reads here.
-async fn authenticate(
-    session: &mut Handle<SshHandler>,
-    target: &SshTarget,
-    secrets: &dyn SecretProvider,
-) -> Result<()> {
-    match &target.auth {
-        SshAuth::Key { path } => {
-            let key_path = path.clone().unwrap_or_else(dirs_or_default);
-            let key_pair = load_secret_key(&key_path, None)
-                .map_err(|e| CoreError::Other(format!("failed to load SSH key {:?}: {e}", key_path)))?;
-
-            let hash = session
-                .best_supported_rsa_hash()
-                .await
-                .map_err(|e| CoreError::Other(format!("RSA hash negotiation failed: {e}")))?
-                .flatten();
-
-            let auth_res = session
-                .authenticate_publickey(
-                    &target.user,
-                    PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash),
-                )
-                .await
-                .map_err(|e| CoreError::Other(format!("publickey auth failed: {e}")))?;
-
-            if !auth_res.success() {
-                return Err(CoreError::Other("publickey authentication rejected".into()));
-            }
-            info!("SSH authenticated via key");
-        }
-        SshAuth::Password { password } => {
-            let password = resolve_ssh_password(password, secrets)?;
-
-            let auth_res = session
-                .authenticate_password(&target.user, &password)
-                .await
-                .map_err(|e| CoreError::Other(format!("password auth failed: {e}")))?;
-
-            if !auth_res.success() {
-                return Err(CoreError::Other("password authentication rejected".into()));
-            }
-            info!("SSH authenticated via password");
-        }
-        SshAuth::Agent => {
-            return Err(CoreError::Other("SSH agent authentication not yet implemented".into()));
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

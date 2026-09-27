@@ -398,3 +398,21 @@ line discipline, которая превращает Ctrl-C в `SIGINT`, поэ�
 
 Проверено живым прогоном на Linux (OpenSSH, `/bin/sh` = dash): `ping -c 30`
 убивается в пределах секунды, следующая команда чистая.
+
+## SSH-агент: сокет и named pipe (#479)
+
+`type = "agent"` ходит к агенту по-разному на разных ОС. filar только просит
+у агента подпись — приватный ключ не читается.
+
+| Платформа | Куда подключается | Если не вышло |
+|---|---|---|
+| Linux / macOS | Unix-сокет из `SSH_AUTH_SOCK` | `SSH agent unavailable: SSH_AUTH_SOCK is not set` / `cannot open agent socket …` с подсказкой `eval "$(ssh-agent)" && ssh-add` |
+| Windows | named pipe из `SSH_AUTH_SOCK`, иначе `\\.\pipe\openssh-ssh-agent` (служба «OpenSSH Authentication Agent»); при неудаче — Pageant | ошибка называет pipe и просит включить службу и выполнить `ssh-add` |
+
+- На macOS `SSH_AUTH_SOCK` задаёт launchd, но у приложения, запущенного не
+  из терминала (Finder/Dock), его может не быть в окружении — тогда агент
+  «недоступен», хотя в терминале `ssh-add -l` работает.
+- Pageant — запасной путь на Windows; вживую он не проверялся.
+- Ключи перебираются по очереди. Сервер с маленьким `MaxAuthTries`
+  (по умолчанию 6) может оборвать вход, если в агенте много ключей раньше
+  нужного — как и у OpenSSH-клиента.

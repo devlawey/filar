@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use filar_core::{
-    CoreError, EnvSecretProvider, HostKeyPolicy, Result, SecretProvider, SshAuth, SshTarget,
+    CoreError, EnvSecretProvider, HostKeyPolicy, Result, SecretProvider, SshTarget,
     DEFAULT_COMMAND_TIMEOUT_SECS,
 };
 
@@ -315,54 +315,7 @@ impl SshSession {
             .map_err(|e| CoreError::Other(format!("SSH connect failed: {e}")))?;
 
         // ── Authenticate ───────────────────────────────────────────────
-        match &target.auth {
-            SshAuth::Key { path } => {
-                let key_path = path
-                    .clone()
-                    .unwrap_or_else(|| {
-                        dirs_or_default()
-                    });
-                let key_pair = load_secret_key(&key_path, None)
-                    .map_err(|e| CoreError::Other(format!("failed to load SSH key {:?}: {e}", key_path)))?;
-
-                let hash = session
-                    .best_supported_rsa_hash()
-                    .await
-                    .map_err(|e| CoreError::Other(format!("RSA hash negotiation failed: {e}")))?
-                    .flatten();
-
-                let auth_res = session
-                    .authenticate_publickey(
-                        &target.user,
-                        PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash),
-                    )
-                    .await
-                    .map_err(|e| CoreError::Other(format!("publickey auth failed: {e}")))?;
-
-                if !auth_res.success() {
-                    return Err(CoreError::Other("publickey authentication rejected".into()));
-                }
-                info!("SSH authenticated via key");
-            }
-
-            SshAuth::Password { password } => {
-                let password = resolve_ssh_password(password, secrets)?;
-
-                let auth_res = session
-                    .authenticate_password(&target.user, &password)
-                    .await
-                    .map_err(|e| CoreError::Other(format!("password auth failed: {e}")))?;
-
-                if !auth_res.success() {
-                    return Err(CoreError::Other("password authentication rejected".into()));
-                }
-                info!("SSH authenticated via password");
-            }
-
-            SshAuth::Agent => {
-                return Err(CoreError::Other("SSH agent authentication not yet implemented".into()));
-            }
-        }
+        crate::auth::authenticate(&mut session, target, secrets).await?;
 
         // ── Open persistent shell channel ──────────────────────────────
         let mut channel = session
@@ -1196,6 +1149,7 @@ async fn recv_until_marker_simple(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use filar_core::SshAuth;
 
     #[test]
     fn marker_format() {
@@ -1302,6 +1256,29 @@ mod tests {
         let next = session.run("echo still-here").await.unwrap();
         assert_eq!(next.stdout.trim(), "still-here");
         assert_eq!(next.exit_code, Some(0), "the next command is clean");
+        session.close().await.unwrap();
+    }
+
+    /// Integration test (#479): log in with a key held by the SSH agent.
+    ///
+    /// Needs a running agent (`SSH_AUTH_SOCK`) holding a key that the
+    /// container accepts for `testuser`, e.g.
+    /// `ssh-copy-id -p 2222 testuser@127.0.0.1 && ssh-add`.
+    #[tokio::test]
+    #[ignore = "requires Docker sshd container on port 2222 and a loaded SSH agent"]
+    async fn ssh_agent_login_runs_a_command() {
+        let target = SshTarget {
+            name: "test".into(),
+            host: "127.0.0.1".into(),
+            port: 2222,
+            user: "testuser".into(),
+            auth: SshAuth::Agent,
+            host_key_policy: HostKeyPolicy::Tofu,
+            tags: Vec::new(),
+        };
+        let session = SshSession::connect(&target).await.unwrap();
+        let out = session.run("echo via-agent").await.unwrap();
+        assert_eq!(out.stdout.trim(), "via-agent");
         session.close().await.unwrap();
     }
 
