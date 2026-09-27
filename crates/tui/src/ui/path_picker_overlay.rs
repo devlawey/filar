@@ -1,5 +1,7 @@
 //! Path-picker overlay — in-TUI file/folder browser on the active target (#351).
 
+use std::borrow::Cow;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -111,11 +113,12 @@ pub(crate) fn render_path_picker(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Footer hint (#483), the longest variant that fits the overlay's width.
+/// Footer hint (#483): the longest variant that fits the overlay's width,
+/// whatever the order of the list.
 ///
 /// Both pickers navigate the same way: Enter opens a folder, `a` picks one
 /// (on `..` — the folder shown, "here"). Enter on a file picks it in the file picker.
-fn footer_hint(kind: PathPickerKind, width: u16) -> &'static str {
+fn footer_hint(kind: PathPickerKind, width: u16) -> Cow<'static, str> {
     let variants: &[&'static str] = match kind {
         PathPickerKind::File => &[
             " \u{2191}\u{2193} move  Enter open/pick file  a pick folder (.. = here)  Esc ",
@@ -129,11 +132,15 @@ fn footer_hint(kind: PathPickerKind, width: u16) -> &'static str {
             " Enter open  a pick  Esc ",
         ],
     };
-    variants
-        .iter()
-        .copied()
-        .find(|v| v.chars().count() <= width as usize)
-        .unwrap_or(variants[variants.len() - 1])
+    let fits = |v: &&&str| v.chars().count() <= width as usize;
+    match variants.iter().filter(fits).max_by_key(|v| v.chars().count()) {
+        Some(v) => Cow::Borrowed(v),
+        // Narrower than every variant: the shortest, cut to the width.
+        None => {
+            let shortest = variants.iter().min_by_key(|v| v.chars().count()).copied().unwrap_or("");
+            Cow::Owned(shortest.chars().take(width as usize).collect())
+        }
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -163,5 +170,10 @@ mod tests {
             }
         }
         assert!(footer_hint(PathPickerKind::File, OVERLAY_MAX_WIDTH).contains("pick file"));
+        // Narrower than any variant: cut to fit, never wider than the overlay.
+        for width in [0u16, 5, 12] {
+            let hint = footer_hint(PathPickerKind::File, width);
+            assert!(hint.chars().count() <= width as usize, "{width}: {hint}");
+        }
     }
 }
