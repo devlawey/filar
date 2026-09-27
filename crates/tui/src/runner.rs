@@ -122,19 +122,33 @@ async fn drain_pty_cwd(
     }
 }
 
-/// Route the PTY output already queued, without waiting — the prompt of a
-/// self-reporting shell (#482) may still sit in the channel.
-fn drain_queued_pty(
+/// Route PTY output until the shell goes quiet — a self-reporting shell's
+/// prompt (#482) may still be on its way when the user hides right after a
+/// `cd`. Stops after [`SETTLE_QUIET`] without output, or [`SETTLE_MAX`] in
+/// total; an idle shell costs one quiet window.
+async fn drain_pty_until_quiet(
     app: &mut App,
     term_rx: &mut Option<mpsc::UnboundedReceiver<(SessionId, TermChunk)>>,
 ) {
     let Some(rx) = term_rx.as_mut() else {
         return;
     };
-    while let Ok((chunk_sid, chunk)) = rx.try_recv() {
-        let _ = route_term_chunk(app, chunk_sid, chunk);
+    let deadline = tokio::time::Instant::now() + SETTLE_MAX;
+    loop {
+        let quiet = (tokio::time::Instant::now() + SETTLE_QUIET).min(deadline);
+        match tokio::time::timeout_at(quiet, rx.recv()).await {
+            Ok(Some((chunk_sid, chunk))) => {
+                let _ = route_term_chunk(app, chunk_sid, chunk);
+            }
+            _ => return,
+        }
     }
 }
+
+/// Silence that ends [`drain_pty_until_quiet`].
+const SETTLE_QUIET: Duration = Duration::from_millis(80);
+/// Upper bound of [`drain_pty_until_quiet`], for a shell that never stops.
+const SETTLE_MAX: Duration = Duration::from_millis(500);
 
 /// Probe OSC 7 on a live interactive PTY, update `session.cwd`, and `set_cwd`
 /// on the agent executor. Does not close the backend (#338).
@@ -143,7 +157,7 @@ fn drain_queued_pty(
 /// `session.cwd` from enter-time does not skip refresh; the previous cwd is
 /// restored if the probe times out. A shell that reports OSC 7 from its
 /// prompt (cmd.exe, PowerShell — #482) is not probed: its queued output is
-/// routed and the latest reported directory is used.
+/// read until it goes quiet and the latest reported directory is used.
 async fn sync_cwd_from_interactive(
     app: &mut App,
     sid: SessionId,
@@ -161,7 +175,7 @@ async fn sync_cwd_from_interactive(
     // report OSC 7 from every prompt, so their queued output already holds
     // the latest directory.
     if term.reports_cwd_itself() {
-        drain_queued_pty(app, term_rx);
+        drain_pty_until_quiet(app, term_rx).await;
     } else {
         if let Some(idx) = app.find_session_idx(sid) {
             app.sessions[idx].cwd = None;
@@ -3069,7 +3083,7 @@ mod tests {
         tx.send((
             sid,
             TermChunk::Bytes(
-                "\x1b]7;file://localhost/C:\\Работа\\My Dir\x1b\\C:\\Работа\\My Dir>"
+                "\x1b]7;file://filar-raw/C:\\Работа\\My Dir\x1b\\C:\\Работа\\My Dir>"
                     .as_bytes()
                     .to_vec(),
             ),
@@ -3082,6 +3096,30 @@ mod tests {
 
         assert!(rec.writes.lock().unwrap().is_empty(), "no POSIX probe for cmd/PowerShell");
         assert_eq!(app.sessions[0].cwd.as_deref(), Some(r"C:\Работа\My Dir"));
+    }
+
+    #[tokio::test]
+    async fn a_prompt_arriving_just_after_the_hide_still_counts() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        app.sessions[0].terminal = Some(crate::terminal::TerminalModel::new(80, 24));
+        app.sessions[0].cwd = Some(r"C:\old".into());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut term_rx = Some(rx);
+        // `cd` ran; its prompt reaches the channel 30 ms after the hide.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = tx.send((
+                sid,
+                TermChunk::Bytes(b"\x1b]7;file://filar-raw/C:\\new\x1b\\C:\\new>".to_vec()),
+            ));
+        });
+        let (_rec, term) = recording(true);
+
+        sync_cwd_from_interactive(&mut app, sid, &term, &HashMap::new(), &mut term_rx).await;
+
+        assert_eq!(app.sessions[0].cwd.as_deref(), Some(r"C:\new"));
     }
 
     #[tokio::test]

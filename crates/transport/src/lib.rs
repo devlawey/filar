@@ -32,7 +32,7 @@ pub use interactive::{InteractiveTerminal, SshInteractive};
 pub use local::LocalExecutor;
 pub use cwd::{
     cmd_osc7_prompt, is_safe_cwd, posix_cd_command, posix_cd_input, posix_shell_quote,
-    shell_flavor, ShellFlavor, OSC7_PWD_PROBE, POWERSHELL_OSC7_PROMPT,
+    shell_flavor, ShellFlavor, OSC7_PWD_PROBE, OSC7_RAW_HOST, POWERSHELL_OSC7_PROMPT,
 };
 pub use readonly::ReadOnlyExecutor;
 pub use secret::SecretSubstitutingExecutor;

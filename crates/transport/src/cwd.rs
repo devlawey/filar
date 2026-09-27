@@ -6,12 +6,19 @@
 /// Maximum length of a cwd we will accept from OSC 7, `$PWD`, or `set_cwd`.
 pub const MAX_CWD_LEN: usize = 1024;
 
+/// Host of the OSC 7 URIs filar's own hooks emit: the path after it is the
+/// raw directory, **not** percent-encoded, so the reader must not decode it —
+/// a directory literally named `build%20final` stays that (#482 review).
+/// Shells' own OSC 7 (`localhost` or a hostname) is decoded as usual.
+pub const OSC7_RAW_HOST: &str = "filar-raw";
+
 /// Bytes written to a POSIX interactive shell to emit OSC 7 for the current pwd.
 ///
 /// No files are created. The PTY is typically closed immediately after, so the
-/// command does not stay in the user's session.
+/// command does not stay in the user's session. The path is raw, hence
+/// [`OSC7_RAW_HOST`].
 pub const OSC7_PWD_PROBE: &[u8] =
-    b"printf '\\033]7;file://localhost%s\\007' \"$(pwd)\"\n";
+    b"printf '\\033]7;file://filar-raw%s\\007' \"$(pwd)\"\n";
 
 /// How an interactive shell can tell its working directory (#482).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,13 +52,13 @@ pub fn shell_flavor(program: &str) -> ShellFlavor {
 /// the visible prompt (`existing`, else cmd's default `$P$G`).
 ///
 /// `$E` is ESC and `$P` the current drive and path, so every prompt reports
-/// `file://localhost/C:\dir` without typing anything into the session — no
+/// `file://filar-raw/C:\dir` without typing anything into the session — no
 /// probe to see, nothing written to disk. The payload is not
 /// percent-encoded: spaces and non-ASCII arrive as they are, which the OSC 7
 /// reader accepts.
 pub fn cmd_osc7_prompt(existing: Option<&str>) -> String {
     let visible = existing.map(str::trim).filter(|p| !p.is_empty()).unwrap_or("$P$G");
-    format!("$E]7;file://localhost/$P$E\\{visible}")
+    format!("$E]7;file://{OSC7_RAW_HOST}/$P$E\\{visible}")
 }
 
 /// `-Command` for PowerShell (5.1 and 7) defining a prompt that emits OSC 7
@@ -62,7 +69,7 @@ pub fn cmd_osc7_prompt(existing: Option<&str>) -> String {
 /// prompt the user's profile defined — the profile runs first.
 pub const POWERSHELL_OSC7_PROMPT: &str = "function global:prompt { \
 $p = $ExecutionContext.SessionState.Path.CurrentLocation.ProviderPath; \
-[Console]::Write([char]27 + ']7;file://localhost/' + $p.TrimStart('/') + [char]27 + '\\'); \
+[Console]::Write([char]27 + ']7;file://filar-raw/' + $p.TrimStart('/') + [char]27 + '\\'); \
 'PS ' + $p + '> ' }";
 
 /// Reject empty, oversized, or newline/NUL-containing paths.
@@ -123,12 +130,19 @@ mod tests {
 
     #[test]
     fn the_cmd_prompt_reports_osc7_and_keeps_the_users_prompt() {
-        assert_eq!(cmd_osc7_prompt(None), "$E]7;file://localhost/$P$E\\$P$G");
-        assert_eq!(cmd_osc7_prompt(Some("  ")), "$E]7;file://localhost/$P$E\\$P$G");
+        assert_eq!(cmd_osc7_prompt(None), "$E]7;file://filar-raw/$P$E\\$P$G");
+        assert_eq!(cmd_osc7_prompt(Some("  ")), "$E]7;file://filar-raw/$P$E\\$P$G");
         assert_eq!(
             cmd_osc7_prompt(Some("[$T] $P$G")),
-            "$E]7;file://localhost/$P$E\\[$T] $P$G"
+            "$E]7;file://filar-raw/$P$E\\[$T] $P$G"
         );
+    }
+
+    #[test]
+    fn the_hooks_mark_their_raw_paths() {
+        assert!(std::str::from_utf8(OSC7_PWD_PROBE).unwrap().contains("file://filar-raw%s"));
+        assert!(cmd_osc7_prompt(None).contains("file://filar-raw/$P"));
+        assert!(POWERSHELL_OSC7_PROMPT.contains("file://filar-raw/"));
     }
 
     #[test]

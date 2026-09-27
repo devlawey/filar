@@ -234,8 +234,15 @@ and `logs/` all share this single app root.
 > | PTY shell | How the cwd is reported |
 > |---|---|
 > | POSIX (`sh`, `bash`, `zsh`; local Unix/macOS, any SSH) | on hide, a `printf` OSC 7 probe is typed into the shell; a stale enter-time cwd does not skip it |
-> | `cmd.exe` (Windows local default) | started with `PROMPT=$E]7;file://localhost/$P$E\<prompt>`: every prompt emits OSC 7, nothing is typed; a user `PROMPT` is kept after the OSC part |
+> | `cmd.exe` (Windows local default) | started with `PROMPT=$E]7;file://filar-raw/$P$E\<prompt>`: every prompt emits OSC 7, nothing is typed; a user `PROMPT` is kept after the OSC part |
 > | PowerShell 5.1 / 7 (`powershell.exe`, `pwsh`) | started with `-NoLogo -NoExit -Command` defining `prompt` (`[char]27`, not `` `e ``, for 5.1) that emits OSC 7 with `ProviderPath`; it replaces a prompt from the user's profile |
+>
+> filar's own OSC 7 (these prompts and the POSIX probe) uses the host
+> `filar-raw`: its path is raw and is **not** percent-decoded, so a directory
+> literally named `build%20final` survives; a shell's own OSC 7 (`localhost`,
+> a hostname) is decoded as usual. On hide, a self-reporting shell's output is
+> read until it goes quiet (80 ms, at most 500 ms), so a prompt still on its
+> way after a last-moment `cd` is not missed.
 >
 > The OSC 7 payload of cmd/PowerShell is the raw path (`C:\dir with spaces\Кириллица`),
 > not percent-encoded; the reader accepts both. Entering interactive still

@@ -513,7 +513,7 @@ mod tests {
         let dir = dir.canonicalize().unwrap();
         let osc7 = |p: &std::path::Path| {
             format!(
-                "\x1b]7;file://localhost/{}\x1b\\",
+                "\x1b]7;file://filar-raw/{}\x1b\\",
                 p.to_string_lossy().trim_start_matches('/')
             )
         };
