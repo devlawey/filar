@@ -9743,9 +9743,14 @@ none of N key(s)». Флот: `MissingCredentials::AgentUnsupported` удалё�
 `filar_agent::fleet_creds::MissingCredentials` потерял вариант
 `AgentUnsupported`.
 
-**Не проверено.** Живой вход через агент (`#[ignore]`
-`ssh_agent_login_runs_a_command`, docker-sshd + ключ в агенте), Windows
-(OpenSSH-агент, Pageant), прогон бинарника `./filar --target <host>`.
+**Проверено вживую** (локальный OpenSSH `sshd` в контейнере агента, не
+docker-sshd): `#[ignore]` `ssh_agent_login_runs_a_command` — неверный ключ
+отклонён, зашифрованный ed25519 из агента принят; RSA через агент; все три
+ошибки. Бинарник: `./filar --target <host>` с `type = "agent"` подключается,
+`!echo` выполняется на хосте; без `SSH_AUTH_SOCK` — ошибка с подсказкой.
+
+**Не проверено.** Windows (OpenSSH-агент, Pageant) — только компиляция;
+macOS; живой флот с агент-хостами.
 
 **Next:** #480 — ключи с парольной фразой для `SshAuth::Key`.
 

@@ -44,7 +44,14 @@ pub(crate) async fn authenticate<H: client::Handler>(
     match &target.auth {
         SshAuth::Key { path } => {
             let key_path = path.clone().unwrap_or_else(dirs_or_default);
-            let key_pair = load_secret_key(&key_path, None).map_err(|e| {
+            // Reading the key file is blocking I/O; keep it off the runtime.
+            let key_pair = tokio::task::spawn_blocking({
+                let key_path = key_path.clone();
+                move || load_secret_key(&key_path, None)
+            })
+            .await
+            .map_err(|e| CoreError::Other(format!("SSH key loader task failed: {e}")))?
+            .map_err(|e| {
                 CoreError::Other(format!("failed to load SSH key {:?}: {e}", key_path))
             })?;
 
