@@ -294,7 +294,10 @@ mod tests {
     async fn an_agent_without_keys_is_an_error_with_an_ssh_add_hint() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let dir = std::env::temp_dir().join(format!("filar-agent-{}", uuid::Uuid::new_v4()));
+        // Not `temp_dir()`: macOS's `$TMPDIR` is long enough to push a socket
+        // path past `SUN_LEN` (104 bytes), and `bind` then fails.
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let dir = std::path::PathBuf::from(format!("/tmp/filar-agent-{}", &id[..12]));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let sock = dir.join("agent.sock");
         let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
