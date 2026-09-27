@@ -1225,7 +1225,9 @@ filar
   задан (`eval "$(ssh-agent)" && ssh-add`; на Windows — служба «OpenSSH
   Authentication Agent»); `SSH agent has no keys` — выполните `ssh-add`;
   `accepted none of the agent's … key(s)` — нужного ключа нет в агенте или его
-  нет в `authorized_keys` хоста
+  нет в `authorized_keys` хоста; `SSH agent did not sign with key …` — агент
+  отказался подписать (ключ из `ssh-add -c` не подтверждён, аппаратный ключ не
+  нажат): подтвердите или уберите ключ из агента (`ssh-add -d`)
 - **Порт:** проверьте поле `port` (по умолчанию 22)
 
 ### TUI отображается некорректно

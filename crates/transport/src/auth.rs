@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use russh::client::{self, Handle};
+use russh::AgentAuthError;
 use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::*;
@@ -201,10 +202,12 @@ where
             None
         };
         let fingerprint = key.fingerprint(HashAlg::Sha256);
+        // A failed signature ends the attempt: russh still waits for that
+        // signature on this session, so a later key cannot be offered on it.
         let res = session
             .authenticate_publickey_with(user, key, hash, agent)
             .await
-            .map_err(|e| CoreError::Other(format!("SSH agent auth failed: {e}")))?;
+            .map_err(|e| agent_sign_error(&e, &fingerprint.to_string()))?;
         if res.success() {
             info!(%fingerprint, "SSH authenticated via agent");
             return Ok(());
@@ -215,6 +218,23 @@ where
     Err(CoreError::Other(format!(
         "SSH agent authentication rejected: the server accepted none of the agent's {total} key(s)"
     )))
+}
+
+/// Error for a signature the agent did not produce for key `fingerprint`.
+///
+/// Typical causes: a key added with `ssh-add -c` whose confirmation was
+/// declined, or a hardware key that was not touched in time.
+fn agent_sign_error(err: &AgentAuthError, fingerprint: &str) -> CoreError {
+    match err {
+        AgentAuthError::Key(e) => CoreError::Other(format!(
+            "SSH agent did not sign with key {fingerprint} ({e}); the remaining agent keys \
+             were not tried. Confirm the key if the agent asks (ssh-add -c, hardware key), \
+             or remove it from the agent: ssh-add -d <key>"
+        )),
+        AgentAuthError::Send(e) => {
+            CoreError::Other(format!("SSH agent auth failed: connection lost ({e})"))
+        }
+    }
 }
 
 /// The agent's identities, or an error with a hint if it holds none.
@@ -270,6 +290,15 @@ mod tests {
         };
         assert_eq!(agent_endpoint(None), expected);
         assert_eq!(agent_endpoint(Some("  ".into())), expected);
+    }
+
+    #[test]
+    fn a_refused_signature_names_the_key_and_the_way_out() {
+        let err = AgentAuthError::Key(russh::keys::Error::AgentFailure);
+        let msg = agent_sign_error(&err, "SHA256:abc").to_string();
+        assert!(msg.contains("did not sign with key SHA256:abc"), "{msg}");
+        assert!(msg.contains("remaining agent keys were not tried"), "{msg}");
+        assert!(msg.contains("ssh-add -d"), "{msg}");
     }
 
     #[cfg(unix)]
