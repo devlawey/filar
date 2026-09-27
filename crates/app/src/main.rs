@@ -591,14 +591,22 @@ async fn run() -> anyhow::Result<()> {
     let command_timeout = Duration::from_secs(config.timeouts.command_secs);
     // An encrypted key needs its passphrase before the TUI takes the
     // terminal: store → SSH_KEY_PASSPHRASE → prompt without echo (#480).
-    if let Some(ref mut target) = ssh_target {
-        let keyring = filar_core::KeyringSecretProvider::new();
-        let env = filar_core::EnvSecretProvider::new();
-        passphrase::resolve_key_passphrase(
-            target,
-            &passphrase::PassphraseSources { keyring: &keyring, env: &env },
-            &mut passphrase::TerminalPrompt,
-        )?;
+    // Key file reads, the KDF and the terminal prompt all block: off the
+    // runtime they go.
+    if let Some(mut target) = ssh_target.take() {
+        let (target, resolved) = tokio::task::spawn_blocking(move || {
+            let keyring = filar_core::KeyringSecretProvider::new();
+            let env = filar_core::EnvSecretProvider::new();
+            let resolved = passphrase::resolve_key_passphrase(
+                &mut target,
+                &passphrase::PassphraseSources { keyring: &keyring, env: &env },
+                &mut passphrase::TerminalPrompt,
+            );
+            (target, resolved)
+        })
+        .await?;
+        resolved?;
+        ssh_target = Some(target);
     }
     let executor: Arc<dyn filar_transport::CommandExecutor> = if let Some(ref target) = ssh_target {
         info!(host = %target.host, port = target.port, user = %target.user, "connecting via SSH");

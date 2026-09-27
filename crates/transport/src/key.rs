@@ -72,6 +72,10 @@ pub enum KeyPassphrase {
 /// one shared secret for every host is what per-host credentials avoid.
 /// A stored passphrase that does not decrypt the key is skipped with a
 /// warning that names its source, never its value.
+///
+/// On [`KeyPassphrase::Missing`] the target carries **no** passphrase: one
+/// it came with was tried first and did not decrypt the key, so it is
+/// dropped rather than left to fail the login.
 pub fn fill_key_passphrase(
     target: &mut SshTarget,
     store: &dyn SecretProvider,

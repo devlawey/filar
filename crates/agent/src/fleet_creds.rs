@@ -241,10 +241,23 @@ mod tests {
         assert_eq!(creds.missing(&op, handles[0]), None);
     }
 
-    /// A throwaway ed25519 key file, encrypted with `passphrase`.
-    fn encrypted_key(passphrase: &str) -> std::path::PathBuf {
+    /// A temp key file, removed when dropped — even when the test panics.
+    struct TempKey(std::path::PathBuf);
+
+    impl Drop for TempKey {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A throwaway ed25519 key file, encrypted with `passphrase`. Named by a
+    /// counter, not the clock: macOS's clock is coarse enough for parallel
+    /// tests to collide on a timestamp.
+    fn encrypted_key(passphrase: &str) -> TempKey {
         use russh::keys::ssh_key::private::Ed25519Keypair;
         use russh::keys::ssh_key::{Cipher, Kdf, LineEnding, PrivateKey};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         let key = PrivateKey::from(Ed25519Keypair::from_seed(&[4u8; 32]))
             .encrypt_with(
                 Cipher::Aes256Ctr,
@@ -254,22 +267,17 @@ mod tests {
             )
             .expect("encrypt");
         let pem = key.to_openssh(LineEnding::LF).expect("encode");
-        let path = std::env::temp_dir().join(format!(
-            "filar-fleet-key-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!("filar-fleet-key-{}-{n}", std::process::id()));
         std::fs::write(&path, pem.as_bytes()).expect("write");
-        path
+        TempKey(path)
     }
 
     #[test]
     fn an_encrypted_key_takes_part_only_with_its_own_stored_passphrase() {
         let key = encrypted_key("per-host");
-        let key_auth = || SshAuth::Key { path: Some(key.clone()), passphrase: None };
+        let key_auth = || SshAuth::Key { path: Some(key.0.clone()), passphrase: None };
         let op = fleet(&[target("web-1", key_auth()), target("web-2", key_auth())]);
         let store = StaticSecretProvider::new();
         store.insert("ssh_key_passphrase:web-1", "per-host");
@@ -283,16 +291,14 @@ mod tests {
             SshAuth::Key { passphrase, .. } => assert_eq!(passphrase.as_deref(), Some("per-host")),
             other => panic!("unexpected auth {other:?}"),
         }
-        let _ = std::fs::remove_file(key);
     }
 
     #[test]
     fn an_encrypted_key_with_an_unusable_store_says_so() {
         let key = encrypted_key("x");
-        let op = fleet(&[target("web-1", SshAuth::Key { path: Some(key.clone()), passphrase: None })]);
+        let op = fleet(&[target("web-1", SshAuth::Key { path: Some(key.0.clone()), passphrase: None })]);
         let creds = FleetCredentials::resolve(&op, &BrokenStore);
         assert_eq!(creds.skipped(&op), [("web-1", MissingCredentials::StoreUnavailable)]);
-        let _ = std::fs::remove_file(key);
     }
 
     #[test]

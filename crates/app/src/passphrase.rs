@@ -118,8 +118,11 @@ fn read_hidden(prompt: &str) -> Option<String> {
     terminal::enable_raw_mode().ok()?;
     let mut typed = String::new();
     let result = loop {
-        let Ok(Event::Key(key)) = event::read() else {
-            continue;
+        let key = match event::read() {
+            Ok(Event::Key(key)) => key,
+            Ok(_) => continue,
+            // A terminal that cannot be read will not recover: stop asking.
+            Err(_) => break None,
         };
         // Windows reports key releases too; only presses carry input.
         if key.kind != KeyEventKind::Press {
@@ -177,9 +180,30 @@ mod tests {
 
     const GOOD: &str = "correct horse";
 
-    fn encrypted_key() -> PathBuf {
+    /// A temp key file, removed when dropped — even when the test panics.
+    struct TempKey(PathBuf);
+
+    impl std::ops::Deref for TempKey {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempKey {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A throwaway encrypted key with a name unique within the process: a
+    /// counter, not the clock — macOS's clock is coarse enough for two
+    /// parallel tests to draw the same timestamp and delete each other's file.
+    fn encrypted_key() -> TempKey {
         use russh::keys::ssh_key::private::Ed25519Keypair;
         use russh::keys::ssh_key::{Cipher, Kdf, LineEnding, PrivateKey};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         let key = PrivateKey::from(Ed25519Keypair::from_seed(&[9u8; 32]))
             .encrypt_with(
                 Cipher::Aes256Ctr,
@@ -189,17 +213,11 @@ mod tests {
             )
             .expect("encrypt");
         let pem = key.to_openssh(LineEnding::LF).expect("encode");
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir()
-            .join(format!("filar-app-key-{}-{}", std::process::id(), rand_suffix()));
+            .join(format!("filar-app-key-{}-{n}", std::process::id()));
         std::fs::write(&path, pem.as_bytes()).expect("write");
-        path
-    }
-
-    fn rand_suffix() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default()
+        TempKey(path)
     }
 
     fn key_target(path: &Path) -> SshTarget {
@@ -248,7 +266,6 @@ mod tests {
         res.expect("resolved");
         assert_eq!(passphrase_of(&t), Some(GOOD));
         assert_eq!(prompt.asked, 0);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -261,7 +278,6 @@ mod tests {
         res.expect("resolved");
         assert_eq!(passphrase_of(&t), Some(GOOD));
         assert_eq!(prompt.asked, 0);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -278,7 +294,6 @@ mod tests {
             prompt.saved,
             [("ssh_key_passphrase:prod-web".to_string(), GOOD.to_string())]
         );
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -294,7 +309,6 @@ mod tests {
         for typed in ["a", "b", "c", GOOD] {
             assert!(!msg.contains(&format!(" {typed} ")), "{msg}");
         }
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -304,7 +318,6 @@ mod tests {
         let empty = StaticSecretProvider::new();
         let (_, res) = resolve(&path, &empty, &empty, &mut prompt);
         assert!(res.is_err());
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
