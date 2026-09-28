@@ -1,7 +1,7 @@
 //! Configuration types and loading logic.
 //!
 //! Configuration is loaded from a TOML file ([`Config::load`]). Secrets such as
-//! the GLM API key are **not** stored in the config file — they are read from
+//! LLM API keys are **not** stored in the config file — they are read from
 //! the environment via the [`crate::secrets`] module.
 
 use std::fmt;
@@ -227,9 +227,11 @@ pub enum HostKeyPolicy {
 /// LLM service configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
-    /// Model identifier (e.g. `"glm-5.1"`).
+    /// Model identifier (e.g. `"deepseek-chat"`). Empty when no `[llm]`
+    /// section is configured.
     pub model: String,
-    /// Base URL of the API (e.g. `"https://open.bigmodel.cn/api/paas/v4"`).
+    /// Base URL of the OpenAI-compatible API (e.g.
+    /// `"https://api.deepseek.com/v1"`).
     pub api_base_url: String,
     /// Maximum number of tokens to generate in a single response.
     #[serde(default = "default_max_tokens")]
@@ -251,8 +253,10 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            model: "glm-5.1".to_string(),
-            api_base_url: "https://open.bigmodel.cn/api/paas/v4".to_string(),
+            // No built-in provider: without `[llm]` or `[[llm_profiles]]` the
+            // LLM is simply not configured (#490).
+            model: String::new(),
+            api_base_url: String::new(),
             max_tokens: default_max_tokens(),
             temperature: None,
             top_p: None,
@@ -301,13 +305,13 @@ fn default_max_tokens() -> u32 {
 
 /// A named LLM profile with its own API key environment variable.
 ///
-/// Profiles allow selecting between different LLM backends (e.g. GLM,
-/// DeepSeek) at launch time via `--llm <name>`.
+/// Profiles allow selecting between different LLM backends (e.g. DeepSeek,
+/// a local Ollama) at launch time via `--llm <name>`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmProfile {
-    /// Human-readable name (e.g. `"glm"`, `"deepseek"`).
+    /// Human-readable name (e.g. `"deepseek"`, `"local"`).
     pub name: String,
-    /// Model identifier (e.g. `"glm-5.1"`).
+    /// Model identifier (e.g. `"deepseek-chat"`).
     pub model: String,
     /// Base URL of the API.
     pub api_base_url: String,
@@ -315,12 +319,12 @@ pub struct LlmProfile {
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     /// Name of the environment variable / OS credential holding the API key
-    /// (default: `"GLM_API_KEY"`).
+    /// (default: [`env_vars::LLM_API_KEY`](crate::secrets::env_vars::LLM_API_KEY)).
     ///
     /// An **empty** `key_env` is an explicit marker that this profile does not
     /// require a key (local / air-gapped OpenAI-compatible servers such as
     /// ollama). A non-empty `key_env` whose secret is missing is still an error.
-    #[serde(default = "default_glm_key_env")]
+    #[serde(default = "default_llm_key_env")]
     pub key_env: String,
     /// Sampling temperature (0.0–2.0). `None` = provider default.
     #[serde(default)]
@@ -348,8 +352,9 @@ fn default_compact_at_tokens() -> u64 {
     DEFAULT_COMPACT_AT_TOKENS
 }
 
-fn default_glm_key_env() -> String {
-    "GLM_API_KEY".to_string()
+/// The `key_env` of the `[llm]` section and of a profile that sets none.
+pub fn default_llm_key_env() -> String {
+    crate::secrets::env_vars::LLM_API_KEY.to_string()
 }
 
 impl LlmProfile {
@@ -807,11 +812,17 @@ impl Config {
     /// Returns `(LlmConfig, key_env)` where `key_env` is the name of the
     /// environment variable holding the API key.
     ///
-    /// - `None` → the default `[llm]` section with `"GLM_API_KEY"`.
+    /// - `None` → the `[llm]` section with [`default_llm_key_env`]; error if
+    ///   there is no `[llm]` section (no model configured).
     /// - `Some(name)` → searches `llm_profiles`; error if not found.
     pub fn select_llm(&self, name: Option<&str>) -> Result<(LlmConfig, String)> {
         match name {
-            None => Ok((self.llm.clone(), default_glm_key_env())),
+            None if self.llm.model.trim().is_empty() => Err(CoreError::Config(
+                "no LLM configured: add an [[llm_profiles]] entry (or an [llm] section with \
+                 model and api_base_url) to config.toml, or use the GUI launcher"
+                    .into(),
+            )),
+            None => Ok((self.llm.clone(), default_llm_key_env())),
             Some(n) => self
                 .llm_profiles
                 .iter()
@@ -1169,6 +1180,25 @@ user = "dev"
     }
 
     #[test]
+    fn without_an_llm_section_the_default_selection_is_an_error() {
+        // No [llm]: there is no built-in provider to fall back to (#490).
+        let toml = r#"
+[[llm_profiles]]
+name = "openrouter"
+model = "some/model"
+api_base_url = "https://openrouter.ai/api/v1"
+key_env = "OPENROUTER_API_KEY"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let msg = cfg.select_llm(None).expect_err("no [llm]").to_string();
+        assert!(msg.contains("no LLM configured"), "{msg}");
+        let (llm_cfg, key_env) = cfg.select_llm(Some("openrouter")).unwrap();
+        assert_eq!(llm_cfg.model, "some/model");
+        assert_eq!(key_env, "OPENROUTER_API_KEY");
+        assert!(Config::default().select_llm(None).is_err());
+    }
+
+    #[test]
     fn parse_multi_llm_config() {
         let toml = r#"
 [llm]
@@ -1193,7 +1223,7 @@ api_base_url = "https://open.bigmodel.cn/api/paas/v4"
         // Default selection (no name).
         let (llm_cfg, key_env) = cfg.select_llm(None).unwrap();
         assert_eq!(llm_cfg.model, "glm-5.1");
-        assert_eq!(key_env, "GLM_API_KEY");
+        assert_eq!(key_env, "FILAR_LLM_API_KEY");
 
         // Named profile.
         let (llm_cfg, key_env) = cfg.select_llm(Some("deepseek")).unwrap();
@@ -1203,7 +1233,7 @@ api_base_url = "https://open.bigmodel.cn/api/paas/v4"
 
         // Profile with default key_env.
         let (_, key_env) = cfg.select_llm(Some("glm")).unwrap();
-        assert_eq!(key_env, "GLM_API_KEY");
+        assert_eq!(key_env, "FILAR_LLM_API_KEY");
 
         // Non-existent profile.
         assert!(cfg.select_llm(Some("nonexistent")).is_err());

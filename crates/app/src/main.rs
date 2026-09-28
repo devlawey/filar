@@ -121,6 +121,24 @@ pub fn resolve_startup_profile(
     }
 }
 
+/// The LLM profile a CLI launch starts on (#490).
+///
+/// A name given with `--llm` (other than `default`) is kept as is, so an
+/// unknown one fails with "profile not found" instead of silently running
+/// on another provider. Otherwise, with any `[[llm_profiles]]` defined, the
+/// first profile — the one the TUI shows. `None` (the `[llm]` section) only
+/// when no profiles are defined.
+pub fn cli_llm_selection(
+    profiles: &[filar_core::LlmProfile],
+    cli_llm: Option<&str>,
+) -> Option<String> {
+    match cli_llm.filter(|n| *n != "default") {
+        Some(name) => Some(name.to_string()),
+        None if profiles.is_empty() => None,
+        None => Some(resolve_startup_profile(profiles, None, None)),
+    }
+}
+
 /// Build an [`SshTarget`](filar_core::SshTarget) from a GUI [`SshConnection`](filar_gui::SshConnection).
 ///
 /// When the password is empty (normal after `pending_launch.json` deserialize —
@@ -199,26 +217,9 @@ pub fn build_llm_client_from_profile(
     let key = if !profile.requires_api_key() {
         String::new()
     } else {
-        let key = sp.get(&profile.key_env).unwrap_or_default();
-        let key = if key.is_empty() {
-            let keyring = filar_core::KeyringSecretProvider::new();
-            let kr_key = keyring.get(&profile.key_env).ok().unwrap_or_default();
-            if !kr_key.is_empty() {
-                sp.insert(&profile.key_env, &kr_key);
-                kr_key
-            } else {
-                std::env::var(&profile.key_env).unwrap_or_default()
-            }
-        } else {
-            key
-        };
-        if key.is_empty() {
-            return Err(filar_core::CoreError::Secret(format!(
-                "no API key found for profile {}",
-                profile.name
-            )));
-        }
-        key
+        lookup_profile_api_key(profile, sp).ok_or_else(|| {
+            filar_core::CoreError::Secret(format!("no API key found for profile {}", profile.name))
+        })?
     };
     let llm_config: filar_core::LlmConfig = profile.into();
     Ok(Arc::new(
@@ -240,32 +241,33 @@ fn check_profile_api_key(
     profile: &filar_core::LlmProfile,
     sp: &filar_core::StaticSecretProvider,
 ) -> Option<String> {
-    if !profile.requires_api_key() {
+    if !profile.requires_api_key() || lookup_profile_api_key(profile, sp).is_some() {
         return None;
     }
-    let key = sp.get(&profile.key_env).unwrap_or_default();
-    if !key.is_empty() {
-        return None;
+    Some(format!(
+        "no API key found (checked memory, OS store, env '{}')",
+        profile.key_env
+    ))
+}
+
+/// The API key of `profile`: in-memory `sp` → OS credential store →
+/// environment, each under [`secrets::llm_key_lookup_names`] of its
+/// `key_env` (the default name falls back to its legacy one, #490). A key
+/// found in the OS store is cached in `sp`.
+fn lookup_profile_api_key(
+    profile: &filar_core::LlmProfile,
+    sp: &filar_core::StaticSecretProvider,
+) -> Option<String> {
+    let non_empty = |k: filar_core::Result<String>| k.ok().filter(|k| !k.is_empty());
+    if let Some(key) = non_empty(secrets::llm_api_key(sp, &profile.key_env)) {
+        return Some(key);
     }
     let keyring = filar_core::KeyringSecretProvider::new();
-    match keyring.get(&profile.key_env) {
-        Ok(k) if !k.is_empty() => {
-            sp.insert(&profile.key_env, &k);
-            None
-        }
-        _ => {
-            if std::env::var(&profile.key_env)
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
-            {
-                return None;
-            }
-            Some(format!(
-                "no API key found (checked memory, OS store, env '{}')",
-                profile.key_env
-            ))
-        }
+    if let Some(key) = non_empty(secrets::llm_api_key(&keyring, &profile.key_env)) {
+        sp.insert(&profile.key_env, &key);
+        return Some(key);
     }
+    non_empty(secrets::llm_api_key(&filar_core::EnvSecretProvider::new(), &profile.key_env))
 }
 
 // ---------------------------------------------------------------------------
@@ -485,7 +487,7 @@ async fn run() -> anyhow::Result<()> {
                     String::new()
                 } else if launch.api_key.is_empty() {
                     let cred = filar_core::KeyringSecretProvider::new();
-                    cred.get(&key_env_name)
+                    secrets::llm_api_key(&cred, &key_env_name)
                         .inspect_err(|e| tracing::warn!(error = %e, key_name = %key_env_name, "failed to read API key from OS credential store"))
                         .unwrap_or_default()
                 } else {
@@ -516,19 +518,14 @@ async fn run() -> anyhow::Result<()> {
     } else {
         // CLI mode — use config profiles and env vars.
         let target = args.target.unwrap_or_else(|| "local".into());
-        let startup_profile = resolve_startup_profile(&config.llm_profiles, args.llm.as_deref(), None);
-        let profile_ref = if startup_profile == config.llm_profiles.first().map(|p| &p.name).cloned().unwrap_or_default() {
-            None
-        } else {
-            Some(startup_profile.as_str())
-        };
+        let profile = cli_llm_selection(&config.llm_profiles, args.llm.as_deref());
         let (llm_config, key_env) = config
-            .select_llm(profile_ref)
+            .select_llm(profile.as_deref())
             .map_err(|e| anyhow::anyhow!(e))?;
         let key = if key_env.trim().is_empty() {
             String::new()
         } else {
-            secrets::api_key(&key_env).map_err(|e| {
+            secrets::llm_api_key(&filar_core::EnvSecretProvider::new(), &key_env).map_err(|e| {
                 anyhow::anyhow!("{e}. Set the {key_env} environment variable or use the GUI launcher.")
             })?
         };
@@ -553,33 +550,17 @@ async fn run() -> anyhow::Result<()> {
     // The StaticSecretProvider holds the API key and will also hold dynamic
     // $FILAR_SECRET_N variables added at runtime (via Ctrl+P in the TUI).
     let secret_provider = Arc::new(StaticSecretProvider::new());
+    // A non-empty key always comes with a non-empty key_env (keyless
+    // profiles resolve no key), so the key is held under its own name.
     if !api_key.is_empty() {
-        let insert_name = if key_env_name.trim().is_empty() {
-            secrets::env_vars::GLM_API_KEY
-        } else {
-            key_env_name.as_str()
-        };
-        secret_provider.insert(insert_name, &api_key);
-        // Keep GLM_API_KEY alias for the initial client when using default name.
-        if insert_name != secrets::env_vars::GLM_API_KEY {
-            secret_provider.insert(secrets::env_vars::GLM_API_KEY, &api_key);
-        }
+        secret_provider.insert(&key_env_name, &api_key);
     }
 
-    let llm: Arc<dyn LlmClient> = Arc::new(if api_key.is_empty() {
-        OpenAiCompatClient::new_with_key(
-            &llm_config,
-            Duration::from_secs(config.timeouts.llm_secs),
-            "",
-        )?
-    } else {
-        OpenAiCompatClient::new_with_provider(
-            &llm_config,
-            Duration::from_secs(config.timeouts.llm_secs),
-            secrets::env_vars::GLM_API_KEY,
-            &*secret_provider,
-        )?
-    });
+    let llm: Arc<dyn LlmClient> = Arc::new(OpenAiCompatClient::new_with_key(
+        &llm_config,
+        Duration::from_secs(config.timeouts.llm_secs),
+        &api_key,
+    )?);
 
     info!(model = %llm_config.model, keyless = api_key.is_empty(), "LLM client initialised");
 
@@ -1116,5 +1097,68 @@ mod tests {
         let profiles: Vec<LlmProfile> = vec![];
         let result = resolve_startup_profile(&profiles, None, None);
         assert_eq!(result, "default");
+    }
+
+    // ── CLI profile selection (#490) ───────────────────────────────────
+
+    use super::cli_llm_selection;
+
+    #[test]
+    fn cli_launch_runs_on_the_first_profile_not_the_llm_section() {
+        let mut first = make_profile("openrouter");
+        first.key_env = "OPENROUTER_API_KEY".into();
+        let config = filar_core::Config {
+            llm_profiles: vec![first, make_profile("local")],
+            ..Default::default()
+        };
+        let selected = cli_llm_selection(&config.llm_profiles, None);
+        assert_eq!(selected.as_deref(), Some("openrouter"));
+        let (llm, key_env) = config.select_llm(selected.as_deref()).unwrap();
+        assert_eq!(llm.model, "openrouter");
+        assert_eq!(key_env, "OPENROUTER_API_KEY");
+        // Naming the first profile, or `default`, lands on it too.
+        assert_eq!(cli_llm_selection(&config.llm_profiles, Some("openrouter")).as_deref(), Some("openrouter"));
+        assert_eq!(cli_llm_selection(&config.llm_profiles, Some("default")).as_deref(), Some("openrouter"));
+    }
+
+    #[test]
+    fn an_unknown_explicit_profile_is_an_error_not_the_first_profile() {
+        let config = filar_core::Config {
+            llm_profiles: vec![make_profile("local")],
+            ..Default::default()
+        };
+        let selected = cli_llm_selection(&config.llm_profiles, Some("openrouter"));
+        assert_eq!(selected.as_deref(), Some("openrouter"));
+        let msg = config.select_llm(selected.as_deref()).expect_err("unknown").to_string();
+        assert!(msg.contains("'openrouter' not found"), "{msg}");
+    }
+
+    #[test]
+    fn a_keyless_first_profile_needs_no_key_on_a_cli_launch() {
+        let config = filar_core::Config {
+            llm_profiles: vec![make_profile("local")],
+            ..Default::default()
+        };
+        let selected = cli_llm_selection(&config.llm_profiles, None);
+        let (_, key_env) = config.select_llm(selected.as_deref()).unwrap();
+        assert!(key_env.is_empty(), "keyless profile: {key_env}");
+    }
+
+    #[test]
+    fn without_profiles_the_cli_uses_the_llm_section() {
+        assert_eq!(cli_llm_selection(&[], None), None);
+        assert_eq!(cli_llm_selection(&[], Some("default")), None);
+    }
+
+    #[test]
+    fn without_profiles_an_explicit_profile_name_is_not_swapped_for_the_llm_section() {
+        let config = filar_core::Config {
+            llm: filar_core::LlmConfig { model: "m".into(), api_base_url: "u".into(), ..Default::default() },
+            ..Default::default()
+        };
+        let selected = cli_llm_selection(&config.llm_profiles, Some("deepseek"));
+        assert_eq!(selected.as_deref(), Some("deepseek"));
+        let msg = config.select_llm(selected.as_deref()).expect_err("unknown profile").to_string();
+        assert!(msg.contains("'deepseek' not found"), "{msg}");
     }
 }

@@ -287,6 +287,22 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Changed
 
+- The default LLM API key name is `FILAR_LLM_API_KEY`; `GLM_API_KEY` is
+  still read as a fallback, with a warning
+  ([#490](https://github.com/devlawey/filar/issues/490)).
+
+- `[llm]` has no built-in model or endpoint; GLM is no longer a default
+  ([#490](https://github.com/devlawey/filar/issues/490)).
+
+- A launch with neither `[llm]` nor `[[llm_profiles]]` reports "no LLM
+  configured" instead of calling a built-in provider
+  ([#490](https://github.com/devlawey/filar/issues/490)).
+
+- Removed the deprecated `filar_agent::GlmClient` alias and
+  `secrets::glm_api_key()` (use `OpenAiCompatClient` and
+  `secrets::default_llm_api_key()`)
+  ([#490](https://github.com/devlawey/filar/issues/490)).
+
 - `Ctrl+S` no longer generates a runbook unconditionally: the save overlay
   asks "Runbook: create one? [y/n]" (`н`/`т` on the Russian layout); the
   `.md` is written at once, `n`/Esc saves only the session without a model
@@ -307,6 +323,15 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   ([#435](https://github.com/devlawey/filar/issues/435)).
 
 ### Fixed
+
+- CLI launch (`--target`, no GUI) runs on the first `[[llm_profiles]]` entry
+  instead of silently swapping it for the `[llm]` section and demanding
+  `GLM_API_KEY`; a keyless first profile no longer asks for a key
+  ([#490](https://github.com/devlawey/filar/issues/490)).
+
+- CLI `--llm <name>` naming an unknown profile fails with "profile not
+  found" instead of running on another provider
+  ([#490](https://github.com/devlawey/filar/issues/490)).
 
 - Windows, local: the directory changed in the terminal mode (`Ctrl+T`) now
   reaches the agent mode, `!` commands and the status bar — `cmd.exe` and

@@ -364,7 +364,7 @@ pub struct LaunchConfig {
     /// SSH connection details; `Some` identifies an SSH launch and drives
     /// the executor choice in `main` (#406).
     pub ssh: Option<SshConnection>,
-    /// Model name (e.g. `"glm-5.1"`).
+    /// Model name (e.g. `"deepseek-chat"`).
     pub model: String,
     /// API base URL.
     pub api_base_url: String,
@@ -383,7 +383,7 @@ pub struct LaunchConfig {
     #[serde(default)]
     pub selected_profile: Option<String>,
     /// Env var / credential name for the API key.
-    #[serde(default = "default_glm_key_env_gui")]
+    #[serde(default = "filar_core::config::default_llm_key_env")]
     pub key_env: String,
     /// Directory for Ctrl+S session exports (`None` = CWD).
     #[serde(default)]
@@ -398,10 +398,6 @@ pub struct LaunchConfig {
     /// Carried through pending_launch so the TUI does not depend on CWD config.toml (#360).
     #[serde(default)]
     pub arbiter_profile: Option<String>,
-}
-
-fn default_glm_key_env_gui() -> String {
-    "GLM_API_KEY".to_string()
 }
 
 /// SSH connection details from the GUI.
@@ -1963,7 +1959,8 @@ impl LauncherApp {
             if ui.button("Add Profile").clicked() {
                 self.profiles.push(LlmProfileData {
                     name: "default".into(), model: String::new(),
-                    api_base_url: String::new(), key_env: "GLM_API_KEY".into(),
+                    api_base_url: String::new(),
+                    key_env: filar_core::secrets::env_vars::LLM_API_KEY.into(),
                     api_key: String::new(), temperature: String::new(),
                     max_tokens: String::new(), top_p: String::new(),
                     extra_body: String::new(), compact_at_tokens: String::new(),

@@ -17,8 +17,12 @@ use crate::error::{CoreError, Result};
 
 /// Environment variable names for secrets.
 pub mod env_vars {
-    /// API key for the GLM LLM service.
-    pub const GLM_API_KEY: &str = "GLM_API_KEY";
+    /// Default name of the LLM API key: the `key_env` of the `[llm]` section
+    /// and of a profile that sets none (#490).
+    pub const LLM_API_KEY: &str = "FILAR_LLM_API_KEY";
+    /// Former default name of the LLM API key. Still read when nothing is
+    /// stored under [`LLM_API_KEY`], so existing setups keep working (#490).
+    pub const LEGACY_LLM_API_KEY: &str = "GLM_API_KEY";
     /// Passphrase of an encrypted SSH key (`SshAuth::Key`), for a single
     /// tab or `--target` launch. Never used by the fleet: a shared secret
     /// for every host is what per-host credentials exist to avoid (#480).
@@ -40,7 +44,7 @@ pub mod env_vars {
 /// must go through this trait — direct `std::env::var` calls for secrets are
 /// only permitted inside `EnvSecretProvider`.
 pub trait SecretProvider: Send + Sync {
-    /// Retrieve a secret by its logical name (e.g. `"GLM_API_KEY"`,
+    /// Retrieve a secret by its logical name (e.g. `"FILAR_LLM_API_KEY"`,
     /// `"$FILAR_SECRET_1"`).
     ///
     /// Returns [`CoreError::Secret`] if the secret is not available.
@@ -59,7 +63,7 @@ pub trait SecretProvider: Send + Sync {
 
 /// Default [`SecretProvider`] — reads secrets from environment variables.
 ///
-/// This is the default for TUI/desktop: `GLM_API_KEY` and `FILAR_SECRET_*`
+/// This is the default for TUI/desktop: LLM API keys and `FILAR_SECRET_*`
 /// are read from the process environment.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EnvSecretProvider;
@@ -202,7 +206,7 @@ impl Drop for StaticSecretProvider {
 
 /// Redact a potentially sensitive string for use in error messages.
 ///
-/// Shows the first 4 characters and the total length, e.g. `"glm_… (len 11)"`.
+/// Shows the first 4 characters and the total length, e.g. `"FILA… (len 17)"`.
 /// Preserves diagnostics (you can tell which secret is missing) while ensuring
 /// that a full secret value cannot appear in user-facing text even if passed by
 /// mistake in place of a secret name.
@@ -211,7 +215,7 @@ impl Drop for StaticSecretProvider {
 ///
 /// ```
 /// use filar_core::secrets::redact;
-/// assert_eq!(redact("GLM_API_KEY"), "GLM_… (len 11)".to_string());
+/// assert_eq!(redact("FILAR_LLM_API_KEY"), "FILA… (len 17)".to_string());
 /// assert_eq!(redact("sk-or-v1-abc123def456"), "sk-o… (len 21)".to_string());
 /// ```
 pub fn redact(s: &str) -> String {
@@ -299,13 +303,52 @@ pub fn redact_secrets(text: &str, provider: &dyn SecretProvider) -> String {
 // Legacy convenience functions (delegates to EnvSecretProvider)
 // ---------------------------------------------------------------------------
 
-/// Retrieve the GLM API key from the environment.
+/// The names an LLM API key stored for `key_env` is looked up under, in
+/// order: `key_env` itself and, for the default name
+/// [`env_vars::LLM_API_KEY`], the legacy [`env_vars::LEGACY_LLM_API_KEY`]
+/// (#490).
+pub fn llm_key_lookup_names(key_env: &str) -> Vec<&str> {
+    if key_env == env_vars::LLM_API_KEY {
+        vec![key_env, env_vars::LEGACY_LLM_API_KEY]
+    } else {
+        vec![key_env]
+    }
+}
+
+/// Retrieve the LLM API key stored for `key_env` from `provider`, falling
+/// back to the legacy name for the default one (see [`llm_key_lookup_names`]).
 ///
-/// Returns [`CoreError::Secret`] if the variable is unset or empty.
+/// A hit under the legacy name logs a warning naming both variables, never
+/// the value. Returns the error for `key_env` itself when nothing is found.
+pub fn llm_api_key(provider: &dyn SecretProvider, key_env: &str) -> Result<String> {
+    let names = llm_key_lookup_names(key_env);
+    let mut first_err = None;
+    for name in names {
+        match provider.get(name) {
+            Ok(key) => {
+                if name != key_env {
+                    tracing::warn!(
+                        legacy = %name,
+                        current = %key_env,
+                        "LLM API key read from its legacy name; rename it"
+                    );
+                }
+                return Ok(key);
+            }
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    Err(first_err.unwrap_or_else(|| CoreError::Secret(format!("{key_env} is not set"))))
+}
+
+/// Retrieve the default LLM API key ([`env_vars::LLM_API_KEY`], or its
+/// legacy name) from the environment.
 ///
-/// **Deprecated:** prefer [`SecretProvider::get`] with [`EnvSecretProvider`].
-pub fn glm_api_key() -> Result<String> {
-    EnvSecretProvider::new().get(env_vars::GLM_API_KEY)
+/// Returns [`CoreError::Secret`] if neither variable is set.
+pub fn default_llm_api_key() -> Result<String> {
+    llm_api_key(&EnvSecretProvider::new(), env_vars::LLM_API_KEY)
 }
 
 /// Retrieve an API key from a named environment variable.
@@ -734,5 +777,22 @@ mod tests {
     fn key_passphrase_entry_is_separate_from_the_password_entry() {
         assert_eq!(ssh_key_passphrase_name("prod-web"), "ssh_key_passphrase:prod-web");
         assert_ne!(ssh_key_passphrase_name("prod-web"), ssh_cred_name(0, "prod-web"));
+    }
+
+    #[test]
+    fn the_default_llm_key_falls_back_to_its_legacy_name() {
+        let provider = StaticSecretProvider::new();
+        provider.insert("GLM_API_KEY", "legacy-key");
+        assert_eq!(llm_api_key(&provider, env_vars::LLM_API_KEY).unwrap(), "legacy-key");
+        provider.insert("FILAR_LLM_API_KEY", "new-key");
+        assert_eq!(llm_api_key(&provider, env_vars::LLM_API_KEY).unwrap(), "new-key");
+    }
+
+    #[test]
+    fn a_named_llm_key_has_no_fallback() {
+        let provider = StaticSecretProvider::new();
+        provider.insert("GLM_API_KEY", "legacy-key");
+        assert!(llm_api_key(&provider, "OPENROUTER_API_KEY").is_err());
+        assert_eq!(llm_key_lookup_names("OPENROUTER_API_KEY"), vec!["OPENROUTER_API_KEY"]);
     }
 }
