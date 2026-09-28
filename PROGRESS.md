@@ -9937,7 +9937,9 @@ Agent — подсказка про `ssh-add` / OpenSSH Agent / Pageant.
 (если сохраняется) проверяется `key_passphrase_matches` — ошибка в лаунчере.
 Фраза — только в keyring `ssh_key_passphrase:<alias>`
 (`key_passphrase_ops`, как `ssh_credential_ops` для паролей; пароль теперь
-сохраняется только при парольном входе). `resolve_gui_ssh_target` строит
+сохраняется только при парольном входе; удаление хоста стирает обе записи
+безусловно). В unit-тестах `save/load/delete_secret` — no-op: тесты не
+трогают настоящее хранилище разработчика. `resolve_gui_ssh_target` строит
 `SshAuth` по способу; фразу заполняет существующий шаг `--target`
 (keyring → `SSH_KEY_PASSPHRASE` → терминал). Sync/import/export несут `type`
 и `path`; CSV и хост без `auth` → агент. `filar-gui` зависит от

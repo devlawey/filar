@@ -93,7 +93,14 @@ fn secret_text_edit(
 }
 
 /// Save a secret to the OS credential store.
+///
+/// A no-op in unit tests, like [`load_secret`] and [`delete_secret`]: host
+/// list tests use ordinary aliases, and must never touch the developer's
+/// real credential store.
 fn save_secret(username: &str, secret: &str) {
+    if cfg!(test) {
+        return;
+    }
     let secret = sanitize_secret_clipboard(secret);
     if secret.is_empty() {
         delete_secret(username);
@@ -111,6 +118,9 @@ fn save_secret(username: &str, secret: &str) {
 
 /// Load a secret from the OS credential store. Returns empty string if not found.
 fn load_secret(username: &str) -> String {
+    if cfg!(test) {
+        return String::new();
+    }
     let raw = match keyring::Entry::new(CRED_SERVICE, username) {
         Ok(entry) => entry.get_password().unwrap_or_default(),
         Err(_) => String::new(),
@@ -120,6 +130,9 @@ fn load_secret(username: &str) -> String {
 
 /// Delete a secret from the OS credential store.
 fn delete_secret(username: &str) {
+    if cfg!(test) {
+        return;
+    }
     if let Ok(entry) = keyring::Entry::new(CRED_SERVICE, username) {
         let _ = entry.delete_credential();
     }
@@ -3041,10 +3054,11 @@ impl LauncherApp {
             return;
         }
         let slot = self.ssh_slots.remove(idx);
-        if slot.save_password && !slot.alias.trim().is_empty() {
+        // Both entries go, whatever the save flags say now: a flag unchecked
+        // since the last launch still leaves that launch's secret behind
+        // (#489 review).
+        if !slot.alias.trim().is_empty() {
             delete_secret(&ssh_cred_name(idx, &slot.alias));
-        }
-        if slot.save_passphrase && !slot.alias.trim().is_empty() {
             delete_secret(&slot_passphrase_cred_name(idx, &slot.alias));
         }
         if self.target_mode == idx + 1 {
