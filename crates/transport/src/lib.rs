@@ -12,6 +12,7 @@ mod auth;
 pub mod cwd;
 pub mod error;
 pub mod interactive;
+pub mod key;
 #[cfg(feature = "local")]
 pub mod local;
 pub mod readonly;
@@ -33,6 +34,10 @@ pub use local::LocalExecutor;
 pub use cwd::{
     cmd_osc7_prompt, is_safe_cwd, posix_cd_command, posix_cd_input, posix_shell_quote,
     shell_flavor, ShellFlavor, OSC7_PWD_PROBE, OSC7_RAW_HOST, POWERSHELL_OSC7_PROMPT,
+};
+pub use key::{
+    fill_key_passphrase, key_passphrase_matches, key_protection, resolve_key_path, KeyPassphrase,
+    KeyProtection,
 };
 pub use readonly::ReadOnlyExecutor;
 pub use secret::SecretSubstitutingExecutor;

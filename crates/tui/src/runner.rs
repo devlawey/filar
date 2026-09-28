@@ -439,6 +439,19 @@ fn ssh_transport_config(command_timeout: Duration) -> SshTransportConfig {
     SshTransportConfig::default().with_command_timeout(command_timeout)
 }
 
+/// Whether the passphrase typed for `target`'s encrypted key decrypts it
+/// (#480). Decrypting is blocking, so it runs off the runtime.
+async fn typed_passphrase_opens_key(target: &filar_core::SshTarget) -> bool {
+    let filar_core::SshAuth::Key { path, passphrase: Some(passphrase) } = &target.auth else {
+        return false;
+    };
+    let path = filar_transport::resolve_key_path(path.as_deref());
+    let passphrase = passphrase.clone();
+    tokio::task::spawn_blocking(move || filar_transport::key_passphrase_matches(&path, &passphrase))
+        .await
+        .unwrap_or(false)
+}
+
 /// Wrap `exec` in a [`filar_transport::ReadOnlyExecutor`] when `target` is a
 /// member of a read-only [`filar_core::HostGroup`] (#419); return it
 /// untouched otherwise. Ad-hoc targets carry no tags and never match.
@@ -1360,7 +1373,13 @@ async fn run_app(
             app.ctrl_o_needs_connect = false;
             // If we have a pending password entry target, use it directly.
             if let (Some(mut target), Some(password)) = (app.ctrl_o_pending_target.take(), app.pending_ssh_password.take()) {
-                target.auth = filar_core::SshAuth::Password { password: Some(password) };
+                // What was typed is the key's passphrase for a key target
+                // (#480), the password otherwise.
+                let is_key = matches!(target.auth, filar_core::SshAuth::Key { .. });
+                match &mut target.auth {
+                    filar_core::SshAuth::Key { passphrase, .. } => *passphrase = Some(password),
+                    auth => *auth = filar_core::SshAuth::Password { password: Some(password) },
+                }
                 let sid = app.ctrl_o_pending_session_id.take().unwrap_or(app.sessions[app.active].id);
                 let exec_entry = executors.get(&sid)
                     .map(|e| (e.executor.clone(), e.ssh_target.clone()));
@@ -1390,6 +1409,18 @@ async fn run_app(
                         _ = token.cancelled() => return,
                         _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
                     }
+                    // A typed passphrase is checked locally first: a wrong one
+                    // asks again instead of failing the connect (#480).
+                    if is_key && !typed_passphrase_opens_key(&target).await {
+                        let _ = tx.send(TuiEvent::Agent {
+                            session_id: sid,
+                            event: filar_agent::AgentEvent::Error(
+                                "Wrong passphrase for the SSH key — try again".into(),
+                            ),
+                        });
+                        let _ = tx.send(TuiEvent::PasswordNeeded { session_id: sid, target });
+                        return;
+                    }
                     let new_info = format!("{}@{}:{}", target.user, target.host, target.port);
                     match SshExecutor::connect_with_config(
                         &target,
@@ -1407,9 +1438,10 @@ async fn run_app(
                             let _ = tx.send(TuiEvent::TransportChanged {
                                 session_id: sid, is_local: false, ssh_info: Some(new_info), alias: Some(alias.clone()),
                             });
+                            let how = if is_key { "key" } else { "password" };
                             let _ = tx.send(TuiEvent::Agent {
                                 session_id: sid,
-                                event: filar_agent::AgentEvent::Finished(format!("Connected to {} (password)", alias)),
+                                event: filar_agent::AgentEvent::Finished(format!("Connected to {} ({how})", alias)),
                             });
                         }
                         Err(e) => {
@@ -1498,6 +1530,35 @@ async fn run_app(
                                     session_id: sid, target: target.clone(),
                                 });
                                 return;
+                            }
+                        }
+                        // An encrypted key: its passphrase from the OS
+                        // credential store or SSH_KEY_PASSPHRASE, else ask
+                        // (#480). Decrypting is blocking.
+                        if matches!(target.auth, filar_core::SshAuth::Key { .. }) {
+                            let filled = tokio::task::spawn_blocking(move || {
+                                let store = filar_core::KeyringSecretProvider::new();
+                                let env = filar_core::EnvSecretProvider::new();
+                                filar_transport::fill_key_passphrase(&mut target, &store, Some(&env))
+                                    .map(|found| (target, found))
+                            })
+                            .await
+                            .map_err(|e| CoreError::Other(format!("key check task failed: {e}")))
+                            .and_then(|r| r);
+                            match filled {
+                                Ok((t, filar_transport::KeyPassphrase::Missing(_))) => {
+                                    let _ = tx.send(TuiEvent::PasswordNeeded { session_id: sid, target: t });
+                                    return;
+                                }
+                                Ok((t, _)) => target = t,
+                                Err(e) => {
+                                    let _ = tx.send(TuiEvent::Agent {
+                                        session_id: sid,
+                                        event: filar_agent::AgentEvent::Error(format!("SSH connection failed: {e}")),
+                                    });
+                                    let _ = tx.send(TuiEvent::TransportSwapFailed { session_id: sid });
+                                    return;
+                                }
                             }
                         }
                         let new_info = format!("{}@{}:{}", target.user, target.host, target.port);
@@ -2693,7 +2754,7 @@ mod tests {
                 host: format!("{n}.example"),
                 port: 22,
                 user: "admin".into(),
-                auth: filar_core::SshAuth::Key { path: None },
+                auth: filar_core::SshAuth::Key { path: None, passphrase: None },
                 host_key_policy: Default::default(),
                 tags: vec![if n.starts_with("web") { "web".into() } else { "db".into() }],
             })
@@ -3268,7 +3329,7 @@ mod tests {
             host: format!("{name}.example"),
             port: 22,
             user: "ops".into(),
-            auth: filar_core::SshAuth::Key { path: None },
+            auth: filar_core::SshAuth::Key { path: None, passphrase: None },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
             tags: vec!["g".into()],
         };

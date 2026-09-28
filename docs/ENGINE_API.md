@@ -215,6 +215,16 @@ The transport itself **never reads environment variables** for the password. The
 reading `SSH_PASSWORD` from the environment, while external consumers whose env is
 not a secret source are not trapped by it.
 
+### Encrypted keys (`SshAuth::Key`)
+
+An encrypted key's passphrase is taken from `SshAuth::Key { passphrase: Some(..) }`,
+else from your `SecretProvider` under `"SSH_KEY_PASSPHRASE"`; with neither, the
+connect fails with `… is encrypted and no passphrase was given`, and with a wrong
+one with `wrong passphrase for SSH key …` — neither error carries the passphrase.
+`filar_transport::fill_key_passphrase` (store, then optional env provider,
+each checked by decrypting), `key_protection` and `key_passphrase_matches` let you
+resolve or verify a passphrase locally before connecting; they are blocking.
+
 `SshTransportConfig::command_timeout` (default 300s,
 `filar_core::DEFAULT_COMMAND_TIMEOUT_SECS`) is how long `SshSession::run` waits
 for the command marker. Override with
@@ -503,6 +513,8 @@ registered first.
 | `Session::fleet: Option<FleetSnapshot>` added | Struct literals constructing `Session` | `fleet: None` for an ordinary session. Deserialised sessions are unaffected |
 | `SessionMeta::fleet_group: Option<String>` added | Struct literals constructing `SessionMeta` | `fleet_group: None` |
 | Fleet modules, `ReadOnlyExecutor`, `FleetOperation`, fleet checks, fleet runbook | Nothing — additive | Opt in where you need a fleet |
+| `SshAuth::Key` gains `passphrase: Option<String>` (#480) | Struct literals and exhaustive patterns of `SshAuth::Key` | `SshAuth::Key { path, passphrase: None }`; patterns `SshAuth::Key { path, .. }`. Never (de)serialised |
+| `MissingCredentials::NoPassphrase` added (#480); `AgentUnsupported` removed (#479) | Exhaustive matches on `MissingCredentials` | Handle the new reason; drop the removed one |
 
 ## Upgrading to `engine-v1.0.6`
 

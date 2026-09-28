@@ -4995,6 +4995,16 @@ impl App {
                 }
             }
             TuiEvent::PasswordNeeded { session_id, target } => {
+                // The same masked entry serves an encrypted key's passphrase
+                // (#480); say which one is asked for.
+                if let filar_core::SshAuth::Key { path, .. } = &target.auth {
+                    let key = filar_transport::resolve_key_path(path.as_deref());
+                    self.push_message(ChatBlock::System(format!(
+                        "Enter the passphrase for SSH key {} ({})",
+                        key.display(),
+                        target.name
+                    )));
+                }
                 self.ctrl_o_pending_target = Some(target);
                 self.ctrl_o_pending_session_id = Some(session_id);
                 self.mode = AppMode::PasswordInput;
@@ -5399,7 +5409,7 @@ pub(crate) fn test_fleet_app(view: filar_agent::fleet_view::FleetView) -> App {
         host: format!("{name}.example"),
         port: 22,
         user: "ops".into(),
-        auth: filar_core::SshAuth::Key { path: None },
+        auth: filar_core::SshAuth::Key { path: None, passphrase: None },
         host_key_policy: filar_core::HostKeyPolicy::Tofu,
         tags: vec!["web".into()],
     };
@@ -5536,6 +5546,18 @@ fn fleet_intro(
             lines.push(format!(
                 "Save a password in the launcher (keyring {}), then reopen.",
                 filar_agent::fleet_creds::target_secret_name("<host>")
+            ));
+        }
+        // The launcher cannot store a key passphrase; `--target` offers to.
+        let missing_passphrase = creds
+            .skipped(op)
+            .iter()
+            .any(|(_, why)| *why == filar_agent::fleet_creds::MissingCredentials::NoPassphrase);
+        if missing_passphrase {
+            lines.push(format!(
+                "Encrypted key: run `filar --target <host>` once and save its passphrase \
+                 (keyring {}), then reopen.",
+                filar_core::ssh_key_passphrase_name("<host>")
             ));
         }
         lines.push("Fixed at entry: retagging does not change the fleet.".into());
@@ -6252,7 +6274,7 @@ mod tests {
             host: format!("{name}.example"),
             port: 22,
             user: "ops".into(),
-            auth: filar_core::SshAuth::Key { path: None },
+            auth: filar_core::SshAuth::Key { path: None, passphrase: None },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
             tags: tags.iter().map(|s| (*s).to_string()).collect(),
         }
@@ -12653,6 +12675,32 @@ mod tests {
         assert!(app.ctrl_o_pending_target.is_some(), "pending ctrl+o target must be set");
         assert!(app.ctrl_o_pending_session_id.is_some(), "pending session id must be set");
         assert_eq!(app.mode, AppMode::PasswordInput);
+    }
+
+    #[test]
+    fn an_encrypted_key_asks_for_its_passphrase_by_name() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let target = filar_core::SshTarget {
+            name: "srv".into(), host: "h".into(), port: 22, user: "u".into(),
+            auth: filar_core::SshAuth::Key {
+                path: Some(std::path::PathBuf::from("/keys/id_srv")),
+                passphrase: None,
+            },
+            host_key_policy: filar_core::HostKeyPolicy::Tofu,
+            tags: Vec::new(),
+        };
+        app.handle_agent_event(TuiEvent::PasswordNeeded {
+            session_id: app.sessions[0].id,
+            target,
+        });
+        assert_eq!(app.mode, AppMode::PasswordInput);
+        let asked = app.messages.iter().rev().find_map(|m| match m {
+            ChatBlock::System(t) => Some(t.clone()),
+            _ => None,
+        });
+        let asked = asked.expect("a prompt line");
+        assert!(asked.contains("passphrase for SSH key"), "{asked}");
+        assert!(asked.contains("id_srv") && asked.contains("(srv)"), "{asked}");
     }
 
     #[test]

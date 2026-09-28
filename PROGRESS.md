@@ -9847,3 +9847,44 @@ POSIX для SSH) и закрыть; `..` — вставить текущий к
 
 **Next:** все issue пачки 479–483 в PR.
 
+## #480 — ключи с парольной фразой (`SshAuth::Key`)
+
+**Что сделано.** `SshAuth::Key { path, passphrase }` — фраза `#[serde(skip)]`,
+в `Debug` скрыта. Транспорт (`crates/transport/src/key.rs`): ключ сначала
+грузится без фразы, зашифрованный — с фразой цели или `SSH_KEY_PASSPHRASE`
+из `SecretProvider`; ошибки «is encrypted and no passphrase was given» /
+«wrong passphrase» без самой фразы. Публичные помощники
+`fill_key_passphrase` (хранилище ОС → env, каждая фраза проверяется
+расшифровкой), `key_protection`, `key_passphrase_matches`, `resolve_key_path`.
+`--target` (`crates/app/src/passphrase.rs`): хранилище → env → запрос без эха
+(crossterm raw mode) до 3 попыток, после верной — предложение сохранить в
+хранилище (`ssh_key_passphrase:<target>`). TUI `Ctrl+O`: то же без запроса,
+иначе `PasswordNeeded` → маскированный ввод; неверная фраза — ошибка и
+повторный запрос. Флот: у зашифрованного ключа нужна фраза хоста в
+хранилище, иначе `MissingCredentials::NoPassphrase`; ключ только
+распознаётся, не расшифровывается (не тормозить вход во флот); общий
+`SSH_KEY_PASSPHRASE` во флоте не используется.
+
+**Решения.** Фраза живёт в цели (как пароль), а не в общем секрете — у
+хостов флота свои фразы. Проверка локальной расшифровкой до подключения:
+повторный запрос без сети и без разбора текста ошибок. **GUI-лаунчер не
+тронут:** он вообще не умеет входить по ключу (запуск из GUI всегда
+`SshAuth::Password`), поле фразы там опирается на отсутствующую функцию —
+вынесено в отдельную задачу.
+
+**Контракты.** `CommandExecutor` / `LlmClient` / `SecretProvider` не
+менялись. `SshAuth::Key` получил поле (ломает struct-литералы — в
+ENGINE_API); `MissingCredentials::NoPassphrase`.
+
+**Проверено вживую** (локальный OpenSSH `sshd`, ключ `ssh-keygen` с
+фразой): `#[ignore]` `ssh_encrypted_key_login_runs_a_command` — верная /
+неверная / отсутствующая фраза; бинарник `--target`: запрос без эха,
+неверная → повтор, верная → подключение и `!echo` на хосте;
+`SSH_KEY_PASSPHRASE` — без запроса; без TTY — ошибка, не зависание; фразы
+нет ни в выводе, ни в логе. Windows — только кросс-компиляция и clippy.
+
+**Не проверено.** Windows/macOS вживую (ввод без эха, сохранение в
+Credential Manager / Keychain), TUI `Ctrl+O` вживую, живой флот.
+
+**Next:** #481.
+

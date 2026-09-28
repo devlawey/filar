@@ -1500,6 +1500,7 @@ dependencies = [
  "filar-transport",
  "futures",
  "reqwest",
+ "russh",
  "serde",
  "serde_json",
  "tokio",
@@ -1512,11 +1513,13 @@ name = "filar-app"
 version = "1.0.7"
 dependencies = [
  "anyhow",
+ "crossterm",
  "filar-agent",
  "filar-core",
  "filar-gui",
  "filar-transport",
  "filar-tui",
+ "russh",
  "serde_json",
  "tokio",
  "tracing",

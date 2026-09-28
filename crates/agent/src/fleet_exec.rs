@@ -513,7 +513,7 @@ mod tests {
                 host: format!("{n}.example"),
                 port: 22,
                 user: "admin".into(),
-                auth: SshAuth::Key { path: None },
+                auth: SshAuth::Key { path: None, passphrase: None },
                 host_key_policy: Default::default(),
                 tags: vec!["web".into()],
             })

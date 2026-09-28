@@ -18,7 +18,7 @@ use tracing::{debug, info};
 
 use filar_core::{CoreError, Result, SecretProvider, SshAuth, SshTarget};
 
-use crate::ssh::{dirs_or_default, resolve_ssh_password};
+use crate::ssh::resolve_ssh_password;
 
 /// Hint appended to "agent unavailable" errors.
 const START_AGENT_HINT: &str = "start one and load a key: eval \"$(ssh-agent)\" && ssh-add";
@@ -43,18 +43,25 @@ pub(crate) async fn authenticate<H: client::Handler>(
     secrets: &dyn SecretProvider,
 ) -> Result<()> {
     match &target.auth {
-        SshAuth::Key { path } => {
-            let key_path = path.clone().unwrap_or_else(dirs_or_default);
-            // Reading the key file is blocking I/O; keep it off the runtime.
+        SshAuth::Key { path, passphrase } => {
+            let key_path = crate::key::resolve_key_path(path.as_deref());
+            // An explicit passphrase (keyring / prompt, filled by the caller)
+            // wins over the provider's `SSH_KEY_PASSPHRASE`.
+            let passphrase = passphrase.clone().or_else(|| {
+                secrets
+                    .get(filar_core::secrets::env_vars::SSH_KEY_PASSPHRASE)
+                    .ok()
+                    .filter(|p| !p.is_empty())
+            });
+            // Reading (and decrypting) the key is blocking; keep it off the
+            // runtime.
             let key_pair = tokio::task::spawn_blocking({
                 let key_path = key_path.clone();
-                move || load_secret_key(&key_path, None)
+                let name = target.name.clone();
+                move || crate::key::load_key(&key_path, passphrase.as_deref(), &name)
             })
             .await
-            .map_err(|e| CoreError::Other(format!("SSH key loader task failed: {e}")))?
-            .map_err(|e| {
-                CoreError::Other(format!("failed to load SSH key {:?}: {e}", key_path))
-            })?;
+            .map_err(|e| CoreError::Other(format!("SSH key loader task failed: {e}")))??;
 
             let hash = session
                 .best_supported_rsa_hash()

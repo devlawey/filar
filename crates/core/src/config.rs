@@ -156,6 +156,11 @@ pub enum SshAuth {
     Key {
         /// Path to the private key file.
         path: Option<PathBuf>,
+        /// Passphrase of an encrypted key, filled at connect time from the OS
+        /// credential store, `SSH_KEY_PASSPHRASE` or a masked prompt (#480).
+        /// Never read from or written to `config.toml`.
+        #[serde(skip)]
+        passphrase: Option<String>,
     },
     /// Use the system SSH agent.
     #[default]
@@ -177,7 +182,11 @@ pub enum SshAuth {
 impl fmt::Debug for SshAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Key { path } => f.debug_struct("Key").field("path", path).finish(),
+            Self::Key { path, passphrase } => f
+                .debug_struct("Key")
+                .field("path", path)
+                .field("passphrase", &passphrase.as_ref().map(|_| "<redacted>"))
+                .finish(),
             Self::Agent => f.write_str("Agent"),
             Self::Password { password } => f
                 .debug_struct("Password")
@@ -1504,12 +1513,34 @@ policy = "read-write"
             format!(
                 "{:?}",
                 SshAuth::Key {
-                    path: Some(PathBuf::from("/home/me/.ssh/id_ed25519"))
+                    path: Some(PathBuf::from("/home/me/.ssh/id_ed25519")),
+                    passphrase: None,
                 }
             ),
-            "Key { path: Some(\"/home/me/.ssh/id_ed25519\") }",
+            "Key { path: Some(\"/home/me/.ssh/id_ed25519\"), passphrase: None }",
             "a key path is not a secret and stays readable"
         );
+        let with_passphrase = format!(
+            "{:?}",
+            SshAuth::Key { path: None, passphrase: Some("open sesame".into()) }
+        );
+        assert!(!with_passphrase.contains("open sesame"), "{with_passphrase}");
+        assert!(with_passphrase.contains("<redacted>"), "{with_passphrase}");
+    }
+
+    #[test]
+    fn a_key_passphrase_never_goes_to_or_comes_from_config_toml() {
+        let auth = SshAuth::Key { path: None, passphrase: Some("open sesame".into()) };
+        let written = toml::to_string(&auth).expect("serialize");
+        assert!(!written.contains("open sesame"), "{written}");
+        assert!(!written.contains("passphrase"), "{written}");
+
+        let read: SshAuth =
+            toml::from_str("type = \"key\"\npassphrase = \"typed in config\"").expect("parse");
+        match read {
+            SshAuth::Key { passphrase, .. } => assert_eq!(passphrase, None),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

@@ -1259,6 +1259,30 @@ mod tests {
         session.close().await.unwrap();
     }
 
+    /// Integration test (#480): log in with a passphrase-protected key file.
+    ///
+    /// Needs `FILAR_TEST_ENCRYPTED_KEY` (a key the container accepts for
+    /// `testuser`) and its passphrase in `SSH_KEY_PASSPHRASE`.
+    #[tokio::test]
+    #[ignore = "requires Docker sshd container on port 2222 and an encrypted test key"]
+    async fn ssh_encrypted_key_login_runs_a_command() {
+        let key = std::env::var("FILAR_TEST_ENCRYPTED_KEY")
+            .expect("set FILAR_TEST_ENCRYPTED_KEY to an encrypted key accepted by the container");
+        let target = SshTarget {
+            name: "test".into(),
+            host: "127.0.0.1".into(),
+            port: 2222,
+            user: "testuser".into(),
+            auth: SshAuth::Key { path: Some(PathBuf::from(key)), passphrase: None },
+            host_key_policy: HostKeyPolicy::Tofu,
+            tags: Vec::new(),
+        };
+        let session = SshSession::connect(&target).await.unwrap();
+        let out = session.run("echo via-encrypted-key").await.unwrap();
+        assert_eq!(out.stdout.trim(), "via-encrypted-key");
+        session.close().await.unwrap();
+    }
+
     /// Integration test (#479): log in with a key held by the SSH agent.
     ///
     /// Needs a running agent (`SSH_AUTH_SOCK`) holding a key that the
