@@ -1,5 +1,7 @@
 //! Path-picker overlay — in-TUI file/folder browser on the active target (#351).
 
+use std::borrow::Cow;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -98,7 +100,7 @@ pub(crate) fn render_path_picker(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_stateful_widget(list, overlay_area, &mut state);
 
-    let footer = " \u{2191}\u{2193} navigate   Enter select/open   Esc cancel ";
+    let footer = footer_hint(app.path_picker_kind, overlay_area.width);
     let footer_area = Rect::new(
         overlay_area.x,
         overlay_area.y + overlay_area.height.saturating_sub(1),
@@ -111,11 +113,67 @@ pub(crate) fn render_path_picker(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// Footer hint (#483): the longest variant that fits the overlay's width,
+/// whatever the order of the list.
+///
+/// Both pickers navigate the same way: Enter opens a folder, `a` picks one
+/// (on `..` — the folder shown, "here"). Enter on a file picks it in the file picker.
+fn footer_hint(kind: PathPickerKind, width: u16) -> Cow<'static, str> {
+    let variants: &[&'static str] = match kind {
+        PathPickerKind::File => &[
+            " \u{2191}\u{2193} move  Enter open/pick file  a pick folder (.. = here)  Esc ",
+            " Enter open/pick file  a pick folder (.. = here)  Esc ",
+            " Enter open/file  a folder  Esc ",
+            " Enter file  a folder  Esc ",
+        ],
+        PathPickerKind::Folder => &[
+            " \u{2191}\u{2193} move  Enter open  a pick folder (.. = here)  Esc cancel ",
+            " Enter open  a pick folder (.. = here)  Esc ",
+            " Enter open  a pick  Esc ",
+        ],
+    };
+    let fits = |v: &&&str| v.chars().count() <= width as usize;
+    match variants.iter().filter(fits).max_by_key(|v| v.chars().count()) {
+        Some(v) => Cow::Borrowed(v),
+        // Narrower than every variant: the shortest, cut to the width.
+        None => {
+            let shortest = variants.iter().min_by_key(|v| v.chars().count()).copied().unwrap_or("");
+            Cow::Owned(shortest.chars().take(width as usize).collect())
+        }
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() > max {
         let keep = max.saturating_sub(1).max(1);
         s.chars().take(keep).collect::<String>() + "\u{2026}"
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_footer_names_the_folder_key_and_fits_the_overlay() {
+        for kind in [PathPickerKind::File, PathPickerKind::Folder] {
+            let full = footer_hint(kind, OVERLAY_MAX_WIDTH);
+            assert!(full.contains("a pick folder"), "{full}");
+            assert!(full.contains("Enter open"), "{full}");
+            assert!(full.chars().count() <= OVERLAY_MAX_WIDTH as usize, "{full}");
+            for width in [30u16, 40, 50, 60] {
+                let hint = footer_hint(kind, width);
+                assert!(hint.chars().count() <= width as usize, "{width}: {hint}");
+                assert!(hint.contains("a "), "{width}: {hint}");
+            }
+        }
+        assert!(footer_hint(PathPickerKind::File, OVERLAY_MAX_WIDTH).contains("pick file"));
+        // Narrower than any variant: cut to fit, never wider than the overlay.
+        for width in [0u16, 5, 12] {
+            let hint = footer_hint(PathPickerKind::File, width);
+            assert!(hint.chars().count() <= width as usize, "{width}: {hint}");
+        }
     }
 }
