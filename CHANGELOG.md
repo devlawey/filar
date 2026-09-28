@@ -291,8 +291,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   still read as a fallback, with a warning
   ([#490](https://github.com/devlawey/filar/issues/490)).
 
-- `[llm]` has no built-in model or endpoint (GLM is no longer a default); a
-  launch with neither `[llm]` nor profiles reports "no LLM configured"
+- `[llm]` has no built-in model or endpoint; GLM is no longer a default
+  ([#490](https://github.com/devlawey/filar/issues/490)).
+
+- A launch with neither `[llm]` nor `[[llm_profiles]]` reports "no LLM
+  configured" instead of calling a built-in provider
   ([#490](https://github.com/devlawey/filar/issues/490)).
 
 - Removed the deprecated `filar_agent::GlmClient` alias and
