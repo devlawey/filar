@@ -13,7 +13,7 @@ Filar is a Rust-based terminal application that integrates an AI agent (LLM) wit
 
 ## Features
 
-- **AI Agent** — powered by any OpenAI-compatible LLM (default: GLM), with tool calling support
+- **AI Agent** — powered by any OpenAI-compatible LLM (cloud or local), with tool calling support
 - **SSH Remote Execution** — agent manages remote machines via SSH, zero-install (no files left on the remote)
 - **Local Mode** — run commands on your own machine (PowerShell on Windows; POSIX `sh -c` on macOS)
 - **TUI Interface** — built with [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm)
@@ -62,7 +62,7 @@ for 1.0.0.
   - Visual Studio Build Tools (MSVC target), or
   - MinGW/GCC (GNU target) — see `.cargo/config.toml.example`
 - **macOS** (Apple Silicon): Xcode Command Line Tools (`xcode-select --install`)
-- An **LLM API key** (e.g. GLM / OpenAI-compatible)
+- An **LLM API key** for any OpenAI-compatible provider (not needed for a local keyless model)
 
 ### Build
 
@@ -159,7 +159,7 @@ automatically on first Launch. SSH passwords are saved when you check
 
 In CLI mode, set environment variables:
 ```powershell
-$env:GLM_API_KEY = "your-key"       # default profile
+$env:FILAR_LLM_API_KEY = "your-key" # [llm] section / profile without key_env
 $env:DEEPSEEK_API_KEY = "your-key"  # named profile
 $env:SSH_PASSWORD = "ssh-password"   # SSH auth type = "password"
 ```
@@ -176,10 +176,11 @@ confirm_mode = "allowlist"
 #               explanation. Toggle at runtime with F2. Session is auto-saved
 #               to Markdown. (!command shell escape is not affected.)
 
-# ── LLM (default profile) ─────────────────────────────────
+# ── LLM (fallback when no [[llm_profiles]] are defined) ───
+# Any OpenAI-compatible provider. Key: FILAR_LLM_API_KEY.
 [llm]
-model = "glm-5.1"
-api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+model = "deepseek-chat"
+api_base_url = "https://api.deepseek.com/v1"
 max_tokens = 4096
 # temperature = 0.3         # optional (0.0–2.0)
 # top_p = 0.9              # optional (0.0–1.0]
@@ -307,11 +308,14 @@ filar --session <session-id>
 ## Choosing an LLM
 
 Filar works with **any OpenAI-compatible** `chat/completions` endpoint — the
-agent client is not GLM-specific. You switch providers by changing only the
-config (`model`, `api_base_url`, and the API key env var).
+agent client is not tied to any provider. You switch providers by changing
+only the config (`model`, `api_base_url`, and the API key env var).
 
-The default profile points at the GLM cloud (`open.bigmodel.cn`,
-`GLM_API_KEY`).
+There is no built-in default provider. A launch runs on the first
+`[[llm_profiles]]` entry (or the one named with `--llm`); the `[llm]` section
+is used only when no profiles are defined. The key of `[llm]`, and of a
+profile without `key_env`, is read from `FILAR_LLM_API_KEY`. The former name
+`GLM_API_KEY` is still read as a fallback, with a warning in the log.
 
 ### Local / air-gapped models (ollama, vLLM, LM Studio, …)
 
@@ -368,14 +372,14 @@ max_tokens = 4096
 key_env = "GLM_API_KEY"
 ```
 
-> For local keyless use, prefer `key_env = ""` (see above). The default `[llm]`
-> block still expects `GLM_API_KEY` unless you select a keyless profile.
+> For local keyless use, prefer `key_env = ""` (see above). The `[llm]` block
+> reads its key from `FILAR_LLM_API_KEY`.
 
 ### Verified providers
 
 | Provider | Endpoint | Tool calling | Streaming | Notes |
 |----------|----------|--------------|-----------|-------|
-| GLM cloud | `https://open.bigmodel.cn/api/paas/v4` | verified | verified | Default profile; key via `GLM_API_KEY`. |
+| GLM cloud | `https://open.bigmodel.cn/api/paas/v4` | verified | verified | Key via the profile's `key_env`. |
 | Ollama (local) | `http://localhost:11434/v1` | pending manual check | pending manual check | Use empty `key_env`; pick a model with tool support. |
 
 > The table lists only what has been checked by hand. Add rows as more

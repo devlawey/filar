@@ -9888,3 +9888,31 @@ Credential Manager / Keychain), TUI `Ctrl+O` вживую, живой флот.
 
 **Next:** #481.
 
+
+## #490 — CLI-запуск на первом профиле; GLM больше не «по умолчанию»
+
+**Баг.** В CLI-режиме выбранный профиль сравнивался с первым из
+`[[llm_profiles]]` и при совпадении заменялся секцией `[llm]` (+ жёсткий
+`GLM_API_KEY`). Без `--llm` первый профиль молча подменялся GLM, а TUI при
+этом показывал имя первого профиля. Без профилей CLI вообще не стартовал
+(«profile 'default' not found»). Теперь `cli_llm_selection`: при наличии
+профилей — всегда профиль (`resolve_startup_profile`), `[llm]` — только без
+профилей.
+
+**GLM-нейминг убран.** Имя ключа по умолчанию — `FILAR_LLM_API_KEY`
+(`env_vars::LLM_API_KEY`); `GLM_API_KEY` = `env_vars::LEGACY_LLM_API_KEY`,
+читается fallback'ом через `secrets::llm_api_key` / `llm_key_lookup_names`
+(memory → OS store → env) с warn без значения. `LlmConfig::default()` пуст;
+`select_llm(None)` без `[llm]` → «no LLM configured». Удалены алиас
+`GlmClient` и `secrets::glm_api_key()` (→ `default_llm_api_key()`);
+`new_with_provider` тоже знает fallback. `main.rs` больше не держит ключ под
+алиасом `GLM_API_KEY`. `config.toml` в репо — `[llm]` закомментирован.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. Публичное API
+движка: удалены `GlmClient` и `glm_api_key()`, `env_vars::GLM_API_KEY` →
+`LLM_API_KEY` / `LEGACY_LLM_API_KEY`, добавлены `llm_api_key`,
+`llm_key_lookup_names`, `default_llm_api_key`, `config::default_llm_key_env`.
+
+**Вне объёма.** Тестовые профили `glm` и eval-smoke на `glm-5.2` — это
+реальная модель, не концепция «по умолчанию». CLI по-прежнему берёт ключ
+стартового профиля только из env (не из OS store).

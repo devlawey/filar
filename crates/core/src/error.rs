@@ -12,7 +12,7 @@ pub enum CoreError {
     #[error("config error: {0}")]
     Config(String),
 
-    /// A required secret (e.g. `GLM_API_KEY`) was not found in the environment.
+    /// A required secret (e.g. `FILAR_LLM_API_KEY`) was not found in the environment.
     #[error("missing secret: {0}")]
     Secret(String),
 

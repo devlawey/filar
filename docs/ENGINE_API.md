@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Provide an API key via SecretProvider.
     let secrets = Arc::new(StaticSecretProvider::new());
-    secrets.insert("GLM_API_KEY", "your-api-key");
+    secrets.insert("FILAR_LLM_API_KEY", "your-api-key");
 
     // 4. Create a simple event sink that prints events.
     struct PrintSink;
@@ -87,17 +87,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 5. Build the agent. `OpenAiCompatClient` speaks the OpenAI-compatible
-    //    chat/completions protocol (default endpoint: GLM). The deprecated
-    //    `GlmClient` alias still works for existing consumers.
+    //    chat/completions protocol with any provider.
     let agent = AgentBuilder::new()
         .llm(Arc::new(filar_agent::OpenAiCompatClient::new_with_provider(
             &filar_core::LlmConfig {
-                api_base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
-                model: "glm-4-flash".into(),
+                api_base_url: "https://api.deepseek.com/v1".into(),
+                model: "deepseek-chat".into(),
                 ..Default::default()
             },
             Duration::from_secs(60),
-            "GLM_API_KEY",
+            "FILAR_LLM_API_KEY",
             &*secrets,
         )?))
         .executor(executor)
@@ -621,7 +620,8 @@ let config = LlmConfig {
 
 ### Choosing the API key environment variable
 
-By default the key is read from `GLM_API_KEY`. A profile can override this with
+By default the key is read from `FILAR_LLM_API_KEY` (the former name
+`GLM_API_KEY` is still read as a fallback). A profile can override this with
 `key_env` so each provider uses its own variable.
 
 **Empty `key_env`** means the profile is keyless (local / air-gapped servers):

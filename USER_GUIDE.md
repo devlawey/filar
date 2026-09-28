@@ -37,13 +37,14 @@ filar          # Windows: filar.exe
 CLI-режим читает `config.toml` (см. раздел 2). Нужны env-переменные для ключей.
 
 ```bash
-# Локальная машина (требуется GLM_API_KEY в env)
-export GLM_API_KEY="ваш-ключ"          # macOS / bash / zsh
-# $env:GLM_API_KEY = "ваш-ключ"        # Windows PowerShell
+# Локальная машина. Ключ — в переменной из key_env профиля
+# (для [llm] и профиля без key_env — FILAR_LLM_API_KEY)
+export DEEPSEEK_API_KEY="ваш-ключ"     # macOS / bash / zsh
+# $env:DEEPSEEK_API_KEY = "ваш-ключ"   # Windows PowerShell
 filar --target local
 
 # SSH-таргет + конкретный LLM-профиль
-filar --target test-docker --llm glm
+filar --target test-docker --llm deepseek
 
 # Восстановить предыдущую сессию
 filar --target local --session 1718900000
@@ -135,10 +136,13 @@ max_parallel = 3              # по умолчанию 3
 per_host_timeout_secs = 30    # по умолчанию 30
 # llm_profile = "deepseek"    # необязательно; имя из [[llm_profiles]]
 
-# ── LLM по умолчанию (профиль "default") ──────────────────
+# ── LLM без профилей (секция [llm]) ────────────────────────
+# Используется, только если нет ни одного [[llm_profiles]]; иначе запуск
+# идёт на первом профиле (или на указанном в --llm). Провайдер — любой
+# OpenAI-совместимый; ключ — в FILAR_LLM_API_KEY.
 [llm]
-model = "glm-5.1"
-api_base_url = "https://open.bigmodel.cn/api/paas/v4"
+model = "deepseek-chat"
+api_base_url = "https://api.deepseek.com/v1"
 max_tokens = 4096
 # compact_at_tokens = 200000 # порог сжатия истории; 0 — отключить (см. 4.6)
 # temperature = 0.3          # опционально (0.0–2.0)
@@ -251,10 +255,12 @@ store автоматически при первом Launch:
 **В CLI-режиме:** через переменные окружения:
 
 ```bash
-export GLM_API_KEY="ваш-ключ"          # профиль по умолчанию
-export DEEPSEEK_API_KEY="ваш-ключ"    # именованный профиль
+export DEEPSEEK_API_KEY="ваш-ключ"    # профиль с key_env = "DEEPSEEK_API_KEY"
+export FILAR_LLM_API_KEY="ваш-ключ"   # секция [llm] / профиль без key_env
 export SSH_PASSWORD="пароль-ssh"     # SSH auth type = "password"
-# Windows PowerShell: $env:GLM_API_KEY = "…"
+# Windows PowerShell: $env:DEEPSEEK_API_KEY = "…"
+# Прежнее имя GLM_API_KEY ещё читается вместо FILAR_LLM_API_KEY (с
+# предупреждением в логе) — переименуйте переменную.
 ```
 
 Ключи **никогда** не записываются в `config.toml`, `settings.json`, или
@@ -1244,7 +1250,8 @@ filar
 
 ### "API key is required"
 - В GUI-режиме: введите ключ в поле "API key" и нажмите Launch
-- В CLI-режиме: установите переменную `$env:GLM_API_KEY = "ваш-ключ"`
+- В CLI-режиме: установите переменную из `key_env` выбранного профиля
+  (для `[llm]` и профиля без `key_env` — `$env:FILAR_LLM_API_KEY = "ваш-ключ"`)
 
 ### "SSH target 'xxx' not found"
 - Проверьте имя таргета в `config.toml` (поле `name` в `[[ssh_targets]]`)

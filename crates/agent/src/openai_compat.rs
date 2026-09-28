@@ -1,8 +1,8 @@
 //! OpenAI-compatible LLM client — `chat/completions` API.
 //!
 //! Implements [`crate::LlmClient`] using `reqwest` to talk to any
-//! OpenAI-compatible endpoint (default: the GLM platform, e.g.
-//! `open.bigmodel.cn`). The request/response shapes mirror the standard
+//! OpenAI-compatible endpoint. There is no default provider: the endpoint and
+//! model come from the config. The request/response shapes mirror the standard
 //! `chat/completions` format with tool/function calling support, so any
 //! provider implementing that protocol (GLM cloud, Ollama / LM Studio at
 //! `http://localhost:11434/v1`, DeepSeek, OpenAI, …) works by changing only
@@ -10,7 +10,7 @@
 //!
 //! # Features
 //! - Configurable model, base URL, and max tokens (from [`filar_core::LlmConfig`]).
-//! - API key read from the `GLM_API_KEY` environment variable by default
+//! - API key read from the `FILAR_LLM_API_KEY` environment variable by default
 //!   (overridable per profile via `filar_core::LlmProfile::key_env`).
 //!   Empty `key_env` = keyless local profile: no `Authorization` header.
 //! - Retries with exponential backoff on transient failures (5xx, 429, network).
@@ -104,7 +104,7 @@ enum StreamOutcome {
 }
 
 /// [`LlmClient`] implementation backed by an OpenAI-compatible
-/// `chat/completions` API (default endpoint: GLM).
+/// `chat/completions` API.
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
     http_stream: reqwest::Client,
@@ -123,14 +123,16 @@ pub struct OpenAiCompatClient {
 impl OpenAiCompatClient {
     /// Create a new `OpenAiCompatClient` from the given LLM config.
     ///
-    /// The API key is read from the `GLM_API_KEY` environment variable.
+    /// The API key is read from the `FILAR_LLM_API_KEY` environment variable
+    /// (or its legacy name `GLM_API_KEY`, see [`secrets::llm_api_key`]).
     pub fn new(config: &LlmConfig, timeout: Duration) -> Result<Self> {
-        Self::new_with_key(config, timeout, &secrets::glm_api_key()?)
+        Self::new_with_key(config, timeout, &secrets::default_llm_api_key()?)
     }
 
     /// Create a new `OpenAiCompatClient` using a [`SecretProvider`] to retrieve the
     /// API key.  The `key_name` is the logical name passed to the provider
-    /// (e.g. `"GLM_API_KEY"` or a profile-specific env var name).
+    /// (e.g. `"FILAR_LLM_API_KEY"` or a profile-specific env var name); the
+    /// default name falls back to its legacy one (see [`secrets::llm_api_key`]).
     ///
     /// This is the preferred constructor for engine consumers (bots, mobile,
     /// GUI-launched sessions) — it avoids direct `std::env::var` calls.
@@ -140,7 +142,7 @@ impl OpenAiCompatClient {
         key_name: &str,
         provider: &dyn SecretProvider,
     ) -> Result<Self> {
-        let api_key = provider.get(key_name)?;
+        let api_key = secrets::llm_api_key(provider, key_name)?;
         Self::new_with_key(config, timeout, &api_key)
     }
 
@@ -544,7 +546,7 @@ impl OpenAiCompatClient {
 
         let status = response.status();
         if status.is_success() {
-            debug!(status = %status, "GLM streaming API connection established");
+            debug!(status = %status, "streaming API connection established");
             Ok(response)
         } else {
             let status_code = status.as_u16();
@@ -1727,25 +1729,6 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         let extra = serde_json::json!(42);
         merge_extra_body(&mut body, &extra);
         assert_eq!(body["model"], "glm-5.1");
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn glm_client_alias_still_compiles() {
-        // The deprecated `GlmClient` alias (re-exported in `lib.rs`) must
-        // resolve to the same type as `OpenAiCompatClient`, so existing engine
-        // consumers (bots, mobile) keep compiling until the next major engine
-        // tag removes the alias.
-        fn assert_same_type(_: &OpenAiCompatClient) {}
-        let config = LlmConfig {
-            model: "glm-5.1".into(),
-            api_base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
-            max_tokens: 64,
-            ..Default::default()
-        };
-        let client = crate::GlmClient::new_with_key(&config, Duration::from_secs(1), "dummy-key")
-            .unwrap();
-        assert_same_type(&client);
     }
 
     #[test]
