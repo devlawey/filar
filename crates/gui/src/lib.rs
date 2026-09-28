@@ -1668,6 +1668,9 @@ struct LauncherApp {
     save_dir: Option<std::path::PathBuf>,
     /// Reveal SSH password field (not persisted).
     show_ssh_password: bool,
+    /// Reveal the key passphrase field — its own flag, so revealing a
+    /// password never reveals a passphrase (#489 review). Not persisted.
+    show_key_passphrase: bool,
     /// Reveal API key field (not persisted).
     show_api_key: bool,
     /// Arbiter profile selection (`None` = same as session profile).
@@ -2123,6 +2126,7 @@ impl LauncherApp {
         // frame, and only when it actually changed.
         let key_status = self.refresh_key_probe(idx);
         let hint = egui::Color32::from_rgb(140, 140, 140);
+        let mut show_passphrase = self.show_key_passphrase;
         ui.add_enabled_ui(!locked, |ui| {
             let slot = &mut self.ssh_slots[idx];
             match slot.auth {
@@ -2141,12 +2145,12 @@ impl LauncherApp {
                         if slot.save_passphrase {
                             ui.horizontal(|ui| {
                                 ui.label("Passphrase:");
-                                ui.checkbox(&mut show, "Show");
+                                ui.checkbox(&mut show_passphrase, "Show");
                                 secret_text_edit(
                                     ui,
                                     "ssh_key_passphrase",
                                     &mut slot.passphrase,
-                                    show,
+                                    show_passphrase,
                                 );
                             });
                         } else {
@@ -2174,6 +2178,7 @@ impl LauncherApp {
             }
         });
         self.show_ssh_password = show;
+        self.show_key_passphrase = show_passphrase;
     }
 
     /// Whether the selected slot's key file is encrypted, re-read only when
@@ -3354,6 +3359,7 @@ pub fn run_launcher(config: &Config) {
         profile_error_shown: false,
         save_dir: settings.save_dir.clone(),
         show_ssh_password: false,
+        show_key_passphrase: false,
         show_api_key: false,
         arbiter_profile: settings.arbiter_profile.clone(),
         import_dialog: None,
@@ -4308,6 +4314,7 @@ mod tests {
             profile_error_shown: false,
             save_dir: None,
             show_ssh_password: false,
+            show_key_passphrase: false,
             show_api_key: false,
             arbiter_profile: None,
             import_dialog: None,
