@@ -141,9 +141,17 @@ pub fn cli_llm_selection(
 
 /// Build an [`SshTarget`](filar_core::SshTarget) from a GUI [`SshConnection`](filar_gui::SshConnection).
 ///
-/// When the password is empty (normal after `pending_launch.json` deserialize —
-/// it is `#[serde(skip)]`), reads it from the OS keyring under
-/// [`filar_core::ssh_cred_name`] — the same key the launcher writes.
+/// The auth follows the login method picked in the launcher (#489):
+///
+/// - **Password** — when the password is empty (normal after
+///   `pending_launch.json` deserialize — it is `#[serde(skip)]`), it is read
+///   from the OS keyring under [`filar_core::ssh_cred_name`], the same key
+///   the launcher writes.
+/// - **Key** — the key file only; the passphrase of an encrypted key is
+///   filled afterwards by the `--target` passphrase step (keyring
+///   `ssh_key_passphrase:{name}` → `SSH_KEY_PASSPHRASE` → terminal prompt).
+/// - **Agent** — nothing to resolve.
+///
 /// Target `name` uses [`filar_core::ssh_target_display_name`] so later TUI
 /// reconnects (`ssh_target:{name}`) hit the same entry.
 ///
@@ -155,21 +163,31 @@ pub fn cli_llm_selection(
 /// a hot async path without `spawn_blocking`.
 fn resolve_gui_ssh_target(s: &filar_gui::SshConnection) -> filar_core::SshTarget {
     let name = filar_core::ssh_target_display_name(s.slot, &s.alias);
-    let password = if s.password.is_empty() {
-        let cred = filar_core::KeyringSecretProvider::new();
-        let key = filar_core::ssh_cred_name(s.slot, &s.alias);
-        cred.get(&key)
-            .inspect_err(|e| tracing::debug!(error = %e, %key, "no saved SSH password in keyring"))
-            .ok()
-    } else {
-        Some(s.password.clone())
+    let auth = match s.auth {
+        filar_gui::SlotAuth::Password => {
+            let password = if s.password.is_empty() {
+                let cred = filar_core::KeyringSecretProvider::new();
+                let key = filar_core::ssh_cred_name(s.slot, &s.alias);
+                cred.get(&key)
+                    .inspect_err(|e| tracing::debug!(error = %e, %key, "no saved SSH password in keyring"))
+                    .ok()
+            } else {
+                Some(s.password.clone())
+            };
+            filar_core::SshAuth::Password { password }
+        }
+        filar_gui::SlotAuth::Key => filar_core::SshAuth::Key {
+            path: s.key_path.clone(),
+            passphrase: None,
+        },
+        filar_gui::SlotAuth::Agent => filar_core::SshAuth::Agent,
     };
     filar_core::SshTarget {
         name,
         host: s.host.clone(),
         port: s.port,
         user: s.user.clone(),
-        auth: filar_core::SshAuth::Password { password },
+        auth,
         host_key_policy: filar_core::HostKeyPolicy::Tofu,
         tags: s.tags.clone(),
     }
@@ -767,6 +785,8 @@ mod tests {
             port: 22,
             user: "root".into(),
             password: String::new(),
+            auth: filar_gui::SlotAuth::Password,
+            key_path: None,
             slot: 0,
             alias: String::new(),
             tags: Vec::new(),
@@ -792,6 +812,8 @@ mod tests {
             port: 2222,
             user: "admin".into(),
             password: "in-memory".into(),
+            auth: filar_gui::SlotAuth::Password,
+            key_path: None,
             slot: 2,
             alias: "prod-web".into(),
             tags: vec!["prod".into(), "web".into()],
@@ -814,6 +836,38 @@ mod tests {
             }
             other => panic!("expected Password auth, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_gui_ssh_follows_the_launcher_login_method() {
+        // Key and agent login from the launcher reach the session as such,
+        // not as password auth (#489). The key carries no passphrase here:
+        // the passphrase step fills it from the keyring by target name.
+        let mut conn = filar_gui::SshConnection {
+            host: "10.0.0.1".into(),
+            port: 22,
+            user: "root".into(),
+            password: String::new(),
+            auth: filar_gui::SlotAuth::Key,
+            key_path: Some("/home/ops/.ssh/deploy".into()),
+            slot: 0,
+            alias: "prod-web".into(),
+            tags: Vec::new(),
+        };
+        match resolve_gui_ssh_target(&conn).auth {
+            filar_core::SshAuth::Key { path, passphrase } => {
+                assert_eq!(path.as_deref(), Some(std::path::Path::new("/home/ops/.ssh/deploy")));
+                assert!(passphrase.is_none());
+            }
+            other => panic!("expected Key auth, got {other:?}"),
+        }
+        conn.key_path = None;
+        assert!(matches!(
+            resolve_gui_ssh_target(&conn).auth,
+            filar_core::SshAuth::Key { path: None, .. }
+        ));
+        conn.auth = filar_gui::SlotAuth::Agent;
+        assert!(matches!(resolve_gui_ssh_target(&conn).auth, filar_core::SshAuth::Agent));
     }
 
     #[test]

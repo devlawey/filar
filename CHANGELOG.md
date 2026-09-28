@@ -13,6 +13,15 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- GUI launcher: each SSH host picks its login method — SSH agent (default for
+  new hosts), key file or password; an encrypted key's passphrase can be
+  saved in the OS credential store and is checked before launch
+  ([#489](https://github.com/devlawey/filar/issues/489)).
+
+- Host list import/export and the synced `[[ssh_targets]]` carry the login
+  method and the key file path; hosts saved before keep password login
+  ([#489](https://github.com/devlawey/filar/issues/489)).
+
 - Passphrase-protected SSH keys (`type = "key"`): the passphrase comes from
   the OS credential store (`ssh_key_passphrase:<target>`), `SSH_KEY_PASSPHRASE`
   or a no-echo prompt (terminal for `--target`, masked input on `Ctrl+O`), is

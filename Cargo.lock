@@ -1548,9 +1548,11 @@ version = "1.0.7"
 dependencies = [
  "eframe",
  "filar-core",
+ "filar-transport",
  "image",
  "keyring",
  "rfd",
+ "russh",
  "serde",
  "serde_json",
  "toml 0.8.23",
