@@ -126,13 +126,15 @@ pub fn resolve_startup_profile(
 /// With any `[[llm_profiles]]` defined, always a profile — the one
 /// [`resolve_startup_profile`] picks, the first one by default — so the
 /// session runs on the same profile the TUI shows. `None` (the `[llm]`
-/// section) only when no profiles are defined.
+/// section) only when no profiles are defined and `--llm` names none but
+/// `default`; any other name is kept, so the launch fails with "profile
+/// not found" instead of silently running on `[llm]`.
 pub fn cli_llm_selection(
     profiles: &[filar_core::LlmProfile],
     cli_llm: Option<&str>,
 ) -> Option<String> {
     if profiles.is_empty() {
-        None
+        cli_llm.filter(|n| *n != "default").map(str::to_string)
     } else {
         Some(resolve_startup_profile(profiles, cli_llm, None))
     }
@@ -1135,5 +1137,17 @@ mod tests {
     fn without_profiles_the_cli_uses_the_llm_section() {
         assert_eq!(cli_llm_selection(&[], None), None);
         assert_eq!(cli_llm_selection(&[], Some("default")), None);
+    }
+
+    #[test]
+    fn without_profiles_an_explicit_profile_name_is_not_swapped_for_the_llm_section() {
+        let config = filar_core::Config {
+            llm: filar_core::LlmConfig { model: "m".into(), api_base_url: "u".into(), ..Default::default() },
+            ..Default::default()
+        };
+        let selected = cli_llm_selection(&config.llm_profiles, Some("deepseek"));
+        assert_eq!(selected.as_deref(), Some("deepseek"));
+        let msg = config.select_llm(selected.as_deref()).expect_err("unknown profile").to_string();
+        assert!(msg.contains("'deepseek' not found"), "{msg}");
     }
 }
