@@ -123,20 +123,19 @@ pub fn resolve_startup_profile(
 
 /// The LLM profile a CLI launch starts on (#490).
 ///
-/// With any `[[llm_profiles]]` defined, always a profile — the one
-/// [`resolve_startup_profile`] picks, the first one by default — so the
-/// session runs on the same profile the TUI shows. `None` (the `[llm]`
-/// section) only when no profiles are defined and `--llm` names none but
-/// `default`; any other name is kept, so the launch fails with "profile
-/// not found" instead of silently running on `[llm]`.
+/// A name given with `--llm` (other than `default`) is kept as is, so an
+/// unknown one fails with "profile not found" instead of silently running
+/// on another provider. Otherwise, with any `[[llm_profiles]]` defined, the
+/// first profile — the one the TUI shows. `None` (the `[llm]` section) only
+/// when no profiles are defined.
 pub fn cli_llm_selection(
     profiles: &[filar_core::LlmProfile],
     cli_llm: Option<&str>,
 ) -> Option<String> {
-    if profiles.is_empty() {
-        cli_llm.filter(|n| *n != "default").map(str::to_string)
-    } else {
-        Some(resolve_startup_profile(profiles, cli_llm, None))
+    match cli_llm.filter(|n| *n != "default") {
+        Some(name) => Some(name.to_string()),
+        None if profiles.is_empty() => None,
+        None => Some(resolve_startup_profile(profiles, None, None)),
     }
 }
 
@@ -1120,6 +1119,18 @@ mod tests {
         // Naming the first profile, or `default`, lands on it too.
         assert_eq!(cli_llm_selection(&config.llm_profiles, Some("openrouter")).as_deref(), Some("openrouter"));
         assert_eq!(cli_llm_selection(&config.llm_profiles, Some("default")).as_deref(), Some("openrouter"));
+    }
+
+    #[test]
+    fn an_unknown_explicit_profile_is_an_error_not_the_first_profile() {
+        let config = filar_core::Config {
+            llm_profiles: vec![make_profile("local")],
+            ..Default::default()
+        };
+        let selected = cli_llm_selection(&config.llm_profiles, Some("openrouter"));
+        assert_eq!(selected.as_deref(), Some("openrouter"));
+        let msg = config.select_llm(selected.as_deref()).expect_err("unknown").to_string();
+        assert!(msg.contains("'openrouter' not found"), "{msg}");
     }
 
     #[test]
