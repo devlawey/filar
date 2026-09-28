@@ -3325,6 +3325,8 @@ impl App {
                     }
                 }
                 KeyCode::Enter => self.path_picker_activate(),
+                // `a` picks a folder (#483), also on the Russian layout.
+                KeyCode::Char('a' | 'A' | 'ф' | 'Ф') => self.path_picker_pick_folder(),
                 _ => {}
             }
             return;
@@ -5236,20 +5238,35 @@ impl App {
             return;
         }
         if entry.is_dir {
+            // Enter opens a folder in both pickers (#483): a folder deep in
+            // the tree is reached with Enter and picked with `a`.
             let path =
                 crate::path_picker::join_path(&self.path_picker_dir, &entry.name, remote);
-            if self.path_picker_kind == crate::path_picker::PathPickerKind::Folder {
-                self.insert_path_string_at_cursor(&path);
-                self.close_path_picker();
-            } else {
-                self.path_picker_navigate(path);
-            }
+            self.path_picker_navigate(path);
         } else if self.path_picker_kind == crate::path_picker::PathPickerKind::File {
             let path =
                 crate::path_picker::join_path(&self.path_picker_dir, &entry.name, remote);
             self.insert_path_string_at_cursor(&path);
             self.close_path_picker();
         }
+    }
+
+    /// `a` in the path picker (#483): insert the highlighted folder's path and
+    /// close. On `..` it is the folder being shown — the only way to pick the
+    /// one you have just entered. A file is ignored (Enter picks files).
+    fn path_picker_pick_folder(&mut self) {
+        let Some(entry) = self.path_picker_entries.get(self.path_picker_index).cloned() else {
+            return;
+        };
+        let path = if entry.name == ".." {
+            self.path_picker_dir.clone()
+        } else if entry.is_dir {
+            crate::path_picker::join_path(&self.path_picker_dir, &entry.name, self.path_picker_remote)
+        } else {
+            return;
+        };
+        self.insert_path_string_at_cursor(&path);
+        self.close_path_picker();
     }
 
     /// Insert a path string at the input cursor (Normal / Confirming).
@@ -10296,6 +10313,83 @@ mod tests {
         }];
         app.path_picker_activate();
         assert!(!app.path_picker_visible);
+        assert_eq!(app.input, "/etc/hosts ");
+    }
+
+    /// A picker showing `dir` with a `..`, a folder and a file (#483).
+    fn picker_at(dir: &str, remote: bool, kind: crate::path_picker::PathPickerKind) -> App {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.path_picker_visible = true;
+        app.path_picker_remote = remote;
+        app.path_picker_kind = kind;
+        app.path_picker_dir = dir.into();
+        app.path_picker_entries = vec![
+            crate::path_picker::PathEntry { name: "..".into(), is_dir: true },
+            crate::path_picker::PathEntry { name: "my logs".into(), is_dir: true },
+            crate::path_picker::PathEntry { name: "hosts".into(), is_dir: false },
+        ];
+        app
+    }
+
+    fn press(app: &mut App, c: char) {
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(c),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+
+    #[test]
+    fn a_picks_the_highlighted_folder_over_ssh_and_locally() {
+        // SSH: POSIX join, quoted for the space (#359).
+        let mut app = picker_at("/var", true, crate::path_picker::PathPickerKind::File);
+        app.path_picker_index = 1;
+        press(&mut app, 'a');
+        assert!(!app.path_picker_visible, "a closes the picker");
+        assert_eq!(app.input, "'/var/my logs' ");
+
+        // Local, Russian layout: ф is a.
+        let dir = std::env::temp_dir().to_string_lossy().into_owned();
+        let mut app = picker_at(&dir, false, crate::path_picker::PathPickerKind::File);
+        app.path_picker_index = 1;
+        press(&mut app, 'ф');
+        let expected = crate::path_picker::format_path_for_input(
+            &crate::path_picker::join_path(&dir, "my logs", false),
+        );
+        assert_eq!(app.input.trim_end(), expected.trim_end());
+    }
+
+    #[test]
+    fn a_on_a_file_does_nothing() {
+        let mut app = picker_at("/etc", true, crate::path_picker::PathPickerKind::File);
+        app.path_picker_index = 2;
+        press(&mut app, 'A');
+        assert!(app.path_picker_visible, "files are picked with Enter");
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn a_on_dotdot_picks_the_folder_being_shown() {
+        let mut app = picker_at("/srv/app", true, crate::path_picker::PathPickerKind::File);
+        app.path_picker_index = 0;
+        press(&mut app, 'a');
+        assert!(!app.path_picker_visible);
+        assert_eq!(app.input, "/srv/app ");
+    }
+
+    #[test]
+    fn enter_opens_a_folder_in_both_pickers() {
+        for kind in [crate::path_picker::PathPickerKind::File, crate::path_picker::PathPickerKind::Folder] {
+            let mut app = picker_at("/var", true, kind);
+            app.path_picker_index = 1;
+            app.handle_key(key_event(crossterm::event::KeyCode::Enter));
+            assert!(app.path_picker_visible, "{kind:?}: Enter goes in, not picks");
+            assert_eq!(app.path_picker_dir, "/var/my logs", "{kind:?}");
+            assert!(app.input.is_empty(), "{kind:?}");
+        }
+        // Enter on a file still inserts it in the file picker.
+        let mut app = picker_at("/etc", true, crate::path_picker::PathPickerKind::File);
+        app.path_picker_index = 2;
+        app.handle_key(key_event(crossterm::event::KeyCode::Enter));
         assert_eq!(app.input, "/etc/hosts ");
     }
 
