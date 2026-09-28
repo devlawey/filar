@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 filar-core = { workspace = true }
+# Key-file checks for key login in the launcher (#489); SSH only, no PTY.
+filar-transport = { workspace = true }
 eframe = { workspace = true }
 rfd = { workspace = true }
 tracing = { workspace = true }
@@ -14,3 +16,7 @@ serde_json = { workspace = true }
 keyring = { workspace = true }
 toml = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+# Throwaway encrypted keys for the key-login checks (#489).
+russh = { workspace = true }

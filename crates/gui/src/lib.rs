@@ -93,7 +93,14 @@ fn secret_text_edit(
 }
 
 /// Save a secret to the OS credential store.
+///
+/// A no-op in unit tests, like [`load_secret`] and [`delete_secret`]: host
+/// list tests use ordinary aliases, and must never touch the developer's
+/// real credential store.
 fn save_secret(username: &str, secret: &str) {
+    if cfg!(test) {
+        return;
+    }
     let secret = sanitize_secret_clipboard(secret);
     if secret.is_empty() {
         delete_secret(username);
@@ -111,6 +118,9 @@ fn save_secret(username: &str, secret: &str) {
 
 /// Load a secret from the OS credential store. Returns empty string if not found.
 fn load_secret(username: &str) -> String {
+    if cfg!(test) {
+        return String::new();
+    }
     let raw = match keyring::Entry::new(CRED_SERVICE, username) {
         Ok(entry) => entry.get_password().unwrap_or_default(),
         Err(_) => String::new(),
@@ -120,6 +130,9 @@ fn load_secret(username: &str) -> String {
 
 /// Delete a secret from the OS credential store.
 fn delete_secret(username: &str) {
+    if cfg!(test) {
+        return;
+    }
     if let Ok(entry) = keyring::Entry::new(CRED_SERVICE, username) {
         let _ = entry.delete_credential();
     }
@@ -400,9 +413,46 @@ pub struct LaunchConfig {
     pub arbiter_profile: Option<String>,
 }
 
+/// How the launcher logs in to an SSH host (#489).
+///
+/// Mirrors the three [`filar_core::SshAuth`] variants without their secrets:
+/// a password or key passphrase lives only in the OS credential store.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SlotAuth {
+    /// Password, typed or saved in the OS credential store.
+    Password,
+    /// A private key file, optionally passphrase-protected.
+    Key,
+    /// Keys of the running SSH agent — the default, like `SshAuth::default()`.
+    #[default]
+    Agent,
+}
+
+impl SlotAuth {
+    /// The auth of a slot saved before #489, when the launcher could only
+    /// log in by password: whatever `save_password` said, Launch always
+    /// built password auth.
+    fn legacy() -> Self {
+        Self::Password
+    }
+
+    /// The `auth = { type = "…" }` name used by `config.toml` and the host
+    /// list import/export.
+    fn type_name(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::Key => "key",
+            Self::Agent => "agent",
+        }
+    }
+}
+
 /// SSH connection details from the GUI.
 ///
 /// The password is NEVER serialized — it goes through the OS credential store.
+/// So does a key passphrase, which is not even carried here: the session
+/// reads it from the store under [`filar_core::ssh_key_passphrase_name`].
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SshConnection {
     pub host: String,
@@ -411,6 +461,14 @@ pub struct SshConnection {
     /// Password — NEVER written to disk.
     #[serde(skip, default)]
     pub password: String,
+    /// Login method (#489). A handoff file written before it had none and
+    /// was always password login.
+    #[serde(default = "SlotAuth::legacy")]
+    pub auth: SlotAuth,
+    /// Key file for [`SlotAuth::Key`]; `None` = the default key
+    /// (`~/.ssh/id_ed25519`, then `id_rsa`). Not a secret.
+    #[serde(default)]
+    pub key_path: Option<std::path::PathBuf>,
     /// Slot index for saving/loading the password from the OS credential store.
     /// Not a secret — must be persisted so resume picks the correct keyring entry.
     #[serde(default)]
@@ -486,6 +544,16 @@ struct SshProfile {
     /// Whether the user checked "Save password" for this slot.
     #[serde(default)]
     save_password: bool,
+    /// Login method (#489). `None` in files saved before it: those slots
+    /// migrate to [`SlotAuth::legacy`] on load.
+    #[serde(default)]
+    auth: Option<SlotAuth>,
+    /// Key file for key login; empty = the default key. Not a secret.
+    #[serde(default)]
+    key_path: String,
+    /// Whether the user checked "Save passphrase" for the key (#489).
+    #[serde(default)]
+    save_passphrase: bool,
 }
 
 /// Persistent settings saved between launches.
@@ -617,6 +685,26 @@ fn parse_tags(raw: &str) -> Vec<String> {
     raw.split(',').map(clean_tag).filter(|t| !t.is_empty()).collect()
 }
 
+/// The key file typed in a slot: `None` for a blank field (the default key).
+fn slot_key_path(key_path: &str) -> Option<std::path::PathBuf> {
+    let trimmed = key_path.trim();
+    (!trimmed.is_empty()).then(|| std::path::PathBuf::from(trimmed))
+}
+
+/// The secret-free [`filar_core::SshAuth`] of a launcher slot (#489). The
+/// password and passphrase stay in the OS credential store; the session
+/// resolves them by target name.
+fn slot_ssh_auth(auth: SlotAuth, key_path: &str) -> filar_core::SshAuth {
+    match auth {
+        SlotAuth::Password => filar_core::SshAuth::Password { password: None },
+        SlotAuth::Key => filar_core::SshAuth::Key {
+            path: slot_key_path(key_path),
+            passphrase: None,
+        },
+        SlotAuth::Agent => filar_core::SshAuth::Agent,
+    }
+}
+
 /// Build the launcher-owned part of the SSH target list from its profiles.
 ///
 /// A full rebuild of the launcher's own records: each non-empty profile
@@ -644,10 +732,10 @@ fn build_ssh_targets_from_profiles(profiles: &[SshProfile]) -> Vec<filar_core::S
             host: profile.host.clone(),
             port,
             user: profile.user.clone(),
-            auth: match profile.save_password {
-                true => filar_core::SshAuth::Password { password: None },
-                false => filar_core::SshAuth::Key { path: None, passphrase: None },
-            },
+            auth: slot_ssh_auth(
+                profile.auth.unwrap_or_else(SlotAuth::legacy),
+                &profile.key_path,
+            ),
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
             tags: parse_tags(&profile.tags),
         });
@@ -743,15 +831,22 @@ enum ImportStaged {
     },
 }
 
-/// One parsed import row: the candidate slot plus the auth type the file
+/// The login method an import file gave a host (#417, #489).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportAuth {
+    kind: SlotAuth,
+    /// The key `path` of `type = "key"`; empty = the default key.
+    key_path: String,
+}
+
+/// One parsed import row: the candidate slot plus the auth the file
 /// specified, if any (#417).
 #[derive(Debug)]
 struct ImportRow {
     slot: SshSlot,
-    /// `Some(true)` — `auth = { type = "password" }`; `Some(false)` —
-    /// `key`/`agent`; `None` — the file did not say, so an overwrite keeps
-    /// the existing host's auth.
-    auth: Option<bool>,
+    /// `None` — the file did not say, so an overwrite keeps the existing
+    /// host's auth.
+    auth: Option<ImportAuth>,
 }
 
 /// Clean a list of imported tags like the launcher's own field does (#413).
@@ -768,8 +863,8 @@ fn clean_tags(tags: &[String]) -> Vec<String> {
 /// `host entry #2`). The alias is stored in the same truncated form
 /// [`SshSlot::to_profile`] persists, so collision checks and the 32-char
 /// uniqueness rule ([`LauncherApp::validate_ssh_slots`]) see exactly what
-/// would be saved. `password_auth` is the file's auth type, if it had one
-/// (#417).
+/// would be saved. `auth` is the file's auth, if it had one (#417); a new
+/// host without one gets the default, agent login (#489).
 fn make_import_slot(
     where_: &str,
     name: &str,
@@ -777,7 +872,7 @@ fn make_import_slot(
     port: u16,
     user: &str,
     tags: &[String],
-    password_auth: Option<bool>,
+    auth: Option<&ImportAuth>,
 ) -> Result<SshSlot, String> {
     // The alias is rendered in the TUI status bar verbatim; `clean_tag`
     // keeps imported control characters out, like the tag fields do
@@ -799,8 +894,9 @@ fn make_import_slot(
         user: user.trim().to_string(),
         alias,
         tags: clean_tags(tags).join(", "),
-        password: String::new(),
-        save_password: password_auth.unwrap_or(false),
+        auth: auth.map(|a| a.kind).unwrap_or_default(),
+        key_path: auth.map(|a| a.key_path.clone()).unwrap_or_default(),
+        ..SshSlot::blank()
     })
 }
 
@@ -823,10 +919,9 @@ fn ensure_unique_aliases(rows: &[ImportRow]) -> Result<(), String> {
 /// Parse a TOML host list — the same `[[ssh_targets]]` shape `config.toml`
 /// uses. Unknown keys (`host_key_policy`, other sections) are ignored.
 ///
-/// `auth` contributes only its `type` (#417): `password` marks the host
-/// for the connect password prompt, `key`/`agent` clear it. An inline
-/// `password` or key `path` is never read — secrets stay in the keyring
-/// (invariant #3).
+/// `auth` contributes its `type` (#417) and, for `key`, the key file `path`
+/// (#489) — a location, not a secret. An inline `password` is never read:
+/// secrets stay in the keyring (invariant #3).
 fn parse_import_toml(text: &str) -> Result<Vec<ImportRow>, String> {
     #[derive(serde::Deserialize)]
     struct File {
@@ -846,13 +941,14 @@ fn parse_import_toml(text: &str) -> Result<Vec<ImportRow>, String> {
         #[serde(default)]
         auth: Option<Auth>,
     }
-    /// The config's `auth = { type = "…" }` table. Only the type is
-    /// declared: a `password` or key `path` field, if present, is dropped
-    /// unread (invariant #3).
+    /// The config's `auth = { type = "…" }` table. A `password` field is
+    /// not declared, so it is dropped unread (invariant #3).
     #[derive(serde::Deserialize)]
     struct Auth {
         #[serde(rename = "type")]
         kind: String,
+        #[serde(default)]
+        path: Option<String>,
     }
     fn default_import_port() -> u16 {
         22
@@ -865,11 +961,21 @@ fn parse_import_toml(text: &str) -> Result<Vec<ImportRow>, String> {
     let mut rows = Vec::with_capacity(file.ssh_targets.len());
     for (i, entry) in file.ssh_targets.iter().enumerate() {
         let where_ = format!("host entry #{}", i + 1);
-        let password_auth = match entry.auth.as_ref().map(|a| a.kind.as_str()) {
+        let auth = match entry.auth.as_ref() {
             None => None,
-            Some("password") => Some(true),
-            Some("key") | Some("agent") => Some(false),
-            Some(other) => return Err(format!("{where_}: unknown auth type \"{other}\"")),
+            Some(a) => {
+                let kind = match a.kind.as_str() {
+                    "password" => SlotAuth::Password,
+                    "key" => SlotAuth::Key,
+                    "agent" => SlotAuth::Agent,
+                    other => return Err(format!("{where_}: unknown auth type \"{other}\"")),
+                };
+                let key_path = match kind {
+                    SlotAuth::Key => a.path.as_deref().unwrap_or("").trim().to_string(),
+                    _ => String::new(),
+                };
+                Some(ImportAuth { kind, key_path })
+            }
         };
         rows.push(ImportRow {
             slot: make_import_slot(
@@ -879,9 +985,9 @@ fn parse_import_toml(text: &str) -> Result<Vec<ImportRow>, String> {
                 entry.port,
                 &entry.user,
                 &entry.tags,
-                password_auth,
+                auth.as_ref(),
             )?,
-            auth: password_auth,
+            auth,
         });
     }
     ensure_unique_aliases(&rows)?;
@@ -942,7 +1048,7 @@ fn split_csv_rows(text: &str) -> Result<Vec<Vec<String>>, String> {
 /// `name` and `host` columns (case-insensitive, any order), optional `port`,
 /// `user` and `tags` columns. Tags are `;`-separated — `,` is the CSV
 /// separator itself. Auth types are a TOML-only field (#417); CSV rows
-/// default to key auth.
+/// default to agent login (#489).
 fn parse_import_csv(text: &str) -> Result<Vec<ImportRow>, String> {
     let all_rows = split_csv_rows(text)?;
     let is_blank = |r: &Vec<String>| r.len() == 1 && r[0].trim().is_empty();
@@ -1052,13 +1158,12 @@ fn unique_alias(existing: &[SshSlot], base: &str) -> String {
 /// Apply parsed rows to the launcher's host list under the chosen policy.
 ///
 /// The policy only affects colliding rows; fresh names are appended.
-/// Overwrite replaces the connection fields in place; the saved password
-/// survives only while the connection identity (host, port, user) is
-/// unchanged and both the host and the file stay on password auth — a
-/// credential belonging to another machine, or to key auth, must not
-/// linger. The file's auth type wins when it carries one; without it, a
-/// changed identity drops password auth, like a changed identity drops
-/// the password (#416/#417 reviews).
+/// Overwrite replaces the connection fields in place. The file's auth wins
+/// when it carries one; without it the host keeps its own (#417, #489).
+/// A saved password or key passphrase survives only while it still belongs
+/// to the host: same identity (host, port, user), the same login method,
+/// and for a passphrase the same key file — a credential of another
+/// machine or another key must not linger (#416/#417 reviews).
 fn apply_import(
     existing: &mut Vec<SshSlot>,
     imported: Vec<ImportRow>,
@@ -1081,19 +1186,23 @@ fn apply_import(
                 let identity_changed = slot.host.trim() != candidate.host.trim()
                     || slot.port.trim() != candidate.port.trim()
                     || slot.user.trim() != candidate.user.trim();
-                // The file's auth type wins when specified; without one the
-                // host keeps its own — except a changed identity drops
-                // password auth, like a changed identity drops the password.
-                let password_auth = row.auth.unwrap_or(!identity_changed && slot.save_password);
-                // The credential survives only while it still belongs to
-                // this host: same identity, password auth on both sides.
+                let (auth, key_path) = match row.auth {
+                    Some(a) => (a.kind, a.key_path),
+                    None => (slot.auth, slot.key_path.clone()),
+                };
                 // The launch path deletes the keyring entry of a cleared
-                // password, so a credential for another machine does not
+                // credential, so a secret for another machine does not
                 // silently follow the alias (and TOFU may not warn).
-                if identity_changed || !slot.save_password || !password_auth {
+                if identity_changed || auth != SlotAuth::Password {
                     slot.password.clear();
+                    slot.save_password = false;
                 }
-                slot.save_password = password_auth;
+                if identity_changed || auth != SlotAuth::Key || key_path.trim() != slot.key_path.trim() {
+                    slot.passphrase.clear();
+                    slot.save_passphrase = false;
+                }
+                slot.auth = auth;
+                slot.key_path = key_path;
                 slot.host = candidate.host;
                 slot.port = candidate.port;
                 slot.user = candidate.user;
@@ -1140,9 +1249,9 @@ fn import_status_line(outcome: &ImportOutcome) -> String {
 /// `config.toml` read it, so the file can be committed, shared, and
 /// imported back as-is.
 ///
-/// Secrets are never written (invariant #3): the auth block carries only
-/// its `type`, and neither `password` nor a key `path` has any
-/// representation in the format.
+/// Secrets are never written (invariant #3): the auth block carries its
+/// `type` and, for key login, the key file `path` (#489) — a location, not
+/// a key. Passwords and passphrases have no representation in the format.
 fn export_hosts_toml(slots: &[&SshSlot]) -> Result<String, String> {
     #[derive(serde::Serialize)]
     struct File {
@@ -1161,6 +1270,8 @@ fn export_hosts_toml(slots: &[&SshSlot]) -> Result<String, String> {
     struct Auth {
         #[serde(rename = "type")]
         kind: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     }
     let file = File {
         ssh_targets: slots
@@ -1175,7 +1286,12 @@ fn export_hosts_toml(slots: &[&SshSlot]) -> Result<String, String> {
                     user: slot.user.trim().to_string(),
                     tags: parse_tags(&slot.tags),
                     auth: Auth {
-                        kind: if slot.save_password { "password" } else { "key" },
+                        kind: slot.auth.type_name(),
+                        path: match slot.auth {
+                            SlotAuth::Key => slot_key_path(&slot.key_path)
+                                .map(|p| p.to_string_lossy().into_owned()),
+                            _ => None,
+                        },
                     },
                 }
             })
@@ -1183,8 +1299,8 @@ fn export_hosts_toml(slots: &[&SshSlot]) -> Result<String, String> {
     };
     let body = toml::to_string(&file).map_err(|e| format!("cannot serialize host list: {e}"))?;
     Ok(format!(
-        "# Filar host list — addresses, ports, users, tags and auth types.\n\
-         # Safe to commit and share: no passwords, no keys, no key paths.\n\
+        "# Filar host list — addresses, ports, users, tags and login methods.\n\
+         # No passwords, passphrases or keys; key login lists the key file path.\n\
          # Import it back with the launcher's \"Import…\" button.\n\
          {body}"
     ))
@@ -1267,12 +1383,21 @@ struct SshSlot {
     alias: String,
     /// Comma-separated tags as typed in the Tags field (#413).
     tags: String,
+    /// Login method (#489).
+    auth: SlotAuth,
     password: String,
     save_password: bool,
+    /// Key file for key login, as typed; empty = the default key.
+    key_path: String,
+    /// Passphrase of an encrypted key — held in memory and the OS
+    /// credential store only (#489).
+    passphrase: String,
+    save_passphrase: bool,
 }
 
-/// Redacts `password`: `Debug` output can reach a test failure message via
-/// `ImportStaged`, and a slot must never print its secret (#416 review).
+/// Redacts the password and the key passphrase: `Debug` output can reach a
+/// test failure message via `ImportStaged`, and a slot must never print its
+/// secrets (#416 review, #489).
 impl std::fmt::Debug for SshSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SshSlot")
@@ -1281,16 +1406,26 @@ impl std::fmt::Debug for SshSlot {
             .field("user", &self.user)
             .field("alias", &self.alias)
             .field("tags", &self.tags)
+            .field("auth", &self.auth)
             .field("password", &"<redacted>")
             .field("save_password", &self.save_password)
+            .field("key_path", &self.key_path)
+            .field("passphrase", &"<redacted>")
+            .field("save_passphrase", &self.save_passphrase)
             .finish()
     }
 }
 
 impl SshSlot {
     fn from_profile(p: &SshProfile, slot_idx: usize) -> Self {
-        let password = if p.save_password {
+        let auth = p.auth.unwrap_or_else(SlotAuth::legacy);
+        let password = if auth == SlotAuth::Password && p.save_password {
             load_secret(&ssh_cred_name(slot_idx, &p.alias))
+        } else {
+            String::new()
+        };
+        let passphrase = if auth == SlotAuth::Key && p.save_passphrase {
+            load_secret(&slot_passphrase_cred_name(slot_idx, &p.alias))
         } else {
             String::new()
         };
@@ -1304,8 +1439,12 @@ impl SshSlot {
             user: p.user.clone(),
             alias: p.alias.clone(),
             tags: p.tags.clone(),
+            auth,
             password,
             save_password: p.save_password,
+            key_path: p.key_path.clone(),
+            passphrase,
+            save_passphrase: p.save_passphrase,
         }
     }
 
@@ -1317,10 +1456,14 @@ impl SshSlot {
             alias: self.alias.trim().chars().take(32).collect(),
             tags: self.tags.trim().to_string(),
             save_password: self.save_password,
+            auth: Some(self.auth),
+            key_path: self.key_path.trim().to_string(),
+            save_passphrase: self.save_passphrase,
         }
     }
 
-    /// A blank entry backing the "Add host" button.
+    /// A blank entry backing the "Add host" button. New hosts log in
+    /// through the SSH agent, like `SshAuth::default()` (#489).
     fn blank() -> Self {
         Self {
             host: String::new(),
@@ -1328,10 +1471,26 @@ impl SshSlot {
             user: String::new(),
             alias: String::new(),
             tags: String::new(),
+            auth: SlotAuth::default(),
             password: String::new(),
             save_password: false,
+            key_path: String::new(),
+            passphrase: String::new(),
+            save_passphrase: false,
         }
     }
+
+    /// The key file this slot logs in with: the typed path, or the default
+    /// key when the field is blank.
+    fn resolved_key_path(&self) -> std::path::PathBuf {
+        filar_transport::resolve_key_path(slot_key_path(&self.key_path).as_deref())
+    }
+}
+
+/// OS credential-store name of a slot's key passphrase:
+/// `ssh_key_passphrase:<name>`, the name the session looks up (#489).
+fn slot_passphrase_cred_name(slot: usize, alias: &str) -> String {
+    filar_core::ssh_key_passphrase_name(&filar_core::ssh_target_display_name(slot, alias))
 }
 
 /// Row actions from the SSH host list, applied after the render pass so the
@@ -1522,6 +1681,9 @@ struct LauncherApp {
     save_dir: Option<std::path::PathBuf>,
     /// Reveal SSH password field (not persisted).
     show_ssh_password: bool,
+    /// Reveal the key passphrase field — its own flag, so revealing a
+    /// password never reveals a passphrase (#489 review). Not persisted.
+    show_key_passphrase: bool,
     /// Reveal API key field (not persisted).
     show_api_key: bool,
     /// Arbiter profile selection (`None` = same as session profile).
@@ -1535,6 +1697,15 @@ struct LauncherApp {
     host_groups: Vec<HostGroupDraft>,
     /// Active central tab: 0 = session & hosts, 1 = groups (#418).
     active_tab: usize,
+    /// Last "is this key encrypted?" answer for the key login fields (#489).
+    key_probe: Option<KeyProbe>,
+}
+
+/// Whether a key file needs a passphrase, cached per path so the launcher
+/// does not re-read the file on every frame (#489).
+struct KeyProbe {
+    path: std::path::PathBuf,
+    result: Result<filar_transport::KeyProtection, String>,
 }
 
 /// Local copy of an LLM profile for GUI editing.
@@ -1934,21 +2105,111 @@ impl LauncherApp {
                             .desired_width(160.0),
                     );
                     ui.end_row();
-                    ui.label("Password:");
+                    ui.label("Login:");
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut show, "Show");
-                        secret_text_edit(ui, "ssh_password", &mut slot.password, show);
+                        ui.radio_value(&mut slot.auth, SlotAuth::Agent, "SSH agent");
+                        ui.radio_value(&mut slot.auth, SlotAuth::Key, "Key file");
+                        ui.radio_value(&mut slot.auth, SlotAuth::Password, "Password");
                     });
                     ui.end_row();
+                    match slot.auth {
+                        SlotAuth::Password => {
+                            ui.label("Password:");
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut show, "Show");
+                                secret_text_edit(ui, "ssh_password", &mut slot.password, show);
+                            });
+                            ui.end_row();
+                        }
+                        SlotAuth::Key => {
+                            let default_key = filar_transport::resolve_key_path(None);
+                            ui.label("Key file:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut slot.key_path)
+                                    .hint_text(format!("{} (default)", default_key.display()))
+                                    .desired_width(240.0),
+                            );
+                            ui.end_row();
+                        }
+                        SlotAuth::Agent => {}
+                    }
                 });
         });
-        self.show_ssh_password = show;
+        // Probed after the fields: an edited path is re-read on the next
+        // frame, and only when it actually changed.
+        let key_status = self.refresh_key_probe(idx);
+        let hint = egui::Color32::from_rgb(140, 140, 140);
+        let mut show_passphrase = self.show_key_passphrase;
         ui.add_enabled_ui(!locked, |ui| {
-            ui.checkbox(
-                &mut self.ssh_slots[idx].save_password,
-                "Save password (encrypted in OS credential store)",
-            );
+            let slot = &mut self.ssh_slots[idx];
+            match slot.auth {
+                SlotAuth::Password => {
+                    ui.checkbox(
+                        &mut slot.save_password,
+                        "Save password (encrypted in OS credential store)",
+                    );
+                }
+                SlotAuth::Key => match key_status {
+                    Some(Ok(filar_transport::KeyProtection::Encrypted)) => {
+                        ui.checkbox(
+                            &mut slot.save_passphrase,
+                            "Save passphrase (encrypted in OS credential store)",
+                        );
+                        if slot.save_passphrase {
+                            ui.horizontal(|ui| {
+                                ui.label("Passphrase:");
+                                ui.checkbox(&mut show_passphrase, "Show");
+                                secret_text_edit(
+                                    ui,
+                                    "ssh_key_passphrase",
+                                    &mut slot.passphrase,
+                                    show_passphrase,
+                                );
+                            });
+                        } else {
+                            ui.colored_label(
+                                hint,
+                                "The key is encrypted: its passphrase is asked in the terminal at launch.",
+                            );
+                        }
+                    }
+                    Some(Ok(filar_transport::KeyProtection::Plain)) => {
+                        ui.colored_label(hint, "The key has no passphrase.");
+                    }
+                    Some(Err(e)) => {
+                        ui.colored_label(egui::Color32::from_rgb(220, 150, 60), e);
+                    }
+                    None => {}
+                },
+                SlotAuth::Agent => {
+                    ui.colored_label(
+                        hint,
+                        "Uses the keys loaded into your SSH agent (ssh-add). On Windows: \
+                         the \"OpenSSH Authentication Agent\" service or Pageant.",
+                    );
+                }
+            }
         });
+        self.show_ssh_password = show;
+        self.show_key_passphrase = show_passphrase;
+    }
+
+    /// Whether the selected slot's key file is encrypted, re-read only when
+    /// its path changed (#489). `None` unless the slot uses key login.
+    fn refresh_key_probe(
+        &mut self,
+        idx: usize,
+    ) -> Option<Result<filar_transport::KeyProtection, String>> {
+        let slot = self.ssh_slots.get(idx)?;
+        if slot.auth != SlotAuth::Key {
+            return None;
+        }
+        let path = slot.resolved_key_path();
+        if self.key_probe.as_ref().map(|p| &p.path) != Some(&path) {
+            let result = filar_transport::key_protection(&path).map_err(|e| e.to_string());
+            self.key_probe = Some(KeyProbe { path, result });
+        }
+        self.key_probe.as_ref().map(|p| p.result.clone())
     }
 
     fn render_llm_settings(&mut self, ui: &mut egui::Ui) {
@@ -2570,6 +2831,10 @@ impl LauncherApp {
             self.set_other_error(msg);
             return false;
         }
+        if let Err(msg) = self.validate_selected_key() {
+            self.set_other_error(msg);
+            return false;
+        }
         if let Err(msg) = self.validate_host_groups() {
             self.set_other_error(msg);
             return false;
@@ -2606,6 +2871,36 @@ impl LauncherApp {
                 return Err(format!(
                     "Duplicate SSH host alias \"{alias}\". Aliases must be unique."
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The selected host's key must be usable before the launcher closes
+    /// (#489): the file readable as a private key and, for an encrypted key
+    /// whose passphrase is to be saved, that passphrase checked locally —
+    /// a wrong one is reported here, not as a failed login later. Only the
+    /// selected host is checked: decrypting runs a deliberately slow KDF.
+    fn validate_selected_key(&self) -> Result<(), String> {
+        let Some(slot) = self.target_mode.checked_sub(1).and_then(|i| self.ssh_slots.get(i)) else {
+            return Ok(());
+        };
+        if slot.auth != SlotAuth::Key {
+            return Ok(());
+        }
+        let path = slot.resolved_key_path();
+        let protection = filar_transport::key_protection(&path).map_err(|e| e.to_string())?;
+        if protection == filar_transport::KeyProtection::Encrypted && slot.save_passphrase {
+            let passphrase = sanitize_secret_clipboard(&slot.passphrase);
+            if passphrase.is_empty() {
+                return Err(format!(
+                    "Enter the passphrase of SSH key {} — or uncheck \"Save passphrase\" \
+                     to be asked for it in the terminal.",
+                    path.display()
+                ));
+            }
+            if !filar_transport::key_passphrase_matches(&path, &passphrase) {
+                return Err(format!("Wrong passphrase for SSH key {}.", path.display()));
             }
         }
         Ok(())
@@ -2716,8 +3011,29 @@ impl LauncherApp {
             .filter(|(_, s)| !s.host.trim().is_empty() && !s.alias.trim().is_empty())
             .map(|(i, s)| {
                 let key = ssh_cred_name(i, &s.alias);
-                if s.save_password && !s.password.is_empty() {
+                if s.auth == SlotAuth::Password && s.save_password && !s.password.is_empty() {
                     (key, Some(s.password.clone()))
+                } else {
+                    (key, None)
+                }
+            })
+            .collect()
+    }
+
+    /// The same for key passphrases (#489): saved under
+    /// `ssh_key_passphrase:<alias>` for a key-login host with "Save
+    /// passphrase" checked, cleared otherwise — a host switched to another
+    /// login method must not keep its old key's secret. Persisted rows only,
+    /// for the reason [`Self::ssh_credential_ops`] gives.
+    fn key_passphrase_ops(&self) -> Vec<(String, Option<String>)> {
+        self.ssh_slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.host.trim().is_empty() && !s.alias.trim().is_empty())
+            .map(|(i, s)| {
+                let key = slot_passphrase_cred_name(i, &s.alias);
+                if s.auth == SlotAuth::Key && s.save_passphrase && !s.passphrase.is_empty() {
+                    (key, Some(s.passphrase.clone()))
                 } else {
                     (key, None)
                 }
@@ -2738,8 +3054,12 @@ impl LauncherApp {
             return;
         }
         let slot = self.ssh_slots.remove(idx);
-        if slot.save_password && !slot.alias.trim().is_empty() {
+        // Both entries go, whatever the save flags say now: a flag unchecked
+        // since the last launch still leaves that launch's secret behind
+        // (#489 review).
+        if !slot.alias.trim().is_empty() {
             delete_secret(&ssh_cred_name(idx, &slot.alias));
+            delete_secret(&slot_passphrase_cred_name(idx, &slot.alias));
         }
         if self.target_mode == idx + 1 {
             self.target_mode = 0;
@@ -2826,6 +3146,8 @@ impl LauncherApp {
                 port: slot.port.parse().unwrap_or(22),
                 user: slot.user.clone(),
                 password: sanitize_secret_clipboard(&slot.password),
+                auth: slot.auth,
+                key_path: slot_key_path(&slot.key_path),
                 slot: self.target_mode.saturating_sub(1),
                 alias: slot.alias.clone(),
                 tags: parse_tags(&slot.tags),
@@ -2859,7 +3181,11 @@ impl LauncherApp {
                 save_secret(&prof.key_env, &prof.api_key);
             }
         }
-        for (key, password) in self.ssh_credential_ops() {
+        for (key, password) in self
+            .ssh_credential_ops()
+            .into_iter()
+            .chain(self.key_passphrase_ops())
+        {
             match password {
                 Some(p) => save_secret(&key, &p),
                 None => delete_secret(&key),
@@ -3047,12 +3373,14 @@ pub fn run_launcher(config: &Config) {
         profile_error_shown: false,
         save_dir: settings.save_dir.clone(),
         show_ssh_password: false,
+        show_key_passphrase: false,
         show_api_key: false,
         arbiter_profile: settings.arbiter_profile.clone(),
         import_dialog: None,
         file_status: String::new(),
         host_groups: config.host_groups.iter().map(HostGroupDraft::from_group).collect(),
         active_tab: 0,
+        key_probe: None,
     };
 
     let options = eframe::NativeOptions {
@@ -3124,6 +3452,8 @@ mod tests {
                 port: 22,
                 user: "root".into(),
                 password: "supersecret".into(),
+                auth: SlotAuth::Key,
+                key_path: Some("/home/ops/.ssh/deploy".into()),
                 slot: 0,
                 alias: "prod".into(),
                 tags: vec!["prod".into()],
@@ -3154,6 +3484,14 @@ mod tests {
         assert_eq!(loaded.ssh.as_ref().unwrap().slot, 0);
         assert_eq!(loaded.ssh.as_ref().unwrap().alias, "prod");
         assert_eq!(loaded.ssh.as_ref().unwrap().tags, vec!["prod"]);
+        // The login method and key file reach the session (#489) — and the
+        // handoff still does not trip the plaintext-secret heuristic.
+        assert_eq!(loaded.ssh.as_ref().unwrap().auth, SlotAuth::Key);
+        assert_eq!(
+            loaded.ssh.as_ref().unwrap().key_path.as_deref(),
+            Some(std::path::Path::new("/home/ops/.ssh/deploy"))
+        );
+        assert!(!json.contains("\"password\":"), "got {json}");
         // Secrets must be absent after deserialization (serde(skip) → default).
         assert!(loaded.api_key.is_empty());
         assert!(loaded.ssh.as_ref().unwrap().password.is_empty());
@@ -3163,12 +3501,9 @@ mod tests {
     fn launch_target_name_uses_the_alias_or_slot_number_not_the_literal_ssh() {
         let slot = |alias: &str| SshSlot {
             host: "10.0.0.1".into(),
-            port: "22".into(),
             user: "root".into(),
             alias: alias.into(),
-            tags: String::new(),
-            password: String::new(),
-            save_password: false,
+            ..SshSlot::blank()
         };
         let slots = vec![slot("VPS DE"), slot("")];
         assert_eq!(launch_target_name(0, &slots), "local");
@@ -3184,6 +3519,8 @@ mod tests {
             port: 22,
             user: "admin".into(),
             password: "p@ssw0rd".into(),
+            auth: SlotAuth::Password,
+            key_path: None,
             slot: 2,
             alias: String::new(),
             tags: Vec::new(),
@@ -3199,12 +3536,24 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_489_handoff_file_means_password_login() {
+        // A handoff written before the login method existed was always
+        // password login; reading it must not switch to the agent (#489).
+        let old = r#"{"host":"h","port":22,"user":"u","slot":0,"alias":"web-1"}"#;
+        let conn: SshConnection = serde_json::from_str(old).unwrap();
+        assert_eq!(conn.auth, SlotAuth::Password);
+        assert!(conn.key_path.is_none());
+    }
+
+    #[test]
     fn ssh_connection_alias_survives_round_trip() {
         let conn = SshConnection {
             host: "h".into(),
             port: 22,
             user: "u".into(),
             password: "secret".into(),
+            auth: SlotAuth::Password,
+            key_path: None,
             slot: 1,
             alias: "VPS DE".into(),
             tags: Vec::new(),
@@ -3691,8 +4040,8 @@ mod tests {
     #[test]
     fn config_save_writes_launcher_ssh_profiles() {
         let profiles = vec![
-            SshProfile { host: "10.0.0.1".into(), port: "2222".into(), user: "admin".into(), alias: String::new(), tags: "  ".into(), save_password: false },
-            SshProfile { host: "10.0.0.2".into(), port: "22".into(), user: "root".into(), alias: "prod-web".into(), tags: "prod, web".into(), save_password: true },
+            SshProfile { host: "10.0.0.1".into(), port: "2222".into(), user: "admin".into(), alias: String::new(), tags: "  ".into(), auth: Some(SlotAuth::Key), key_path: " /home/ops/.ssh/deploy ".into(), ..SshProfile::default() },
+            SshProfile { host: "10.0.0.2".into(), port: "22".into(), user: "root".into(), alias: "prod-web".into(), tags: "prod, web".into(), save_password: true, auth: Some(SlotAuth::Password), ..SshProfile::default() },
             SshProfile::default(), // empty slot — skipped
             SshProfile::default(),
             SshProfile::default(),
@@ -3705,9 +4054,15 @@ mod tests {
         assert_eq!(result[1].name, "prod-web", "alias overrides slot name");
         assert_eq!(result[1].host, "10.0.0.2");
         assert_eq!(result[1].port, 22);
-        // Auth type follows save_password flag from the profile.
-        assert!(matches!(result[0].auth, filar_core::SshAuth::Key { .. }), "save_password=false → Key auth");
-        assert!(matches!(result[1].auth, filar_core::SshAuth::Password { .. }), "save_password=true → Password auth");
+        // Auth follows the slot's login method, key path included (#489).
+        match &result[0].auth {
+            filar_core::SshAuth::Key { path, passphrase } => {
+                assert_eq!(path.as_deref(), Some(std::path::Path::new("/home/ops/.ssh/deploy")));
+                assert!(passphrase.is_none(), "no secret in the synced target");
+            }
+            other => panic!("expected Key auth, got {other:?}"),
+        }
+        assert!(matches!(result[1].auth, filar_core::SshAuth::Password { password: None }));
         // Tags pass through the launcher profile → SshTarget conversion; a
         // whitespace-only tag field is simply empty (#413).
         assert!(result[0].tags.is_empty(), "blank tag field → no tags");
@@ -3717,7 +4072,7 @@ mod tests {
     #[test]
     fn build_rewrites_all_targets_no_preservation() {
         let profiles = vec![
-            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: String::new(), tags: String::new(), save_password: false },
+            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: String::new(), tags: String::new(), save_password: false, ..SshProfile::default() },
             SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
         ];
         let result = build_ssh_targets_from_profiles(&profiles);
@@ -3728,7 +4083,7 @@ mod tests {
     #[test]
     fn build_removes_old_target_when_alias_changes() {
         let profiles = vec![
-            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: "prod-api".into(), tags: String::new(), save_password: false },
+            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: "prod-api".into(), tags: String::new(), save_password: false, ..SshProfile::default() },
             SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
         ];
         let result = build_ssh_targets_from_profiles(&profiles);
@@ -3742,7 +4097,7 @@ mod tests {
         // Profile with no alias — uses slot name SSH1. Old stale target
         // with same host/port/user but different name must be removed.
         let profiles = vec![
-            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: String::new(), tags: String::new(), save_password: false },
+            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: String::new(), tags: String::new(), save_password: false, ..SshProfile::default() },
             SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
         ];
         let result = build_ssh_targets_from_profiles(&profiles);
@@ -3756,6 +4111,31 @@ mod tests {
         let profiles = vec![SshProfile::default(); 5];
         let result = build_ssh_targets_from_profiles(&profiles);
         assert!(result.is_empty(), "all launcher targets must be removed when slots are cleared");
+    }
+
+    #[test]
+    fn sync_maps_every_login_method_and_old_profiles_to_password() {
+        let profile = |auth: Option<SlotAuth>, save_password: bool| SshProfile {
+            host: "10.0.0.1".into(),
+            alias: "web-1".into(),
+            save_password,
+            auth,
+            ..SshProfile::default()
+        };
+        let auth_of = |p: SshProfile| build_ssh_targets_from_profiles(&[p]).remove(0).auth;
+        assert!(matches!(auth_of(profile(Some(SlotAuth::Agent), false)), filar_core::SshAuth::Agent));
+        assert!(matches!(
+            auth_of(profile(Some(SlotAuth::Key), false)),
+            filar_core::SshAuth::Key { path: None, .. }
+        ));
+        // A pre-#489 slot logged in by password whatever its save flag said:
+        // Launch always built password auth, so the migration keeps it.
+        for save in [true, false] {
+            assert!(matches!(
+                auth_of(profile(None, save)),
+                filar_core::SshAuth::Password { password: None }
+            ));
+        }
     }
 
     // ── Manual `[[ssh_targets]]` from config.toml (#412) ─────────────
@@ -3925,12 +4305,10 @@ mod tests {
             target_mode: 0,
             ssh_slots: vec![SshSlot {
                 host: "10.0.0.5".into(),
-                port: "22".into(),
                 user: "root".into(),
                 alias: "SSH1".into(),
-                tags: String::new(),
-                password: String::new(),
-                save_password: false,
+                auth: SlotAuth::Password,
+                ..SshSlot::blank()
             }],
             manual_targets: Vec::new(),
             profiles: vec![LlmProfileData {
@@ -3950,12 +4328,14 @@ mod tests {
             profile_error_shown: false,
             save_dir: None,
             show_ssh_password: false,
+            show_key_passphrase: false,
             show_api_key: false,
             arbiter_profile: None,
             import_dialog: None,
             file_status: String::new(),
             host_groups: Vec::new(),
             active_tab: 0,
+            key_probe: None,
         }
     }
 
@@ -4084,8 +4464,7 @@ mod tests {
             port: "22".into(),
             user: "root".into(),
             alias: alias.into(),
-            tags: String::new(),
-            save_password: false,
+            ..SshProfile::default()
         }
     }
 
@@ -4187,7 +4566,7 @@ mod tests {
             user: "root".into(),
             alias: "web-1".into(),
             tags: "prod, web".into(),
-            save_password: false,
+            ..SshProfile::default()
         };
         let json = serde_json::to_string(&profile).unwrap();
         assert!(json.contains("\"tags\":\"prod, web\""), "json: {json}");
@@ -4216,14 +4595,14 @@ mod tests {
         let mut app = make_app(make_meta(None, None, None, None));
         app.ssh_slots = hosts
             .iter()
+            // Password login, the method every pre-#489 host had: the
+            // credential tests below are about the saved password.
             .map(|(host, alias)| SshSlot {
                 host: (*host).into(),
-                port: "22".into(),
                 user: "root".into(),
                 alias: (*alias).into(),
-                tags: String::new(),
-                password: String::new(),
-                save_password: false,
+                auth: SlotAuth::Password,
+                ..SshSlot::blank()
             })
             .collect();
         app.target_mode = 0;
@@ -4381,6 +4760,191 @@ mod tests {
     }
 
     #[test]
+    fn a_password_is_saved_only_for_password_login() {
+        // A host switched to key or agent login must not keep its old
+        // password in the keyring (#489).
+        let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
+        app.ssh_slots[0].save_password = true;
+        app.ssh_slots[0].password = "s3cret".into();
+        app.ssh_slots[0].auth = SlotAuth::Key;
+        assert_eq!(app.ssh_credential_ops(), vec![("ssh_target:web-1".to_string(), None)]);
+    }
+
+    #[test]
+    fn key_passphrase_ops_save_only_a_checked_key_passphrase() {
+        let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
+        app.add_host(); // blank scratch row: never touches the keyring
+        let slot = &mut app.ssh_slots[0];
+        slot.auth = SlotAuth::Key;
+        slot.passphrase = "correct horse".into();
+        slot.save_passphrase = true;
+        assert_eq!(
+            app.key_passphrase_ops(),
+            vec![("ssh_key_passphrase:web-1".to_string(), Some("correct horse".to_string()))]
+        );
+        // Unchecked, or another login method: the entry is cleared.
+        app.ssh_slots[0].save_passphrase = false;
+        assert_eq!(app.key_passphrase_ops(), vec![("ssh_key_passphrase:web-1".to_string(), None)]);
+        app.ssh_slots[0].save_passphrase = true;
+        app.ssh_slots[0].auth = SlotAuth::Agent;
+        assert_eq!(app.key_passphrase_ops(), vec![("ssh_key_passphrase:web-1".to_string(), None)]);
+    }
+
+    #[test]
+    fn the_passphrase_entry_is_the_one_the_session_reads() {
+        // The session looks up `ssh_key_passphrase:<target name>`, and the
+        // target name of a launcher host is its alias (#489).
+        assert_eq!(
+            slot_passphrase_cred_name(3, "prod-web"),
+            filar_core::ssh_key_passphrase_name(&filar_core::ssh_target_display_name(3, "prod-web"))
+        );
+        assert_eq!(slot_passphrase_cred_name(3, "prod-web"), "ssh_key_passphrase:prod-web");
+    }
+
+    #[test]
+    fn slot_debug_redacts_the_password_and_the_passphrase() {
+        let mut slot = SshSlot::blank();
+        slot.password = "s3cret".into();
+        slot.passphrase = "correct horse".into();
+        let debug = format!("{slot:?}");
+        assert!(!debug.contains("s3cret") && !debug.contains("correct horse"), "{debug}");
+    }
+
+    #[test]
+    fn profile_round_trip_keeps_the_login_method_and_never_a_passphrase() {
+        let mut slot = SshSlot::blank();
+        slot.host = "10.0.0.5".into();
+        slot.alias = "web-1".into();
+        slot.auth = SlotAuth::Key;
+        slot.key_path = " /home/ops/.ssh/deploy ".into();
+        slot.passphrase = "correct horse".into();
+        slot.save_passphrase = false; // not saved → no keyring read on load
+        let profile = slot.to_profile();
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(!json.contains("correct horse"), "{json}");
+        assert!(json.contains("\"auth\":\"key\""), "{json}");
+        let back = SshSlot::from_profile(&serde_json::from_str(&json).unwrap(), 0);
+        assert_eq!(back.auth, SlotAuth::Key);
+        assert_eq!(back.key_path, "/home/ops/.ssh/deploy");
+        assert!(back.passphrase.is_empty());
+    }
+
+    #[test]
+    fn a_pre_489_profile_migrates_to_password_login() {
+        // Old settings files have no `auth`: Launch always built password
+        // auth for them, so the migration keeps the login working.
+        let old = r#"{"host":"10.0.0.11","port":"22","user":"root","alias":"web-1","save_password":false}"#;
+        let profile: SshProfile = serde_json::from_str(old).unwrap();
+        assert_eq!(profile.auth, None);
+        let slot = SshSlot::from_profile(&profile, 0);
+        assert_eq!(slot.auth, SlotAuth::Password);
+        assert_eq!(slot.to_profile().auth, Some(SlotAuth::Password));
+        assert_eq!(SshSlot::blank().auth, SlotAuth::Agent, "new hosts use the agent");
+    }
+
+    const KEY_PASSPHRASE: &str = "correct horse";
+
+    /// A temp key file, removed when dropped — even when the test panics.
+    struct TempKey(std::path::PathBuf);
+
+    impl Drop for TempKey {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A throwaway ed25519 key, encrypted when `encrypted`. Deterministic
+    /// seed, one bcrypt round; named by a counter so parallel tests never
+    /// share a file.
+    fn temp_key(encrypted: bool) -> TempKey {
+        use russh::keys::ssh_key::private::Ed25519Keypair;
+        use russh::keys::ssh_key::{Cipher, Kdf, LineEnding, PrivateKey};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let key = PrivateKey::from(Ed25519Keypair::from_seed(&[4u8; 32]));
+        let key = if encrypted {
+            key.encrypt_with(
+                Cipher::Aes256Ctr,
+                Kdf::Bcrypt { salt: [6u8; 16].to_vec(), rounds: 1 },
+                11,
+                KEY_PASSPHRASE,
+            )
+            .expect("encrypt")
+        } else {
+            key
+        };
+        let pem = key.to_openssh(LineEnding::LF).expect("encode");
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("filar-gui-key-{}-{n}", std::process::id()));
+        std::fs::write(&path, pem.as_bytes()).expect("write");
+        TempKey(path)
+    }
+
+    fn app_with_key_host(key: &TempKey) -> LauncherApp {
+        let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
+        app.target_mode = 1;
+        app.ssh_slots[0].auth = SlotAuth::Key;
+        app.ssh_slots[0].key_path = key.0.display().to_string();
+        app
+    }
+
+    #[test]
+    fn launch_checks_the_saved_passphrase_of_the_selected_key() {
+        let key = temp_key(true);
+        let mut app = app_with_key_host(&key);
+        app.ssh_slots[0].save_passphrase = true;
+
+        let err = app.validate_selected_key().unwrap_err();
+        assert!(err.contains("Enter the passphrase"), "{err}");
+
+        app.ssh_slots[0].passphrase = "battery staple".into();
+        let err = app.validate_selected_key().unwrap_err();
+        assert!(err.starts_with("Wrong passphrase for SSH key"), "{err}");
+        assert!(!err.contains("battery staple"), "the error must not echo it: {err}");
+
+        app.ssh_slots[0].passphrase = KEY_PASSPHRASE.into();
+        assert_eq!(app.validate_selected_key(), Ok(()));
+
+        // Not saved: nothing to check here, the terminal asks at launch.
+        app.ssh_slots[0].passphrase.clear();
+        app.ssh_slots[0].save_passphrase = false;
+        assert_eq!(app.validate_selected_key(), Ok(()));
+    }
+
+    #[test]
+    fn launch_accepts_a_plain_key_and_refuses_a_missing_one() {
+        let key = temp_key(false);
+        let mut app = app_with_key_host(&key);
+        app.ssh_slots[0].save_passphrase = true; // irrelevant for a plain key
+        assert_eq!(app.validate_selected_key(), Ok(()));
+        assert_eq!(
+            app.refresh_key_probe(0),
+            Some(Ok(filar_transport::KeyProtection::Plain))
+        );
+
+        let missing = key.0.with_extension("missing");
+        app.ssh_slots[0].key_path = missing.display().to_string();
+        let err = app.validate_selected_key().unwrap_err();
+        assert!(err.contains("failed to load SSH key"), "{err}");
+        assert!(matches!(app.refresh_key_probe(0), Some(Err(_))));
+
+        // Another login method, or Local: no key to check.
+        app.ssh_slots[0].auth = SlotAuth::Agent;
+        assert_eq!(app.validate_selected_key(), Ok(()));
+        assert_eq!(app.refresh_key_probe(0), None);
+    }
+
+    #[test]
+    fn the_key_probe_sees_an_encrypted_key() {
+        let key = temp_key(true);
+        let mut app = app_with_key_host(&key);
+        assert_eq!(
+            app.refresh_key_probe(0),
+            Some(Ok(filar_transport::KeyProtection::Encrypted))
+        );
+    }
+
+    #[test]
     fn last_ssh_is_one_plus_the_persisted_position() {
         // Blank scratch rows are dropped from the saved list (#411), so a
         // raw slot index would preselect a different host after a restart.
@@ -4501,9 +5065,15 @@ host_key_policy = \"strict\"
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].slot.port, "22", "an omitted port defaults to 22");
         assert_eq!(rows[0].slot.tags, "");
-        assert_eq!(rows[0].auth, Some(true), "the auth type is read (#417)");
+        assert_eq!(
+            rows[0].auth.as_ref().map(|a| a.kind),
+            Some(SlotAuth::Password),
+            "the auth type is read (#417)"
+        );
         assert!(
-            rows[0].slot.save_password && rows[0].slot.password.is_empty(),
+            rows[0].slot.auth == SlotAuth::Password
+                && !rows[0].slot.save_password
+                && rows[0].slot.password.is_empty(),
             "password auth means the connect prompt, never a stored secret"
         );
     }
@@ -4524,7 +5094,7 @@ host_key_policy = \"strict\"
             "[[ssh_targets]]\nname = \"web-1\"\nhost = \"192.0.2.1\"\nauth = { type = \"password\", password = \"hunter2\" }\n",
         )
         .unwrap();
-        assert_eq!(rows[0].auth, Some(true));
+        assert_eq!(rows[0].auth.as_ref().map(|a| a.kind), Some(SlotAuth::Password));
         assert!(
             rows[0].slot.password.is_empty(),
             "an inline secret must not be read"
@@ -4541,18 +5111,36 @@ host_key_policy = \"strict\"
     }
 
     #[test]
-    fn import_auth_key_drops_an_inline_key_path() {
+    fn import_auth_key_keeps_the_key_path_and_export_writes_it_back() {
+        // A key file path is a location, not a secret: the host keeps it,
+        // and the export carries it so the round trip loses nothing (#489).
         let rows = parse_import_toml(
-            "[[ssh_targets]]\nname = \"web-1\"\nhost = \"192.0.2.1\"\nauth = { type = \"key\", path = \"/root/.ssh/id_rsa\" }\n",
+            "[[ssh_targets]]\nname = \"web-1\"\nhost = \"192.0.2.1\"\nauth = { type = \"key\", path = \" /root/.ssh/id_rsa \" }\n",
         )
         .unwrap();
-        assert_eq!(rows[0].auth, Some(false));
-        // Nothing remembers the path, and the export format has no field
-        // for one (DoD of #417).
+        assert_eq!(
+            rows[0].auth,
+            Some(ImportAuth { kind: SlotAuth::Key, key_path: "/root/.ssh/id_rsa".into() })
+        );
+        assert_eq!(rows[0].slot.auth, SlotAuth::Key);
+        assert_eq!(rows[0].slot.key_path, "/root/.ssh/id_rsa");
         let refs: Vec<&SshSlot> = rows.iter().map(|r| &r.slot).collect();
         let text = export_hosts_toml(&refs).unwrap();
-        assert!(!text.contains("path = "), "got {text}");
-        assert!(!text.contains("id_rsa"), "got {text}");
+        assert!(text.contains("type = \"key\""), "got {text}");
+        assert!(text.contains("path = \"/root/.ssh/id_rsa\""), "got {text}");
+    }
+
+    #[test]
+    fn import_agent_and_a_missing_auth_mean_agent_login() {
+        let rows = parse_import_toml(
+            "[[ssh_targets]]\nname = \"a\"\nhost = \"192.0.2.1\"\nauth = { type = \"agent\", path = \"/ignored\" }\n\n\
+             [[ssh_targets]]\nname = \"b\"\nhost = \"192.0.2.2\"\n",
+        )
+        .unwrap();
+        assert_eq!(rows[0].slot.auth, SlotAuth::Agent);
+        assert!(rows[0].slot.key_path.is_empty(), "a path only belongs to key login");
+        assert_eq!(rows[1].slot.auth, SlotAuth::Agent, "new hosts default to the agent");
+        assert!(rows[1].auth.is_none());
     }
 
     #[test]
@@ -4719,10 +5307,37 @@ host_key_policy = \"strict\"
         let outcome = apply_import(&mut app.ssh_slots, rows, CollisionPolicy::Overwrite);
         assert_eq!(outcome.overwritten, 1);
         let slot = &app.ssh_slots[0];
+        assert_eq!(slot.auth, SlotAuth::Key);
         assert!(
             !slot.save_password && slot.password.is_empty(),
             "the file says key auth: the stored password must not linger"
         );
+    }
+
+    #[test]
+    fn import_overwrite_drops_the_passphrase_of_another_key() {
+        let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
+        let slot = &mut app.ssh_slots[0];
+        slot.auth = SlotAuth::Key;
+        slot.key_path = "/keys/old".into();
+        slot.save_passphrase = true;
+        slot.passphrase = "correct horse".into();
+        // Same key file: the passphrase still belongs to it.
+        let same = parse_import_toml(
+            "[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.11\"\nuser = \"root\"\nauth = { type = \"key\", path = \"/keys/old\" }\n",
+        )
+        .unwrap();
+        apply_import(&mut app.ssh_slots, same, CollisionPolicy::Overwrite);
+        assert!(app.ssh_slots[0].save_passphrase && app.ssh_slots[0].passphrase == "correct horse");
+        // Another key file: the old passphrase must not follow it.
+        let other = parse_import_toml(
+            "[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.11\"\nuser = \"root\"\nauth = { type = \"key\", path = \"/keys/new\" }\n",
+        )
+        .unwrap();
+        apply_import(&mut app.ssh_slots, other, CollisionPolicy::Overwrite);
+        let slot = &app.ssh_slots[0];
+        assert_eq!(slot.key_path, "/keys/new");
+        assert!(!slot.save_passphrase && slot.passphrase.is_empty());
     }
 
     #[test]
@@ -4737,7 +5352,7 @@ host_key_policy = \"strict\"
         apply_import(&mut app.ssh_slots, rows, CollisionPolicy::Overwrite);
         let slot = &app.ssh_slots[0];
         assert!(
-            slot.save_password && slot.password.is_empty(),
+            slot.auth == SlotAuth::Password && !slot.save_password && slot.password.is_empty(),
             "the new machine keeps the prompt but not the old machine's secret"
         );
     }
@@ -4884,35 +5499,50 @@ host_key_policy = \"strict\"
 
     #[test]
     fn export_import_round_trip_restores_the_fleet() {
-        let mut app = app_with_hosts(&[("10.0.0.11", "web-1"), ("10.0.0.12", "db-1")]);
+        let mut app = app_with_hosts(&[
+            ("10.0.0.11", "web-1"),
+            ("10.0.0.12", "db-1"),
+            ("10.0.0.13", "ci-1"),
+        ]);
         app.ssh_slots[0].save_password = true;
+        app.ssh_slots[0].password = "s3cret".into();
         app.ssh_slots[0].port = "2222".into();
         app.ssh_slots[0].user = "admin".into();
         app.ssh_slots[0].tags = "prod, fleet".into();
+        app.ssh_slots[1].auth = SlotAuth::Key;
+        app.ssh_slots[1].key_path = "/home/ops/.ssh/deploy".into();
+        app.ssh_slots[1].save_passphrase = true;
+        app.ssh_slots[1].passphrase = "correct horse".into();
+        app.ssh_slots[2].auth = SlotAuth::Agent;
         let refs: Vec<&SshSlot> = app.ssh_slots.iter().collect();
         let text = export_hosts_toml(&refs).unwrap();
+        assert!(!text.contains("s3cret") && !text.contains("correct horse"), "got {text}");
 
         let rows = parse_import_toml(&text).expect("the export must parse as an import");
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].slot.alias, "web-1");
         assert_eq!(rows[0].slot.host, "10.0.0.11");
         assert_eq!(rows[0].slot.port, "2222");
         assert_eq!(rows[0].slot.user, "admin");
         assert_eq!(rows[0].slot.tags, "prod, fleet");
-        assert_eq!(rows[0].auth, Some(true), "password auth survives the trip");
+        let kind = |i: usize| rows[i].auth.as_ref().map(|a| a.kind);
+        assert_eq!(kind(0), Some(SlotAuth::Password), "password auth survives the trip");
         assert_eq!(rows[1].slot.alias, "db-1");
-        assert_eq!(rows[1].auth, Some(false), "key auth survives the trip");
+        assert_eq!(kind(1), Some(SlotAuth::Key), "key auth survives the trip");
+        assert_eq!(rows[1].slot.key_path, "/home/ops/.ssh/deploy", "and so does its path");
+        assert_eq!(kind(2), Some(SlotAuth::Agent), "agent auth survives the trip");
 
         // A clean machine gets the very same fleet back.
         let mut clean = app_with_hosts(&[]);
         let outcome = apply_import(&mut clean.ssh_slots, rows, CollisionPolicy::Skip);
-        assert_eq!(outcome.added, 2);
-        assert_eq!(clean.ssh_slots.len(), 2);
+        assert_eq!(outcome.added, 3);
+        assert_eq!(clean.ssh_slots.len(), 3);
         assert_eq!(clean.ssh_slots[0].host, "10.0.0.11");
-        assert!(clean.ssh_slots[0].save_password);
-        assert!(!clean.ssh_slots[1].save_password);
+        assert_eq!(clean.ssh_slots[0].auth, SlotAuth::Password);
+        assert_eq!(clean.ssh_slots[1].auth, SlotAuth::Key);
+        assert_eq!(clean.ssh_slots[2].auth, SlotAuth::Agent);
         assert!(
-            clean.ssh_slots[0].password.is_empty(),
+            clean.ssh_slots[0].password.is_empty() && clean.ssh_slots[1].passphrase.is_empty(),
             "the round trip restores the prompt, not the secret"
         );
     }

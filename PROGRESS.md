@@ -9923,3 +9923,53 @@ Credential Manager / Keychain), TUI `Ctrl+O` вживую, живой флот.
 выбираемый — отдельная задача, если понадобится.
 
 **Next:** #489 (GUI-лаунчер: вход по ключу и через агент).
+
+## #489 — лаунчер: способ входа на хост (агент / ключ / пароль)
+
+**Сделано.** `SlotAuth { Password, Key, Agent }` (pub в `filar-gui`): слот
+хоста, `SshProfile` (`auth: Option<_>`, `key_path`, `save_passphrase`) и
+`SshConnection` (`auth`, `key_path`). UI: переключатель Login; Key — путь
+(пусто = `resolve_key_path(None)`, подсказка с реальным путём), статус
+«зашифрован / нет / не читается» из кэша `KeyProbe` (перечитывается только
+при смене пути), для зашифрованного — «Save passphrase» + маскированное поле;
+Agent — подсказка про `ssh-add` / OpenSSH Agent / Pageant.
+`validate_selected_key`: при Launch у выбранного хоста ключ читается, фраза
+(если сохраняется) проверяется `key_passphrase_matches` — ошибка в лаунчере.
+Фраза — только в keyring `ssh_key_passphrase:<alias>`
+(`key_passphrase_ops`, как `ssh_credential_ops` для паролей; пароль теперь
+сохраняется только при парольном входе; удаление хоста стирает обе записи
+безусловно). В unit-тестах `save/load/delete_secret` — no-op: тесты не
+трогают настоящее хранилище разработчика. `resolve_gui_ssh_target` строит
+`SshAuth` по способу; фразу заполняет существующий шаг `--target`
+(keyring → `SSH_KEY_PASSPHRASE` → терминал). Sync/import/export несут `type`
+и `path`; CSV и хост без `auth` → агент. `filar-gui` зависит от
+`filar-transport` (без `local`).
+
+**Решения.** Миграция: слот без `auth` → `Password` независимо от
+`save_password` — Launch и раньше всегда входил паролем (sync в
+`[[ssh_targets]]` при этом писал `key` для неотмеченных — это расхождение
+устранено). Фраза не передаётся через `pending_launch.json` и не
+передаётся «разово»: без «Save passphrase» её спрашивает терминал (как
+несохранённый пароль спрашивается сессией). Путь к ключу в экспорте — по
+тексту issue; это расположение, не секрет (раньше путь сознательно
+отбрасывался, #417). Overwrite при импорте: секрет сбрасывается при смене
+identity, способа входа, а фраза — и при смене файла ключа.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. Публичное:
+`filar_gui::SlotAuth`, поля `SshConnection::{auth, key_path}` (ломает
+struct-литералы).
+
+**Проверено вживую (Linux, Xvfb + xdotool, локальный OpenSSH sshd).**
+Лаунчер показывает Login и статус ключа; Launch с пустой / неверной фразой —
+ошибка в лаунчере, окно не закрывается, фраза в тексте ошибки не звучит;
+верная — `pending_launch.json` с `auth = key` и путём, без фразы; хост без
+`auth` в settings.json → Password. Полный `filar`: Key без «Save» → фраза в
+терминале → `SSH authenticated via key`; Agent (`SSH_AUTH_SOCK`) →
+`SSH authenticated via agent`. Для Xvfb понадобились `libxkbcommon-x11-0` и
+`xdotool windowfocus` (иначе ввод с клавиатуры не доходит).
+
+**Не проверено.** Сохранение фразы в keyring и повторный запуск без запроса:
+в контейнере нет Secret Service (DBus) — нужен прогон на Windows/macOS
+(Credential Manager / Keychain). `~` в пути ключа не раскрывается (как и в
+`config.toml` — пример `path = "~/.ssh/id_ed25519"` в USER_GUIDE 2.2 вводит в
+заблуждение, вне объёма).
