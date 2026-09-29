@@ -9973,3 +9973,22 @@ struct-литералы).
 (Credential Manager / Keychain). `~` в пути ключа не раскрывается (как и в
 `config.toml` — пример `path = "~/.ssh/id_ed25519"` в USER_GUIDE 2.2 вводит в
 заблуждение, вне объёма).
+
+## Релиз 2.0.0 (2026-09-29)
+
+**Входит:** флот-режим (группы хостов, read-only фан-аут, каталог проверок,
+флот-ранбук), вход через SSH-агент (#479) и ключи с парольной фразой (#480,
+#489 — лаунчер), ранбук по запросу (#481), cwd из терминального режима на
+Windows (#482), выбор папки в path picker (#483), CLI-запуск на первом профиле
+и отказ от GLM как значения по умолчанию (#490). Полный список — CHANGELOG
+`[2.0.0]`.
+
+**Preflight:** build/test на `main` (fd05c3f) зелёные — 1430 passed, 0 failed,
+10 ignored (docker-sshd); milestone 2.0.0 закрыт (39/39); теги `v2.0.0` и
+`engine-v2.0.0` свободны; `release.yml` собирает Windows + macOS. Движок
+менялся — `engine-v2.0.0` на том же коммите, примеры `docs/ENGINE_API.md`
+обновлены. Ручной SMOKE Win + Mac — за мейнтейнером (`docs/SMOKE.md`, #298).
+
+**Долг:** в таблицу «Upgrading to engine-v2.0.0» не вошли изменения #490
+(`GlmClient`, `glm_api_key()`, `env_vars::GLM_API_KEY`; `LlmConfig::default()`
+стал пустым) — отдельным docs-PR.
