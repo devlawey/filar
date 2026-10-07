@@ -13,6 +13,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- `Ctrl+V` in terminal mode pastes the clipboard into the shell instead of
+  sending `^V`; pastes use bracketed paste when the shell enabled it, so
+  multi-line text is inserted rather than run
+  ([#494](https://github.com/devlawey/filar/issues/494)).
+
 - Local agent and `!` commands keep the working directory between calls on
   Windows, macOS and Linux, and the status bar shows it after each command;
   a cancelled local command no longer outlives its shell on Unix

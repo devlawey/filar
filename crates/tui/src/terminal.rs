@@ -166,6 +166,13 @@ impl TerminalModel {
         self.term.mode().contains(TermMode::SGR_MOUSE)
     }
 
+    /// Check whether the application in the terminal has enabled bracketed
+    /// paste (DECSET 2004): pasted text must then arrive wrapped in
+    /// `ESC[200~ … ESC[201~` so the shell inserts it instead of running it.
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     /// Check whether the terminal is in alternate screen mode.
     ///
     /// In alt-screen (used by `less`, `vim`, `htop`, etc.) scrollback
@@ -484,6 +491,26 @@ fn build_style(flags: Flags, fg: Color, bg: Color) -> Style {
 // Key event → terminal input bytes
 // ---------------------------------------------------------------------------
 
+/// Bytes a paste of `text` sends to the PTY (#494).
+///
+/// Line breaks become `\r`, as a terminal's Enter. With `bracketed` (the
+/// application enabled DECSET 2004) the text is wrapped in `ESC[200~ …
+/// ESC[201~`, so a shell inserts multi-line text instead of running each
+/// line; ESC is dropped from the text, so an `ESC[201~` inside it cannot end
+/// the bracket early and have the rest run as typed input.
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+    if !bracketed {
+        return normalized.into_bytes();
+    }
+    let body: String = normalized.chars().filter(|c| *c != '\x1b').collect();
+    let mut out = Vec::with_capacity(body.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend_from_slice(body.as_bytes());
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}
+
 /// Convert a crossterm `KeyEvent` to the byte sequence that should be sent
 /// to the terminal (PTY/SSH channel).
 ///
@@ -730,6 +757,22 @@ fn from_hex(b: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn paste_bytes_plain_turns_newlines_into_enter() {
+        assert_eq!(paste_bytes("a\r\nb\nc", false), b"a\rb\rc");
+        assert_eq!(paste_bytes("Привет", false), "Привет".as_bytes());
+    }
+
+    #[test]
+    fn paste_bytes_bracketed_wraps_and_cannot_be_closed_early() {
+        assert_eq!(paste_bytes("a\nb", true), b"\x1b[200~a\rb\x1b[201~");
+        // An end marker inside the text would run `rm` as typed input.
+        assert_eq!(
+            paste_bytes("x\x1b[201~\nrm -rf ~\n", true),
+            b"\x1b[200~x[201~\rrm -rf ~\r\x1b[201~"
+        );
+    }
     use super::*;
 
     #[test]

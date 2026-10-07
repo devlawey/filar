@@ -10038,3 +10038,32 @@ local Linux — шаги 1–4 DoD; SSH на локальный sshd — аге�
 `CommandResult.cwd` для local теперь фактический каталог).
 `InteractiveTerminal::cd_input` — новый метод с реализацией по умолчанию
 (POSIX `cd`).
+
+## #494 — Ctrl+V в терминальном режиме
+
+**Причина.** В `AppMode::Interactive` `Ctrl+V` не перехватывался и уходил в
+PTY как `0x16` (шелл показывает `^V`, консоль Windows вставку из этого не
+делает); буфер обмена читался только в режиме агента (#153). `Event::Paste`
+писался в PTY сырым текстом, без `ESC[200~ … ESC[201~`, даже когда шелл
+включил bracketed paste.
+
+**Что сделано.** `Ctrl+V` / `Ctrl+Shift+V` в терминале: `arboard` →
+`App::paste_to_terminal`; пустой/недоступный буфер — по-прежнему `0x16`
+(vim, quoted-insert). `Event::Paste` идёт тем же путём.
+`terminal::paste_bytes`: переводы строк → `\r`; при DECSET 2004
+(`TerminalModel::bracketed_paste`) — обёртка `ESC[200~ … ESC[201~`, ESC из
+текста выкидывается (вставка не может закрыть скобку раньше).
+
+**Проверено.** Юнит-тесты (`paste_bytes`, режим шелла). Бинарник в tmux с
+Xvfb-буфером: `Ctrl+T` → `Ctrl+V` двухстрочного текста в bash — обе строки
+в приглашении, выполняются только по Enter; `tmux paste-buffer -p`
+(`Event::Paste`) — так же; при выключенном bracketed paste (`cat -v`) текст
+приходит без маркеров.
+
+**Не проверено.** Windows (Windows Terminal, классическая консоль; local и
+SSH) и macOS вживую — ручной сценарий DoD. cmd.exe и PowerShell 5.1 через
+ConPTY bracketed paste не включают — многострочная вставка там исполняется
+построчно (PLATFORM_NOTES).
+
+**Контракты.** Без изменений.
+

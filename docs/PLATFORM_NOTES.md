@@ -31,6 +31,22 @@ Add findings here whenever a platform difference is discovered.
 >
 > GUI launcher secret fields (API key / SSH password) do **not** take the raw
 > egui paste: see [GUI launcher secrets](#gui-launcher-secrets-macos).
+>
+> Terminal mode (`Ctrl+T`, #494): `Ctrl+V` / `Ctrl+Shift+V` read the
+> clipboard with `arboard` and write it to the PTY; before #494 the key went
+> through as a raw `0x16`, which shells show as `^V` and which the Windows
+> console never turns into a paste. An empty or unreadable clipboard still
+> sends `0x16` (vim visual block, readline quoted-insert). A paste the outer
+> terminal delivers itself as bracketed paste (`Event::Paste`: macOS and
+> Linux terminals, tmux `paste-buffer -p`) takes the same path; on Windows
+> crossterm reads console input records and does not produce `Event::Paste`.
+> Line breaks are sent as `\r` (Enter). When the application in the PTY has
+> enabled bracketed paste (DECSET 2004 — bash/zsh readline, also over SSH)
+> the text is wrapped in `ESC[200~ … ESC[201~` and a multi-line
+> paste is inserted, not run; ESC is dropped from the text so it cannot end
+> the bracket early. `cmd.exe` and Windows PowerShell 5.1 do not enable it
+> through ConPTY: a multi-line paste there runs line by line, as in a plain
+> console.
 
 ## GUI launcher secrets (macOS)
 
