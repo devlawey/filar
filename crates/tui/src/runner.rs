@@ -930,9 +930,10 @@ async fn run_app(
                     Some(Ok(Event::Paste(text))) => {
                         // Bracketed paste: forward to app's paste handler,
                         // which dispatches by mode (normal/confirm/password).
-                        // In Interactive mode, paste manually writes to PTY.
+                        // In Interactive mode it goes to the PTY, re-wrapped
+                        // as bracketed paste if the shell enabled it (#494).
                         if app.mode == AppMode::Interactive {
-                            app.push_term_input(text.as_bytes());
+                            app.paste_to_terminal(&text);
                         } else {
                             app.paste_text(&text);
                         }

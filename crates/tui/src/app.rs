@@ -3241,8 +3241,8 @@ impl App {
         }
 
         // Ctrl+V — paste from clipboard. Active in Normal, Confirming, and
-        // PasswordInput modes. In Interactive mode, bracketed paste (Event::Paste)
-        // handles insertion; in Thinking mode, the agent is running — no paste.
+        // PasswordInput modes. Interactive mode pastes into the PTY in its own
+        // key handler (#494); in Thinking mode, the agent is running — no paste.
         if ctrl_key('v', 'м')
             && matches!(self.mode, AppMode::Normal | AppMode::Confirming | AppMode::PasswordInput)
         {
@@ -3719,6 +3719,20 @@ impl App {
                 if ctrl_key('w', 'ц') {
                     self.close_tab();
                     return;
+                }
+                // Ctrl+V — paste the clipboard into the PTY (#494). The key
+                // used to go through as a raw 0x16, which shells show as `^V`
+                // and Windows terminals never turn into a paste. An empty or
+                // unreadable clipboard still sends 0x16 (vim, quoted-insert).
+                // Ctrl+Shift+V too, for terminals that pass it through.
+                if ctrl_key('v', 'м') || ctrl_key('V', 'М') {
+                    let text = arboard::Clipboard::new()
+                        .and_then(|mut c| c.get_text())
+                        .unwrap_or_default();
+                    if !text.is_empty() {
+                        self.paste_to_terminal(&text);
+                        return;
+                    }
                 }
                 // Tab navigation when multiple tabs are open: switch the active
                 // tab while preserving per-tab terminal state. PTY stays alive
@@ -4231,6 +4245,25 @@ impl App {
     }
 
     /// Append bytes to the pending terminal input buffer.
+    /// Paste `text` into the interactive terminal (#494): as bracketed paste
+    /// when the application there enabled it, see
+    /// [`crate::terminal::paste_bytes`]. Snaps the view to the bottom like
+    /// typed keys.
+    pub fn paste_to_terminal(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let bracketed = match self.terminal.as_mut() {
+            Some(t) => {
+                t.scroll_to_bottom();
+                t.bracketed_paste()
+            }
+            None => false,
+        };
+        let bytes = crate::terminal::paste_bytes(text, bracketed);
+        self.push_term_input(&bytes);
+    }
+
     pub(crate) fn push_term_input(&mut self, bytes: &[u8]) {
         match &mut self.pending_term_input {
             Some(existing) => existing.extend_from_slice(bytes),
@@ -10150,6 +10183,25 @@ mod tests {
     }
 
     // ── Paste tests ───────────────────────────────────────────────────
+
+    /// #494: a paste into the terminal goes to the PTY input — plain while
+    /// the shell has not enabled bracketed paste, wrapped once it has.
+    #[test]
+    fn paste_to_terminal_follows_the_shells_bracketed_paste_mode() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.enter_interactive(crate::terminal::TerminalModel::new(80, 24));
+        app.paste_to_terminal("ls\npwd");
+        assert_eq!(app.take_term_input().unwrap(), b"ls\rpwd");
+
+        // The shell turns on DECSET 2004 (bash/zsh readline do this).
+        app.terminal.as_mut().unwrap().feed(b"\x1b[?2004h");
+        app.paste_to_terminal("ls\npwd");
+        assert_eq!(app.take_term_input().unwrap(), b"\x1b[200~ls\rpwd\x1b[201~");
+
+        app.paste_to_terminal("");
+        assert!(app.take_term_input().is_none(), "empty paste sends nothing");
+    }
+
 
     #[test]
     fn paste_inserts_at_cursor_in_normal_mode() {
