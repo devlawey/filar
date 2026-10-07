@@ -13,6 +13,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- A password-login SSH host without "Save password" (or `filar --target` with
+  `auth = "password"` and no `SSH_PASSWORD`) asks for the password in the
+  terminal without echo instead of failing with "missing secret", and offers
+  to save it after a successful login
+  ([#495](https://github.com/devlawey/filar/issues/495)).
+
 - `Ctrl+V` in terminal mode pastes the clipboard into the shell instead of
   sending `^V`; pastes use bracketed paste when the shell enabled it, so
   multi-line text is inserted rather than run
