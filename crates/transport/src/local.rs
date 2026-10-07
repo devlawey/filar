@@ -465,6 +465,10 @@ mod tests {
         assert_eq!(run("exit 4").2, Some(4));
         let (out, cwd, code) = run("'hi' # note }");
         assert_eq!((out.trim(), cwd.as_deref(), code), ("hi", Some("/"), Some(0)));
+        // A `}` inside a string or comment does not close the wrapper's
+        // block; a bare one is a parse error in PowerShell anyway.
+        let (out, cwd, code) = run("Write-Output '}' \"{ }\"\n<# } #>");
+        assert_eq!((out.trim(), cwd.as_deref(), code), ("}\n{ }", Some("/"), Some(0)));
     }
 
     /// Cancel kills the command, not only the wrapping shell (#493).

@@ -1068,6 +1068,16 @@ async fn run_app(
                     }
                 }
 
+                // Ctrl+T show of a hidden PTY: carry an agent/`!` cd into it
+                // (#493) — before forwarding keys, so keys typed right after
+                // the toggle land after the `cd`, not in the middle of it.
+                for sid in app.take_pending_cwd_carry() {
+                    if let Some((term, _)) = interactive_backends.get(&sid) {
+                        let term = term.clone();
+                        carry_agent_cwd_into_pty(&mut app, sid, &term).await;
+                    }
+                }
+
                 // Forward terminal input bytes to the backend.
                 if let Some(bytes) = app.take_term_input() {
                     let write_sid = app.sessions[app.active].id;
@@ -1676,16 +1686,6 @@ async fn run_app(
                 )
                 .await;
                 needs_redraw = true;
-            }
-        }
-
-        // Ctrl+T show of a hidden PTY: carry an agent/`!` cd into it (#493).
-        // After the hide sync, so a hide + show in one tick compares against
-        // the directory the shell just reported.
-        for sid in app.take_pending_cwd_carry() {
-            if let Some((term, _)) = interactive_backends.get(&sid) {
-                let term = term.clone();
-                carry_agent_cwd_into_pty(&mut app, sid, &term).await;
             }
         }
 
