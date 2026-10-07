@@ -21,6 +21,7 @@ use filar_transport::{LocalExecutor, SshExecutor, SshTransportConfig};
 use filar_tui::TuiConfig;
 
 mod passphrase;
+mod password;
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing
@@ -590,8 +591,11 @@ async fn run() -> anyhow::Result<()> {
     let command_timeout = Duration::from_secs(config.timeouts.command_secs);
     // An encrypted key needs its passphrase before the TUI takes the
     // terminal: store → SSH_KEY_PASSPHRASE → prompt without echo (#480).
-    // Key file reads, the KDF and the terminal prompt all block: off the
-    // runtime they go.
+    // A password target without a password gets the same: store
+    // (`ssh_target:<name>`) → SSH_PASSWORD → prompt without echo (#495).
+    // Key file reads, the KDF, the store and the terminal prompt all block:
+    // off the runtime they go.
+    let mut password_origin = password::PasswordOrigin::NotNeeded;
     if let Some(mut target) = ssh_target.take() {
         let (target, resolved) = tokio::task::spawn_blocking(move || {
             let keyring = filar_core::KeyringSecretProvider::new();
@@ -600,11 +604,18 @@ async fn run() -> anyhow::Result<()> {
                 &mut target,
                 &passphrase::PassphraseSources { keyring: &keyring, env: &env },
                 &mut passphrase::TerminalPrompt,
-            );
+            )
+            .and_then(|()| {
+                password::resolve_ssh_password(
+                    &mut target,
+                    &password::PasswordSources { keyring: &keyring, env: &env },
+                    &mut password::TerminalPrompt,
+                )
+            });
             (target, resolved)
         })
         .await?;
-        resolved?;
+        password_origin = resolved?;
         ssh_target = Some(target);
     }
     let executor: Arc<dyn filar_transport::CommandExecutor> = if let Some(ref target) = ssh_target {
@@ -618,6 +629,15 @@ async fn run() -> anyhow::Result<()> {
             warn!(error = %e, "SSH connection failed");
             anyhow::anyhow!(e)
         })?;
+        // Logged in with a typed password: offer to keep it — asked, never
+        // done silently (#495).
+        if password_origin == password::PasswordOrigin::Typed {
+            let target = target.clone();
+            tokio::task::spawn_blocking(move || {
+                password::offer_to_save_password(&target, &mut password::TerminalPrompt)
+            })
+            .await?;
+        }
         let ssh: Arc<dyn filar_transport::CommandExecutor> = Arc::new(ssh);
         // Read-only host groups (#419): the transport refuses every
         // non-allowlisted command before it reaches the wire.

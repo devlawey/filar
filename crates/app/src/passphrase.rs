@@ -90,16 +90,7 @@ impl PassphrasePrompt for TerminalPrompt {
     }
 
     fn offer_to_save(&mut self, _target: &str) -> bool {
-        if !std::io::stdin().is_terminal() {
-            return false;
-        }
-        eprint!("Save the passphrase in the OS credential store? [y/N] ");
-        let _ = std::io::stderr().flush();
-        let mut answer = String::new();
-        if std::io::stdin().read_line(&mut answer).is_err() {
-            return false;
-        }
-        matches!(answer.trim(), "y" | "Y" | "yes" | "Yes")
+        ask_yes_no("Save the passphrase in the OS credential store? [y/N] ")
     }
 
     fn save(&mut self, name: &str, passphrase: &str) {
@@ -107,9 +98,24 @@ impl PassphrasePrompt for TerminalPrompt {
     }
 }
 
+/// Ask a yes/no question on the terminal; anything but `y`/`yes` — and no
+/// terminal at all — is a no. Shared with the SSH password step (#495).
+pub(crate) fn ask_yes_no(question: &str) -> bool {
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    eprint!("{question}");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim(), "y" | "Y" | "yes" | "Yes")
+}
+
 /// Read one line from the terminal without echo. `None` on Esc / Ctrl+C or
-/// a terminal error.
-fn read_hidden(prompt: &str) -> Option<String> {
+/// a terminal error. Shared with the SSH password step (#495).
+pub(crate) fn read_hidden(prompt: &str) -> Option<String> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use crossterm::terminal;
 
