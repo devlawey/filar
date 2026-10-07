@@ -10100,3 +10100,21 @@ Launch → запрос в консоли; с «Save password» — без за�
 
 **Контракты.** Без изменений.
 
+## Релиз 2.0.1 (2026-10-07)
+
+**Входит:** запрос SSH-пароля без «Save password» и при `--target` без
+`SSH_PASSWORD` (#495), Ctrl+V в терминальном режиме (#494), постоянный cwd
+между агентом, `!` и `Ctrl+T` (#493). Полный список — CHANGELOG `[2.0.1]`.
+
+**Preflight:** build/test на `main` (8f21662) зелёные — 1451 passed, 0 failed,
+10 ignored (docker-sshd); открытых issue, относящихся к релизу, нет (вне
+милстоунов только #80 — трекинг code-sign); теги `v2.0.1` и `engine-v2.0.1`
+свободны; `release.yml` собирает Windows + macOS. Движок менялся (аддитивно:
+экспорт `cd_input_for`, `InteractiveTerminal::cd_input` с реализацией по
+умолчанию; `CommandExecutor`/`LlmClient` без изменений) — `engine-v2.0.1` на
+том же коммите, примеры `docs/ENGINE_API.md` обновлены. Ручной SMOKE Win + Mac —
+за мейнтейнером (`docs/SMOKE.md`, #298).
+
+**Контракты.** Без изменений; дополнение — `InteractiveTerminal::cd_input`
+(реализация по умолчанию) и свободная `cd_input_for` (перенос cwd в PTY).
+
