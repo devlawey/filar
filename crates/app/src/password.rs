@@ -54,7 +54,8 @@ pub fn password_entry(target_name: &str) -> String {
     format!("ssh_target:{target_name}")
 }
 
-/// Fill `target`'s password when it is a password target without one.
+/// Fill `target`'s password when it is a password target without one (or
+/// with an empty one).
 ///
 /// Errors — without the password, which is unknown anyway — when nothing was
 /// stored and no terminal can ask (or the user cancelled).
@@ -63,7 +64,12 @@ pub fn resolve_ssh_password(
     sources: &PasswordSources<'_>,
     prompt: &mut dyn PasswordPrompt,
 ) -> anyhow::Result<PasswordOrigin> {
-    if !matches!(target.auth, SshAuth::Password { password: None }) {
+    // An empty password (`password = ""` in config.toml) counts as none.
+    let missing = match &target.auth {
+        SshAuth::Password { password } => password.as_deref().is_none_or(str::is_empty),
+        _ => false,
+    };
+    if !missing {
         return Ok(PasswordOrigin::NotNeeded);
     }
     let stored = [
@@ -275,6 +281,20 @@ mod tests {
         );
         assert_eq!(password_of(&set), Some("given"));
         assert_eq!(prompt.asked, 0);
+    }
+
+    #[test]
+    fn an_empty_password_counts_as_none() {
+        let empty = StaticSecretProvider::new();
+        let mut prompt = Scripted::new(&[SECRET], false);
+        let mut t = password_target(Some(""));
+        let res = resolve_ssh_password(
+            &mut t,
+            &PasswordSources { keyring: &empty, env: &empty },
+            &mut prompt,
+        );
+        assert_eq!(res.unwrap(), PasswordOrigin::Typed);
+        assert_eq!(password_of(&t), Some(SECRET));
     }
 
     #[test]
