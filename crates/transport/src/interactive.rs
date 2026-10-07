@@ -60,6 +60,13 @@ pub trait InteractiveTerminal: Send + Sync {
     fn reports_cwd_itself(&self) -> bool {
         false
     }
+
+    /// Input that moves this terminal's shell to `path`, Enter included
+    /// (#493), or `None` if the path cannot be typed safely. Defaults to a
+    /// POSIX `cd`, which fits a login shell over SSH.
+    fn cd_input(&self, path: &str) -> Option<String> {
+        crate::posix_cd_input(path)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -82,8 +89,9 @@ pub struct LocalInteractive {
     /// Child process handle (kept alive).
     #[allow(dead_code)]
     child: Arc<std::sync::Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
-    /// The shell reports its cwd from its prompt (cmd.exe, PowerShell).
-    reports_cwd: bool,
+    /// Which shell runs in the PTY: how it reports its cwd (from the prompt
+    /// for cmd.exe and PowerShell) and how it is told to `cd`.
+    flavor: crate::ShellFlavor,
 }
 
 /// Resolve the default local interactive shell when none is passed explicitly.
@@ -230,7 +238,7 @@ impl LocalInteractive {
             writer: Arc::new(std::sync::Mutex::new(writer)),
             master: Arc::new(std::sync::Mutex::new(pair.master)),
             child: Arc::new(std::sync::Mutex::new(child)),
-            reports_cwd: flavor != crate::ShellFlavor::Posix,
+            flavor,
         })
     }
 }
@@ -278,7 +286,11 @@ impl InteractiveTerminal for LocalInteractive {
     }
 
     fn reports_cwd_itself(&self) -> bool {
-        self.reports_cwd
+        self.flavor != crate::ShellFlavor::Posix
+    }
+
+    fn cd_input(&self, path: &str) -> Option<String> {
+        crate::cd_input_for(self.flavor, path)
     }
 }
 

@@ -118,12 +118,14 @@ fn build_system_prompt(is_local: bool, ssh_info: Option<&str>, is_windows: bool)
     let shell_desc = if is_local {
         if is_windows {
             "You are running on Windows with PowerShell. \
-             Each command runs in a separate process — shell state (cwd, env) does NOT persist between calls. \
-             Use absolute paths or chain commands with semicolons if needed."
+             Each command runs in a separate process: the working directory DOES persist between calls \
+             (a `cd` carries over to the next command), but variables and environment changes do NOT. \
+             Chain commands with semicolons when they depend on a variable set earlier."
         } else {
             "You are running on a POSIX shell. \
-             Each command runs in a separate process — shell state (cwd, env) does NOT persist between calls. \
-             Use absolute paths or chain commands with && or ; if needed."
+             Each command runs in a separate process: the working directory DOES persist between calls \
+             (a `cd` carries over to the next command), but variables and exports do NOT. \
+             Chain commands with && or ; when they depend on a variable set earlier."
         }
     } else {
         // SSH: persistent channel — state persists between commands.
@@ -1524,13 +1526,23 @@ mod tests {
     }
 
     #[test]
-    fn local_prompt_states_no_persistence() {
-        // Local mode: prompt should say state does NOT persist.
-        let prompt = build_system_prompt(true, None, false);
-        assert!(
-            prompt.contains("does NOT persist"),
-            "Local prompt should mention state does NOT persist, got: {prompt}"
-        );
+    fn local_prompt_states_cwd_persists_but_env_does_not() {
+        // Local mode (#493): `cd` carries over, variables do not.
+        for is_windows in [false, true] {
+            let prompt = build_system_prompt(true, None, is_windows);
+            assert!(
+                prompt.contains("working directory DOES persist"),
+                "Local prompt must say cwd persists, got: {prompt}"
+            );
+            assert!(
+                prompt.contains("do NOT"),
+                "Local prompt must say variables do not persist, got: {prompt}"
+            );
+            assert!(
+                !prompt.contains("(cwd, env) does NOT persist"),
+                "Local prompt must not claim cwd is lost, got: {prompt}"
+            );
+        }
     }
 
     #[test]

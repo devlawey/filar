@@ -254,6 +254,45 @@ and `logs/` all share this single app root.
 > side. The PowerShell prompt itself is verified with a real `pwsh`
 > (`#[ignore]` `powershell_reports_its_cwd_as_osc7`).
 
+## Agent local commands: persistent cwd (#493)
+
+`LocalExecutor` starts a new process per command, so a `cd` used to be lost
+between agent and `!` commands. Now the wrapper reports the final directory
+on a one-off marker line (random per command, stripped from stdout) and the
+next command starts there. Env and variables still do not persist.
+
+| Platform | Wrapper | Notes |
+|----------|---------|-------|
+| Unix / macOS | `sh -c '<cmd>\n__filar_rc=$?; printf <marker>"$(pwd)"; exit $__filar_rc'` | `sh` no longer `exec`s a lone command, so cancel/timeout SIGKILLs the whole process group (the shell is a `setsid` leader) — the command does not outlive its shell |
+| Windows (PowerShell 5.1/7) | `. { <cmd>\n$global:__filar_ok = $? } 2>&1 \| Out-Default`, then the marker with `(Get-Location -PSProvider FileSystem).ProviderPath`, then `exit` | see below |
+
+> PowerShell buffers table output in its formatter (`Get-Location`,
+> `Get-ChildItem`, …) and an explicit `exit` at the end of `-Command`
+> **drops** it — hence the explicit `| Out-Default` before the marker. The
+> exit code is 0 when the command's last statement succeeded, otherwise the
+> native `$LASTEXITCODE`, otherwise 1. `2>&1` now covers the whole command,
+> not only its last statement. After `cd HKLM:` / `cd Env:` the FileSystem
+> location is reported, so the next process can start in it.
+>
+> Testing on Unix with `pwsh`: without `TERM` set, `pwsh` with redirected
+> stdout prints tables as blank lines — set `TERM` (the
+> `#[ignore]` `powershell_command_against_real_pwsh` test does).
+>
+> Hidden terminal (`Ctrl+T` kept alive, #338): when the agent or `!` moved the
+> tab cwd while the PTY was hidden, showing it again types `cd` into the shell
+> — POSIX `cd '…'`, cmd `cd /d "…"`, PowerShell `Set-Location -LiteralPath
+> '…'` (Enter = `\r` for Windows shells). Only when the shell is known to sit
+> at an empty prompt: it reported OSC 7 (prompt or hide probe) after the
+> user's last keystroke; a program left running there (`top`, an editor) or a
+> half-typed line (cmd.exe would submit it with the `cd` appended) gets nothing.
+>
+> `sudo -i` / `sudo su -` in the terminal (SSH or local): the probe then
+> reports the root shell's directory (e.g. `/root`), and the agent's next
+> command starts with `cd /root && …`, which an unprivileged agent shell
+> cannot do — the command fails with `Permission denied` rather than running
+> elsewhere. The reverse direction works: the `cd` is typed into the root
+> shell.
+
 ## Agent local commands and controlling TTY (#329)
 
 | Surface | Controlling TTY | Password prompts |
