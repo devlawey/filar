@@ -561,9 +561,9 @@ pub struct Session {
     /// Agent↔interactive sync applies this value via `CommandExecutor::set_cwd`.
     pub cwd: Option<String>,
     /// Directory the interactive shell reported (OSC 7, prompt or probe)
-    /// since the user last pressed Enter in it — where it waits at its
-    /// prompt. `None` while a program may be running there or before any
-    /// report. Lets Ctrl+T carry an agent `cd` into a hidden terminal
+    /// since the user last typed into it — where it waits at an empty
+    /// prompt. `None` while a program may be running there, a line is
+    /// half-typed, or before any report. Lets Ctrl+T carry an agent `cd` into a hidden terminal
     /// without typing into a running program (#493).
     pub pty_prompt_cwd: Option<String>,
     /// LLM profile selected via Ctrl+L. None = use App default.

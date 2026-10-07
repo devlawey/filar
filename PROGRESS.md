@@ -10009,7 +10009,8 @@ Unix: `cmd; rc=$?; printf …; exit $rc` + отмена/таймаут убив�
 `. { cmd; $global:__filar_ok = $? } 2>&1 | Out-Default` — без явного
 `Out-Default` `exit` теряет табличный вывод; код выхода: 0 / native
 `$LASTEXITCODE` / 1. TUI: `Session::pty_prompt_cwd` — каталог, о котором
-шелл PTY сообщил (OSC 7) после последнего Enter пользователя; при показе
+шелл PTY сообщил (OSC 7) после последнего ввода пользователя (любая
+клавиша сбрасывает: недонабранная строка + `cd` в cmd ушла бы целиком); при показе
 скрытого терминала, если `session.cwd` отличается, в шелл вводится `cd`
 (`InteractiveTerminal::cd_input`, `cd_input_for(ShellFlavor, path)`).
 Системный промпт local: cwd сохраняется, переменные — нет.

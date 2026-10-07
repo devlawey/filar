@@ -151,10 +151,12 @@ const SETTLE_QUIET: Duration = Duration::from_millis(80);
 /// Upper bound of [`drain_pty_until_quiet`], for a shell that never stops.
 const SETTLE_MAX: Duration = Duration::from_millis(500);
 
-/// Keystrokes on their way to the PTY: an Enter may start a program, so the
-/// shell is no longer known to sit at its prompt until it reports again (#493).
+/// Keystrokes on their way to the PTY: an Enter may start a program, and
+/// text without one sits on the prompt line where a typed `cd` would join
+/// it — either way the shell is not known to sit at an empty prompt until it
+/// reports again (#493).
 fn note_pty_input(app: &mut App, sid: SessionId, bytes: &[u8]) {
-    if bytes.iter().any(|b| matches!(b, b'\r' | b'\n')) {
+    if !bytes.is_empty() {
         if let Some(idx) = app.find_session_idx(sid) {
             app.sessions[idx].pty_prompt_cwd = None;
         }
@@ -3290,18 +3292,19 @@ mod tests {
         assert!(rec.writes.lock().unwrap().is_empty());
     }
 
-    /// After an Enter the shell may be running a program (`top`, an editor):
-    /// nothing is typed into it until it reports a prompt again.
+    /// After any keystroke the shell may be running a program (`top`, an
+    /// editor) or hold a half-typed line a `cd` would join: nothing is typed
+    /// into it until it reports a prompt again.
     #[tokio::test]
-    async fn a_terminal_busy_after_enter_gets_no_cd() {
+    async fn a_terminal_typed_into_gets_no_cd() {
         use filar_core::CommandConfirmMode;
         let mut app = App::new("t0".into(), CommandConfirmMode::Always);
         let sid = app.sessions[0].id;
         app.sessions[0].pty_prompt_cwd = Some("/home/u".into());
+        note_pty_input(&mut app, sid, b"");
+        assert!(app.sessions[0].pty_prompt_cwd.is_some(), "no input, no change");
         note_pty_input(&mut app, sid, b"ls");
-        assert!(app.sessions[0].pty_prompt_cwd.is_some(), "no Enter yet");
-        note_pty_input(&mut app, sid, b"top\r");
-        assert!(app.sessions[0].pty_prompt_cwd.is_none());
+        assert!(app.sessions[0].pty_prompt_cwd.is_none(), "half-typed line");
         app.sessions[0].cwd = Some("/var/log".into());
         let (rec, term) = recording(false);
 

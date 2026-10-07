@@ -282,8 +282,9 @@ next command starts there. Env and variables still do not persist.
 > tab cwd while the PTY was hidden, showing it again types `cd` into the shell
 > — POSIX `cd '…'`, cmd `cd /d "…"`, PowerShell `Set-Location -LiteralPath
 > '…'` (Enter = `\r` for Windows shells). Only when the shell is known to sit
-> at its prompt: it reported OSC 7 (prompt or hide probe) after the user's
-> last Enter; a program left running there (`top`, an editor) gets nothing.
+> at an empty prompt: it reported OSC 7 (prompt or hide probe) after the
+> user's last keystroke; a program left running there (`top`, an editor) or a
+> half-typed line (cmd.exe would submit it with the `cd` appended) gets nothing.
 >
 > `sudo -i` / `sudo su -` in the terminal (SSH or local): the probe then
 > reports the root shell's directory (e.g. `/root`), and the agent's next
