@@ -113,6 +113,32 @@ pub fn posix_cd_command(path: &str) -> Option<String> {
     Some(format!("cd {}", posix_shell_quote(path.trim())))
 }
 
+/// Input that moves an interactive shell of `flavor` to `path`, Enter
+/// included — typed into a hidden terminal the agent has moved on from (#493).
+///
+/// `None` for a path [`is_safe_cwd`] rejects, or one cmd.exe cannot quote
+/// (`"`, which Windows paths never contain anyway). Windows shells get `\r`,
+/// the byte their console reads as Enter.
+pub fn cd_input_for(flavor: ShellFlavor, path: &str) -> Option<String> {
+    if !is_safe_cwd(path) {
+        return None;
+    }
+    let path = path.trim();
+    match flavor {
+        ShellFlavor::Posix => posix_cd_input(path),
+        ShellFlavor::Cmd => {
+            if path.contains('"') {
+                return None;
+            }
+            Some(format!("cd /d \"{path}\"\r"))
+        }
+        ShellFlavor::PowerShell => {
+            let escaped = path.replace('\'', "''");
+            Some(format!("Set-Location -LiteralPath '{escaped}'\r"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +177,25 @@ mod tests {
         assert!(POWERSHELL_OSC7_PROMPT.contains("[char]27"));
         assert!(!POWERSHELL_OSC7_PROMPT.contains("`e"), "PowerShell 5.1 has no `e");
         assert!(POWERSHELL_OSC7_PROMPT.contains("ProviderPath"));
+    }
+
+    #[test]
+    fn cd_input_per_shell_flavor() {
+        assert_eq!(
+            cd_input_for(ShellFlavor::Posix, "/srv/a b").as_deref(),
+            Some("cd '/srv/a b'\n")
+        );
+        assert_eq!(
+            cd_input_for(ShellFlavor::Cmd, r"C:\Users\Мой Dir").as_deref(),
+            Some("cd /d \"C:\\Users\\Мой Dir\"\r")
+        );
+        assert_eq!(
+            cd_input_for(ShellFlavor::PowerShell, r"C:\it's").as_deref(),
+            Some("Set-Location -LiteralPath 'C:\\it''s'\r")
+        );
+        assert!(cd_input_for(ShellFlavor::Cmd, "C:\\a\"b").is_none());
+        assert!(cd_input_for(ShellFlavor::PowerShell, "C:\\a\nb").is_none());
+        assert!(cd_input_for(ShellFlavor::Posix, "").is_none());
     }
 
     #[test]

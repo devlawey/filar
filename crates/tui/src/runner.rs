@@ -79,6 +79,7 @@ fn route_term_chunk(app: &mut App, sid: SessionId, chunk: TermChunk) -> RouteOut
             if let Some(ref mut model) = session.terminal {
                 model.feed(&bytes);
                 if let Some(cwd) = model.take_osc7_cwd() {
+                    session.pty_prompt_cwd = Some(cwd.clone());
                     session.cwd = Some(cwd);
                 }
             }
@@ -149,6 +150,45 @@ async fn drain_pty_until_quiet(
 const SETTLE_QUIET: Duration = Duration::from_millis(80);
 /// Upper bound of [`drain_pty_until_quiet`], for a shell that never stops.
 const SETTLE_MAX: Duration = Duration::from_millis(500);
+
+/// Keystrokes on their way to the PTY: an Enter may start a program, so the
+/// shell is no longer known to sit at its prompt until it reports again (#493).
+fn note_pty_input(app: &mut App, sid: SessionId, bytes: &[u8]) {
+    if bytes.iter().any(|b| matches!(b, b'\r' | b'\n')) {
+        if let Some(idx) = app.find_session_idx(sid) {
+            app.sessions[idx].pty_prompt_cwd = None;
+        }
+    }
+}
+
+/// Before a hidden terminal is shown again, type a `cd` to the tab's cwd if
+/// the agent or `!` moved it since the shell last reported (#493).
+///
+/// Only a shell known to be idle at its prompt is typed into, so a program
+/// left running in the terminal (an editor, `top`) never receives the `cd`.
+async fn carry_agent_cwd_into_pty(
+    app: &mut App,
+    sid: SessionId,
+    term: &Arc<dyn InteractiveTerminal>,
+) {
+    let Some(idx) = app.find_session_idx(sid) else {
+        return;
+    };
+    let session = &app.sessions[idx];
+    let (Some(want), Some(at)) = (session.cwd.as_deref(), session.pty_prompt_cwd.as_deref())
+    else {
+        return;
+    };
+    if want == at {
+        return;
+    }
+    let Some(input) = term.cd_input(want) else {
+        return;
+    };
+    if term.write_input(input.as_bytes()).await.is_ok() {
+        app.sessions[idx].pty_prompt_cwd = None;
+    }
+}
 
 /// Probe OSC 7 on a live interactive PTY, update `session.cwd`, and `set_cwd`
 /// on the agent executor. Does not close the backend (#338).
@@ -1031,6 +1071,7 @@ async fn run_app(
                 // Forward terminal input bytes to the backend.
                 if let Some(bytes) = app.take_term_input() {
                     let write_sid = app.sessions[app.active].id;
+                    note_pty_input(&mut app, write_sid, &bytes);
                     if let Some((ref term, _)) = interactive_backends.get(&write_sid) {
                         let _ = term.write_input(&bytes).await;
                     }
@@ -1635,6 +1676,16 @@ async fn run_app(
                 )
                 .await;
                 needs_redraw = true;
+            }
+        }
+
+        // Ctrl+T show of a hidden PTY: carry an agent/`!` cd into it (#493).
+        // After the hide sync, so a hide + show in one tick compares against
+        // the directory the shell just reported.
+        for sid in app.take_pending_cwd_carry() {
+            if let Some((term, _)) = interactive_backends.get(&sid) {
+                let term = term.clone();
+                carry_agent_cwd_into_pty(&mut app, sid, &term).await;
             }
         }
 
@@ -3198,6 +3249,65 @@ mod tests {
         assert_eq!(rec.writes.lock().unwrap().as_slice(), [OSC7_PWD_PROBE.to_vec()]);
         // No answer within the window: the last known cwd stays.
         assert_eq!(app.sessions[0].cwd.as_deref(), Some("/srv"));
+    }
+
+    /// #493: the agent moved on while the terminal was hidden at its prompt —
+    /// showing it again types a `cd` there, once.
+    #[tokio::test]
+    async fn showing_an_idle_terminal_carries_the_agent_cwd() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        app.sessions[0].terminal = Some(crate::terminal::TerminalModel::new(80, 24));
+        // The shell reported /home/u from its prompt (or the hide probe).
+        route_term_chunk(
+            &mut app,
+            sid,
+            TermChunk::Bytes(b"\x1b]7;file://filar-raw/home/u\x07".to_vec()),
+        );
+        assert_eq!(app.sessions[0].pty_prompt_cwd.as_deref(), Some("/home/u"));
+        // The agent then ran `cd /var/log`.
+        app.sessions[0].cwd = Some("/var/log".into());
+        let (rec, term) = recording(false);
+
+        carry_agent_cwd_into_pty(&mut app, sid, &term).await;
+        carry_agent_cwd_into_pty(&mut app, sid, &term).await;
+
+        assert_eq!(rec.writes.lock().unwrap().as_slice(), [b"cd /var/log\n".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_in_step_with_the_agent_gets_no_cd() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        app.sessions[0].cwd = Some("/srv".into());
+        app.sessions[0].pty_prompt_cwd = Some("/srv".into());
+        let (rec, term) = recording(false);
+
+        carry_agent_cwd_into_pty(&mut app, sid, &term).await;
+
+        assert!(rec.writes.lock().unwrap().is_empty());
+    }
+
+    /// After an Enter the shell may be running a program (`top`, an editor):
+    /// nothing is typed into it until it reports a prompt again.
+    #[tokio::test]
+    async fn a_terminal_busy_after_enter_gets_no_cd() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        app.sessions[0].pty_prompt_cwd = Some("/home/u".into());
+        note_pty_input(&mut app, sid, b"ls");
+        assert!(app.sessions[0].pty_prompt_cwd.is_some(), "no Enter yet");
+        note_pty_input(&mut app, sid, b"top\r");
+        assert!(app.sessions[0].pty_prompt_cwd.is_none());
+        app.sessions[0].cwd = Some("/var/log".into());
+        let (rec, term) = recording(false);
+
+        carry_agent_cwd_into_pty(&mut app, sid, &term).await;
+
+        assert!(rec.writes.lock().unwrap().is_empty());
     }
 
     #[test]

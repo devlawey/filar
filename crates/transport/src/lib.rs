@@ -32,7 +32,7 @@ pub use interactive::{InteractiveTerminal, SshInteractive};
 #[cfg(feature = "local")]
 pub use local::LocalExecutor;
 pub use cwd::{
-    cmd_osc7_prompt, is_safe_cwd, posix_cd_command, posix_cd_input, posix_shell_quote,
+    cd_input_for, cmd_osc7_prompt, is_safe_cwd, posix_cd_command, posix_cd_input, posix_shell_quote,
     shell_flavor, ShellFlavor, OSC7_PWD_PROBE, OSC7_RAW_HOST, POWERSHELL_OSC7_PROMPT,
 };
 pub use key::{
@@ -55,7 +55,7 @@ pub struct CommandResult {
     /// Wall-clock duration the command ran for.
     pub duration: Duration,
     /// Working directory after the command, when the transport can report it
-    /// (SSH marker includes `$PWD`; local uses the executor's stored cwd).
+    /// (SSH marker includes `$PWD`; local reports it after each command, #493).
     pub cwd: Option<String>,
 }
 

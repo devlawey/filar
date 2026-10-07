@@ -11,6 +11,16 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- Local agent and `!` commands keep the working directory between calls on
+  Windows, macOS and Linux, and the status bar shows it after each command;
+  a cancelled local command no longer outlives its shell on Unix
+  ([#493](https://github.com/devlawey/filar/issues/493)).
+- `Ctrl+T` back into a hidden terminal moves its shell to the directory the
+  agent or `!` went to, if the shell sits at its prompt — locally and over SSH
+  ([#493](https://github.com/devlawey/filar/issues/493)).
+
 ## [2.0.0] - 2026-09-29
 
 ### Added

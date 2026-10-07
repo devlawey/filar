@@ -294,6 +294,9 @@ pub struct App {
     /// SessionIds awaiting a cwd refresh from a live interactive PTY (Ctrl+T
     /// hide keeps the PTY; runner probes OSC 7 and `set_cwd` without teardown).
     pub pending_cwd_sync: Vec<SessionId>,
+    /// SessionIds whose hidden PTY was just shown again: the runner types a
+    /// `cd` there if the agent or `!` moved the tab cwd meanwhile (#493).
+    pub pending_cwd_carry: Vec<SessionId>,
     /// SessionIds of new tabs awaiting a local executor from the runner.
     /// App signals the runner here; runner creates the executor asynchronously
     /// and stores it in its per-session map.
@@ -557,6 +560,12 @@ pub struct Session {
     /// a POSIX `pwd` probe on Ctrl+T leave, or the SSH command marker `$PWD`.
     /// Agent↔interactive sync applies this value via `CommandExecutor::set_cwd`.
     pub cwd: Option<String>,
+    /// Directory the interactive shell reported (OSC 7, prompt or probe)
+    /// since the user last pressed Enter in it — where it waits at its
+    /// prompt. `None` while a program may be running there or before any
+    /// report. Lets Ctrl+T carry an agent `cd` into a hidden terminal
+    /// without typing into a running program (#493).
+    pub pty_prompt_cwd: Option<String>,
     /// LLM profile selected via Ctrl+L. None = use App default.
     pub llm_profile: Option<String>,
     /// Cumulative input tokens consumed by this session.
@@ -664,6 +673,7 @@ impl App {
             fleet_return: None,
             pending_term_teardown: Vec::new(),
             pending_cwd_sync: Vec::new(),
+            pending_cwd_carry: Vec::new(),
             pending_local_executors: Vec::new(),
             help_overlay_visible: false,
             help_scroll: 0,
@@ -855,6 +865,11 @@ impl App {
         v
     }
 
+    /// Take and clear tabs whose hidden PTY was shown again (#493).
+    pub fn take_pending_cwd_carry(&mut self) -> Vec<SessionId> {
+        std::mem::take(&mut self.pending_cwd_carry)
+    }
+
     /// Take and clear the list of sessions awaiting a local executor (for runner to process).
     pub fn take_pending_local_executors(&mut self) -> Vec<SessionId> {
         std::mem::take(&mut self.pending_local_executors)
@@ -978,6 +993,7 @@ impl Session {
             awaiting_confirmation: false,
             ssh_info: None,
             cwd: local_cwd(),
+            pty_prompt_cwd: None,
             llm_profile: None,
             tokens_in: 0,
             last_prompt_tokens: None,
@@ -5119,6 +5135,7 @@ impl App {
     /// Enter interactive terminal mode with the given terminal model.
     pub fn enter_interactive(&mut self, model: TerminalModel) {
         self.terminal = Some(model);
+        self.pty_prompt_cwd = None;
         self.mode = AppMode::Interactive;
         self.push_message(ChatBlock::System(
             "Entered interactive terminal mode (Ctrl+T to switch back)".into(),
@@ -5149,8 +5166,15 @@ impl App {
     }
 
     /// Show the interactive view for the active session, if a terminal exists.
+    ///
+    /// Queues a cwd carry so the runner can move the shell to where the agent
+    /// or `!` went while the terminal was hidden (#493).
     pub fn show_interactive_view(&mut self) {
         if self.terminal.is_some() {
+            let sid = self.sessions[self.active].id;
+            if !self.pending_cwd_carry.contains(&sid) {
+                self.pending_cwd_carry.push(sid);
+            }
             self.mode = AppMode::Interactive;
             self.selection = None;
             self.mouse_drag = None;
@@ -9754,6 +9778,22 @@ mod tests {
         app.hide_interactive_view(); // still Interactive→Normal once; push again while queued
         // Two pushes from two Interactive→Normal transitions; take dedups.
         assert_eq!(app.take_pending_cwd_sync(), vec![sid]);
+    }
+
+    /// Showing a hidden terminal again queues the #493 cwd carry, once.
+    #[test]
+    fn show_view_queues_cwd_carry() {
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        app.show_interactive_view();
+        assert!(app.take_pending_cwd_carry().is_empty(), "no terminal, nothing to carry");
+        app.enter_interactive(crate::terminal::TerminalModel::new(80, 24));
+        app.hide_interactive_view();
+        app.show_interactive_view();
+        app.hide_interactive_view();
+        app.show_interactive_view();
+        assert_eq!(app.take_pending_cwd_carry(), vec![sid]);
+        assert!(app.take_pending_cwd_carry().is_empty(), "take clears the queue");
     }
 
     #[test]
