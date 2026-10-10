@@ -232,8 +232,9 @@ impl ComparedValue {
 /// Raw output is where a host could talk to the model, so what passes is
 /// narrow on purpose: at most [`MAX_SHOWN_LINES`] lines and
 /// [`MAX_SHOWN_BYTES`] bytes, no line over [`MAX_SHOWN_LINE_CHARS`], and no
-/// control character or undecodable byte anywhere — which rules out binary
-/// data and escape sequences. Nothing is clamped to fit: an answer that
+/// control character, undecodable byte or invisible character
+/// ([`is_invisible`]) anywhere — which rules out binary data, escape
+/// sequences and text that reads differently from how it is stored. Nothing is clamped to fit: an answer that
 /// does not qualify whole stays a digest, so two different answers never
 /// read the same. Trailing whitespace is not part of the value.
 fn short_text(output: &str) -> Option<Vec<String>> {
@@ -245,13 +246,31 @@ fn short_text(output: &str) -> Option<Vec<String>> {
     for line in text.lines() {
         let plain = line
             .chars()
-            .all(|c| c != '\u{fffd}' && (!c.is_control() || c == '\t'));
+            .all(|c| c != '\u{fffd}' && !is_invisible(c) && (!c.is_control() || c == '\t'));
         if !plain || lines.len() == MAX_SHOWN_LINES || line.chars().count() > MAX_SHOWN_LINE_CHARS {
             return None;
         }
         lines.push(line.to_string());
     }
     Some(lines)
+}
+
+/// Characters that draw nothing but change how text reads: Unicode line and
+/// paragraph separators (a line break `lines()` does not see), bidirectional
+/// overrides and isolates (text that displays in another order than it is
+/// stored), zero-width characters and the byte-order mark. None belongs in a
+/// hostname or a version string, so an answer carrying one is not quoted.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{2028}' | '\u{2029}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{feff}'
+            | '\u{061c}'
+            | '\u{e0000}'..='\u{e007f}'
+    )
 }
 
 /// FNV-1a, so a digest printed in a fold means the same thing in every
@@ -1278,6 +1297,10 @@ mod tests {
         assert!(short_text("\u{1b}[2Jcleared").is_none());
         assert!(short_text("real\rfake").is_none());
         assert!(short_text("bad \u{fffd} byte").is_none());
+        // Invisible characters: a hidden line break, reordered or hidden text.
+        for sneaky in ["a\u{2028}b", "a\u{2029}b", "abc\u{202e}cba", "a\u{200b}b", "\u{feff}x", "x\u{2066}y\u{2069}", "t\u{e0041}"] {
+            assert!(short_text(sneaky).is_none(), "{sneaky:?}");
+        }
     }
 
     #[test]
