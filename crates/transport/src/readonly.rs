@@ -505,6 +505,13 @@ const IP_READ_COMMANDS: &[&str] = &["show", "list", "lst", "get"];
 /// The arguments of a segment without its redirections (`2>&1`,
 /// `2>/dev/null`, `> /dev/null`): [`check_redirections`] has already
 /// allowed exactly those, and they are not arguments of the binary.
+///
+/// A redirection can be glued to an argument — the shell reads
+/// `--rotate>/dev/null` as the argument `--rotate` plus a redirection — so
+/// whatever stands before the `>` in a token is kept as an argument, unless
+/// it is only digits, which is the file descriptor being redirected
+/// (`2>&1`). Quotes and backslashes never get here
+/// ([`check_reinterpretable_characters`]), so a `>` is always an operator.
 fn without_redirections<'a>(tokens: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
     let mut args = Vec::new();
     let mut target_follows = false;
@@ -512,11 +519,15 @@ fn without_redirections<'a>(tokens: impl Iterator<Item = &'a str>) -> Vec<&'a st
         if std::mem::take(&mut target_follows) {
             continue;
         }
-        if token.contains('>') {
-            target_follows = token.ends_with('>');
+        let Some(at) = token.find('>') else {
+            args.push(token);
             continue;
+        };
+        let before = &token[..at];
+        if !before.is_empty() && !before.bytes().all(|b| b.is_ascii_digit()) {
+            args.push(before);
         }
-        args.push(token);
+        target_follows = token.ends_with('>');
     }
     args
 }
@@ -543,6 +554,11 @@ fn check_form(form: &GuardedForm, args: &[&str]) -> std::result::Result<(), Stri
             }
             if form.flags.contains(&arg) {
                 satisfied |= form.needs_one_of.contains(&arg);
+                // `journalctl -b -1`: the boot offset is an optional value
+                // of its own, and the only one that starts with a dash.
+                if form.bin == "journalctl" && arg == "-b" && args.get(i).is_some_and(|v| is_boot_offset(v)) {
+                    i += 1;
+                }
                 continue;
             }
             // `--name=VALUE`
@@ -586,6 +602,12 @@ fn check_form(form: &GuardedForm, args: &[&str]) -> std::result::Result<(), Stri
         return Err(format!("one of {} is required", form.needs_one_of.join(", ")));
     }
     Ok(())
+}
+
+/// A `journalctl -b` offset: `0`, `1`, `-1`, `-20`.
+fn is_boot_offset(word: &str) -> bool {
+    let digits = word.strip_prefix('-').unwrap_or(word);
+    !digits.is_empty() && digits.len() <= 4 && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Strip one of the standard binary-directory prefixes, if present.
@@ -815,6 +837,10 @@ mod tests {
             "journalctl -u nginx --since=today --no-pager",
             "journalctl -k -b --no-pager -p err",
             "journalctl --boot=-1 --lines=20",
+            "journalctl -b -1 --no-pager",
+            "journalctl -b 0 -p err",
+            "dmesg -T>/dev/null",
+            "systemctl status nginx 2>/dev/null",
             "journalctl --disk-usage",
             "dmesg",
             "dmesg -T --level=err,warn",
@@ -975,6 +1001,37 @@ mod tests {
         ] {
             assert_refused(&exec, &inner, cmd).await;
         }
+    }
+
+    /// #504 review: a redirection glued to an argument does not hide it —
+    /// the shell runs `--rotate>/dev/null` as `--rotate`.
+    #[tokio::test]
+    async fn an_argument_glued_to_a_redirection_is_still_checked() {
+        let (exec, inner) = gated();
+        for cmd in [
+            "journalctl --rotate>/dev/null",
+            "journalctl --rotate> /dev/null",
+            "journalctl --rotate>/dev/null 2>&1",
+            "journalctl --vacuum-time=1s>/dev/null",
+            "dmesg -C>/dev/null",
+            "dmesg -c2>/dev/null",
+            "sshd -D>/dev/null",
+            "sshd -V -D2>&1",
+            "systemctl restart>/dev/null nginx",
+            "systemctl stop nginx>/dev/null",
+            "ip link set>/dev/null eth0 down",
+            "ip addr flush>/dev/null dev eth0",
+            "dpkg -P>/dev/null openssh-server",
+            "rpm -e>/dev/null openssh-server",
+            "zcat -f>/dev/null /etc/passwd",
+            "journalctl -b -1 --rotate",
+            "journalctl -b --rotate",
+            "journalctl -b -f",
+        ] {
+            assert_refused(&exec, &inner, cmd).await;
+        }
+        assert_eq!(without_redirections("-T 2>&1 >/dev/null -x".split_whitespace()), ["-T", "-x"]);
+        assert_eq!(without_redirections("a> /dev/null b 12>&1".split_whitespace()), ["a", "b"]);
     }
 
     /// #504: a guarded binary never slips through behind an allowed one.
