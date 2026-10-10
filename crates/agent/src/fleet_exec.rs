@@ -552,13 +552,17 @@ mod tests {
         })
     }
 
+    /// More lines than a short answer may have (#505): digest only.
+    const LONG_ANSWER: &str =
+        "SECRET-LOOKING TEXT\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n";
+
     #[tokio::test]
     async fn one_run_asks_every_host_and_returns_the_fold_not_the_output() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let runs = Arc::new(AtomicUsize::new(0));
         let exec = executor(
             &fleet(&["web-1", "web-2", "web-3"]),
-            connector(&[], &[("web-3", "SECRET-LOOKING TEXT")], attempts.clone(), runs.clone()),
+            connector(&[], &[("web-3", LONG_ANSWER)], attempts.clone(), runs.clone()),
         );
         assert_eq!(exec.radius(), ["web-1", "web-2", "web-3"]);
 
@@ -567,7 +571,8 @@ mod tests {
         assert!(out.stdout.contains("3 of 3 hosts answered"), "{}", out.stdout);
         assert!(out.stdout.contains("same on 2 (web-1, web-2)"), "{}", out.stdout);
         assert!(out.stdout.contains("web-3 differs"), "{}", out.stdout);
-        assert!(!out.stdout.contains("SECRET-LOOKING"), "host output never reaches the model");
+        assert!(!out.stdout.contains("SECRET-LOOKING"), "a long answer never reaches the model");
+        assert!(out.stdout.contains("same on 2 (web-1, web-2):\n  | same\n"), "{}", out.stdout);
         assert_eq!(out.exit_code, Some(0));
 
         exec.run("uname -r").await.expect("second run");
@@ -880,7 +885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_person_gets_samples_the_model_never_does() {
+    async fn the_person_gets_every_sample_the_model_only_short_ones() {
         use crate::fleet_result::HostState;
         use crate::fleet_view::GroupRole;
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -912,8 +917,8 @@ mod tests {
         assert_eq!(view.dropped[0].host, "web-4");
         assert_eq!(view.dropped[0].state, HostState::NoContact);
 
-        // The model's copy still has digests only.
-        assert!(!out.stdout.contains("6.1.0-other"), "{}", out.stdout);
+        // The model is quoted the short answers (#505), as data.
+        assert!(out.stdout.contains("web-3 differs:\n  | 6.1.0-other\n"), "{}", out.stdout);
     }
 
     #[tokio::test]
