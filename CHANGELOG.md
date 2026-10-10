@@ -11,6 +11,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- A fleet command that prints binary data (`cat` of an archive or an
+  executable) shows one line with its size and digest in the summary panel
+  instead of garbage
+  ([#502](https://github.com/devlawey/filar/issues/502)).
+
 ## [2.0.1] - 2026-10-07
 
 ### Fixed
