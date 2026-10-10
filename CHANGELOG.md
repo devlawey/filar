@@ -11,6 +11,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Fleet (read-only) sessions can run diagnostics in their read-only forms:
+  `systemctl status`/`--failed`/`list-units`, `journalctl`, `dmesg`,
+  `ip … show`, `dpkg -l`/`-s`, `rpm -q`, `sshd -V`, `zcat`; every other form
+  of these tools is still refused before it reaches a host
+  ([#504](https://github.com/devlawey/filar/issues/504)).
+
 ## [2.0.1] - 2026-10-07
 
 ### Fixed
