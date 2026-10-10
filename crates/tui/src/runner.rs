@@ -151,6 +151,110 @@ const SETTLE_QUIET: Duration = Duration::from_millis(80);
 /// Upper bound of [`drain_pty_until_quiet`], for a shell that never stops.
 const SETTLE_MAX: Duration = Duration::from_millis(500);
 
+/// Output must be quiet this long before the terminal's directory is asked
+/// for (#499): the command has most likely finished printing.
+const CWD_WATCH_QUIET: Duration = Duration::from_millis(200);
+/// Shortest pause between two questions about one terminal.
+const CWD_WATCH_MIN_GAP: Duration = Duration::from_secs(1);
+/// Longest pause between two questions while a program keeps running.
+const CWD_WATCH_MAX_GAP: Duration = Duration::from_secs(10);
+
+/// When to ask a terminal where it is (#499).
+///
+/// A POSIX shell does not report its directory, so the status bar would
+/// only move when the terminal is hidden. Instead the backend is asked
+/// ([`InteractiveTerminal::foreground_cwd`] — nothing is typed) after the
+/// user presses Enter, once the output goes quiet. While the started program
+/// is still in the foreground its output keeps the watch armed, at a growing
+/// interval; back at the prompt the watch rests until the next Enter, so an
+/// idle terminal and a user typing a line cost nothing.
+#[derive(Debug)]
+struct CwdWatch {
+    /// A question is due once the output is quiet.
+    armed: bool,
+    /// The program started by the last Enter may still be running.
+    busy: bool,
+    /// A question is on its way.
+    in_flight: bool,
+    last_activity: Instant,
+    last_asked: Option<Instant>,
+    gap: Duration,
+}
+
+impl CwdWatch {
+    fn new(now: Instant) -> Self {
+        Self {
+            armed: false,
+            busy: false,
+            in_flight: false,
+            last_activity: now,
+            last_asked: None,
+            gap: CWD_WATCH_MIN_GAP,
+        }
+    }
+
+    /// The user pressed Enter: a command may have started.
+    fn note_enter(&mut self, now: Instant) {
+        self.armed = true;
+        self.busy = true;
+        self.gap = CWD_WATCH_MIN_GAP;
+        self.last_activity = now;
+    }
+
+    /// The terminal printed something.
+    fn note_output(&mut self, now: Instant) {
+        if self.busy {
+            self.armed = true;
+            self.last_activity = now;
+        }
+    }
+
+    /// Whether to ask now.
+    fn due(&self, now: Instant) -> bool {
+        self.armed
+            && !self.in_flight
+            && now.duration_since(self.last_activity) >= CWD_WATCH_QUIET
+            && self.last_asked.is_none_or(|t| now.duration_since(t) >= self.gap)
+    }
+
+    /// The question was sent.
+    fn asked(&mut self, now: Instant) {
+        self.armed = false;
+        self.in_flight = true;
+        self.last_asked = Some(now);
+    }
+
+    /// The answer came: `at_prompt` is `None` when the backend could not tell.
+    fn answered(&mut self, at_prompt: Option<bool>) {
+        self.in_flight = false;
+        if at_prompt == Some(false) {
+            self.gap = (self.gap * 2).min(CWD_WATCH_MAX_GAP);
+        } else {
+            self.busy = false;
+        }
+    }
+}
+
+/// Whether input bytes on their way to the PTY contain an Enter.
+fn has_enter(bytes: &[u8]) -> bool {
+    bytes.iter().any(|b| matches!(b, b'\r' | b'\n'))
+}
+
+/// Put an answer of [`InteractiveTerminal::foreground_cwd`] into the tab's
+/// status (#499). The prompt bookkeeping of #493 (`pty_prompt_cwd`) is left
+/// alone: it still follows only what the shell itself reported.
+fn apply_foreground_cwd(app: &mut App, sid: SessionId, path: String) -> bool {
+    let Some(idx) = app.find_session_idx(sid) else {
+        return false;
+    };
+    let session = &mut app.sessions[idx];
+    if session.terminal.is_none() || session.cwd.as_deref() == Some(path.as_str()) {
+        return false;
+    }
+    session.cwd = Some(path);
+    true
+}
+
 /// Keystrokes on their way to the PTY: an Enter may start a program, and
 /// text without one sits on the prompt line where a typed `cd` would join
 /// it — either way the shell is not known to sit at an empty prompt until it
@@ -773,6 +877,16 @@ async fn run_app(
     // (same pattern as log_rx), avoiding a busy-loop.
     let mut term_rx_opt: Option<tokio::sync::mpsc::UnboundedReceiver<_>> = Some(term_rx);
 
+    // Status-bar cwd of POSIX terminals (#499): when to ask each backend
+    // where it is, and the answers on their way back.
+    let mut cwd_watches: HashMap<crate::app::SessionId, CwdWatch> = HashMap::new();
+    let (cwd_tx, mut cwd_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        crate::app::SessionId,
+        Option<filar_transport::ForegroundCwd>,
+    )>();
+    let mut cwd_watch_interval = tokio::time::interval(Duration::from_millis(100));
+    cwd_watch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     // Draw initial UI.
     terminal.draw(|f| ui::render(f, &mut app)).ok();
 
@@ -1087,6 +1201,15 @@ async fn run_app(
                     note_pty_input(&mut app, write_sid, &bytes);
                     if let Some((ref term, _)) = interactive_backends.get(&write_sid) {
                         let _ = term.write_input(&bytes).await;
+                        // cmd.exe and PowerShell report every prompt (#482);
+                        // a POSIX shell is asked once the command settles.
+                        if has_enter(&bytes) && !term.reports_cwd_itself() {
+                            let now = Instant::now();
+                            cwd_watches
+                                .entry(write_sid)
+                                .or_insert_with(|| CwdWatch::new(now))
+                                .note_enter(now);
+                        }
                     }
                 }
 
@@ -1772,6 +1895,38 @@ async fn run_app(
                 }
             }
 
+            // Ask the terminals whose command has settled where they are
+            // (#499). Gated on an armed watch, so an idle TUI keeps sleeping.
+            _ = cwd_watch_interval.tick(), if cwd_watches.values().any(|w| w.armed) => {
+                let now = Instant::now();
+                cwd_watches.retain(|sid, _| interactive_backends.contains_key(sid));
+                for (sid, watch) in cwd_watches.iter_mut() {
+                    if !watch.due(now) {
+                        continue;
+                    }
+                    let Some((term, _)) = interactive_backends.get(sid) else {
+                        continue;
+                    };
+                    watch.asked(now);
+                    let (term, tx, sid) = (term.clone(), cwd_tx.clone(), *sid);
+                    tokio::spawn(async move {
+                        let _ = tx.send((sid, term.foreground_cwd().await));
+                    });
+                }
+            }
+
+            Some((sid, answer)) = cwd_rx.recv() => {
+                if let Some(watch) = cwd_watches.get_mut(&sid) {
+                    watch.answered(answer.as_ref().map(|a| a.at_prompt));
+                }
+                // A backend replaced or closed meanwhile has no say.
+                if interactive_backends.contains_key(&sid) {
+                    if let Some(answer) = answer {
+                        needs_redraw |= apply_foreground_cwd(&mut app, sid, answer.path);
+                    }
+                }
+            }
+
             _ = ops_interval.tick(), if app.operations_need_refresh() => {
                 if app.refresh_operations() {
                     needs_redraw = true;
@@ -1797,6 +1952,11 @@ async fn run_app(
             maybe_chunk = recv_term_chunk(&mut term_rx_opt) => {
                 if let Some((sid, chunk)) = maybe_chunk {
                     let outcome = route_term_chunk(&mut app, sid, chunk);
+                    if matches!(outcome, RouteOutcome::Fed) {
+                        if let Some(watch) = cwd_watches.get_mut(&sid) {
+                            watch.note_output(Instant::now());
+                        }
+                    }
                     match outcome {
                         RouteOutcome::Eof => {
                             if let Some((term, handle)) = interactive_backends.remove(&sid) {
@@ -3152,6 +3312,92 @@ mod tests {
         );
         assert!(matches!(outcome, RouteOutcome::Fed));
         assert_eq!(app.sessions[0].cwd.as_deref(), Some("/opt/app"));
+    }
+
+    /// #499: Enter arms the watch; the question goes out once the output is
+    /// quiet, and not again until something happens.
+    #[test]
+    fn the_cwd_watch_asks_after_enter_once_output_is_quiet() {
+        let t0 = Instant::now();
+        let mut watch = CwdWatch::new(t0);
+        assert!(!watch.due(t0 + Duration::from_secs(5)), "an idle terminal is not asked");
+        watch.note_output(t0);
+        assert!(!watch.due(t0 + Duration::from_secs(5)), "typing a line is not a command");
+
+        watch.note_enter(t0);
+        assert!(!watch.due(t0 + Duration::from_millis(50)), "the command is still printing");
+        watch.note_output(t0 + Duration::from_millis(150));
+        assert!(!watch.due(t0 + Duration::from_millis(250)));
+        let t1 = t0 + Duration::from_millis(150) + CWD_WATCH_QUIET;
+        assert!(watch.due(t1));
+
+        watch.asked(t1);
+        assert!(!watch.due(t1 + Duration::from_secs(5)), "one question at a time");
+        watch.answered(Some(true));
+        watch.note_output(t1 + Duration::from_secs(6));
+        assert!(!watch.due(t1 + Duration::from_secs(20)), "back at the prompt: rest");
+    }
+
+    /// #499: `sleep 5; cd /x` — the first answer comes while the command
+    /// runs, so its later output asks again, at a growing interval.
+    #[test]
+    fn the_cwd_watch_keeps_asking_while_a_program_runs() {
+        let t0 = Instant::now();
+        let mut watch = CwdWatch::new(t0);
+        watch.note_enter(t0);
+        let t1 = t0 + CWD_WATCH_QUIET;
+        assert!(watch.due(t1));
+        watch.asked(t1);
+        watch.answered(Some(false));
+        assert_eq!(watch.gap, CWD_WATCH_MIN_GAP * 2);
+
+        // Output right away: armed, but not before the gap has passed.
+        watch.note_output(t1 + Duration::from_millis(300));
+        assert!(!watch.due(t1 + Duration::from_millis(600)));
+        assert!(watch.due(t1 + CWD_WATCH_MIN_GAP * 2));
+
+        // The gap stops growing, and the next Enter resets it.
+        for _ in 0..10 {
+            watch.answered(Some(false));
+        }
+        assert_eq!(watch.gap, CWD_WATCH_MAX_GAP);
+        watch.note_enter(t1);
+        assert_eq!(watch.gap, CWD_WATCH_MIN_GAP);
+
+        // A backend that cannot tell is not asked over and over.
+        watch.asked(t1);
+        watch.answered(None);
+        watch.note_output(t1 + Duration::from_secs(30));
+        assert!(!watch.due(t1 + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn enter_is_found_in_pty_input() {
+        assert!(has_enter(b"cd /\r"));
+        assert!(has_enter(b"\n"));
+        assert!(!has_enter(b"cd /"));
+        assert!(!has_enter(b""));
+    }
+
+    /// #499: the answer moves the status-bar cwd of a POSIX terminal after
+    /// `cd`, and leaves the #493 prompt bookkeeping alone.
+    #[test]
+    fn a_foreground_cwd_answer_updates_the_status_cwd() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("t0".into(), CommandConfirmMode::Always);
+        let sid = app.sessions[0].id;
+        app.sessions[0].cwd = Some("/root".into());
+        assert!(
+            !apply_foreground_cwd(&mut app, sid, "/".into()),
+            "no terminal open: a late answer is dropped"
+        );
+        app.sessions[0].terminal = Some(crate::terminal::TerminalModel::new(80, 24));
+        app.sessions[0].pty_prompt_cwd = Some("/root".into());
+
+        assert!(apply_foreground_cwd(&mut app, sid, "/".into()));
+        assert_eq!(app.sessions[0].cwd.as_deref(), Some("/"));
+        assert_eq!(app.sessions[0].pty_prompt_cwd.as_deref(), Some("/root"));
+        assert!(!apply_foreground_cwd(&mut app, sid, "/".into()), "unchanged: no redraw");
     }
 
     /// A PTY stand-in that records what is written to it (#482).

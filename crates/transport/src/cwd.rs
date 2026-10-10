@@ -20,6 +20,74 @@ pub const OSC7_RAW_HOST: &str = "filar-raw";
 pub const OSC7_PWD_PROBE: &[u8] =
     b"printf '\\033]7;file://filar-raw%s\\007' \"$(pwd)\"\n";
 
+/// Where an interactive terminal's foreground program is, learned without
+/// typing anything into the terminal (#499).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForegroundCwd {
+    /// Working directory of the foreground program (the shell itself while
+    /// it waits at its prompt).
+    pub path: String,
+    /// Whether the shell that owns the terminal is in the foreground, i.e.
+    /// no program started from it is still running.
+    pub at_prompt: bool,
+}
+
+/// Prefix of the one line [`PTY_CWD_COMMAND`] prints.
+const PTY_CWD_MARK: &str = "filar-cwd:";
+
+/// Command for a **second** SSH channel (no PTY) that tells where the
+/// foreground program of the connection's terminal is (#499).
+///
+/// Nothing is typed into the user's shell, so nothing shows in the terminal
+/// or in the shell history, and no file is written: the script only reads
+/// `/proc`. It finds the one process that has a terminal and is a child of
+/// this connection's `sshd` (the interactive shell), takes the terminal's
+/// foreground process group from its `stat`, and prints that process's
+/// directory as `filar-cwd:<1 if the shell is in the foreground, else
+/// 0>:<path>`. A host without `/proc` (macOS, the BSDs) prints nothing, and
+/// the caller keeps what it knew.
+///
+/// One line, no single quotes or backslashes inside: the login shell that
+/// runs it may be bash, dash, zsh, fish or csh.
+pub const PTY_CWD_COMMAND: &str = concat!(
+    "sh -c 'a=$$; anc=\" \"; i=0; ",
+    "while [ \"$a\" -gt 1 ] && [ $i -lt 4 ]; do ",
+    "{ read -r s < /proc/$a/stat; } 2>/dev/null || break; ",
+    "s=${s##*) }; set -- $s; a=$2; [ \"$a\" -gt 1 ] && anc=\"$anc$a \"; i=$((i+1)); done; ",
+    "n=0; p=; f=; for d in /proc/[0-9]*; do ",
+    "{ read -r s < $d/stat; } 2>/dev/null || continue; ",
+    "s=${s##*) }; set -- $s; [ \"$5\" != 0 ] || continue; ",
+    "case \"$anc\" in *\" $2 \"*) ;; *) continue ;; esac; ",
+    "n=$((n+1)); p=${d#/proc/}; f=$6; done; ",
+    "[ $n = 1 ] || exit 0; q=0; [ \"$f\" = \"$p\" ] && q=1; ",
+    "c=$(readlink /proc/$f/cwd 2>/dev/null) || c=$(readlink /proc/$p/cwd 2>/dev/null) || exit 0; ",
+    "printf \"filar-cwd:%s:%s\" $q \"$c\"'",
+);
+
+/// Read the answer of [`PTY_CWD_COMMAND`]. `None` for anything else — an
+/// empty reply, a banner, a directory that was removed, an unsafe path.
+pub fn parse_pty_cwd_reply(reply: &str) -> Option<ForegroundCwd> {
+    let rest = &reply[reply.rfind(PTY_CWD_MARK)? + PTY_CWD_MARK.len()..];
+    let (flag, path) = rest.split_once(':')?;
+    let at_prompt = match flag {
+        "1" => true,
+        "0" => false,
+        _ => return None,
+    };
+    let path = usable_proc_cwd(path)?;
+    Some(ForegroundCwd { path, at_prompt })
+}
+
+/// A `/proc/<pid>/cwd` link target as a cwd, or `None` if it is not an
+/// absolute, safe path of a directory that still exists.
+pub fn usable_proc_cwd(link: &str) -> Option<String> {
+    let path = link.strip_suffix('\n').unwrap_or(link);
+    if !path.starts_with('/') || path.ends_with(" (deleted)") || !is_safe_cwd(path) {
+        return None;
+    }
+    Some(path.to_string())
+}
+
 /// How an interactive shell can tell its working directory (#482).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellFlavor {
@@ -142,6 +210,41 @@ pub fn cd_input_for(flavor: ShellFlavor, path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pty_cwd_command_is_one_line_any_login_shell_can_pass_on() {
+        assert!(!PTY_CWD_COMMAND.contains('\n'));
+        assert!(!PTY_CWD_COMMAND.contains('\\'));
+        assert_eq!(PTY_CWD_COMMAND.matches('\'').count(), 2, "only the outer quotes");
+        assert!(PTY_CWD_COMMAND.starts_with("sh -c '") && PTY_CWD_COMMAND.ends_with('\''));
+    }
+
+    #[test]
+    fn the_pty_cwd_reply_is_parsed() {
+        assert_eq!(
+            parse_pty_cwd_reply("filar-cwd:1:/var/log"),
+            Some(ForegroundCwd { path: "/var/log".into(), at_prompt: true })
+        );
+        assert_eq!(
+            parse_pty_cwd_reply("banner\nfilar-cwd:0:/srv/a b:c"),
+            Some(ForegroundCwd { path: "/srv/a b:c".into(), at_prompt: false })
+        );
+    }
+
+    #[test]
+    fn a_reply_that_is_not_a_directory_is_ignored() {
+        for reply in [
+            "",
+            "Welcome",
+            "filar-cwd:",
+            "filar-cwd:2:/tmp",
+            "filar-cwd:1:relative",
+            "filar-cwd:1:/tmp/gone (deleted)",
+            "filar-cwd:1:/a\nb",
+        ] {
+            assert_eq!(parse_pty_cwd_reply(reply), None, "{reply:?}");
+        }
+    }
 
     #[test]
     fn the_shell_flavor_comes_from_the_program_name() {

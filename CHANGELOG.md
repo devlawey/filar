@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- In terminal mode the status-bar directory follows `cd` in a POSIX shell too
+  — over SSH and in a local Linux/macOS tab — without typing anything into
+  the shell ([#499](https://github.com/devlawey/filar/issues/499)).
+
 ## [2.0.1] - 2026-10-07
 
 ### Fixed
