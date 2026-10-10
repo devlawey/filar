@@ -30,6 +30,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   — over SSH and in a local Linux/macOS tab — without typing anything into
   the shell ([#499](https://github.com/devlawey/filar/issues/499)).
 
+- A fleet command that prints binary data (`cat` of an archive or an
+  executable) shows one line with its size and digest in the summary panel
+  instead of garbage
+  ([#502](https://github.com/devlawey/filar/issues/502)).
+
 ## [2.0.1] - 2026-10-07
 
 ### Fixed
