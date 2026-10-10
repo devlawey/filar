@@ -18,6 +18,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   the left edge; its scroll and row counter follow the wrapped rows
   ([#500](https://github.com/devlawey/filar/issues/500)).
 
+- The key hint of the fleet summary panel wraps instead of being cut off at
+  the docked width, and the operation headline breaks between words
+  ([#503](https://github.com/devlawey/filar/issues/503)).
+
 ## [2.0.1] - 2026-10-07
 
 ### Fixed
