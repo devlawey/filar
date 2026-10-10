@@ -67,6 +67,44 @@ pub trait InteractiveTerminal: Send + Sync {
     fn cd_input(&self, path: &str) -> Option<String> {
         crate::posix_cd_input(path)
     }
+
+    /// Where the terminal's foreground program is, learned **without typing
+    /// into the terminal** (#499) — so it is safe at any moment: mid-line,
+    /// inside an editor, in a nested shell. `None` when the backend cannot
+    /// tell (the default), and the caller keeps what it knew.
+    async fn foreground_cwd(&self) -> Option<crate::ForegroundCwd> {
+        None
+    }
+}
+
+/// How long [`SshInteractive::foreground_cwd`] waits for the host.
+const FOREGROUND_CWD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Directory of local process `pid`, or `None` where the OS offers no cheap
+/// way to ask.
+#[cfg(all(unix, feature = "local"))]
+fn local_process_cwd(pid: i64) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let link = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+        crate::usable_proc_cwd(link.to_str()?)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // No /proc: `lsof` ships with macOS and prints the cwd as an `n` field.
+        let out = std::process::Command::new("lsof")
+            .args(["-a", "-d", "cwd", "-Fn", "-p", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        let text = String::from_utf8(out.stdout).ok()?;
+        text.lines().find_map(|l| l.strip_prefix('n')).and_then(crate::usable_proc_cwd)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +330,24 @@ impl InteractiveTerminal for LocalInteractive {
     fn cd_input(&self, path: &str) -> Option<String> {
         crate::cd_input_for(self.flavor, path)
     }
+
+    #[cfg(unix)]
+    async fn foreground_cwd(&self) -> Option<crate::ForegroundCwd> {
+        let shell = self.child.lock().ok()?.process_id().map(i64::from);
+        let foreground = self.master.lock().ok()?.process_group_leader().map(i64::from);
+        let at_prompt = foreground.is_none() || foreground == shell;
+        tokio::task::spawn_blocking(move || {
+            // A foreground program of another user (`sudo -i`) cannot be
+            // asked; the shell that started it can.
+            let path = foreground
+                .and_then(local_process_cwd)
+                .or_else(|| shell.and_then(local_process_cwd))?;
+            Some(crate::ForegroundCwd { path, at_prompt })
+        })
+        .await
+        .ok()
+        .flatten()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,8 +363,8 @@ pub struct SshInteractive {
     rx: Arc<Mutex<mpsc::UnboundedReceiver<Vec<u8>>>>,
     /// Write half of the SSH channel (for input and resize).
     write_half: Arc<ChannelWriteHalf<Msg>>,
-    /// SSH session handle (kept alive to maintain the connection).
-    #[allow(dead_code)]
+    /// SSH session handle: keeps the connection alive and opens the side
+    /// channel of [`foreground_cwd`](InteractiveTerminal::foreground_cwd).
     session: Handle<SshHandler>,
 }
 
@@ -453,6 +509,27 @@ impl InteractiveTerminal for SshInteractive {
         info!("SSH interactive session closed");
         Ok(())
     }
+
+    async fn foreground_cwd(&self) -> Option<crate::ForegroundCwd> {
+        // A second channel of the same connection, without a PTY: the
+        // user's shell sees no input, and stdout carries only the answer.
+        let ask = async {
+            let mut channel = self.session.channel_open_session().await.ok()?;
+            channel.exec(true, crate::PTY_CWD_COMMAND).await.ok()?;
+            let mut out = Vec::new();
+            while let Some(msg) = channel.wait().await {
+                if let ChannelMsg::Data { ref data } = msg {
+                    out.extend_from_slice(data);
+                    if out.len() > 2 * crate::cwd::MAX_CWD_LEN {
+                        break;
+                    }
+                }
+            }
+            let _ = channel.close().await;
+            crate::parse_pty_cwd_reply(std::str::from_utf8(&out).ok()?)
+        };
+        tokio::time::timeout(FOREGROUND_CWD_TIMEOUT, ask).await.ok().flatten()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -463,6 +540,39 @@ impl InteractiveTerminal for SshInteractive {
 mod tests {
     #[cfg(all(unix, feature = "local"))]
     use super::*;
+
+    /// #499: after `cd` in a POSIX shell the directory is known without
+    /// typing a probe — and a program started from the shell is noticed.
+    #[cfg(all(target_os = "linux", feature = "local"))]
+    #[tokio::test]
+    async fn a_local_posix_pty_tells_its_cwd_after_cd() {
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let term = LocalInteractive::with_shell_size_and_cwd(Some("/bin/sh"), 80, 24, Some("/"))
+            .await
+            .unwrap();
+        assert!(!term.reports_cwd_itself());
+        let wait_for = |want: crate::ForegroundCwd| {
+            let term = &term;
+            async move {
+                for _ in 0..100 {
+                    if term.foreground_cwd().await.as_ref() == Some(&want) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                panic!("never saw {want:?}, last {:?}", term.foreground_cwd().await);
+            }
+        };
+        let path = dir.to_str().unwrap().to_string();
+        wait_for(crate::ForegroundCwd { path: "/".into(), at_prompt: true }).await;
+
+        term.write_input(format!("cd {path}\n").as_bytes()).await.unwrap();
+        wait_for(crate::ForegroundCwd { path: path.clone(), at_prompt: true }).await;
+
+        term.write_input(b"sleep 30\n").await.unwrap();
+        wait_for(crate::ForegroundCwd { path, at_prompt: false }).await;
+        term.close().await.unwrap();
+    }
 
     #[cfg(all(unix, feature = "local"))]
     #[test]
