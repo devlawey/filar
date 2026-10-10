@@ -163,9 +163,10 @@ const BINARY_SNIFF_CHARS: usize = 4096;
 /// Whether a host's answer is binary data rather than text (#502): `cat` of
 /// an archive or an executable, decoded lossily on the way here.
 ///
-/// A NUL settles it. Otherwise it is binary when more than a tenth of the
-/// first [`BINARY_SNIFF_CHARS`] characters are undecodable bytes (U+FFFD)
-/// or control characters no text output carries. Line breaks, tabs and the
+/// A NUL settles it. Otherwise it is binary when at least four and more
+/// than a tenth of the first [`BINARY_SNIFF_CHARS`] characters are
+/// undecodable bytes (U+FFFD) or control characters no text output carries
+/// — the floor of four keeps a log with a stray bad byte or two a log. Line breaks, tabs and the
 /// escape sequences of coloured output do not count, and any script —
 /// Cyrillic, CJK — is text.
 pub fn looks_binary(output: &str) -> bool {
@@ -198,7 +199,8 @@ fn readable_sample(output: &str, digest: u64) -> String {
     }
 }
 
-/// A byte count as a person reads it.
+/// A byte count as a person reads it. Kilobytes are rounded up: the size is
+/// shown as "about", and a 100-byte file is not "0 KB".
 fn human_size(bytes: usize) -> String {
     const KB: usize = 1024;
     match bytes {
@@ -255,6 +257,26 @@ mod tests {
         assert!(!sample.contains('\n') && !sample.contains('\u{fffd}'), "{sample}");
         assert!(sample.starts_with("binary data, about 2 KB, digest 0xe6f5edc220c90ffa"), "{sample}");
         assert_eq!(readable_sample("5.15.0-91\n", 1), "5.15.0-91\n");
+    }
+
+    /// Progress bars redraw one line with `\r` and colour it with escape
+    /// sequences; a page break or a bell in a text file is still text.
+    #[test]
+    fn progress_bars_and_page_breaks_are_text() {
+        let bar: String = (0..=100)
+            .map(|p| format!("\r\u{1b}[K{p:3}% [{}>{}]", "=".repeat(p / 5), " ".repeat(20 - p / 5)))
+            .collect();
+        assert!(!looks_binary(&bar));
+        assert!(!looks_binary("Chapter 1\n\u{c}Chapter 2\n\u{c}Chapter 3\n\u{c}\u{c}\u{7}\n"));
+    }
+
+    /// A long text answer is still bounded on its way to the panel.
+    #[test]
+    fn a_long_text_sample_is_clamped() {
+        let long = "line of text\n".repeat(MAX_SAMPLE_CHARS);
+        let sample = clamp(&readable_sample(&long, 7));
+        assert!(sample.starts_with("line of text\n"));
+        assert_eq!(sample.chars().count(), MAX_SAMPLE_CHARS + 1, "clamped plus the ellipsis");
     }
 
     #[test]
