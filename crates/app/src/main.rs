@@ -431,7 +431,7 @@ async fn run() -> anyhow::Result<()> {
     // ── Determine launch parameters ──────────────────────────────────
     // When no CLI args, check for pending launch from a previous GUI
     // session, or spawn the GUI as a subprocess.
-    let (target_name, session_id, llm_config, api_key, key_env_name, mut ssh_target, gui_selected_profile, launch_profiles, launch_ssh_targets, launch_save_dir, launch_arbiter_profile) = if args.is_empty() {
+    let (target_name, session_id, llm_config, api_key, key_env_name, mut ssh_target, gui_selected_profile, launch_profiles, launch_ssh_targets, launch_save_dir, launch_arbiter_profile, launch_host_groups) = if args.is_empty() {
         // Check if the GUI subprocess already saved a launch config.
         let launch = filar_gui::load_pending_launch().or_else(|| {
             // Spawn GUI subprocess.
@@ -527,6 +527,7 @@ async fn run() -> anyhow::Result<()> {
                     // Explicit `None` means "same as session" from the launcher —
                     // do not fall back to CWD/app-data config.toml (#360).
                     launch.arbiter_profile,
+                    launch.host_groups,
                 )
             }
             None => {
@@ -556,8 +557,9 @@ async fn run() -> anyhow::Result<()> {
             None
         };
 
-        (target, args.session, llm_config, key, key_env, ssh_target, None, config.llm_profiles.clone(), config.ssh_targets.clone(), config.save_dir.clone(), config.arbiter_profile.clone())
+        (target, args.session, llm_config, key, key_env, ssh_target, None, config.llm_profiles.clone(), config.ssh_targets.clone(), config.save_dir.clone(), config.arbiter_profile.clone(), None)
     };
+    let host_groups = session_host_groups(launch_host_groups, &config.host_groups);
 
     // Validate API key unless the profile is explicitly keyless (empty key_env).
     let requires_key = !key_env_name.trim().is_empty();
@@ -641,7 +643,7 @@ async fn run() -> anyhow::Result<()> {
         let ssh: Arc<dyn filar_transport::CommandExecutor> = Arc::new(ssh);
         // Read-only host groups (#419): the transport refuses every
         // non-allowlisted command before it reaches the wire.
-        if filar_core::is_read_only_target(&config.host_groups, target) {
+        if filar_core::is_read_only_target(&host_groups, target) {
             Arc::new(filar_transport::ReadOnlyExecutor::new(ssh))
         } else {
             ssh
@@ -732,7 +734,7 @@ async fn run() -> anyhow::Result<()> {
         // (#414).
         global_confirm_mode: config.confirm_mode,
         tag_policies: config.tag_policies.clone(),
-        host_groups: config.host_groups.clone(),
+        host_groups,
         initial_group: cli_group,
         initial_fleet: loaded.fleet,
         llm_profile: default_profile_name.clone(),
@@ -786,14 +788,53 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Host groups of the session being started (#501).
+///
+/// A launch from the launcher carries the Groups tab as it was at Launch
+/// (`Some`, possibly empty — a removed group stays removed); a direct start
+/// (`--target`, `--group`) or a `pending_launch.json` written before #501
+/// (`None`) uses what `config.toml` holds.
+fn session_host_groups(
+    launch: Option<Vec<filar_core::HostGroup>>,
+    config: &[filar_core::HostGroup],
+) -> Vec<filar_core::HostGroup> {
+    launch.unwrap_or_else(|| config.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use filar_core::{LlmProfile, SecretProvider, StaticSecretProvider};
 
     use super::{
         build_llm_client_from_profile, check_profile_api_key, gui_launch_target_name,
-        resolve_gui_ssh_target,
+        resolve_gui_ssh_target, session_host_groups,
     };
+
+    fn group(name: &str, tag: &str) -> filar_core::HostGroup {
+        serde_json::from_value(serde_json::json!({ "name": name, "match": [tag] })).unwrap()
+    }
+
+    /// #501: the session uses the groups the launcher just saved, not the
+    /// snapshot of config.toml read before the launcher opened.
+    #[test]
+    fn a_launch_brings_its_own_host_groups() {
+        let stale = vec![group("old", "x")];
+        // Created or edited in the launcher.
+        let fresh = vec![group("sim-all", "sim"), group("sim-prod", "prod")];
+        assert_eq!(session_host_groups(Some(fresh.clone()), &stale), fresh);
+        // Created from nothing.
+        assert_eq!(session_host_groups(Some(fresh.clone()), &[]), fresh);
+        // Every group removed: none comes back from the snapshot.
+        assert!(session_host_groups(Some(vec![]), &stale).is_empty());
+    }
+
+    /// Direct start (`--target`, `--group`) and a pending launch written
+    /// before #501 read the groups from config.toml.
+    #[test]
+    fn without_a_launcher_the_groups_come_from_the_config() {
+        let config = vec![group("prod", "prod")];
+        assert_eq!(session_host_groups(None, &config), config);
+    }
 
     // ── GUI→TUI SSH keyring handoff (#290) ──────────────────────────────
 

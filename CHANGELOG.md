@@ -22,6 +22,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   the docked width, and the operation headline breaks between words
   ([#503](https://github.com/devlawey/filar/issues/503)).
 
+- Host groups created, edited or removed in the launcher apply to the session it
+  starts, like hosts do, instead of after the next restart
+  ([#501](https://github.com/devlawey/filar/issues/501)).
+
 ## [2.0.1] - 2026-10-07
 
 ### Fixed

@@ -411,6 +411,13 @@ pub struct LaunchConfig {
     /// Carried through pending_launch so the TUI does not depend on CWD config.toml (#360).
     #[serde(default)]
     pub arbiter_profile: Option<String>,
+    /// Host groups as the launcher's Groups tab left them (#501): the
+    /// session started by this launch uses them instead of the snapshot of
+    /// `config.toml` read before the launcher opened. `Some(vec![])` means
+    /// every group was removed; `None` (a file written before #501) means
+    /// "not said" and the session keeps what `config.toml` holds.
+    #[serde(default)]
+    pub host_groups: Option<Vec<filar_core::HostGroup>>,
 }
 
 /// How the launcher logs in to an SSH host (#489).
@@ -3203,6 +3210,7 @@ impl LauncherApp {
             profiles: self.profiles.iter().map(LlmProfileData::to_profile).collect(),
             ssh_targets,
             arbiter_profile: self.arbiter_profile.clone(),
+            host_groups: Some(host_groups),
         };
         save_pending_launch(&cfg);
         std::process::exit(0);
@@ -3470,6 +3478,7 @@ mod tests {
             profiles: vec![],
             ssh_targets: vec![],
             arbiter_profile: None,
+            host_groups: None,
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(!json.contains("supersecret"));
@@ -3597,6 +3606,7 @@ mod tests {
                 tags: Vec::new(),
             }],
             arbiter_profile: None,
+            host_groups: None,
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(!json.contains("\"password\":"), "must not emit password key when None, got: {json}");
@@ -3687,6 +3697,7 @@ mod tests {
             profiles: vec![edited_profile().to_profile()],
             ssh_targets: vec![],
             arbiter_profile: None,
+            host_groups: None,
         };
 
         let json = serde_json::to_string(&cfg).unwrap();
@@ -3933,10 +3944,30 @@ mod tests {
             profiles: vec![],
             ssh_targets: vec![],
             arbiter_profile: Some("arbiter-b".into()),
+            host_groups: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let loaded: LaunchConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.arbiter_profile.as_deref(), Some("arbiter-b"));
+    }
+
+    /// #501: the Groups tab travels with the launch; "all removed" and
+    /// "not said" (a file from before #501) stay distinguishable.
+    #[test]
+    fn launch_config_carries_host_groups() {
+        let json = r#"{"target":"local","ssh":null,"model":"m","api_base_url":"u","session_id":null}"#;
+        let old: LaunchConfig = serde_json::from_str(json).unwrap();
+        assert!(old.host_groups.is_none(), "a pre-#501 file says nothing about groups");
+
+        let group: filar_core::HostGroup =
+            toml::from_str("name = \"sim-all\"\nmatch = [\"sim\"]").unwrap();
+        for groups in [vec![], vec![group]] {
+            let mut cfg: LaunchConfig = serde_json::from_str(json).unwrap();
+            cfg.host_groups = Some(groups.clone());
+            let loaded: LaunchConfig =
+                serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(loaded.host_groups, Some(groups));
+        }
     }
 
     #[test]
