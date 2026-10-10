@@ -107,7 +107,7 @@ impl FleetView {
                 .find(|(_, m)| m.name() == name)
                 .and_then(|(h, _)| report.run_for(h))
                 .map(|run| match run {
-                    HostRun::Answered(result) => clamp(result.stdout.trim_end()),
+                    HostRun::Answered(result) => result.stdout.trim_end().to_string(),
                     _ => String::new(),
                 })
                 .unwrap_or_default()
@@ -126,10 +126,10 @@ impl FleetView {
                     ComparedValue::Rows(rows) => {
                         clamp(&rows.iter().map(|r| r.join("  ")).collect::<Vec<_>>().join("\n"))
                     }
-                    ComparedValue::Digest(_) => group
+                    ComparedValue::Digest(digest) => group
                         .hosts()
                         .first()
-                        .map(|h| output_of(h))
+                        .map(|h| clamp(&readable_sample(&output_of(h), *digest)))
                         .unwrap_or_default(),
                 };
                 ViewGroup {
@@ -157,10 +157,112 @@ impl FleetView {
     }
 }
 
+/// How much of an answer is looked at to tell text from binary data.
+const BINARY_SNIFF_CHARS: usize = 4096;
+
+/// Whether a host's answer is binary data rather than text (#502): `cat` of
+/// an archive or an executable, decoded lossily on the way here.
+///
+/// A NUL settles it. Otherwise it is binary when more than a tenth of the
+/// first [`BINARY_SNIFF_CHARS`] characters are undecodable bytes (U+FFFD)
+/// or control characters no text output carries. Line breaks, tabs and the
+/// escape sequences of coloured output do not count, and any script —
+/// Cyrillic, CJK — is text.
+pub fn looks_binary(output: &str) -> bool {
+    let (mut seen, mut odd) = (0usize, 0usize);
+    for c in output.chars().take(BINARY_SNIFF_CHARS) {
+        if c == '\0' {
+            return true;
+        }
+        seen += 1;
+        let layout = matches!(c, '\n' | '\r' | '\t' | '\u{1b}' | '\u{8}' | '\u{c}' | '\u{7}');
+        if c == '\u{fffd}' || (c.is_control() && !layout) {
+            odd += 1;
+        }
+    }
+    odd >= 4 && odd * 10 > seen
+}
+
+/// The sample a person is shown for a raw answer: the text itself, or — for
+/// binary data — one line saying so, with its size and the digest the
+/// summary compared (the same number the agent is given), so "is this file
+/// the same on every host" still reads off the panel.
+fn readable_sample(output: &str, digest: u64) -> String {
+    if looks_binary(output) {
+        format!(
+            "binary data, about {}, digest {digest:#018x} (not shown)",
+            human_size(output.len())
+        )
+    } else {
+        output.to_string()
+    }
+}
+
+/// A byte count as a person reads it.
+fn human_size(bytes: usize) -> String {
+    const KB: usize = 1024;
+    match bytes {
+        b if b < KB => format!("{b} B"),
+        b if b < KB * KB => format!("{} KB", b.div_ceil(KB)),
+        b => format!("{:.1} MB", b as f64 / (KB * KB) as f64),
+    }
+}
+
 /// Bound a sample's size, cutting on a character boundary.
 fn clamp(s: &str) -> String {
     match s.char_indices().nth(MAX_SAMPLE_CHARS) {
         Some((cut, _)) => format!("{}…", &s[..cut]),
         None => s.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `cat file.gz` looks like after lossy decoding.
+    fn gzip_like() -> String {
+        let bytes: Vec<u8> = (0u32..600).map(|i| (i * 37 % 251) as u8 | 0x80).collect();
+        format!("\u{1f}\u{8}{}", String::from_utf8_lossy(&bytes))
+    }
+
+    #[test]
+    fn binary_data_is_told_from_text() {
+        assert!(looks_binary(&gzip_like()));
+        assert!(looks_binary("ELF\0\0\0"), "a NUL settles it");
+        assert!(looks_binary(&"\u{1}\u{2}\u{3}\u{4}ab".repeat(10)));
+    }
+
+    #[test]
+    fn text_in_any_script_is_not_binary() {
+        for text in [
+            "",
+            "node1",
+            "Filesystem  Inodes IUsed\n/dev/sda1  1000  10\n",
+            "Привет, мир\tтаблица\r\n",
+            "日本語のテキスト\n한국어\n",
+            "\u{1b}[31mred\u{1b}[0m \u{1b}[1mbold\u{1b}[0m\n",
+            // A stray undecodable byte in a log is still a log.
+            "2026-10-11 error: bad byte \u{fffd} in request from 10.0.0.1\n",
+        ] {
+            assert!(!looks_binary(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_binary_answer_is_replaced_by_one_line() {
+        let sample = readable_sample(&gzip_like(), 0xe6f5_edc2_20c9_0ffa);
+        assert!(!sample.contains('\n') && !sample.contains('\u{fffd}'), "{sample}");
+        assert!(sample.starts_with("binary data, about 2 KB, digest 0xe6f5edc220c90ffa"), "{sample}");
+        assert_eq!(readable_sample("5.15.0-91\n", 1), "5.15.0-91\n");
+    }
+
+    #[test]
+    fn sizes_read_like_sizes() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1 KB");
+        assert_eq!(human_size(12_000), "12 KB");
+        assert_eq!(human_size(3 * 1024 * 1024), "3.0 MB");
     }
 }
