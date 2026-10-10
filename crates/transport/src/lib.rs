@@ -32,7 +32,7 @@ pub use interactive::{InteractiveTerminal, SshInteractive};
 #[cfg(feature = "local")]
 pub use local::LocalExecutor;
 pub use cwd::{
-    cd_input_for, cmd_osc7_prompt, is_safe_cwd, posix_cd_command, posix_cd_input, posix_shell_quote,
+    cd_input_for, cmd_osc7_prompt, is_safe_cwd, parse_pty_cwd_reply, usable_proc_cwd, ForegroundCwd, PTY_CWD_COMMAND, posix_cd_command, posix_cd_input, posix_shell_quote,
     shell_flavor, ShellFlavor, OSC7_PWD_PROBE, OSC7_RAW_HOST, POWERSHELL_OSC7_PROMPT,
 };
 pub use key::{

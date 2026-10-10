@@ -77,7 +77,7 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
         fit(&format!(" $ {}", one_line(&view.command)), width),
         app.theme.command_style(),
     ))];
-    for l in wrap_text(&view.headline, width.saturating_sub(1).max(1)) {
+    for l in wrap_at_words(&view.headline, width.saturating_sub(1).max(1)) {
         head.push(Line::from(Span::styled(format!(" {l}"), app.theme.dim())));
     }
     let sep = glyphs.separator.repeat(width / glyphs.separator.width().max(1));
@@ -171,34 +171,83 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
         }
     }
 
-    let hint = Line::from(Span::styled(
-        fit(
-            &format!(
- " {}{} select {d} Enter expand {d} PgUp/PgDn scroll {d} Esc close",
-                glyphs.arrow_up,
-                glyphs.arrow_down,
-                d = glyphs.middle_dot
-            ),
-            width,
-        ),
-        app.theme.muted(),
-    ));
+    // The key hint, whole at any width: what does not fit on one row
+    // moves to the next instead of being cut (#503).
+    let hint: Vec<Line> = pack_hint(
+        &[
+            format!("{}{} select", glyphs.arrow_up, glyphs.arrow_down),
+            "Enter expand".to_string(),
+            "PgUp/PgDn scroll".to_string(),
+            "Esc close".to_string(),
+        ],
+        &format!(" {} ", glyphs.middle_dot),
+        width.saturating_sub(1),
+    )
+    .into_iter()
+    .map(|row| Line::from(Span::styled(format!(" {row}"), app.theme.muted())))
+    .collect();
 
     // Scroll the body so the selected row's first line stays visible, then
     // by `PgUp`/`PgDn` on top — so an expanded answer taller than the panel
     // can be read line by line rather than skipped past.
-    let body_h = (area.height as usize).saturating_sub(head.len() + 1);
+    let body_h = (area.height as usize).saturating_sub(head.len() + hint.len());
     let anchor = starts.get(selected).copied().unwrap_or(0);
     let max_offset = body.len().saturating_sub(body_h);
     let offset = (anchor.saturating_sub(body_h.saturating_sub(2)) + app.side_panel.scroll)
         .min(max_offset);
     let mut lines = head;
     lines.extend(body.into_iter().skip(offset).take(body_h));
-    while lines.len() + 1 < area.height as usize {
+    while lines.len() + hint.len() < area.height as usize {
         lines.push(Line::from(""));
     }
-    lines.push(hint);
+    lines.extend(hint);
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Wrap `text` to `width` cells at spaces, so the headline never breaks
+/// inside a word (#503); a word wider than the row is cut by [`wrap_text`].
+fn wrap_at_words(text: &str, width: usize) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.width() + 1 + word.width() <= width {
+            current.push(' ');
+            current.push_str(word);
+            continue;
+        }
+        if !current.is_empty() {
+            rows.push(std::mem::take(&mut current));
+        }
+        let mut pieces = wrap_text(word, width);
+        current = pieces.pop().unwrap_or_default();
+        rows.extend(pieces);
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
+
+/// Lay hint `parts` out in rows of at most `width` cells, joined by `sep`:
+/// a part that does not fit starts the next row, so no key is ever cut off.
+/// A single part wider than the row is clamped — nothing else can be done.
+fn pack_hint(parts: &[String], sep: &str, width: usize) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for part in parts {
+        if current.is_empty() {
+            current = fit(part, width);
+        } else if current.width() + sep.width() + part.width() <= width {
+            current.push_str(sep);
+            current.push_str(part);
+        } else {
+            rows.push(std::mem::replace(&mut current, fit(part, width)));
+        }
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    rows
 }
 
 /// Mark for a host without a value: silence and errors stand out, a host
@@ -598,5 +647,58 @@ mod tests {
         let text = render(&app, 72, 20, Glyphs::detect());
         assert!(text.contains("line-60"), "{text}");
         assert!(text.contains("PgUp/PgDn"), "the hint names the keys: {text}");
+    }
+
+    /// #503: at the docked panel's width (56 minus the border) and below,
+    /// every key of the hint is readable — wrapped, never cut.
+    #[test]
+    fn the_key_hint_is_whole_at_the_docked_width_and_narrower() {
+        let app = crate::app::test_fleet_app(crate::app::test_fleet_view());
+        for glyphs in [Glyphs::detect(), &Glyphs::ASCII] {
+            for width in [crate::side_panel::FLEET_PANEL_WIDTH - 2, 40, 24] {
+                let text = render(&app, width, 24, glyphs);
+                for key in ["select", "Enter expand", "PgUp/PgDn scroll", "Esc close"] {
+                    assert!(text.contains(key), "{width}: {key:?} is missing:\n{text}");
+                }
+                for line in text.lines() {
+                    assert!(line.chars().count() <= width as usize, "{width}: {line:?}");
+                }
+            }
+        }
+        // Wide enough: one row, as before.
+        let text = render(&app, 72, 24, Glyphs::detect());
+        let row = text.lines().find(|l| l.contains("select")).unwrap();
+        assert!(row.contains("Esc close"), "{row}");
+    }
+
+    #[test]
+    fn hint_parts_move_to_the_next_row_instead_of_being_cut() {
+        let parts: Vec<String> = ["ab", "cd", "efgh"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(pack_hint(&parts, " - ", 20), ["ab - cd - efgh"]);
+        assert_eq!(pack_hint(&parts, " - ", 8), ["ab - cd", "efgh"]);
+        assert_eq!(pack_hint(&parts, " - ", 3), ["ab", "cd", "ef…"]);
+        assert!(pack_hint(&[], " - ", 10).is_empty());
+    }
+
+    #[test]
+    fn the_headline_breaks_between_words() {
+        assert_eq!(wrap_at_words("3 of 5 hosts answered", 12), ["3 of 5 hosts", "answered"]);
+        assert_eq!(wrap_at_words("abcdefgh", 3), ["abc", "def", "gh"]);
+        assert_eq!(wrap_at_words("", 5), [""]);
+    }
+
+    /// #503: the headline wraps to the panel's width and loses nothing.
+    #[test]
+    fn the_headline_is_wrapped_whole() {
+        let app = crate::app::test_fleet_app(crate::app::test_fleet_view());
+        let text = render(&app, crate::side_panel::FLEET_PANEL_WIDTH - 2, 24, Glyphs::detect());
+        let joined: String = text
+            .lines()
+            .map(|l| l.trim_start_matches(['│', '|']).trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for piece in ["operation #9:", "3 of 5 hosts answered", "1 did not answer", "1 n/a"] {
+            assert!(joined.contains(piece), "{piece:?} is missing:\n{text}");
+        }
     }
 }

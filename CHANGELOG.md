@@ -19,6 +19,30 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   of these tools is still refused before it reaches a host
   ([#504](https://github.com/devlawey/filar/issues/504)).
 
+### Fixed
+
+- The F1 help overlay wraps long descriptions at word boundaries inside the
+  description column instead of breaking them mid-phrase and continuing at
+  the left edge; its scroll and row counter follow the wrapped rows
+  ([#500](https://github.com/devlawey/filar/issues/500)).
+
+- The key hint of the fleet summary panel wraps instead of being cut off at
+  the docked width, and the operation headline breaks between words
+  ([#503](https://github.com/devlawey/filar/issues/503)).
+
+- Host groups created, edited or removed in the launcher apply to the session it
+  starts, like hosts do, instead of after the next restart
+  ([#501](https://github.com/devlawey/filar/issues/501)).
+
+- In terminal mode the status-bar directory follows `cd` in a POSIX shell too
+  — over SSH and in a local Linux/macOS tab — without typing anything into
+  the shell ([#499](https://github.com/devlawey/filar/issues/499)).
+
+- A fleet command that prints binary data (`cat` of an archive or an
+  executable) shows one line with its size and digest in the summary panel
+  instead of garbage
+  ([#502](https://github.com/devlawey/filar/issues/502)).
+
 ## [2.0.1] - 2026-10-07
 
 ### Fixed
