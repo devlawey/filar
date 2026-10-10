@@ -19,6 +19,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   of these tools is still refused before it reaches a host
   ([#504](https://github.com/devlawey/filar/issues/504)).
 
+### Changed
+
+- In a fleet the agent is now quoted short plain-text answers (up to 10 lines
+  and 1 KB — a hostname, a version) instead of digests only; longer and
+  binary answers stay digests. It is told not to guess values it was not
+  shown and not to report naturally varying values (uptime, load, memory) as
+  anomalies ([#505](https://github.com/devlawey/filar/issues/505)).
+
 ### Fixed
 
 - The F1 help overlay wraps long descriptions at word boundaries inside the

@@ -1,7 +1,7 @@
 //! What a person sees of a fleet operation (#438).
 //!
 //! The model gets the fold (#430): who agreed with whom, and — for an
-//! ad-hoc command — only digests, because host output must never reach it.
+//! ad-hoc command — short answers quoted (#505) and digests for the rest.
 //! A digest tells a person nothing, though. They want to read the answer:
 //! "eleven hosts say 5.15.0-91, one says 6.1.0". This module builds that
 //! view from the same operation — groups of agreeing hosts, each with a
@@ -126,6 +126,12 @@ impl FleetView {
                     ComparedValue::Rows(rows) => {
                         clamp(&rows.iter().map(|r| r.join("  ")).collect::<Vec<_>>().join("\n"))
                     }
+                    // A short answer is plain text by construction.
+                    ComparedValue::Text(_) => group
+                        .hosts()
+                        .first()
+                        .map(|h| clamp(&output_of(h)))
+                        .unwrap_or_default(),
                     ComparedValue::Digest(digest) => group
                         .hosts()
                         .first()
