@@ -56,8 +56,11 @@ use crate::{CommandExecutor, CommandResult, StreamEvent};
 /// Deliberately absent, with intent: `find` (`-delete`, `-exec`), `sed`/`awk`
 /// (`-i`, `system()`), `env`/`nice`/`timeout`/`xargs` (execute code),
 /// `sudo`/`su`/`doas` (privilege escalation), `tee`/`cp`/`mv`/`rm`/`touch`
-/// (writes), `ip`/`ifconfig`/`hostname` (configuration changes: `ip link
-/// set`, `hostname NAME`).
+/// (writes), `ifconfig`/`hostname` (configuration changes: `hostname
+/// NAME`). Binaries that are worth reading through but can also change the
+/// host — `systemctl`, `journalctl`, `dmesg`, `ip`, `dpkg`, `rpm`, `sshd` —
+/// are not here either: they are [`GUARDED_FORMS`], allowed only in the
+/// argument shapes spelled out there.
 pub const ALLOWED_COMMANDS: &[&str] = &[
     "base64", "cat", "cksum", "cmp", "comm", "cut", "date", "df", "diff", "dig", "du", "echo",
     "egrep", "fgrep", "file", "free", "grep", "groups", "head", "host", "id", "ls", "lsblk",
@@ -248,6 +251,12 @@ fn check_segment(segment: &str) -> std::result::Result<(), String> {
         .next()
         .ok_or_else(|| "empty command".to_string())?;
     let base = strip_bin_prefix(token);
+    if let Some(form) = GUARDED_FORMS.iter().find(|f| f.bin == base) {
+        let args = without_redirections(segment.split_whitespace().skip(1));
+        return check_form(form, &args).map_err(|why| {
+            format!("\"{base}\" is only allowed in its read-only forms: {why}")
+        });
+    }
     if !ALLOWED_COMMANDS.contains(&base) {
         return Err(format!("\"{token}\" is not in the read-only allowlist"));
     }
@@ -291,6 +300,314 @@ fn forbidden_flag(arg: &str, long_opts: &[&str], short_chars: &[char]) -> Option
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Guarded forms: binaries that can change the host, allowed only as readers
+// ---------------------------------------------------------------------------
+
+/// What may stand where a guarded binary takes free words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Words {
+    /// No free words at all.
+    None,
+    /// Any word that does not start with `-` (unit names, packages, paths).
+    Any,
+}
+
+/// A binary that has writing or executing modes, allowed **only** in the
+/// argument shapes listed here (#504).
+///
+/// Unlike [`FORBIDDEN_ARGS`] — a deny-list for binaries that are readers
+/// but for one flag — this is an allow-list: every argument must be
+/// recognised, and anything else refuses the whole command. A new flag of a
+/// future version, an abbreviation, a cluster, a subcommand not named here
+/// are all refused without anyone having to think of them.
+struct GuardedForm {
+    bin: &'static str,
+    /// Options without a value, matched as whole tokens — no clusters, no
+    /// abbreviations.
+    flags: &'static [&'static str],
+    /// Options with a value: a long one as `--name=VALUE`, a short one as
+    /// `-x VALUE`. The value is one literal word.
+    valued: &'static [&'static str],
+    /// Subcommands (the first free word). Empty: the binary has none.
+    subcommands: &'static [&'static str],
+    /// Whether a subcommand must be given (`ip`), or the binary reads
+    /// without one too (`systemctl --failed`).
+    subcommand_required: bool,
+    /// The free words after the subcommand (or all of them, without one).
+    words: Words,
+    /// At least one of these must be present — the option that puts the
+    /// binary into its reading mode (`dpkg -l`). Empty: no such need.
+    needs_one_of: &'static [&'static str],
+}
+
+const GUARDED_FORMS: &[GuardedForm] = &[
+    // Unit state, never unit control: no start/stop/restart/enable/mask/
+    // edit/set-property/daemon-reload/kill/isolate, no `-H`/`-M` (another
+    // host or container), no `--root`.
+    GuardedForm {
+        bin: "systemctl",
+        flags: &[
+            "--failed", "--no-pager", "--all", "-a", "--full", "-l", "--no-legend", "--plain",
+            "--quiet", "-q", "--recursive", "-r", "--reverse", "--with-dependencies",
+        ],
+        valued: &["--type", "-t", "--state", "--property", "-p", "--lines", "-n", "--output", "-o"],
+        subcommands: &[
+            "status", "is-active", "is-enabled", "is-failed", "is-system-running", "list-units",
+            "list-unit-files", "list-timers", "list-sockets", "list-dependencies", "show", "cat",
+            "get-default",
+        ],
+        subcommand_required: false,
+        words: Words::Any,
+        needs_one_of: &[],
+    },
+    // The journal, read only: no `--rotate`, `--vacuum-*`, `--flush`,
+    // `--sync`, `--relinquish-var`, `--setup-keys`, `--update-catalog`; no
+    // `-f` (never ends); no `-D`/`--file`/`--root`/`-M` (other journals).
+    GuardedForm {
+        bin: "journalctl",
+        flags: &[
+            "--no-pager", "-b", "--boot", "-k", "--dmesg", "-x", "--catalog", "-e", "--pager-end",
+            "-r", "--reverse", "-a", "--all", "-q", "--quiet", "--utc", "--no-hostname",
+            "--system", "--list-boots", "--disk-usage", "--no-full",
+        ],
+        valued: &[
+            "--unit", "-u", "--lines", "-n", "--priority", "-p", "--since", "-S", "--until", "-U",
+            "--output", "-o", "--grep", "-g", "--identifier", "-t", "--boot", "--facility",
+        ],
+        subcommands: &[],
+        subcommand_required: false,
+        words: Words::None,
+        needs_one_of: &[],
+    },
+    // The kernel ring buffer, read only: no `-C`/`-c` (clear), `-n`/`-D`/`-E`
+    // (console level), `-w`/`-W` (never ends).
+    GuardedForm {
+        bin: "dmesg",
+        flags: &[
+            "-T", "--ctime", "-H", "--human", "-k", "--kernel", "-u", "--userspace", "-x",
+            "--decode", "-t", "--notime", "-e", "--reltime", "-r", "--raw", "--nopager", "-P",
+        ],
+        valued: &["--level", "-l", "--facility", "-f", "--since", "--until"],
+        subcommands: &[],
+        subcommand_required: false,
+        words: Words::None,
+        needs_one_of: &[],
+    },
+    // Network state: `ip OBJECT [show|list|get …]`. The object and the
+    // command are whole words — `ip link s` is `set`, not `show`. No
+    // `-batch`, `-force`, `-netns`; no `netns`, `tuntap`, `xfrm`, `monitor`.
+    // The command is checked by `check_ip`.
+    GuardedForm {
+        bin: "ip",
+        flags: &[
+            "-4", "-6", "-br", "-brief", "-s", "-stats", "-statistics", "-d", "-details", "-o",
+            "-oneline", "-j", "-json", "-p", "-pretty", "-h", "-human", "-c", "-color",
+        ],
+        valued: &[],
+        subcommands: &[
+            "a", "addr", "address", "l", "link", "r", "ro", "route", "n", "neigh", "neighbor",
+            "neighbour", "rule", "maddr", "maddress",
+        ],
+        subcommand_required: true,
+        words: Words::Any,
+        needs_one_of: &[],
+    },
+    // Package state: no install, remove, purge, configure, no `--root`,
+    // `--admindir`, `--force-*`.
+    GuardedForm {
+        bin: "dpkg",
+        flags: &[
+            "-l", "--list", "-s", "--status", "-L", "--listfiles", "-S", "--search", "-p",
+            "--print-avail", "--get-selections", "--print-architecture", "--version", "--no-pager",
+        ],
+        valued: &[],
+        subcommands: &[],
+        subcommand_required: false,
+        words: Words::Any,
+        needs_one_of: &[
+            "-l", "--list", "-s", "--status", "-L", "--listfiles", "-S", "--search", "-p",
+            "--print-avail", "--get-selections", "--print-architecture", "--version",
+        ],
+    },
+    GuardedForm {
+        bin: "dpkg-query",
+        flags: &[
+            "-l", "--list", "-W", "--show", "-s", "--status", "-L", "--listfiles", "-S",
+            "--search", "-p", "--print-avail", "--version", "--no-pager",
+        ],
+        valued: &[],
+        subcommands: &[],
+        subcommand_required: false,
+        words: Words::Any,
+        needs_one_of: &[
+            "-l", "--list", "-W", "--show", "-s", "--status", "-L", "--listfiles", "-S",
+            "--search", "-p", "--print-avail", "--version",
+        ],
+    },
+    // `rpm` in query mode only; the mode letters are spelled out, so no
+    // cluster can hide `-e`, `-i` (install without `-q`), `-U`, `-p` (reads a
+    // package file or URL), and `--pipe`/`--eval`/`--root` are not listed.
+    GuardedForm {
+        bin: "rpm",
+        flags: &[
+            "-q", "--query", "-qa", "-qi", "-ql", "-qf", "-qc", "-qd", "-qR", "-qal", "-qil",
+            "--all", "--info", "--list", "--file", "--requires", "--provides", "--whatprovides",
+            "--whatrequires", "--changelog", "--last", "--version",
+        ],
+        valued: &[],
+        subcommands: &[],
+        subcommand_required: false,
+        words: Words::Any,
+        needs_one_of: &[
+            "-q", "--query", "-qa", "-qi", "-ql", "-qf", "-qc", "-qd", "-qR", "-qal", "-qil",
+            "--version",
+        ],
+    },
+    // Version only: any other `sshd` argument starts a daemon, any other
+    // `ssh` argument connects somewhere.
+    GuardedForm {
+        bin: "sshd",
+        flags: &["-V"],
+        valued: &[],
+        subcommands: &[],
+        subcommand_required: false,
+        words: Words::None,
+        needs_one_of: &["-V"],
+    },
+    GuardedForm {
+        bin: "ssh",
+        flags: &["-V"],
+        valued: &[],
+        subcommands: &[],
+        subcommand_required: false,
+        words: Words::None,
+        needs_one_of: &["-V"],
+    },
+    // Compressed logs and changelogs to stdout; no options at all.
+    GuardedForm {
+        bin: "zcat",
+        flags: &[],
+        valued: &[],
+        subcommands: &[],
+        subcommand_required: false,
+        words: Words::Any,
+        needs_one_of: &[],
+    },
+];
+
+/// The `ip` commands that only read. Whole words: iproute2 takes any prefix
+/// of a command name, and `s` after `link` is `set`.
+const IP_READ_COMMANDS: &[&str] = &["show", "list", "lst", "get"];
+
+/// The arguments of a segment without its redirections (`2>&1`,
+/// `2>/dev/null`, `> /dev/null`): [`check_redirections`] has already
+/// allowed exactly those, and they are not arguments of the binary.
+///
+/// A redirection can be glued to an argument — the shell reads
+/// `--rotate>/dev/null` as the argument `--rotate` plus a redirection — so
+/// whatever stands before the `>` in a token is kept as an argument, unless
+/// it is only digits, which is the file descriptor being redirected
+/// (`2>&1`). Quotes and backslashes never get here
+/// ([`check_reinterpretable_characters`]), so a `>` is always an operator.
+fn without_redirections<'a>(tokens: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut args = Vec::new();
+    let mut target_follows = false;
+    for token in tokens {
+        if std::mem::take(&mut target_follows) {
+            continue;
+        }
+        let Some(at) = token.find('>') else {
+            args.push(token);
+            continue;
+        };
+        let before = &token[..at];
+        if !before.is_empty() && !before.bytes().all(|b| b.is_ascii_digit()) {
+            args.push(before);
+        }
+        target_follows = token.ends_with('>');
+    }
+    args
+}
+
+/// Validate the arguments of a guarded binary against its form: every
+/// argument must be recognised. `Err` names the first one that is not.
+fn check_form(form: &GuardedForm, args: &[&str]) -> std::result::Result<(), String> {
+    let mut subcommand: Option<&str> = None;
+    let mut words_after = 0usize;
+    let mut satisfied = form.needs_one_of.is_empty();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        i += 1;
+        if let Some(rest) = arg.strip_prefix('-') {
+            // Options belong before the free words for `ip` (after the
+            // object everything is a selector); elsewhere the position does
+            // not change the meaning.
+            if form.bin == "ip" && subcommand.is_some() {
+                return Err(format!("`{arg}` after the object"));
+            }
+            if rest.is_empty() || arg == "--" {
+                return Err(format!("`{arg}` is not accepted"));
+            }
+            if form.flags.contains(&arg) {
+                satisfied |= form.needs_one_of.contains(&arg);
+                // `journalctl -b -1`: the boot offset is an optional value
+                // of its own, and the only one that starts with a dash.
+                if form.bin == "journalctl" && arg == "-b" && args.get(i).is_some_and(|v| is_boot_offset(v)) {
+                    i += 1;
+                }
+                continue;
+            }
+            // `--name=VALUE`
+            if let Some((name, value)) = arg.split_once('=') {
+                if name.starts_with("--") && form.valued.contains(&name) && !value.is_empty() {
+                    continue;
+                }
+                return Err(format!("`{name}` is not an accepted option"));
+            }
+            // `-x VALUE` / `--name VALUE`: the value is the next word.
+            if form.valued.contains(&arg) {
+                match args.get(i) {
+                    Some(value) if !value.starts_with('-') => {
+                        i += 1;
+                        continue;
+                    }
+                    _ => return Err(format!("`{arg}` needs a value")),
+                }
+            }
+            return Err(format!("`{arg}` is not an accepted option"));
+        }
+        if !form.subcommands.is_empty() && subcommand.is_none() {
+            if !form.subcommands.contains(&arg) {
+                return Err(format!("`{arg}` is not a read-only subcommand"));
+            }
+            subcommand = Some(arg);
+            continue;
+        }
+        if form.words == Words::None {
+            return Err(format!("`{arg}` is not accepted"));
+        }
+        if form.bin == "ip" && words_after == 0 && !IP_READ_COMMANDS.contains(&arg) {
+            return Err(format!("`{arg}` is not a read-only command (use show, list or get)"));
+        }
+        words_after += 1;
+    }
+    if form.subcommand_required && subcommand.is_none() {
+        return Err("an object is required".into());
+    }
+    if !satisfied {
+        return Err(format!("one of {} is required", form.needs_one_of.join(", ")));
+    }
+    Ok(())
+}
+
+/// A `journalctl -b` offset: `0`, `1`, `-1`, `-20`.
+fn is_boot_offset(word: &str) -> bool {
+    let digits = word.strip_prefix('-').unwrap_or(word);
+    !digits.is_empty() && digits.len() <= 4 && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Strip one of the standard binary-directory prefixes, if present.
@@ -499,6 +816,254 @@ mod tests {
         assert_refused(&exec, &inner, "xargs ls").await;
         assert_refused(&exec, &inner, "tee /tmp/x").await;
         assert_refused(&exec, &inner, "find / -name x -delete").await;
+    }
+
+    /// #504: diagnostics an administrator reads a fleet with.
+    #[tokio::test]
+    async fn guarded_binaries_run_in_their_read_only_forms() {
+        let (exec, inner) = gated();
+        let allowed = [
+            "systemctl --failed",
+            "systemctl --failed --no-pager --no-legend",
+            "systemctl status nginx",
+            "systemctl status nginx.service sshd --no-pager -n 20",
+            "systemctl is-active nginx",
+            "systemctl is-enabled nginx",
+            "systemctl list-units --type=service --state=running",
+            "systemctl list-unit-files -t service",
+            "systemctl show nginx --property=ActiveState",
+            "systemctl cat nginx",
+            "journalctl --no-pager -n 50",
+            "journalctl -u nginx --since=today --no-pager",
+            "journalctl -k -b --no-pager -p err",
+            "journalctl --boot=-1 --lines=20",
+            "journalctl -b -1 --no-pager",
+            "journalctl -b 0 -p err",
+            "dmesg -T>/dev/null",
+            "systemctl status nginx 2>/dev/null",
+            "journalctl --disk-usage",
+            "dmesg",
+            "dmesg -T --level=err,warn",
+            "dmesg -H | tail -n 20",
+            "ip a",
+            "ip addr",
+            "ip -br addr show",
+            "ip -4 addr show dev eth0",
+            "ip link show",
+            "ip -s link show eth0",
+            "ip route",
+            "ip route show table all",
+            "ip route get 8.8.8.8",
+            "ip neigh show",
+            "ip rule list",
+            "/usr/sbin/ip -j addr",
+            "dpkg -l",
+            "dpkg -l openssh-server",
+            "dpkg -s openssh-server",
+            "dpkg -S /usr/sbin/sshd",
+            "dpkg-query -W openssh-server",
+            "rpm -q openssh-server",
+            "rpm -qa",
+            "rpm -qi openssh-server",
+            "rpm -qa --last",
+            "sshd -V",
+            "sshd -V 2>&1",
+            "dmesg -T 2>/dev/null",
+            "journalctl --no-pager -n 5 2> /dev/null",
+            "/usr/sbin/sshd -V",
+            "ssh -V",
+            "zcat /usr/share/doc/openssh-server/changelog.gz",
+            "zcat /var/log/syslog.2.gz | grep -i error | tail -n 5",
+        ];
+        for cmd in allowed {
+            exec.run(cmd).await.unwrap_or_else(|e| panic!("{cmd:?} must be allowed: {e}"));
+        }
+        assert_eq!(inner.calls(), allowed.len());
+    }
+
+    /// #504: the same binaries in any form that changes the host, reaches
+    /// another one, runs something or never ends.
+    #[tokio::test]
+    async fn guarded_binaries_are_refused_in_every_other_form() {
+        let (exec, inner) = gated();
+        for cmd in [
+            // systemctl: control, other hosts, unknown words.
+            "systemctl restart nginx",
+            "systemctl stop nginx",
+            "systemctl start nginx",
+            "systemctl enable nginx",
+            "systemctl disable --now nginx",
+            "systemctl mask nginx",
+            "systemctl daemon-reload",
+            "systemctl edit nginx",
+            "systemctl set-property nginx CPUWeight=1",
+            "systemctl kill nginx",
+            "systemctl isolate rescue.target",
+            "systemctl reboot",
+            "systemctl poweroff",
+            "systemctl -H root@other status nginx",
+            "systemctl --host=other status",
+            "systemctl -M box status",
+            "systemctl --root=/mnt status",
+            "systemctl nginx",
+            "systemctl --failed restart nginx",
+            "systemctl status nginx --now",
+            "systemctl stat nginx",
+            // journalctl: maintenance, follow, other journals.
+            "journalctl --rotate",
+            "journalctl --vacuum-time=1s",
+            "journalctl --vacuum-size=1M",
+            "journalctl --flush",
+            "journalctl --sync",
+            "journalctl --relinquish-var",
+            "journalctl --setup-keys",
+            "journalctl --update-catalog",
+            "journalctl -f",
+            "journalctl --follow",
+            "journalctl -D /mnt/journal",
+            "journalctl --file=/tmp/x.journal",
+            "journalctl --root=/mnt",
+            "journalctl -fu nginx",
+            "journalctl /dev/sda",
+            // dmesg: clearing, console level, follow.
+            "dmesg -C",
+            "dmesg --clear",
+            "dmesg -c",
+            "dmesg --read-clear",
+            "dmesg -n 1",
+            "dmesg --console-level=1",
+            "dmesg -D",
+            "dmesg -E",
+            "dmesg -w",
+            "dmesg -Tc",
+            "dmesg extra",
+            // ip: changes, abbreviations that mean `set`, batch, netns.
+            "ip",
+            "ip link set eth0 down",
+            "ip link s eth0 down",
+            "ip link se eth0 down",
+            "ip addr add 10.0.0.1/24 dev eth0",
+            "ip addr del 10.0.0.1/24 dev eth0",
+            "ip addr flush dev eth0",
+            "ip a f dev eth0",
+            "ip route add default via 10.0.0.1",
+            "ip route del default",
+            "ip route replace default via 10.0.0.1",
+            "ip route flush cache",
+            "ip neigh flush all",
+            "ip rule add from all lookup 1",
+            "ip -batch /tmp/cmds",
+            "ip -b /tmp/cmds",
+            "ip -force -batch /tmp/cmds",
+            "ip -n ns1 addr show",
+            "ip netns exec ns1 ls",
+            "ip netns list",
+            "ip tuntap add dev tun0 mode tun",
+            "ip monitor",
+            "ip addr show -batch /tmp/x",
+            // packages: anything but queries.
+            "dpkg -i /tmp/x.deb",
+            "dpkg --install /tmp/x.deb",
+            "dpkg -r openssh-server",
+            "dpkg -P openssh-server",
+            "dpkg --purge openssh-server",
+            "dpkg --configure -a",
+            "dpkg -l --root=/mnt",
+            "dpkg --force-all -l",
+            "dpkg openssh-server",
+            "dpkg-query --admindir=/tmp -l",
+            "rpm -i /tmp/x.rpm",
+            "rpm -U /tmp/x.rpm",
+            "rpm -e openssh-server",
+            "rpm -qp /tmp/x.rpm",
+            "rpm -q --pipe sh x",
+            "rpm -q -e openssh-server",
+            "rpm --all",
+            "rpm -q --root=/mnt x",
+            "rpm --eval x",
+            "rpm openssh-server",
+            // ssh/sshd: only the version.
+            "sshd",
+            "sshd -D",
+            "sshd -V -D",
+            "sshd -V 2>&1 -D",
+            "sshd -V > /tmp/x",
+            "sshd 2>&1",
+            "sshd -p 2222",
+            "sshd -t",
+            "ssh",
+            "ssh other-host",
+            "ssh -V other-host",
+            "ssh -V -o ProxyCommand=x other",
+            // zcat: no options.
+            "zcat -f /etc/passwd",
+            "zcat --force x",
+        ] {
+            assert_refused(&exec, &inner, cmd).await;
+        }
+    }
+
+    /// #504 review: a redirection glued to an argument does not hide it —
+    /// the shell runs `--rotate>/dev/null` as `--rotate`.
+    #[tokio::test]
+    async fn an_argument_glued_to_a_redirection_is_still_checked() {
+        let (exec, inner) = gated();
+        for cmd in [
+            "journalctl --rotate>/dev/null",
+            "journalctl --rotate> /dev/null",
+            "journalctl --rotate>/dev/null 2>&1",
+            "journalctl --vacuum-time=1s>/dev/null",
+            "dmesg -C>/dev/null",
+            "dmesg -c2>/dev/null",
+            "sshd -D>/dev/null",
+            "sshd -V -D2>&1",
+            "systemctl restart>/dev/null nginx",
+            "systemctl stop nginx>/dev/null",
+            "ip link set>/dev/null eth0 down",
+            "ip addr flush>/dev/null dev eth0",
+            "dpkg -P>/dev/null openssh-server",
+            "rpm -e>/dev/null openssh-server",
+            "zcat -f>/dev/null /etc/passwd",
+            "journalctl -b -1 --rotate",
+            "journalctl -b --rotate",
+            "journalctl -b -f",
+        ] {
+            assert_refused(&exec, &inner, cmd).await;
+        }
+        assert_eq!(without_redirections("-T 2>&1 >/dev/null -x".split_whitespace()), ["-T", "-x"]);
+        assert_eq!(without_redirections("a> /dev/null b 12>&1".split_whitespace()), ["a", "b"]);
+    }
+
+    /// #504: a guarded binary never slips through behind an allowed one.
+    #[tokio::test]
+    async fn a_guarded_form_is_checked_in_every_segment() {
+        let (exec, inner) = gated();
+        assert_refused(&exec, &inner, "systemctl --failed; systemctl restart nginx").await;
+        assert_refused(&exec, &inner, "ip a && ip link set eth0 down").await;
+        assert_refused(&exec, &inner, "ls | dmesg -C").await;
+        exec.run("systemctl --failed --no-pager | grep -c failed").await.unwrap();
+        assert_eq!(inner.calls(), 1);
+    }
+
+    #[test]
+    fn a_refusal_names_what_was_not_accepted() {
+        let err = check_read_only("systemctl restart nginx").unwrap_err();
+        assert!(err.contains("only allowed in its read-only forms"), "{err}");
+        assert!(err.contains("`restart`"), "{err}");
+        let err = check_read_only("ip link s eth0 down").unwrap_err();
+        assert!(err.contains("show, list or get"), "{err}");
+    }
+
+    /// No binary is both a plain reader and a guarded one: the plain list
+    /// would let every argument through.
+    #[test]
+    fn guarded_binaries_are_not_on_the_plain_allowlist() {
+        for form in GUARDED_FORMS {
+            assert!(!ALLOWED_COMMANDS.contains(&form.bin), "{}", form.bin);
+            for needed in form.needs_one_of {
+                assert!(form.flags.contains(needed), "{}: {needed} is not a flag", form.bin);
+            }
+        }
     }
 
     #[tokio::test]
