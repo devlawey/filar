@@ -11,6 +11,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- The F1 help overlay wraps long descriptions at word boundaries inside the
+  description column instead of breaking them mid-phrase and continuing at
+  the left edge; its scroll and row counter follow the wrapped rows
+  ([#500](https://github.com/devlawey/filar/issues/500)).
+
 ## [2.0.1] - 2026-10-07
 
 ### Fixed
