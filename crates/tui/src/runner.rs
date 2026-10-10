@@ -235,6 +235,13 @@ impl CwdWatch {
     }
 }
 
+/// Whether `a` and `b` are the same backend. Compared by address: a tab's
+/// terminal can be closed and opened again while a question to the old one
+/// is still on its way (#499 review).
+fn same_backend(a: &Arc<dyn InteractiveTerminal>, b: &Arc<dyn InteractiveTerminal>) -> bool {
+    std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
+}
+
 /// Whether input bytes on their way to the PTY contain an Enter.
 fn has_enter(bytes: &[u8]) -> bool {
     bytes.iter().any(|b| matches!(b, b'\r' | b'\n'))
@@ -879,9 +886,16 @@ async fn run_app(
 
     // Status-bar cwd of POSIX terminals (#499): when to ask each backend
     // where it is, and the answers on their way back.
-    let mut cwd_watches: HashMap<crate::app::SessionId, CwdWatch> = HashMap::new();
+    // Each watch and each answer names the backend it is about, so a
+    // terminal reopened in the same tab starts clean and never takes an
+    // answer meant for its predecessor.
+    let mut cwd_watches: HashMap<
+        crate::app::SessionId,
+        (Arc<dyn InteractiveTerminal>, CwdWatch),
+    > = HashMap::new();
     let (cwd_tx, mut cwd_rx) = tokio::sync::mpsc::unbounded_channel::<(
         crate::app::SessionId,
+        Arc<dyn InteractiveTerminal>,
         Option<filar_transport::ForegroundCwd>,
     )>();
     let mut cwd_watch_interval = tokio::time::interval(Duration::from_millis(100));
@@ -1205,10 +1219,15 @@ async fn run_app(
                         // a POSIX shell is asked once the command settles.
                         if has_enter(&bytes) && !term.reports_cwd_itself() {
                             let now = Instant::now();
-                            cwd_watches
-                                .entry(write_sid)
-                                .or_insert_with(|| CwdWatch::new(now))
-                                .note_enter(now);
+                            let fresh = cwd_watches
+                                .get(&write_sid)
+                                .is_none_or(|(of, _)| !same_backend(of, term));
+                            if fresh {
+                                cwd_watches.insert(write_sid, (term.clone(), CwdWatch::new(now)));
+                            }
+                            if let Some((_, watch)) = cwd_watches.get_mut(&write_sid) {
+                                watch.note_enter(now);
+                            }
                         }
                     }
                 }
@@ -1897,30 +1916,37 @@ async fn run_app(
 
             // Ask the terminals whose command has settled where they are
             // (#499). Gated on an armed watch, so an idle TUI keeps sleeping.
-            _ = cwd_watch_interval.tick(), if cwd_watches.values().any(|w| w.armed) => {
+            _ = cwd_watch_interval.tick(), if cwd_watches.values().any(|(_, w)| w.armed) => {
                 let now = Instant::now();
-                cwd_watches.retain(|sid, _| interactive_backends.contains_key(sid));
-                for (sid, watch) in cwd_watches.iter_mut() {
+                // A watch outlives neither its terminal nor its replacement.
+                cwd_watches.retain(|sid, (of, _)| {
+                    interactive_backends.get(sid).is_some_and(|(term, _)| same_backend(of, term))
+                });
+                for (sid, (term, watch)) in cwd_watches.iter_mut() {
                     if !watch.due(now) {
                         continue;
                     }
-                    let Some((term, _)) = interactive_backends.get(sid) else {
-                        continue;
-                    };
                     watch.asked(now);
                     let (term, tx, sid) = (term.clone(), cwd_tx.clone(), *sid);
                     tokio::spawn(async move {
-                        let _ = tx.send((sid, term.foreground_cwd().await));
+                        let answer = term.foreground_cwd().await;
+                        let _ = tx.send((sid, term, answer));
                     });
                 }
             }
 
-            Some((sid, answer)) = cwd_rx.recv() => {
-                if let Some(watch) = cwd_watches.get_mut(&sid) {
-                    watch.answered(answer.as_ref().map(|a| a.at_prompt));
-                }
-                // A backend replaced or closed meanwhile has no say.
-                if interactive_backends.contains_key(&sid) {
+            Some((sid, from, answer)) = cwd_rx.recv() => {
+                // Only the backend that was asked may answer: one closed or
+                // replaced meanwhile has no say over the tab's cwd.
+                let current = interactive_backends
+                    .get(&sid)
+                    .is_some_and(|(term, _)| same_backend(term, &from));
+                if current {
+                    if let Some((of, watch)) = cwd_watches.get_mut(&sid) {
+                        if same_backend(of, &from) {
+                            watch.answered(answer.as_ref().map(|a| a.at_prompt));
+                        }
+                    }
                     if let Some(answer) = answer {
                         needs_redraw |= apply_foreground_cwd(&mut app, sid, answer.path);
                     }
@@ -1953,7 +1979,7 @@ async fn run_app(
                 if let Some((sid, chunk)) = maybe_chunk {
                     let outcome = route_term_chunk(&mut app, sid, chunk);
                     if matches!(outcome, RouteOutcome::Fed) {
-                        if let Some(watch) = cwd_watches.get_mut(&sid) {
+                        if let Some((_, watch)) = cwd_watches.get_mut(&sid) {
                             watch.note_output(Instant::now());
                         }
                     }
@@ -3369,6 +3395,15 @@ mod tests {
         watch.answered(None);
         watch.note_output(t1 + Duration::from_secs(30));
         assert!(!watch.due(t1 + Duration::from_secs(60)));
+    }
+
+    /// #499 review: an answer is matched to the backend that was asked.
+    #[test]
+    fn backends_are_told_apart_by_identity() {
+        let (_a, a) = recording(false);
+        let (_b, b) = recording(false);
+        assert!(same_backend(&a, &a.clone()));
+        assert!(!same_backend(&a, &b));
     }
 
     #[test]
