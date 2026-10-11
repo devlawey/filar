@@ -10311,3 +10311,31 @@ iproute2 (в контейнере агента их нет — команды д
 **Контракты.** `CommandExecutor`/`LlmClient` без изменений. `ComparedValue`
 получил вариант `Text`; добавлены `MAX_SHOWN_LINES`, `MAX_SHOWN_BYTES`,
 `MAX_SHOWN_LINE_CHARS`.
+
+## Релиз 2.0.2 (2026-10-11)
+
+**Входит:** read-only формы диагностических утилит во флоте (#504), короткие
+значения в сводке флота агенту (#505), перенос описаний в оверлее F1 (#500),
+подсказка и заголовок панели fleet summary (#503), группы из лаунчера в той же
+сессии (#501), каталог в статус-баре за `cd` в POSIX-терминале (#499),
+однострочная заглушка для бинарного вывода во флоте (#502). Полный список —
+CHANGELOG `[2.0.2]`.
+
+**Preflight:** build/test на `main` (91da108) зелёные — 1487 passed, 0 failed,
+10 ignored (docker-sshd); открытых issue, относящихся к релизу, нет (вне
+милстоунов только #80 — трекинг code-sign); теги `v2.0.2` и `engine-v2.0.2`
+свободны; `release.yml` собирает Windows + macOS. Движок менялся: для
+embedders добавление варианта `ComparedValue::Text` (#505) ломает
+исчерпывающие матчи по enum; аддитивно — `InteractiveTerminal::foreground_cwd`
+(#499, реализация по умолчанию `None`) и `fleet_view::looks_binary` (#502);
+`CommandExecutor`/`LlmClient` без изменений. `engine-v2.0.2` на том же
+коммите; примеры зависимостей и секция «Upgrading to engine-v2.0.2»
+в `docs/ENGINE_API.md` обновлены. Ручной SMOKE Win + Mac — за мейнтейнером
+(`docs/SMOKE.md`, #298).
+
+**Контракты.** `CommandExecutor`/`LlmClient` без изменений; дополнения —
+`InteractiveTerminal::foreground_cwd` (реализация по умолчанию `None`) и
+экспорты `ForegroundCwd`, `PTY_CWD_COMMAND`, `parse_pty_cwd_reply`,
+`usable_proc_cwd` (#499), `fleet_view::looks_binary` (#502), вариант
+`ComparedValue::Text` (#505) с `MAX_SHOWN_LINES`/`MAX_SHOWN_BYTES`/
+`MAX_SHOWN_LINE_CHARS`.

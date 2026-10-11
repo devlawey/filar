@@ -27,22 +27,22 @@ working example.
 Bots and mobile apps that only need SSH should disable default features:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.1", default-features = false }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.2", default-features = false }
 ```
 
 Desktop apps (TUI/GUI) should keep `local` enabled:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.1" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.2" }
 ```
 
 ## Cargo.toml example
 
 ```toml
 [dependencies]
-filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.1" }
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.1", default-features = false }
-filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.1" }
+filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.2" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.2", default-features = false }
+filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.2" }
 
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"
@@ -504,6 +504,13 @@ Register your own preprocessors with `register()`; claimants are consulted
 in registration order and the first that claims the command and parses its
 output wins. The built-in set (`with_builtins()`, the `Default`) is
 registered first.
+
+## Upgrading to `engine-v2.0.2`
+
+| Change | Breaks | What to do |
+|--------|--------|------------|
+| `ComparedValue::Text` added (#505) | Exhaustive matches on `ComparedValue` | Handle the variant: a short plain-text answer (up to 10 lines / 1 KB) of a raw-text check, shown to the agent line by line |
+| `InteractiveTerminal::foreground_cwd` (#499), `fleet_view::looks_binary` (#502) added | Nothing — additive | `foreground_cwd` defaults to `None`; override where the terminal can report the foreground process's directory |
 
 ## Upgrading to `engine-v2.0.0`
 
