@@ -167,6 +167,23 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
                     line = line.style(Style::default().add_modifier(Modifier::REVERSED));
                 }
                 body.push(line);
+                // Why it failed (#513): the exit code and the first line the
+                // command printed, under the host — sanitised like a sample.
+                let code = host.exit_code.map(|c| format!("exit {c}"));
+                let reason = host
+                    .reason
+                    .as_deref()
+                    .map(|r| sanitize_output(r).replace('\t', " "))
+                    .filter(|r| !r.trim().is_empty());
+                let detail = match (code, reason) {
+                    (Some(c), Some(r)) => Some(format!("{c}: {r}")),
+                    (Some(c), None) => Some(c),
+                    (None, Some(r)) => Some(r),
+                    (None, None) => None,
+                };
+                if let Some(detail) = detail {
+                    body.push(Line::from(Span::styled(fit(&format!("   {detail}"), width), app.theme.dim())));
+                }
             }
         }
     }
@@ -700,5 +717,23 @@ mod tests {
         for piece in ["operation #9:", "3 of 5 hosts answered", "1 did not answer", "1 n/a"] {
             assert!(joined.contains(piece), "{piece:?} is missing:\n{text}");
         }
+    }
+
+    /// #513: a host that failed shows why, under its name.
+    #[test]
+    fn a_failed_host_shows_its_exit_code_and_first_line() {
+        use filar_agent::fleet_result::HostState;
+        let mut view = crate::app::test_fleet_view();
+        view.dropped.push(filar_agent::fleet_view::ViewDropped {
+            host: "sim1".into(),
+            state: HostState::ExecutionError,
+            exit_code: Some(127),
+            reason: Some("bash: ip: \u{1b}[31mcommand not found".into()),
+        });
+        let app = crate::app::test_fleet_app(view);
+        let text = render(&app, 54, 30, Glyphs::detect());
+        assert!(text.contains("sim1"), "{text}");
+        assert!(text.contains("exit 127: bash: ip: command not found"), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
     }
 }

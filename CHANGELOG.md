@@ -18,6 +18,15 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   `file '--compile'` is still refused); double quotes, `$`, `\` and globs
   are still refused ([#515](https://github.com/devlawey/filar/issues/515)).
 
+### Fixed
+
+- A fleet host whose command failed shows its exit code instead of a bare
+  "error", in the summary panel together with the first line of the error.
+  The agent gets that line too when it can be quoted like a short answer
+  (an ad-hoc command, a short plain line); otherwise the exit code alone.
+  Hosts that failed the same way are grouped
+  ([#513](https://github.com/devlawey/filar/issues/513)).
+
 ## [2.0.2] - 2026-10-11
 
 ### Added
