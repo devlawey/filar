@@ -18,6 +18,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   `file '--compile'` is still refused); double quotes, `$`, `\` and globs
   are still refused ([#515](https://github.com/devlawey/filar/issues/515)).
 
+- `nproc`, `lsmod` and `getconf` run in read-only (fleet) sessions
+  ([#516](https://github.com/devlawey/filar/issues/516)).
+
 ### Fixed
 
 - A fleet host whose command failed shows its exit code instead of a bare
