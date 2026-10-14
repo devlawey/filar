@@ -138,7 +138,12 @@ fn verify_host_key(
     fingerprint: &str,
     policy: HostKeyPolicy,
 ) -> bool {
-    let _guard = KNOWN_HOSTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = KNOWN_HOSTS_LOCK.lock().unwrap_or_else(|poisoned| {
+        // A panic while holding the lock may have left a partial entry; the
+        // parser below reports it as a damaged line, so carry on and say so.
+        warn!("known_hosts lock was poisoned by a panic; the file may hold a partial entry");
+        poisoned.into_inner()
+    });
     let known = match parse_known_hosts(known_hosts) {
         Ok(known) => known,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => KnownHosts::default(),
