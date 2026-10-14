@@ -10466,3 +10466,25 @@ MSRV проекта 1.85, внешний крейт ради этого не т�
 **Не проверено.** Windows вживую.
 
 **Контракты.** Без изменений.
+
+## Релиз 2.0.3 (2026-10-15)
+
+**Входит:** причина ошибки хоста во флоте (#513), промпт флота — Ctrl+O,
+кавычки, причины ошибок (#514), одинарные кавычки в read-only командах (#515),
+`nproc`/`lsmod`/`getconf` в белом списке (#516), гонка записи `known_hosts`
+(#521). Полный список — CHANGELOG `[2.0.3]`.
+
+**Preflight:** build/test на `main` (470c116) зелёные — 1502 passed, 0 failed,
+10 ignored (docker-sshd); открытых issue, относящихся к релизу, нет (вне
+милстоунов только #80 — трекинг code-sign); теги `v2.0.3` и `engine-v2.0.3`
+свободны; `release.yml` собирает Windows + macOS. Движок менялся: для
+embedders добавление полей `exit_code`/`reason` в `ViewDropped` (#513) ломает
+struct-литералы; аддитивно — `fleet_fold::Failure` и методы
+`DroppedHost::failure()`/`handle()`; `CommandExecutor`/`LlmClient` без
+изменений. `engine-v2.0.3` на том же коммите; примеры зависимостей и секция
+«Upgrading to engine-v2.0.3» в `docs/ENGINE_API.md` обновлены. Ручной SMOKE
+Win + Mac — за мейнтейнером (`docs/SMOKE.md`, #298).
+
+**Контракты.** `CommandExecutor`/`LlmClient` без изменений; дополнения —
+`ViewDropped::exit_code`/`reason` (#513), `fleet_fold::Failure`,
+`DroppedHost::failure()`/`handle()` (#513).

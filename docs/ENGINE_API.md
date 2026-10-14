@@ -27,22 +27,22 @@ working example.
 Bots and mobile apps that only need SSH should disable default features:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.2", default-features = false }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.3", default-features = false }
 ```
 
 Desktop apps (TUI/GUI) should keep `local` enabled:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.2" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.3" }
 ```
 
 ## Cargo.toml example
 
 ```toml
 [dependencies]
-filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.2" }
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.2", default-features = false }
-filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.2" }
+filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.3" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.3", default-features = false }
+filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.3" }
 
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"
@@ -504,6 +504,13 @@ Register your own preprocessors with `register()`; claimants are consulted
 in registration order and the first that claims the command and parses its
 output wins. The built-in set (`with_builtins()`, the `Default`) is
 registered first.
+
+## Upgrading to `engine-v2.0.3`
+
+| Change | Breaks | What to do |
+|--------|--------|------------|
+| `ViewDropped::exit_code` and `ViewDropped::reason` added (#513) | Struct literals constructing `ViewDropped` | `exit_code: None, reason: None` where you build one by hand; reading an existing value is unaffected |
+| `fleet_fold::Failure` and `DroppedHost::failure()`/`handle()` added (#513) | Nothing — additive | Opt in to show a failed host's exit code and first error line |
 
 ## Upgrading to `engine-v2.0.2`
 
