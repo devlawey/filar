@@ -10361,5 +10361,7 @@ embedders добавление варианта `ComparedValue::Text` (#505) л�
 
 **Не проверено.** Windows-консоль вживую.
 
-**Контракты.** Без изменений; в `DroppedHost` добавлен `failure()`, в
+**Контракты.** `CommandExecutor`/`LlmClient` без изменений. В `DroppedHost` добавлены
+`failure()` и `handle()` (панель находит результат хоста по handle — имена
+могут повторяться), в
 `ViewDropped` — поля `exit_code`, `reason`.
