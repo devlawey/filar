@@ -48,6 +48,10 @@ read-only allowlist is refused before it reaches any host. Besides plain readers
 only, with subcommands and options spelled in full: systemctl status, is-active, \
 is-enabled, list-units, show, cat and --failed; journalctl (no -f); dmesg; \
 ip <object> show (ip a, ip route); dpkg -l / -s; rpm -q; sshd -V 2>&1 (it prints to stderr); zcat. \
+Quoting: single quotes work for a whole word ('^ID=|^NAME=', 'Time zone'); a quote \
+glued to other text, a backslash inside quotes, and double quotes are refused, and \
+so are $, backslash, *, ?, [ ], { } and backticks outside quotes — write commands \
+without them. \
 The result is a summary \
 of which hosts answered and which agree with each other. A short plain-text answer \
 (a hostname, a version, a few lines) is quoted in it after `|`; a longer or binary \
@@ -57,10 +61,15 @@ shown — a digest says only whether hosts agree; say that the user can read the
 output itself in the side panel (Ctrl+J). Values that naturally differ between \
 machines or moments (uptime, load average, free memory, timestamps, PIDs, \
 hostnames) are expected to differ: do not report that as a problem. \
+A host whose command failed is listed with its exit code and, when it can be \
+quoted, the first line of the error: base what you say about a failure on those, \
+and if neither is shown, say that the cause is not visible rather than guessing it. \
+Containers share the kernel of the machine they run on, so `uname` names that \
+machine's kernel; judge the platform from the other answers as well. \
 read_file, list_dir and background jobs work on one host and are not available, \
 and so are secrets from Ctrl+P and sudo. These FLEET rules take precedence over \
 anything above about a single host or a persistent shell. \
-If one host needs a closer look, ask the user to open it in its own tab.";
+If one host needs a closer look, ask the user to open it in its own tab with Ctrl+O.";
 
 /// How long a cancelled fleet command may take to wind down and hand back
 /// its partial result (#437). Each host's interruption is already bounded
@@ -2098,6 +2107,24 @@ mod tests {
         let prompt = &requests[0].messages[0].content;
         assert!(prompt.contains("Only run_command is available"), "{prompt}");
         assert!(prompt.contains("read_file, list_dir and background jobs"), "{prompt}");
+    }
+
+    /// #514: the fleet prompt names the key that opens a host, the quoting
+    /// the gate accepts, and how to speak about a failed host.
+    #[test]
+    fn the_fleet_prompt_matches_the_gate_and_the_ui() {
+        assert!(FLEET_PROMPT.contains("own tab with Ctrl+O"), "{FLEET_PROMPT}");
+        assert!(!FLEET_PROMPT.contains("Ctrl+J →"), "{FLEET_PROMPT}");
+        assert!(FLEET_PROMPT.contains("single quotes work for a whole word"), "{FLEET_PROMPT}");
+        assert!(FLEET_PROMPT.contains("the cause is not visible"), "{FLEET_PROMPT}");
+        // The quoting examples it gives really pass the gate, and the
+        // spellings it warns about really are refused.
+        for ok in ["grep -E '^ID=|^NAME=' /etc/os-release", "grep 'Time zone' /etc/timezone"] {
+            assert!(filar_transport::readonly::check_read_only(ok).is_ok(), "{ok}");
+        }
+        for bad in ["grep \"x\" f", "ls --a'b'", "ls 'a\\b'", "ls $HOME", "ls *", "ls `x`"] {
+            assert!(filar_transport::readonly::check_read_only(bad).is_err(), "{bad}");
+        }
     }
 
     #[tokio::test]

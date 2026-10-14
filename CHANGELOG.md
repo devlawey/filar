@@ -11,6 +11,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- The fleet agent is told how to open one host (`Ctrl+O`, not `Ctrl+J`),
+  which quoting the read-only gate accepts, to explain a failed host only by
+  its exit code and error line, and that a container's `uname` names the
+  machine it runs on ([#514](https://github.com/devlawey/filar/issues/514)).
+
 ### Added
 
 - Read-only fleet commands accept single quotes: a quoted word is checked as
