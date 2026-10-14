@@ -74,6 +74,12 @@ pub struct ViewDropped {
     /// Why: no contact, timed out, not applicable, skipped, cancelled, or
     /// an execution error.
     pub state: HostState,
+    /// For an execution error (#513): the exit code, when there is one.
+    pub exit_code: Option<i32>,
+    /// For an execution error (#513): the first non-empty line it printed —
+    /// stderr, else stdout — as the host printed it; the panel sanitises it.
+    /// Unlike the model's copy it is not limited to a short quote.
+    pub reason: Option<String>,
 }
 
 /// The person-facing aggregate of one fleet operation.
@@ -148,9 +154,25 @@ impl FleetView {
         let dropped = table
             .dropped()
             .iter()
-            .map(|d| ViewDropped {
-                host: d.host().to_string(),
-                state: d.state(),
+            .map(|d| {
+                let failed = op
+                    .handles()
+                    .zip(op.members())
+                    .find(|(_, m)| m.name() == d.host())
+                    .and_then(|(h, _)| report.run_for(h))
+                    .and_then(|run| match run {
+                        HostRun::Answered(result) if d.state() == HostState::ExecutionError => Some(result),
+                        _ => None,
+                    });
+                let first = |text: &str| {
+                    text.lines().map(str::trim).find(|l| !l.is_empty()).map(clamp)
+                };
+                ViewDropped {
+                    host: d.host().to_string(),
+                    state: d.state(),
+                    exit_code: failed.and_then(|r| r.exit_code),
+                    reason: failed.and_then(|r| first(&r.stderr).or_else(|| first(&r.stdout))),
+                }
             })
             .collect();
         Self {

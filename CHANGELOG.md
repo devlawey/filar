@@ -11,6 +11,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- A fleet host whose command failed shows its exit code and the first line
+  of the error — to the agent (grouped by identical failure, quoted like a
+  short answer) and in the summary panel — instead of a bare "error"
+  ([#513](https://github.com/devlawey/filar/issues/513)).
+
 ## [2.0.2] - 2026-10-11
 
 ### Added
