@@ -5509,8 +5509,8 @@ pub(crate) fn test_fleet_view() -> filar_agent::fleet_view::FleetView {
             },
         ],
         dropped: vec![
-            ViewDropped { host: "db-1".into(), state: HostState::NoContact },
-            ViewDropped { host: "win-1".into(), state: HostState::NotApplicable },
+            ViewDropped { host: "db-1".into(), state: HostState::NoContact, exit_code: None, reason: None },
+            ViewDropped { host: "win-1".into(), state: HostState::NotApplicable, exit_code: None, reason: None },
         ],
     }
 }
@@ -13196,10 +13196,10 @@ mod tests {
                 },
             ],
             dropped: vec![
-                ViewDropped { host: "db-1".into(), state: HostState::NoContact },
-                ViewDropped { host: "win-1".into(), state: HostState::NotApplicable },
-                ViewDropped { host: "app-1".into(), state: HostState::Skipped },
-                ViewDropped { host: "app-2".into(), state: HostState::Cancelled },
+                ViewDropped { host: "db-1".into(), state: HostState::NoContact, exit_code: None, reason: None },
+                ViewDropped { host: "win-1".into(), state: HostState::NotApplicable, exit_code: None, reason: None },
+                ViewDropped { host: "app-1".into(), state: HostState::Skipped, exit_code: None, reason: None },
+                ViewDropped { host: "app-2".into(), state: HostState::Cancelled, exit_code: None, reason: None },
             ],
         };
 

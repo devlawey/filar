@@ -81,7 +81,15 @@ pub enum FleetGate {
 /// else → [`FleetGate::Refuse`]: the per-host approval path exists in the
 /// model and is closed, so no approval, however given, lets it through.
 pub fn fleet_gate(command: &str) -> FleetGate {
-    match check_read_only(command) {
+    // A Ctrl+P secret was typed for one host (#436). `$` used to keep it
+    // out on its own, but inside single quotes `$` is literal since #515,
+    // so the placeholder is refused by name.
+    let checked = if command.contains("$FILAR_SECRET") {
+        Err("Ctrl+P secrets ($FILAR_SECRET_N) are not available in a fleet".to_string())
+    } else {
+        check_read_only(command)
+    };
+    match checked {
         Ok(()) => FleetGate::Ask(ApprovalScope::Once),
         Err(reason) => FleetGate::Refuse(format!(
             "Error: the fleet is read-only, so this command runs on no host: {reason}. \
@@ -136,5 +144,16 @@ mod tests {
         let hosts = vec!["web-1".to_string(), "web-2".to_string()];
         assert_eq!(radius_line(&hosts), "on 2 hosts: web-1, web-2");
         assert_eq!(radius_line(&hosts[..1]), "on 1 host: web-1");
+    }
+
+    #[test]
+    fn a_secret_placeholder_is_refused_even_in_single_quotes() {
+        for cmd in ["grep -c '$FILAR_SECRET_1' /etc/hostname", "echo '$FILAR_SECRET_12'"] {
+            let FleetGate::Refuse(text) = fleet_gate(cmd) else {
+                panic!("{cmd} must be refused");
+            };
+            assert!(text.contains("Ctrl+P secrets"), "{text}");
+        }
+        assert_eq!(fleet_gate("grep -c 'x' /etc/hostname"), FleetGate::Ask(ApprovalScope::Once));
     }
 }

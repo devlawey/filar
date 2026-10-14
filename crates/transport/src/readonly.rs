@@ -10,6 +10,12 @@
 //! background execution — and no output redirection to anything but
 //! `/dev/null` or a bare file descriptor.
 //!
+//! Single quotes are the one quoting the gate understands (#515): inside
+//! `'…'` the shell changes nothing, so a quoted word is unquoted here and
+//! checked as the argument it will be (`file '--compile'` is refused like
+//! `file --compile`); a quote glued to other text, an unclosed one, and a
+//! backslash or line break inside one are refused.
+//!
 //! The gate validates *literal text only*: characters the remote shell
 //! would re-lex or expand are refused outright, because these checks see
 //! the command **before** the host shell does — `$X`, `${X}`, `$'…'`
@@ -111,6 +117,14 @@ pub fn check_read_only(command: &str) -> std::result::Result<(), String> {
     if cmd.is_empty() {
         return Err("empty command".into());
     }
+    if cmd.contains('\0') {
+        return Err("a NUL character is not allowed".into());
+    }
+    // Single-quoted words become placeholders (#515): what is inside is
+    // literal to the host shell, so it is checked as the argument it will
+    // be, and every check below sees only the text outside quotes.
+    let (skeleton, quoted) = lift_single_quotes(cmd)?;
+    let cmd = skeleton.as_str();
 
     // Substitution constructs can hide anything — refuse outright, before
     // any segmentation, and never try to interpret what is inside.
@@ -135,7 +149,7 @@ pub fn check_read_only(command: &str) -> std::result::Result<(), String> {
             continue;
         }
         segments_checked += 1;
-        check_segment(segment)?;
+        check_segment(segment, &quoted)?;
     }
     if segments_checked == 0 {
         return Err("empty command".into());
@@ -149,7 +163,7 @@ pub fn check_read_only(command: &str) -> std::result::Result<(), String> {
 /// can still turn a checked argument into a write flag. `~` is not listed —
 /// tilde expansion yields a path, never a flag.
 fn check_reinterpretable_characters(cmd: &str) -> std::result::Result<(), String> {
-    for c in ['$', '\\', '\'', '"', '{', '}', '*', '?', '[', ']'] {
+    for c in ['$', '\\', '"', '{', '}', '*', '?', '[', ']'] {
         if cmd.contains(c) {
             return Err(format!(
                 "shell metacharacter `{c}` is not allowed in read-only commands (literal text only)"
@@ -246,14 +260,17 @@ fn check_redirections(cmd: &str) -> std::result::Result<(), String> {
 
 /// Validate one simple command segment: its first token must be an
 /// allowlisted binary, and its arguments must not carry a write/execute flag.
-fn check_segment(segment: &str) -> std::result::Result<(), String> {
-    let token = segment
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| "empty command".to_string())?;
-    let base = strip_bin_prefix(token);
+fn check_segment(segment: &str, quoted: &[String]) -> std::result::Result<(), String> {
+    let skeleton: Vec<&str> = segment.split_whitespace().collect();
+    let resolve = |token: &str| unquote(token, quoted);
+    let token = resolve(skeleton.first().ok_or_else(|| "empty command".to_string())?)?;
+    let base = strip_bin_prefix(&token);
     if let Some(form) = GUARDED_FORMS.iter().find(|f| f.bin == base) {
-        let args = without_redirections(segment.split_whitespace().skip(1));
+        let args = without_redirections(skeleton[1..].iter().copied())
+            .into_iter()
+            .map(resolve)
+            .collect::<std::result::Result<Vec<String>, String>>()?;
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         return check_form(form, &args).map_err(|why| {
             format!("\"{base}\" is only allowed in its read-only forms: {why}")
         });
@@ -261,16 +278,70 @@ fn check_segment(segment: &str) -> std::result::Result<(), String> {
     if !ALLOWED_COMMANDS.contains(&base) {
         return Err(format!("\"{token}\" is not in the read-only allowlist"));
     }
+    let args = skeleton[1..]
+        .iter()
+        .map(|t| resolve(t))
+        .collect::<std::result::Result<Vec<String>, String>>()?;
     if let Some((_, long_opts, short_chars)) =
         FORBIDDEN_ARGS.iter().find(|(bin, _, _)| *bin == base)
     {
-        for arg in segment.split_whitespace().skip(1) {
+        for arg in &args {
             if let Some(bad) = forbidden_flag(arg, long_opts, short_chars) {
                 return Err(format!("\"{base} {bad}\" is not read-only"));
             }
         }
     }
     Ok(())
+}
+
+/// Replace every single-quoted word of `cmd` with a placeholder and return
+/// the rewritten command and the words, unquoted (#515).
+///
+/// Inside `'…'` a POSIX shell does nothing at all — no expansion, no
+/// escapes, no splitting — so the content is exactly the argument the
+/// binary receives, and the checks can look at it as such: `file '--compile'`
+/// is still `file --compile`. Refused, fail-closed: an unclosed quote, and
+/// a backslash or a line break inside quotes (fish treats `\'` and `\\`
+/// inside single quotes as escapes; a line break would end a command on
+/// the host). A placeholder is `NUL index NUL`; NUL never appears in a
+/// command that gets this far.
+fn lift_single_quotes(cmd: &str) -> std::result::Result<(String, Vec<String>), String> {
+    let mut skeleton = String::with_capacity(cmd.len());
+    let mut quoted = Vec::new();
+    let mut rest = cmd;
+    while let Some(open) = rest.find('\'') {
+        skeleton.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = after.find('\'').ok_or_else(|| "unclosed single quote".to_string())?;
+        let content = &after[..close];
+        if content.contains(['\\', '\n', '\r']) {
+            return Err("a backslash or a line break inside quotes is not allowed".into());
+        }
+        skeleton.push_str(&format!("\0{}\0", quoted.len()));
+        quoted.push(content.to_string());
+        rest = &after[close + 1..];
+    }
+    skeleton.push_str(rest);
+    Ok((skeleton, quoted))
+}
+
+/// A token of the rewritten command as the argument the host will see: a
+/// placeholder becomes its quoted word, any other token stays as it is.
+/// A quote glued to other text (`--comp'ile'`, `'a''b'`) is refused — it
+/// would be one argument assembled from pieces, which is exactly what the
+/// checks must not have to reason about.
+fn unquote(token: &str, quoted: &[String]) -> std::result::Result<String, String> {
+    if !token.contains('\0') {
+        return Ok(token.to_string());
+    }
+    token
+        .strip_prefix('\0')
+        .and_then(|t| t.strip_suffix('\0'))
+        .filter(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|index| index.parse::<usize>().ok())
+        .and_then(|index| quoted.get(index))
+        .cloned()
+        .ok_or_else(|| "a quoted word must stand on its own, not glued to other text".to_string())
 }
 
 /// Detect a write/execute flag in one argument of a guarded binary, in the
@@ -1067,6 +1138,85 @@ mod tests {
         }
     }
 
+    /// #515: single quotes are understood, and only single quotes.
+    #[tokio::test]
+    async fn single_quoted_words_are_checked_as_the_arguments_they_are() {
+        let (exec, inner) = gated();
+        let allowed = [
+            "grep -E '^PRETTY_NAME=|^VERSION_ID=|^ID=' /etc/os-release",
+            "cat /etc/timezone 2>/dev/null || echo 'no /etc/timezone'",
+            "uptime | grep 'load average'",
+            "grep -c '' /etc/passwd",
+            "ls '/var/log' | wc -l",
+            "echo 'a;b|c&d>e<f $HOME `x` $(y) * ? [z] {w} \"q\"'",
+            "'cat' /etc/hostname",
+            "/usr/bin/grep 'x' /etc/hosts",
+            "systemctl 'status' nginx",
+            "journalctl -u 'nginx' --no-pager",
+        ];
+        for cmd in allowed {
+            exec.run(cmd).await.unwrap_or_else(|e| panic!("{cmd:?} must be allowed: {e}"));
+        }
+        assert_eq!(inner.calls(), allowed.len());
+    }
+
+    #[tokio::test]
+    async fn quotes_cannot_smuggle_a_write_or_another_command() {
+        let (exec, inner) = gated();
+        for cmd in [
+            // The quoted word is the argument: flags stay flags.
+            "file '--compile' x",
+            "sort '-o' /tmp/x",
+            "sort -k1 '-o/tmp/x' f",
+            "sort '--out=/tmp/x' f",
+            "date '-s' 2020-01-01",
+            "'rm' -rf /tmp/x",
+            "'/bin/rm' x",
+            "'systemctl' restart nginx",
+            "systemctl 'restart' nginx",
+            "ip link 'set' eth0 down",
+            "journalctl '--rotate'",
+            "dmesg '-C'",
+            "zcat '-f' /etc/passwd",
+            "sshd '-D'",
+            // Glued, unclosed, escapes, line breaks.
+            "file --comp'ile' x",
+            "file '--comp''ile' x",
+            "sort -'o' x",
+            "ls x'y'",
+            "ls 'a",
+            "ls 'a\\'",
+            "ls 'a\nrm -rf /tmp/x'",
+            "ls 'a\rb'",
+            // Other quoting and expansion are still refused outside quotes.
+            "ls \"x\"",
+            "ls 'a' \"b\"",
+            "file $'--compile'",
+            "ls 'a' $HOME",
+            // Separators outside quotes still separate.
+            "ls 'a'; rm -rf /tmp/x",
+            "ls 'a' | 'rm' x",
+            // Redirections to a quoted target are not /dev/null.
+            "cat /etc/passwd > '/tmp/x'",
+            "cat /etc/passwd >'/dev/null'",
+            // A forged placeholder.
+            "ls \u{0}0\u{0}",
+        ] {
+            assert_refused(&exec, &inner, cmd).await;
+        }
+    }
+
+    #[test]
+    fn quoted_words_become_placeholders() {
+        let (skeleton, quoted) = lift_single_quotes("grep -E '^a|b' f || echo 'x y'").unwrap();
+        assert_eq!(skeleton, "grep -E \u{0}0\u{0} f || echo \u{0}1\u{0}");
+        assert_eq!(quoted, ["^a|b", "x y"]);
+        assert_eq!(unquote("\u{0}1\u{0}", &quoted).unwrap(), "x y");
+        assert!(unquote("x\u{0}0\u{0}", &quoted).is_err());
+        assert!(unquote("\u{0}9\u{0}", &quoted).is_err());
+        assert!(lift_single_quotes("a 'b").is_err());
+    }
+
     /// #516: CPU count, loaded modules, system limits.
     #[tokio::test]
     async fn system_facts_are_read_only() {
@@ -1235,13 +1385,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quotes_are_refused_outright() {
+    async fn double_quotes_are_refused_outright() {
         let (exec, inner) = gated();
-        // Quotes are refused by the metacharacter rule (quote removal could
-        // change an argument), and a quoted separator would additionally be
-        // split like a real one — over-strict by design either way.
+        // Double quotes still are: `$`, `` ` `` and `\` keep their meaning
+        // inside them. Single quotes are understood since #515 — a quoted
+        // separator is literal there, not split.
         assert_refused(&exec, &inner, "grep \"a;b\" file").await;
-        assert_refused(&exec, &inner, "echo 'a|b'").await;
+        exec.run("echo 'a|b'").await.unwrap();
+        assert_eq!(inner.calls(), 1);
     }
 
     #[tokio::test]
