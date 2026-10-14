@@ -114,71 +114,91 @@ impl client::Handler for SshHandler {
         server_public_key: &ssh_key::PublicKey,
     ) -> std::result::Result<bool, Self::Error> {
         let fingerprint = server_public_key.fingerprint(ssh_key::HashAlg::Sha256);
-        let fp_str = fingerprint.to_string();
         let host_port = format!("{}:{}", self.host, self.port);
+        Ok(verify_host_key(
+            &self.known_hosts_path,
+            &host_port,
+            &fingerprint.to_string(),
+            self.policy,
+        ))
+    }
+}
 
-        let entries = match parse_known_hosts(&self.known_hosts_path) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(e) => {
+/// Serialises "read known_hosts → compare → append" within the process
+/// (#521): a fleet connects to several hosts at once, and two first
+/// connections must neither interleave their writes nor both be trusted
+/// with different keys for one host.
+static KNOWN_HOSTS_LOCK: StdMutex<()> = StdMutex::new(());
+
+/// Decide whether `fingerprint` is accepted for `host_port` under `policy`,
+/// recording it under TOFU. Fails closed on every doubt.
+fn verify_host_key(
+    known_hosts: &Path,
+    host_port: &str,
+    fingerprint: &str,
+    policy: HostKeyPolicy,
+) -> bool {
+    let _guard = KNOWN_HOSTS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let known = match parse_known_hosts(known_hosts) {
+        Ok(known) => known,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => KnownHosts::default(),
+        Err(e) => {
+            warn!(host = %host_port, error = %e, "failed to read known_hosts, rejecting host key");
+            return false;
+        }
+    };
+    match check_host_key(&known.entries, host_port, fingerprint) {
+        HostKeyCheck::Match => {
+            debug!(host = %host_port, "host key verified (matches known_hosts)");
+            if !known.damaged.is_empty() {
+                warn!(
+                    path = %known_hosts.display(),
+                    lines = ?known.damaged,
+                    "known_hosts has damaged lines; fix or remove them"
+                );
+            }
+            true
+        }
+        HostKeyCheck::Mismatch => {
+            warn!(host = %host_port, "HOST KEY MISMATCH — possible MITM, rejecting");
+            false
+        }
+        HostKeyCheck::New => match policy {
+            HostKeyPolicy::Strict => {
+                warn!(host = %host_port, "unknown host key (strict mode — rejecting)");
+                false
+            }
+            // A damaged line may be this host's entry, unreadable: trusting
+            // the key as a first sight would turn TOFU into "accept any".
+            HostKeyPolicy::Tofu if !known.damaged.is_empty() => {
                 warn!(
                     host = %host_port,
-                    error = %e,
-                    "failed to read known_hosts, rejecting host key"
+                    path = %known_hosts.display(),
+                    lines = ?known.damaged,
+                    "not trusting a new host key while known_hosts has damaged lines; \
+                     fix or remove those lines and connect again"
                 );
-                return Ok(false);
+                false
             }
-        };
-
-        match check_host_key(&entries, &host_port, &fp_str) {
-            HostKeyCheck::Match => {
-                debug!(host = %host_port, "host key verified (matches known_hosts)");
-                Ok(true)
-            }
-            HostKeyCheck::Mismatch => {
-                warn!(
-                    host = %host_port,
-                    "HOST KEY MISMATCH — possible MITM, rejecting"
-                );
-                Ok(false)
-            }
-            HostKeyCheck::New => match self.policy {
-                HostKeyPolicy::Strict => {
+            HostKeyPolicy::Tofu => match append_known_hosts_entry(known_hosts, host_port, fingerprint) {
+                Ok(()) => {
+                    info!(host = %host_port, "host key added (TOFU)");
+                    true
+                }
+                Err(e) => {
                     warn!(
                         host = %host_port,
-                        "unknown host key (strict mode — rejecting)"
+                        error = %e,
+                        "failed to write known_hosts entry, rejecting host key"
                     );
-                    Ok(false)
-                }
-                HostKeyPolicy::Tofu => {
-                    match append_known_hosts_entry(
-                        &self.known_hosts_path,
-                        &host_port,
-                        &fp_str,
-                    ) {
-                        Ok(()) => {
-                            info!(host = %host_port, "host key added (TOFU)");
-                            Ok(true)
-                        }
-                        Err(e) => {
-                            warn!(
-                                host = %host_port,
-                                error = %e,
-                                "failed to write known_hosts entry, rejecting host key"
-                            );
-                            Ok(false)
-                        }
-                    }
-                }
-                HostKeyPolicy::AcceptNew => {
-                    info!(
-                        host = %host_port,
-                        "host key accepted (accept-new, not recorded)"
-                    );
-                    Ok(true)
+                    false
                 }
             },
-        }
+            HostKeyPolicy::AcceptNew => {
+                info!(host = %host_port, "host key accepted (accept-new, not recorded)");
+                true
+            }
+        },
     }
 }
 
@@ -860,53 +880,97 @@ pub(crate) fn known_hosts_path() -> PathBuf {
         .join("known_hosts")
 }
 
-/// Parse known_hosts file contents into a `host:port → fingerprint` map.
-fn parse_known_hosts_contents(contents: &str) -> HashMap<String, String> {
-    let mut entries = HashMap::new();
-    for line in contents.lines() {
+/// The first line of a known_hosts file filar creates.
+const KNOWN_HOSTS_HEADER: &str = "# filar known_hosts — do not edit manually";
+
+/// A parsed known_hosts file.
+#[derive(Debug, Default)]
+struct KnownHosts {
+    /// `host:port → fingerprint` of every well-formed line.
+    entries: HashMap<String, String>,
+    /// 1-based numbers of lines that are not a well-formed entry — for
+    /// example two entries glued together by an interleaved write (#521).
+    damaged: Vec<usize>,
+}
+
+/// Parse known_hosts file contents. A line is an entry when it is exactly
+/// `host:port SHA256:<base64>`; anything else that is not a comment or
+/// blank is reported as damaged, never read as a host.
+fn parse_known_hosts_contents(contents: &str) -> KnownHosts {
+    let mut known = KnownHosts::default();
+    for (index, line) in contents.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let mut parts = line.splitn(2, char::is_whitespace);
-        if let (Some(host), Some(fp)) = (parts.next(), parts.next()) {
-            entries.insert(host.trim().to_string(), fp.trim().to_string());
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        match fields.as_slice() {
+            [host, fp] if is_host_port(host) && is_sha256_fingerprint(fp) => {
+                known.entries.insert(host.to_string(), fp.to_string());
+            }
+            _ => known.damaged.push(index + 1),
         }
     }
-    entries
+    known
+}
+
+/// `host:port` with a numeric port.
+fn is_host_port(field: &str) -> bool {
+    field
+        .rsplit_once(':')
+        .is_some_and(|(host, port)| !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `SHA256:` followed by base64 and nothing else — a second `SHA256:` (or
+/// any `:`) means two fingerprints ran together.
+fn is_sha256_fingerprint(field: &str) -> bool {
+    field.strip_prefix("SHA256:").is_some_and(|b64| {
+        !b64.is_empty() && b64.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+    })
 }
 
 /// Read and parse the known_hosts file.
 ///
-/// Returns `Ok(empty_map)` when the file doesn't exist (first connection).
-/// Returns `Err` for any other I/O error — callers should reject the host key
-/// (fail closed) rather than silently downgrading verification.
-fn parse_known_hosts(path: &Path) -> std::io::Result<HashMap<String, String>> {
-    std::fs::read_to_string(path)
-        .map(|contents| parse_known_hosts_contents(&contents))
+/// Returns `Err` with `NotFound` when the file doesn't exist (first
+/// connection) and for any other I/O error — callers should reject the
+/// host key (fail closed) rather than silently downgrading verification.
+fn parse_known_hosts(path: &Path) -> std::io::Result<KnownHosts> {
+    std::fs::read_to_string(path).map(|contents| parse_known_hosts_contents(&contents))
 }
 
 /// Append a new entry to the known_hosts file. Creates the file (and parent
 /// directories) if it doesn't exist.
+///
+/// The entry goes out in **one** write (#521): with `O_APPEND` a single
+/// write lands whole, while `writeln!` on an unbuffered file issues one
+/// write per piece and two concurrent appends interleave them. Whether the
+/// file is new is decided by `create_new`, so the header is written once.
+/// A file whose last line lacks a newline gets one first.
 fn append_known_hosts_entry(
     path: &Path,
     host_port: &str,
     fingerprint: &str,
 ) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let exists = path.exists();
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    if !exists {
-        writeln!(file, "# filar known_hosts — do not edit manually")?;
+    let line = format!("{host_port} {fingerprint}\n");
+    match std::fs::OpenOptions::new().append(true).create_new(true).open(path) {
+        Ok(mut file) => file.write_all(format!("{KNOWN_HOSTS_HEADER}\n{line}").as_bytes()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut file = std::fs::OpenOptions::new().read(true).append(true).open(path)?;
+            let len = file.metadata()?.len();
+            let mut last = *b"\n";
+            if len > 0 {
+                file.seek(SeekFrom::Start(len - 1))?;
+                file.read_exact(&mut last)?;
+            }
+            let payload = if last[0] == b'\n' { line } else { format!("\n{line}") };
+            file.write_all(payload.as_bytes())
+        }
+        Err(e) => Err(e),
     }
-    writeln!(file, "{host_port} {fingerprint}")?;
-    Ok(())
 }
 
 /// Result of comparing a server key against known_hosts.
@@ -1507,7 +1571,7 @@ mod tests {
     #[test]
     fn known_hosts_parse_contents() {
         let contents = "# filar known_hosts\n127.0.0.1:2222 SHA256:abc123\n10.0.0.5:22 SHA256:def456\n\n# comment line\n";
-        let entries = parse_known_hosts_contents(contents);
+        let entries = parse_known_hosts_contents(contents).entries;
         assert_eq!(
             entries.get("127.0.0.1:2222"),
             Some(&"SHA256:abc123".to_string())
@@ -1517,6 +1581,104 @@ mod tests {
             Some(&"SHA256:def456".to_string())
         );
         assert!(!entries.contains_key("unknown:22"));
+    }
+
+    /// A fresh path for a known_hosts file in a test.
+    fn temp_known_hosts(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("filar_kh_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// #521: concurrent appends land as whole lines, with one header.
+    #[test]
+    fn concurrent_appends_never_interleave() {
+        let path = temp_known_hosts("append");
+        let threads: Vec<_> = (0..32)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    append_known_hosts_entry(&path, &format!("10.0.0.{i}:22"), &format!("SHA256:key{i}AAAA"))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let known = parse_known_hosts_contents(&contents);
+        assert!(known.damaged.is_empty(), "{contents}");
+        assert_eq!(known.entries.len(), 32, "{contents}");
+        assert_eq!(contents.matches(KNOWN_HOSTS_HEADER).count(), 1, "{contents}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #521: two first connections to one host with different keys — one
+    /// key is trusted and recorded, the other is a mismatch.
+    #[test]
+    fn concurrent_first_sights_of_one_host_trust_one_key() {
+        let path = temp_known_hosts("tofu");
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    verify_host_key(&path, "10.0.0.1:22", &format!("SHA256:key{i}AAAA"), HostKeyPolicy::Tofu)
+                })
+            })
+            .collect();
+        let trusted = threads.into_iter().map(|t| t.join().unwrap()).filter(|ok| *ok).count();
+        assert_eq!(trusted, 1);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.matches("10.0.0.1:22").count(), 1, "{contents}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #521: the line from the bug report is damaged, not a host — and
+    /// while it is there no new host is trusted on first sight.
+    #[test]
+    fn a_glued_line_is_damaged_and_blocks_trust_on_first_sight() {
+        let path = temp_known_hosts("glued");
+        std::fs::write(
+            &path,
+            format!(
+                "{KNOWN_HOSTS_HEADER}\nweb:22 SHA256:goodAAAA\n\
+                 127.0.0.1:2222127.0.0.1:2221  SHA256:vdyoLFdoSHA256:vdyoLFdo\n"
+            ),
+        )
+        .unwrap();
+        let known = parse_known_hosts(&path).unwrap();
+        assert_eq!(known.damaged, [3]);
+        assert_eq!(known.entries.len(), 1);
+
+        assert!(!verify_host_key(&path, "127.0.0.1:2221", "SHA256:vdyoLFdo", HostKeyPolicy::Tofu));
+        assert!(!verify_host_key(&path, "other:22", "SHA256:xAAA", HostKeyPolicy::Tofu));
+        assert!(verify_host_key(&path, "web:22", "SHA256:goodAAAA", HostKeyPolicy::Tofu), "intact entries still match");
+        assert!(!verify_host_key(&path, "web:22", "SHA256:evilAAAA", HostKeyPolicy::Tofu));
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains("other:22"), "nothing was recorded: {contents}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn malformed_lines_are_damaged() {
+        let known = parse_known_hosts_contents(
+            "# c\n\nh:22 SHA256:abc+/=\nh SHA256:abc\nh:x SHA256:abc\nh:22 MD5:aa\nh:22 SHA256:a b\nh:22\n",
+        );
+        assert_eq!(known.entries.len(), 1);
+        assert_eq!(known.damaged, [4, 5, 6, 7, 8]);
+    }
+
+    /// A file whose last line has no newline does not swallow the next entry.
+    #[test]
+    fn appending_after_a_line_without_newline() {
+        let path = temp_known_hosts("nonl");
+        std::fs::write(&path, "a:22 SHA256:aaaa").unwrap();
+        append_known_hosts_entry(&path, "b:22", "SHA256:bbbb").unwrap();
+        let known = parse_known_hosts(&path).unwrap();
+        assert!(known.damaged.is_empty());
+        assert_eq!(known.entries.len(), 2);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1531,7 +1693,7 @@ mod tests {
         append_known_hosts_entry(&path, "host1:22", "SHA256:aaa").unwrap();
         append_known_hosts_entry(&path, "host2:22", "SHA256:bbb").unwrap();
 
-        let entries = parse_known_hosts(&path).unwrap();
+        let entries = parse_known_hosts(&path).unwrap().entries;
         assert_eq!(
             entries.get("host1:22"),
             Some(&"SHA256:aaa".to_string())

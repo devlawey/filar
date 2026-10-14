@@ -13,6 +13,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- Parallel first connections (a fleet) no longer write interleaved lines into
+  filar's `known_hosts`. A damaged line is no longer read as an unknown host
+  — which silently re-trusted any key on every connection — but reported,
+  and no new host key is trusted until it is fixed
+  ([#521](https://github.com/devlawey/filar/issues/521)).
+
+### Fixed
+
 - The fleet agent is told how to open one host (`Ctrl+O`, not `Ctrl+J`),
   which quoting the read-only gate accepts, to explain a failed host only by
   its exit code and error line, and that a container's `uname` names the
