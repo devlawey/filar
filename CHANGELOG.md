@@ -11,6 +11,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Read-only fleet commands accept single quotes: a quoted word is checked as
+  the argument the host will receive (`grep -E '^ID=|^VERSION_ID=' …` runs,
+  `file '--compile'` is still refused); double quotes, `$`, `\` and globs
+  are still refused ([#515](https://github.com/devlawey/filar/issues/515)).
+
 ## [2.0.2] - 2026-10-11
 
 ### Added
