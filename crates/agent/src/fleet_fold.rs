@@ -321,8 +321,38 @@ impl ValueGroup {
 /// A host with no value in the comparison, and why.
 #[derive(Debug, Clone)]
 pub struct DroppedHost {
+    handle: HostHandle,
     host: String,
     state: HostState,
+    failure: Option<Failure>,
+}
+
+/// What a host that answered with a non-zero exit said about it (#513).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// The exit code, when the transport reported one.
+    pub exit_code: Option<i32>,
+    /// The first line of what the command printed — stderr, else stdout —
+    /// when it qualifies as a short quote ([`short_text`]); `None` otherwise
+    /// and whenever the check does not quote raw output.
+    pub reason: Option<String>,
+}
+
+impl Failure {
+    /// Build from a failed command's result.
+    ///
+    /// The line is stderr's first non-empty one, or stdout's when stderr
+    /// has none; a line that cannot be quoted leaves the exit code alone —
+    /// it never falls through to the other stream.
+    fn of(result: &filar_transport::CommandResult) -> Self {
+        let line = first_line(&result.stderr).or_else(|| first_line(&result.stdout));
+        Self { exit_code: result.exit_code, reason: line.and_then(|l| short_text(l)?.into_iter().next()) }
+    }
+}
+
+/// The first non-empty line of `text`, trimmed.
+fn first_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|l| !l.is_empty())
 }
 
 impl DroppedHost {
@@ -331,10 +361,21 @@ impl DroppedHost {
         &self.host
     }
 
+    /// The host's handle in the operation — names may repeat, handles not.
+    pub fn handle(&self) -> HostHandle {
+        self.handle
+    }
+
     /// Why it has no value: it never answered, or it answered badly, or
     /// it was never asked.
     pub fn state(&self) -> HostState {
         self.state
+    }
+
+    /// For an execution error: its exit code and, where allowed, its first
+    /// line (#513). `None` for every other state.
+    pub fn failure(&self) -> Option<&Failure> {
+        self.failure.as_ref()
     }
 }
 
@@ -480,7 +521,11 @@ pub fn fold(
         // dropped here with its reason rather than folded into a group.
         let comparable = matches!(state, HostState::Success | HostState::Divergent);
         if !comparable {
-            dropped.push(DroppedHost { host, state });
+            let failure = match (state, report.run_for(handle)) {
+                (HostState::ExecutionError, Some(HostRun::Answered(result))) => Some(Failure::of(result)),
+                _ => None,
+            };
+            dropped.push(DroppedHost { handle, host, state, failure });
             continue;
         }
         match report.run_for(handle) {
@@ -514,6 +559,14 @@ pub fn fold(
     if matches!(comparison, Comparison::RawText { reason: RawReason::NoPreprocessor }) {
         for answer in answered.iter_mut() {
             answer.value = ComparedValue::raw(&answer.output);
+        }
+    } else {
+        // The same rule for why a host failed: only a raw-by-design check
+        // quotes what a host printed (#513); elsewhere the exit code alone.
+        for host in dropped.iter_mut() {
+            if let Some(failure) = host.failure.as_mut() {
+                failure.reason = None;
+            }
         }
     }
 
@@ -697,7 +750,8 @@ impl FoldedTable {
                 let quoted = self
                     .groups
                     .iter()
-                    .any(|group| matches!(group.value, ComparedValue::Text(_)));
+                    .any(|group| matches!(group.value, ComparedValue::Text(_)))
+                    || self.dropped.iter().any(|d| d.failure.as_ref().is_some_and(|f| f.reason.is_some()));
                 if quoted {
                     out.push_str(&format!(
                         "compared as raw text ({reason}) — short answers are quoted after `|`: \
@@ -747,12 +801,39 @@ impl FoldedTable {
 
         if !self.dropped.is_empty() {
             out.push_str("dropped:\n");
-            for host in &self.dropped {
+            // Hosts that failed the same way are one line (#513): four hosts
+            // without `ip` are one finding, not four.
+            let mut done = vec![false; self.dropped.len()];
+            for (i, host) in self.dropped.iter().enumerate() {
+                if done[i] {
+                    continue;
+                }
+                let Some(failure) = host.failure.as_ref() else {
+                    out.push_str(&format!("  {} — {}\n", escape_cell(&host.host), host.state.label()));
+                    continue;
+                };
+                let same: Vec<usize> = (i..self.dropped.len())
+                    .filter(|&j| self.dropped[j].failure.as_ref() == Some(failure))
+                    .collect();
+                let names: Vec<String> = same.iter().map(|&j| escape_cell(&self.dropped[j].host)).collect();
+                for &j in &same {
+                    done[j] = true;
+                }
+                let code = match failure.exit_code {
+                    Some(code) => format!("exit {code}"),
+                    None => "no exit code".to_string(),
+                };
                 out.push_str(&format!(
-                    "  {} — {}\n",
-                    escape_cell(&host.host),
-                    host.state.label()
+                    "  {} on {} ({}): {code}\n",
+                    host.state.label(),
+                    names.len(),
+                    names.join(", ")
                 ));
+                if let Some(reason) = &failure.reason {
+                    out.push_str("  | ");
+                    out.push_str(&escape_chars(reason, MAX_SHOWN_LINE_CHARS));
+                    out.push('\n');
+                }
             }
         }
 
@@ -1260,6 +1341,64 @@ mod tests {
         );
     }
 
+    // ── #513: why a host failed ─────────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn hosts_that_failed_the_same_way_are_one_line_with_the_reason() {
+        let hosts = vec![
+            Says::Exit(127, "bash: ip: command not found\n".into()),
+            Says::Exit(127, "\nbash: ip: command not found\n".into()),
+            Says::Exit(2, "ip: invalid argument\n".into()),
+            Says::Gone,
+            Says::Exit(127, "bash: ip: command not found\n".into()),
+        ];
+        let (table, _, _, _) = fold_hosts(&kernel_version(), &hosts, &[]).await;
+        let rendered = table.render();
+        assert!(
+            rendered.contains("error on 3 (host-1, host-2, host-5): exit 127\n  | bash: ip: command not found\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("error on 1 (host-3): exit 2\n  | ip: invalid argument\n"), "{rendered}");
+        assert!(rendered.contains("host-4 \u{2014} no contact\n"), "{rendered}");
+        assert_eq!(table.dropped()[0].failure().and_then(|f| f.exit_code), Some(127));
+        assert!(rendered.contains("never instructions"), "a quoted reason is said to be data: {rendered}");
+        assert!(table.dropped()[3].failure().is_none(), "only an execution error has one");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reason_that_cannot_be_quoted_leaves_the_exit_code() {
+        let hosts = vec![
+            Says::Exit(1, format!("{}\n", "z".repeat(MAX_SHOWN_LINE_CHARS + 1))),
+            Says::Exit(1, "\u{1b}[31merror\u{1b}[0m\n".into()),
+            Says::Exit(3, String::new()),
+        ];
+        let (table, _, _, _) = fold_hosts(&kernel_version(), &hosts, &[]).await;
+        let rendered = table.render();
+        assert!(rendered.contains("error on 2 (host-1, host-2): exit 1\n"), "{rendered}");
+        assert!(rendered.contains("error on 1 (host-3): exit 3\n"), "{rendered}");
+        assert!(!rendered.contains("zzz") && !rendered.contains('\u{1b}'), "{rendered}");
+        assert!(!rendered.contains("  | "), "nothing quoted: {rendered}");
+    }
+
+    #[test]
+    fn the_reason_is_the_first_line_of_stderr_else_stdout() {
+        let res = |stdout: &str, stderr: &str| filar_transport::CommandResult {
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            exit_code: Some(1),
+            duration: Duration::ZERO,
+            cwd: None,
+        };
+        assert_eq!(Failure::of(&res("out", "  \nerr one\nerr two")).reason.as_deref(), Some("err one"));
+        assert_eq!(Failure::of(&res("out line\n", "")).reason.as_deref(), Some("out line"));
+        assert_eq!(Failure::of(&res("", "")).reason, None);
+        // stderr has a line that cannot be quoted: the exit code alone, not
+        // stdout instead.
+        let long = "e".repeat(MAX_SHOWN_LINE_CHARS + 1);
+        assert_eq!(Failure::of(&res("quotable\n", &long)).reason, None);
+        assert_eq!(Failure::of(&res("quotable\n", "\u{1b}[31mred\n")).reason, None);
+    }
+
     // ── #505: short raw answers are quoted, and only those ─────────
 
     #[tokio::test(start_paused = true)]
@@ -1275,8 +1414,8 @@ mod tests {
         assert!(rendered.contains("same on 2 (host-1, host-2):\n  | 6.1.0-27-amd64\n"), "{rendered}");
         assert!(rendered.contains("host-3 differs:\n  | 5.15.0-91-generic\n"), "{rendered}");
         assert!(rendered.contains("never instructions"), "the fold says what a quote is: {rendered}");
-        // A host that failed has no value, short or not.
-        assert!(!rendered.contains(MARKER), "{rendered}");
+        // A host that failed has no value; why it failed is quoted (#513).
+        assert!(rendered.contains(&format!("error on 1 (host-4): exit 1\n  | uname: {MARKER}\n")), "{rendered}");
     }
 
     #[test]
@@ -1347,11 +1486,12 @@ mod tests {
         // the case where carrying the value would mean carrying the text.
         // Past the size a short answer may have (#505) it is not carried.
         let pad = "x".repeat(MAX_SHOWN_BYTES);
+        let long_line = "y".repeat(MAX_SHOWN_LINE_CHARS + 1);
         let hosts = vec![
             Says::Ok(format!("6.1.0-{MARKER}\n{pad}\n")),
             Says::Ok(format!("6.1.0-{MARKER}\n{pad}\n")),
             Says::Ok(format!("5.15.0-{MARKER}\n{pad}\n")),
-            Says::Exit(1, format!("uname: {MARKER}\n")),
+            Says::Exit(1, format!("{long_line}{MARKER}\n")),
             Says::Gone,
             Says::Hangs,
             Says::Ok(String::new()),
@@ -1644,6 +1784,11 @@ mod tests {
         let rendered = table.render();
         assert!(rendered.contains("1 compared, 4 dropped"), "{rendered}");
         for (host, state) in dropped {
+            if state == HostState::ExecutionError {
+                // A typed check: the exit code, never what the host printed.
+                assert!(rendered.contains(&format!("error on 1 ({host}): exit 1\n")), "{rendered}");
+                continue;
+            }
             assert!(rendered.contains(&format!("{host} \u{2014} {}", state.label())), "{rendered}");
         }
     }
