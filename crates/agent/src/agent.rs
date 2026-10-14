@@ -2122,7 +2122,7 @@ mod tests {
         for ok in ["grep -E '^ID=|^NAME=' /etc/os-release", "grep 'Time zone' /etc/timezone"] {
             assert!(filar_transport::readonly::check_read_only(ok).is_ok(), "{ok}");
         }
-        for bad in ["grep \"x\" f", "ls --a'b'", "ls 'a\\b'", "ls $HOME", "ls *", "ls `x`"] {
+        for bad in ["grep \"x\" f", "ls --a'b'", "ls 'a\\b'", "ls $HOME", "ls *", "ls ?", "ls [a]", "ls {a,b}", "ls `x`"] {
             assert!(filar_transport::readonly::check_read_only(bad).is_err(), "{bad}");
         }
     }
