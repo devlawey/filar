@@ -125,7 +125,7 @@ pub fn fleet_single_host_refusal(tool: &str) -> String {
     format!(
         "Error: {tool} is not available in a fleet: it works on one host, and a fleet \
          has no single host to use. In a fleet only run_command is available. If one \
-         host needs a closer look, ask the user to open it in its own tab."
+         host needs a closer look, ask the user to open it in its own tab with Ctrl+O."
     )
 }
 

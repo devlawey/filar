@@ -95,7 +95,7 @@ pub fn fleet_gate(command: &str) -> FleetGate {
             "Error: the fleet is read-only, so this command runs on no host: {reason}. \
              Changing state across a fleet would need approval on every host and is \
              not available; use read-only commands, or ask the user to open one host \
-             in its own tab."
+             in its own tab with Ctrl+O."
         )),
     }
 }
