@@ -321,6 +321,7 @@ impl ValueGroup {
 /// A host with no value in the comparison, and why.
 #[derive(Debug, Clone)]
 pub struct DroppedHost {
+    handle: HostHandle,
     host: String,
     state: HostState,
     failure: Option<Failure>,
@@ -339,21 +340,30 @@ pub struct Failure {
 
 impl Failure {
     /// Build from a failed command's result.
+    ///
+    /// The line is stderr's first non-empty one, or stdout's when stderr
+    /// has none; a line that cannot be quoted leaves the exit code alone —
+    /// it never falls through to the other stream.
     fn of(result: &filar_transport::CommandResult) -> Self {
-        Self { exit_code: result.exit_code, reason: first_line(&result.stderr).or_else(|| first_line(&result.stdout)) }
+        let line = first_line(&result.stderr).or_else(|| first_line(&result.stdout));
+        Self { exit_code: result.exit_code, reason: line.and_then(|l| short_text(l)?.into_iter().next()) }
     }
 }
 
-/// The first non-empty line of `text`, if it may be quoted to the model.
-fn first_line(text: &str) -> Option<String> {
-    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
-    short_text(line)?.into_iter().next()
+/// The first non-empty line of `text`, trimmed.
+fn first_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|l| !l.is_empty())
 }
 
 impl DroppedHost {
     /// The host's configured name.
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// The host's handle in the operation — names may repeat, handles not.
+    pub fn handle(&self) -> HostHandle {
+        self.handle
     }
 
     /// Why it has no value: it never answered, or it answered badly, or
@@ -515,7 +525,7 @@ pub fn fold(
                 (HostState::ExecutionError, Some(HostRun::Answered(result))) => Some(Failure::of(result)),
                 _ => None,
             };
-            dropped.push(DroppedHost { host, state, failure });
+            dropped.push(DroppedHost { handle, host, state, failure });
             continue;
         }
         match report.run_for(handle) {
@@ -1382,6 +1392,11 @@ mod tests {
         assert_eq!(Failure::of(&res("out", "  \nerr one\nerr two")).reason.as_deref(), Some("err one"));
         assert_eq!(Failure::of(&res("out line\n", "")).reason.as_deref(), Some("out line"));
         assert_eq!(Failure::of(&res("", "")).reason, None);
+        // stderr has a line that cannot be quoted: the exit code alone, not
+        // stdout instead.
+        let long = "e".repeat(MAX_SHOWN_LINE_CHARS + 1);
+        assert_eq!(Failure::of(&res("quotable\n", &long)).reason, None);
+        assert_eq!(Failure::of(&res("quotable\n", "\u{1b}[31mred\n")).reason, None);
     }
 
     // ── #505: short raw answers are quoted, and only those ─────────

@@ -155,11 +155,8 @@ impl FleetView {
             .dropped()
             .iter()
             .map(|d| {
-                let failed = op
-                    .handles()
-                    .zip(op.members())
-                    .find(|(_, m)| m.name() == d.host())
-                    .and_then(|(h, _)| report.run_for(h))
+                let failed = report
+                    .run_for(d.handle())
                     .and_then(|run| match run {
                         HostRun::Answered(result) if d.state() == HostState::ExecutionError => Some(result),
                         _ => None,
