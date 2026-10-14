@@ -11,6 +11,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- `nproc`, `lsmod` and `getconf` run in read-only (fleet) sessions
+  ([#516](https://github.com/devlawey/filar/issues/516)).
+
 ## [2.0.2] - 2026-10-11
 
 ### Added

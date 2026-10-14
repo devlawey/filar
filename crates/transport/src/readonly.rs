@@ -63,8 +63,9 @@ use crate::{CommandExecutor, CommandResult, StreamEvent};
 /// argument shapes spelled out there.
 pub const ALLOWED_COMMANDS: &[&str] = &[
     "base64", "cat", "cksum", "cmp", "comm", "cut", "date", "df", "diff", "dig", "du", "echo",
-    "egrep", "fgrep", "file", "free", "grep", "groups", "head", "host", "id", "ls", "lsblk",
-    "lscpu", "lspci", "lsusb", "md5sum", "netstat", "nl", "nslookup", "od", "ping", "ping6",
+    "egrep", "fgrep", "file", "free", "getconf", "grep", "groups", "head", "host", "id", "ls",
+    "lsblk", "lscpu", "lsmod", "lspci", "lsusb", "md5sum", "netstat", "nl", "nproc", "nslookup",
+    "od", "ping", "ping6",
     "printenv", "printf", "ps", "pwd", "sha1sum", "sha256sum", "sha512sum", "sort", "ss", "stat",
     "strings", "tac", "tail", "tr", "uname", "uniq", "uptime", "wc", "which", "who", "whoami",
 ];
@@ -1063,6 +1064,21 @@ mod tests {
             for needed in form.needs_one_of {
                 assert!(form.flags.contains(needed), "{}: {needed} is not a flag", form.bin);
             }
+        }
+    }
+
+    /// #516: CPU count, loaded modules, system limits.
+    #[tokio::test]
+    async fn system_facts_are_read_only() {
+        let (exec, inner) = gated();
+        let allowed = ["nproc", "nproc --all", "lsmod", "lsmod | grep -c nf_", "getconf PAGESIZE", "getconf -a | head -n 5"];
+        for cmd in allowed {
+            exec.run(cmd).await.unwrap_or_else(|e| panic!("{cmd:?} must be allowed: {e}"));
+        }
+        assert_eq!(inner.calls(), allowed.len());
+        // Their neighbours that change the kernel stay out.
+        for cmd in ["modprobe nf_tables", "rmmod nf_tables", "insmod x.ko"] {
+            assert_refused(&exec, &inner, cmd).await;
         }
     }
 
