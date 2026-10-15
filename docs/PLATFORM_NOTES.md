@@ -14,6 +14,7 @@ Add findings here whenever a platform difference is discovered.
 | Interactive PTY shell | [Local interactive shell](#local-interactive-shell-ctrlt) | #293, #313, #338 |
 | Release assets / packaging | [Release binaries (CI)](#release-binaries-ci) | #289, #297, #80 |
 | Chat wrap display columns | [Chat display width vs char count](#chat-display-width-vs-char-count-333) | #333 |
+| Child processes drawing on filar's console | [Child console isolation](#child-console-isolation-523) | #329, #523 |
 
 ## Clipboard
 
@@ -155,6 +156,20 @@ use `⌘` because they are not rendered in the Windows console.
 > **Note:** this covers PowerShell's *own* output. Native programs writing raw
 > bytes to the pipe in the OEM code page may still be mis-decoded; that is a
 > separate, harder problem and is not handled here.
+
+## Child console isolation (#523)
+
+| Platform | How a local child could draw over the TUI | filar behaviour |
+|----------|-------------------------------------------|-----------------|
+| Windows  | A console child inherits filar's console and writes to its screen buffer directly, past the stdout/stderr pipes — PowerShell's progress pane (`Write-Progress`: yellow on dark cyan, `Test-NetConnection`, `Test-Connection`, `Invoke-WebRequest`) | `CREATE_NO_WINDOW`: the child gets its own hidden console; plus `$ProgressPreference = 'SilentlyContinue'` in the wrapper |
+| Unix     | A child that opens the controlling TTY (`sudo` writing `Password:` to `/dev/tty`) | `setsid` — no controlling TTY (#329) |
+
+> The TUI's diff renderer cannot see writes it did not make: cells painted by
+> a child stay on screen until something redraws them, which is why the
+> progress pane left dark-cyan fragments behind. Over SSH the remote shell has
+> no access to the local console, so only local mode was affected. Applies to
+> the agent's `LocalExecutor` and to local background jobs; the interactive
+> Ctrl+T terminal runs in its own pseudo-console and is unaffected.
 
 ## Release binaries (CI)
 

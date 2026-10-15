@@ -10488,3 +10488,24 @@ Win + Mac — за мейнтейнером (`docs/SMOKE.md`, #298).
 **Контракты.** `CommandExecutor`/`LlmClient` без изменений; дополнения —
 `ViewDropped::exit_code`/`reason` (#513), `fleet_fold::Failure`,
 `DroppedHost::failure()`/`handle()` (#513).
+
+## #523 — прогресс PowerShell поверх TUI (Windows, local)
+
+**Причина.** Бирюзовая плашка с жёлтым текстом в local-режиме на Windows — не
+рендер filar, а progress pane консольного хоста PowerShell (`Write-Progress`).
+Дочерний `powershell` наследовал консоль filar и рисовал прямо в её экранный
+буфер мимо пайпов; diff-рендер ratatui этих ячеек не видел, отсюда обрывки.
+Вероятно, это и был источник #244 (там лечили симптом `Clear` в статус-баре).
+
+**Сделано.** `LocalExecutor::run` и локальные фоновые задания запускают
+PowerShell с `CREATE_NO_WINDOW` (своя скрытая консоль — Windows-аналог
+`setsid` из #329) и с `$ProgressPreference = 'SilentlyContinue'` в обёртке.
+Новых зависимостей нет. Запись в `docs/PLATFORM_NOTES.md`.
+
+**Проверено.** Юнит-тесты на обе обёртки; `cargo clippy --target
+x86_64-pc-windows-gnu` для transport/agent — Windows-ветки компилируются.
+
+**Не проверено.** Живой прогон на Windows (conhost / Windows Terminal) — нет
+Windows в окружении агента; за мейнтейнером.
+
+**Контракты.** Без изменений.

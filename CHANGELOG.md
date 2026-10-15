@@ -11,6 +11,14 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows, local mode: PowerShell progress (`Test-NetConnection`,
+  `Test-Connection`, `Invoke-WebRequest`) no longer paints a dark-cyan pane
+  over the TUI and leaves fragments behind; agent commands and background jobs
+  run in their own hidden console with progress silenced
+  ([#523](https://github.com/devlawey/filar/issues/523)).
+
 ## [2.0.3] - 2026-10-15
 
 ### Added

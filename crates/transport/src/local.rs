@@ -13,8 +13,11 @@
 //!
 //! On Unix, agent children are started in a new session (`setsid`) so they
 //! lose the controlling TTY. That prevents tools like `sudo` from painting
-//! `Password:` over the filar TUI (#329). Interactive Ctrl+T PTY is separate
-//! and is not affected.
+//! `Password:` over the filar TUI (#329). On Windows the same isolation is
+//! `CREATE_NO_WINDOW`: the child gets its own hidden console instead of
+//! sharing filar's, so PowerShell's progress pane (`Write-Progress`) and any
+//! direct console writes cannot paint over the TUI (#523). Interactive Ctrl+T
+//! PTY is separate and is not affected.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -109,6 +112,7 @@ impl crate::CommandExecutor for LocalExecutor {
             let full = build_shell_command(command, &marker);
             let mut c = tokio::process::Command::new("powershell");
             c.args(["-NoProfile", "-NonInteractive", "-Command", &full]);
+            detach_from_parent_console(&mut c);
             c
         };
         #[cfg(unix)]
@@ -247,7 +251,9 @@ fn cwd_marker() -> String {
 /// `chcp 65001`, this does not change the console active code page
 /// (`SetConsoleOutputCP`), which .NET caches at startup and ignores later —
 /// and which could trigger font switch / resize events on the parent console
-/// (#246). The command runs dot-sourced (its variables stay in scope) with
+/// (#246). `$ProgressPreference` is silenced: progress records are drawn
+/// on the console, never on the pipes, so the agent gains nothing from them
+/// and they used to paint over the TUI (#523). The command runs dot-sourced (its variables stay in scope) with
 /// stderr merged into stdout and is piped to `Out-Default`: table output is
 /// buffered by the formatter and an explicit `exit` would drop it, so it must
 /// be written before the marker. `$?` of the command's last statement decides
@@ -272,7 +278,8 @@ fn build_shell_command(command: &str, marker: &str) -> String {
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_command(command: &str, marker: &str) -> String {
     format!(
-        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); . {{ {command}\n\
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); \
+         $ProgressPreference = 'SilentlyContinue'; . {{ {command}\n\
          $global:__filar_ok = $?\n\
          }} 2>&1 | Out-Default\n\
          '{marker}' + (Get-Location -PSProvider FileSystem).ProviderPath\n\
@@ -321,6 +328,21 @@ fn kill_process_group(pid: Option<u32>) {
     }
 }
 
+/// `CREATE_NO_WINDOW` process creation flag (`winbase.h`).
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Give the child its own hidden console instead of filar's (Windows).
+///
+/// A console child inherits the parent's console and can write to its screen
+/// buffer directly, bypassing the stdout/stderr pipes — PowerShell's progress
+/// pane does exactly that and paints over the TUI (#523). The Windows
+/// counterpart of [`detach_from_controlling_tty`].
+#[cfg(windows)]
+fn detach_from_parent_console(cmd: &mut tokio::process::Command) {
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,7 +366,10 @@ mod tests {
     fn powershell_command_has_output_encoding_and_stderr_redirect() {
         let result = powershell_command("dir", M);
         assert!(
-            result.starts_with("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); . { dir\n"),
+            result.starts_with(
+                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); \
+                 $ProgressPreference = 'SilentlyContinue'; . { dir\n"
+            ),
             "Windows command must have the OutputEncoding prefix, got: {result}"
         );
         assert!(result.contains("} 2>&1 | Out-Default\n"), "stderr merged and flushed: {result}");
