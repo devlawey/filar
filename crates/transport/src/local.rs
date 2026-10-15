@@ -563,4 +563,51 @@ mod tests {
             result.stderr
         );
     }
+
+    /// The real PowerShell wrapper runs with progress silenced and still
+    /// returns the command's output after a `Write-Progress` (#523).
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn windows_progress_is_silenced_and_output_kept() {
+        let exec = LocalExecutor::with_timeout(Duration::from_secs(60))
+            .await
+            .unwrap();
+        let result = exec
+            .run("Write-Progress -Activity filar-523 -Status probe -PercentComplete 50; $ProgressPreference; 'after-progress'")
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        let lines: Vec<&str> = result.stdout.lines().map(str::trim).collect();
+        assert!(lines.contains(&"SilentlyContinue"), "{:?}", result.stdout);
+        assert!(lines.contains(&"after-progress"), "{:?}", result.stdout);
+        assert!(!result.stdout.contains("filar-523"), "{:?}", result.stdout);
+    }
+
+    /// Agent local commands must not share filar's console (#523): the
+    /// child's console process list must not include this process. (If the
+    /// test runner itself has no console, the check holds trivially.)
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn windows_agent_child_has_its_own_console() {
+        let exec = LocalExecutor::with_timeout(Duration::from_secs(60))
+            .await
+            .unwrap();
+        let script = "$t = Add-Type -PassThru -Name ConsoleList -Namespace Filar523 -MemberDefinition \
+                      '[DllImport(\"kernel32.dll\")] public static extern uint GetConsoleProcessList(uint[] list, uint count);'\n\
+                      $a = New-Object 'uint32[]' 64\n\
+                      $n = $t::GetConsoleProcessList($a, 64)\n\
+                      'pids=' + (($a | Select-Object -First $n) -join ',')";
+        let result = exec.run(script).await.unwrap();
+        let line = result
+            .stdout
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("pids="))
+            .unwrap_or_else(|| panic!("no pid list: {result:?}"));
+        let pids: Vec<u32> = line.split(',').filter_map(|p| p.parse().ok()).collect();
+        assert!(!pids.is_empty(), "child must have a console: {result:?}");
+        assert!(
+            !pids.contains(&std::process::id()),
+            "child shares filar's console: pids={pids:?}"
+        );
+    }
 }

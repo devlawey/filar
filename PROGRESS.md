@@ -10504,6 +10504,9 @@ PowerShell с `CREATE_NO_WINDOW` (своя скрытая консоль — Win
 
 **Проверено.** Юнит-тесты на обе обёртки; `cargo clippy --target
 x86_64-pc-windows-gnu` для transport/agent — Windows-ветки компилируются.
+На Windows CI два теста запускают настоящий PowerShell через `LocalExecutor`:
+вывод после `Write-Progress` приходит целиком при `SilentlyContinue`, а
+`GetConsoleProcessList` дочернего процесса не содержит PID filar (своя консоль).
 
 **Не проверено.** Живой прогон на Windows (conhost / Windows Terminal) — нет
 Windows в окружении агента; за мейнтейнером.
