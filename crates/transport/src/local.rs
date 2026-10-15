@@ -13,8 +13,11 @@
 //!
 //! On Unix, agent children are started in a new session (`setsid`) so they
 //! lose the controlling TTY. That prevents tools like `sudo` from painting
-//! `Password:` over the filar TUI (#329). Interactive Ctrl+T PTY is separate
-//! and is not affected.
+//! `Password:` over the filar TUI (#329). On Windows the same isolation is
+//! `CREATE_NO_WINDOW`: the child gets its own hidden console instead of
+//! sharing filar's, so PowerShell's progress pane (`Write-Progress`) and any
+//! direct console writes cannot paint over the TUI (#523). Interactive Ctrl+T
+//! PTY is separate and is not affected.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -109,6 +112,7 @@ impl crate::CommandExecutor for LocalExecutor {
             let full = build_shell_command(command, &marker);
             let mut c = tokio::process::Command::new("powershell");
             c.args(["-NoProfile", "-NonInteractive", "-Command", &full]);
+            detach_from_parent_console(&mut c);
             c
         };
         #[cfg(unix)]
@@ -247,7 +251,9 @@ fn cwd_marker() -> String {
 /// `chcp 65001`, this does not change the console active code page
 /// (`SetConsoleOutputCP`), which .NET caches at startup and ignores later —
 /// and which could trigger font switch / resize events on the parent console
-/// (#246). The command runs dot-sourced (its variables stay in scope) with
+/// (#246). `$ProgressPreference` is silenced: progress records are drawn
+/// on the console, never on the pipes, so the agent gains nothing from them
+/// and they used to paint over the TUI (#523). The command runs dot-sourced (its variables stay in scope) with
 /// stderr merged into stdout and is piped to `Out-Default`: table output is
 /// buffered by the formatter and an explicit `exit` would drop it, so it must
 /// be written before the marker. `$?` of the command's last statement decides
@@ -272,7 +278,8 @@ fn build_shell_command(command: &str, marker: &str) -> String {
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_command(command: &str, marker: &str) -> String {
     format!(
-        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); . {{ {command}\n\
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); \
+         $ProgressPreference = 'SilentlyContinue'; . {{ {command}\n\
          $global:__filar_ok = $?\n\
          }} 2>&1 | Out-Default\n\
          '{marker}' + (Get-Location -PSProvider FileSystem).ProviderPath\n\
@@ -321,6 +328,21 @@ fn kill_process_group(pid: Option<u32>) {
     }
 }
 
+/// `CREATE_NO_WINDOW` process creation flag (`winbase.h`).
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Give the child its own hidden console instead of filar's (Windows).
+///
+/// A console child inherits the parent's console and can write to its screen
+/// buffer directly, bypassing the stdout/stderr pipes — PowerShell's progress
+/// pane does exactly that and paints over the TUI (#523). The Windows
+/// counterpart of [`detach_from_controlling_tty`].
+#[cfg(windows)]
+fn detach_from_parent_console(cmd: &mut tokio::process::Command) {
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,7 +366,10 @@ mod tests {
     fn powershell_command_has_output_encoding_and_stderr_redirect() {
         let result = powershell_command("dir", M);
         assert!(
-            result.starts_with("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); . { dir\n"),
+            result.starts_with(
+                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); \
+                 $ProgressPreference = 'SilentlyContinue'; . { dir\n"
+            ),
             "Windows command must have the OutputEncoding prefix, got: {result}"
         );
         assert!(result.contains("} 2>&1 | Out-Default\n"), "stderr merged and flushed: {result}");
@@ -536,6 +561,53 @@ mod tests {
             "expected no controlling tty for agent child, got {tty:?} (stdout={:?} stderr={:?})",
             result.stdout,
             result.stderr
+        );
+    }
+
+    /// The real PowerShell wrapper runs with progress silenced and still
+    /// returns the command's output after a `Write-Progress` (#523).
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn windows_progress_is_silenced_and_output_kept() {
+        let exec = LocalExecutor::with_timeout(Duration::from_secs(60))
+            .await
+            .unwrap();
+        let result = exec
+            .run("Write-Progress -Activity filar-523 -Status probe -PercentComplete 50; $ProgressPreference; 'after-progress'")
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        let lines: Vec<&str> = result.stdout.lines().map(str::trim).collect();
+        assert!(lines.contains(&"SilentlyContinue"), "{:?}", result.stdout);
+        assert!(lines.contains(&"after-progress"), "{:?}", result.stdout);
+        assert!(!result.stdout.contains("filar-523"), "{:?}", result.stdout);
+    }
+
+    /// Agent local commands must not share filar's console (#523): the
+    /// child's console process list must not include this process. (If the
+    /// test runner itself has no console, the check holds trivially.)
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn windows_agent_child_has_its_own_console() {
+        let exec = LocalExecutor::with_timeout(Duration::from_secs(60))
+            .await
+            .unwrap();
+        let script = "$t = Add-Type -PassThru -Name ConsoleList -Namespace Filar523 -MemberDefinition \
+                      '[DllImport(\"kernel32.dll\")] public static extern uint GetConsoleProcessList(uint[] list, uint count);'\n\
+                      $a = New-Object 'uint32[]' 64\n\
+                      $n = $t::GetConsoleProcessList($a, 64)\n\
+                      'pids=' + (($a | Select-Object -First $n) -join ',')";
+        let result = exec.run(script).await.unwrap();
+        let line = result
+            .stdout
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("pids="))
+            .unwrap_or_else(|| panic!("no pid list: {result:?}"));
+        let pids: Vec<u32> = line.split(',').filter_map(|p| p.parse().ok()).collect();
+        assert!(!pids.is_empty(), "child must have a console: {result:?}");
+        assert!(
+            !pids.contains(&std::process::id()),
+            "child shares filar's console: pids={pids:?}"
         );
     }
 }

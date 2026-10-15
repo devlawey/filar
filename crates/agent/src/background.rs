@@ -129,6 +129,25 @@ fn detach_from_controlling_tty(cmd: &mut tokio::process::Command) {
 #[allow(dead_code)]
 fn detach_from_controlling_tty(_cmd: &mut tokio::process::Command) {}
 
+/// `CREATE_NO_WINDOW` process creation flag (`winbase.h`).
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Give the job its own hidden console instead of filar's (Windows), so its
+/// progress pane and direct console writes cannot paint over the TUI (#523).
+#[cfg(windows)]
+fn detach_from_parent_console(cmd: &mut tokio::process::Command) {
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+/// The PowerShell script a local background job runs: progress records are
+/// silenced — they go to the console, never to the captured pipes (#523).
+/// Built on every platform so it is tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_job_script(command: &str) -> String {
+    format!("$ProgressPreference = 'SilentlyContinue'\n{command}")
+}
+
 /// Decrements the open-reader count when a reader task ends, however it ends.
 struct ReaderGuard(Arc<AtomicUsize>);
 
@@ -146,8 +165,10 @@ async fn spawn_local_job(command: &str) -> Result<LocalJob> {
 
     #[cfg(windows)]
     let mut cmd = {
+        let script = powershell_job_script(command);
         let mut c = tokio::process::Command::new("powershell");
-        c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+        c.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        detach_from_parent_console(&mut c);
         c
     };
     #[cfg(unix)]
@@ -722,6 +743,16 @@ mod tests {
     use filar_transport::CommandResult;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
+
+    /// Progress is silenced before the job's command runs (#523).
+    #[test]
+    fn powershell_job_script_silences_progress_first() {
+        let script = powershell_job_script("Test-NetConnection 10.0.0.1");
+        assert_eq!(
+            script,
+            "$ProgressPreference = 'SilentlyContinue'\nTest-NetConnection 10.0.0.1"
+        );
+    }
 
     struct MockExecutor {
         responses: StdMutex<Vec<CommandResult>>,
