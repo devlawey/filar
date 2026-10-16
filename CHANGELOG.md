@@ -13,6 +13,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- Each request no longer sends the user's question to the model twice in a
+  row ([#526](https://github.com/devlawey/filar/issues/526)).
+
 - The agent no longer "runs" commands by writing them as text with invented
   output, and no longer stops after announcing an action ("Let me check the
   logs:"): earlier commands are replayed to the model as real tool calls, an

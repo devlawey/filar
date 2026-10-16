@@ -2434,6 +2434,23 @@ fn history_to_messages(blocks: &[ChatBlock]) -> Vec<filar_agent::ChatMessage> {
     out
 }
 
+/// The history without the request being sent now (#526).
+///
+/// The user's message is already in the chat when the agent starts, and the
+/// agent adds the prompt itself as the last user message — sent from the
+/// history as well, it reached the model twice in a row. Only a trailing
+/// `User` block equal to `prompt` is cut (feed-only `System` lines after it
+/// do not count); anything else is left as is.
+fn without_current_prompt<'a>(blocks: &'a [ChatBlock], prompt: &str) -> &'a [ChatBlock] {
+    match blocks
+        .iter()
+        .rposition(|b| !matches!(b, ChatBlock::System(_)))
+    {
+        Some(i) if matches!(&blocks[i], ChatBlock::User(text) if text == prompt) => &blocks[..i],
+        _ => blocks,
+    }
+}
+
 /// Whether a command block was proposed by the agent (as opposed to the
 /// user's own `!cmd`). Blocks saved before #525 carry no tool; they count as
 /// the agent's unless marked as a shell escape.
@@ -2842,7 +2859,8 @@ fn spawn_agent(
         // not count, so the reactive path is still available then (#378).
         let mut already_compacted = chat_history.len() < before_compaction;
         loop {
-            let history = history_to_messages(&chat_history);
+            let history =
+                history_to_messages(without_current_prompt(&chat_history, &user_input));
 
             let mut builder = AgentBuilder::new()
                 .llm(Arc::clone(&llm))
@@ -3471,6 +3489,30 @@ mod tests {
         assert_eq!(messages[0].tool_calls[0].name, "run_command");
         assert_eq!(messages[0].tool_calls[0].arguments["command"], "uptime");
         assert_eq!(messages[1].content, "(no output)");
+    }
+
+    /// The prompt being sent is not also sent from the history (#526).
+    #[test]
+    fn the_current_prompt_is_cut_from_the_history() {
+        let blocks = vec![
+            ChatBlock::User("first".into()),
+            ChatBlock::Agent("ok".into()),
+            ChatBlock::User("поменяй на 22.20".into()),
+            ChatBlock::System("Context: 40%".into()),
+        ];
+        let history = without_current_prompt(&blocks, "поменяй на 22.20");
+        assert_eq!(history.len(), 2, "{history:?}");
+        let messages = history_to_messages(history);
+        let users = messages
+            .iter()
+            .filter(|m| m.role == filar_agent::MessageRole::User)
+            .count();
+        assert_eq!(users, 1, "only the earlier question: {messages:?}");
+
+        // Nothing to cut: a different last message, or an empty history.
+        assert_eq!(without_current_prompt(&blocks[..2], "first").len(), 2);
+        assert_eq!(without_current_prompt(&blocks, "other").len(), 4);
+        assert!(without_current_prompt(&[], "x").is_empty());
     }
 
     /// The user's own `!cmd` is the user's action, not an assistant call.
