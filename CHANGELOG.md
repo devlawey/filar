@@ -15,7 +15,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 - Each request no longer sends the user's question to the model twice in a
   row ([#526](https://github.com/devlawey/filar/issues/526)).
-
+- Terminal mode (Ctrl+T): Ctrl+C, Ctrl+D, Ctrl+Z, Ctrl+R and the other Ctrl
+  keys work on a Cyrillic keyboard layout; on Windows they used to reach the
+  shell as a Cyrillic letter ([#528](https://github.com/devlawey/filar/issues/528)).
 - The agent no longer "runs" commands by writing them as text with invented
   output, and no longer stops after announcing an action ("Let me check the
   logs:"): earlier commands are replayed to the model as real tool calls, an
@@ -23,9 +25,6 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   announcement without a tool call is followed up once, and a text-only answer
   the provider cut off (`finish_reason` `length` or `content_filter`) says so
   ([#525](https://github.com/devlawey/filar/issues/525)).
-
-### Fixed
-
 - Windows, local mode: PowerShell progress (`Test-NetConnection`,
   `Test-Connection`, `Invoke-WebRequest`) no longer paints a dark-cyan pane
   over the TUI and leaves fragments behind; agent commands and background jobs

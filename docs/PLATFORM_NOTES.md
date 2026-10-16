@@ -15,6 +15,7 @@ Add findings here whenever a platform difference is discovered.
 | Release assets / packaging | [Release binaries (CI)](#release-binaries-ci) | #289, #297, #80 |
 | Chat wrap display columns | [Chat display width vs char count](#chat-display-width-vs-char-count-333) | #333 |
 | Child processes drawing on filar's console | [Child console isolation](#child-console-isolation-523) | #329, #523 |
+| Ctrl+letter on a Cyrillic layout | [Ctrl keys and keyboard layout](#ctrl-keys-and-keyboard-layout-528) | #528 |
 
 ## Clipboard
 
@@ -170,6 +171,21 @@ use `⌘` because they are not rendered in the Windows console.
 > no access to the local console, so only local mode was affected. Applies to
 > the agent's `LocalExecutor` and to local background jobs; the interactive
 > Ctrl+T terminal runs in its own pseudo-console and is unaffected.
+
+## Ctrl keys and keyboard layout (#528)
+
+| Platform | What Ctrl+C arrives as | filar behaviour |
+|----------|------------------------|-----------------|
+| Windows (conhost, Windows Terminal) | `Char(<letter of the key in the layout>)` + CONTROL — on a Russian layout Ctrl+`с` (U+0441) | Ctrl terminal keys are mapped to the Latin letter of the same key (ЙЦУКЕН, Ukrainian і/ї/є) before the control code is computed |
+| Unix terminals | The control byte itself (`0x03`), parsed by crossterm as Ctrl+`c` | Layout-independent; no mapping needed |
+
+> The Windows console delivers Ctrl+C as `uChar = 0x03`; crossterm 0.28
+> recovers the key's character with `ToUnicodeEx` on the active layout. Under
+> conhost it cannot see the window's current layout and uses the one the
+> thread had when filar started — so whether Ctrl+C worked in the Ctrl+T
+> terminal depended on the layout at launch. The agent-mode hotkeys already
+> accepted both layouts (`ctrl_key('t', 'е')`); the terminal path now does too.
+> Alt+letter is not mapped.
 
 ## Release binaries (CI)
 
