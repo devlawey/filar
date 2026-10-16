@@ -2383,34 +2383,135 @@ pub fn resize_all_models(app: &mut App, cols: u16, rows: u16) {
 /// two deliberate asymmetries — `System` blocks are feed-only chrome and are
 /// dropped, while `Summary` blocks stand in for the turns they replaced and
 /// must be sent (#377).
+///
+/// The agent's commands are replayed as what they were: an assistant message
+/// carrying `tool_calls` (with the turn's preamble text as its content), then
+/// one `tool` message per call (#525). Writing them as assistant text —
+/// `Command: …\nOutput: …` — taught the model to "run" commands by typing
+/// that text, and splitting the preamble from its calls taught it to stop
+/// after "Let me check:". A command the user ran directly (`!cmd`) is the
+/// user's action and is replayed as a user message.
 fn history_to_messages(blocks: &[ChatBlock]) -> Vec<filar_agent::ChatMessage> {
-    blocks
-        .iter()
-        .filter_map(|block| match block {
-            ChatBlock::User(text) => Some(filar_agent::ChatMessage::user(text)),
-            ChatBlock::Agent(text) => Some(filar_agent::ChatMessage::assistant(text)),
-            ChatBlock::Command {
-                command,
-                output,
-                approved,
-                ..
-            } => {
-                let output_text = output.as_deref().unwrap_or(
-                    if *approved { "(no output)" } else { "(denied by user)" },
-                );
-                Some(filar_agent::ChatMessage::assistant(format!(
-                    "Command: {command}\nOutput: {output_text}"
-                )))
+    let mut out = Vec::new();
+    let mut next_id = 0usize;
+    let mut i = 0;
+    while i < blocks.len() {
+        match &blocks[i] {
+            ChatBlock::User(text) => out.push(filar_agent::ChatMessage::user(text)),
+            ChatBlock::Agent(text) => {
+                let end = agent_command_run_end(blocks, i + 1);
+                if end > i + 1 {
+                    push_tool_turn(&mut out, text, &blocks[i + 1..end], &mut next_id);
+                    i = end;
+                    continue;
+                }
+                out.push(filar_agent::ChatMessage::assistant(text));
             }
-            ChatBlock::Error(text) => Some(filar_agent::ChatMessage::assistant(format!(
-                "Error: {text}"
+            block @ ChatBlock::Command { .. } if is_agent_command(block) => {
+                let end = agent_command_run_end(blocks, i);
+                push_tool_turn(&mut out, "", &blocks[i..end], &mut next_id);
+                i = end;
+                continue;
+            }
+            ChatBlock::Command {
+                command, output, ..
+            } => {
+                let output_text = output.as_deref().unwrap_or("(no output)");
+                out.push(filar_agent::ChatMessage::user(format!(
+                    "[filar] I ran this command myself:\n$ {command}\n{output_text}"
+                )));
+            }
+            ChatBlock::Error(text) => out.push(filar_agent::ChatMessage::user(format!(
+                "[filar] The previous request ended with an error: {text}"
             ))),
-            ChatBlock::System(_) => None,
-            ChatBlock::Summary { text, .. } => Some(filar_agent::ChatMessage::user(format!(
+            ChatBlock::System(_) => {}
+            ChatBlock::Summary { text, .. } => out.push(filar_agent::ChatMessage::user(format!(
                 "Summary of earlier turns in this session:\n{text}"
             ))),
-        })
-        .collect()
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Whether a command block was proposed by the agent (as opposed to the
+/// user's own `!cmd`). Blocks saved before #525 carry no tool; they count as
+/// the agent's unless marked as a shell escape.
+fn is_agent_command(block: &ChatBlock) -> bool {
+    match block {
+        ChatBlock::Command { tool: Some(_), .. } => true,
+        ChatBlock::Command {
+            explanation,
+            tool: None,
+            ..
+        } => explanation != filar_core::SHELL_ESCAPE_EXPLANATION,
+        _ => false,
+    }
+}
+
+/// End (exclusive) of the run of agent command blocks starting at `start`.
+/// Feed-only `System` lines between them (a denial note) do not break it.
+fn agent_command_run_end(blocks: &[ChatBlock], start: usize) -> usize {
+    let mut end = start;
+    let mut j = start;
+    while let Some(block) = blocks.get(j) {
+        match block {
+            ChatBlock::System(_) => {}
+            b if is_agent_command(b) => end = j + 1,
+            _ => break,
+        }
+        j += 1;
+    }
+    end
+}
+
+/// Push one assistant message with `text` and a tool call per agent command
+/// in `run`, followed by the matching `tool` results.
+fn push_tool_turn(
+    out: &mut Vec<filar_agent::ChatMessage>,
+    text: &str,
+    run: &[ChatBlock],
+    next_id: &mut usize,
+) {
+    let mut calls = Vec::new();
+    let mut results = Vec::new();
+    for block in run {
+        let ChatBlock::Command {
+            command,
+            explanation,
+            output,
+            approved,
+            tool,
+        } = block
+        else {
+            continue;
+        };
+        // Synthetic, 9 alphanumerics: unique within the request, never
+        // clashing with a provider's own ids, accepted by strict providers.
+        let id = format!("h{:08}", *next_id);
+        *next_id += 1;
+        let (name, arguments) = match tool {
+            Some(t) => (t.name.clone(), t.arguments.clone()),
+            // Saved before #525: the shell command is all that is known.
+            None => (
+                filar_agent::tools::TOOL_RUN_COMMAND.to_string(),
+                serde_json::json!({ "command": command, "explanation": explanation }),
+            ),
+        };
+        let result = match output {
+            Some(o) => o.clone(),
+            None if *approved => "(no output)".to_string(),
+            None => "(denied by user)".to_string(),
+        };
+        calls.push(filar_agent::ToolCall {
+            id: id.clone(),
+            name,
+            arguments,
+        });
+        results.push(filar_agent::ChatMessage::tool(id, result));
+    }
+    out.push(filar_agent::ChatMessage::assistant_with_tools(text, calls));
+    out.extend(results);
 }
 
 /// Apply one save-progress event to the app (#235, #401).
@@ -3260,27 +3361,142 @@ mod tests {
         assert_eq!(messages.len(), 2, "summary + user turn");
     }
 
+    fn run_command_block(command: &str, output: Option<&str>, approved: bool) -> ChatBlock {
+        ChatBlock::Command {
+            command: command.into(),
+            explanation: format!("why {command}"),
+            output: output.map(Into::into),
+            approved,
+            tool: Some(filar_core::ToolInvocation {
+                name: "run_command".into(),
+                arguments: serde_json::json!({ "command": command, "explanation": "why" }),
+            }),
+        }
+    }
+
+    /// No command reaches the model as assistant text it could imitate (#525).
     #[test]
-    fn a_command_and_its_outcome_still_reach_the_model_unchanged() {
-        // Guards the extraction of `history_to_messages` out of `spawn_agent`.
+    fn agent_commands_are_replayed_as_tool_calls_with_their_results() {
         let blocks = vec![
-            ChatBlock::Command {
-                command: "systemctl restart nginx".into(),
-                explanation: "restart it".into(),
-                output: Some("done".into()),
-                approved: true,
-            },
-            ChatBlock::Command {
-                command: "rm -rf /var/log".into(),
-                explanation: String::new(),
-                output: None,
-                approved: false,
-            },
+            ChatBlock::User("restart nginx".into()),
+            run_command_block("systemctl restart nginx", Some("done"), true),
+            run_command_block("rm -rf /var/log", None, false),
         ];
         let messages = history_to_messages(&blocks);
-        assert!(messages[0].content.contains("Command: systemctl restart nginx"));
-        assert!(messages[0].content.contains("Output: done"));
-        assert!(messages[1].content.contains("(denied by user)"));
+        assert_eq!(
+            messages.len(),
+            4,
+            "user, assistant with calls, two results: {messages:?}"
+        );
+        let calls = &messages[1].tool_calls;
+        assert_eq!(messages[1].role, filar_agent::MessageRole::Assistant);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "run_command");
+        assert_eq!(calls[0].arguments["command"], "systemctl restart nginx");
+        assert_ne!(calls[0].id, calls[1].id);
+        assert_eq!(
+            messages[2].tool_call_id.as_deref(),
+            Some(calls[0].id.as_str())
+        );
+        assert_eq!(messages[2].content, "done");
+        assert_eq!(
+            messages[3].tool_call_id.as_deref(),
+            Some(calls[1].id.as_str())
+        );
+        assert_eq!(messages[3].content, "(denied by user)");
+        for m in &messages {
+            assert!(!m.content.contains("Command:"), "no command as text: {m:?}");
+            assert!(!m.content.contains("Output:"), "no output as text: {m:?}");
+        }
+    }
+
+    /// The preamble and the calls it introduced are one assistant message, as
+    /// when they were generated — not a message that ends at "…:" (#525).
+    #[test]
+    fn the_preamble_and_its_commands_are_one_assistant_message() {
+        let blocks = vec![
+            ChatBlock::User("check the logs".into()),
+            ChatBlock::Agent("Let me look at the logs:".into()),
+            run_command_block("tail log", Some("a"), true),
+            ChatBlock::System("Denied: x".into()),
+            run_command_block("tail log2", Some("b"), true),
+            ChatBlock::Agent("The log shows a timeout.".into()),
+        ];
+        let messages = history_to_messages(&blocks);
+        assert_eq!(messages.len(), 5, "{messages:?}");
+        assert_eq!(messages[1].content, "Let me look at the logs:");
+        assert_eq!(
+            messages[1].tool_calls.len(),
+            2,
+            "a system line does not split the turn"
+        );
+        assert_eq!(messages[2].role, filar_agent::MessageRole::Tool);
+        assert_eq!(messages[3].role, filar_agent::MessageRole::Tool);
+        assert_eq!(messages[4].content, "The log shows a timeout.");
+        assert!(messages[4].tool_calls.is_empty());
+    }
+
+    /// Read-only tools keep their own name and arguments.
+    #[test]
+    fn other_tools_keep_their_name_and_arguments() {
+        let blocks = vec![ChatBlock::Command {
+            command: "cat /etc/hosts".into(),
+            explanation: "Read file: /etc/hosts".into(),
+            output: Some("127.0.0.1 localhost".into()),
+            approved: true,
+            tool: Some(filar_core::ToolInvocation {
+                name: "read_file".into(),
+                arguments: serde_json::json!({ "path": "/etc/hosts" }),
+            }),
+        }];
+        let messages = history_to_messages(&blocks);
+        assert_eq!(messages[0].tool_calls[0].name, "read_file");
+        assert_eq!(messages[0].tool_calls[0].arguments["path"], "/etc/hosts");
+    }
+
+    /// A block from a session saved before #525 has no tool: it is replayed
+    /// as a `run_command` call, and an approved block that never got output
+    /// (interrupted) still gets a result, so every call is answered.
+    #[test]
+    fn blocks_without_a_tool_fall_back_to_run_command() {
+        let blocks = vec![ChatBlock::Command {
+            command: "uptime".into(),
+            explanation: "load".into(),
+            output: None,
+            approved: true,
+            tool: None,
+        }];
+        let messages = history_to_messages(&blocks);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].tool_calls[0].name, "run_command");
+        assert_eq!(messages[0].tool_calls[0].arguments["command"], "uptime");
+        assert_eq!(messages[1].content, "(no output)");
+    }
+
+    /// The user's own `!cmd` is the user's action, not an assistant call.
+    #[test]
+    fn a_shell_escape_is_the_users_message() {
+        let blocks = vec![ChatBlock::Command {
+            command: "df -h".into(),
+            explanation: filar_core::SHELL_ESCAPE_EXPLANATION.into(),
+            output: Some("/dev/sda1 50%".into()),
+            approved: true,
+            tool: None,
+        }];
+        let messages = history_to_messages(&blocks);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, filar_agent::MessageRole::User);
+        assert!(messages[0].tool_calls.is_empty());
+        assert!(messages[0].content.contains("df -h"));
+        assert!(messages[0].content.contains("/dev/sda1 50%"));
+    }
+
+    /// Errors are filar's notes, not something the assistant said.
+    #[test]
+    fn an_error_is_not_assistant_text() {
+        let messages = history_to_messages(&[ChatBlock::Error("timeout".into())]);
+        assert_eq!(messages[0].role, filar_agent::MessageRole::User);
+        assert!(messages[0].content.contains("timeout"));
     }
 
     #[tokio::test]
@@ -4179,6 +4395,7 @@ mod tests {
             explanation: "check the service".into(),
             output: Some("active (running)".into()),
             approved: true,
+            tool: None,
         });
         app.runbook_armed = Some(crate::app::RunbookArmed {
             session_id: app.sessions[0].id,
@@ -4235,6 +4452,7 @@ mod tests {
             explanation: "check the service".into(),
             output: Some("active (running)".into()),
             approved: true,
+            tool: None,
         });
         app.runbook_offer = Some(crate::app::RunbookArmed {
             session_id: app.sessions[0].id,
@@ -4334,6 +4552,7 @@ mod tests {
             explanation: "check load".into(),
             output: Some("0.1".into()),
             approved: true,
+            tool: None,
         });
         app.runbook_armed = Some(crate::app::RunbookArmed {
             session_id: app.sessions[0].id,
@@ -4407,6 +4626,7 @@ mod tests {
             explanation: "check load".into(),
             output: Some("0.1".into()),
             approved: true,
+            tool: None,
         });
         app.runbook_armed = Some(crate::app::RunbookArmed {
             session_id: app.sessions[0].id,

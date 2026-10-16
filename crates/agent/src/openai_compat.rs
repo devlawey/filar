@@ -434,10 +434,16 @@ impl OpenAiCompatClient {
                         };
                     }
 
+                    if let Some(note) = state.take_cut_off_notice() {
+                        on_delta(note);
+                    }
                     return StreamOutcome::Complete(state.into_response());
                 }
             }
             if state.done {
+                if let Some(note) = state.take_cut_off_notice() {
+                    on_delta(note);
+                }
                 return StreamOutcome::Complete(state.into_response());
             }
         }
@@ -915,7 +921,7 @@ struct ApiUsage {
 #[derive(Deserialize)]
 struct ApiChoice {
     message: ApiChoiceMessage,
-    #[allow(dead_code)]
+    #[serde(default)]
     finish_reason: Option<String>,
 }
 
@@ -983,7 +989,10 @@ impl ApiResponse {
         }
 
         // Otherwise, return the text content.
-        let text = choice.message.content.unwrap_or_default();
+        let mut text = choice.message.content.unwrap_or_default();
+        if let Some(note) = cut_off_notice(choice.finish_reason.as_deref(), false) {
+            text.push_str(&note);
+        }
         let mut resp = ChatResponse::text(text);
         if let Some(u) = usage { resp = resp.with_usage(u); }
         if let Some(m) = model { resp = resp.with_model(m); }
@@ -1009,8 +1018,27 @@ struct SseEvent {
 #[derive(Deserialize)]
 struct SseChoice {
     delta: SseDelta,
-    #[allow(dead_code)]
+    #[serde(default)]
     finish_reason: Option<String>,
+}
+
+/// The note appended to a text answer the provider cut off (#525).
+///
+/// `length` (out of `max_tokens`) and `content_filter` end the answer
+/// mid-way; without the note it reads as a complete final answer — often
+/// one that ends at "Let me check:" with the tool call it announced lost.
+/// `None` for a normal stop, and for an answer with tool calls (a call cut
+/// off mid-arguments already comes back to the model as a parse error).
+fn cut_off_notice(finish_reason: Option<&str>, has_tool_calls: bool) -> Option<String> {
+    match finish_reason {
+        Some(reason @ ("length" | "content_filter")) if !has_tool_calls => {
+            info!(finish_reason = reason, "model answer was cut off");
+            Some(format!(
+                "\n\n[filar: the model's answer was cut off (finish_reason: {reason}) — it may be incomplete]"
+            ))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Deserialize)]
@@ -1053,6 +1081,8 @@ struct SseState {
     done: bool,
     streamed_usage: Option<ApiUsage>,
     streamed_model: Option<String>,
+    /// The last `finish_reason` the stream reported.
+    finish_reason: Option<String>,
 }
 
 impl SseState {
@@ -1064,6 +1094,7 @@ impl SseState {
             done: false,
             streamed_usage: None,
             streamed_model: None,
+            finish_reason: None,
         }
     }
 
@@ -1096,6 +1127,9 @@ impl SseState {
                         self.streamed_model = Some(m);
                     }
                     if let Some(choice) = event.choices.into_iter().next() {
+                        if let Some(reason) = choice.finish_reason {
+                            self.finish_reason = Some(reason);
+                        }
                         if let Some(content) = choice.delta.content {
                             if !content.is_empty() {
                                 new_deltas.push(content.clone());
@@ -1149,6 +1183,14 @@ impl SseState {
     /// neither text nor tool calls is nothing the caller can use.
     fn is_empty(&self) -> bool {
         self.full_text.is_empty() && self.tool_calls.is_empty()
+    }
+
+    /// Append the cut-off note to the text (and return it so the caller can
+    /// stream it too), if the provider cut the answer off.
+    fn take_cut_off_notice(&mut self) -> Option<String> {
+        let note = cut_off_notice(self.finish_reason.as_deref(), !self.tool_calls.is_empty())?;
+        self.full_text.push_str(&note);
+        Some(note)
     }
 
     fn into_response(self) -> Result<ChatResponse> {
@@ -1471,6 +1513,59 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         assert_eq!(calls[0].name, "run_command");
         assert_eq!(calls[1].id, "c2");
         assert_eq!(calls[1].name, "list_dir");
+    }
+
+    /// A text answer cut off by `max_tokens` says so instead of reading as a
+    /// complete final answer (#525).
+    #[test]
+    fn sse_cut_off_text_answer_gets_a_notice() {
+        let mut state = SseState::new();
+        state.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Let me check the logs:\"}}]}\n\n",
+        );
+        state
+            .process_chunk("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n");
+        state.process_chunk("data: [DONE]\n\n");
+        let note = state
+            .take_cut_off_notice()
+            .expect("a cut-off answer is flagged");
+        assert!(note.contains("finish_reason: length"), "{note}");
+        let response = state.into_response().unwrap();
+        assert!(response.text.starts_with("Let me check the logs:"));
+        assert!(response.text.ends_with(&note));
+    }
+
+    /// A normal stop, or a cut-off answer that carries tool calls, gets none.
+    #[test]
+    fn sse_normal_stop_and_tool_calls_get_no_notice() {
+        let mut state = SseState::new();
+        state.process_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"Done.\"},\"finish_reason\":\"stop\"}]}\n\n");
+        assert!(state.take_cut_off_notice().is_none());
+
+        let mut state = SseState::new();
+        state.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{\\\"comm\"}}]},\"finish_reason\":\"length\"}]}\n\n",
+        );
+        assert!(state.take_cut_off_notice().is_none());
+    }
+
+    /// The non-streaming path flags a cut-off answer the same way.
+    #[test]
+    fn non_streaming_cut_off_answer_gets_a_notice() {
+        let raw = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "Partial" },
+                "finish_reason": "content_filter"
+            }]
+        });
+        let resp: ApiResponse = serde_json::from_value(raw).unwrap();
+        let result = resp.try_into_chat_response().unwrap();
+        assert!(result.text.starts_with("Partial"));
+        assert!(
+            result.text.contains("finish_reason: content_filter"),
+            "{}",
+            result.text
+        );
     }
 
     #[test]

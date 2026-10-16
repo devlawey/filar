@@ -7,6 +7,25 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Explanation of a command the user ran directly (`!cmd`), not the agent.
+///
+/// Such a block carries no [`ToolInvocation`]: it is replayed to the model
+/// as the user's action, never as an assistant tool call (#525).
+pub const SHELL_ESCAPE_EXPLANATION: &str = "Shell escape (direct)";
+
+/// The tool call behind a [`ChatBlock::Command`]: the tool's name and its
+/// original arguments, as the model sent them.
+///
+/// Kept so the history can be replayed to the model as real tool calls
+/// rather than as assistant text it would imitate (#525).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolInvocation {
+    /// Tool name (`run_command`, `read_file`, …).
+    pub name: String,
+    /// Arguments object as sent by the model.
+    pub arguments: serde_json::Value,
+}
+
 /// A block in the chat history — visually distinct message type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChatBlock {
@@ -20,6 +39,11 @@ pub enum ChatBlock {
         explanation: String,
         output: Option<String>,
         approved: bool,
+        /// The agent's tool call behind this block (#525). `None` for a
+        /// command the user ran directly ([`SHELL_ESCAPE_EXPLANATION`]) and
+        /// for blocks saved before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<ToolInvocation>,
     },
     /// An error message.
     Error(String),
@@ -78,6 +102,10 @@ mod tests {
                 explanation: "list files".into(),
                 output: Some("total 0".into()),
                 approved: true,
+                tool: Some(ToolInvocation {
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({"command": "ls -la"}),
+                }),
             },
             ChatBlock::Error("something failed".into()),
             ChatBlock::System("connected".into()),
@@ -89,6 +117,29 @@ mod tests {
         assert_eq!(blocks.len(), decoded.len());
         assert!(matches!(&decoded[0], ChatBlock::User(s) if s == "hello"));
         assert!(matches!(&decoded[2], ChatBlock::Command { command, .. } if command == "ls -la"));
+        assert!(
+            matches!(&decoded[2], ChatBlock::Command { tool: Some(t), .. }
+            if t.name == "run_command" && t.arguments["command"] == "ls -la")
+        );
+    }
+
+    #[test]
+    fn command_blocks_saved_without_a_tool_still_load() {
+        // Sessions written before #525 have no `tool` field.
+        let old =
+            r#"[{"Command":{"command":"ls","explanation":"list","output":"a","approved":true}}]"#;
+        let decoded: Vec<ChatBlock> = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            &decoded[0],
+            ChatBlock::Command {
+                tool: None,
+                approved: true,
+                ..
+            }
+        ));
+        // And a block without a tool is written without the field.
+        let json = serde_json::to_string(&decoded).unwrap();
+        assert!(!json.contains("\"tool\""), "{json}");
     }
 
     #[test]

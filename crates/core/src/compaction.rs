@@ -149,6 +149,7 @@ mod tests {
             explanation: String::new(),
             output: Some("ok".into()),
             approved: true,
+            tool: None,
         }
     }
     fn system(s: &str) -> ChatBlock {
@@ -245,6 +246,7 @@ mod tests {
             explanation: String::new(),
             output: None,
             approved: false,
+            tool: None,
         }];
         let text = transcript_for_summary(&blocks);
         assert!(text.contains("(denied by user)"));

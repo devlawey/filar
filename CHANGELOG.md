@@ -13,6 +13,15 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- The agent no longer "runs" commands by writing them as text with invented
+  output, and no longer stops after announcing an action ("Let me check the
+  logs:"): earlier commands are replayed to the model as real tool calls, an
+  answer that writes a command as text is marked as not executed, an
+  announcement without a tool call is followed up once, and an answer the
+  provider cut off says so ([#525](https://github.com/devlawey/filar/issues/525)).
+
+### Fixed
+
 - Windows, local mode: PowerShell progress (`Test-NetConnection`,
   `Test-Connection`, `Invoke-WebRequest`) no longer paints a dark-cyan pane
   over the TUI and leaves fragments behind; agent commands and background jobs
