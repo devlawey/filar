@@ -627,7 +627,7 @@ pub fn key_to_bytes(key: KeyEvent) -> Vec<u8> {
 
 /// Convert a Ctrl+<char> combination to its control code byte(s).
 fn ctrl_char_to_bytes(c: char) -> Vec<u8> {
-    let lower = c.to_ascii_lowercase();
+    let lower = latin_key_for(c).unwrap_or(c).to_ascii_lowercase();
     let byte = match lower {
         'a'..='z' => (lower as u8) - b'a' + 1, // Ctrl+A = 0x01, ..., Ctrl+Z = 0x1A
         '[' => 0x1b, // Ctrl+[ = ESC
@@ -639,6 +639,34 @@ fn ctrl_char_to_bytes(c: char) -> Vec<u8> {
         _ => return c.to_string().into_bytes(),
     };
     vec![byte]
+}
+
+/// The Latin key at the same position as a Cyrillic letter (ЙЦУКЕН, plus
+/// the Ukrainian і/ї/є), for Ctrl combinations (#528).
+///
+/// With a Cyrillic layout active, Windows hands Ctrl+C over as Ctrl+`с`
+/// (U+0441): crossterm recovers the character of the key from the layout.
+/// Sent as is, `с` reached the shell as a letter, so Ctrl+C/D/Z/R… did
+/// nothing. Shells expect the control code of the key's Latin letter.
+fn latin_key_for(c: char) -> Option<char> {
+    const ROWS: [(&str, &str); 3] = [
+        ("йцукенгшщзхъ", "qwertyuiop[]"),
+        ("фывапролджэ", "asdfghjkl;'"),
+        ("ячсмитьбю", "zxcvbnm,."),
+    ];
+    let lower = c.to_lowercase().next()?;
+    let lower = match lower {
+        'ё' => return Some('`'),
+        'і' => 'ы',
+        'ї' => 'ъ',
+        'є' => 'э',
+        other => other,
+    };
+    ROWS.iter().find_map(|(cyr, lat)| {
+        cyr.chars()
+            .position(|k| k == lower)
+            .and_then(|i| lat.chars().nth(i))
+    })
 }
 
 /// Pull complete OSC 7 sequences out of `buf`, leaving a possible incomplete
@@ -903,6 +931,38 @@ mod tests {
     fn key_to_bytes_ctrl_c() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(key_to_bytes(key), b"\x03");
+    }
+
+    /// Ctrl combinations on a Cyrillic layout send the control code of the
+    /// key's Latin letter (#528); plain Cyrillic input is unchanged.
+    #[test]
+    fn key_to_bytes_ctrl_on_a_cyrillic_layout() {
+        let ctrl = |c| key_to_bytes(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        assert_eq!(ctrl('с'), b"\x03", "Ctrl+C");
+        assert_eq!(ctrl('С'), b"\x03", "Ctrl+Shift+C");
+        assert_eq!(ctrl('в'), b"\x04", "Ctrl+D");
+        assert_eq!(ctrl('я'), b"\x1a", "Ctrl+Z");
+        assert_eq!(ctrl('к'), b"\x12", "Ctrl+R");
+        assert_eq!(ctrl('д'), b"\x0c", "Ctrl+L");
+        assert_eq!(ctrl('ф'), b"\x01", "Ctrl+A");
+        assert_eq!(ctrl('х'), b"\x1b", "Ctrl+[");
+        assert_eq!(ctrl('і'), b"\x13", "Ukrainian і is the S key");
+
+        let plain = KeyEvent::new(KeyCode::Char('с'), KeyModifiers::NONE);
+        assert_eq!(key_to_bytes(plain), "с".as_bytes(), "typing Cyrillic is untouched");
+        let alt = KeyEvent::new(KeyCode::Char('с'), KeyModifiers::ALT);
+        assert_eq!(key_to_bytes(alt), "\x1bс".as_bytes(), "Alt is out of scope");
+    }
+
+    #[test]
+    fn latin_key_for_covers_the_whole_layout() {
+        let cyr = "йцукенгшщзхъфывапролджэячсмитьбю";
+        let lat = "qwertyuiop[]asdfghjkl;'zxcvbnm,.";
+        for (c, l) in cyr.chars().zip(lat.chars()) {
+            assert_eq!(latin_key_for(c), Some(l), "{c}");
+        }
+        assert_eq!(latin_key_for('ё'), Some('`'));
+        assert_eq!(latin_key_for('a'), None);
     }
 
     #[test]

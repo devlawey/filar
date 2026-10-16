@@ -13,6 +13,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- Terminal mode (Ctrl+T): Ctrl+C, Ctrl+D, Ctrl+Z, Ctrl+R and the other Ctrl
+  keys work on a Cyrillic keyboard layout; on Windows they used to reach the
+  shell as a Cyrillic letter ([#528](https://github.com/devlawey/filar/issues/528)).
+
 - The agent no longer "runs" commands by writing them as text with invented
   output, and no longer stops after announcing an action ("Let me check the
   logs:"): earlier commands are replayed to the model as real tool calls, an
