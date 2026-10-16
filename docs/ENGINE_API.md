@@ -505,6 +505,24 @@ in registration order and the first that claims the command and parses its
 output wins. The built-in set (`with_builtins()`, the `Default`) is
 registered first.
 
+## Upgrading to the next engine tag (unreleased)
+
+| Change | Breaks | What to do |
+|--------|--------|------------|
+| `ChatBlock::Command::tool: Option<ToolInvocation>` added (#525) | Struct literals and exhaustive patterns of `ChatBlock::Command` | `tool: None` where you build one by hand (or the `ToolInvocation` from `CommandProposed`); add `..` to patterns. Old session files load unchanged (`#[serde(default)]`) |
+| `AgentEvent::CommandProposed::tool: ToolInvocation` added (#525) | Constructing the event by hand; patterns without `..` | Keep the tool on the chat block you create for the command |
+| `ToolInvocation`, `SHELL_ESCAPE_EXPLANATION` exported from `filar-core` (#525) | Nothing — additive | — |
+
+When you rebuild the model's history from your own chat blocks, replay a
+command as what it was: an assistant message with `tool_calls` (the turn's
+preamble text as its content) followed by one `ChatMessage::tool` result per
+call — never as assistant text such as `Command: …\nOutput: …`. Models
+imitate the history: commands written as text teach them to "run" commands by
+typing them, with invented output and no confirmation (#525). The TUI's
+`history_to_messages` is the reference. The agent loop additionally flags an
+answer that writes a command and its output as text, and follows up once on
+an answer that ends by announcing an action without a tool call.
+
 ## Upgrading to `engine-v2.0.3`
 
 | Change | Breaks | What to do |

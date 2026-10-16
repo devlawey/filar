@@ -19,7 +19,7 @@ pub mod os_family;
 pub mod secrets;
 pub mod session;
 
-pub use chat::ChatBlock;
+pub use chat::{ChatBlock, ToolInvocation, SHELL_ESCAPE_EXPLANATION};
 pub use compaction::{
     compact_history, compaction_boundary, should_compact, transcript_for_summary,
     DEFAULT_KEEP_TURNS,

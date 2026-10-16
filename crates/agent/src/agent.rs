@@ -37,6 +37,56 @@ const DEFAULT_MAX_OUTPUT_CHARS: usize = 10_000;
 /// Maximum number of retries for missing explanation in Explain mode.
 const MAX_MISSING_EXPLANATION_RETRIES: u32 = 2;
 
+/// Sent to the model when its answer announced an action ("Let me check:")
+/// but carried no tool call — once per run (#525).
+const NUDGE_ANNOUNCED_ACTION: &str = "[filar] Your previous message announced an action but ended \
+without a tool call, so nothing ran. If you meant to act, call the tool now; otherwise give your answer.";
+
+/// Sent to the model when its answer wrote a command and its output as text
+/// instead of calling a tool — once per run (#525).
+const NUDGE_COMMAND_AS_TEXT: &str = "[filar] Your previous message wrote a command and its output \
+as text. Nothing was executed: commands run only through the tools, after the user's confirmation. \
+Call the tool now if the command is needed, and never report results you have not received.";
+
+/// Appended to an answer that "ran" a command as text, so the user is not
+/// left believing it ran (#525).
+const NOTE_COMMAND_AS_TEXT: &str =
+    "\n\n[filar: the command above was written as text and was NOT executed]";
+
+/// Whether `text`, a final answer without tool calls, ends by announcing an
+/// action it never took: it ends with a colon, not with a code block (#525).
+fn announces_unperformed_action(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    if trimmed.ends_with("```") {
+        return false;
+    }
+    trimmed.ends_with(':') || trimmed.ends_with('：')
+}
+
+/// Whether `text` imitates running a command: a `Command:` line followed by
+/// an `Output:` line, outside code fences (#525). A command quoted inside a
+/// ``` block is an example, not an imitation.
+fn imitates_command_execution(text: &str) -> bool {
+    let mut in_fence = false;
+    let mut saw_command = false;
+    for line in text.lines() {
+        let line = line.trim_start();
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if line.starts_with("Command:") {
+            saw_command = true;
+        } else if saw_command && line.starts_with("Output:") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Appended to the system prompt when the agent works over a fleet (#434,
 /// #435). Must match what the fleet agent actually does: only run_command,
 /// every command on every host, read-only, a fold back instead of output.
@@ -542,6 +592,15 @@ impl Agent {
         }
     }
 
+    /// Stream text the agent adds itself (a separator, a note) the same way
+    /// the model's own deltas are streamed.
+    fn emit_text(&self, text: String) {
+        if let Some(ref cb) = self.on_text_delta {
+            cb(text.clone());
+        }
+        self.emit(AgentEvent::TextDelta(text));
+    }
+
     /// Run the independent command arbiter when enabled. Never blocks confirmation.
     async fn run_command_audit(
         &self,
@@ -649,6 +708,14 @@ impl Agent {
         info!(prompt = %user_prompt, "agent loop started");
 
         let mut missing_explanation_count: u32 = 0;
+        // Each guard against a text-only "action" fires at most once per run
+        // (#525), so a model that insists cannot loop.
+        let mut nudged_announce = false;
+        let mut nudged_command_text = false;
+        // Text already streamed into the current answer block before a nudge:
+        // the final answer is returned with it, so the block the frontend
+        // replaces on `Finished` keeps what the user saw.
+        let mut carried = String::new();
 
         for iteration in 0..self.max_iterations {
             info!(iteration, "sending request to LLM");
@@ -732,9 +799,40 @@ impl Agent {
                     let result = self.process_tool_call(tc, &messages).await?;
                     messages.push(result);
                 }
+                // The frontend starts a new answer block after a command.
+                carried.clear();
             } else {
-                info!(iteration, "agent produced final text response");
-                return Ok(response.text);
+                let mut text = response.text;
+                let nudge = if imitates_command_execution(&text) {
+                    info!(
+                        iteration,
+                        "model wrote a command as text instead of calling a tool"
+                    );
+                    text.push_str(NOTE_COMMAND_AS_TEXT);
+                    self.emit_text(NOTE_COMMAND_AS_TEXT.to_string());
+                    (!std::mem::replace(&mut nudged_command_text, true))
+                        .then_some(NUDGE_COMMAND_AS_TEXT)
+                } else if announces_unperformed_action(&text) {
+                    info!(iteration, "model announced an action without a tool call");
+                    (!std::mem::replace(&mut nudged_announce, true))
+                        .then_some(NUDGE_ANNOUNCED_ACTION)
+                } else {
+                    None
+                };
+                match nudge {
+                    Some(nudge) if iteration + 1 < self.max_iterations => {
+                        info!(iteration, "asking the model to act instead of announcing");
+                        messages.push(ChatMessage::assistant(&text));
+                        messages.push(ChatMessage::user(nudge));
+                        carried.push_str(&text);
+                        carried.push_str("\n\n");
+                        self.emit_text("\n\n".to_string());
+                    }
+                    _ => {
+                        info!(iteration, "agent produced final text response");
+                        return Ok(carried + &text);
+                    }
+                }
             }
         }
 
@@ -817,6 +915,10 @@ impl Agent {
             command: display_command.clone(),
             explanation: parsed.explanation.clone(),
             destructive,
+            tool: filar_core::ToolInvocation {
+                name: tc.name.clone(),
+                arguments: tc.arguments.clone(),
+            },
         });
 
         if let Some(crate::fleet_gate::FleetGate::Refuse(msg)) = fleet_gate {
@@ -1295,6 +1397,134 @@ mod tests {
 
         let result = agent.run("say hello via command", &[]).await.unwrap();
         assert!(result.contains("Done!"));
+    }
+
+    fn echo_call() -> ChatResponse {
+        ChatResponse::tool_calls(
+            "",
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "run_command".into(),
+                arguments: serde_json::json!({ "command": "echo hello", "explanation": "Print hello" }),
+            }],
+        )
+    }
+
+    fn guard_agent(llm: Arc<MockLlm>, executor: Arc<MockExecutor>) -> Agent {
+        Agent::builder()
+            .llm(llm)
+            .executor(executor)
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .confirm_mode(CommandConfirmMode::Always)
+            .build()
+            .unwrap()
+    }
+
+    fn new_executor() -> Arc<MockExecutor> {
+        Arc::new(MockExecutor {
+            last_command: std::sync::Mutex::new(String::new()),
+        })
+    }
+
+    /// "Let me check:" without a tool call does not end the turn: the model
+    /// is asked once to act, and the call it then makes runs (#525).
+    #[tokio::test]
+    async fn an_announced_action_is_followed_up_once() {
+        let llm = Arc::new(MockLlm::new(vec![
+            ChatResponse::text("Let me check the logs:"),
+            echo_call(),
+            ChatResponse::text("All good."),
+        ]));
+        let executor = new_executor();
+        let agent = guard_agent(llm.clone(), executor.clone());
+        let result = agent.run("check", &[]).await.unwrap();
+        assert_eq!(*executor.last_command.lock().unwrap(), "echo hello");
+        assert_eq!(
+            result, "All good.",
+            "a new answer block starts after the command"
+        );
+        assert_eq!(*llm.call_count.lock().unwrap(), 3);
+    }
+
+    /// The follow-up happens once: a second announcement ends the turn, and
+    /// the answer keeps both parts as they were streamed.
+    #[tokio::test]
+    async fn an_announced_action_is_followed_up_only_once() {
+        let llm = Arc::new(MockLlm::new(vec![
+            ChatResponse::text("Let me check:"),
+            ChatResponse::text("Checking now:"),
+        ]));
+        let agent = guard_agent(llm.clone(), new_executor());
+        let result = agent.run("check", &[]).await.unwrap();
+        assert_eq!(result, "Let me check:\n\nChecking now:");
+        assert_eq!(*llm.call_count.lock().unwrap(), 2);
+    }
+
+    /// A command "run" as text is flagged as not executed, and the model is
+    /// asked once to call the tool instead (#525).
+    #[tokio::test]
+    async fn a_command_written_as_text_is_flagged_and_retried_once() {
+        let fake = "Command: sed -i 's/19/20/' bot.py\nOutput: Done\nГотово: 22:20.";
+        let llm = Arc::new(MockLlm::new(vec![
+            ChatResponse::text(fake),
+            echo_call(),
+            ChatResponse::text("Changed."),
+        ]));
+        let executor = new_executor();
+        let agent = guard_agent(llm.clone(), executor.clone());
+        let result = agent.run("change it", &[]).await.unwrap();
+        assert_eq!(
+            *executor.last_command.lock().unwrap(),
+            "echo hello",
+            "the real call ran"
+        );
+        assert_eq!(result, "Changed.");
+
+        // Insisting twice: no second retry, the note stays on the answer.
+        let llm = Arc::new(MockLlm::new(vec![
+            ChatResponse::text(fake),
+            ChatResponse::text(fake),
+        ]));
+        let executor = new_executor();
+        let agent = guard_agent(llm.clone(), executor.clone());
+        let result = agent.run("change it", &[]).await.unwrap();
+        assert!(
+            executor.last_command.lock().unwrap().is_empty(),
+            "nothing ran"
+        );
+        assert!(result.ends_with(NOTE_COMMAND_AS_TEXT), "{result}");
+        assert_eq!(
+            result.matches("NOT executed").count(),
+            2,
+            "both answers are flagged"
+        );
+        assert_eq!(*llm.call_count.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn announcement_detection() {
+        assert!(announces_unperformed_action("Давайте посмотрим логи:"));
+        assert!(announces_unperformed_action("Let me look at the code:\n\n"));
+        assert!(!announces_unperformed_action("The service is running."));
+        assert!(!announces_unperformed_action("Run this:\n```\nls -la\n```"));
+    }
+
+    #[test]
+    fn command_as_text_detection() {
+        assert!(imitates_command_execution(
+            "Command: ls\nOutput: a b\nDone."
+        ));
+        assert!(imitates_command_execution(
+            "  Command: python3 -c \"\nx\n\"\n  Output: Done"
+        ));
+        assert!(
+            !imitates_command_execution("```\nCommand: ls\nOutput: a\n```"),
+            "a quoted example"
+        );
+        assert!(!imitates_command_execution(
+            "Command: ls (I can run it if you want)"
+        ));
+        assert!(!imitates_command_execution("Output: only"));
     }
 
     #[tokio::test]

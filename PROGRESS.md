@@ -10512,3 +10512,32 @@ x86_64-pc-windows-gnu` для transport/agent — Windows-ветки компи�
 Windows в окружении агента; за мейнтейнером.
 
 **Контракты.** Без изменений.
+
+## #525 — история подаётся модели tool calls'ами, а не текстом
+
+**Причина.** `history_to_messages` отдавал прошлые команды assistant-текстом
+`Command: …\nOutput: …`, а анонс хода («Давайте посмотрим логи:») — отдельным
+assistant-сообщением. На длинной истории модель (DeepSeek) подражала: писала
+команду текстом с выдуманным выводом и «Готово» (ничего не запускалось) или
+заканчивала ход на двоеточии.
+
+**Сделано.** `ChatBlock::Command` хранит `tool: Option<ToolInvocation>` (имя и
+исходные аргументы, `#[serde(default)]` — старые сессии читаются); приходит из
+нового поля `AgentEvent::CommandProposed::tool`. Воспроизведение: анонс + идущие
+подряд команды хода → одно assistant-сообщение с `tool_calls`, затем `tool`-ответы
+(синтетические id `hNNNNNNNN`); блоки без `tool` (старые сессии) — как
+`run_command`; `!cmd` пользователя и `Error` — user-сообщения с пометкой
+`[filar]`. В цикле агента: ответ с `Command:`→`Output:` вне ``` помечается «NOT
+executed» и один раз переспрашивается; ответ без tool call, оканчивающийся
+двоеточием, один раз доводится подсказкой; оба — не более раза за ход. Клиент
+читает `finish_reason`: при `length`/`content_filter` без tool calls к ответу
+дописывается пометка об обрыве (без изменения `ChatResponse`).
+
+**Решения.** Повтор после «команды текстом» не стирает уже показанный текст —
+он остаётся с пометкой; `ChatResponse`/`LlmClient` не трогали — пометку об
+обрыве добавляет сам клиент.
+
+**Контракты.** `CommandExecutor`/`LlmClient` без изменений. Breaking для
+embedders: поля `ChatBlock::Command::tool` и `AgentEvent::CommandProposed::tool`;
+аддитивно — `ToolInvocation`, `SHELL_ESCAPE_EXPLANATION` (см. `docs/ENGINE_API.md`).
+

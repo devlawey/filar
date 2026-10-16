@@ -511,7 +511,7 @@ pub struct Session {
     /// Whether the agent is currently streaming a text response.
     pub streaming: bool,
     /// Pending command proposal metadata from `CommandProposed`.
-    pub pending_proposal: Option<(String, String)>,
+    pub pending_proposal: Option<(String, String, filar_core::ToolInvocation)>,
     /// Arbiter audit received before the confirmation dialog opens.
     pub pending_audit: Option<PendingAudit>,
     /// Spinner animation tick counter — incremented each render frame.
@@ -1572,7 +1572,13 @@ pub(crate) fn messages_to_markdown(messages: &[ChatBlock], session_name: &str, s
             ChatBlock::Agent(s) => {
                 md.push_str(&format!("**Agent:** {s}\n\n"));
             }
-            ChatBlock::Command { command, explanation, output, approved } => {
+            ChatBlock::Command {
+                command,
+                explanation,
+                output,
+                approved,
+                ..
+            } => {
                 if !explanation.is_empty() {
                     md.push_str(&format!("> {explanation}\n\n"));
                 }
@@ -3536,9 +3542,10 @@ impl App {
                                     // Regular shell escape.
                                     self.push_message(ChatBlock::Command {
                                         command: cmd,
-                                        explanation: "Shell escape (direct)".into(),
+                                        explanation: filar_core::SHELL_ESCAPE_EXPLANATION.into(),
                                         output: None,
                                         approved: true,
+                                        tool: None,
         });
                                     self.scroll = 0;
                                     self.input.clear();
@@ -4715,11 +4722,17 @@ impl App {
     fn respond_to_confirmation(&mut self, approved: bool) {
         if let Some(confirm) = self.pending_confirm.take() {
             let _ = confirm.respond_to.send(approved);
+            let tool = self
+                .pending_proposal
+                .as_ref()
+                .filter(|(cmd, _, _)| *cmd == confirm.command)
+                .map(|(_, _, tool)| tool.clone());
             self.push_message(ChatBlock::Command {
                 command: confirm.command,
                 explanation: confirm.explanation,
                 output: None,
                 approved,
+                tool,
             });
             self.mode = AppMode::Thinking;
             // Clear modal hit-test state so stale button areas don't swallow clicks.
@@ -4847,9 +4860,14 @@ impl App {
                     self.message_rev = self.message_rev.wrapping_add(1);
                     auto_scroll = self.scroll == 0;
                 }
-                filar_agent::AgentEvent::CommandProposed { command, explanation, .. } => {
+                filar_agent::AgentEvent::CommandProposed {
+                    command,
+                    explanation,
+                    tool,
+                    ..
+                } => {
                     let explanation = self.with_fleet_radius(explanation);
-                    self.pending_proposal = Some((command, explanation));
+                    self.pending_proposal = Some((command, explanation, tool));
                 }
                 filar_agent::AgentEvent::CommandAudited {
                     verdict,
@@ -4868,12 +4886,14 @@ impl App {
                     if !denied {
                         self.streaming = false;
                         auto_scroll = self.scroll == 0;
-                        let explanation = self
+                        let proposal = self
                             .pending_proposal
                             .as_ref()
-                            .filter(|(cmd, _)| *cmd == command)
-                            .map(|(_, expl)| expl.clone())
+                            .filter(|(cmd, _, _)| *cmd == command);
+                        let explanation = proposal
+                            .map(|(_, expl, _)| expl.clone())
                             .unwrap_or_default();
+                        let tool = proposal.map(|(_, _, tool)| tool.clone());
                         let mut updated = false;
                         // The block awaiting this output is usually the last
                         // one; a cancelled fleet run (#437) delivers its
@@ -4902,6 +4922,7 @@ impl App {
                                 explanation,
                                 output: Some(output.clone()),
                                 approved: true,
+                                tool,
                             });
                         }
                     } else {
@@ -6450,6 +6471,7 @@ mod tests {
             explanation: String::new(),
             output: Some("operation #3: 3 of 3 hosts answered\noperation #3 · ad-hoc\nsame on 3".into()),
             approved: true,
+            tool: None,
         });
         let idx = app.messages.len() - 1;
         assert!(app.collapsed_set().contains(&idx), "collapsed to its headline in the fleet");
@@ -6471,6 +6493,7 @@ mod tests {
             explanation: String::new(),
             output: None,
             approved: true,
+            tool: None,
         });
 
         app.handle_key(ctrl_key('z'));
@@ -6693,6 +6716,10 @@ mod tests {
                 command: command.into(),
                 explanation: explanation.into(),
                 destructive: false,
+                tool: filar_core::ToolInvocation {
+                    name: "run_command".into(),
+                    arguments: serde_json::json!({ "command": command }),
+                },
             },
         });
         app.handle_agent_event(TuiEvent::ConfirmationRequest {
@@ -6703,6 +6730,61 @@ mod tests {
             respond_to: tx,
         });
         rx
+    }
+
+    /// The command block keeps the tool call behind it — confirmed or
+    /// auto-approved — so the history can replay it as one (#525).
+    #[test]
+    fn command_blocks_keep_the_tool_call() {
+        use crossterm::event::KeyCode;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let mut rx = request_confirmation(&mut app, "uptime", "load average");
+        app.handle_key(key_event(KeyCode::Char('a')));
+        assert_eq!(rx.try_recv(), Ok(true));
+        let Some(ChatBlock::Command {
+            tool: Some(tool), ..
+        }) = app.messages.last()
+        else {
+            panic!("confirmed block without a tool: {:?}", app.messages.last());
+        };
+        assert_eq!(tool.name, "run_command");
+        assert_eq!(tool.arguments["command"], "uptime");
+
+        // Auto-approved: no confirmation, the block comes from the result.
+        let session_id = app.sessions[app.active].id;
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id,
+            event: filar_agent::AgentEvent::CommandProposed {
+                command: "cat /etc/hosts".into(),
+                explanation: "Read file: /etc/hosts".into(),
+                destructive: false,
+                tool: filar_core::ToolInvocation {
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({ "path": "/etc/hosts" }),
+                },
+            },
+        });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id,
+            event: filar_agent::AgentEvent::CommandFinished {
+                command: "cat /etc/hosts".into(),
+                output: "127.0.0.1 localhost".into(),
+                denied: false,
+            },
+        });
+        let Some(ChatBlock::Command {
+            tool: Some(tool),
+            output: Some(out),
+            ..
+        }) = app.messages.last()
+        else {
+            panic!(
+                "auto-approved block without a tool: {:?}",
+                app.messages.last()
+            );
+        };
+        assert_eq!(tool.name, "read_file");
+        assert_eq!(out, "127.0.0.1 localhost");
     }
 
     #[test]
@@ -6738,7 +6820,7 @@ mod tests {
         assert_eq!(pending.explanation, "load average (runs on 2 hosts: web-1, web-2)");
         // The feed (and so the Explain transcript) keeps the same text.
         assert_eq!(
-            app.pending_proposal.as_ref().map(|(_, e)| e.as_str()),
+            app.pending_proposal.as_ref().map(|(_, e, _)| e.as_str()),
             Some("load average (runs on 2 hosts: web-1, web-2)")
         );
     }
@@ -7484,6 +7566,7 @@ mod tests {
             explanation: String::new(),
             output: None,
             approved: false,
+            tool: None,
         });
         let rev_before = app.message_rev;
         app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::CommandFinished {
@@ -8309,6 +8392,7 @@ mod tests {
             explanation: "".into(),
             output: Some(output),
             approved: true,
+            tool: None,
         });
         app
     }
@@ -8434,6 +8518,7 @@ mod tests {
             explanation: "".into(),
             output: None,
             approved: false,
+            tool: None,
         });
         app.chat_area = Rect::new(0, 1, 80, 24);
         app.layout_cache.lines = vec![
@@ -13470,6 +13555,7 @@ mod tests {
             command: command.into(),
             explanation: "explain".into(),
             output: approved.then(|| "ok".to_string()),
+            tool: None,
             approved,
         }
     }
@@ -13971,6 +14057,7 @@ mod tests {
                 explanation: "list".into(),
                 output: Some("f.txt".into()),
                 approved: true,
+                tool: None,
             },
             ChatBlock::Error("fail".into()),
             ChatBlock::System("started".into()),
@@ -14247,12 +14334,14 @@ mod tests {
                 explanation: "List files to diagnose disk usage".into(),
                 output: Some("file.txt".into()),
                 approved: true,
+                tool: None,
             },
             ChatBlock::Command {
                 command: "rm -rf /tmp".into(),
                 explanation: "Clean temp files".into(),
                 output: None,
                 approved: false,
+                tool: None,
             },
         ];
         let md = messages_to_markdown(&blocks, "test", &None);

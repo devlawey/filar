@@ -154,6 +154,7 @@ impl ChatLayoutCache {
                     explanation,
                     output,
                     approved,
+                    ..
                 } => {
                     let is_collapsed = collapsed.contains(&idx);
 
@@ -468,6 +469,7 @@ mod tests {
             explanation: "expl".into(),
             output: Some(long_output),
             approved: true,
+            tool: None,
         }];
         cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
 
@@ -496,6 +498,7 @@ mod tests {
             explanation: "".into(),
             output: Some(long_output),
             approved: true,
+            tool: None,
         }];
         cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
 
@@ -522,6 +525,7 @@ mod tests {
             explanation: "".into(),
             output: Some(short_output.into()),
             approved: true,
+            tool: None,
         }];
         cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
 
@@ -542,12 +546,14 @@ mod tests {
                 explanation: "".into(),
                 output: Some("file1\nfile2".into()),
                 approved: true,
+                tool: None,
             },
             ChatBlock::Command {
                 command: "rm".into(),
                 explanation: "".into(),
                 output: Some("".into()),
                 approved: false,
+                tool: None,
             },
         ];
         cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
@@ -581,6 +587,7 @@ mod tests {
             explanation: "".into(),
             output: None,
             approved: false,
+            tool: None,
         }];
         cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
 

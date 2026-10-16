@@ -365,6 +365,7 @@ mod tests {
                 explanation: String::new(),
                 output: Some("PID\tTTY\tTIME\tCMD\n1\t??\t0:00.01\t/sbin/launchd\n".repeat(8)),
                 approved: true,
+                tool: None,
             },
             ChatBlock::User("short".into()),
             ChatBlock::Agent("ok".into()),

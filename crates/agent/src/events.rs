@@ -37,6 +37,10 @@ pub enum AgentEvent {
         explanation: String,
         /// Whether the command is flagged as destructive.
         destructive: bool,
+        /// The tool call behind the command — name and original arguments
+        /// (#525). Frontends keep it on the chat block so the history can be
+        /// replayed to the model as a real tool call.
+        tool: filar_core::ToolInvocation,
     },
 
     /// Independent arbiter verdict on a command awaiting confirmation.
