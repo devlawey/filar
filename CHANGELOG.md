@@ -17,8 +17,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   output, and no longer stops after announcing an action ("Let me check the
   logs:"): earlier commands are replayed to the model as real tool calls, an
   answer that writes a command as text is marked as not executed, an
-  announcement without a tool call is followed up once, and an answer the
-  provider cut off says so ([#525](https://github.com/devlawey/filar/issues/525)).
+  announcement without a tool call is followed up once, and a text-only answer
+  the provider cut off (`finish_reason` `length` or `content_filter`) says so
+  ([#525](https://github.com/devlawey/filar/issues/525)).
 
 ### Fixed
 
