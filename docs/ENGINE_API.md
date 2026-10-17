@@ -27,22 +27,22 @@ working example.
 Bots and mobile apps that only need SSH should disable default features:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.3", default-features = false }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.4", default-features = false }
 ```
 
 Desktop apps (TUI/GUI) should keep `local` enabled:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.3" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.4" }
 ```
 
 ## Cargo.toml example
 
 ```toml
 [dependencies]
-filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.3" }
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.3", default-features = false }
-filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.3" }
+filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.4" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.4", default-features = false }
+filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.4" }
 
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"
@@ -505,7 +505,7 @@ in registration order and the first that claims the command and parses its
 output wins. The built-in set (`with_builtins()`, the `Default`) is
 registered first.
 
-## Upgrading to the next engine tag (unreleased)
+## Upgrading to `engine-v2.0.4`
 
 | Change | Breaks | What to do |
 |--------|--------|------------|

@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [2.0.4] - 2026-10-17
+
 ### Fixed
 
 - Each request no longer sends the user's question to the model twice in a
@@ -1362,7 +1364,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v2.0.3...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v2.0.4...HEAD
+[2.0.4]: https://github.com/devlawey/filar/compare/v2.0.3...v2.0.4
 [2.0.3]: https://github.com/devlawey/filar/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/devlawey/filar/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/devlawey/filar/compare/v2.0.0...v2.0.1

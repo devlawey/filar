@@ -10570,3 +10570,17 @@ conhost раскладка берётся на момент запуска filar
 
 **Контракты.** Без изменений.
 
+## Релиз 2.0.4 (2026-10-17)
+
+**Входит:** прогресс PowerShell не рисует поверх TUI на Windows (#523);
+история подаётся модели как tool calls, а не текстом (#525); вопрос уходит
+модели один раз (#526); Ctrl-клавиши в терминале работают на кириллической
+раскладке (#528). Полный список — CHANGELOG `[2.0.4]`.
+
+**Preflight:** build/test на `main` (262c151) зелёные — 1525 passed, 0 failed,
+10 ignored (docker-sshd). Движок затронут: `ChatBlock::Command::tool` и
+`AgentEvent::CommandProposed::tool` (#525) — breaking для embedders, поэтому
+тег `engine-v2.0.4` на том же коммите и раздел «Upgrading» в
+`docs/ENGINE_API.md`. Ручной SMOKE Win + Mac — за мейнтейнером
+(`docs/SMOKE.md`, #298).
+
