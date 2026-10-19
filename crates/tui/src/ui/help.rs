@@ -130,6 +130,24 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
             available: |m| m == AppMode::Normal,
         },
         HelpEntry {
+            key: "^G: Space",
+            desc: "File panels: mark / unmark for copying",
+            section: "Files",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
+            key: "^G: F5 / c",
+            desc: "File panels: copy marked (or the one under the cursor) to the other panel — asks first",
+            section: "Files",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
+            key: "^G: ^Z",
+            desc: "File panels: cancel the running copy",
+            section: "Files",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
             key: "^G: Esc",
             desc: "File panels: close (or ^G again)",
             section: "Files",

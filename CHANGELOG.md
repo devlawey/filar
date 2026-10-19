@@ -18,6 +18,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   with Enter / Backspace. The tab's host opens over the tab's own connection;
   hosts connect with their saved secrets, as Ctrl+O does
   ([#535](https://github.com/devlawey/filar/issues/535)).
+- File panels copy files and folders between the two panels — local to host,
+  host to local, host to host: mark with Space, copy with F5 or `c`. Every copy
+  is confirmed first, an existing file is replaced only when you say so, a
+  copy can be cancelled with Ctrl+Z and keeps running in the background when
+  the panels close (progress under Ctrl+J, result in the chat)
+  ([#536](https://github.com/devlawey/filar/issues/536)).
 - Engine: `FileTransfer` trait with a local implementation — list, stat, read,
   write, rename and permissions on one side of a file copy, the base of the
   upcoming file panels ([#532](https://github.com/devlawey/filar/issues/532)).

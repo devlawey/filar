@@ -4,12 +4,15 @@
 //! connecting happen in the runner, which drains [`FilePanels::requests`]
 //! and answers with [`PanelEvent`]s.
 //!
-//! Nothing here writes anywhere: browsing only. Copying is #536.
+//! Copying (#536) is planned here (marks, confirmation) and run by the
+//! runner over the copy engine; [`FileCopy`] tracks one copy, which outlives
+//! the panels (it keeps going in the background, listed under Ctrl+J).
 
-use std::time::SystemTime;
+use std::collections::BTreeSet;
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use filar_transport::{DirEntry, EntryKind, PathStyle};
+use filar_transport::{CopyEvent, CopyReport, CopySource, DirEntry, EntryKind, PathStyle};
 
 use crate::app::SessionId;
 
@@ -97,6 +100,8 @@ pub struct Panel {
     pub generation: u64,
     /// Name to put the cursor on after the next listing (after going up).
     pub focus_after_load: Option<String>,
+    /// Entries marked for copying (by name, in the directory shown).
+    pub marked: BTreeSet<String>,
 }
 
 impl Panel {
@@ -114,6 +119,7 @@ impl Panel {
             status: PanelStatus::Empty,
             generation: 0,
             focus_after_load: None,
+            marked: BTreeSet::new(),
         }
     }
 
@@ -245,7 +251,7 @@ pub enum PanelEvent {
 }
 
 /// What a key in the panels asks the app to do beyond panel state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PanelsAction {
     /// Nothing more.
     None,
@@ -253,6 +259,91 @@ pub enum PanelsAction {
     Close,
     /// Open the host overlay to choose the source of the active panel.
     ChooseSource(Side),
+    /// The user confirmed this copy: start it.
+    StartCopy(CopyPlan),
+    /// Cancel the running copy (Ctrl+Z).
+    CancelCopy,
+}
+
+/// A copy the user asked for, waiting for (or past) confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyPlan {
+    /// Panel copied from.
+    pub from: Side,
+    /// Source of the `from` panel.
+    pub from_source: PanelSource,
+    /// Source of the target panel.
+    pub to_source: PanelSource,
+    /// What to copy (full paths on the source side).
+    pub sources: Vec<CopySource>,
+    /// Target directory.
+    pub dst_dir: String,
+    /// Target label (`host`), for messages.
+    pub dst_label: String,
+    /// Files among the sources (directories are walked by the engine).
+    pub files: usize,
+    /// Directories among the sources.
+    pub dirs: usize,
+    /// Size of the files among the sources.
+    pub bytes: u64,
+}
+
+impl CopyPlan {
+    /// `3 files (12M) and 2 folders` — what the confirmation names.
+    pub fn what(&self) -> String {
+        let files = match self.files {
+            0 => String::new(),
+            1 => format!("1 file ({})", human_size(self.bytes)),
+            n => format!("{n} files ({})", human_size(self.bytes)),
+        };
+        let dirs = match self.dirs {
+            0 => String::new(),
+            1 => "1 folder".to_string(),
+            n => format!("{n} folders"),
+        };
+        match (files.is_empty(), dirs.is_empty()) {
+            (false, false) => format!("{files} and {dirs}"),
+            (false, true) => files,
+            _ => dirs,
+        }
+    }
+
+    /// `host:/dir` of the target.
+    pub fn target(&self) -> String {
+        format!("{}:{}", self.dst_label, self.dst_dir)
+    }
+}
+
+/// Work for the runner about copies (kept in the app: copies outlive the
+/// panels).
+#[derive(Debug, Clone)]
+pub enum CopyRequest {
+    /// Start copy `id`.
+    Start {
+        /// Copy number.
+        id: u64,
+        /// What to copy.
+        plan: CopyPlan,
+    },
+    /// Cancel copy `id`.
+    Cancel {
+        /// Copy number.
+        id: u64,
+    },
+    /// The user's answer to copy `id`'s overwrite question.
+    Answer {
+        /// Copy number.
+        id: u64,
+        /// The answer.
+        decision: filar_transport::OverwriteDecision,
+    },
+}
+
+/// A modal question inside the panels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PanelDialog {
+    /// "Copy … → host:/dir?" — every copy is confirmed (#536).
+    ConfirmCopy(CopyPlan),
 }
 
 /// Masked entry of a password or key passphrase for a panel's host — only
@@ -309,6 +400,10 @@ pub struct FilePanels {
     pub requests: Vec<PanelRequest>,
     /// Masked secret entry in progress.
     pub prompt: Option<SecretPrompt>,
+    /// Open question (copy confirmation).
+    pub dialog: Option<PanelDialog>,
+    /// One-line notice under the panels (why a copy cannot start, …).
+    pub notice: Option<String>,
     next_generation: u64,
 }
 
@@ -327,6 +422,8 @@ impl FilePanels {
             active: Side::Left,
             requests: Vec::new(),
             prompt: None,
+            dialog: None,
+            notice: None,
             next_generation: 1,
         }
     }
@@ -443,6 +540,11 @@ impl FilePanels {
                 }
                 match result {
                     Ok(mut entries) => {
+                        if p.path != path {
+                            p.marked.clear();
+                        } else {
+                            p.marked.retain(|m| entries.iter().any(|e| &e.name == m));
+                        }
                         sort_entries(&mut entries);
                         p.truncated = entries.len() > MAX_PANEL_ENTRIES;
                         entries.truncate(MAX_PANEL_ENTRIES);
@@ -475,11 +577,26 @@ impl FilePanels {
             self.prompt_key(key);
             return PanelsAction::None;
         }
+        if let Some(PanelDialog::ConfirmCopy(plan)) = self.dialog.take() {
+            return match key.code {
+                KeyCode::Enter | KeyCode::Char('y' | 'Y' | 'н' | 'Н') => {
+                    self.panel_mut(plan.from).marked.clear();
+                    PanelsAction::StartCopy(plan)
+                }
+                KeyCode::Esc | KeyCode::Char('n' | 'N' | 'т' | 'Т') => PanelsAction::None,
+                _ => {
+                    self.dialog = Some(PanelDialog::ConfirmCopy(plan));
+                    PanelsAction::None
+                }
+            };
+        }
+        self.notice = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl {
             return match key.code {
                 KeyCode::Char('g' | 'G' | 'п' | 'П') => PanelsAction::Close,
                 KeyCode::Char('o' | 'O' | 'щ' | 'Щ') => PanelsAction::ChooseSource(self.active),
+                KeyCode::Char('z' | 'Z' | 'я' | 'Я') => PanelsAction::CancelCopy,
                 _ => PanelsAction::None,
             };
         }
@@ -501,9 +618,116 @@ impl FilePanels {
             KeyCode::Enter => self.enter(side),
             KeyCode::Backspace => self.go_up(side),
             KeyCode::Char('r' | 'R' | 'к' | 'К') => self.refresh(side),
+            KeyCode::Char(' ') | KeyCode::Insert => self.toggle_mark(side),
+            KeyCode::F(5) | KeyCode::Char('c' | 'C' | 'с' | 'С') => self.plan_copy(),
             _ => {}
         }
         PanelsAction::None
+    }
+
+    /// Mark or unmark the entry under the cursor, then move down.
+    fn toggle_mark(&mut self, side: Side) {
+        let p = self.panel_mut(side);
+        if !p.browsable() {
+            return;
+        }
+        if let Some(Row::Entry(e)) = p.current() {
+            let name = e.name.clone();
+            if !p.marked.remove(&name) {
+                p.marked.insert(name);
+            }
+        }
+        p.move_cursor(1);
+    }
+
+    /// Plan a copy from the active panel into the other one's directory and
+    /// ask for confirmation — or say why it cannot happen.
+    fn plan_copy(&mut self) {
+        match self.copy_plan() {
+            Ok(plan) => self.dialog = Some(PanelDialog::ConfirmCopy(plan)),
+            Err(why) => self.notice = Some(why),
+        }
+    }
+
+    /// The copy the keys ask for: marked entries of the active panel (or the
+    /// one under the cursor) into the other panel's directory.
+    pub fn copy_plan(&self) -> Result<CopyPlan, String> {
+        let from = self.active;
+        let src = self.panel(from);
+        let dst = self.panel(from.other());
+        let (Some(from_source), Some(to_source)) = (src.source.clone(), dst.source.clone()) else {
+            return Err("Choose a host for both panels first (Ctrl+O)".into());
+        };
+        if src.status != PanelStatus::Ready || src.path.is_empty() {
+            return Err("The source panel is not ready".into());
+        }
+        if dst.status != PanelStatus::Ready || dst.path.is_empty() {
+            return Err("The target panel is not ready".into());
+        }
+        if dst.read_only {
+            return Err(format!("{} is read-only: nothing can be copied there", dst.label));
+        }
+        if dst.style == PathStyle::Windows && dst.path.is_empty() {
+            return Err("Open a drive in the target panel first".into());
+        }
+        let picked: Vec<&DirEntry> = if src.marked.is_empty() {
+            match src.current() {
+                Some(Row::Entry(e)) => vec![e],
+                _ => return Err("Nothing to copy: put the cursor on a file or mark some (Space)".into()),
+            }
+        } else {
+            src.entries.iter().filter(|e| src.marked.contains(&e.name)).collect()
+        };
+        if picked.is_empty() {
+            return Err("Nothing to copy".into());
+        }
+        let same_fs = from_source == to_source;
+        if same_fs && src.path == dst.path {
+            return Err("Source and target are the same folder".into());
+        }
+        let mut plan = CopyPlan {
+            from,
+            from_source,
+            to_source,
+            sources: Vec::new(),
+            dst_dir: dst.path.clone(),
+            dst_label: dst.label.clone(),
+            files: 0,
+            dirs: 0,
+            bytes: 0,
+        };
+        for e in picked {
+            let path = src.style.join(&src.path, &e.name);
+            if same_fs && e.metadata.kind == EntryKind::Dir && is_within(src.style, &dst.path, &path) {
+                return Err(format!("Cannot copy {} into itself", e.name));
+            }
+            if e.metadata.kind == EntryKind::Dir {
+                plan.dirs += 1;
+            } else {
+                plan.files += 1;
+                plan.bytes += e.metadata.size;
+            }
+            plan.sources.push(CopySource {
+                path,
+                kind: e.metadata.kind,
+            });
+        }
+        Ok(plan)
+    }
+
+    /// Re-list a panel that shows `dir` of `source` (after a copy into it).
+    pub fn refresh_if_showing(&mut self, source: &PanelSource, dir: &str) {
+        for side in [Side::Left, Side::Right] {
+            let p = self.panel(side);
+            if p.source.as_ref() == Some(source) && p.path == dir && p.status == PanelStatus::Ready {
+                let focus = match p.current() {
+                    Some(Row::Entry(e)) => Some(e.name.clone()),
+                    _ => None,
+                };
+                self.panel_mut(side).focus_after_load = focus;
+                self.list(side, dir.to_string());
+            }
+        }
     }
 
     /// Keys while the secret prompt is open: type, erase, submit, cancel.
@@ -622,6 +846,217 @@ pub fn sort_entries(entries: &mut [DirEntry]) {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             .then_with(|| a.name.cmp(&b.name))
     });
+}
+
+/// `path` is `dir` itself or lies below it.
+fn is_within(style: PathStyle, path: &str, dir: &str) -> bool {
+    let mut cur = Some(path.to_string());
+    while let Some(c) = cur {
+        if c == dir {
+            return true;
+        }
+        cur = style.parent(&c);
+    }
+    false
+}
+
+/// How a copy ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyState {
+    /// Still copying.
+    Running,
+    /// Every file copied or skipped on purpose.
+    Done,
+    /// At least one file failed.
+    Failed,
+    /// Stopped by the user.
+    Cancelled,
+}
+
+/// One copy started from the panels; lives in the app, not in the panels,
+/// because it keeps running after they close (#536).
+#[derive(Debug, Clone)]
+pub struct FileCopy {
+    /// Number of this copy in the session (`copy-N` in Ctrl+J).
+    pub id: u64,
+    /// Tab the copy was started from.
+    pub session: SessionId,
+    /// What was asked for.
+    pub plan: CopyPlan,
+    /// Files and bytes to copy, once the engine walked the sources.
+    pub files_total: u64,
+    /// Total bytes planned.
+    pub bytes_total: u64,
+    /// Bytes done (copied, skipped or failed).
+    pub done: u64,
+    /// Files finished (copied, skipped or failed).
+    pub files_done: u64,
+    /// File being copied.
+    pub current: Option<String>,
+    /// When it started.
+    pub started: Instant,
+    /// When it ended.
+    pub ended: Option<Instant>,
+    /// Where it stands.
+    pub state: CopyState,
+    /// Final report.
+    pub report: Option<CopyReport>,
+    /// Existing target the engine is asking about (overwrite question).
+    pub asking: Option<String>,
+}
+
+impl FileCopy {
+    /// A copy that just started.
+    pub fn new(id: u64, session: SessionId, plan: CopyPlan) -> Self {
+        Self {
+            id,
+            session,
+            bytes_total: plan.bytes,
+            files_total: plan.files as u64,
+            plan,
+            done: 0,
+            files_done: 0,
+            current: None,
+            started: Instant::now(),
+            ended: None,
+            state: CopyState::Running,
+            report: None,
+            asking: None,
+        }
+    }
+
+    /// Apply a progress event from the engine.
+    pub fn apply(&mut self, event: CopyEvent) {
+        match event {
+            CopyEvent::Planned { files, bytes } => {
+                self.files_total = files;
+                self.bytes_total = bytes;
+            }
+            CopyEvent::FileStarted { dst, .. } => self.current = Some(dst),
+            CopyEvent::Progress { done, total } => {
+                self.done = done;
+                self.bytes_total = total;
+            }
+            CopyEvent::FileDone { .. } | CopyEvent::FileSkipped { .. } => {
+                self.files_done += 1;
+                self.current = None;
+            }
+            CopyEvent::Failed { .. } => {
+                self.files_done += 1;
+                self.current = None;
+            }
+            CopyEvent::Warning(_) => {}
+        }
+    }
+
+    /// The engine finished.
+    pub fn finish(&mut self, report: CopyReport) {
+        self.state = if report.cancelled {
+            CopyState::Cancelled
+        } else if !report.failed.is_empty() {
+            CopyState::Failed
+        } else {
+            CopyState::Done
+        };
+        self.asking = None;
+        self.current = None;
+        self.ended = Some(Instant::now());
+        self.report = Some(report);
+    }
+
+    /// Whether the copy is still going.
+    pub fn running(&self) -> bool {
+        self.state == CopyState::Running
+    }
+
+    /// Whole percent done, when the total is known.
+    pub fn percent(&self) -> Option<u64> {
+        (self.bytes_total > 0).then(|| (self.done.min(self.bytes_total) * 100) / self.bytes_total)
+    }
+
+    /// Bytes per second so far.
+    pub fn speed(&self) -> u64 {
+        let elapsed = self.ended.unwrap_or_else(Instant::now) - self.started;
+        let secs = elapsed.max(Duration::from_millis(100)).as_secs_f64();
+        (self.done as f64 / secs) as u64
+    }
+
+    /// One line on where the copy stands.
+    pub fn status_line(&self) -> String {
+        match self.state {
+            CopyState::Running => {
+                let pct = self.percent().map(|p| format!("{p}% · ")).unwrap_or_default();
+                let current = self
+                    .current
+                    .as_deref()
+                    .map(|c| format!(" · {c}"))
+                    .unwrap_or_default();
+                format!(
+                    "Copying {}/{} · {pct}{}/{} · {}/s{current}",
+                    self.files_done,
+                    self.files_total,
+                    human_size(self.done),
+                    human_size(self.bytes_total),
+                    human_size(self.speed()),
+                )
+            }
+            _ => self.summary(),
+        }
+    }
+
+    /// The result in one sentence, with what the user must know: failures
+    /// and part files that could not be removed (#531).
+    pub fn summary(&self) -> String {
+        let Some(r) = &self.report else {
+            return "Copy running".into();
+        };
+        let head = match self.state {
+            CopyState::Cancelled => "Copy cancelled",
+            CopyState::Failed => "Copy finished with errors",
+            _ => "Copy done",
+        };
+        let mut out = format!(
+            "{head} → {}: {} copied, {} skipped, {} failed",
+            self.plan.target(),
+            r.copied,
+            r.skipped,
+            r.failed.len()
+        );
+        if let Some((path, why)) = r.failed.first() {
+            out.push_str(&format!(" (first: {path}: {why})"));
+        }
+        if !r.leftover_parts.is_empty() {
+            out.push_str(&format!(
+                ". Left behind, remove by hand: {}",
+                r.leftover_parts.join(", ")
+            ));
+        }
+        out
+    }
+
+    /// This copy as a background operation for the Ctrl+J panel.
+    pub fn operation(&self) -> crate::ops::Operation {
+        use crate::ops::{HostOpState, OpHost, Operation};
+        let state = match self.state {
+            CopyState::Running => HostOpState::Running,
+            CopyState::Done => HostOpState::Done,
+            CopyState::Failed => HostOpState::Failed,
+            CopyState::Cancelled => HostOpState::Cancelled,
+        };
+        Operation {
+            session: self.session,
+            id: format!("copy-{}", self.id),
+            label: format!("copy {} → {}", self.plan.what(), self.plan.target()),
+            hosts: vec![OpHost {
+                name: self.plan.dst_label.clone(),
+                state,
+                exit_code: None,
+                tail: self.status_line(),
+                stale: false,
+                settled: true,
+            }],
+        }
+    }
 }
 
 /// Human size: `999`, `1.2K`, `34M`, `5.0G`.
@@ -1011,5 +1446,201 @@ mod tests {
         assert_eq!(human_size(1536), "1.5K");
         assert_eq!(human_size(35 * 1024 * 1024), "35M");
         assert_eq!(human_size(5 * 1024 * 1024 * 1024), "5.0G");
+    }
+
+    // ── Copy (#536) ───────────────────────────────────────────────────
+
+    /// Left: local `/src` with a dir and two files; right: target `/dst`.
+    fn two_panels() -> FilePanels {
+        let mut fp = opened(
+            Side::Left,
+            "/src",
+            vec![
+                entry("dir", EntryKind::Dir),
+                entry("a.txt", EntryKind::File),
+                entry("b.txt", EntryKind::File),
+            ],
+        );
+        fp.set_source(Side::Right, PanelSource::Target(0), None);
+        let g = fp.right.generation;
+        fp.apply(PanelEvent::Opened {
+            side: Side::Right,
+            generation: g,
+            label: "web1".into(),
+            style: PathStyle::Posix,
+            read_only: false,
+        });
+        fp.apply(PanelEvent::Listed {
+            side: Side::Right,
+            generation: g,
+            path: "/dst".into(),
+            result: Ok(vec![]),
+        });
+        fp.requests.clear();
+        fp
+    }
+
+    #[test]
+    fn copy_takes_the_marked_entries_and_asks_first() {
+        let mut fp = two_panels();
+        fp.handle_key(key(KeyCode::Down)); // dir
+        fp.handle_key(key(KeyCode::Char(' '))); // mark dir, cursor -> a.txt
+        fp.handle_key(key(KeyCode::Down)); // b.txt
+        fp.handle_key(key(KeyCode::Insert)); // mark b.txt
+        assert_eq!(fp.left.marked.len(), 2);
+        assert_eq!(fp.handle_key(key(KeyCode::F(5))), PanelsAction::None);
+        let Some(PanelDialog::ConfirmCopy(plan)) = fp.dialog.clone() else {
+            panic!("expected a confirmation");
+        };
+        assert_eq!((plan.files, plan.dirs, plan.bytes), (1, 1, 10));
+        assert_eq!(plan.what(), "1 file (10) and 1 folder");
+        assert_eq!(plan.target(), "web1:/dst");
+        let paths: Vec<_> = plan.sources.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(paths, vec!["/src/dir", "/src/b.txt"]);
+        // Any other key keeps the question open.
+        assert_eq!(fp.handle_key(key(KeyCode::Down)), PanelsAction::None);
+        assert!(fp.dialog.is_some());
+        assert_eq!(fp.handle_key(key(KeyCode::Enter)), PanelsAction::StartCopy(plan));
+        assert!(fp.left.marked.is_empty(), "marks are used up");
+    }
+
+    #[test]
+    fn without_marks_the_entry_under_the_cursor_is_copied_and_esc_cancels() {
+        let mut fp = two_panels();
+        fp.handle_key(key(KeyCode::Down));
+        fp.handle_key(key(KeyCode::Down)); // a.txt
+        fp.handle_key(key(KeyCode::Char('с'))); // Russian layout
+        let Some(PanelDialog::ConfirmCopy(plan)) = fp.dialog.clone() else {
+            panic!("expected a confirmation");
+        };
+        assert_eq!(plan.sources.len(), 1);
+        assert_eq!(plan.sources[0].path, "/src/a.txt");
+        assert_eq!(fp.handle_key(key(KeyCode::Esc)), PanelsAction::None);
+        assert!(fp.dialog.is_none());
+        // Esc closed only the question, not the panels.
+        assert_eq!(fp.handle_key(key(KeyCode::Esc)), PanelsAction::Close);
+    }
+
+    #[test]
+    fn a_copy_that_cannot_happen_says_why() {
+        // The cursor on `..`: nothing to copy.
+        let mut fp = two_panels();
+        fp.handle_key(key(KeyCode::F(5)));
+        assert!(fp.dialog.is_none());
+        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("Nothing to copy")));
+
+        // Read-only target.
+        let mut fp = two_panels();
+        fp.right.read_only = true;
+        fp.handle_key(key(KeyCode::Down));
+        fp.handle_key(key(KeyCode::F(5)));
+        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("read-only")));
+
+        // Target panel not chosen yet.
+        let mut fp = opened(Side::Left, "/src", vec![entry("a", EntryKind::File)]);
+        fp.handle_key(key(KeyCode::Down));
+        fp.handle_key(key(KeyCode::F(5)));
+        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("Ctrl+O")));
+    }
+
+    #[test]
+    fn same_folder_and_into_itself_are_refused() {
+        let mut fp = two_panels();
+        fp.right.source = Some(PanelSource::Local);
+        fp.right.path = "/src".into();
+        fp.handle_key(key(KeyCode::Down));
+        fp.handle_key(key(KeyCode::F(5)));
+        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("same folder")));
+
+        let mut fp = two_panels();
+        fp.right.source = Some(PanelSource::Local);
+        fp.right.path = "/src/dir/deeper".into();
+        fp.handle_key(key(KeyCode::Down)); // dir
+        fp.handle_key(key(KeyCode::F(5)));
+        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("into itself")), "{:?}", fp.notice);
+    }
+
+    #[test]
+    fn marks_survive_a_refresh_but_not_a_new_folder() {
+        let mut fp = two_panels();
+        fp.handle_key(key(KeyCode::Down));
+        fp.handle_key(key(KeyCode::Down));
+        fp.handle_key(key(KeyCode::Char(' '))); // a.txt
+        fp.handle_key(key(KeyCode::Char('r')));
+        let g = fp.left.generation;
+        fp.apply(PanelEvent::Listed {
+            side: Side::Left,
+            generation: g,
+            path: "/src".into(),
+            result: Ok(vec![entry("a.txt", EntryKind::File)]),
+        });
+        assert!(fp.left.marked.contains("a.txt"));
+        fp.handle_key(key(KeyCode::Home));
+        fp.handle_key(key(KeyCode::Enter)); // ..
+        let g = fp.left.generation;
+        fp.apply(PanelEvent::Listed {
+            side: Side::Left,
+            generation: g,
+            path: "/".into(),
+            result: Ok(vec![entry("src", EntryKind::Dir)]),
+        });
+        assert!(fp.left.marked.is_empty());
+    }
+
+    #[test]
+    fn ctrl_z_asks_to_cancel_the_copy() {
+        let mut fp = two_panels();
+        assert_eq!(fp.handle_key(ctrl('z')), PanelsAction::CancelCopy);
+        assert_eq!(fp.handle_key(ctrl('я')), PanelsAction::CancelCopy);
+    }
+
+    fn a_plan() -> CopyPlan {
+        let mut fp = two_panels();
+        fp.handle_key(key(KeyCode::Down));
+        fp.handle_key(key(KeyCode::Down));
+        fp.copy_plan().expect("plan")
+    }
+
+    #[test]
+    fn a_copy_tracks_progress_and_sums_up_what_matters() {
+        let mut c = FileCopy::new(1, SessionId(1), a_plan());
+        c.apply(CopyEvent::Planned { files: 2, bytes: 200 });
+        c.apply(CopyEvent::FileStarted {
+            src: "/src/a.txt".into(),
+            dst: "/dst/a.txt".into(),
+            size: 100,
+        });
+        c.apply(CopyEvent::Progress { done: 50, total: 200 });
+        assert_eq!(c.percent(), Some(25));
+        assert!(c.status_line().contains("Copying 0/2"), "{}", c.status_line());
+        assert!(c.status_line().contains("/dst/a.txt"));
+        c.apply(CopyEvent::FileDone { dst: "/dst/a.txt".into() });
+        assert_eq!(c.files_done, 1);
+        c.finish(CopyReport {
+            copied: 1,
+            failed: vec![("/src/b.txt".into(), "permission denied".into())],
+            leftover_parts: vec!["/dst/b.txt.filar-part".into()],
+            ..Default::default()
+        });
+        assert_eq!(c.state, CopyState::Failed);
+        let s = c.summary();
+        assert!(s.contains("1 copied") && s.contains("1 failed"), "{s}");
+        assert!(s.contains("permission denied"), "{s}");
+        assert!(s.contains("/dst/b.txt.filar-part"), "the leftover path must be shown: {s}");
+        let op = c.operation();
+        assert_eq!(op.id, "copy-1");
+        assert_eq!(op.state(), crate::ops::HostOpState::Failed);
+    }
+
+    #[test]
+    fn a_cancelled_copy_reads_as_cancelled() {
+        let mut c = FileCopy::new(2, SessionId(1), a_plan());
+        c.finish(CopyReport {
+            cancelled: true,
+            ..Default::default()
+        });
+        assert_eq!(c.state, CopyState::Cancelled);
+        assert!(c.summary().starts_with("Copy cancelled"));
+        assert_eq!(c.operation().state(), crate::ops::HostOpState::Cancelled);
     }
 }
