@@ -32,7 +32,9 @@ use crate::ssh::{connect_authenticated, request_subsystem, SshHandler, SshTransp
 /// Seconds to wait for one SFTP response before giving up on it.
 const SFTP_TIMEOUT_SECS: u64 = 30;
 
-/// Suffix the replaced target steps aside to while a rename takes its name.
+/// Suffix the replaced target steps aside to while a rename takes its name;
+/// a short unique id follows it, so a copy kept after a failed cleanup never
+/// blocks a later replacement (#540 review).
 pub const OLD_SUFFIX: &str = ".filar-old";
 
 /// An SSH host's filesystem over SFTP.
@@ -139,6 +141,14 @@ pub(crate) fn map_sftp_error(host: &str, op: &str, path: &str, e: SftpError) -> 
             _ => io::ErrorKind::Other,
         },
         SftpError::Timeout => io::ErrorKind::TimedOut,
+        // The channel or session went away under the SFTP client: say so in
+        // the words `is_connection_lost` knows, so a panel reopens instead of
+        // retrying a dead channel (#540 review).
+        SftpError::IO(msg) | SftpError::UnexpectedBehavior(msg)
+            if crate::is_connection_lost(&CoreError::Other(msg.clone())) =>
+        {
+            return CoreError::Other(format!("{host}: {op} {path}: connection lost ({msg})"));
+        }
         _ => io::ErrorKind::Other,
     };
     CoreError::Io(io::Error::new(kind, format!("{host}: {op} {path}: {e}")))
@@ -254,7 +264,8 @@ impl FileTransfer for SftpFileTransfer {
         {
             return Err(self.err("rename", &format!("{from} -> {to}"), first));
         }
-        let backup = format!("{to}{OLD_SUFFIX}");
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let backup = format!("{to}{OLD_SUFFIX}-{}", &id[..8]);
         self.sftp
             .rename(to, backup.as_str())
             .await
@@ -356,6 +367,12 @@ mod tests {
     fn a_lost_connection_is_recognised_as_such() {
         let e = map_sftp_error("h", "write", "/p", status(StatusCode::ConnectionLost));
         assert!(crate::is_connection_lost(&e), "{e}");
+        // The channel closing under the client surfaces as an I/O error.
+        let e = map_sftp_error("h", "list", "/p", SftpError::IO("channel closed".into()));
+        assert!(crate::is_connection_lost(&e), "{e}");
+        // Other I/O failures stay ordinary errors.
+        let e = map_sftp_error("h", "list", "/p", SftpError::IO("bad length".into()));
+        assert!(!crate::is_connection_lost(&e), "{e}");
     }
 
     #[test]
