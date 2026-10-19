@@ -7,10 +7,13 @@
 //!   with marker-based boundary detection (Stage 2).
 //! - [`LocalExecutor`] — local PTY implementation using `portable-pty` (Stage 3).
 //!   Only available with the `local` feature (enabled by default).
+//! - [`FileTransfer`] — filesystem of one side (local disk or SSH host) for the
+//!   file panels and the copy engine; [`LocalFileTransfer`] is the local one.
 
 mod auth;
 pub mod cwd;
 pub mod error;
+pub mod file_transfer;
 pub mod interactive;
 pub mod key;
 #[cfg(feature = "local")]
@@ -26,6 +29,10 @@ use filar_core::Result;
 
 // Re-export key types.
 pub use error::is_connection_lost;
+pub use file_transfer::{
+    DirEntry, EntryKind, FileTransfer, LocalFileTransfer, Metadata, PathStyle, TransferReader,
+    TransferWriter,
+};
 #[cfg(feature = "local")]
 pub use interactive::LocalInteractive;
 pub use interactive::{InteractiveTerminal, SshInteractive};

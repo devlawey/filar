@@ -10584,3 +10584,22 @@ conhost раскладка берётся на момент запуска filar
 `docs/ENGINE_API.md`. Ручной SMOKE Win + Mac — за мейнтейнером
 (`docs/SMOKE.md`, #298).
 
+
+## #532 — трейт `FileTransfer` и локальная реализация
+
+**Сделано.** `crates/transport/src/file_transfer.rs`: трейт `FileTransfer`
+(path_style, home_dir, list_dir, stat, open_read/open_write, rename, remove_file,
+create_dir, set_permissions), `LocalFileTransfer`, типы `DirEntry`/`Metadata`/
+`EntryKind`, `PathStyle` с `join`/`parent`/`file_name` на строках.
+
+**Решения.** Пути — строки, не `Path`: удалённая сторона всегда POSIX.
+`stat` следует симлинкам, листинг — нет (копированию нужно отличить ссылку на
+каталог). `rename` обязан заменять существующую цель (под `.filar-part` → цель).
+Ошибки — `CoreError::Io` с сохранённым `ErrorKind` и путём в тексте. Windows:
+родитель `C:\` — `""`, листинг `""` — диски. `LocalFileTransfer` не за фичей
+`local` (нужен только tokio). Новая зависимость транспорта — `dirs`.
+
+**Контракты.** Новый публичный трейт (аддитивно); `CommandExecutor`/`LlmClient`
+без изменений. `docs/ENGINE_API.md` — раздел «File transfer».
+
+**Next:** #533 (SFTP) и #534 (копирование) — независимы.
