@@ -34,6 +34,8 @@ async-trait = "0.1"
 # SSH
 russh = "0.61"
 ssh-key = "0.7.0-rc.10"
+# SFTP client over a russh channel (file panels, #533)
+russh-sftp = "3"
 
 # UUID for request IDs
 uuid = { version = "1", features = ["v4"] }

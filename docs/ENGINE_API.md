@@ -515,6 +515,7 @@ files never goes through it. The change is additive; nothing to migrate.
 | Item | What it is |
 |------|------------|
 | `FileTransfer` | `path_style`, `home_dir`, `list_dir`, `stat` (follows symlinks, `Ok(None)` if missing), `open_read` / `open_write` (boxed tokio `AsyncRead` / `AsyncWrite`; `shutdown` the writer), `rename` (replaces the target), `remove_file`, `create_dir`, `set_permissions` (no-op without POSIX modes) |
+| `SftpFileTransfer` | An SSH host over the standard `sftp` subsystem of sshd — nothing installed remotely. `SshExecutor::open_sftp()` opens it on the executor's existing connection (the shell, its cwd and a running command are untouched); `SftpFileTransfer::connect(target, cfg, secrets)` opens a connection of its own with the same host-key check and secret sources. `close()` closes the channel, and the connection only when it owns one. A server without the subsystem fails fast with an error naming it. `rename` over an existing file removes it first (SFTPv3 has no replacing rename) |
 | `LocalFileTransfer` | The client's own disk. Always compiled (no `local` feature needed). On Windows, `list_dir("")` lists the drives |
 | `DirEntry`, `Metadata`, `EntryKind` | Listing entries: kind (`File`/`Dir`/`Symlink`/`Other`, symlinks not followed in listings), size, mtime, POSIX mode |
 | `PathStyle` | `Posix` (every SSH host) or `Windows`; `join`, `parent`, `file_name` on path strings. Windows: the parent of `C:\` is `""`, the virtual drive list |

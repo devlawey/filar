@@ -10603,3 +10603,31 @@ create_dir, set_permissions), `LocalFileTransfer`, типы `DirEntry`/`Metadata
 без изменений. `docs/ENGINE_API.md` — раздел «File transfer».
 
 **Next:** #533 (SFTP) и #534 (копирование) — независимы.
+
+## #533 — `SftpFileTransfer`
+
+**Сделано.** `crates/transport/src/sftp.rs` на `russh-sftp` 3 (новая зависимость
+workspace). Два входа: `SshExecutor::open_sftp()` — SFTP-канал на соединении
+вкладки (шелл, cwd и бегущая команда не затронуты, лок сессии — только на
+открытие канала); `SftpFileTransfer::connect` — своё соединение.
+Из `SshSession::connect_with_config_and_provider` вынесен
+`connect_authenticated` (connect + host key + auth) — общий для шелла и SFTP,
+плюс `request_subsystem`, который ждёт ответа сервера.
+
+**Решения.** Сервер без `Subsystem sftp` → сразу ошибка «the server refused the
+sftp subsystem», без зависания. SFTPv3 `RENAME` не заменяет цель, а
+`posix-rename@openssh.com` клиент не даёт → при отказе и файле на месте цели:
+remove + rename (файл-часть к этому моменту целый). Таймаут ответа SFTP — 30 с.
+Ошибки: `NoSuchFile`/`PermissionDenied`/таймаут → `io::ErrorKind`, потеря связи
+→ текст «connection lost» (ловит `is_connection_lost`); в тексте хост, операция,
+путь. Каталог — размер 0, как у локальной стороны.
+
+**Проверено вживую** (локальный openssh-server в контейнере агента, scratch-
+программа вне репо): запись, chmod, rename поверх файла, NotFound,
+PermissionDenied, SFTP на соединении `SshExecutor` с неизменным `pwd`, отказ
+сервера без SFTP-подсистемы (~0,2 с). `#[ignore]`-тесты на docker-sshd — ручные.
+
+**Контракты.** `CommandExecutor` не тронут; новые публичные `SftpFileTransfer`
+и `SshExecutor::open_sftp` (аддитивно). `docs/ENGINE_API.md`.
+
+**Next:** #534.

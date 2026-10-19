@@ -283,6 +283,74 @@ pub struct SshSession {
     command_timeout: Duration,
 }
 
+/// Connect to `target`, verify its host key and authenticate — without
+/// opening any channel. Shared by the shell session and SFTP (#533) so both
+/// go through the same host-key check and the same secret sources.
+pub(crate) async fn connect_authenticated(
+    target: &SshTarget,
+    cfg: &SshTransportConfig,
+    secrets: &dyn SecretProvider,
+) -> Result<Handle<SshHandler>> {
+    let config = Arc::new(client::Config {
+        // Keep the inactivity guard well above the keepalive interval so a
+        // healthy session (keepalives answered) never trips it.
+        inactivity_timeout: Some(Duration::from_secs(300)),
+        keepalive_interval: cfg.keepalive_interval,
+        keepalive_max: cfg.keepalive_max,
+        ..<_>::default()
+    });
+
+    let addr = (target.host.as_str(), target.port);
+    info!(host = %target.host, port = target.port, user = %target.user, "connecting via SSH");
+
+    let handler = SshHandler {
+        host: target.host.clone(),
+        port: target.port,
+        policy: target.host_key_policy,
+        known_hosts_path: known_hosts_path(),
+    };
+    let mut session = client::connect(config, addr, handler)
+        .await
+        .map_err(|e| CoreError::Other(format!("SSH connect failed: {e}")))?;
+
+    crate::auth::authenticate(&mut session, target, secrets).await?;
+    Ok(session)
+}
+
+/// Ask the server to run subsystem `name` on `channel` and wait for its
+/// answer: a refusal (subsystem not configured in sshd) is an error naming it,
+/// not a silent hang later.
+pub(crate) async fn request_subsystem(
+    mut channel: Channel<Msg>,
+    name: &str,
+) -> Result<Channel<Msg>> {
+    channel
+        .request_subsystem(true, name)
+        .await
+        .map_err(|e| CoreError::Other(format!("failed to request the {name} subsystem: {e}")))?;
+    let answer = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Success) => return Ok(()),
+                Some(ChannelMsg::Failure) => {
+                    return Err(CoreError::Other(format!(
+                        "the server refused the {name} subsystem (disabled in sshd?)"
+                    )))
+                }
+                Some(_) => continue,
+                None => {
+                    return Err(CoreError::Other(format!(
+                        "channel closed while requesting the {name} subsystem"
+                    )))
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| CoreError::Other(format!("no answer to the {name} subsystem request")))?;
+    answer.map(|()| channel)
+}
+
 impl SshSession {
     /// Connect to an SSH target with the default transport config.
     ///
@@ -317,30 +385,7 @@ impl SshSession {
         cfg: &SshTransportConfig,
         secrets: &dyn SecretProvider,
     ) -> Result<Self> {
-        let config = Arc::new(client::Config {
-            // Keep the inactivity guard well above the keepalive interval so a
-            // healthy session (keepalives answered) never trips it.
-            inactivity_timeout: Some(Duration::from_secs(300)),
-            keepalive_interval: cfg.keepalive_interval,
-            keepalive_max: cfg.keepalive_max,
-            ..<_>::default()
-        });
-
-        let addr = (target.host.as_str(), target.port);
-        info!(host = %target.host, port = target.port, user = %target.user, "connecting via SSH");
-
-        let handler = SshHandler {
-            host: target.host.clone(),
-            port: target.port,
-            policy: target.host_key_policy,
-            known_hosts_path: known_hosts_path(),
-        };
-        let mut session = client::connect(config, addr, handler)
-            .await
-            .map_err(|e| CoreError::Other(format!("SSH connect failed: {e}")))?;
-
-        // ── Authenticate ───────────────────────────────────────────────
-        crate::auth::authenticate(&mut session, target, secrets).await?;
+        let session = connect_authenticated(target, cfg, secrets).await?;
 
         // ── Open persistent shell channel ──────────────────────────────
         let mut channel = session
@@ -558,6 +603,20 @@ impl SshSession {
         self.shutdown.store(true, Ordering::Relaxed);
     }
 
+    /// Open a channel on this connection running the server subsystem
+    /// `name` (e.g. `sftp`, #533). The shell channel, its cwd and a running
+    /// command are not touched; the session lock is held only to open it.
+    pub(crate) async fn open_subsystem(&self, name: &str) -> Result<Channel<Msg>> {
+        let channel = {
+            let session = self.session.lock().await;
+            session
+                .channel_open_session()
+                .await
+                .map_err(|e| CoreError::Other(format!("failed to open channel: {e}")))?
+        };
+        request_subsystem(channel, name).await
+    }
+
     /// Disconnect the SSH session.
     pub async fn close(&self) -> Result<()> {
         self.mark_shutdown();
@@ -718,6 +777,14 @@ impl SshExecutor {
     /// Close the underlying session.
     pub async fn close(&self) -> Result<()> {
         self.session.read().await.close().await
+    }
+
+    /// Open an SFTP channel on this executor's connection (#533). The shell,
+    /// its cwd and a running command are untouched; the SFTP side lives until
+    /// it is dropped or the connection goes away.
+    pub async fn open_sftp(&self) -> Result<crate::sftp::SftpFileTransfer> {
+        let channel = self.session.read().await.open_subsystem("sftp").await?;
+        crate::sftp::SftpFileTransfer::from_channel(channel, &self.target.name, None).await
     }
 
     fn store_cwd_from(&self, result: &Result<CommandResult>) {
