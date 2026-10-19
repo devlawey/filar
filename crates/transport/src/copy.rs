@@ -451,6 +451,16 @@ async fn advance(done: &AtomicU64, size: u64, total: u64, observer: &dyn CopyObs
         .await;
 }
 
+/// `Some(path)` when `path` still exists (or its existence cannot be ruled
+/// out): a part the user must be told about.
+async fn still_there(dst: &dyn FileTransfer, path: &str) -> Option<String> {
+    match dst.stat(path).await {
+        Ok(None) => None,
+        Err(e) if is_not_found(&e) => None,
+        _ => Some(path.to_string()),
+    }
+}
+
 fn is_not_found(e: &CoreError) -> bool {
     matches!(e, CoreError::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
 }
@@ -504,10 +514,7 @@ async fn copy_file(
         Err(e) if is_not_found(&e) => {}
         // It stays where it is: the user must see its path (#531).
         Err(e) => {
-            let leftover = match dst.stat(&part).await {
-                Ok(None) => None,
-                _ => Some(part.clone()),
-            };
+            let leftover = still_there(dst, &part).await;
             return Err(FileError {
                 error: e.to_string(),
                 leftover,
@@ -555,8 +562,8 @@ async fn copy_file(
                 Ok(()) => None,
                 // Already gone (e.g. the failure was the rename itself and
                 // the part was moved) — nothing left behind.
-                Err(_) if matches!(dst.stat(&part).await, Ok(None)) => None,
-                Err(_) => Some(part),
+                Err(e) if is_not_found(&e) => None,
+                Err(_) => still_there(dst, &part).await,
             };
             Err(FileError { error, leftover })
         }

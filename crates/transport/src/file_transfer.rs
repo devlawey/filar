@@ -191,8 +191,8 @@ pub trait FileTransfer: Send + Sync {
     /// List `path`. Order is unspecified; `.` and `..` are not included.
     async fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>>;
 
-    /// Metadata of `path`, following symlinks; `Ok(None)` when it does not
-    /// exist.
+    /// Metadata of `path`, following symlinks. A missing path is `Ok(None)`,
+    /// not an error.
     async fn stat(&self, path: &str) -> Result<Option<Metadata>>;
 
     /// Open `path` for reading from the start.
