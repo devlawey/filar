@@ -14530,6 +14530,19 @@ mod tests {
     }
 
     #[test]
+    fn a_filtered_panel_overlay_picks_the_host_on_the_row() {
+        use crate::file_panels::PanelSource;
+        let mut app = app_with_targets_and_group();
+        app.handle_key(ctrl_key_event('g')); // overlay for the right panel
+        // Search hides `local` and `web1`: the only row left is `db1`.
+        press(&mut app, 'd');
+        press(&mut app, 'b');
+        app.handle_key(code_key(crossterm::event::KeyCode::Enter));
+        let fp = app.file_panels.as_ref().expect("panels open");
+        assert_eq!(fp.right.source, Some(PanelSource::Target(1)));
+    }
+
+    #[test]
     fn ctrl_o_inside_panels_picks_the_active_panel_and_esc_resets_the_purpose() {
         use crate::file_panels::Side;
         let mut app = app_with_targets_and_group();
