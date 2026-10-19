@@ -176,6 +176,10 @@ pub type TransferWriter = Box<dyn AsyncWrite + Send + Unpin>;
 /// Errors keep the [`io::ErrorKind`] where one exists (`NotFound`,
 /// `PermissionDenied`, …) wrapped in [`CoreError::Io`], with the operation
 /// and path in the message. They never contain secrets.
+///
+/// Required of every implementation: a path that does not exist is reported
+/// as [`CoreError::Io`] with [`io::ErrorKind::NotFound`] — the copy engine
+/// tells "nothing to clean up" from a real failure by it (#541 review).
 #[async_trait::async_trait]
 pub trait FileTransfer: Send + Sync {
     /// Path conventions of this side.

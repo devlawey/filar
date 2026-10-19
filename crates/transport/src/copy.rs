@@ -502,7 +502,17 @@ async fn copy_file(
     match dst.remove_file(&part).await {
         Ok(()) => {}
         Err(e) if is_not_found(&e) => {}
-        Err(e) => return Err(plain(e.to_string())),
+        // It stays where it is: the user must see its path (#531).
+        Err(e) => {
+            let leftover = match dst.stat(&part).await {
+                Ok(None) => None,
+                _ => Some(part.clone()),
+            };
+            return Err(FileError {
+                error: e.to_string(),
+                leftover,
+            });
+        }
     }
     let mut reader = src
         .open_read(src_path)
@@ -1061,6 +1071,36 @@ mod tests {
         let expected = format!("{}{PART_SUFFIX}", s(&b.join("f")));
         assert_eq!(r.leftover_parts, vec![expected.clone()]);
         assert!(Path::new(&expected).exists());
+        let _ = (std::fs::remove_dir_all(&a), std::fs::remove_dir_all(&b));
+    }
+
+    #[tokio::test]
+    async fn an_old_part_that_cannot_be_removed_is_reported_by_path() {
+        let (a, b) = (temp_dir(), temp_dir());
+        std::fs::write(a.join("f"), "data").expect("write");
+        let old_part = b.join(format!("f{PART_SUFFIX}"));
+        std::fs::write(&old_part, "stale").expect("write");
+        let dst = Flaky {
+            inner: LocalFileTransfer::new(),
+            cancel_on_read: None,
+            fail_remove: true,
+            fail_write: false,
+            // The link is already "down" before this copy starts.
+            writing: std::sync::atomic::AtomicBool::new(true),
+        };
+        let obs = Recorder::new(vec![]);
+        let r = copy(
+            &LocalFileTransfer::new(),
+            &[file_src(&a.join("f"))],
+            &dst,
+            &s(&b),
+            &obs,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(r.copied, 0);
+        assert_eq!(r.leftover_parts, vec![s(&old_part)], "{r:?}");
+        assert!(!b.join("f").exists());
         let _ = (std::fs::remove_dir_all(&a), std::fs::remove_dir_all(&b));
     }
 
