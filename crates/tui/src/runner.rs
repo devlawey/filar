@@ -605,20 +605,28 @@ fn ssh_transport_config(command_timeout: Duration) -> SshTransportConfig {
 // ---------------------------------------------------------------------------
 
 /// An open panel source.
+#[derive(Clone)]
 struct PanelConn {
     ft: Arc<dyn filar_transport::FileTransfer>,
     /// Set for SSH sources, so the channel (and an owned connection) can be
     /// closed when the panel moves on.
     sftp: Option<Arc<filar_transport::SftpFileTransfer>>,
+    /// Writes refused (read-only host group, #419).
+    read_only: bool,
 }
 
 impl PanelConn {
-    /// Close an SSH source in the background (a tab's connection is kept).
+    /// Close an SSH source in the background (a tab's connection is kept) —
+    /// unless a copy still uses it: the copy closes it when done (#536).
     fn close(self) {
-        if let Some(sftp) = self.sftp {
-            tokio::spawn(async move {
-                let _ = sftp.close().await;
-            });
+        let PanelConn { ft, sftp, .. } = self;
+        drop(ft);
+        if let Some(sftp) = sftp {
+            if Arc::strong_count(&sftp) == 1 {
+                tokio::spawn(async move {
+                    let _ = sftp.close().await;
+                });
+            }
         }
     }
 }
@@ -633,6 +641,49 @@ enum PanelMsg {
     },
     /// State for the panel itself.
     Event(crate::file_panels::PanelEvent),
+    /// Progress of copy `id` (#536).
+    CopyEvent { id: u64, event: filar_transport::CopyEvent },
+    /// Copy `id` asks whether to replace `dst`.
+    CopyAsk {
+        id: u64,
+        dst: String,
+        reply: tokio::sync::oneshot::Sender<filar_transport::OverwriteDecision>,
+    },
+    /// Copy `id` ended.
+    CopyDone { id: u64, report: filar_transport::CopyReport },
+}
+
+/// A copy in flight: how to stop it and how to answer its question.
+struct CopyTask {
+    cancel: CancellationToken,
+    reply: Option<tokio::sync::oneshot::Sender<filar_transport::OverwriteDecision>>,
+}
+
+/// Forwards engine progress to the runner; asks overwrite questions through it.
+struct ChannelObserver {
+    id: u64,
+    tx: tokio::sync::mpsc::UnboundedSender<PanelMsg>,
+}
+
+#[async_trait::async_trait]
+impl filar_transport::CopyObserver for ChannelObserver {
+    async fn on_event(&self, event: filar_transport::CopyEvent) {
+        let _ = self.tx.send(PanelMsg::CopyEvent { id: self.id, event });
+    }
+
+    async fn decide_overwrite(&self, dst: &str) -> filar_transport::OverwriteDecision {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let asked = self.tx.send(PanelMsg::CopyAsk {
+            id: self.id,
+            dst: dst.to_string(),
+            reply,
+        });
+        if asked.is_err() {
+            return filar_transport::OverwriteDecision::Cancel;
+        }
+        // No answer (the app went away) never replaces anything.
+        answer.await.unwrap_or(filar_transport::OverwriteDecision::Cancel)
+    }
 }
 
 /// What panel tasks need from the runner.
@@ -664,8 +715,27 @@ fn side_index(side: crate::file_panels::Side) -> usize {
 }
 
 /// Apply a panel task's answer.
-fn handle_panel_msg(app: &mut App, sides: &mut [Option<PanelConn>; 2], msg: PanelMsg) {
+fn handle_panel_msg(
+    app: &mut App,
+    sides: &mut [Option<PanelConn>; 2],
+    copies: &mut HashMap<u64, CopyTask>,
+    msg: PanelMsg,
+) {
     match msg {
+        PanelMsg::CopyEvent { id, event } => app.apply_copy_event(id, event),
+        PanelMsg::CopyAsk { id, dst, reply } => match copies.get_mut(&id) {
+            Some(task) => {
+                task.reply = Some(reply);
+                app.ask_copy_overwrite(id, dst);
+            }
+            None => {
+                let _ = reply.send(filar_transport::OverwriteDecision::Cancel);
+            }
+        },
+        PanelMsg::CopyDone { id, report } => {
+            copies.remove(&id);
+            app.finish_copy(id, report);
+        }
         PanelMsg::Ready {
             side,
             generation,
@@ -790,6 +860,80 @@ fn drive_file_panels(
     }
 }
 
+/// Start, cancel and answer copies (#536).
+fn drive_copies(
+    app: &mut App,
+    sides: &[Option<PanelConn>; 2],
+    copies: &mut HashMap<u64, CopyTask>,
+    ctx: &PanelCtx,
+) {
+    use crate::file_panels::CopyRequest;
+    for req in std::mem::take(&mut app.copy_requests) {
+        match req {
+            CopyRequest::Start { id, plan } => {
+                let from = sides[side_index(plan.from)].clone();
+                let to = sides[side_index(plan.from.other())].clone();
+                let refused = match (&from, &to) {
+                    (Some(_), Some(to)) if to.read_only => Some("the target host is read-only"),
+                    (Some(_), Some(_)) => None,
+                    _ => Some("a panel lost its connection — refresh it (r) and try again"),
+                };
+                if let Some(why) = refused {
+                    app.finish_copy(
+                        id,
+                        filar_transport::CopyReport {
+                            failed: vec![(plan.target(), why.to_string())],
+                            ..Default::default()
+                        },
+                    );
+                    continue;
+                }
+                let (Some(from), Some(to)) = (from, to) else {
+                    continue;
+                };
+                let cancel = CancellationToken::new();
+                copies.insert(
+                    id,
+                    CopyTask {
+                        cancel: cancel.clone(),
+                        reply: None,
+                    },
+                );
+                let tx = ctx.tx.clone();
+                tokio::spawn(async move {
+                    let observer = ChannelObserver { id, tx: tx.clone() };
+                    let report = filar_transport::copy(
+                        &*from.ft,
+                        &plan.sources,
+                        &*to.ft,
+                        &plan.dst_dir,
+                        &observer,
+                        &cancel,
+                    )
+                    .await;
+                    let _ = tx.send(PanelMsg::CopyDone { id, report });
+                    // Sources the panels already let go of close here.
+                    from.close();
+                    to.close();
+                });
+            }
+            CopyRequest::Cancel { id } => {
+                if let Some(task) = copies.get_mut(&id) {
+                    task.cancel.cancel();
+                    if let Some(reply) = task.reply.take() {
+                        let _ = reply.send(filar_transport::OverwriteDecision::Cancel);
+                    }
+                }
+            }
+            CopyRequest::Answer { id, decision } => {
+                if let Some(reply) = copies.get_mut(&id).and_then(|t| t.reply.take()) {
+                    let _ = reply.send(decision);
+                }
+            }
+        }
+    }
+}
+
 fn fail_open(ctx: &PanelCtx, side: crate::file_panels::Side, generation: u64, error: &str) {
     let _ = ctx.tx.send(PanelMsg::Event(crate::file_panels::PanelEvent::OpenFailed {
         side,
@@ -903,6 +1047,7 @@ async fn open_panel_source(
                 conn: PanelConn {
                     ft: Arc::new(filar_transport::LocalFileTransfer::new()),
                     sftp: None,
+                    read_only: false,
                 },
                 label: "local".into(),
                 read_only: false,
@@ -969,13 +1114,15 @@ fn ready_sftp(
     host_groups: &[filar_core::HostGroup],
 ) -> PanelOpened {
     let sftp = Arc::new(sftp);
+    let read_only = filar_core::is_read_only_target(host_groups, target);
     PanelOpened::Ready {
         conn: PanelConn {
             ft: sftp.clone(),
             sftp: Some(sftp),
+            read_only,
         },
         label: target.name.clone(),
-        read_only: filar_core::is_read_only_target(host_groups, target),
+        read_only,
     }
 }
 
@@ -1260,6 +1407,13 @@ async fn run_app(
     // the tasks that open and list them.
     let (panel_tx, mut panel_rx) = tokio::sync::mpsc::unbounded_channel::<PanelMsg>();
     let mut panel_sides: [Option<PanelConn>; 2] = [None, None];
+    // Copies started from the panels (#536), by copy number.
+    let mut copy_tasks: HashMap<u64, CopyTask> = HashMap::new();
+    let panel_ctx = PanelCtx {
+        tx: panel_tx.clone(),
+        command_timeout,
+        host_groups: host_groups.clone(),
+    };
 
     // Receiver for WARN/ERROR log lines mirrored into the chat.
     let mut log_rx = config.log_rx.take();
@@ -1394,7 +1548,11 @@ async fn run_app(
             biased;
 
             Some(msg) = panel_rx.recv() => {
-                handle_panel_msg(&mut app, &mut panel_sides, msg);
+                handle_panel_msg(&mut app, &mut panel_sides, &mut copy_tasks, msg);
+                // An answer can queue work (a copy refreshes its target
+                // panel): run it now, not on the next key.
+                drive_file_panels(&mut app, &mut panel_sides, &executors, &panel_ctx);
+                drive_copies(&mut app, &panel_sides, &mut copy_tasks, &panel_ctx);
                 needs_redraw = true;
             }
 
@@ -1547,12 +1705,8 @@ async fn run_app(
 
                 // File panels (#535): run their requests; drop the sources
                 // once they close.
-                let panel_ctx = PanelCtx {
-                    tx: panel_tx.clone(),
-                    command_timeout,
-                    host_groups: host_groups.clone(),
-                };
                 drive_file_panels(&mut app, &mut panel_sides, &executors, &panel_ctx);
+                drive_copies(&mut app, &panel_sides, &mut copy_tasks, &panel_ctx);
 
                 // Handle mode toggle (Ctrl+T).
                 if app.take_toggle_interactive() {

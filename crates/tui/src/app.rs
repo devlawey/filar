@@ -390,6 +390,11 @@ pub struct App {
     /// The host overlay is choosing the source of this panel instead of the
     /// tab's host (Ctrl+O inside the file panels, #535).
     pub host_select_for_panel: Option<crate::file_panels::Side>,
+    /// Copies started from the file panels (#536), newest last; a finished
+    /// one stays listed in Ctrl+J like a finished background job.
+    pub file_copies: Vec<crate::file_panels::FileCopy>,
+    /// Work for the runner about copies: start, cancel, overwrite answers.
+    pub copy_requests: Vec<crate::file_panels::CopyRequest>,
     /// In-TUI path picker overlay (#351).
     pub path_picker_visible: bool,
     pub path_picker_kind: crate::path_picker::PathPickerKind,
@@ -715,6 +720,8 @@ impl App {
             pending_path_picker: None,
             file_panels: None,
             host_select_for_panel: None,
+            file_copies: Vec::new(),
+            copy_requests: Vec::new(),
             path_picker_visible: false,
             path_picker_kind: crate::path_picker::PathPickerKind::File,
             path_picker_dir: String::new(),
@@ -2394,7 +2401,106 @@ impl App {
             PanelsAction::None => {}
             PanelsAction::Close => self.close_file_panels(),
             PanelsAction::ChooseSource(side) => self.choose_panel_source(side),
+            PanelsAction::StartCopy(plan) => self.start_copy(plan),
+            PanelsAction::CancelCopy => self.cancel_copy(),
         }
+    }
+
+    /// The running copy, if any (one at a time).
+    pub fn running_copy(&self) -> Option<&crate::file_panels::FileCopy> {
+        self.file_copies.iter().find(|c| c.running())
+    }
+
+    /// Start a confirmed copy (#536). One copy runs at a time.
+    fn start_copy(&mut self, plan: crate::file_panels::CopyPlan) {
+        if self.running_copy().is_some() {
+            if let Some(fp) = self.file_panels.as_mut() {
+                fp.notice = Some("A copy is already running — wait for it or cancel it (Ctrl+Z)".into());
+            }
+            return;
+        }
+        let id = self.file_copies.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+        let session = self.sessions[self.active].id;
+        // Keep the last few finished copies for Ctrl+J, not all of them.
+        let finished = self.file_copies.iter().filter(|c| !c.running()).count();
+        if finished >= MAX_FINISHED_COPIES {
+            if let Some(oldest) = self.file_copies.iter().position(|c| !c.running()) {
+                self.file_copies.remove(oldest);
+            }
+        }
+        self.file_copies
+            .push(crate::file_panels::FileCopy::new(id, session, plan.clone()));
+        self.copy_requests
+            .push(crate::file_panels::CopyRequest::Start { id, plan });
+        self.refresh_copy_operations();
+    }
+
+    /// Cancel the running copy (Ctrl+Z in the panels).
+    fn cancel_copy(&mut self) {
+        if let Some(id) = self.running_copy().map(|c| c.id) {
+            self.copy_requests
+                .push(crate::file_panels::CopyRequest::Cancel { id });
+        }
+    }
+
+    /// A copy's progress from the runner.
+    pub fn apply_copy_event(&mut self, id: u64, event: filar_transport::CopyEvent) {
+        if let Some(c) = self.file_copies.iter_mut().find(|c| c.id == id) {
+            c.apply(event);
+        }
+        self.refresh_copy_operations();
+    }
+
+    /// The engine asks whether to replace `dst` (overwrite dialog).
+    pub fn ask_copy_overwrite(&mut self, id: u64, dst: String) {
+        if let Some(c) = self.file_copies.iter_mut().find(|c| c.id == id) {
+            c.asking = Some(dst);
+        }
+    }
+
+    /// A copy ended: keep its report, say it in the tab's chat (failures and
+    /// left-behind part files must reach the user, #531), refresh the target
+    /// panel if it shows the target folder.
+    pub fn finish_copy(&mut self, id: u64, report: filar_transport::CopyReport) {
+        let Some(c) = self.file_copies.iter_mut().find(|c| c.id == id) else {
+            return;
+        };
+        c.finish(report);
+        let summary = c.summary();
+        let session = c.session;
+        let (to_source, dst_dir) = (c.plan.to_source.clone(), c.plan.dst_dir.clone());
+        if let Some(idx) = self.find_session_idx(session) {
+            if idx == self.active {
+                self.push_message(ChatBlock::System(summary.clone()));
+            } else {
+                self.sessions[idx]
+                    .messages
+                    .push(ChatBlock::System(summary.clone()));
+            }
+        }
+        if let Some(fp) = self.file_panels.as_mut() {
+            fp.notice = Some(summary);
+            fp.refresh_if_showing(&to_source, &dst_dir);
+        }
+        self.refresh_copy_operations();
+    }
+
+    /// Answer the overwrite question of the running copy.
+    fn answer_overwrite(&mut self, decision: filar_transport::OverwriteDecision) {
+        let Some(c) = self.file_copies.iter_mut().find(|c| c.asking.is_some()) else {
+            return;
+        };
+        c.asking = None;
+        let id = c.id;
+        self.copy_requests
+            .push(crate::file_panels::CopyRequest::Answer { id, decision });
+    }
+
+    /// Re-list Ctrl+J operations so copies appear next to background jobs.
+    fn refresh_copy_operations(&mut self) {
+        self.refresh_operations_with(|sid| {
+            filar_agent::background::snapshot(&sid.0.to_string(), OPS_TAIL_LINES)
+        });
     }
 
     /// Drop the active tab's interactive terminal before a host/target switch.
@@ -3318,6 +3424,26 @@ impl App {
                 KeyCode::Home => self.help_scroll = 0,
                 KeyCode::End => self.help_scroll = u16::MAX,
                 _ => {}
+            }
+            return;
+        }
+
+        // A copy asks whether to replace an existing file (#536). Asked over
+        // everything, panels open or not: the copy waits for the answer.
+        if self.file_copies.iter().any(|c| c.asking.is_some()) {
+            use filar_transport::OverwriteDecision as D;
+            let decision = match key.code {
+                KeyCode::Char('o' | 'O' | 'щ' | 'Щ') => Some(D::Overwrite),
+                KeyCode::Char('s' | 'S' | 'ы' | 'Ы') => Some(D::Skip),
+                KeyCode::Char('a' | 'A' | 'ф' | 'Ф') => Some(D::OverwriteAll),
+                KeyCode::Char('n' | 'N' | 'т' | 'Т') => Some(D::SkipAll),
+                // Only Esc cancels: `c` copies in the panels, a reflex must
+                // not stop a running copy (#543 review).
+                KeyCode::Esc => Some(D::Cancel),
+                _ => None,
+            };
+            if let Some(d) = decision {
+                self.answer_overwrite(d);
             }
             return;
         }
@@ -6015,6 +6141,9 @@ impl App {
 /// Lines of output tail kept per host for the side panel.
 const OPS_TAIL_LINES: usize = 200;
 
+/// Finished copies kept in Ctrl+J (#536); older ones drop off.
+const MAX_FINISHED_COPIES: usize = 10;
+
 impl App {
     /// Refresh [`App::operations`] from the agent's background-job registry.
     ///
@@ -6040,6 +6169,14 @@ impl App {
         for (i, s) in self.sessions.iter().enumerate() {
             let host = s.tab_label(i);
             ops.extend(crate::ops::from_background_jobs(s.id, &host, fetch(s.id)));
+            // Copies from the file panels (#536) are operations of the tab
+            // they were started from.
+            ops.extend(
+                self.file_copies
+                    .iter()
+                    .filter(|c| c.session == s.id)
+                    .map(crate::file_panels::FileCopy::operation),
+            );
         }
         if ops == self.operations {
             return false;
@@ -14593,5 +14730,170 @@ mod tests {
             .host_select_rows()
             .iter()
             .any(|r| matches!(r, HostSelectRow::Group { .. })));
+    }
+
+    // ── Copy from the file panels (#536) ───────────────────────────────
+
+    /// Panels open: left local `/src` with `a.txt` under the cursor,
+    /// right `web1:/dst`.
+    fn app_ready_to_copy() -> App {
+        use crate::file_panels::{PanelEvent, PanelSource, Side};
+        use filar_transport::{DirEntry, EntryKind, Metadata, PathStyle};
+        let mut app = app_with_targets_and_group();
+        app.handle_key(ctrl_key_event('g'));
+        app.handle_key(code_key(crossterm::event::KeyCode::Esc)); // host overlay
+        let fp = app.file_panels.as_mut().expect("panels");
+        let file = DirEntry {
+            name: "a.txt".into(),
+            metadata: Metadata { kind: EntryKind::File, size: 5, modified: None, mode: None },
+        };
+        for (side, source, label, path, entries) in [
+            (Side::Left, PanelSource::Local, "local", "/src", vec![file]),
+            (Side::Right, PanelSource::Target(0), "web1", "/dst", vec![]),
+        ] {
+            fp.set_source(side, source, None);
+            let generation = fp.panel(side).generation;
+            fp.apply(PanelEvent::Opened {
+                side,
+                generation,
+                label: label.into(),
+                style: PathStyle::Posix,
+                read_only: false,
+            });
+            fp.apply(PanelEvent::Listed {
+                side,
+                generation,
+                path: path.into(),
+                result: Ok(entries),
+            });
+        }
+        fp.requests.clear();
+        fp.active = Side::Left;
+        fp.left.cursor = 1; // a.txt
+        app
+    }
+
+    #[test]
+    fn a_confirmed_copy_starts_once_and_shows_in_ctrl_j() {
+        use crate::file_panels::CopyRequest;
+        let mut app = app_ready_to_copy();
+        app.handle_key(code_key(crossterm::event::KeyCode::F(5)));
+        assert!(app.copy_requests.is_empty(), "nothing starts before the answer");
+        app.handle_key(code_key(crossterm::event::KeyCode::Enter));
+        assert!(matches!(app.copy_requests.as_slice(), [CopyRequest::Start { id: 1, .. }]));
+        assert!(app.running_copy().is_some());
+        assert!(app.operations.iter().any(|op| op.id == "copy-1"));
+        // A second copy while one runs is refused with a notice.
+        app.copy_requests.clear();
+        app.handle_key(code_key(crossterm::event::KeyCode::F(5)));
+        app.handle_key(code_key(crossterm::event::KeyCode::Enter));
+        assert!(app.copy_requests.is_empty());
+        assert!(app
+            .file_panels
+            .as_ref()
+            .and_then(|fp| fp.notice.as_deref())
+            .is_some_and(|n| n.contains("already running")));
+        // Ctrl+Z cancels it.
+        app.handle_key(ctrl_key_event('z'));
+        assert!(matches!(app.copy_requests.as_slice(), [CopyRequest::Cancel { id: 1 }]));
+    }
+
+    #[test]
+    fn a_copy_is_confirmed_in_every_confirm_mode() {
+        for mode in [
+            CommandConfirmMode::Never,
+            CommandConfirmMode::Allowlist,
+            CommandConfirmMode::Always,
+            CommandConfirmMode::Explain,
+        ] {
+            let mut app = app_ready_to_copy();
+            app.confirm_mode = mode;
+            app.handle_key(code_key(crossterm::event::KeyCode::F(5)));
+            assert!(app.copy_requests.is_empty(), "{mode:?}: started without asking");
+            assert!(
+                matches!(
+                    app.file_panels.as_ref().and_then(|fp| fp.dialog.as_ref()),
+                    Some(crate::file_panels::PanelDialog::ConfirmCopy(_))
+                ),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_overwrite_question_takes_keys_on_both_layouts_even_with_panels_closed() {
+        use crate::file_panels::CopyRequest;
+        use filar_transport::OverwriteDecision as D;
+        let mut app = app_ready_to_copy();
+        app.handle_key(code_key(crossterm::event::KeyCode::F(5)));
+        app.handle_key(code_key(crossterm::event::KeyCode::Enter));
+        app.handle_key(code_key(crossterm::event::KeyCode::Esc)); // close panels
+        assert!(app.file_panels.is_none());
+        app.copy_requests.clear();
+        for (c, want) in [('o', D::Overwrite), ('ы', D::Skip), ('a', D::OverwriteAll), ('т', D::SkipAll)] {
+            app.ask_copy_overwrite(1, "/dst/a.txt".into());
+            press(&mut app, 'x'); // other keys wait for an answer
+            assert!(app.copy_requests.is_empty());
+            press(&mut app, c);
+            assert!(
+                matches!(app.copy_requests.pop(), Some(CopyRequest::Answer { id: 1, decision }) if decision == want),
+                "{c}"
+            );
+        }
+        // `c` copies in the panels; here it must not cancel the copy.
+        app.ask_copy_overwrite(1, "/dst/a.txt".into());
+        press(&mut app, 'c');
+        assert!(app.copy_requests.is_empty());
+        app.handle_key(code_key(crossterm::event::KeyCode::Esc));
+        assert!(matches!(
+            app.copy_requests.pop(),
+            Some(CopyRequest::Answer { decision: D::Cancel, .. })
+        ));
+        assert!(app.input.is_empty(), "answers never reach the agent input");
+    }
+
+    #[test]
+    fn only_the_last_finished_copies_are_kept() {
+        let mut app = app_ready_to_copy();
+        let plan = app
+            .file_panels
+            .as_ref()
+            .and_then(|fp| fp.copy_plan().ok())
+            .expect("plan");
+        for i in 1..=(MAX_FINISHED_COPIES as u64 + 3) {
+            // Started directly: after a copy the target panel re-lists, and
+            // the keys would rightly wait for that listing.
+            app.start_copy(plan.clone());
+            assert_eq!(app.running_copy().map(|c| c.id), Some(i));
+            app.finish_copy(i, filar_transport::CopyReport::default());
+        }
+        assert_eq!(app.file_copies.len(), MAX_FINISHED_COPIES);
+        assert_eq!(app.file_copies.last().map(|c| c.id), Some(MAX_FINISHED_COPIES as u64 + 3));
+    }
+
+    #[test]
+    fn a_finished_copy_reports_in_the_chat_and_refreshes_the_target_panel() {
+        use crate::file_panels::PanelRequest;
+        let mut app = app_ready_to_copy();
+        app.handle_key(code_key(crossterm::event::KeyCode::F(5)));
+        app.handle_key(code_key(crossterm::event::KeyCode::Enter));
+        app.finish_copy(
+            1,
+            filar_transport::CopyReport {
+                copied: 1,
+                bytes: 5,
+                ..Default::default()
+            },
+        );
+        assert!(app.running_copy().is_none());
+        let said = app.messages.iter().any(|m| matches!(m, ChatBlock::System(t) if t.contains("Copy done") && t.contains("web1:/dst")));
+        assert!(said, "{:?}", app.messages);
+        let fp = app.file_panels.as_ref().expect("panels");
+        assert!(fp
+            .requests
+            .iter()
+            .any(|r| matches!(r, PanelRequest::List { path, .. } if path == "/dst")));
+        let op = app.operations.iter().find(|op| op.id == "copy-1").expect("listed");
+        assert_eq!(op.state(), crate::ops::HostOpState::Done);
     }
 }

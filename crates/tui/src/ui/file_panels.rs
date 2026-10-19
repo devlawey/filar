@@ -8,7 +8,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
-use crate::file_panels::{format_mtime, human_size, Panel, PanelStatus, Row, SecretPrompt, Side};
+use crate::file_panels::{format_mtime, human_size, CopyPlan, Panel, PanelDialog, PanelStatus, Row, SecretPrompt, Side};
 use filar_transport::EntryKind;
 
 const SIZE_COL: usize = 7;
@@ -17,6 +17,7 @@ const DATE_COL: usize = 16;
 /// Draw the panels over the whole frame.
 pub(crate) fn render_file_panels(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = &app.theme;
+    let copies = &app.file_copies;
     let Some(fp) = app.file_panels.as_mut() else {
         return;
     };
@@ -25,7 +26,11 @@ pub(crate) fn render_file_panels(f: &mut Frame, app: &mut App, area: Rect) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(area);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -36,9 +41,29 @@ pub(crate) fn render_file_panels(f: &mut Frame, app: &mut App, area: Rect) {
     render_panel(f, theme, &mut fp.left, active == Side::Left, cols[0]);
     render_panel(f, theme, &mut fp.right, active == Side::Right, cols[1]);
 
-    let hint = fit_hint(rows[1].width as usize);
-    f.render_widget(Paragraph::new(Span::styled(hint, theme.muted())), rows[1]);
+    // Status: the running copy, else the last notice (why a copy cannot
+    // start, a copy's result).
+    let running = copies.iter().find(|c| c.running());
+    let (status, style) = match (running, fp.notice.as_deref()) {
+        (Some(c), _) => (
+            format!(" {}   Ctrl+Z cancel", c.status_line()),
+            Style::default().fg(theme.accent),
+        ),
+        (None, Some(n)) => (format!(" {n}"), theme.warning_fg()),
+        (None, None) => (String::new(), theme.muted()),
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(truncate(&status, rows[1].width as usize), style)),
+        rows[1],
+    );
 
+    let hint = fit_hint(rows[2].width as usize);
+    f.render_widget(Paragraph::new(Span::styled(hint, theme.muted())), rows[2]);
+
+    if let Some(PanelDialog::ConfirmCopy(plan)) = fp.dialog.as_ref() {
+        let from = fp.panel(plan.from).label.clone();
+        render_confirm(f, theme, plan, &from, area);
+    }
     if let Some(prompt) = fp.prompt.as_ref() {
         render_prompt(f, theme, prompt, area);
     }
@@ -120,6 +145,7 @@ fn render_panel(f: &mut Frame, theme: &crate::ui::Theme, p: &mut Panel, active: 
                 break;
             };
             let selected = active && i == p.cursor;
+            let marked = matches!(row, Row::Entry(e) if p.marked.contains(&e.name));
             let (name, size, date, is_dir) = match row {
                 Row::Parent => ("..".to_string(), String::new(), String::new(), true),
                 Row::Entry(e) => {
@@ -137,9 +163,10 @@ fn render_panel(f: &mut Frame, theme: &crate::ui::Theme, p: &mut Panel, active: 
                     (name, size, format_mtime(e.metadata.modified), is_dir)
                 }
             };
+            let lead = if marked { '*' } else { ' ' };
             let text = if show_cols {
                 format!(
-                    " {:<nw$} {:>sw$}  {:<dw$}",
+                    "{lead}{:<nw$} {:>sw$}  {:<dw$}",
                     pad_to(&truncate(&name, name_width), name_width),
                     size,
                     date,
@@ -148,13 +175,16 @@ fn render_panel(f: &mut Frame, theme: &crate::ui::Theme, p: &mut Panel, active: 
                     dw = DATE_COL
                 )
             } else {
-                format!(" {}", truncate(&name, width.saturating_sub(1)))
+                format!("{lead}{}", truncate(&name, width.saturating_sub(1)))
             };
             let mut style = if is_dir {
                 Style::default().fg(theme.accent)
             } else {
                 Style::default().fg(theme.fg)
             };
+            if marked {
+                style = theme.warning_fg();
+            }
             if selected {
                 style = style.bg(theme.selection_bg).add_modifier(Modifier::BOLD);
             } else if !active && i == p.cursor {
@@ -179,6 +209,79 @@ fn render_panel(f: &mut Frame, theme: &crate::ui::Theme, p: &mut Panel, active: 
         )));
     }
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// "Copy … → host:/dir?" — every copy is confirmed (#536).
+fn render_confirm(f: &mut Frame, theme: &crate::ui::Theme, plan: &CopyPlan, from: &str, area: Rect) {
+    let width = 72.min(area.width.saturating_sub(4));
+    let inner = width.saturating_sub(4) as usize;
+    let rect = centered(area, width, 7);
+    f.render_widget(Clear, rect);
+    let lines = vec![
+        Line::from(Span::styled(
+            truncate(&format!("Copy {} from {from}", plan.what()), inner),
+            Style::default().fg(theme.fg),
+        )),
+        Line::from(Span::styled(
+            truncate_left(&format!("to {}", plan.target()), inner),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            truncate("Enter copy   Esc cancel   (existing files: asked one by one)", inner),
+            theme.muted(),
+        )),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.bg))
+        .title(" Copy? ");
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+/// "File exists" question of a running copy — drawn over everything, since
+/// the copy may run with the panels closed (#536).
+pub(crate) fn render_overwrite(f: &mut Frame, app: &App, area: Rect) {
+    let Some(copy) = app.file_copies.iter().find(|c| c.asking.is_some()) else {
+        return;
+    };
+    let dst = copy.asking.clone().unwrap_or_default();
+    let theme = &app.theme;
+    let width = 72.min(area.width.saturating_sub(4));
+    let inner = width.saturating_sub(4) as usize;
+    let rect = centered(area, width, 7);
+    f.render_widget(Clear, rect);
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("Already exists on {}:", copy.plan.dst_label),
+            Style::default().fg(theme.fg),
+        )),
+        Line::from(Span::styled(
+            truncate_left(&dst, inner),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            truncate("o overwrite  s skip  a overwrite all  n skip all  Esc cancel copy", inner),
+            theme.muted(),
+        )),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.warning_fg())
+        .style(Style::default().bg(theme.bg))
+        .title(" Replace? ");
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    Rect::new(
+        area.x + (area.width.saturating_sub(width)) / 2,
+        area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height.min(area.height),
+    )
 }
 
 /// Masked password / passphrase box over the panels.
@@ -228,8 +331,8 @@ fn render_prompt(f: &mut Frame, theme: &crate::ui::Theme, prompt: &SecretPrompt,
 /// The longest key hint that fits the width.
 fn fit_hint(width: usize) -> String {
     const VARIANTS: [&str; 4] = [
-        " Tab panel  \u{2191}\u{2193} move  Enter open  Backspace up  r refresh  Ctrl+O host  Esc/Ctrl+G close ",
-        " Tab panel  Enter open  Bksp up  r refresh  ^O host  Esc close ",
+        " Tab panel  Enter open  Bksp up  Space mark  F5/c copy  r refresh  Ctrl+O host  Esc close ",
+        " Tab  Enter  Bksp  Space mark  F5/c copy  r  ^O host  Esc ",
         " Tab  Enter  Bksp  r  ^O host  Esc ",
         " Esc ",
     ];
