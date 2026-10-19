@@ -385,6 +385,11 @@ pub struct App {
     pub session_select_metas: Vec<SessionMeta>,
     /// Native path picker queued from Normal input (^⇧F / `/` at path start).
     pub pending_path_picker: Option<crate::path_picker::PathPickerKind>,
+    /// File panels (Ctrl+G, #535); `Some` while they are open.
+    pub file_panels: Option<crate::file_panels::FilePanels>,
+    /// The host overlay is choosing the source of this panel instead of the
+    /// tab's host (Ctrl+O inside the file panels, #535).
+    pub host_select_for_panel: Option<crate::file_panels::Side>,
     /// In-TUI path picker overlay (#351).
     pub path_picker_visible: bool,
     pub path_picker_kind: crate::path_picker::PathPickerKind,
@@ -708,6 +713,8 @@ impl App {
             session_select_index: 0,
             session_select_metas: Vec::new(),
             pending_path_picker: None,
+            file_panels: None,
+            host_select_for_panel: None,
             path_picker_visible: false,
             path_picker_kind: crate::path_picker::PathPickerKind::File,
             path_picker_dir: String::new(),
@@ -2111,7 +2118,13 @@ impl App {
         let mut rows = Vec::new();
         // In the fleet the overlay drills into the fleet's own hosts (#433):
         // `local` and hosts outside the fleet are not offered.
-        let fleet = self.sessions[self.active].fleet.as_ref();
+        // Choosing a file panel's source (#535): every host, never a group.
+        let for_panel = self.host_select_for_panel.is_some();
+        let fleet = if for_panel {
+            None
+        } else {
+            self.sessions[self.active].fleet.as_ref()
+        };
         if fleet.is_none() && tag.is_none() && (q.is_empty() || "local".contains(&q)) {
             rows.push(HostSelectRow::Local);
         }
@@ -2159,6 +2172,7 @@ impl App {
             .host_groups
             .iter()
             .enumerate()
+            .filter(|_| !for_panel)
             .filter(|(_, g)| {
                 tag.is_none_or(|tf| g.match_tags.iter().any(|t| t.eq_ignore_ascii_case(tf)))
                     && (q.is_empty()
@@ -2266,6 +2280,20 @@ impl App {
         let idx = self.host_select_index;
         self.host_select_visible = false;
 
+        // Ctrl+O inside the file panels picks that panel's source (#535);
+        // the tab's own host is not touched.
+        if let Some(side) = self.host_select_for_panel.take() {
+            let source = match idx {
+                0 => crate::file_panels::PanelSource::Local,
+                i if i <= self.ssh_targets.len() => crate::file_panels::PanelSource::Target(i - 1),
+                _ => return,
+            };
+            if let Some(fp) = self.file_panels.as_mut() {
+                fp.set_source(side, source, None);
+            }
+            return;
+        }
+
         // A host group enters the fleet layer (#432).
         if let Some(group) = idx.checked_sub(1 + self.ssh_targets.len()) {
             if let Some(name) = self.host_groups.get(group).map(|g| g.name.clone()) {
@@ -2318,6 +2346,54 @@ impl App {
         }
         if let Some(tok) = self.ctrl_o_cancel.take() {
             tok.cancel();
+        }
+    }
+
+    /// Open the file panels (Ctrl+G, #535): the left one on the local disk,
+    /// the right one on the tab's host. A local or fleet tab has no host to
+    /// show, so the host overlay opens for the right panel at once.
+    pub fn open_file_panels(&mut self) {
+        use crate::file_panels::{FilePanels, PanelSource, Side};
+        let session = &self.sessions[self.active];
+        let on_ssh = session.ssh_info.is_some() && session.fleet.is_none();
+        let cwd = session.cwd.clone();
+        let sid = session.id;
+        let mut fp = FilePanels::new();
+        fp.set_source(Side::Left, PanelSource::Local, if on_ssh { None } else { cwd.clone() });
+        if on_ssh {
+            fp.set_source(Side::Right, PanelSource::TabHost(sid), cwd);
+        }
+        self.file_panels = Some(fp);
+        if !on_ssh {
+            self.choose_panel_source(Side::Right);
+        }
+    }
+
+    /// Close the file panels; the runner drops their connections.
+    pub fn close_file_panels(&mut self) {
+        self.file_panels = None;
+        self.host_select_for_panel = None;
+    }
+
+    /// Open the host overlay to choose the source of panel `side`.
+    fn choose_panel_source(&mut self, side: crate::file_panels::Side) {
+        if let Some(fp) = self.file_panels.as_mut() {
+            fp.active = side;
+        }
+        self.host_select_for_panel = Some(side);
+        self.open_host_select();
+    }
+
+    /// A key while the file panels are open.
+    fn file_panels_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crate::file_panels::PanelsAction;
+        let Some(fp) = self.file_panels.as_mut() else {
+            return;
+        };
+        match fp.handle_key(key) {
+            PanelsAction::None => {}
+            PanelsAction::Close => self.close_file_panels(),
+            PanelsAction::ChooseSource(side) => self.choose_panel_source(side),
         }
     }
 
@@ -3246,6 +3322,22 @@ impl App {
             return;
         }
 
+        // File panels (Ctrl+G, #535): open from the agent prompt; while open
+        // they take every key except the host overlay they opened (Ctrl+O).
+        if self.file_panels.is_some() && !self.host_select_visible {
+            self.file_panels_key(key);
+            return;
+        }
+        if ctrl_key('g', 'п')
+            && self.mode == AppMode::Normal
+            && !self.host_select_visible
+            && !self.path_picker_visible
+            && !self.session_select_visible
+        {
+            self.open_file_panels();
+            return;
+        }
+
         // Ctrl+V — paste from clipboard. Active in Normal, Confirming, and
         // PasswordInput modes. Interactive mode pastes into the PTY in its own
         // key handler (#494); in Thinking mode, the agent is running — no paste.
@@ -3293,6 +3385,7 @@ impl App {
 
         // Ctrl+O — open host selection overlay.
         if ctrl_key('o', 'щ') && self.mode == AppMode::Normal && !self.host_select_visible {
+            self.host_select_for_panel = None;
             self.open_host_select();
             return;
         }
@@ -3310,6 +3403,7 @@ impl App {
                         self.host_select_ensure_visible();
                     } else {
                         self.host_select_visible = false;
+                        self.host_select_for_panel = None;
                     }
                 }
                 KeyCode::Up => self.host_select_move(-1),
@@ -14376,5 +14470,128 @@ mod tests {
             chrono::DateTime::parse_from_str(rest, "%Y-%m-%d %H:%M:%S %:z").is_ok(),
             "Date line must contain timezone offset (YYYY-MM-DD HH:MM:SS ±HH:MM): {date_line}"
         );
+    }
+
+    // ── File panels (Ctrl+G, #535) ─────────────────────────────────────
+
+    fn ctrl_key_event(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(c),
+            crossterm::event::KeyModifiers::CONTROL,
+        )
+    }
+
+    fn code_key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn app_with_targets_and_group() -> App {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.ssh_targets = vec![make_ssh_target("web1"), make_ssh_target("db1")];
+        app.host_groups = vec![filar_core::HostGroup {
+            name: "all".into(),
+            match_tags: vec!["web".into()],
+            ..Default::default()
+        }];
+        app
+    }
+
+    #[test]
+    fn ctrl_g_on_a_local_tab_opens_panels_and_asks_for_the_right_host() {
+        use crate::file_panels::{PanelSource, Side};
+        let mut app = app_with_targets_and_group();
+        app.handle_key(ctrl_key_event('g'));
+        let fp = app.file_panels.as_ref().expect("panels open");
+        assert_eq!(fp.left.source, Some(PanelSource::Local));
+        assert_eq!(fp.right.source, None);
+        assert!(app.host_select_visible);
+        assert_eq!(app.host_select_for_panel, Some(Side::Right));
+        // The panel overlay offers hosts only: no fleet groups.
+        assert!(app
+            .host_select_rows()
+            .iter()
+            .all(|r| !matches!(r, HostSelectRow::Group { .. } | HostSelectRow::GroupsHeader { .. })));
+    }
+
+    #[test]
+    fn choosing_a_panel_host_does_not_touch_the_tab() {
+        use crate::file_panels::{PanelSource, Side};
+        let mut app = app_with_targets_and_group();
+        app.handle_key(ctrl_key_event('п')); // Ctrl+G, Russian layout
+        app.handle_key(code_key(crossterm::event::KeyCode::Down)); // local -> web1
+        app.handle_key(code_key(crossterm::event::KeyCode::Enter));
+        assert!(!app.host_select_visible);
+        assert_eq!(app.host_select_for_panel, None);
+        assert!(!app.ctrl_o_needs_connect, "the tab must not switch hosts");
+        assert!(app.connecting.is_none());
+        let fp = app.file_panels.as_ref().expect("panels open");
+        assert_eq!(fp.right.source, Some(PanelSource::Target(0)));
+        assert_eq!(fp.active, Side::Right);
+    }
+
+    #[test]
+    fn a_filtered_panel_overlay_picks_the_host_on_the_row() {
+        use crate::file_panels::PanelSource;
+        let mut app = app_with_targets_and_group();
+        app.handle_key(ctrl_key_event('g')); // overlay for the right panel
+        // Search hides `local` and `web1`: the only row left is `db1`.
+        press(&mut app, 'd');
+        press(&mut app, 'b');
+        app.handle_key(code_key(crossterm::event::KeyCode::Enter));
+        let fp = app.file_panels.as_ref().expect("panels open");
+        assert_eq!(fp.right.source, Some(PanelSource::Target(1)));
+    }
+
+    #[test]
+    fn ctrl_o_inside_panels_picks_the_active_panel_and_esc_resets_the_purpose() {
+        use crate::file_panels::Side;
+        let mut app = app_with_targets_and_group();
+        app.handle_key(ctrl_key_event('g'));
+        app.handle_key(code_key(crossterm::event::KeyCode::Esc)); // close overlay
+        assert!(!app.host_select_visible);
+        assert_eq!(app.host_select_for_panel, None);
+        assert!(app.file_panels.is_some(), "panels stay open");
+        app.handle_key(code_key(crossterm::event::KeyCode::Tab)); // -> Left
+        app.handle_key(ctrl_key_event('o'));
+        assert!(app.host_select_visible);
+        assert_eq!(app.host_select_for_panel, Some(Side::Left));
+    }
+
+    #[test]
+    fn panels_take_keys_and_close_with_esc_or_ctrl_g() {
+        let mut app = app_with_targets_and_group();
+        app.handle_key(ctrl_key_event('g'));
+        app.handle_key(code_key(crossterm::event::KeyCode::Esc)); // overlay
+        // Typing does not reach the agent input while the panels are open.
+        press(&mut app, 'x');
+        assert!(app.input.is_empty(), "input: {:?}", app.input);
+        app.handle_key(code_key(crossterm::event::KeyCode::Esc));
+        assert!(app.file_panels.is_none());
+        app.handle_key(ctrl_key_event('g'));
+        app.handle_key(code_key(crossterm::event::KeyCode::Esc));
+        app.handle_key(ctrl_key_event('g'));
+        assert!(app.file_panels.is_none());
+    }
+
+    #[test]
+    fn ctrl_g_is_only_for_the_agent_prompt() {
+        let mut app = app_with_targets_and_group();
+        app.mode = AppMode::Thinking;
+        app.handle_key(ctrl_key_event('g'));
+        assert!(app.file_panels.is_none());
+    }
+
+    #[test]
+    fn plain_ctrl_o_still_offers_groups_after_panels() {
+        let mut app = app_with_targets_and_group();
+        app.handle_key(ctrl_key_event('g'));
+        app.handle_key(code_key(crossterm::event::KeyCode::Esc));
+        app.handle_key(code_key(crossterm::event::KeyCode::Esc));
+        app.handle_key(ctrl_key_event('o'));
+        assert_eq!(app.host_select_for_panel, None);
+        assert!(app
+            .host_select_rows()
+            .iter()
+            .any(|r| matches!(r, HostSelectRow::Group { .. })));
     }
 }

@@ -596,3 +596,11 @@ line discipline, которая превращает Ctrl-C в `SIGINT`, поэ�
 `std::fs::rename` на Windows вызывает `MoveFileExW` с
 `MOVEFILE_REPLACE_EXISTING` (проверено тестом в CI `windows-x86_64`). Права
 (`set_permissions`) на Windows — no-op: POSIX-битов там нет.
+
+## Ctrl+G — файловые панели (#535)
+
+Ctrl+G приходит как `0x07` (BEL) и в raw-режиме Unix-терминала, и в консоли
+Windows (`KEY_EVENT` с `uChar = 0x07`); ни Windows Terminal, ни conhost,
+ни Terminal.app / iTerm2, ни tmux его по умолчанию не перехватывают. На
+русской раскладке Windows отдаёт символ клавиши — `п`, он обрабатывается так же
+(как Ctrl+O/`щ`). Проверено вживую: Linux, tmux. Windows и macOS — по SMOKE.

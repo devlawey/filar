@@ -31,6 +31,7 @@ pub fn interactive_grid_rows(total_height: u16) -> u16 {
 mod bars;
 mod chat;
 mod confirm;
+mod file_panels;
 mod help;
 mod host_select;
 mod input;
@@ -123,6 +124,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // Render confirmation modal on top of chat if in Confirming mode.
     if app.mode == AppMode::Confirming {
         confirm::render_confirm_modal(f, app, app.chat_area);
+    }
+
+    // File panels (Ctrl+G, #535) cover the chat; overlays below draw on top.
+    if app.file_panels.is_some() {
+        let full = f.area();
+        file_panels::render_file_panels(f, app, full);
     }
 
     // Render help overlay on top of everything if active.

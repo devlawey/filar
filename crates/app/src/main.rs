@@ -620,6 +620,7 @@ async fn run() -> anyhow::Result<()> {
         password_origin = resolved?;
         ssh_target = Some(target);
     }
+    let mut initial_ssh_executor: Option<Arc<SshExecutor>> = None;
     let executor: Arc<dyn filar_transport::CommandExecutor> = if let Some(ref target) = ssh_target {
         info!(host = %target.host, port = target.port, user = %target.user, "connecting via SSH");
         let ssh = SshExecutor::connect_with_config(
@@ -640,7 +641,10 @@ async fn run() -> anyhow::Result<()> {
             })
             .await?;
         }
-        let ssh: Arc<dyn filar_transport::CommandExecutor> = Arc::new(ssh);
+        let ssh = Arc::new(ssh);
+        // The file panels open SFTP on this connection (#535).
+        initial_ssh_executor = Some(ssh.clone());
+        let ssh: Arc<dyn filar_transport::CommandExecutor> = ssh;
         // Read-only host groups (#419): the transport refuses every
         // non-allowlisted command before it reaches the wire.
         if filar_core::is_read_only_target(&host_groups, target) {
@@ -748,6 +752,7 @@ async fn run() -> anyhow::Result<()> {
         initial_last_served_model: loaded.last_served_model,
         initial_model_per_profile: loaded.model_per_profile,
         ssh_target: ssh_target.clone(),
+        initial_ssh_executor,
         is_local: ssh_target.is_none(),
         initial_ssh_info: loaded.ssh_info,
         secret_provider: secret_provider.clone(),

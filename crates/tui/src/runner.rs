@@ -428,6 +428,10 @@ struct ExecutorEntry {
     /// same host. `None` for local sessions. Shared via `Arc<RwLock>` so the
     /// `!ssh` spawned task can write it alongside swapping the executor.
     ssh_target: Arc<tokio::sync::RwLock<Option<filar_core::SshTarget>>>,
+    /// The tab's SSH executor itself (unwrapped), so a file panel on the
+    /// tab's host can open an SFTP channel on its connection (#535). `None`
+    /// for local tabs. Kept next to `ssh_target` at every swap.
+    ssh_exec: Arc<tokio::sync::RwLock<Option<Arc<SshExecutor>>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +552,10 @@ pub struct TuiConfig {
     /// SSH target for interactive terminal mode (Ctrl+T).
     /// If `None`, the agent runs in local mode.
     pub ssh_target: Option<filar_core::SshTarget>,
+    /// The start-up SSH executor itself, when the first tab is on SSH — the
+    /// file panels open SFTP on its connection (#535). `None` falls back to a
+    /// connection of the panel's own.
+    pub initial_ssh_executor: Option<Arc<SshExecutor>>,
     /// SSH connection info restored from a saved session (e.g. `user@host:port`).
     /// Used to pre-populate the session's display info on restore; the actual
     /// reconnection is handled by the session-select overlay / launcher.
@@ -590,6 +598,435 @@ pub struct TuiConfig {
 /// SSH transport tunables with the app-configured command timeout.
 fn ssh_transport_config(command_timeout: Duration) -> SshTransportConfig {
     SshTransportConfig::default().with_command_timeout(command_timeout)
+}
+
+// ---------------------------------------------------------------------------
+// File panels (Ctrl+G, #535)
+// ---------------------------------------------------------------------------
+
+/// An open panel source.
+struct PanelConn {
+    ft: Arc<dyn filar_transport::FileTransfer>,
+    /// Set for SSH sources, so the channel (and an owned connection) can be
+    /// closed when the panel moves on.
+    sftp: Option<Arc<filar_transport::SftpFileTransfer>>,
+}
+
+impl PanelConn {
+    /// Close an SSH source in the background (a tab's connection is kept).
+    fn close(self) {
+        if let Some(sftp) = self.sftp {
+            tokio::spawn(async move {
+                let _ = sftp.close().await;
+            });
+        }
+    }
+}
+
+/// Messages from panel tasks.
+enum PanelMsg {
+    /// A source opened for `side` under request `generation`.
+    Ready {
+        side: crate::file_panels::Side,
+        generation: u64,
+        conn: PanelConn,
+    },
+    /// State for the panel itself.
+    Event(crate::file_panels::PanelEvent),
+}
+
+/// What panel tasks need from the runner.
+struct PanelCtx {
+    tx: tokio::sync::mpsc::UnboundedSender<PanelMsg>,
+    command_timeout: Duration,
+    host_groups: Vec<filar_core::HostGroup>,
+}
+
+/// How a source is reached.
+enum PanelOpen {
+    Local,
+    /// A configured target; saved secrets are filled like Ctrl+O.
+    Target(filar_core::SshTarget),
+    /// A target with a secret the user just typed.
+    Typed(filar_core::SshTarget),
+    /// A tab's host: SFTP on its connection when the executor is known.
+    TabHost {
+        exec: Arc<tokio::sync::RwLock<Option<Arc<SshExecutor>>>>,
+        target: Arc<tokio::sync::RwLock<Option<filar_core::SshTarget>>>,
+    },
+}
+
+fn side_index(side: crate::file_panels::Side) -> usize {
+    match side {
+        crate::file_panels::Side::Left => 0,
+        crate::file_panels::Side::Right => 1,
+    }
+}
+
+/// Apply a panel task's answer.
+fn handle_panel_msg(app: &mut App, sides: &mut [Option<PanelConn>; 2], msg: PanelMsg) {
+    match msg {
+        PanelMsg::Ready {
+            side,
+            generation,
+            conn,
+        } => {
+            let current = app
+                .file_panels
+                .as_ref()
+                .is_some_and(|fp| fp.panel(side).generation == generation);
+            if current {
+                if let Some(old) = sides[side_index(side)].replace(conn) {
+                    old.close();
+                }
+            } else {
+                conn.close();
+            }
+        }
+        PanelMsg::Event(event) => {
+            if let Some(fp) = app.file_panels.as_mut() {
+                fp.apply(event);
+            }
+        }
+    }
+}
+
+/// Start the panels' pending requests; close the sources of closed panels.
+fn drive_file_panels(
+    app: &mut App,
+    sides: &mut [Option<PanelConn>; 2],
+    executors: &HashMap<SessionId, ExecutorEntry>,
+    ctx: &PanelCtx,
+) {
+    use crate::file_panels::{PanelRequest, PanelSource};
+    let Some(fp) = app.file_panels.as_mut() else {
+        for conn in sides.iter_mut().filter_map(Option::take) {
+            conn.close();
+        }
+        return;
+    };
+    let requests = std::mem::take(&mut fp.requests);
+    for req in requests {
+        match req {
+            PanelRequest::Open {
+                side,
+                source,
+                start_dir,
+                generation,
+            } => {
+                let open = match source {
+                    PanelSource::Local => PanelOpen::Local,
+                    PanelSource::Target(i) => match app.ssh_targets.get(i) {
+                        Some(t) => PanelOpen::Target(t.clone()),
+                        None => {
+                            fail_open(ctx, side, generation, "no such host in the config");
+                            continue;
+                        }
+                    },
+                    PanelSource::TabHost(sid) => match executors.get(&sid) {
+                        Some(e) => PanelOpen::TabHost {
+                            exec: e.ssh_exec.clone(),
+                            target: e.ssh_target.clone(),
+                        },
+                        None => {
+                            fail_open(ctx, side, generation, "the tab is closed");
+                            continue;
+                        }
+                    },
+                };
+                spawn_panel_open(ctx, side, generation, open, start_dir);
+            }
+            PanelRequest::OpenTarget {
+                side,
+                target,
+                generation,
+            } => spawn_panel_open(ctx, side, generation, PanelOpen::Typed(target), None),
+            PanelRequest::List {
+                side,
+                path,
+                generation,
+            } => match &sides[side_index(side)] {
+                Some(conn) => {
+                    let ft = conn.ft.clone();
+                    let tx = ctx.tx.clone();
+                    tokio::spawn(async move {
+                        let result = ft.list_dir(&path).await;
+                        if let Err(e) = &result {
+                            if filar_transport::is_connection_lost(e) {
+                                warn!(error = %e, "file panel source lost its connection");
+                            }
+                        }
+                        let _ = tx.send(PanelMsg::Event(crate::file_panels::PanelEvent::Listed {
+                            side,
+                            generation,
+                            path,
+                            result: result.map_err(|e| e.to_string()),
+                        }));
+                    });
+                }
+                // The source went away (closed, or never opened): open it
+                // again at the same place.
+                None => {
+                    let source = fp.panel(side).source.clone();
+                    let open = match source {
+                        Some(PanelSource::Local) => PanelOpen::Local,
+                        Some(PanelSource::Target(i)) => match app.ssh_targets.get(i) {
+                            Some(t) => PanelOpen::Target(t.clone()),
+                            None => continue,
+                        },
+                        Some(PanelSource::TabHost(sid)) => match executors.get(&sid) {
+                            Some(e) => PanelOpen::TabHost {
+                                exec: e.ssh_exec.clone(),
+                                target: e.ssh_target.clone(),
+                            },
+                            None => continue,
+                        },
+                        None => continue,
+                    };
+                    spawn_panel_open(ctx, side, generation, open, Some(path));
+                }
+            },
+        }
+    }
+}
+
+fn fail_open(ctx: &PanelCtx, side: crate::file_panels::Side, generation: u64, error: &str) {
+    let _ = ctx.tx.send(PanelMsg::Event(crate::file_panels::PanelEvent::OpenFailed {
+        side,
+        generation,
+        error: error.to_string(),
+    }));
+}
+
+/// Open a panel source in the background, then list its first directory.
+fn spawn_panel_open(
+    ctx: &PanelCtx,
+    side: crate::file_panels::Side,
+    generation: u64,
+    open: PanelOpen,
+    start_dir: Option<String>,
+) {
+    use crate::file_panels::PanelEvent;
+    let tx = ctx.tx.clone();
+    let cfg = ssh_transport_config(ctx.command_timeout);
+    let host_groups = ctx.host_groups.clone();
+    tokio::spawn(async move {
+        let opened = open_panel_source(open, &cfg, &host_groups).await;
+        let (conn, label, read_only) = match opened {
+            PanelOpened::Ready {
+                conn,
+                label,
+                read_only,
+            } => (conn, label, read_only),
+            PanelOpened::NeedSecret { target, retry } => {
+                let _ = tx.send(PanelMsg::Event(PanelEvent::NeedSecret {
+                    side,
+                    generation,
+                    target,
+                    retry,
+                }));
+                return;
+            }
+            PanelOpened::Failed(error) => {
+                let _ = tx.send(PanelMsg::Event(PanelEvent::OpenFailed {
+                    side,
+                    generation,
+                    error,
+                }));
+                return;
+            }
+        };
+        let ft = conn.ft.clone();
+        let style = ft.path_style();
+        let _ = tx.send(PanelMsg::Ready {
+            side,
+            generation,
+            conn,
+        });
+        let _ = tx.send(PanelMsg::Event(PanelEvent::Opened {
+            side,
+            generation,
+            label,
+            style,
+            read_only,
+        }));
+        // The wanted directory, else home when it is gone or unreadable.
+        let mut listed = None;
+        if let Some(dir) = start_dir.filter(|d| !d.is_empty() || style == filar_transport::PathStyle::Windows) {
+            if let Ok(entries) = ft.list_dir(&dir).await {
+                listed = Some((dir, Ok(entries)));
+            }
+        }
+        let (path, result) = match listed {
+            Some(l) => l,
+            None => match ft.home_dir().await {
+                Ok(home) => {
+                    let r = ft.list_dir(&home).await.map_err(|e| e.to_string());
+                    (home, r)
+                }
+                Err(e) => (String::new(), Err(e.to_string())),
+            },
+        };
+        let _ = tx.send(PanelMsg::Event(PanelEvent::Listed {
+            side,
+            generation,
+            path,
+            result,
+        }));
+    });
+}
+
+/// Outcome of opening a panel source.
+enum PanelOpened {
+    Ready {
+        conn: PanelConn,
+        label: String,
+        read_only: bool,
+    },
+    NeedSecret {
+        target: filar_core::SshTarget,
+        retry: bool,
+    },
+    Failed(String),
+}
+
+/// Open a panel source. SSH goes through the same secret sources, host-key
+/// check and read-only rule as the tab's own connection.
+async fn open_panel_source(
+    open: PanelOpen,
+    cfg: &SshTransportConfig,
+    host_groups: &[filar_core::HostGroup],
+) -> PanelOpened {
+    let target = match open {
+        PanelOpen::Local => {
+            return PanelOpened::Ready {
+                conn: PanelConn {
+                    ft: Arc::new(filar_transport::LocalFileTransfer::new()),
+                    sftp: None,
+                },
+                label: "local".into(),
+                read_only: false,
+            }
+        }
+        PanelOpen::TabHost { exec, target } => {
+            let target = target.read().await.clone();
+            let exec = exec.read().await.clone();
+            match (exec, target) {
+                (Some(exec), Some(t)) => {
+                    return match exec.open_sftp().await {
+                        Ok(sftp) => ready_sftp(sftp, &t, host_groups),
+                        Err(e) => PanelOpened::Failed(e.to_string()),
+                    };
+                }
+                // Known host, but not its executor (e.g. a restored tab):
+                // a connection of the panel's own.
+                (None, Some(t)) => match fill_saved_secret(t).await {
+                    Ok(SavedSecret::Ready(t)) => t,
+                    Ok(SavedSecret::Missing(t)) => {
+                        return PanelOpened::NeedSecret {
+                            target: t,
+                            retry: false,
+                        }
+                    }
+                    Err(e) => return PanelOpened::Failed(e.to_string()),
+                },
+                _ => return PanelOpened::Failed("this tab is not on an SSH host".into()),
+            }
+        }
+        PanelOpen::Target(t) => match fill_saved_secret(t).await {
+            Ok(SavedSecret::Ready(t)) => t,
+            Ok(SavedSecret::Missing(t)) => {
+                return PanelOpened::NeedSecret {
+                    target: t,
+                    retry: false,
+                }
+            }
+            Err(e) => return PanelOpened::Failed(e.to_string()),
+        },
+        PanelOpen::Typed(mut t) => {
+            // A typed key passphrase is checked locally first, like Ctrl+O.
+            if matches!(t.auth, filar_core::SshAuth::Key { .. }) && !typed_passphrase_opens_key(&t).await {
+                if let filar_core::SshAuth::Key { passphrase, .. } = &mut t.auth {
+                    *passphrase = None;
+                }
+                return PanelOpened::NeedSecret {
+                    target: t,
+                    retry: true,
+                };
+            }
+            t
+        }
+    };
+    match filar_transport::SftpFileTransfer::connect(&target, cfg, &filar_core::EnvSecretProvider::new()).await {
+        Ok(sftp) => ready_sftp(sftp, &target, host_groups),
+        Err(e) => PanelOpened::Failed(e.to_string()),
+    }
+}
+
+fn ready_sftp(
+    sftp: filar_transport::SftpFileTransfer,
+    target: &filar_core::SshTarget,
+    host_groups: &[filar_core::HostGroup],
+) -> PanelOpened {
+    let sftp = Arc::new(sftp);
+    PanelOpened::Ready {
+        conn: PanelConn {
+            ft: sftp.clone(),
+            sftp: Some(sftp),
+        },
+        label: target.name.clone(),
+        read_only: filar_core::is_read_only_target(host_groups, target),
+    }
+}
+
+/// A target with its secret filled from the saved sources, or still missing it.
+enum SavedSecret {
+    /// Ready to connect.
+    Ready(filar_core::SshTarget),
+    /// No saved password / key passphrase anywhere: ask the user.
+    Missing(filar_core::SshTarget),
+}
+
+/// Fill `target`'s secret the way Ctrl+O does — and the file panels (#535),
+/// which must connect exactly like it: a password from config, the OS
+/// credential store (`ssh_target:<name>`) or `SSH_PASSWORD`; an encrypted
+/// key's passphrase from the credential store or `SSH_KEY_PASSPHRASE` (#480).
+async fn fill_saved_secret(mut target: filar_core::SshTarget) -> Result<SavedSecret> {
+    if let filar_core::SshAuth::Password { ref password } = target.auth {
+        let keyring_name = format!("ssh_target:{}", target.name);
+        let resolved = password
+            .clone()
+            .or_else(|| {
+                let kr = filar_core::KeyringSecretProvider::new();
+                kr.get(&keyring_name).ok().filter(|v| !v.is_empty())
+            })
+            .or_else(|| std::env::var("SSH_PASSWORD").ok().filter(|v| !v.is_empty()));
+        match resolved {
+            Some(pw) => {
+                if password.is_some() {
+                    warn!(target = %target.name, "password in config.toml for SSH target — consider moving to OS credential store");
+                }
+                target.auth = filar_core::SshAuth::Password { password: Some(pw) };
+            }
+            None => return Ok(SavedSecret::Missing(target)),
+        }
+    }
+    // An encrypted key: decrypting is blocking.
+    if matches!(target.auth, filar_core::SshAuth::Key { .. }) {
+        let (t, found) = tokio::task::spawn_blocking(move || {
+            let store = filar_core::KeyringSecretProvider::new();
+            let env = filar_core::EnvSecretProvider::new();
+            filar_transport::fill_key_passphrase(&mut target, &store, Some(&env))
+                .map(|found| (target, found))
+        })
+        .await
+        .map_err(|e| CoreError::Other(format!("key check task failed: {e}")))??;
+        if matches!(found, filar_transport::KeyPassphrase::Missing(_)) {
+            return Ok(SavedSecret::Missing(t));
+        }
+        target = t;
+    }
+    Ok(SavedSecret::Ready(target))
 }
 
 /// Whether the passphrase typed for `target`'s encrypted key decrypts it
@@ -819,6 +1256,11 @@ async fn run_app(
     let path_picker_tx_load = path_picker_tx.clone();
     let mut path_picker_load_in_flight: Option<u64> = None;
 
+    // File panels (Ctrl+G, #535): one open source per panel, answers from
+    // the tasks that open and list them.
+    let (panel_tx, mut panel_rx) = tokio::sync::mpsc::unbounded_channel::<PanelMsg>();
+    let mut panel_sides: [Option<PanelConn>; 2] = [None, None];
+
     // Receiver for WARN/ERROR log lines mirrored into the chat.
     let mut log_rx = config.log_rx.take();
 
@@ -845,6 +1287,7 @@ async fn run_app(
         ExecutorEntry {
             executor: initial_tui,
             ssh_target: Arc::new(tokio::sync::RwLock::new(config.ssh_target.clone())),
+            ssh_exec: Arc::new(tokio::sync::RwLock::new(config.initial_ssh_executor.clone())),
         },
     );
     // Set initial ssh_info on the first session.
@@ -949,6 +1392,11 @@ async fn run_app(
         let in_interactive = app.mode == AppMode::Interactive;
         tokio::select! {
             biased;
+
+            Some(msg) = panel_rx.recv() => {
+                handle_panel_msg(&mut app, &mut panel_sides, msg);
+                needs_redraw = true;
+            }
 
             Some((token, result)) = path_picker_rx.recv() => {
                 path_picker_load_in_flight = None;
@@ -1096,6 +1544,15 @@ async fn run_app(
                         });
                     }
                 }
+
+                // File panels (#535): run their requests; drop the sources
+                // once they close.
+                let panel_ctx = PanelCtx {
+                    tx: panel_tx.clone(),
+                    command_timeout,
+                    host_groups: host_groups.clone(),
+                };
+                drive_file_panels(&mut app, &mut panel_sides, &executors, &panel_ctx);
 
                 // Handle mode toggle (Ctrl+T).
                 if app.take_toggle_interactive() {
@@ -1443,7 +1900,7 @@ async fn run_app(
                         let sid = app.sessions[app.active].id;
                         let tx = agent_tx.clone();
                         let exec_entry = executors.get(&sid)
-                            .map(|e| (e.executor.clone(), e.ssh_target.clone()));
+                            .map(|e| (e.executor.clone(), e.ssh_target.clone(), e.ssh_exec.clone()));
                         // Cancel any previous in-flight attempt for this tab so
                         // a stale connection can't overwrite a newer one (race
                         // between `!ssh` and F3 restore).
@@ -1488,15 +1945,16 @@ async fn run_app(
                                     // Ad-hoc `!ssh` targets carry no tags, so the
                                     // read-only wrap can't fire here — routed
                                     // through the helper regardless (#419).
-                                    if let Some((ref exec, ref st)) = exec_entry {
-                                        let exec_arc: Arc<dyn CommandExecutor> =
-                                            Arc::new(ssh_exec);
+                                    if let Some((ref exec, ref st, ref se)) = exec_entry {
+                                        let ssh_exec = Arc::new(ssh_exec);
+                                        let exec_arc: Arc<dyn CommandExecutor> = ssh_exec.clone();
                                         let exec_arc =
                                             wrap_if_read_only(exec_arc, &target, &host_groups);
                                         exec.swap_executor(exec_arc).await;
                                         // Store the SshTarget so Ctrl+T can open a PTY
                                         // on the same host for this tab.
                                         *st.write().await = Some(target.clone());
+                                        *se.write().await = Some(ssh_exec);
                                     }
                                     // Notify runner to update per-session info.
                                     let _ = tx.send(TuiEvent::TransportChanged {
@@ -1548,6 +2006,7 @@ async fn run_app(
                                 inner: Arc::new(tokio::sync::RwLock::new(Arc::new(local))),
                             }),
                             ssh_target: Arc::new(tokio::sync::RwLock::new(None)),
+                            ssh_exec: Arc::new(tokio::sync::RwLock::new(None)),
                         },
                     );
                 }
@@ -1578,7 +2037,7 @@ async fn run_app(
                 }
                 let sid = app.ctrl_o_pending_session_id.take().unwrap_or(app.sessions[app.active].id);
                 let exec_entry = executors.get(&sid)
-                    .map(|e| (e.executor.clone(), e.ssh_target.clone()));
+                    .map(|e| (e.executor.clone(), e.ssh_target.clone(), e.ssh_exec.clone()));
                 // No executor to swap means nothing would carry the new
                 // transport: announcing the host anyway is a wrong-target
                 // label (#433). Refuse instead.
@@ -1624,12 +2083,14 @@ async fn run_app(
                     )
                     .await {
                         Ok(ssh_exec) => {
-                            if let Some((ref exec, ref st)) = exec_entry {
-                                let exec_arc: Arc<dyn CommandExecutor> = Arc::new(ssh_exec);
+                            if let Some((ref exec, ref st, ref se)) = exec_entry {
+                                let ssh_exec = Arc::new(ssh_exec);
+                                let exec_arc: Arc<dyn CommandExecutor> = ssh_exec.clone();
                                 let exec_arc =
                                     wrap_if_read_only(exec_arc, &target, &host_groups);
                                 exec.swap_executor(exec_arc).await;
                                 *st.write().await = Some(target);
+                                *se.write().await = Some(ssh_exec);
                             }
                             let _ = tx.send(TuiEvent::TransportChanged {
                                 session_id: sid, is_local: false, ssh_info: Some(new_info), alias: Some(alias.clone()),
@@ -1666,7 +2127,7 @@ async fn run_app(
             let host_groups = host_groups.clone();
             let sid = app.sessions[app.active].id;
             let exec_entry = executors.get(&sid)
-                .map(|e| (e.executor.clone(), e.ssh_target.clone()));
+                .map(|e| (e.executor.clone(), e.ssh_target.clone(), e.ssh_exec.clone()));
             if exec_entry.is_none() {
                 app.push_error("Tab executor not ready yet — host not switched".into());
                 app.settle_pending_swap();
@@ -1696,9 +2157,10 @@ async fn run_app(
                                 return;
                             }
                         };
-                        if let Some((ref exec, ref st)) = exec_entry {
+                        if let Some((ref exec, ref st, ref se)) = exec_entry {
                             exec.swap_executor(Arc::new(local_exec) as Arc<dyn CommandExecutor>).await;
                             *st.write().await = None;
+                            *se.write().await = None;
                         }
                         let _ = tx.send(TuiEvent::TransportChanged {
                             session_id: sid, is_local: true, ssh_info: None, alias: Some("local".into()),
@@ -1706,57 +2168,23 @@ async fn run_app(
                         return;
                     }
                     if let Some(t) = targets.get(idx - 1) {
-                        let mut target = t.clone();
-                        // Resolve password for Password-auth targets.
-                        if let filar_core::SshAuth::Password { ref password } = target.auth {
-                            let keyring_name = format!("ssh_target:{}", target.name);
-                            let resolved = password.clone()
-                                .or_else(|| {
-                                    let kr = filar_core::KeyringSecretProvider::new();
-                                    kr.get(&keyring_name).ok().filter(|v| !v.is_empty())
-                                })
-                                .or_else(|| std::env::var("SSH_PASSWORD").ok().filter(|v| !v.is_empty()));
-                            if let Some(pw) = resolved {
-                                if password.is_some() {
-                                    warn!(target = %target.name, "password in config.toml for SSH target — consider moving to OS credential store");
-                                }
-                                target.auth = filar_core::SshAuth::Password { password: Some(pw) };
-                            } else {
-                                let _ = tx.send(TuiEvent::PasswordNeeded {
-                                    session_id: sid, target: target.clone(),
-                                });
+                        // Saved secrets first: config, OS credential store,
+                        // env (#480); ask only when none has it.
+                        let target = match fill_saved_secret(t.clone()).await {
+                            Ok(SavedSecret::Ready(target)) => target,
+                            Ok(SavedSecret::Missing(target)) => {
+                                let _ = tx.send(TuiEvent::PasswordNeeded { session_id: sid, target });
                                 return;
                             }
-                        }
-                        // An encrypted key: its passphrase from the OS
-                        // credential store or SSH_KEY_PASSPHRASE, else ask
-                        // (#480). Decrypting is blocking.
-                        if matches!(target.auth, filar_core::SshAuth::Key { .. }) {
-                            let filled = tokio::task::spawn_blocking(move || {
-                                let store = filar_core::KeyringSecretProvider::new();
-                                let env = filar_core::EnvSecretProvider::new();
-                                filar_transport::fill_key_passphrase(&mut target, &store, Some(&env))
-                                    .map(|found| (target, found))
-                            })
-                            .await
-                            .map_err(|e| CoreError::Other(format!("key check task failed: {e}")))
-                            .and_then(|r| r);
-                            match filled {
-                                Ok((t, filar_transport::KeyPassphrase::Missing(_))) => {
-                                    let _ = tx.send(TuiEvent::PasswordNeeded { session_id: sid, target: t });
-                                    return;
-                                }
-                                Ok((t, _)) => target = t,
-                                Err(e) => {
-                                    let _ = tx.send(TuiEvent::Agent {
-                                        session_id: sid,
-                                        event: filar_agent::AgentEvent::Error(format!("SSH connection failed: {e}")),
-                                    });
-                                    let _ = tx.send(TuiEvent::TransportSwapFailed { session_id: sid });
-                                    return;
-                                }
+                            Err(e) => {
+                                let _ = tx.send(TuiEvent::Agent {
+                                    session_id: sid,
+                                    event: filar_agent::AgentEvent::Error(format!("SSH connection failed: {e}")),
+                                });
+                                let _ = tx.send(TuiEvent::TransportSwapFailed { session_id: sid });
+                                return;
                             }
-                        }
+                        };
                         let new_info = format!("{}@{}:{}", target.user, target.host, target.port);
                         match SshExecutor::connect_with_config(
                             &target,
@@ -1764,12 +2192,14 @@ async fn run_app(
                         )
                         .await {
                             Ok(ssh_exec) => {
-                                if let Some((ref exec, ref st)) = exec_entry {
-                                    let exec_arc: Arc<dyn CommandExecutor> = Arc::new(ssh_exec);
+                                if let Some((ref exec, ref st, ref se)) = exec_entry {
+                                    let ssh_exec = Arc::new(ssh_exec);
+                                    let exec_arc: Arc<dyn CommandExecutor> = ssh_exec.clone();
                                     let exec_arc =
                                         wrap_if_read_only(exec_arc, &target, &host_groups);
                                     exec.swap_executor(exec_arc).await;
                                     *st.write().await = Some(target);
+                                    *se.write().await = Some(ssh_exec);
                                 }
                                 let alias = t.name.clone();
                                 let _ = tx.send(TuiEvent::TransportChanged {
@@ -4391,6 +4821,7 @@ mod tests {
             initial_last_served_model: None,
             initial_model_per_profile: HashMap::new(),
             ssh_target: None,
+            initial_ssh_executor: None,
             initial_ssh_info: None,
             is_local: true,
             secret_provider,

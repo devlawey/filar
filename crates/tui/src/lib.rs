@@ -10,6 +10,8 @@
 pub mod app;
 pub mod confirmer;
 pub mod event;
+/// File panels (Ctrl+G): two-pane browsing of local and SSH filesystems.
+pub mod file_panels;
 /// Tracing layer that mirrors WARN/ERROR log records into the chat.
 pub mod log_layer;
 pub mod ops;
