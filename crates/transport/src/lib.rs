@@ -8,7 +8,8 @@
 //! - [`LocalExecutor`] — local PTY implementation using `portable-pty` (Stage 3).
 //!   Only available with the `local` feature (enabled by default).
 //! - [`FileTransfer`] — filesystem of one side (local disk or SSH host) for the
-//!   file panels and the copy engine; [`LocalFileTransfer`] is the local one.
+//!   file panels and the copy engine; [`LocalFileTransfer`] is the local one,
+//!   [`SftpFileTransfer`] the SSH one.
 //! - [`copy()`] — copy engine between two [`FileTransfer`] sides.
 
 mod auth;
@@ -22,6 +23,7 @@ pub mod key;
 pub mod local;
 pub mod readonly;
 pub mod secret;
+pub mod sftp;
 pub mod ssh;
 
 use std::time::Duration;
@@ -51,6 +53,7 @@ pub use key::{
 };
 pub use readonly::ReadOnlyExecutor;
 pub use secret::SecretSubstitutingExecutor;
+pub use sftp::SftpFileTransfer;
 pub use ssh::{SshExecutor, SshSession, SshTransportConfig};
 
 /// Result of executing a command.

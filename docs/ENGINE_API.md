@@ -515,8 +515,10 @@ files never goes through it. The change is additive; nothing to migrate.
 | Item | What it is |
 |------|------------|
 | `FileTransfer` | `path_style`, `home_dir`, `list_dir`, `stat` (follows symlinks, `Ok(None)` if missing), `open_read` / `open_write` (boxed tokio `AsyncRead` / `AsyncWrite`; `open_write` is exclusive — an existing file or a symlink at the path is `AlreadyExists`, never followed; `shutdown` the writer, drop it to close), `rename` (replaces the target), `remove_file`, `create_dir`, `set_permissions` (no-op without POSIX modes) |
+| `SftpFileTransfer` | An SSH host over the standard `sftp` subsystem of sshd — nothing installed remotely. `SshExecutor::open_sftp()` opens it on the executor's existing connection (the shell, its cwd and a running command are untouched); `SftpFileTransfer::connect(target, cfg, secrets)` opens a connection of its own with the same host-key check and secret sources. `close()` closes the channel, and the connection only when it owns one. A server without the subsystem fails fast with an error naming it. `rename` over an existing file: SFTPv3 has no replacing rename, so on that refusal (both ends files) the old file steps aside as `<name>.filar-old-<id>` (`sftp::OLD_SUFFIX` + a short unique id, so a copy left by a failed cleanup never blocks the next replacement), the new one takes the name, the old one is removed — or put back if taking the name fails |
 | `LocalFileTransfer` | The client's own disk. Always compiled (no `local` feature needed). On Windows, `list_dir("")` lists the drives |
 | `DirEntry`, `Metadata`, `EntryKind` | Listing entries: kind (`File`/`Dir`/`Symlink`/`Other`, symlinks not followed in listings), size, mtime, POSIX mode |
+| `take_leftovers()` | Default method: files a side had to leave behind (an SFTP replace whose old copy could not be removed). The copy engine adds them to `CopyReport::leftover_parts`; a UI must show them |
 | `PathStyle` | `Posix` (every SSH host) or `Windows`; `join`, `parent`, `file_name` on path strings. Windows: the parent of `C:\` is `""`, the virtual drive list |
 
 ### Copy engine — `copy()` (#534)

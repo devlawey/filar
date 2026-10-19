@@ -10649,3 +10649,38 @@ Writer закрывается до `rename` (Windows, SFTP). Пропуски, �
 `CREATE|EXCLUDE`.
 
 **Next:** #535.
+
+## #533 — `SftpFileTransfer`
+
+**Сделано.** `crates/transport/src/sftp.rs` на `russh-sftp` 3 (новая зависимость
+workspace). Два входа: `SshExecutor::open_sftp()` — SFTP-канал на соединении
+вкладки (шелл, cwd и бегущая команда не затронуты, лок сессии — только на
+открытие канала); `SftpFileTransfer::connect` — своё соединение.
+Из `SshSession::connect_with_config_and_provider` вынесен
+`connect_authenticated` (connect + host key + auth) — общий для шелла и SFTP,
+плюс `request_subsystem`, который ждёт ответа сервера.
+
+**Решения.** Сервер без `Subsystem sftp` → сразу ошибка «the server refused the
+sftp subsystem», без зависания. SFTPv3 `RENAME` не заменяет цель, а
+`posix-rename@openssh.com` клиент не даёт → только на статус `Failure` и когда
+оба конца — файлы: цель → `<имя>.filar-old-<id>` (уникально — оставшийся после
+сбоя очистки не блокирует следующую замену), источник → цель, `.filar-old`
+удаляется (не удалось — путь уходит через `FileTransfer::take_leftovers` в
+`CopyReport::leftover_parts`); если второй rename упал — `.filar-old`
+возвращается на место (ревью
+#540: удалять цель до успешной замены нельзя). Исключение #531 в AGENTS.md
+дополнено этим временным именем. `open_sftp` держит лок сессии только на
+открытие канала, запрос подсистемы — без него. Таймаут ответа SFTP — 30 с.
+Ошибки: `NoSuchFile`/`PermissionDenied`/таймаут → `io::ErrorKind`, потеря связи
+→ текст «connection lost» (ловит `is_connection_lost`); в тексте хост, операция,
+путь. Каталог — размер 0, как у локальной стороны.
+
+**Проверено вживую** (локальный openssh-server в контейнере агента, scratch-
+программа вне репо): запись, chmod, rename поверх файла, NotFound,
+PermissionDenied, SFTP на соединении `SshExecutor` с неизменным `pwd`, отказ
+сервера без SFTP-подсистемы (~0,2 с). `#[ignore]`-тесты на docker-sshd — ручные.
+
+**Контракты.** `CommandExecutor` не тронут; новые публичные `SftpFileTransfer`
+и `SshExecutor::open_sftp` (аддитивно). `docs/ENGINE_API.md`.
+
+**Next:** #535.

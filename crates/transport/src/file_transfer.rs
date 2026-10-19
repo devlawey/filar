@@ -216,6 +216,14 @@ pub trait FileTransfer: Send + Sync {
     /// Set POSIX permission bits on `path`. Sides without POSIX permissions
     /// (Windows) accept the call and do nothing.
     async fn set_permissions(&self, path: &str, mode: u32) -> Result<()>;
+
+    /// Files this side had to leave behind since the last call (e.g. a
+    /// replaced file it could not remove after a `rename`), by full path.
+    /// The user must see them (AGENTS.md, #531); the copy engine moves them
+    /// into its report. Default: none.
+    fn take_leftovers(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Wrap an I/O error with the operation and path, keeping its kind.

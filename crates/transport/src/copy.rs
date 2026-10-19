@@ -184,6 +184,7 @@ pub async fn copy(
             &mut steps,
             &mut report,
             observer,
+            cancel,
         )
         .await;
     }
@@ -329,6 +330,9 @@ pub async fn copy(
             }
         }
     }
+    // Whatever the target side had to leave behind (e.g. a replaced file it
+    // could not remove) goes to the user with the part files (#531).
+    report.leftover_parts.extend(dst.take_leftovers());
     report
 }
 
@@ -343,10 +347,16 @@ async fn plan(
     steps: &mut Vec<Step>,
     report: &mut CopyReport,
     observer: &dyn CopyObserver,
+    cancel: &CancellationToken,
 ) {
     // Iterative walk: (source path, its kind, target path).
     let mut stack = vec![(path.to_string(), kind, target.to_string())];
     while let Some((p, k, t)) = stack.pop() {
+        // A large tree is walked before anything is copied: stop walking on
+        // cancel, not only when copying starts (#540 review).
+        if cancel.is_cancelled() {
+            return;
+        }
         let resolved = match k {
             EntryKind::Symlink | EntryKind::File | EntryKind::Other => match src.stat(&p).await {
                 Ok(Some(md)) => md,
@@ -921,6 +931,8 @@ mod tests {
         fail_write: bool,
         /// Set once a write started: the link only "drops" after that.
         writing: std::sync::atomic::AtomicBool,
+        /// Handed out once by `take_leftovers`.
+        leftovers: Mutex<Vec<String>>,
     }
 
     struct TrippingReader {
@@ -1016,6 +1028,39 @@ mod tests {
         async fn set_permissions(&self, path: &str, mode: u32) -> Result<()> {
             self.inner.set_permissions(path, mode).await
         }
+        fn take_leftovers(&self) -> Vec<String> {
+            std::mem::take(&mut *self.leftovers.lock().expect("lock"))
+        }
+    }
+
+    #[tokio::test]
+    async fn what_the_target_side_left_behind_reaches_the_report() {
+        let (a, b) = (temp_dir(), temp_dir());
+        std::fs::write(a.join("f"), "data").expect("write");
+        let dst = Flaky {
+            inner: LocalFileTransfer::new(),
+            cancel_on_read: None,
+            fail_remove: false,
+            fail_write: false,
+            writing: Default::default(),
+            leftovers: Mutex::new(vec!["/srv/f.filar-old-1a2b3c4d".into()]),
+        };
+        let obs = Recorder::new(vec![]);
+        let r = copy(
+            &LocalFileTransfer::new(),
+            &[file_src(&a.join("f"))],
+            &dst,
+            &s(&b),
+            &obs,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(r.copied, 1);
+        assert_eq!(
+            r.leftover_parts,
+            vec!["/srv/f.filar-old-1a2b3c4d".to_string()]
+        );
+        let _ = (std::fs::remove_dir_all(&a), std::fs::remove_dir_all(&b));
     }
 
     #[tokio::test]
@@ -1030,6 +1075,7 @@ mod tests {
             fail_remove: false,
             fail_write: false,
             writing: Default::default(),
+            leftovers: Default::default(),
         };
         let dst = LocalFileTransfer::new();
         let obs = Recorder::new(vec![OverwriteDecision::Overwrite]);
@@ -1060,6 +1106,7 @@ mod tests {
             fail_remove: true,
             fail_write: true,
             writing: Default::default(),
+            leftovers: Default::default(),
         };
         let obs = Recorder::new(vec![]);
         let r = copy(
@@ -1093,6 +1140,7 @@ mod tests {
             fail_write: false,
             // The link is already "down" before this copy starts.
             writing: std::sync::atomic::AtomicBool::new(true),
+            leftovers: Default::default(),
         };
         let obs = Recorder::new(vec![]);
         let r = copy(

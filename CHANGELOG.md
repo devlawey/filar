@@ -16,6 +16,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Engine: `FileTransfer` trait with a local implementation — list, stat, read,
   write, rename and permissions on one side of a file copy, the base of the
   upcoming file panels ([#532](https://github.com/devlawey/filar/issues/532)).
+- Engine: `SftpFileTransfer` — the `FileTransfer` of an SSH host over the
+  standard SFTP subsystem, on a tab's existing connection or a connection of
+  its own; files a side had to leave behind reach `CopyReport::leftover_parts`
+  through `FileTransfer::take_leftovers`
+  ([#533](https://github.com/devlawey/filar/issues/533)).
 - Engine: `copy()` — copy files and directories between two `FileTransfer`
   sides with progress, cancel, overwrite decisions and `.filar-part` writes
   renamed into place ([#534](https://github.com/devlawey/filar/issues/534)).
