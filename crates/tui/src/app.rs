@@ -2421,6 +2421,13 @@ impl App {
         }
         let id = self.file_copies.iter().map(|c| c.id).max().unwrap_or(0) + 1;
         let session = self.sessions[self.active].id;
+        // Keep the last few finished copies for Ctrl+J, not all of them.
+        let finished = self.file_copies.iter().filter(|c| !c.running()).count();
+        if finished >= MAX_FINISHED_COPIES {
+            if let Some(oldest) = self.file_copies.iter().position(|c| !c.running()) {
+                self.file_copies.remove(oldest);
+            }
+        }
         self.file_copies
             .push(crate::file_panels::FileCopy::new(id, session, plan.clone()));
         self.copy_requests
@@ -3430,7 +3437,9 @@ impl App {
                 KeyCode::Char('s' | 'S' | 'ы' | 'Ы') => Some(D::Skip),
                 KeyCode::Char('a' | 'A' | 'ф' | 'Ф') => Some(D::OverwriteAll),
                 KeyCode::Char('n' | 'N' | 'т' | 'Т') => Some(D::SkipAll),
-                KeyCode::Esc | KeyCode::Char('c' | 'C' | 'с' | 'С') => Some(D::Cancel),
+                // Only Esc cancels: `c` copies in the panels, a reflex must
+                // not stop a running copy (#543 review).
+                KeyCode::Esc => Some(D::Cancel),
                 _ => None,
             };
             if let Some(d) = decision {
@@ -6131,6 +6140,9 @@ impl App {
 
 /// Lines of output tail kept per host for the side panel.
 const OPS_TAIL_LINES: usize = 200;
+
+/// Finished copies kept in Ctrl+J (#536); older ones drop off.
+const MAX_FINISHED_COPIES: usize = 10;
 
 impl App {
     /// Refresh [`App::operations`] from the agent's background-job registry.
@@ -14828,13 +14840,28 @@ mod tests {
                 "{c}"
             );
         }
+        // `c` copies in the panels; here it must not cancel the copy.
         app.ask_copy_overwrite(1, "/dst/a.txt".into());
+        press(&mut app, 'c');
+        assert!(app.copy_requests.is_empty());
         app.handle_key(code_key(crossterm::event::KeyCode::Esc));
         assert!(matches!(
             app.copy_requests.pop(),
             Some(CopyRequest::Answer { decision: D::Cancel, .. })
         ));
         assert!(app.input.is_empty(), "answers never reach the agent input");
+    }
+
+    #[test]
+    fn only_the_last_finished_copies_are_kept() {
+        let mut app = app_ready_to_copy();
+        for i in 1..=(MAX_FINISHED_COPIES as u64 + 3) {
+            app.handle_key(code_key(crossterm::event::KeyCode::F(5)));
+            app.handle_key(code_key(crossterm::event::KeyCode::Enter));
+            app.finish_copy(i, filar_transport::CopyReport::default());
+        }
+        assert_eq!(app.file_copies.len(), MAX_FINISHED_COPIES);
+        assert_eq!(app.file_copies.last().map(|c| c.id), Some(MAX_FINISHED_COPIES as u64 + 3));
     }
 
     #[test]
