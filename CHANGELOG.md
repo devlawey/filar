@@ -19,6 +19,9 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Engine: `SftpFileTransfer` — the `FileTransfer` of an SSH host over the
   standard SFTP subsystem, on a tab's existing connection or a connection of
   its own ([#533](https://github.com/devlawey/filar/issues/533)).
+- Engine: `copy()` — copy files and directories between two `FileTransfer`
+  sides with progress, cancel, overwrite decisions and `.filar-part` writes
+  renamed into place ([#534](https://github.com/devlawey/filar/issues/534)).
 
 ## [2.0.4] - 2026-10-17
 
