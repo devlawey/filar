@@ -450,7 +450,10 @@ mod tests {
         names.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
             names,
-            vec![("a.txt".into(), EntryKind::File), ("sub".into(), EntryKind::Dir)]
+            vec![
+                ("a.txt".into(), EntryKind::File),
+                ("sub".into(), EntryKind::Dir)
+            ]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -493,14 +496,21 @@ mod tests {
         let f = s(&dir.join("f"));
         std::fs::write(&f, "x").expect("write");
         ft.set_permissions(&f, 0o640).await.expect("chmod");
-        assert_eq!(ft.stat(&f).await.expect("stat").expect("exists").mode, Some(0o640));
+        assert_eq!(
+            ft.stat(&f).await.expect("stat").expect("exists").mode,
+            Some(0o640)
+        );
 
         std::os::unix::fs::symlink(&f, dir.join("link")).expect("symlink");
         let list = ft.list_dir(&s(&dir)).await.expect("list");
         let link = list.iter().find(|e| e.name == "link").expect("link listed");
         assert_eq!(link.metadata.kind, EntryKind::Symlink);
         // stat follows the link.
-        let followed = ft.stat(&s(&dir.join("link"))).await.expect("stat").expect("exists");
+        let followed = ft
+            .stat(&s(&dir.join("link")))
+            .await
+            .expect("stat")
+            .expect("exists");
         assert_eq!(followed.kind, EntryKind::File);
         let _ = std::fs::remove_dir_all(&dir);
     }
