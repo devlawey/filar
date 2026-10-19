@@ -560,9 +560,8 @@ async fn copy_file(
         Err(error) => {
             let leftover = match dst.remove_file(&part).await {
                 Ok(()) => None,
-                // Already gone (e.g. the failure was the rename itself and
-                // the part was moved) — nothing left behind.
-                Err(e) if is_not_found(&e) => None,
+                // Whatever the removal said, only a look at the part itself
+                // decides whether something is left behind.
                 Err(_) => still_there(dst, &part).await,
             };
             Err(FileError { error, leftover })
