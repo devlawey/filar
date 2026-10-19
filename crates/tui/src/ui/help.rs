@@ -98,6 +98,43 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
             section: "Status bar",
             available: |_| true,
         },
+        // ── Files ─────────────────────────────────────────────────────
+        HelpEntry {
+            key: "^G",
+            desc: "File panels: local disk and hosts side by side",
+            section: "Files",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
+            key: "^G: Tab",
+            desc: "File panels: switch panel",
+            section: "Files",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
+            key: "^G: Enter/Bksp",
+            desc: "File panels: open a folder / go up",
+            section: "Files",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
+            key: "^G: ^O",
+            desc: "File panels: choose the active panel's host",
+            section: "Files",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
+            key: "^G: r",
+            desc: "File panels: refresh (reconnect after a drop)",
+            section: "Files",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
+            key: "^G: Esc",
+            desc: "File panels: close (or ^G again)",
+            section: "Files",
+            available: |m| m == AppMode::Normal,
+        },
         // ── Tabs ──────────────────────────────────────────────────────
         HelpEntry {
             key: "^N",
