@@ -505,6 +505,28 @@ in registration order and the first that claims the command and parses its
 output wins. The built-in set (`with_builtins()`, the `Default`) is
 registered first.
 
+## File transfer — `FileTransfer` (2.0.5)
+
+`filar_transport::FileTransfer` is the filesystem of one side — the local disk
+or an SSH host — as the file panels (Ctrl+G) and the copy engine see it. It is
+a **new, separate trait**: `CommandExecutor` is unchanged, and transferring
+files never goes through it. The change is additive; nothing to migrate.
+
+| Item | What it is |
+|------|------------|
+| `FileTransfer` | `path_style`, `home_dir`, `list_dir`, `stat` (follows symlinks, `Ok(None)` if missing), `open_read` / `open_write` (boxed tokio `AsyncRead` / `AsyncWrite`; `shutdown` the writer), `rename` (replaces the target), `remove_file`, `create_dir`, `set_permissions` (no-op without POSIX modes) |
+| `LocalFileTransfer` | The client's own disk. Always compiled (no `local` feature needed). On Windows, `list_dir("")` lists the drives |
+| `DirEntry`, `Metadata`, `EntryKind` | Listing entries: kind (`File`/`Dir`/`Symlink`/`Other`, symlinks not followed in listings), size, mtime, POSIX mode |
+| `PathStyle` | `Posix` (every SSH host) or `Windows`; `join`, `parent`, `file_name` on path strings. Windows: the parent of `C:\` is `""`, the virtual drive list |
+
+Errors keep the `io::ErrorKind` (`NotFound`, `PermissionDenied`, …) inside
+`CoreError::Io`, with the operation and path in the message, so a UI can tell
+"no such file" from "no access".
+
+Remote writes are allowed only on an explicit user action (AGENTS.md,
+invariant 1 and its #531 exception); an embedder must not let the model drive
+`open_write`, `rename` or `remove_file` on a remote side.
+
 ## Upgrading to `engine-v2.0.4`
 
 | Change | Breaks | What to do |

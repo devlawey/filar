@@ -22,6 +22,7 @@ portable-pty = { workspace = true, optional = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }
+dirs = { workspace = true }
 
 [dev-dependencies]
 # Integration tests in `tests/` do not inherit the regular dependencies, and

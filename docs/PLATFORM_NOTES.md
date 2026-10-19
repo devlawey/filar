@@ -16,6 +16,7 @@ Add findings here whenever a platform difference is discovered.
 | Chat wrap display columns | [Chat display width vs char count](#chat-display-width-vs-char-count-333) | #333 |
 | Child processes drawing on filar's console | [Child console isolation](#child-console-isolation-523) | #329, #523 |
 | Ctrl+letter on a Cyrillic layout | [Ctrl keys and keyboard layout](#ctrl-keys-and-keyboard-layout-528) | #528 |
+| File panels: path styles, Windows drive list | [Пути и диски в `FileTransfer`](#пути-и-диски-в-filetransfer-532) | #532 |
 
 ## Clipboard
 
@@ -575,3 +576,23 @@ line discipline, которая превращает Ctrl-C в `SIGINT`, поэ�
 1.85). Два экземпляра filar, одновременно впервые подключающиеся к одному
 `host:port`, могут оба записать ключ; если ключи разные, при следующем
 подключении один из них даст «HOST KEY MISMATCH».
+
+## Пути и диски в `FileTransfer` (#532)
+
+`FileTransfer` (файловые панели, 2.0.5) передаёт пути строками, а не `Path`:
+удалённая сторона по SFTP всегда POSIX, даже если клиент на Windows.
+
+| Сторона | `PathStyle` | Верх дерева |
+|---|---|---|
+| SSH-хост (любой клиент) | `Posix` | `/` — у него нет родителя |
+| Локально, Linux / macOS | `Posix` | `/` |
+| Локально, Windows | `Windows` | `""` — виртуальный корень над дисками |
+
+На Windows родитель `C:\` — пустая строка, и `list_dir("")` возвращает
+существующие диски (`C:\`, `D:\`, …) как каталоги: из корня диска можно
+подняться и перейти на другой. Разделители `\` и `/` принимаются оба.
+
+`rename` поверх существующего файла заменяет его на всех ОС:
+`std::fs::rename` на Windows вызывает `MoveFileExW` с
+`MOVEFILE_REPLACE_EXISTING` (проверено тестом в CI `windows-x86_64`). Права
+(`set_permissions`) на Windows — no-op: POSIX-битов там нет.
