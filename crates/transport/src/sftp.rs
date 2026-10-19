@@ -40,6 +40,9 @@ pub const OLD_SUFFIX: &str = ".filar-old";
 /// An SSH host's filesystem over SFTP.
 pub struct SftpFileTransfer {
     sftp: SftpSession,
+    /// Replaced files that could not be removed after a rename (#540
+    /// review), handed out by [`FileTransfer::take_leftovers`].
+    leftovers: std::sync::Mutex<Vec<String>>,
     /// Target name, for error messages (never a secret).
     host: String,
     /// The connection this side owns ([`SftpFileTransfer::connect`]); `None`
@@ -100,6 +103,7 @@ impl SftpFileTransfer {
         info!(host = %host, "SFTP session ready");
         Ok(Self {
             sftp,
+            leftovers: std::sync::Mutex::new(Vec::new()),
             host: host.to_string(),
             own: own.map(Mutex::new),
         })
@@ -274,6 +278,9 @@ impl FileTransfer for SftpFileTransfer {
             Ok(()) => {
                 if let Err(e) = self.sftp.remove_file(backup.as_str()).await {
                     warn!(host = %self.host, path = %backup, error = %e, "could not remove the replaced file");
+                    if let Ok(mut l) = self.leftovers.lock() {
+                        l.push(backup);
+                    }
                 }
                 Ok(())
             }
@@ -302,6 +309,13 @@ impl FileTransfer for SftpFileTransfer {
             .create_dir(path)
             .await
             .map_err(|e| self.err("mkdir", path, e))
+    }
+
+    fn take_leftovers(&self) -> Vec<String> {
+        self.leftovers
+            .lock()
+            .map(|mut l| std::mem::take(&mut *l))
+            .unwrap_or_default()
     }
 
     async fn set_permissions(&self, path: &str, mode: u32) -> Result<()> {
