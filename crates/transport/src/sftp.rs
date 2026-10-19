@@ -22,7 +22,7 @@ use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, FileType, StatusCode};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use crate::file_transfer::{
     DirEntry, EntryKind, FileTransfer, Metadata, PathStyle, TransferReader, TransferWriter,
@@ -31,6 +31,9 @@ use crate::ssh::{connect_authenticated, request_subsystem, SshHandler, SshTransp
 
 /// Seconds to wait for one SFTP response before giving up on it.
 const SFTP_TIMEOUT_SECS: u64 = 30;
+
+/// Suffix the replaced target steps aside to while a rename takes its name.
+pub const OLD_SUFFIX: &str = ".filar-old";
 
 /// An SSH host's filesystem over SFTP.
 pub struct SftpFileTransfer {
@@ -103,10 +106,16 @@ impl SftpFileTransfer {
     /// Close the SFTP channel, and the connection when this side owns one.
     /// A tab's connection is left alone.
     pub async fn close(&self) -> Result<()> {
-        let _ = self.sftp.close().await;
+        // Closing is best effort: a channel already gone (lost connection) has
+        // nothing left to close. Logged, not returned (#540 review).
+        if let Err(e) = self.sftp.close().await {
+            debug!(host = %self.host, error = %e, "SFTP channel close");
+        }
         if let Some(h) = &self.own {
             let h = h.lock().await;
-            let _ = h.disconnect(Disconnect::ByApplication, "", "English").await;
+            if let Err(e) = h.disconnect(Disconnect::ByApplication, "", "English").await {
+                debug!(host = %self.host, error = %e, "SFTP connection disconnect");
+            }
         }
         Ok(())
     }
@@ -220,26 +229,48 @@ impl FileTransfer for SftpFileTransfer {
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        // SFTPv3 RENAME refuses an existing target (OpenSSH answers FAILURE),
-        // and the client offers no `posix-rename@openssh.com`. The contract
-        // says "replaces", so on refusal with a file in the way: remove it and
-        // rename again. The part file is complete at this point, so the gap
-        // is two round trips, never a half-written target.
+        // SFTPv3 RENAME refuses an existing target (OpenSSH answers a plain
+        // FAILURE) and the client offers no `posix-rename@openssh.com`. The
+        // contract says "replaces", so — only for that refusal, and only when
+        // both ends are files — the old target steps aside as
+        // `<to>.filar-old`, the new file takes its name, and the old one is
+        // dropped. If taking the name fails, the old file is put back: the
+        // target is never lost (#540 review).
+        let first = match self.sftp.rename(from, to).await {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let refused =
+            matches!(&first, SftpError::Status(s) if s.status_code == StatusCode::Failure);
+        let is_file = |m: &std::result::Result<FileAttributes, SftpError>| matches!(m, Ok(a) if a.file_type() == FileType::File);
+        if !refused
+            || !is_file(&self.sftp.metadata(from).await)
+            || !is_file(&self.sftp.metadata(to).await)
+        {
+            return Err(self.err("rename", &format!("{from} -> {to}"), first));
+        }
+        let backup = format!("{to}{OLD_SUFFIX}");
+        self.sftp
+            .rename(to, backup.as_str())
+            .await
+            .map_err(|e| self.err("rename", &format!("{to} -> {backup}"), e))?;
         match self.sftp.rename(from, to).await {
-            Ok(()) => Ok(()),
-            Err(first) => match self.sftp.metadata(to).await {
-                Ok(a) if !a.file_type().is_dir() => {
-                    self.sftp
-                        .remove_file(to)
-                        .await
-                        .map_err(|e| self.err("replace", to, e))?;
-                    self.sftp
-                        .rename(from, to)
-                        .await
-                        .map_err(|e| self.err("rename", &format!("{from} -> {to}"), e))
+            Ok(()) => {
+                if let Err(e) = self.sftp.remove_file(backup.as_str()).await {
+                    warn!(host = %self.host, path = %backup, error = %e, "could not remove the replaced file");
                 }
-                _ => Err(self.err("rename", &format!("{from} -> {to}"), first)),
-            },
+                Ok(())
+            }
+            Err(e) => {
+                if let Err(back) = self.sftp.rename(backup.as_str(), to).await {
+                    warn!(host = %self.host, path = %backup, error = %back, "could not restore the replaced file");
+                    return Err(CoreError::Other(format!(
+                        "{}: rename {from} -> {to}: {e}; the previous file is kept as {backup}",
+                        self.host
+                    )));
+                }
+                Err(self.err("rename", &format!("{from} -> {to}"), e))
+            }
         }
     }
 
