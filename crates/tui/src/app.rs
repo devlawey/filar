@@ -14855,9 +14855,16 @@ mod tests {
     #[test]
     fn only_the_last_finished_copies_are_kept() {
         let mut app = app_ready_to_copy();
+        let plan = app
+            .file_panels
+            .as_ref()
+            .and_then(|fp| fp.copy_plan().ok())
+            .expect("plan");
         for i in 1..=(MAX_FINISHED_COPIES as u64 + 3) {
-            app.handle_key(code_key(crossterm::event::KeyCode::F(5)));
-            app.handle_key(code_key(crossterm::event::KeyCode::Enter));
+            // Started directly: after a copy the target panel re-lists, and
+            // the keys would rightly wait for that listing.
+            app.start_copy(plan.clone());
+            assert_eq!(app.running_copy().map(|c| c.id), Some(i));
             app.finish_copy(i, filar_transport::CopyReport::default());
         }
         assert_eq!(app.file_copies.len(), MAX_FINISHED_COPIES);
