@@ -20,9 +20,9 @@ use russh::client::{Handle, Msg};
 use russh::{Channel, Disconnect};
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::{FileAttributes, FileType, StatusCode};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use crate::file_transfer::{
     DirEntry, EntryKind, FileTransfer, Metadata, PathStyle, TransferReader, TransferWriter,
@@ -32,9 +32,17 @@ use crate::ssh::{connect_authenticated, request_subsystem, SshHandler, SshTransp
 /// Seconds to wait for one SFTP response before giving up on it.
 const SFTP_TIMEOUT_SECS: u64 = 30;
 
+/// Suffix the replaced target steps aside to while a rename takes its name;
+/// a short unique id follows it, so a copy kept after a failed cleanup never
+/// blocks a later replacement (#540 review).
+pub const OLD_SUFFIX: &str = ".filar-old";
+
 /// An SSH host's filesystem over SFTP.
 pub struct SftpFileTransfer {
     sftp: SftpSession,
+    /// Replaced files that could not be removed after a rename (#540
+    /// review), handed out by [`FileTransfer::take_leftovers`].
+    leftovers: std::sync::Mutex<Vec<String>>,
     /// Target name, for error messages (never a secret).
     host: String,
     /// The connection this side owns ([`SftpFileTransfer::connect`]); `None`
@@ -95,6 +103,7 @@ impl SftpFileTransfer {
         info!(host = %host, "SFTP session ready");
         Ok(Self {
             sftp,
+            leftovers: std::sync::Mutex::new(Vec::new()),
             host: host.to_string(),
             own: own.map(Mutex::new),
         })
@@ -103,10 +112,16 @@ impl SftpFileTransfer {
     /// Close the SFTP channel, and the connection when this side owns one.
     /// A tab's connection is left alone.
     pub async fn close(&self) -> Result<()> {
-        let _ = self.sftp.close().await;
+        // Closing is best effort: a channel already gone (lost connection) has
+        // nothing left to close. Logged, not returned (#540 review).
+        if let Err(e) = self.sftp.close().await {
+            debug!(host = %self.host, error = %e, "SFTP channel close");
+        }
         if let Some(h) = &self.own {
             let h = h.lock().await;
-            let _ = h.disconnect(Disconnect::ByApplication, "", "English").await;
+            if let Err(e) = h.disconnect(Disconnect::ByApplication, "", "English").await {
+                debug!(host = %self.host, error = %e, "SFTP connection disconnect");
+            }
         }
         Ok(())
     }
@@ -130,6 +145,14 @@ pub(crate) fn map_sftp_error(host: &str, op: &str, path: &str, e: SftpError) -> 
             _ => io::ErrorKind::Other,
         },
         SftpError::Timeout => io::ErrorKind::TimedOut,
+        // The channel or session went away under the SFTP client: say so in
+        // the words `is_connection_lost` knows, so a panel reopens instead of
+        // retrying a dead channel (#540 review).
+        SftpError::IO(msg) | SftpError::UnexpectedBehavior(msg)
+            if crate::is_connection_lost(&CoreError::Other(msg.clone())) =>
+        {
+            return CoreError::Other(format!("{host}: {op} {path}: connection lost ({msg})"));
+        }
         _ => io::ErrorKind::Other,
     };
     CoreError::Io(io::Error::new(kind, format!("{host}: {op} {path}: {e}")))
@@ -211,35 +234,66 @@ impl FileTransfer for SftpFileTransfer {
     }
 
     async fn open_write(&self, path: &str) -> Result<TransferWriter> {
+        // Exclusive, like the local side: an existing file or a symlink at
+        // `path` makes the open fail instead of being written through.
         let f = self
             .sftp
-            .create(path)
+            .open_with_flags(
+                path,
+                OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            )
             .await
             .map_err(|e| self.err("create", path, e))?;
         Ok(Box::new(f))
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<()> {
-        // SFTPv3 RENAME refuses an existing target (OpenSSH answers FAILURE),
-        // and the client offers no `posix-rename@openssh.com`. The contract
-        // says "replaces", so on refusal with a file in the way: remove it and
-        // rename again. The part file is complete at this point, so the gap
-        // is two round trips, never a half-written target.
+        // SFTPv3 RENAME refuses an existing target (OpenSSH answers a plain
+        // FAILURE) and the client offers no `posix-rename@openssh.com`. The
+        // contract says "replaces", so — only for that refusal, and only when
+        // both ends are files — the old target steps aside as
+        // `<to>.filar-old`, the new file takes its name, and the old one is
+        // dropped. If taking the name fails, the old file is put back: the
+        // target is never lost (#540 review).
+        let first = match self.sftp.rename(from, to).await {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let refused =
+            matches!(&first, SftpError::Status(s) if s.status_code == StatusCode::Failure);
+        let is_file = |m: &std::result::Result<FileAttributes, SftpError>| matches!(m, Ok(a) if a.file_type() == FileType::File);
+        if !refused
+            || !is_file(&self.sftp.metadata(from).await)
+            || !is_file(&self.sftp.metadata(to).await)
+        {
+            return Err(self.err("rename", &format!("{from} -> {to}"), first));
+        }
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let backup = format!("{to}{OLD_SUFFIX}-{}", &id[..8]);
+        self.sftp
+            .rename(to, backup.as_str())
+            .await
+            .map_err(|e| self.err("rename", &format!("{to} -> {backup}"), e))?;
         match self.sftp.rename(from, to).await {
-            Ok(()) => Ok(()),
-            Err(first) => match self.sftp.metadata(to).await {
-                Ok(a) if !a.file_type().is_dir() => {
-                    self.sftp
-                        .remove_file(to)
-                        .await
-                        .map_err(|e| self.err("replace", to, e))?;
-                    self.sftp
-                        .rename(from, to)
-                        .await
-                        .map_err(|e| self.err("rename", &format!("{from} -> {to}"), e))
+            Ok(()) => {
+                if let Err(e) = self.sftp.remove_file(backup.as_str()).await {
+                    warn!(host = %self.host, path = %backup, error = %e, "could not remove the replaced file");
+                    if let Ok(mut l) = self.leftovers.lock() {
+                        l.push(backup);
+                    }
                 }
-                _ => Err(self.err("rename", &format!("{from} -> {to}"), first)),
-            },
+                Ok(())
+            }
+            Err(e) => {
+                if let Err(back) = self.sftp.rename(backup.as_str(), to).await {
+                    warn!(host = %self.host, path = %backup, error = %back, "could not restore the replaced file");
+                    return Err(CoreError::Other(format!(
+                        "{}: rename {from} -> {to}: {e}; the previous file is kept as {backup}",
+                        self.host
+                    )));
+                }
+                Err(self.err("rename", &format!("{from} -> {to}"), e))
+            }
         }
     }
 
@@ -255,6 +309,13 @@ impl FileTransfer for SftpFileTransfer {
             .create_dir(path)
             .await
             .map_err(|e| self.err("mkdir", path, e))
+    }
+
+    fn take_leftovers(&self) -> Vec<String> {
+        self.leftovers
+            .lock()
+            .map(|mut l| std::mem::take(&mut *l))
+            .unwrap_or_default()
     }
 
     async fn set_permissions(&self, path: &str, mode: u32) -> Result<()> {
@@ -320,6 +381,12 @@ mod tests {
     fn a_lost_connection_is_recognised_as_such() {
         let e = map_sftp_error("h", "write", "/p", status(StatusCode::ConnectionLost));
         assert!(crate::is_connection_lost(&e), "{e}");
+        // The channel closing under the client surfaces as an I/O error.
+        let e = map_sftp_error("h", "list", "/p", SftpError::IO("channel closed".into()));
+        assert!(crate::is_connection_lost(&e), "{e}");
+        // Other I/O failures stay ordinary errors.
+        let e = map_sftp_error("h", "list", "/p", SftpError::IO("bad length".into()));
+        assert!(!crate::is_connection_lost(&e), "{e}");
     }
 
     #[test]
@@ -387,6 +454,10 @@ mod tests {
         w.write_all(b"old").await.expect("write");
         w.shutdown().await.expect("close");
 
+        assert!(
+            ft.open_write(&b).await.is_err(),
+            "open_write must be exclusive"
+        );
         ft.set_permissions(&a, 0o600).await.expect("chmod");
         assert_eq!(
             ft.stat(&a).await.expect("stat").expect("exists").mode,

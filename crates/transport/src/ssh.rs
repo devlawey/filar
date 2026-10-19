@@ -603,18 +603,15 @@ impl SshSession {
         self.shutdown.store(true, Ordering::Relaxed);
     }
 
-    /// Open a channel on this connection running the server subsystem
-    /// `name` (e.g. `sftp`, #533). The shell channel, its cwd and a running
-    /// command are not touched; the session lock is held only to open it.
-    pub(crate) async fn open_subsystem(&self, name: &str) -> Result<Channel<Msg>> {
-        let channel = {
-            let session = self.session.lock().await;
-            session
-                .channel_open_session()
-                .await
-                .map_err(|e| CoreError::Other(format!("failed to open channel: {e}")))?
-        };
-        request_subsystem(channel, name).await
+    /// Open a new session channel on this connection (for a subsystem such
+    /// as `sftp`, #533). The shell channel, its cwd and a running command are
+    /// not touched; the handle lock is held only while the channel opens.
+    pub(crate) async fn open_channel(&self) -> Result<Channel<Msg>> {
+        let session = self.session.lock().await;
+        session
+            .channel_open_session()
+            .await
+            .map_err(|e| CoreError::Other(format!("failed to open channel: {e}")))
     }
 
     /// Disconnect the SSH session.
@@ -783,7 +780,11 @@ impl SshExecutor {
     /// its cwd and a running command are untouched; the SFTP side lives until
     /// it is dropped or the connection goes away.
     pub async fn open_sftp(&self) -> Result<crate::sftp::SftpFileTransfer> {
-        let channel = self.session.read().await.open_subsystem("sftp").await?;
+        // Only opening the channel needs the session; the subsystem request
+        // (up to its timeout) runs without holding it, so a reconnect is
+        // never kept waiting (#540 review).
+        let channel = self.session.read().await.open_channel().await?;
+        let channel = request_subsystem(channel, "sftp").await?;
         crate::sftp::SftpFileTransfer::from_channel(channel, &self.target.name, None).await
     }
 

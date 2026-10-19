@@ -10,8 +10,10 @@
 //! - [`FileTransfer`] — filesystem of one side (local disk or SSH host) for the
 //!   file panels and the copy engine; [`LocalFileTransfer`] is the local one,
 //!   [`SftpFileTransfer`] the SSH one.
+//! - [`copy()`] — copy engine between two [`FileTransfer`] sides.
 
 mod auth;
+pub mod copy;
 pub mod cwd;
 pub mod error;
 pub mod file_transfer;
@@ -30,6 +32,7 @@ use tokio::sync::mpsc;
 use filar_core::Result;
 
 // Re-export key types.
+pub use copy::{copy, CopyEvent, CopyObserver, CopyReport, CopySource, OverwriteDecision, PART_SUFFIX};
 pub use error::is_connection_lost;
 pub use file_transfer::{
     DirEntry, EntryKind, FileTransfer, LocalFileTransfer, Metadata, PathStyle, TransferReader,
