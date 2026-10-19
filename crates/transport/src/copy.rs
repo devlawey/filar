@@ -17,7 +17,7 @@ use filar_core::{CoreError, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-use crate::file_transfer::{EntryKind, FileTransfer, Metadata};
+use crate::file_transfer::{EntryKind, FileTransfer, Metadata, TransferReader, TransferWriter};
 
 /// Suffix of the temporary file a copy writes before renaming it over the target.
 pub const PART_SUFFIX: &str = ".filar-part";
@@ -218,6 +218,11 @@ pub async fn copy(
             break;
         }
         if failed_dirs.iter().any(|d| is_inside(src, step.src(), d)) {
+            // Cut off with its directory (reported once): its bytes still
+            // count, so the bar reaches the end (#541 review).
+            if let Step::File { meta, .. } = step {
+                advance(&done, meta.size, total_bytes, observer).await;
+            }
             continue;
         }
         match step {
@@ -242,6 +247,7 @@ pub async fn copy(
                             "a directory with this name exists".into(),
                         )
                         .await;
+                        advance(&done, meta.size, total_bytes, observer).await;
                         continue;
                     }
                     Ok(Some(_)) => {
@@ -265,7 +271,7 @@ pub async fn copy(
                                     sticky = Some(OverwriteDecision::SkipAll);
                                 }
                                 report.skipped += 1;
-                                done.fetch_add(meta.size, Ordering::Relaxed);
+                                advance(&done, meta.size, total_bytes, observer).await;
                                 observer
                                     .on_event(CopyEvent::FileSkipped { dst: d.clone() })
                                     .await;
@@ -280,6 +286,7 @@ pub async fn copy(
                     Ok(None) => {}
                     Err(e) => {
                         fail(&mut report, observer, d, e.to_string()).await;
+                        advance(&done, meta.size, total_bytes, observer).await;
                         continue;
                     }
                 }
@@ -310,6 +317,12 @@ pub async fn copy(
                         }
                         // Keep the bar consistent: the failed file's bytes count as done.
                         done.store(before + meta.size, Ordering::Relaxed);
+                        observer
+                            .on_event(CopyEvent::Progress {
+                                done: before + meta.size,
+                                total: total_bytes,
+                            })
+                            .await;
                         fail(&mut report, observer, s, error).await;
                     }
                 }
@@ -429,6 +442,19 @@ async fn ensure_dir(dst: &dyn FileTransfer, path: &str) -> Result<()> {
     }
 }
 
+/// Count `size` bytes as done without copying them (skipped or failed) and
+/// report the new position.
+async fn advance(done: &AtomicU64, size: u64, total: u64, observer: &dyn CopyObserver) {
+    let now = done.fetch_add(size, Ordering::Relaxed) + size;
+    observer
+        .on_event(CopyEvent::Progress { done: now, total })
+        .await;
+}
+
+fn is_not_found(e: &CoreError) -> bool {
+    matches!(e, CoreError::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
+}
+
 async fn fail(report: &mut CopyReport, observer: &dyn CopyObserver, path: &str, error: String) {
     observer
         .on_event(CopyEvent::Failed {
@@ -469,38 +495,38 @@ async fn copy_file(
         leftover: None,
     };
 
+    // Whatever sits under the part's name — a part left by an earlier crash,
+    // or a symlink planted there — is removed first (removal never follows
+    // a link), and the part is then created exclusively: the bytes can only
+    // land in a fresh file of our own (#541 review).
+    match dst.remove_file(&part).await {
+        Ok(()) => {}
+        Err(e) if is_not_found(&e) => {}
+        Err(e) => return Err(plain(e.to_string())),
+    }
     let mut reader = src
         .open_read(src_path)
         .await
         .map_err(|e| plain(e.to_string()))?;
-    let mut writer = dst
+    let writer = dst
         .open_write(&part)
         .await
         .map_err(|e| plain(e.to_string()))?;
 
     let result: std::result::Result<(), String> = async {
-        let mut buf = vec![0u8; CHUNK];
-        loop {
-            let n = tokio::select! {
-                r = reader.read(&mut buf) => r.map_err(|e| format!("read {src_path}: {e}"))?,
-                _ = cancel.cancelled() => return Err("cancelled".to_string()),
-            };
-            if n == 0 {
-                break;
-            }
-            tokio::select! {
-                r = writer.write_all(&buf[..n]) => r.map_err(|e| format!("write {part}: {e}"))?,
-                _ = cancel.cancelled() => return Err("cancelled".to_string()),
-            }
-            let now = done.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-            observer
-                .on_event(CopyEvent::Progress { done: now, total })
-                .await;
-        }
-        writer
-            .shutdown()
-            .await
-            .map_err(|e| format!("close {part}: {e}"))?;
+        // The writer is consumed: its handle is closed before the rename,
+        // which Windows and some SFTP servers need.
+        stream_into(
+            &mut reader,
+            writer,
+            &part,
+            src_path,
+            observer,
+            cancel,
+            done,
+            total,
+        )
+        .await?;
         if let Some(mode) = meta.mode {
             // Best effort: a side without POSIX modes accepts and ignores it,
             // a refusal is not worth losing the copied file over.
@@ -515,7 +541,6 @@ async fn copy_file(
     match result {
         Ok(()) => Ok(()),
         Err(error) => {
-            drop(writer);
             let leftover = match dst.remove_file(&part).await {
                 Ok(()) => None,
                 // Already gone (e.g. the failure was the rename itself and
@@ -526,6 +551,43 @@ async fn copy_file(
             Err(FileError { error, leftover })
         }
     }
+}
+
+/// Copy `reader` into `writer` chunk by chunk, then flush and close the
+/// writer. The writer is dropped on every return, so its handle is closed.
+#[allow(clippy::too_many_arguments)]
+async fn stream_into(
+    reader: &mut TransferReader,
+    mut writer: TransferWriter,
+    part: &str,
+    src_path: &str,
+    observer: &dyn CopyObserver,
+    cancel: &CancellationToken,
+    done: &AtomicU64,
+    total: u64,
+) -> std::result::Result<(), String> {
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = tokio::select! {
+            r = reader.read(&mut buf) => r.map_err(|e| format!("read {src_path}: {e}"))?,
+            _ = cancel.cancelled() => return Err("cancelled".to_string()),
+        };
+        if n == 0 {
+            break;
+        }
+        tokio::select! {
+            r = writer.write_all(&buf[..n]) => r.map_err(|e| format!("write {part}: {e}"))?,
+            _ = cancel.cancelled() => return Err("cancelled".to_string()),
+        }
+        let now = done.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        observer
+            .on_event(CopyEvent::Progress { done: now, total })
+            .await;
+    }
+    writer
+        .shutdown()
+        .await
+        .map_err(|e| format!("close {part}: {e}"))
 }
 
 #[cfg(test)]
@@ -671,6 +733,19 @@ mod tests {
             ("new".into(), "old".into(), "new".into(), "new".into())
         );
 
+        // Skipped files still move the bar to the end (#541 review).
+        let last = obs
+            .events
+            .lock()
+            .expect("lock")
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                CopyEvent::Progress { done, total } => Some((*done, *total)),
+                _ => None,
+            });
+        assert_eq!(last, Some((12, 12)));
+
         // SkipAll: one question, nothing replaced.
         for n in ["f1", "f2", "f3", "f4"] {
             std::fs::write(b.join(n), "old").expect("write");
@@ -740,6 +815,87 @@ mod tests {
         let _ = (std::fs::remove_dir_all(&a), std::fs::remove_dir_all(&b));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_planted_as_the_part_is_never_written_through() {
+        let (a, b, elsewhere) = (temp_dir(), temp_dir(), temp_dir());
+        std::fs::write(a.join("f"), "payload").expect("write");
+        let victim = elsewhere.join("victim");
+        std::fs::write(&victim, "precious").expect("write");
+        std::os::unix::fs::symlink(&victim, b.join(format!("f{PART_SUFFIX}"))).expect("symlink");
+        let ft = LocalFileTransfer::new();
+        let obs = Recorder::new(vec![]);
+        let r = copy(
+            &ft,
+            &[file_src(&a.join("f"))],
+            &ft,
+            &s(&b),
+            &obs,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(r.copied, 1, "{r:?}");
+        assert_eq!(std::fs::read_to_string(&victim).expect("read"), "precious");
+        let target = b.join("f");
+        assert!(!std::fs::symlink_metadata(&target)
+            .expect("md")
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "payload");
+        assert!(no_parts(&b));
+        let _ = (
+            std::fs::remove_dir_all(&a),
+            std::fs::remove_dir_all(&b),
+            std::fs::remove_dir_all(&elsewhere),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leftover_part_from_an_earlier_run_is_replaced() {
+        let (a, b) = (temp_dir(), temp_dir());
+        std::fs::write(a.join("f"), "fresh").expect("write");
+        std::fs::write(b.join(format!("f{PART_SUFFIX}")), "stale half").expect("write");
+        let ft = LocalFileTransfer::new();
+        let obs = Recorder::new(vec![]);
+        let r = copy(
+            &ft,
+            &[file_src(&a.join("f"))],
+            &ft,
+            &s(&b),
+            &obs,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(r.copied, 1, "{r:?}");
+        assert_eq!(std::fs::read_to_string(b.join("f")).expect("read"), "fresh");
+        assert!(no_parts(&b));
+        let _ = (std::fs::remove_dir_all(&a), std::fs::remove_dir_all(&b));
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_subtree_still_completes_the_progress() {
+        let (a, b) = (temp_dir(), temp_dir());
+        std::fs::create_dir_all(a.join("d/sub")).expect("mkdir");
+        std::fs::write(a.join("d/sub/x"), "xxxx").expect("write");
+        std::fs::write(a.join("d/y"), "yy").expect("write");
+        // A file where the target directory `d` should go.
+        std::fs::write(b.join("d"), "in the way").expect("write");
+        let ft = LocalFileTransfer::new();
+        let obs = Recorder::new(vec![]);
+        let sources = vec![CopySource {
+            path: s(&a.join("d")),
+            kind: EntryKind::Dir,
+        }];
+        let r = copy(&ft, &sources, &ft, &s(&b), &obs, &CancellationToken::new()).await;
+        assert_eq!((r.copied, r.failed.len()), (0, 1), "{r:?}");
+        let events = obs.events.lock().expect("lock");
+        assert!(
+            events.contains(&CopyEvent::Progress { done: 6, total: 6 }),
+            "{events:?}"
+        );
+        let _ = (std::fs::remove_dir_all(&a), std::fs::remove_dir_all(&b));
+    }
+
     /// Local side whose reader trips the token after the first chunk, and whose
     /// `remove_file` can be made to fail (a lost connection).
     struct Flaky {
@@ -747,6 +903,8 @@ mod tests {
         cancel_on_read: Option<CancellationToken>,
         fail_remove: bool,
         fail_write: bool,
+        /// Set once a write started: the link only "drops" after that.
+        writing: std::sync::atomic::AtomicBool,
     }
 
     struct TrippingReader {
@@ -820,6 +978,7 @@ mod tests {
         async fn open_write(&self, path: &str) -> Result<TransferWriter> {
             // Create the part file for real, so a failed remove leaves it behind.
             let w = self.inner.open_write(path).await?;
+            self.writing.store(true, Ordering::Relaxed);
             if self.fail_write {
                 drop(w);
                 return Ok(Box::new(FailingWriter));
@@ -830,7 +989,7 @@ mod tests {
             self.inner.rename(from, to).await
         }
         async fn remove_file(&self, path: &str) -> Result<()> {
-            if self.fail_remove {
+            if self.fail_remove && self.writing.load(Ordering::Relaxed) {
                 return Err(CoreError::Other("connection lost".into()));
             }
             self.inner.remove_file(path).await
@@ -854,6 +1013,7 @@ mod tests {
             cancel_on_read: Some(token.clone()),
             fail_remove: false,
             fail_write: false,
+            writing: Default::default(),
         };
         let dst = LocalFileTransfer::new();
         let obs = Recorder::new(vec![OverwriteDecision::Overwrite]);
@@ -883,6 +1043,7 @@ mod tests {
             cancel_on_read: None,
             fail_remove: true,
             fail_write: true,
+            writing: Default::default(),
         };
         let obs = Recorder::new(vec![]);
         let r = copy(

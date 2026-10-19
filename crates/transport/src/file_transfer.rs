@@ -194,8 +194,10 @@ pub trait FileTransfer: Send + Sync {
     /// Open `path` for reading from the start.
     async fn open_read(&self, path: &str) -> Result<TransferReader>;
 
-    /// Create `path` (truncating an existing file) and open it for writing.
-    /// The caller must `shutdown` the writer to flush and close it.
+    /// Create `path`, which must not exist yet, and open it for writing.
+    /// Exclusive: an existing file — or a symlink, which is never followed —
+    /// is an `AlreadyExists` error, so a write can only land in a fresh file.
+    /// The caller must `shutdown` the writer to flush it, and drop it to close.
     async fn open_write(&self, path: &str) -> Result<TransferWriter>;
 
     /// Rename `from` to `to`, replacing an existing file at `to`.
@@ -334,7 +336,10 @@ impl FileTransfer for LocalFileTransfer {
     }
 
     async fn open_write(&self, path: &str) -> Result<TransferWriter> {
-        let f = tokio::fs::File::create(path)
+        let f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
             .await
             .map_err(|e| io_context("create", path, e))?;
         Ok(Box::new(f))
@@ -469,6 +474,29 @@ mod tests {
         };
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
         assert!(e.to_string().contains("nope"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn local_open_write_is_exclusive() {
+        let ft = LocalFileTransfer::new();
+        let dir = temp_dir();
+        let f = s(&dir.join("exists"));
+        std::fs::write(&f, "keep").expect("write");
+        let Err(CoreError::Io(e)) = ft.open_write(&f).await else {
+            panic!("expected AlreadyExists");
+        };
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&f).expect("read"), "keep");
+        #[cfg(unix)]
+        {
+            let victim = dir.join("victim");
+            std::fs::write(&victim, "keep").expect("write");
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+            assert!(ft.open_write(&s(&link)).await.is_err());
+            assert_eq!(std::fs::read_to_string(&victim).expect("read"), "keep");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
