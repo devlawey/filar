@@ -20,7 +20,7 @@ use russh::client::{Handle, Msg};
 use russh::{Channel, Disconnect};
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::{FileAttributes, FileType, StatusCode};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -220,9 +220,14 @@ impl FileTransfer for SftpFileTransfer {
     }
 
     async fn open_write(&self, path: &str) -> Result<TransferWriter> {
+        // Exclusive, like the local side: an existing file or a symlink at
+        // `path` makes the open fail instead of being written through.
         let f = self
             .sftp
-            .create(path)
+            .open_with_flags(
+                path,
+                OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            )
             .await
             .map_err(|e| self.err("create", path, e))?;
         Ok(Box::new(f))
@@ -418,6 +423,10 @@ mod tests {
         w.write_all(b"old").await.expect("write");
         w.shutdown().await.expect("close");
 
+        assert!(
+            ft.open_write(&b).await.is_err(),
+            "open_write must be exclusive"
+        );
         ft.set_permissions(&a, 0o600).await.expect("chmod");
         assert_eq!(
             ft.stat(&a).await.expect("stat").expect("exists").mode,
