@@ -132,6 +132,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
         file_panels::render_file_panels(f, app, full);
     }
 
+    // A copy's "file exists" question (#536), panels open or not.
+    if app.file_copies.iter().any(|c| c.asking.is_some()) {
+        let full = f.area();
+        file_panels::render_overwrite(f, app, full);
+    }
+
     // Render help overlay on top of everything if active.
     if app.help_overlay_visible {
         let full = f.area();
