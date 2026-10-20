@@ -574,6 +574,7 @@ let scorer = build_risk_scorer(
         model: "typesafe/jev-1.14".into(),
         key_env: "FILAR_RISK_API_KEY".into(), // "" = keyless local server
         timeout_secs: 8,
+        ..Default::default()
     },
     &secrets,
 )?;
@@ -611,6 +612,7 @@ let _agent = builder.risk_scorer(Some(scorer));
 |--------|--------|------------|
 | `AgentEvent::CommandProposed::proposal_id: u64` added (#549) | Constructing the event by hand; patterns without `..` | Add `..` to patterns; keep the id if you show safety ratings |
 | `AgentEvent::CommandScored` added (#549) | Nothing — `AgentEvent` is `#[non_exhaustive]` | Handle it to show the rating next to the command |
+| `RiskScorerConfig::warn_below` / `danger_below` (display thresholds) and `impl Default for RiskScorerConfig` (#551) | Struct literals without `..Default::default()` | Add `..Default::default()` |
 | `ChatLogprobScorer`, `RiskScorerKind::ChatLogprobs` (#550); `RiskScorerKind` is `#[non_exhaustive]` | Exhaustive matches on `RiskScorerKind` | Add a `_` arm |
 | `RiskScorer`, `RiskInput`, `RiskScore`, `DecisionsApiScorer`, `build_risk_scorer`, `AgentBuilder::risk_scorer`; `RiskScorerConfig`, `RiskScorerKind`, `Config::risk_scorer` (#549) | Nothing — additive (struct literals of `Config` use `..Default::default()`) | Opt in; see the safety-rating section |
 

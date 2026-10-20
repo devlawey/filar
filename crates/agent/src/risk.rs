@@ -709,6 +709,7 @@ mod tests {
             model: "typesafe/jev-1.14".into(),
             key_env: "MY_RISK_KEY".into(),
             timeout_secs: 8,
+            ..Default::default()
         };
         let empty = filar_core::secrets::StaticSecretProvider::new();
         let err = build_risk_scorer(&cfg, &empty).err().unwrap().to_string();
@@ -816,6 +817,7 @@ mod tests {
             model: "qwen".into(),
             key_env: String::new(),
             timeout_secs: 8,
+            ..Default::default()
         };
         let s = build_risk_scorer(&cfg, &filar_core::secrets::StaticSecretProvider::new()).unwrap();
         assert_eq!(s.model_name(), "qwen");

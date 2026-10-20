@@ -10,7 +10,7 @@
 //! `app.messages` and a [`LineRegion`] tag, enabling future mouse
 //! hit-testing ("which block was clicked?") without a separate scan.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::text::{Line, Span};
 
@@ -18,6 +18,7 @@ use filar_core::ChatBlock;
 
 use super::text::{render_markdown_line, sanitize_output, strip_emoji, wrap_text, MarkdownState};
 use super::theme::Theme;
+use crate::app::SafetyLevel;
 
 /// Which part of a [`ChatBlock`] a rendered line belongs to.
 ///
@@ -66,6 +67,10 @@ pub struct ChatLayoutCache {
     /// only its headline and points at the side panel for the table. Set
     /// once per session — a session is a fleet or it is not.
     pub fleet: bool,
+    /// Safety-rating badges of command blocks (#551): message index →
+    /// (label, level). Set before each rebuild; a new rating bumps
+    /// `message_rev`, which triggers the rebuild.
+    pub safety_badges: HashMap<usize, (String, SafetyLevel)>,
 }
 
 /// Maximum number of rendered lines to cache.
@@ -84,6 +89,7 @@ impl ChatLayoutCache {
             message_count: 0,
             last_block_rev: 0,
             fleet: false,
+            safety_badges: HashMap::new(),
         }
     }
 
@@ -172,13 +178,27 @@ impl ChatLayoutCache {
                         " "
                     };
 
-                    self.push_header(idx, vec![
+                    let mut header = vec![
                         Span::raw("  "),
                         Span::styled(format!("{} ", arrow), theme.warning_fg()),
+                    ];
+                    // Safety badge (#551) before the command: the header is
+                    // not wrapped, so after a long command it would be cut.
+                    if let Some((label, level)) = self.safety_badges.get(&idx) {
+                        let style = match level {
+                            SafetyLevel::Safe => theme.success_fg(),
+                            SafetyLevel::Warn => theme.warning_fg(),
+                            SafetyLevel::Danger => theme.danger_fg(),
+                            SafetyLevel::Muted => theme.muted(),
+                        };
+                        header.push(Span::styled(format!("[{label}] "), style));
+                    }
+                    header.extend([
                         Span::styled("$ ", theme.warning_fg()),
                         Span::styled(command.clone(), theme.command_style()),
                         status,
                     ]);
+                    self.push_header(idx, header);
 
                     if !explanation.is_empty() {
                         for wrapped in wrap_text(&strip_emoji(explanation), output_width) {
@@ -455,6 +475,35 @@ mod tests {
         assert_eq!(cache.lines[1].block_index, Some(0));
         assert_eq!(cache.lines[2].region, LineRegion::Spacer);
         assert_eq!(cache.lines[2].block_index, None);
+    }
+
+    #[test]
+    fn a_rated_command_shows_its_badge_before_the_command() {
+        let theme = Theme::default_dark();
+        let mut cache = ChatLayoutCache::new();
+        let long = format!("echo {}", "x".repeat(300));
+        let msgs = vec![ChatBlock::Command {
+            command: long,
+            explanation: String::new(),
+            output: Some("ok".into()),
+            approved: true,
+            tool: None,
+        }];
+        cache.safety_badges.insert(0, ("~62%".into(), SafetyLevel::Warn));
+        cache.rebuild(&msgs, 80, &theme, &HashSet::new(), 1);
+        let header: String = cache.lines[0].line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let badge = header.find("[~62%]").expect("badge in the header");
+        assert!(badge < header.find("$ echo").unwrap(), "{header}");
+        let with_badge = cache.lines[0].line.spans.len();
+
+        // Without a badge the header is exactly the same minus the badge
+        // span — structurally, not by text: the ASCII glyph set on Windows
+        // draws the status as `[ok]` (#551).
+        cache.safety_badges.clear();
+        cache.rebuild(&msgs, 80, &theme, &HashSet::new(), 2);
+        let plain: String = cache.lines[0].line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(cache.lines[0].line.spans.len(), with_badge - 1);
+        assert_eq!(header.replacen("[~62%] ", "", 1), plain);
     }
 
     #[test]

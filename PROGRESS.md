@@ -10888,3 +10888,33 @@ HTTP-клиент и POST вынесены в общие хелперы (`scorer
 документации пока не ведётся — только требование «сервер отдаёт `logprobs`».
 
 **Next:** #551.
+
+## #551 — оценка безопасности в TUI
+
+**Сделано.** Runner получает скорер из `TuiConfig.risk_scorer` (собирается в
+`filar-app` при старте: ключ по `key_env` — память → keyring → env, кэш в
+`StaticSecretProvider`) и передаёт в каждый `spawn_agent`. Невалидная секция
+или нет ключа → строка `Safety rating off: …` в ленте при старте, скорер выключен.
+В `App`: `risk_scorer_on`, `risk_thresholds`; в `Session`: `safety_scores`
+(`proposal_id` → `SafetyScore::{Pending, Ready, Unavailable}`),
+`pending_proposal_id`, `block_proposals` (индекс блока → id + команда;
+команда сверяется при рендере; при сжатии истории индексы пересчитываются,
+при восстановлении сессии карты очищаются), `risk_ratings`/`risk_cost_usd`. `CommandProposed` → `Pending` (если
+скорер есть, не флот, не `background_job_status`/`list_background_jobs` —
+как в агенте); `CommandScored` → результат + bump `message_rev`.
+
+**UI.** Окно подтверждения — строка `Safety: N% (model)` / `rating…` /
+`unavailable`, окно не ждёт скорер. Лента — бейдж `[N%]` перед `$ команда`
+(заголовок не переносится, после длинной команды бейдж обрезался бы). Цвет
+по `warn_below`/`danger_below` (новые поля `[risk_scorer]`, 70/40, проверка
+`danger ≤ warn ≤ 100`), `~` при `confidence < 0.5`. F1 → Usage → `Risk scorer:
+N ratings $…`. Арбитр не тронут.
+
+**Проверено.** Бинарник в tmux 150×40, mock-сервер (LLM со стримингом + Decisions
+API с задержкой 1.5 с): `always` — окно сразу с `Safety: rating…`, через ~1.5 с
+`Safety: 15% (typesafe/jev-1.14)`, после Approve бейдж `[15%]`; `never` —
+`[rating…]` → `[95%]` после выполнения; F1 — `Risk scorer: 1 rating $0.000020`;
+ключ не найден — `Safety rating off: no key found …`. Живой Jev — за
+мейнтейнером (ключа в окружении нет).
+
+**Next:** #552 (настройка в лаунчере).

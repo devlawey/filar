@@ -26,11 +26,13 @@ pub(crate) fn render_chat_history(f: &mut Frame, app: &mut App, area: Rect) {
         .needs_rebuild(&app.messages, inner_width, app.message_rev)
     {
         let collapsed = app.collapsed_set();
+        let badges = app.safety_badges();
         // Get a local mutable reference to the active session so Rust's
         // split-borrow analysis sees distinct field borrows instead of
         // clashing through DerefMut.
         let s = &mut app.sessions[app.active];
         s.layout_cache.fleet = s.fleet.is_some();
+        s.layout_cache.safety_badges = badges;
         s.layout_cache.rebuild(
             &s.messages,
             inner_width,

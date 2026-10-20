@@ -593,6 +593,14 @@ pub struct TuiConfig {
     pub arbiter_enabled: bool,
     /// Optional named profile for the arbiter (`None` = session profile).
     pub arbiter_profile: Option<String>,
+    /// Command safety scorer from `[risk_scorer]` (#549/#551): every
+    /// command the agent proposes is rated, advisory only. `None` = off.
+    pub risk_scorer: Option<Arc<dyn filar_agent::RiskScorer>>,
+    /// `(warn_below, danger_below)` for colouring the ratings.
+    pub risk_thresholds: (u8, u8),
+    /// Shown once at start-up when the scorer is configured but cannot be
+    /// used (invalid section, missing key). Never contains a secret.
+    pub risk_scorer_note: Option<String>,
 }
 
 /// SSH transport tunables with the app-configured command timeout.
@@ -1413,6 +1421,11 @@ async fn run_app(
     // Fleet hosts' own passwords come from the OS credential store (#436).
     app.credential_store = Arc::new(filar_core::KeyringSecretProvider::new());
     app.runbook_enabled = config.save_runbook;
+    app.risk_scorer_on = config.risk_scorer.is_some();
+    app.risk_thresholds = config.risk_thresholds;
+    if let Some(note) = config.risk_scorer_note.take() {
+        app.push_message(ChatBlock::System(note));
+    }
     // Host groups are fleet entry points in Ctrl+O; `--group` opens the fleet
     // layer straight away, over the start-up tab (#432).
     app.host_groups = config.host_groups.clone();
@@ -2053,6 +2066,7 @@ async fn run_app(
                         };
                         spawn_agent(
                             session_llm,
+                            config.risk_scorer.clone(),
                             arbiter_llm,
                             config.arbiter_enabled,
                             arbiter_model_name,
@@ -3397,6 +3411,7 @@ async fn build_runbook_file(
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent(
     llm: Arc<dyn LlmClient>,
+    risk_scorer: Option<Arc<dyn filar_agent::RiskScorer>>,
     arbiter_llm: Option<Arc<dyn LlmClient>>,
     arbiter_enabled: bool,
     arbiter_model_name: String,
@@ -3490,7 +3505,8 @@ fn spawn_agent(
                 .secret_provider(Arc::clone(&secret_provider))
                 .arbiter_enabled(arbiter_enabled)
                 .arbiter_llm(arbiter_llm.clone())
-                .arbiter_model_name(arbiter_model_name.clone());
+                .arbiter_model_name(arbiter_model_name.clone())
+                .risk_scorer(risk_scorer.clone());
             if is_local {
                 builder = builder.local_mode().arbiter_local_context();
             } else {
@@ -5034,6 +5050,9 @@ mod tests {
             command_timeout: std::time::Duration::from_secs(30),
             arbiter_enabled: false,
             arbiter_profile: None,
+            risk_scorer: None,
+            risk_thresholds: (70, 40),
+            risk_scorer_note: None,
         }
     }
 
