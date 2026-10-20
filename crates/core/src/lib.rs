@@ -30,7 +30,7 @@ pub use config::{
     HostGroupPolicy, LlmConfig, LlmProfile, CommandConfirmMode, TimeoutConfig, HostKeyPolicy,
     DEFAULT_COMMAND_TIMEOUT_SECS,
     DEFAULT_COMPACT_AT_TOKENS, DEFAULT_MAX_TOKENS,
-    RiskScorerConfig, RiskScorerKind, DEFAULT_RISK_SCORER_TIMEOUT_SECS,
+    RiskScorerConfig, RiskScorerKind, DEFAULT_RISK_SCORER_TIMEOUT_SECS, MAX_RISK_SCORER_TIMEOUT_SECS,
 };
 pub use error::{CoreError, Result};
 pub use fleet_checks::{

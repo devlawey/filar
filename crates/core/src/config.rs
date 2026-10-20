@@ -79,13 +79,14 @@ pub struct Config {
 
     /// Command safety scorer from `[risk_scorer]` (#549): a decision model
     /// that rates every command the agent proposes, 0–100 (100 = safe).
-    /// `None` — no section, or an invalid one (see
-    /// [`risk_scorer_error`](Self::risk_scorer_error)) — means the feature
-    /// is off. Advisory only: it never touches the confirmation gate.
+    /// Advisory only: it never touches the confirmation gate. The section is
+    /// kept as written even when invalid, so saving the config does not drop
+    /// it; use [`active_risk_scorer`](Self::active_risk_scorer) to get the one
+    /// that may actually be used.
     #[serde(default)]
     pub risk_scorer: Option<RiskScorerConfig>,
 
-    /// Why `[risk_scorer]` was switched off at load, if it was invalid.
+    /// Why `[risk_scorer]` is switched off, if it is invalid.
     /// Never contains a secret — only the field that is wrong.
     #[serde(skip)]
     pub risk_scorer_error: Option<String>,
@@ -121,6 +122,11 @@ fn default_arbiter_enabled() -> bool {
 
 /// Default per-request timeout of the safety scorer, seconds.
 pub const DEFAULT_RISK_SCORER_TIMEOUT_SECS: u64 = 8;
+
+/// Largest allowed per-request timeout of the safety scorer, seconds. The
+/// agent waits for in-flight ratings before it finishes, so this also bounds
+/// how long a slow scorer can hold the final answer back.
+pub const MAX_RISK_SCORER_TIMEOUT_SECS: u64 = 30;
 
 /// Protocol the safety scorer speaks (`[risk_scorer].kind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,10 +204,10 @@ impl RiskScorerConfig {
                 "[risk_scorer] base_url must start with http:// or https://".into(),
             ));
         }
-        if self.timeout_secs == 0 {
-            return Err(CoreError::Config(
-                "[risk_scorer] timeout_secs must be greater than 0".into(),
-            ));
+        if self.timeout_secs == 0 || self.timeout_secs > MAX_RISK_SCORER_TIMEOUT_SECS {
+            return Err(CoreError::Config(format!(
+                "[risk_scorer] timeout_secs must be between 1 and {MAX_RISK_SCORER_TIMEOUT_SECS}"
+            )));
         }
         Ok(kind)
     }
@@ -801,15 +807,27 @@ impl Config {
 
     /// Switch an invalid `[risk_scorer]` off instead of failing the whole
     /// load: the scorer is advisory, the app must start without it (#549).
-    /// The reason is kept in [`risk_scorer_error`](Self::risk_scorer_error).
+    /// The reason is kept in [`risk_scorer_error`](Self::risk_scorer_error);
+    /// the section itself stays, so a save writes it back unchanged.
     pub fn check_risk_scorer(&mut self) {
-        if let Some(rs) = &self.risk_scorer {
-            if let Err(e) = rs.validate() {
-                tracing::warn!(error = %e, "risk scorer disabled");
-                self.risk_scorer_error = Some(e.to_string());
-                self.risk_scorer = None;
-            }
-        }
+        self.risk_scorer_error = match &self.risk_scorer {
+            Some(rs) => match rs.validate() {
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(error = %e, "risk scorer disabled");
+                    Some(e.to_string())
+                }
+            },
+            None => None,
+        };
+    }
+
+    /// The `[risk_scorer]` section to use, or `None` when there is none or
+    /// it is invalid.
+    pub fn active_risk_scorer(&self) -> Option<&RiskScorerConfig> {
+        self.risk_scorer
+            .as_ref()
+            .filter(|rs| self.risk_scorer_error.is_none() && rs.validate().is_ok())
     }
 
     /// Resolve the effective arbiter profile name.
@@ -1075,6 +1093,7 @@ confirm_mode = "explain"
     fn risk_scorer_absent_by_default() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.risk_scorer.is_none());
+        assert!(cfg.active_risk_scorer().is_none());
         assert!(cfg.risk_scorer_error.is_none());
     }
 
@@ -1102,7 +1121,7 @@ base_url = "https://openrouter.ai/api/alpha"
 model = "typesafe/jev-1.14"
 "#,
         );
-        let rs = cfg.risk_scorer.expect("scorer configured");
+        let rs = cfg.active_risk_scorer().expect("scorer configured").clone();
         assert_eq!(rs.kind, "decisions");
         assert_eq!(rs.key_env, crate::secrets::env_vars::RISK_API_KEY);
         assert_eq!(rs.timeout_secs, DEFAULT_RISK_SCORER_TIMEOUT_SECS);
@@ -1121,7 +1140,7 @@ key_env = ""
 timeout_secs = 3
 "#,
         );
-        let rs = cfg.risk_scorer.unwrap();
+        let rs = cfg.active_risk_scorer().unwrap();
         assert!(rs.key_env.is_empty());
         assert_eq!(rs.timeout_secs, 3);
     }
@@ -1133,11 +1152,18 @@ timeout_secs = 3
             ("[risk_scorer]\nbase_url = \"https://x\"\n", "model is empty"),
             ("[risk_scorer]\nbase_url = \"ftp://x\"\nmodel = \"m\"\n", "base_url"),
             ("[risk_scorer]\nbase_url = \"https://x\"\nmodel = \"m\"\ntimeout_secs = 0\n", "timeout_secs"),
+            ("[risk_scorer]\nbase_url = \"https://x\"\nmodel = \"m\"\ntimeout_secs = 31\n", "timeout_secs"),
         ] {
             let cfg = load_str(toml);
-            assert!(cfg.risk_scorer.is_none(), "{toml}");
-            let err = cfg.risk_scorer_error.expect("reason kept");
+            assert!(cfg.active_risk_scorer().is_none(), "{toml}");
+            let err = cfg.risk_scorer_error.clone().expect("reason kept");
             assert!(err.contains(needle), "{err}");
+            // A save writes the section back as it was, without the reason.
+            let saved = toml::to_string_pretty(&cfg).unwrap();
+            assert!(saved.contains("[risk_scorer]"), "{saved}");
+            assert!(!saved.contains(&err), "{saved}");
+            let reread: Config = toml::from_str(&saved).unwrap();
+            assert_eq!(reread.risk_scorer, cfg.risk_scorer);
         }
     }
 

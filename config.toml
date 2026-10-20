@@ -55,7 +55,7 @@ connect_secs = 15
 # base_url = "https://openrouter.ai/api/alpha"
 # model = "typesafe/jev-1.14"
 # key_env = "FILAR_RISK_API_KEY"
-# timeout_secs = 8
+# timeout_secs = 8              # 1–30
 
 # ── SSH targets ──────────────────────────────────────────────────────
 # "local" (built-in) = commands run on your machine, no SSH needed.

@@ -276,6 +276,22 @@ pub struct Agent {
     pending_scores: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
+/// Upper bound on one safety rating, whatever the scorer's own timeout: the
+/// agent waits for in-flight ratings before its terminal event, so a scorer
+/// that never answers must not hold `Finished` back for ever.
+const RISK_SCORE_MAX_WAIT: Duration =
+    Duration::from_secs(filar_core::MAX_RISK_SCORER_TIMEOUT_SECS + 2);
+
+/// Abort `handles` and wait until each task has actually stopped.
+async fn abort_and_join(handles: Vec<tokio::task::JoinHandle<()>>) {
+    for h in &handles {
+        h.abort();
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+}
+
 /// Process-wide source of [`AgentEvent::CommandProposed`] ids: unique across
 /// agents, since a frontend typically builds a new agent per prompt.
 static NEXT_PROPOSAL_ID: AtomicU64 = AtomicU64::new(1);
@@ -696,7 +712,11 @@ impl Agent {
         let sink = self.event_sink.clone();
         let handle = tokio::spawn(async move {
             let model = scorer.model_name().to_string();
-            let event = match scorer.score(&input).await {
+            let result = match tokio::time::timeout(RISK_SCORE_MAX_WAIT, scorer.score(&input)).await {
+                Ok(r) => r,
+                Err(_) => Err(CoreError::Other("risk scorer: no answer in time".into())),
+            };
+            let event = match result {
                 Ok(score) => AgentEvent::CommandScored {
                     proposal_id,
                     safety_pct: Some(score.safety_pct),
@@ -750,19 +770,19 @@ impl Agent {
             };
             if cancelled {
                 h.abort();
-                for rest in handles.by_ref() {
-                    rest.abort();
-                }
+                let _ = h.await;
+                abort_and_join(handles.by_ref().collect()).await;
                 return;
             }
         }
     }
 
-    /// Drop every rating still in flight (on cancellation).
-    fn abort_pending_scores(&self) {
-        for h in self.pending_scores_lock().drain(..) {
-            h.abort();
-        }
+    /// Drop every rating still in flight (on cancellation) and wait until
+    /// the tasks are gone: `abort` only requests it, and a task already
+    /// inside the sink would otherwise emit after `Cancelled`.
+    async fn abort_pending_scores(&self) {
+        let handles: Vec<_> = self.pending_scores_lock().drain(..).collect();
+        abort_and_join(handles).await;
     }
 
     /// Check whether the cancellation token has been triggered.
@@ -790,11 +810,11 @@ impl Agent {
         // cancellation token, so a cancel before or during the wait aborts
         // them instead — `Cancelled` is terminal, no rating may follow it.
         if self.is_cancelled() {
-            self.abort_pending_scores();
+            self.abort_pending_scores().await;
         } else {
             self.await_pending_scores().await;
             if self.is_cancelled() {
-                self.abort_pending_scores();
+                self.abort_pending_scores().await;
             }
         }
         match result {
