@@ -7,7 +7,8 @@
 //! user prompt → LLM → (tool call?) → confirm → execute → result → LLM → … → final answer
 //! ```
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -19,6 +20,7 @@ use filar_transport::{CommandExecutor, SecretSubstitutingExecutor};
 use crate::{
     arbiter::{self, ArbiterContext, ARBITER_TIMEOUT_SECS, HISTORY_TAIL_EXCHANGES},
     events::{AgentEvent, EventSink},
+    risk::{RiskInput, RiskScorer},
     security::{self, CommandConfirmer, ConfirmDecision},
     tools::{self},
     ChatMessage, ChatRequest, LlmClient, ToolCall,
@@ -267,7 +269,32 @@ pub struct Agent {
     /// Working over a fleet (#434): single-host tools are neither offered
     /// nor executed.
     fleet: bool,
+    /// Optional command safety scorer (#549). Advisory only.
+    risk_scorer: Option<Arc<dyn RiskScorer>>,
+    /// Ratings still in flight; awaited before `Finished`/`Error`, aborted
+    /// on cancellation, so no event follows the terminal one.
+    pending_scores: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
+
+/// Upper bound on one safety rating, whatever the scorer's own timeout: the
+/// agent waits for in-flight ratings before its terminal event, so a scorer
+/// that never answers must not hold `Finished` back for ever.
+const RISK_SCORE_MAX_WAIT: Duration =
+    Duration::from_secs(filar_core::MAX_RISK_SCORER_TIMEOUT_SECS + 2);
+
+/// Abort `handles` and wait until each task has actually stopped.
+async fn abort_and_join(handles: Vec<tokio::task::JoinHandle<()>>) {
+    for h in &handles {
+        h.abort();
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+}
+
+/// Process-wide source of [`AgentEvent::CommandProposed`] ids: unique across
+/// agents, since a frontend typically builds a new agent per prompt.
+static NEXT_PROPOSAL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Builder for [`Agent`].
 pub struct AgentBuilder {
@@ -291,6 +318,7 @@ pub struct AgentBuilder {
     session_id: Option<String>,
     is_local: bool,
     fleet: bool,
+    risk_scorer: Option<Arc<dyn RiskScorer>>,
 }
 
 impl AgentBuilder {
@@ -317,6 +345,7 @@ impl AgentBuilder {
             session_id: None,
             is_local: false,
             fleet: false,
+            risk_scorer: None,
         }
     }
 
@@ -459,6 +488,14 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the command safety scorer (#549). Every command the agent proposes
+    /// is rated asynchronously, in every confirmation mode; the rating
+    /// arrives as [`AgentEvent::CommandScored`] and never affects the gate.
+    pub fn risk_scorer(mut self, scorer: Option<Arc<dyn RiskScorer>>) -> Self {
+        self.risk_scorer = scorer;
+        self
+    }
+
     /// Mark whether the executor targets the local machine (affects background spawn).
     pub fn is_local(mut self, is_local: bool) -> Self {
         self.is_local = is_local;
@@ -547,6 +584,8 @@ impl AgentBuilder {
                 .unwrap_or_else(|| "default".into()),
             is_local: self.is_local,
             fleet: self.fleet,
+            risk_scorer: self.risk_scorer,
+            pending_scores: Mutex::new(Vec::new()),
         })
     }
 }
@@ -656,6 +695,96 @@ impl Agent {
         }
     }
 
+    /// Start rating `command` with the risk scorer, if one is set (#549).
+    ///
+    /// Runs in a separate task: neither confirmation nor execution waits for
+    /// it. The result is emitted as [`AgentEvent::CommandScored`]; any error
+    /// becomes `unavailable: true`. Never called for fleet runs.
+    fn spawn_risk_score(&self, proposal_id: u64, command: &str, explanation: &str) {
+        let Some(scorer) = self.risk_scorer.clone() else {
+            return;
+        };
+        let input = RiskInput {
+            command: command.to_string(),
+            explanation: explanation.to_string(),
+            target: arbiter::target_description(&self.arbiter_context),
+        };
+        let sink = self.event_sink.clone();
+        let handle = tokio::spawn(async move {
+            let model = scorer.model_name().to_string();
+            let result = match tokio::time::timeout(RISK_SCORE_MAX_WAIT, scorer.score(&input)).await {
+                Ok(r) => r,
+                Err(_) => Err(CoreError::Other("risk scorer: no answer in time".into())),
+            };
+            let event = match result {
+                Ok(score) => AgentEvent::CommandScored {
+                    proposal_id,
+                    safety_pct: Some(score.safety_pct),
+                    confidence: score.confidence,
+                    model: score.model,
+                    cost_usd: score.cost_usd,
+                    unavailable: false,
+                },
+                Err(e) => {
+                    warn!(error = %e, "command safety rating unavailable");
+                    AgentEvent::CommandScored {
+                        proposal_id,
+                        safety_pct: None,
+                        confidence: None,
+                        model,
+                        cost_usd: None,
+                        unavailable: true,
+                    }
+                }
+            };
+            if let Some(sink) = sink {
+                sink(event);
+            }
+        });
+        let mut pending = self.pending_scores_lock();
+        pending.retain(|h| !h.is_finished());
+        pending.push(handle);
+    }
+
+    /// Lock the in-flight ratings. A poisoned lock is taken over rather than
+    /// skipped: waiting for or aborting the ratings must never be lost.
+    fn pending_scores_lock(&self) -> std::sync::MutexGuard<'_, Vec<tokio::task::JoinHandle<()>>> {
+        self.pending_scores.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wait for every rating still in flight. A cancellation that arrives
+    /// while waiting aborts the rest, so no rating can follow `Cancelled`.
+    async fn await_pending_scores(&self) {
+        let handles: Vec<_> = self.pending_scores_lock().drain(..).collect();
+        let mut handles = handles.into_iter();
+        while let Some(mut h) = handles.next() {
+            let cancelled = match &self.cancellation {
+                Some(token) => tokio::select! {
+                    _ = &mut h => false,
+                    _ = token.cancelled() => true,
+                },
+                None => {
+                    let _ = (&mut h).await;
+                    false
+                }
+            };
+            if cancelled {
+                h.abort();
+                let _ = h.await;
+                abort_and_join(handles.by_ref().collect()).await;
+                return;
+            }
+        }
+    }
+
+    /// Drop every rating still in flight (on cancellation) and wait until
+    /// the tasks are gone: `abort` only requests it, and a task already
+    /// inside the sink would otherwise emit after `Cancelled`.
+    async fn abort_pending_scores(&self) {
+        let handles: Vec<_> = self.pending_scores_lock().drain(..).collect();
+        abort_and_join(handles).await;
+    }
+
     /// Check whether the cancellation token has been triggered.
     fn is_cancelled(&self) -> bool {
         match &self.cancellation {
@@ -675,7 +804,20 @@ impl Agent {
     /// [`AgentEvent::Finished`] (success) or [`AgentEvent::Error`] (failure).
     pub async fn run(&self, user_prompt: &str, history: &[ChatMessage]) -> Result<String> {
         self.emit(AgentEvent::Started);
-        match self.run_loop(user_prompt, history).await {
+        let result = self.run_loop(user_prompt, history).await;
+        // Ratings still in flight land before the terminal event; each is
+        // bounded by the scorer's own timeout. Waiting watches the
+        // cancellation token, so a cancel before or during the wait aborts
+        // them instead — `Cancelled` is terminal, no rating may follow it.
+        if self.is_cancelled() {
+            self.abort_pending_scores().await;
+        } else {
+            self.await_pending_scores().await;
+            if self.is_cancelled() {
+                self.abort_pending_scores().await;
+            }
+        }
+        match result {
             Ok(text) => {
                 self.emit(AgentEvent::Finished(text.clone()));
                 Ok(text)
@@ -911,7 +1053,9 @@ impl Agent {
             || matches!(parsed.kind, tools::ToolKind::CancelBackgroundJob);
 
         // Emit CommandProposed before any confirmation logic.
+        let proposal_id = NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed);
         self.emit(AgentEvent::CommandProposed {
+            proposal_id,
             command: display_command.clone(),
             explanation: parsed.explanation.clone(),
             destructive,
@@ -920,6 +1064,18 @@ impl Agent {
                 arguments: tc.arguments.clone(),
             },
         });
+
+        // Safety rating (#549): every command the agent proposes, in every
+        // confirmation mode, without waiting. Not for fleet runs (out of
+        // scope) nor for the bookkeeping tools that run nothing.
+        if !self.fleet
+            && !matches!(
+                parsed.kind,
+                tools::ToolKind::BackgroundJobStatus | tools::ToolKind::ListBackgroundJobs
+            )
+        {
+            self.spawn_risk_score(proposal_id, &display_command, &parsed.explanation);
+        }
 
         if let Some(crate::fleet_gate::FleetGate::Refuse(msg)) = fleet_gate {
             info!(command = %parsed.command, "write refused by the fleet gate");
@@ -2841,5 +2997,251 @@ mod tests {
             )),
             "expected MISMATCH CommandAudited, got {received:?}"
         );
+    }
+
+    // ── Risk scorer (#549) ────────────────────────────────────────────
+
+    /// Scorer stand-in: a fixed result after `delay`, counting calls.
+    struct FakeScorer {
+        result: std::result::Result<u8, ()>,
+        delay: Duration,
+        calls: std::sync::atomic::AtomicUsize,
+        inputs: std::sync::Mutex<Vec<crate::risk::RiskInput>>,
+    }
+
+    impl FakeScorer {
+        fn new(result: std::result::Result<u8, ()>, delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                result,
+                delay,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                inputs: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::risk::RiskScorer for FakeScorer {
+        async fn score(&self, input: &crate::risk::RiskInput) -> Result<crate::risk::RiskScore> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inputs.lock().unwrap().push(input.clone());
+            tokio::time::sleep(self.delay).await;
+            match self.result {
+                Ok(pct) => Ok(crate::risk::RiskScore {
+                    safety_pct: pct,
+                    confidence: Some(0.9),
+                    probabilities: Default::default(),
+                    cost_usd: Some(0.0001),
+                    model: "fake-decider".into(),
+                }),
+                Err(()) => Err(CoreError::Other("HTTP 503".into())),
+            }
+        }
+
+        fn model_name(&self) -> &str {
+            "fake-decider"
+        }
+    }
+
+    fn one_command_llm(command: &str) -> Arc<MockLlm> {
+        Arc::new(MockLlm::new(vec![
+            ChatResponse::tool_calls("", vec![ToolCall {
+                id: "call_1".into(),
+                name: "run_command".into(),
+                arguments: serde_json::json!({ "command": command, "explanation": "why" }),
+            }]),
+            ChatResponse::text("Done!"),
+        ]))
+    }
+
+    async fn run_with_scorer(
+        mode: CommandConfirmMode,
+        scorer: Arc<FakeScorer>,
+        approve: bool,
+        fleet: bool,
+    ) -> Vec<AgentEvent> {
+        let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> = Arc::default();
+        let ev = events.clone();
+        let sink: EventSink = Arc::new(move |e| ev.lock().unwrap().push(e));
+        let agent = Agent::builder()
+            .llm(one_command_llm("echo hello"))
+            .executor(Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) }))
+            .confirmer(Arc::new(MockConfirmer { approve }))
+            .confirm_mode(mode)
+            .event_sink(sink)
+            .risk_scorer(Some(scorer as Arc<dyn crate::risk::RiskScorer>))
+            .arbiter_ssh_context(Some("root@web1".into()))
+            .fleet(fleet)
+            .build()
+            .unwrap();
+        let _ = agent.run("go", &[]).await;
+        let out = events.lock().unwrap().clone();
+        out
+    }
+
+    fn proposal_id_of(events: &[AgentEvent]) -> u64 {
+        events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::CommandProposed { proposal_id, .. } => Some(*proposal_id),
+                _ => None,
+            })
+            .expect("a CommandProposed")
+    }
+
+    #[tokio::test]
+    async fn every_mode_rates_the_proposed_command() {
+        for mode in [
+            CommandConfirmMode::Always,
+            CommandConfirmMode::Allowlist,
+            CommandConfirmMode::Never,
+        ] {
+            let scorer = FakeScorer::new(Ok(83), Duration::ZERO);
+            let events = run_with_scorer(mode, scorer.clone(), true, false).await;
+            let id = proposal_id_of(&events);
+            let scored = events.iter().position(|e| matches!(e,
+                AgentEvent::CommandScored { proposal_id, safety_pct: Some(83), unavailable: false, model, .. }
+                    if *proposal_id == id && model == "fake-decider"));
+            assert!(scored.is_some(), "{mode:?}: no rating in {events:?}");
+            // The rating lands before the terminal event.
+            let finished = events.iter().position(|e| matches!(e, AgentEvent::Finished(_))).unwrap();
+            assert!(scored.unwrap() < finished, "{mode:?}: rating after Finished");
+            assert_eq!(scorer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let input = scorer.inputs.lock().unwrap()[0].clone();
+            assert_eq!(input.command, "echo hello");
+            assert_eq!(input.explanation, "why");
+            assert!(input.target.contains("root@web1"), "{}", input.target);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_rating_never_delays_execution() {
+        // Auto-approved: the command finishes long before the rating arrives,
+        // and the rating still lands — after CommandFinished, before Finished.
+        let scorer = FakeScorer::new(Ok(40), Duration::from_millis(300));
+        let events = run_with_scorer(CommandConfirmMode::Never, scorer, true, false).await;
+        let finished_cmd = events.iter().position(|e| matches!(e, AgentEvent::CommandFinished { .. })).unwrap();
+        let scored = events.iter().position(|e| matches!(e, AgentEvent::CommandScored { .. })).unwrap();
+        let finished = events.iter().position(|e| matches!(e, AgentEvent::Finished(_))).unwrap();
+        assert!(finished_cmd < scored && scored < finished, "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_rating_is_unavailable_and_the_command_still_runs() {
+        let scorer = FakeScorer::new(Err(()), Duration::ZERO);
+        let events = run_with_scorer(CommandConfirmMode::Never, scorer, true, false).await;
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::CommandScored { safety_pct: None, unavailable: true, .. })), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::CommandFinished { denied: false, .. })), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn the_rating_does_not_touch_the_gate() {
+        // A perfectly "safe" rating does not approve a command the user denies,
+        // and a "dangerous" one does not stop a command the mode auto-approves.
+        let events = run_with_scorer(CommandConfirmMode::Always, FakeScorer::new(Ok(100), Duration::ZERO), false, false).await;
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::CommandFinished { denied: true, .. })), "{events:?}");
+        let events = run_with_scorer(CommandConfirmMode::Never, FakeScorer::new(Ok(0), Duration::ZERO), true, false).await;
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::CommandFinished { denied: false, .. })), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn fleet_runs_are_not_rated() {
+        let scorer = FakeScorer::new(Ok(50), Duration::ZERO);
+        let events = run_with_scorer(CommandConfirmMode::Always, scorer.clone(), true, true).await;
+        assert_eq!(scorer.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandScored { .. })));
+    }
+
+    #[tokio::test]
+    async fn no_scorer_no_rating_and_ids_are_unique() {
+        let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> = Arc::default();
+        for _ in 0..2 {
+            let ev = events.clone();
+            let agent = Agent::builder()
+                .llm(one_command_llm("echo hi"))
+                .executor(Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) }))
+                .confirmer(Arc::new(MockConfirmer { approve: true }))
+                .confirm_mode(CommandConfirmMode::Never)
+                .event_sink(Arc::new(move |e| ev.lock().unwrap().push(e)))
+                .build()
+                .unwrap();
+            agent.run("go", &[]).await.unwrap();
+        }
+        let events = events.lock().unwrap();
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandScored { .. })));
+        let ids: Vec<u64> = events.iter().filter_map(|e| match e {
+            AgentEvent::CommandProposed { proposal_id, .. } => Some(*proposal_id),
+            _ => None,
+        }).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "ids are unique across agents");
+    }
+
+    #[tokio::test]
+    async fn no_rating_after_cancellation() {
+        let scorer = FakeScorer::new(Ok(10), Duration::from_secs(5));
+        let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> = Arc::default();
+        let ev = events.clone();
+        let token = CancellationToken::new();
+        // The confirmer cancels the run while the rating is still in flight.
+        struct CancellingConfirmer(CancellationToken);
+        #[async_trait::async_trait]
+        impl CommandConfirmer for CancellingConfirmer {
+            async fn confirm(&self, _c: &str, _e: &str, _d: bool) -> Result<bool> {
+                self.0.cancel();
+                std::future::pending::<()>().await;
+                Ok(false)
+            }
+        }
+        let agent = Agent::builder()
+            .llm(one_command_llm("rm -rf /tmp/x"))
+            .executor(Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) }))
+            .confirmer(Arc::new(CancellingConfirmer(token.clone())))
+            .confirm_mode(CommandConfirmMode::Always)
+            .cancellation(token)
+            .event_sink(Arc::new(move |e| ev.lock().unwrap().push(e)))
+            .risk_scorer(Some(scorer as Arc<dyn crate::risk::RiskScorer>))
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(agent.run("go", &[]).await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(4), "cancel waited for the scorer");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = events.lock().unwrap();
+        assert!(matches!(events.last(), Some(AgentEvent::Cancelled)), "{events:?}");
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandScored { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_while_waiting_for_ratings_aborts_them() {
+        // The loop is done and the agent waits for a slow rating; a cancel
+        // arriving now must not wait the rating out nor let it be emitted.
+        let scorer = FakeScorer::new(Ok(10), Duration::from_secs(5));
+        let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> = Arc::default();
+        let ev = events.clone();
+        let token = CancellationToken::new();
+        let agent = Agent::builder()
+            .llm(one_command_llm("echo hi"))
+            .executor(Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) }))
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .confirm_mode(CommandConfirmMode::Never)
+            .cancellation(token.clone())
+            .event_sink(Arc::new(move |e| ev.lock().unwrap().push(e)))
+            .risk_scorer(Some(scorer as Arc<dyn crate::risk::RiskScorer>))
+            .build()
+            .unwrap();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            token.cancel();
+        });
+        let started = std::time::Instant::now();
+        let _ = agent.run("go", &[]).await;
+        canceller.await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3), "the wait ignored the cancel");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = events.lock().unwrap();
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandScored { .. })), "{events:?}");
     }
 }

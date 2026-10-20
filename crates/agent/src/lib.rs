@@ -5,6 +5,7 @@
 //! - The agent loop that orchestrates LLM ↔ tool execution (Stage 5).
 //! - Tool definitions (`run_command`, `read_file`, `list_dir`, background jobs) (Stage 5).
 //! - Security layer: confirmation, destructive command detection (Stage 5).
+//! - Command safety scoring by a decision model, advisory only (#549).
 //! - Output preprocessors: machine-format command output → typed tables; raw
 //!   text remains the fallback (Stage 2.0, fleet).
 //! - OS-family detection per host, cached for the session (Stage 2.0, fleet).
@@ -45,6 +46,7 @@ pub mod openai_compat;
 pub mod os_probe;
 pub mod password_prompt;
 pub mod preprocess;
+pub mod risk;
 pub mod runbook;
 pub mod security;
 pub mod tools;
@@ -62,6 +64,7 @@ pub use preprocess::{
     PreprocessorRegistry, PsPreprocessor, RawFallback, RpmPreprocessor, SsPreprocessor,
     SystemctlPreprocessor, VersionPreprocessor,
 };
+pub use risk::{build_risk_scorer, DecisionsApiScorer, RiskInput, RiskScore, RiskScorer};
 pub use runbook::{
     generate_fleet_runbook, generate_runbook, FleetIdentifiers, RunbookOutcome, FLEET_RUNBOOK_PROMPT,
     RUNBOOK_SYSTEM_PROMPT,

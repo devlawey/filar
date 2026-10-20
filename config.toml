@@ -44,6 +44,19 @@ connect_secs = 15
 # session. Silent saves (Explain F2, exit) never call the model.
 # save_runbook = true
 
+# ── Command safety rating ────────────────────────────────────────────
+# A decision model rates every command the agent proposes: 0–100%, where
+# 100% = completely safe. Advisory only — it never approves, denies or
+# delays a command, and it is separate from the arbiter. No section = off.
+# The key lives in the OS credential store (or the environment) under the
+# name given by `key_env` — never here; `key_env = ""` = keyless server.
+# [risk_scorer]
+# kind = "decisions"
+# base_url = "https://openrouter.ai/api/alpha"
+# model = "typesafe/jev-1.14"
+# key_env = "FILAR_RISK_API_KEY"
+# timeout_secs = 8              # 1–30
+
 # ── SSH targets ──────────────────────────────────────────────────────
 # "local" (built-in) = commands run on your machine, no SSH needed.
 # Add your servers below. To connect, select the name in the GUI Target dropdown

@@ -11,6 +11,15 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Command safety rating (engine): a decision model configured in
+  `[risk_scorer]` (e.g. `typesafe/jev-1.14` via the Decisions API) rates every
+  command the agent proposes, 0–100% where 100% is safe, in every
+  confirmation mode — asynchronously and without touching the confirmation
+  gate; the key has its own `key_env` (`AgentEvent::CommandScored`,
+  `CommandProposed::proposal_id`) ([#549](https://github.com/devlawey/filar/issues/549)).
+
 ## [2.0.6] - 2026-10-20
 
 ### Added

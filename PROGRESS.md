@@ -10830,3 +10830,39 @@ Ctrl+J и счётчик ops (#545). Полный список — CHANGELOG `[2
 поэтому секция Upgrading не добавлялась; `engine-v2.0.6` поставлен на тот же
 коммит как обычная пара к `v2.0.6`, ссылки на тег в ENGINE_API обновлены.
 Ручной SMOKE Win + Mac — за мейнтейнером (`docs/SMOKE.md`, #298).
+
+## Веха 2.0.7 — оценка безопасности команд decision-моделью (#549–#553)
+
+## #549 — RiskScorer и Decisions API (движок)
+
+**Сделано.** Модуль `filar_agent::risk`: трейт `RiskScorer` (`score(&RiskInput)
+-> RiskScore`, `model_name()`), адаптер `DecisionsApiScorer`
+(`POST {base_url}/decisions`, один вопрос `score` по пяти уровням
+`RISK_LEVELS`, `state` ≤ 4000 символов), `build_risk_scorer` (ключ из
+`SecretProvider` по `key_env`, пусто — без ключа и без редиректов).
+`safety_pct = 100 − score/(N−1)·100`, клэмп; нет `score` — матожидание по
+`probabilities`. В core — `[risk_scorer]` (`RiskScorerConfig`: kind, base_url,
+model, key_env = `FILAR_RISK_API_KEY`, timeout_secs = 8); невалидная секция
+при `Config::load` выключается (`risk_scorer_error`; сама секция остаётся,
+чтобы сохранение конфига из GUI её не стёрло), приложение стартует;
+использовать — через `Config::active_risk_scorer()`. `timeout_secs` — 1..=30.
+
+**Агент.** `AgentBuilder::risk_scorer`. После `CommandProposed` — отдельная
+задача скоринга для каждой команды агента во всех режимах (кроме флота и
+`job_status`/`list_jobs`); ни гейт, ни выполнение её не ждут. Результат —
+`AgentEvent::CommandScored`, ошибка → `unavailable: true`. Незавершённые
+оценки дожидаются перед `Finished`/`Error` (не позже терминального события)
+и обрываются при отмене, в том числе пришедшей во время ожидания: задачи
+абортируются и дожидаются, после `Cancelled` событий нет. Каждая оценка на
+стороне агента ограничена 32 с, даже если у реализации скорера нет таймаута.
+
+**Контракты.** `CommandProposed` получил `proposal_id: u64` (уникален в
+процессе: TUI строит агента на каждый промпт) — ломает ручное построение
+события и паттерны без `..`; Upgrading в `docs/ENGINE_API.md`.
+`CommandExecutor` и `LlmClient` не менялись. Арбитр не тронут.
+
+**Не проверено вживую.** Ключа OpenRouter в окружении агента нет: Decisions
+API проверен mock-сервером (формат запроса, разбор, ошибки). Формат ответа
+взят из документации OpenRouter (API в статусе alpha).
+
+**Next:** #550 (адаптер chat + logprobs), затем #551 (показ в TUI и подключение скорера в runner).
