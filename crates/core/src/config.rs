@@ -130,10 +130,15 @@ pub const MAX_RISK_SCORER_TIMEOUT_SECS: u64 = 30;
 
 /// Protocol the safety scorer speaks (`[risk_scorer].kind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RiskScorerKind {
     /// A decision model behind the Decisions API (`POST {base_url}/decisions`),
     /// e.g. `typesafe/jev-1.14` on OpenRouter.
     Decisions,
+    /// Any OpenAI-compatible chat model whose server returns `logprobs`
+    /// (`POST {base_url}/chat/completions`): the level distribution is read
+    /// from the log-probabilities of a one-token answer (#550).
+    ChatLogprobs,
 }
 
 impl RiskScorerKind {
@@ -141,6 +146,7 @@ impl RiskScorerKind {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim() {
             "decisions" => Some(Self::Decisions),
+            "chat-logprobs" => Some(Self::ChatLogprobs),
             _ => None,
         }
     }
@@ -154,10 +160,11 @@ impl RiskScorerKind {
 /// only the name it is looked up under in the environment / OS keyring.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RiskScorerConfig {
-    /// Protocol: `"decisions"` (the default).
+    /// Protocol: `"decisions"` (the default) or `"chat-logprobs"`.
     #[serde(default = "default_risk_kind")]
     pub kind: String,
-    /// API base URL, e.g. `https://openrouter.ai/api/alpha`.
+    /// API base URL, e.g. `https://openrouter.ai/api/alpha` for the Decisions
+    /// API, or `http://127.0.0.1:8080/v1` for a local chat server.
     #[serde(default)]
     pub base_url: String,
     /// Model identifier, e.g. `typesafe/jev-1.14`.
@@ -191,7 +198,7 @@ impl RiskScorerConfig {
     pub fn validate(&self) -> Result<RiskScorerKind> {
         let kind = RiskScorerKind::parse(&self.kind).ok_or_else(|| {
             CoreError::Config(format!(
-                "[risk_scorer] unknown kind '{}' (expected \"decisions\")",
+                "[risk_scorer] unknown kind '{}' (expected \"decisions\" or \"chat-logprobs\")",
                 self.kind
             ))
         })?;
@@ -1126,6 +1133,23 @@ model = "typesafe/jev-1.14"
         assert_eq!(rs.key_env, crate::secrets::env_vars::RISK_API_KEY);
         assert_eq!(rs.timeout_secs, DEFAULT_RISK_SCORER_TIMEOUT_SECS);
         assert_eq!(rs.validate().unwrap(), RiskScorerKind::Decisions);
+    }
+
+    #[test]
+    fn risk_scorer_chat_logprobs_kind_parses() {
+        let cfg = load_str(
+            r#"
+[risk_scorer]
+kind = "chat-logprobs"
+base_url = "http://127.0.0.1:8080/v1"
+model = "qwen2.5-7b-instruct"
+key_env = ""
+"#,
+        );
+        let rs = cfg.active_risk_scorer().expect("valid");
+        assert_eq!(rs.validate().unwrap(), RiskScorerKind::ChatLogprobs);
+        assert_eq!(RiskScorerKind::parse(" decisions "), Some(RiskScorerKind::Decisions));
+        assert_eq!(RiskScorerKind::parse("chat"), None);
     }
 
     #[test]

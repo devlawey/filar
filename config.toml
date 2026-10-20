@@ -56,6 +56,16 @@ connect_secs = 15
 # model = "typesafe/jev-1.14"
 # key_env = "FILAR_RISK_API_KEY"
 # timeout_secs = 8              # 1–30
+#
+# Any OpenAI-compatible chat model can rate commands too, if its server
+# returns `logprobs` (llama.cpp server, vLLM and the like): the model answers
+# with one digit and the distribution comes from that token's logprobs.
+# A server without logprobs gives "unavailable", never a made-up number.
+# [risk_scorer]
+# kind = "chat-logprobs"
+# base_url = "http://127.0.0.1:8080/v1"
+# model = "qwen2.5-7b-instruct"
+# key_env = ""
 
 # ── SSH targets ──────────────────────────────────────────────────────
 # "local" (built-in) = commands run on your machine, no SSH needed.
