@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [2.0.6] - 2026-10-20
+
 ### Added
 
 - File panels: create a folder in the active panel's directory with F7 or
@@ -1404,7 +1406,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v2.0.5...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v2.0.6...HEAD
+[2.0.6]: https://github.com/devlawey/filar/compare/v2.0.5...v2.0.6
 [2.0.5]: https://github.com/devlawey/filar/compare/v2.0.4...v2.0.5
 [2.0.4]: https://github.com/devlawey/filar/compare/v2.0.3...v2.0.4
 [2.0.3]: https://github.com/devlawey/filar/compare/v2.0.2...v2.0.3
