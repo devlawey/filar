@@ -10918,3 +10918,29 @@ API с задержкой 1.5 с): `always` — окно сразу с `Safety: 
 мейнтейнером (ключа в окружении нет).
 
 **Next:** #552 (настройка в лаунчере).
+
+## #552 — настройка оценки безопасности в лаунчере
+
+**Сделано.** `RiskScorerDraft` в `filar-gui`: включено, тип (Decisions /
+chat + logprobs), адрес (для Decisions подставляется OpenRouter), модель,
+«no key» (→ `key_env = ""`, имя запоминается), имя ключа, маскированный ключ
+(при Launch → `save_secret(key_env, …)`; статус «saved»/«not set» читается из
+keyring один раз при старте), пороги в «Advanced»; `timeout_secs` переносится
+из `config.toml` без правки. `to_config()` валидирует (адрес, модель, пороги
+0–100, `danger ≤ warn`, затем `RiskScorerConfig::validate`) и вызывается в
+`validate_launch`. При Launch: `[risk_scorer]` пишется в `config.toml`
+(выключено — секции нет) и уходит в `LaunchConfig.risk_scorer:
+Option<RiskScorerLaunch::{Off, On{config}}>` — без ключа; `None` (старый
+pending_launch) — «не сказано», `filar-app` берёт `config.toml`.
+`config_with_launch_risk_scorer` в `main.rs` применяет выбор лаунчера
+(невалидный `On` → выключено с причиной). У `RiskScorerDraft` нет `Debug` —
+в нём набранный ключ. Строки лаунчера — только английские, как и остальной
+лаунчер.
+
+**Проверено.** GUI в окружении агента не запускается (нет дисплея) — сам
+лаунчер за мейнтейнером (`docs/SMOKE.md`). Путь лаунчер → TUI проверен
+бинарником: `pending_launch.json` с `risk_scorer: on` при `config.toml` без
+секции → в окне `Safety: 15% (typesafe/jev-1.14)`; `off` при `config.toml` с
+секцией → строки `Safety` нет.
+
+**Next:** #553 (eval-набор).
