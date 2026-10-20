@@ -811,6 +811,40 @@ fn drive_file_panels(
                 target,
                 generation,
             } => spawn_panel_open(ctx, side, generation, PanelOpen::Typed(target), None),
+            PanelRequest::CreateDir { side, dir, name } => {
+                use crate::file_panels::PanelEvent;
+                let conn = sides[side_index(side)].clone();
+                let tx = ctx.tx.clone();
+                let Some(conn) = conn else {
+                    let _ = tx.send(PanelMsg::Event(PanelEvent::DirCreated {
+                        side,
+                        dir,
+                        name,
+                        result: Err("the panel lost its connection — refresh it (r)".into()),
+                    }));
+                    continue;
+                };
+                tokio::spawn(async move {
+                    let path = conn.ft.path_style().join(&dir, &name);
+                    // Only through the side's `create_dir` (SFTP `mkdir` on a
+                    // host): nothing runs in a shell (#546, AGENTS.md #531).
+                    let result = if conn.read_only {
+                        Err("the host is read-only".to_string())
+                    } else {
+                        match conn.ft.stat(&path).await {
+                            Ok(Some(_)) => Err("already exists".to_string()),
+                            Ok(None) => conn.ft.create_dir(&path).await.map_err(|e| e.to_string()),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    };
+                    let _ = tx.send(PanelMsg::Event(PanelEvent::DirCreated {
+                        side,
+                        dir,
+                        name,
+                        result,
+                    }));
+                });
+            }
             PanelRequest::List {
                 side,
                 path,

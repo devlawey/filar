@@ -60,9 +60,17 @@ pub(crate) fn render_file_panels(f: &mut Frame, app: &mut App, area: Rect) {
     let hint = fit_hint(rows[2].width as usize);
     f.render_widget(Paragraph::new(Span::styled(hint, theme.muted())), rows[2]);
 
-    if let Some(PanelDialog::ConfirmCopy(plan)) = fp.dialog.as_ref() {
-        let from = fp.panel(plan.from).label.clone();
-        render_confirm(f, theme, plan, &from, area);
+    match fp.dialog.as_ref() {
+        Some(PanelDialog::ConfirmCopy(plan)) => {
+            let from = fp.panel(plan.from).label.clone();
+            render_confirm(f, theme, plan, &from, area);
+        }
+        Some(PanelDialog::NewFolder { side, input, error }) => {
+            let p = fp.panel(*side);
+            let place = format!("{}:{}", p.label, p.path);
+            render_new_folder(f, theme, &place, input, error.as_deref(), area);
+        }
+        None => {}
     }
     if let Some(prompt) = fp.prompt.as_ref() {
         render_prompt(f, theme, prompt, area);
@@ -284,6 +292,42 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+/// "New folder in host:/dir" with the name being typed (#546).
+fn render_new_folder(
+    f: &mut Frame,
+    theme: &crate::ui::Theme,
+    place: &str,
+    input: &str,
+    error: Option<&str>,
+    area: Rect,
+) {
+    let width = 72.min(area.width.saturating_sub(4));
+    let inner = width.saturating_sub(4) as usize;
+    let rect = centered(area, width, 7);
+    f.render_widget(Clear, rect);
+    let lines = vec![
+        Line::from(Span::styled(
+            truncate_left(&format!("in {place}"), inner),
+            Style::default().fg(theme.fg),
+        )),
+        Line::from(Span::styled(
+            truncate_left(&format!("> {input}_"), inner),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        )),
+        match error {
+            Some(e) => Line::from(Span::styled(truncate(e, inner), theme.warning_fg())),
+            None => Line::from(""),
+        },
+        Line::from(Span::styled("Enter create   Esc cancel", theme.muted())),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.bg))
+        .title(" New folder ");
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
 /// Masked password / passphrase box over the panels.
 fn render_prompt(f: &mut Frame, theme: &crate::ui::Theme, prompt: &SecretPrompt, area: Rect) {
     let width = 60.min(area.width.saturating_sub(4));
@@ -330,9 +374,10 @@ fn render_prompt(f: &mut Frame, theme: &crate::ui::Theme, prompt: &SecretPrompt,
 
 /// The longest key hint that fits the width.
 fn fit_hint(width: usize) -> String {
-    const VARIANTS: [&str; 4] = [
-        " Tab panel  Enter open  Bksp up  Space mark  F5/c copy  r refresh  Ctrl+O host  Esc close ",
-        " Tab  Enter  Bksp  Space mark  F5/c copy  r  ^O host  Esc ",
+    const VARIANTS: [&str; 5] = [
+        " Tab panel  Enter open  Bksp up  Space mark  F5/c copy  F7/m folder  r refresh  Ctrl+O host  Esc close ",
+        " Tab  Enter  Bksp  Space mark  F5/c copy  F7/m folder  r  ^O host  Esc ",
+        " Tab  Enter  Bksp  Space  F5/c copy  F7/m folder  Esc ",
         " Tab  Enter  Bksp  r  ^O host  Esc ",
         " Esc ",
     ];
