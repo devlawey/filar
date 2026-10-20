@@ -10898,8 +10898,8 @@ HTTP-клиент и POST вынесены в общие хелперы (`scorer
 В `App`: `risk_scorer_on`, `risk_thresholds`; в `Session`: `safety_scores`
 (`proposal_id` → `SafetyScore::{Pending, Ready, Unavailable}`),
 `pending_proposal_id`, `block_proposals` (индекс блока → id + команда;
-команда сверяется при рендере, чтобы после замены истории не было чужого
-бейджа), `risk_ratings`/`risk_cost_usd`. `CommandProposed` → `Pending` (если
+команда сверяется при рендере; при сжатии истории индексы пересчитываются,
+при восстановлении сессии карты очищаются), `risk_ratings`/`risk_cost_usd`. `CommandProposed` → `Pending` (если
 скорер есть, не флот, не `background_job_status`/`list_background_jobs` —
 как в агенте); `CommandScored` → результат + bump `message_rev`.
 

@@ -1997,6 +1997,15 @@ impl App {
         self.active_session_mut().folded_history.extend(folded);
         self.active_session_mut().messages = compacted;
         self.active_session_mut().pending_compaction = None;
+        // Safety badges follow their blocks (#551): the kept tail moves up by
+        // the folded head, less the summary that replaces it.
+        let shift = before - after;
+        let links = std::mem::take(&mut self.active_session_mut().block_proposals);
+        self.active_session_mut().block_proposals = links
+            .into_iter()
+            .filter(|(idx, _)| *idx >= boundary)
+            .map(|(idx, link)| (idx - shift, link))
+            .collect();
         // The stored figure described the context that was just folded away.
         // Left in place, the status bar would show the pre-compaction fill —
         // and its warning colour — until the next response; `None` reads as
@@ -2744,6 +2753,10 @@ impl App {
         self.selection = None;
 
         self.messages = session.messages;
+        // Ratings belong to the replaced history's blocks (#551).
+        self.block_proposals.clear();
+        self.safety_scores.clear();
+        self.pending_proposal_id = None;
         // Restored alongside the context it was folded out of, so reopening a
         // compacted session does not quietly shorten its transcript. Sessions
         // saved before #379 carry none, which is simply an empty archive.
@@ -15247,5 +15260,27 @@ mod tests {
             tool: None,
         };
         assert!(app.safety_badges().is_empty());
+    }
+
+    #[test]
+    fn badges_follow_their_blocks_through_compaction() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Never);
+        app.risk_scorer_on = true;
+        app.messages.clear();
+        app.messages.push(ChatBlock::User("old".into()));
+        app.messages.push(ChatBlock::Agent("old".into()));
+        propose(&mut app, 601, "ls", "run_command");
+        finished(&mut app, "ls"); // index 2 — folded away
+        app.messages.push(ChatBlock::User("new".into()));
+        propose(&mut app, 602, "ls", "run_command");
+        finished(&mut app, "ls"); // index 4 — kept
+        scored(&mut app, 601, Some(10));
+        scored(&mut app, 602, Some(90));
+        app.active_session_mut().pending_compaction = Some(3);
+        app.apply_compaction(3, "summary".into());
+        // [Summary, User(new), Command(ls)] — the kept block is now index 2.
+        let badges = app.safety_badges();
+        assert_eq!(badges.len(), 1, "{badges:?}");
+        assert_eq!(badges.get(&2).map(|b| b.0.as_str()), Some("90%"));
     }
 }
