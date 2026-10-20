@@ -123,6 +123,14 @@ fn default_arbiter_enabled() -> bool {
 /// Default per-request timeout of the safety scorer, seconds.
 pub const DEFAULT_RISK_SCORER_TIMEOUT_SECS: u64 = 8;
 
+/// Default `warn_below`: a safety rating under this many percent is shown
+/// as a warning (#551).
+pub const DEFAULT_RISK_WARN_BELOW: u8 = 70;
+
+/// Default `danger_below`: a safety rating under this many percent is shown
+/// as dangerous (#551).
+pub const DEFAULT_RISK_DANGER_BELOW: u8 = 40;
+
 /// Largest allowed per-request timeout of the safety scorer, seconds. The
 /// agent waits for in-flight ratings before it finishes, so this also bounds
 /// how long a slow scorer can hold the final answer back.
@@ -177,6 +185,34 @@ pub struct RiskScorerConfig {
     /// Per-request timeout, seconds.
     #[serde(default = "default_risk_timeout_secs")]
     pub timeout_secs: u64,
+    /// A rating below this percentage is shown as a warning (display only).
+    #[serde(default = "default_risk_warn_below")]
+    pub warn_below: u8,
+    /// A rating below this percentage is shown as dangerous (display only).
+    #[serde(default = "default_risk_danger_below")]
+    pub danger_below: u8,
+}
+
+impl Default for RiskScorerConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_risk_kind(),
+            base_url: String::new(),
+            model: String::new(),
+            key_env: default_risk_key_env(),
+            timeout_secs: DEFAULT_RISK_SCORER_TIMEOUT_SECS,
+            warn_below: DEFAULT_RISK_WARN_BELOW,
+            danger_below: DEFAULT_RISK_DANGER_BELOW,
+        }
+    }
+}
+
+fn default_risk_warn_below() -> u8 {
+    DEFAULT_RISK_WARN_BELOW
+}
+
+fn default_risk_danger_below() -> u8 {
+    DEFAULT_RISK_DANGER_BELOW
 }
 
 /// Default `key_env` of the safety scorer.
@@ -216,7 +252,17 @@ impl RiskScorerConfig {
                 "[risk_scorer] timeout_secs must be between 1 and {MAX_RISK_SCORER_TIMEOUT_SECS}"
             )));
         }
+        if self.warn_below > 100 || self.danger_below > self.warn_below {
+            return Err(CoreError::Config(
+                "[risk_scorer] need 0 <= danger_below <= warn_below <= 100".into(),
+            ));
+        }
         Ok(kind)
+    }
+
+    /// `(warn_below, danger_below)` for colouring ratings.
+    pub fn thresholds(&self) -> (u8, u8) {
+        (self.warn_below, self.danger_below)
     }
 }
 
@@ -1132,6 +1178,7 @@ model = "typesafe/jev-1.14"
         assert_eq!(rs.kind, "decisions");
         assert_eq!(rs.key_env, crate::secrets::env_vars::RISK_API_KEY);
         assert_eq!(rs.timeout_secs, DEFAULT_RISK_SCORER_TIMEOUT_SECS);
+        assert_eq!(rs.thresholds(), (DEFAULT_RISK_WARN_BELOW, DEFAULT_RISK_DANGER_BELOW));
         assert_eq!(rs.validate().unwrap(), RiskScorerKind::Decisions);
     }
 
@@ -1177,6 +1224,8 @@ timeout_secs = 3
             ("[risk_scorer]\nbase_url = \"ftp://x\"\nmodel = \"m\"\n", "base_url"),
             ("[risk_scorer]\nbase_url = \"https://x\"\nmodel = \"m\"\ntimeout_secs = 0\n", "timeout_secs"),
             ("[risk_scorer]\nbase_url = \"https://x\"\nmodel = \"m\"\ntimeout_secs = 31\n", "timeout_secs"),
+            ("[risk_scorer]\nbase_url = \"https://x\"\nmodel = \"m\"\nwarn_below = 30\ndanger_below = 50\n", "danger_below"),
+            ("[risk_scorer]\nbase_url = \"https://x\"\nmodel = \"m\"\nwarn_below = 120\n", "warn_below"),
         ] {
             let cfg = load_str(toml);
             assert!(cfg.active_risk_scorer().is_none(), "{toml}");

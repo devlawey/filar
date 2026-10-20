@@ -269,6 +269,60 @@ fn check_profile_api_key(
     ))
 }
 
+/// The scorer, the display thresholds `(warn_below, danger_below)` and the
+/// start-up note (if the scorer cannot be used).
+type LaunchRiskScorer = (Option<Arc<dyn filar_agent::RiskScorer>>, (u8, u8), Option<String>);
+
+/// The command safety scorer of `config` (#549/#551), with the note to show
+/// at start-up when a configured scorer cannot be used.
+///
+/// The key is looked up like a profile's: in-memory `sp` → OS credential
+/// store → environment, under the section's own `key_env`, and cached in
+/// `sp` (so command output that echoes it is masked). Called once during
+/// start-up, before the TUI loop runs (the keyring is synchronous). Neither the result nor
+/// the note ever carries the key.
+fn build_risk_scorer_for_launch(
+    config: &filar_core::Config,
+    sp: &filar_core::StaticSecretProvider,
+) -> LaunchRiskScorer {
+    let default_thresholds = (
+        filar_core::DEFAULT_RISK_WARN_BELOW,
+        filar_core::DEFAULT_RISK_DANGER_BELOW,
+    );
+    if let Some(err) = &config.risk_scorer_error {
+        return (None, default_thresholds, Some(format!("Safety rating off: {err}")));
+    }
+    let Some(rs) = config.active_risk_scorer() else {
+        return (None, default_thresholds, None);
+    };
+    let key_env = rs.key_env.trim();
+    if !key_env.is_empty() {
+        let non_empty = |k: filar_core::Result<String>| k.ok().filter(|k| !k.is_empty());
+        let found = non_empty(sp.get(key_env))
+            .or_else(|| non_empty(filar_core::KeyringSecretProvider::new().get(key_env)))
+            .or_else(|| non_empty(filar_core::EnvSecretProvider::new().get(key_env)));
+        match found {
+            Some(key) => sp.insert(key_env, &key),
+            None => {
+                return (
+                    None,
+                    rs.thresholds(),
+                    Some(format!(
+                        "Safety rating off: no key found for the risk scorer (checked memory, OS store, env '{key_env}')."
+                    )),
+                )
+            }
+        }
+    }
+    match filar_agent::build_risk_scorer(rs, sp) {
+        Ok(scorer) => {
+            info!(model = %rs.model, "risk scorer initialised");
+            (Some(scorer), rs.thresholds(), None)
+        }
+        Err(e) => (None, rs.thresholds(), Some(format!("Safety rating off: {e}"))),
+    }
+}
+
 /// The API key of `profile`: in-memory `sp` → OS credential store →
 /// environment, each under [`secrets::llm_key_lookup_names`] of its
 /// `key_env` (the default name falls back to its legacy one, #490). A key
@@ -727,6 +781,10 @@ async fn run() -> anyhow::Result<()> {
         LoadedSession::default()
     };
 
+    // ── Command safety scorer (#549/#551) ──────────────────────────────
+    let (risk_scorer, risk_thresholds, risk_scorer_note) =
+        build_risk_scorer_for_launch(&config, &secret_provider);
+
     // ── Launch TUI ─────────────────────────────────────────────────────
     let default_profile_name =
         resolve_startup_profile(&launch_profiles, cli_llm_name.as_deref(), gui_selected_profile.as_deref());
@@ -779,6 +837,9 @@ async fn run() -> anyhow::Result<()> {
         // GUI: from pending_launch (including explicit None = same as session).
         // CLI: from config.toml (see tuple construction above).
         arbiter_profile: launch_arbiter_profile,
+        risk_scorer,
+        risk_thresholds,
+        risk_scorer_note,
     };
 
     info!("launching TUI");

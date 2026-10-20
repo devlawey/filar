@@ -31,6 +31,7 @@ pub use config::{
     DEFAULT_COMMAND_TIMEOUT_SECS,
     DEFAULT_COMPACT_AT_TOKENS, DEFAULT_MAX_TOKENS,
     RiskScorerConfig, RiskScorerKind, DEFAULT_RISK_SCORER_TIMEOUT_SECS, MAX_RISK_SCORER_TIMEOUT_SECS,
+    DEFAULT_RISK_WARN_BELOW, DEFAULT_RISK_DANGER_BELOW,
 };
 pub use error::{CoreError, Result};
 pub use fleet_checks::{

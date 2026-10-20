@@ -171,6 +171,70 @@ pub struct PendingConfirm {
     pub radius: Vec<String>,
     /// The host list is expanded in the dialog.
     pub radius_expanded: bool,
+    /// `proposal_id` of the command, to show its safety rating (#551).
+    pub proposal_id: Option<u64>,
+}
+
+/// Safety rating of one proposed command by the risk scorer (#551).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SafetyScore {
+    /// Asked for, not answered yet.
+    Pending,
+    /// 0–100, where 100 = completely safe.
+    Ready {
+        pct: u8,
+        confidence: Option<f32>,
+        model: String,
+    },
+    /// The scorer could not rate it (timeout, HTTP error, …).
+    Unavailable { model: String },
+}
+
+/// How a safety percentage reads against the configured thresholds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetyLevel {
+    /// At or above `warn_below`.
+    Safe,
+    /// Between `danger_below` and `warn_below`.
+    Warn,
+    /// Below `danger_below`.
+    Danger,
+    /// Pending or unavailable.
+    Muted,
+}
+
+/// Confidence below which the percentage is marked as approximate (`~`).
+pub const LOW_SAFETY_CONFIDENCE: f32 = 0.5;
+
+impl SafetyScore {
+    /// Short label: `88%`, `~62%`, `rating…`, `unavailable`.
+    pub fn label(&self) -> String {
+        match self {
+            SafetyScore::Pending => "rating…".to_string(),
+            SafetyScore::Ready { pct, confidence, .. } => {
+                let approx = matches!(confidence, Some(c) if *c < LOW_SAFETY_CONFIDENCE);
+                format!("{}{pct}%", if approx { "~" } else { "" })
+            }
+            SafetyScore::Unavailable { .. } => "unavailable".to_string(),
+        }
+    }
+
+    /// Level for colouring, given `(warn_below, danger_below)`.
+    pub fn level(&self, thresholds: (u8, u8)) -> SafetyLevel {
+        match self {
+            SafetyScore::Ready { pct, .. } => {
+                let (warn_below, danger_below) = thresholds;
+                if *pct < danger_below {
+                    SafetyLevel::Danger
+                } else if *pct < warn_below {
+                    SafetyLevel::Warn
+                } else {
+                    SafetyLevel::Safe
+                }
+            }
+            _ => SafetyLevel::Muted,
+        }
+    }
 }
 
 /// Pending arbiter audit result, stored until `ConfirmationRequest` merges it.
@@ -201,6 +265,7 @@ impl PendingConfirm {
             audit_unavailable: false,
             radius: Vec::new(),
             radius_expanded: false,
+            proposal_id: None,
         }
     }
 }
@@ -364,6 +429,11 @@ pub struct App {
     pub save_dir: Option<std::path::PathBuf>,
     /// Whether Ctrl+S also generates a runbook (#401, `save_runbook`).
     pub runbook_enabled: bool,
+    /// A command safety scorer is configured (#551): proposals show
+    /// "rating…" until their `CommandScored` arrives.
+    pub risk_scorer_on: bool,
+    /// `(warn_below, danger_below)` for colouring safety ratings.
+    pub risk_thresholds: (u8, u8),
     /// Runbook job armed by the save currently in flight, if any.
     pub runbook_armed: Option<RunbookArmed>,
     /// A runbook the overlay is asking about — "create one? y/n" (#481).
@@ -640,6 +710,18 @@ pub struct Session {
     pub arbiter_tokens_out: u64,
     /// Cumulative arbiter cost in USD.
     pub arbiter_cost_usd: Option<f64>,
+    /// `proposal_id` of the pending proposal (#551).
+    pub pending_proposal_id: Option<u64>,
+    /// Safety ratings by `proposal_id` (#551).
+    pub safety_scores: HashMap<u64, SafetyScore>,
+    /// Command blocks that have a rating: message index → (`proposal_id`,
+    /// command). The command is checked at render time, so a stale index
+    /// after the history is replaced shows nothing rather than a wrong badge.
+    pub block_proposals: HashMap<usize, (u64, String)>,
+    /// Safety ratings received in this session (for F1).
+    pub risk_ratings: u64,
+    /// Their cost in USD, when reported.
+    pub risk_cost_usd: Option<f64>,
     /// Command confirmation mode for this tab (per-session, toggled via F2).
     pub confirm_mode: CommandConfirmMode,
     /// Previous confirm mode (to toggle back from Explain via F2).
@@ -712,6 +794,11 @@ impl App {
             save_tx: None,
             save_dir: None,
             runbook_enabled: true,
+            risk_scorer_on: false,
+            risk_thresholds: (
+                filar_core::DEFAULT_RISK_WARN_BELOW,
+                filar_core::DEFAULT_RISK_DANGER_BELOW,
+            ),
             runbook_armed: None,
             runbook_offer: None,
             runbook_offer_md: None,
@@ -1029,6 +1116,11 @@ impl Session {
             arbiter_tokens_in: 0,
             arbiter_tokens_out: 0,
             arbiter_cost_usd: None,
+            pending_proposal_id: None,
+            safety_scores: HashMap::new(),
+            block_proposals: HashMap::new(),
+            risk_ratings: 0,
+            risk_cost_usd: None,
             confirm_mode,
             prev_confirm_mode: CommandConfirmMode::Allowlist,
             transcript_path: None,
@@ -4938,6 +5030,57 @@ impl App {
         })
     }
 
+    /// Whether a proposal of `tool` will get a safety rating (#551): a
+    /// scorer is configured, this is not a fleet run, and the tool runs a
+    /// command (job bookkeeping is not rated) — mirrors the agent.
+    fn expects_safety_rating(&self, tool: &filar_core::ToolInvocation) -> bool {
+        self.risk_scorer_on
+            && !self.in_fleet()
+            && tool.name != filar_agent::tools::TOOL_BACKGROUND_JOB_STATUS
+            && tool.name != filar_agent::tools::TOOL_LIST_BACKGROUND_JOBS
+    }
+
+    /// Link the command block at `idx` to the pending proposal's rating, when
+    /// it is that proposal's block.
+    fn link_block_to_proposal(&mut self, idx: usize, command: &str) {
+        let matches = self
+            .pending_proposal
+            .as_ref()
+            .is_some_and(|(cmd, _, _)| cmd == command);
+        if let (true, Some(pid)) = (matches, self.pending_proposal_id) {
+            self.block_proposals.insert(idx, (pid, command.to_string()));
+        }
+    }
+
+    /// The safety rating shown for the block at `idx`, if any (#551).
+    pub fn block_safety(&self, idx: usize) -> Option<&SafetyScore> {
+        let (pid, cmd) = self.block_proposals.get(&idx)?;
+        match self.messages.get(idx) {
+            Some(ChatBlock::Command { command, .. }) if command == cmd => {
+                self.safety_scores.get(pid)
+            }
+            _ => None,
+        }
+    }
+
+    /// Safety badges of the active session's command blocks, for the chat
+    /// layout: message index → (label, level).
+    pub fn safety_badges(&self) -> HashMap<usize, (String, SafetyLevel)> {
+        self.block_proposals
+            .keys()
+            .filter_map(|idx| {
+                self.block_safety(*idx)
+                    .map(|s| (*idx, (s.label(), s.level(self.risk_thresholds))))
+            })
+            .collect()
+    }
+
+    /// The safety rating of the command in the confirmation dialog, if any.
+    pub fn confirm_safety(&self) -> Option<&SafetyScore> {
+        let pid = self.pending_confirm.as_ref()?.proposal_id?;
+        self.safety_scores.get(&pid)
+    }
+
     /// Respond to a pending confirmation request.
     fn respond_to_confirmation(&mut self, approved: bool) {
         if let Some(confirm) = self.pending_confirm.take() {
@@ -4947,6 +5090,7 @@ impl App {
                 .as_ref()
                 .filter(|(cmd, _, _)| *cmd == confirm.command)
                 .map(|(_, _, tool)| tool.clone());
+            let command = confirm.command.clone();
             self.push_message(ChatBlock::Command {
                 command: confirm.command,
                 explanation: confirm.explanation,
@@ -4954,6 +5098,10 @@ impl App {
                 approved,
                 tool,
             });
+            if let Some(pid) = confirm.proposal_id {
+                let idx = self.messages.len() - 1;
+                self.block_proposals.insert(idx, (pid, command));
+            }
             self.mode = AppMode::Thinking;
             // Clear modal hit-test state so stale button areas don't swallow clicks.
             self.confirm_button_areas.clear();
@@ -5081,13 +5229,42 @@ impl App {
                     auto_scroll = self.scroll == 0;
                 }
                 filar_agent::AgentEvent::CommandProposed {
+                    proposal_id,
                     command,
                     explanation,
                     tool,
                     ..
                 } => {
+                    if self.expects_safety_rating(&tool) {
+                        self.safety_scores.insert(proposal_id, SafetyScore::Pending);
+                    }
                     let explanation = self.with_fleet_radius(explanation);
                     self.pending_proposal = Some((command, explanation, tool));
+                    self.pending_proposal_id = Some(proposal_id);
+                }
+                filar_agent::AgentEvent::CommandScored {
+                    proposal_id,
+                    safety_pct,
+                    confidence,
+                    model,
+                    cost_usd,
+                    unavailable,
+                } => {
+                    let score = match safety_pct {
+                        Some(pct) if !unavailable => SafetyScore::Ready { pct, confidence, model },
+                        _ => SafetyScore::Unavailable { model },
+                    };
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        s.safety_scores.insert(proposal_id, score);
+                        s.risk_ratings += 1;
+                        if let Some(c) = cost_usd {
+                            let total = s.risk_cost_usd.unwrap_or(0.0) + c;
+                            s.risk_cost_usd = Some((total * 1_000_000.0).round() / 1_000_000.0);
+                        }
+                        // The badge is part of the cached chat layout.
+                        s.message_rev = s.message_rev.wrapping_add(1);
+                    }
+                    auto_scroll = self.scroll == 0;
                 }
                 filar_agent::AgentEvent::CommandAudited {
                     verdict,
@@ -5136,7 +5313,10 @@ impl App {
                             updated = true;
                             self.message_rev = self.message_rev.wrapping_add(1);
                         }
-                        if !updated {
+                        if updated {
+                            // Approved through the dialog: the block was
+                            // linked to its rating when it was pushed.
+                        } else {
                             self.push_message(ChatBlock::Command {
                                 command: command.clone(),
                                 explanation,
@@ -5144,6 +5324,8 @@ impl App {
                                 approved: true,
                                 tool,
                             });
+                            let idx = self.messages.len() - 1;
+                            self.link_block_to_proposal(idx, &command);
                         }
                     } else {
                         // A denial the user did not make carries its reason
@@ -5158,6 +5340,7 @@ impl App {
                         auto_scroll = self.scroll == 0;
                     }
                     self.pending_proposal = None;
+                    self.pending_proposal_id = None;
                     // Save transcript if in Explain mode.
                     self.save_transcript_silent();
                 }
@@ -5267,6 +5450,11 @@ impl App {
                 // composition — the same snapshot the fleet executor runs
                 // the command on.
                 pending.radius = self.fleet_radius();
+                pending.proposal_id = self
+                    .pending_proposal
+                    .as_ref()
+                    .filter(|(cmd, _, _)| *cmd == command)
+                    .and(self.pending_proposal_id);
                 pending.explanation = self.with_fleet_radius(pending.explanation);
                 self.pending_confirm = Some(pending);
                 self.mode = AppMode::Confirming;
@@ -14927,5 +15115,137 @@ mod tests {
             app.operations.iter().all(|op| op.id != "copy-1"),
             "a finished copy leaves Ctrl+J (#545)"
         );
+    }
+
+    // ── Safety rating (#551) ─────────────────────────────────────────
+
+    fn propose(app: &mut App, id: u64, command: &str, tool: &str) {
+        let session_id = app.sessions[app.active].id;
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id,
+            event: filar_agent::AgentEvent::CommandProposed {
+                proposal_id: id,
+                command: command.into(),
+                explanation: "why".into(),
+                destructive: false,
+                tool: filar_core::ToolInvocation {
+                    name: tool.into(),
+                    arguments: serde_json::json!({ "command": command }),
+                },
+            },
+        });
+    }
+
+    fn scored(app: &mut App, id: u64, pct: Option<u8>) {
+        let session_id = app.sessions[app.active].id;
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id,
+            event: filar_agent::AgentEvent::CommandScored {
+                proposal_id: id,
+                safety_pct: pct,
+                confidence: Some(0.9),
+                model: "jev".into(),
+                cost_usd: Some(0.0001),
+                unavailable: pct.is_none(),
+            },
+        });
+    }
+
+    fn finished(app: &mut App, command: &str) {
+        let session_id = app.sessions[app.active].id;
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id,
+            event: filar_agent::AgentEvent::CommandFinished {
+                command: command.into(),
+                output: "ok".into(),
+                denied: false,
+            },
+        });
+    }
+
+    #[test]
+    fn the_dialog_opens_at_once_and_fills_in_the_rating() {
+        use crossterm::event::KeyCode;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.risk_scorer_on = true;
+        propose(&mut app, 501, "rm -rf /tmp/x", "run_command");
+        let (tx, mut rx) = oneshot::channel();
+        let session_id = app.sessions[app.active].id;
+        app.handle_agent_event(TuiEvent::ConfirmationRequest {
+            session_id,
+            command: "rm -rf /tmp/x".into(),
+            explanation: "why".into(),
+            destructive: false,
+            respond_to: tx,
+        });
+        // No waiting on the scorer: the dialog is up, the rating pending.
+        assert_eq!(app.mode, AppMode::Confirming);
+        assert_eq!(app.confirm_safety(), Some(&SafetyScore::Pending));
+        scored(&mut app, 501, Some(35));
+        assert!(matches!(app.confirm_safety(), Some(SafetyScore::Ready { pct: 35, .. })));
+        // The rating changes nothing about the decision: still the user's.
+        assert_eq!(app.mode, AppMode::Confirming);
+        app.handle_key(key_event(KeyCode::Char('a')));
+        assert_eq!(rx.try_recv(), Ok(true));
+        let idx = app.messages.len() - 1;
+        assert_eq!(app.safety_badges().get(&idx), Some(&("35%".to_string(), SafetyLevel::Danger)));
+        assert_eq!(app.risk_ratings, 1);
+        assert_eq!(app.risk_cost_usd, Some(0.0001));
+    }
+
+    #[test]
+    fn a_rating_after_the_command_finished_lands_on_its_block() {
+        // Auto-approved: the block exists before the rating arrives.
+        let mut app = App::new("local".into(), CommandConfirmMode::Never);
+        app.risk_scorer_on = true;
+        propose(&mut app, 502, "ls -la", "run_command");
+        finished(&mut app, "ls -la");
+        let idx = app.messages.len() - 1;
+        assert_eq!(app.safety_badges().get(&idx), Some(&("rating…".to_string(), SafetyLevel::Muted)));
+        let rev = app.message_rev;
+        scored(&mut app, 502, Some(97));
+        assert_ne!(app.message_rev, rev, "the badge is in the cached layout");
+        assert_eq!(app.safety_badges().get(&idx), Some(&("97%".to_string(), SafetyLevel::Safe)));
+        // Unavailable reads as such.
+        propose(&mut app, 503, "uptime", "run_command");
+        finished(&mut app, "uptime");
+        scored(&mut app, 503, None);
+        let idx = app.messages.len() - 1;
+        assert_eq!(app.safety_badges().get(&idx).map(|b| b.0.as_str()), Some("unavailable"));
+    }
+
+    #[test]
+    fn without_a_scorer_nothing_is_shown() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Never);
+        propose(&mut app, 504, "ls", "run_command");
+        finished(&mut app, "ls");
+        assert!(app.safety_badges().is_empty());
+        assert!(app.safety_scores.is_empty());
+    }
+
+    #[test]
+    fn job_bookkeeping_is_not_rated() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Never);
+        app.risk_scorer_on = true;
+        propose(&mut app, 505, "list_background_jobs", filar_agent::tools::TOOL_LIST_BACKGROUND_JOBS);
+        assert!(app.safety_scores.is_empty());
+    }
+
+    #[test]
+    fn a_replaced_history_shows_no_stale_badge() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Never);
+        app.risk_scorer_on = true;
+        propose(&mut app, 506, "ls", "run_command");
+        finished(&mut app, "ls");
+        scored(&mut app, 506, Some(90));
+        let idx = app.messages.len() - 1;
+        app.messages[idx] = ChatBlock::Command {
+            command: "something else".into(),
+            explanation: String::new(),
+            output: None,
+            approved: true,
+            tool: None,
+        };
+        assert!(app.safety_badges().is_empty());
     }
 }

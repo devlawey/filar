@@ -56,6 +56,8 @@ connect_secs = 15
 # model = "typesafe/jev-1.14"
 # key_env = "FILAR_RISK_API_KEY"
 # timeout_secs = 8              # 1–30
+# warn_below = 70               # colour: below — yellow
+# danger_below = 40             # colour: below — red
 #
 # Any OpenAI-compatible chat model can rate commands too, if its server
 # returns `logprobs` (llama.cpp server, vLLM and the like): the model answers

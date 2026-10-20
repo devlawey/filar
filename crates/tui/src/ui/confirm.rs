@@ -59,6 +59,17 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let audit_unavailable = confirm.audit_unavailable;
     let radius = confirm.radius.clone();
     let radius_expanded = confirm.radius_expanded;
+    // Safety rating (#551) — advisory, separate from the arbiter's audit.
+    let safety = app.confirm_safety().map(|score| {
+        let text = safety_line_text(score);
+        let style = match score.level(app.risk_thresholds) {
+            crate::app::SafetyLevel::Safe => app.theme.success_fg(),
+            crate::app::SafetyLevel::Warn => app.theme.warning_fg(),
+            crate::app::SafetyLevel::Danger => app.theme.danger_fg(),
+            crate::app::SafetyLevel::Muted => app.theme.muted(),
+        };
+        (text, style)
+    });
 
     // `audit_model` holds the arbiter *profile* name from `CommandAudited`
     // (runner passes `LlmProfile.name` as `arbiter_model_name`).
@@ -88,6 +99,10 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         audit_model.as_deref(),
     );
     let warning_rows = if destructive { 1 } else { 0 };
+    let safety_rows = safety
+        .as_ref()
+        .map(|(t, _)| estimate_wrapped_rows(t, inner_width))
+        .unwrap_or(0);
     let command_rows = estimate_wrapped_rows(&command_text, inner_width);
     let empty_rows = 1; // separator line before buttons
     let radius_rows = match radius_lines(&radius, radius_expanded) {
@@ -97,7 +112,7 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let natural_content =
-        (radius_rows + explanation_rows + audit_rows + warning_rows + command_rows + empty_rows) as u16;
+        (radius_rows + explanation_rows + audit_rows + safety_rows + warning_rows + command_rows + empty_rows) as u16;
     // +2 borders +1 buttons
     let natural_height = natural_content.saturating_add(3);
 
@@ -116,6 +131,7 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         audit_model.as_deref(),
         same_as_session,
         &session_name,
+        safety,
         app.theme.fg_style(),
         app.theme.danger_fg(),
         app.theme.warning_fg(),
@@ -185,6 +201,17 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     render_buttons(f, app, chunks[1]);
 }
 
+/// The dialog's safety line (#551): `Safety: 88% (model)`, `Safety:
+/// rating…`, `Safety: unavailable (model)`. 100% = completely safe.
+pub(crate) fn safety_line_text(score: &crate::app::SafetyScore) -> String {
+    use crate::app::SafetyScore;
+    match score {
+        SafetyScore::Pending => "Safety: rating…".to_string(),
+        SafetyScore::Ready { model, .. } => format!("Safety: {} ({model})", score.label()),
+        SafetyScore::Unavailable { model } => format!("Safety: unavailable ({model})"),
+    }
+}
+
 /// Estimate rows used by the arbiter audit block.
 fn audit_display_rows(
     unavailable: bool,
@@ -239,6 +266,7 @@ fn build_modal_lines(
     audit_model: Option<&str>,
     same_as_session: bool,
     session_name: &str,
+    safety: Option<(String, Style)>,
     fg: Style,
     danger: Style,
     warning: Style,
@@ -305,6 +333,12 @@ fn build_modal_lines(
             danger,
             accent,
         );
+    }
+
+    if let Some((text, style)) = safety {
+        if used < max_rows {
+            let _ = push(&mut lines, &mut used, text, style);
+        }
     }
 
     if destructive && used < max_rows {
@@ -707,6 +741,61 @@ mod tests {
         let screen = render_confirm(&mut app, 60, 12);
         assert!(screen.contains("Runs on 100 hosts"), "{screen}");
         assert!(!app.confirm_button_areas.is_empty(), "buttons stay on screen");
+    }
+
+    fn rated(app: &mut App, score: crate::app::SafetyScore) {
+        let mut p = pending("rm -rf /tmp/x", false);
+        p.proposal_id = Some(7);
+        app.pending_confirm = Some(p);
+        app.safety_scores.insert(7, score);
+        app.mode = AppMode::Confirming;
+    }
+
+    #[test]
+    fn the_dialog_shows_the_safety_rating() {
+        use crate::app::SafetyScore;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        rated(&mut app, SafetyScore::Pending);
+        assert!(render_confirm(&mut app, 80, 24).contains("Safety: rating…"));
+
+        rated(&mut app, SafetyScore::Ready { pct: 88, confidence: Some(0.9), model: "jev".into() });
+        let screen = render_confirm(&mut app, 80, 24);
+        assert!(screen.contains("Safety: 88% (jev)"), "{screen}");
+        assert!(screen.contains("$ rm -rf /tmp/x"), "{screen}");
+        assert!(!app.confirm_button_areas.is_empty(), "buttons stay on screen");
+
+        rated(&mut app, SafetyScore::Ready { pct: 62, confidence: Some(0.3), model: "jev".into() });
+        assert!(render_confirm(&mut app, 80, 24).contains("Safety: ~62% (jev)"));
+
+        rated(&mut app, SafetyScore::Unavailable { model: "jev".into() });
+        assert!(render_confirm(&mut app, 80, 24).contains("Safety: unavailable (jev)"));
+    }
+
+    #[test]
+    fn no_scorer_no_safety_line() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let mut p = pending("ls", false);
+        p.proposal_id = Some(9);
+        app.pending_confirm = Some(p);
+        app.mode = AppMode::Confirming;
+        assert!(!render_confirm(&mut app, 80, 24).contains("Safety"));
+    }
+
+    #[test]
+    fn the_rating_colour_follows_the_thresholds() {
+        use crate::app::{SafetyLevel, SafetyScore};
+        let r = |pct| SafetyScore::Ready { pct, confidence: None, model: String::new() };
+        let t = (70, 40);
+        assert_eq!(r(100).level(t), SafetyLevel::Safe);
+        assert_eq!(r(70).level(t), SafetyLevel::Safe);
+        assert_eq!(r(69).level(t), SafetyLevel::Warn);
+        assert_eq!(r(40).level(t), SafetyLevel::Warn);
+        assert_eq!(r(39).level(t), SafetyLevel::Danger);
+        assert_eq!(r(0).level(t), SafetyLevel::Danger);
+        assert_eq!(SafetyScore::Pending.level(t), SafetyLevel::Muted);
+        assert_eq!(SafetyScore::Unavailable { model: String::new() }.level(t), SafetyLevel::Muted);
+        // Configured thresholds move the bands.
+        assert_eq!(r(60).level((50, 20)), SafetyLevel::Safe);
     }
 
     #[test]

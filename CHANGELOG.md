@@ -24,6 +24,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   server): the percentage comes from the log-probabilities of a one-digit
   answer, and a server without logprobs reports the rating as unavailable
   ([#550](https://github.com/devlawey/filar/issues/550)).
+- TUI shows the command safety rating: `Safety: N%` in the confirmation
+  dialog (it opens at once and fills in) and an `[N%]` badge before the
+  command in the feed, coloured by `warn_below` / `danger_below`, `~` when
+  the model is unsure, `unavailable` on failure; a `Risk scorer` line in F1
+  ([#551](https://github.com/devlawey/filar/issues/551)).
 
 ## [2.0.6] - 2026-10-20
 

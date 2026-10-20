@@ -585,6 +585,18 @@ fn append_usage_summary(lines: &mut Vec<Line<'static>>, app: &App) {
         lines.push(Line::from(Span::styled(arb, app.theme.dim())));
     }
 
+    // Safety ratings (#551): their own line — a separate model and cost.
+    if app.risk_ratings > 0 {
+        let noun = if app.risk_ratings == 1 { "rating" } else { "ratings" };
+        let mut risk = format!("  Risk scorer: {} {noun}", app.risk_ratings);
+        if let Some(cost) = app.risk_cost_usd {
+            if cost > 0.0 {
+                risk.push_str(&format!(" ${cost:.6}"));
+            }
+        }
+        lines.push(Line::from(Span::styled(risk, app.theme.dim())));
+    }
+
     if let Some(cost) = app.cost_usd {
         if cost > 0.0 {
             lines.push(Line::from(Span::styled(
