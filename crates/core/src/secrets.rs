@@ -27,6 +27,9 @@ pub mod env_vars {
     /// tab or `--target` launch. Never used by the fleet: a shared secret
     /// for every host is what per-host credentials exist to avoid (#480).
     pub const SSH_KEY_PASSPHRASE: &str = "SSH_KEY_PASSPHRASE";
+    /// Default name of the command safety scorer's API key — the
+    /// `key_env` of `[risk_scorer]` when it sets none (#549).
+    pub const RISK_API_KEY: &str = "FILAR_RISK_API_KEY";
 }
 
 // ---------------------------------------------------------------------------

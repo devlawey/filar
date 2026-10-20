@@ -551,6 +551,63 @@ Remote writes are allowed only on an explicit user action (AGENTS.md,
 invariant 1 and its #531 exception); an embedder must not let the model drive
 `open_write`, `rename` or `remove_file` on a remote side.
 
+## Command safety rating — `RiskScorer` (2.0.7)
+
+An embedder can have every command the agent proposes rated by a separate
+*decision model*: a model that does not write text but returns a probability
+distribution over the levels of an ordered scale (e.g. `typesafe/jev-1.14` on
+OpenRouter). The rating is `safety_pct` 0–100, where **100 = completely
+safe**. It is advisory only: it never approves, denies or delays a command,
+and it is independent of the arbiter.
+
+```rust,no_run
+# use std::sync::Arc;
+# use filar_agent::{AgentBuilder, build_risk_scorer};
+# use filar_core::{RiskScorerConfig, StaticSecretProvider};
+# fn example(builder: AgentBuilder) -> filar_core::Result<()> {
+let secrets = StaticSecretProvider::new();
+secrets.insert("FILAR_RISK_API_KEY", "your-openrouter-key");
+let scorer = build_risk_scorer(
+    &RiskScorerConfig {
+        kind: "decisions".into(),
+        base_url: "https://openrouter.ai/api/alpha".into(),
+        model: "typesafe/jev-1.14".into(),
+        key_env: "FILAR_RISK_API_KEY".into(), // "" = keyless local server
+        timeout_secs: 8,
+    },
+    &secrets,
+)?;
+let _agent = builder.risk_scorer(Some(scorer));
+# Ok(()) }
+```
+
+- `RiskScorer` (trait, `filar_agent::risk`) — `score(&RiskInput) -> RiskScore`.
+  `DecisionsApiScorer` speaks the Decisions API (`POST {base_url}/decisions`,
+  one `score` question over `filar_agent::risk::RISK_LEVELS`). Implement the
+  trait for another protocol; `LlmClient` is not involved.
+- Every command the agent proposes is rated, in every confirmation mode,
+  except fleet runs and the bookkeeping tools that run nothing. Scoring runs
+  in its own task and never waits on the gate or delays execution.
+- The result arrives as `AgentEvent::CommandScored { proposal_id, safety_pct,
+  confidence, model, cost_usd, unavailable }`. Match it to its command by
+  `proposal_id` (also on `CommandProposed`, unique within the process). It may
+  come after the command's `CommandFinished`, but always before `Finished` /
+  `Error`, and never after `Cancelled`.
+- Any failure (timeout, HTTP error, unexpected response) is `unavailable:
+  true`; the command is unaffected. The key is never part of an error.
+- The decision model sees the command, the agent's explanation and the target
+  description — the same data the session's LLM already has.
+
+## Upgrading to `engine-v2.0.7`
+
+| Change | Breaks | What to do |
+|--------|--------|------------|
+| `AgentEvent::CommandProposed::proposal_id: u64` added (#549) | Constructing the event by hand; patterns without `..` | Add `..` to patterns; keep the id if you show safety ratings |
+| `AgentEvent::CommandScored` added (#549) | Nothing — `AgentEvent` is `#[non_exhaustive]` | Handle it to show the rating next to the command |
+| `RiskScorer`, `RiskInput`, `RiskScore`, `DecisionsApiScorer`, `build_risk_scorer`, `AgentBuilder::risk_scorer`; `RiskScorerConfig`, `RiskScorerKind`, `Config::risk_scorer` (#549) | Nothing — additive (struct literals of `Config` use `..Default::default()`) | Opt in; see the safety-rating section |
+
+`CommandExecutor` and `LlmClient` are unchanged.
+
 ## Upgrading to `engine-v2.0.5`
 
 Nothing breaks: `CommandExecutor`, `LlmClient` and the existing traits are

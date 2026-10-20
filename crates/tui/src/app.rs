@@ -6942,6 +6942,7 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id,
             event: filar_agent::AgentEvent::CommandProposed {
+                proposal_id: 1,
                 command: command.into(),
                 explanation: explanation.into(),
                 destructive: false,
@@ -6984,6 +6985,7 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id,
             event: filar_agent::AgentEvent::CommandProposed {
+                proposal_id: 2,
                 command: "cat /etc/hosts".into(),
                 explanation: "Read file: /etc/hosts".into(),
                 destructive: false,

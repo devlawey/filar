@@ -31,6 +31,10 @@ pub enum AgentEvent {
     /// Emitted **before** the confirmer is called.  The frontend can use
     /// this to show a pending command block or update UI state.
     CommandProposed {
+        /// Identifier of this proposal, unique within the process (#549).
+        /// A later [`AgentEvent::CommandScored`] carries the same id, so a
+        /// frontend can attach an asynchronous safety rating to its command.
+        proposal_id: u64,
         /// The command to execute.
         command: String,
         /// Human-readable explanation of what the command does.
@@ -56,6 +60,33 @@ pub enum AgentEvent {
         /// Display name / slug of the arbiter model (if known).
         arbiter_model: Option<String>,
         /// `true` when the audit could not be completed (timeout, error, bad JSON).
+        unavailable: bool,
+    },
+
+    /// Safety rating of a proposed command by the risk scorer (#549).
+    ///
+    /// Emitted asynchronously after the [`CommandProposed`] with the same
+    /// `proposal_id` — possibly after its [`CommandFinished`], since scoring
+    /// never delays confirmation or execution. Advisory only: it has no effect
+    /// on whether the command runs. Only emitted when a scorer is configured,
+    /// only for the agent's own commands, never after [`Cancelled`].
+    ///
+    /// [`CommandProposed`]: AgentEvent::CommandProposed
+    /// [`CommandFinished`]: AgentEvent::CommandFinished
+    /// [`Cancelled`]: AgentEvent::Cancelled
+    CommandScored {
+        /// The `proposal_id` of the rated command.
+        proposal_id: u64,
+        /// 0–100, where 100 = completely safe. `None` when unavailable.
+        safety_pct: Option<u8>,
+        /// The model's confidence in the rating, when reported.
+        confidence: Option<f32>,
+        /// The scorer's model.
+        model: String,
+        /// Cost of the rating in USD, when reported.
+        cost_usd: Option<f64>,
+        /// `true` when the rating could not be obtained (timeout, HTTP error,
+        /// unexpected response).
         unavailable: bool,
     },
 
