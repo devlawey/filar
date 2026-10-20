@@ -494,11 +494,16 @@ mod tests {
         let header: String = cache.lines[0].line.spans.iter().map(|s| s.content.as_ref()).collect();
         let badge = header.find("[~62%]").expect("badge in the header");
         assert!(badge < header.find("$ echo").unwrap(), "{header}");
+        let with_badge = cache.lines[0].line.spans.len();
 
+        // Without a badge the header is exactly the same minus the badge
+        // span — structurally, not by text: the ASCII glyph set on Windows
+        // draws the status as `[ok]` (#551).
         cache.safety_badges.clear();
         cache.rebuild(&msgs, 80, &theme, &HashSet::new(), 2);
-        let header: String = cache.lines[0].line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!header.contains("62%"), "{header}");
+        let plain: String = cache.lines[0].line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(cache.lines[0].line.spans.len(), with_badge - 1);
+        assert_eq!(header.replacen("[~62%] ", "", 1), plain);
     }
 
     #[test]

@@ -2753,10 +2753,14 @@ impl App {
         self.selection = None;
 
         self.messages = session.messages;
-        // Ratings belong to the replaced history's blocks (#551).
+        // Ratings belong to the replaced history's blocks (#551), and so does
+        // their F1 count: ratings are not saved with a session, so a
+        // restored one starts from zero rather than showing the old tab's.
         self.block_proposals.clear();
         self.safety_scores.clear();
         self.pending_proposal_id = None;
+        self.risk_ratings = 0;
+        self.risk_cost_usd = None;
         // Restored alongside the context it was folded out of, so reopening a
         // compacted session does not quietly shorten its transcript. Sessions
         // saved before #379 carry none, which is simply an empty archive.
@@ -15282,5 +15286,21 @@ mod tests {
         let badges = app.safety_badges();
         assert_eq!(badges.len(), 1, "{badges:?}");
         assert_eq!(badges.get(&2).map(|b| b.0.as_str()), Some("90%"));
+    }
+
+    #[test]
+    fn a_restored_session_starts_without_ratings() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Never);
+        app.risk_scorer_on = true;
+        propose(&mut app, 701, "ls", "run_command");
+        finished(&mut app, "ls");
+        scored(&mut app, 701, Some(90));
+        assert_eq!(app.risk_ratings, 1);
+        let saved = crate::runner::session_snapshot(&app, "test", "1", "t");
+        app.apply_loaded_session(saved);
+        assert!(app.safety_badges().is_empty());
+        assert!(app.safety_scores.is_empty());
+        assert_eq!(app.risk_ratings, 0, "F1 does not count the replaced tab's ratings");
+        assert_eq!(app.risk_cost_usd, None);
     }
 }
