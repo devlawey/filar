@@ -27,22 +27,22 @@ working example.
 Bots and mobile apps that only need SSH should disable default features:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.4", default-features = false }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.5", default-features = false }
 ```
 
 Desktop apps (TUI/GUI) should keep `local` enabled:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.4" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.5" }
 ```
 
 ## Cargo.toml example
 
 ```toml
 [dependencies]
-filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.4" }
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.4", default-features = false }
-filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.4" }
+filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.5" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.5", default-features = false }
+filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.5" }
 
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"
@@ -550,6 +550,15 @@ Errors keep the `io::ErrorKind` (`NotFound`, `PermissionDenied`, …) inside
 Remote writes are allowed only on an explicit user action (AGENTS.md,
 invariant 1 and its #531 exception); an embedder must not let the model drive
 `open_write`, `rename` or `remove_file` on a remote side.
+
+## Upgrading to `engine-v2.0.5`
+
+Nothing breaks: `CommandExecutor`, `LlmClient` and the existing traits are
+unchanged — file transfer is a new, separate trait.
+
+| Change | Breaks | What to do |
+|--------|--------|------------|
+| `FileTransfer`, `LocalFileTransfer`, `SftpFileTransfer`, `copy()`, `CopyObserver`, `CopyReport`, `CopyEvent`, `CopySource`, `OverwriteDecision`, `EntryKind`, `Metadata`, `DirEntry`, `PathStyle`, `PART_SUFFIX`, `OLD_SUFFIX`, `SshExecutor::open_sftp()` added (#532–#534) | Nothing — additive | Opt in where a client moves files between the local disk and SSH hosts; remote writes only on an explicit user action (see the file-transfer section and the #531 exception) |
 
 ## Upgrading to `engine-v2.0.4`
 
