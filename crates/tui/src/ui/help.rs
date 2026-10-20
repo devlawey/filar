@@ -142,6 +142,12 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
             available: |m| m == AppMode::Normal,
         },
         HelpEntry {
+            key: "^G: F7 / m",
+            desc: "File panels: new folder in the active panel's directory",
+            section: "Files",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
             key: "^G: ^Z",
             desc: "File panels: cancel the running copy",
             section: "Files",

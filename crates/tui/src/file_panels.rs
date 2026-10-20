@@ -190,6 +190,15 @@ pub enum PanelRequest {
         /// Request generation.
         generation: u64,
     },
+    /// Create folder `name` in `dir` of the source open for `side` (#546).
+    CreateDir {
+        /// Panel.
+        side: Side,
+        /// Directory to create it in.
+        dir: String,
+        /// New folder's name (already checked).
+        name: String,
+    },
     /// Open an SSH target whose secret the user just typed (no saved one).
     OpenTarget {
         /// Panel.
@@ -227,6 +236,17 @@ pub enum PanelEvent {
         path: String,
         /// Entries, or the error text.
         result: Result<Vec<DirEntry>, String>,
+    },
+    /// A folder was created — or could not be (#546).
+    DirCreated {
+        /// Panel.
+        side: Side,
+        /// Directory it was created in.
+        dir: String,
+        /// Its name.
+        name: String,
+        /// What went wrong, if anything.
+        result: Result<(), String>,
     },
     /// No saved secret for the target: ask for it (masked).
     NeedSecret {
@@ -344,6 +364,15 @@ pub enum CopyRequest {
 pub enum PanelDialog {
     /// "Copy … → host:/dir?" — every copy is confirmed (#536).
     ConfirmCopy(CopyPlan),
+    /// Name of a new folder in the active panel's directory (#546).
+    NewFolder {
+        /// Panel the folder goes into.
+        side: Side,
+        /// Name typed so far.
+        input: String,
+        /// Why the last Enter was refused.
+        error: Option<String>,
+    },
 }
 
 /// Masked entry of a password or key passphrase for a panel's host — only
@@ -499,6 +528,21 @@ impl FilePanels {
                 // The listing follows from the same request.
                 p.status = PanelStatus::Loading;
             }
+            PanelEvent::DirCreated {
+                side,
+                dir,
+                name,
+                result,
+            } => match result {
+                Ok(()) => {
+                    self.notice = Some(format!("Folder {name} created"));
+                    if self.panel(side).path == dir {
+                        self.panel_mut(side).focus_after_load = Some(name);
+                        self.list(side, dir);
+                    }
+                }
+                Err(e) => self.notice = Some(format!("Could not create {name}: {e}")),
+            },
             PanelEvent::NeedSecret {
                 side,
                 generation,
@@ -577,6 +621,10 @@ impl FilePanels {
             self.prompt_key(key);
             return PanelsAction::None;
         }
+        if let Some(PanelDialog::NewFolder { .. }) = self.dialog {
+            self.new_folder_key(key);
+            return PanelsAction::None;
+        }
         if let Some(PanelDialog::ConfirmCopy(plan)) = self.dialog.take() {
             return match key.code {
                 KeyCode::Enter | KeyCode::Char('y' | 'Y' | 'н' | 'Н') => {
@@ -620,9 +668,79 @@ impl FilePanels {
             KeyCode::Char('r' | 'R' | 'к' | 'К') => self.refresh(side),
             KeyCode::Char(' ') | KeyCode::Insert => self.toggle_mark(side),
             KeyCode::F(5) | KeyCode::Char('c' | 'C' | 'с' | 'С') => self.plan_copy(),
+            KeyCode::F(7) | KeyCode::Char('m' | 'M' | 'ь' | 'Ь') => self.open_new_folder(side),
             _ => {}
         }
         PanelsAction::None
+    }
+
+    /// Ask for the name of a new folder in `side`'s directory (#546) — or
+    /// say why there cannot be one there.
+    fn open_new_folder(&mut self, side: Side) {
+        let p = self.panel(side);
+        let why = if p.source.is_none() {
+            Some("Choose a host for this panel first (Ctrl+O)".to_string())
+        } else if p.status != PanelStatus::Ready {
+            Some("The panel is not ready".to_string())
+        } else if p.style == PathStyle::Windows && p.path.is_empty() {
+            Some("This is the list of drives: open a drive to create a folder there".to_string())
+        } else if p.path.is_empty() {
+            Some("The panel is not ready".to_string())
+        } else if p.read_only {
+            Some(format!("{} is read-only: no folder can be created there", p.label))
+        } else {
+            None
+        };
+        match why {
+            Some(why) => self.notice = Some(why),
+            None => {
+                self.dialog = Some(PanelDialog::NewFolder {
+                    side,
+                    input: String::new(),
+                    error: None,
+                })
+            }
+        }
+    }
+
+    /// Keys in the new-folder dialog: type, erase, create, cancel.
+    fn new_folder_key(&mut self, key: KeyEvent) {
+        let Some(PanelDialog::NewFolder { side, input, error }) = self.dialog.as_mut() else {
+            return;
+        };
+        let side = *side;
+        match key.code {
+            KeyCode::Esc => self.dialog = None,
+            KeyCode::Backspace => {
+                input.pop();
+                *error = None;
+            }
+            KeyCode::Enter => {
+                let name = input.clone();
+                let p = self.panel(side);
+                match check_folder_name(p.style, &name) {
+                    Err(e) => {
+                        if let Some(PanelDialog::NewFolder { error, .. }) = self.dialog.as_mut() {
+                            *error = Some(e);
+                        }
+                    }
+                    Ok(()) => {
+                        let dir = p.path.clone();
+                        self.dialog = None;
+                        self.requests.push(PanelRequest::CreateDir { side, dir, name });
+                    }
+                }
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                input.push(c);
+                *error = None;
+            }
+            _ => {}
+        }
     }
 
     /// Mark or unmark the entry under the cursor, then move down.
@@ -846,6 +964,37 @@ pub fn sort_entries(entries: &mut [DirEntry]) {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             .then_with(|| a.name.cmp(&b.name))
     });
+}
+
+/// Whether `name` can be a new folder's name on a side with `style` (#546).
+/// Checked before anything is sent: a name that would land elsewhere (`..`,
+/// a separator) or that the side's filesystem refuses never leaves.
+pub fn check_folder_name(style: PathStyle, name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("Type a name".into());
+    }
+    if name == "." || name == ".." {
+        return Err("\".\" and \"..\" are not folder names".into());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("The name has a control character".into());
+    }
+    match style {
+        PathStyle::Posix => {
+            if name.contains('/') {
+                return Err("A name cannot contain /".into());
+            }
+        }
+        PathStyle::Windows => {
+            if let Some(c) = name.chars().find(|c| "\\/:*?\"<>|".contains(*c)) {
+                return Err(format!("A name cannot contain {c}"));
+            }
+            if name.ends_with(' ') || name.ends_with('.') {
+                return Err("A name cannot end with a space or a dot".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `path` is `dir` itself or lies below it.
@@ -1642,5 +1791,118 @@ mod tests {
         assert_eq!(c.state, CopyState::Cancelled);
         assert!(c.summary().starts_with("Copy cancelled"));
         assert_eq!(c.operation().state(), crate::ops::HostOpState::Cancelled);
+    }
+
+    // ── New folder (#546) ─────────────────────────────────────────────
+
+    #[test]
+    fn folder_names_are_checked_for_each_side() {
+        let p = PathStyle::Posix;
+        let w = PathStyle::Windows;
+        assert!(check_folder_name(p, "logs-2026").is_ok());
+        assert!(check_folder_name(p, "новая папка").is_ok());
+        assert!(check_folder_name(p, "a:b").is_ok(), ": is fine on POSIX");
+        for bad in ["", "   ", ".", "..", "a/b", "a\tb"] {
+            assert!(check_folder_name(p, bad).is_err(), "{bad:?}");
+        }
+        assert!(check_folder_name(w, "Reports").is_ok());
+        for bad in ["a:b", "a\\b", "a/b", "what?", "x*", "q\"", "<a>", "a|b", "trail.", "trail "] {
+            assert!(check_folder_name(w, bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn f7_asks_for_a_name_and_enter_creates_it_in_the_active_panel() {
+        let mut fp = two_panels();
+        fp.handle_key(key(KeyCode::Tab)); // right: web1:/dst
+        fp.handle_key(key(KeyCode::F(7)));
+        assert!(matches!(fp.dialog, Some(PanelDialog::NewFolder { side: Side::Right, .. })));
+        for c in "logs".chars() {
+            fp.handle_key(key(KeyCode::Char(c)));
+        }
+        // Keys go to the name, not the panel.
+        assert_eq!(fp.active, Side::Right);
+        fp.handle_key(key(KeyCode::Enter));
+        assert!(fp.dialog.is_none());
+        assert!(matches!(
+            fp.requests.pop(),
+            Some(PanelRequest::CreateDir { side: Side::Right, ref dir, ref name })
+                if dir == "/dst" && name == "logs"
+        ));
+    }
+
+    #[test]
+    fn a_bad_name_keeps_the_dialog_open_with_the_reason() {
+        let mut fp = two_panels();
+        fp.handle_key(key(KeyCode::Char('ь'))); // `m`, Russian layout
+        for c in "a/b".chars() {
+            fp.handle_key(key(KeyCode::Char(c)));
+        }
+        fp.handle_key(key(KeyCode::Enter));
+        assert!(fp.requests.is_empty());
+        assert!(matches!(
+            &fp.dialog,
+            Some(PanelDialog::NewFolder { error: Some(e), .. }) if e.contains('/')
+        ));
+        fp.handle_key(key(KeyCode::Esc));
+        assert!(fp.dialog.is_none());
+        assert!(fp.requests.is_empty());
+        // Esc closed only the dialog.
+        assert_eq!(fp.handle_key(key(KeyCode::Esc)), PanelsAction::Close);
+    }
+
+    #[test]
+    fn no_folder_on_a_read_only_host_or_the_drive_list() {
+        let mut fp = two_panels();
+        fp.right.read_only = true;
+        fp.handle_key(key(KeyCode::Tab));
+        fp.handle_key(key(KeyCode::F(7)));
+        assert!(fp.dialog.is_none());
+        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("read-only")));
+
+        let mut fp = two_panels();
+        fp.left.style = PathStyle::Windows;
+        fp.left.path = String::new();
+        fp.handle_key(key(KeyCode::F(7)));
+        assert!(fp.dialog.is_none());
+        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("drives")));
+
+        let mut fp = opened(Side::Left, "/src", vec![]);
+        fp.handle_key(key(KeyCode::Tab)); // right panel has no host
+        fp.handle_key(key(KeyCode::F(7)));
+        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("Ctrl+O")));
+    }
+
+    #[test]
+    fn a_created_folder_is_listed_and_selected_and_a_failure_is_said() {
+        let mut fp = two_panels();
+        fp.apply(PanelEvent::DirCreated {
+            side: Side::Right,
+            dir: "/dst".into(),
+            name: "logs".into(),
+            result: Ok(()),
+        });
+        assert_eq!(fp.right.focus_after_load.as_deref(), Some("logs"));
+        let g = fp.right.generation;
+        assert!(matches!(
+            fp.requests.pop(),
+            Some(PanelRequest::List { side: Side::Right, ref path, generation }) if path == "/dst" && generation == g
+        ));
+        fp.apply(PanelEvent::Listed {
+            side: Side::Right,
+            generation: g,
+            path: "/dst".into(),
+            result: Ok(vec![entry("a", EntryKind::Dir), entry("logs", EntryKind::Dir)]),
+        });
+        assert!(matches!(fp.right.current(), Some(Row::Entry(e)) if e.name == "logs"));
+
+        fp.apply(PanelEvent::DirCreated {
+            side: Side::Right,
+            dir: "/dst".into(),
+            name: "logs".into(),
+            result: Err("already exists".into()),
+        });
+        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("already exists")));
+        assert!(fp.requests.is_empty());
     }
 }

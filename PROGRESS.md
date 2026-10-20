@@ -10782,3 +10782,19 @@ Ctrl+G в таблице клавиш. `docs/SMOKE.md` — раздел «Фай
 (`FileTransfer`, `copy()` и пр.) — тег `engine-v2.0.5` на том же коммите и
 секция «Upgrading» в `docs/ENGINE_API.md`; `CommandExecutor`/`LlmClient` не
 менялись. Ручной SMOKE Win + Mac — за мейнтейнером (`docs/SMOKE.md`, #298).
+
+## #546 — создание папки в панелях
+
+**Сделано.** `F7` / `m` / `ь` → `PanelDialog::NewFolder` (имя, ошибка в окне)
+→ `check_folder_name` (пусто, `.`/`..`, управляющие, `/`; Windows — ещё
+`\ : * ? " < > |` и точка/пробел в конце) → `PanelRequest::CreateDir` → runner:
+`stat` (существует → «already exists») → `FileTransfer::create_dir` →
+`PanelEvent::DirCreated` → перелистинг с курсором на новой папке или
+сообщение под панелями. Отказ до окна: нет хоста, панель не готова, список
+дисков Windows, read-only хост (и ещё раз в runner).
+
+**Решения.** Исключение #531 в `AGENTS.md` расширено на создание каталога по
+явному действию пользователя (согласовано мейнтейнером в #546). Только через
+`create_dir` (SFTP `mkdir`), без шелла.
+
+**Next:** веха 2.0.6 — SMOKE и релиз за мейнтейнером.

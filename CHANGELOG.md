@@ -11,6 +11,12 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- File panels: create a folder in the active panel's directory with F7 or
+  `m` — locally or on the host over SFTP; the name is checked first and the
+  new folder is selected ([#546](https://github.com/devlawey/filar/issues/546)).
+
 ## [2.0.5] - 2026-10-20
 
 ### Added
