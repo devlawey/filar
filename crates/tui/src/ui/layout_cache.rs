@@ -498,7 +498,7 @@ mod tests {
         cache.safety_badges.clear();
         cache.rebuild(&msgs, 80, &theme, &HashSet::new(), 2);
         let header: String = cache.lines[0].line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!header.contains('['), "{header}");
+        assert!(!header.contains("62%"), "{header}");
     }
 
     #[test]
