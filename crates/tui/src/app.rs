@@ -390,9 +390,12 @@ pub struct App {
     /// The host overlay is choosing the source of this panel instead of the
     /// tab's host (Ctrl+O inside the file panels, #535).
     pub host_select_for_panel: Option<crate::file_panels::Side>,
-    /// Copies started from the file panels (#536), newest last; a finished
-    /// one stays listed in Ctrl+J like a finished background job.
+    /// Copies started from the file panels (#536) that are still running.
+    /// A finished copy leaves at once (#545): its result is in the chat, so
+    /// it does not hold the Ctrl+J panel or the `ops` counter.
     pub file_copies: Vec<crate::file_panels::FileCopy>,
+    /// Number of the last copy started (`copy-N` stays unique).
+    copy_counter: u64,
     /// Work for the runner about copies: start, cancel, overwrite answers.
     pub copy_requests: Vec<crate::file_panels::CopyRequest>,
     /// In-TUI path picker overlay (#351).
@@ -721,6 +724,7 @@ impl App {
             file_panels: None,
             host_select_for_panel: None,
             file_copies: Vec::new(),
+            copy_counter: 0,
             copy_requests: Vec::new(),
             path_picker_visible: false,
             path_picker_kind: crate::path_picker::PathPickerKind::File,
@@ -2419,15 +2423,9 @@ impl App {
             }
             return;
         }
-        let id = self.file_copies.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+        self.copy_counter += 1;
+        let id = self.copy_counter;
         let session = self.sessions[self.active].id;
-        // Keep the last few finished copies for Ctrl+J, not all of them.
-        let finished = self.file_copies.iter().filter(|c| !c.running()).count();
-        if finished >= MAX_FINISHED_COPIES {
-            if let Some(oldest) = self.file_copies.iter().position(|c| !c.running()) {
-                self.file_copies.remove(oldest);
-            }
-        }
         self.file_copies
             .push(crate::file_panels::FileCopy::new(id, session, plan.clone()));
         self.copy_requests
@@ -2458,13 +2456,15 @@ impl App {
         }
     }
 
-    /// A copy ended: keep its report, say it in the tab's chat (failures and
-    /// left-behind part files must reach the user, #531), refresh the target
-    /// panel if it shows the target folder.
+    /// A copy ended: say it in the tab's chat (failures and left-behind part
+    /// files must reach the user, #531), refresh the target panel if it shows
+    /// the target folder, and drop the copy from Ctrl+J and the `ops` counter
+    /// (#545) — background jobs and the fleet keep their own rules.
     pub fn finish_copy(&mut self, id: u64, report: filar_transport::CopyReport) {
-        let Some(c) = self.file_copies.iter_mut().find(|c| c.id == id) else {
+        let Some(pos) = self.file_copies.iter().position(|c| c.id == id) else {
             return;
         };
+        let mut c = self.file_copies.remove(pos);
         c.finish(report);
         let summary = c.summary();
         let session = c.session;
@@ -6141,8 +6141,6 @@ impl App {
 /// Lines of output tail kept per host for the side panel.
 const OPS_TAIL_LINES: usize = 200;
 
-/// Finished copies kept in Ctrl+J (#536); older ones drop off.
-const MAX_FINISHED_COPIES: usize = 10;
 
 impl App {
     /// Refresh [`App::operations`] from the agent's background-job registry.
@@ -6174,7 +6172,7 @@ impl App {
             ops.extend(
                 self.file_copies
                     .iter()
-                    .filter(|c| c.session == s.id)
+                    .filter(|c| c.session == s.id && c.running())
                     .map(crate::file_panels::FileCopy::operation),
             );
         }
@@ -14853,22 +14851,52 @@ mod tests {
     }
 
     #[test]
-    fn only_the_last_finished_copies_are_kept() {
+    fn a_finished_copy_leaves_ctrl_j_and_the_counter_but_jobs_stay() {
+        use filar_agent::background::JobState;
         let mut app = app_ready_to_copy();
         let plan = app
             .file_panels
             .as_ref()
             .and_then(|fp| fp.copy_plan().ok())
             .expect("plan");
-        for i in 1..=(MAX_FINISHED_COPIES as u64 + 3) {
-            // Started directly: after a copy the target panel re-lists, and
-            // the keys would rightly wait for that listing.
+        let sid = app.sessions[app.active].id;
+        let jobs = |s: SessionId| {
+            if s == sid {
+                vec![job("job-1", JobState::Done { exit_code: 0 })]
+            } else {
+                Vec::new()
+            }
+        };
+        for (i, report) in [
+            filar_transport::CopyReport { copied: 1, ..Default::default() },
+            filar_transport::CopyReport {
+                failed: vec![("/src/a.txt".into(), "denied".into())],
+                ..Default::default()
+            },
+            filar_transport::CopyReport { cancelled: true, ..Default::default() },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = i as u64 + 1;
             app.start_copy(plan.clone());
-            assert_eq!(app.running_copy().map(|c| c.id), Some(i));
-            app.finish_copy(i, filar_transport::CopyReport::default());
+            app.refresh_operations_with(jobs);
+            // Running: listed next to the finished background job.
+            let ids: Vec<_> = app.operations.iter().map(|o| o.id.clone()).collect();
+            assert_eq!(ids, vec!["job-1".to_string(), format!("copy-{id}")]);
+            assert_eq!(app.operation_counts().running, 1);
+            app.finish_copy(id, report);
+            app.refresh_operations_with(jobs);
+            // Done, failed or cancelled: gone; the job is untouched.
+            let ids: Vec<_> = app.operations.iter().map(|o| o.id.as_str()).collect();
+            assert_eq!(ids, vec!["job-1"]);
+            let c = app.operation_counts();
+            assert_eq!((c.running, c.done, c.failed, c.cancelled), (0, 1, 0, 0));
+            assert!(app.file_copies.is_empty());
         }
-        assert_eq!(app.file_copies.len(), MAX_FINISHED_COPIES);
-        assert_eq!(app.file_copies.last().map(|c| c.id), Some(MAX_FINISHED_COPIES as u64 + 3));
+        // Numbers stay unique after copies leave.
+        app.start_copy(plan);
+        assert_eq!(app.running_copy().map(|c| c.id), Some(4));
     }
 
     #[test]
@@ -14893,7 +14921,9 @@ mod tests {
             .requests
             .iter()
             .any(|r| matches!(r, PanelRequest::List { path, .. } if path == "/dst")));
-        let op = app.operations.iter().find(|op| op.id == "copy-1").expect("listed");
-        assert_eq!(op.state(), crate::ops::HostOpState::Done);
+        assert!(
+            app.operations.iter().all(|op| op.id != "copy-1"),
+            "a finished copy leaves Ctrl+J (#545)"
+        );
     }
 }

@@ -17,6 +17,13 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   `m` — locally or on the host over SFTP; the name is checked first and the
   new folder is selected ([#546](https://github.com/devlawey/filar/issues/546)).
 
+### Fixed
+
+- File panels: a finished copy leaves the Ctrl+J operations panel and the
+  `ops` counter right away — its result is already in the chat — so the
+  panel no longer stays docked after copying; background jobs and the fleet
+  are unchanged ([#545](https://github.com/devlawey/filar/issues/545)).
+
 ## [2.0.5] - 2026-10-20
 
 ### Added
