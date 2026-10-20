@@ -721,29 +721,47 @@ impl Agent {
                 sink(event);
             }
         });
-        if let Ok(mut pending) = self.pending_scores.lock() {
-            pending.retain(|h| !h.is_finished());
-            pending.push(handle);
-        }
+        let mut pending = self.pending_scores_lock();
+        pending.retain(|h| !h.is_finished());
+        pending.push(handle);
     }
 
-    /// Wait for every rating still in flight.
+    /// Lock the in-flight ratings. A poisoned lock is taken over rather than
+    /// skipped: waiting for or aborting the ratings must never be lost.
+    fn pending_scores_lock(&self) -> std::sync::MutexGuard<'_, Vec<tokio::task::JoinHandle<()>>> {
+        self.pending_scores.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wait for every rating still in flight. A cancellation that arrives
+    /// while waiting aborts the rest, so no rating can follow `Cancelled`.
     async fn await_pending_scores(&self) {
-        let handles: Vec<_> = match self.pending_scores.lock() {
-            Ok(mut pending) => pending.drain(..).collect(),
-            Err(_) => return,
-        };
-        for h in handles {
-            let _ = h.await;
+        let handles: Vec<_> = self.pending_scores_lock().drain(..).collect();
+        let mut handles = handles.into_iter();
+        while let Some(mut h) = handles.next() {
+            let cancelled = match &self.cancellation {
+                Some(token) => tokio::select! {
+                    _ = &mut h => false,
+                    _ = token.cancelled() => true,
+                },
+                None => {
+                    let _ = (&mut h).await;
+                    false
+                }
+            };
+            if cancelled {
+                h.abort();
+                for rest in handles.by_ref() {
+                    rest.abort();
+                }
+                return;
+            }
         }
     }
 
     /// Drop every rating still in flight (on cancellation).
     fn abort_pending_scores(&self) {
-        if let Ok(mut pending) = self.pending_scores.lock() {
-            for h in pending.drain(..) {
-                h.abort();
-            }
+        for h in self.pending_scores_lock().drain(..) {
+            h.abort();
         }
     }
 
@@ -767,13 +785,17 @@ impl Agent {
     pub async fn run(&self, user_prompt: &str, history: &[ChatMessage]) -> Result<String> {
         self.emit(AgentEvent::Started);
         let result = self.run_loop(user_prompt, history).await;
+        // Ratings still in flight land before the terminal event; each is
+        // bounded by the scorer's own timeout. Waiting watches the
+        // cancellation token, so a cancel before or during the wait aborts
+        // them instead — `Cancelled` is terminal, no rating may follow it.
         if self.is_cancelled() {
-            // `Cancelled` is terminal: no rating may follow it.
             self.abort_pending_scores();
         } else {
-            // Ratings still in flight land before the terminal event. Each is
-            // bounded by the scorer's own timeout.
             self.await_pending_scores().await;
+            if self.is_cancelled() {
+                self.abort_pending_scores();
+            }
         }
         match result {
             Ok(text) => {
@@ -3170,5 +3192,36 @@ mod tests {
         let events = events.lock().unwrap();
         assert!(matches!(events.last(), Some(AgentEvent::Cancelled)), "{events:?}");
         assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandScored { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_while_waiting_for_ratings_aborts_them() {
+        // The loop is done and the agent waits for a slow rating; a cancel
+        // arriving now must not wait the rating out nor let it be emitted.
+        let scorer = FakeScorer::new(Ok(10), Duration::from_secs(5));
+        let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> = Arc::default();
+        let ev = events.clone();
+        let token = CancellationToken::new();
+        let agent = Agent::builder()
+            .llm(one_command_llm("echo hi"))
+            .executor(Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) }))
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .confirm_mode(CommandConfirmMode::Never)
+            .cancellation(token.clone())
+            .event_sink(Arc::new(move |e| ev.lock().unwrap().push(e)))
+            .risk_scorer(Some(scorer as Arc<dyn crate::risk::RiskScorer>))
+            .build()
+            .unwrap();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            token.cancel();
+        });
+        let started = std::time::Instant::now();
+        let _ = agent.run("go", &[]).await;
+        canceller.await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3), "the wait ignored the cancel");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = events.lock().unwrap();
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandScored { .. })), "{events:?}");
     }
 }
