@@ -14,8 +14,11 @@
 //! rather than from a number a chat model wrote.
 //!
 //! [`DecisionsApiScorer`] speaks the Decisions API
-//! (`POST {base_url}/decisions`); other protocols plug in behind the same
-//! trait.
+//! (`POST {base_url}/decisions`). [`ChatLogprobScorer`] makes any
+//! OpenAI-compatible chat model a scorer, as long as its server returns
+//! `logprobs`: the model answers with one digit and the level distribution is
+//! read from that token's log-probabilities (#550). Other protocols plug in
+//! behind the same trait.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -152,17 +155,8 @@ impl DecisionsApiScorer {
     /// Build a scorer for `base_url` / `model` with an already resolved key
     /// (empty = send no `Authorization` header).
     pub fn new(base_url: &str, model: &str, api_key: &str, timeout: Duration) -> Result<Self> {
-        let mut builder = reqwest::Client::builder().timeout(timeout);
-        // Keyless (local) servers: no redirects, so the command text cannot
-        // be forwarded to another host — same policy as the LLM client.
-        if api_key.is_empty() {
-            builder = builder.redirect(reqwest::redirect::Policy::none());
-        }
-        let http = builder
-            .build()
-            .map_err(|e| CoreError::Other(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
-            http,
+            http: scorer_http_client(api_key, timeout)?,
             endpoint: format!("{}/decisions", base_url.trim().trim_end_matches('/')),
             model: model.trim().to_string(),
             api_key: api_key.to_string(),
@@ -255,30 +249,234 @@ pub fn parse_decisions_response(body: &str, requested_model: &str) -> Result<Ris
 #[async_trait]
 impl RiskScorer for DecisionsApiScorer {
     async fn score(&self, input: &RiskInput) -> Result<RiskScore> {
-        let mut req = self.http.post(&self.endpoint).json(&self.request_body(input));
-        if !self.api_key.is_empty() {
-            req = req.bearer_auth(&self.api_key);
-        }
-        // `without_url`: the error text must carry neither the key nor the
-        // full request URL.
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| CoreError::Other(format!("risk scorer request failed: {}", e.without_url())))?;
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| CoreError::Other(format!("risk scorer: body unreadable: {}", e.without_url())))?;
-        if !status.is_success() {
-            return Err(CoreError::Other(format!("risk scorer: HTTP {}", status.as_u16())));
-        }
-        parse_decisions_response(&body, &self.model)
+        let body = self.request_body(input);
+        let text = post_json(&self.http, &self.endpoint, &self.api_key, &body).await?;
+        parse_decisions_response(&text, &self.model)
     }
 
     fn model_name(&self) -> &str {
         &self.model
     }
+}
+
+// ---------------------------------------------------------------------------
+// Chat + logprobs
+// ---------------------------------------------------------------------------
+
+/// System instruction for [`ChatLogprobScorer`]: the same [`RISK_LEVELS`],
+/// numbered, and a one-digit answer.
+pub fn chat_logprob_instruction() -> String {
+    let mut s = String::from(
+        "You rate how dangerous it is to run a shell command on the described target.\n\
+         Danger levels, from safest to most dangerous:\n",
+    );
+    for (i, level) in RISK_LEVELS.iter().enumerate() {
+        s.push_str(&format!("{i}: {level}\n"));
+    }
+    s.push_str(&format!(
+        "Answer with exactly one digit from 0 to {} — the level of the command. No other text.",
+        RISK_LEVELS.len() - 1
+    ));
+    s
+}
+
+/// Chat-completions request body for [`ChatLogprobScorer`].
+pub fn build_chat_logprob_request(model: &str, input: &RiskInput) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": chat_logprob_instruction() },
+            { "role": "user", "content": input.state_text() },
+        ],
+        "max_tokens": 1,
+        "temperature": 0,
+        "logprobs": true,
+        "top_logprobs": RISK_LEVELS.len().max(5),
+        "stream": false,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatLogprobResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    choices: Vec<ChatLogprobChoice>,
+    #[serde(default)]
+    usage: Option<DecisionsUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatLogprobChoice {
+    #[serde(default)]
+    logprobs: Option<ChatLogprobs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatLogprobs {
+    #[serde(default)]
+    content: Option<Vec<ChatTokenLogprob>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatTokenLogprob {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    logprob: Option<f64>,
+    #[serde(default)]
+    top_logprobs: Vec<ChatTopLogprob>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatTopLogprob {
+    token: String,
+    logprob: f64,
+}
+
+/// The level a token stands for: a single digit `0..N`, surrounding
+/// whitespace ignored (tokenizers often emit `" 2"`).
+fn token_level(token: &str) -> Option<usize> {
+    let t = token.trim();
+    if t.len() != 1 {
+        return None;
+    }
+    t.parse::<usize>().ok().filter(|i| *i < RISK_LEVELS.len())
+}
+
+/// Parse a chat-completions response with `logprobs` into a [`RiskScore`].
+///
+/// The distribution is taken from `top_logprobs` of the first generated
+/// token: probabilities of the tokens that name a level are summed per level
+/// and normalised. A response without logprobs is an error — the generated
+/// digit alone is not a rating.
+pub fn parse_chat_logprob_response(body: &str, requested_model: &str) -> Result<RiskScore> {
+    let resp: ChatLogprobResponse = serde_json::from_str(body)
+        .map_err(|e| CoreError::Other(format!("risk scorer: unexpected response: {e}")))?;
+    let first = resp
+        .choices
+        .first()
+        .and_then(|c| c.logprobs.as_ref())
+        .and_then(|l| l.content.as_ref())
+        .and_then(|c| c.first())
+        .ok_or_else(|| CoreError::Other("risk scorer: server does not return logprobs".into()))?;
+
+    let mut mass: BTreeMap<usize, f64> = BTreeMap::new();
+    let mut add = |token: &str, logprob: f64| {
+        if let Some(level) = token_level(token) {
+            if logprob.is_finite() {
+                *mass.entry(level).or_insert(0.0) += logprob.exp();
+            }
+        }
+    };
+    if first.top_logprobs.is_empty() {
+        // Some servers return only the chosen token's logprob.
+        if let Some(lp) = first.logprob {
+            add(&first.token, lp);
+        }
+    } else {
+        for t in &first.top_logprobs {
+            add(&t.token, t.logprob);
+        }
+    }
+    let total: f64 = mass.values().sum();
+    if total <= 0.0 || !total.is_finite() {
+        return Err(CoreError::Other(
+            "risk scorer: no level digit among the returned logprobs".into(),
+        ));
+    }
+    let probabilities: BTreeMap<usize, f32> = mass
+        .iter()
+        .map(|(i, p)| (*i, (*p / total) as f32))
+        .collect();
+    let position = expected_position(&probabilities)
+        .ok_or_else(|| CoreError::Other("risk scorer: empty distribution".into()))?;
+    let confidence = probabilities.values().cloned().fold(None, |m: Option<f32>, p| {
+        Some(m.map_or(p, |m| m.max(p)))
+    });
+    Ok(RiskScore {
+        safety_pct: safety_pct_from_position(position, RISK_LEVELS.len()),
+        confidence,
+        probabilities,
+        cost_usd: resp.usage.and_then(|u| u.cost),
+        model: resp.model.unwrap_or_else(|| requested_model.to_string()),
+    })
+}
+
+/// [`RiskScorer`] over an OpenAI-compatible chat-completions endpoint that
+/// returns `logprobs` — e.g. a local server, or a provider without the
+/// Decisions API.
+pub struct ChatLogprobScorer {
+    http: reqwest::Client,
+    endpoint: String,
+    model: String,
+    api_key: String,
+}
+
+impl ChatLogprobScorer {
+    /// Build a scorer for `base_url` / `model` with an already resolved key
+    /// (empty = send no `Authorization` header).
+    pub fn new(base_url: &str, model: &str, api_key: &str, timeout: Duration) -> Result<Self> {
+        Ok(Self {
+            http: scorer_http_client(api_key, timeout)?,
+            endpoint: format!("{}/chat/completions", base_url.trim().trim_end_matches('/')),
+            model: model.trim().to_string(),
+            api_key: api_key.to_string(),
+        })
+    }
+}
+
+#[async_trait]
+impl RiskScorer for ChatLogprobScorer {
+    async fn score(&self, input: &RiskInput) -> Result<RiskScore> {
+        let body = build_chat_logprob_request(&self.model, input);
+        let text = post_json(&self.http, &self.endpoint, &self.api_key, &body).await?;
+        parse_chat_logprob_response(&text, &self.model)
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+}
+
+/// HTTP client shared by the scorers: total timeout; keyless (local)
+/// servers get no redirects, so the command text cannot be forwarded to
+/// another host — same policy as the LLM client.
+fn scorer_http_client(api_key: &str, timeout: Duration) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if api_key.is_empty() {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
+    builder
+        .build()
+        .map_err(|e| CoreError::Other(format!("failed to build HTTP client: {e}")))
+}
+
+/// POST `body` as JSON and return the response text of a 2xx answer. Errors
+/// carry neither the key nor the URL.
+async fn post_json(
+    http: &reqwest::Client,
+    endpoint: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+) -> Result<String> {
+    let mut req = http.post(endpoint).json(body);
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| CoreError::Other(format!("risk scorer request failed: {}", e.without_url())))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| CoreError::Other(format!("risk scorer: body unreadable: {}", e.without_url())))?;
+    if !status.is_success() {
+        return Err(CoreError::Other(format!("risk scorer: HTTP {}", status.as_u16())));
+    }
+    Ok(text)
 }
 
 /// Build the scorer described by `[risk_scorer]`, resolving its key from
@@ -306,6 +504,13 @@ pub fn build_risk_scorer(
             &key,
             timeout,
         )?)),
+        RiskScorerKind::ChatLogprobs => Ok(std::sync::Arc::new(ChatLogprobScorer::new(
+            &cfg.base_url,
+            &cfg.model,
+            &key,
+            timeout,
+        )?)),
+        _ => Err(CoreError::Config("[risk_scorer] unsupported kind".into())),
     }
 }
 
@@ -519,5 +724,100 @@ mod tests {
 
         let bad = RiskScorerConfig { kind: "magic".into(), ..cfg };
         assert!(build_risk_scorer(&bad, &with_key).is_err());
+    }
+
+    // ── chat + logprobs (#550) ──────────────────────────────────────
+
+    #[test]
+    fn chat_request_asks_for_one_token_with_logprobs() {
+        let body = build_chat_logprob_request("qwen", &input());
+        assert_eq!(body["model"], "qwen");
+        assert_eq!(body["max_tokens"], 1);
+        assert_eq!(body["temperature"], 0);
+        assert_eq!(body["logprobs"], true);
+        assert!(body["top_logprobs"].as_u64().unwrap() >= RISK_LEVELS.len() as u64);
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        for (i, level) in RISK_LEVELS.iter().enumerate() {
+            assert!(system.contains(&format!("{i}: {level}")), "{system}");
+        }
+        assert!(system.contains("exactly one digit"));
+        assert!(body["messages"][1]["content"].as_str().unwrap().contains("rm -rf /tmp/x"));
+    }
+
+    #[test]
+    fn chat_distribution_from_top_logprobs() {
+        // "3" and " 3" both name level 3; "Sure" is ignored; 0.5/0.25/0.25 overall.
+        let body = format!(
+            r#"{{"model":"qwen","choices":[{{"logprobs":{{"content":[{{"token":"3","logprob":{l3a},
+            "top_logprobs":[{{"token":"3","logprob":{l3a}}},{{"token":" 3","logprob":{l3b}}},
+            {{"token":"1","logprob":{l1}}},{{"token":"Sure","logprob":{lx}}}]}}]}}}}],
+            "usage":{{"prompt_tokens":10,"completion_tokens":1}}}}"#,
+            l3a = (0.25f64).ln(), l3b = (0.25f64).ln(), l1 = (0.5f64).ln(), lx = (0.1f64).ln()
+        );
+        let s = parse_chat_logprob_response(&body, "m").unwrap();
+        // Expected position: 0.5·3 + 0.5·1 = 2 → 50%.
+        assert_eq!(s.safety_pct, 50);
+        assert_eq!(s.probabilities.len(), 2);
+        assert!((s.confidence.unwrap() - 0.5).abs() < 1e-4);
+        assert_eq!(s.model, "qwen");
+    }
+
+    #[test]
+    fn chat_without_logprobs_is_unavailable() {
+        let body = r#"{"choices":[{"message":{"content":"2"}}]}"#;
+        let err = parse_chat_logprob_response(body, "m").unwrap_err().to_string();
+        assert!(err.contains("does not return logprobs"), "{err}");
+        let body = r#"{"choices":[{"logprobs":null}]}"#;
+        assert!(parse_chat_logprob_response(body, "m").is_err());
+    }
+
+    #[test]
+    fn chat_only_chosen_token_logprob_still_rates() {
+        let body = r#"{"choices":[{"logprobs":{"content":[{"token":"0","logprob":-0.01,"top_logprobs":[]}]}}]}"#;
+        let s = parse_chat_logprob_response(body, "m").unwrap();
+        assert_eq!(s.safety_pct, 100);
+    }
+
+    #[test]
+    fn chat_with_no_level_digit_is_an_error() {
+        let body = r#"{"choices":[{"logprobs":{"content":[{"token":"I","logprob":-0.1,
+            "top_logprobs":[{"token":"I","logprob":-0.1},{"token":"7","logprob":-3.0},{"token":"12","logprob":-4.0}]}]}}]}"#;
+        assert!(parse_chat_logprob_response(body, "m").is_err());
+    }
+
+    const CHAT_OK: &str = r#"{"model":"local","choices":[{"logprobs":{"content":[{"token":"4","logprob":0.0,"top_logprobs":[{"token":"4","logprob":0.0}]}]}}]}"#;
+
+    #[tokio::test]
+    async fn chat_scorer_posts_to_chat_completions() {
+        let (base, seen) = serve_once(200, CHAT_OK, Duration::ZERO).await;
+        let s = ChatLogprobScorer::new(&base, "local", "", Duration::from_secs(5)).unwrap();
+        let r = s.score(&input()).await.unwrap();
+        assert_eq!(r.safety_pct, 0);
+        let req = seen.lock().unwrap().to_ascii_lowercase();
+        assert!(req.starts_with("post /api/alpha/chat/completions "), "{req}");
+        assert!(!req.contains("authorization:"), "keyless sends no key");
+        assert!(req.contains("\"logprobs\":true"));
+    }
+
+    #[tokio::test]
+    async fn chat_scorer_errors_carry_no_key() {
+        let (base, seen) = serve_once(500, "{}", Duration::ZERO).await;
+        let s = ChatLogprobScorer::new(&base, "m", SECRET, Duration::from_secs(5)).unwrap();
+        let err = s.score(&input()).await.unwrap_err().to_string();
+        assert!(err.contains("500") && !err.contains(SECRET), "{err}");
+        assert!(seen.lock().unwrap().to_ascii_lowercase().contains("authorization: bearer"));
+    }
+
+    #[test]
+    fn build_picks_the_chat_adapter() {
+        let cfg = RiskScorerConfig {
+            kind: "chat-logprobs".into(),
+            base_url: "http://127.0.0.1:8080/v1".into(),
+            model: "qwen".into(),
+            key_env: String::new(),
+            timeout_secs: 8,
+        };
+        let s = build_risk_scorer(&cfg, &filar_core::secrets::StaticSecretProvider::new()).unwrap();
+        assert_eq!(s.model_name(), "qwen");
     }
 }

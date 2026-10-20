@@ -585,6 +585,13 @@ let _agent = builder.risk_scorer(Some(scorer));
   `DecisionsApiScorer` speaks the Decisions API (`POST {base_url}/decisions`,
   one `score` question over `filar_agent::risk::RISK_LEVELS`). Implement the
   trait for another protocol; `LlmClient` is not involved.
+- `ChatLogprobScorer` (`kind = "chat-logprobs"`, #550) turns any
+  OpenAI-compatible chat model into a scorer, if the server returns
+  `logprobs`: `POST {base_url}/chat/completions` with `max_tokens: 1`,
+  `logprobs: true`, `top_logprobs`, and an instruction listing the same
+  levels; the level distribution is read from the first token's
+  `top_logprobs` (digits `0`–`4`, with or without a leading space). No
+  `logprobs` in the answer → `unavailable`.
 - Every command the agent proposes is rated, in every confirmation mode,
   except fleet runs and the bookkeeping tools that run nothing. Scoring runs
   in its own task and never waits on the gate or delays execution.
@@ -604,6 +611,7 @@ let _agent = builder.risk_scorer(Some(scorer));
 |--------|--------|------------|
 | `AgentEvent::CommandProposed::proposal_id: u64` added (#549) | Constructing the event by hand; patterns without `..` | Add `..` to patterns; keep the id if you show safety ratings |
 | `AgentEvent::CommandScored` added (#549) | Nothing — `AgentEvent` is `#[non_exhaustive]` | Handle it to show the rating next to the command |
+| `ChatLogprobScorer`, `RiskScorerKind::ChatLogprobs` (#550); `RiskScorerKind` is `#[non_exhaustive]` | Exhaustive matches on `RiskScorerKind` | Add a `_` arm |
 | `RiskScorer`, `RiskInput`, `RiskScore`, `DecisionsApiScorer`, `build_risk_scorer`, `AgentBuilder::risk_scorer`; `RiskScorerConfig`, `RiskScorerKind`, `Config::risk_scorer` (#549) | Nothing — additive (struct literals of `Config` use `..Default::default()`) | Opt in; see the safety-rating section |
 
 `CommandExecutor` and `LlmClient` are unchanged.

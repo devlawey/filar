@@ -19,6 +19,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   confirmation mode — asynchronously and without touching the confirmation
   gate; the key has its own `key_env` (`AgentEvent::CommandScored`,
   `CommandProposed::proposal_id`) ([#549](https://github.com/devlawey/filar/issues/549)).
+- Command safety rating with any OpenAI-compatible chat model whose server
+  returns `logprobs` (`kind = "chat-logprobs"`, e.g. a local llama.cpp or vLLM
+  server): the percentage comes from the log-probabilities of a one-digit
+  answer, and a server without logprobs reports the rating as unavailable
+  ([#550](https://github.com/devlawey/filar/issues/550)).
 
 ## [2.0.6] - 2026-10-20
 
