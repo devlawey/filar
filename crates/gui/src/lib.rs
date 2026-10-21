@@ -1587,9 +1587,11 @@ struct RiskScorerDraft {
     key_env: String,
     /// A newly typed key — saved to the OS store at launch, never to a file.
     key: String,
-    /// A key is already stored under `key_env` (checked at start-up and
-    /// after a save, not on every frame).
+    /// A key is already stored under `key_checked_for` (checked at
+    /// start-up and when the key name is edited, not on every frame).
     key_saved: bool,
+    /// The key name `key_saved` was checked under.
+    key_checked_for: String,
     warn_below: String,
     danger_below: String,
     /// Not edited in the launcher; carried over from `config.toml`.
@@ -1622,11 +1624,25 @@ impl RiskScorerDraft {
             },
             key: String::new(),
             key_saved: false,
+            key_checked_for: String::new(),
             warn_below: c.warn_below.to_string(),
             danger_below: c.danger_below.to_string(),
             timeout_secs: c.timeout_secs,
             advanced_open: false,
         }
+    }
+
+    /// Whether a key is stored under the name as it reads now. A name not
+    /// checked yet (being edited) reads as "not set" until it is.
+    fn key_saved_now(&self) -> bool {
+        self.key_saved && self.key_env.trim() == self.key_checked_for
+    }
+
+    /// Look the key name up in the OS store once (no-op in unit tests).
+    fn refresh_key_saved(&mut self) {
+        let name = self.key_env.trim().to_string();
+        self.key_saved = !name.is_empty() && !load_secret(&name).is_empty();
+        self.key_checked_for = name;
     }
 
     /// The `key_env` the section gets: empty for a keyless server.
@@ -2629,16 +2645,23 @@ impl LauncherApp {
                     .desired_width(f32::INFINITY),
             );
         });
-        ui.checkbox(&mut d.keyless, "No key (local server)");
+        if ui.checkbox(&mut d.keyless, "No key (local server)").changed() && d.keyless {
+            // A key typed before ticking "no key" must not be saved later.
+            d.key.clear();
+        }
         if !d.keyless {
             ui.horizontal(|ui| {
                 ui.label("Key name:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut d.key_env)
-                        .desired_width(180.0),
-                )
-                .on_hover_text("Environment variable / OS store entry the key is kept under.");
+                let resp = ui
+                    .add(egui::TextEdit::singleline(&mut d.key_env).desired_width(180.0))
+                    .on_hover_text("Environment variable / OS store entry the key is kept under.");
+                // The "saved" status is for the name it was checked under:
+                // re-check once the name is edited, not on every keystroke.
+                if resp.lost_focus() && d.key_env.trim() != d.key_checked_for {
+                    d.refresh_key_saved();
+                }
             });
+            let saved = d.key_saved_now();
             ui.horizontal(|ui| {
                 ui.label("Key:");
                 let id = ui.make_persistent_id("risk_scorer_key");
@@ -2647,11 +2670,11 @@ impl LauncherApp {
                     egui::TextEdit::singleline(&mut d.key)
                         .id(id)
                         .password(true)
-                        .hint_text(if d.key_saved { "saved — type to replace" } else { "not set" })
+                        .hint_text(if saved { "saved — type to replace" } else { "not set" })
                         .desired_width(180.0),
                 );
                 ui.label(
-                    egui::RichText::new(if d.key_saved { "saved" } else { "not set" })
+                    egui::RichText::new(if saved { "saved" } else { "not set" })
                         .small()
                         .weak(),
                 );
@@ -3668,8 +3691,11 @@ pub fn run_launcher(config: &Config) {
         arbiter_profile: settings.arbiter_profile.clone(),
         risk_scorer: {
             let mut d = RiskScorerDraft::from_config(config.risk_scorer.as_ref());
-            // One OS-store read at start-up, not one per frame.
-            d.key_saved = !load_secret(&d.key_env).is_empty();
+            // One OS-store read at start-up, not one per frame — and none for
+            // a keyless scorer, whose key name is not in use.
+            if !d.keyless {
+                d.refresh_key_saved();
+            }
             d
         },
         import_dialog: None,
@@ -6089,6 +6115,7 @@ host_key_policy = \"strict\"
         assert_eq!(d.key_to_save(), None);
         // Unticking brings the remembered name back.
         d.keyless = false;
+        d.key.clear(); // what ticking "no key" does in the UI
         assert_eq!(d.to_config().unwrap().unwrap().key_env, "FILAR_RISK_API_KEY");
     }
 
@@ -6114,5 +6141,18 @@ host_key_policy = \"strict\"
         let json = r#"{"target":"local","ssh":null,"model":"m","api_base_url":"u","session_id":null}"#;
         let cfg: LaunchConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.risk_scorer, None);
+    }
+
+    #[test]
+    fn risk_key_status_belongs_to_the_name_it_was_checked_under() {
+        let mut d = enabled_draft();
+        d.key_saved = true;
+        d.key_checked_for = d.key_env.clone();
+        assert!(d.key_saved_now());
+        d.key_env = "OTHER_KEY".into();
+        assert!(!d.key_saved_now(), "a renamed key is not shown as saved until checked");
+        d.refresh_key_saved(); // load_secret is a no-op in tests
+        assert_eq!(d.key_checked_for, "OTHER_KEY");
+        assert!(!d.key_saved_now());
     }
 }
