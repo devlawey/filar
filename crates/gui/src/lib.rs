@@ -1632,6 +1632,28 @@ impl RiskScorerDraft {
         }
     }
 
+    /// Switch the type. Leaving Decisions drops its auto-filled address, so
+    /// a chat scorer is never pointed at the Decisions endpoint unnoticed;
+    /// an address the user typed is kept.
+    fn set_chat_logprobs(&mut self, chat: bool) {
+        if chat && !self.chat_logprobs && self.base_url.trim() == RISK_DECISIONS_BASE_URL {
+            self.base_url.clear();
+        }
+        self.chat_logprobs = chat;
+    }
+
+    /// Tick or untick "no key". Ticking drops a typed key (it must not be
+    /// saved later); unticking reads the name's status if it was never
+    /// checked (a keyless section skips the start-up read).
+    fn set_keyless(&mut self, keyless: bool) {
+        self.keyless = keyless;
+        if keyless {
+            self.key.clear();
+        } else if self.key_env.trim() != self.key_checked_for {
+            self.refresh_key_saved();
+        }
+    }
+
     /// Whether a key is stored under the name as it reads now. A name not
     /// checked yet (being edited) reads as "not set" until it is.
     fn key_saved_now(&self) -> bool {
@@ -2605,7 +2627,7 @@ impl LauncherApp {
         ui.horizontal(|ui| {
             ui.label("Type:");
             if ui.radio(!d.chat_logprobs, "Decisions API").clicked() {
-                d.chat_logprobs = false;
+                d.set_chat_logprobs(false);
             }
             if ui
                 .radio(d.chat_logprobs, "Chat + logprobs")
@@ -2615,7 +2637,7 @@ impl LauncherApp {
                 )
                 .clicked()
             {
-                d.chat_logprobs = true;
+                d.set_chat_logprobs(true);
             }
         });
         if !d.chat_logprobs && d.base_url.trim().is_empty() {
@@ -2645,9 +2667,9 @@ impl LauncherApp {
                     .desired_width(f32::INFINITY),
             );
         });
-        if ui.checkbox(&mut d.keyless, "No key (local server)").changed() && d.keyless {
-            // A key typed before ticking "no key" must not be saved later.
-            d.key.clear();
+        let mut keyless = d.keyless;
+        if ui.checkbox(&mut keyless, "No key (local server)").changed() {
+            d.set_keyless(keyless);
         }
         if !d.keyless {
             ui.horizontal(|ui| {
@@ -6114,8 +6136,10 @@ host_key_policy = \"strict\"
         assert_eq!(d.to_config().unwrap().unwrap().key_env, "");
         assert_eq!(d.key_to_save(), None);
         // Unticking brings the remembered name back.
-        d.keyless = false;
-        d.key.clear(); // what ticking "no key" does in the UI
+        d.set_keyless(true);
+        assert!(d.key.is_empty(), "ticking \"no key\" drops the typed key");
+        d.set_keyless(false);
+        assert_eq!(d.key_checked_for, "FILAR_RISK_API_KEY", "status read on unticking");
         assert_eq!(d.to_config().unwrap().unwrap().key_env, "FILAR_RISK_API_KEY");
     }
 
@@ -6154,5 +6178,17 @@ host_key_policy = \"strict\"
         d.refresh_key_saved(); // load_secret is a no-op in tests
         assert_eq!(d.key_checked_for, "OTHER_KEY");
         assert!(!d.key_saved_now());
+    }
+
+    #[test]
+    fn switching_to_chat_drops_only_the_auto_filled_decisions_address() {
+        let mut d = enabled_draft();
+        assert_eq!(d.base_url, RISK_DECISIONS_BASE_URL);
+        d.set_chat_logprobs(true);
+        assert!(d.base_url.is_empty(), "the Decisions default does not follow into chat");
+        d.base_url = "https://my-proxy.example/v1".into();
+        d.set_chat_logprobs(false);
+        d.set_chat_logprobs(true);
+        assert_eq!(d.base_url, "https://my-proxy.example/v1", "a typed address is kept");
     }
 }
