@@ -27,3 +27,11 @@ tokio-util = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # Encrypted test keys for the fleet credential tests (#480).
 russh = { workspace = true }
+# The risk eval runner reads its dataset (#553).
+toml = { workspace = true }
+
+# Command safety rating eval (#553). `test = true` so its unit tests run
+# with `cargo test`; the eval itself only runs when invoked.
+[[example]]
+name = "risk_eval"
+test = true
