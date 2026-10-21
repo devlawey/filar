@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [2.0.7] - 2026-10-21
+
 ### Added
 
 - Command safety rating (engine): a decision model configured in
@@ -1430,7 +1432,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v2.0.6...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v2.0.7...HEAD
+[2.0.7]: https://github.com/devlawey/filar/compare/v2.0.6...v2.0.7
 [2.0.6]: https://github.com/devlawey/filar/compare/v2.0.5...v2.0.6
 [2.0.5]: https://github.com/devlawey/filar/compare/v2.0.4...v2.0.5
 [2.0.4]: https://github.com/devlawey/filar/compare/v2.0.3...v2.0.4

@@ -10972,3 +10972,18 @@ GitHub закрыто прокси), а аннотации читаются че
 поэтому `note` модели больше не отправляется.
 
 **Next:** веха 2.0.7 закрыта по коду; SMOKE и релиз — за мейнтейнером.
+
+## Релиз 2.0.7 (2026-10-21)
+
+**Входит:** оценка опасности команд (risk scorer): движок — `RiskScorer` +
+Decisions API (#549), chat-logprobs (#550); TUI — бейдж `Safety: N%` в диалоге
+и ленте (#551); лаунчер — блок «Command safety score» (#552); eval —
+датасет, раннер и workflow (#553). Полный список — CHANGELOG `[2.0.7]`.
+
+**Preflight:** build/test на `main` (212a06d) зелёные — 1649 passed, 0 failed,
+12 ignored (docker-sshd); диск снова кончился (os error 112) — сделан полный
+`cargo clean` (17.1 ГБ), чистая сборка 11м, тесты с `CARGO_INCREMENTAL=0`.
+Движок затронут: `AgentEvent` уже `#[non_exhaustive]`, ломает только
+`CommandProposed::proposal_id` (структурные литералы/паттерны без `..`) —
+Upgrading-секция для `engine-v2.0.7` уже была в доке, обновлены теги.
+Ручной SMOKE Win + Mac — за мейнтейнером (`docs/SMOKE.md`, #298).
