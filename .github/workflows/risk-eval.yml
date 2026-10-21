@@ -68,6 +68,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # `inputs` exist only on workflow_dispatch; a `needs-eval` label run
+      # gets the defaults (Jev on OpenRouter).
       - name: Rate the command set
         env:
           FILAR_RISK_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
