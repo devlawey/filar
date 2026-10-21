@@ -515,6 +515,29 @@ WARN filar: fleet check rejected: check #4 ('typo-key') in /.../fleet_checks.tom
 следующем Launch. Ни пароль, ни фраза не попадают в `settings.json`,
 `config.toml` и `pending_launch.json`.
 
+**Оценка безопасности команд** — блок **Command safety score** под выбором
+арбитра (см. 4.5). Он не связан ни с LLM-профилями, ни с арбитром: у модели
+оценки свои адрес, модель и ключ.
+
+- Галочка **Command safety score** включает оценку; без неё секции
+  `[risk_scorer]` в `config.toml` нет.
+- **Type** — `Decisions API` (Jev и другие decision-модели; адрес
+  подставляется `https://openrouter.ai/api/alpha`) или `Chat + logprobs`
+  (OpenAI-совместимая модель, сервер которой отдаёт logprobs, например
+  локальный).
+- **Address**, **Model** — обязательные; адрес начинается с `http://` или
+  `https://`.
+- **Key** — маскированное поле. При Launch ключ уходит в хранилище ОС под
+  именем из **Key name** (по умолчанию `FILAR_RISK_API_KEY`). Рядом видно
+  только «saved» / «not set», без значения; чтобы заменить ключ, наберите
+  новый. **No key (local server)** — сервер без ключа (`key_env = ""`).
+- **Advanced** — пороги цвета `Warn below %` и `Danger below %` (0–100,
+  danger не больше warn).
+
+При Launch секция `[risk_scorer]` записывается в `config.toml` (без ключа) и
+передаётся в TUI через `pending_launch.json`, тоже без ключа. Ошибка в полях —
+сообщение в лаунчере, окно не закрывается.
+
 ### 3.1. Импорт списка хостов
 
 Кнопка **Import…** рядом с «+ Add host» загружает парк хостов одним файлом —

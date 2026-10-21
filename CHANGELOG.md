@@ -29,6 +29,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
   command in the feed, coloured by `warn_below` / `danger_below`, `~` when
   the model is unsure, `unavailable` on failure; a `Risk scorer` line in F1
   ([#551](https://github.com/devlawey/filar/issues/551)).
+- Launcher: a "Command safety score" block — on/off, Decisions API or chat +
+  logprobs, address, model, a masked key saved to the OS credential store
+  under its own name (or "no key" for a local server), and the colour
+  thresholds; written to `config.toml` and passed to the TUI without the key
+  ([#552](https://github.com/devlawey/filar/issues/552)).
 
 ## [2.0.6] - 2026-10-20
 

@@ -418,6 +418,25 @@ pub struct LaunchConfig {
     /// "not said" and the session keeps what `config.toml` holds.
     #[serde(default)]
     pub host_groups: Option<Vec<filar_core::HostGroup>>,
+    /// The command safety scorer as the launcher left it (#552): `On` with
+    /// its settings, or `Off`. `None` (a file written before #552) means
+    /// "not said" and the session keeps `config.toml`'s `[risk_scorer]`.
+    /// Never carries the key — only `key_env`, the name it is stored under.
+    #[serde(default)]
+    pub risk_scorer: Option<RiskScorerLaunch>,
+}
+
+/// The launcher's choice for the command safety scorer (#552).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum RiskScorerLaunch {
+    /// No scorer for this session.
+    Off,
+    /// Rate commands with this scorer.
+    On {
+        /// The `[risk_scorer]` settings (no secret in them).
+        config: filar_core::RiskScorerConfig,
+    },
 }
 
 /// How the launcher logs in to an SSH host (#489).
@@ -1318,7 +1337,11 @@ fn export_hosts_toml(slots: &[&SshSlot]) -> Result<String, String> {
 /// launcher still picks them up.
 ///
 /// If a `config.toml` already exists, unrelated sections are preserved.
-fn save_config_toml(settings: &Settings, host_groups: &[filar_core::HostGroup]) {
+fn save_config_toml(
+    settings: &Settings,
+    host_groups: &[filar_core::HostGroup],
+    risk_scorer: Option<&filar_core::RiskScorerConfig>,
+) {
     let base = match filar_core::default_base_dir() {
         Ok(b) => b,
         Err(_) => return,
@@ -1362,6 +1385,9 @@ fn save_config_toml(settings: &Settings, host_groups: &[filar_core::HostGroup]) 
     // passes them via `pending_launch.json` (#255) and must NOT clear them,
     // because direct-TUI launches read them from config.toml as fallback.
     config.host_groups = host_groups.to_vec();
+    // `[risk_scorer]` likewise (#552): the launcher owns it, switched off =
+    // no section. Never a key — only `key_env`.
+    config.risk_scorer = risk_scorer.cloned();
 
     if let Err(e) = std::fs::create_dir_all(&app_dir) {
         tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");
@@ -1542,6 +1568,170 @@ fn launch_target_name(target_mode: usize, slots: &[SshSlot]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Command safety scorer (#552)
+// ---------------------------------------------------------------------------
+
+/// Launcher working copy of `[risk_scorer]` (#552): the command safety
+/// scorer, separate from the LLM profiles and the arbiter — its own address,
+/// model and key. No `Debug`: it holds a typed key.
+#[derive(Clone, PartialEq)]
+struct RiskScorerDraft {
+    enabled: bool,
+    /// `true` = `chat-logprobs`, `false` = Decisions API.
+    chat_logprobs: bool,
+    base_url: String,
+    model: String,
+    /// The server needs no key (`key_env = ""`).
+    keyless: bool,
+    /// Name the key is stored under; kept when "no key" is toggled back.
+    key_env: String,
+    /// A newly typed key — saved to the OS store at launch, never to a file.
+    key: String,
+    /// A key is already stored under `key_checked_for` (checked at
+    /// start-up and when the key name is edited, not on every frame).
+    key_saved: bool,
+    /// The key name `key_saved` was checked under.
+    key_checked_for: String,
+    warn_below: String,
+    danger_below: String,
+    /// Not edited in the launcher; carried over from `config.toml`.
+    timeout_secs: u64,
+    /// Show the threshold fields.
+    advanced_open: bool,
+}
+
+/// Default Decisions API address offered when the field is empty.
+const RISK_DECISIONS_BASE_URL: &str = "https://openrouter.ai/api/alpha";
+/// Model suggested for the Decisions API.
+const RISK_DECISIONS_MODEL_HINT: &str = "typesafe/jev-1.14";
+
+impl RiskScorerDraft {
+    /// From `config.toml`'s section; `key_saved` is filled in by the caller.
+    fn from_config(cfg: Option<&filar_core::RiskScorerConfig>) -> Self {
+        let d = filar_core::RiskScorerConfig::default();
+        let c = cfg.unwrap_or(&d);
+        Self {
+            enabled: cfg.is_some(),
+            chat_logprobs: filar_core::RiskScorerKind::parse(&c.kind)
+                == Some(filar_core::RiskScorerKind::ChatLogprobs),
+            base_url: c.base_url.clone(),
+            model: c.model.clone(),
+            keyless: cfg.is_some() && c.key_env.trim().is_empty(),
+            key_env: if c.key_env.trim().is_empty() {
+                filar_core::config::default_risk_key_env()
+            } else {
+                c.key_env.trim().to_string()
+            },
+            key: String::new(),
+            key_saved: false,
+            key_checked_for: String::new(),
+            warn_below: c.warn_below.to_string(),
+            danger_below: c.danger_below.to_string(),
+            timeout_secs: c.timeout_secs,
+            advanced_open: false,
+        }
+    }
+
+    /// Switch the type. Leaving Decisions drops its auto-filled address, so
+    /// a chat scorer is never pointed at the Decisions endpoint unnoticed;
+    /// an address the user typed is kept.
+    fn set_chat_logprobs(&mut self, chat: bool) {
+        if chat && !self.chat_logprobs && self.base_url.trim() == RISK_DECISIONS_BASE_URL {
+            self.base_url.clear();
+        }
+        self.chat_logprobs = chat;
+    }
+
+    /// Tick or untick "no key". Ticking drops a typed key (it must not be
+    /// saved later); unticking reads the name's status if it was never
+    /// checked (a keyless section skips the start-up read).
+    fn set_keyless(&mut self, keyless: bool) {
+        self.keyless = keyless;
+        if keyless {
+            self.key.clear();
+        } else if self.key_env.trim() != self.key_checked_for {
+            self.refresh_key_saved();
+        }
+    }
+
+    /// Whether a key is stored under the name as it reads now. A name not
+    /// checked yet (being edited) reads as "not set" until it is.
+    fn key_saved_now(&self) -> bool {
+        self.key_saved && self.key_env.trim() == self.key_checked_for
+    }
+
+    /// Look the key name up in the OS store once (no-op in unit tests).
+    fn refresh_key_saved(&mut self) {
+        let name = self.key_env.trim().to_string();
+        self.key_saved = !name.is_empty() && !load_secret(&name).is_empty();
+        self.key_checked_for = name;
+    }
+
+    /// The `key_env` the section gets: empty for a keyless server.
+    fn effective_key_env(&self) -> String {
+        if self.keyless {
+            String::new()
+        } else {
+            self.key_env.trim().to_string()
+        }
+    }
+
+    /// The section to write and launch with — `None` when switched off —
+    /// or the first problem, worded for the launcher. Never contains a key.
+    fn to_config(&self) -> Result<Option<filar_core::RiskScorerConfig>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let percent = |raw: &str, name: &str| -> Result<u8, String> {
+            raw.trim()
+                .parse::<u8>()
+                .ok()
+                .filter(|v| *v <= 100)
+                .ok_or_else(|| format!("Command safety: {name} must be a whole number from 0 to 100"))
+        };
+        let cfg = filar_core::RiskScorerConfig {
+            kind: if self.chat_logprobs { "chat-logprobs" } else { "decisions" }.to_string(),
+            base_url: self.base_url.trim().to_string(),
+            model: self.model.trim().to_string(),
+            key_env: self.effective_key_env(),
+            timeout_secs: self.timeout_secs,
+            warn_below: percent(&self.warn_below, "warn below")?,
+            danger_below: percent(&self.danger_below, "danger below")?,
+        };
+        if cfg.base_url.is_empty() {
+            return Err("Command safety: enter the address".into());
+        }
+        if !(cfg.base_url.starts_with("http://") || cfg.base_url.starts_with("https://")) {
+            return Err("Command safety: the address must start with http:// or https://".into());
+        }
+        if cfg.model.is_empty() {
+            return Err("Command safety: enter the model".into());
+        }
+        if !self.keyless && cfg.key_env.is_empty() {
+            return Err("Command safety: enter the key name, or tick \"no key\"".into());
+        }
+        cfg.validate()
+            .map_err(|e| format!("Command safety: {}", e.to_string().trim_start_matches("config error: ")))?;
+        Ok(Some(cfg))
+    }
+
+    /// What pending_launch carries for this draft (it is validated first).
+    fn to_launch(&self) -> Result<RiskScorerLaunch, String> {
+        Ok(match self.to_config()? {
+            Some(config) => RiskScorerLaunch::On { config },
+            None => RiskScorerLaunch::Off,
+        })
+    }
+
+    /// A key to store at launch: `(key_env, key)` when one was typed.
+    fn key_to_save(&self) -> Option<(String, String)> {
+        let key = sanitize_secret_clipboard(&self.key);
+        let env = self.effective_key_env();
+        (self.enabled && !env.is_empty() && !key.is_empty()).then_some((env, key))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Host groups (#418)
 // ---------------------------------------------------------------------------
 
@@ -1695,6 +1885,8 @@ struct LauncherApp {
     show_api_key: bool,
     /// Arbiter profile selection (`None` = same as session profile).
     arbiter_profile: Option<String>,
+    /// Command safety scorer settings (#552).
+    risk_scorer: RiskScorerDraft,
     /// Staged import waiting for the collision policy choice (#416).
     import_dialog: Option<ImportDialog>,
     /// Result of the last host-file operation — import or export (#416/#417),
@@ -2413,6 +2605,121 @@ impl LauncherApp {
             .small()
             .weak(),
         );
+
+        ui.separator();
+        self.render_risk_scorer(ui);
+    }
+
+    /// Command safety scorer settings (#552): a decision model that rates
+    /// every command the agent proposes, 0–100% (100% = safe). Separate from
+    /// the LLM profiles and the arbiter, with its own address and key.
+    fn render_risk_scorer(&mut self, ui: &mut egui::Ui) {
+        let d = &mut self.risk_scorer;
+        ui.checkbox(&mut d.enabled, "Command safety score")
+            .on_hover_text(
+                "A separate decision model rates every command the agent proposes: \
+                 0–100%, 100% = safe. Shown in the confirmation dialog and next to \
+                 the command. Advisory only — it never approves or blocks anything.",
+            );
+        if !d.enabled {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Type:");
+            if ui.radio(!d.chat_logprobs, "Decisions API").clicked() {
+                d.set_chat_logprobs(false);
+            }
+            if ui
+                .radio(d.chat_logprobs, "Chat + logprobs")
+                .on_hover_text(
+                    "Any OpenAI-compatible chat model whose server returns logprobs \
+                     (e.g. a local llama.cpp or vLLM server).",
+                )
+                .clicked()
+            {
+                d.set_chat_logprobs(true);
+            }
+        });
+        if !d.chat_logprobs && d.base_url.trim().is_empty() {
+            d.base_url = RISK_DECISIONS_BASE_URL.to_string();
+        }
+        ui.horizontal(|ui| {
+            ui.label("Address:");
+            ui.add(
+                egui::TextEdit::singleline(&mut d.base_url)
+                    .hint_text(if d.chat_logprobs {
+                        "http://127.0.0.1:8080/v1"
+                    } else {
+                        RISK_DECISIONS_BASE_URL
+                    })
+                    .desired_width(f32::INFINITY),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Model:");
+            ui.add(
+                egui::TextEdit::singleline(&mut d.model)
+                    .hint_text(if d.chat_logprobs {
+                        "local model name"
+                    } else {
+                        RISK_DECISIONS_MODEL_HINT
+                    })
+                    .desired_width(f32::INFINITY),
+            );
+        });
+        let mut keyless = d.keyless;
+        if ui.checkbox(&mut keyless, "No key (local server)").changed() {
+            d.set_keyless(keyless);
+        }
+        if !d.keyless {
+            ui.horizontal(|ui| {
+                ui.label("Key name:");
+                let resp = ui
+                    .add(egui::TextEdit::singleline(&mut d.key_env).desired_width(180.0))
+                    .on_hover_text("Environment variable / OS store entry the key is kept under.");
+                // The "saved" status is for the name it was checked under:
+                // re-check once the name is edited, not on every keystroke.
+                if resp.lost_focus() && d.key_env.trim() != d.key_checked_for {
+                    d.refresh_key_saved();
+                }
+            });
+            let saved = d.key_saved_now();
+            ui.horizontal(|ui| {
+                ui.label("Key:");
+                let id = ui.make_persistent_id("risk_scorer_key");
+                apply_focused_secret_paste(ui, id, &mut d.key);
+                ui.add(
+                    egui::TextEdit::singleline(&mut d.key)
+                        .id(id)
+                        .password(true)
+                        .hint_text(if saved { "saved — type to replace" } else { "not set" })
+                        .desired_width(180.0),
+                );
+                ui.label(
+                    egui::RichText::new(if saved { "saved" } else { "not set" })
+                        .small()
+                        .weak(),
+                );
+            });
+        }
+        egui::CollapsingHeader::new("Advanced")
+            .id_salt("risk_scorer_advanced")
+            .default_open(d.advanced_open)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Warn below %:");
+                    ui.add(egui::TextEdit::singleline(&mut d.warn_below).desired_width(50.0));
+                    ui.label("Danger below %:");
+                    ui.add(egui::TextEdit::singleline(&mut d.danger_below).desired_width(50.0));
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Colours of the rating. Tune them to the model: probabilities differ between models.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            });
     }
 
     /// Folder picker for the Ctrl+S session export directory.
@@ -2846,6 +3153,10 @@ impl LauncherApp {
             self.set_other_error(msg);
             return false;
         }
+        if let Err(msg) = self.risk_scorer.to_config() {
+            self.set_other_error(msg);
+            return false;
+        }
         true
     }
 
@@ -3181,8 +3492,23 @@ impl LauncherApp {
                 return;
             }
         };
+        let risk_scorer = match self.risk_scorer.to_launch() {
+            Ok(choice) => choice,
+            // validate_launch already refused it; never launch half-set.
+            Err(msg) => {
+                self.set_other_error(msg);
+                return;
+            }
+        };
+        let risk_section = match &risk_scorer {
+            RiskScorerLaunch::On { config } => Some(config.clone()),
+            RiskScorerLaunch::Off => None,
+        };
         settings.save();
-        save_config_toml(&settings, &host_groups);
+        save_config_toml(&settings, &host_groups, risk_section.as_ref());
+        if let Some((key_env, key)) = self.risk_scorer.key_to_save() {
+            save_secret(&key_env, &key);
+        }
         for prof in &self.profiles {
             if !prof.key_env.trim().is_empty() && !prof.api_key.is_empty() {
                 save_secret(&prof.key_env, &prof.api_key);
@@ -3211,6 +3537,7 @@ impl LauncherApp {
             ssh_targets,
             arbiter_profile: self.arbiter_profile.clone(),
             host_groups: Some(host_groups),
+            risk_scorer: Some(risk_scorer),
         };
         save_pending_launch(&cfg);
         std::process::exit(0);
@@ -3384,6 +3711,15 @@ pub fn run_launcher(config: &Config) {
         show_key_passphrase: false,
         show_api_key: false,
         arbiter_profile: settings.arbiter_profile.clone(),
+        risk_scorer: {
+            let mut d = RiskScorerDraft::from_config(config.risk_scorer.as_ref());
+            // One OS-store read at start-up, not one per frame — and none for
+            // a keyless scorer, whose key name is not in use.
+            if !d.keyless {
+                d.refresh_key_saved();
+            }
+            d
+        },
         import_dialog: None,
         file_status: String::new(),
         host_groups: config.host_groups.iter().map(HostGroupDraft::from_group).collect(),
@@ -3479,6 +3815,7 @@ mod tests {
             ssh_targets: vec![],
             arbiter_profile: None,
             host_groups: None,
+            risk_scorer: None,
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(!json.contains("supersecret"));
@@ -3607,6 +3944,7 @@ mod tests {
             }],
             arbiter_profile: None,
             host_groups: None,
+            risk_scorer: None,
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(!json.contains("\"password\":"), "must not emit password key when None, got: {json}");
@@ -3698,6 +4036,7 @@ mod tests {
             ssh_targets: vec![],
             arbiter_profile: None,
             host_groups: None,
+            risk_scorer: None,
         };
 
         let json = serde_json::to_string(&cfg).unwrap();
@@ -3945,6 +4284,7 @@ mod tests {
             ssh_targets: vec![],
             arbiter_profile: Some("arbiter-b".into()),
             host_groups: None,
+            risk_scorer: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let loaded: LaunchConfig = serde_json::from_str(&json).unwrap();
@@ -4362,6 +4702,7 @@ mod tests {
             show_key_passphrase: false,
             show_api_key: false,
             arbiter_profile: None,
+            risk_scorer: RiskScorerDraft::from_config(None),
             import_dialog: None,
             file_status: String::new(),
             host_groups: Vec::new(),
@@ -5709,5 +6050,145 @@ host_key_policy = \"strict\"
         let targets = app.launch_ssh_targets();
         let line = group_preview_line("", &targets);
         assert!(line.contains("0 hosts") && line.contains("no tags"), "{line}");
+    }
+
+    // ── Command safety scorer (#552) ─────────────────────────────────
+
+    fn enabled_draft() -> RiskScorerDraft {
+        let mut d = RiskScorerDraft::from_config(None);
+        d.enabled = true;
+        d.base_url = RISK_DECISIONS_BASE_URL.into();
+        d.model = RISK_DECISIONS_MODEL_HINT.into();
+        d
+    }
+
+    #[test]
+    fn risk_draft_off_writes_no_section() {
+        let d = RiskScorerDraft::from_config(None);
+        assert!(!d.enabled);
+        assert_eq!(d.to_config(), Ok(None));
+        assert_eq!(d.to_launch(), Ok(RiskScorerLaunch::Off));
+        assert_eq!(d.key_to_save(), None);
+    }
+
+    #[test]
+    fn risk_draft_round_trips_a_config_section() {
+        let cfg = filar_core::RiskScorerConfig {
+            kind: "chat-logprobs".into(),
+            base_url: "http://127.0.0.1:8080/v1".into(),
+            model: "qwen".into(),
+            key_env: String::new(),
+            timeout_secs: 12,
+            warn_below: 60,
+            danger_below: 30,
+        };
+        let d = RiskScorerDraft::from_config(Some(&cfg));
+        assert!(d.enabled && d.chat_logprobs && d.keyless);
+        assert_eq!(d.to_config(), Ok(Some(cfg)), "timeout carried over untouched");
+    }
+
+    #[test]
+    fn risk_draft_uses_its_own_key_name_and_never_the_key() {
+        let mut d = enabled_draft();
+        assert_eq!(d.key_env, filar_core::secrets::env_vars::RISK_API_KEY);
+        d.key = "sk-or-SECRET\n".into();
+        let cfg = d.to_config().unwrap().unwrap();
+        assert_eq!(cfg.key_env, "FILAR_RISK_API_KEY");
+        assert_eq!(cfg.kind, "decisions");
+        // The key is stored in the OS store under key_env, sanitised...
+        assert_eq!(d.key_to_save(), Some(("FILAR_RISK_API_KEY".into(), "sk-or-SECRET".into())));
+        // ...and appears in neither config.toml nor pending_launch.json.
+        let toml_text = toml::to_string_pretty(&filar_core::Config {
+            risk_scorer: Some(cfg),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(toml_text.contains("[risk_scorer]") && !toml_text.contains("SECRET"), "{toml_text}");
+        let launch = LaunchConfig {
+            target: "local".into(),
+            ssh: None,
+            model: "m".into(),
+            api_base_url: "http://x".into(),
+            api_key: String::new(),
+            session_id: None,
+            temperature: String::new(),
+            extra_body: String::new(),
+            selected_profile: None,
+            key_env: String::new(),
+            save_dir: None,
+            profiles: vec![],
+            ssh_targets: vec![],
+            arbiter_profile: None,
+            host_groups: None,
+            risk_scorer: Some(d.to_launch().unwrap()),
+        };
+        let json = serde_json::to_string(&launch).unwrap();
+        assert!(!json.contains("SECRET"), "{json}");
+        let back: LaunchConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.risk_scorer, launch.risk_scorer);
+    }
+
+    #[test]
+    fn risk_draft_no_key_means_empty_key_env_and_nothing_to_store() {
+        let mut d = enabled_draft();
+        d.keyless = true;
+        d.key = "typed anyway".into();
+        assert_eq!(d.to_config().unwrap().unwrap().key_env, "");
+        assert_eq!(d.key_to_save(), None);
+        // Unticking brings the remembered name back.
+        d.set_keyless(true);
+        assert!(d.key.is_empty(), "ticking \"no key\" drops the typed key");
+        d.set_keyless(false);
+        assert_eq!(d.key_checked_for, "FILAR_RISK_API_KEY", "status read on unticking");
+        assert_eq!(d.to_config().unwrap().unwrap().key_env, "FILAR_RISK_API_KEY");
+    }
+
+    #[test]
+    fn risk_draft_validation() {
+        let check = |f: fn(&mut RiskScorerDraft), needle: &str| {
+            let mut d = enabled_draft();
+            f(&mut d);
+            let err = d.to_config().unwrap_err();
+            assert!(err.contains(needle), "{err}");
+        };
+        check(|d| d.model.clear(), "model");
+        check(|d| d.base_url.clear(), "address");
+        check(|d| d.base_url = "openrouter.ai".into(), "http");
+        check(|d| d.warn_below = "abc".into(), "warn below");
+        check(|d| d.danger_below = "101".into(), "danger below");
+        check(|d| { d.warn_below = "30".into(); d.danger_below = "50".into(); }, "danger_below");
+        check(|d| d.key_env = "  ".into(), "key name");
+    }
+
+    #[test]
+    fn a_pending_launch_from_before_552_says_nothing_about_the_scorer() {
+        let json = r#"{"target":"local","ssh":null,"model":"m","api_base_url":"u","session_id":null}"#;
+        let cfg: LaunchConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.risk_scorer, None);
+    }
+
+    #[test]
+    fn risk_key_status_belongs_to_the_name_it_was_checked_under() {
+        let mut d = enabled_draft();
+        d.key_saved = true;
+        d.key_checked_for = d.key_env.clone();
+        assert!(d.key_saved_now());
+        d.key_env = "OTHER_KEY".into();
+        assert!(!d.key_saved_now(), "a renamed key is not shown as saved until checked");
+        d.refresh_key_saved(); // load_secret is a no-op in tests
+        assert_eq!(d.key_checked_for, "OTHER_KEY");
+        assert!(!d.key_saved_now());
+    }
+
+    #[test]
+    fn switching_to_chat_drops_only_the_auto_filled_decisions_address() {
+        let mut d = enabled_draft();
+        assert_eq!(d.base_url, RISK_DECISIONS_BASE_URL);
+        d.set_chat_logprobs(true);
+        assert!(d.base_url.is_empty(), "the Decisions default does not follow into chat");
+        d.base_url = "https://my-proxy.example/v1".into();
+        d.set_chat_logprobs(false);
+        d.set_chat_logprobs(true);
+        assert_eq!(d.base_url, "https://my-proxy.example/v1", "a typed address is kept");
     }
 }

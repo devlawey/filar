@@ -269,6 +269,22 @@ fn check_profile_api_key(
     ))
 }
 
+/// `config` with the launcher's `[risk_scorer]` choice applied (#552): `On`
+/// replaces the section (re-validated), `Off` removes it, `None` keeps what
+/// `config.toml` holds.
+fn config_with_launch_risk_scorer(
+    mut config: filar_core::Config,
+    launch: Option<filar_gui::RiskScorerLaunch>,
+) -> filar_core::Config {
+    match launch {
+        None => return config,
+        Some(filar_gui::RiskScorerLaunch::Off) => config.risk_scorer = None,
+        Some(filar_gui::RiskScorerLaunch::On { config: rs }) => config.risk_scorer = Some(rs),
+    }
+    config.check_risk_scorer();
+    config
+}
+
 /// The scorer, the display thresholds `(warn_below, danger_below)` and the
 /// start-up note (if the scorer cannot be used).
 type LaunchRiskScorer = (Option<Arc<dyn filar_agent::RiskScorer>>, (u8, u8), Option<String>);
@@ -482,6 +498,10 @@ async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // The launcher's command-safety choice (#552); `None` = not said (CLI
+    // launch, or a pending_launch.json from before #552) → config.toml.
+    let mut launch_risk_scorer: Option<filar_gui::RiskScorerLaunch> = None;
+
     // ── Determine launch parameters ──────────────────────────────────
     // When no CLI args, check for pending launch from a previous GUI
     // session, or spawn the GUI as a subprocess.
@@ -567,6 +587,7 @@ async fn run() -> anyhow::Result<()> {
                     launch.api_key
                 };
 
+                launch_risk_scorer = launch.risk_scorer.clone();
                 (
                     target_name,
                     launch.session_id,
@@ -782,6 +803,7 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // ── Command safety scorer (#549/#551) ──────────────────────────────
+    let config = config_with_launch_risk_scorer(config, launch_risk_scorer);
     let (risk_scorer, risk_thresholds, risk_scorer_note) =
         build_risk_scorer_for_launch(&config, &secret_provider);
 
@@ -1341,5 +1363,42 @@ mod tests {
         assert_eq!(selected.as_deref(), Some("deepseek"));
         let msg = config.select_llm(selected.as_deref()).expect_err("unknown profile").to_string();
         assert!(msg.contains("'deepseek' not found"), "{msg}");
+    }
+
+    use super::config_with_launch_risk_scorer;
+
+    fn risk_section(model: &str) -> filar_core::RiskScorerConfig {
+        filar_core::RiskScorerConfig {
+            base_url: "https://openrouter.ai/api/alpha".into(),
+            model: model.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_launcher_choice_overrides_the_config_scorer() {
+        let config = filar_core::Config {
+            risk_scorer: Some(risk_section("from-config")),
+            ..Default::default()
+        };
+        // Not said (CLI / old pending_launch): config.toml wins.
+        let kept = config_with_launch_risk_scorer(config.clone(), None);
+        assert_eq!(kept.active_risk_scorer().map(|r| r.model.as_str()), Some("from-config"));
+        // Off: no scorer, no note.
+        let off = config_with_launch_risk_scorer(config.clone(), Some(filar_gui::RiskScorerLaunch::Off));
+        assert!(off.active_risk_scorer().is_none() && off.risk_scorer_error.is_none());
+        // On: the launcher's settings.
+        let on = config_with_launch_risk_scorer(
+            config.clone(),
+            Some(filar_gui::RiskScorerLaunch::On { config: risk_section("from-launcher") }),
+        );
+        assert_eq!(on.active_risk_scorer().map(|r| r.model.as_str()), Some("from-launcher"));
+        // On but invalid (hand-edited file): switched off with the reason.
+        let bad = config_with_launch_risk_scorer(
+            config,
+            Some(filar_gui::RiskScorerLaunch::On { config: risk_section("") }),
+        );
+        assert!(bad.active_risk_scorer().is_none());
+        assert!(bad.risk_scorer_error.is_some());
     }
 }
