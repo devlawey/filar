@@ -964,14 +964,15 @@ impl KubeCluster {
             )));
         }
         for cm in &self.reveal_configmaps {
-            let valid = match cm.split_once('/') {
-                Some((ns, name)) => is_dns1123_label(ns) && is_dns1123_label(name),
-                None => false,
+            let mut parts = cm.split('/');
+            let valid = match (parts.next(), parts.next(), parts.next()) {
+                (Some(ns), Some(name), None) => is_dns1123_label(ns) && is_dns1123_label(name),
+                _ => false,
             };
             if !valid {
                 return Err(CoreError::Config(format!(
                     "kube_clusters: \"{}\": reveal_configmaps entry \"{cm}\" must be \
-                     \"<namespace>/<name>\" with DNS-1123 parts",
+                     \"<namespace>/<name>\" with exactly one '/' and DNS-1123 parts",
                     self.name
                 )));
             }
@@ -1375,7 +1376,9 @@ confirm_mode = "explain"
         let path = dir.join("config.toml");
         std::fs::write(&path, toml).unwrap();
         let err = Config::load(&path).err().map(|e| e.to_string());
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            eprintln!("failed to clean up {dir:?}: {e}");
+        }
         err.unwrap_or_default()
     }
 
@@ -1516,10 +1519,39 @@ context = "prod-eu"
         let path = dir.join("config.toml");
         std::fs::write(&path, clash).unwrap();
         let err = Config::load(&path).unwrap_err().to_string();
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            eprintln!("failed to clean up {dir:?}: {e}");
+        }
         assert!(err.contains("duplicate target name \"prod-eu\""), "{err}");
         assert!(err.contains("[[ssh_targets]]"), "{err}");
         assert!(err.contains("[[kube_clusters]]"), "{err}");
+    }
+
+    #[test]
+    fn two_ssh_targets_with_the_same_name_are_rejected() {
+        // Before #562 duplicate SSH names were silently accepted; now that
+        // `--target` resolves one shared name space they are a load error.
+        let err = kube_err_raw(
+            r#"
+[[ssh_targets]]
+name = "dup"
+host = "10.0.0.1"
+user = "admin"
+
+[[ssh_targets]]
+name = "dup"
+host = "10.0.0.2"
+user = "admin"
+"#,
+        );
+        assert!(err.contains("duplicate target name \"dup\""), "{err}");
+    }
+
+    #[test]
+    fn reveal_configmaps_rejects_extra_slashes() {
+        assert!(kube_err("reveal_configmaps = [\"shop/a/b\"]\n").contains("exactly one '/'"));
+        assert!(kube_err("reveal_configmaps = [\"shop/\"]\n").contains("reveal_configmaps"));
+        assert!(kube_err("reveal_configmaps = [\"/flags\"]\n").contains("reveal_configmaps"));
     }
 
     #[test]
