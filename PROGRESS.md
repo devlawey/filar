@@ -11043,3 +11043,31 @@ SSH-целей не проверялись. Теги идут в существ�
 `DEFAULT_KUBE_REQUEST_TIMEOUT_SECS`, `MAX_KUBE_REQUEST_TIMEOUT_SECS`.
 
 **Next:** #571 (тестовый кластер), #572 (`ClusterApi`).
+
+## #571 — тестовый кластер `docker/k8s`
+
+**Сделано.** Инфраструктура интеграционных тестов по образцу docker-sshd:
+`up.sh`/`down.sh` поднимают kind (основной путь) или k3s в Docker, применяют
+манифесты и печатают `FILAR_TEST_KUBECONFIG`. В namespace `shop` — `web`
+(3 реплики, `main`+`sidecar`, лог каждую секунду), падающий через 5 секунд
+`crashy`, однобинарный `distroless` без шелла. Контейнеры non-root, с read-only
+rootfs, `/tmp` на emptyDir и лимитами памяти. SA `reader`/`no-exec` имеют только
+read на pods/events/pods/log; их 24-часовые kubeconfig генерируются в ignored
+`.run/` с режимом 0600. README описывает airgap-образы, локальный busybox и
+обёртку runc для запрета отрицательного `oom_score_adj`.
+
+**Проверка.** k3s v1.33.5 в Docker Desktop: node, все 3×2 контейнера `web` и
+`distroless` Ready; `crashy` в CrashLoopBackOff, `--previous` отдаёт строку;
+`/bin/sh` в distroless отсутствует. `reader` читает pods и previous-логи;
+`no-exec` получает Forbidden на `pods/exec` и Secrets. Отрицательный
+`oom_score_adj` в этой VM не потребовал обёртки. Соглашение
+`#[ignore = "needs docker/k8s cluster"]` добавлено в AGENTS.md.
+
+**Review (PR #586).** Airgap-Busybox получил копии бинарника под именами
+апплетов (`sh`, `date`, `hostname`, `sleep`), а `up.sh` — `umask 077` до
+создания kubeconfig.
+
+**Контракты.** Код и публичные API не менялись; CHANGELOG не требуется (только
+тестовая инфраструктура).
+
+**Next:** #572 (`ClusterApi`).
