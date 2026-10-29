@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: crashy
+  namespace: shop
+  labels:
+    app: crashy
+    app.kubernetes.io/part-of: filar-test-fixtures
+spec:
+  restartPolicy: Always
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: main
+      image: busybox:1.37.0
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          echo "crashy: exiting after 5 seconds"; sleep 5; exit 1
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: 5m
+          memory: 8Mi
+        limits:
+          memory: 16Mi
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}
