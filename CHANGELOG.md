@@ -11,6 +11,15 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Kubernetes targets in the config: `[[kube_clusters]]` (`KubeCluster`,
+  `Config::kube_clusters`) — a mandatory kubeconfig `context`, optional
+  kubeconfig path, namespaces with a default, a per-request timeout and tags
+  that feed `[[tag_policies]]`; validated at load with errors naming the
+  target and field, and target names are now unique across SSH targets and
+  clusters together ([#562](https://github.com/devlawey/filar/issues/562)).
+
 ## [2.0.7] - 2026-10-21
 
 ### Added

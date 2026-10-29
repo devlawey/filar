@@ -11021,3 +11021,25 @@ runc обнуляет его в OCI-конфиге. Docker Hub закрыт пр
 из GitHub Releases и локально собранный busybox. Оформление — #571.
 
 **Next:** 3.0.0 по порядку из документа (§8), начиная с #571 и #562.
+
+## #562 — `[[kube_clusters]]`
+
+**Сделано.** В `filar-core` появился `KubeCluster` и поле `Config::kube_clusters`
+(аддитивно, пустой список не сериализуется — лаунчер, перезаписывающий
+`config.toml` через `toml::to_string_pretty(&Config)`, секцию сохраняет).
+Поля: `name`, обязательный `context`, `kubeconfig`, `namespaces`,
+`default_namespace`, `request_timeout_secs` (1–120, дефолт 20), `tags`,
+`reveal_configmaps` (заготовка под #573). Валидация в `Config::load`:
+непустые имя/контекст, DNS-1123 для namespace, `default_namespace` из списка,
+таймаут, формат `namespace/name` у reveal_configmaps. Имена целей уникальны
+среди SSH и кластеров вместе (`validate_target_names`) — раньше дубли имён
+SSH-целей не проверялись. Теги идут в существующий `tag_policy_floor` без
+изменений; описание цели для агента — `KubeCluster::describe(namespace)`.
+Доки: `config.toml` (пример), `USER_GUIDE.md` §2.2, `docs/ENGINE_API.md`
+(Upgrading `engine-v3.0.0` unreleased).
+
+**Контракты.** `CommandExecutor` / `LlmClient` не тронуты. Публичное в core:
+`KubeCluster`, `Config::kube_clusters`, `Config::kube_cluster(name)`,
+`DEFAULT_KUBE_REQUEST_TIMEOUT_SECS`, `MAX_KUBE_REQUEST_TIMEOUT_SECS`.
+
+**Next:** #571 (тестовый кластер), #572 (`ClusterApi`).

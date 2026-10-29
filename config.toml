@@ -84,6 +84,20 @@ user = "testuser"
 [ssh_targets.auth]
 type = "password"
 
+# ── Kubernetes clusters ────────────────────────────────────────────
+# A cluster is a target of its own, in the same name space as SSH targets:
+# `context` is mandatory (current-context is never used), credentials stay
+# in your kubeconfig — only its path is named here, never its contents.
+# [[kube_clusters]]
+# name = "prod-eu"
+# context = "prod-eu"
+# kubeconfig = "~/.kube/config"   # optional; else $KUBECONFIG, then ~/.kube/config
+# namespaces = ["shop", "pay"]    # optional: what Ctrl+O offers
+# default_namespace = "shop"      # must be listed in namespaces when given
+# request_timeout_secs = 20        # 1–120
+# tags = ["prod", "k8s"]          # feed [[tag_policies]] exactly like SSH tags
+# reveal_configmaps = ["shop/feature-flags"]  # redaction opt-outs, namespace/name
+
 # Example: key-based auth
 # [[ssh_targets]]
 # name = "my-server"
