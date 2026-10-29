@@ -31,6 +31,10 @@ anyhow = "1"
 # Async trait support
 async-trait = "0.1"
 
+# Kubernetes (read-only cluster API)
+kube = { version = "4.2", default-features = false, features = ["client", "config", "ws", "rustls-tls", "ring", "http-proxy", "socks5"] }
+k8s-openapi = { version = "0.28", features = ["v1_33"] }
+
 # SSH
 russh = "0.61"
 ssh-key = "0.7.0-rc.10"

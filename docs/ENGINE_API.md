@@ -23,6 +23,7 @@ working example.
 | Feature  | Default | What it enables                                   |
 |----------|---------|---------------------------------------------------|
 | `local`  | Yes     | `LocalExecutor`, `LocalInteractive` (requires `portable-pty`) |
+| `kube`   | Yes     | Read-only `ClusterApi` and `KubeClusterApi` (requires `kube-rs`) |
 
 Bots and mobile apps that only need SSH should disable default features:
 
@@ -35,6 +36,29 @@ Desktop apps (TUI/GUI) should keep `local` enabled:
 ```toml
 filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.7" }
 ```
+
+Consumers that need Kubernetes but not a local terminal can enable only `kube`:
+
+```toml
+filar-transport = { git = "https://github.com/devlawey/filar", default-features = false, features = ["kube"] }
+```
+
+## Read-only Kubernetes API
+
+With the `kube` feature, `KubeClusterApi::connect(&KubeCluster)` implements
+`ClusterApi`. It reads pods, events, bounded logs, workloads, rollout history,
+nodes, metrics, Services, Endpoints, Ingresses, ConfigMaps and namespaces. The
+public result types do not expose `kube-rs`; `CommandExecutor` is unchanged.
+There are no write methods and no method can read a Kubernetes `Secret`.
+
+The connection always uses the context named by the target, never the
+kubeconfig's `current-context`. Lists return at most 500 objects and do not
+silently follow continuation tokens. Log calls require both a line and a byte
+limit. If a cluster-wide list is denied by namespace-scoped RBAC, reads fall
+back only to namespaces explicitly configured on the target. Absent
+`metrics.k8s.io` support is reported as `Unsupported`; RBAC, policy and
+not-found errors are sanitized so credentials and kubeconfig contents do not
+leak. ConfigMap values still require the consumer's output-redaction policy.
 
 ## Cargo.toml example
 
@@ -612,6 +636,7 @@ let _agent = builder.risk_scorer(Some(scorer));
 |--------|--------|------------|
 | `KubeCluster`, `Config::kube_clusters`, `Config::kube_cluster(name)`, `KubeCluster::describe(namespace)`, `DEFAULT_KUBE_REQUEST_TIMEOUT_SECS`, `MAX_KUBE_REQUEST_TIMEOUT_SECS` (#562) | Nothing in the API — additive (struct literals of `Config` use `..Default::default()`) | Opt in: `[[kube_clusters]]` names a kubeconfig context plus namespaces |
 | `Config::load` rejects duplicate target names — across `[[ssh_targets]]` and `[[kube_clusters]]`, **including two SSH targets with the same name** (#562) | Existing **configurations**, not code: a config with duplicate SSH target names loaded before and now fails at startup, even without any `[[kube_clusters]]` | Rename duplicated targets so every name is unique before upgrading |
+| `ClusterApi`, `KubeClusterApi`, read-only cluster result types and the default `kube` transport feature (#572) | Dependency footprint for consumers using default features; no Rust API break | Disable default features for SSH-only/mobile builds, or enable only `kube` for cluster access |
 
 `CommandExecutor` and `LlmClient` are unchanged.
 
