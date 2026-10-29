@@ -26,7 +26,8 @@ pub use compaction::{
 };
 pub use config::{
     tag_policy_floor, select_hosts_for_group, target_matches_group, is_read_only_target,
-    Config, SshTarget, SshAuth, TagPolicy, HostGroup,
+    Config, SshTarget, SshAuth, TagPolicy, HostGroup, KubeCluster,
+    DEFAULT_KUBE_REQUEST_TIMEOUT_SECS, MAX_KUBE_REQUEST_TIMEOUT_SECS,
     HostGroupPolicy, LlmConfig, LlmProfile, CommandConfirmMode, TimeoutConfig, HostKeyPolicy,
     DEFAULT_COMMAND_TIMEOUT_SECS,
     DEFAULT_COMPACT_AT_TOKENS, DEFAULT_MAX_TOKENS,

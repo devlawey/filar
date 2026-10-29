@@ -90,6 +90,13 @@ pub struct Config {
     /// Never contains a secret — only the field that is wrong.
     #[serde(skip)]
     pub risk_scorer_error: Option<String>,
+
+    /// Named Kubernetes clusters from `[[kube_clusters]]` (#562). A cluster
+    /// shares the target namespace with [`ssh_targets`](Self::ssh_targets):
+    /// `--target` and Ctrl+O look names up in one space. Only the kubeconfig
+    /// path and the context name live here — never its contents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kube_clusters: Vec<KubeCluster>,
 }
 
 impl Default for Config {
@@ -108,6 +115,7 @@ impl Default for Config {
             arbiter_enabled: default_arbiter_enabled(),
             risk_scorer: None,
             risk_scorer_error: None,
+            kube_clusters: Vec::new(),
         }
     }
 }
@@ -826,6 +834,197 @@ pub fn is_read_only_target(groups: &[HostGroup], target: &SshTarget) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Kubernetes clusters (#562)
+// ---------------------------------------------------------------------------
+
+/// Default per-request timeout of Kubernetes API calls, seconds.
+pub const DEFAULT_KUBE_REQUEST_TIMEOUT_SECS: u64 = 20;
+
+/// Largest allowed per-request timeout of Kubernetes API calls, seconds.
+pub const MAX_KUBE_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+fn default_kube_request_timeout_secs() -> u64 {
+    DEFAULT_KUBE_REQUEST_TIMEOUT_SECS
+}
+
+/// A named Kubernetes cluster target, from `[[kube_clusters]]` (#562).
+///
+/// The target of a Kubernetes tab is the **cluster** (a kubeconfig context)
+/// plus a namespace — pods are ephemeral and are picked inside the cluster.
+/// Only the kubeconfig *path* and the context name are stored: credentials
+/// stay in the user's own kubeconfig and are never copied into `config.toml`
+/// (invariant 3 of `AGENTS.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubeCluster {
+    /// Target name, unique across SSH targets and clusters together.
+    ///
+    /// `default` (not a required field for serde) so that a missing key is
+    /// reported by [`validate`](Self::validate), which names the cluster and
+    /// the field, instead of a bare TOML «missing field» error.
+    #[serde(default)]
+    pub name: String,
+    /// kubeconfig context to use. Mandatory: `current-context` is never
+    /// consulted — it can be switched in another terminal, sending a command
+    /// to the wrong cluster.
+    #[serde(default)]
+    pub context: String,
+    /// Explicit kubeconfig path. `None` = `$KUBECONFIG`, then `~/.kube/config`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubeconfig: Option<PathBuf>,
+    /// Namespaces offered by Ctrl+O. Empty = the cluster decides; needed
+    /// when RBAC is scoped per namespace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub namespaces: Vec<String>,
+    /// Namespace to start in. Must be listed in [`namespaces`](Self::namespaces)
+    /// when that list is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_namespace: Option<String>,
+    /// Per-request Kubernetes API timeout, seconds (1–120, default 20).
+    #[serde(default = "default_kube_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// Free-form tags, exactly like [`SshTarget::tags`]: they feed
+    /// [`tag_policy_floor`] and the safety rating.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// ConfigMaps exempt from secret redaction (#573), as `namespace/name`.
+    /// Empty = everything is redacted; an entry is an explicit opt-out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reveal_configmaps: Vec<String>,
+}
+
+/// Manual `Default` matching the serde defaults — a derived one would give
+/// a zero timeout and diverge from a parsed `[[kube_clusters]]` entry.
+impl Default for KubeCluster {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            context: String::new(),
+            kubeconfig: None,
+            namespaces: Vec::new(),
+            default_namespace: None,
+            request_timeout_secs: default_kube_request_timeout_secs(),
+            tags: Vec::new(),
+            reveal_configmaps: Vec::new(),
+        }
+    }
+}
+
+/// Whether `s` is a valid DNS-1123 subdomain (Kubernetes object names, e.g.
+/// ConfigMaps): lower-case alphanumerics, `-` and `.`, at most 253 characters,
+/// starting and ending with an alphanumeric. Dots are legal here — unlike in
+/// a namespace — and names may be longer than 63 characters.
+fn is_dns1123_subdomain(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+        && s.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && s.ends_with(|c: char| c.is_ascii_alphanumeric())
+}
+
+/// Whether `s` is a valid DNS-1123 label (the Kubernetes namespace / object
+/// name rules): lower-case alphanumerics and `-`, at most 63 characters,
+/// starting and ending with an alphanumeric.
+fn is_dns1123_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && s.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && s.ends_with(|c: char| c.is_ascii_alphanumeric())
+}
+
+impl KubeCluster {
+    /// Reject definitions that cannot work or would surprise (#562). Every
+    /// error names the cluster and the offending field.
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(CoreError::Config(
+                "kube_clusters: name must not be empty".into(),
+            ));
+        }
+        if self.context.trim().is_empty() {
+            return Err(CoreError::Config(format!(
+                "kube_clusters: \"{}\": context must not be empty \
+                 (current-context is never used)",
+                self.name
+            )));
+        }
+        for ns in &self.namespaces {
+            if !is_dns1123_label(ns) {
+                return Err(CoreError::Config(format!(
+                    "kube_clusters: \"{}\": namespaces: \"{ns}\" is not a valid \
+                     DNS-1123 label (lower-case alphanumerics and '-', max 63 chars)",
+                    self.name
+                )));
+            }
+        }
+        if let Some(default) = &self.default_namespace {
+            if !is_dns1123_label(default) {
+                return Err(CoreError::Config(format!(
+                    "kube_clusters: \"{}\": default_namespace \"{default}\" is not \
+                     a valid DNS-1123 label",
+                    self.name
+                )));
+            }
+            if !self.namespaces.is_empty() && !self.namespaces.iter().any(|ns| ns == default) {
+                return Err(CoreError::Config(format!(
+                    "kube_clusters: \"{}\": default_namespace \"{default}\" is not \
+                     listed in namespaces",
+                    self.name
+                )));
+            }
+        }
+        if self.request_timeout_secs == 0 || self.request_timeout_secs > MAX_KUBE_REQUEST_TIMEOUT_SECS
+        {
+            return Err(CoreError::Config(format!(
+                "kube_clusters: \"{}\": request_timeout_secs must be between 1 and \
+                 {MAX_KUBE_REQUEST_TIMEOUT_SECS}",
+                self.name
+            )));
+        }
+        for cm in &self.reveal_configmaps {
+            let mut parts = cm.split('/');
+            let valid = match (parts.next(), parts.next(), parts.next()) {
+                (Some(ns), Some(name), None) => {
+                    is_dns1123_label(ns) && is_dns1123_subdomain(name)
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err(CoreError::Config(format!(
+                    "kube_clusters: \"{}\": reveal_configmaps entry \"{cm}\" must be \
+                     \"<namespace>/<name>\" with exactly one '/', a DNS-1123 label \
+                     namespace and a DNS-1123 subdomain name",
+                    self.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// One-line description of the target for the agent (#562), e.g.
+    /// `Kubernetes cluster prod-eu (context prod-eu, namespace shop, tags: prod, k8s)`.
+    ///
+    /// `namespace` is the namespace actually selected in the tab; when it is
+    /// `None`, [`default_namespace`](Self::default_namespace) is used, falling
+    /// back to Kubernetes' own `default`.
+    pub fn describe(&self, namespace: Option<&str>) -> String {
+        let ns = namespace
+            .or(self.default_namespace.as_deref())
+            .unwrap_or("default");
+        let tags = if self.tags.is_empty() {
+            "-".to_string()
+        } else {
+            self.tags.join(", ")
+        };
+        format!(
+            "Kubernetes cluster {} (context {}, namespace {}, tags: {})",
+            self.name, self.context, ns, tags
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
 
@@ -854,6 +1053,10 @@ impl Config {
         for group in &cfg.host_groups {
             group.validate()?;
         }
+        for cluster in &cfg.kube_clusters {
+            cluster.validate()?;
+        }
+        cfg.validate_target_names()?;
         cfg.check_risk_scorer();
         Ok(cfg)
     }
@@ -999,6 +1202,37 @@ impl Config {
         self.ssh_targets.iter().find(|t| t.name == name)
     }
 
+    /// Look up a Kubernetes cluster by name (#562).
+    pub fn kube_cluster(&self, name: &str) -> Option<&KubeCluster> {
+        self.kube_clusters.iter().find(|c| c.name == name)
+    }
+
+    /// Enforce one target-name space (#562): `--target` and Ctrl+O resolve a
+    /// name without knowing whether it is an SSH host or a cluster, so a name
+    /// repeated anywhere — two SSH targets, two clusters, or one of each —
+    /// would make the choice ambiguous and is rejected at load time.
+    fn validate_target_names(&self) -> Result<()> {
+        let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        let all = self
+            .ssh_targets
+            .iter()
+            .map(|t| (t.name.as_str(), "[[ssh_targets]]"))
+            .chain(
+                self.kube_clusters
+                    .iter()
+                    .map(|c| (c.name.as_str(), "[[kube_clusters]]")),
+            );
+        for (name, section) in all {
+            if let Some(previous) = seen.insert(name, section) {
+                return Err(CoreError::Config(format!(
+                    "duplicate target name \"{name}\": used in {previous} and {section}; \
+                     names are shared between SSH targets and Kubernetes clusters"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Select an LLM configuration by profile name.
     ///
     /// Returns `(LlmConfig, key_env)` where `key_env` is the name of the
@@ -1140,6 +1374,236 @@ confirm_mode = "explain"
         assert_eq!(cfg.tag_policies[0].confirm_mode, CommandConfirmMode::Always);
         assert_eq!(cfg.tag_policies[1].tag, "db");
         assert_eq!(cfg.tag_policies[1].confirm_mode, CommandConfirmMode::Explain);
+    }
+
+    // ── Kubernetes clusters (#562) ────────────────────────────
+
+    fn kube_toml(extra: &str) -> String {
+        format!(
+            "[[kube_clusters]]\nname = \"prod-eu\"\ncontext = \"prod-eu\"\n{extra}"
+        )
+    }
+
+    fn kube_err(extra: &str) -> String {
+        kube_err_raw(&kube_toml(extra))
+    }
+
+    fn kube_err_raw(toml: &str) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "filar-kube-cfg-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = Config::load(&path).err().map(|e| e.to_string());
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            eprintln!("failed to clean up {dir:?}: {e}");
+        }
+        err.unwrap_or_default()
+    }
+
+    #[test]
+    fn kube_clusters_absent_by_default() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.kube_clusters.is_empty());
+        assert!(cfg.kube_cluster("prod-eu").is_none());
+    }
+
+    #[test]
+    fn kube_cluster_parses_all_fields() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[kube_clusters]]
+name = "prod-eu"
+context = "prod-eu"
+kubeconfig = "~/.kube/config"
+namespaces = ["shop", "pay"]
+default_namespace = "shop"
+request_timeout_secs = 30
+tags = ["prod", "k8s"]
+reveal_configmaps = ["shop/feature-flags"]
+"#,
+        )
+        .unwrap();
+        let c = cfg.kube_cluster("prod-eu").unwrap();
+        assert_eq!(c.context, "prod-eu");
+        assert_eq!(c.kubeconfig, Some(PathBuf::from("~/.kube/config")));
+        assert_eq!(c.namespaces, vec!["shop", "pay"]);
+        assert_eq!(c.default_namespace.as_deref(), Some("shop"));
+        assert_eq!(c.request_timeout_secs, 30);
+        assert_eq!(c.tags, vec!["prod", "k8s"]);
+        assert_eq!(c.reveal_configmaps, vec!["shop/feature-flags"]);
+        assert_eq!(
+            c.describe(None),
+            "Kubernetes cluster prod-eu (context prod-eu, namespace shop, tags: prod, k8s)"
+        );
+        assert_eq!(
+            c.describe(Some("pay")),
+            "Kubernetes cluster prod-eu (context prod-eu, namespace pay, tags: prod, k8s)"
+        );
+    }
+
+    #[test]
+    fn kube_cluster_minimal_entry_uses_defaults() {
+        let cfg = load_str(&kube_toml(""));
+        let c = cfg.kube_cluster("prod-eu").unwrap();
+        assert_eq!(c.request_timeout_secs, DEFAULT_KUBE_REQUEST_TIMEOUT_SECS);
+        assert_eq!(*c, KubeCluster {
+            name: "prod-eu".into(),
+            context: "prod-eu".into(),
+            ..KubeCluster::default()
+        });
+        // No namespaces configured: the description falls back to `default`.
+        assert_eq!(
+            c.describe(None),
+            "Kubernetes cluster prod-eu (context prod-eu, namespace default, tags: -)"
+        );
+    }
+
+    #[test]
+    fn kube_cluster_empty_name_is_rejected() {
+        let err = kube_err_raw("[[kube_clusters]]\nname = \"  \"\ncontext = \"prod-eu\"\n");
+        assert!(err.contains("name must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn kube_cluster_empty_context_is_rejected() {
+        let err = kube_err_raw("[[kube_clusters]]\nname = \"prod-eu\"\ncontext = \"  \"\n");
+        assert!(err.contains("prod-eu"), "{err}");
+        assert!(err.contains("context must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn kube_cluster_invalid_namespace_is_rejected() {
+        for bad in ["Shop", "-shop", "shop-", "shop_eu", ""] {
+            let err = kube_err(&format!("namespaces = [\"{bad}\"]\n"));
+            assert!(err.contains("namespaces"), "{bad}: {err}");
+            assert!(err.contains("DNS-1123"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn kube_cluster_default_namespace_must_be_listed() {
+        let err = kube_err("namespaces = [\"shop\", \"pay\"]\ndefault_namespace = \"web\"\n");
+        assert!(err.contains("default_namespace"), "{err}");
+        assert!(err.contains("not listed in namespaces"), "{err}");
+        // No explicit list: any valid namespace is acceptable.
+        let cfg = load_str(&kube_toml("default_namespace = \"web\"\n"));
+        assert_eq!(
+            cfg.kube_cluster("prod-eu").unwrap().default_namespace.as_deref(),
+            Some("web")
+        );
+    }
+
+    #[test]
+    fn kube_cluster_timeout_range_is_enforced() {
+        assert!(kube_err("request_timeout_secs = 0\n").contains("request_timeout_secs"));
+        assert!(kube_err("request_timeout_secs = 121\n").contains("request_timeout_secs"));
+        let cfg = load_str(&kube_toml("request_timeout_secs = 120\n"));
+        assert_eq!(cfg.kube_cluster("prod-eu").unwrap().request_timeout_secs, 120);
+    }
+
+    #[test]
+    fn kube_cluster_reveal_configmaps_must_be_namespaced() {
+        assert!(kube_err("reveal_configmaps = [\"feature-flags\"]\n").contains("reveal_configmaps"));
+        assert!(kube_err("reveal_configmaps = [\"Shop/feature-flags\"]\n").contains("reveal_configmaps"));
+        let cfg = load_str(&kube_toml("reveal_configmaps = [\"shop/feature-flags\"]\n"));
+        assert_eq!(cfg.kube_cluster("prod-eu").unwrap().reveal_configmaps.len(), 1);
+    }
+
+    #[test]
+    fn kube_cluster_tags_feed_tag_policy_floor() {
+        let policies = [policy("prod", CommandConfirmMode::Always)];
+        let cfg = load_str(&kube_toml("tags = [\"prod\", \"k8s\"]\n"));
+        let c = cfg.kube_cluster("prod-eu").unwrap();
+        assert_eq!(
+            tag_policy_floor(CommandConfirmMode::Allowlist, &policies, &c.tags),
+            Some(CommandConfirmMode::Always)
+        );
+    }
+
+    #[test]
+    fn target_names_are_unique_across_ssh_and_kube() {
+        let clash = r#"
+[[ssh_targets]]
+name = "prod-eu"
+host = "10.0.0.1"
+user = "admin"
+
+[[kube_clusters]]
+name = "prod-eu"
+context = "prod-eu"
+"#;
+        let dir = std::env::temp_dir().join(format!("filar-kube-dup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, clash).unwrap();
+        let err = Config::load(&path).unwrap_err().to_string();
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            eprintln!("failed to clean up {dir:?}: {e}");
+        }
+        assert!(err.contains("duplicate target name \"prod-eu\""), "{err}");
+        assert!(err.contains("[[ssh_targets]]"), "{err}");
+        assert!(err.contains("[[kube_clusters]]"), "{err}");
+    }
+
+    #[test]
+    fn kube_cluster_missing_context_names_the_cluster() {
+        // A missing key must not surface as a bare TOML «missing field»:
+        // the validation error names the target and the field (#562).
+        let err = kube_err_raw("[[kube_clusters]]\nname = \"prod-eu\"\n");
+        assert!(err.contains("prod-eu"), "{err}");
+        assert!(err.contains("context must not be empty"), "{err}");
+        let err = kube_err_raw("[[kube_clusters]]\ncontext = \"prod-eu\"\n");
+        assert!(err.contains("name must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn reveal_configmaps_names_are_dns_subdomains() {
+        // ConfigMap names may contain dots and exceed 63 chars; namespaces
+        // may not (#562 review).
+        let long = "f".repeat(80);
+        let cfg = load_str(&kube_toml(&format!(
+            "reveal_configmaps = [\"shop/feature.flags\", \"shop/{long}\"]\n"
+        )));
+        assert_eq!(cfg.kube_cluster("prod-eu").unwrap().reveal_configmaps.len(), 2);
+        assert!(kube_err("reveal_configmaps = [\"shop/feature_flags\"]\n").contains("reveal_configmaps"));
+        assert!(kube_err("reveal_configmaps = [\"shop./flags\"]\n").contains("reveal_configmaps"));
+    }
+
+    #[test]
+    fn two_ssh_targets_with_the_same_name_are_rejected() {
+        // Before #562 duplicate SSH names were silently accepted; now that
+        // `--target` resolves one shared name space they are a load error.
+        let err = kube_err_raw(
+            r#"
+[[ssh_targets]]
+name = "dup"
+host = "10.0.0.1"
+user = "admin"
+
+[[ssh_targets]]
+name = "dup"
+host = "10.0.0.2"
+user = "admin"
+"#,
+        );
+        assert!(err.contains("duplicate target name \"dup\""), "{err}");
+    }
+
+    #[test]
+    fn reveal_configmaps_rejects_extra_slashes() {
+        assert!(kube_err("reveal_configmaps = [\"shop/a/b\"]\n").contains("exactly one '/'"));
+        assert!(kube_err("reveal_configmaps = [\"shop/\"]\n").contains("reveal_configmaps"));
+        assert!(kube_err("reveal_configmaps = [\"/flags\"]\n").contains("reveal_configmaps"));
+    }
+
+    #[test]
+    fn two_clusters_with_the_same_name_are_rejected() {
+        let err = kube_err("\n[[kube_clusters]]\nname = \"prod-eu\"\ncontext = \"other\"\n");
+        assert!(err.contains("duplicate target name \"prod-eu\""), "{err}");
     }
 
     #[test]

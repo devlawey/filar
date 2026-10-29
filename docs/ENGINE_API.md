@@ -606,6 +606,15 @@ let _agent = builder.risk_scorer(Some(scorer));
 - The decision model sees the command, the agent's explanation and the target
   description — the same data the session's LLM already has.
 
+## Upgrading to `engine-v3.0.0` (unreleased)
+
+| Change | Breaks | What to do |
+|--------|--------|------------|
+| `KubeCluster`, `Config::kube_clusters`, `Config::kube_cluster(name)`, `KubeCluster::describe(namespace)`, `DEFAULT_KUBE_REQUEST_TIMEOUT_SECS`, `MAX_KUBE_REQUEST_TIMEOUT_SECS` (#562) | Nothing in the API — additive (struct literals of `Config` use `..Default::default()`) | Opt in: `[[kube_clusters]]` names a kubeconfig context plus namespaces |
+| `Config::load` rejects duplicate target names — across `[[ssh_targets]]` and `[[kube_clusters]]`, **including two SSH targets with the same name** (#562) | Existing **configurations**, not code: a config with duplicate SSH target names loaded before and now fails at startup, even without any `[[kube_clusters]]` | Rename duplicated targets so every name is unique before upgrading |
+
+`CommandExecutor` and `LlmClient` are unchanged.
+
 ## Upgrading to `engine-v2.0.7`
 
 | Change | Breaks | What to do |
