@@ -857,10 +857,16 @@ fn default_kube_request_timeout_secs() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KubeCluster {
     /// Target name, unique across SSH targets and clusters together.
+    ///
+    /// `default` (not a required field for serde) so that a missing key is
+    /// reported by [`validate`](Self::validate), which names the cluster and
+    /// the field, instead of a bare TOML «missing field» error.
+    #[serde(default)]
     pub name: String,
     /// kubeconfig context to use. Mandatory: `current-context` is never
     /// consulted — it can be switched in another terminal, sending a command
     /// to the wrong cluster.
+    #[serde(default)]
     pub context: String,
     /// Explicit kubeconfig path. `None` = `$KUBECONFIG`, then `~/.kube/config`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -901,6 +907,19 @@ impl Default for KubeCluster {
             reveal_configmaps: Vec::new(),
         }
     }
+}
+
+/// Whether `s` is a valid DNS-1123 subdomain (Kubernetes object names, e.g.
+/// ConfigMaps): lower-case alphanumerics, `-` and `.`, at most 253 characters,
+/// starting and ending with an alphanumeric. Dots are legal here — unlike in
+/// a namespace — and names may be longer than 63 characters.
+fn is_dns1123_subdomain(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+        && s.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && s.ends_with(|c: char| c.is_ascii_alphanumeric())
 }
 
 /// Whether `s` is a valid DNS-1123 label (the Kubernetes namespace / object
@@ -966,13 +985,16 @@ impl KubeCluster {
         for cm in &self.reveal_configmaps {
             let mut parts = cm.split('/');
             let valid = match (parts.next(), parts.next(), parts.next()) {
-                (Some(ns), Some(name), None) => is_dns1123_label(ns) && is_dns1123_label(name),
+                (Some(ns), Some(name), None) => {
+                    is_dns1123_label(ns) && is_dns1123_subdomain(name)
+                }
                 _ => false,
             };
             if !valid {
                 return Err(CoreError::Config(format!(
                     "kube_clusters: \"{}\": reveal_configmaps entry \"{cm}\" must be \
-                     \"<namespace>/<name>\" with exactly one '/' and DNS-1123 parts",
+                     \"<namespace>/<name>\" with exactly one '/', a DNS-1123 label \
+                     namespace and a DNS-1123 subdomain name",
                     self.name
                 )));
             }
@@ -1525,6 +1547,30 @@ context = "prod-eu"
         assert!(err.contains("duplicate target name \"prod-eu\""), "{err}");
         assert!(err.contains("[[ssh_targets]]"), "{err}");
         assert!(err.contains("[[kube_clusters]]"), "{err}");
+    }
+
+    #[test]
+    fn kube_cluster_missing_context_names_the_cluster() {
+        // A missing key must not surface as a bare TOML «missing field»:
+        // the validation error names the target and the field (#562).
+        let err = kube_err_raw("[[kube_clusters]]\nname = \"prod-eu\"\n");
+        assert!(err.contains("prod-eu"), "{err}");
+        assert!(err.contains("context must not be empty"), "{err}");
+        let err = kube_err_raw("[[kube_clusters]]\ncontext = \"prod-eu\"\n");
+        assert!(err.contains("name must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn reveal_configmaps_names_are_dns_subdomains() {
+        // ConfigMap names may contain dots and exceed 63 chars; namespaces
+        // may not (#562 review).
+        let long = "f".repeat(80);
+        let cfg = load_str(&kube_toml(&format!(
+            "reveal_configmaps = [\"shop/feature.flags\", \"shop/{long}\"]\n"
+        )));
+        assert_eq!(cfg.kube_cluster("prod-eu").unwrap().reveal_configmaps.len(), 2);
+        assert!(kube_err("reveal_configmaps = [\"shop/feature_flags\"]\n").contains("reveal_configmaps"));
+        assert!(kube_err("reveal_configmaps = [\"shop./flags\"]\n").contains("reveal_configmaps"));
     }
 
     #[test]
