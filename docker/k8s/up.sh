@@ -1,6 +1,7 @@
 #!/bin/sh
 # Start the disposable filar Kubernetes test cluster and apply its fixtures.
 set -eu
+umask 077
 
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 RUN_DIR="$DIR/.run"

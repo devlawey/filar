@@ -11063,6 +11063,10 @@ read на pods/events/pods/log; их 24-часовые kubeconfig генерир
 `oom_score_adj` в этой VM не потребовал обёртки. Соглашение
 `#[ignore = "needs docker/k8s cluster"]` добавлено в AGENTS.md.
 
+**Review (PR #586).** Airgap-Busybox получил копии бинарника под именами
+апплетов (`sh`, `date`, `hostname`, `sleep`), а `up.sh` — `umask 077` до
+создания kubeconfig.
+
 **Контракты.** Код и публичные API не менялись; CHANGELOG не требуется (только
 тестовая инфраструктура).
 
