@@ -628,6 +628,47 @@ struct KubeConnectionResult {
     result: std::result::Result<(Arc<dyn ClusterApi>, Vec<String>), String>,
 }
 
+/// Start every queued cluster connection or namespace discovery (#575).
+fn start_pending_kube_connects(
+    app: &mut App,
+    kube_apis: &mut HashMap<SessionId, Arc<dyn ClusterApi>>,
+    kube_tx: &mpsc::UnboundedSender<KubeConnectionResult>,
+) {
+    for request in app.take_pending_kube_connects() {
+        kube_apis.remove(&request.session_id);
+        let tx = kube_tx.clone();
+        tokio::spawn(async move {
+            let session_id = request.session_id;
+            let connection_id = request.connection_id;
+            let result = match KubeClusterApi::connect(&request.target).await {
+                Ok(api) => {
+                    let api: Arc<dyn ClusterApi> = Arc::new(api);
+                    if request.discover {
+                        match api.namespaces().await {
+                            Ok(namespaces) => Ok((
+                                api,
+                                namespaces
+                                    .into_iter()
+                                    .map(|namespace| namespace.name)
+                                    .collect(),
+                            )),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    } else {
+                        Ok((api, Vec::new()))
+                    }
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = tx.send(KubeConnectionResult {
+                session_id,
+                connection_id,
+                result,
+            });
+        });
+    }
+}
+
 /// SSH transport tunables with the app-configured command timeout.
 fn ssh_transport_config(command_timeout: Duration) -> SshTransportConfig {
     SshTransportConfig::default().with_command_timeout(command_timeout)
@@ -1575,6 +1616,7 @@ async fn run_app(
     if let Some(snapshot) = config.initial_kube.take() {
         app.restore_kube_snapshot(snapshot);
     }
+    start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
     // The startup target may carry policy tags — tighten before the first
     // render so the bar and the confirm gate agree from the start (#414).
     app.sync_confirm_mode();
@@ -1958,37 +2000,8 @@ async fn run_app(
                     }
                 }
 
-                // Connect or discover namespaces for the cluster selected in Ctrl+O.
-                for request in app.take_pending_kube_connects() {
-                    kube_apis.remove(&request.session_id);
-                    let tx = kube_tx.clone();
-                    tokio::spawn(async move {
-                        let session_id = request.session_id;
-                        let connection_id = request.connection_id;
-                        let result = match KubeClusterApi::connect(&request.target).await {
-                            Ok(api) => {
-                                let api: Arc<dyn ClusterApi> = Arc::new(api);
-                                if request.discover {
-                                    match api.namespaces().await {
-                                        Ok(namespaces) => Ok((
-                                            api,
-                                            namespaces.into_iter().map(|namespace| namespace.name).collect(),
-                                        )),
-                                        Err(error) => Err(error.to_string()),
-                                    }
-                                } else {
-                                    Ok((api, Vec::new()))
-                                }
-                            }
-                            Err(error) => Err(error.to_string()),
-                        };
-                        let _ = tx.send(KubeConnectionResult {
-                            session_id,
-                            connection_id,
-                            result,
-                        });
-                    });
-                }
+                // Start a cluster selected by this key before consuming input.
+                start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
 
                 // Check if user sent input — spawn agent or execute shell escape.
                 if let Some(user_input) = app.take_input() {
@@ -2914,6 +2927,9 @@ async fn run_app(
                 render_interval.reset();
             }
         }
+
+        // Non-terminal events can also queue a restored or selected cluster.
+        start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
 
         if app.should_quit {
             break;
@@ -5053,6 +5069,37 @@ mod tests {
         let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
         assert!(!json.contains("private-context"));
         assert!(!json.contains("secret-path"));
+    }
+
+    #[tokio::test]
+    async fn restored_cluster_connect_starts_without_terminal_input() {
+        let target = filar_core::KubeCluster {
+            name: "missing-cluster".into(),
+            context: "missing-context".into(),
+            kubeconfig: Some(
+                std::env::temp_dir().join("filar-575-definitely-missing-kubeconfig.yaml"),
+            ),
+            ..Default::default()
+        };
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.kube_clusters = vec![target];
+        app.restore_kube_snapshot(filar_core::KubeSessionSnapshot {
+            target: "missing-cluster".into(),
+            namespace: Some("shop".into()),
+        });
+        let sid = app.active_session().id;
+        let (kube_tx, mut kube_rx) = mpsc::unbounded_channel();
+        let mut kube_apis: HashMap<SessionId, Arc<dyn ClusterApi>> = HashMap::new();
+
+        start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
+
+        assert!(app.take_pending_kube_connects().is_empty());
+        let completed = tokio::time::timeout(Duration::from_secs(2), kube_rx.recv())
+            .await
+            .expect("connection attempt starts immediately")
+            .expect("connection attempt reports its result");
+        assert_eq!(completed.session_id, sid);
+        assert!(completed.result.is_err());
     }
 
     #[test]

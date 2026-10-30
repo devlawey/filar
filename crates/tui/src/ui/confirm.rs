@@ -59,7 +59,7 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let audit_unavailable = confirm.audit_unavailable;
     let radius = confirm.radius.clone();
     let radius_expanded = confirm.radius_expanded;
-    let kubernetes = command.starts_with("k8s_");
+    let kubernetes = app.kube.is_some() && command.starts_with("k8s_");
     let kube_target = app.kube.as_ref().map(|kube| {
         (
             kube.target.name.clone(),
@@ -924,6 +924,18 @@ mod tests {
         assert!(screen.contains("Tool: k8s_get"), "{screen}");
         assert!(screen.contains("Arguments:"), "{screen}");
         assert!(screen.contains("k8s_get pods -l app=web"), "{screen}");
+    }
+
+    #[test]
+    fn shell_command_with_kubernetes_prefix_keeps_the_shell_dialog() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(pending("k8s_cleanup.sh --all", false));
+        app.mode = AppMode::Confirming;
+
+        let screen = render_confirm(&mut app, 100, 30);
+        assert!(screen.contains("Confirm command"), "{screen}");
+        assert!(screen.contains("$ k8s_cleanup.sh --all"), "{screen}");
+        assert!(!screen.contains("Confirm Kubernetes"), "{screen}");
     }
 
     #[test]

@@ -172,9 +172,7 @@ impl KubeAgent {
                                 .into(),
                         ));
                     }
-                    for (id, error) in errors {
-                        messages.push(ChatMessage::tool(id, error));
-                    }
+                    messages.extend(explanation_retry_messages(&response.tool_calls, &errors));
                     continue;
                 }
                 missing_explanations = 0;
@@ -219,7 +217,7 @@ impl KubeAgent {
         self.emit(AgentEvent::CommandProposed {
             proposal_id: NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed),
             command: display.clone(),
-            explanation: confirmation_explanation.clone(),
+            explanation: explanation.clone(),
             destructive: false,
             tool: filar_core::ToolInvocation {
                 name: call.name.clone(),
@@ -276,6 +274,23 @@ impl KubeAgent {
     }
 }
 
+fn explanation_retry_messages(calls: &[ToolCall], errors: &[(String, String)]) -> Vec<ChatMessage> {
+    calls
+        .iter()
+        .map(|call| {
+            let content = errors
+                .iter()
+                .find(|(id, _)| id == &call.id)
+                .map(|(_, error)| error.clone())
+                .unwrap_or_else(|| {
+                    "Error: not executed because another call in this response lacked the required explanation. Repeat it with an explanation."
+                        .to_string()
+                });
+            ChatMessage::tool(&call.id, content)
+        })
+        .collect()
+}
+
 fn explanation_error(call: &ToolCall) -> Option<String> {
     match call.arguments.get("explanation").and_then(serde_json::Value::as_str) {
         Some(text) if !text.trim().is_empty() => None,
@@ -300,6 +315,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(call.display_command(), "k8s_get pod -l app=web --limit 50");
+    }
+
+    #[test]
+    fn explain_retry_answers_every_tool_call_in_the_batch() {
+        let calls = vec![
+            ToolCall {
+                id: "valid".into(),
+                name: "k8s_get".into(),
+                arguments: serde_json::json!({"kind": "Pod", "explanation": "Inspect pods"}),
+            },
+            ToolCall {
+                id: "invalid".into(),
+                name: "k8s_events".into(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let messages =
+            explanation_retry_messages(&calls, &[("invalid".into(), "missing explanation".into())]);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("valid"));
+        assert!(messages[0].content.contains("not executed"));
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("invalid"));
+        assert_eq!(messages[1].content, "missing explanation");
     }
 
     #[test]

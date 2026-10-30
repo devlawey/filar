@@ -11169,7 +11169,10 @@ runner хранит отдельный `Arc<dyn ClusterApi>`, отбрасыва
 вызовы сворачиваются как command blocks, confirm показывает инструмент,
 аргументы и цель, статус-бар поддерживает сокращение и ASCII. `Ctrl+T`, `Ctrl+G`
 и `!cmd` получают точный отказ без шелла. Сессия хранит только configured target
-name и namespace; восстановление переподключается по имени.
+name и namespace; восстановление переподключается по имени. После ревью reconnect
+запускается без ожидания ввода, Explain mode отвечает на каждый tool call из
+пакета, контекст кластера остаётся только в confirm и не попадает в историю, а
+shell-команды с префиксом `k8s_` не маркируются как typed API в обычных вкладках.
 
 **Контракты.** `CommandExecutor` / `LlmClient` не менялись. Аддитивно: `KubeAgent`,
 `KubeSessionSnapshot` / `Session::kube`, поля Kubernetes в `TuiConfig`; публичный
