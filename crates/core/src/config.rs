@@ -890,6 +890,10 @@ pub struct KubeCluster {
     /// Empty = everything is redacted; an entry is an explicit opt-out.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reveal_configmaps: Vec<String>,
+    /// Literal pod environment values exempt from redaction (#573), as
+    /// `namespace/pod/VARIABLE`. Revealed values are visibly marked in output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reveal_env: Vec<String>,
 }
 
 /// Manual `Default` matching the serde defaults — a derived one would give
@@ -905,6 +909,7 @@ impl Default for KubeCluster {
             request_timeout_secs: default_kube_request_timeout_secs(),
             tags: Vec::new(),
             reveal_configmaps: Vec::new(),
+            reveal_env: Vec::new(),
         }
     }
 }
@@ -931,6 +936,15 @@ fn is_dns1123_label(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && s.starts_with(|c: char| c.is_ascii_alphanumeric())
         && s.ends_with(|c: char| c.is_ascii_alphanumeric())
+}
+
+/// Whether `s` is a conventional environment variable identifier.
+fn is_environment_variable_name(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 impl KubeCluster {
@@ -995,6 +1009,25 @@ impl KubeCluster {
                     "kube_clusters: \"{}\": reveal_configmaps entry \"{cm}\" must be \
                      \"<namespace>/<name>\" with exactly one '/', a DNS-1123 label \
                      namespace and a DNS-1123 subdomain name",
+                    self.name
+                )));
+            }
+        }
+        for entry in &self.reveal_env {
+            let mut parts = entry.split('/');
+            let valid = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                (Some(ns), Some(pod), Some(variable), None) => {
+                    is_dns1123_label(ns)
+                        && is_dns1123_subdomain(pod)
+                        && is_environment_variable_name(variable)
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err(CoreError::Config(format!(
+                    "kube_clusters: \"{}\": reveal_env entry \"{entry}\" must be \
+                     \"<namespace>/<pod>/<VARIABLE>\" with DNS-1123 object names and \
+                     a valid environment variable name",
                     self.name
                 )));
             }
@@ -1424,6 +1457,7 @@ default_namespace = "shop"
 request_timeout_secs = 30
 tags = ["prod", "k8s"]
 reveal_configmaps = ["shop/feature-flags"]
+reveal_env = ["shop/api/PUBLIC_MODE"]
 "#,
         )
         .unwrap();
@@ -1435,6 +1469,7 @@ reveal_configmaps = ["shop/feature-flags"]
         assert_eq!(c.request_timeout_secs, 30);
         assert_eq!(c.tags, vec!["prod", "k8s"]);
         assert_eq!(c.reveal_configmaps, vec!["shop/feature-flags"]);
+        assert_eq!(c.reveal_env, vec!["shop/api/PUBLIC_MODE"]);
         assert_eq!(
             c.describe(None),
             "Kubernetes cluster prod-eu (context prod-eu, namespace shop, tags: prod, k8s)"
@@ -1511,6 +1546,18 @@ reveal_configmaps = ["shop/feature-flags"]
         assert!(kube_err("reveal_configmaps = [\"Shop/feature-flags\"]\n").contains("reveal_configmaps"));
         let cfg = load_str(&kube_toml("reveal_configmaps = [\"shop/feature-flags\"]\n"));
         assert_eq!(cfg.kube_cluster("prod-eu").unwrap().reveal_configmaps.len(), 1);
+    }
+
+    #[test]
+    fn kube_cluster_reveal_env_is_scoped_to_one_pod_variable() {
+        assert!(kube_err("reveal_env = [\"PUBLIC_MODE\"]\n").contains("reveal_env"));
+        assert!(kube_err("reveal_env = [\"shop/api/1BAD\"]\n").contains("reveal_env"));
+        assert!(kube_err("reveal_env = [\"shop/api/PASS-WORD\"]\n").contains("reveal_env"));
+        let cfg = load_str(&kube_toml("reveal_env = [\"shop/api/PUBLIC_MODE\"]\n"));
+        assert_eq!(
+            cfg.kube_cluster("prod-eu").unwrap().reveal_env,
+            vec!["shop/api/PUBLIC_MODE"]
+        );
     }
 
     #[test]

@@ -11100,3 +11100,33 @@ conversion покрыты unit-тестами; ReplicaSet/Job больше не 
 SSH-only consumers отключают defaults.
 
 **Next:** #573 (маскирование ConfigMaps).
+
+## #573 — редакция секретов в объектах и логах Kubernetes
+
+**Сделано.** В `filar-agent` добавлен `KubeToolOutput::redact_for_model` —
+граница между объектами/логами Kubernetes и сообщениями модели, историей или
+экспортом. Литералы env заменяются на `«скрыто»`, `valueFrom`/`envFrom` остаются
+только ссылками; last-applied и managedFields удаляются. ConfigMap сохраняет
+ключи, но скрывает секретные по имени/учётным данным/энтропии/длине значения;
+binaryData скрыт всегда. Известные секреты маскируются и в обычных строках
+объектов; вложенный JSON и многострочные YAML/.properties/.env ConfigMap
+проверяются на секретные присваивания. Аргументы маскируют inline и отдельные
+значения секретных `--`-флагов и `IDENT=value`, а также любой непустой userinfo
+URL. Логи проходят `redact_secrets`, bearer-токены и URL userinfo.
+Явные `reveal_configmaps` и новый `reveal_env = ["namespace/pod/VARIABLE"]`
+оставляют значение с пометкой `«раскрыто настройкой»`; env-исключение действует
+только на Pod, а не на вложенный шаблон Deployment.
+
+**Проверка.** 19 unit-тестов границы инструмента покрывают каждый тип редакции,
+оба reveal, переходы `ConfigMapInfo`/`PodLogs` от `ClusterApi` и ложные
+срабатывания на портах, хостах, обычных URL и флагах; 12 config-тестов
+`KubeCluster`, `cargo build --workspace` и `cargo test --workspace` зелёные.
+Подключение правил к конкретным `k8s_*`-инструментам — следующая issue #574;
+их реализация сюда не входит.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. Аддитивно:
+`KubeToolOutput`, его переходы из `ConfigMapInfo`/`PodLogs`, `redact_logs`,
+маркеры редакции и `KubeCluster::reveal_env`; `filar-agent` включает существующий
+transport feature `kube`.
+
+**Next:** #574 (read-only Kubernetes tools поверх этой границы).

@@ -10,7 +10,7 @@ smoke = []
 
 [dependencies]
 filar-core = { workspace = true }
-filar-transport = { workspace = true }
+filar-transport = { workspace = true, features = ["kube"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
