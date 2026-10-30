@@ -327,12 +327,18 @@ check('wrong Kubernetes tool fails required argument assert', () => {
 });
 
 check('OOMKilled answer includes reason and memory limit', () => {
-  const r = outputContains('Причина — OOMKilled при лимите памяти 128Mi.', { vars: { expected_facts: ['OOMKilled', '128Mi'] } });
+  const r = outputContains('Причина — OOMKilled при лимите памяти 128Mi.', { vars: { expected_facts: { facts: ['OOMKilled', '128Mi'] } } });
   assert.strictEqual(r.pass, true, JSON.stringify(r));
 });
 
 check('OOMKilled answer without limit fails', () => {
-  const r = outputContains('Причина — OOMKilled.', { vars: { expected_facts: ['OOMKilled', '128Mi'] } });
+  const r = outputContains('Причина — OOMKilled.', { vars: { expected_facts: { facts: ['OOMKilled', '128Mi'] } } });
+  assert.strictEqual(r.pass, false, JSON.stringify(r));
+});
+
+check('OOMKilled facts in a tool-call explanation do not satisfy the final answer assert', () => {
+  const output = kubeResponse('k8s_describe', { kind: 'Pod', name: 'web-1', explanation: 'OOMKilled 128Mi' });
+  const r = outputContains(output, { vars: { expected_facts: { facts: ['OOMKilled', '128Mi'] } } });
   assert.strictEqual(r.pass, false, JSON.stringify(r));
 });
 

@@ -308,13 +308,37 @@ function kubeToolArgs(output, context) {
   };
 }
 
+// Extract final assistant content without tool-call explanations.
+function finalAssistantContent(output) {
+  if (typeof output === 'string') return output;
+  if (!output || Array.isArray(output)) return '';
+  const parts = [];
+  function add(content) {
+    if (typeof content === 'string') parts.push(content);
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (typeof part?.text === 'string') parts.push(part.text);
+      }
+    }
+  }
+  add(output.content);
+  if (Array.isArray(output.choices)) {
+    for (const choice of output.choices) add((choice.message || choice.delta || {}).content);
+  }
+  add(output.message);
+  add(output.message && output.message.content);
+  add(output.output);
+  add(output.output && output.output.content);
+  return parts.join('\n\n');
+}
+
 // Assert 8 — final diagnostic prose contains every required fact.
 function outputContains(output, context) {
-  const expected = context?.vars?.expected_facts;
+  const expected = context?.vars?.expected_facts?.facts;
   if (!Array.isArray(expected) || expected.length === 0) {
-    return { pass: false, score: 0, reason: 'outputContains requires a non-empty `expected_facts` array' };
+    return { pass: false, score: 0, reason: 'outputContains requires a non-empty `expected_facts.facts` array' };
   }
-  const prose = extractProse(output);
+  const prose = finalAssistantContent(output);
   const missing = expected.filter((value) => !prose.includes(String(value)));
   const pass = missing.length === 0;
   return {

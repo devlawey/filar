@@ -686,7 +686,7 @@ impl KubeToolExecutor {
                 if transport_truncated {
                     content.push_str("\n[truncated: log byte limit reached]");
                 }
-                truncate_output(&mut content);
+                truncate_log_output(&mut content);
                 Ok(KubeToolResult { content, truncated })
             }
             KubeToolCall::Events {
@@ -1148,6 +1148,21 @@ fn render_table(table: &PreprocessedOutput, total: usize, truncated: bool) -> Re
     let mut output = lines.join("\n");
     truncate_output(&mut output);
     Ok(output)
+}
+
+/// Keep the newest log lines when character limiting is necessary.
+fn truncate_log_output(output: &mut String) {
+    const MARKER: &str = "[truncated: older log lines dropped, output character limit reached]";
+    let total = output.chars().count();
+    if total <= MAX_KUBE_OUTPUT_CHARS {
+        return;
+    }
+    let keep = MAX_KUBE_OUTPUT_CHARS.saturating_sub(MARKER.chars().count() + 1);
+    let tail = output
+        .chars()
+        .skip(total.saturating_sub(keep))
+        .collect::<String>();
+    *output = format!("{MARKER}\n{tail}");
 }
 
 fn truncate_output(output: &mut String) {

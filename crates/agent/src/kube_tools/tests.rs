@@ -389,6 +389,28 @@ async fn logs_pass_previous_and_bounds_then_redact() {
 }
 
 #[tokio::test]
+async fn log_character_limit_keeps_the_newest_lines() {
+    let executor = executor(MockCluster {
+        logs: Some(PodLogs {
+            text: format!(
+                "oldest line\n{}\nnewest OOMKilled line",
+                "x".repeat(MAX_KUBE_OUTPUT_CHARS)
+            ),
+            truncated: false,
+        }),
+        ..MockCluster::default()
+    });
+    let call = parse_kube_tool_call(TOOL_K8S_LOGS, &json!({"pod": "web-1"}), Some("shop"))
+        .unwrap();
+    let result = executor.execute(&call).await.unwrap();
+    assert!(!result.content.contains("oldest line"));
+    assert!(result.content.contains("newest OOMKilled line"));
+    assert!(result.content.contains("older log lines dropped"));
+    assert!(result.content.chars().count() <= MAX_KUBE_OUTPUT_CHARS);
+    assert!(result.truncated);
+}
+
+#[tokio::test]
 async fn metrics_unsupported_has_actionable_message() {
     let executor = executor(MockCluster {
         metrics_unsupported: true,
