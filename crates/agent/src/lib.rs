@@ -41,6 +41,7 @@ pub mod fleet_result;
 pub mod fleet_retry;
 pub mod fleet_run;
 pub mod fleet_view;
+pub mod kube_agent;
 pub mod kube_redact;
 pub mod kube_tools;
 pub mod long_wait;
@@ -58,6 +59,7 @@ pub use agent::{Agent, AgentBuilder};
 pub use arbiter::{ArbiterContext, ArbiterVerdict, ARBITER_TIMEOUT_SECS};
 pub use compaction::{summarise_history, SummaryOutcome, COMPACTION_SYSTEM_PROMPT};
 pub use events::{AgentEvent, EventSink};
+pub use kube_agent::KubeAgent;
 pub use kube_redact::{
     redact_logs, KubeToolOutput, CONFIGMAP_VALUE_MAX_CHARS, HIDDEN_VALUE, REVEALED_BY_CONFIG,
 };
@@ -76,8 +78,8 @@ pub use preprocess::{
 };
 pub use risk::{build_risk_scorer, DecisionsApiScorer, RiskInput, RiskScore, RiskScorer};
 pub use runbook::{
-    generate_fleet_runbook, generate_runbook, FleetIdentifiers, RunbookOutcome, FLEET_RUNBOOK_PROMPT,
-    RUNBOOK_SYSTEM_PROMPT,
+    generate_fleet_runbook, generate_runbook, FleetIdentifiers, RunbookOutcome,
+    FLEET_RUNBOOK_PROMPT, RUNBOOK_SYSTEM_PROMPT,
 };
 pub use security::{CliConfirmer, CommandConfirmer, ConfirmDecision};
 pub use tools::{tool_definitions, ToolKind};

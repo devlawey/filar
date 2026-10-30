@@ -9,8 +9,13 @@ use std::io::{self, Stdout};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{EnableBracketedPaste, DisableBracketedPaste, EnableMouseCapture, DisableMouseCapture, Event, EventStream};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream,
+};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use futures::{FutureExt, StreamExt};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -20,8 +25,9 @@ use tracing::{error, info, warn};
 use filar_agent::{AgentBuilder, CommandConfirmer, LlmClient};
 use filar_core::{CommandConfirmMode, CoreError, Result, SecretProvider, StaticSecretProvider};
 use filar_transport::{
-    posix_cd_input, CommandExecutor, InteractiveTerminal, LocalInteractive,
-    SecretSubstitutingExecutor, SshExecutor, SshInteractive, SshTransportConfig, OSC7_PWD_PROBE,
+    posix_cd_input, ClusterApi, CommandExecutor, InteractiveTerminal, KubeClusterApi,
+    LocalInteractive, SecretSubstitutingExecutor, SshExecutor, SshInteractive, SshTransportConfig,
+    OSC7_PWD_PROBE,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -214,7 +220,9 @@ impl CwdWatch {
         self.armed
             && !self.in_flight
             && now.duration_since(self.last_activity) >= CWD_WATCH_QUIET
-            && self.last_asked.is_none_or(|t| now.duration_since(t) >= self.gap)
+            && self
+                .last_asked
+                .is_none_or(|t| now.duration_since(t) >= self.gap)
     }
 
     /// The question was sent.
@@ -288,8 +296,7 @@ async fn carry_agent_cwd_into_pty(
         return;
     };
     let session = &app.sessions[idx];
-    let (Some(want), Some(at)) = (session.cwd.as_deref(), session.pty_prompt_cwd.as_deref())
-    else {
+    let (Some(want), Some(at)) = (session.cwd.as_deref(), session.pty_prompt_cwd.as_deref()) else {
         return;
     };
     if want == at {
@@ -571,11 +578,22 @@ pub struct TuiConfig {
     /// Name of the default (startup) profile.
     pub default_profile_name: String,
     /// Factory for creating per-session LLM clients from profiles.
-    pub llm_factory: Arc<dyn Fn(&filar_core::LlmProfile, &StaticSecretProvider) -> std::result::Result<Arc<dyn LlmClient>, CoreError> + Send + Sync>,
+    pub llm_factory: Arc<
+        dyn Fn(
+                &filar_core::LlmProfile,
+                &StaticSecretProvider,
+            ) -> std::result::Result<Arc<dyn LlmClient>, CoreError>
+            + Send
+            + Sync,
+    >,
     /// For validating a profile's API key at Ctrl+L time without building a client.
     pub key_checker: Arc<dyn Fn(&filar_core::LlmProfile) -> Option<String> + Send + Sync>,
     /// Named SSH targets from config for Ctrl+O cycling.
     pub ssh_targets: Vec<filar_core::SshTarget>,
+    /// Named Kubernetes targets available in Ctrl+O (#575).
+    pub kube_clusters: Vec<filar_core::KubeCluster>,
+    /// Cluster identity restored by configured target name; reconnection is asynchronous.
+    pub initial_kube: Option<filar_core::KubeSessionSnapshot>,
     /// Receiver for WARN/ERROR log lines forwarded from the tracing subscriber
     /// (see [`crate::log_layer`]). The runner polls it and shows each line as a
     /// `System` block, so important logs surface in the chat instead of being
@@ -601,6 +619,54 @@ pub struct TuiConfig {
     /// Shown once at start-up when the scorer is configured but cannot be
     /// used (invalid section, missing key). Never contains a secret.
     pub risk_scorer_note: Option<String>,
+}
+
+/// Result of an asynchronous cluster connection or namespace discovery (#575).
+struct KubeConnectionResult {
+    session_id: SessionId,
+    connection_id: u64,
+    result: std::result::Result<(Arc<dyn ClusterApi>, Vec<String>), String>,
+}
+
+/// Start every queued cluster connection or namespace discovery (#575).
+fn start_pending_kube_connects(
+    app: &mut App,
+    kube_apis: &mut HashMap<SessionId, Arc<dyn ClusterApi>>,
+    kube_tx: &mpsc::UnboundedSender<KubeConnectionResult>,
+) {
+    for request in app.take_pending_kube_connects() {
+        kube_apis.remove(&request.session_id);
+        let tx = kube_tx.clone();
+        tokio::spawn(async move {
+            let session_id = request.session_id;
+            let connection_id = request.connection_id;
+            let result = match KubeClusterApi::connect(&request.target).await {
+                Ok(api) => {
+                    let api: Arc<dyn ClusterApi> = Arc::new(api);
+                    if request.discover {
+                        match api.namespaces().await {
+                            Ok(namespaces) => Ok((
+                                api,
+                                namespaces
+                                    .into_iter()
+                                    .map(|namespace| namespace.name)
+                                    .collect(),
+                            )),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    } else {
+                        Ok((api, Vec::new()))
+                    }
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = tx.send(KubeConnectionResult {
+                session_id,
+                connection_id,
+                result,
+            });
+        });
+    }
 }
 
 /// SSH transport tunables with the app-configured command timeout.
@@ -650,7 +716,10 @@ enum PanelMsg {
     /// State for the panel itself.
     Event(crate::file_panels::PanelEvent),
     /// Progress of copy `id` (#536).
-    CopyEvent { id: u64, event: filar_transport::CopyEvent },
+    CopyEvent {
+        id: u64,
+        event: filar_transport::CopyEvent,
+    },
     /// Copy `id` asks whether to replace `dst`.
     CopyAsk {
         id: u64,
@@ -658,7 +727,10 @@ enum PanelMsg {
         reply: tokio::sync::oneshot::Sender<filar_transport::OverwriteDecision>,
     },
     /// Copy `id` ended.
-    CopyDone { id: u64, report: filar_transport::CopyReport },
+    CopyDone {
+        id: u64,
+        report: filar_transport::CopyReport,
+    },
 }
 
 /// A copy in flight: how to stop it and how to answer its question.
@@ -690,7 +762,9 @@ impl filar_transport::CopyObserver for ChannelObserver {
             return filar_transport::OverwriteDecision::Cancel;
         }
         // No answer (the app went away) never replaces anything.
-        answer.await.unwrap_or(filar_transport::OverwriteDecision::Cancel)
+        answer
+            .await
+            .unwrap_or(filar_transport::OverwriteDecision::Cancel)
     }
 }
 
@@ -977,11 +1051,13 @@ fn drive_copies(
 }
 
 fn fail_open(ctx: &PanelCtx, side: crate::file_panels::Side, generation: u64, error: &str) {
-    let _ = ctx.tx.send(PanelMsg::Event(crate::file_panels::PanelEvent::OpenFailed {
-        side,
-        generation,
-        error: error.to_string(),
-    }));
+    let _ = ctx.tx.send(PanelMsg::Event(
+        crate::file_panels::PanelEvent::OpenFailed {
+            side,
+            generation,
+            error: error.to_string(),
+        },
+    ));
 }
 
 /// Open a panel source in the background, then list its first directory.
@@ -1038,7 +1114,9 @@ fn spawn_panel_open(
         }));
         // The wanted directory, else home when it is gone or unreadable.
         let mut listed = None;
-        if let Some(dir) = start_dir.filter(|d| !d.is_empty() || style == filar_transport::PathStyle::Windows) {
+        if let Some(dir) =
+            start_dir.filter(|d| !d.is_empty() || style == filar_transport::PathStyle::Windows)
+        {
             if let Ok(entries) = ft.list_dir(&dir).await {
                 listed = Some((dir, Ok(entries)));
             }
@@ -1132,7 +1210,9 @@ async fn open_panel_source(
         },
         PanelOpen::Typed(mut t) => {
             // A typed key passphrase is checked locally first, like Ctrl+O.
-            if matches!(t.auth, filar_core::SshAuth::Key { .. }) && !typed_passphrase_opens_key(&t).await {
+            if matches!(t.auth, filar_core::SshAuth::Key { .. })
+                && !typed_passphrase_opens_key(&t).await
+            {
                 if let filar_core::SshAuth::Key { passphrase, .. } = &mut t.auth {
                     *passphrase = None;
                 }
@@ -1144,7 +1224,13 @@ async fn open_panel_source(
             t
         }
     };
-    match filar_transport::SftpFileTransfer::connect(&target, cfg, &filar_core::EnvSecretProvider::new()).await {
+    match filar_transport::SftpFileTransfer::connect(
+        &target,
+        cfg,
+        &filar_core::EnvSecretProvider::new(),
+    )
+    .await
+    {
         Ok(sftp) => ready_sftp(sftp, &target, host_groups),
         Err(e) => PanelOpened::Failed(e.to_string()),
     }
@@ -1221,7 +1307,11 @@ async fn fill_saved_secret(mut target: filar_core::SshTarget) -> Result<SavedSec
 /// Whether the passphrase typed for `target`'s encrypted key decrypts it
 /// (#480). Decrypting is blocking, so it runs off the runtime.
 async fn typed_passphrase_opens_key(target: &filar_core::SshTarget) -> bool {
-    let filar_core::SshAuth::Key { path, passphrase: Some(passphrase) } = &target.auth else {
+    let filar_core::SshAuth::Key {
+        path,
+        passphrase: Some(passphrase),
+    } = &target.auth
+    else {
         return false;
     };
     let path = filar_transport::resolve_key_path(path.as_deref());
@@ -1262,8 +1352,10 @@ fn fleet_connector(command_timeout: Duration) -> filar_agent::fleet_exec::HostCo
                 Arc::new(StaticSecretProvider::new()),
             )
             .await?;
-            Ok(Arc::new(filar_transport::ReadOnlyExecutor::new(Arc::new(ssh)))
-                as Arc<dyn CommandExecutor>)
+            Ok(
+                Arc::new(filar_transport::ReadOnlyExecutor::new(Arc::new(ssh)))
+                    as Arc<dyn CommandExecutor>,
+            )
         })
     })
 }
@@ -1326,7 +1418,9 @@ pub async fn run(
     if let Err(e) = crossterm::execute!(stdout, EnterAlternateScreen) {
         // Restore terminal state before returning the error.
         disable_raw_mode().ok();
-        return Err(CoreError::Other(format!("failed to enter alternate screen: {e}")));
+        return Err(CoreError::Other(format!(
+            "failed to enter alternate screen: {e}"
+        )));
     }
     // Mouse capture is optional — degrade gracefully if unsupported.
     if let Err(e) = crossterm::execute!(io::stdout(), EnableMouseCapture) {
@@ -1351,7 +1445,13 @@ pub async fn run(
 
     // Restore terminal.
     disable_raw_mode().ok();
-    crossterm::execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen).ok();
+    crossterm::execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )
+    .ok();
 
     result
 }
@@ -1372,9 +1472,13 @@ async fn run_app(
     let default_for_restore = std::mem::take(&mut config.default_profile_name);
     let has_history = !config.initial_messages.is_empty()
         || !config.initial_input_history.is_empty()
-        || config.initial_llm_profile.as_ref().is_some_and(|p| !p.is_empty())
+        || config
+            .initial_llm_profile
+            .as_ref()
+            .is_some_and(|p| !p.is_empty())
         || config.initial_tokens_in > 0
-        || config.initial_tokens_out > 0;
+        || config.initial_tokens_out > 0
+        || config.initial_kube.is_some();
     let mut app = if has_history {
         let mut a = App::with_history(
             config.target_name.clone(),
@@ -1394,6 +1498,7 @@ async fn run_app(
         a.profiles = profiles_for_restore;
         a.default_profile_name = default_for_restore;
         a.ssh_targets = config.ssh_targets.clone();
+        a.kube_clusters = config.kube_clusters.clone();
         a.save_dir = config.save_dir.clone();
         a
     } else {
@@ -1401,6 +1506,7 @@ async fn run_app(
         a.profiles = profiles_for_restore;
         a.default_profile_name = default_for_restore;
         a.ssh_targets = config.ssh_targets.clone();
+        a.kube_clusters = config.kube_clusters.clone();
         a.save_dir = config.save_dir.clone();
         if let Some(s) = a.sessions.first_mut() {
             s.llm_profile = Some(config.llm_profile.clone());
@@ -1437,6 +1543,9 @@ async fn run_app(
 
     // Channel for agent → UI events.
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<TuiEvent>();
+    // Live typed Kubernetes APIs stay in the runner, never in persisted state.
+    let (kube_tx, mut kube_rx) = mpsc::unbounded_channel::<KubeConnectionResult>();
+    let mut kube_apis: HashMap<SessionId, Arc<dyn ClusterApi>> = HashMap::new();
 
     // Channel for session-save progress (Ctrl+S, #234/#235).
     let (save_tx, mut save_rx) = tokio::sync::mpsc::unbounded_channel::<SaveProgress>();
@@ -1479,22 +1588,21 @@ async fn run_app(
         crate::app::SessionId,
         Arc<filar_agent::fleet_exec::FleetExecutor>,
     > = HashMap::new();
-    let mut executors: std::collections::HashMap<
-        crate::app::SessionId,
-        ExecutorEntry,
-    > = std::collections::HashMap::new();
+    let mut executors: std::collections::HashMap<crate::app::SessionId, ExecutorEntry> =
+        std::collections::HashMap::new();
     executors.insert(
         initial_sid,
         ExecutorEntry {
             executor: initial_tui,
             ssh_target: Arc::new(tokio::sync::RwLock::new(config.ssh_target.clone())),
-            ssh_exec: Arc::new(tokio::sync::RwLock::new(config.initial_ssh_executor.clone())),
+            ssh_exec: Arc::new(tokio::sync::RwLock::new(
+                config.initial_ssh_executor.clone(),
+            )),
         },
     );
     // Set initial ssh_info on the first session.
     if let Some(ref target) = config.ssh_target {
-        app.sessions[0].ssh_info =
-            Some(format!("{}@{}:{}", target.user, target.host, target.port));
+        app.sessions[0].ssh_info = Some(format!("{}@{}:{}", target.user, target.host, target.port));
         // Do not run unconfirmed `pwd` here (AGENTS.md confirm gate).
         // Pwd appears once OSC 7 reports it (interactive) or #313 syncs it.
         app.sessions[0].cwd = None;
@@ -1505,6 +1613,10 @@ async fn run_app(
         app.sessions[0].ssh_info = Some(info.clone());
         app.sessions[0].cwd = None;
     }
+    if let Some(snapshot) = config.initial_kube.take() {
+        app.restore_kube_snapshot(snapshot);
+    }
+    start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
     // The startup target may carry policy tags — tighten before the first
     // render so the bar and the confirm gate agree from the start (#414).
     app.sync_confirm_mode();
@@ -1533,10 +1645,8 @@ async fn run_app(
     // Each watch and each answer names the backend it is about, so a
     // terminal reopened in the same tab starts clean and never takes an
     // answer meant for its predecessor.
-    let mut cwd_watches: HashMap<
-        crate::app::SessionId,
-        (Arc<dyn InteractiveTerminal>, CwdWatch),
-    > = HashMap::new();
+    let mut cwd_watches: HashMap<crate::app::SessionId, (Arc<dyn InteractiveTerminal>, CwdWatch)> =
+        HashMap::new();
     let (cwd_tx, mut cwd_rx) = tokio::sync::mpsc::unbounded_channel::<(
         crate::app::SessionId,
         Arc<dyn InteractiveTerminal>,
@@ -1890,9 +2000,73 @@ async fn run_app(
                     }
                 }
 
+                // Start a cluster selected by this key before consuming input.
+                start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
+
                 // Check if user sent input — spawn agent or execute shell escape.
                 if let Some(user_input) = app.take_input() {
-                    if let Some(stripped) = user_input.strip_prefix('!') {
+                    if let Some(kube) = app.kube.clone() {
+                        if user_input.starts_with('!') {
+                            app.push_message(ChatBlock::System(crate::app::KUBE_SHELL_REFUSAL.into()));
+                            app.mode = AppMode::Normal;
+                            app.agent_running = false;
+                        } else {
+                            let sid = app.sessions[app.active].id;
+                            let Some(api) = kube_apis.get(&sid).cloned() else {
+                                app.push_error("Kubernetes cluster is not connected yet".into());
+                                app.mode = AppMode::Normal;
+                                app.agent_running = false;
+                                continue;
+                            };
+                            let pending_compaction = app.sessions[app.active].pending_compaction;
+                            let profile_name = app.sessions[app.active]
+                                .llm_profile
+                                .as_deref()
+                                .unwrap_or(&app.default_profile_name)
+                                .to_string();
+                            let session_llm = {
+                                let profile = app.profiles.iter().find(|p| p.name == profile_name);
+                                match profile {
+                                    Some(p) => match (config.llm_factory)(p, &config.secret_provider) {
+                                        Ok(client) => client,
+                                        Err(error) => {
+                                            app.push_error(format!("Failed to create LLM client: {error}"));
+                                            app.mode = AppMode::Normal;
+                                            app.agent_running = false;
+                                            continue;
+                                        }
+                                    },
+                                    None => {
+                                        app.push_error(format!("Profile '{profile_name}' not found"));
+                                        app.mode = AppMode::Normal;
+                                        app.agent_running = false;
+                                        continue;
+                                    }
+                                }
+                            };
+                            let cancel_token = CancellationToken::new();
+                            app.cancellation = Some(cancel_token.clone());
+                            spawn_kube_agent(
+                                session_llm,
+                                api,
+                                kube.target,
+                                kube.namespace,
+                                app.confirm_mode,
+                                config.tag_policies.clone(),
+                                user_input,
+                                app.messages.clone(),
+                                app.active_session().history_epoch,
+                                agent_tx.clone(),
+                                cancel_token,
+                                config.secret_provider.clone(),
+                                sid,
+                                profile_name,
+                                app.active_session().compaction_exhausted,
+                                pending_compaction,
+                            );
+                            app.sessions[app.active].pending_compaction = None;
+                        }
+                    } else if let Some(stripped) = user_input.strip_prefix('!') {
                         // Shell escape: execute command directly without agent.
                         let cmd = stripped.trim().to_string();
                         if !cmd.is_empty() {
@@ -2438,6 +2612,7 @@ async fn run_app(
             // A closed fleet drops its group-level executor and with it
             // every host connection it held (#435).
             fleet_executors.remove(&sid);
+            kube_apis.remove(&sid);
         }
 
         // Teardown interactive backends for tabs reset by session restore
@@ -2472,6 +2647,36 @@ async fn run_app(
                 }
             }
 
+            // Cluster connection and namespace discovery results (#575).
+            maybe_kube = kube_rx.recv() => {
+                if let Some(completed) = maybe_kube {
+                    match completed.result {
+                        Ok((api, namespaces)) => {
+                            if app.kube_connection_is_current(
+                                completed.session_id,
+                                completed.connection_id,
+                            ) {
+                                kube_apis.insert(completed.session_id, api);
+                                app.complete_kube_connection(
+                                    completed.session_id,
+                                    completed.connection_id,
+                                    namespaces,
+                                );
+                                needs_redraw = true;
+                            }
+                        }
+                        Err(error) => {
+                            app.fail_kube_connection(
+                                completed.session_id,
+                                completed.connection_id,
+                                error,
+                            );
+                            needs_redraw = true;
+                        }
+                    }
+                }
+            }
+
             // Agent event (only when not in interactive mode).
             maybe_agent_event = async {
                 if in_interactive {
@@ -2483,7 +2688,14 @@ async fn run_app(
                 if let Some(event) = maybe_agent_event {
                     // Intercept TransportChanged to update per-session info.
                     if let TuiEvent::TransportChanged { session_id, is_local, ref ssh_info, ref alias, .. } = &event {
+                        kube_apis.remove(session_id);
+                        if app.kube_namespace_select.as_ref().is_some_and(|select| {
+                            select.session_id == *session_id
+                        }) {
+                            app.kube_namespace_select = None;
+                        }
                         if let Some(idx) = app.find_session_idx(*session_id) {
+                            app.sessions[idx].kube = None;
                             app.sessions[idx].ssh_info = ssh_info.clone();
                             app.sessions[idx].target_name =
                                 alias.clone().unwrap_or_else(|| {
@@ -2716,6 +2928,9 @@ async fn run_app(
             }
         }
 
+        // Non-terminal events can also queue a restored or selected cluster.
+        start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
+
         if app.should_quit {
             break;
         }
@@ -2829,7 +3044,11 @@ pub(crate) fn session_snapshot(
 /// an ordinary tab plus the frozen composition, so a restore rebuilds the
 /// fleet from the hosts it had rather than from today's tags. No ssh_info —
 /// a fleet has no single host.
-pub(crate) fn fleet_session_snapshot(app: &App, id: &str, timestamp: &str) -> Option<filar_core::Session> {
+pub(crate) fn fleet_session_snapshot(
+    app: &App,
+    id: &str,
+    timestamp: &str,
+) -> Option<filar_core::Session> {
     let fleet = &app.sessions[app.fleet_index()?];
     let mut session = session_snapshot_of(app, fleet, &fleet.target_name, id, timestamp);
     session.ssh_info = None;
@@ -2866,7 +3085,11 @@ impl FleetSaveState {
         timestamp: &str,
     ) -> Option<(filar_core::Session, u64)> {
         let fleet = &app.sessions[app.fleet_index()?];
-        if !fleet.messages.iter().any(|b| matches!(b, ChatBlock::User(_))) {
+        if !fleet
+            .messages
+            .iter()
+            .any(|b| matches!(b, ChatBlock::User(_)))
+        {
             return None;
         }
         if self.file.as_ref().map(|(sid, _)| *sid) != Some(fleet.id) {
@@ -2898,7 +3121,9 @@ impl FleetSaveState {
 
 /// Write a fleet session off the event loop (#442). Not the panic-safe
 /// snapshot: that one slot belongs to the tab session.
-async fn save_fleet_session_async(session: filar_core::Session) -> std::result::Result<(), CoreError> {
+async fn save_fleet_session_async(
+    session: filar_core::Session,
+) -> std::result::Result<(), CoreError> {
     tokio::task::spawn_blocking(move || {
         let store = filar_core::SessionStore::with_default_dir()?;
         store.save(&session)?;
@@ -2949,6 +3174,13 @@ fn session_snapshot_of(
         api_base_url,
         confirm_mode: Some(tab.confirm_mode),
         fleet: tab.fleet_snapshot(),
+        kube: tab
+            .kube
+            .as_ref()
+            .map(|kube| filar_core::KubeSessionSnapshot {
+                target: kube.target.name.clone(),
+                namespace: kube.namespace.clone(),
+            }),
     };
     session.truncate_history();
     session
@@ -3231,16 +3463,23 @@ fn apply_save_progress(
                 if let Some(err) = result {
                     if !app.sessions[idx].transcript_error_shown {
                         app.sessions[idx].transcript_error_shown = true;
-                        app.sessions[idx].messages.push(filar_core::ChatBlock::Error(
-                            format!("Transcript write failed: {err}"),
-                        ));
+                        app.sessions[idx]
+                            .messages
+                            .push(filar_core::ChatBlock::Error(format!(
+                                "Transcript write failed: {err}"
+                            )));
                         app.sessions[idx].message_rev =
                             app.sessions[idx].message_rev.wrapping_add(1);
                     }
                 }
             }
         }
-        SaveProgress::RunbookDone { sid, outcome, usage, profile } => {
+        SaveProgress::RunbookDone {
+            sid,
+            outcome,
+            usage,
+            profile,
+        } => {
             app.finish_runbook(sid, outcome, usage, profile);
         }
         SaveProgress::RunbookCancelled { sid } => {
@@ -3252,7 +3491,10 @@ fn apply_save_progress(
 /// The LLM-client factory the runner uses, spelled once for the runbook
 /// helpers that must borrow it out of a partially moved [`TuiConfig`].
 type RunbookLlmFactory = Arc<
-    dyn Fn(&filar_core::LlmProfile, &StaticSecretProvider) -> std::result::Result<Arc<dyn LlmClient>, CoreError>
+    dyn Fn(
+            &filar_core::LlmProfile,
+            &StaticSecretProvider,
+        ) -> std::result::Result<Arc<dyn LlmClient>, CoreError>
         + Send
         + Sync,
 >;
@@ -3279,7 +3521,12 @@ fn spawn_runbook_generation(
         Some(profile) => match (llm_factory)(profile, secret_provider) {
             Ok(client) => client,
             Err(e) => {
-                app.finish_runbook(armed.session_id, Err(e.to_string()), None, armed.profile.clone());
+                app.finish_runbook(
+                    armed.session_id,
+                    Err(e.to_string()),
+                    None,
+                    armed.profile.clone(),
+                );
                 return;
             }
         },
@@ -3382,7 +3629,10 @@ async fn build_runbook_file(
     // A fleet session's host identifiers (#443): the runbook becomes a
     // procedure for the group, with every one of them scrubbed.
     fleet: Option<&filar_agent::FleetIdentifiers>,
-) -> Option<(std::result::Result<String, String>, Option<filar_agent::TokenUsage>)> {
+) -> Option<(
+    std::result::Result<String, String>,
+    Option<filar_agent::TokenUsage>,
+)> {
     let redacted = filar_core::redact_secrets(transcript, provider);
     let generate = async {
         match fleet {
@@ -3492,8 +3742,7 @@ fn spawn_agent(
         // not count, so the reactive path is still available then (#378).
         let mut already_compacted = chat_history.len() < before_compaction;
         loop {
-            let history =
-                history_to_messages(without_current_prompt(&chat_history, &user_input));
+            let history = history_to_messages(without_current_prompt(&chat_history, &user_input));
 
             let mut builder = AgentBuilder::new()
                 .llm(Arc::clone(&llm))
@@ -3590,6 +3839,137 @@ fn spawn_agent(
             let _ = tx.send(TuiEvent::Agent {
                 session_id: sid,
                 event: filar_agent::AgentEvent::Error(msg),
+            });
+        }
+    });
+}
+
+/// Spawn the typed Kubernetes agent, reusing chat history and compaction (#575).
+#[allow(clippy::too_many_arguments)]
+fn spawn_kube_agent(
+    llm: Arc<dyn LlmClient>,
+    api: Arc<dyn ClusterApi>,
+    target: filar_core::KubeCluster,
+    namespace: Option<String>,
+    confirm_mode: CommandConfirmMode,
+    tag_policies: Vec<filar_core::TagPolicy>,
+    user_input: String,
+    chat_history: Vec<ChatBlock>,
+    history_epoch: u64,
+    event_tx: mpsc::UnboundedSender<TuiEvent>,
+    cancellation: CancellationToken,
+    secret_provider: Arc<StaticSecretProvider>,
+    sid: SessionId,
+    profile_name: String,
+    compaction_exhausted: bool,
+    pending_compaction: Option<usize>,
+) {
+    let tx = event_tx.clone();
+    let confirmer = Arc::new(TuiConfirmer::new(event_tx, sid)) as Arc<dyn CommandConfirmer>;
+    tokio::spawn(async move {
+        let _ = tx.send(TuiEvent::Thinking);
+        let held_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let tx_for_sink = tx.clone();
+        let held_for_sink = Arc::clone(&held_error);
+        let sink: filar_agent::EventSink = Arc::new(move |event: filar_agent::AgentEvent| {
+            if let filar_agent::AgentEvent::Error(message) = &event {
+                *held_for_sink
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(message.clone());
+                return;
+            }
+            let _ = tx_for_sink.send(TuiEvent::Agent {
+                session_id: sid,
+                event,
+            });
+        });
+
+        let before_compaction = chat_history.len();
+        let mut chat_history = compact_for_request(
+            chat_history,
+            pending_compaction,
+            llm.as_ref(),
+            &tx,
+            sid,
+            &profile_name,
+            &cancellation,
+        )
+        .await;
+        let mut already_compacted = chat_history.len() < before_compaction;
+        let secrets: Arc<dyn SecretProvider> = secret_provider;
+
+        loop {
+            let history = history_to_messages(without_current_prompt(&chat_history, &user_input));
+            let agent = filar_agent::KubeAgent::new(
+                Arc::clone(&llm),
+                filar_agent::KubeToolExecutor::new(
+                    Arc::clone(&api),
+                    target.clone(),
+                    Arc::clone(&secrets),
+                ),
+                target.clone(),
+                namespace.clone(),
+                Arc::clone(&confirmer),
+                confirm_mode,
+                tag_policies.clone(),
+            )
+            .event_sink(Arc::clone(&sink))
+            .cancellation(cancellation.clone());
+
+            *held_error
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = None;
+            let outcome = agent.run(&user_input, &history).await;
+            let overflow = matches!(outcome, Err(CoreError::ContextOverflow(_)));
+            if !should_retry_after_overflow(
+                overflow,
+                already_compacted,
+                cancellation.is_cancelled(),
+                compaction_exhausted,
+            ) {
+                break;
+            }
+
+            let boundary =
+                filar_core::compaction_boundary(&chat_history, filar_core::DEFAULT_KEEP_TURNS);
+            if boundary == 0 {
+                break;
+            }
+            let _ = tx.send(TuiEvent::Notice {
+                session_id: sid,
+                text: "The context window overflowed. Compacting the history and retrying once."
+                    .to_string(),
+            });
+            let before = chat_history.len();
+            let _ = tx.send(TuiEvent::CompactionStarted {
+                session_id: sid,
+                boundary,
+                epoch: history_epoch,
+            });
+            chat_history = compact_for_request(
+                chat_history,
+                Some(boundary),
+                llm.as_ref(),
+                &tx,
+                sid,
+                &profile_name,
+                &cancellation,
+            )
+            .await;
+            if chat_history.len() >= before {
+                break;
+            }
+            already_compacted = true;
+        }
+
+        let final_error = held_error
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some(message) = final_error {
+            let _ = tx.send(TuiEvent::Agent {
+                session_id: sid,
+                event: filar_agent::AgentEvent::Error(message),
             });
         }
     });
@@ -3747,9 +4127,16 @@ mod tests {
                 host: format!("{n}.example"),
                 port: 22,
                 user: "admin".into(),
-                auth: filar_core::SshAuth::Key { path: None, passphrase: None },
+                auth: filar_core::SshAuth::Key {
+                    path: None,
+                    passphrase: None,
+                },
                 host_key_policy: Default::default(),
-                tags: vec![if n.starts_with("web") { "web".into() } else { "db".into() }],
+                tags: vec![if n.starts_with("web") {
+                    "web".into()
+                } else {
+                    "db".into()
+                }],
             })
             .collect();
         let group = |tag: &str| filar_core::HostGroup {
@@ -3769,9 +4156,14 @@ mod tests {
         };
         let web = filar_core::FleetOperation::open(&group("web"), &targets);
         let web_creds = creds(&web);
-        let first = fleet_executor_for(&mut map, sid, &web, &web_creds, connector, || None).expect("web");
-        let again = fleet_executor_for(&mut map, sid, &web, &web_creds, connector, || None).expect("web");
-        assert!(Arc::ptr_eq(&first, &again), "same fleet: connections are kept");
+        let first =
+            fleet_executor_for(&mut map, sid, &web, &web_creds, connector, || None).expect("web");
+        let again =
+            fleet_executor_for(&mut map, sid, &web, &web_creds, connector, || None).expect("web");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "same fleet: connections are kept"
+        );
 
         // Any other operation under the same key — however it got there —
         // gets its own executor over its own composition.
@@ -3780,10 +4172,19 @@ mod tests {
             fleet_executor_for(&mut map, sid, &db, &web_creds, connector, || None).is_err(),
             "another fleet's credentials are refused"
         );
-        let swapped = fleet_executor_for(&mut map, sid, &db, &creds(&db), connector, || None).expect("db");
+        let swapped =
+            fleet_executor_for(&mut map, sid, &db, &creds(&db), connector, || None).expect("db");
         assert!(!Arc::ptr_eq(&first, &swapped));
-        assert_eq!(swapped.radius(), ["db-1"], "runs where the gate says it runs");
-        assert_eq!(map.len(), 1, "the stale executor is dropped with its connections");
+        assert_eq!(
+            swapped.radius(),
+            ["db-1"],
+            "runs where the gate says it runs"
+        );
+        assert_eq!(
+            map.len(),
+            1,
+            "the stale executor is dropped with its connections"
+        );
     }
 
     #[test]
@@ -3803,10 +4204,16 @@ mod tests {
 
     #[test]
     fn only_an_overflow_triggers_the_retry() {
-        assert!(!should_retry_after_overflow(false, false, false, false), "a success");
+        assert!(
+            !should_retry_after_overflow(false, false, false, false),
+            "a success"
+        );
         // Any other failure would fail identically over a shorter history, so
         // retrying it just costs the user another request.
-        assert!(!should_retry_after_overflow(false, true, false, false), "another error");
+        assert!(
+            !should_retry_after_overflow(false, true, false, false),
+            "another error"
+        );
     }
 
     #[test]
@@ -3870,7 +4277,9 @@ mod tests {
     }
 
     fn history(n: usize) -> Vec<ChatBlock> {
-        (0..n).map(|i| ChatBlock::User(format!("turn {i}"))).collect()
+        (0..n)
+            .map(|i| ChatBlock::User(format!("turn {i}")))
+            .collect()
     }
 
     #[tokio::test]
@@ -3899,7 +4308,15 @@ mod tests {
         // suite is a much worse regression signal than a failed assertion.
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            compact_for_request(blocks.clone(), Some(4), &llm, &tx, SessionId(1), "p", &token),
+            compact_for_request(
+                blocks.clone(),
+                Some(4),
+                &llm,
+                &tx,
+                SessionId(1),
+                "p",
+                &token,
+            ),
         )
         .await
         .expect("cancellation must abandon the request, not wait it out");
@@ -3935,13 +4352,29 @@ mod tests {
 
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            compact_for_request(blocks.clone(), Some(4), &llm, &tx, SessionId(1), "p", &token),
+            compact_for_request(
+                blocks.clone(),
+                Some(4),
+                &llm,
+                &tx,
+                SessionId(1),
+                "p",
+                &token,
+            ),
         )
         .await
         .expect("an already-cancelled compaction must return at once");
 
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "no request sent");
-        assert_eq!(format!("{out:?}"), format!("{blocks:?}"), "history untouched");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no request sent"
+        );
+        assert_eq!(
+            format!("{out:?}"),
+            format!("{blocks:?}"),
+            "history untouched"
+        );
         assert!(rx.try_recv().is_err(), "and nothing announced");
     }
 
@@ -3980,7 +4413,10 @@ mod tests {
 
         assert!(out.len() < blocks.len(), "the head was folded");
         assert!(
-            matches!(rx.try_recv(), Ok(TuiEvent::HistoryCompacted { summary: Ok(_), .. })),
+            matches!(
+                rx.try_recv(),
+                Ok(TuiEvent::HistoryCompacted { summary: Ok(_), .. })
+            ),
             "and the result was reported"
         );
     }
@@ -4205,14 +4641,9 @@ mod tests {
         let mut app = App::new("t0".into(), CommandConfirmMode::Always);
         app.new_tab(); // active = 1
         let sid0 = app.sessions[0].id;
-        app.sessions[0].terminal =
-            Some(crate::terminal::TerminalModel::new(80, 24));
+        app.sessions[0].terminal = Some(crate::terminal::TerminalModel::new(80, 24));
 
-        let outcome = route_term_chunk(
-            &mut app,
-            sid0,
-            TermChunk::Bytes(b"hi".to_vec()),
-        );
+        let outcome = route_term_chunk(&mut app, sid0, TermChunk::Bytes(b"hi".to_vec()));
         assert!(matches!(outcome, RouteOutcome::Fed));
         assert!(app.sessions[0].has_new, "background tab must be marked");
     }
@@ -4238,22 +4669,37 @@ mod tests {
     fn the_cwd_watch_asks_after_enter_once_output_is_quiet() {
         let t0 = Instant::now();
         let mut watch = CwdWatch::new(t0);
-        assert!(!watch.due(t0 + Duration::from_secs(5)), "an idle terminal is not asked");
+        assert!(
+            !watch.due(t0 + Duration::from_secs(5)),
+            "an idle terminal is not asked"
+        );
         watch.note_output(t0);
-        assert!(!watch.due(t0 + Duration::from_secs(5)), "typing a line is not a command");
+        assert!(
+            !watch.due(t0 + Duration::from_secs(5)),
+            "typing a line is not a command"
+        );
 
         watch.note_enter(t0);
-        assert!(!watch.due(t0 + Duration::from_millis(50)), "the command is still printing");
+        assert!(
+            !watch.due(t0 + Duration::from_millis(50)),
+            "the command is still printing"
+        );
         watch.note_output(t0 + Duration::from_millis(150));
         assert!(!watch.due(t0 + Duration::from_millis(250)));
         let t1 = t0 + Duration::from_millis(150) + CWD_WATCH_QUIET;
         assert!(watch.due(t1));
 
         watch.asked(t1);
-        assert!(!watch.due(t1 + Duration::from_secs(5)), "one question at a time");
+        assert!(
+            !watch.due(t1 + Duration::from_secs(5)),
+            "one question at a time"
+        );
         watch.answered(Some(true));
         watch.note_output(t1 + Duration::from_secs(6));
-        assert!(!watch.due(t1 + Duration::from_secs(20)), "back at the prompt: rest");
+        assert!(
+            !watch.due(t1 + Duration::from_secs(20)),
+            "back at the prompt: rest"
+        );
     }
 
     /// #499: `sleep 5; cd /x` — the first answer comes while the command
@@ -4324,7 +4770,10 @@ mod tests {
         assert!(apply_foreground_cwd(&mut app, sid, "/".into()));
         assert_eq!(app.sessions[0].cwd.as_deref(), Some("/"));
         assert_eq!(app.sessions[0].pty_prompt_cwd.as_deref(), Some("/root"));
-        assert!(!apply_foreground_cwd(&mut app, sid, "/".into()), "unchanged: no redraw");
+        assert!(
+            !apply_foreground_cwd(&mut app, sid, "/".into()),
+            "unchanged: no redraw"
+        );
     }
 
     /// A PTY stand-in that records what is written to it (#482).
@@ -4354,7 +4803,10 @@ mod tests {
     }
 
     fn recording(reports_cwd: bool) -> (Arc<RecordingTerm>, Arc<dyn InteractiveTerminal>) {
-        let term = Arc::new(RecordingTerm { reports_cwd, writes: Default::default() });
+        let term = Arc::new(RecordingTerm {
+            reports_cwd,
+            writes: Default::default(),
+        });
         let dyn_term: Arc<dyn InteractiveTerminal> = term.clone();
         (term, dyn_term)
     }
@@ -4382,7 +4834,10 @@ mod tests {
 
         sync_cwd_from_interactive(&mut app, sid, &term, &HashMap::new(), &mut term_rx).await;
 
-        assert!(rec.writes.lock().unwrap().is_empty(), "no POSIX probe for cmd/PowerShell");
+        assert!(
+            rec.writes.lock().unwrap().is_empty(),
+            "no POSIX probe for cmd/PowerShell"
+        );
         assert_eq!(app.sessions[0].cwd.as_deref(), Some(r"C:\Работа\My Dir"));
     }
 
@@ -4422,7 +4877,10 @@ mod tests {
 
         sync_cwd_from_interactive(&mut app, sid, &term, &HashMap::new(), &mut term_rx).await;
 
-        assert_eq!(rec.writes.lock().unwrap().as_slice(), [OSC7_PWD_PROBE.to_vec()]);
+        assert_eq!(
+            rec.writes.lock().unwrap().as_slice(),
+            [OSC7_PWD_PROBE.to_vec()]
+        );
         // No answer within the window: the last known cwd stays.
         assert_eq!(app.sessions[0].cwd.as_deref(), Some("/srv"));
     }
@@ -4449,7 +4907,10 @@ mod tests {
         carry_agent_cwd_into_pty(&mut app, sid, &term).await;
         carry_agent_cwd_into_pty(&mut app, sid, &term).await;
 
-        assert_eq!(rec.writes.lock().unwrap().as_slice(), [b"cd /var/log\n".to_vec()]);
+        assert_eq!(
+            rec.writes.lock().unwrap().as_slice(),
+            [b"cd /var/log\n".to_vec()]
+        );
     }
 
     #[tokio::test]
@@ -4476,7 +4937,10 @@ mod tests {
         let sid = app.sessions[0].id;
         app.sessions[0].pty_prompt_cwd = Some("/home/u".into());
         note_pty_input(&mut app, sid, b"");
-        assert!(app.sessions[0].pty_prompt_cwd.is_some(), "no input, no change");
+        assert!(
+            app.sessions[0].pty_prompt_cwd.is_some(),
+            "no input, no change"
+        );
         note_pty_input(&mut app, sid, b"ls");
         assert!(app.sessions[0].pty_prompt_cwd.is_none(), "half-typed line");
         app.sessions[0].cwd = Some("/var/log".into());
@@ -4580,6 +5044,65 @@ mod tests {
     }
 
     #[test]
+    fn session_snapshot_captures_only_the_configured_kubernetes_identity() {
+        use filar_core::CommandConfirmMode;
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.sessions[0].kube = Some(crate::app::KubeTabState {
+            target: filar_core::KubeCluster {
+                name: "prod-eu".into(),
+                context: "private-context".into(),
+                kubeconfig: Some("secret-path/kubeconfig".into()),
+                ..Default::default()
+            },
+            namespace: Some("shop".into()),
+            connection_id: 7,
+        });
+
+        let snapshot = session_snapshot(&app, "prod-eu", "123456", "2026-10-30 00:00:00");
+        assert_eq!(
+            snapshot.kube,
+            Some(filar_core::KubeSessionSnapshot {
+                target: "prod-eu".into(),
+                namespace: Some("shop".into()),
+            })
+        );
+        let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
+        assert!(!json.contains("private-context"));
+        assert!(!json.contains("secret-path"));
+    }
+
+    #[tokio::test]
+    async fn restored_cluster_connect_starts_without_terminal_input() {
+        let target = filar_core::KubeCluster {
+            name: "missing-cluster".into(),
+            context: "missing-context".into(),
+            kubeconfig: Some(
+                std::env::temp_dir().join("filar-575-definitely-missing-kubeconfig.yaml"),
+            ),
+            ..Default::default()
+        };
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.kube_clusters = vec![target];
+        app.restore_kube_snapshot(filar_core::KubeSessionSnapshot {
+            target: "missing-cluster".into(),
+            namespace: Some("shop".into()),
+        });
+        let sid = app.active_session().id;
+        let (kube_tx, mut kube_rx) = mpsc::unbounded_channel();
+        let mut kube_apis: HashMap<SessionId, Arc<dyn ClusterApi>> = HashMap::new();
+
+        start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
+
+        assert!(app.take_pending_kube_connects().is_empty());
+        let completed = tokio::time::timeout(Duration::from_secs(2), kube_rx.recv())
+            .await
+            .expect("connection attempt starts immediately")
+            .expect("connection attempt reports its result");
+        assert_eq!(completed.session_id, sid);
+        assert!(completed.result.is_err());
+    }
+
+    #[test]
     fn session_snapshot_nulls_launch_context_when_absent() {
         use filar_core::CommandConfirmMode;
         let app = App::new("local".into(), CommandConfirmMode::Allowlist);
@@ -4603,7 +5126,10 @@ mod tests {
         let sid0 = app.active_session().id;
         let rev0 = app.active_session().message_rev;
         app.enter_fleet("g");
-        assert!(!session_changed(&app, rev0, sid0), "the fleet never overwrites the tab's save");
+        assert!(
+            !session_changed(&app, rev0, sid0),
+            "the fleet never overwrites the tab's save"
+        );
         app.leave_fleet_view();
         assert!(!session_changed(&app, rev0, sid0));
     }
@@ -4616,7 +5142,10 @@ mod tests {
             host: format!("{name}.example"),
             port: 22,
             user: "ops".into(),
-            auth: filar_core::SshAuth::Key { path: None, passphrase: None },
+            auth: filar_core::SshAuth::Key {
+                path: None,
+                passphrase: None,
+            },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
             tags: vec!["g".into()],
         };
@@ -4627,31 +5156,50 @@ mod tests {
             ..Default::default()
         }];
         let mut state = FleetSaveState::default();
-        assert!(state.due(&app, "1790", "ts").is_none(), "no fleet, nothing to save");
+        assert!(
+            state.due(&app, "1790", "ts").is_none(),
+            "no fleet, nothing to save"
+        );
 
         app.enter_fleet("g");
-        assert!(state.due(&app, "1790", "ts").is_none(), "intro lines only: not worth a file");
+        assert!(
+            state.due(&app, "1790", "ts").is_none(),
+            "intro lines only: not worth a file"
+        );
 
         app.push_message(ChatBlock::User("uptime?".into()));
-        let (session, rev) = state.due(&app, "1790", "ts").expect("a fleet with a question is saved");
+        let (session, rev) = state
+            .due(&app, "1790", "ts")
+            .expect("a fleet with a question is saved");
         assert_eq!(session.id, "1790-fleet1");
         assert_eq!(session.ssh_info, None);
         let fleet = session.fleet.clone().expect("the composition is saved");
         assert_eq!(fleet.group, "g");
         assert_eq!(fleet.hosts, ["a", "b"]);
         state.saved(rev);
-        assert!(state.due(&app, "1790", "ts").is_none(), "unchanged since the save");
+        assert!(
+            state.due(&app, "1790", "ts").is_none(),
+            "unchanged since the save"
+        );
 
         // Retag the config, restore the saved session — same hosts.
         app.exit_fleet();
         app.ssh_targets[1].tags.clear();
         app.restore_fleet(session);
-        let names: Vec<_> = app.fleet().unwrap().members().iter().map(|m| m.name().to_string()).collect();
+        let names: Vec<_> = app
+            .fleet()
+            .unwrap()
+            .members()
+            .iter()
+            .map(|m| m.name().to_string())
+            .collect();
         assert_eq!(names, ["a", "b"]);
 
         // The restored fleet writes back to the file it came from — no copy.
         app.push_message(ChatBlock::User("again".into()));
-        let (second, _) = state.due(&app, "1790", "ts").expect("the restored fleet is saved too");
+        let (second, _) = state
+            .due(&app, "1790", "ts")
+            .expect("the restored fleet is saved too");
         assert_eq!(second.id, "1790-fleet1");
 
         // A fleet entered fresh in the same run gets a file of its own.
@@ -4709,8 +5257,18 @@ mod tests {
         }
 
         fn captured_prompt(&self) -> String {
-            let request = self.captured.lock().unwrap().clone().expect("request captured");
-            request.messages.into_iter().map(|m| m.content).collect::<Vec<_>>().join("\n")
+            let request = self
+                .captured
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("request captured");
+            request
+                .messages
+                .into_iter()
+                .map(|m| m.content)
+                .collect::<Vec<_>>()
+                .join("\n")
         }
     }
 
@@ -4818,11 +5376,23 @@ mod tests {
         assert!(usage.is_some(), "usage rides back for billing");
 
         let written = tokio::fs::read_to_string(&path).await.unwrap();
-        assert!(!written.contains("hunter2-password"), "the secret must not reach the file");
-        assert!(written.contains("$FILAR_SECRET_1"), "the placeholder is kept instead");
+        assert!(
+            !written.contains("hunter2-password"),
+            "the secret must not reach the file"
+        );
+        assert!(
+            written.contains("$FILAR_SECRET_1"),
+            "the placeholder is kept instead"
+        );
         let sent = llm.captured_prompt();
-        assert!(!sent.contains("hunter2-password"), "the secret must not leave the machine");
-        assert!(sent.contains("$FILAR_SECRET_1"), "the placeholder replaces it in the request");
+        assert!(
+            !sent.contains("hunter2-password"),
+            "the secret must not leave the machine"
+        );
+        assert!(
+            sent.contains("$FILAR_SECRET_1"),
+            "the placeholder replaces it in the request"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -4853,15 +5423,27 @@ mod tests {
             Some(&ids),
         )
         .await;
-        outcome.expect("no cancellation").0.expect("the write must succeed");
+        outcome
+            .expect("no cancellation")
+            .0
+            .expect("the write must succeed");
 
         let written = tokio::fs::read_to_string(&path).await.unwrap();
         let sent = llm.captured_prompt();
         for leaked in ["web-1", "web-2", "10.0.0.11", "ops@", "as ops"] {
-            assert!(!written.contains(leaked), "{leaked:?} reached the file:\n{written}");
-            assert!(!sent.contains(leaked), "{leaked:?} reached the model:\n{sent}");
+            assert!(
+                !written.contains(leaked),
+                "{leaked:?} reached the file:\n{written}"
+            );
+            assert!(
+                !sent.contains(leaked),
+                "{leaked:?} reached the model:\n{sent}"
+            );
         }
-        assert!(sent.contains("for the group, not for one machine"), "the fleet prompt was used");
+        assert!(
+            sent.contains("for the group, not for one machine"),
+            "the fleet prompt was used"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -4886,7 +5468,11 @@ mod tests {
         )
         .await;
         let (result, usage) = outcome.expect("no cancellation — must return");
-        assert_eq!(result.unwrap(), "prod-web/db-1.runbook.md", "the feed gets the display path");
+        assert_eq!(
+            result.unwrap(),
+            "prod-web/db-1.runbook.md",
+            "the feed gets the display path"
+        );
         assert!(usage.is_some());
         let written = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(written.contains("Symptom"), "the file lands on disk");
@@ -4949,7 +5535,9 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let markdown = dir.join("db-1.md");
-        tokio::fs::write(&markdown, "# Session: db-1").await.unwrap();
+        tokio::fs::write(&markdown, "# Session: db-1")
+            .await
+            .unwrap();
 
         let provider = filar_core::StaticSecretProvider::new();
         let path = dir.join("db-1.runbook.md");
@@ -4996,8 +5584,14 @@ mod tests {
         let (result, usage) = outcome.expect("not cancelled");
         let err = result.expect_err("a stub reply must not be written");
         assert!(err.contains("too short"), "got: {err}");
-        assert!(usage.is_some(), "the call was billed even though the reply was unusable");
-        assert!(!tokio::fs::try_exists(&path).await.unwrap_or(false), "nothing written");
+        assert!(
+            usage.is_some(),
+            "the call was billed even though the reply was unusable"
+        );
+        assert!(
+            !tokio::fs::try_exists(&path).await.unwrap_or(false),
+            "nothing written"
+        );
     }
 
     /// A `TuiConfig` with one `glm` profile served by `llm`, for tests that
@@ -5044,6 +5638,8 @@ mod tests {
             llm_factory: Arc::new(move |_, _| Ok(Arc::clone(&llm))),
             key_checker: Arc::new(|_| None),
             ssh_targets: Vec::new(),
+            kube_clusters: Vec::new(),
+            initial_kube: None,
             log_rx: None,
             save_dir: None,
             save_runbook: true,
@@ -5096,13 +5692,22 @@ mod tests {
             &tx,
         );
 
-        assert_eq!(app.runbook_state, Some(RunbookState::Generating), "the call is in flight");
+        assert_eq!(
+            app.runbook_state,
+            Some(RunbookState::Generating),
+            "the call is in flight"
+        );
         let report = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
             .expect("the runbook must report back")
             .expect("channel is open");
         match report {
-            SaveProgress::RunbookDone { sid, outcome, usage, profile } => {
+            SaveProgress::RunbookDone {
+                sid,
+                outcome,
+                usage,
+                profile,
+            } => {
                 assert_eq!(sid, app.sessions[0].id);
                 assert_eq!(outcome.unwrap(), "prod-web/db-1.runbook.md");
                 assert!(usage.is_some(), "billing data rides along");
@@ -5110,8 +5715,13 @@ mod tests {
             }
             other => panic!("expected RunbookDone, got {other:?}"),
         }
-        let written = tokio::fs::read_to_string(dir.join("db-1.runbook.md")).await.unwrap();
-        assert!(written.contains("Symptom"), "the runbook lands beside the export");
+        let written = tokio::fs::read_to_string(dir.join("db-1.runbook.md"))
+            .await
+            .unwrap();
+        assert!(
+            written.contains("Symptom"),
+            "the runbook lands beside the export"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -5160,7 +5770,13 @@ mod tests {
         // `y`: the app asks the runner, which starts the runbook for that file.
         app.answer_runbook_offer(true);
         let request = rx.try_recv().expect("y after Done sends a request");
-        apply_save_progress(&mut app, request, &config.llm_factory, &config.secret_provider, &tx);
+        apply_save_progress(
+            &mut app,
+            request,
+            &config.llm_factory,
+            &config.secret_provider,
+            &tx,
+        );
         assert_eq!(app.runbook_state, Some(RunbookState::Generating));
         let report = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
@@ -5200,7 +5816,10 @@ mod tests {
             &tx,
         );
 
-        assert!(app.runbook_armed.is_none(), "a failed export must drop the job");
+        assert!(
+            app.runbook_armed.is_none(),
+            "a failed export must drop the job"
+        );
         assert!(app.save_error.is_some());
     }
 
@@ -5266,12 +5885,24 @@ mod tests {
             SaveProgress::RunbookCancelled { sid } => assert_eq!(*sid, app.sessions[0].id),
             other => panic!("expected RunbookCancelled, got {other:?}"),
         }
-        apply_save_progress(&mut app, report, &config.llm_factory, &config.secret_provider, &tx);
+        apply_save_progress(
+            &mut app,
+            report,
+            &config.llm_factory,
+            &config.secret_provider,
+            &tx,
+        );
         release.notify_waiters();
 
         assert_eq!(app.runbook_state, Some(RunbookState::Cancelled));
-        assert!(app.runbook_cancel.is_none(), "the in-flight token is cleared");
-        let last = app.sessions[0].messages.last().expect("the stop must be named");
+        assert!(
+            app.runbook_cancel.is_none(),
+            "the in-flight token is cleared"
+        );
+        let last = app.sessions[0]
+            .messages
+            .last()
+            .expect("the stop must be named");
         match last {
             ChatBlock::System(text) => {
                 assert!(text.contains("Runbook generation cancelled"), "got: {text}")
@@ -5279,7 +5910,9 @@ mod tests {
             other => panic!("expected a system note, got {other:?}"),
         }
         assert!(
-            !tokio::fs::try_exists(dir.join("db-1.runbook.md")).await.unwrap_or(false),
+            !tokio::fs::try_exists(dir.join("db-1.runbook.md"))
+                .await
+                .unwrap_or(false),
             "a cancelled runbook leaves no file"
         );
 

@@ -63,6 +63,10 @@ pub struct Glyphs {
     pub fleet_differs: &'static str,
     /// Fleet summary: a group of a split fleet (no majority): `≈` or `~`.
     pub fleet_split: &'static str,
+    /// Kubernetes target/tool marker: `⎈` or `k8s:` (#575).
+    pub kube: &'static str,
+    /// Cluster/namespace separator: `›` or `>` (#575).
+    pub kube_namespace_sep: &'static str,
 }
 
 impl Glyphs {
@@ -91,6 +95,8 @@ impl Glyphs {
         fleet_same: "=",
         fleet_differs: "≠",
         fleet_split: "≈",
+        kube: "⎈",
+        kube_namespace_sep: "›",
     };
 
     /// ASCII fallback for conhost and legacy terminals.
@@ -118,6 +124,8 @@ impl Glyphs {
         fleet_same: "=",
         fleet_differs: "!=",
         fleet_split: "~",
+        kube: "k8s:",
+        kube_namespace_sep: ">",
     };
 
     /// Detect terminal capabilities and return the appropriate glyph set.
@@ -212,7 +220,9 @@ impl Theme {
 
     /// Style for the user's chat header: accent + bold.
     pub fn user_style(&self) -> Style {
-        Style::default().fg(self.accent).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::BOLD)
     }
 
     /// Style for the agent's chat header: success + bold.
@@ -315,7 +325,9 @@ impl Theme {
 
     /// Style for markdown headers: `accent` + bold.
     pub fn header_style(&self) -> Style {
-        Style::default().fg(self.accent).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::BOLD)
     }
 }
 
@@ -363,10 +375,28 @@ mod tests {
     fn ascii_glyph_set_is_pure_ascii() {
         let g = Glyphs::ASCII;
         let fields = [
-            g.prompt, g.gutter, g.separator, g.success, g.danger, g.middle_dot,
-            g.collapse_arrow, g.expand_arrow, g.bullet, g.target_sep, g.bar_full,
-            g.bar_empty, g.cursor, g.current, g.arrow_up, g.arrow_down,
-            g.op_running, g.op_done, g.op_failed, g.op_cancelled,
+            g.prompt,
+            g.gutter,
+            g.separator,
+            g.success,
+            g.danger,
+            g.middle_dot,
+            g.collapse_arrow,
+            g.expand_arrow,
+            g.bullet,
+            g.target_sep,
+            g.bar_full,
+            g.bar_empty,
+            g.cursor,
+            g.current,
+            g.arrow_up,
+            g.arrow_down,
+            g.op_running,
+            g.op_done,
+            g.op_failed,
+            g.op_cancelled,
+            g.kube,
+            g.kube_namespace_sep,
         ];
         for f in fields {
             assert!(f.is_ascii(), "ASCII fallback must stay ASCII, got {f:?}");

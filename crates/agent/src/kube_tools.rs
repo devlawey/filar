@@ -257,6 +257,116 @@ impl KubeToolCall {
         }
     }
 
+    /// Command-like label used by cluster-tab feed blocks and confirmations.
+    /// This is display text only; execution always uses the typed API call.
+    pub fn display_command(&self) -> String {
+        fn push_flag(command: &mut String, flag: &str, value: &str) {
+            command.push(' ');
+            command.push_str(flag);
+            command.push(' ');
+            command.push_str(value);
+        }
+
+        let mut command = self.tool_name().to_string();
+        match self {
+            Self::Get {
+                kind,
+                namespace,
+                label_selector,
+                field_selector,
+                limit,
+            } => {
+                command.push(' ');
+                command.push_str(&kind.as_str().to_ascii_lowercase());
+                if let Some(namespace) = namespace {
+                    push_flag(&mut command, "-n", namespace);
+                }
+                if let Some(selector) = label_selector {
+                    push_flag(&mut command, "-l", selector);
+                }
+                if let Some(selector) = field_selector {
+                    push_flag(&mut command, "--field-selector", selector);
+                }
+                push_flag(&mut command, "--limit", &limit.to_string());
+            }
+            Self::Describe {
+                kind,
+                namespace,
+                name,
+                ..
+            } => {
+                command.push(' ');
+                command.push_str(&kind.as_str().to_ascii_lowercase());
+                command.push(' ');
+                command.push_str(name);
+                if let Some(namespace) = namespace {
+                    push_flag(&mut command, "-n", namespace);
+                }
+            }
+            Self::Logs {
+                namespace,
+                pod,
+                container,
+                previous,
+                since,
+                tail,
+                ..
+            } => {
+                command.push(' ');
+                command.push_str(pod);
+                push_flag(&mut command, "-n", namespace);
+                if let Some(container) = container {
+                    push_flag(&mut command, "-c", container);
+                }
+                if *previous {
+                    command.push_str(" --previous");
+                }
+                if let Some(since) = since {
+                    push_flag(&mut command, "--since", &format!("{}s", since.as_secs()));
+                }
+                push_flag(&mut command, "--tail", &tail.to_string());
+            }
+            Self::Events {
+                namespace,
+                involved_object,
+                limit,
+            } => {
+                if let Some(namespace) = namespace {
+                    push_flag(&mut command, "-n", namespace);
+                }
+                if let Some(object) = involved_object {
+                    push_flag(&mut command, "--for", object);
+                }
+                push_flag(&mut command, "--limit", &limit.to_string());
+            }
+            Self::Top {
+                resource,
+                namespace,
+                limit,
+            } => {
+                command.push_str(match resource {
+                    KubeTopResource::Pods => " pods",
+                    KubeTopResource::Nodes => " nodes",
+                });
+                if let Some(namespace) = namespace {
+                    push_flag(&mut command, "-n", namespace);
+                }
+                push_flag(&mut command, "--limit", &limit.to_string());
+            }
+            Self::RolloutHistory {
+                namespace,
+                deployment,
+                limit,
+            } => {
+                command.push(' ');
+                command.push_str(deployment);
+                push_flag(&mut command, "-n", namespace);
+                push_flag(&mut command, "--limit", &limit.to_string());
+            }
+        }
+        command
+    }
+
     /// Tool, normalized arguments, kubeconfig context and namespace for approval.
     pub fn confirmation_context(&self, target: &KubeCluster) -> String {
         format!(

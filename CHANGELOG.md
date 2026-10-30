@@ -13,6 +13,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Kubernetes cluster tabs in the TUI: Ctrl+O target and namespace selection,
+  typed read-only agent calls with collapsible API blocks, target-aware
+  confirmations, status/ASCII rendering, shell-action refusals and reconnecting
+  session restore ([#575](https://github.com/devlawey/filar/issues/575)).
 - Read-only Kubernetes agent tools over `ClusterApi`: typed resource, event, log,
   metrics and rollout calls with compact tables, bounded redacted output,
   confirmation/tag policies, a cluster-tab prompt and CrashLoopBackOff/OOMKilled

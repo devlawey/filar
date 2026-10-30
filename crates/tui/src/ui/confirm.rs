@@ -59,6 +59,17 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let audit_unavailable = confirm.audit_unavailable;
     let radius = confirm.radius.clone();
     let radius_expanded = confirm.radius_expanded;
+    let kubernetes = app.kube.is_some() && command.starts_with("k8s_");
+    let kube_target = app.kube.as_ref().map(|kube| {
+        (
+            kube.target.name.clone(),
+            kube.namespace.clone(),
+            kube.target
+                .tags
+                .iter()
+                .any(|tag| tag.eq_ignore_ascii_case("prod")),
+        )
+    });
     // Safety rating (#551) — advisory, separate from the arbiter's audit.
     let safety = app.confirm_safety().map(|score| {
         let text = safety_line_text(score);
@@ -86,7 +97,11 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let modal_width = 70u16.min(area.width.saturating_sub(8)).max(32);
     let inner_width = (modal_width.saturating_sub(2)) as usize; // -2 borders
 
-    let command_text = format!("$ {command}");
+    let command_text = if kubernetes {
+        format!("{} {command}", app.theme.glyphs().kube)
+    } else {
+        format!("$ {command}")
+    };
     let explanation_rows = if !explanation.is_empty() {
         estimate_wrapped_rows(&explanation, inner_width)
     } else {
@@ -111,8 +126,13 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         Some((_, Some(list))) => 1 + estimate_wrapped_rows(&list, inner_width),
     };
 
-    let natural_content =
-        (radius_rows + explanation_rows + audit_rows + safety_rows + warning_rows + command_rows + empty_rows) as u16;
+    let natural_content = (radius_rows
+        + explanation_rows
+        + audit_rows
+        + safety_rows
+        + warning_rows
+        + command_rows
+        + empty_rows) as u16;
     // +2 borders +1 buttons
     let natural_height = natural_content.saturating_add(3);
 
@@ -158,21 +178,34 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
 
     f.render_widget(Clear, modal_area);
 
-    let border_color = if destructive {
+    let production_kube = kubernetes && kube_target.as_ref().is_some_and(|(_, _, prod)| *prod);
+    let border_color = if destructive || production_kube {
         app.theme.danger
     } else {
         app.theme.warning
+    };
+    let modal_title = if kubernetes {
+        match kube_target {
+            Some((name, namespace, _)) => format!(
+                " Confirm Kubernetes: {} / {} ",
+                name,
+                namespace.as_deref().unwrap_or("all namespaces")
+            ),
+            None => " Confirm Kubernetes request ".to_string(),
+        }
+    } else {
+        match radius.len() {
+            0 => " Confirm command ".to_string(),
+            1 => " Confirm command on 1 host ".to_string(),
+            n => format!(" Confirm command on {n} hosts "),
+        }
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(Span::styled(
-            match radius.len() {
-                0 => " Confirm command ".to_string(),
-                1 => " Confirm command on 1 host ".to_string(),
-                n => format!(" Confirm command on {n} hosts "),
-            },
+            modal_title,
             Style::default()
                 .fg(border_color)
                 .add_modifier(Modifier::BOLD),
@@ -190,10 +223,7 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let content_len = content_height.min(inner.height.saturating_sub(1));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(content_len),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(content_len), Constraint::Length(1)])
         .split(inner);
 
     let content = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -295,7 +325,12 @@ fn build_modal_lines(
 
     if let Some((header, list)) = radius {
         let header = truncate_to_rows(&header, inner_width, 1);
-        let _ = push(&mut lines, &mut used, header, warning.add_modifier(Modifier::BOLD));
+        let _ = push(
+            &mut lines,
+            &mut used,
+            header,
+            warning.add_modifier(Modifier::BOLD),
+        );
         if let Some(list) = list {
             // Leave room for the command line and the separator.
             let budget = max_rows.saturating_sub(used).saturating_sub(2).max(1);
@@ -429,7 +464,14 @@ fn append_audit_lines(
         return;
     }
     let header = format!("Audit: {verdict}");
-    let _ = push_line(lines, used, max_rows, inner_width, header, Style::default().fg(accent).add_modifier(Modifier::BOLD));
+    let _ = push_line(
+        lines,
+        used,
+        max_rows,
+        inner_width,
+        header,
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    );
     if !reason.is_empty() && *used < max_rows {
         let _ = push_line(
             lines,
@@ -449,14 +491,7 @@ fn append_audit_lines(
             } else {
                 format!("— arbiter profile: {m}")
             };
-            let _ = push_line(
-                lines,
-                used,
-                max_rows,
-                inner_width,
-                label,
-                muted,
-            );
+            let _ = push_line(lines, used, max_rows, inner_width, label, muted);
         }
     }
 }
@@ -580,8 +615,15 @@ fn render_buttons(f: &mut Frame, app: &mut App, area: Rect) {
     let start_x = area.x + (area.width.saturating_sub(total_len)) / 2;
 
     let approve_area = Rect::new(start_x, area.y, approve_len.min(area.width), 1);
-    let deny_x = start_x.saturating_add(approve_len).saturating_add(spacing_len);
-    let deny_area = Rect::new(deny_x, area.y, deny_len.min(area.width.saturating_sub(deny_x.saturating_sub(area.x))), 1);
+    let deny_x = start_x
+        .saturating_add(approve_len)
+        .saturating_add(spacing_len);
+    let deny_area = Rect::new(
+        deny_x,
+        area.y,
+        deny_len.min(area.width.saturating_sub(deny_x.saturating_sub(area.x))),
+        1,
+    );
 
     // Only store hit zones that sit inside the host area.
     if approve_area.width > 0 {
@@ -604,9 +646,7 @@ fn render_buttons(f: &mut Frame, app: &mut App, area: Rect) {
             .bg(app.theme.surface)
             .add_modifier(Modifier::UNDERLINED)
     } else {
-        Style::default()
-            .fg(app.theme.success)
-            .bg(app.theme.surface)
+        Style::default().fg(app.theme.success).bg(app.theme.surface)
     };
 
     let deny_selected = !app.confirm_selected;
@@ -622,9 +662,7 @@ fn render_buttons(f: &mut Frame, app: &mut App, area: Rect) {
             .bg(app.theme.surface)
             .add_modifier(Modifier::UNDERLINED)
     } else {
-        Style::default()
-            .fg(app.theme.danger)
-            .bg(app.theme.surface)
+        Style::default().fg(app.theme.danger).bg(app.theme.surface)
     };
 
     f.render_widget(
@@ -644,10 +682,7 @@ fn render_buttons(f: &mut Frame, app: &mut App, area: Rect) {
         );
     }
     if deny_area.width > 0 {
-        f.render_widget(
-            Paragraph::new(deny_label).style(deny_style),
-            deny_area,
-        );
+        f.render_widget(Paragraph::new(deny_label).style(deny_style), deny_area);
     }
 }
 
@@ -693,7 +728,11 @@ mod tests {
             .expect("confirm render must not panic");
         let buf = terminal.backend().buffer();
         (0..buf.area.height)
-            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -713,7 +752,10 @@ mod tests {
         let screen = render_confirm(&mut app, 80, 24);
         assert!(screen.contains("Confirm command on 12 hosts"), "{screen}");
         assert!(screen.contains("Runs on 12 hosts — l: list"), "{screen}");
-        assert!(!screen.contains("web-01"), "collapsed: a count, not a list\n{screen}");
+        assert!(
+            !screen.contains("web-01"),
+            "collapsed: a count, not a list\n{screen}"
+        );
         assert!(screen.contains("$ uname -r"), "{screen}");
     }
 
@@ -724,9 +766,18 @@ mod tests {
         app.mode = AppMode::Confirming;
         let screen = render_confirm(&mut app, 80, 24);
         assert!(screen.contains("Runs on 12 hosts — l: hide"), "{screen}");
-        assert!(screen.contains("web-01") && screen.contains("web-12"), "{screen}");
-        assert!(screen.contains("$ uname -r"), "the command stays visible\n{screen}");
-        assert!(!app.confirm_button_areas.is_empty(), "buttons stay on screen");
+        assert!(
+            screen.contains("web-01") && screen.contains("web-12"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("$ uname -r"),
+            "the command stays visible\n{screen}"
+        );
+        assert!(
+            !app.confirm_button_areas.is_empty(),
+            "buttons stay on screen"
+        );
     }
 
     #[test]
@@ -740,7 +791,10 @@ mod tests {
         app.mode = AppMode::Confirming;
         let screen = render_confirm(&mut app, 60, 12);
         assert!(screen.contains("Runs on 100 hosts"), "{screen}");
-        assert!(!app.confirm_button_areas.is_empty(), "buttons stay on screen");
+        assert!(
+            !app.confirm_button_areas.is_empty(),
+            "buttons stay on screen"
+        );
     }
 
     fn rated(app: &mut App, score: crate::app::SafetyScore) {
@@ -758,16 +812,38 @@ mod tests {
         rated(&mut app, SafetyScore::Pending);
         assert!(render_confirm(&mut app, 80, 24).contains("Safety: rating…"));
 
-        rated(&mut app, SafetyScore::Ready { pct: 88, confidence: Some(0.9), model: "jev".into() });
+        rated(
+            &mut app,
+            SafetyScore::Ready {
+                pct: 88,
+                confidence: Some(0.9),
+                model: "jev".into(),
+            },
+        );
         let screen = render_confirm(&mut app, 80, 24);
         assert!(screen.contains("Safety: 88% (jev)"), "{screen}");
         assert!(screen.contains("$ rm -rf /tmp/x"), "{screen}");
-        assert!(!app.confirm_button_areas.is_empty(), "buttons stay on screen");
+        assert!(
+            !app.confirm_button_areas.is_empty(),
+            "buttons stay on screen"
+        );
 
-        rated(&mut app, SafetyScore::Ready { pct: 62, confidence: Some(0.3), model: "jev".into() });
+        rated(
+            &mut app,
+            SafetyScore::Ready {
+                pct: 62,
+                confidence: Some(0.3),
+                model: "jev".into(),
+            },
+        );
         assert!(render_confirm(&mut app, 80, 24).contains("Safety: ~62% (jev)"));
 
-        rated(&mut app, SafetyScore::Unavailable { model: "jev".into() });
+        rated(
+            &mut app,
+            SafetyScore::Unavailable {
+                model: "jev".into(),
+            },
+        );
         assert!(render_confirm(&mut app, 80, 24).contains("Safety: unavailable (jev)"));
     }
 
@@ -784,7 +860,11 @@ mod tests {
     #[test]
     fn the_rating_colour_follows_the_thresholds() {
         use crate::app::{SafetyLevel, SafetyScore};
-        let r = |pct| SafetyScore::Ready { pct, confidence: None, model: String::new() };
+        let r = |pct| SafetyScore::Ready {
+            pct,
+            confidence: None,
+            model: String::new(),
+        };
         let t = (70, 40);
         assert_eq!(r(100).level(t), SafetyLevel::Safe);
         assert_eq!(r(70).level(t), SafetyLevel::Safe);
@@ -793,7 +873,13 @@ mod tests {
         assert_eq!(r(39).level(t), SafetyLevel::Danger);
         assert_eq!(r(0).level(t), SafetyLevel::Danger);
         assert_eq!(SafetyScore::Pending.level(t), SafetyLevel::Muted);
-        assert_eq!(SafetyScore::Unavailable { model: String::new() }.level(t), SafetyLevel::Muted);
+        assert_eq!(
+            SafetyScore::Unavailable {
+                model: String::new()
+            }
+            .level(t),
+            SafetyLevel::Muted
+        );
         // Configured thresholds move the bands.
         assert_eq!(r(60).level((50, 20)), SafetyLevel::Safe);
     }
@@ -810,12 +896,46 @@ mod tests {
 
     fn pending(command: &str, destructive: bool) -> PendingConfirm {
         let (tx, _rx) = oneshot::channel();
-        PendingConfirm::new(
-            command.to_string(),
-            "long command".into(),
-            destructive,
-            tx,
-        )
+        PendingConfirm::new(command.to_string(), "long command".into(), destructive, tx)
+    }
+
+    #[test]
+    fn kubernetes_confirmation_shows_the_tool_arguments_and_target() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.kube = Some(crate::app::KubeTabState {
+            target: filar_core::KubeCluster {
+                name: "prod-eu".into(),
+                tags: vec!["prod".into()],
+                ..Default::default()
+            },
+            namespace: Some("shop".into()),
+            connection_id: 1,
+        });
+        let mut confirm = pending("k8s_get pods -l app=web", false);
+        confirm.explanation = "Tool: k8s_get\nArguments: {\"selector\":\"app=web\"}".into();
+        app.pending_confirm = Some(confirm);
+        app.mode = AppMode::Confirming;
+
+        let screen = render_confirm(&mut app, 100, 30);
+        assert!(
+            screen.contains("Confirm Kubernetes: prod-eu / shop"),
+            "{screen}"
+        );
+        assert!(screen.contains("Tool: k8s_get"), "{screen}");
+        assert!(screen.contains("Arguments:"), "{screen}");
+        assert!(screen.contains("k8s_get pods -l app=web"), "{screen}");
+    }
+
+    #[test]
+    fn shell_command_with_kubernetes_prefix_keeps_the_shell_dialog() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(pending("k8s_cleanup.sh --all", false));
+        app.mode = AppMode::Confirming;
+
+        let screen = render_confirm(&mut app, 100, 30);
+        assert!(screen.contains("Confirm command"), "{screen}");
+        assert!(screen.contains("$ k8s_cleanup.sh --all"), "{screen}");
+        assert!(!screen.contains("Confirm Kubernetes"), "{screen}");
     }
 
     #[test]

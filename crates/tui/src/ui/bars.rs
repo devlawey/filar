@@ -23,12 +23,36 @@ struct HelpItem {
 /// leading — it is the way to every single-host feature.
 fn fleet_help_items() -> Vec<HelpItem> {
     vec![
-        HelpItem { key: "^O", desc: "open host", action: None },
-        HelpItem { key: "^N", desc: "tab", action: None },
-        HelpItem { key: "^W", desc: "close fleet", action: None },
-        HelpItem { key: "^Tab", desc: "tabs", action: None },
-        HelpItem { key: "F1", desc: "help", action: None },
-        HelpItem { key: "^Q", desc: "quit", action: Some(HelpAction::Quit) },
+        HelpItem {
+            key: "^O",
+            desc: "open host",
+            action: None,
+        },
+        HelpItem {
+            key: "^N",
+            desc: "tab",
+            action: None,
+        },
+        HelpItem {
+            key: "^W",
+            desc: "close fleet",
+            action: None,
+        },
+        HelpItem {
+            key: "^Tab",
+            desc: "tabs",
+            action: None,
+        },
+        HelpItem {
+            key: "F1",
+            desc: "help",
+            action: None,
+        },
+        HelpItem {
+            key: "^Q",
+            desc: "quit",
+            action: Some(HelpAction::Quit),
+        },
     ]
 }
 
@@ -36,44 +60,164 @@ fn fleet_help_items() -> Vec<HelpItem> {
 fn help_items(mode: AppMode) -> Vec<HelpItem> {
     match mode {
         AppMode::Normal => vec![
-            HelpItem { key: "enter", desc: "send", action: Some(HelpAction::Send) },
-            HelpItem { key: "F1", desc: "help", action: None },
-            HelpItem { key: "F2", desc: "safe", action: None },
-            HelpItem { key: "F3", desc: "sessions", action: None },
-            HelpItem { key: "!", desc: "shell", action: Some(HelpAction::Shell) },
-            HelpItem { key: "^T", desc: "terminal", action: Some(HelpAction::Terminal) },
-            HelpItem { key: "^O", desc: "hosts", action: None },
-            HelpItem { key: "^S", desc: "save", action: None },
-            HelpItem { key: "^P", desc: "password", action: Some(HelpAction::Password) },
-            HelpItem { key: "^N", desc: "tab", action: None },
-            HelpItem { key: "^W", desc: "close", action: None },
-            HelpItem { key: "wheel", desc: "scroll", action: None },
-            HelpItem { key: "click", desc: "expand", action: None },
-            HelpItem { key: "drag", desc: "copy", action: None },
-            HelpItem { key: "^Q", desc: "quit", action: Some(HelpAction::Quit) },
+            HelpItem {
+                key: "enter",
+                desc: "send",
+                action: Some(HelpAction::Send),
+            },
+            HelpItem {
+                key: "F1",
+                desc: "help",
+                action: None,
+            },
+            HelpItem {
+                key: "F2",
+                desc: "safe",
+                action: None,
+            },
+            HelpItem {
+                key: "F3",
+                desc: "sessions",
+                action: None,
+            },
+            HelpItem {
+                key: "!",
+                desc: "shell",
+                action: Some(HelpAction::Shell),
+            },
+            HelpItem {
+                key: "^T",
+                desc: "terminal",
+                action: Some(HelpAction::Terminal),
+            },
+            HelpItem {
+                key: "^O",
+                desc: "hosts",
+                action: None,
+            },
+            HelpItem {
+                key: "^S",
+                desc: "save",
+                action: None,
+            },
+            HelpItem {
+                key: "^P",
+                desc: "password",
+                action: Some(HelpAction::Password),
+            },
+            HelpItem {
+                key: "^N",
+                desc: "tab",
+                action: None,
+            },
+            HelpItem {
+                key: "^W",
+                desc: "close",
+                action: None,
+            },
+            HelpItem {
+                key: "wheel",
+                desc: "scroll",
+                action: None,
+            },
+            HelpItem {
+                key: "click",
+                desc: "expand",
+                action: None,
+            },
+            HelpItem {
+                key: "drag",
+                desc: "copy",
+                action: None,
+            },
+            HelpItem {
+                key: "^Q",
+                desc: "quit",
+                action: Some(HelpAction::Quit),
+            },
         ],
         AppMode::Thinking => vec![
-            HelpItem { key: "F1", desc: "help", action: None },
-            HelpItem { key: "^Z", desc: "cancel", action: Some(HelpAction::CancelWork) },
-            HelpItem { key: "^Q", desc: "quit", action: Some(HelpAction::Quit) },
-            HelpItem { key: "wheel", desc: "scroll", action: None },
+            HelpItem {
+                key: "F1",
+                desc: "help",
+                action: None,
+            },
+            HelpItem {
+                key: "^Z",
+                desc: "cancel",
+                action: Some(HelpAction::CancelWork),
+            },
+            HelpItem {
+                key: "^Q",
+                desc: "quit",
+                action: Some(HelpAction::Quit),
+            },
+            HelpItem {
+                key: "wheel",
+                desc: "scroll",
+                action: None,
+            },
         ],
         AppMode::Confirming => vec![
-            HelpItem { key: "tab", desc: "switch", action: Some(HelpAction::Switch) },
-            HelpItem { key: "enter", desc: "confirm", action: Some(HelpAction::Confirm) },
-            HelpItem { key: "a/y", desc: "approve", action: Some(HelpAction::Approve) },
-            HelpItem { key: "d/n", desc: "deny", action: Some(HelpAction::Deny) },
-            HelpItem { key: "^Z", desc: "deny", action: Some(HelpAction::CancelWork) },
-            HelpItem { key: "^Q", desc: "quit", action: Some(HelpAction::Quit) },
+            HelpItem {
+                key: "tab",
+                desc: "switch",
+                action: Some(HelpAction::Switch),
+            },
+            HelpItem {
+                key: "enter",
+                desc: "confirm",
+                action: Some(HelpAction::Confirm),
+            },
+            HelpItem {
+                key: "a/y",
+                desc: "approve",
+                action: Some(HelpAction::Approve),
+            },
+            HelpItem {
+                key: "d/n",
+                desc: "deny",
+                action: Some(HelpAction::Deny),
+            },
+            HelpItem {
+                key: "^Z",
+                desc: "deny",
+                action: Some(HelpAction::CancelWork),
+            },
+            HelpItem {
+                key: "^Q",
+                desc: "quit",
+                action: Some(HelpAction::Quit),
+            },
         ],
         AppMode::Interactive => vec![
-            HelpItem { key: "ctrl+t", desc: "agent mode", action: Some(HelpAction::Terminal) },
-            HelpItem { key: "wheel", desc: "scroll", action: None },
+            HelpItem {
+                key: "ctrl+t",
+                desc: "agent mode",
+                action: Some(HelpAction::Terminal),
+            },
+            HelpItem {
+                key: "wheel",
+                desc: "scroll",
+                action: None,
+            },
         ],
         AppMode::PasswordInput => vec![
-            HelpItem { key: "enter", desc: "send password", action: Some(HelpAction::SendPassword) },
-            HelpItem { key: "esc", desc: "cancel", action: Some(HelpAction::Cancel) },
-            HelpItem { key: "^Q", desc: "quit", action: Some(HelpAction::Quit) },
+            HelpItem {
+                key: "enter",
+                desc: "send password",
+                action: Some(HelpAction::SendPassword),
+            },
+            HelpItem {
+                key: "esc",
+                desc: "cancel",
+                action: Some(HelpAction::Cancel),
+            },
+            HelpItem {
+                key: "^Q",
+                desc: "quit",
+                action: Some(HelpAction::Quit),
+            },
         ],
     }
 }
@@ -123,7 +267,11 @@ fn context_indicator_text(
     };
     let mut bar = String::with_capacity(bar_cells * 3);
     for i in 0..bar_cells {
-        bar.push_str(if i < filled { glyphs.bar_full } else { glyphs.bar_empty });
+        bar.push_str(if i < filled {
+            glyphs.bar_full
+        } else {
+            glyphs.bar_empty
+        });
     }
     format!("ctx [{bar}] {used_text}/{threshold_text}")
 }
@@ -221,7 +369,48 @@ fn fleet_segment(
         Some(st) => format!("{}/{}", st.answering, st.total),
         None => format!("?/{total}"),
     };
-    (format!("fleet {group}"), format!(" {} {count} live", glyphs.middle_dot))
+    (
+        format!("fleet {group}"),
+        format!(" {} {count} live", glyphs.middle_dot),
+    )
+}
+
+/// Truncate one cluster identity component without splitting a wide glyph.
+fn kube_component(value: &str, max_cells: usize, glyphs: &Glyphs) -> String {
+    let clean: String = value.chars().filter(|c| !c.is_control()).collect();
+    if UnicodeWidthStr::width(clean.as_str()) <= max_cells {
+        return clean;
+    }
+    let ellipsis = if glyphs.kube.is_ascii() { "~" } else { "…" };
+    let budget = max_cells.saturating_sub(UnicodeWidthStr::width(ellipsis));
+    let mut out = String::new();
+    let mut cells = 0;
+    for ch in clean.chars() {
+        let mut buf = [0; 4];
+        let ch_width = UnicodeWidthStr::width(ch.encode_utf8(&mut buf));
+        if cells + ch_width > budget {
+            break;
+        }
+        out.push(ch);
+        cells += ch_width;
+    }
+    out.push_str(ellipsis);
+    out
+}
+
+/// Cluster identity in the status bar: `⎈ prod-eu › shop [prod]` (#575).
+fn kube_segment(kube: &crate::app::KubeTabState, tags: Option<&str>, glyphs: &Glyphs) -> String {
+    let name = kube_component(&kube.target.name, 24, glyphs);
+    let namespace = kube_component(kube.namespace.as_deref().unwrap_or("?"), 24, glyphs);
+    let mut out = format!(
+        "{} {name} {} {namespace}",
+        glyphs.kube, glyphs.kube_namespace_sep
+    );
+    if let Some(tags) = tags.filter(|tags| !tags.is_empty()) {
+        out.push(' ');
+        out.push_str(tags);
+    }
+    out
 }
 
 /// Render the status bar (top line).
@@ -262,7 +451,13 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
             };
             (target, Some((live, style)))
         }
-        None => (app.status_target(), None),
+        None => (
+            app.kube
+                .as_ref()
+                .map(|kube| kube_segment(kube, None, glyphs))
+                .unwrap_or_else(|| app.status_target()),
+            None,
+        ),
     };
 
     // Mode indicator — only shown for non-Normal modes.
@@ -283,7 +478,10 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Token counter — per-profile breakdown from per_profile, not total.
     // Cost — total session sum. Model slug follows active profile.
-    let active = app.llm_profile.clone().unwrap_or_else(|| app.default_profile_name.clone());
+    let active = app
+        .llm_profile
+        .clone()
+        .unwrap_or_else(|| app.default_profile_name.clone());
     let tokens = match app.per_profile.get(&active) {
         Some(pu) if pu.tokens_in > 0 || pu.tokens_out > 0 => {
             format!("toks: {}↑ {}↓", pu.tokens_in, pu.tokens_out)
@@ -413,7 +611,11 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
 
     // ── Assemble, left to right ─────────────────────────────────────
     let target = match (&fleet_target, &tags_segment) {
-        (None, Some(t)) => app.status_target_with_tags(Some(t)),
+        (None, Some(t)) => app
+            .kube
+            .as_ref()
+            .map(|kube| kube_segment(kube, Some(t), glyphs))
+            .unwrap_or_else(|| app.status_target_with_tags(Some(t))),
         _ => target,
     };
     let mut spans = vec![
@@ -536,10 +738,8 @@ pub(crate) fn render_help_bar(f: &mut Frame, app: &mut App, area: Rect) {
         // Store the zone if this item has an action.
         if let Some(action) = item.action {
             let width = col.saturating_sub(item_start);
-            app.helpbar_zones.push((
-                Rect::new(item_start, area.y, width, 1),
-                action,
-            ));
+            app.helpbar_zones
+                .push((Rect::new(item_start, area.y, width, 1), action));
         }
     }
 
@@ -560,11 +760,30 @@ mod tests {
     #[test]
     fn operations_counter_omits_zero_states_and_hides_when_empty() {
         use crate::ops::OpCounts;
-        assert_eq!(operations_counter(OpCounts::default(), &Glyphs::UNICODE), None);
-        let c = OpCounts { running: 2, done: 1, failed: 0, cancelled: 3 };
-        assert_eq!(operations_counter(c, &Glyphs::UNICODE).as_deref(), Some("ops ▸2 ✓1 ■3"));
-        let c = OpCounts { running: 1, done: 1, failed: 1, cancelled: 1 };
-        assert_eq!(operations_counter(c, &Glyphs::ASCII).as_deref(), Some("ops >1 +1 !1 ~1"));
+        assert_eq!(
+            operations_counter(OpCounts::default(), &Glyphs::UNICODE),
+            None
+        );
+        let c = OpCounts {
+            running: 2,
+            done: 1,
+            failed: 0,
+            cancelled: 3,
+        };
+        assert_eq!(
+            operations_counter(c, &Glyphs::UNICODE).as_deref(),
+            Some("ops ▸2 ✓1 ■3")
+        );
+        let c = OpCounts {
+            running: 1,
+            done: 1,
+            failed: 1,
+            cancelled: 1,
+        };
+        assert_eq!(
+            operations_counter(c, &Glyphs::ASCII).as_deref(),
+            Some("ops >1 +1 !1 ~1")
+        );
     }
 
     #[test]
@@ -590,7 +809,10 @@ mod tests {
         let items = fleet_help_items();
         assert_eq!(items[0].key, "^O");
         for refused in ["^T", "!", "^P"] {
-            assert!(items.iter().all(|i| i.key != refused), "{refused} is refused in the fleet");
+            assert!(
+                items.iter().all(|i| i.key != refused),
+                "{refused} is refused in the fleet"
+            );
         }
     }
 
@@ -694,35 +916,52 @@ mod tests {
     #[test]
     fn status_bar_shows_configured_model_with_tilde_when_no_response() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.profiles = vec![
-            filar_core::LlmProfile {
-                name: "glm".into(), model: "z-ai/glm-5.2".into(), api_base_url: "".into(),
-                max_tokens: 1024, key_env: "K".into(),
-                temperature: None, top_p: None, extra_body: None,
-                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
-            },
-        ];
+        app.profiles = vec![filar_core::LlmProfile {
+            name: "glm".into(),
+            model: "z-ai/glm-5.2".into(),
+            api_base_url: "".into(),
+            max_tokens: 1024,
+            key_env: "K".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+            compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
+        }];
         app.active_session_mut().llm_profile = Some("glm".into());
         let row = render_status_row(&mut app, 120);
-        assert!(row.contains("~z-ai/glm-5.2"), "unconfirmed model must have ~ prefix, got: {row}");
+        assert!(
+            row.contains("~z-ai/glm-5.2"),
+            "unconfirmed model must have ~ prefix, got: {row}"
+        );
     }
 
     #[test]
     fn status_bar_shows_served_model_without_tilde_after_response() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.profiles = vec![
-            filar_core::LlmProfile {
-                name: "glm".into(), model: "z-ai/glm-5.2".into(), api_base_url: "".into(),
-                max_tokens: 1024, key_env: "K".into(),
-                temperature: None, top_p: None, extra_body: None,
-                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
-            },
-        ];
+        app.profiles = vec![filar_core::LlmProfile {
+            name: "glm".into(),
+            model: "z-ai/glm-5.2".into(),
+            api_base_url: "".into(),
+            max_tokens: 1024,
+            key_env: "K".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+            compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
+        }];
         app.active_session_mut().llm_profile = Some("glm".into());
-        app.active_session_mut().model_per_profile.insert("glm".into(), "openai/gpt-4o-mini".into());
+        app.active_session_mut()
+            .model_per_profile
+            .insert("glm".into(), "openai/gpt-4o-mini".into());
         let row = render_status_row(&mut app, 120);
-        assert!(row.contains("openai/gpt-4o-mini"), "served model must appear without ~, got: {row}");
-        assert!(!row.contains("~openai"), "served model must NOT have ~, got: {row}");
+        assert!(
+            row.contains("openai/gpt-4o-mini"),
+            "served model must appear without ~, got: {row}"
+        );
+        assert!(
+            !row.contains("~openai"),
+            "served model must NOT have ~, got: {row}"
+        );
     }
 
     #[test]
@@ -730,23 +969,37 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.active_session_mut().tokens_in = 999;
         app.active_session_mut().tokens_out = 999;
-        app.active_session_mut().per_profile.insert("glm".into(), filar_core::ProfileUsage {
-            tokens_in: 50, tokens_out: 30,
-        });
+        app.active_session_mut().per_profile.insert(
+            "glm".into(),
+            filar_core::ProfileUsage {
+                tokens_in: 50,
+                tokens_out: 30,
+            },
+        );
         app.active_session_mut().llm_profile = Some("glm".into());
         let row = render_status_row(&mut app, 120);
-        assert!(row.contains("50↑ 30↓"), "must show per-profile tokens, got: {row}");
+        assert!(
+            row.contains("50↑ 30↓"),
+            "must show per-profile tokens, got: {row}"
+        );
     }
 
     #[test]
     fn status_bar_shows_dash_when_no_profile_data() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.active_session_mut().per_profile.insert("glm".into(), filar_core::ProfileUsage {
-            tokens_in: 0, tokens_out: 0,
-        });
+        app.active_session_mut().per_profile.insert(
+            "glm".into(),
+            filar_core::ProfileUsage {
+                tokens_in: 0,
+                tokens_out: 0,
+            },
+        );
         app.active_session_mut().llm_profile = Some("glm".into());
         let row = render_status_row(&mut app, 120);
-        assert!(row.contains("toks: —"), "zero tokens must show dash, got: {row}");
+        assert!(
+            row.contains("toks: —"),
+            "zero tokens must show dash, got: {row}"
+        );
     }
 
     #[test]
@@ -754,7 +1007,10 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.active_session_mut().cost_usd = Some(0.0);
         let row = render_status_row(&mut app, 120);
-        assert!(!row.contains("$0"), "zero cost must not show $0.00, got: {row}");
+        assert!(
+            !row.contains("$0"),
+            "zero cost must not show $0.00, got: {row}"
+        );
         assert!(row.contains('—'), "zero cost must show dash, got: {row}");
     }
 
@@ -771,7 +1027,10 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.active_session_mut().cost_usd = None;
         let row = render_status_row(&mut app, 120);
-        assert!(!row.contains('$'), "absent cost must omit $ amount, got: {row}");
+        assert!(
+            !row.contains('$'),
+            "absent cost must omit $ amount, got: {row}"
+        );
     }
 
     #[test]
@@ -820,8 +1079,14 @@ mod tests {
         let row = render_status_row(&mut app, 120);
         assert!(row.contains("fleet web"), "group, got: {row}");
         assert!(row.contains("?/3 live"), "no operation yet, got: {row}");
-        assert!(row.contains("$?"), "cost is shown before it is known, got: {row}");
-        assert!(row.ends_with(" Always"), "right side stays right-aligned, got: {row}");
+        assert!(
+            row.contains("$?"),
+            "cost is shown before it is known, got: {row}"
+        );
+        assert!(
+            row.ends_with(" Always"),
+            "right side stays right-aligned, got: {row}"
+        );
         assert_eq!(row.chars().count(), 120);
 
         app.cost_usd = Some(0.0123);
@@ -832,7 +1097,10 @@ mod tests {
                 status: fleet_status(answering, running),
             });
             let row = render_status_row(&mut app, 120);
-            assert!(row.contains(&format!("{answering}/3 live")), "live count, got: {row}");
+            assert!(
+                row.contains(&format!("{answering}/3 live")),
+                "live count, got: {row}"
+            );
             assert!(row.contains("$0.0123"), "cost, got: {row}");
             assert!(row.ends_with(" Always"), "got: {row}");
         }
@@ -853,7 +1121,10 @@ mod tests {
         for width in [80u16, 60, 55] {
             let row = render_status_row(&mut app, width);
             for essential in ["fleet web", "1/3 live", "confirm", "$1.5000"] {
-                assert!(row.contains(essential), "{essential} at {width}, got: {row}");
+                assert!(
+                    row.contains(essential),
+                    "{essential} at {width}, got: {row}"
+                );
             }
             assert!(row.ends_with(" Always"), "at {width}, got: {row}");
             assert_eq!(row.chars().count(), width as usize);
@@ -861,7 +1132,10 @@ mod tests {
         // 55 is exactly the essentials: the model and the token counter
         // have given way, the group, count, mode badge, cost and confirm mode stay.
         let row = render_status_row(&mut app, 55);
-        assert!(!row.contains("toks"), "tokens yield before the essentials, got: {row}");
+        assert!(
+            !row.contains("toks"),
+            "tokens yield before the essentials, got: {row}"
+        );
     }
 
     #[test]
@@ -870,8 +1144,14 @@ mod tests {
         assert!(render_status_row(&mut app, 120).contains("fleet web"));
         app.leave_fleet_view();
         let row = render_status_row(&mut app, 120);
-        assert!(!row.contains("fleet web"), "the tab's own target, got: {row}");
-        assert!(!row.contains("live"), "no fleet count on a host tab, got: {row}");
+        assert!(
+            !row.contains("fleet web"),
+            "the tab's own target, got: {row}"
+        );
+        assert!(
+            !row.contains("live"),
+            "no fleet count on a host tab, got: {row}"
+        );
         assert!(!row.contains("$?"), "no fleet cost placeholder, got: {row}");
     }
 
@@ -883,8 +1163,14 @@ mod tests {
         let older = fleet_status(0, true);
         let newer = fleet_status(3, false);
         assert!(newer.operation > older.operation, "ids grow");
-        app.handle_agent_event(crate::event::TuiEvent::FleetStatus { session_id: sid, status: newer });
-        app.handle_agent_event(crate::event::TuiEvent::FleetStatus { session_id: sid, status: older });
+        app.handle_agent_event(crate::event::TuiEvent::FleetStatus {
+            session_id: sid,
+            status: newer,
+        });
+        app.handle_agent_event(crate::event::TuiEvent::FleetStatus {
+            session_id: sid,
+            status: older,
+        });
         assert_eq!(app.active_session().fleet_status, Some(newer));
     }
 
@@ -928,7 +1214,10 @@ mod tests {
             row.contains("10.0.0.5 [work,prod] /srv"),
             "tags segment must sit between host and pwd, got: {row}"
         );
-        assert!(row.ends_with(" Always"), "right side must stay right-aligned, got: {row}");
+        assert!(
+            row.ends_with(" Always"),
+            "right side must stay right-aligned, got: {row}"
+        );
     }
 
     #[test]
@@ -955,7 +1244,11 @@ mod tests {
             row_narrow.ends_with(" Always"),
             "confirm_mode must stay at the right edge after the drop, got: {row_narrow}"
         );
-        assert_eq!(row_narrow.chars().count(), 47, "row must fill exactly 47 columns");
+        assert_eq!(
+            row_narrow.chars().count(),
+            47,
+            "row must fill exactly 47 columns"
+        );
     }
 
     #[test]
@@ -1040,7 +1333,10 @@ mod tests {
         let mut app = app_with_tagged_target(&["work"]);
         app.ssh_info = Some("root@10.0.0.9:22".into());
         let row = render_status_row(&mut app, 120);
-        assert!(!row.contains("[work]"), "no tags segment for an unmatched host, got: {row}");
+        assert!(
+            !row.contains("[work]"),
+            "no tags segment for an unmatched host, got: {row}"
+        );
     }
 
     #[test]
@@ -1052,41 +1348,118 @@ mod tests {
         assert!(row.contains("/tmp"), "local pwd, got: {row}");
     }
 
+    fn kube_state(name: &str, namespace: &str) -> crate::app::KubeTabState {
+        crate::app::KubeTabState {
+            target: filar_core::KubeCluster {
+                name: name.into(),
+                context: "test-context".into(),
+                tags: vec!["prod".into()],
+                ..Default::default()
+            },
+            namespace: Some(namespace.into()),
+            connection_id: 1,
+        }
+    }
+
+    #[test]
+    fn kube_segment_has_unicode_and_ascii_forms() {
+        let kube = kube_state("prod-eu", "shop");
+        assert_eq!(
+            kube_segment(&kube, Some("[prod]"), &Glyphs::UNICODE),
+            "⎈ prod-eu › shop [prod]"
+        );
+        assert_eq!(
+            kube_segment(&kube, Some("[prod]"), &Glyphs::ASCII),
+            "k8s: prod-eu > shop [prod]"
+        );
+    }
+
+    #[test]
+    fn kube_segment_truncates_long_components_by_display_width() {
+        let kube = kube_state(
+            "cluster-name-that-is-much-longer-than-24",
+            "namespace-that-is-much-longer-than-24",
+        );
+        let unicode = kube_segment(&kube, None, &Glyphs::UNICODE);
+        assert!(unicode.contains('…'), "{unicode}");
+        assert!(UnicodeWidthStr::width(unicode.as_str()) <= 56, "{unicode}");
+        let wide = kube_component("中中中中中中中中中中中中中", 10, &Glyphs::UNICODE);
+        assert_eq!(UnicodeWidthStr::width(wide.as_str()), 9, "four wide glyphs plus the ellipsis fit the ten-cell budget");
+        assert!(kube_segment(&kube, None, &Glyphs::ASCII).is_ascii());
+    }
+
+    #[test]
+    fn status_bar_shows_cluster_namespace_and_tags() {
+        let mut app = App::new("prod-eu".into(), CommandConfirmMode::Always);
+        app.kube = Some(kube_state("prod-eu", "shop"));
+        let row = render_status_row(&mut app, 120);
+        assert!(row.contains("prod-eu") && row.contains("shop"), "{row}");
+        assert!(row.contains("[prod]"), "{row}");
+        assert!(!row.contains("shop [prod] /"), "cluster tabs have no shell cwd: {row}");
+    }
+
     #[test]
     fn profile_switch_restores_correct_status_bar_data() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.profiles = vec![
             filar_core::LlmProfile {
-                name: "glm".into(), model: "z-ai/glm-5.2".into(), api_base_url: "".into(),
-                max_tokens: 1024, key_env: "K".into(),
-                temperature: None, top_p: None, extra_body: None,
+                name: "glm".into(),
+                model: "z-ai/glm-5.2".into(),
+                api_base_url: "".into(),
+                max_tokens: 1024,
+                key_env: "K".into(),
+                temperature: None,
+                top_p: None,
+                extra_body: None,
                 compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
             },
             filar_core::LlmProfile {
-                name: "ds".into(), model: "deepseek-v3".into(), api_base_url: "".into(),
-                max_tokens: 1024, key_env: "K".into(),
-                temperature: None, top_p: None, extra_body: None,
+                name: "ds".into(),
+                model: "deepseek-v3".into(),
+                api_base_url: "".into(),
+                max_tokens: 1024,
+                key_env: "K".into(),
+                temperature: None,
+                top_p: None,
+                extra_body: None,
                 compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
             },
         ];
         // Profile A: has served model and tokens
-        app.active_session_mut().per_profile.insert("glm".into(), filar_core::ProfileUsage {
-            tokens_in: 100, tokens_out: 50,
-        });
-        app.active_session_mut().model_per_profile.insert("glm".into(), "openai/gpt-4o".into());
+        app.active_session_mut().per_profile.insert(
+            "glm".into(),
+            filar_core::ProfileUsage {
+                tokens_in: 100,
+                tokens_out: 50,
+            },
+        );
+        app.active_session_mut()
+            .model_per_profile
+            .insert("glm".into(), "openai/gpt-4o".into());
         app.active_session_mut().llm_profile = Some("glm".into());
         let row_a = render_status_row(&mut app, 120);
-        assert!(row_a.contains("100↑ 50↓") && row_a.contains("openai/gpt-4o"),
-            "profile A must show its data, got: {row_a}");
+        assert!(
+            row_a.contains("100↑ 50↓") && row_a.contains("openai/gpt-4o"),
+            "profile A must show its data, got: {row_a}"
+        );
         // Switch to B (no data yet)
         app.llm_profile = Some("ds".into());
         let row_b = render_status_row(&mut app, 120);
-        assert!(row_b.contains("~deepseek-v3"), "profile B must show ~configured model, got: {row_b}");
-        assert!(!row_b.contains("openai/gpt-4o"), "must not show A's model, got: {row_b}");
+        assert!(
+            row_b.contains("~deepseek-v3"),
+            "profile B must show ~configured model, got: {row_b}"
+        );
+        assert!(
+            !row_b.contains("openai/gpt-4o"),
+            "must not show A's model, got: {row_b}"
+        );
         // Switch back to A
         app.llm_profile = Some("glm".into());
         let row_a2 = render_status_row(&mut app, 120);
-        assert!(row_a2.contains("openai/gpt-4o"), "back to A must restore A's model, got: {row_a2}");
+        assert!(
+            row_a2.contains("openai/gpt-4o"),
+            "back to A must restore A's model, got: {row_a2}"
+        );
     }
 
     #[test]
@@ -1113,9 +1486,14 @@ mod tests {
     /// A profile with the given compaction threshold, for status-bar tests.
     fn profile_with_threshold(name: &str, compact_at_tokens: u64) -> filar_core::LlmProfile {
         filar_core::LlmProfile {
-            name: name.into(), model: "test-model".into(), api_base_url: "".into(),
-            max_tokens: 1024, key_env: "K".into(),
-            temperature: None, top_p: None, extra_body: None,
+            name: name.into(),
+            model: "test-model".into(),
+            api_base_url: "".into(),
+            max_tokens: 1024,
+            key_env: "K".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
             compact_at_tokens,
         }
     }
@@ -1142,7 +1520,10 @@ mod tests {
         let g = Glyphs::detect();
         let empty: String = std::iter::repeat_n(g.bar_empty, 8).collect();
         assert!(row.contains(&format!("ctx [{empty}] —/200k")), "got: {row}");
-        assert!(!row.contains("0/200k"), "unknown usage is not zero, got: {row}");
+        assert!(
+            !row.contains("0/200k"),
+            "unknown usage is not zero, got: {row}"
+        );
     }
 
     #[test]
@@ -1169,7 +1550,10 @@ mod tests {
         let bar: String = std::iter::repeat_n(g.bar_full, 7)
             .chain(std::iter::repeat_n(g.bar_empty, 1))
             .collect();
-        assert!(row.contains(&format!("ctx [{bar}] 190k/200k")), "got: {row}");
+        assert!(
+            row.contains(&format!("ctx [{bar}] 190k/200k")),
+            "got: {row}"
+        );
     }
 
     #[test]
@@ -1179,7 +1563,10 @@ mod tests {
         let row = render_status_row(&mut app, 120);
         let g = Glyphs::detect();
         let full: String = std::iter::repeat_n(g.bar_full, 8).collect();
-        assert!(row.contains(&format!("ctx [{full}] 250k/200k")), "got: {row}");
+        assert!(
+            row.contains(&format!("ctx [{full}] 250k/200k")),
+            "got: {row}"
+        );
     }
 
     #[test]
@@ -1195,7 +1582,9 @@ mod tests {
             app.active_session_mut().last_prompt_tokens = Some(used);
             let buffer = render_status_buffer(&mut app, 120);
             let row: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
-            let byte = row.find("ctx").unwrap_or_else(|| panic!("indicator shown: {row}"));
+            let byte = row
+                .find("ctx")
+                .unwrap_or_else(|| panic!("indicator shown: {row}"));
             let x = row[..byte].chars().count() as u16;
             assert_eq!(
                 buffer[(x, 0)].style().fg,
@@ -1212,7 +1601,10 @@ mod tests {
         app.active_session_mut().last_prompt_tokens = Some(15_235);
         let row = render_status_row(&mut app, 120);
         assert!(row.contains("ctx 15k"), "got: {row}");
-        assert!(!row.contains("ctx ["), "no scale when there is no denominator, got: {row}");
+        assert!(
+            !row.contains("ctx ["),
+            "no scale when there is no denominator, got: {row}"
+        );
         assert!(!row.contains("15k/"), "got: {row}");
     }
 
@@ -1230,14 +1622,20 @@ mod tests {
         let g = Glyphs::detect();
         assert!(row.contains("ctx ["), "indicator shown, got: {row}");
         let toast = format!("  {} copied", g.middle_dot);
-        assert!(row.ends_with(&toast), "toast stays pinned to the right edge, got: {row}");
+        assert!(
+            row.ends_with(&toast),
+            "toast stays pinned to the right edge, got: {row}"
+        );
         let confirm = " Always";
         let expected = 120 - toast.chars().count() - confirm.chars().count();
         // `find` answers in bytes and the row holds multi-byte `—`, so
         // compare in characters.
         let byte_pos = row.find(confirm).expect("confirm_mode present");
         let char_pos = row[..byte_pos].chars().count();
-        assert_eq!(char_pos, expected, "confirm_mode right-aligned before the toast, got: {row}");
+        assert_eq!(
+            char_pos, expected,
+            "confirm_mode right-aligned before the toast, got: {row}"
+        );
     }
 
     #[test]
@@ -1248,8 +1646,14 @@ mod tests {
         let mut app = app_with_threshold(200_000);
         app.active_session_mut().last_prompt_tokens = Some(150_000);
         let row = render_status_row(&mut app, 45);
-        assert!(!row.contains("ctx"), "indicator must yield on a narrow terminal, got: {row}");
-        assert!(row.ends_with(" Always"), "confirm_mode still right-aligned, got: {row}");
+        assert!(
+            !row.contains("ctx"),
+            "indicator must yield on a narrow terminal, got: {row}"
+        );
+        assert!(
+            row.ends_with(" Always"),
+            "confirm_mode still right-aligned, got: {row}"
+        );
         assert_eq!(row.chars().count(), 45);
     }
 
@@ -1265,7 +1669,10 @@ mod tests {
         let bar: String = std::iter::repeat_n(g.bar_full, 3)
             .chain(std::iter::repeat_n(g.bar_empty, 1))
             .collect();
-        assert!(row.contains(&format!("ctx [{bar}] 150k/200k")), "4-cell tier expected, got: {row}");
+        assert!(
+            row.contains(&format!("ctx [{bar}] 150k/200k")),
+            "4-cell tier expected, got: {row}"
+        );
     }
 
     #[test]
