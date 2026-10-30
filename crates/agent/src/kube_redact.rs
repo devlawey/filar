@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use filar_core::{redact_secrets, KubeCluster, SecretProvider};
+use filar_transport::{ConfigMapInfo, PodLogs};
 use serde_json::{Map, Value};
 
 /// Replacement used wherever a value must not reach the model.
@@ -35,13 +36,35 @@ pub enum KubeToolOutput {
     Logs(String),
 }
 
+impl From<ConfigMapInfo> for KubeToolOutput {
+    fn from(info: ConfigMapInfo) -> Self {
+        let binary_data = info
+            .binary_data_keys
+            .into_iter()
+            .map(|key| (key, Value::String(HIDDEN_VALUE.to_string())))
+            .collect::<Map<_, _>>();
+        Self::Object(serde_json::json!({
+            "kind": "ConfigMap",
+            "metadata": {"name": info.name, "namespace": info.namespace},
+            "data": info.data,
+            "binaryData": binary_data,
+        }))
+    }
+}
+
+impl From<PodLogs> for KubeToolOutput {
+    fn from(logs: PodLogs) -> Self {
+        Self::Logs(logs.text)
+    }
+}
+
 impl KubeToolOutput {
     /// Apply all Kubernetes and known-secret redaction rules. The returned
     /// value is the only form suitable for model messages, history and exports.
     pub fn redact_for_model(self, target: &KubeCluster, secrets: &dyn SecretProvider) -> Self {
         match self {
             Self::Object(mut object) => {
-                redact_node(&mut object, target, None);
+                redact_node(&mut object, target, secrets, None);
                 Self::Object(object)
             }
             Self::Logs(logs) => Self::Logs(redact_logs(&logs, secrets)),
@@ -104,13 +127,18 @@ fn string_field(map: &Map<String, Value>, key: &str) -> Option<String> {
     map.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
-fn redact_node(value: &mut Value, target: &KubeCluster, inherited: Option<&ObjectContext>) {
+fn redact_node(
+    value: &mut Value,
+    target: &KubeCluster,
+    secrets: &dyn SecretProvider,
+    inherited: Option<&ObjectContext>,
+) {
     match value {
         Value::Object(map) => {
             remove_sensitive_metadata(map);
             let context = ObjectContext::of(map, inherited);
             if context.is("ConfigMap") {
-                redact_configmap(map, target, &context);
+                redact_configmap(map, target, secrets, &context);
             } else if context.is("Secret") {
                 // Defence in depth only: ClusterApi and the agent tools cannot
                 // request Secret objects in the first place.
@@ -122,20 +150,20 @@ fn redact_node(value: &mut Value, target: &KubeCluster, inherited: Option<&Objec
                 match key.as_str() {
                     "env" => redact_env(child, target, &context),
                     "envFrom" => redact_env_from(child),
-                    "command" | "args" => redact_command(child),
+                    "command" | "args" => redact_command(child, secrets),
                     "data" | "binaryData" | "stringData"
                         if context.is("ConfigMap") || context.is("Secret") => {}
-                    _ => redact_node(child, target, Some(&context)),
+                    _ => redact_node(child, target, secrets, Some(&context)),
                 }
             }
         }
         Value::Array(items) => {
             for item in items {
-                redact_node(item, target, inherited);
+                redact_node(item, target, secrets, inherited);
             }
         }
         Value::String(text) => {
-            *text = redact_bearer_and_urls(text);
+            *text = redact_bearer_and_urls(&redact_secrets(text, secrets));
         }
         _ => {}
     }
@@ -171,9 +199,10 @@ fn redact_env(value: &mut Value, target: &KubeCluster, context: &ObjectContext) 
         let Some(literal) = entry.get_mut("value") else {
             continue;
         };
-        let revealed = context
-            .env_id(&variable)
-            .is_some_and(|id| target.reveal_env.iter().any(|allowed| allowed == &id));
+        let revealed = context.is("Pod")
+            && context
+                .env_id(&variable)
+                .is_some_and(|id| target.reveal_env.iter().any(|allowed| allowed == &id));
         if revealed {
             if let Some(text) = literal.as_str() {
                 *literal = Value::String(format!("{text} {REVEALED_BY_CONFIG}"));
@@ -227,7 +256,12 @@ fn redact_env_from(value: &mut Value) {
     }
 }
 
-fn redact_configmap(map: &mut Map<String, Value>, target: &KubeCluster, context: &ObjectContext) {
+fn redact_configmap(
+    map: &mut Map<String, Value>,
+    target: &KubeCluster,
+    secrets: &dyn SecretProvider,
+    context: &ObjectContext,
+) {
     let revealed = context.configmap_id().is_some_and(|id| {
         target
             .reveal_configmaps
@@ -244,6 +278,8 @@ fn redact_configmap(map: &mut Map<String, Value>, target: &KubeCluster, context:
                 *value = Value::String(format!("{text} {REVEALED_BY_CONFIG}"));
             } else if configmap_value_is_sensitive(key, text) {
                 *value = Value::String(HIDDEN_VALUE.to_string());
+            } else {
+                *value = Value::String(redact_secrets(text, secrets));
             }
         }
     }
@@ -261,18 +297,37 @@ fn hide_payload(map: &mut Map<String, Value>, field: &str) {
 }
 
 fn configmap_value_is_sensitive(key: &str, value: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    if ["password", "secret", "token", "key", "dsn"]
-        .iter()
-        .any(|marker| key.contains(marker))
-    {
-        return true;
-    }
-    if value.chars().count() >= CONFIGMAP_VALUE_MAX_CHARS {
+    if key_is_sensitive(key) || value.chars().count() >= CONFIGMAP_VALUE_MAX_CHARS {
         return true;
     }
     let has_credentials = redact_bearer_and_urls(value) != value;
-    has_credentials || has_high_entropy(value)
+    has_credentials || has_high_entropy(value) || embedded_json_is_sensitive(value)
+}
+
+fn key_is_sensitive(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["password", "secret", "token", "key", "dsn"]
+        .iter()
+        .any(|marker| key.contains(marker))
+}
+
+fn embedded_json_is_sensitive(value: &str) -> bool {
+    serde_json::from_str::<Value>(value)
+        .ok()
+        .is_some_and(|value| embedded_json_node_is_sensitive(&value))
+}
+
+fn embedded_json_node_is_sensitive(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| key_is_sensitive(key) || embedded_json_node_is_sensitive(value)),
+        Value::Array(items) => items.iter().any(embedded_json_node_is_sensitive),
+        Value::String(text) => {
+            redact_bearer_and_urls(text) != text.as_str() || has_high_entropy(text)
+        }
+        _ => false,
+    }
 }
 
 fn has_high_entropy(value: &str) -> bool {
@@ -291,13 +346,20 @@ fn has_high_entropy(value: &str) -> bool {
     entropy >= HIGH_ENTROPY_THRESHOLD
 }
 
-fn redact_command(value: &mut Value) {
+fn redact_command(value: &mut Value, secrets: &dyn SecretProvider) {
     match value {
-        Value::String(command) => *command = redact_command_text(command),
+        Value::String(command) => *command = redact_secrets(&redact_command_text(command), secrets),
         Value::Array(arguments) => {
+            let mut hide_next = false;
             for argument in arguments {
+                if hide_next {
+                    *argument = Value::String(HIDDEN_VALUE.to_string());
+                    hide_next = false;
+                    continue;
+                }
                 if let Some(text) = argument.as_str() {
-                    *argument = Value::String(redact_command_text(text));
+                    hide_next = is_credential_flag(text);
+                    *argument = Value::String(redact_secrets(&redact_command_text(text), secrets));
                 }
             }
         }
@@ -320,9 +382,31 @@ fn redact_assignment_flags(text: &str) -> String {
     let mut copied = 0;
     let mut searched = 0;
     while let Some((start, flag_length)) = find_next_flag(text, searched) {
-        let value_start = start + flag_length;
-        if start > 0 && text.as_bytes()[start - 1].is_ascii_alphanumeric() {
-            searched = value_start;
+        let flag_end = start + flag_length;
+        if start > 0
+            && (is_identifier_byte(text.as_bytes()[start - 1])
+                || text.as_bytes()[start - 1] == b'-')
+        {
+            searched = flag_end;
+            continue;
+        }
+        let Some(delimiter) = text[flag_end..].chars().next() else {
+            break;
+        };
+        let mut value_start = flag_end;
+        if delimiter == '=' {
+            value_start += 1;
+        } else if delimiter.is_whitespace() {
+            value_start += delimiter.len_utf8();
+            while value_start < text.len() {
+                let character = text[value_start..].chars().next().unwrap_or(' ');
+                if !character.is_whitespace() {
+                    break;
+                }
+                value_start += character.len_utf8();
+            }
+        } else {
+            searched = flag_end;
             continue;
         }
         let value_end = text[value_start..]
@@ -341,8 +425,14 @@ fn redact_assignment_flags(text: &str) -> String {
     output
 }
 
+fn is_credential_flag(text: &str) -> bool {
+    ["--password", "--token"]
+        .iter()
+        .any(|flag| text.eq_ignore_ascii_case(flag))
+}
+
 fn find_next_flag(text: &str, from: usize) -> Option<(usize, usize)> {
-    ["--password=", "--token="]
+    ["--password", "--token"]
         .iter()
         .filter_map(|flag| {
             find_ascii_case_insensitive(&text[from..], flag)
@@ -424,11 +514,7 @@ fn redact_url_credentials(text: &str) -> String {
             continue;
         };
         let userinfo = &authority[..at];
-        let Some(colon) = userinfo.find(':') else {
-            searched = authority_start;
-            continue;
-        };
-        if colon == 0 || colon + 1 == userinfo.len() || at + 1 == authority.len() {
+        if userinfo.is_empty() || at + 1 == authority.len() {
             searched = authority_start;
             continue;
         }
@@ -473,7 +559,15 @@ mod tests {
     }
 
     fn redacted_object(object: Value, target: &KubeCluster) -> Value {
-        match KubeToolOutput::Object(object).redact_for_model(target, &secrets()) {
+        redacted_object_with_secrets(object, target, &secrets())
+    }
+
+    fn redacted_object_with_secrets(
+        object: Value,
+        target: &KubeCluster,
+        secrets: &dyn SecretProvider,
+    ) -> Value {
+        match KubeToolOutput::Object(object).redact_for_model(target, secrets) {
             KubeToolOutput::Object(object) => object,
             KubeToolOutput::Logs(_) => unreachable!("object stays an object"),
         }
@@ -547,6 +641,26 @@ mod tests {
         let object = redacted_object(pod(), &target);
         assert_eq!(
             object["spec"]["containers"][0]["env"][0]["value"],
+            HIDDEN_VALUE
+        );
+    }
+
+    #[test]
+    fn env_reveal_does_not_apply_to_a_deployment_pod_template() {
+        let mut target = target();
+        target.reveal_env = vec!["shop/api/PUBLIC_MODE".into()];
+        let object = redacted_object(
+            json!({
+                "kind": "Deployment",
+                "metadata": {"name": "api", "namespace": "shop"},
+                "spec": {"template": {"spec": {"containers": [{"env": [
+                    {"name": "PUBLIC_MODE", "value": "readonly"}
+                ]}]}}}
+            }),
+            &target,
+        );
+        assert_eq!(
+            object["spec"]["template"]["spec"]["containers"][0]["env"][0]["value"],
             HIDDEN_VALUE
         );
     }
@@ -635,6 +749,26 @@ mod tests {
     }
 
     #[test]
+    fn configmap_embedded_json_credentials_hide_the_whole_document() {
+        let object = redacted_object(
+            json!({
+                "kind": "ConfigMap",
+                "metadata": {"name": "settings", "namespace": "shop"},
+                "data": {
+                    "app.json": "{\"database\":{\"password\":\"hunter2\"}}",
+                    "ordinary.json": "{\"host\":\"db.internal\",\"port\":5432}"
+                }
+            }),
+            &target(),
+        );
+        assert_eq!(object["data"]["app.json"], HIDDEN_VALUE);
+        assert_eq!(
+            object["data"]["ordinary.json"],
+            "{\"host\":\"db.internal\",\"port\":5432}"
+        );
+    }
+
+    #[test]
     fn configmap_reveal_is_explicit_and_marked() {
         let mut target = target();
         target.reveal_configmaps = vec!["shop/feature-flags".into()];
@@ -693,6 +827,83 @@ mod tests {
     }
 
     #[test]
+    fn separated_credential_flags_hide_the_following_value() {
+        let object = redacted_object(
+            json!({
+                "kind": "Pod",
+                "metadata": {"name": "api", "namespace": "shop"},
+                "spec": {"containers": [{
+                    "command": "start --password hunter2 --token   abc123 --verbose",
+                    "args": ["--password", "hunter2", "--token", "abc123", "--verbose"]
+                }]}
+            }),
+            &target(),
+        );
+        let container = &object["spec"]["containers"][0];
+        assert_eq!(
+            container["command"],
+            format!("start --password {HIDDEN_VALUE} --token   {HIDDEN_VALUE} --verbose")
+        );
+        assert_eq!(
+            container["args"],
+            json!([
+                "--password",
+                HIDDEN_VALUE,
+                "--token",
+                HIDDEN_VALUE,
+                "--verbose"
+            ])
+        );
+        assert!(!object.to_string().contains("hunter2"));
+        assert!(!object.to_string().contains("abc123"));
+    }
+
+    #[test]
+    fn structured_objects_mask_known_secrets_without_overriding_reveals() {
+        let secrets = StaticSecretProvider::new();
+        secrets.insert("$FILAR_SECRET_1", "hunter2");
+        let mut target = target();
+        target.reveal_configmaps = vec!["shop/revealed".into()];
+        let object = redacted_object_with_secrets(
+            json!({
+                "kind": "Pod",
+                "metadata": {
+                    "name": "api",
+                    "namespace": "shop",
+                    "annotations": {"example.com/credential": "hunter2"}
+                },
+                "spec": {"description": "password=hunter2", "args": ["hunter2"]}
+            }),
+            &target,
+            &secrets,
+        );
+        assert!(!object.to_string().contains("hunter2"));
+        let configmap = redacted_object_with_secrets(
+            json!({
+                "kind": "ConfigMap",
+                "metadata": {"name": "settings", "namespace": "shop"},
+                "data": {"ordinary": "hunter2"}
+            }),
+            &target,
+            &secrets,
+        );
+        assert!(!configmap.to_string().contains("hunter2"));
+        let revealed = redacted_object_with_secrets(
+            json!({
+                "kind": "ConfigMap",
+                "metadata": {"name": "revealed", "namespace": "shop"},
+                "data": {"ordinary": "hunter2"}
+            }),
+            &target,
+            &secrets,
+        );
+        assert_eq!(
+            revealed["data"]["ordinary"],
+            format!("hunter2 {REVEALED_BY_CONFIG}")
+        );
+    }
+
+    #[test]
     fn logs_mask_known_secrets_bearer_tokens_and_url_userinfo() {
         let secrets = StaticSecretProvider::new();
         secrets.insert("$FILAR_SECRET_1", "hunter2");
@@ -712,10 +923,53 @@ mod tests {
     }
 
     #[test]
+    fn colon_less_url_userinfo_is_masked() {
+        let output = redact_logs("https://access-token@service.example/health", &secrets());
+        assert_eq!(
+            output,
+            format!("https://{HIDDEN_VALUE}@service.example/health")
+        );
+        assert!(!output.contains("access-token"));
+    }
+
+    #[test]
     fn ordinary_hosts_ports_flags_and_urls_are_not_masked() {
         let input = "host=db.internal port=5432 flags=--verbose,--dry-run \
                      https://db.internal:8443/health";
         assert_eq!(redact_logs(input, &secrets()), input);
+    }
+
+    #[test]
+    fn cluster_api_outputs_pass_through_the_agent_tool_boundary() {
+        let info = ConfigMapInfo {
+            namespace: "shop".into(),
+            name: "settings".into(),
+            data: BTreeMap::from([
+                ("app.json".into(), "{\"password\":\"hunter2\"}".into()),
+                ("host".into(), "db.internal".into()),
+            ]),
+            binary_data_keys: vec!["blob".into()],
+            age_seconds: None,
+        };
+        let output = KubeToolOutput::from(info).redact_for_model(&target(), &secrets());
+        let KubeToolOutput::Object(object) = output else {
+            unreachable!("ConfigMap stays an object")
+        };
+        assert_eq!(object["data"]["app.json"], HIDDEN_VALUE);
+        assert_eq!(object["data"]["host"], "db.internal");
+        assert_eq!(object["binaryData"]["blob"], HIDDEN_VALUE);
+        assert!(!object.to_string().contains("hunter2"));
+
+        let logs = PodLogs {
+            text: "Bearer abc123 https://token@service.example".into(),
+            truncated: false,
+        };
+        let output = KubeToolOutput::from(logs).redact_for_model(&target(), &secrets());
+        let KubeToolOutput::Logs(logs) = output else {
+            unreachable!("pod logs stay logs")
+        };
+        assert!(!logs.contains("abc123"));
+        assert!(!logs.contains("token@"));
     }
 
     #[test]

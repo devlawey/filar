@@ -65,21 +65,26 @@ leak. ConfigMap values still require the consumer's output-redaction policy.
 `filar_agent::KubeToolOutput::redact_for_model` is the boundary between
 Kubernetes tool output and model messages, session history or exports. Structured
 objects lose `metadata.managedFields` and the last-applied-configuration
-annotation. Literal environment values become `«скрыто»`; `valueFrom` and
-`envFrom` retain only source references. Container commands and arguments mask
-`--password=`, `--token=` and URL userinfo. ConfigMap keys stay visible, while
-secret-like keys, credential-bearing URLs, high-entropy values and values of at
-least 256 characters are hidden. Binary ConfigMap payloads are always hidden.
+annotation, and ordinary strings also pass through known-secret redaction.
+Literal environment values become `«скрыто»`; `valueFrom` and `envFrom` retain
+only source references. Container commands and arguments mask both inline and
+separate values of `--password` and `--token`, plus URL userinfo (with or
+without a colon). ConfigMap keys stay visible, while secret-like keys,
+credentials in embedded JSON, credential-bearing URLs, high-entropy values and
+values of at least 256 characters are hidden. Binary ConfigMap payloads are
+always hidden.
 
 Log output first uses `filar_core::redact_secrets`, then masks bearer tokens and
 URL userinfo. `KubeCluster::reveal_configmaps` (`namespace/name`) and
-`KubeCluster::reveal_env` (`namespace/pod/VARIABLE`) are narrow, explicit
-exceptions; revealed values carry the visible `«раскрыто настройкой»` marker.
-No exception enables Kubernetes Secret reads.
+`KubeCluster::reveal_env` (`namespace/pod/VARIABLE`, Pod objects only) are
+narrow, explicit exceptions; revealed values carry the visible
+`«раскрыто настройкой»` marker. No exception enables Kubernetes Secret reads.
 
-The transport remains independent of the agent's `SecretProvider`. Embedders
-that construct their own model messages from `ClusterApi` results must apply
-this boundary rather than serializing raw objects or logs directly.
+`From<ConfigMapInfo>` and `From<PodLogs>` adapt the corresponding `ClusterApi`
+results to this boundary. The transport remains independent of the agent's
+`SecretProvider`. Embedders that construct their own model messages from
+`ClusterApi` results must apply this boundary rather than serializing raw
+objects or logs directly.
 
 ## Cargo.toml example
 

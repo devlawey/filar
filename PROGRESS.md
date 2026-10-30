@@ -11108,18 +11108,24 @@ SSH-only consumers отключают defaults.
 экспортом. Литералы env заменяются на `«скрыто»`, `valueFrom`/`envFrom` остаются
 только ссылками; last-applied и managedFields удаляются. ConfigMap сохраняет
 ключи, но скрывает секретные по имени/учётным данным/энтропии/длине значения;
-binaryData скрыт всегда. Аргументы маскируют `--password=`, `--token=` и
+binaryData скрыт всегда. Известные секреты маскируются и в обычных строках
+объектов; вложенный JSON ConfigMap проверяется на секретные ключи. Аргументы
+маскируют inline и отдельные значения `--password`/`--token` и любой непустой
 userinfo URL. Логи проходят `redact_secrets`, bearer-токены и URL userinfo.
 Явные `reveal_configmaps` и новый `reveal_env = ["namespace/pod/VARIABLE"]`
-оставляют значение с пометкой `«раскрыто настройкой»`.
+оставляют значение с пометкой `«раскрыто настройкой»`; env-исключение действует
+только на Pod, а не на вложенный шаблон Deployment.
 
-**Проверка.** 10 unit-тестов границы инструмента покрывают каждый тип редакции,
-оба reveal и ложные срабатывания на портах, хостах, обычных URL и флагах;
-12 config-тестов `KubeCluster` зелёные; `cargo build --workspace` и
-`cargo test --workspace` тоже зелёные. Подключение правил к конкретным
-`k8s_*`-инструментам — следующая issue #574; их реализация сюда не входит.
+**Проверка.** 16 unit-тестов границы инструмента покрывают каждый тип редакции,
+оба reveal, переходы `ConfigMapInfo`/`PodLogs` от `ClusterApi` и ложные
+срабатывания на портах, хостах, обычных URL и флагах; 12 config-тестов
+`KubeCluster`, `cargo build --workspace` и `cargo test --workspace` зелёные.
+Подключение правил к конкретным `k8s_*`-инструментам — следующая issue #574;
+их реализация сюда не входит.
 
 **Контракты.** `CommandExecutor` / `LlmClient` не менялись. Аддитивно:
-`KubeToolOutput`, `redact_logs`, маркеры редакции и `KubeCluster::reveal_env`.
+`KubeToolOutput`, его переходы из `ConfigMapInfo`/`PodLogs`, `redact_logs`,
+маркеры редакции и `KubeCluster::reveal_env`; `filar-agent` включает существующий
+transport feature `kube`.
 
 **Next:** #574 (read-only Kubernetes tools поверх этой границы).
