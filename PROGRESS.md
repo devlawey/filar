@@ -11144,7 +11144,9 @@ metrics-server. Гейт учитывает все режимы подтверж
 tag policies; confirmation context содержит tool, аргументы, context и namespace.
 Кластерный системный промпт синхронизирован с eval snapshot. В eval добавлены
 стадии CrashLoopBackOff (previous logs и events) и разбор OOMKilled с memory
-limit; `eval-smoke` запускает Kubernetes suite отдельно от SSH suite.
+limit; `eval-smoke` запускает Kubernetes suite отдельно от SSH suite. Прямой
+Pod describe без namespace отклоняется; OOM eval использует `expected_facts`,
+чтобы promptfoo не размножал кейс по зарезервированной переменной `expected`.
 
 **Контракты.** `CommandExecutor` / `LlmClient` не менялись. Аддитивно:
 `KubeToolCall`, `KubeToolExecutor`, `KubeToolResult`, схемы/парсер/гейт/промпт

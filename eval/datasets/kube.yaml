@@ -31,7 +31,7 @@
       lastTermination={container=main, reason=OOMKilled, exitCode=137};
       containers[main].resources.requests.memory=64Mi;
       containers[main].resources.limits.memory=128Mi. Назови причину и лимит.
-    expected: [OOMKilled, 128Mi]
+    expected_facts: [OOMKilled, 128Mi]
   metadata: { smoke: true }
   assert:
     - { type: javascript, value: "file://asserts.js:outputContains" }

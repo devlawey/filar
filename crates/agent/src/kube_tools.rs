@@ -608,11 +608,10 @@ impl KubeToolExecutor {
                 event_limit,
             } => {
                 let object = if *kind == KubeResourceKind::Pod {
-                    pod_object(
-                        self.api
-                            .get_pod(namespace.as_deref().unwrap_or(""), name)
-                            .await?,
-                    )
+                    let namespace = namespace.as_deref().ok_or_else(|| {
+                        CoreError::Other("namespace is required for Pod describe".into())
+                    })?;
+                    pod_object(self.api.get_pod(namespace, name).await?)
                 } else {
                     list_objects(&*self.api, *kind, namespace.as_deref(), None, None)
                         .await?

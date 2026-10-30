@@ -310,9 +310,9 @@ function kubeToolArgs(output, context) {
 
 // Assert 8 — final diagnostic prose contains every required fact.
 function outputContains(output, context) {
-  const expected = context?.vars?.expected;
+  const expected = context?.vars?.expected_facts;
   if (!Array.isArray(expected) || expected.length === 0) {
-    return { pass: false, score: 0, reason: 'outputContains requires a non-empty `expected` array' };
+    return { pass: false, score: 0, reason: 'outputContains requires a non-empty `expected_facts` array' };
   }
   const prose = extractProse(output);
   const missing = expected.filter((value) => !prose.includes(String(value)));

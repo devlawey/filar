@@ -353,6 +353,21 @@ async fn describe_contains_oom_reason_limits_and_redacted_sorted_events() {
 }
 
 #[tokio::test]
+async fn describe_rejects_direct_pod_call_without_namespace() {
+    let executor = executor(MockCluster::default());
+    let call = KubeToolCall::Describe {
+        kind: KubeResourceKind::Pod,
+        namespace: None,
+        name: "web-1".into(),
+        event_limit: 20,
+    };
+    let error = executor.execute(&call).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("namespace is required for Pod describe"));
+}
+
+#[tokio::test]
 async fn logs_pass_previous_and_bounds_then_redact() {
     let cluster = Arc::new(MockCluster {
         logs: Some(PodLogs {
