@@ -4,23 +4,23 @@
 //! confirmation requests. It is updated by both terminal events (keyboard)
 //! and agent events (from the agent task).
 
-use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
 use filar_core::{ChatBlock, CommandConfirmMode, SessionMeta, SessionStore, StaticSecretProvider};
 use ratatui::layout::Rect;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use crate::event::TuiEvent;
-use tracing::warn;
 use crate::terminal::{key_to_bytes, TerminalModel};
 use crate::ui::layout_cache::ChatLayoutCache;
 use crate::ui::Theme;
+use tracing::warn;
 
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 use std::time::Duration;
+use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // App mode
@@ -103,7 +103,11 @@ impl Selection {
     pub fn normalised(&self) -> ((usize, usize), (usize, usize)) {
         let a = (self.anchor_line, self.anchor_col);
         let h = (self.head_line, self.head_col);
-        if a <= h { (a, h) } else { (h, a) }
+        if a <= h {
+            (a, h)
+        } else {
+            (h, a)
+        }
     }
 
     /// Whether the selection is empty (anchor == head).
@@ -211,7 +215,9 @@ impl SafetyScore {
     pub fn label(&self) -> String {
         match self {
             SafetyScore::Pending => "rating…".to_string(),
-            SafetyScore::Ready { pct, confidence, .. } => {
+            SafetyScore::Ready {
+                pct, confidence, ..
+            } => {
                 let approx = matches!(confidence, Some(c) if *c < LOW_SAFETY_CONFIDENCE);
                 format!("{}{pct}%", if approx { "~" } else { "" })
             }
@@ -287,11 +293,15 @@ pub(crate) enum HostSelectRow {
     Local,
     /// SSH target at `ssh_targets[i]` (flat selection index `i + 1`).
     Target(usize),
+    /// Non-selectable header of the Kubernetes cluster section (#575).
+    KubeHeader { count: usize },
+    /// Kubernetes cluster at `kube_clusters[cluster]`.
+    Kube { cluster: usize, selection: usize },
     /// Non-selectable header of the host-group section (#432).
     GroupsHeader { count: usize },
     /// Host group at `host_groups[group]` — enters the fleet layer (#432).
-    /// `selection` is its flat index, `1 + ssh_targets.len() + group`: after
-    /// every target, so the target indices keep their meaning.
+    /// `selection` is its flat index after local, SSH targets and clusters,
+    /// so the existing local and SSH indices keep their meaning.
     Group { group: usize, selection: usize },
 }
 
@@ -301,12 +311,49 @@ impl HostSelectRow {
     /// expect.
     pub(crate) fn selection_index(&self) -> Option<usize> {
         match self {
-            HostSelectRow::Header { .. } | HostSelectRow::GroupsHeader { .. } => None,
+            HostSelectRow::Header { .. }
+            | HostSelectRow::KubeHeader { .. }
+            | HostSelectRow::GroupsHeader { .. } => None,
             HostSelectRow::Local => Some(0),
             HostSelectRow::Target(i) => Some(i + 1),
-            HostSelectRow::Group { selection, .. } => Some(*selection),
+            HostSelectRow::Kube { selection, .. } | HostSelectRow::Group { selection, .. } => {
+                Some(*selection)
+            }
         }
     }
+}
+
+/// Exact explanation for actions that require a shell in a cluster tab (#575).
+pub const KUBE_SHELL_REFUSAL: &str = "во вкладке кластера нет шелла; войдите в под — 3.0.1";
+
+/// Kubernetes identity and namespace of one tab. Live API clients stay in the runner.
+#[derive(Debug, Clone)]
+pub struct KubeTabState {
+    pub target: filar_core::KubeCluster,
+    pub namespace: Option<String>,
+    pub connection_id: u64,
+}
+
+/// A connection or namespace-discovery request consumed by the runner (#575).
+#[derive(Debug, Clone)]
+pub struct KubeConnectRequest {
+    pub session_id: SessionId,
+    pub target: filar_core::KubeCluster,
+    pub namespace: Option<String>,
+    pub connection_id: u64,
+    pub discover: bool,
+}
+
+/// Namespace chooser shown after selecting a cluster, or while discovery runs.
+#[derive(Debug, Clone)]
+pub struct KubeNamespaceSelect {
+    pub session_id: SessionId,
+    pub connection_id: u64,
+    pub namespaces: Vec<String>,
+    pub index: usize,
+    pub loading: bool,
+    /// Configured choices need a final connection; discovered ones reuse it.
+    pub needs_connect: bool,
 }
 
 /// The main application state.
@@ -378,6 +425,14 @@ pub struct App {
     pub key_checker: Option<Arc<dyn Fn(&filar_core::LlmProfile) -> Option<String> + Send + Sync>>,
     /// Named SSH targets from config, selectable via the Ctrl+O overlay.
     pub ssh_targets: Vec<filar_core::SshTarget>,
+    /// Configured Kubernetes clusters, selectable via the Ctrl+O overlay (#575).
+    pub kube_clusters: Vec<filar_core::KubeCluster>,
+    /// Cluster connections and namespace discoveries awaiting the runner.
+    pub pending_kube_connects: Vec<KubeConnectRequest>,
+    /// Namespace chooser for the active cluster tab, if any.
+    pub kube_namespace_select: Option<KubeNamespaceSelect>,
+    /// Monotonic id used to reject late results from abandoned connections.
+    next_kube_connection_id: u64,
     /// Host groups from `[[host_groups]]`, listed in the Ctrl+O overlay as
     /// fleet entry points (#432).
     pub host_groups: Vec<filar_core::HostGroup>,
@@ -638,6 +693,8 @@ pub struct Session {
     /// SSH connection info for this tab (e.g. "user@host:port"). None = local.
     /// Set when `!ssh` succeeds for this tab. Used for display and system prompt.
     pub ssh_info: Option<String>,
+    /// Selected Kubernetes cluster and namespace; mutually exclusive with SSH (#575).
+    pub kube: Option<KubeTabState>,
     /// Last known working directory for the status bar (`None` = unknown).
     /// Local tabs start from the process cwd; SSH is filled from OSC 7,
     /// a POSIX `pwd` probe on Ctrl+T leave, or the SSH command marker `$PWD`.
@@ -776,6 +833,10 @@ impl App {
             default_profile_name: String::new(),
             key_checker: None,
             ssh_targets: Vec::new(),
+            kube_clusters: Vec::new(),
+            pending_kube_connects: Vec::new(),
+            kube_namespace_select: None,
+            next_kube_connection_id: 1,
             ctrl_o_selection: None,
             ctrl_o_pending_tags: None,
             ctrl_o_needs_connect: false,
@@ -919,15 +980,11 @@ impl App {
             let dir_name = self.session_export_dir(self.active);
             let session = &mut self.sessions[self.active];
             if session.transcript_path.is_none() {
-                let base_dir = self
-                    .save_dir
-                    .clone()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
-                let filename = transcript_filename(
-                    &session.target_name,
-                    &session.ssh_info,
-                    &messages,
-                );
+                let base_dir = self.save_dir.clone().unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                });
+                let filename =
+                    transcript_filename(&session.target_name, &session.ssh_info, &messages);
                 // Inside the per-target folder (#400) — the group's folder in
                 // the fleet (#441); the file stays there even if the tab's
                 // host changes mid-session.
@@ -935,16 +992,15 @@ impl App {
                 session.transcript_path = Some(path.clone());
                 session.transcript_error_shown = false;
                 self.push_message(ChatBlock::System(format!(
-                    "Safe mode (Explain) activated. Transcript: {}", path.display()
+                    "Safe mode (Explain) activated. Transcript: {}",
+                    path.display()
                 )));
             }
         } else {
             // Exiting Explain mode — push deactivation message BEFORE the
             // final save so it appears in the transcript, then clear path
             // so the next F2 entry creates a new file.
-            self.push_message(ChatBlock::System(
-                "Safe mode (Explain) deactivated".into(),
-            ));
+            self.push_message(ChatBlock::System("Safe mode (Explain) deactivated".into()));
             self.save_transcript_silent();
             self.sessions[self.active].transcript_path = None;
             self.sessions[self.active].transcript_error_shown = false;
@@ -978,6 +1034,11 @@ impl App {
     /// Take and clear the list of sessions awaiting a local executor (for runner to process).
     pub fn take_pending_local_executors(&mut self) -> Vec<SessionId> {
         std::mem::take(&mut self.pending_local_executors)
+    }
+
+    /// Take cluster connection/discovery work queued by selection or restore.
+    pub fn take_pending_kube_connects(&mut self) -> Vec<KubeConnectRequest> {
+        std::mem::take(&mut self.pending_kube_connects)
     }
 
     /// Switch to the previous tab (wraps around). Ordinary tabs only: from
@@ -1051,9 +1112,7 @@ impl Session {
             id: SessionId::next(),
             target_name,
             folded_history: Vec::new(),
-            messages: vec![ChatBlock::System(format!(
-                "Connected to: {name}"
-            ))],
+            messages: vec![ChatBlock::System(format!("Connected to: {name}"))],
             input: String::new(),
             cursor_pos: 0,
             mode: AppMode::Normal,
@@ -1097,6 +1156,7 @@ impl Session {
             has_new: false,
             awaiting_confirmation: false,
             ssh_info: None,
+            kube: None,
             cwd: local_cwd(),
             pty_prompt_cwd: None,
             llm_profile: None,
@@ -1150,7 +1210,11 @@ impl Session {
     /// (see [`App::format_tags_segment`]) — an empty string renders as if
     /// there were no tags.
     pub fn status_target_with_tags(&self, tags_segment: Option<&str>) -> String {
-        let pwd = self.cwd.as_deref().map(|p| truncate_pwd(p, 24)).unwrap_or_default();
+        let pwd = self
+            .cwd
+            .as_deref()
+            .map(|p| truncate_pwd(p, 24))
+            .unwrap_or_default();
         let tags = tags_segment.unwrap_or("");
         match self.ssh_info.as_deref().and_then(parse_ssh_info) {
             Some((_, host, _)) => {
@@ -1248,8 +1312,8 @@ impl Session {
 pub enum SaveProgress {
     Started,
     Writing,
-    Done(String),   // display path relative to the export root (`folder/file.md`, #400)
-    Error(String),  // error message
+    Done(String),  // display path relative to the export root (`folder/file.md`, #400)
+    Error(String), // error message
     /// Silent transcript save completed. `None` = success, `Some` = error.
     TranscriptDone(SessionId, Option<String>),
     /// Runbook generation finished (#401). `outcome` is the runbook's path
@@ -1265,7 +1329,9 @@ pub enum SaveProgress {
     /// was written and nothing more is being paid for. Sent by the task
     /// itself, so the note reaches the session the job started from even
     /// after the user has moved to another tab.
-    RunbookCancelled { sid: SessionId },
+    RunbookCancelled {
+        sid: SessionId,
+    },
     /// The user answered `y` to the runbook question after the `.md` named
     /// here was already written (#481): start the armed job for it now.
     RunbookRequested(String),
@@ -1366,8 +1432,7 @@ fn slugify_max(s: &str, max: usize) -> String {
     let mut result = String::new();
     let mut prev_dash = false;
     for ch in s.chars() {
-        if !is_filename_hostile(ch)
-            && (ch.is_alphanumeric() || ch == '.' || ch == '_' || ch == '-')
+        if !is_filename_hostile(ch) && (ch.is_alphanumeric() || ch == '.' || ch == '_' || ch == '-')
         {
             result.push(ch);
             prev_dash = ch == '-';
@@ -1398,9 +1463,28 @@ const FALLBACK_EXPORT_DIR: &str = "target";
 fn is_windows_reserved_name(stem: &str) -> bool {
     matches!(
         stem.to_ascii_uppercase().as_str(),
-        "CON" | "PRN" | "AUX" | "NUL"
-            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
-            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
     )
 }
 
@@ -1554,12 +1638,11 @@ fn fleet_summary_markdown(
         } else {
             from_view
         };
-        let state = from_view.unwrap_or_else(|| {
-            match skipped.iter().find(|(host, _)| host == member) {
+        let state =
+            from_view.unwrap_or_else(|| match skipped.iter().find(|(host, _)| host == member) {
                 Some((_, why)) => format!("skipped ({why})"),
                 None => "not asked yet".to_string(),
-            }
-        });
+            });
         out.push_str(&format!(
             "| {} | {} |\n",
             markdown_cell(member),
@@ -1625,7 +1708,10 @@ fn transcript_filename(
     ssh_info: &Option<String>,
     messages: &[ChatBlock],
 ) -> String {
-    format!("{}.md", export_filename_stem(session_name, ssh_info, messages))
+    format!(
+        "{}.md",
+        export_filename_stem(session_name, ssh_info, messages)
+    )
 }
 
 /// Generate a Ctrl+S save filename: `{host}.{topic?}.{date}.{time}.md`,
@@ -1640,16 +1726,25 @@ async fn generate_save_filename(
     let stem = export_filename_stem(session_name, ssh_info, messages);
     let mut name = format!("{stem}.md");
     // Avoid overwriting: append -1, -2, … if file already exists.
-    if tokio::fs::try_exists(base_dir.join(&name)).await.unwrap_or(false) {
+    if tokio::fs::try_exists(base_dir.join(&name))
+        .await
+        .unwrap_or(false)
+    {
         for n in 1u32..1000 {
             let alt = format!("{stem}-{n}.md");
-            if !tokio::fs::try_exists(base_dir.join(&alt)).await.unwrap_or(false) {
+            if !tokio::fs::try_exists(base_dir.join(&alt))
+                .await
+                .unwrap_or(false)
+            {
                 name = alt;
                 break;
             }
         }
         // Extreme edge-case: all 999 suffixes taken → append nanos.
-        if tokio::fs::try_exists(base_dir.join(&name)).await.unwrap_or(false) {
+        if tokio::fs::try_exists(base_dir.join(&name))
+            .await
+            .unwrap_or(false)
+        {
             let ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1664,10 +1759,16 @@ async fn generate_save_filename(
 ///
 /// `pub(crate)` because the runbook task (#401) hands the LLM the exact
 /// transcript conversion the `.md` export is written from.
-pub(crate) fn messages_to_markdown(messages: &[ChatBlock], session_name: &str, ssh_info: &Option<String>) -> String {
+pub(crate) fn messages_to_markdown(
+    messages: &[ChatBlock],
+    session_name: &str,
+    ssh_info: &Option<String>,
+) -> String {
     let mut md = String::new();
     md.push_str(&format!("# Session: {session_name}\n\n"));
-    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z").to_string();
+    let ts = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S %:z")
+        .to_string();
     md.push_str(&format!("Date: {ts}\n"));
     if let Some(ref info) = ssh_info {
         md.push_str(&format!("Target: {info}\n"));
@@ -1785,7 +1886,11 @@ impl App {
             s.compacted_without_relief = false;
             s.compaction_exhausted = false;
         }
-        let default_name = if default_profile_name.is_empty() { "default" } else { default_profile_name };
+        let default_name = if default_profile_name.is_empty() {
+            "default"
+        } else {
+            default_profile_name
+        };
         if let Some(profile) = llm_profile {
             if profile.is_empty() {
                 // Old session (pre-0.7.0 fix): silently fall back to default.
@@ -1795,7 +1900,8 @@ impl App {
             } else {
                 app.llm_profile = Some(default_name.to_string());
                 app.push_message(ChatBlock::System(format!(
-                    "Profile '{}' not found — using '{}'", profile, default_name
+                    "Profile '{}' not found — using '{}'",
+                    profile, default_name
                 )));
             }
         }
@@ -1982,11 +2088,8 @@ impl App {
             return;
         }
 
-        let compacted = filar_core::compact_history(
-            &self.active_session().messages,
-            boundary,
-            &summary,
-        );
+        let compacted =
+            filar_core::compact_history(&self.active_session().messages, boundary, &summary);
         let after = compacted.len();
         // The head leaves `messages` — that is the point of compaction — but it
         // does not leave the session. The transcript and the saved file are
@@ -2060,7 +2163,12 @@ impl App {
     /// for a background tab is billed to *that* tab even though the user has
     /// since switched away — the call was made on its session, and the
     /// outcome lands in its feed (#401).
-    fn record_summary_usage_for(&mut self, idx: usize, usage: &filar_agent::TokenUsage, profile: String) {
+    fn record_summary_usage_for(
+        &mut self,
+        idx: usize,
+        usage: &filar_agent::TokenUsage,
+        profile: String,
+    ) {
         let tokens_in = usage.prompt_tokens.unwrap_or(0);
         let tokens_out = usage.completion_tokens.unwrap_or(0);
         let cost = usage.cost;
@@ -2088,6 +2196,9 @@ impl App {
     /// the Ctrl+O overlay uses. Ad-hoc `!ssh` sessions and hosts absent from
     /// the config have no tags.
     pub fn active_ssh_tags(&self) -> Vec<String> {
+        if let Some(kube) = &self.kube {
+            return kube.target.tags.clone();
+        }
         let Some(info) = self.ssh_info.as_deref() else {
             return Vec::new();
         };
@@ -2178,21 +2289,29 @@ impl App {
         // the full grouped list.
         self.host_select_query.clear();
         self.host_select_tag_filter = None;
-        if self.ssh_targets.is_empty() {
+        if self.ssh_targets.is_empty() && self.kube_clusters.is_empty() {
             self.push_message(ChatBlock::System("No [[ssh_targets]] configured. Add targets in config.toml, then restart filar.\nSyntax: [[ssh_targets]] + name/host/user + [ssh_targets.auth] type = \"agent\"".into()));
         }
-        let list_size = 1 + self.ssh_targets.len() + self.host_groups.len();
+        let list_size =
+            1 + self.ssh_targets.len() + self.kube_clusters.len() + self.host_groups.len();
         // Derive current position from the active SSH target — or, in the
         // fleet layer, from the fleet's group (#432).
-        let fleet_group = self
-            .sessions[self.active]
-            .fleet
-            .as_ref()
-            .and_then(|f| self.host_groups.iter().position(|g| g.name == f.group_name()));
+        let fleet_group = self.sessions[self.active].fleet.as_ref().and_then(|f| {
+            self.host_groups
+                .iter()
+                .position(|g| g.name == f.group_name())
+        });
         let current = if let Some(g) = fleet_group {
-            1 + self.ssh_targets.len() + g
+            1 + self.ssh_targets.len() + self.kube_clusters.len() + g
+        } else if let Some(kube) = &self.kube {
+            self.kube_clusters
+                .iter()
+                .position(|target| target.name == kube.target.name)
+                .map(|i| 1 + self.ssh_targets.len() + i)
+                .unwrap_or(0)
         } else if let Some(ref info) = self.ssh_info {
-            self.ssh_targets.iter()
+            self.ssh_targets
+                .iter()
                 .position(|t| format!("{}@{}:{}", t.user, t.host, t.port) == *info)
                 .map(|i| i + 1)
                 .unwrap_or(0)
@@ -2215,6 +2334,13 @@ impl App {
                 }
             }
         }
+        for target in &self.kube_clusters {
+            for tag in &target.tags {
+                if !tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+                    tags.push(tag.clone());
+                }
+            }
+        }
         tags
     }
 
@@ -2225,7 +2351,11 @@ impl App {
     /// `local` and hides under an active tag filter (local carries no tags).
     /// Targets group under their primary tag (first entry of `tags`), in
     /// first-appearance order; untagged hosts form the trailing group.
-    pub(crate) fn host_select_rows_filtered(&self, query: &str, tag: Option<&str>) -> Vec<HostSelectRow> {
+    pub(crate) fn host_select_rows_filtered(
+        &self,
+        query: &str,
+        tag: Option<&str>,
+    ) -> Vec<HostSelectRow> {
         let q = query.trim().to_lowercase();
         let mut rows = Vec::new();
         // In the fleet the overlay drills into the fleet's own hosts (#433):
@@ -2270,12 +2400,44 @@ impl App {
             }
         }
         for (tag, idxs) in tagged {
-            rows.push(HostSelectRow::Header { tag: Some(tag), count: idxs.len() });
+            rows.push(HostSelectRow::Header {
+                tag: Some(tag),
+                count: idxs.len(),
+            });
             rows.extend(idxs.into_iter().map(HostSelectRow::Target));
         }
         if !untagged.is_empty() {
-            rows.push(HostSelectRow::Header { tag: None, count: untagged.len() });
+            rows.push(HostSelectRow::Header {
+                tag: None,
+                count: untagged.len(),
+            });
             rows.extend(untagged.into_iter().map(HostSelectRow::Target));
+        }
+        // Kubernetes clusters are agent targets, never file-panel sources or
+        // fleet hosts. Their flat indices follow local and all SSH targets.
+        let clusters: Vec<usize> = self
+            .kube_clusters
+            .iter()
+            .enumerate()
+            .filter(|_| fleet.is_none() && !for_panel)
+            .filter(|(_, target)| {
+                tag.is_none_or(|tf| target.tags.iter().any(|t| t.eq_ignore_ascii_case(tf)))
+                    && (q.is_empty()
+                        || target.name.to_lowercase().contains(&q)
+                        || target.context.to_lowercase().contains(&q)
+                        || target.tags.iter().any(|t| t.to_lowercase().contains(&q)))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if !clusters.is_empty() {
+            rows.push(HostSelectRow::KubeHeader {
+                count: clusters.len(),
+            });
+            let base = 1 + self.ssh_targets.len();
+            rows.extend(clusters.into_iter().map(|cluster| HostSelectRow::Kube {
+                cluster,
+                selection: base + cluster,
+            }));
         }
         // Host groups (#432): fleet entry points, after every target. The
         // search matches the group name or its rule's tags; a tag filter
@@ -2294,25 +2456,30 @@ impl App {
             .map(|(i, _)| i)
             .collect();
         if !groups.is_empty() {
-            rows.push(HostSelectRow::GroupsHeader { count: groups.len() });
-            let base = 1 + self.ssh_targets.len();
-            rows.extend(
-                groups
-                    .into_iter()
-                    .map(|group| HostSelectRow::Group { group, selection: base + group }),
-            );
+            rows.push(HostSelectRow::GroupsHeader {
+                count: groups.len(),
+            });
+            let base = 1 + self.ssh_targets.len() + self.kube_clusters.len();
+            rows.extend(groups.into_iter().map(|group| HostSelectRow::Group {
+                group,
+                selection: base + group,
+            }));
         }
         rows
     }
 
     /// The overlay view under the current search/tag filters (#415).
     pub(crate) fn host_select_rows(&self) -> Vec<HostSelectRow> {
-        self.host_select_rows_filtered(&self.host_select_query, self.host_select_tag_filter.as_deref())
+        self.host_select_rows_filtered(
+            &self.host_select_query,
+            self.host_select_tag_filter.as_deref(),
+        )
     }
 
     /// Position of the row matching the flat `host_select_index`, if visible.
     pub(crate) fn host_select_visible_pos(&self, rows: &[HostSelectRow]) -> Option<usize> {
-        rows.iter().position(|r| r.selection_index() == Some(self.host_select_index))
+        rows.iter()
+            .position(|r| r.selection_index() == Some(self.host_select_index))
     }
 
     /// After a filter change: keep the cursor on a visible row — snap to the
@@ -2333,8 +2500,10 @@ impl App {
     /// matching the pre-#415 behavior).
     fn host_select_move(&mut self, delta: isize) {
         let rows = self.host_select_rows();
-        let selectable: Vec<usize> =
-            rows.iter().filter_map(HostSelectRow::selection_index).collect();
+        let selectable: Vec<usize> = rows
+            .iter()
+            .filter_map(HostSelectRow::selection_index)
+            .collect();
         let Some(pos) = selectable.iter().position(|&i| i == self.host_select_index) else {
             // Defensive: a filtered-out cursor snaps to the first row
             // (ensure_visible normally keeps this from happening).
@@ -2386,7 +2555,10 @@ impl App {
     fn select_host(&mut self) {
         // Rows are filtered by search/tag (#415); Enter with no visible
         // match must not select a filtered-out host.
-        if self.host_select_visible_pos(&self.host_select_rows()).is_none() {
+        if self
+            .host_select_visible_pos(&self.host_select_rows())
+            .is_none()
+        {
             return;
         }
         let idx = self.host_select_index;
@@ -2406,8 +2578,26 @@ impl App {
             return;
         }
 
+        let kube_base = 1 + self.ssh_targets.len();
+        let group_base = kube_base + self.kube_clusters.len();
+        // A cluster changes this tab immediately; namespace discovery and the
+        // live API connection are asynchronous runner work (#575).
+        if let Some(cluster) = idx.checked_sub(kube_base).filter(|_| idx < group_base) {
+            let Some(target) = self.kube_clusters.get(cluster).cloned() else {
+                return;
+            };
+            self.abandon_pending_connects();
+            self.tear_down_interactive_on_target_change();
+            self.ctrl_o_pending_tags = None;
+            self.ctrl_o_selection = None;
+            self.ssh_info = None;
+            self.cwd = None;
+            self.connecting = None;
+            self.activate_kube_target(target);
+            return;
+        }
         // A host group enters the fleet layer (#432).
-        if let Some(group) = idx.checked_sub(1 + self.ssh_targets.len()) {
+        if let Some(group) = idx.checked_sub(group_base) {
             if let Some(name) = self.host_groups.get(group).map(|g| g.name.clone()) {
                 self.enter_fleet(&name);
             }
@@ -2461,17 +2651,212 @@ impl App {
         }
     }
 
+    /// Refuse an action that would require a local or remote shell (#575).
+    fn refuse_kube_shell(&mut self) {
+        self.push_message(ChatBlock::System(KUBE_SHELL_REFUSAL.into()));
+    }
+
+    fn next_kube_id(&mut self) -> u64 {
+        let id = self.next_kube_connection_id;
+        self.next_kube_connection_id = self.next_kube_connection_id.wrapping_add(1);
+        id
+    }
+
+    /// Activate a configured target and ask for its namespace.
+    fn activate_kube_target(&mut self, target: filar_core::KubeCluster) {
+        let sid = self.active_session().id;
+        let connection_id = self.next_kube_id();
+        self.target_name = target.name.clone();
+        self.kube = Some(KubeTabState {
+            target: target.clone(),
+            namespace: None,
+            connection_id,
+        });
+        self.sync_confirm_mode();
+        if target.namespaces.is_empty() {
+            self.kube_namespace_select = Some(KubeNamespaceSelect {
+                session_id: sid,
+                connection_id,
+                namespaces: Vec::new(),
+                index: 0,
+                loading: true,
+                needs_connect: false,
+            });
+            self.pending_kube_connects.push(KubeConnectRequest {
+                session_id: sid,
+                target,
+                namespace: None,
+                connection_id,
+                discover: true,
+            });
+        } else {
+            let index = target
+                .default_namespace
+                .as_ref()
+                .and_then(|default| target.namespaces.iter().position(|ns| ns == default))
+                .unwrap_or(0);
+            self.kube_namespace_select = Some(KubeNamespaceSelect {
+                session_id: sid,
+                connection_id,
+                namespaces: target.namespaces.clone(),
+                index,
+                loading: false,
+                needs_connect: true,
+            });
+        }
+    }
+
+    /// Queue a direct cluster connection, replacing any older attempt.
+    fn queue_kube_connection(
+        &mut self,
+        target: filar_core::KubeCluster,
+        namespace: Option<String>,
+    ) {
+        let sid = self.active_session().id;
+        let connection_id = self.next_kube_id();
+        self.target_name = target.name.clone();
+        self.ssh_info = None;
+        self.cwd = None;
+        self.kube = Some(KubeTabState {
+            target: target.clone(),
+            namespace: namespace.clone(),
+            connection_id,
+        });
+        self.pending_kube_connects.push(KubeConnectRequest {
+            session_id: sid,
+            target,
+            namespace,
+            connection_id,
+            discover: false,
+        });
+        self.sync_confirm_mode();
+    }
+
+    /// Restore a cluster by configured name and reconnect to its saved namespace.
+    pub fn restore_kube_snapshot(&mut self, snapshot: filar_core::KubeSessionSnapshot) {
+        self.kube_namespace_select = None;
+        match self
+            .kube_clusters
+            .iter()
+            .find(|target| target.name == snapshot.target)
+            .cloned()
+        {
+            Some(target) => self.queue_kube_connection(target, snapshot.namespace),
+            None => {
+                self.kube = None;
+                self.push_error(format!(
+                    "Kubernetes cluster '{}' from the saved session is not configured",
+                    snapshot.target
+                ));
+            }
+        }
+    }
+
+    /// Whether an asynchronous result still belongs to the tab's current target.
+    pub fn kube_connection_is_current(&self, sid: SessionId, connection_id: u64) -> bool {
+        self.sessions.iter().any(|session| {
+            session.id == sid
+                && session
+                    .kube
+                    .as_ref()
+                    .is_some_and(|kube| kube.connection_id == connection_id)
+        })
+    }
+
+    /// Apply a successful connection or discovery result. Stale results return false.
+    pub fn complete_kube_connection(
+        &mut self,
+        sid: SessionId,
+        connection_id: u64,
+        namespaces: Vec<String>,
+    ) -> bool {
+        if !self.kube_connection_is_current(sid, connection_id) {
+            return false;
+        }
+        if self.kube_namespace_select.as_ref().is_some_and(|select| {
+            select.session_id == sid && select.connection_id == connection_id && select.loading
+        }) {
+            if namespaces.is_empty() {
+                self.kube_namespace_select = None;
+                self.push_kube_message(
+                    sid,
+                    ChatBlock::Error(
+                        "Kubernetes namespace discovery returned no accessible namespaces".into(),
+                    ),
+                );
+            } else if let Some(select) = self.kube_namespace_select.as_mut() {
+                select.namespaces = namespaces;
+                select.index = 0;
+                select.loading = false;
+            }
+        } else {
+            let label = self
+                .sessions
+                .iter()
+                .find(|session| session.id == sid)
+                .and_then(|session| session.kube.as_ref())
+                .map(|kube| {
+                    format!(
+                        "Connected to Kubernetes cluster {} ({})",
+                        kube.target.name,
+                        kube.namespace.as_deref().unwrap_or("all namespaces")
+                    )
+                })
+                .unwrap_or_else(|| "Connected to Kubernetes cluster".into());
+            self.push_kube_message(sid, ChatBlock::System(label));
+        }
+        true
+    }
+
+    /// Surface a connection/RBAC failure without destroying the cluster tab.
+    pub fn fail_kube_connection(&mut self, sid: SessionId, connection_id: u64, error: String) {
+        if !self.kube_connection_is_current(sid, connection_id) {
+            return;
+        }
+        if self
+            .kube_namespace_select
+            .as_ref()
+            .is_some_and(|select| select.session_id == sid && select.connection_id == connection_id)
+        {
+            self.kube_namespace_select = None;
+        }
+        self.push_kube_message(
+            sid,
+            ChatBlock::Error(format!("Kubernetes connection failed: {error}")),
+        );
+    }
+
+    fn push_kube_message(&mut self, sid: SessionId, message: ChatBlock) {
+        let Some(index) = self.find_session_idx(sid) else {
+            return;
+        };
+        let session = &mut self.sessions[index];
+        session.messages.push(message);
+        session.message_rev = session.message_rev.wrapping_add(1);
+        if index != self.active {
+            session.has_new = true;
+        }
+    }
+
     /// Open the file panels (Ctrl+G, #535): the left one on the local disk,
     /// the right one on the tab's host. A local or fleet tab has no host to
     /// show, so the host overlay opens for the right panel at once.
     pub fn open_file_panels(&mut self) {
+        if self.kube.is_some() {
+            self.refuse_kube_shell();
+            return;
+        }
         use crate::file_panels::{FilePanels, PanelSource, Side};
         let session = &self.sessions[self.active];
         let on_ssh = session.ssh_info.is_some() && session.fleet.is_none();
         let cwd = session.cwd.clone();
         let sid = session.id;
         let mut fp = FilePanels::new();
-        fp.set_source(Side::Left, PanelSource::Local, if on_ssh { None } else { cwd.clone() });
+        fp.set_source(
+            Side::Left,
+            PanelSource::Local,
+            if on_ssh { None } else { cwd.clone() },
+        );
         if on_ssh {
             fp.set_source(Side::Right, PanelSource::TabHost(sid), cwd);
         }
@@ -2520,7 +2905,8 @@ impl App {
     fn start_copy(&mut self, plan: crate::file_panels::CopyPlan) {
         if self.running_copy().is_some() {
             if let Some(fp) = self.file_panels.as_mut() {
-                fp.notice = Some("A copy is already running — wait for it or cancel it (Ctrl+Z)".into());
+                fp.notice =
+                    Some("A copy is already running — wait for it or cancel it (Ctrl+Z)".into());
             }
             return;
         }
@@ -2823,15 +3209,20 @@ impl App {
             }
         }
 
+        // A restored cluster is resolved only by its configured name. No
+        // kubeconfig path, credentials or live client is persisted (#575).
+        self.kube = None;
+        self.kube_namespace_select = None;
+        if let Some(snapshot) = session.kube.clone() {
+            self.restore_kube_snapshot(snapshot);
+            return;
+        }
+
         // SSH reconnect: parse the saved `ssh_info` and reconnect to the remote
         // host. If it matches a configured SSH target, route through the Ctrl+O
         // connect path so the password is auto-resolved from keyring/env (like
         // the launcher); otherwise fall back to the manual password prompt.
-        if let Some((user, host, port)) = session
-            .ssh_info
-            .as_deref()
-            .and_then(parse_ssh_info)
-        {
+        if let Some((user, host, port)) = session.ssh_info.as_deref().and_then(parse_ssh_info) {
             if let Some(pos) = self
                 .ssh_targets
                 .iter()
@@ -3081,7 +3472,10 @@ impl App {
         let op = session.fleet.as_ref()?;
         // The composition as the fleet has it — for a restored one, the saved
         // list with the hosts the config lost still in their places (#442).
-        let members: Vec<String> = session.fleet_snapshot().map(|s| s.hosts).unwrap_or_default();
+        let members: Vec<String> = session
+            .fleet_snapshot()
+            .map(|s| s.hosts)
+            .unwrap_or_default();
         // Which places of the saved list got no target. Positional, not by
         // name: with duplicate names only the occurrences past the ones
         // `FleetOperation::restore` could fill are gone (review) — it fills
@@ -3155,10 +3549,9 @@ impl App {
         let messages = self.full_history();
         let tx = tx.clone();
         // Resolve the export directory: configured `save_dir`, else CWD.
-        let base_dir = self
-            .save_dir
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+        let base_dir = self.save_dir.clone().unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
         // One folder per target (#400), decided from the host the tab is on
         // *now*: the sanitized display name, or `local` for local tabs. The
         // fleet layer saves under its group's name (#441), with every host's
@@ -3176,7 +3569,8 @@ impl App {
         if self.runbook_enabled {
             if self.runbook_state == Some(RunbookState::Generating) {
                 self.push_message(ChatBlock::System(
-                    "A runbook is already being generated — this export is saved without one.".into(),
+                    "A runbook is already being generated — this export is saved without one."
+                        .into(),
                 ));
             } else {
                 let profile = self
@@ -3245,10 +3639,12 @@ impl App {
             match tokio::fs::write(&filepath, &md_content).await {
                 Ok(_) => {
                     // Show the folder too — the layout is the point (#400).
-                    tx.send(SaveProgress::Done(format!("{dir_name}/{filename}"))).ok();
+                    tx.send(SaveProgress::Done(format!("{dir_name}/{filename}")))
+                        .ok();
                 }
                 Err(e) => {
-                    tx.send(SaveProgress::Error(format!("Failed to write file: {e}"))).ok();
+                    tx.send(SaveProgress::Error(format!("Failed to write file: {e}")))
+                        .ok();
                 }
             }
         });
@@ -3405,10 +3801,7 @@ impl App {
         // (new file; old empty-topic path is left unused). Compare via
         // `.{topic}.` marker so a fresh timestamp does not rewrite every save.
         let path = if let Some(topic) = topic_slug_from_messages(&messages) {
-            let current_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let current_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let topic_marker = format!(".{topic}.");
             if current_name.contains(&topic_marker) {
                 path
@@ -3452,7 +3845,8 @@ impl App {
                 }
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "transcript write failed");
-                    tx.send(SaveProgress::TranscriptDone(sid, Some(e.to_string()))).ok();
+                    tx.send(SaveProgress::TranscriptDone(sid, Some(e.to_string())))
+                        .ok();
                 }
             }
         });
@@ -3463,10 +3857,8 @@ impl App {
 
         // Helper: check if key is Ctrl+<english_char>, considering Russian layout.
         // On Russian ЙЦУКЕН layout, physical keys produce different characters.
-        let is_ctrl = |c: char| {
-            key.modifiers.contains(KeyModifiers::CONTROL)
-                && key.code == KeyCode::Char(c)
-        };
+        let is_ctrl =
+            |c: char| key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c);
         // Map English Ctrl shortcuts to both English and Russian layout chars.
         // Russian equivalents (ЙЦУКЕН): T=е, C=с, A=ф, D=в, Y=н, N=т, P=з,
         // Q=й, Z=я, W=ц, V=м
@@ -3484,7 +3876,72 @@ impl App {
                     self.save_overlay_visible = false;
                 }
                 KeyCode::Char('y' | 'Y' | 'н' | 'Н') if asking => self.answer_runbook_offer(true),
-                KeyCode::Char('n' | 'N' | 'т' | 'Т') if asking => self.answer_runbook_offer(false),
+                KeyCode::Char('n' | 'N' | 'т' | 'Т') if asking => {
+                    self.answer_runbook_offer(false)
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Namespace selection is modal: discovery must not leak late results
+        // after Esc, and global overlays must not steal its navigation (#575).
+        if self.kube_namespace_select.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    if let Some(select) = self.kube_namespace_select.take() {
+                        if select.loading {
+                            let next = self.next_kube_id();
+                            if let Some(session) = self
+                                .sessions
+                                .iter_mut()
+                                .find(|session| session.id == select.session_id)
+                            {
+                                if let Some(kube) = session.kube.as_mut() {
+                                    kube.connection_id = next;
+                                }
+                            }
+                        }
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(select) = self.kube_namespace_select.as_mut() {
+                        select.index = select.index.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(select) = self.kube_namespace_select.as_mut() {
+                        if select.index + 1 < select.namespaces.len() {
+                            select.index += 1;
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    let Some(select) = self.kube_namespace_select.clone() else {
+                        return;
+                    };
+                    if select.loading {
+                        return;
+                    }
+                    let Some(namespace) = select.namespaces.get(select.index).cloned() else {
+                        return;
+                    };
+                    self.kube_namespace_select = None;
+                    if select.needs_connect {
+                        let Some(target) = self.kube.as_ref().map(|kube| kube.target.clone())
+                        else {
+                            return;
+                        };
+                        self.queue_kube_connection(target, Some(namespace));
+                    } else {
+                        if let Some(kube) = self.kube.as_mut() {
+                            kube.namespace = Some(namespace.clone());
+                        }
+                        self.push_message(ChatBlock::System(format!(
+                            "Kubernetes namespace: {namespace}"
+                        )));
+                    }
+                }
                 _ => {}
             }
             return;
@@ -3577,7 +4034,10 @@ impl App {
         // PasswordInput modes. Interactive mode pastes into the PTY in its own
         // key handler (#494); in Thinking mode, the agent is running — no paste.
         if ctrl_key('v', 'м')
-            && matches!(self.mode, AppMode::Normal | AppMode::Confirming | AppMode::PasswordInput)
+            && matches!(
+                self.mode,
+                AppMode::Normal | AppMode::Confirming | AppMode::PasswordInput
+            )
         {
             if let Ok(mut clipboard) = arboard::Clipboard::new() {
                 if let Ok(text) = clipboard.get_text() {
@@ -3590,17 +4050,18 @@ impl App {
         }
 
         // Ctrl+L — cycle LLM profiles for this session.
-        if ctrl_key('l', 'д')
-            && self.mode == AppMode::Normal
-            && !self.profiles.is_empty()
-        {
+        if ctrl_key('l', 'д') && self.mode == AppMode::Normal && !self.profiles.is_empty() {
             let current = self.llm_profile.as_deref();
-            let idx = match self.profiles.iter()
+            let idx = match self
+                .profiles
+                .iter()
                 .position(|p| Some(p.name.as_str()) == current)
             {
                 Some(i) => (i + 1) % self.profiles.len(),
                 // First Ctrl+L: start from the default profile, not the last one.
-                None => self.profiles.iter()
+                None => self
+                    .profiles
+                    .iter()
                     .position(|p| p.name == self.default_profile_name)
                     .unwrap_or(0),
             };
@@ -3652,7 +4113,9 @@ impl App {
                 }
                 KeyCode::Enter => self.select_host(),
                 KeyCode::Char(c)
-                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.host_select_query.push(c);
                     self.host_select_ensure_visible();
@@ -3791,15 +4254,11 @@ impl App {
                 return;
             }
             // Ctrl+PageDown / Ctrl+PageUp — alternative tab switching.
-            if key.code == KeyCode::PageDown
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-            {
+            if key.code == KeyCode::PageDown && key.modifiers.contains(KeyModifiers::CONTROL) {
                 self.next_tab();
                 return;
             }
-            if key.code == KeyCode::PageUp
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-            {
+            if key.code == KeyCode::PageUp && key.modifiers.contains(KeyModifiers::CONTROL) {
                 self.prev_tab();
                 return;
             }
@@ -3824,20 +4283,21 @@ impl App {
                         }
                         self.history_pos = None;
                         if let Some(stripped) = text.strip_prefix('!') {
+                            if self.kube.is_some() {
+                                self.input.clear();
+                                self.cursor_pos = 0;
+                                self.refuse_kube_shell();
+                                return;
+                            }
                             let cmd = stripped.trim().to_string();
                             if !cmd.is_empty() {
                                 // Check if this is an SSH connection command.
                                 if let Some((user, host, port)) = parse_ssh_command(&cmd) {
-                                    self.pending_ssh = Some((
-                                        user.clone(),
-                                        host.clone(),
-                                        port,
-                                    ));
+                                    self.pending_ssh = Some((user.clone(), host.clone(), port));
                                     // Update session ssh_info immediately so
                                     // spawn_agent sees the correct is_local/ssh_info
                                     // even before TransportChanged arrives.
-                                    self.ssh_info =
-                                        Some(format!("{user}@{host}:{port}"));
+                                    self.ssh_info = Some(format!("{user}@{host}:{port}"));
                                     // A host matching a configured, policy-tagged
                                     // target folds its floor at once — but only
                                     // upward: the old transport keeps running
@@ -3875,7 +4335,7 @@ impl App {
                                         output: None,
                                         approved: true,
                                         tool: None,
-        });
+                                    });
                                     self.scroll = 0;
                                     self.input.clear();
                                     self.cursor_pos = 0;
@@ -3892,6 +4352,10 @@ impl App {
                     }
                 }
                 _ if ctrl_key('t', 'е') => {
+                    if self.kube.is_some() {
+                        self.refuse_kube_shell();
+                        return;
+                    }
                     // If the active session already has a live terminal,
                     // show it instead of creating a new one.
                     if self.terminal.is_some() {
@@ -3925,8 +4389,7 @@ impl App {
                             self.cursor_pos,
                         )
                     {
-                        self.pending_path_picker =
-                            Some(crate::path_picker::PathPickerKind::File);
+                        self.pending_path_picker = Some(crate::path_picker::PathPickerKind::File);
                     } else {
                         self.insert_char(c);
                     }
@@ -4016,17 +4479,27 @@ impl App {
                     // Toggle between Approve and Deny.
                     self.confirm_selected = !self.confirm_selected;
                 }
-                KeyCode::Char('a') | KeyCode::Char('y') | KeyCode::Char('e')
-                | KeyCode::Char('ф') | KeyCode::Char('н') | KeyCode::Char('у') => {
+                KeyCode::Char('a')
+                | KeyCode::Char('y')
+                | KeyCode::Char('e')
+                | KeyCode::Char('ф')
+                | KeyCode::Char('н')
+                | KeyCode::Char('у') => {
                     self.respond_to_confirmation(true);
                 }
-                KeyCode::Char('d') | KeyCode::Char('n')
-                | KeyCode::Char('в') | KeyCode::Char('т') => {
+                KeyCode::Char('d')
+                | KeyCode::Char('n')
+                | KeyCode::Char('в')
+                | KeyCode::Char('т') => {
                     self.respond_to_confirmation(false);
                 }
                 // Expand / collapse the fleet radius (#435).
                 KeyCode::Char('l') | KeyCode::Char('д') => {
-                    if let Some(p) = self.pending_confirm.as_mut().filter(|p| !p.radius.is_empty()) {
+                    if let Some(p) = self
+                        .pending_confirm
+                        .as_mut()
+                        .filter(|p| !p.radius.is_empty())
+                    {
                         p.radius_expanded = !p.radius_expanded;
                     }
                 }
@@ -4163,9 +4636,10 @@ impl App {
                                  Use this variable directly in your commands.",
                                 var_name
                             );
-                            self.push_message(ChatBlock::System(
-                                format!("Password provided as {} (hidden)", var_name)
-                            ));
+                            self.push_message(ChatBlock::System(format!(
+                                "Password provided as {} (hidden)",
+                                var_name
+                            )));
                             self.scroll = 0;
                             self.input.clear();
                             self.cursor_pos = 0;
@@ -4228,11 +4702,7 @@ impl App {
         }
         // Borderless layout: full height is the visible height.
         let visible_height = self.chat_area.height as usize;
-        let max_scroll = self
-            .layout_cache
-            .lines
-            .len()
-            .saturating_sub(visible_height);
+        let max_scroll = self.layout_cache.lines.len().saturating_sub(visible_height);
         if self.scroll > max_scroll {
             self.scroll = max_scroll;
         }
@@ -4341,7 +4811,10 @@ impl App {
                                     // Only toggle for Command blocks with output.
                                     if matches!(
                                         self.messages.get(block_idx),
-                                        Some(ChatBlock::Command { output: Some(_), .. })
+                                        Some(ChatBlock::Command {
+                                            output: Some(_),
+                                            ..
+                                        })
                                     ) {
                                         self.toggle_collapse(block_idx);
                                         return;
@@ -4356,7 +4829,9 @@ impl App {
                     let char_col = (m.column.saturating_sub(self.chat_area.x)) as usize;
                     // Detect double/triple click (< 400 ms, same position).
                     let now = Instant::now();
-                    let is_repeat = self.last_click_time.is_some_and(|t| now.duration_since(t) < Duration::from_millis(400))
+                    let is_repeat = self
+                        .last_click_time
+                        .is_some_and(|t| now.duration_since(t) < Duration::from_millis(400))
                         && self.last_click_pos == Some((line_idx, char_col));
                     if is_repeat {
                         self.click_count = (self.click_count % 3) + 1;
@@ -4380,8 +4855,10 @@ impl App {
                         _ => {
                             // Single click — start char selection.
                             self.selection = Some(Selection {
-                                anchor_line: line_idx, anchor_col: char_col,
-                                head_line: line_idx, head_col: char_col,
+                                anchor_line: line_idx,
+                                anchor_col: char_col,
+                                head_line: line_idx,
+                                head_col: char_col,
                             });
                             self.mouse_drag = Some(DragKind::Selection);
                         }
@@ -4460,9 +4937,8 @@ impl App {
         // Detect scrollbar column: rightmost column of the terminal area.
         // Mouse events on the scrollbar are intercepted before forwarding to PTY.
         let scrollbar_col = area.x + area.width - 1;
-        let on_scrollbar = m.column == scrollbar_col
-            && m.row >= area.y
-            && m.row < area.y + area.height;
+        let on_scrollbar =
+            m.column == scrollbar_col && m.row >= area.y && m.row < area.y + area.height;
 
         let dragging_scrollbar = self.mouse_drag == Some(DragKind::Scrollbar);
         if on_scrollbar || dragging_scrollbar {
@@ -4621,7 +5097,9 @@ impl App {
                 }
             }
             HelpAction::Terminal => {
-                if self.in_fleet() {
+                if self.kube.is_some() {
+                    self.refuse_kube_shell();
+                } else if self.in_fleet() {
                     self.fleet_refusal(FleetRefusal::Terminal);
                 } else if self.connecting.is_some() {
                     self.push_message(ChatBlock::System(
@@ -4822,7 +5300,9 @@ impl App {
         if area.height < 2 {
             return;
         }
-        let Some(ref mut t) = self.terminal else { return };
+        let Some(ref mut t) = self.terminal else {
+            return;
+        };
         let visible_height = (area.height as usize).min(t.rows() as usize);
         if visible_height < 2 {
             return;
@@ -4876,7 +5356,10 @@ impl App {
         if col >= self.chat_area.x + self.chat_area.width - 1 {
             return None;
         }
-        if col < self.chat_area.x || row < self.chat_area.y || row >= self.chat_area.y + self.chat_area.height {
+        if col < self.chat_area.x
+            || row < self.chat_area.y
+            || row >= self.chat_area.y + self.chat_area.height
+        {
             return None;
         }
         let visible_height = self.chat_area.height as usize;
@@ -4933,7 +5416,13 @@ impl App {
                 // Single-line selection
                 let s = start_col.min(text.chars().count());
                 let e = end_col.min(text.chars().count());
-                result.push_str(&text.chars().skip(s).take(e.saturating_sub(s)).collect::<String>());
+                result.push_str(
+                    &text
+                        .chars()
+                        .skip(s)
+                        .take(e.saturating_sub(s))
+                        .collect::<String>(),
+                );
             } else if line_idx == start_line {
                 let s = start_col.min(text.chars().count());
                 result.push_str(&text.chars().skip(s).collect::<String>());
@@ -4947,7 +5436,11 @@ impl App {
                 result.push('\n');
             }
         }
-        if result.is_empty() { None } else { Some(result) }
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
     }
 
     /// Extract selected text from the interactive terminal grid.
@@ -4974,7 +5467,11 @@ impl App {
                 result.push('\n');
             }
         }
-        if result.is_empty() { None } else { Some(result) }
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
     }
 
     /// Copy the current selection to the system clipboard.
@@ -5006,8 +5503,10 @@ impl App {
         let char_count = text.chars().count();
         if char_count == 0 {
             self.selection = Some(Selection {
-                anchor_line: line_idx, anchor_col: 0,
-                head_line: line_idx, head_col: 0,
+                anchor_line: line_idx,
+                anchor_col: 0,
+                head_line: line_idx,
+                head_col: 0,
             });
             return;
         }
@@ -5026,8 +5525,10 @@ impl App {
             end += 1;
         }
         self.selection = Some(Selection {
-            anchor_line: line_idx, anchor_col: start,
-            head_line: line_idx, head_col: end,
+            anchor_line: line_idx,
+            anchor_col: start,
+            head_line: line_idx,
+            head_col: end,
         });
     }
 
@@ -5035,15 +5536,21 @@ impl App {
     fn select_line(&mut self, line_idx: usize) {
         let char_count = self.line_text(line_idx).chars().count();
         self.selection = Some(Selection {
-            anchor_line: line_idx, anchor_col: 0,
-            head_line: line_idx, head_col: char_count,
+            anchor_line: line_idx,
+            anchor_col: 0,
+            head_line: line_idx,
+            head_col: char_count,
         });
     }
 
     /// Whether the toast is still active (not expired).
     pub fn toast_text(&self) -> Option<&str> {
         self.toast.as_ref().and_then(|(text, expiry)| {
-            if *expiry > Instant::now() { Some(text.as_str()) } else { None }
+            if *expiry > Instant::now() {
+                Some(text.as_str())
+            } else {
+                None
+            }
         })
     }
 
@@ -5053,6 +5560,7 @@ impl App {
     fn expects_safety_rating(&self, tool: &filar_core::ToolInvocation) -> bool {
         self.risk_scorer_on
             && !self.in_fleet()
+            && !tool.name.starts_with("k8s_")
             && tool.name != filar_agent::tools::TOOL_BACKGROUND_JOB_STATUS
             && tool.name != filar_agent::tools::TOOL_LIST_BACKGROUND_JOBS
     }
@@ -5138,8 +5646,12 @@ impl App {
     /// keeps one line per operation rather than a sheet of text.
     fn default_collapsed_for(msg: &ChatBlock, fleet: bool) -> bool {
         match msg {
-            ChatBlock::Command { output: Some(out), .. } if fleet => out.lines().count() > 1,
-            ChatBlock::Command { output: Some(out), .. } => out.lines().count() > 6,
+            ChatBlock::Command {
+                output: Some(out), ..
+            } if fleet => out.lines().count() > 1,
+            ChatBlock::Command {
+                output: Some(out), ..
+            } => out.lines().count() > 6,
             ChatBlock::Summary { .. } => true,
             _ => false,
         }
@@ -5158,7 +5670,11 @@ impl App {
                     .get(&idx)
                     .copied()
                     .unwrap_or_else(|| Self::default_collapsed_for(msg, fleet));
-                if is_collapsed { Some(idx) } else { None }
+                if is_collapsed {
+                    Some(idx)
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -5226,7 +5742,10 @@ impl App {
 
         let mut auto_scroll = true;
         match event {
-            TuiEvent::Agent { session_id, event: agent_event } => match agent_event {
+            TuiEvent::Agent {
+                session_id,
+                event: agent_event,
+            } => match agent_event {
                 filar_agent::AgentEvent::Started => {
                     self.mode = AppMode::Thinking;
                     self.active_session_mut().background_activity = true;
@@ -5268,7 +5787,11 @@ impl App {
                     unavailable,
                 } => {
                     let score = match safety_pct {
-                        Some(pct) if !unavailable => SafetyScore::Ready { pct, confidence, model },
+                        Some(pct) if !unavailable => SafetyScore::Ready {
+                            pct,
+                            confidence,
+                            model,
+                        },
                         _ => SafetyScore::Unavailable { model },
                     };
                     if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
@@ -5296,7 +5819,11 @@ impl App {
                         unavailable,
                     });
                 }
-                filar_agent::AgentEvent::CommandFinished { command, output, denied } => {
+                filar_agent::AgentEvent::CommandFinished {
+                    command,
+                    output,
+                    denied,
+                } => {
                     if !denied {
                         self.streaming = false;
                         auto_scroll = self.scroll == 0;
@@ -5364,7 +5891,9 @@ impl App {
                 filar_agent::AgentEvent::Finished(text) => {
                     if self.streaming {
                         if !text.is_empty() {
-                            if let Some(ChatBlock::Agent(ref mut existing)) = self.messages.last_mut() {
+                            if let Some(ChatBlock::Agent(ref mut existing)) =
+                                self.messages.last_mut()
+                            {
                                 *existing = text;
                                 self.message_rev = self.message_rev.wrapping_add(1);
                             } else {
@@ -5381,7 +5910,13 @@ impl App {
                     self.cancellation = None;
                     self.active_session_mut().background_activity = false;
                 }
-                filar_agent::AgentEvent::TokenUsage { tokens_in, tokens_out, cost, model, arbiter } => {
+                filar_agent::AgentEvent::TokenUsage {
+                    tokens_in,
+                    tokens_out,
+                    cost,
+                    model,
+                    arbiter,
+                } => {
                     if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                         if arbiter {
                             s.arbiter_tokens_in += tokens_in;
@@ -5433,8 +5968,7 @@ impl App {
                     self.cancellation = None;
                     self.active_session_mut().background_activity = false;
                 }
-                filar_agent::AgentEvent::Cancelled => {
-                }
+                filar_agent::AgentEvent::Cancelled => {}
                 _ => {}
             },
             TuiEvent::Thinking => {
@@ -5508,7 +6042,9 @@ impl App {
             // Dispatch above already switched to the originating session, so
             // a summary that arrives while the user is on another tab still
             // lands on the history it was made from (#377).
-            TuiEvent::CompactionStarted { boundary, epoch, .. } => {
+            TuiEvent::CompactionStarted {
+                boundary, epoch, ..
+            } => {
                 // The boundary was computed inside the runner, so it is only
                 // meaningful against the history it was computed from. The
                 // epoch changes when that history is replaced or the run is
@@ -5517,7 +6053,11 @@ impl App {
                 if epoch == s.history_epoch && boundary > 0 && boundary <= s.messages.len() {
                     self.active_session_mut().pending_compaction = Some(boundary);
                 } else {
-                    tracing::debug!(boundary, epoch, "ignoring a reactive compaction for a history that has moved");
+                    tracing::debug!(
+                        boundary,
+                        epoch,
+                        "ignoring a reactive compaction for a history that has moved"
+                    );
                 }
             }
             TuiEvent::Notice { text, .. } => {
@@ -5560,7 +6100,13 @@ impl App {
                 }
                 auto_scroll = false;
             }
-            TuiEvent::HistoryCompacted { boundary, summary, usage, profile, .. } => {
+            TuiEvent::HistoryCompacted {
+                boundary,
+                summary,
+                usage,
+                profile,
+                ..
+            } => {
                 // Counted here, before the summary is judged: the tokens were
                 // spent by the time this event exists, so an unusable summary
                 // and one that no longer fits the history are both owed for.
@@ -5625,9 +6171,7 @@ impl App {
     pub fn exit_interactive(&mut self) {
         self.terminal = None;
         self.mode = AppMode::Normal;
-        self.push_message(ChatBlock::System(
-            "Returned to agent mode".into(),
-        ));
+        self.push_message(ChatBlock::System("Returned to agent mode".into()));
     }
 
     /// Hide the interactive view, keeping the terminal alive in the background.
@@ -5678,8 +6222,7 @@ impl App {
         let is_remote = session.ssh_info.is_some();
         self.path_picker_kind = kind;
         self.path_picker_remote = is_remote;
-        self.path_picker_dir =
-            crate::path_picker::initial_picker_dir(&session.cwd, is_remote);
+        self.path_picker_dir = crate::path_picker::initial_picker_dir(&session.cwd, is_remote);
         self.path_picker_index = 0;
         self.path_picker_entries.clear();
         self.path_picker_loading = true;
@@ -5730,7 +6273,11 @@ impl App {
     }
 
     fn path_picker_activate(&mut self) {
-        let Some(entry) = self.path_picker_entries.get(self.path_picker_index).cloned() else {
+        let Some(entry) = self
+            .path_picker_entries
+            .get(self.path_picker_index)
+            .cloned()
+        else {
             return;
         };
         let remote = self.path_picker_remote;
@@ -5743,12 +6290,10 @@ impl App {
         if entry.is_dir {
             // Enter opens a folder in both pickers (#483): a folder deep in
             // the tree is reached with Enter and picked with `a`.
-            let path =
-                crate::path_picker::join_path(&self.path_picker_dir, &entry.name, remote);
+            let path = crate::path_picker::join_path(&self.path_picker_dir, &entry.name, remote);
             self.path_picker_navigate(path);
         } else if self.path_picker_kind == crate::path_picker::PathPickerKind::File {
-            let path =
-                crate::path_picker::join_path(&self.path_picker_dir, &entry.name, remote);
+            let path = crate::path_picker::join_path(&self.path_picker_dir, &entry.name, remote);
             self.insert_path_string_at_cursor(&path);
             self.close_path_picker();
         }
@@ -5758,13 +6303,21 @@ impl App {
     /// close. On `..` it is the folder being shown — the only way to pick the
     /// one you have just entered. A file is ignored (Enter picks files).
     fn path_picker_pick_folder(&mut self) {
-        let Some(entry) = self.path_picker_entries.get(self.path_picker_index).cloned() else {
+        let Some(entry) = self
+            .path_picker_entries
+            .get(self.path_picker_index)
+            .cloned()
+        else {
             return;
         };
         let path = if entry.name == ".." {
             self.path_picker_dir.clone()
         } else if entry.is_dir {
-            crate::path_picker::join_path(&self.path_picker_dir, &entry.name, self.path_picker_remote)
+            crate::path_picker::join_path(
+                &self.path_picker_dir,
+                &entry.name,
+                self.path_picker_remote,
+            )
         } else {
             return;
         };
@@ -5912,7 +6465,10 @@ pub(crate) fn test_fleet_app(view: filar_agent::fleet_view::FleetView) -> App {
         host: format!("{name}.example"),
         port: 22,
         user: "ops".into(),
-        auth: filar_core::SshAuth::Key { path: None, passphrase: None },
+        auth: filar_core::SshAuth::Key {
+            path: None,
+            passphrase: None,
+        },
         host_key_policy: filar_core::HostKeyPolicy::Tofu,
         tags: vec!["web".into()],
     };
@@ -5993,9 +6549,7 @@ impl FleetRefusal {
             FleetRefusal::Password => {
                 "Passwords are per host: store it in the OS keyring, or use Ctrl+O."
             }
-            FleetRefusal::PathPicker => {
-                "Paths differ per host: open one with Ctrl+O to browse it."
-            }
+            FleetRefusal::PathPicker => "Paths differ per host: open one with Ctrl+O to browse it.",
             FleetRefusal::SessionRestore => {
                 "Session restore is per tab: press F3 on an ordinary tab."
             }
@@ -6094,7 +6648,8 @@ impl App {
 
     /// The open fleet operation, shown or not.
     pub fn fleet(&self) -> Option<&filar_core::FleetOperation> {
-        self.fleet_index().and_then(|i| self.sessions[i].fleet.as_ref())
+        self.fleet_index()
+            .and_then(|i| self.sessions[i].fleet.as_ref())
     }
 
     /// Enter the fleet layer over the group `group_name` (#432).
@@ -6104,8 +6659,15 @@ impl App {
     /// the open fleet; another group replaces it — one fleet at a time.
     /// Returns whether the fleet layer is now on screen.
     pub fn enter_fleet(&mut self, group_name: &str) -> bool {
-        let Some(group) = self.host_groups.iter().find(|g| g.name == group_name).cloned() else {
-            self.push_message(ChatBlock::System(format!("Unknown host group: {group_name}")));
+        let Some(group) = self
+            .host_groups
+            .iter()
+            .find(|g| g.name == group_name)
+            .cloned()
+        else {
+            self.push_message(ChatBlock::System(format!(
+                "Unknown host group: {group_name}"
+            )));
             return false;
         };
         self.remember_return_tab();
@@ -6130,8 +6692,12 @@ impl App {
             .map(str::to_string)
             .or_else(|| base.llm_profile.clone());
         // Each host's own secret, looked up once, now (#436).
-        let creds = filar_agent::fleet_creds::FleetCredentials::resolve(&op, &*self.credential_store);
-        session.messages = fleet_intro(&op, &creds).into_iter().map(ChatBlock::System).collect();
+        let creds =
+            filar_agent::fleet_creds::FleetCredentials::resolve(&op, &*self.credential_store);
+        session.messages = fleet_intro(&op, &creds)
+            .into_iter()
+            .map(ChatBlock::System)
+            .collect();
         session.cwd = None;
         session.fleet = Some(op);
         session.fleet_credentials = Some(creds);
@@ -6154,7 +6720,11 @@ impl App {
         let Some(snapshot) = saved.fleet.clone() else {
             return false;
         };
-        let configured = self.host_groups.iter().find(|g| g.name == snapshot.group).cloned();
+        let configured = self
+            .host_groups
+            .iter()
+            .find(|g| g.name == snapshot.group)
+            .cloned();
         let group_gone = configured.is_none();
         let group = configured.unwrap_or_else(|| filar_core::HostGroup {
             name: snapshot.group.clone(),
@@ -6182,7 +6752,8 @@ impl App {
             .clone()
             .or_else(|| op.llm_profile().map(str::to_string))
             .or_else(|| base.llm_profile.clone());
-        let creds = filar_agent::fleet_creds::FleetCredentials::resolve(&op, &*self.credential_store);
+        let creds =
+            filar_agent::fleet_creds::FleetCredentials::resolve(&op, &*self.credential_store);
 
         let mut messages = saved.messages;
         messages.push(ChatBlock::System(format!(
@@ -6280,9 +6851,11 @@ impl App {
     pub fn fleet_radius(&self) -> Vec<String> {
         let session = self.active_session();
         match (&session.fleet, &session.fleet_credentials) {
-            (Some(op), Some(creds)) => {
-                creds.participants(op).into_iter().map(str::to_string).collect()
-            }
+            (Some(op), Some(creds)) => creds
+                .participants(op)
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -6345,7 +6918,6 @@ impl App {
 
 /// Lines of output tail kept per host for the side panel.
 const OPS_TAIL_LINES: usize = 200;
-
 
 impl App {
     /// Refresh [`App::operations`] from the agent's background-job registry.
@@ -6419,8 +6991,7 @@ impl App {
     /// runner polls the registry only then, so an idle TUI stays idle.
     pub fn operations_need_refresh(&self) -> bool {
         self.operations.iter().any(|op| {
-            op.state() == crate::ops::HostOpState::Running
-                || op.hosts.iter().any(|h| !h.settled)
+            op.state() == crate::ops::HostOpState::Running || op.hosts.iter().any(|h| !h.settled)
         })
     }
 
@@ -6445,7 +7016,10 @@ impl App {
 
     /// Selectable rows of what the panel shows.
     fn panel_rows(&self) -> usize {
-        match (self.panel_content(), self.active_session().fleet_view.as_ref()) {
+        match (
+            self.panel_content(),
+            self.active_session().fleet_view.as_ref(),
+        ) {
             (crate::side_panel::PanelContent::FleetSummary, Some(view)) => {
                 crate::side_panel::summary_rows(view).len()
             }
@@ -6597,7 +7171,12 @@ fn truncate_pwd(pwd: &str, max: usize) -> String {
     if chars.len() <= max {
         pwd.to_string()
     } else {
-        format!("…{}", chars[chars.len() - (max.saturating_sub(1))..].iter().collect::<String>())
+        format!(
+            "…{}",
+            chars[chars.len() - (max.saturating_sub(1))..]
+                .iter()
+                .collect::<String>()
+        )
     }
 }
 
@@ -6633,23 +7212,60 @@ fn parse_ssh_info(info: &str) -> Option<(String, String, u16)> {
 /// Check if a command is interactive (would hang the executor waiting for input).
 /// These commands take over the terminal and never produce the expected marker.
 fn is_interactive_command(cmd: &str) -> bool {
-    let first_word = cmd.split_whitespace().next().unwrap_or("").trim_start_matches("./");
+    let first_word = cmd
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_start_matches("./");
     // Strip path prefix (e.g. /usr/bin/vim → vim).
     let prog = first_word.rsplit('/').next().unwrap_or(first_word);
     matches!(
         prog,
-        "vim" | "vi" | "nano" | "emacs" | "pico" | "ed"
-        | "top" | "htop" | "btop" | "btop++" | "glances" | "atop"
-        | "less" | "more" | "most"
-        | "man" | "info"
-        | "mc" | "midnight"
-        | "screen" | "tmux"
-        | "passwd" | "chsh" | "chfn"
-        | "telnet" | "ftp" | "sftp" | "nc" | "ncat"
-        | "mysql" | "psql" | "sqlite3" | "redis-cli"
-        | "python" | "python3" | "node" | "irb" | "pry"
-        | "bash" | "sh" | "zsh" | "fish" | "dash"
-        | "su" | "sudo"  // sudo can be interactive (e.g. sudo -i)
+        "vim"
+            | "vi"
+            | "nano"
+            | "emacs"
+            | "pico"
+            | "ed"
+            | "top"
+            | "htop"
+            | "btop"
+            | "btop++"
+            | "glances"
+            | "atop"
+            | "less"
+            | "more"
+            | "most"
+            | "man"
+            | "info"
+            | "mc"
+            | "midnight"
+            | "screen"
+            | "tmux"
+            | "passwd"
+            | "chsh"
+            | "chfn"
+            | "telnet"
+            | "ftp"
+            | "sftp"
+            | "nc"
+            | "ncat"
+            | "mysql"
+            | "psql"
+            | "sqlite3"
+            | "redis-cli"
+            | "python"
+            | "python3"
+            | "node"
+            | "irb"
+            | "pry"
+            | "bash"
+            | "sh"
+            | "zsh"
+            | "fish"
+            | "dash"
+            | "su"
+            | "sudo" // sudo can be interactive (e.g. sudo -i)
     )
 }
 
@@ -6664,7 +7280,7 @@ fn is_interactive_command(cmd: &str) -> bool {
 /// Format: `\x1b[<{button};{x};{y}M` for press/motion, `\x1b[<{button};{x};{y}m`
 /// for release.  Coordinates are 1-based.
 fn encode_sgr_mouse(m: &crossterm::event::MouseEvent, x: usize, y: usize) -> Option<Vec<u8>> {
-    use crossterm::event::{MouseButton, MouseEventKind, KeyModifiers};
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 
     // Base button code.
     let (button, is_release) = match m.kind {
@@ -6696,8 +7312,10 @@ fn encode_sgr_mouse(m: &crossterm::event::MouseEvent, x: usize, y: usize) -> Opt
     }
 
     let suffix = if is_release { b'm' } else { b'M' };
-    Some(format!("\x1b[<{code};{x};{y}").into_bytes())
-        .map(|mut v| { v.push(suffix); v })
+    Some(format!("\x1b[<{code};{x};{y}").into_bytes()).map(|mut v| {
+        v.push(suffix);
+        v
+    })
 }
 
 /// Encode a crossterm mouse event using the legacy (pre-SGR) encoding.
@@ -6707,7 +7325,7 @@ fn encode_sgr_mouse(m: &crossterm::event::MouseEvent, x: usize, y: usize) -> Opt
 ///
 /// Returns `None` for event types that don't have a standard encoding.
 fn encode_legacy_mouse(m: &crossterm::event::MouseEvent, x: usize, y: usize) -> Option<Vec<u8>> {
-    use crossterm::event::{MouseButton, MouseEventKind, KeyModifiers};
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 
     // Base button code (same as SGR for the low bits).
     let button = match m.kind {
@@ -6747,6 +7365,7 @@ fn encode_legacy_mouse(m: &crossterm::event::MouseEvent, x: usize, y: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn app_new_initializes_correctly() {
@@ -6786,7 +7405,10 @@ mod tests {
             host: format!("{name}.example"),
             port: 22,
             user: "ops".into(),
-            auth: filar_core::SshAuth::Key { path: None, passphrase: None },
+            auth: filar_core::SshAuth::Key {
+                path: None,
+                passphrase: None,
+            },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
             tags: tags.iter().map(|s| (*s).to_string()).collect(),
         }
@@ -6827,7 +7449,11 @@ mod tests {
         let names: Vec<&str> = fleet.members().iter().map(|m| m.name()).collect();
         assert_eq!(names, ["web-1", "web-2"]);
         // Ordinary tabs are untouched and the fleet gets no executor.
-        let tabs_after: Vec<SessionId> = app.tab_indices().iter().map(|&i| app.sessions[i].id).collect();
+        let tabs_after: Vec<SessionId> = app
+            .tab_indices()
+            .iter()
+            .map(|&i| app.sessions[i].id)
+            .collect();
         assert_eq!(tabs_after, tabs_before);
         assert!(app.take_pending_local_executors().is_empty());
         assert_eq!(executors_before, 1);
@@ -6840,15 +7466,31 @@ mod tests {
         let mut app = app_with_groups();
         app.enter_fleet("web");
         let before = app.messages.len();
-        assert_eq!(app.panel_content(), crate::side_panel::PanelContent::Operations);
+        assert_eq!(
+            app.panel_content(),
+            crate::side_panel::PanelContent::Operations
+        );
         let sid = app.sessions[app.active].id;
-        app.handle_agent_event(TuiEvent::FleetSummary { session_id: sid, view: test_fleet_view() });
-        assert_eq!(app.messages.len(), before, "host output never enters the feed or history");
-        assert_eq!(app.panel_content(), crate::side_panel::PanelContent::FleetSummary);
+        app.handle_agent_event(TuiEvent::FleetSummary {
+            session_id: sid,
+            view: test_fleet_view(),
+        });
+        assert_eq!(
+            app.messages.len(),
+            before,
+            "host output never enters the feed or history"
+        );
+        assert_eq!(
+            app.panel_content(),
+            crate::side_panel::PanelContent::FleetSummary
+        );
         assert!(app.panel_has_content(), "a wide terminal docks the table");
         // Outside the fleet the panel keeps showing operations.
         app.leave_fleet_view();
-        assert_eq!(app.panel_content(), crate::side_panel::PanelContent::Operations);
+        assert_eq!(
+            app.panel_content(),
+            crate::side_panel::PanelContent::Operations
+        );
     }
 
     #[test]
@@ -6860,7 +7502,10 @@ mod tests {
         let mut app = test_fleet_app(newer);
         let sid = app.sessions[app.active].id;
         // A cancelled run winding down reports after the next one did (#437).
-        app.handle_agent_event(TuiEvent::FleetSummary { session_id: sid, view: older });
+        app.handle_agent_event(TuiEvent::FleetSummary {
+            session_id: sid,
+            view: older,
+        });
         let shown = app.active_session().fleet_view.as_ref().expect("view");
         assert_eq!(shown.command, "uname -r", "the newer summary stays");
     }
@@ -6877,7 +7522,10 @@ mod tests {
         assert_eq!(app.side_panel.scroll, 0);
         app.handle_key(key(crossterm::event::KeyCode::PageDown));
         app.handle_key(key(crossterm::event::KeyCode::Down));
-        assert_eq!(app.side_panel.scroll, 0, "a new selection starts at its own row");
+        assert_eq!(
+            app.side_panel.scroll, 0,
+            "a new selection starts at its own row"
+        );
     }
 
     #[test]
@@ -6888,9 +7536,15 @@ mod tests {
         app.handle_key(key(crossterm::event::KeyCode::Down));
         assert_eq!(app.side_panel.selected, 1);
         app.handle_key(key(crossterm::event::KeyCode::Enter));
-        assert!(app.side_panel.expanded.contains(&1), "Enter expands the second group");
+        assert!(
+            app.side_panel.expanded.contains(&1),
+            "Enter expands the second group"
+        );
         app.handle_key(key(crossterm::event::KeyCode::Enter));
-        assert!(!app.side_panel.expanded.contains(&1), "and collapses it again");
+        assert!(
+            !app.side_panel.expanded.contains(&1),
+            "and collapses it again"
+        );
         // A dropped host has nothing to expand.
         app.handle_key(key(crossterm::event::KeyCode::Down));
         app.handle_key(key(crossterm::event::KeyCode::Enter));
@@ -6903,12 +7557,17 @@ mod tests {
         app.push_message(ChatBlock::Command {
             command: "uname -r".into(),
             explanation: String::new(),
-            output: Some("operation #3: 3 of 3 hosts answered\noperation #3 · ad-hoc\nsame on 3".into()),
+            output: Some(
+                "operation #3: 3 of 3 hosts answered\noperation #3 · ad-hoc\nsame on 3".into(),
+            ),
             approved: true,
             tool: None,
         });
         let idx = app.messages.len() - 1;
-        assert!(app.collapsed_set().contains(&idx), "collapsed to its headline in the fleet");
+        assert!(
+            app.collapsed_set().contains(&idx),
+            "collapsed to its headline in the fleet"
+        );
     }
 
     // ── Fleet cancellation (#437) ───────────────────────────────────
@@ -6933,7 +7592,9 @@ mod tests {
         app.handle_key(ctrl_key('z'));
         assert!(token.is_cancelled(), "the fleet run is told to stop");
         assert_eq!(app.mode, AppMode::Normal);
-        assert!(matches!(app.messages.last(), Some(ChatBlock::System(s)) if s.contains("running ones get Ctrl-C")));
+        assert!(
+            matches!(app.messages.last(), Some(ChatBlock::System(s)) if s.contains("running ones get Ctrl-C"))
+        );
 
         // The partial summary arrives after the cancellation and fills the
         // command block that was waiting for it, not a second one.
@@ -6942,7 +7603,8 @@ mod tests {
             session_id: sid,
             event: filar_agent::AgentEvent::CommandFinished {
                 command: "uname -r".into(),
-                output: "operation #7: 1 of 2 hosts answered, 0 did not answer — 1 ok, 1 cancelled".into(),
+                output: "operation #7: 1 of 2 hosts answered, 0 did not answer — 1 ok, 1 cancelled"
+                    .into(),
                 denied: false,
             },
         });
@@ -6955,7 +7617,9 @@ mod tests {
             })
             .collect();
         assert_eq!(commands.len(), 1, "one block for one command");
-        assert!(commands[0].as_deref().is_some_and(|o| o.contains("1 cancelled")));
+        assert!(commands[0]
+            .as_deref()
+            .is_some_and(|o| o.contains("1 cancelled")));
     }
 
     // ── Fleet credentials (#436) ────────────────────────────────────
@@ -6968,7 +7632,11 @@ mod tests {
             auth: filar_core::SshAuth::Password { password: None },
             ..fleet_target(name, &["web"])
         };
-        app.ssh_targets = vec![fleet_target("web-1", &["web"]), password("web-2"), password("web-3")];
+        app.ssh_targets = vec![
+            fleet_target("web-1", &["web"]),
+            password("web-2"),
+            password("web-3"),
+        ];
         let store = StaticSecretProvider::new();
         store.insert("ssh_target:web-3", "hunter2-of-web-3");
         // A shared password is not a fleet credential.
@@ -7019,7 +7687,11 @@ mod tests {
             crossterm::event::KeyCode::Char('p'),
             crossterm::event::KeyModifiers::CONTROL,
         ));
-        assert_eq!(app.mode, AppMode::Normal, "no masked prompt for the whole group");
+        assert_eq!(
+            app.mode,
+            AppMode::Normal,
+            "no masked prompt for the whole group"
+        );
         assert!(filar_core::SecretProvider::secret_names(&*app.secrets).is_empty());
         assert!(feed_text(&app).contains("Passwords are per host"));
     }
@@ -7051,7 +7723,11 @@ mod tests {
             1,
             "the fleet stays open in the background, and stays one"
         );
-        assert_eq!(app.take_pending_local_executors().len(), 1, "an ordinary local tab");
+        assert_eq!(
+            app.take_pending_local_executors().len(),
+            1,
+            "an ordinary local tab"
+        );
         assert_eq!(app.sessions[app.active].target_name, "local-2");
     }
 
@@ -7115,7 +7791,11 @@ mod tests {
             app.handle_key(key_event(KeyCode::Char(c)));
         }
         app.handle_key(key_event(KeyCode::Enter));
-        assert_eq!(app.take_input().as_deref(), Some("uptime"), "sent to the fleet agent");
+        assert_eq!(
+            app.take_input().as_deref(),
+            Some("uptime"),
+            "sent to the fleet agent"
+        );
         app.mode = AppMode::Normal;
         app.agent_running = false;
         // Everything that would reach a host around the agent is refused.
@@ -7137,11 +7817,18 @@ mod tests {
         assert!(app.pending_path_picker.is_none(), "no path picker");
         assert_eq!(app.input, "/");
         app.handle_key(key_event(KeyCode::F(3)));
-        assert!(!app.session_select_visible, "no session restore into the fleet");
+        assert!(
+            !app.session_select_visible,
+            "no session restore into the fleet"
+        );
     }
 
     /// Deliver a confirmation request for `command` to the active session.
-    fn request_confirmation(app: &mut App, command: &str, explanation: &str) -> oneshot::Receiver<bool> {
+    fn request_confirmation(
+        app: &mut App,
+        command: &str,
+        explanation: &str,
+    ) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
         let session_id = app.sessions[app.active].id;
         app.handle_agent_event(TuiEvent::Agent {
@@ -7231,15 +7918,37 @@ mod tests {
         let mut rx = request_confirmation(&mut app, "uname -r", "kernel version");
         assert_eq!(app.mode, AppMode::Confirming);
         let pending = app.pending_confirm.as_ref().expect("gate open");
-        assert_eq!(pending.radius, ["web-1", "web-2"], "the radius is the fleet's frozen composition");
-        assert!(!pending.radius_expanded, "a counter first, the list on demand");
-        assert_eq!(pending.explanation, "kernel version", "only F2 rewrites the explanation");
+        assert_eq!(
+            pending.radius,
+            ["web-1", "web-2"],
+            "the radius is the fleet's frozen composition"
+        );
+        assert!(
+            !pending.radius_expanded,
+            "a counter first, the list on demand"
+        );
+        assert_eq!(
+            pending.explanation, "kernel version",
+            "only F2 rewrites the explanation"
+        );
 
         app.handle_key(key_event(KeyCode::Char('l')));
-        assert!(app.pending_confirm.as_ref().is_some_and(|p| p.radius_expanded));
+        assert!(app
+            .pending_confirm
+            .as_ref()
+            .is_some_and(|p| p.radius_expanded));
         app.handle_key(key_event(KeyCode::Char('д')));
-        assert!(app.pending_confirm.as_ref().is_some_and(|p| !p.radius_expanded), "l toggles back");
-        assert_eq!(app.mode, AppMode::Confirming, "expanding never answers the gate");
+        assert!(
+            app.pending_confirm
+                .as_ref()
+                .is_some_and(|p| !p.radius_expanded),
+            "l toggles back"
+        );
+        assert_eq!(
+            app.mode,
+            AppMode::Confirming,
+            "expanding never answers the gate"
+        );
 
         app.handle_key(key_event(KeyCode::Char('a')));
         assert_eq!(rx.try_recv(), Ok(true), "one approval for both hosts");
@@ -7253,7 +7962,10 @@ mod tests {
         app.toggle_explain_mode();
         let _rx = request_confirmation(&mut app, "uptime", "load average");
         let pending = app.pending_confirm.as_ref().expect("gate open");
-        assert_eq!(pending.explanation, "load average (runs on 2 hosts: web-1, web-2)");
+        assert_eq!(
+            pending.explanation,
+            "load average (runs on 2 hosts: web-1, web-2)"
+        );
         // The feed (and so the Explain transcript) keeps the same text.
         assert_eq!(
             app.pending_proposal.as_ref().map(|(_, e, _)| e.as_str()),
@@ -7292,9 +8004,16 @@ mod tests {
         let first = app.sessions[app.active].id;
         app.take_closed_ids();
         app.exit_fleet();
-        assert_eq!(app.take_closed_ids(), vec![first], "closing the fleet releases its id");
+        assert_eq!(
+            app.take_closed_ids(),
+            vec![first],
+            "closing the fleet releases its id"
+        );
         app.enter_fleet("web");
-        assert_ne!(app.sessions[app.active].id, first, "re-entry is a new fleet session");
+        assert_ne!(
+            app.sessions[app.active].id, first,
+            "re-entry is a new fleet session"
+        );
     }
 
     #[test]
@@ -7307,7 +8026,10 @@ mod tests {
         assert!(pending.radius.is_empty());
         assert_eq!(pending.explanation, "load average");
         app.handle_key(key_event(KeyCode::Char('l')));
-        assert!(app.pending_confirm.as_ref().is_some_and(|p| !p.radius_expanded));
+        assert!(app
+            .pending_confirm
+            .as_ref()
+            .is_some_and(|p| !p.radius_expanded));
     }
 
     #[test]
@@ -7372,7 +8094,10 @@ mod tests {
         let web = rows
             .iter()
             .find_map(|r| match r {
-                HostSelectRow::Group { group: 0, selection } => Some(*selection),
+                HostSelectRow::Group {
+                    group: 0,
+                    selection,
+                } => Some(*selection),
                 _ => None,
             })
             .expect("web group row");
@@ -7414,7 +8139,11 @@ mod tests {
     }
 
     fn fleet_host_selection(app: &App, name: &str) -> usize {
-        1 + app.ssh_targets.iter().position(|t| t.name == name).expect("target")
+        1 + app
+            .ssh_targets
+            .iter()
+            .position(|t| t.name == name)
+            .expect("target")
     }
 
     #[test]
@@ -7432,7 +8161,11 @@ mod tests {
         assert_ne!(tab, origin);
         assert_eq!(app.sessions[app.active].target_name, "~web-2");
         assert!(app.ctrl_o_needs_connect);
-        assert_eq!(app.take_pending_local_executors(), vec![tab], "its own executor");
+        assert_eq!(
+            app.take_pending_local_executors(),
+            vec![tab],
+            "its own executor"
+        );
         // The fleet stays open, and the origin tab is untouched.
         assert!(app.fleet().is_some());
         let origin_idx = app.find_session_idx(origin).expect("origin tab");
@@ -7480,7 +8213,10 @@ mod tests {
         assert_eq!(app.take_input(), None, "nothing runs on the local executor");
         assert_eq!(app.input, "uptime");
         app.handle_key(ctrl_key('t'));
-        assert!(!app.take_toggle_interactive(), "no terminal on the old executor");
+        assert!(
+            !app.take_toggle_interactive(),
+            "no terminal on the old executor"
+        );
         // The swap lands: sending works again, the label stays.
         app.connect_settled(tab, true);
         assert!(app.connecting.is_none());
@@ -7499,7 +8235,10 @@ mod tests {
         let tab = app.sessions[app.active].id;
         app.connect_settled(tab, false); // TransportSwapFailed
         assert!(app.connecting.is_none());
-        assert_eq!(app.target_name, "local-2", "the tab runs locally and says so");
+        assert_eq!(
+            app.target_name, "local-2",
+            "the tab runs locally and says so"
+        );
     }
 
     #[test]
@@ -7516,7 +8255,10 @@ mod tests {
         let idx = app.find_session_idx(first).expect("first tab");
         assert!(app.sessions[idx].connecting.is_none(), "never left blocked");
         assert_eq!(app.sessions[idx].target_name, "local");
-        assert!(app.connecting.is_some(), "the new switch is the one in flight");
+        assert!(
+            app.connecting.is_some(),
+            "the new switch is the one in flight"
+        );
     }
 
     #[test]
@@ -7543,7 +8285,10 @@ mod tests {
         app.enter_fleet("web");
         app.open_host_select();
         let rows = app.host_select_rows();
-        assert!(!rows.contains(&HostSelectRow::Local), "no local in the fleet overlay");
+        assert!(
+            !rows.contains(&HostSelectRow::Local),
+            "no local in the fleet overlay"
+        );
         let targets: Vec<&str> = rows
             .iter()
             .filter_map(|r| match r {
@@ -7571,7 +8316,9 @@ mod tests {
         app.select_session();
         assert!(app.in_fleet());
         assert!(app.ssh_info.is_none() && !app.ctrl_o_needs_connect);
-        assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m == FleetRefusal::SessionRestore.explanation()));
+        assert!(
+            matches!(app.messages.last(), Some(ChatBlock::System(m)) if m == FleetRefusal::SessionRestore.explanation())
+        );
     }
 
     #[test]
@@ -7584,7 +8331,10 @@ mod tests {
         app.terminal = Some(TerminalModel::new(80, 24));
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
         assert!(!app.in_fleet());
-        assert!(app.take_term_input().is_some(), "Ctrl+Tab goes to the PTY, as with one tab");
+        assert!(
+            app.take_term_input().is_some(),
+            "Ctrl+Tab goes to the PTY, as with one tab"
+        );
     }
 
     #[test]
@@ -7623,7 +8373,10 @@ mod tests {
 
     // ── Side panel (#431) ───────────────────────────────────────────
 
-    fn job(id: &str, state: filar_agent::background::JobState) -> filar_agent::background::JobSnapshot {
+    fn job(
+        id: &str,
+        state: filar_agent::background::JobState,
+    ) -> filar_agent::background::JobSnapshot {
         filar_agent::background::JobSnapshot {
             job_id: id.into(),
             command: format!("run {id}"),
@@ -7671,7 +8424,10 @@ mod tests {
         use filar_agent::background::JobState;
         let mut app = App::new("local".into(), CommandConfirmMode::Always);
         app.refresh_operations_with(|_| {
-            vec![job("job-1", JobState::Running), job("job-2", JobState::Running)]
+            vec![
+                job("job-1", JobState::Running),
+                job("job-2", JobState::Running),
+            ]
         });
         app.side_panel.selected = 3;
         app.refresh_operations_with(|_| vec![job("job-1", JobState::Cancelled)]);
@@ -7686,15 +8442,22 @@ mod tests {
         app.new_tab();
         let first = app.sessions[0].id;
         app.refresh_operations_with(|sid| {
-            if sid == first { vec![] } else { vec![job("job-1", JobState::Running)] }
+            if sid == first {
+                vec![]
+            } else {
+                vec![job("job-1", JobState::Running)]
+            }
         });
         app.side_panel.selected = 1; // host row of the second tab's job-1
-        // A job starts in the first tab too: two rows appear above the selection.
+                                     // A job starts in the first tab too: two rows appear above the selection.
         app.refresh_operations_with(|_| vec![job("job-1", JobState::Running)]);
         assert_eq!(app.side_panel.selected, 3);
         let rows = crate::side_panel::tree_rows(&app.operations);
         let (op, _) = rows[app.side_panel.selected].target();
-        assert_ne!(app.operations[op].session, first, "still the second tab's job");
+        assert_ne!(
+            app.operations[op].session, first,
+            "still the second tab's job"
+        );
     }
 
     #[test]
@@ -7717,7 +8480,10 @@ mod tests {
         use filar_agent::background::JobState;
         let mut app = App::new("local".into(), CommandConfirmMode::Always);
         app.refresh_operations_with(|_| {
-            vec![job("job-1", JobState::Running), job("job-2", JobState::Running)]
+            vec![
+                job("job-1", JobState::Running),
+                job("job-2", JobState::Running),
+            ]
         });
         app.handle_key(ctrl_key('j'));
         assert!(app.side_panel.open);
@@ -7752,7 +8518,10 @@ mod tests {
         app.toggle_help_overlay();
         app.handle_key(key_event(KeyCode::Esc));
         assert!(!app.help_overlay_visible);
-        assert!(app.side_panel.open, "Esc closed the overlay on top, not the panel");
+        assert!(
+            app.side_panel.open,
+            "Esc closed the overlay on top, not the panel"
+        );
         app.handle_key(key_event(KeyCode::Esc));
         assert!(!app.side_panel.open);
     }
@@ -7768,7 +8537,10 @@ mod tests {
     fn ctrl_c_is_noop_in_normal() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.handle_key(ctrl_key('c'));
-        assert!(!app.should_quit, "Ctrl+C must do nothing (users use it to copy)");
+        assert!(
+            !app.should_quit,
+            "Ctrl+C must do nothing (users use it to copy)"
+        );
         // Russian layout equivalent (с) is likewise a no-op.
         app.handle_key(ctrl_key('с'));
         assert!(!app.should_quit);
@@ -7853,15 +8625,25 @@ mod tests {
         assert_eq!(app.mode, AppMode::Interactive);
 
         app.handle_key(ctrl_key('z'));
-        assert_eq!(app.mode, AppMode::Interactive, "^Z must not cancel in Interactive");
+        assert_eq!(
+            app.mode,
+            AppMode::Interactive,
+            "^Z must not cancel in Interactive"
+        );
         assert!(!app.should_quit);
 
         let bytes = app
             .pending_term_input
             .clone()
             .expect("keys should be forwarded to the PTY");
-        assert!(bytes.contains(&0x11), "Ctrl+Q should forward 0x11, got {bytes:?}");
-        assert!(bytes.contains(&0x1a), "Ctrl+Z should forward 0x1A, got {bytes:?}");
+        assert!(
+            bytes.contains(&0x11),
+            "Ctrl+Q should forward 0x11, got {bytes:?}"
+        );
+        assert!(
+            bytes.contains(&0x1a),
+            "Ctrl+Z should forward 0x1A, got {bytes:?}"
+        );
     }
 
     #[test]
@@ -7900,7 +8682,9 @@ mod tests {
         app.push_system_log("second".into());
 
         // Two distinct System blocks; the second collapsed the repeat.
-        assert!(matches!(&app.messages[app.messages.len() - 2], ChatBlock::System(s) if s == "first"));
+        assert!(
+            matches!(&app.messages[app.messages.len() - 2], ChatBlock::System(s) if s == "first")
+        );
         assert!(matches!(app.messages.last(), Some(ChatBlock::System(s)) if s == "second … x2"));
     }
 
@@ -7979,7 +8763,10 @@ mod tests {
     fn agent_text_response_bumps_message_rev() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let rev_before = app.message_rev;
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::Finished("hello".into()) });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::Finished("hello".into()),
+        });
         assert!(app.message_rev > rev_before);
     }
 
@@ -7987,7 +8774,10 @@ mod tests {
     fn agent_error_bumps_message_rev() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let rev_before = app.message_rev;
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::Error("oops".into()) });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::Error("oops".into()),
+        });
         assert!(app.message_rev > rev_before);
         assert_eq!(app.mode, AppMode::Normal);
     }
@@ -8005,12 +8795,18 @@ mod tests {
             tool: None,
         });
         let rev_before = app.message_rev;
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::CommandFinished {
-            command: "ls".into(),
-            output: "file1\nfile2".into(),
-            denied: false,
-        }});
-        assert!(app.message_rev > rev_before, "in-place update must bump rev");
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::CommandFinished {
+                command: "ls".into(),
+                output: "file1\nfile2".into(),
+                denied: false,
+            },
+        });
+        assert!(
+            app.message_rev > rev_before,
+            "in-place update must bump rev"
+        );
         // Verify the block was updated in-place, not duplicated.
         assert_eq!(app.messages.len(), 2); // system + command (updated)
     }
@@ -8041,7 +8837,11 @@ mod tests {
     // ----- Mouse / scroll tests (issue #15) -----
 
     /// Helper: create a mouse scroll event.
-    fn mouse_event(kind: crossterm::event::MouseEventKind, col: u16, row: u16) -> crossterm::event::MouseEvent {
+    fn mouse_event(
+        kind: crossterm::event::MouseEventKind,
+        col: u16,
+        row: u16,
+    ) -> crossterm::event::MouseEvent {
         crossterm::event::MouseEvent {
             kind,
             column: col,
@@ -8055,7 +8855,7 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         // Simulate a chat area with content (set chat_area so clamp_scroll works).
         app.chat_area = Rect::new(0, 1, 80, 24); // y=1, height=24
-        // Fill cache with enough lines so scroll is possible.
+                                                 // Fill cache with enough lines so scroll is possible.
         app.layout_cache.lines = (0..50)
             .map(|_| crate::ui::layout_cache::RenderedLine {
                 line: ratatui::text::Line::raw("test"),
@@ -8223,12 +9023,7 @@ mod tests {
     fn end_key_resets_scroll_in_confirming_mode() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let (tx, _rx) = oneshot::channel();
-        app.pending_confirm = Some(PendingConfirm::new(
-            "ls".into(),
-            "test".into(),
-            false,
-            tx,
-        ));
+        app.pending_confirm = Some(PendingConfirm::new("ls".into(), "test".into(), false, tx));
         app.mode = AppMode::Confirming;
         app.scroll = 12;
         app.handle_key(crossterm::event::KeyEvent::new(
@@ -8436,9 +9231,9 @@ mod tests {
         let mut app = make_hit_test_app();
         app.mode = AppMode::Normal;
         app.input = "hello world test".into(); // 16 chars
-        // input_area = x=0, y=26, w=80, h=5 (borderless: prompt at col 0-1)
-        // inner_x=2, inner_y=26, inner_width=78
-        // Click at col=4, row=26 → relative_col=2, relative_row=0 → cursor_pos=2
+                                               // input_area = x=0, y=26, w=80, h=5 (borderless: prompt at col 0-1)
+                                               // inner_x=2, inner_y=26, inner_width=78
+                                               // Click at col=4, row=26 → relative_col=2, relative_row=0 → cursor_pos=2
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             4,
@@ -8468,7 +9263,7 @@ mod tests {
         let mut app = make_hit_test_app();
         app.mode = AppMode::Normal;
         app.input = "hi".into(); // 2 chars
-        // Click far right → cursor_pos clamped to 2
+                                 // Click far right → cursor_pos clamped to 2
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             70,
@@ -8633,7 +9428,11 @@ mod tests {
         let mut app = make_confirm_app(false);
         app.handle_key(ctrl_key('c'));
         assert!(!app.should_quit, "Ctrl+C must do nothing in Confirming");
-        assert_eq!(app.mode, AppMode::Confirming, "should stay awaiting a choice");
+        assert_eq!(
+            app.mode,
+            AppMode::Confirming,
+            "should stay awaiting a choice"
+        );
     }
 
     #[test]
@@ -8685,9 +9484,11 @@ mod tests {
         let mut app = make_confirm_app(false);
         // Simulate button areas (set during render).
         // Approve button at col 20-34, row 10.
-        app.confirm_button_areas.push((Rect::new(20, 10, 15, 1), true));
+        app.confirm_button_areas
+            .push((Rect::new(20, 10, 15, 1), true));
         // Deny button at col 38-50, row 10.
-        app.confirm_button_areas.push((Rect::new(38, 10, 13, 1), false));
+        app.confirm_button_areas
+            .push((Rect::new(38, 10, 13, 1), false));
         // Click on Approve.
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -8705,8 +9506,10 @@ mod tests {
     #[test]
     fn mouse_click_deny_button() {
         let mut app = make_confirm_app(false);
-        app.confirm_button_areas.push((Rect::new(20, 10, 15, 1), true));
-        app.confirm_button_areas.push((Rect::new(38, 10, 13, 1), false));
+        app.confirm_button_areas
+            .push((Rect::new(20, 10, 15, 1), true));
+        app.confirm_button_areas
+            .push((Rect::new(38, 10, 13, 1), false));
         // Click on Deny.
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -8724,30 +9527,23 @@ mod tests {
     #[test]
     fn mouse_hover_does_not_change_confirm_selected() {
         let mut app = make_confirm_app(false);
-        app.confirm_button_areas.push((Rect::new(20, 10, 15, 1), true));
-        app.confirm_button_areas.push((Rect::new(38, 10, 13, 1), false));
+        app.confirm_button_areas
+            .push((Rect::new(20, 10, 15, 1), true));
+        app.confirm_button_areas
+            .push((Rect::new(38, 10, 13, 1), false));
         // Hover over Approve — hovered_button updates but confirm_selected stays Deny.
-        app.handle_mouse(mouse_event(
-            crossterm::event::MouseEventKind::Moved,
-            25,
-            10,
-        ));
+        app.handle_mouse(mouse_event(crossterm::event::MouseEventKind::Moved, 25, 10));
         assert_eq!(app.hovered_button, Some(true));
-        assert!(!app.confirm_selected, "hover must NOT change confirm_selected");
+        assert!(
+            !app.confirm_selected,
+            "hover must NOT change confirm_selected"
+        );
         // Hover over Deny — hovered_button updates, confirm_selected unchanged.
-        app.handle_mouse(mouse_event(
-            crossterm::event::MouseEventKind::Moved,
-            42,
-            10,
-        ));
+        app.handle_mouse(mouse_event(crossterm::event::MouseEventKind::Moved, 42, 10));
         assert_eq!(app.hovered_button, Some(false));
         assert!(!app.confirm_selected);
         // Hover outside buttons — hovered_button clears.
-        app.handle_mouse(mouse_event(
-            crossterm::event::MouseEventKind::Moved,
-            0,
-            0,
-        ));
+        app.handle_mouse(mouse_event(crossterm::event::MouseEventKind::Moved, 0, 0));
         assert_eq!(app.hovered_button, None);
         assert!(!app.confirm_selected);
     }
@@ -8755,29 +9551,22 @@ mod tests {
     #[test]
     fn repeated_hover_does_not_change_confirm_selected() {
         let mut app = make_confirm_app(false);
-        app.confirm_button_areas.push((Rect::new(20, 10, 15, 1), true));
-        app.confirm_button_areas.push((Rect::new(38, 10, 13, 1), false));
+        app.confirm_button_areas
+            .push((Rect::new(20, 10, 15, 1), true));
+        app.confirm_button_areas
+            .push((Rect::new(38, 10, 13, 1), false));
         // Multiple hovers over Approve — confirm_selected must remain false.
         for _ in 0..3 {
-            app.handle_mouse(mouse_event(
-                crossterm::event::MouseEventKind::Moved,
-                25,
-                10,
-            ));
+            app.handle_mouse(mouse_event(crossterm::event::MouseEventKind::Moved, 25, 10));
             assert!(!app.confirm_selected);
         }
         // Hover over Deny, then back over Approve — still must remain false.
-        app.handle_mouse(mouse_event(
-            crossterm::event::MouseEventKind::Moved,
-            42,
-            10,
-        ));
-        app.handle_mouse(mouse_event(
-            crossterm::event::MouseEventKind::Moved,
-            25,
-            10,
-        ));
-        assert!(!app.confirm_selected, "hover must never change confirm_selected");
+        app.handle_mouse(mouse_event(crossterm::event::MouseEventKind::Moved, 42, 10));
+        app.handle_mouse(mouse_event(crossterm::event::MouseEventKind::Moved, 25, 10));
+        assert!(
+            !app.confirm_selected,
+            "hover must never change confirm_selected"
+        );
     }
 
     #[test]
@@ -8785,7 +9574,8 @@ mod tests {
         let mut app = make_hit_test_app();
         app.mode = AppMode::Confirming;
         // Place a confirm button over the chat area.
-        app.confirm_button_areas.push((Rect::new(5, 5, 15, 1), true));
+        app.confirm_button_areas
+            .push((Rect::new(5, 5, 15, 1), true));
         // Hit-test at a point inside the button — should be ConfirmButton, not Chat.
         let zone = app.hit_test(7, 5);
         assert_eq!(zone, HitZone::ConfirmButton(true));
@@ -8795,15 +9585,20 @@ mod tests {
     fn confirm_state_cleared_after_response() {
         let mut app = make_confirm_app(false);
         // Populate button areas as if rendered.
-        app.confirm_button_areas.push((Rect::new(20, 10, 15, 1), true));
-        app.confirm_button_areas.push((Rect::new(38, 10, 13, 1), false));
+        app.confirm_button_areas
+            .push((Rect::new(20, 10, 15, 1), true));
+        app.confirm_button_areas
+            .push((Rect::new(38, 10, 13, 1), false));
         app.hovered_button = Some(true);
 
         // Deny via keyboard.
         app.handle_key(key_event(crossterm::event::KeyCode::Char('d')));
 
         // After response, modal state should be cleared.
-        assert!(app.confirm_button_areas.is_empty(), "button areas should be cleared");
+        assert!(
+            app.confirm_button_areas.is_empty(),
+            "button areas should be cleared"
+        );
         assert_eq!(app.hovered_button, None, "hovered_button should be cleared");
 
         // Hit-test in the former button area should NOT return ConfirmButton.
@@ -8837,14 +9632,20 @@ mod tests {
     fn collapsed_set_defaults_long_output_collapsed() {
         let app = make_command_app(50);
         let collapsed = app.collapsed_set();
-        assert!(collapsed.contains(&0), "50-line output should be collapsed by default");
+        assert!(
+            collapsed.contains(&0),
+            "50-line output should be collapsed by default"
+        );
     }
 
     #[test]
     fn collapsed_set_defaults_short_output_not_collapsed() {
         let app = make_command_app(3);
         let collapsed = app.collapsed_set();
-        assert!(!collapsed.contains(&0), "3-line output should not be collapsed by default");
+        assert!(
+            !collapsed.contains(&0),
+            "3-line output should not be collapsed by default"
+        );
     }
 
     #[test]
@@ -8852,7 +9653,10 @@ mod tests {
         let mut app = make_command_app(50);
         app.collapsed_overrides.insert(0, false);
         let collapsed = app.collapsed_set();
-        assert!(!collapsed.contains(&0), "override=false should expand even long output");
+        assert!(
+            !collapsed.contains(&0),
+            "override=false should expand even long output"
+        );
     }
 
     #[test]
@@ -8860,7 +9664,10 @@ mod tests {
         let mut app = make_command_app(3);
         app.collapsed_overrides.insert(0, true);
         let collapsed = app.collapsed_set();
-        assert!(collapsed.contains(&0), "override=true should collapse even short output");
+        assert!(
+            collapsed.contains(&0),
+            "override=true should collapse even short output"
+        );
     }
 
     #[test]
@@ -8885,11 +9692,17 @@ mod tests {
         let mut app = make_command_app(50);
         let rev_before = app.message_rev;
         app.toggle_collapse(0);
-        assert_ne!(app.message_rev, rev_before, "message_rev must change on toggle_collapse");
+        assert_ne!(
+            app.message_rev, rev_before,
+            "message_rev must change on toggle_collapse"
+        );
         // Toggle back — rev must change again.
         let rev_after = app.message_rev;
         app.toggle_collapse(0);
-        assert_ne!(app.message_rev, rev_after, "message_rev must change on second toggle");
+        assert_ne!(
+            app.message_rev, rev_after,
+            "message_rev must change on second toggle"
+        );
     }
 
     // ---- Mouse click routing tests (issue #18 review) ----
@@ -8926,13 +9739,11 @@ mod tests {
     fn mouse_click_command_header_with_output_toggles_collapse() {
         let mut app = make_command_app(50);
         app.chat_area = Rect::new(0, 1, 80, 24);
-        app.layout_cache.lines = vec![
-            crate::ui::layout_cache::RenderedLine {
-                line: ratatui::text::Line::raw("header"),
-                block_index: Some(0),
-                region: crate::ui::layout_cache::LineRegion::Header,
-            },
-        ];
+        app.layout_cache.lines = vec![crate::ui::layout_cache::RenderedLine {
+            line: ratatui::text::Line::raw("header"),
+            block_index: Some(0),
+            region: crate::ui::layout_cache::LineRegion::Header,
+        }];
         // Click the Header line (row 1 → inner_row=0 → line_idx 0, borderless).
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -8957,13 +9768,11 @@ mod tests {
             tool: None,
         });
         app.chat_area = Rect::new(0, 1, 80, 24);
-        app.layout_cache.lines = vec![
-            crate::ui::layout_cache::RenderedLine {
-                line: ratatui::text::Line::raw("header"),
-                block_index: Some(0),
-                region: crate::ui::layout_cache::LineRegion::Header,
-            },
-        ];
+        app.layout_cache.lines = vec![crate::ui::layout_cache::RenderedLine {
+            line: ratatui::text::Line::raw("header"),
+            block_index: Some(0),
+            region: crate::ui::layout_cache::LineRegion::Header,
+        }];
         // Click the Header line — should NOT toggle (no output).
         app.handle_mouse(mouse_event(
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -9012,7 +9821,10 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("Hello".into()) });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TextDelta("Hello".into()),
+        });
 
         assert!(app.streaming);
         assert_eq!(app.messages.len(), 1);
@@ -9028,8 +9840,14 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("Hello".into()) });
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta(" world".into()) });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TextDelta("Hello".into()),
+        });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TextDelta(" world".into()),
+        });
 
         assert!(app.streaming);
         assert_eq!(app.messages.len(), 1);
@@ -9046,14 +9864,21 @@ mod tests {
         app.mode = AppMode::Thinking;
 
         // Stream some text.
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("Partial".into()) });
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta(" response".into()) });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TextDelta("Partial".into()),
+        });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TextDelta(" response".into()),
+        });
         assert!(app.streaming);
 
         // Finished replaces with authoritative text.
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::Finished(
-            "Partial response — finalized".into(),
-        )});
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::Finished("Partial response — finalized".into()),
+        });
 
         assert!(!app.streaming);
         assert_eq!(app.mode, AppMode::Normal);
@@ -9070,8 +9895,14 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("Streamed text".into()) });
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::Finished(String::new()) });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TextDelta("Streamed text".into()),
+        });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::Finished(String::new()),
+        });
 
         assert!(!app.streaming);
         assert_eq!(app.messages.len(), 1);
@@ -9087,10 +9918,16 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("Partial".into()) });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TextDelta("Partial".into()),
+        });
         assert!(app.streaming);
 
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::Error("network error".into()) });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::Error("network error".into()),
+        });
 
         assert!(!app.streaming);
         assert_eq!(app.mode, AppMode::Normal);
@@ -9106,7 +9943,10 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("Let me check...".into()) });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TextDelta("Let me check...".into()),
+        });
         assert!(app.streaming);
 
         let (tx, _rx) = oneshot::channel::<bool>();
@@ -9158,7 +9998,10 @@ mod tests {
         app.mode = AppMode::Thinking;
         app.scroll = 5; // User scrolled up.
 
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("new text".into()) });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TextDelta("new text".into()),
+        });
 
         // Scroll should NOT be reset to 0 — user is reading history.
         assert_eq!(app.scroll, 5);
@@ -9171,7 +10014,10 @@ mod tests {
         app.mode = AppMode::Thinking;
         app.scroll = 0;
 
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("new text".into()) });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TextDelta("new text".into()),
+        });
 
         // Scroll stays at 0 (bottom).
         assert_eq!(app.scroll, 0);
@@ -9199,13 +10045,22 @@ mod tests {
         app.messages.clear();
         app.mode = AppMode::Thinking;
 
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("First".into()) });
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::Finished("First".into()) });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TextDelta("First".into()),
+        });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::Finished("First".into()),
+        });
         assert!(!app.streaming);
 
         // New run.
         app.handle_agent_event(TuiEvent::Thinking);
-        app.handle_agent_event(TuiEvent::Agent { session_id: app.sessions[0].id, event: filar_agent::AgentEvent::TextDelta("Second".into()) });
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::TextDelta("Second".into()),
+        });
 
         assert!(app.streaming);
         assert_eq!(app.messages.len(), 2);
@@ -9288,12 +10143,7 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         app.mode = AppMode::Confirming;
-        app.pending_confirm = Some(PendingConfirm::new(
-            "ls".into(),
-            "list".into(),
-            false,
-            tx,
-        ));
+        app.pending_confirm = Some(PendingConfirm::new("ls".into(), "list".into(), false, tx));
         app.execute_help_action(HelpAction::Approve);
         assert_eq!(app.mode, AppMode::Thinking);
         assert!(rx.try_recv().unwrap());
@@ -9304,12 +10154,7 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         app.mode = AppMode::Confirming;
-        app.pending_confirm = Some(PendingConfirm::new(
-            "rm".into(),
-            "remove".into(),
-            true,
-            tx,
-        ));
+        app.pending_confirm = Some(PendingConfirm::new("rm".into(), "remove".into(), true, tx));
         app.execute_help_action(HelpAction::Deny);
         assert_eq!(app.mode, AppMode::Thinking);
         assert!(!rx.try_recv().unwrap());
@@ -9341,8 +10186,10 @@ mod tests {
     #[test]
     fn selection_normalised_forward() {
         let sel = Selection {
-            anchor_line: 5, anchor_col: 3,
-            head_line: 10, head_col: 7,
+            anchor_line: 5,
+            anchor_col: 3,
+            head_line: 10,
+            head_col: 7,
         };
         let ((sl, sc), (el, ec)) = sel.normalised();
         assert_eq!((sl, sc), (5, 3));
@@ -9352,8 +10199,10 @@ mod tests {
     #[test]
     fn selection_normalised_backward() {
         let sel = Selection {
-            anchor_line: 10, anchor_col: 7,
-            head_line: 5, head_col: 3,
+            anchor_line: 10,
+            anchor_col: 7,
+            head_line: 5,
+            head_col: 3,
         };
         let ((sl, sc), (el, ec)) = sel.normalised();
         assert_eq!((sl, sc), (5, 3));
@@ -9363,8 +10212,10 @@ mod tests {
     #[test]
     fn selection_is_empty_when_anchor_equals_head() {
         let sel = Selection {
-            anchor_line: 5, anchor_col: 3,
-            head_line: 5, head_col: 3,
+            anchor_line: 5,
+            anchor_col: 3,
+            head_line: 5,
+            head_col: 3,
         };
         assert!(sel.is_empty());
     }
@@ -9372,8 +10223,10 @@ mod tests {
     #[test]
     fn selection_not_empty_when_different_line() {
         let sel = Selection {
-            anchor_line: 5, anchor_col: 0,
-            head_line: 6, head_col: 0,
+            anchor_line: 5,
+            anchor_col: 0,
+            head_line: 6,
+            head_col: 0,
         };
         assert!(!sel.is_empty());
     }
@@ -9383,8 +10236,10 @@ mod tests {
         let mut app = make_hit_test_app();
         // Line 26 = "line 26" — 7 chars
         app.selection = Some(Selection {
-            anchor_line: 26, anchor_col: 0,
-            head_line: 26, head_col: 4,
+            anchor_line: 26,
+            anchor_col: 0,
+            head_line: 26,
+            head_col: 4,
         });
         assert_eq!(app.selected_text().unwrap(), "line");
     }
@@ -9394,8 +10249,10 @@ mod tests {
         let mut app = make_hit_test_app();
         // Lines 26-28: "line 26", "line 27", "line 28"
         app.selection = Some(Selection {
-            anchor_line: 26, anchor_col: 5,
-            head_line: 28, head_col: 2,
+            anchor_line: 26,
+            anchor_col: 5,
+            head_line: 28,
+            head_col: 2,
         });
         // From line 26 col 5: "26"
         // Full line 27: "line 27"
@@ -9407,8 +10264,10 @@ mod tests {
     fn selected_text_empty_returns_none() {
         let mut app = make_hit_test_app();
         app.selection = Some(Selection {
-            anchor_line: 26, anchor_col: 3,
-            head_line: 26, head_col: 3,
+            anchor_line: 26,
+            anchor_col: 3,
+            head_line: 26,
+            head_col: 3,
         });
         assert!(app.selected_text().is_none());
     }
@@ -9416,13 +10275,11 @@ mod tests {
     #[test]
     fn select_word_picks_non_whitespace_run() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.layout_cache.lines = vec![
-            crate::ui::layout_cache::RenderedLine {
-                line: ratatui::text::Line::raw("hello world test"),
-                block_index: Some(0),
-                region: crate::ui::layout_cache::LineRegion::Body,
-            }
-        ];
+        app.layout_cache.lines = vec![crate::ui::layout_cache::RenderedLine {
+            line: ratatui::text::Line::raw("hello world test"),
+            block_index: Some(0),
+            region: crate::ui::layout_cache::LineRegion::Body,
+        }];
         // Click on "world" at col 6 (the 'w')
         app.select_word(0, 6);
         let sel = app.selection.unwrap();
@@ -9433,13 +10290,11 @@ mod tests {
     #[test]
     fn select_word_at_start_of_line() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.layout_cache.lines = vec![
-            crate::ui::layout_cache::RenderedLine {
-                line: ratatui::text::Line::raw("hello world"),
-                block_index: Some(0),
-                region: crate::ui::layout_cache::LineRegion::Body,
-            }
-        ];
+        app.layout_cache.lines = vec![crate::ui::layout_cache::RenderedLine {
+            line: ratatui::text::Line::raw("hello world"),
+            block_index: Some(0),
+            region: crate::ui::layout_cache::LineRegion::Body,
+        }];
         // Click at col 0
         app.select_word(0, 0);
         let sel = app.selection.unwrap();
@@ -9450,13 +10305,11 @@ mod tests {
     #[test]
     fn select_line_selects_entire_line() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.layout_cache.lines = vec![
-            crate::ui::layout_cache::RenderedLine {
-                line: ratatui::text::Line::raw("hello world"),
-                block_index: Some(0),
-                region: crate::ui::layout_cache::LineRegion::Body,
-            }
-        ];
+        app.layout_cache.lines = vec![crate::ui::layout_cache::RenderedLine {
+            line: ratatui::text::Line::raw("hello world"),
+            block_index: Some(0),
+            region: crate::ui::layout_cache::LineRegion::Body,
+        }];
         app.select_line(0);
         let sel = app.selection.unwrap();
         assert_eq!(sel.anchor_col, 0);
@@ -9554,8 +10407,10 @@ mod tests {
     fn push_message_clears_selection() {
         let mut app = make_hit_test_app();
         app.selection = Some(Selection {
-            anchor_line: 26, anchor_col: 0,
-            head_line: 26, head_col: 4,
+            anchor_line: 26,
+            anchor_col: 0,
+            head_line: 26,
+            head_col: 4,
         });
         app.push_message(ChatBlock::User("new message".into()));
         assert!(app.selection.is_none());
@@ -9570,14 +10425,20 @@ mod tests {
     #[test]
     fn toast_text_shown_when_active() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.toast = Some(("copied".to_string(), Instant::now() + Duration::from_secs(10)));
+        app.toast = Some((
+            "copied".to_string(),
+            Instant::now() + Duration::from_secs(10),
+        ));
         assert_eq!(app.toast_text().unwrap(), "copied");
     }
 
     #[test]
     fn toast_text_expired_returns_none() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.toast = Some(("copied".to_string(), Instant::now() - Duration::from_secs(1)));
+        app.toast = Some((
+            "copied".to_string(),
+            Instant::now() - Duration::from_secs(1),
+        ));
         assert!(app.toast_text().is_none());
     }
 
@@ -9586,13 +10447,11 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.chat_area = Rect::new(0, 1, 80, 24);
         // A Header line for a User message (not a collapsible Command).
-        app.layout_cache.lines = vec![
-            crate::ui::layout_cache::RenderedLine {
-                line: ratatui::text::Line::raw("  you"),
-                block_index: Some(0),
-                region: crate::ui::layout_cache::LineRegion::Header,
-            },
-        ];
+        app.layout_cache.lines = vec![crate::ui::layout_cache::RenderedLine {
+            line: ratatui::text::Line::raw("  you"),
+            block_index: Some(0),
+            region: crate::ui::layout_cache::LineRegion::Header,
+        }];
         app.messages = vec![ChatBlock::User("test".into())];
         // Click at col=3, row=1 (on the "you" header text)
         app.handle_mouse(crossterm::event::MouseEvent {
@@ -9766,7 +10625,10 @@ mod tests {
             row: 5,
             modifiers: crossterm::event::KeyModifiers::empty(),
         });
-        assert!(app.pending_term_input.is_none(), "select must not write to PTY");
+        assert!(
+            app.pending_term_input.is_none(),
+            "select must not write to PTY"
+        );
         assert_eq!(app.mouse_drag, Some(DragKind::Selection));
         let sel = app.selection.expect("selection started");
         assert_eq!(sel.anchor_line, 3);
@@ -9841,7 +10703,8 @@ mod tests {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
             column: 5,
             row: 3,
-            modifiers: crossterm::event::KeyModifiers::SHIFT | crossterm::event::KeyModifiers::CONTROL,
+            modifiers: crossterm::event::KeyModifiers::SHIFT
+                | crossterm::event::KeyModifiers::CONTROL,
         });
         let input = app.take_term_input().unwrap();
         assert_eq!(input, b"\x1b[<20;6;2M");
@@ -9977,7 +10840,10 @@ mod tests {
         assert_eq!(offset, rows, "PgUp should scroll one screen up");
 
         // PgUp was NOT forwarded to PTY (no pending input).
-        assert!(app.take_term_input().is_none(), "PgUp should not be forwarded to PTY");
+        assert!(
+            app.take_term_input().is_none(),
+            "PgUp should not be forwarded to PTY"
+        );
     }
 
     /// PgDn in interactive mode scrolls history down.
@@ -10164,7 +11030,7 @@ mod tests {
     fn scrollbar_content_length_at_bottom() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.chat_area = Rect::new(0, 1, 80, 24); // height=24
-        // 50 lines → visible_height=24, max_scroll = 50-24 = 26
+                                                 // 50 lines → visible_height=24, max_scroll = 50-24 = 26
         app.layout_cache.lines = (0..50)
             .map(|_| crate::ui::layout_cache::RenderedLine {
                 line: ratatui::text::Line::raw("test"),
@@ -10182,7 +11048,10 @@ mod tests {
         // At scroll = 0 (bottom), the skip equals content_len — thumb at end.
         app.scroll = 0;
         let skip = total_lines.saturating_sub(visible_height + app.scroll);
-        assert_eq!(skip, content_len, "at bottom, skip should match scrollbar content_length");
+        assert_eq!(
+            skip, content_len,
+            "at bottom, skip should match scrollbar content_length"
+        );
 
         // Edge: content fits in viewport → content_len = 0, scrollbar hidden.
         app.layout_cache.lines = (0..10)
@@ -10192,10 +11061,7 @@ mod tests {
                 region: crate::ui::layout_cache::LineRegion::Spacer,
             })
             .collect();
-        let short = crate::ui::scrollbar_content_len(
-            app.layout_cache.lines.len(),
-            visible_height,
-        );
+        let short = crate::ui::scrollbar_content_len(app.layout_cache.lines.len(), visible_height);
         assert_eq!(short, 0, "content fits → no scrollable positions");
 
         // Edge: content exactly equals viewport → content_len = 0.
@@ -10206,10 +11072,7 @@ mod tests {
                 region: crate::ui::layout_cache::LineRegion::Spacer,
             })
             .collect();
-        let exact = crate::ui::scrollbar_content_len(
-            app.layout_cache.lines.len(),
-            visible_height,
-        );
+        let exact = crate::ui::scrollbar_content_len(app.layout_cache.lines.len(), visible_height);
         assert_eq!(exact, 0, "exact fit → no scrollable positions");
     }
 
@@ -10250,8 +11113,14 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
 
         assert_ne!(app.active, before, "Ctrl+Tab must switch tab");
-        assert!(!app.take_toggle_interactive(), "Ctrl+Tab must NOT request interactive teardown");
-        assert!(app.take_term_input().is_none(), "Ctrl+Tab must not be forwarded to PTY");
+        assert!(
+            !app.take_toggle_interactive(),
+            "Ctrl+Tab must NOT request interactive teardown"
+        );
+        assert!(
+            app.take_term_input().is_none(),
+            "Ctrl+Tab must not be forwarded to PTY"
+        );
     }
 
     #[test]
@@ -10280,11 +11149,20 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
 
         assert_eq!(app.sessions.len(), 2, "Ctrl+N must create a new tab");
-        assert!(!app.take_toggle_interactive(), "Ctrl+N must NOT request interactive teardown");
-        assert!(app.take_term_input().is_none(), "Ctrl+N must not be forwarded to PTY");
+        assert!(
+            !app.take_toggle_interactive(),
+            "Ctrl+N must NOT request interactive teardown"
+        );
+        assert!(
+            app.take_term_input().is_none(),
+            "Ctrl+N must not be forwarded to PTY"
+        );
         // Old tab's terminal still alive in background.
         assert_eq!(app.sessions[0].mode, AppMode::Interactive);
-        assert!(app.sessions[0].terminal.is_some(), "old tab terminal must persist");
+        assert!(
+            app.sessions[0].terminal.is_some(),
+            "old tab terminal must persist"
+        );
     }
 
     #[test]
@@ -10298,7 +11176,10 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
 
         assert_eq!(app.sessions.len(), 1, "Ctrl+W must close the active tab");
-        assert!(app.take_term_input().is_none(), "Ctrl+W must not be forwarded to PTY");
+        assert!(
+            app.take_term_input().is_none(),
+            "Ctrl+W must not be forwarded to PTY"
+        );
     }
 
     #[test]
@@ -10330,7 +11211,7 @@ mod tests {
         app.show_interactive_view();
         app.hide_interactive_view();
         app.hide_interactive_view(); // still Interactive→Normal once; push again while queued
-        // Two pushes from two Interactive→Normal transitions; take dedups.
+                                     // Two pushes from two Interactive→Normal transitions; take dedups.
         assert_eq!(app.take_pending_cwd_sync(), vec![sid]);
     }
 
@@ -10340,14 +11221,20 @@ mod tests {
         let mut app = App::new("t0".into(), CommandConfirmMode::Always);
         let sid = app.sessions[0].id;
         app.show_interactive_view();
-        assert!(app.take_pending_cwd_carry().is_empty(), "no terminal, nothing to carry");
+        assert!(
+            app.take_pending_cwd_carry().is_empty(),
+            "no terminal, nothing to carry"
+        );
         app.enter_interactive(crate::terminal::TerminalModel::new(80, 24));
         app.hide_interactive_view();
         app.show_interactive_view();
         app.hide_interactive_view();
         app.show_interactive_view();
         assert_eq!(app.take_pending_cwd_carry(), vec![sid]);
-        assert!(app.take_pending_cwd_carry().is_empty(), "take clears the queue");
+        assert!(
+            app.take_pending_cwd_carry().is_empty(),
+            "take clears the queue"
+        );
     }
 
     #[test]
@@ -10385,8 +11272,15 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
 
-        assert_eq!(app.mode, AppMode::Interactive, "Ctrl+T must show hidden terminal");
-        assert!(!app.take_toggle_interactive(), "must not request runner teardown");
+        assert_eq!(
+            app.mode,
+            AppMode::Interactive,
+            "Ctrl+T must show hidden terminal"
+        );
+        assert!(
+            !app.take_toggle_interactive(),
+            "must not request runner teardown"
+        );
     }
 
     #[test]
@@ -10404,7 +11298,10 @@ mod tests {
         app.sessions[1].mode = AppMode::Interactive;
 
         // Switch to tab 0.
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
         assert_eq!(app.active, 0);
 
         // Verify tab 0's terminal is intact, tab 1's also alive.
@@ -10421,7 +11318,10 @@ mod tests {
         let sid = app.sessions[app.active].id;
         app.close_tab();
         let closed = app.take_closed_ids();
-        assert!(closed.contains(&sid), "close_tab must signal SessionId for teardown");
+        assert!(
+            closed.contains(&sid),
+            "close_tab must signal SessionId for teardown"
+        );
     }
 
     #[test]
@@ -10434,7 +11334,10 @@ mod tests {
         app.switch_to_tab(1); // switch to tab 0 (1-based index)
         assert_eq!(app.active, 0, "should switch to tab 0");
         assert!(!app.sessions[0].has_new, "marker must clear on target tab");
-        assert!(app.sessions[1].has_new, "marker on old active tab must survive");
+        assert!(
+            app.sessions[1].has_new,
+            "marker on old active tab must survive"
+        );
     }
 
     // ── Per-session executor tests ─────────────────────────────────────
@@ -10592,7 +11495,10 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         );
         app.handle_key(a);
-        assert!(app.input.is_empty(), "input must stay empty when overlay is open");
+        assert!(
+            app.input.is_empty(),
+            "input must stay empty when overlay is open"
+        );
     }
 
     #[test]
@@ -10723,7 +11629,6 @@ mod tests {
         assert!(app.take_term_input().is_none(), "empty paste sends nothing");
     }
 
-
     #[test]
     fn paste_inserts_at_cursor_in_normal_mode() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
@@ -10798,7 +11703,10 @@ mod tests {
         assert!(app.input_history().is_empty());
         app.paste_text("s3cret");
         assert!(!app.input.is_empty(), "input should receive pasted text");
-        assert!(app.input_history().is_empty(), "history must NOT contain password");
+        assert!(
+            app.input_history().is_empty(),
+            "history must NOT contain password"
+        );
     }
 
     #[test]
@@ -10819,7 +11727,10 @@ mod tests {
             crossterm::event::KeyCode::Char('/'),
             crossterm::event::KeyModifiers::NONE,
         ));
-        assert_eq!(app.input, "", "slash must not be inserted when picker opens");
+        assert_eq!(
+            app.input, "",
+            "slash must not be inserted when picker opens"
+        );
         assert_eq!(
             app.pending_path_picker,
             Some(crate::path_picker::PathPickerKind::File)
@@ -10937,9 +11848,18 @@ mod tests {
         app.path_picker_kind = kind;
         app.path_picker_dir = dir.into();
         app.path_picker_entries = vec![
-            crate::path_picker::PathEntry { name: "..".into(), is_dir: true },
-            crate::path_picker::PathEntry { name: "my logs".into(), is_dir: true },
-            crate::path_picker::PathEntry { name: "hosts".into(), is_dir: false },
+            crate::path_picker::PathEntry {
+                name: "..".into(),
+                is_dir: true,
+            },
+            crate::path_picker::PathEntry {
+                name: "my logs".into(),
+                is_dir: true,
+            },
+            crate::path_picker::PathEntry {
+                name: "hosts".into(),
+                is_dir: false,
+            },
         ];
         app
     }
@@ -10965,9 +11885,9 @@ mod tests {
         let mut app = picker_at(&dir, false, crate::path_picker::PathPickerKind::File);
         app.path_picker_index = 1;
         press(&mut app, 'ф');
-        let expected = crate::path_picker::format_path_for_input(
-            &crate::path_picker::join_path(&dir, "my logs", false),
-        );
+        let expected = crate::path_picker::format_path_for_input(&crate::path_picker::join_path(
+            &dir, "my logs", false,
+        ));
         assert_eq!(app.input.trim_end(), expected.trim_end());
     }
 
@@ -10991,11 +11911,17 @@ mod tests {
 
     #[test]
     fn enter_opens_a_folder_in_both_pickers() {
-        for kind in [crate::path_picker::PathPickerKind::File, crate::path_picker::PathPickerKind::Folder] {
+        for kind in [
+            crate::path_picker::PathPickerKind::File,
+            crate::path_picker::PathPickerKind::Folder,
+        ] {
             let mut app = picker_at("/var", true, kind);
             app.path_picker_index = 1;
             app.handle_key(key_event(crossterm::event::KeyCode::Enter));
-            assert!(app.path_picker_visible, "{kind:?}: Enter goes in, not picks");
+            assert!(
+                app.path_picker_visible,
+                "{kind:?}: Enter goes in, not picks"
+            );
             assert_eq!(app.path_picker_dir, "/var/my logs", "{kind:?}");
             assert!(app.input.is_empty(), "{kind:?}");
         }
@@ -11043,13 +11969,36 @@ mod tests {
     fn ctrl_l_cycles_llm_profiles() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.profiles = vec![
-            filar_core::LlmProfile { name: "glm".into(), model: "g".into(), api_base_url: "u".into(), max_tokens: 4096, key_env: "k1".into(), temperature: None, top_p: None, extra_body: None, compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS },
-            filar_core::LlmProfile { name: "ds".into(), model: "d".into(), api_base_url: "u".into(), max_tokens: 4096, key_env: "k2".into(), temperature: None, top_p: None, extra_body: None, compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS },
+            filar_core::LlmProfile {
+                name: "glm".into(),
+                model: "g".into(),
+                api_base_url: "u".into(),
+                max_tokens: 4096,
+                key_env: "k1".into(),
+                temperature: None,
+                top_p: None,
+                extra_body: None,
+                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
+            },
+            filar_core::LlmProfile {
+                name: "ds".into(),
+                model: "d".into(),
+                api_base_url: "u".into(),
+                max_tokens: 4096,
+                key_env: "k2".into(),
+                temperature: None,
+                top_p: None,
+                extra_body: None,
+                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
+            },
         ];
         app.default_profile_name = "glm".into();
 
         // First Ctrl+L with None profile → jumps to default.
-        let ctrl_l = crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('l'), crossterm::event::KeyModifiers::CONTROL);
+        let ctrl_l = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
         app.handle_key(ctrl_l);
         assert_eq!(app.llm_profile.as_deref(), Some("glm"));
 
@@ -11072,7 +12021,10 @@ mod tests {
             crossterm::event::KeyCode::Enter,
             crossterm::event::KeyModifiers::NONE,
         ));
-        assert_eq!(app.tokens_in, 0, "tokens_in unchanged until API returns usage");
+        assert_eq!(
+            app.tokens_in, 0,
+            "tokens_in unchanged until API returns usage"
+        );
         assert_eq!(app.tokens_out, 0);
     }
 
@@ -11081,7 +12033,13 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
-            event: filar_agent::AgentEvent::TokenUsage { tokens_in: 10, tokens_out: 20, cost: None, model: None, arbiter: false },
+            event: filar_agent::AgentEvent::TokenUsage {
+                tokens_in: 10,
+                tokens_out: 20,
+                cost: None,
+                model: None,
+                arbiter: false,
+            },
         });
         assert_eq!(app.sessions[0].tokens_in, 10);
         app.new_tab();
@@ -11099,7 +12057,11 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
             event: filar_agent::AgentEvent::TokenUsage {
-                tokens_in: 100, tokens_out: 200, cost: Some(0.0015), model: None, arbiter: false,
+                tokens_in: 100,
+                tokens_out: 200,
+                cost: Some(0.0015),
+                model: None,
+                arbiter: false,
             },
         });
         assert_eq!(app.sessions[0].tokens_in, 100);
@@ -11111,14 +12073,21 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
             event: filar_agent::AgentEvent::TokenUsage {
-                tokens_in: 50, tokens_out: 100, cost: Some(0.0030), model: Some("cohere/command-r".into()), arbiter: false,
+                tokens_in: 50,
+                tokens_out: 100,
+                cost: Some(0.0030),
+                model: Some("cohere/command-r".into()),
+                arbiter: false,
             },
         });
         assert_eq!(app.sessions[0].tokens_in, 150);
         assert!((app.sessions[0].cost_usd.unwrap() - 0.0045).abs() < 0.0001);
         assert_eq!(app.sessions[0].per_profile["glm"].tokens_in, 100);
         assert_eq!(app.sessions[0].per_profile["deepseek"].tokens_in, 50);
-        assert_eq!(app.sessions[0].last_served_model.as_deref(), Some("cohere/command-r"));
+        assert_eq!(
+            app.sessions[0].last_served_model.as_deref(),
+            Some("cohere/command-r")
+        );
     }
 
     #[test]
@@ -11132,11 +12101,18 @@ mod tests {
             app.handle_agent_event(TuiEvent::Agent {
                 session_id: sid,
                 event: filar_agent::AgentEvent::TokenUsage {
-                    tokens_in: used, tokens_out: 100, cost: None, model: None, arbiter: false,
+                    tokens_in: used,
+                    tokens_out: 100,
+                    cost: None,
+                    model: None,
+                    arbiter: false,
                 },
             });
         }
-        assert_eq!(app.sessions[0].tokens_in, 95_000, "the running total still accumulates");
+        assert_eq!(
+            app.sessions[0].tokens_in, 95_000,
+            "the running total still accumulates"
+        );
         assert_eq!(
             app.sessions[0].last_prompt_tokens,
             Some(20_000),
@@ -11156,17 +12132,28 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id: sid,
             event: filar_agent::AgentEvent::TokenUsage {
-                tokens_in: 40_000, tokens_out: 100, cost: None, model: None, arbiter: false,
+                tokens_in: 40_000,
+                tokens_out: 100,
+                cost: None,
+                model: None,
+                arbiter: false,
             },
         });
         app.handle_agent_event(TuiEvent::Agent {
             session_id: sid,
             event: filar_agent::AgentEvent::TokenUsage {
-                tokens_in: 800, tokens_out: 20, cost: None, model: None, arbiter: true,
+                tokens_in: 800,
+                tokens_out: 20,
+                cost: None,
+                model: None,
+                arbiter: true,
             },
         });
         assert_eq!(app.sessions[0].last_prompt_tokens, Some(40_000));
-        assert_eq!(app.sessions[0].arbiter_tokens_in, 800, "arbiter usage is still counted");
+        assert_eq!(
+            app.sessions[0].arbiter_tokens_in, 800,
+            "arbiter usage is still counted"
+        );
     }
 
     #[test]
@@ -11178,7 +12165,11 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id: sid,
             event: filar_agent::AgentEvent::TokenUsage {
-                tokens_in: 0, tokens_out: 50, cost: None, model: None, arbiter: false,
+                tokens_in: 0,
+                tokens_out: 50,
+                cost: None,
+                model: None,
+                arbiter: false,
             },
         });
         assert_eq!(app.sessions[0].last_prompt_tokens, None);
@@ -11188,9 +12179,14 @@ mod tests {
     fn context_notice_fires_once_per_crossing_and_leaves_history_alone() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.profiles = vec![filar_core::LlmProfile {
-            name: "glm".into(), model: "g".into(), api_base_url: "u".into(),
-            max_tokens: 4096, key_env: "k".into(),
-            temperature: None, top_p: None, extra_body: None,
+            name: "glm".into(),
+            model: "g".into(),
+            api_base_url: "u".into(),
+            max_tokens: 4096,
+            key_env: "k".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
             compact_at_tokens: 50_000,
         }];
         app.llm_profile = Some("glm".into());
@@ -11229,9 +12225,14 @@ mod tests {
         // compaction off entirely.
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.profiles = vec![filar_core::LlmProfile {
-            name: "glm".into(), model: "g".into(), api_base_url: "u".into(),
-            max_tokens: 4096, key_env: "k".into(),
-            temperature: None, top_p: None, extra_body: None,
+            name: "glm".into(),
+            model: "g".into(),
+            api_base_url: "u".into(),
+            max_tokens: 4096,
+            key_env: "k".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
             compact_at_tokens: 0,
         }];
         app.llm_profile = Some("glm".into());
@@ -11444,9 +12445,14 @@ mod tests {
     fn zero_threshold_profile_never_reports() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.profiles = vec![filar_core::LlmProfile {
-            name: "glm".into(), model: "g".into(), api_base_url: "u".into(),
-            max_tokens: 4096, key_env: "k".into(),
-            temperature: None, top_p: None, extra_body: None,
+            name: "glm".into(),
+            model: "g".into(),
+            api_base_url: "u".into(),
+            max_tokens: 4096,
+            key_env: "k".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
             compact_at_tokens: 0,
         }];
         app.llm_profile = Some("glm".into());
@@ -11463,9 +12469,14 @@ mod tests {
     fn app_over_threshold(threshold: u64, used: u64) -> App {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.profiles = vec![filar_core::LlmProfile {
-            name: "p".into(), model: "m".into(), api_base_url: "u".into(),
-            max_tokens: 4096, key_env: "k".into(),
-            temperature: None, top_p: None, extra_body: None,
+            name: "p".into(),
+            model: "m".into(),
+            api_base_url: "u".into(),
+            max_tokens: 4096,
+            key_env: "k".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
             compact_at_tokens: threshold,
         }];
         app.default_profile_name = "p".into();
@@ -11496,13 +12507,15 @@ mod tests {
         app.report_context_fill("p");
 
         assert_eq!(
-            app.active_session().pending_compaction, None,
+            app.active_session().pending_compaction,
+            None,
             "compaction must not be armed a second time in a row"
         );
         assert!(
             matches!(app.active_session().messages.last(),
                 Some(ChatBlock::System(s)) if s.contains("cannot be") && s.contains("new session")),
-            "the user must be told, got {:?}", app.active_session().messages.last()
+            "the user must be told, got {:?}",
+            app.active_session().messages.last()
         );
 
         // And the notice is not repeated on every following turn.
@@ -11528,7 +12541,10 @@ mod tests {
         let sid = app.active_session().id;
         app.active_session_mut().pending_llm_profile = Some("p".into());
         app.report_context_fill("p");
-        let boundary = app.active_session().pending_compaction.expect("compaction armed");
+        let boundary = app
+            .active_session()
+            .pending_compaction
+            .expect("compaction armed");
         (app, sid, boundary)
     }
 
@@ -11552,7 +12568,11 @@ mod tests {
         assert_eq!(app.active_session().tokens_in, before_in + 9_000);
         assert_eq!(app.active_session().tokens_out, before_out + 120);
         assert_eq!(app.active_session().cost_usd, Some(0.25));
-        let pu = app.active_session().per_profile.get("p").expect("attributed to the sending profile");
+        let pu = app
+            .active_session()
+            .per_profile
+            .get("p")
+            .expect("attributed to the sending profile");
         assert_eq!(pu.tokens_in, 9_000);
         assert_eq!(pu.tokens_out, 120);
     }
@@ -11580,10 +12600,18 @@ mod tests {
         // and the history is left alone.
         app.apply_compaction(boundary, summary.into());
 
-        assert_eq!(app.active_session().tokens_in, after_first, "no double count");
+        assert_eq!(
+            app.active_session().tokens_in,
+            after_first,
+            "no double count"
+        );
         assert_eq!(app.active_session().per_profile["p"].tokens_in, 9_000);
         assert_eq!(app.active_session().cost_usd, Some(0.25));
-        assert_eq!(app.active_session().messages.len(), blocks, "history untouched");
+        assert_eq!(
+            app.active_session().messages.len(),
+            blocks,
+            "history untouched"
+        );
     }
 
     #[test]
@@ -11620,7 +12648,11 @@ mod tests {
         app.record_summary_usage(&summary_usage(9_000, 120, None), "p".into());
 
         assert_eq!(app.active_session().last_prompt_tokens, before);
-        assert_eq!(app.active_session().tokens_in, 9_000, "but it is still counted");
+        assert_eq!(
+            app.active_session().tokens_in,
+            9_000,
+            "but it is still counted"
+        );
 
         // The fold itself drops the stale figure instead of keeping it.
         app.handle_agent_event(TuiEvent::HistoryCompacted {
@@ -11664,9 +12696,14 @@ mod tests {
         // charge the head of a `p` session to `other` (review of #391).
         let (mut app, sid, boundary) = app_awaiting_summary();
         app.profiles.push(filar_core::LlmProfile {
-            name: "other".into(), model: "m2".into(), api_base_url: "u".into(),
-            max_tokens: 4096, key_env: "k".into(),
-            temperature: None, top_p: None, extra_body: None,
+            name: "other".into(),
+            model: "m2".into(),
+            api_base_url: "u".into(),
+            max_tokens: 4096,
+            key_env: "k".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
             compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         });
 
@@ -11712,7 +12749,10 @@ mod tests {
         let (mut app, sid, boundary) = app_awaiting_summary();
         app.new_tab();
         let other_tab = app.active;
-        assert_ne!(app.sessions[other_tab].id, sid, "the fixture needs two tabs");
+        assert_ne!(
+            app.sessions[other_tab].id, sid,
+            "the fixture needs two tabs"
+        );
 
         app.handle_agent_event(TuiEvent::HistoryCompacted {
             session_id: sid,
@@ -11722,10 +12762,17 @@ mod tests {
             profile: "p".into(),
         });
 
-        let compacted = app.sessions.iter().find(|s| s.id == sid).expect("session alive");
+        let compacted = app
+            .sessions
+            .iter()
+            .find(|s| s.id == sid)
+            .expect("session alive");
         assert_eq!(compacted.tokens_in, 9_000);
         assert_eq!(compacted.per_profile["p"].tokens_in, 9_000);
-        assert_eq!(app.sessions[other_tab].tokens_in, 0, "the visible tab pays nothing");
+        assert_eq!(
+            app.sessions[other_tab].tokens_in, 0,
+            "the visible tab pays nothing"
+        );
         assert!(app.sessions[other_tab].per_profile.is_empty());
         assert_eq!(app.active, other_tab, "the user's tab must be where it was");
     }
@@ -11762,7 +12809,8 @@ mod tests {
         );
         let full = app.full_history();
         assert!(
-            full.iter().any(|b| matches!(b, ChatBlock::User(t) if t == "turn 0")),
+            full.iter()
+                .any(|b| matches!(b, ChatBlock::User(t) if t == "turn 0")),
             "the record still holds the first turn, which the context no longer does"
         );
         // The record reads head, then the summary that stood in for it, then
@@ -11794,14 +12842,20 @@ mod tests {
             );
         }
         // The model-facing context is untouched by any of this.
-        assert!(matches!(app.messages.first(), Some(ChatBlock::Summary { .. })));
+        assert!(matches!(
+            app.messages.first(),
+            Some(ChatBlock::Summary { .. })
+        ));
     }
 
     #[test]
     fn the_transcript_is_written_from_the_whole_conversation() {
         let (app, _, _) = app_after_one_compaction();
         let md = messages_to_markdown(&app.full_history(), "test", &None);
-        assert!(md.contains("turn 0"), "the folded head reaches the transcript");
+        assert!(
+            md.contains("turn 0"),
+            "the folded head reaches the transcript"
+        );
         assert!(md.contains("turn 19"), "so does the tail");
         assert!(
             !messages_to_markdown(&app.messages, "test", &None).contains("turn 0"),
@@ -11846,21 +12900,23 @@ mod tests {
         app.apply_loaded_session(saved);
 
         assert!(
-            app.active_session().messages.iter().any(
-                |b| matches!(b, ChatBlock::User(t) if t == "from the saved file")
-            ),
+            app.active_session()
+                .messages
+                .iter()
+                .any(|b| matches!(b, ChatBlock::User(t) if t == "from the saved file")),
             "the loaded context reached the session, not just App::messages"
         );
         assert!(
-            !app.active_session().messages.iter().any(
-                |b| matches!(b, ChatBlock::User(t) if t == "turn 19")
-            ),
+            !app.active_session()
+                .messages
+                .iter()
+                .any(|b| matches!(b, ChatBlock::User(t) if t == "turn 19")),
             "and the previous context is gone"
         );
         assert!(
-            app.full_history().iter().any(
-                |b| matches!(b, ChatBlock::User(t) if t == "folded in the saved file")
-            ),
+            app.full_history()
+                .iter()
+                .any(|b| matches!(b, ChatBlock::User(t) if t == "folded in the saved file")),
             "the loaded archive is what the record is built from"
         );
     }
@@ -11871,9 +12927,14 @@ mod tests {
         // session, and the threshold is read from whichever profile is active.
         let (mut app, _, _) = app_after_one_compaction();
         app.profiles.push(filar_core::LlmProfile {
-            name: "wide".into(), model: "m2".into(), api_base_url: "u".into(),
-            max_tokens: 4096, key_env: "k".into(),
-            temperature: None, top_p: None, extra_body: None,
+            name: "wide".into(),
+            model: "m2".into(),
+            api_base_url: "u".into(),
+            max_tokens: 4096,
+            key_env: "k".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
             compact_at_tokens: 900_000,
         });
         let folded = app.active_session().folded_history.clone();
@@ -11892,8 +12953,14 @@ mod tests {
             "archive intact"
         );
         assert_eq!(
-            app.messages.iter().filter(|b| !matches!(b, ChatBlock::System(_))).count(),
-            messages.iter().filter(|b| !matches!(b, ChatBlock::System(_))).count(),
+            app.messages
+                .iter()
+                .filter(|b| !matches!(b, ChatBlock::System(_)))
+                .count(),
+            messages
+                .iter()
+                .filter(|b| !matches!(b, ChatBlock::System(_)))
+                .count(),
             "the compacted context is intact apart from the switch notice"
         );
         let now = app.llm_profile.clone().expect("a profile is selected");
@@ -11929,7 +12996,10 @@ mod tests {
             format!("{:?}", before),
             "history byte for byte"
         );
-        assert!(app.active_session().folded_history.is_empty(), "nothing archived");
+        assert!(
+            app.active_session().folded_history.is_empty(),
+            "nothing archived"
+        );
         assert_eq!(format!("{:?}", app.full_history()), format!("{:?}", before));
     }
 
@@ -11950,7 +13020,11 @@ mod tests {
         let before = app.active_session().messages.len();
 
         let epoch = app.active_session().history_epoch;
-        app.handle_agent_event(TuiEvent::CompactionStarted { session_id: sid, boundary, epoch });
+        app.handle_agent_event(TuiEvent::CompactionStarted {
+            session_id: sid,
+            boundary,
+            epoch,
+        });
         assert_eq!(app.active_session().pending_compaction, Some(boundary));
 
         app.handle_agent_event(TuiEvent::HistoryCompacted {
@@ -11993,10 +13067,15 @@ mod tests {
         let bumped = app.active_session().history_epoch.wrapping_add(1);
         app.active_session_mut().history_epoch = bumped;
 
-        app.handle_agent_event(TuiEvent::CompactionStarted { session_id: sid, boundary, epoch });
+        app.handle_agent_event(TuiEvent::CompactionStarted {
+            session_id: sid,
+            boundary,
+            epoch,
+        });
 
         assert_eq!(
-            app.active_session().pending_compaction, None,
+            app.active_session().pending_compaction,
+            None,
             "a boundary from the previous history must not arm the new one"
         );
     }
@@ -12011,7 +13090,11 @@ mod tests {
         let past_end = app.active_session().messages.len() + 5;
 
         let epoch = app.active_session().history_epoch;
-        app.handle_agent_event(TuiEvent::CompactionStarted { session_id: sid, boundary: past_end, epoch });
+        app.handle_agent_event(TuiEvent::CompactionStarted {
+            session_id: sid,
+            boundary: past_end,
+            epoch,
+        });
 
         assert_eq!(app.active_session().pending_compaction, None);
     }
@@ -12050,7 +13133,8 @@ mod tests {
         assert_eq!(app.active_session().pending_compaction, None);
         assert!(
             matches!(after.last(), Some(ChatBlock::System(s)) if s.contains("compaction failed")),
-            "the failure must be visible, got {:?}", after.last()
+            "the failure must be visible, got {:?}",
+            after.last()
         );
     }
 
@@ -12059,15 +13143,25 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.profiles = vec![
             filar_core::LlmProfile {
-                name: "big".into(), model: "g".into(), api_base_url: "u".into(),
-                max_tokens: 4096, key_env: "k".into(),
-                temperature: None, top_p: None, extra_body: None,
+                name: "big".into(),
+                model: "g".into(),
+                api_base_url: "u".into(),
+                max_tokens: 4096,
+                key_env: "k".into(),
+                temperature: None,
+                top_p: None,
+                extra_body: None,
                 compact_at_tokens: 900_000,
             },
             filar_core::LlmProfile {
-                name: "small".into(), model: "d".into(), api_base_url: "u".into(),
-                max_tokens: 4096, key_env: "k".into(),
-                temperature: None, top_p: None, extra_body: None,
+                name: "small".into(),
+                model: "d".into(),
+                api_base_url: "u".into(),
+                max_tokens: 4096,
+                key_env: "k".into(),
+                temperature: None,
+                top_p: None,
+                extra_body: None,
                 compact_at_tokens: 100_000,
             },
         ];
@@ -12083,17 +13177,23 @@ mod tests {
     #[test]
     fn begin_agent_request_sets_pending_llm_profile() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.profiles = vec![
-            filar_core::LlmProfile {
-                name: "glm".into(), model: "glm".into(), api_base_url: "".into(),
-                max_tokens: 1024, key_env: "K".into(),
-                temperature: None, top_p: None, extra_body: None,
-                compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
-            },
-        ];
+        app.profiles = vec![filar_core::LlmProfile {
+            name: "glm".into(),
+            model: "glm".into(),
+            api_base_url: "".into(),
+            max_tokens: 1024,
+            key_env: "K".into(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+            compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
+        }];
         app.llm_profile = Some("glm".into());
         app.begin_agent_request("hello".into());
-        assert_eq!(app.active_session().pending_llm_profile.as_deref(), Some("glm"));
+        assert_eq!(
+            app.active_session().pending_llm_profile.as_deref(),
+            Some("glm")
+        );
         assert!(app.agent_running);
         assert_eq!(app.mode, AppMode::Thinking);
     }
@@ -12103,15 +13203,25 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.profiles = vec![
             filar_core::LlmProfile {
-                name: "glm".into(), model: "glm".into(), api_base_url: "".into(),
-                max_tokens: 1024, key_env: "K".into(),
-                temperature: None, top_p: None, extra_body: None,
+                name: "glm".into(),
+                model: "glm".into(),
+                api_base_url: "".into(),
+                max_tokens: 1024,
+                key_env: "K".into(),
+                temperature: None,
+                top_p: None,
+                extra_body: None,
                 compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
             },
             filar_core::LlmProfile {
-                name: "ds".into(), model: "ds".into(), api_base_url: "".into(),
-                max_tokens: 1024, key_env: "K".into(),
-                temperature: None, top_p: None, extra_body: None,
+                name: "ds".into(),
+                model: "ds".into(),
+                api_base_url: "".into(),
+                max_tokens: 1024,
+                key_env: "K".into(),
+                temperature: None,
+                top_p: None,
+                extra_body: None,
                 compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
             },
         ];
@@ -12124,7 +13234,11 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
             event: filar_agent::AgentEvent::TokenUsage {
-                tokens_in: 10, tokens_out: 20, cost: None, model: Some("served-glm".into()), arbiter: false,
+                tokens_in: 10,
+                tokens_out: 20,
+                cost: None,
+                model: Some("served-glm".into()),
+                arbiter: false,
             },
         });
         assert_eq!(app.sessions[0].per_profile["glm"].tokens_in, 10);
@@ -12132,8 +13246,10 @@ mod tests {
         assert_eq!(app.sessions[0].model_per_profile["glm"], "served-glm");
         // ds profile must NOT have received the usage.
         let ds_usage = app.sessions[0].per_profile.get("ds");
-        assert!(ds_usage.map_or(true, |u| u.tokens_in == 0 && u.tokens_out == 0),
-            "ds profile must not have usage attributed to it");
+        assert!(
+            ds_usage.map_or(true, |u| u.tokens_in == 0 && u.tokens_out == 0),
+            "ds profile must not have usage attributed to it"
+        );
     }
 
     #[test]
@@ -12143,7 +13259,11 @@ mod tests {
         app.handle_agent_event(TuiEvent::Agent {
             session_id: app.sessions[0].id,
             event: filar_agent::AgentEvent::TokenUsage {
-                tokens_in: 10, tokens_out: 20, cost: None, model: None, arbiter: false,
+                tokens_in: 10,
+                tokens_out: 20,
+                cost: None,
+                model: None,
+                arbiter: false,
             },
         });
         let pu = app.sessions[0].per_profile.get("fallback-profile").unwrap();
@@ -12155,7 +13275,10 @@ mod tests {
 
     fn make_ssh_target(name: &str) -> filar_core::SshTarget {
         filar_core::SshTarget {
-            name: name.into(), host: "host".into(), port: 22, user: "user".into(),
+            name: name.into(),
+            host: "host".into(),
+            port: 22,
+            user: "user".into(),
             auth: filar_core::SshAuth::Agent,
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
             tags: Vec::new(),
@@ -12252,7 +13375,10 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert!(app.terminal.is_none(), "old TerminalModel must be cleared (#339)");
+        assert!(
+            app.terminal.is_none(),
+            "old TerminalModel must be cleared (#339)"
+        );
         assert_eq!(app.mode, AppMode::Normal);
         assert!(app.cwd.is_none(), "stale host cwd must clear during switch");
         assert_eq!(
@@ -12278,7 +13404,10 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.host_select_visible, "overlay must close on Esc");
-        assert_eq!(app.target_name, before, "target_name must be unchanged on cancel");
+        assert_eq!(
+            app.target_name, before,
+            "target_name must be unchanged on cancel"
+        );
         assert!(!app.ctrl_o_needs_connect, "no connect on cancel");
     }
 
@@ -12305,7 +13434,10 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(token.is_cancelled(), "previous token must be cancelled on select");
+        assert!(
+            token.is_cancelled(),
+            "previous token must be cancelled on select"
+        );
     }
 
     #[test]
@@ -12335,16 +13467,26 @@ mod tests {
         assert_eq!(
             app.host_select_rows(),
             vec![
-                HostSelectRow::Header { tag: None, count: 1 },
+                HostSelectRow::Header {
+                    tag: None,
+                    count: 1
+                },
                 HostSelectRow::Target(1),
             ],
             "only web-beta must survive the filter"
         );
-        assert_eq!(app.host_select_index, 2, "cursor snaps to the only visible target");
+        assert_eq!(
+            app.host_select_index, 2,
+            "cursor snaps to the only visible target"
+        );
         host_select_press(&mut app, KeyCode::Enter);
         assert!(!app.host_select_visible);
         assert_eq!(app.target_name, "~web-beta");
-        assert_eq!(app.ctrl_o_selection, Some(2), "flat index contract (0 = local)");
+        assert_eq!(
+            app.ctrl_o_selection,
+            Some(2),
+            "flat index contract (0 = local)"
+        );
     }
 
     #[test]
@@ -12360,19 +13502,28 @@ mod tests {
         assert_eq!(
             app.host_select_rows(),
             vec![
-                HostSelectRow::Header { tag: Some("prod".into()), count: 1 },
+                HostSelectRow::Header {
+                    tag: Some("prod".into()),
+                    count: 1
+                },
                 HostSelectRow::Target(0),
             ],
             "query must match the host field"
         );
         host_select_press(&mut app, KeyCode::Esc); // clears the query
         assert!(app.host_select_query.is_empty());
-        assert!(app.host_select_visible, "Esc only clears when a filter is set");
+        assert!(
+            app.host_select_visible,
+            "Esc only clears when a filter is set"
+        );
         host_select_type(&mut app, "prod");
         assert_eq!(
             app.host_select_rows(),
             vec![
-                HostSelectRow::Header { tag: Some("prod".into()), count: 1 },
+                HostSelectRow::Header {
+                    tag: Some("prod".into()),
+                    count: 1
+                },
                 HostSelectRow::Target(0),
             ],
             "query must match tags"
@@ -12394,19 +13545,32 @@ mod tests {
         assert_eq!(
             app.host_select_rows(),
             vec![
-                HostSelectRow::Header { tag: Some("prod".into()), count: 1 },
+                HostSelectRow::Header {
+                    tag: Some("prod".into()),
+                    count: 1
+                },
                 HostSelectRow::Target(0),
             ],
             "local hides, only the tagged host remains"
         );
-        assert_eq!(app.host_select_index, 1, "cursor snaps out of the hidden local row");
+        assert_eq!(
+            app.host_select_index, 1,
+            "cursor snaps out of the hidden local row"
+        );
         host_select_press(&mut app, KeyCode::Tab);
         assert_eq!(app.host_select_tag_filter.as_deref(), Some("web"));
         host_select_press(&mut app, KeyCode::Tab);
-        assert_eq!(app.host_select_tag_filter, None, "cycle wraps back to no filter");
+        assert_eq!(
+            app.host_select_tag_filter, None,
+            "cycle wraps back to no filter"
+        );
         assert_eq!(app.host_select_rows().len(), 7, "full grouped view returns");
         host_select_press(&mut app, KeyCode::BackTab);
-        assert_eq!(app.host_select_tag_filter.as_deref(), Some("web"), "BackTab cycles backwards");
+        assert_eq!(
+            app.host_select_tag_filter.as_deref(),
+            Some("web"),
+            "BackTab cycles backwards"
+        );
     }
 
     #[test]
@@ -12444,12 +13608,19 @@ mod tests {
         host_select_type(&mut app, "zzz");
         assert!(app.host_select_rows().is_empty());
         host_select_press(&mut app, KeyCode::Enter);
-        assert!(app.host_select_visible, "Enter with no visible match must be a no-op");
+        assert!(
+            app.host_select_visible,
+            "Enter with no visible match must be a no-op"
+        );
         assert!(!app.ctrl_o_needs_connect);
         host_select_press(&mut app, KeyCode::Esc); // clears the query, keeps the overlay
         assert!(app.host_select_visible);
         assert!(app.host_select_query.is_empty());
-        assert_eq!(app.host_select_rows().len(), 3, "local + header + srv return");
+        assert_eq!(
+            app.host_select_rows().len(),
+            3,
+            "local + header + srv return"
+        );
         host_select_press(&mut app, KeyCode::Esc); // closes
         assert!(!app.host_select_visible);
     }
@@ -12466,7 +13637,11 @@ mod tests {
         assert_eq!(app.host_select_query, "s");
         host_select_press(&mut app, KeyCode::Backspace);
         assert!(app.host_select_query.is_empty());
-        assert_eq!(app.host_select_rows().len(), 4, "local + header + both hosts return");
+        assert_eq!(
+            app.host_select_rows().len(),
+            4,
+            "local + header + both hosts return"
+        );
     }
 
     #[test]
@@ -12483,12 +13658,21 @@ mod tests {
             app.host_select_rows(),
             vec![
                 HostSelectRow::Local,
-                HostSelectRow::Header { tag: Some("prod".into()), count: 2 },
+                HostSelectRow::Header {
+                    tag: Some("prod".into()),
+                    count: 2
+                },
                 HostSelectRow::Target(0),
                 HostSelectRow::Target(1),
-                HostSelectRow::Header { tag: Some("web".into()), count: 1 },
+                HostSelectRow::Header {
+                    tag: Some("web".into()),
+                    count: 1
+                },
                 HostSelectRow::Target(3),
-                HostSelectRow::Header { tag: None, count: 1 },
+                HostSelectRow::Header {
+                    tag: None,
+                    count: 1
+                },
                 HostSelectRow::Target(2),
             ],
             "primary-tag groups in first-appearance order, untagged last"
@@ -12509,8 +13693,14 @@ mod tests {
         host_select_press(&mut app, KeyCode::Esc); // closes
         assert!(!app.host_select_visible);
         app.open_host_select();
-        assert!(app.host_select_query.is_empty(), "reopen starts from a fresh query");
-        assert_eq!(app.host_select_tag_filter, None, "reopen starts with no tag filter");
+        assert!(
+            app.host_select_query.is_empty(),
+            "reopen starts from a fresh query"
+        );
+        assert_eq!(
+            app.host_select_tag_filter, None,
+            "reopen starts with no tag filter"
+        );
     }
 
     #[test]
@@ -12613,7 +13803,10 @@ mod tests {
         assert!(app.active_ssh_tags().is_empty());
 
         app.ssh_info = None;
-        assert!(app.active_ssh_tags().is_empty(), "local session has no tags");
+        assert!(
+            app.active_ssh_tags().is_empty(),
+            "local session has no tags"
+        );
     }
 
     // ── Tag policies tighten confirm_mode (#414) ────────────────
@@ -12905,7 +14098,10 @@ mod tests {
         let long = "/very/long/path/that/exceeds/limit";
         let t = truncate_pwd(long, 24);
         assert!(t.starts_with('…'), "{t}");
-        assert!(t.ends_with("exceeds/limit") || t.ends_with(long.rsplit('/').next().unwrap()), "{t}");
+        assert!(
+            t.ends_with("exceeds/limit") || t.ends_with(long.rsplit('/').next().unwrap()),
+            "{t}"
+        );
         assert!(t.chars().count() <= 24, "{t}");
     }
 
@@ -12973,9 +14169,13 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
         app.apply_loaded_session(session);
-        assert!(app.messages.iter().any(|b| matches!(b, ChatBlock::User(s) if s == "hello")));
+        assert!(app
+            .messages
+            .iter()
+            .any(|b| matches!(b, ChatBlock::User(s) if s == "hello")));
         assert!(app.input_history().iter().any(|s| s == "ls"));
         assert_eq!(app.tokens_in, 11);
         assert_eq!(app.tokens_out, 22);
@@ -13029,6 +14229,7 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
         app.apply_loaded_session(session);
 
@@ -13072,6 +14273,7 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
         app.apply_loaded_session(session);
         assert_eq!(
@@ -13112,11 +14314,18 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
         app.apply_loaded_session(session);
-        assert!(app.pending_ssh.is_none(), "stale pending_ssh must be cleared");
+        assert!(
+            app.pending_ssh.is_none(),
+            "stale pending_ssh must be cleared"
+        );
         assert!(app.pending_ssh_password.is_none());
-        assert!(token.is_cancelled(), "in-flight pending_ssh must be cancelled");
+        assert!(
+            token.is_cancelled(),
+            "in-flight pending_ssh must be cancelled"
+        );
         assert_eq!(app.mode, AppMode::Normal);
     }
 
@@ -13148,9 +14357,13 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
         app.apply_loaded_session(session);
-        assert!(app.pending_ssh_handle.is_none(), "handle must be taken on reset");
+        assert!(
+            app.pending_ssh_handle.is_none(),
+            "handle must be taken on reset"
+        );
         // The spawned task is aborted, so its oneshot sender is dropped without
         // sending — awaiting the receiver resolves to `Err`.
         assert!(rx.await.is_err(), "aborted task must not run to completion");
@@ -13184,10 +14397,17 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
         app.apply_loaded_session(session);
-        assert!(app.ctrl_o_handle.is_none(), "ctrl_o handle must be taken on reset");
-        assert!(rx.await.is_err(), "aborted Ctrl+O task must not run to completion");
+        assert!(
+            app.ctrl_o_handle.is_none(),
+            "ctrl_o handle must be taken on reset"
+        );
+        assert!(
+            rx.await.is_err(),
+            "aborted Ctrl+O task must not run to completion"
+        );
     }
 
     #[test]
@@ -13221,11 +14441,15 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
         app.apply_loaded_session(session);
         // Matching target → routed through the Ctrl+O connect path (password
         // auto-resolved in the runner), not the manual password prompt.
-        assert!(app.ctrl_o_needs_connect, "matched target must trigger connect");
+        assert!(
+            app.ctrl_o_needs_connect,
+            "matched target must trigger connect"
+        );
         assert_eq!(app.ctrl_o_selection, Some(1));
         assert_eq!(app.target_name, "~srv-a");
         assert_eq!(app.mode, AppMode::Normal);
@@ -13267,6 +14491,7 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
         app.apply_loaded_session(session);
         assert_eq!(app.llm_profile.as_deref(), Some("glm"));
@@ -13276,7 +14501,10 @@ mod tests {
     fn password_needed_sets_pending_and_switches_mode() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let target = filar_core::SshTarget {
-            name: "srv".into(), host: "h".into(), port: 22, user: "u".into(),
+            name: "srv".into(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
             auth: filar_core::SshAuth::Password { password: None },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
             tags: Vec::new(),
@@ -13285,8 +14513,14 @@ mod tests {
             session_id: app.sessions[0].id,
             target: target.clone(),
         });
-        assert!(app.ctrl_o_pending_target.is_some(), "pending ctrl+o target must be set");
-        assert!(app.ctrl_o_pending_session_id.is_some(), "pending session id must be set");
+        assert!(
+            app.ctrl_o_pending_target.is_some(),
+            "pending ctrl+o target must be set"
+        );
+        assert!(
+            app.ctrl_o_pending_session_id.is_some(),
+            "pending session id must be set"
+        );
         assert_eq!(app.mode, AppMode::PasswordInput);
     }
 
@@ -13294,7 +14528,10 @@ mod tests {
     fn an_encrypted_key_asks_for_its_passphrase_by_name() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         let target = filar_core::SshTarget {
-            name: "srv".into(), host: "h".into(), port: 22, user: "u".into(),
+            name: "srv".into(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
             auth: filar_core::SshAuth::Key {
                 path: Some(std::path::PathBuf::from("/keys/id_srv")),
                 passphrase: None,
@@ -13313,14 +14550,20 @@ mod tests {
         });
         let asked = asked.expect("a prompt line");
         assert!(asked.contains("passphrase for SSH key"), "{asked}");
-        assert!(asked.contains("id_srv") && asked.contains("(srv)"), "{asked}");
+        assert!(
+            asked.contains("id_srv") && asked.contains("(srv)"),
+            "{asked}"
+        );
     }
 
     #[test]
     fn password_entry_for_ctrl_o_retriggers_connect() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.ctrl_o_pending_target = Some(filar_core::SshTarget {
-            name: "srv".into(), host: "h".into(), port: 22, user: "u".into(),
+            name: "srv".into(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
             auth: filar_core::SshAuth::Password { password: None },
             host_key_policy: filar_core::HostKeyPolicy::Tofu,
             tags: Vec::new(),
@@ -13330,9 +14573,15 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.pending_ssh_password.is_some());
-        assert!(app.ctrl_o_needs_connect, "ctrl_o_needs_connect must be set for runner");
+        assert!(
+            app.ctrl_o_needs_connect,
+            "ctrl_o_needs_connect must be set for runner"
+        );
         assert_eq!(app.mode, AppMode::Normal);
-        assert!(app.ctrl_o_pending_target.is_some(), "pending target consumed by runner, not app");
+        assert!(
+            app.ctrl_o_pending_target.is_some(),
+            "pending target consumed by runner, not app"
+        );
     }
 
     // ── Ctrl+S save session overlay tests (#232) ─────────────────────
@@ -13373,8 +14622,14 @@ mod tests {
         app.save_progress = 50;
         // Any non-Esc key must be ignored and not reset progress.
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.save_overlay_visible, "overlay must stay visible on non-Esc key");
-        assert_eq!(app.save_progress, 50, "progress must not reset on non-Esc key");
+        assert!(
+            app.save_overlay_visible,
+            "overlay must stay visible on non-Esc key"
+        );
+        assert_eq!(
+            app.save_progress, 50,
+            "progress must not reset on non-Esc key"
+        );
         // Esc must close.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.save_overlay_visible);
@@ -13389,7 +14644,10 @@ mod tests {
         // Second Ctrl+S must be blocked by the guard, not reset state.
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(app.save_overlay_visible, "overlay must stay visible");
-        assert_eq!(app.save_progress, 75, "progress must not reset on repeated Ctrl+S");
+        assert_eq!(
+            app.save_progress, 75,
+            "progress must not reset on repeated Ctrl+S"
+        );
     }
 
     #[test]
@@ -13398,7 +14656,10 @@ mod tests {
         app.save_error = Some("previous error".into());
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        assert!(app.save_error.is_none(), "save_error must be cleared on open");
+        assert!(
+            app.save_error.is_none(),
+            "save_error must be cleared on open"
+        );
     }
 
     #[test]
@@ -13408,7 +14669,10 @@ mod tests {
         // Ctrl+S in Thinking mode must be a no-op.
         app.mode = AppMode::Thinking;
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        assert!(!app.save_overlay_visible, "Ctrl+S must not open overlay in Thinking mode");
+        assert!(
+            !app.save_overlay_visible,
+            "Ctrl+S must not open overlay in Thinking mode"
+        );
     }
 
     // ── Session-save export helpers (#234) ────────────────────────────
@@ -13422,7 +14686,10 @@ mod tests {
     #[test]
     fn slugify_collapses_consecutive_nonalphanum() {
         let s = slugify("a@#b");
-        assert_eq!(s, "a-b", "consecutive special chars must collapse to one dash");
+        assert_eq!(
+            s, "a-b",
+            "consecutive special chars must collapse to one dash"
+        );
     }
 
     #[test]
@@ -13451,13 +14718,7 @@ mod tests {
     #[tokio::test]
     async fn generate_save_filename_includes_topic_slug() {
         let msgs = vec![ChatBlock::User("fix nginx timeout on prod".into())];
-        let name = generate_save_filename(
-            "local",
-            &None,
-            &msgs,
-            std::path::Path::new("."),
-        )
-        .await;
+        let name = generate_save_filename("local", &None, &msgs, std::path::Path::new(".")).await;
         assert!(
             name.starts_with("local.fix-nginx-timeout-on-prod."),
             "expected host.topic.ts.md, got: {name}"
@@ -13481,7 +14742,10 @@ mod tests {
         // After host slug: immediately the date (YYYY-…), not a topic word.
         let after_host = name.strip_prefix("local.").unwrap();
         assert!(
-            after_host.as_bytes().get(..4).is_some_and(|b| b.iter().all(u8::is_ascii_digit)),
+            after_host
+                .as_bytes()
+                .get(..4)
+                .is_some_and(|b| b.iter().all(u8::is_ascii_digit)),
             "expected date after host when no topic, got: {name}"
         );
     }
@@ -13530,6 +14794,7 @@ mod tests {
                 group: group.into(),
                 hosts: hosts.iter().map(|h| h.to_string()).collect(),
             }),
+            kube: None,
         }
     }
 
@@ -13545,7 +14810,10 @@ mod tests {
     #[test]
     fn a_fleet_session_restores_with_its_saved_composition() {
         let mut app = App::new("local".into(), CommandConfirmMode::Always);
-        app.ssh_targets = vec![fleet_target("web-1", &["web"]), fleet_target("web-2", &["web"])];
+        app.ssh_targets = vec![
+            fleet_target("web-1", &["web"]),
+            fleet_target("web-2", &["web"]),
+        ];
         app.host_groups = vec![filar_core::HostGroup {
             name: "web".into(),
             match_tags: vec!["web".into()],
@@ -13577,7 +14845,10 @@ mod tests {
 
         app.restore_fleet(saved_fleet("web", &["web-1", "web-2"]));
         assert_eq!(fleet_names(&app), ["web-1", "web-2"]);
-        assert!(app.messages.iter().any(|m| matches!(m, ChatBlock::System(t) if t.contains("not from current tags"))));
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| matches!(m, ChatBlock::System(t) if t.contains("not from current tags"))));
 
         // Entering the group afresh is what follows today's tags.
         app.exit_fleet();
@@ -13603,15 +14874,22 @@ mod tests {
         assert!(said("Group web is no longer in the config"));
 
         // Saving again keeps the vanished host in the composition.
-        let snapshot = app.active_session().fleet_snapshot().expect("fleet session");
+        let snapshot = app
+            .active_session()
+            .fleet_snapshot()
+            .expect("fleet session");
         assert_eq!(snapshot.hosts, ["web-1", "web-7"]);
         assert_eq!(snapshot.group, "web");
-        assert_eq!(app.active_session().fleet_saved_id.as_deref(), Some("1790000000-fleet1"));
+        assert_eq!(
+            app.active_session().fleet_saved_id.as_deref(),
+            Some("1790000000-fleet1")
+        );
     }
 
     #[tokio::test]
     async fn the_export_of_a_restored_fleet_names_the_hosts_the_config_lost() {
-        let base = std::env::temp_dir().join(format!("filar_export_restored_{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("filar_export_restored_{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&base).await;
         let mut app = App::new("local".into(), CommandConfirmMode::Always);
         app.ssh_targets = vec![fleet_target("web-1", &["web"])];
@@ -13619,7 +14897,9 @@ mod tests {
         app.restore_fleet(saved_fleet("web", &["web-7", "web-1"]));
 
         let done = run_save_to_completion(&mut app).await;
-        let text = tokio::fs::read_to_string(base.join(&done)).await.expect("export written");
+        let text = tokio::fs::read_to_string(base.join(&done))
+            .await
+            .expect("export written");
         assert!(text.contains("| web-7 | no longer in config |"), "{text}");
         assert!(
             text.find("| web-7 |") < text.find("| web-1 |"),
@@ -13639,8 +14919,14 @@ mod tests {
         app.restore_fleet(saved_fleet("web", &["dup", "dup"]));
 
         let done = run_save_to_completion(&mut app).await;
-        let text = tokio::fs::read_to_string(base.join(&done)).await.expect("export written");
-        assert_eq!(text.matches("| dup | no longer in config |").count(), 1, "{text}");
+        let text = tokio::fs::read_to_string(base.join(&done))
+            .await
+            .expect("export written");
+        assert_eq!(
+            text.matches("| dup | no longer in config |").count(),
+            1,
+            "{text}"
+        );
         assert_eq!(text.matches("| dup | not asked yet |").count(), 1, "{text}");
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
@@ -13652,24 +14938,40 @@ mod tests {
         let mut app = App::new("local".into(), CommandConfirmMode::Never);
         app.ssh_targets = vec![fleet_target("web-1", &["web"])];
         app.restore_fleet(stricter);
-        assert_eq!(app.active_session().confirm_mode, CommandConfirmMode::Always);
+        assert_eq!(
+            app.active_session().confirm_mode,
+            CommandConfirmMode::Always
+        );
 
         let mut looser = saved_fleet("web", &["web-1"]);
         looser.confirm_mode = Some(CommandConfirmMode::Never);
         let mut app = App::new("local".into(), CommandConfirmMode::Always);
         app.ssh_targets = vec![fleet_target("web-1", &["web"])];
         app.restore_fleet(looser);
-        assert_eq!(app.active_session().confirm_mode, CommandConfirmMode::Always);
+        assert_eq!(
+            app.active_session().confirm_mode,
+            CommandConfirmMode::Always
+        );
     }
 
     #[test]
     fn a_vanished_host_keeps_its_place_in_the_saved_order() {
         let mut app = App::new("local".into(), CommandConfirmMode::Always);
-        app.ssh_targets = vec![fleet_target("web-1", &["web"]), fleet_target("web-2", &["web"])];
+        app.ssh_targets = vec![
+            fleet_target("web-1", &["web"]),
+            fleet_target("web-2", &["web"]),
+        ];
         app.restore_fleet(saved_fleet("web", &["web-7", "web-1", "web-2"]));
         assert_eq!(fleet_names(&app), ["web-1", "web-2"]);
-        let snapshot = app.active_session().fleet_snapshot().expect("fleet session");
-        assert_eq!(snapshot.hosts, ["web-7", "web-1", "web-2"], "order survives a save");
+        let snapshot = app
+            .active_session()
+            .fleet_snapshot()
+            .expect("fleet session");
+        assert_eq!(
+            snapshot.hosts,
+            ["web-7", "web-1", "web-2"],
+            "order survives a save"
+        );
     }
 
     // ── Fleet export (#441) ─────────────────────────────────────────
@@ -13677,7 +14979,17 @@ mod tests {
     #[test]
     fn hostile_group_names_cannot_escape_the_save_dir() {
         let base = std::path::Path::new("exports");
-        for name in ["..", "../../etc", "..\\..\\Windows", "CON", ".", "  ", "///", "", "a/../../b"] {
+        for name in [
+            "..",
+            "../../etc",
+            "..\\..\\Windows",
+            "CON",
+            ".",
+            "  ",
+            "///",
+            "",
+            "a/../../b",
+        ] {
             let segment = fleet_export_dir_name(name);
             let path = base.join(&segment);
             let parts: Vec<_> = path.components().collect();
@@ -13701,7 +15013,8 @@ mod tests {
             .to_vec();
         let skipped = vec![("app-1".to_string(), "no password".to_string())];
         let view = FleetView {
-            operation: filar_core::FleetOperation::open(&filar_core::HostGroup::default(), &[]).id(),
+            operation: filar_core::FleetOperation::open(&filar_core::HostGroup::default(), &[])
+                .id(),
             command: "uname -r".into(),
             headline: "operation #3: 3 of 6 hosts answered, 1 did not answer".into(),
             groups: vec![
@@ -13717,10 +15030,30 @@ mod tests {
                 },
             ],
             dropped: vec![
-                ViewDropped { host: "db-1".into(), state: HostState::NoContact, exit_code: None, reason: None },
-                ViewDropped { host: "win-1".into(), state: HostState::NotApplicable, exit_code: None, reason: None },
-                ViewDropped { host: "app-1".into(), state: HostState::Skipped, exit_code: None, reason: None },
-                ViewDropped { host: "app-2".into(), state: HostState::Cancelled, exit_code: None, reason: None },
+                ViewDropped {
+                    host: "db-1".into(),
+                    state: HostState::NoContact,
+                    exit_code: None,
+                    reason: None,
+                },
+                ViewDropped {
+                    host: "win-1".into(),
+                    state: HostState::NotApplicable,
+                    exit_code: None,
+                    reason: None,
+                },
+                ViewDropped {
+                    host: "app-1".into(),
+                    state: HostState::Skipped,
+                    exit_code: None,
+                    reason: None,
+                },
+                ViewDropped {
+                    host: "app-2".into(),
+                    state: HostState::Cancelled,
+                    exit_code: None,
+                    reason: None,
+                },
             ],
         };
 
@@ -13738,7 +15071,10 @@ mod tests {
         ] {
             assert!(md.contains(row), "missing {row:?} in:\n{md}");
         }
-        assert!(!md.contains("SAMPLE-OUTPUT"), "host output is not part of the summary");
+        assert!(
+            !md.contains("SAMPLE-OUTPUT"),
+            "host output is not part of the summary"
+        );
 
         // Before any operation every host is still listed.
         let md = fleet_summary_markdown("web", &members, &skipped, &[], None, None);
@@ -13754,7 +15090,12 @@ mod tests {
         let view = test_fleet_view();
         let members: Vec<String> = ["web-1", "web-2", "web-3"].map(String::from).to_vec();
         let later = filar_core::FleetOperation::open(&filar_core::HostGroup::default(), &[]).id();
-        let status = |operation, running| FleetStatus { operation, answering: 1, total: 3, running };
+        let status = |operation, running| FleetStatus {
+            operation,
+            answering: 1,
+            total: 3,
+            running,
+        };
         let md = |view: Option<&filar_agent::fleet_view::FleetView>, status: FleetStatus| {
             fleet_summary_markdown("web", &members, &[], &[], view, Some(&status))
         };
@@ -13775,7 +15116,10 @@ mod tests {
         assert!(!text.contains("before it"), "{text}");
         // Finished without reporting: said, and "no command ran" is not.
         let text = md(None, status(later, false));
-        assert!(text.contains("ended without reporting any host's state"), "{text}");
+        assert!(
+            text.contains("ended without reporting any host's state"),
+            "{text}"
+        );
         assert!(!text.contains("No command has been run"), "{text}");
         // Finished and reported: no caveat.
         let text = md(Some(&view), status(view.operation, false));
@@ -13786,7 +15130,10 @@ mod tests {
     fn a_hostile_host_name_cannot_forge_a_table_row() {
         let members = vec!["evil | ok |\n| web-9".to_string()];
         let md = fleet_summary_markdown("web", &members, &[], &[], None, None);
-        assert!(md.contains("| evil \\| ok \\| \\| web-9 | not asked yet |"), "{md}");
+        assert!(
+            md.contains("| evil \\| ok \\| \\| web-9 | not asked yet |"),
+            "{md}"
+        );
     }
 
     #[tokio::test]
@@ -13801,7 +15148,9 @@ mod tests {
             .strip_prefix("web/")
             .unwrap_or_else(|| panic!("Done must name the group folder, got: {done}"));
         let file = base.join("web").join(filename);
-        let text = tokio::fs::read_to_string(&file).await.expect("export written");
+        let text = tokio::fs::read_to_string(&file)
+            .await
+            .expect("export written");
         assert!(text.contains("## Fleet: web"), "{text}");
         for row in ["| web-1 | ok |", "| web-2 | ok |", "| web-3 | differs |"] {
             assert!(text.contains(row), "missing {row:?} in:\n{text}");
@@ -13814,7 +15163,9 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 1);
-        assert!(!tokio::fs::try_exists(base.join("local")).await.unwrap_or(false));
+        assert!(!tokio::fs::try_exists(base.join("local"))
+            .await
+            .unwrap_or(false));
 
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
@@ -13823,9 +15174,22 @@ mod tests {
     fn hostile_aliases_cannot_escape_the_save_dir() {
         let base = std::path::Path::new("exports");
         let ssh = Some("root@10.0.0.5".to_string());
-        for alias in ["..", "../../etc", "..\\..\\Windows", "CON", ".", "  ", "///", "", "***"] {
+        for alias in [
+            "..",
+            "../../etc",
+            "..\\..\\Windows",
+            "CON",
+            ".",
+            "  ",
+            "///",
+            "",
+            "***",
+        ] {
             let segment = export_dir_name(alias, &ssh);
-            assert!(!segment.is_empty(), "alias {alias:?} gave an empty folder name");
+            assert!(
+                !segment.is_empty(),
+                "alias {alias:?} gave an empty folder name"
+            );
             assert!(
                 !segment.contains('/') && !segment.contains('\\'),
                 "alias {alias:?} leaked a separator into {segment:?}"
@@ -13901,7 +15265,9 @@ mod tests {
         );
         // The export root itself stays clean — no flat .md files (#400).
         assert!(
-            !tokio::fs::try_exists(base.join(filename)).await.unwrap_or(false),
+            !tokio::fs::try_exists(base.join(filename))
+                .await
+                .unwrap_or(false),
             "export must not land flat in the export root"
         );
 
@@ -13946,7 +15312,9 @@ mod tests {
         let mut suffixed = false;
         for _ in 0..5 {
             let first = generate_save_filename("db-replica", &ssh, &msgs, &dir).await;
-            tokio::fs::write(dir.join(&first), "occupied").await.unwrap();
+            tokio::fs::write(dir.join(&first), "occupied")
+                .await
+                .unwrap();
             let second = generate_save_filename("db-replica", &ssh, &msgs, &dir).await;
             let ok = first
                 .strip_suffix(".md")
@@ -13957,7 +15325,10 @@ mod tests {
                 break;
             }
         }
-        assert!(suffixed, "a colliding name must get the -1 suffix, last pair: {last:?}");
+        assert!(
+            suffixed,
+            "a colliding name must get the -1 suffix, last pair: {last:?}"
+        );
         // The resolution happened inside the target folder, not the root.
         assert!(dir.starts_with(&base));
 
@@ -14009,19 +15380,34 @@ mod tests {
         app.push_message(command_block("systemctl restart nginx", true));
 
         let done = run_save_to_completion(&mut app).await;
-        assert!(done.starts_with("prod-web/"), "export goes to the target folder, got {done}");
+        assert!(
+            done.starts_with("prod-web/"),
+            "export goes to the target folder, got {done}"
+        );
 
         // Asked for, not armed, until the user answers (#481).
         assert!(app.runbook_armed.is_none(), "no runbook before the answer");
-        let armed = app.runbook_offer.as_ref().expect("Ctrl+S must offer a runbook");
+        let armed = app
+            .runbook_offer
+            .as_ref()
+            .expect("Ctrl+S must offer a runbook");
         assert_eq!(armed.session_id, app.sessions[0].id);
-        assert!(armed.fleet.is_none(), "an ordinary tab's runbook is the single-host one");
-        assert_eq!(armed.profile, "glm", "the runbook uses the session's profile");
+        assert!(
+            armed.fleet.is_none(),
+            "an ordinary tab's runbook is the single-host one"
+        );
+        assert_eq!(
+            armed.profile, "glm",
+            "the runbook uses the session's profile"
+        );
         assert_eq!(armed.target_dir, base.join("prod-web"));
         assert_eq!(armed.session_name, "prod-web");
         // Folded from the same full history the `.md` was written from (#379).
         let md = messages_to_markdown(&armed.messages, &armed.session_name, &armed.ssh_info);
-        assert!(md.contains("systemctl restart nginx"), "snapshot must carry the session");
+        assert!(
+            md.contains("systemctl restart nginx"),
+            "snapshot must carry the session"
+        );
 
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
@@ -14036,20 +15422,37 @@ mod tests {
         app.push_message(command_block("uname -r", true));
         run_save_to_completion(&mut app).await;
 
-        let armed = app.runbook_offer.as_ref().expect("Ctrl+S in the fleet offers a runbook too");
-        let ids = armed.fleet.as_ref().expect("a fleet runbook carries the hosts to scrub");
+        let armed = app
+            .runbook_offer
+            .as_ref()
+            .expect("Ctrl+S in the fleet offers a runbook too");
+        let ids = armed
+            .fleet
+            .as_ref()
+            .expect("a fleet runbook carries the hosts to scrub");
         for host in ["web-1", "web-2", "web-3", "web-1.example", "web-3.example"] {
-            assert!(ids.hosts.iter().any(|h| h == host), "{host} must be scrubbed");
+            assert!(
+                ids.hosts.iter().any(|h| h == host),
+                "{host} must be scrubbed"
+            );
         }
-        assert!(ids.users.iter().any(|u| u == "ops"), "accounts are scrubbed too");
-        assert_eq!(armed.target_dir, base.join("web"), "beside the group's export (#441)");
+        assert!(
+            ids.users.iter().any(|u| u == "ops"),
+            "accounts are scrubbed too"
+        );
+        assert_eq!(
+            armed.target_dir,
+            base.join("web"),
+            "beside the group's export (#441)"
+        );
 
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
     #[tokio::test]
     async fn a_restored_fleet_runbook_scrubs_the_hosts_the_config_lost() {
-        let base = std::env::temp_dir().join(format!("filar_runbook_restored_{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("filar_runbook_restored_{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&base).await;
         let mut app = App::new("local".into(), CommandConfirmMode::Always);
         app.ssh_targets = vec![fleet_target("web-1", &["web"])];
@@ -14058,8 +15461,15 @@ mod tests {
         app.push_message(command_block("uname -r", true));
         run_save_to_completion(&mut app).await;
 
-        let ids = app.runbook_offer.as_ref().and_then(|a| a.fleet.as_ref()).expect("fleet runbook offered");
-        assert!(ids.hosts.iter().any(|h| h == "web-7"), "a vanished host is scrubbed too");
+        let ids = app
+            .runbook_offer
+            .as_ref()
+            .and_then(|a| a.fleet.as_ref())
+            .expect("fleet runbook offered");
+        assert!(
+            ids.hosts.iter().any(|h| h == "web-7"),
+            "a vanished host is scrubbed too"
+        );
         assert!(ids.hosts.iter().any(|h| h == "web-1"));
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
@@ -14102,15 +15512,22 @@ mod tests {
         assert!(app.runbook_armed.is_some(), "y arms the captured job");
         match rx.try_recv() {
             Ok(SaveProgress::RunbookRequested(name)) => assert_eq!(name, md),
-            other => panic!("expected RunbookRequested, got {:?}", other.map(|_| "another event")),
+            other => panic!(
+                "expected RunbookRequested, got {:?}",
+                other.map(|_| "another event")
+            ),
         }
-        assert!(app.save_overlay_visible, "the overlay stays to show the runbook");
+        assert!(
+            app.save_overlay_visible,
+            "the overlay stays to show the runbook"
+        );
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
     #[tokio::test]
     async fn y_before_the_export_finishes_leaves_the_start_to_done() {
-        let base = std::env::temp_dir().join(format!("filar_runbook_y_early_{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("filar_runbook_y_early_{}", std::process::id()));
         let (mut app, mut rx) = app_saving_a_session_with_commands(&base);
         app.start_save();
         // Russian layout: н is y.
@@ -14127,14 +15544,23 @@ mod tests {
     #[tokio::test]
     async fn n_t_and_esc_save_only_the_session() {
         use crossterm::event::KeyCode;
-        for (answer, closes) in [(KeyCode::Char('n'), false), (KeyCode::Char('т'), false), (KeyCode::Esc, true)] {
-            let base = std::env::temp_dir()
-                .join(format!("filar_runbook_no_{}_{:?}", std::process::id(), answer).replace(['(', ')', '\'', ' '], ""));
+        for (answer, closes) in [
+            (KeyCode::Char('n'), false),
+            (KeyCode::Char('т'), false),
+            (KeyCode::Esc, true),
+        ] {
+            let base = std::env::temp_dir().join(
+                format!("filar_runbook_no_{}_{:?}", std::process::id(), answer)
+                    .replace(['(', ')', '\'', ' '], ""),
+            );
             let (mut app, mut rx) = app_saving_a_session_with_commands(&base);
             app.start_save();
             app.handle_key(key_event(answer));
             assert!(app.runbook_offer.is_none(), "{answer:?} answers");
-            assert!(app.runbook_armed.is_none(), "{answer:?}: no runbook is armed");
+            assert!(
+                app.runbook_armed.is_none(),
+                "{answer:?}: no runbook is armed"
+            );
             assert_eq!(app.save_overlay_visible, !closes, "{answer:?}");
             let md = wait_for_done(&mut rx).await;
             assert!(md.ends_with(".md"), "the session is still saved: {md}");
@@ -14150,7 +15576,10 @@ mod tests {
         app.save_dir = Some(base.clone());
         app.push_message(command_block("rm -rf /tmp/x", false));
         run_save_to_completion(&mut app).await;
-        assert!(app.runbook_offer.is_none(), "nothing to fold — nothing to ask");
+        assert!(
+            app.runbook_offer.is_none(),
+            "nothing to fold — nothing to ask"
+        );
 
         // `save_runbook = false`: neither question nor job.
         let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
@@ -14172,7 +15601,8 @@ mod tests {
 
     #[tokio::test]
     async fn explain_transcript_save_never_arms_a_runbook() {
-        let base = std::env::temp_dir().join(format!("filar_runbook_silent_{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("filar_runbook_silent_{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&base).await;
 
         let mut app = App::new("prod-web".into(), CommandConfirmMode::Explain);
@@ -14184,16 +15614,28 @@ mod tests {
 
         app.save_transcript_silent();
         loop {
-            match rx.recv().await.expect("silent save must report its outcome") {
+            match rx
+                .recv()
+                .await
+                .expect("silent save must report its outcome")
+            {
                 SaveProgress::TranscriptDone(..) => break,
-                other => panic!("the silent path must send nothing but TranscriptDone, got {other:?}"),
+                other => {
+                    panic!("the silent path must send nothing but TranscriptDone, got {other:?}")
+                }
             }
         }
 
         // The silent save does no network work: no runbook job is armed
         // (the only thing that starts an LLM call) and no status appears.
-        assert!(app.runbook_armed.is_none(), "the silent path must not arm a runbook");
-        assert!(app.runbook_state.is_none(), "and must not touch the overlay status");
+        assert!(
+            app.runbook_armed.is_none(),
+            "the silent path must not arm a runbook"
+        );
+        assert!(
+            app.runbook_state.is_none(),
+            "and must not touch the overlay status"
+        );
 
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
@@ -14202,8 +15644,12 @@ mod tests {
     fn take_runbook_job_skips_a_session_without_executed_commands() {
         let mut app = App::new("local-1".into(), CommandConfirmMode::Always);
         // Small talk and a denied command — nothing was run, nothing to fold.
-        app.sessions[0].messages.push(ChatBlock::User("привет".into()));
-        app.sessions[0].messages.push(command_block("rm -rf /", false));
+        app.sessions[0]
+            .messages
+            .push(ChatBlock::User("привет".into()));
+        app.sessions[0]
+            .messages
+            .push(command_block("rm -rf /", false));
         app.runbook_armed = Some(RunbookArmed {
             session_id: app.sessions[0].id,
             target_dir: std::path::PathBuf::from("exports/local"),
@@ -14214,12 +15660,23 @@ mod tests {
             fleet: None,
         });
 
-        assert!(app.take_runbook_job().is_none(), "no executed commands — no LLM call");
+        assert!(
+            app.take_runbook_job().is_none(),
+            "no executed commands — no LLM call"
+        );
         assert_eq!(app.runbook_state, Some(RunbookState::Skipped));
-        assert!(app.runbook_armed.is_none(), "the job is consumed either way");
-        let last = app.sessions[0].messages.last().expect("skip must be explained");
+        assert!(
+            app.runbook_armed.is_none(),
+            "the job is consumed either way"
+        );
+        let last = app.sessions[0]
+            .messages
+            .last()
+            .expect("skip must be explained");
         match last {
-            ChatBlock::System(text) => assert!(text.contains("no executed commands"), "got: {text}"),
+            ChatBlock::System(text) => {
+                assert!(text.contains("no executed commands"), "got: {text}")
+            }
             other => panic!("expected a system note, got {other:?}"),
         }
     }
@@ -14227,7 +15684,9 @@ mod tests {
     #[test]
     fn take_runbook_job_accepts_a_session_with_an_approved_command() {
         let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
-        app.sessions[0].messages.push(command_block("systemctl restart nginx", true));
+        app.sessions[0]
+            .messages
+            .push(command_block("systemctl restart nginx", true));
         app.runbook_armed = Some(RunbookArmed {
             session_id: app.sessions[0].id,
             target_dir: std::path::PathBuf::from("exports/prod-web"),
@@ -14238,10 +15697,15 @@ mod tests {
             fleet: None,
         });
 
-        let job = app.take_runbook_job().expect("an approved command must pass the gate");
+        let job = app
+            .take_runbook_job()
+            .expect("an approved command must pass the gate");
         assert_eq!(job.profile, "glm");
         assert_eq!(job.messages.len(), 2, "greeting + command");
-        assert_eq!(app.runbook_state, None, "the runner owns the state once the job is taken");
+        assert_eq!(
+            app.runbook_state, None,
+            "the runner owns the state once the job is taken"
+        );
     }
 
     #[tokio::test]
@@ -14256,7 +15720,10 @@ mod tests {
 
         // The export still happens — the setting only turns off the LLM part.
         let _ = run_save_to_completion(&mut app).await;
-        assert!(app.runbook_armed.is_none(), "save_runbook = false must not call the LLM");
+        assert!(
+            app.runbook_armed.is_none(),
+            "save_runbook = false must not call the LLM"
+        );
         assert!(app.runbook_state.is_none());
 
         let _ = tokio::fs::remove_dir_all(&base).await;
@@ -14279,9 +15746,14 @@ mod tests {
             Some(RunbookState::Generating),
             "the in-flight runbook keeps its status through the new save"
         );
-        let last = app.sessions[0].messages.last().expect("must explain the omission");
+        let last = app.sessions[0]
+            .messages
+            .last()
+            .expect("must explain the omission");
         match last {
-            ChatBlock::System(text) => assert!(text.contains("already being generated"), "got: {text}"),
+            ChatBlock::System(text) => {
+                assert!(text.contains("already being generated"), "got: {text}")
+            }
             other => panic!("expected a system note, got {other:?}"),
         }
 
@@ -14312,7 +15784,10 @@ mod tests {
         app.finish_runbook_cancelled(sid);
 
         assert_eq!(app.runbook_state, Some(RunbookState::Cancelled));
-        let last = app.sessions[0].messages.last().expect("cancellation must be visible");
+        let last = app.sessions[0]
+            .messages
+            .last()
+            .expect("cancellation must be visible");
         match last {
             ChatBlock::System(text) => {
                 assert!(text.contains("Runbook generation cancelled"), "got: {text}");
@@ -14342,7 +15817,10 @@ mod tests {
 
         let _ = run_save_to_completion(&mut app).await;
 
-        assert_eq!(app.runbook_state, None, "stale status must not leak into the new save");
+        assert_eq!(
+            app.runbook_state, None,
+            "stale status must not leak into the new save"
+        );
 
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
@@ -14373,7 +15851,10 @@ mod tests {
         assert_eq!(app.sessions[0].per_profile["glm"].tokens_in, 1200);
         match app.sessions[0].messages.last().unwrap() {
             ChatBlock::System(text) => {
-                assert!(text.contains("Runbook saved to prod-web/db-2026.runbook.md"), "got: {text}")
+                assert!(
+                    text.contains("Runbook saved to prod-web/db-2026.runbook.md"),
+                    "got: {text}"
+                )
             }
             other => panic!("expected a system note, got {other:?}"),
         }
@@ -14402,8 +15883,14 @@ mod tests {
         );
 
         assert_eq!(app.runbook_state, Some(RunbookState::Failed));
-        assert!(app.runbook_cancel.is_none(), "the in-flight token is cleared");
-        assert_eq!(app.sessions[0].tokens_in, 100, "a billed failure is still billed");
+        assert!(
+            app.runbook_cancel.is_none(),
+            "the in-flight token is cleared"
+        );
+        assert_eq!(
+            app.sessions[0].tokens_in, 100,
+            "a billed failure is still billed"
+        );
         match app.sessions[0].messages.last().unwrap() {
             ChatBlock::System(text) => {
                 assert!(text.contains("provider timeout"), "got: {text}");
@@ -14418,7 +15905,12 @@ mod tests {
         let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
         // A tab closed while its runbook was generating: the file (if it was
         // written) stays, and nothing panics over the missing session.
-        app.finish_runbook(SessionId::next(), Ok("local/x.runbook.md".into()), None, "glm".into());
+        app.finish_runbook(
+            SessionId::next(),
+            Ok("local/x.runbook.md".into()),
+            None,
+            "glm".into(),
+        );
         assert_eq!(app.runbook_state, Some(RunbookState::Saved));
     }
 
@@ -14521,7 +16013,10 @@ mod tests {
         app.save_progress = 99;
         app.start_save();
         assert!(!app.save_overlay_visible, "second start_save must be no-op");
-        assert_eq!(app.save_progress, 99, "state must not reset on blocked call");
+        assert_eq!(
+            app.save_progress, 99,
+            "state must not reset on blocked call"
+        );
         // finish_save must allow a new save.
         app.finish_save();
         assert!(!app.save_in_flight, "finish_save must clear the flag");
@@ -14575,15 +16070,13 @@ mod tests {
     fn f2_aborts_pending_confirm() {
         let mut app = App::new("test".into(), CommandConfirmMode::Allowlist);
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        app.pending_confirm = Some(PendingConfirm::new(
-            "ls".into(),
-            "list".into(),
-            false,
-            tx,
-        ));
+        app.pending_confirm = Some(PendingConfirm::new("ls".into(), "list".into(), false, tx));
         app.mode = AppMode::Confirming;
         app.awaiting_confirmation = true;
-        app.confirm_button_areas = vec![(Rect::new(0, 0, 10, 3), true), (Rect::new(0, 0, 10, 3), false)];
+        app.confirm_button_areas = vec![
+            (Rect::new(0, 0, 10, 3), true),
+            (Rect::new(0, 0, 10, 3), false),
+        ];
         app.hovered_button = Some(true);
 
         // Press F2 → should abort the pending confirmation.
@@ -14593,19 +16086,40 @@ mod tests {
         ));
 
         // Confirmation should be cleared and denied.
-        assert!(app.pending_confirm.is_none(), "pending_confirm must be cleared");
-        assert_eq!(app.mode, AppMode::Thinking, "mode should return to Thinking");
-        assert!(!rx.try_recv().unwrap(), "respond_to should have received false (denied)");
+        assert!(
+            app.pending_confirm.is_none(),
+            "pending_confirm must be cleared"
+        );
+        assert_eq!(
+            app.mode,
+            AppMode::Thinking,
+            "mode should return to Thinking"
+        );
+        assert!(
+            !rx.try_recv().unwrap(),
+            "respond_to should have received false (denied)"
+        );
 
         // All confirmation UI state must be cleared — stale hit-areas must not
         // consume subsequent clicks.
-        assert!(!app.awaiting_confirmation, "awaiting_confirmation must be cleared");
-        assert!(app.confirm_button_areas.is_empty(), "confirm_button_areas must be cleared");
-        assert!(app.hovered_button.is_none(), "hovered_button must be cleared");
+        assert!(
+            !app.awaiting_confirmation,
+            "awaiting_confirmation must be cleared"
+        );
+        assert!(
+            app.confirm_button_areas.is_empty(),
+            "confirm_button_areas must be cleared"
+        );
+        assert!(
+            app.hovered_button.is_none(),
+            "hovered_button must be cleared"
+        );
 
         // A system message about cancellation should be present.
         assert!(
-            app.messages.iter().any(|m| matches!(m, ChatBlock::System(s) if s.contains("cancelled"))),
+            app.messages
+                .iter()
+                .any(|m| matches!(m, ChatBlock::System(s) if s.contains("cancelled"))),
             "a system message about cancellation should be present"
         );
 
@@ -14655,14 +16169,16 @@ mod tests {
         // Switch to tab 2 — app.confirm_mode should reflect tab 2's mode (Allowlist).
         app.next_tab();
         assert_eq!(
-            app.confirm_mode, CommandConfirmMode::Allowlist,
+            app.confirm_mode,
+            CommandConfirmMode::Allowlist,
             "tab switch must sync confirm_mode"
         );
 
         // Switch back to tab 1 — should be Explain again.
         app.prev_tab();
         assert_eq!(
-            app.confirm_mode, CommandConfirmMode::Explain,
+            app.confirm_mode,
+            CommandConfirmMode::Explain,
             "switching back should restore Explain"
         );
     }
@@ -14679,7 +16195,10 @@ mod tests {
         assert!(!name.contains(' '), "filename must not contain spaces");
         // Verify format: slug.date.time.md — at least 3 dots.
         let dot_count = name.chars().filter(|&c| c == '.').count();
-        assert!(dot_count >= 3, "expected at least 3 dots (slug.date.time.md), got {dot_count} dots in: {name}");
+        assert!(
+            dot_count >= 3,
+            "expected at least 3 dots (slug.date.time.md), got {dot_count} dots in: {name}"
+        );
     }
 
     #[test]
@@ -14687,7 +16206,10 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Explain);
         // transcript_path is None by default — save should be a no-op.
         app.save_transcript_silent();
-        assert!(!app.sessions[0].transcript_saving, "transcript_saving must not be set without path");
+        assert!(
+            !app.sessions[0].transcript_saving,
+            "transcript_saving must not be set without path"
+        );
     }
 
     #[test]
@@ -14696,7 +16218,10 @@ mod tests {
         app.sessions[0].transcript_path = Some(std::path::PathBuf::from("/tmp/test.md"));
         app.save_in_flight = true;
         app.save_transcript_silent();
-        assert!(!app.sessions[0].transcript_saving, "must skip when save_in_flight is true");
+        assert!(
+            !app.sessions[0].transcript_saving,
+            "must skip when save_in_flight is true"
+        );
     }
 
     #[test]
@@ -14706,13 +16231,19 @@ mod tests {
         app.sessions[0].transcript_saving = true;
         app.save_transcript_silent();
         // Should not reset the flag or spawn another task.
-        assert!(app.sessions[0].transcript_saving, "must skip when transcript_saving is already true");
+        assert!(
+            app.sessions[0].transcript_saving,
+            "must skip when transcript_saving is already true"
+        );
     }
 
     #[test]
     fn toggle_explain_creates_transcript_path() {
         let mut app = App::new("test".into(), CommandConfirmMode::Allowlist);
-        assert!(app.sessions[0].transcript_path.is_none(), "transcript_path must start as None");
+        assert!(
+            app.sessions[0].transcript_path.is_none(),
+            "transcript_path must start as None"
+        );
 
         // Press F2 to enter Explain mode.
         app.handle_key(crossterm::event::KeyEvent::new(
@@ -14721,7 +16252,10 @@ mod tests {
         ));
 
         // transcript_path should now be set.
-        assert!(app.sessions[0].transcript_path.is_some(), "transcript_path must be set on entering Explain");
+        assert!(
+            app.sessions[0].transcript_path.is_some(),
+            "transcript_path must be set on entering Explain"
+        );
 
         // A system message with the path should be in the feed.
         assert!(
@@ -14740,14 +16274,20 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         ));
         let path1 = app.sessions[0].transcript_path.clone();
-        assert!(path1.is_some(), "transcript_path must be set on first entry");
+        assert!(
+            path1.is_some(),
+            "transcript_path must be set on first entry"
+        );
 
         // Exit Explain — path should be cleared.
         app.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::F(2),
             crossterm::event::KeyModifiers::NONE,
         ));
-        assert!(app.sessions[0].transcript_path.is_none(), "transcript_path must be cleared on exit");
+        assert!(
+            app.sessions[0].transcript_path.is_none(),
+            "transcript_path must be cleared on exit"
+        );
 
         // Wait 1 second so the new file gets a different timestamp.
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -14782,11 +16322,20 @@ mod tests {
         ];
         let md = messages_to_markdown(&blocks, "test", &None);
         // Explanation rendered as blockquote.
-        assert!(md.contains("> List files to diagnose disk usage"), "must include explanation");
+        assert!(
+            md.contains("> List files to diagnose disk usage"),
+            "must include explanation"
+        );
         // Approved command — no *(denied)* marker.
-        assert!(md.contains("**$ ls**\n"), "approved command must be rendered");
+        assert!(
+            md.contains("**$ ls**\n"),
+            "approved command must be rendered"
+        );
         // Denied command — has *(denied)* marker.
-        assert!(md.contains("**$ rm -rf /tmp** *(denied)*"), "denied command must have *(denied)* marker");
+        assert!(
+            md.contains("**$ rm -rf /tmp** *(denied)*"),
+            "denied command must have *(denied)* marker"
+        );
     }
 
     #[test]
@@ -14849,10 +16398,10 @@ mod tests {
         assert!(app.host_select_visible);
         assert_eq!(app.host_select_for_panel, Some(Side::Right));
         // The panel overlay offers hosts only: no fleet groups.
-        assert!(app
-            .host_select_rows()
-            .iter()
-            .all(|r| !matches!(r, HostSelectRow::Group { .. } | HostSelectRow::GroupsHeader { .. })));
+        assert!(app.host_select_rows().iter().all(|r| !matches!(
+            r,
+            HostSelectRow::Group { .. } | HostSelectRow::GroupsHeader { .. }
+        )));
     }
 
     #[test]
@@ -14876,7 +16425,7 @@ mod tests {
         use crate::file_panels::PanelSource;
         let mut app = app_with_targets_and_group();
         app.handle_key(ctrl_key_event('g')); // overlay for the right panel
-        // Search hides `local` and `web1`: the only row left is `db1`.
+                                             // Search hides `local` and `web1`: the only row left is `db1`.
         press(&mut app, 'd');
         press(&mut app, 'b');
         app.handle_key(code_key(crossterm::event::KeyCode::Enter));
@@ -14904,7 +16453,7 @@ mod tests {
         let mut app = app_with_targets_and_group();
         app.handle_key(ctrl_key_event('g'));
         app.handle_key(code_key(crossterm::event::KeyCode::Esc)); // overlay
-        // Typing does not reach the agent input while the panels are open.
+                                                                  // Typing does not reach the agent input while the panels are open.
         press(&mut app, 'x');
         assert!(app.input.is_empty(), "input: {:?}", app.input);
         app.handle_key(code_key(crossterm::event::KeyCode::Esc));
@@ -14950,7 +16499,12 @@ mod tests {
         let fp = app.file_panels.as_mut().expect("panels");
         let file = DirEntry {
             name: "a.txt".into(),
-            metadata: Metadata { kind: EntryKind::File, size: 5, modified: None, mode: None },
+            metadata: Metadata {
+                kind: EntryKind::File,
+                size: 5,
+                modified: None,
+                mode: None,
+            },
         };
         for (side, source, label, path, entries) in [
             (Side::Left, PanelSource::Local, "local", "/src", vec![file]),
@@ -14983,9 +16537,15 @@ mod tests {
         use crate::file_panels::CopyRequest;
         let mut app = app_ready_to_copy();
         app.handle_key(code_key(crossterm::event::KeyCode::F(5)));
-        assert!(app.copy_requests.is_empty(), "nothing starts before the answer");
+        assert!(
+            app.copy_requests.is_empty(),
+            "nothing starts before the answer"
+        );
         app.handle_key(code_key(crossterm::event::KeyCode::Enter));
-        assert!(matches!(app.copy_requests.as_slice(), [CopyRequest::Start { id: 1, .. }]));
+        assert!(matches!(
+            app.copy_requests.as_slice(),
+            [CopyRequest::Start { id: 1, .. }]
+        ));
         assert!(app.running_copy().is_some());
         assert!(app.operations.iter().any(|op| op.id == "copy-1"));
         // A second copy while one runs is refused with a notice.
@@ -15000,7 +16560,10 @@ mod tests {
             .is_some_and(|n| n.contains("already running")));
         // Ctrl+Z cancels it.
         app.handle_key(ctrl_key_event('z'));
-        assert!(matches!(app.copy_requests.as_slice(), [CopyRequest::Cancel { id: 1 }]));
+        assert!(matches!(
+            app.copy_requests.as_slice(),
+            [CopyRequest::Cancel { id: 1 }]
+        ));
     }
 
     #[test]
@@ -15014,7 +16577,10 @@ mod tests {
             let mut app = app_ready_to_copy();
             app.confirm_mode = mode;
             app.handle_key(code_key(crossterm::event::KeyCode::F(5)));
-            assert!(app.copy_requests.is_empty(), "{mode:?}: started without asking");
+            assert!(
+                app.copy_requests.is_empty(),
+                "{mode:?}: started without asking"
+            );
             assert!(
                 matches!(
                     app.file_panels.as_ref().and_then(|fp| fp.dialog.as_ref()),
@@ -15035,7 +16601,12 @@ mod tests {
         app.handle_key(code_key(crossterm::event::KeyCode::Esc)); // close panels
         assert!(app.file_panels.is_none());
         app.copy_requests.clear();
-        for (c, want) in [('o', D::Overwrite), ('ы', D::Skip), ('a', D::OverwriteAll), ('т', D::SkipAll)] {
+        for (c, want) in [
+            ('o', D::Overwrite),
+            ('ы', D::Skip),
+            ('a', D::OverwriteAll),
+            ('т', D::SkipAll),
+        ] {
             app.ask_copy_overwrite(1, "/dst/a.txt".into());
             press(&mut app, 'x'); // other keys wait for an answer
             assert!(app.copy_requests.is_empty());
@@ -15052,7 +16623,10 @@ mod tests {
         app.handle_key(code_key(crossterm::event::KeyCode::Esc));
         assert!(matches!(
             app.copy_requests.pop(),
-            Some(CopyRequest::Answer { decision: D::Cancel, .. })
+            Some(CopyRequest::Answer {
+                decision: D::Cancel,
+                ..
+            })
         ));
         assert!(app.input.is_empty(), "answers never reach the agent input");
     }
@@ -15075,12 +16649,18 @@ mod tests {
             }
         };
         for (i, report) in [
-            filar_transport::CopyReport { copied: 1, ..Default::default() },
+            filar_transport::CopyReport {
+                copied: 1,
+                ..Default::default()
+            },
             filar_transport::CopyReport {
                 failed: vec![("/src/a.txt".into(), "denied".into())],
                 ..Default::default()
             },
-            filar_transport::CopyReport { cancelled: true, ..Default::default() },
+            filar_transport::CopyReport {
+                cancelled: true,
+                ..Default::default()
+            },
         ]
         .into_iter()
         .enumerate()
@@ -15199,13 +16779,19 @@ mod tests {
         assert_eq!(app.mode, AppMode::Confirming);
         assert_eq!(app.confirm_safety(), Some(&SafetyScore::Pending));
         scored(&mut app, 501, Some(35));
-        assert!(matches!(app.confirm_safety(), Some(SafetyScore::Ready { pct: 35, .. })));
+        assert!(matches!(
+            app.confirm_safety(),
+            Some(SafetyScore::Ready { pct: 35, .. })
+        ));
         // The rating changes nothing about the decision: still the user's.
         assert_eq!(app.mode, AppMode::Confirming);
         app.handle_key(key_event(KeyCode::Char('a')));
         assert_eq!(rx.try_recv(), Ok(true));
         let idx = app.messages.len() - 1;
-        assert_eq!(app.safety_badges().get(&idx), Some(&("35%".to_string(), SafetyLevel::Danger)));
+        assert_eq!(
+            app.safety_badges().get(&idx),
+            Some(&("35%".to_string(), SafetyLevel::Danger))
+        );
         assert_eq!(app.risk_ratings, 1);
         assert_eq!(app.risk_cost_usd, Some(0.0001));
     }
@@ -15218,17 +16804,26 @@ mod tests {
         propose(&mut app, 502, "ls -la", "run_command");
         finished(&mut app, "ls -la");
         let idx = app.messages.len() - 1;
-        assert_eq!(app.safety_badges().get(&idx), Some(&("rating…".to_string(), SafetyLevel::Muted)));
+        assert_eq!(
+            app.safety_badges().get(&idx),
+            Some(&("rating…".to_string(), SafetyLevel::Muted))
+        );
         let rev = app.message_rev;
         scored(&mut app, 502, Some(97));
         assert_ne!(app.message_rev, rev, "the badge is in the cached layout");
-        assert_eq!(app.safety_badges().get(&idx), Some(&("97%".to_string(), SafetyLevel::Safe)));
+        assert_eq!(
+            app.safety_badges().get(&idx),
+            Some(&("97%".to_string(), SafetyLevel::Safe))
+        );
         // Unavailable reads as such.
         propose(&mut app, 503, "uptime", "run_command");
         finished(&mut app, "uptime");
         scored(&mut app, 503, None);
         let idx = app.messages.len() - 1;
-        assert_eq!(app.safety_badges().get(&idx).map(|b| b.0.as_str()), Some("unavailable"));
+        assert_eq!(
+            app.safety_badges().get(&idx).map(|b| b.0.as_str()),
+            Some("unavailable")
+        );
     }
 
     #[test]
@@ -15244,7 +16839,12 @@ mod tests {
     fn job_bookkeeping_is_not_rated() {
         let mut app = App::new("local".into(), CommandConfirmMode::Never);
         app.risk_scorer_on = true;
-        propose(&mut app, 505, "list_background_jobs", filar_agent::tools::TOOL_LIST_BACKGROUND_JOBS);
+        propose(
+            &mut app,
+            505,
+            "list_background_jobs",
+            filar_agent::tools::TOOL_LIST_BACKGROUND_JOBS,
+        );
         assert!(app.safety_scores.is_empty());
     }
 
@@ -15300,7 +16900,193 @@ mod tests {
         app.apply_loaded_session(saved);
         assert!(app.safety_badges().is_empty());
         assert!(app.safety_scores.is_empty());
-        assert_eq!(app.risk_ratings, 0, "F1 does not count the replaced tab's ratings");
+        assert_eq!(
+            app.risk_ratings, 0,
+            "F1 does not count the replaced tab's ratings"
+        );
         assert_eq!(app.risk_cost_usd, None);
+    }
+
+    fn kube_test_target(namespaces: &[&str]) -> filar_core::KubeCluster {
+        filar_core::KubeCluster {
+            name: "prod-eu".into(),
+            context: "prod-context".into(),
+            namespaces: namespaces
+                .iter()
+                .map(|namespace| (*namespace).into())
+                .collect(),
+            default_namespace: namespaces.get(1).map(|namespace| (*namespace).into()),
+            tags: vec!["prod".into()],
+            ..Default::default()
+        }
+    }
+
+    fn kube_test_app(namespaces: &[&str]) -> App {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.kube_clusters = vec![kube_test_target(namespaces)];
+        app
+    }
+
+    fn select_test_cluster(app: &mut App) {
+        app.open_host_select();
+        app.host_select_index = 1;
+        app.select_host();
+    }
+
+    #[test]
+    fn ctrl_o_lists_clusters_and_offers_the_configured_default_namespace() {
+        let mut app = kube_test_app(&["default", "shop"]);
+        app.open_host_select();
+        let rows = app.host_select_rows();
+        assert!(rows
+            .iter()
+            .any(|row| matches!(row, HostSelectRow::KubeHeader { count: 1 })));
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            HostSelectRow::Kube {
+                cluster: 0,
+                selection: 1
+            }
+        )));
+        select_test_cluster(&mut app);
+        assert_eq!(
+            app.kube.as_ref().map(|kube| kube.target.name.as_str()),
+            Some("prod-eu")
+        );
+        let select = app
+            .kube_namespace_select
+            .as_ref()
+            .expect("namespace chooser");
+        assert_eq!(select.namespaces, ["default", "shop"]);
+        assert_eq!(select.index, 1, "default_namespace is preselected");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let requests = app.take_pending_kube_connects();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].namespace.as_deref(), Some("shop"));
+        assert!(!requests[0].discover);
+        assert_eq!(
+            app.kube.as_ref().and_then(|kube| kube.namespace.as_deref()),
+            Some("shop")
+        );
+    }
+
+    #[test]
+    fn discovered_namespaces_reuse_the_established_cluster_connection() {
+        let mut app = kube_test_app(&[]);
+        select_test_cluster(&mut app);
+        let request = app.take_pending_kube_connects().remove(0);
+        assert!(request.discover);
+        assert!(app.complete_kube_connection(
+            request.session_id,
+            request.connection_id,
+            vec!["default".into(), "shop".into()],
+        ));
+        let select = app
+            .kube_namespace_select
+            .as_mut()
+            .expect("discovered choices");
+        assert!(!select.loading);
+        select.index = 1;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.kube.as_ref().and_then(|kube| kube.namespace.as_deref()),
+            Some("shop")
+        );
+        assert!(
+            app.take_pending_kube_connects().is_empty(),
+            "discovery already connected"
+        );
+    }
+
+    #[test]
+    fn cancelling_discovery_rejects_its_late_result() {
+        let mut app = kube_test_app(&[]);
+        select_test_cluster(&mut app);
+        let request = app.take_pending_kube_connects().remove(0);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.kube_connection_is_current(request.session_id, request.connection_id));
+        assert!(!app.complete_kube_connection(
+            request.session_id,
+            request.connection_id,
+            vec!["shop".into()],
+        ));
+        assert!(app.kube_namespace_select.is_none());
+    }
+
+    #[test]
+    fn cluster_restore_reconnects_by_name_to_the_saved_namespace() {
+        let mut app = kube_test_app(&["default", "shop"]);
+        app.restore_kube_snapshot(filar_core::KubeSessionSnapshot {
+            target: "prod-eu".into(),
+            namespace: Some("shop".into()),
+        });
+        let requests = app.take_pending_kube_connects();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].target.context, "prod-context");
+        assert_eq!(requests[0].namespace.as_deref(), Some("shop"));
+        assert!(!requests[0].discover);
+        assert!(
+            app.kube_namespace_select.is_none(),
+            "restore does not ask again"
+        );
+    }
+
+    #[test]
+    fn a_connection_failure_leaves_the_cluster_tab_usable() {
+        let mut app = kube_test_app(&["shop"]);
+        app.restore_kube_snapshot(filar_core::KubeSessionSnapshot {
+            target: "prod-eu".into(),
+            namespace: Some("shop".into()),
+        });
+        let request = app.take_pending_kube_connects().remove(0);
+        app.fail_kube_connection(
+            request.session_id,
+            request.connection_id,
+            "access denied".into(),
+        );
+        assert!(app.kube.is_some());
+        assert!(matches!(
+            app.messages.last(),
+            Some(ChatBlock::Error(error)) if error.contains("access denied")
+        ));
+    }
+
+    fn connected_kube_app() -> App {
+        let mut app = App::new("prod-eu".into(), CommandConfirmMode::Always);
+        app.kube = Some(KubeTabState {
+            target: kube_test_target(&["shop"]),
+            namespace: Some("shop".into()),
+            connection_id: 1,
+        });
+        app
+    }
+
+    fn assert_shell_refusal(app: &App) {
+        assert!(matches!(
+            app.messages.last(),
+            Some(ChatBlock::System(message)) if message == KUBE_SHELL_REFUSAL
+        ));
+        assert!(!app.agent_running);
+        assert_eq!(app.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn cluster_tabs_refuse_terminal_file_panels_and_shell_escape() {
+        let mut terminal = connected_kube_app();
+        terminal.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_shell_refusal(&terminal);
+        assert!(!terminal.toggle_interactive);
+
+        let mut panels = connected_kube_app();
+        panels.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert_shell_refusal(&panels);
+        assert!(panels.file_panels.is_none());
+
+        let mut shell = connected_kube_app();
+        shell.input = "!date".into();
+        shell.cursor_pos = shell.input.chars().count();
+        shell.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_shell_refusal(&shell);
+        assert!(shell.take_input().is_none());
     }
 }

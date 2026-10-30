@@ -1,4 +1,4 @@
-﻿//! `filar` — terminal with an AI agent over SSH.
+//! `filar` — terminal with an AI agent over SSH.
 //!
 //! Entry point: initialise logging, load configuration, then either launch the
 //! GUI launcher (no CLI args) or go straight to the TUI (with `--target`,
@@ -14,9 +14,12 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
-use filar_agent::OpenAiCompatClient;
 use filar_agent::LlmClient;
-use filar_core::{secrets, default_base_dir, ChatBlock, Config, CoreError, SecretProvider, SessionStore, StaticSecretProvider};
+use filar_agent::OpenAiCompatClient;
+use filar_core::{
+    default_base_dir, secrets, ChatBlock, Config, CoreError, SecretProvider, SessionStore,
+    StaticSecretProvider,
+};
 use filar_transport::{LocalExecutor, SshExecutor, SshTransportConfig};
 use filar_tui::TuiConfig;
 
@@ -75,9 +78,13 @@ fn parse_args() -> Args {
                 eprintln!("With no arguments, launches the GUI launcher.");
                 eprintln!();
                 eprintln!("Options:");
-                eprintln!("  --target <name>   Connect to this target ('local' or an SSH target name)");
+                eprintln!(
+                    "  --target <name>   Connect to this target ('local' or an SSH target name)"
+                );
                 eprintln!("  --group <name>    Open the fleet layer over this host group ([[host_groups]])");
-                eprintln!("  --llm <profile>   Use this LLM profile ('default' or a name from config)");
+                eprintln!(
+                    "  --llm <profile>   Use this LLM profile ('default' or a name from config)"
+                );
                 eprintln!("  --session <id>    Restore a previous session by ID");
                 eprintln!("  -h, --help        Show this help message");
                 std::process::exit(0);
@@ -111,9 +118,7 @@ pub fn resolve_startup_profile(
         .map(|p| p.name.clone())
         .unwrap_or_else(|| "default".into());
     let cli_profile = cli_llm.filter(|n| *n != "default");
-    let candidate = cli_profile
-        .or(gui_selected)
-        .unwrap_or(&first_in_config);
+    let candidate = cli_profile.or(gui_selected).unwrap_or(&first_in_config);
     if profiles.iter().any(|p| p.name == candidate) {
         candidate.to_string()
     } else {
@@ -170,7 +175,9 @@ fn resolve_gui_ssh_target(s: &filar_gui::SshConnection) -> filar_core::SshTarget
                 let cred = filar_core::KeyringSecretProvider::new();
                 let key = filar_core::ssh_cred_name(s.slot, &s.alias);
                 cred.get(&key)
-                    .inspect_err(|e| tracing::debug!(error = %e, %key, "no saved SSH password in keyring"))
+                    .inspect_err(
+                        |e| tracing::debug!(error = %e, %key, "no saved SSH password in keyring"),
+                    )
                     .ok()
             } else {
                 Some(s.password.clone())
@@ -242,13 +249,9 @@ pub fn build_llm_client_from_profile(
     };
     let llm_config: filar_core::LlmConfig = profile.into();
     Ok(Arc::new(
-        OpenAiCompatClient::new_with_key(
-            &llm_config,
-            Duration::from_secs(llm_timeout_secs),
-            &key,
-        )
-        .inspect_err(|_| warn!("LLM client construction failed"))
-        .map_err(|_| filar_core::CoreError::Other("failed to construct LLM client".into()))?,
+        OpenAiCompatClient::new_with_key(&llm_config, Duration::from_secs(llm_timeout_secs), &key)
+            .inspect_err(|_| warn!("LLM client construction failed"))
+            .map_err(|_| filar_core::CoreError::Other("failed to construct LLM client".into()))?,
     ))
 }
 
@@ -287,7 +290,11 @@ fn config_with_launch_risk_scorer(
 
 /// The scorer, the display thresholds `(warn_below, danger_below)` and the
 /// start-up note (if the scorer cannot be used).
-type LaunchRiskScorer = (Option<Arc<dyn filar_agent::RiskScorer>>, (u8, u8), Option<String>);
+type LaunchRiskScorer = (
+    Option<Arc<dyn filar_agent::RiskScorer>>,
+    (u8, u8),
+    Option<String>,
+);
 
 /// The command safety scorer of `config` (#549/#551), with the note to show
 /// at start-up when a configured scorer cannot be used.
@@ -306,7 +313,11 @@ fn build_risk_scorer_for_launch(
         filar_core::DEFAULT_RISK_DANGER_BELOW,
     );
     if let Some(err) = &config.risk_scorer_error {
-        return (None, default_thresholds, Some(format!("Safety rating off: {err}")));
+        return (
+            None,
+            default_thresholds,
+            Some(format!("Safety rating off: {err}")),
+        );
     }
     let Some(rs) = config.active_risk_scorer() else {
         return (None, default_thresholds, None);
@@ -335,7 +346,11 @@ fn build_risk_scorer_for_launch(
             info!(model = %rs.model, "risk scorer initialised");
             (Some(scorer), rs.thresholds(), None)
         }
-        Err(e) => (None, rs.thresholds(), Some(format!("Safety rating off: {e}"))),
+        Err(e) => (
+            None,
+            rs.thresholds(),
+            Some(format!("Safety rating off: {e}")),
+        ),
     }
 }
 
@@ -356,7 +371,10 @@ fn lookup_profile_api_key(
         sp.insert(&profile.key_env, &key);
         return Some(key);
     }
-    non_empty(secrets::llm_api_key(&filar_core::EnvSecretProvider::new(), &profile.key_env))
+    non_empty(secrets::llm_api_key(
+        &filar_core::EnvSecretProvider::new(),
+        &profile.key_env,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -505,13 +523,25 @@ async fn run() -> anyhow::Result<()> {
     // ── Determine launch parameters ──────────────────────────────────
     // When no CLI args, check for pending launch from a previous GUI
     // session, or spawn the GUI as a subprocess.
-    let (target_name, session_id, llm_config, api_key, key_env_name, mut ssh_target, gui_selected_profile, launch_profiles, launch_ssh_targets, launch_save_dir, launch_arbiter_profile, launch_host_groups) = if args.is_empty() {
+    let (
+        target_name,
+        session_id,
+        llm_config,
+        api_key,
+        key_env_name,
+        mut ssh_target,
+        gui_selected_profile,
+        launch_profiles,
+        launch_ssh_targets,
+        launch_save_dir,
+        launch_arbiter_profile,
+        launch_host_groups,
+    ) = if args.is_empty() {
         // Check if the GUI subprocess already saved a launch config.
         let launch = filar_gui::load_pending_launch().or_else(|| {
             // Spawn GUI subprocess.
             info!("spawning GUI subprocess");
-            let exe = std::env::current_exe()
-                .ok()?;
+            let exe = std::env::current_exe().ok()?;
             let status = std::process::Command::new(&exe)
                 .arg("--gui-only")
                 .status()
@@ -547,9 +577,7 @@ async fn run() -> anyhow::Result<()> {
                     match serde_json::from_str(&launch.extra_body) {
                         Ok(v) => Some(v),
                         Err(e) => {
-                            anyhow::bail!(
-                                "Invalid extra body JSON: {e}"
-                            );
+                            anyhow::bail!("Invalid extra body JSON: {e}");
                         }
                     }
                 };
@@ -567,9 +595,7 @@ async fn run() -> anyhow::Result<()> {
                 // Read password from OS credential store if not passed in
                 // (since the struct now excludes secrets from serialization).
                 // Keyring key MUST match GUI/`ssh_cred_name` (#290), not legacy `ssh{slot}`.
-                let ssh_target = launch.ssh.map(|s| {
-                    resolve_gui_ssh_target(&s)
-                });
+                let ssh_target = launch.ssh.map(|s| resolve_gui_ssh_target(&s));
                 // Session label: the alias (or SSH{n}) for SSH, `local`
                 // otherwise — never the transport literal (#406).
                 let target_name = gui_launch_target_name(ssh_target.as_ref(), &launch.target);
@@ -621,7 +647,9 @@ async fn run() -> anyhow::Result<()> {
             String::new()
         } else {
             secrets::llm_api_key(&filar_core::EnvSecretProvider::new(), &key_env).map_err(|e| {
-                anyhow::anyhow!("{e}. Set the {key_env} environment variable or use the GUI launcher.")
+                anyhow::anyhow!(
+                    "{e}. Set the {key_env} environment variable or use the GUI launcher."
+                )
             })?
         };
 
@@ -632,7 +660,20 @@ async fn run() -> anyhow::Result<()> {
             None
         };
 
-        (target, args.session, llm_config, key, key_env, ssh_target, None, config.llm_profiles.clone(), config.ssh_targets.clone(), config.save_dir.clone(), config.arbiter_profile.clone(), None)
+        (
+            target,
+            args.session,
+            llm_config,
+            key,
+            key_env,
+            ssh_target,
+            None,
+            config.llm_profiles.clone(),
+            config.ssh_targets.clone(),
+            config.save_dir.clone(),
+            config.arbiter_profile.clone(),
+            None,
+        )
     };
     let host_groups = session_host_groups(launch_host_groups, &config.host_groups);
 
@@ -679,13 +720,19 @@ async fn run() -> anyhow::Result<()> {
             let env = filar_core::EnvSecretProvider::new();
             let resolved = passphrase::resolve_key_passphrase(
                 &mut target,
-                &passphrase::PassphraseSources { keyring: &keyring, env: &env },
+                &passphrase::PassphraseSources {
+                    keyring: &keyring,
+                    env: &env,
+                },
                 &mut passphrase::TerminalPrompt,
             )
             .and_then(|()| {
                 password::resolve_ssh_password(
                     &mut target,
-                    &password::PasswordSources { keyring: &keyring, env: &env },
+                    &password::PasswordSources {
+                        keyring: &keyring,
+                        env: &env,
+                    },
                     &mut password::TerminalPrompt,
                 )
             });
@@ -729,10 +776,14 @@ async fn run() -> anyhow::Result<()> {
         }
     } else if target_name == "local" {
         info!("initialising local command executor");
-        Arc::new(LocalExecutor::with_timeout(command_timeout).await.map_err(|e| {
-            warn!(error = %e, "failed to create local executor");
-            anyhow::anyhow!(e)
-        })?)
+        Arc::new(
+            LocalExecutor::with_timeout(command_timeout)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "failed to create local executor");
+                    anyhow::anyhow!(e)
+                })?,
+        )
     } else {
         anyhow::bail!(
             "SSH target '{target_name}' not found. Use the GUI launcher to enter SSH connection details."
@@ -755,6 +806,8 @@ async fn run() -> anyhow::Result<()> {
         confirm_mode: Option<filar_core::CommandConfirmMode>,
         /// A fleet dialogue reopens as the fleet layer, not as this tab (#442).
         fleet: Option<filar_core::Session>,
+        /// Cluster identity is resolved again from the current configuration (#575).
+        kube: Option<filar_core::KubeSessionSnapshot>,
     }
     let loaded = if let Some(ref sid) = session_id {
         info!(session_id = %sid, "loading session");
@@ -782,6 +835,7 @@ async fn run() -> anyhow::Result<()> {
                         ssh_info: session.ssh_info,
                         confirm_mode: session.confirm_mode,
                         fleet: None,
+                        kube: session.kube,
                     }
                 }
                 Ok(None) => {
@@ -808,8 +862,11 @@ async fn run() -> anyhow::Result<()> {
         build_risk_scorer_for_launch(&config, &secret_provider);
 
     // ── Launch TUI ─────────────────────────────────────────────────────
-    let default_profile_name =
-        resolve_startup_profile(&launch_profiles, cli_llm_name.as_deref(), gui_selected_profile.as_deref());
+    let default_profile_name = resolve_startup_profile(
+        &launch_profiles,
+        cli_llm_name.as_deref(),
+        gui_selected_profile.as_deref(),
+    );
     let tui_config = TuiConfig {
         target_name: target_name.clone(),
         confirm_mode: loaded.confirm_mode.unwrap_or(config.confirm_mode),
@@ -821,6 +878,7 @@ async fn run() -> anyhow::Result<()> {
         host_groups,
         initial_group: cli_group,
         initial_fleet: loaded.fleet,
+        initial_kube: loaded.kube,
         llm_profile: default_profile_name.clone(),
         initial_messages: loaded.messages,
         initial_input_history: loaded.input_history,
@@ -841,9 +899,11 @@ async fn run() -> anyhow::Result<()> {
         default_profile_name,
         llm_factory: {
             let llm_timeout_secs = config.timeouts.llm_secs;
-            Arc::new(move |profile: &filar_core::LlmProfile, sp: &filar_core::StaticSecretProvider| {
-                build_llm_client_from_profile(profile, sp, llm_timeout_secs)
-            })
+            Arc::new(
+                move |profile: &filar_core::LlmProfile, sp: &filar_core::StaticSecretProvider| {
+                    build_llm_client_from_profile(profile, sp, llm_timeout_secs)
+                },
+            )
         },
         key_checker: {
             let key_checker_provider = secret_provider.clone();
@@ -852,6 +912,7 @@ async fn run() -> anyhow::Result<()> {
             })
         },
         ssh_targets: launch_ssh_targets,
+        kube_clusters: config.kube_clusters.clone(),
         save_dir: launch_save_dir,
         save_runbook: config.save_runbook,
         command_timeout,
@@ -1005,7 +1066,10 @@ mod tests {
         };
         match resolve_gui_ssh_target(&conn).auth {
             filar_core::SshAuth::Key { path, passphrase } => {
-                assert_eq!(path.as_deref(), Some(std::path::Path::new("/home/ops/.ssh/deploy")));
+                assert_eq!(
+                    path.as_deref(),
+                    Some(std::path::Path::new("/home/ops/.ssh/deploy"))
+                );
                 assert!(passphrase.is_none());
             }
             other => panic!("expected Key auth, got {other:?}"),
@@ -1016,7 +1080,10 @@ mod tests {
             filar_core::SshAuth::Key { path: None, .. }
         ));
         conn.auth = filar_gui::SlotAuth::Agent;
-        assert!(matches!(resolve_gui_ssh_target(&conn).auth, filar_core::SshAuth::Agent));
+        assert!(matches!(
+            resolve_gui_ssh_target(&conn).auth,
+            filar_core::SshAuth::Agent
+        ));
     }
 
     #[test]
@@ -1068,7 +1135,10 @@ mod tests {
             sp.insert("KR_KEY_1", &result);
         }
         let cached = sp.get("KR_KEY_1").unwrap_or_default();
-        assert_eq!(cached, "kr-secret", "key must be cached after first keyring read");
+        assert_eq!(
+            cached, "kr-secret",
+            "key must be cached after first keyring read"
+        );
     }
 
     #[test]
@@ -1076,7 +1146,10 @@ mod tests {
         let sp = StaticSecretProvider::new();
         sp.insert("MY_KEY_2", "mem-val");
         let result = resolve_test_key("MY_KEY_2", &sp, Some("kr-val"));
-        assert_eq!(result, "mem-val", "memory must take precedence over keyring");
+        assert_eq!(
+            result, "mem-val",
+            "memory must take precedence over keyring"
+        );
     }
 
     #[test]
@@ -1084,7 +1157,10 @@ mod tests {
         std::env::set_var("FILAR_TEST_EMPTY", "");
         let sp = StaticSecretProvider::new();
         let result = resolve_test_key("FILAR_TEST_EMPTY", &sp, None);
-        assert!(result.is_empty(), "empty env var must be treated as missing");
+        assert!(
+            result.is_empty(),
+            "empty env var must be treated as missing"
+        );
         std::env::remove_var("FILAR_TEST_EMPTY");
     }
 
@@ -1142,7 +1218,10 @@ mod tests {
             compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         };
         let result = build_llm_client_from_profile(&profile, &sp, 60);
-        assert!(result.is_err(), "factory must fail when no key is available");
+        assert!(
+            result.is_err(),
+            "factory must fail when no key is available"
+        );
     }
 
     #[test]
@@ -1201,7 +1280,10 @@ mod tests {
             compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         };
         let msg = check_profile_api_key(&profile, &sp);
-        assert!(msg.is_some(), "key_checker must fail when required key is missing");
+        assert!(
+            msg.is_some(),
+            "key_checker must fail when required key is missing"
+        );
         assert!(
             msg.unwrap().contains("no API key found"),
             "message must mention missing key"
@@ -1320,8 +1402,14 @@ mod tests {
         assert_eq!(llm.model, "openrouter");
         assert_eq!(key_env, "OPENROUTER_API_KEY");
         // Naming the first profile, or `default`, lands on it too.
-        assert_eq!(cli_llm_selection(&config.llm_profiles, Some("openrouter")).as_deref(), Some("openrouter"));
-        assert_eq!(cli_llm_selection(&config.llm_profiles, Some("default")).as_deref(), Some("openrouter"));
+        assert_eq!(
+            cli_llm_selection(&config.llm_profiles, Some("openrouter")).as_deref(),
+            Some("openrouter")
+        );
+        assert_eq!(
+            cli_llm_selection(&config.llm_profiles, Some("default")).as_deref(),
+            Some("openrouter")
+        );
     }
 
     #[test]
@@ -1332,7 +1420,10 @@ mod tests {
         };
         let selected = cli_llm_selection(&config.llm_profiles, Some("openrouter"));
         assert_eq!(selected.as_deref(), Some("openrouter"));
-        let msg = config.select_llm(selected.as_deref()).expect_err("unknown").to_string();
+        let msg = config
+            .select_llm(selected.as_deref())
+            .expect_err("unknown")
+            .to_string();
         assert!(msg.contains("'openrouter' not found"), "{msg}");
     }
 
@@ -1356,12 +1447,19 @@ mod tests {
     #[test]
     fn without_profiles_an_explicit_profile_name_is_not_swapped_for_the_llm_section() {
         let config = filar_core::Config {
-            llm: filar_core::LlmConfig { model: "m".into(), api_base_url: "u".into(), ..Default::default() },
+            llm: filar_core::LlmConfig {
+                model: "m".into(),
+                api_base_url: "u".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let selected = cli_llm_selection(&config.llm_profiles, Some("deepseek"));
         assert_eq!(selected.as_deref(), Some("deepseek"));
-        let msg = config.select_llm(selected.as_deref()).expect_err("unknown profile").to_string();
+        let msg = config
+            .select_llm(selected.as_deref())
+            .expect_err("unknown profile")
+            .to_string();
         assert!(msg.contains("'deepseek' not found"), "{msg}");
     }
 
@@ -1383,20 +1481,31 @@ mod tests {
         };
         // Not said (CLI / old pending_launch): config.toml wins.
         let kept = config_with_launch_risk_scorer(config.clone(), None);
-        assert_eq!(kept.active_risk_scorer().map(|r| r.model.as_str()), Some("from-config"));
+        assert_eq!(
+            kept.active_risk_scorer().map(|r| r.model.as_str()),
+            Some("from-config")
+        );
         // Off: no scorer, no note.
-        let off = config_with_launch_risk_scorer(config.clone(), Some(filar_gui::RiskScorerLaunch::Off));
+        let off =
+            config_with_launch_risk_scorer(config.clone(), Some(filar_gui::RiskScorerLaunch::Off));
         assert!(off.active_risk_scorer().is_none() && off.risk_scorer_error.is_none());
         // On: the launcher's settings.
         let on = config_with_launch_risk_scorer(
             config.clone(),
-            Some(filar_gui::RiskScorerLaunch::On { config: risk_section("from-launcher") }),
+            Some(filar_gui::RiskScorerLaunch::On {
+                config: risk_section("from-launcher"),
+            }),
         );
-        assert_eq!(on.active_risk_scorer().map(|r| r.model.as_str()), Some("from-launcher"));
+        assert_eq!(
+            on.active_risk_scorer().map(|r| r.model.as_str()),
+            Some("from-launcher")
+        );
         // On but invalid (hand-edited file): switched off with the reason.
         let bad = config_with_launch_risk_scorer(
             config,
-            Some(filar_gui::RiskScorerLaunch::On { config: risk_section("") }),
+            Some(filar_gui::RiskScorerLaunch::On {
+                config: risk_section(""),
+            }),
         );
         assert!(bad.active_risk_scorer().is_none());
         assert!(bad.risk_scorer_error.is_some());

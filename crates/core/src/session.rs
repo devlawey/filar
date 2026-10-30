@@ -1,4 +1,4 @@
-﻿//! Session persistence: save and restore chat histories.
+//! Session persistence: save and restore chat histories.
 //!
 //! Sessions are stored as JSON files under the platform data directory:
 //! - Windows: `%APPDATA%/filar/sessions/<id>.json`
@@ -111,6 +111,21 @@ pub struct Session {
     /// saved before it existed are ordinary ones.
     #[serde(default)]
     pub fleet: Option<FleetSnapshot>,
+    /// Kubernetes target and namespace for a cluster tab (#575).
+    ///
+    /// Only configured names are persisted. Kubeconfig paths, credentials and
+    /// live connections are resolved again when the session is restored.
+    #[serde(default)]
+    pub kube: Option<KubeSessionSnapshot>,
+}
+
+/// The configured identity of a saved Kubernetes cluster tab (#575).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubeSessionSnapshot {
+    /// Name of the entry in `[[kube_clusters]]`.
+    pub target: String,
+    /// Namespace selected in the tab, if one was chosen.
+    pub namespace: Option<String>,
 }
 
 /// The composition of a saved fleet session (#442).
@@ -273,14 +288,12 @@ impl SessionStore {
                 continue;
             }
             match std::fs::read_to_string(&path) {
-                Ok(contents) => {
-                    match serde_json::from_str::<Session>(&contents) {
-                        Ok(session) => metas.push(SessionMeta::from(&session)),
-                        Err(e) => {
-                            tracing::warn!(path = %path.display(), error = %e, "skipping unparseable session file");
-                        }
+                Ok(contents) => match serde_json::from_str::<Session>(&contents) {
+                    Ok(session) => metas.push(SessionMeta::from(&session)),
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "skipping unparseable session file");
                     }
-                }
+                },
                 Err(e) => {
                     tracing::warn!(path = %path.display(), error = %e, "skipping unreadable session file");
                 }
@@ -473,6 +486,7 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
         let meta = SessionMeta::from(&session);
         assert_eq!(meta.id, "123");
@@ -501,6 +515,7 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
         let meta = SessionMeta::from(&session);
         assert!(meta.preview.is_empty());
@@ -531,6 +546,7 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
 
         store.save(&session).unwrap();
@@ -543,7 +559,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "no temp files should remain: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "no temp files should remain: {leftovers:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -554,9 +573,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("filar_test_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        let store = SessionStore {
-            dir: tmp.clone(),
-        };
+        let store = SessionStore { dir: tmp.clone() };
 
         let session = Session {
             folded_history: Vec::new(),
@@ -580,6 +597,10 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: Some(KubeSessionSnapshot {
+                target: "prod-eu".into(),
+                namespace: Some("shop".into()),
+            }),
         };
 
         store.save(&session).unwrap();
@@ -588,6 +609,15 @@ mod tests {
         assert_eq!(loaded.target, "test");
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.input_history, session.input_history);
+        assert_eq!(loaded.kube, session.kube);
+
+        let mut legacy_json = serde_json::to_value(&session).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("kube");
+        let legacy: Session = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(
+            legacy.kube, None,
+            "sessions saved before Kubernetes support still load"
+        );
 
         let metas = store.list().unwrap();
         assert_eq!(metas.len(), 1);
@@ -605,9 +635,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("filar_prune_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        let store = SessionStore {
-            dir: tmp.clone(),
-        };
+        let store = SessionStore { dir: tmp.clone() };
 
         // Save 5 sessions with different IDs (timestamps).
         for i in 1..=5u64 {
@@ -619,17 +647,18 @@ mod tests {
                 llm_profile: Some("t".into()),
                 messages: vec![ChatBlock::User(format!("msg{i}"))],
                 input_history: vec![],
-            tokens_in: 0,
-            tokens_out: 0,
-            cost_usd: None,
-            per_profile: HashMap::new(),
-            last_served_model: None,
-            model_per_profile: HashMap::new(),
-            ssh_info: None,
-            model: None,
-            api_base_url: None,
-            confirm_mode: None,
-            fleet: None,
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: None,
+                per_profile: HashMap::new(),
+                last_served_model: None,
+                model_per_profile: HashMap::new(),
+                ssh_info: None,
+                model: None,
+                api_base_url: None,
+                confirm_mode: None,
+                fleet: None,
+                kube: None,
             };
             store.save(&session).unwrap();
         }
@@ -741,11 +770,24 @@ mod tests {
     fn tokens_in_out_roundtrip() {
         let s = Session {
             folded_history: Vec::new(),
-            id: "1".into(), timestamp: "t".into(), target: "t".into(),
-            llm_profile: Some("glm".into()), messages: vec![], input_history: vec![],
-            tokens_in: 150, tokens_out: 300,
-            cost_usd: None, per_profile: HashMap::new(), last_served_model: None, model_per_profile: HashMap::new(),
-            ssh_info: None, model: None, api_base_url: None, confirm_mode: None, fleet: None,
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "t".into(),
+            llm_profile: Some("glm".into()),
+            messages: vec![],
+            input_history: vec![],
+            tokens_in: 150,
+            tokens_out: 300,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
+            model_per_profile: HashMap::new(),
+            ssh_info: None,
+            model: None,
+            api_base_url: None,
+            confirm_mode: None,
+            fleet: None,
+            kube: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("tokens_in"), "must serialize tokens_in");
@@ -792,10 +834,17 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
         let json = serde_json::to_string_pretty(&session).unwrap();
-        assert!(json.contains("input_history"), "JSON must contain input_history");
-        assert!(json.contains("find port 8080"), "must contain history entries");
+        assert!(
+            json.contains("input_history"),
+            "JSON must contain input_history"
+        );
+        assert!(
+            json.contains("find port 8080"),
+            "must contain history entries"
+        );
         let loaded: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.input_history.len(), 2);
         assert_eq!(loaded.input_history[0], "ls");
@@ -814,7 +863,10 @@ mod tests {
         }"#;
         let session: Session = serde_json::from_str(json).unwrap();
         assert_eq!(session.id, "123");
-        assert!(session.input_history.is_empty(), "missing field → default empty");
+        assert!(
+            session.input_history.is_empty(),
+            "missing field → default empty"
+        );
     }
 
     #[test]
@@ -828,7 +880,10 @@ mod tests {
             target: "t".into(),
             llm_profile: None,
             messages: vec![
-                ChatBlock::Summary { text: "earlier turns".into(), replaced_blocks: 2 },
+                ChatBlock::Summary {
+                    text: "earlier turns".into(),
+                    replaced_blocks: 2,
+                },
                 ChatBlock::User("still here".into()),
             ],
             folded_history: vec![
@@ -847,6 +902,7 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
         let json = serde_json::to_string(&session).unwrap();
         let loaded: Session = serde_json::from_str(&json).unwrap();
@@ -855,7 +911,11 @@ mod tests {
             matches!(&loaded.folded_history[0], ChatBlock::User(t) if t == "the very first question"),
             "the folded head comes back verbatim"
         );
-        assert_eq!(loaded.messages.len(), 2, "and the context is unchanged by it");
+        assert_eq!(
+            loaded.messages.len(),
+            2,
+            "and the context is unchanged by it"
+        );
     }
 
     #[test]
@@ -869,7 +929,10 @@ mod tests {
             "messages":[{"User":"hello"},{"Agent":"world"}]
         }"#;
         let session: Session = serde_json::from_str(json).unwrap();
-        assert!(session.folded_history.is_empty(), "missing field → empty archive");
+        assert!(
+            session.folded_history.is_empty(),
+            "missing field → empty archive"
+        );
         assert_eq!(session.messages.len(), 2, "and the history is untouched");
     }
 
@@ -894,6 +957,7 @@ mod tests {
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
         assert!(session.input_history.len() > MAX_INPUT_HISTORY);
         session.truncate_history();
@@ -923,21 +987,34 @@ mod tests {
     fn model_per_profile_survives_roundtrip() {
         let mut session = Session {
             folded_history: Vec::new(),
-            id: "1".into(), timestamp: "t".into(), target: "t".into(),
-            llm_profile: None, messages: vec![], input_history: vec![],
-            tokens_in: 0, tokens_out: 0,
-            cost_usd: None, per_profile: HashMap::new(), last_served_model: None,
+            id: "1".into(),
+            timestamp: "t".into(),
+            target: "t".into(),
+            llm_profile: None,
+            messages: vec![],
+            input_history: vec![],
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            per_profile: HashMap::new(),
+            last_served_model: None,
             model_per_profile: HashMap::new(),
             ssh_info: None,
             model: None,
             api_base_url: None,
             confirm_mode: None,
             fleet: None,
+            kube: None,
         };
-        session.model_per_profile.insert("glm".into(), "openai/gpt-4o-mini".into());
+        session
+            .model_per_profile
+            .insert("glm".into(), "openai/gpt-4o-mini".into());
         let json = serde_json::to_string(&session).unwrap();
         let restored: Session = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.model_per_profile.get("glm").map(|s| s.as_str()), Some("openai/gpt-4o-mini"));
+        assert_eq!(
+            restored.model_per_profile.get("glm").map(|s| s.as_str()),
+            Some("openai/gpt-4o-mini")
+        );
     }
 
     #[test]
@@ -972,9 +1049,20 @@ mod tests {
             api_base_url: Some("https://open.bigmodel.cn/api/paas/v4".into()),
             confirm_mode: Some(CommandConfirmMode::Always),
             fleet: None,
+            kube: Some(KubeSessionSnapshot {
+                target: "prod-eu".into(),
+                namespace: Some("shop".into()),
+            }),
         };
         let json = serde_json::to_string(&session).unwrap();
         let restored: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.kube,
+            Some(KubeSessionSnapshot {
+                target: "prod-eu".into(),
+                namespace: Some("shop".into()),
+            })
+        );
         assert_eq!(restored.ssh_info.as_deref(), Some("root@10.0.0.5:22"));
         assert_eq!(restored.model.as_deref(), Some("glm-5.1"));
         assert_eq!(
@@ -1019,6 +1107,7 @@ mod tests {
             api_base_url: Some("https://example.com".into()),
             confirm_mode: Some(CommandConfirmMode::Allowlist),
             fleet: None,
+            kube: None,
         };
         let meta = SessionMeta::from(&session);
         assert_eq!(meta.ssh_info.as_deref(), Some("root@10.0.0.5:22"));

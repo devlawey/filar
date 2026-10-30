@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 filar-core = { workspace = true }
 filar-agent = { workspace = true }
-filar-transport = { workspace = true, features = ["local"] }
+filar-transport = { workspace = true, features = ["local", "kube"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

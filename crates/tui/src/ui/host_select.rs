@@ -65,7 +65,9 @@ fn render_host_select_with_glyphs(f: &mut Frame, app: &App, area: Rect, glyphs: 
         .style(Style::default().bg(app.theme.bg))
         .title(Span::styled(
             title,
-            Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(overlay_area);
     f.render_widget(block, overlay_area);
@@ -132,7 +134,10 @@ fn search_line(app: &App, rows: &[HostSelectRow], width: u16) -> Line<'static> {
     let (body, style) = if app.host_select_query.is_empty() {
         ("type to filter".to_string(), app.theme.muted())
     } else {
-        (fit_tail(&app.host_select_query, body_max), app.theme.fg_style())
+        (
+            fit_tail(&app.host_select_query, body_max),
+            app.theme.fg_style(),
+        )
     };
     let body_width = UnicodeWidthStr::width(body.as_str());
     let pad = total.saturating_sub(label.len() + body_width + counter.len() + 1);
@@ -193,23 +198,28 @@ fn row_line(app: &App, row: &HostSelectRow, glyphs: &Glyphs) -> Line<'static> {
                 Span::raw(format!(" {}{} ", glyphs.separator, glyphs.separator)),
                 Span::styled(
                     label,
-                    Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(app.theme.accent)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ])
         }
-        HostSelectRow::Local => {
-            Line::from(vec![
-                cursor_span(app, glyphs, 0),
-                current_span(glyphs, app.ssh_info.is_none() && !app.in_fleet()),
-                Span::raw(" "),
-                Span::styled(
-                    "local",
-                    Style::default().fg(app.theme.fg).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled("Local machine", app.theme.muted()),
-            ])
-        }
+        HostSelectRow::Local => Line::from(vec![
+            cursor_span(app, glyphs, 0),
+            current_span(
+                glyphs,
+                app.ssh_info.is_none() && app.kube.is_none() && !app.in_fleet(),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                "local",
+                Style::default()
+                    .fg(app.theme.fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("Local machine", app.theme.muted()),
+        ]),
         HostSelectRow::Target(i) => {
             let Some(t) = app.ssh_targets.get(*i) else {
                 return Line::default();
@@ -231,10 +241,15 @@ fn row_line(app: &App, row: &HostSelectRow, glyphs: &Glyphs) -> Line<'static> {
                 Span::raw(" "),
                 Span::styled(
                     t.name.clone(),
-                    Style::default().fg(app.theme.fg).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(app.theme.fg)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::styled(format!("{}@{}:{}", t.user, t.host, t.port), app.theme.muted()),
+                Span::styled(
+                    format!("{}@{}:{}", t.user, t.host, t.port),
+                    app.theme.muted(),
+                ),
                 Span::raw("  "),
                 Span::styled(format!("[{}]", auth_label), app.theme.dim()),
             ];
@@ -243,18 +258,54 @@ fn row_line(app: &App, row: &HostSelectRow, glyphs: &Glyphs) -> Line<'static> {
             }
             Line::from(spans)
         }
+        HostSelectRow::KubeHeader { count } => Line::from(vec![
+            Span::raw(format!(" {}{} ", glyphs.separator, glyphs.separator)),
+            Span::styled(
+                format!("kubernetes clusters ({count})"),
+                Style::default()
+                    .fg(app.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        HostSelectRow::Kube { cluster, selection } => {
+            let Some(target) = app.kube_clusters.get(*cluster) else {
+                return Line::default();
+            };
+            let is_current = app
+                .kube
+                .as_ref()
+                .is_some_and(|active| active.target.name == target.name);
+            let tags = if target.tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", target.tags.join(","))
+            };
+            Line::from(vec![
+                cursor_span(app, glyphs, *selection),
+                current_span(glyphs, is_current),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{} {}", glyphs.kube, target.name),
+                    app.theme.command_style(),
+                ),
+                Span::styled(tags, app.theme.dim()),
+            ])
+        }
         HostSelectRow::GroupsHeader { count } => Line::from(vec![
             Span::raw(format!(" {}{} ", glyphs.separator, glyphs.separator)),
             Span::styled(
                 format!("groups — fleet ({count})"),
-                Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(app.theme.accent)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
         HostSelectRow::Group { group, selection } => {
             let Some(g) = app.host_groups.get(*group) else {
                 return Line::default();
             };
-            let is_current = app.in_fleet() && app.fleet().map(|f| f.group_name()) == Some(g.name.as_str());
+            let is_current =
+                app.in_fleet() && app.fleet().map(|f| f.group_name()) == Some(g.name.as_str());
             let members = filar_core::select_hosts_for_group(g, &app.ssh_targets).len();
             let rule: Vec<String> = g.match_tags.iter().map(|t| format!("#{t}")).collect();
             Line::from(vec![
@@ -263,7 +314,9 @@ fn row_line(app: &App, row: &HostSelectRow, glyphs: &Glyphs) -> Line<'static> {
                 Span::raw(" "),
                 Span::styled(
                     g.name.clone(),
-                    Style::default().fg(app.theme.fg).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(app.theme.fg)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(format!("{members} host(s)"), app.theme.muted()),
@@ -276,7 +329,11 @@ fn row_line(app: &App, row: &HostSelectRow, glyphs: &Glyphs) -> Line<'static> {
 
 /// Row cursor: `▶`/`>` on the row carrying the flat selection index.
 fn cursor_span(app: &App, glyphs: &Glyphs, index: usize) -> Span<'static> {
-    let cursor = if app.host_select_index == index { glyphs.cursor } else { " " };
+    let cursor = if app.host_select_index == index {
+        glyphs.cursor
+    } else {
+        " "
+    };
     Span::raw(cursor)
 }
 
@@ -327,32 +384,38 @@ mod tests {
     #[test]
     fn overlay_renders_without_risky_unicode_in_ascii_mode() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.ssh_targets = vec![
-            make_target("web-01", &["prod"]),
-            make_target("db-01", &[]),
-        ];
+        app.ssh_targets = vec![make_target("web-01", &["prod"]), make_target("db-01", &[])];
         app.host_select_visible = true;
         let text = render_to_text(&app, 80, 24, &Glyphs::ASCII);
         for bad in ['▶', '●', '↑', '↓', '·', '▸', '▾', '•', '❯', '░', '█'] {
-            assert!(!text.contains(bad), "ASCII mode must not draw {bad:?}: {text:?}");
+            assert!(
+                !text.contains(bad),
+                "ASCII mode must not draw {bad:?}: {text:?}"
+            );
         }
         assert!(text.contains("^v"), "footer uses ASCII arrows: {text:?}");
-        assert!(text.contains("prod (1)"), "group header must show: {text:?}");
+        assert!(
+            text.contains("prod (1)"),
+            "group header must show: {text:?}"
+        );
         assert!(text.contains("#prod"), "row tags must show: {text:?}");
     }
 
     #[test]
     fn overlay_shows_group_headers_and_untagged_bucket() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
-        app.ssh_targets = vec![
-            make_target("web-01", &["prod"]),
-            make_target("db-01", &[]),
-        ];
+        app.ssh_targets = vec![make_target("web-01", &["prod"]), make_target("db-01", &[])];
         app.host_select_visible = true;
         let text = render_to_text(&app, 90, 24, &Glyphs::UNICODE);
         assert!(text.contains("prod (1)"), "tagged group header: {text:?}");
-        assert!(text.contains("no tags (1)"), "untagged bucket header: {text:?}");
-        assert!(text.contains("Local machine"), "local row stays first: {text:?}");
+        assert!(
+            text.contains("no tags (1)"),
+            "untagged bucket header: {text:?}"
+        );
+        assert!(
+            text.contains("Local machine"),
+            "local row stays first: {text:?}"
+        );
     }
 
     #[test]
@@ -364,8 +427,14 @@ mod tests {
         app.host_select_visible = true;
         app.host_select_index = 22; // near the end of the flat list
         let text = render_to_text(&app, 90, 16, &Glyphs::UNICODE);
-        assert!(text.contains("fleet-22"), "selected row must be visible: {text:?}");
-        assert!(!text.contains("fleet-01"), "early rows must have scrolled out: {text:?}");
+        assert!(
+            text.contains("fleet-22"),
+            "selected row must be visible: {text:?}"
+        );
+        assert!(
+            !text.contains("fleet-01"),
+            "early rows must have scrolled out: {text:?}"
+        );
     }
 
     #[test]
@@ -389,7 +458,10 @@ mod tests {
         app.host_select_visible = true;
         app.host_select_query = "zzz".into();
         let text = render_to_text(&app, 90, 30, &Glyphs::UNICODE);
-        assert!(text.contains("(no matches)"), "empty view explains itself: {text:?}");
+        assert!(
+            text.contains("(no matches)"),
+            "empty view explains itself: {text:?}"
+        );
         assert!(
             text.contains("Esc clear"),
             "footer hints must survive the empty view: {text:?}"

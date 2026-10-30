@@ -95,9 +95,7 @@ impl ChatLayoutCache {
 
     /// Returns `true` if the cache must be rebuilt for the given parameters.
     pub fn needs_rebuild(&self, messages: &[ChatBlock], width: u16, rev: u64) -> bool {
-        self.width != width
-            || self.message_count != messages.len()
-            || self.last_block_rev != rev
+        self.width != width || self.message_count != messages.len() || self.last_block_rev != rev
     }
 
     /// Rebuild the cache from scratch.
@@ -126,10 +124,10 @@ impl ChatLayoutCache {
             match msg {
                 ChatBlock::User(text) => {
                     let text = strip_emoji(text);
-                    self.push_header(idx, vec![
-                        Span::raw("  "),
-                        Span::styled("you", theme.user_style()),
-                    ]);
+                    self.push_header(
+                        idx,
+                        vec![Span::raw("  "), Span::styled("you", theme.user_style())],
+                    );
                     for line in text.lines() {
                         for wrapped in wrap_text(line, content_width) {
                             self.push_body(idx, format!("  {wrapped}"));
@@ -140,10 +138,10 @@ impl ChatLayoutCache {
 
                 ChatBlock::Agent(text) => {
                     let text = strip_emoji(text);
-                    self.push_header(idx, vec![
-                        Span::raw("  "),
-                        Span::styled("agent", theme.agent_style()),
-                    ]);
+                    self.push_header(
+                        idx,
+                        vec![Span::raw("  "), Span::styled("agent", theme.agent_style())],
+                    );
                     let mut md_state = MarkdownState::default();
                     for line in text.lines() {
                         for wrapped in wrap_text(line, content_width) {
@@ -160,7 +158,7 @@ impl ChatLayoutCache {
                     explanation,
                     output,
                     approved,
-                    ..
+                    tool,
                 } => {
                     let is_collapsed = collapsed.contains(&idx);
 
@@ -173,7 +171,11 @@ impl ChatLayoutCache {
 
                     // Arrow indicator from Glyphs.
                     let arrow = if output.is_some() {
-                        if is_collapsed { glyphs.collapse_arrow } else { glyphs.expand_arrow }
+                        if is_collapsed {
+                            glyphs.collapse_arrow
+                        } else {
+                            glyphs.expand_arrow
+                        }
                     } else {
                         " "
                     };
@@ -193,8 +195,16 @@ impl ChatLayoutCache {
                         };
                         header.push(Span::styled(format!("[{label}] "), style));
                     }
+                    let marker = if tool
+                        .as_ref()
+                        .is_some_and(|tool| tool.name.starts_with("k8s_"))
+                    {
+                        format!("{} ", glyphs.kube)
+                    } else {
+                        "$ ".to_string()
+                    };
                     header.extend([
-                        Span::styled("$ ", theme.warning_fg()),
+                        Span::styled(marker, theme.warning_fg()),
                         Span::styled(command.clone(), theme.command_style()),
                         status,
                     ]);
@@ -219,7 +229,10 @@ impl ChatLayoutCache {
                             let preview = if self.fleet { 1 } else { 5 };
                             for line in all_lines.iter().take(preview) {
                                 for wrapped in wrap_text(line, output_width) {
-                                    self.push_output(idx, format!("  {} {}", glyphs.gutter, wrapped));
+                                    self.push_output(
+                                        idx,
+                                        format!("  {} {}", glyphs.gutter, wrapped),
+                                    );
                                 }
                             }
                             if total > preview {
@@ -237,7 +250,10 @@ impl ChatLayoutCache {
                             const MAX_EXPANDED_LINES: usize = 400;
                             for line in all_lines.iter().take(MAX_EXPANDED_LINES) {
                                 for wrapped in wrap_text(line, output_width) {
-                                    self.push_output(idx, format!("  {} {}", glyphs.gutter, wrapped));
+                                    self.push_output(
+                                        idx,
+                                        format!("  {} {}", glyphs.gutter, wrapped),
+                                    );
                                 }
                             }
                             if total > MAX_EXPANDED_LINES {
@@ -260,21 +276,27 @@ impl ChatLayoutCache {
 
                 ChatBlock::Error(text) => {
                     let text = strip_emoji(text);
-                    self.push_header(idx, vec![
-                        Span::raw("  "),
-                        Span::styled(format!("{} ", glyphs.danger), theme.error_style()),
-                        Span::styled(text, theme.error_style()),
-                    ]);
+                    self.push_header(
+                        idx,
+                        vec![
+                            Span::raw("  "),
+                            Span::styled(format!("{} ", glyphs.danger), theme.error_style()),
+                            Span::styled(text, theme.error_style()),
+                        ],
+                    );
                     self.push_spacer();
                 }
 
                 ChatBlock::System(text) => {
                     let text = strip_emoji(text);
-                    self.push_header(idx, vec![
-                        Span::raw("  "),
-                        Span::styled(format!("{} ", glyphs.middle_dot), theme.muted()),
-                        Span::styled(text, theme.muted()),
-                    ]);
+                    self.push_header(
+                        idx,
+                        vec![
+                            Span::raw("  "),
+                            Span::styled(format!("{} ", glyphs.middle_dot), theme.muted()),
+                            Span::styled(text, theme.muted()),
+                        ],
+                    );
                     self.push_spacer();
                 }
 
@@ -282,18 +304,28 @@ impl ChatLayoutCache {
                 // Collapsed by default, expandable like command output: it is
                 // context the user may want to audit, not part of the
                 // conversation they actually had.
-                ChatBlock::Summary { text, replaced_blocks } => {
+                ChatBlock::Summary {
+                    text,
+                    replaced_blocks,
+                } => {
                     let is_collapsed = collapsed.contains(&idx);
-                    let arrow = if is_collapsed { glyphs.collapse_arrow } else { glyphs.expand_arrow };
+                    let arrow = if is_collapsed {
+                        glyphs.collapse_arrow
+                    } else {
+                        glyphs.expand_arrow
+                    };
 
-                    self.push_header(idx, vec![
-                        Span::raw("  "),
-                        Span::styled(format!("{} ", arrow), theme.muted()),
-                        Span::styled(
-                            format!("History compacted - {replaced_blocks} blocks summarised"),
-                            theme.muted(),
-                        ),
-                    ]);
+                    self.push_header(
+                        idx,
+                        vec![
+                            Span::raw("  "),
+                            Span::styled(format!("{} ", arrow), theme.muted()),
+                            Span::styled(
+                                format!("History compacted - {replaced_blocks} blocks summarised"),
+                                theme.muted(),
+                            ),
+                        ],
+                    );
 
                     if !is_collapsed {
                         for line in strip_emoji(text).lines() {
@@ -489,9 +521,16 @@ mod tests {
             approved: true,
             tool: None,
         }];
-        cache.safety_badges.insert(0, ("~62%".into(), SafetyLevel::Warn));
+        cache
+            .safety_badges
+            .insert(0, ("~62%".into(), SafetyLevel::Warn));
         cache.rebuild(&msgs, 80, &theme, &HashSet::new(), 1);
-        let header: String = cache.lines[0].line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let header: String = cache.lines[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
         let badge = header.find("[~62%]").expect("badge in the header");
         assert!(badge < header.find("$ echo").unwrap(), "{header}");
         let with_badge = cache.lines[0].line.spans.len();
@@ -501,7 +540,12 @@ mod tests {
         // draws the status as `[ok]` (#551).
         cache.safety_badges.clear();
         cache.rebuild(&msgs, 80, &theme, &HashSet::new(), 2);
-        let plain: String = cache.lines[0].line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let plain: String = cache.lines[0]
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
         assert_eq!(cache.lines[0].line.spans.len(), with_badge - 1);
         assert_eq!(header.replacen("[~62%] ", "", 1), plain);
     }
@@ -512,7 +556,10 @@ mod tests {
         let collapsed = HashSet::new();
         let mut cache = ChatLayoutCache::new();
 
-        let long_output = (0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let long_output = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let msgs = vec![ChatBlock::Command {
             command: "test".into(),
             explanation: "expl".into(),
@@ -523,15 +570,28 @@ mod tests {
         cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
 
         // Expanded: Header, Output (expl), Output x50, OutputToggle (▾ collapse), Spacer.
-        let has_toggle = cache.lines.iter().any(|l| l.region == LineRegion::OutputToggle);
-        assert!(has_toggle, "expected a ▾ collapse toggle for expanded long output");
+        let has_toggle = cache
+            .lines
+            .iter()
+            .any(|l| l.region == LineRegion::OutputToggle);
+        assert!(
+            has_toggle,
+            "expected a ▾ collapse toggle for expanded long output"
+        );
         let has_output = cache.lines.iter().any(|l| l.region == LineRegion::Output);
         assert!(has_output, "expected Output lines");
 
         // The toggle text should say "collapse", not "more lines".
-        let toggle = cache.lines.iter().find(|l| l.region == LineRegion::OutputToggle).unwrap();
+        let toggle = cache
+            .lines
+            .iter()
+            .find(|l| l.region == LineRegion::OutputToggle)
+            .unwrap();
         let toggle_text = format!("{}", toggle.line);
-        assert!(toggle_text.contains("collapse"), "toggle should say collapse, got: {toggle_text}");
+        assert!(
+            toggle_text.contains("collapse"),
+            "toggle should say collapse, got: {toggle_text}"
+        );
     }
 
     #[test]
@@ -541,7 +601,10 @@ mod tests {
         collapsed.insert(0);
         let mut cache = ChatLayoutCache::new();
 
-        let long_output = (0..50).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let long_output = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let msgs = vec![ChatBlock::Command {
             command: "test".into(),
             explanation: "".into(),
@@ -552,14 +615,33 @@ mod tests {
         cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
 
         // Collapsed: Header, Output x5, OutputToggle (▸ … 45 more lines), Spacer.
-        let output_count = cache.lines.iter().filter(|l| l.region == LineRegion::Output).count();
-        assert_eq!(output_count, 5, "collapsed block should show exactly 5 output lines");
+        let output_count = cache
+            .lines
+            .iter()
+            .filter(|l| l.region == LineRegion::Output)
+            .count();
+        assert_eq!(
+            output_count, 5,
+            "collapsed block should show exactly 5 output lines"
+        );
 
-        let toggle = cache.lines.iter().find(|l| l.region == LineRegion::OutputToggle);
-        assert!(toggle.is_some(), "collapsed block should have a toggle line");
+        let toggle = cache
+            .lines
+            .iter()
+            .find(|l| l.region == LineRegion::OutputToggle);
+        assert!(
+            toggle.is_some(),
+            "collapsed block should have a toggle line"
+        );
         let toggle_text = format!("{}", toggle.unwrap().line);
-        assert!(toggle_text.contains("more lines"), "toggle should mention more lines, got: {toggle_text}");
-        assert!(toggle_text.contains("45"), "toggle should say 45 more lines, got: {toggle_text}");
+        assert!(
+            toggle_text.contains("more lines"),
+            "toggle should mention more lines, got: {toggle_text}"
+        );
+        assert!(
+            toggle_text.contains("45"),
+            "toggle should say 45 more lines, got: {toggle_text}"
+        );
     }
 
     #[test]
@@ -579,7 +661,10 @@ mod tests {
         cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
 
         // Short output: Header, Output x3, Spacer — no toggle.
-        let has_toggle = cache.lines.iter().any(|l| l.region == LineRegion::OutputToggle);
+        let has_toggle = cache
+            .lines
+            .iter()
+            .any(|l| l.region == LineRegion::OutputToggle);
         assert!(!has_toggle, "short output should not have a toggle line");
     }
 
@@ -612,17 +697,70 @@ mod tests {
         let header0 = &cache.lines[0];
         assert_eq!(header0.region, LineRegion::Header);
         let header0_text = format!("{}", header0.line);
-        assert!(header0_text.contains(glyphs.expand_arrow), "expanded header should have expand arrow, got: {header0_text}");
-        assert!(header0_text.contains("ls"), "header should contain command, got: {header0_text}");
-        assert!(header0_text.contains(glyphs.success), "approved header should have success glyph, got: {header0_text}");
+        assert!(
+            header0_text.contains(glyphs.expand_arrow),
+            "expanded header should have expand arrow, got: {header0_text}"
+        );
+        assert!(
+            header0_text.contains("ls"),
+            "header should contain command, got: {header0_text}"
+        );
+        assert!(
+            header0_text.contains(glyphs.success),
+            "approved header should have success glyph, got: {header0_text}"
+        );
 
         // Find the second header (skip first block's lines + spacer).
-        let header1 = cache.lines.iter().find(|l| {
-            l.region == LineRegion::Header && l.block_index == Some(1)
-        }).unwrap();
+        let header1 = cache
+            .lines
+            .iter()
+            .find(|l| l.region == LineRegion::Header && l.block_index == Some(1))
+            .unwrap();
         let header1_text = format!("{}", header1.line);
-        assert!(header1_text.contains(glyphs.danger), "denied header should have danger glyph, got: {header1_text}");
-        assert!(header1_text.contains("rm"), "header should contain command, got: {header1_text}");
+        assert!(
+            header1_text.contains(glyphs.danger),
+            "denied header should have danger glyph, got: {header1_text}"
+        );
+        assert!(
+            header1_text.contains("rm"),
+            "header should contain command, got: {header1_text}"
+        );
+    }
+
+    #[test]
+    fn kubernetes_tool_block_uses_the_cluster_marker_and_collapses_output() {
+        let theme = Theme::default_dark();
+        let mut cache = ChatLayoutCache::new();
+        let output = (0..8)
+            .map(|i| format!("pod-{i} Running"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msgs = vec![ChatBlock::Command {
+            command: "k8s_get pods -l app=web".into(),
+            explanation: String::new(),
+            output: Some(output),
+            approved: true,
+            tool: Some(filar_core::ToolInvocation {
+                name: "k8s_get".into(),
+                arguments: serde_json::json!({"resource": "pods", "selector": "app=web"}),
+            }),
+        }];
+        cache.rebuild(&msgs, 100, &theme, &HashSet::from([0]), 1);
+
+        let header = format!("{}", cache.lines[0].line);
+        assert!(
+            header.contains(&format!("{} k8s_get pods -l app=web", theme.glyphs().kube)),
+            "{header}"
+        );
+        assert!(!header.contains("$ k8s_get"), "{header}");
+        assert!(cache
+            .lines
+            .iter()
+            .any(|line| format!("{}", line.line).contains("pod-0 Running")));
+        assert!(cache.lines.iter().any(|line| {
+            line.region == LineRegion::OutputToggle
+                && format!("{}", line.line).contains("3 more lines")
+        }));
     }
 
     #[test]
@@ -643,7 +781,9 @@ mod tests {
         let header = &cache.lines[0];
         let header_text = format!("{}", header.line);
         let g = theme.glyphs();
-        assert!(!header_text.contains(g.collapse_arrow) && !header_text.contains(g.expand_arrow),
-            "no-output block should not have arrow, got: {header_text}");
+        assert!(
+            !header_text.contains(g.collapse_arrow) && !header_text.contains(g.expand_arrow),
+            "no-output block should not have arrow, got: {header_text}"
+        );
     }
 }

@@ -11156,3 +11156,23 @@ promptfoo не размножал кейс по array-valued variable.
 форматируется как `Kubernetes cluster prod-eu (namespace shop, tags: prod)`.
 
 **Next:** #575 (вкладка кластера в TUI и DoD с бинарником).
+
+## #575 — вкладка Kubernetes-кластера в TUI
+
+**Сделано.** `Ctrl+O` открывает настроенные `[[kube_clusters]]`; namespace
+выбирается из конфигурации или обнаруживается через API. Для каждой вкладки
+runner хранит отдельный `Arc<dyn ClusterApi>`, отбрасывает устаревшие результаты
+подключения/discovery и освобождает соединение при закрытии или смене цели.
+Отдельный `KubeAgent` работает только через typed `KubeToolExecutor`, повторно
+используя существующие подтверждения, события, историю, compaction и отмену —
+`CommandExecutor` и shell-команды для Kubernetes не используются. В ленте API-
+вызовы сворачиваются как command blocks, confirm показывает инструмент,
+аргументы и цель, статус-бар поддерживает сокращение и ASCII. `Ctrl+T`, `Ctrl+G`
+и `!cmd` получают точный отказ без шелла. Сессия хранит только configured target
+name и namespace; восстановление переподключается по имени.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. Аддитивно: `KubeAgent`,
+`KubeSessionSnapshot` / `Session::kube`, поля Kubernetes в `TuiConfig`; публичный
+`ClusterApi` используется без проброса специфики kube-rs в UI.
+
+**Next:** #566 (лаунчер и `--target` для кластеров).

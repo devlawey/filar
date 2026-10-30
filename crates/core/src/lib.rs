@@ -25,14 +25,12 @@ pub use compaction::{
     DEFAULT_KEEP_TURNS,
 };
 pub use config::{
-    tag_policy_floor, select_hosts_for_group, target_matches_group, is_read_only_target,
-    Config, SshTarget, SshAuth, TagPolicy, HostGroup, KubeCluster,
-    DEFAULT_KUBE_REQUEST_TIMEOUT_SECS, MAX_KUBE_REQUEST_TIMEOUT_SECS,
-    HostGroupPolicy, LlmConfig, LlmProfile, CommandConfirmMode, TimeoutConfig, HostKeyPolicy,
-    DEFAULT_COMMAND_TIMEOUT_SECS,
-    DEFAULT_COMPACT_AT_TOKENS, DEFAULT_MAX_TOKENS,
-    RiskScorerConfig, RiskScorerKind, DEFAULT_RISK_SCORER_TIMEOUT_SECS, MAX_RISK_SCORER_TIMEOUT_SECS,
-    DEFAULT_RISK_WARN_BELOW, DEFAULT_RISK_DANGER_BELOW,
+    is_read_only_target, select_hosts_for_group, tag_policy_floor, target_matches_group,
+    CommandConfirmMode, Config, HostGroup, HostGroupPolicy, HostKeyPolicy, KubeCluster, LlmConfig,
+    LlmProfile, RiskScorerConfig, RiskScorerKind, SshAuth, SshTarget, TagPolicy, TimeoutConfig,
+    DEFAULT_COMMAND_TIMEOUT_SECS, DEFAULT_COMPACT_AT_TOKENS, DEFAULT_KUBE_REQUEST_TIMEOUT_SECS,
+    DEFAULT_MAX_TOKENS, DEFAULT_RISK_DANGER_BELOW, DEFAULT_RISK_SCORER_TIMEOUT_SECS,
+    DEFAULT_RISK_WARN_BELOW, MAX_KUBE_REQUEST_TIMEOUT_SECS, MAX_RISK_SCORER_TIMEOUT_SECS,
 };
 pub use error::{CoreError, Result};
 pub use fleet_checks::{
@@ -43,7 +41,10 @@ pub use fleet_file_check::{FileBaseline, FileProbe, FileReference};
 pub use fleet_op::{FleetMember, FleetOperation, HostHandle, HostProgress, OperationId};
 pub use os_family::{OsFamily, OS_RELEASE_COMMAND};
 pub use secrets::{
-    ssh_cred_name, ssh_key_passphrase_name, ssh_target_display_name, EnvSecretProvider, KeyringSecretProvider,
-    SecretProvider, StaticSecretProvider, redact, redact_secrets,
+    redact, redact_secrets, ssh_cred_name, ssh_key_passphrase_name, ssh_target_display_name,
+    EnvSecretProvider, KeyringSecretProvider, SecretProvider, StaticSecretProvider,
 };
-pub use session::{default_base_dir, FleetSnapshot, ProfileUsage, Session, SessionMeta, SessionStore};
+pub use session::{
+    default_base_dir, FleetSnapshot, KubeSessionSnapshot, ProfileUsage, Session, SessionMeta,
+    SessionStore,
+};

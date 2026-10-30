@@ -35,6 +35,7 @@ mod file_panels;
 mod help;
 mod host_select;
 mod input;
+mod namespace_select;
 mod path_picker_overlay;
 mod save_overlay;
 mod session_select;
@@ -50,11 +51,13 @@ pub use theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::Frame;
 
-use crate::app::{App, AppMode};
 use self::text::wrap_text;
+use crate::app::{App, AppMode};
 
 /// Compute the input area height based on wrapped input text.
 ///
@@ -88,13 +91,13 @@ pub fn render(f: &mut Frame, app: &mut App) {
         constraints.push(Constraint::Length(1)); // tab bar
     }
     constraints.extend_from_slice(&[
-        Constraint::Length(1),       // status bar
-        Constraint::Length(1),       // separator
-        Constraint::Min(8),          // chat history
-        Constraint::Length(1),       // separator
+        Constraint::Length(1),         // status bar
+        Constraint::Length(1),         // separator
+        Constraint::Min(8),            // chat history
+        Constraint::Length(1),         // separator
         Constraint::Length(in_height), // input
-        Constraint::Length(1),       // separator
-        Constraint::Length(1),       // help bar
+        Constraint::Length(1),         // separator
+        Constraint::Length(1),         // help bar
     ]);
 
     let chunks = Layout::default()
@@ -150,6 +153,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
         host_select::render_host_select(f, app, full);
     }
 
+    // Namespace selection follows cluster selection and stays above the feed.
+    if app.kube_namespace_select.is_some() {
+        namespace_select::render_namespace_select(f, app, f.area());
+    }
+
     // Render session-selection overlay on top of everything if active.
     if app.session_select_visible {
         let full = f.area();
@@ -182,7 +190,11 @@ fn side_panel_layout(app: &App, feed: Rect, term_width: u16) -> (Rect, Option<Re
     }
     let fleet = app.panel_content() == PanelContent::FleetSummary;
     if docks(term_width) {
-        let panel = if fleet { FLEET_PANEL_WIDTH } else { SIDE_PANEL_WIDTH };
+        let panel = if fleet {
+            FLEET_PANEL_WIDTH
+        } else {
+            SIDE_PANEL_WIDTH
+        };
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(20), Constraint::Length(panel)])
@@ -193,7 +205,9 @@ fn side_panel_layout(app: &App, feed: Rect, term_width: u16) -> (Rect, Option<Re
     // The fleet's table takes all but that strip — at 80 columns a 40-wide
     // drawer would clamp every value to a stub (#438).
     let wanted = if fleet { feed.width } else { SIDE_PANEL_WIDTH };
-    let width = wanted.min(feed.width.saturating_sub(8)).max(feed.width.min(20));
+    let width = wanted
+        .min(feed.width.saturating_sub(8))
+        .max(feed.width.min(20));
     let drawer = Rect::new(feed.x + feed.width - width, feed.y, width, feed.height);
     (feed, Some(drawer))
 }
@@ -203,11 +217,11 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // status bar
-            Constraint::Length(1),  // separator
-            Constraint::Min(1),     // terminal grid
-            Constraint::Length(1),  // separator
-            Constraint::Length(1),  // help bar
+            Constraint::Length(1), // status bar
+            Constraint::Length(1), // separator
+            Constraint::Min(1),    // terminal grid
+            Constraint::Length(1), // separator
+            Constraint::Length(1), // help bar
         ])
         .split(f.area());
 
@@ -222,7 +236,9 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
         term.render_with_selection(
             f,
             chunks[2],
-            app.selection.filter(|s| !s.is_empty()).map(|s| s.normalised()),
+            app.selection
+                .filter(|s| !s.is_empty())
+                .map(|s| s.normalised()),
             app.theme.selection_bg,
         );
 
@@ -267,6 +283,11 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
     if app.host_select_visible {
         let full = f.area();
         host_select::render_host_select(f, app, full);
+    }
+
+    // Namespace selection follows cluster selection and stays above the feed.
+    if app.kube_namespace_select.is_some() {
+        namespace_select::render_namespace_select(f, app, f.area());
     }
 
     // Render session-selection overlay on top of everything if active.
@@ -370,7 +391,10 @@ mod tests {
         let panel = panel.expect("docked");
         assert_eq!(chat.width + panel.width, 160);
         assert_eq!(panel.width, crate::side_panel::SIDE_PANEL_WIDTH);
-        assert!(panel.x >= chat.x + chat.width, "panel does not cover the feed");
+        assert!(
+            panel.x >= chat.x + chat.width,
+            "panel does not cover the feed"
+        );
     }
 
     #[test]
@@ -391,10 +415,17 @@ mod tests {
     fn the_fleet_table_gets_a_wider_panel() {
         let mut app = crate::app::test_fleet_app(crate::app::test_fleet_view());
         let (_, docked) = side_panel_layout(&app, Rect::new(0, 2, 160, 30), 160);
-        assert_eq!(docked.expect("docked").width, crate::side_panel::FLEET_PANEL_WIDTH);
+        assert_eq!(
+            docked.expect("docked").width,
+            crate::side_panel::FLEET_PANEL_WIDTH
+        );
         app.side_panel.toggle();
         let (_, drawer) = side_panel_layout(&app, Rect::new(0, 2, 80, 20), 80);
-        assert_eq!(drawer.expect("drawer").width, 72, "all but an 8-column strip of the feed");
+        assert_eq!(
+            drawer.expect("drawer").width,
+            72,
+            "all but an 8-column strip of the feed"
+        );
     }
 
     #[test]
@@ -426,8 +457,13 @@ mod tests {
         app.enter_fleet("web");
         let mut t = Terminal::new(TestBackend::new(80, 1)).unwrap();
         t.draw(|f| render_tab_bar(f, &app, f.area())).unwrap();
-        let row: String = (0..80).map(|x| t.backend().buffer()[(x, 0)].symbol().to_string()).collect();
-        assert!(row.starts_with("[fleet: web (1)] 1. local 2. local-2"), "{row:?}");
+        let row: String = (0..80)
+            .map(|x| t.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            row.starts_with("[fleet: web (1)] 1. local 2. local-2"),
+            "{row:?}"
+        );
     }
 
     #[test]
