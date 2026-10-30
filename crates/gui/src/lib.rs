@@ -20,6 +20,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use filar_core::{Config, SessionMeta, SessionStore};
+use filar_transport::ClusterApi as _;
 
 /// Current SSH host-list format version (#411).
 ///
@@ -377,6 +378,14 @@ pub struct LaunchConfig {
     /// SSH connection details; `Some` identifies an SSH launch and drives
     /// the executor choice in `main` (#406).
     pub ssh: Option<SshConnection>,
+    /// Kubernetes tab to open. Transport selection is explicit, never inferred
+    /// from the display label.
+    #[serde(default)]
+    pub kube: Option<filar_core::KubeSessionSnapshot>,
+    /// Cluster definitions as edited in the launcher. `None` in an old handoff
+    /// means "not said" and preserves the config-file fallback.
+    #[serde(default)]
+    pub kube_clusters: Option<Vec<filar_core::KubeCluster>>,
     /// Model name (e.g. `"deepseek-chat"`).
     pub model: String,
     /// API base URL.
@@ -589,6 +598,13 @@ struct Settings {
     api_base_url: String,
     #[serde(default)]
     ssh_profiles: Vec<SshProfile>,
+    /// Kubernetes targets as last saved by the launcher. These contain only
+    /// target metadata, never kubeconfig contents or credentials.
+    #[serde(default)]
+    kube_profiles: Vec<filar_core::KubeCluster>,
+    /// Name of the last selected cluster; `None` restores `last_ssh` instead.
+    #[serde(default)]
+    last_kube: Option<String>,
     /// SSH host-list format version (#411). Absent in pre-#411 files, which
     /// is what triggers the one-time migration in [`Settings::load`].
     #[serde(default)]
@@ -842,6 +858,7 @@ struct ImportOutcome {
     overwritten: usize,
     renamed: usize,
     skipped: usize,
+    kube_skipped: usize,
 }
 
 /// The outcome of staging an import file (#416).
@@ -854,6 +871,7 @@ enum ImportStaged {
     NeedsDecision {
         rows: Vec<ImportRow>,
         collisions: Vec<String>,
+        kube_skipped: usize,
     },
 }
 
@@ -948,11 +966,23 @@ fn ensure_unique_aliases(rows: &[ImportRow]) -> Result<(), String> {
 /// `auth` contributes its `type` (#417) and, for `key`, the key file `path`
 /// (#489) — a location, not a secret. An inline `password` is never read:
 /// secrets stay in the keyring (invariant #3).
+#[cfg(test)]
 fn parse_import_toml(text: &str) -> Result<Vec<ImportRow>, String> {
+    Ok(parse_import_toml_details(text)?.rows)
+}
+
+struct ParsedImport {
+    rows: Vec<ImportRow>,
+    kube_skipped: usize,
+}
+
+fn parse_import_toml_details(text: &str) -> Result<ParsedImport, String> {
     #[derive(serde::Deserialize)]
     struct File {
         #[serde(default)]
         ssh_targets: Vec<Entry>,
+        #[serde(default)]
+        kube_clusters: Vec<serde::de::IgnoredAny>,
     }
     #[derive(serde::Deserialize)]
     struct Entry {
@@ -981,8 +1011,8 @@ fn parse_import_toml(text: &str) -> Result<Vec<ImportRow>, String> {
     }
 
     let file: File = toml::from_str(text).map_err(|e| format!("not valid TOML: {e}"))?;
-    if file.ssh_targets.is_empty() {
-        return Err("no [[ssh_targets]] entries found".to_string());
+    if file.ssh_targets.is_empty() && file.kube_clusters.is_empty() {
+        return Err("no [[ssh_targets]] or [[kube_clusters]] entries found".to_string());
     }
     let mut rows = Vec::with_capacity(file.ssh_targets.len());
     for (i, entry) in file.ssh_targets.iter().enumerate() {
@@ -1017,7 +1047,10 @@ fn parse_import_toml(text: &str) -> Result<Vec<ImportRow>, String> {
         });
     }
     ensure_unique_aliases(&rows)?;
-    Ok(rows)
+    Ok(ParsedImport {
+        rows,
+        kube_skipped: file.kube_clusters.len(),
+    })
 }
 
 /// Split CSV text into rows of fields (RFC 4180: quoted fields, doubled
@@ -1130,7 +1163,7 @@ fn parse_import_csv(text: &str) -> Result<Vec<ImportRow>, String> {
 /// Read and parse an import file. The format follows the extension: `.csv`
 /// → CSV, anything else → TOML (#416). Nothing is applied here — a parse
 /// failure leaves every existing host untouched.
-fn parse_import_file(path: &std::path::Path) -> Result<Vec<ImportRow>, String> {
+fn parse_import_file(path: &std::path::Path) -> Result<ParsedImport, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let is_csv = path
@@ -1138,9 +1171,12 @@ fn parse_import_file(path: &std::path::Path) -> Result<Vec<ImportRow>, String> {
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
     if is_csv {
-        parse_import_csv(&text)
+        Ok(ParsedImport {
+            rows: parse_import_csv(&text)?,
+            kube_skipped: 0,
+        })
     } else {
-        parse_import_toml(&text)
+        parse_import_toml_details(&text)
     }
 }
 
@@ -1249,25 +1285,39 @@ fn apply_import(
 /// rows back for the user's collision choice (#416). Mutates nothing when
 /// the file cannot be parsed.
 fn stage_import(slots: &mut Vec<SshSlot>, path: &std::path::Path) -> Result<ImportStaged, String> {
-    let rows = parse_import_file(path)?;
+    let ParsedImport { rows, kube_skipped } = parse_import_file(path)?;
     let collisions = find_import_collisions(slots, &rows);
     if collisions.is_empty() {
-        Ok(ImportStaged::Applied(apply_import(
-            slots,
-            rows,
-            CollisionPolicy::Skip,
-        )))
+        let mut outcome = apply_import(slots, rows, CollisionPolicy::Skip);
+        outcome.kube_skipped = kube_skipped;
+        Ok(ImportStaged::Applied(outcome))
     } else {
-        Ok(ImportStaged::NeedsDecision { rows, collisions })
+        Ok(ImportStaged::NeedsDecision {
+            rows,
+            collisions,
+            kube_skipped,
+        })
     }
 }
 
 /// One-line import result for the launcher (#416).
 fn import_status_line(outcome: &ImportOutcome) -> String {
-    format!(
+    let mut line = format!(
         "Import: {} added, {} overwritten, {} renamed, {} skipped",
         outcome.added, outcome.overwritten, outcome.renamed, outcome.skipped
-    )
+    );
+    if outcome.kube_skipped > 0 {
+        line.push_str(&format!("; {} Kubernetes cluster(s) skipped", outcome.kube_skipped));
+    }
+    line
+}
+
+fn export_status_line(count: usize, kube_skipped: usize, path: &std::path::Path) -> String {
+    let mut line = format!("Export: {count} hosts → {}", path.display());
+    if kube_skipped > 0 {
+        line.push_str(&format!("; {kube_skipped} Kubernetes cluster(s) skipped"));
+    }
+    line
 }
 
 /// Serialize a host list to the import format (#417) — one `[[ssh_targets]]`
@@ -1385,6 +1435,10 @@ fn save_config_toml(
     // passes them via `pending_launch.json` (#255) and must NOT clear them,
     // because direct-TUI launches read them from config.toml as fallback.
     config.host_groups = host_groups.to_vec();
+    // The launcher owns `[[kube_clusters]]` too (#566): replace the section
+    // wholesale so a removed cluster stays removed. Only target metadata is
+    // written; kubeconfig contents and credentials never enter this object.
+    config.kube_clusters = settings.kube_profiles.clone();
     // `[risk_scorer]` likewise (#552): the launcher owns it, switched off =
     // no section. Never a key — only `key_env`.
     config.risk_scorer = risk_scorer.cloned();
@@ -1408,6 +1462,151 @@ fn save_config_toml(
 // ---------------------------------------------------------------------------
 // LauncherApp
 // ---------------------------------------------------------------------------
+
+/// Editable Kubernetes target. Only the kubeconfig path is held here; its
+/// contents and credentials are read by the transport when needed.
+#[derive(Clone, Debug)]
+struct KubeSlot {
+    id: u64,
+    name: String,
+    kubeconfig: String,
+    context: String,
+    contexts: Vec<String>,
+    contexts_loaded_for: Option<String>,
+    context_error: String,
+    namespaces: String,
+    default_namespace: String,
+    timeout: String,
+    tags: String,
+    reveal_configmaps: Vec<String>,
+    reveal_env: Vec<String>,
+    check_status: String,
+    check_in_flight: bool,
+}
+
+impl KubeSlot {
+    fn blank(id: u64) -> Self {
+        Self {
+            id,
+            name: String::new(),
+            kubeconfig: String::new(),
+            context: String::new(),
+            contexts: Vec::new(),
+            contexts_loaded_for: None,
+            context_error: String::new(),
+            namespaces: String::new(),
+            default_namespace: String::new(),
+            timeout: filar_core::DEFAULT_KUBE_REQUEST_TIMEOUT_SECS.to_string(),
+            tags: String::new(),
+            reveal_configmaps: Vec::new(),
+            reveal_env: Vec::new(),
+            check_status: String::new(),
+            check_in_flight: false,
+        }
+    }
+
+    fn from_cluster(id: u64, cluster: &filar_core::KubeCluster) -> Self {
+        Self {
+            id,
+            name: cluster.name.clone(),
+            kubeconfig: cluster
+                .kubeconfig
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            context: cluster.context.clone(),
+            contexts: Vec::new(),
+            contexts_loaded_for: None,
+            context_error: String::new(),
+            namespaces: cluster.namespaces.join(", "),
+            default_namespace: cluster.default_namespace.clone().unwrap_or_default(),
+            timeout: cluster.request_timeout_secs.to_string(),
+            tags: cluster.tags.join(", "),
+            reveal_configmaps: cluster.reveal_configmaps.clone(),
+            reveal_env: cluster.reveal_env.clone(),
+            check_status: String::new(),
+            check_in_flight: false,
+        }
+    }
+
+    fn is_blank(&self) -> bool {
+        self.name.trim().is_empty()
+            && self.kubeconfig.trim().is_empty()
+            && self.context.trim().is_empty()
+            && self.namespaces.trim().is_empty()
+            && self.default_namespace.trim().is_empty()
+            && self.tags.trim().is_empty()
+    }
+
+    fn to_cluster(&self) -> Result<filar_core::KubeCluster, String> {
+        let timeout = self.timeout.trim().parse::<u64>().map_err(|_| {
+            format!(
+                "Kubernetes cluster '{}': timeout must be a whole number from 1 to {}",
+                self.name.trim(),
+                filar_core::MAX_KUBE_REQUEST_TIMEOUT_SECS
+            )
+        })?;
+        let cluster = filar_core::KubeCluster {
+            name: self.name.trim().to_string(),
+            context: self.context.trim().to_string(),
+            kubeconfig: (!self.kubeconfig.trim().is_empty())
+                .then(|| std::path::PathBuf::from(self.kubeconfig.trim())),
+            namespaces: parse_tags(&self.namespaces),
+            default_namespace: (!self.default_namespace.trim().is_empty())
+                .then(|| self.default_namespace.trim().to_string()),
+            request_timeout_secs: timeout,
+            tags: parse_tags(&self.tags),
+            reveal_configmaps: self.reveal_configmaps.clone(),
+            reveal_env: self.reveal_env.clone(),
+        };
+        cluster.validate().map_err(|e| e.to_string())?;
+        Ok(cluster)
+    }
+
+    /// Refresh the drop-down only after the path changes. This is a local file
+    /// read; neither context discovery nor rendering contacts the API server.
+    fn refresh_contexts(&mut self) {
+        let path = self.kubeconfig.trim().to_string();
+        if self.contexts_loaded_for.as_deref() == Some(path.as_str()) {
+            return;
+        }
+        let explicit = (!path.is_empty()).then(|| std::path::PathBuf::from(&path));
+        match filar_transport::KubeClusterApi::context_names(explicit.as_deref()) {
+            Ok(contexts) => {
+                self.contexts = contexts;
+                self.context_error.clear();
+            }
+            Err(e) => {
+                self.contexts.clear();
+                self.context_error = e.to_string();
+            }
+        }
+        self.contexts_loaded_for = Some(path);
+    }
+}
+
+struct KubeCheckResult {
+    slot_id: u64,
+    target: filar_core::KubeCluster,
+    result: Result<String, String>,
+}
+
+/// Perform the launcher's single Kubernetes API request. A namespaced pod
+/// list avoids the cluster-wide RBAC fallback and cannot turn into retries.
+async fn check_kubernetes_target(target: &filar_core::KubeCluster) -> Result<String, String> {
+    let api = filar_transport::KubeClusterApi::connect(target)
+        .await
+        .map_err(|e| e.to_string())?;
+    let namespace = target.default_namespace.as_deref().unwrap_or("default");
+    let pods = api
+        .list_pods(Some(namespace), None, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "Available: {} pod(s) in {namespace}",
+        pods.len()
+    ))
+}
 
 struct SshSlot {
     host: String,
@@ -1548,6 +1747,8 @@ struct ImportDialog {
     rows: Vec<ImportRow>,
     /// Imported names that already exist in the host list.
     collisions: Vec<String>,
+    /// Cluster entries are not part of the SSH inventory format (#566).
+    kube_skipped: usize,
 }
 
 /// Session label for a GUI launch (#406).
@@ -1858,7 +2059,14 @@ struct LauncherApp {
     sessions: Vec<SessionMeta>,
     selected_session: Option<usize>,
     target_mode: usize,
+    /// Selected Kubernetes row. When set, `target_mode` is only the remembered
+    /// SSH selection and does not describe the launch target.
+    selected_kube: Option<usize>,
     ssh_slots: Vec<SshSlot>,
+    kube_slots: Vec<KubeSlot>,
+    next_kube_slot_id: u64,
+    kube_check_tx: std::sync::mpsc::Sender<KubeCheckResult>,
+    kube_check_rx: std::sync::mpsc::Receiver<KubeCheckResult>,
     /// Manual `[[ssh_targets]]` from the `config.toml` the GUI process
     /// loaded, passwords stripped ([`strip_manual_ssh_passwords`]) — merged
     /// after the launcher's own targets at launch (#412).
@@ -2117,9 +2325,11 @@ impl LauncherApp {
                     s.host == host && slot_port == Some(port)
                 }) {
                     self.target_mode = slot_idx + 1;
+                    self.selected_kube = None;
                     self.clear_error();
                 } else {
                     self.target_mode = 0;
+                    self.selected_kube = None;
                     self.set_other_error(format!(
                         "No SSH profile matches '{}'. Select a target manually.",
                         meta.ssh_info.as_deref().unwrap_or_default()
@@ -2128,6 +2338,7 @@ impl LauncherApp {
             }
             None => {
                 self.target_mode = 0;
+                self.selected_kube = None;
                 self.clear_error();
             }
         }
@@ -2135,7 +2346,15 @@ impl LauncherApp {
 
     fn render_target_selector(&mut self, ui: &mut egui::Ui) {
         ui.label("Target:");
-        ui.radio_value(&mut self.target_mode, 0, "Local");
+        let mut mode = self.target_mode;
+        let mut kube_mode = self.selected_kube;
+        if ui
+            .radio(kube_mode.is_none() && mode == 0, "Local")
+            .clicked()
+        {
+            mode = 0;
+            kube_mode = None;
+        }
 
         // While the collision dialog is open the host list must not change
         // under it — a second import would replace the staged one and
@@ -2150,6 +2369,8 @@ impl LauncherApp {
                 .clicked()
             {
                 self.add_host();
+                mode = self.target_mode;
+                kube_mode = None;
             }
             if ui
                 .add_enabled(!editing_locked, egui::Button::new("Import…"))
@@ -2160,11 +2381,12 @@ impl LauncherApp {
             {
                 self.start_host_import();
             }
-            let has_hosts = self.ssh_slots.iter().any(|s| !s.host.trim().is_empty());
+            let has_targets = self.ssh_slots.iter().any(|s| !s.host.trim().is_empty())
+                || self.kube_slots.iter().any(|slot| !slot.is_blank());
             if ui
-                .add_enabled(!editing_locked && has_hosts, egui::Button::new("Export…"))
+                .add_enabled(!editing_locked && has_targets, egui::Button::new("Export…"))
                 .on_hover_text(
-                    "Save the host list to a TOML file for git and the team — no passwords, no keys",
+                    "Save SSH hosts to TOML; Kubernetes clusters are skipped with a notice",
                 )
                 .clicked()
             {
@@ -2176,88 +2398,128 @@ impl LauncherApp {
         }
         if self.ssh_slots.is_empty() {
             ui.label(egui::RichText::new("  (no saved hosts yet)").weak());
-            return;
+        } else {
+            // One pointer delivers at most one click per frame, so a single
+            // pending action is enough even when a row changes the indices.
+            let mut action: Option<HostAction> = None;
+            egui::ScrollArea::vertical()
+                .id_salt("ssh_host_list")
+                .max_height(140.0)
+                .show(ui, |ui| {
+                    for (i, slot) in self.ssh_slots.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .radio(kube_mode.is_none() && mode == i + 1, "")
+                                .clicked()
+                            {
+                                mode = i + 1;
+                                kube_mode = None;
+                            }
+                            let alias = slot.alias.trim();
+                            let label = if alias.is_empty() {
+                                egui::RichText::new("(no alias)").weak()
+                            } else if alias.chars().count() > 32 {
+                                egui::RichText::new(format!(
+                                    "{}…",
+                                    alias.chars().take(31).collect::<String>()
+                                ))
+                            } else {
+                                egui::RichText::new(alias.to_string())
+                            };
+                            ui.label(label);
+                            let host = slot.host.trim();
+                            let detail = if host.is_empty() {
+                                "(no address)".to_string()
+                            } else if slot.user.trim().is_empty() {
+                                host.to_string()
+                            } else {
+                                format!("{}@{}", slot.user.trim(), host)
+                            };
+                            ui.label(egui::RichText::new(detail).weak());
+                            if ui
+                                .add_enabled(
+                                    !editing_locked && i > 0,
+                                    egui::Button::new("⬆").small(),
+                                )
+                                .on_hover_text("Move up")
+                                .clicked()
+                            {
+                                action = Some(HostAction::Up(i));
+                            }
+                            if ui
+                                .add_enabled(
+                                    !editing_locked && i + 1 < self.ssh_slots.len(),
+                                    egui::Button::new("⬇").small(),
+                                )
+                                .on_hover_text("Move down")
+                                .clicked()
+                            {
+                                action = Some(HostAction::Down(i));
+                            }
+                            if ui
+                                .add_enabled(!editing_locked, egui::Button::new("X"))
+                                .on_hover_text("Remove host")
+                                .clicked()
+                            {
+                                action = Some(HostAction::Remove(i));
+                            }
+                        });
+                    }
+                });
+            match action {
+                Some(HostAction::Up(i)) => self.move_host_up(i),
+                Some(HostAction::Down(i)) => self.move_host_down(i),
+                Some(HostAction::Remove(i)) => self.remove_host(i),
+                None => {}
+            }
+            mode = self.target_mode;
         }
 
-        // The rows live in their own scroll area: the list is open-ended
-        // (#411), so it must not push the form off the window. The explicit
-        // salt keeps it distinct from the session list, the other scroll area
-        // under the same parent (without it both share one auto-ID and thus
-        // one scroll offset).
-        let mut mode = self.target_mode;
-        // One pointer delivers at most one click per frame, so a single
-        // pending action is enough — a Vec would apply stale row indices
-        // once the first action had shifted the list.
-        let mut action: Option<HostAction> = None;
-        egui::ScrollArea::vertical()
-            .id_salt("ssh_host_list")
-            .max_height(140.0)
-            .show(ui, |ui| {
-                for (i, slot) in self.ssh_slots.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut mode, i + 1, "");
-                        let alias = slot.alias.trim();
-                        let label = if alias.is_empty() {
-                            egui::RichText::new("(no alias)").weak()
-                        } else if alias.chars().count() > 32 {
-                            egui::RichText::new(format!(
-                                "{}…",
-                                alias.chars().take(31).collect::<String>()
-                            ))
-                        } else {
-                            egui::RichText::new(alias.to_string())
-                        };
-                        ui.label(label);
-                        let host = slot.host.trim();
-                        let detail = if host.is_empty() {
-                            "(no address)".to_string()
-                        } else if slot.user.trim().is_empty() {
-                            host.to_string()
-                        } else {
-                            format!("{}@{}", slot.user.trim(), host)
-                        };
-                        ui.label(egui::RichText::new(detail).weak());
-                        if ui
-                            .add_enabled(
-                                !editing_locked && i > 0,
-                                egui::Button::new("⬆").small(),
-                            )
-                            .on_hover_text("Move up")
-                            .clicked()
-                        {
-                            action = Some(HostAction::Up(i));
-                        }
-                        if ui
-                            .add_enabled(
-                                !editing_locked && i + 1 < self.ssh_slots.len(),
-                                egui::Button::new("⬇").small(),
-                            )
-                            .on_hover_text("Move down")
-                            .clicked()
-                        {
-                            action = Some(HostAction::Down(i));
-                        }
-                        if ui
-                            .add_enabled(!editing_locked, egui::Button::new("X"))
-                            .on_hover_text("Remove host")
-                            .clicked()
-                        {
-                            action = Some(HostAction::Remove(i));
-                        }
+        ui.horizontal(|ui| {
+            ui.label(format!("Kubernetes clusters ({}):", self.kube_slots.len()));
+            if ui.button("+ Add cluster").clicked() {
+                self.add_kube();
+                kube_mode = self.selected_kube;
+            }
+        });
+        if self.kube_slots.is_empty() {
+            ui.label(egui::RichText::new("  (no clusters yet)").weak());
+        } else {
+            let mut remove = None;
+            for (i, slot) in self.kube_slots.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui.radio(kube_mode == Some(i), "").clicked() {
+                        kube_mode = Some(i);
+                    }
+                    ui.label(if slot.name.trim().is_empty() {
+                        "(no name)"
+                    } else {
+                        slot.name.trim()
                     });
-                }
-            });
-        self.target_mode = mode;
-        match action {
-            Some(HostAction::Up(i)) => self.move_host_up(i),
-            Some(HostAction::Down(i)) => self.move_host_down(i),
-            Some(HostAction::Remove(i)) => self.remove_host(i),
-            None => {}
+                    ui.label(
+                        egui::RichText::new(if slot.context.trim().is_empty() {
+                            "(no context)"
+                        } else {
+                            slot.context.trim()
+                        })
+                        .weak(),
+                    );
+                    if ui.button("X").on_hover_text("Remove cluster").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                self.remove_kube(i);
+                kube_mode = self.selected_kube;
+            }
         }
+        self.target_mode = mode;
+        self.selected_kube = kube_mode;
     }
 
     fn render_ssh_fields(&mut self, ui: &mut egui::Ui) {
-        if self.target_mode == 0 {
+        if self.selected_kube.is_some() || self.target_mode == 0 {
             return;
         }
         // Editing connection fields is also a host-list mutation: a renamed
@@ -2391,6 +2653,148 @@ impl LauncherApp {
         });
         self.show_ssh_password = show;
         self.show_key_passphrase = show_passphrase;
+    }
+
+    fn render_kube_fields(&mut self, ui: &mut egui::Ui) {
+        let Some(idx) = self.selected_kube else {
+            return;
+        };
+        let Some(slot) = self.kube_slots.get_mut(idx) else {
+            return;
+        };
+        slot.refresh_contexts();
+        let mut check = false;
+        egui::Grid::new("kube_grid")
+            .num_columns(2)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Name:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut slot.name)
+                        .hint_text("prod-eu (required)")
+                        .desired_width(180.0),
+                );
+                ui.end_row();
+                ui.label("Kubeconfig:");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut slot.kubeconfig)
+                            .hint_text("empty = $KUBECONFIG / ~/.kube/config")
+                            .desired_width(220.0),
+                    );
+                    if ui.button("Browse…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                            slot.kubeconfig = path.to_string_lossy().into_owned();
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label("Context:");
+                let selected = if slot.context.is_empty() {
+                    "Select context"
+                } else {
+                    slot.context.as_str()
+                };
+                egui::ComboBox::from_id_salt(("kube_context", slot.id))
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        for context in &slot.contexts {
+                            ui.selectable_value(&mut slot.context, context.clone(), context);
+                        }
+                    });
+                ui.end_row();
+                ui.label("Namespaces:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut slot.namespaces)
+                        .hint_text("shop, pay (empty = discover)")
+                        .desired_width(200.0),
+                );
+                ui.end_row();
+                ui.label("Default namespace:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut slot.default_namespace)
+                        .hint_text("shop (empty = default)")
+                        .desired_width(160.0),
+                );
+                ui.end_row();
+                ui.label("Timeout, sec:");
+                ui.add(egui::TextEdit::singleline(&mut slot.timeout).desired_width(60.0));
+                ui.end_row();
+                ui.label("Tags:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut slot.tags)
+                        .hint_text("prod, k8s (comma-separated)")
+                        .desired_width(180.0),
+                );
+                ui.end_row();
+                ui.label("Connection:");
+                check = ui
+                    .add_enabled(!slot.check_in_flight, egui::Button::new("Check"))
+                    .on_hover_text("Make one read-only pod-list request")
+                    .clicked();
+                ui.end_row();
+            });
+        if !slot.context_error.is_empty() {
+            ui.colored_label(egui::Color32::from_rgb(220, 150, 60), &slot.context_error);
+        } else if slot.contexts.is_empty() {
+            ui.label(egui::RichText::new("No contexts read from this kubeconfig.").weak());
+        }
+        if slot.check_in_flight {
+            ui.label("Checking…");
+        } else if !slot.check_status.is_empty() {
+            ui.label(&slot.check_status);
+        }
+        if check {
+            match slot.to_cluster() {
+                Ok(target) => self.start_kube_check(idx, target),
+                Err(msg) => self.set_other_error(msg),
+            }
+        }
+    }
+
+    fn start_kube_check(&mut self, idx: usize, target: filar_core::KubeCluster) {
+        let Some(slot) = self.kube_slots.get_mut(idx) else {
+            return;
+        };
+        slot.check_in_flight = true;
+        slot.check_status.clear();
+        let slot_id = slot.id;
+        let tx = self.kube_check_tx.clone();
+        std::thread::spawn(move || {
+            let result = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(check_kubernetes_target(&target)),
+                Err(e) => Err(format!("cannot start the Kubernetes check runtime: {e}")),
+            };
+            let _ = tx.send(KubeCheckResult {
+                slot_id,
+                target,
+                result,
+            });
+        });
+    }
+
+    fn poll_kube_checks(&mut self, ctx: &egui::Context) {
+        while let Ok(done) = self.kube_check_rx.try_recv() {
+            if let Some(slot) = self
+                .kube_slots
+                .iter_mut()
+                .find(|slot| slot.id == done.slot_id)
+            {
+                slot.check_in_flight = false;
+                slot.check_status = if slot.to_cluster().ok().as_ref() == Some(&done.target) {
+                    match done.result {
+                        Ok(message) => message,
+                        Err(message) => format!("Check failed: {message}"),
+                    }
+                } else {
+                    "Check result discarded: the cluster fields changed.".to_string()
+                };
+            }
+            ctx.request_repaint();
+        }
     }
 
     /// Whether the selected slot's key file is encrypted, re-read only when
@@ -2769,8 +3173,16 @@ impl LauncherApp {
                 self.clear_error();
                 self.file_status = import_status_line(&outcome);
             }
-            Ok(ImportStaged::NeedsDecision { rows, collisions }) => {
-                self.import_dialog = Some(ImportDialog { rows, collisions });
+            Ok(ImportStaged::NeedsDecision {
+                rows,
+                collisions,
+                kube_skipped,
+            }) => {
+                self.import_dialog = Some(ImportDialog {
+                    rows,
+                    collisions,
+                    kube_skipped,
+                });
             }
         }
     }
@@ -2790,6 +3202,13 @@ impl LauncherApp {
                 .filter(|s| !s.host.trim().is_empty())
                 .collect();
             if rows.is_empty() {
+                let kube_skipped = self.kube_slots.iter().filter(|slot| !slot.is_blank()).count();
+                if kube_skipped > 0 {
+                    self.clear_error();
+                    self.file_status = format!(
+                        "Export: no SSH hosts; {kube_skipped} Kubernetes cluster(s) skipped"
+                    );
+                }
                 return;
             }
             export_hosts_toml(&rows).map(|text| (text, rows.len()))
@@ -2801,6 +3220,11 @@ impl LauncherApp {
                 return;
             }
         };
+        let kube_skipped = self
+            .kube_slots
+            .iter()
+            .filter(|slot| !slot.is_blank())
+            .count();
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Host list", &["toml"])
             .set_file_name("filar-hosts.toml")
@@ -2811,7 +3235,7 @@ impl LauncherApp {
         match std::fs::write(&path, text) {
             Ok(()) => {
                 self.clear_error();
-                self.file_status = format!("Export: {count} hosts → {}", path.display());
+                self.file_status = export_status_line(count, kube_skipped, &path);
             }
             Err(e) => self.set_other_error(format!("Export failed: {e}")),
         }
@@ -3018,7 +3442,8 @@ impl LauncherApp {
             });
         match decision {
             Some(Decision::Apply(policy)) => {
-                let outcome = apply_import(&mut self.ssh_slots, dialog.rows, policy);
+                let mut outcome = apply_import(&mut self.ssh_slots, dialog.rows, policy);
+                outcome.kube_skipped = dialog.kube_skipped;
                 self.clear_error();
                 self.file_status = import_status_line(&outcome);
             }
@@ -3082,10 +3507,20 @@ impl LauncherApp {
         }
         self.clear_profile_error();
         let p = self.profiles.get(self.selected_profile);
+        let kube_profiles = match self.persistable_kube_clusters() {
+            Ok(clusters) => clusters,
+            Err(msg) => {
+                self.set_other_error(msg);
+                return;
+            }
+        };
+        let last_kube = self.selected_kube_name();
         Settings {
             model: p.map_or_else(String::new, |x| x.model.clone()),
             api_base_url: p.map_or_else(String::new, |x| x.api_base_url.clone()),
             ssh_profiles: self.persistable_ssh_profiles(),
+            kube_profiles,
+            last_kube,
             ssh_list_version: SSH_LIST_VERSION,
             last_ssh: self.persisted_last_ssh(),
             temperature: p.map_or_else(String::new, |x| x.temperature.clone()),
@@ -3149,6 +3584,10 @@ impl LauncherApp {
             self.set_other_error(msg);
             return false;
         }
+        if let Err(msg) = self.validate_kube_clusters() {
+            self.set_other_error(msg);
+            return false;
+        }
         if let Err(msg) = self.validate_host_groups() {
             self.set_other_error(msg);
             return false;
@@ -3172,7 +3611,7 @@ impl LauncherApp {
         for (i, slot) in self.ssh_slots.iter().enumerate() {
             let host = slot.host.trim();
             if host.is_empty() {
-                if self.target_mode == i + 1 {
+                if self.selected_kube.is_none() && self.target_mode == i + 1 {
                     return Err("Host is required for the selected SSH target.".to_string());
                 }
                 continue;
@@ -3200,6 +3639,9 @@ impl LauncherApp {
     /// a wrong one is reported here, not as a failed login later. Only the
     /// selected host is checked: decrypting runs a deliberately slow KDF.
     fn validate_selected_key(&self) -> Result<(), String> {
+        if self.selected_kube.is_some() {
+            return Ok(());
+        }
         let Some(slot) = self.target_mode.checked_sub(1).and_then(|i| self.ssh_slots.get(i)) else {
             return Ok(());
         };
@@ -3267,6 +3709,46 @@ impl LauncherApp {
             .collect()
     }
 
+    fn validate_kube_clusters(&self) -> Result<(), String> {
+        self.persistable_kube_clusters().map(|_| ())
+    }
+
+    fn persistable_kube_clusters(&self) -> Result<Vec<filar_core::KubeCluster>, String> {
+        let mut seen: std::collections::HashSet<String> = self
+            .launch_ssh_targets()
+            .into_iter()
+            .map(|target| target.name)
+            .collect();
+        let mut clusters = Vec::new();
+        for slot in self.kube_slots.iter().filter(|slot| !slot.is_blank()) {
+            let cluster = slot.to_cluster()?;
+            if !seen.insert(cluster.name.clone()) {
+                return Err(format!(
+                    "Duplicate target name \"{}\". SSH hosts and Kubernetes clusters share one namespace.",
+                    cluster.name
+                ));
+            }
+            clusters.push(cluster);
+        }
+        if let Some(selected) = self.selected_kube {
+            if self
+                .kube_slots
+                .get(selected)
+                .is_none_or(KubeSlot::is_blank)
+            {
+                return Err("Name and context are required for the selected Kubernetes cluster.".into());
+            }
+        }
+        Ok(clusters)
+    }
+
+    fn selected_kube_name(&self) -> Option<String> {
+        self.selected_kube
+            .and_then(|idx| self.kube_slots.get(idx))
+            .filter(|slot| !slot.is_blank())
+            .map(|slot| slot.name.trim().to_string())
+    }
+
     /// The merged SSH target list a launch hands to the TUI (#412): the
     /// launcher's profiles rebuilt from the current fields, plus the manual
     /// `[[ssh_targets]]` entries.
@@ -3293,7 +3775,7 @@ impl LauncherApp {
     /// survives a restart. A selected blank row has no persisted counterpart
     /// and restores as Local, the same way `target_mode == 0` does.
     fn persisted_last_ssh(&self) -> usize {
-        if self.target_mode == 0 {
+        if self.selected_kube.is_some() || self.target_mode == 0 {
             return 0;
         }
         let idx = self.target_mode - 1;
@@ -3363,6 +3845,26 @@ impl LauncherApp {
     fn add_host(&mut self) {
         self.ssh_slots.push(SshSlot::blank());
         self.target_mode = self.ssh_slots.len();
+        self.selected_kube = None;
+    }
+
+    fn add_kube(&mut self) {
+        let id = self.next_kube_slot_id;
+        self.next_kube_slot_id = self.next_kube_slot_id.saturating_add(1);
+        self.kube_slots.push(KubeSlot::blank(id));
+        self.selected_kube = Some(self.kube_slots.len() - 1);
+    }
+
+    fn remove_kube(&mut self, idx: usize) {
+        if idx >= self.kube_slots.len() {
+            return;
+        }
+        self.kube_slots.remove(idx);
+        match self.selected_kube {
+            Some(selected) if selected == idx => self.selected_kube = None,
+            Some(selected) if selected > idx => self.selected_kube = Some(selected - 1),
+            _ => {}
+        }
     }
 
     /// Remove a host; a saved password goes with it. The selection falls
@@ -3456,8 +3958,8 @@ impl LauncherApp {
         let Some(p) = self.profiles.get(self.selected_profile) else {
             return;
         };
-        let target = launch_target_name(self.target_mode, &self.ssh_slots);
-        let ssh = if self.target_mode > 0 {
+        let mut target = launch_target_name(self.target_mode, &self.ssh_slots);
+        let ssh = if self.selected_kube.is_none() && self.target_mode > 0 {
             let slot = &self.ssh_slots[self.target_mode - 1];
             Some(SshConnection {
                 host: slot.host.clone(),
@@ -3471,10 +3973,31 @@ impl LauncherApp {
                 tags: parse_tags(&slot.tags),
             })
         } else { None };
+        let kube_clusters = match self.persistable_kube_clusters() {
+            Ok(clusters) => clusters,
+            Err(msg) => {
+                self.set_other_error(msg);
+                return;
+            }
+        };
+        let kube = self.selected_kube_name().and_then(|name| {
+            kube_clusters
+                .iter()
+                .find(|cluster| cluster.name == name)
+                .map(|cluster| filar_core::KubeSessionSnapshot {
+                    target: cluster.name.clone(),
+                    namespace: cluster.default_namespace.clone(),
+                })
+        });
+        if let Some(snapshot) = &kube {
+            target = snapshot.target.clone();
+        }
 
         let settings = Settings {
             model: p.model.clone(), api_base_url: p.api_base_url.clone(),
             ssh_profiles: self.persistable_ssh_profiles(),
+            kube_profiles: kube_clusters.clone(),
+            last_kube: self.selected_kube_name(),
             ssh_list_version: SSH_LIST_VERSION,
             last_ssh: self.persisted_last_ssh(),
             temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
@@ -3527,7 +4050,10 @@ impl LauncherApp {
         let session_id = self.selected_session.map(|i| self.sessions[i].id.clone());
         let ssh_targets = self.launch_ssh_targets();
         let cfg = LaunchConfig {
-            target, ssh,
+            target,
+            ssh,
+            kube,
+            kube_clusters: Some(kube_clusters),
             model: p.model.clone(), api_base_url: p.api_base_url.clone(),
             api_key: sanitize_secret_clipboard(&p.api_key), session_id,
             temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
@@ -3548,6 +4074,7 @@ impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Dark theme matching the TUI accent palette.
         configure_theme(ctx);
+        self.poll_kube_checks(ctx);
 
         // Fixed bottom panel: Launch/Cancel always visible, regardless of
         // window height. The rest of the content scrolls above it.
@@ -3600,6 +4127,7 @@ impl eframe::App for LauncherApp {
                     self.render_target_selector(ui);
                     ui.separator();
                     self.render_ssh_fields(ui);
+                    self.render_kube_fields(ui);
                     ui.separator();
                     self.render_llm_settings(ui);
                     ui.separator();
@@ -3634,6 +4162,25 @@ pub fn run_launcher(config: &Config) {
         .enumerate()
         .map(|(i, p)| SshSlot::from_profile(p, i))
         .collect();
+    // Settings are the launcher's latest edited list; config-only entries are
+    // merged in so hand-written clusters remain editable. A launcher save
+    // replaces both lists, so removed entries do not reappear.
+    let mut kube_clusters = settings.kube_profiles.clone();
+    for cluster in &config.kube_clusters {
+        if !kube_clusters.iter().any(|saved| saved.name == cluster.name) {
+            kube_clusters.push(cluster.clone());
+        }
+    }
+    let kube_slots: Vec<KubeSlot> = kube_clusters
+        .iter()
+        .enumerate()
+        .map(|(i, cluster)| KubeSlot::from_cluster(i as u64, cluster))
+        .collect();
+    let next_kube_slot_id = kube_slots.len() as u64;
+    let selected_kube = settings.last_kube.as_ref().and_then(|name| {
+        kube_slots.iter().position(|slot| slot.name == *name)
+    });
+    let (kube_check_tx, kube_check_rx) = std::sync::mpsc::channel();
 
     // Build profile list. Migrate old flat settings into a default profile
     // on first upgrade, preserving existing api_key.
@@ -3678,6 +4225,8 @@ pub fn run_launcher(config: &Config) {
             model: settings.model.clone(),
             api_base_url: settings.api_base_url.clone(),
             ssh_profiles: settings.ssh_profiles.clone(),
+            kube_profiles: settings.kube_profiles.clone(),
+            last_kube: settings.last_kube.clone(),
             ssh_list_version: SSH_LIST_VERSION,
             last_ssh: settings.last_ssh,
             temperature: settings.temperature.clone(),
@@ -3700,7 +4249,12 @@ pub fn run_launcher(config: &Config) {
         } else {
             0
         },
+        selected_kube,
         ssh_slots,
+        kube_slots,
+        next_kube_slot_id,
+        kube_check_tx,
+        kube_check_rx,
         manual_targets: strip_manual_ssh_passwords(&config.ssh_targets),
         profiles,
         selected_profile,
@@ -3802,6 +4356,8 @@ mod tests {
                 alias: "prod".into(),
                 tags: vec!["prod".into()],
             }),
+            kube: None,
+            kube_clusters: None,
             model: "glm".into(),
             api_base_url: "https://api.example.com".into(),
             api_key: "sk-test-key-12345".into(),
@@ -3841,6 +4397,57 @@ mod tests {
         // Secrets must be absent after deserialization (serde(skip) → default).
         assert!(loaded.api_key.is_empty());
         assert!(loaded.ssh.as_ref().unwrap().password.is_empty());
+    }
+
+    #[test]
+    fn kube_handoff_and_config_keep_only_the_kubeconfig_path() {
+        let cluster = filar_core::KubeCluster {
+            name: "prod-eu".into(),
+            context: "kind-prod".into(),
+            kubeconfig: Some("C:/ops/prod.kubeconfig".into()),
+            namespaces: vec!["shop".into()],
+            default_namespace: Some("shop".into()),
+            ..filar_core::KubeCluster::default()
+        };
+        let cfg = LaunchConfig {
+            target: "prod-eu".into(),
+            ssh: None,
+            kube: Some(filar_core::KubeSessionSnapshot {
+                target: "prod-eu".into(),
+                namespace: Some("shop".into()),
+            }),
+            kube_clusters: Some(vec![cluster.clone()]),
+            model: "local".into(),
+            api_base_url: "http://127.0.0.1:11434/v1".into(),
+            api_key: String::new(),
+            session_id: None,
+            temperature: String::new(),
+            extra_body: String::new(),
+            selected_profile: None,
+            key_env: String::new(),
+            save_dir: None,
+            profiles: vec![],
+            ssh_targets: vec![],
+            arbiter_profile: None,
+            host_groups: None,
+            risk_scorer: None,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let loaded: LaunchConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.kube.unwrap().namespace.as_deref(), Some("shop"));
+        assert_eq!(loaded.kube_clusters.unwrap(), vec![cluster.clone()]);
+        assert!(json.contains("C:/ops/prod.kubeconfig"));
+        assert!(!json.contains("certificate-authority-data"));
+        assert!(!json.contains("client-key-data"));
+        let config = filar_core::Config {
+            kube_clusters: vec![cluster],
+            ..filar_core::Config::default()
+        };
+        let toml = toml::to_string(&config).unwrap();
+        assert!(toml.contains("[[kube_clusters]]"));
+        assert!(toml.contains("kubeconfig"));
+        assert!(!toml.contains("certificate-authority-data"));
+        assert!(!toml.contains("client-key-data"));
     }
 
     #[test]
@@ -3923,6 +4530,8 @@ mod tests {
         let cfg = LaunchConfig {
             target: "ssh".into(),
             ssh: None,
+            kube: None,
+            kube_clusters: None,
             model: "glm".into(),
             api_base_url: "https://api.example.com".into(),
             api_key: String::new(),
@@ -4023,6 +4632,8 @@ mod tests {
         let cfg = LaunchConfig {
             target: "local".into(),
             ssh: None,
+            kube: None,
+            kube_clusters: None,
             model: "glm-5.1".into(),
             api_base_url: "https://example.invalid/v1".into(),
             api_key: String::new(),
@@ -4271,6 +4882,8 @@ mod tests {
     fn launch_config_round_trips_arbiter_profile() {        let cfg = LaunchConfig {
             target: "local".into(),
             ssh: None,
+            kube: None,
+            kube_clusters: None,
             model: "glm".into(),
             api_base_url: "https://api.example.com".into(),
             api_key: String::new(),
@@ -4323,7 +4936,8 @@ mod tests {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         let s = Settings {
             model: "test-model".into(), api_base_url: "https://example.com".into(),
-            ssh_profiles: vec![], ssh_list_version: SSH_LIST_VERSION, last_ssh: 0, temperature: "0.5".into(),
+            ssh_profiles: vec![], kube_profiles: vec![], last_kube: None,
+            ssh_list_version: SSH_LIST_VERSION, last_ssh: 0, temperature: "0.5".into(),
             extra_body: String::new(),
             profiles: vec![],
             selected_profile: 0,
@@ -4670,10 +5284,12 @@ mod tests {
     }
 
     fn make_app(meta: SessionMeta) -> LauncherApp {
+        let (kube_check_tx, kube_check_rx) = std::sync::mpsc::channel();
         LauncherApp {
             sessions: vec![meta],
             selected_session: None,
             target_mode: 0,
+            selected_kube: None,
             ssh_slots: vec![SshSlot {
                 host: "10.0.0.5".into(),
                 user: "root".into(),
@@ -4681,6 +5297,10 @@ mod tests {
                 auth: SlotAuth::Password,
                 ..SshSlot::blank()
             }],
+            kube_slots: Vec::new(),
+            next_kube_slot_id: 0,
+            kube_check_tx,
+            kube_check_rx,
             manual_targets: Vec::new(),
             profiles: vec![LlmProfileData {
                 name: "glm".into(),
@@ -5617,7 +6237,7 @@ host_key_policy = \"strict\"
         let outcome = apply_import(&mut app.ssh_slots, rows, CollisionPolicy::Skip);
         assert_eq!(
             outcome,
-            ImportOutcome { added: 0, overwritten: 0, renamed: 0, skipped: 1 }
+            ImportOutcome { added: 0, overwritten: 0, renamed: 0, skipped: 1, kube_skipped: 0 }
         );
         assert_eq!(app.ssh_slots.len(), 1);
         assert_eq!(app.ssh_slots[0].host, "10.0.0.11", "the existing host survives");
@@ -5809,7 +6429,7 @@ host_key_policy = \"strict\"
 
         let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
         match stage_import(&mut app.ssh_slots, &path).unwrap() {
-            ImportStaged::NeedsDecision { rows, collisions } => {
+            ImportStaged::NeedsDecision { rows, collisions, .. } => {
                 assert_eq!(collisions, vec!["web-1".to_string()]);
                 assert_eq!(rows.len(), 1);
             }
@@ -5826,8 +6446,8 @@ host_key_policy = \"strict\"
 
         let csv = dir.join("hosts.csv");
         std::fs::write(&csv, "name,host\nweb-1,10.0.0.11\n").unwrap();
-        let rows = parse_import_file(&csv).unwrap();
-        assert_eq!(rows[0].slot.alias, "web-1");
+        let parsed = parse_import_file(&csv).unwrap();
+        assert_eq!(parsed.rows[0].slot.alias, "web-1");
 
         // TOML content under a .csv name fails as CSV (explicit, not guessed).
         let lying = dir.join("lying.csv");
@@ -5837,7 +6457,7 @@ host_key_policy = \"strict\"
         let toml = dir.join("hosts.toml");
         std::fs::write(&toml, "[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.11\"\n")
             .unwrap();
-        assert_eq!(parse_import_file(&toml).unwrap().len(), 1);
+        assert_eq!(parse_import_file(&toml).unwrap().rows.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5849,8 +6469,29 @@ host_key_policy = \"strict\"
             overwritten: 1,
             renamed: 2,
             skipped: 4,
+            kube_skipped: 0,
         });
         assert_eq!(line, "Import: 3 added, 1 overwritten, 2 renamed, 4 skipped");
+    }
+
+    #[test]
+    fn import_and_export_explicitly_report_skipped_kubernetes_clusters() {
+        let parsed = parse_import_toml_details(
+            "[[kube_clusters]]\nname = \"prod-eu\"\ncontext = \"kind-prod\"\n",
+        )
+        .unwrap();
+        assert!(parsed.rows.is_empty());
+        assert_eq!(parsed.kube_skipped, 1);
+        let outcome = ImportOutcome {
+            kube_skipped: parsed.kube_skipped,
+            ..ImportOutcome::default()
+        };
+        assert!(
+            import_status_line(&outcome).contains("1 Kubernetes cluster(s) skipped")
+        );
+        let line = export_status_line(2, 1, std::path::Path::new("hosts.toml"));
+        assert!(line.contains("2 hosts"));
+        assert!(line.contains("1 Kubernetes cluster(s) skipped"));
     }
 
     // ── Host list export (#417) ─────────────────────────────────────
@@ -6107,6 +6748,8 @@ host_key_policy = \"strict\"
         let launch = LaunchConfig {
             target: "local".into(),
             ssh: None,
+            kube: None,
+            kube_clusters: None,
             model: "m".into(),
             api_base_url: "http://x".into(),
             api_key: String::new(),

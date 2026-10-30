@@ -11179,3 +11179,23 @@ shell-команды с префиксом `k8s_` не маркируются к
 `ClusterApi` используется без проброса специфики kube-rs в UI.
 
 **Next:** #566 (лаунчер и `--target` для кластеров).
+
+## #566 — Kubernetes в лаунчере и `--target`
+
+**Сделано.** Лаунчер редактирует `[[kube_clusters]]`, читает контексты из
+kubeconfig локально и выполняет Check одним namespaced pod-list запросом.
+Выбранный кластер и весь launcher-owned список сохраняются в `config.toml` и
+`pending_launch.json`; kubeconfig передаётся только как путь. Старый handoff
+без списка использует config fallback, а явно пустой список не воскрешает
+удалённые цели. Импорт/экспорт SSH-инвентаря явно сообщает число пропущенных
+кластеров. CLI разрешает `cluster` и `cluster/namespace`; явный snapshot
+лаунчера/CLI имеет приоритет над восстановленным, а executor для кластерной
+вкладки остаётся локальным без SSH.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. В `LaunchConfig`
+аддитивно добавлены optional `kube` и `kube_clusters`; публичный
+`KubeClusterApi::context_names` возвращает только имена контекстов.
+Тесты покрывают secret-free handoff/config, локальное чтение контекстов,
+разрешение CLI и уведомления импорта/экспорта.
+
+**Next:** #567.

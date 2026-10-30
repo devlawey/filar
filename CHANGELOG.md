@@ -13,6 +13,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Kubernetes clusters in the GUI launcher with local kubeconfig context discovery, a single-request Check, config/pending-launch persistence, explicit import/export skip notices, and `--target cluster[/namespace]` ([#566](https://github.com/devlawey/filar/issues/566)).
 - Kubernetes cluster tabs in the TUI: Ctrl+O target and namespace selection,
   typed read-only agent calls with collapsible API blocks, target-aware
   confirmations, status/ASCII rendering, shell-action refusals and reconnecting
