@@ -311,7 +311,8 @@ fn has_sensitive_assignment(value: &str) -> bool {
     value.lines().any(|line| {
         let line = line.trim_start();
         let line = line
-            .strip_prefix("export ")
+            .strip_prefix("export")
+            .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
             .map_or(line, |line| line.trim_start());
         let Some(separator) = line.find(|character| matches!(character, '=' | ':')) else {
             return false;
@@ -957,7 +958,7 @@ mod tests {
                 "data": {
                     "app.properties": "db.host=localhost\ndb.password=hunter2",
                     "app.yaml": "database:\n  host: localhost\n  password: hunter2",
-                    ".env": "export MODE=prod\nexport DB_PASSWORD=x",
+                    ".env": "export MODE=prod\nexport  DB_PASSWORD=x\nexport\tAPI_TOKEN=y",
                     "ordinary.yaml": "database:\n  host: localhost\n  port: 5432"
                 }
             }),
