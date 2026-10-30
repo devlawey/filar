@@ -11071,3 +11071,32 @@ read на pods/events/pods/log; их 24-часовые kubeconfig генерир
 тестовая инфраструктура).
 
 **Next:** #572 (`ClusterApi`).
+
+## #572 — read-only `ClusterApi`
+
+**Сделано.** В `filar-transport` за default-фичей `kube` появились публичный
+`ClusterApi`, `KubeClusterApi` и типы результатов без типов `kube-rs`: pods,
+events, bounded logs, workloads, rollout history, nodes, metrics, Services,
+Endpoints, Ingresses, ConfigMaps, namespaces. Путь kubeconfig — цель / env /
+`~/.kube/config`, контекст всегда явный; списки ограничены 500 без silent
+continuation, логи — tail и bytes. Namespace-RBAC fallback идёт только по
+сконфигурированным namespace; ошибки RBAC/Policy/404 различаются и не содержат
+источников с секретами. Методов записи и чтения Secret нет.
+
+**Проверка.** 137 transport unit-тестов (125 passed, 12 docker-sshd ignored) и
+оба live-теста против k3s зелёные, включая previous logs и namespace-only
+RBAC. Metrics-server в живом кластере доступен, поэтому live-тест принимает
+и валидные метрики, и документированный `Unsupported` при отсутствии API.
+Host engine-check с `--no-default-features` зелёный; Android target/cargo-ndk
+в окружении не установлены — проверка остаётся в `engine-targets` CI.
+
+**Review (PR #587).** Rollout-history дополнительно фильтрует ReplicaSets
+selector'ом Deployment; metrics не паникует на неполном `usage`; 404/quantity
+conversion покрыты unit-тестами; ReplicaSet/Job больше не подставляют чужие
+счётчики в `updated`.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. Новые публичные
+`ClusterApi`, `KubeClusterApi` и result-типы; `kube` входит в default features,
+SSH-only consumers отключают defaults.
+
+**Next:** #573 (маскирование ConfigMaps).

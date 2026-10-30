@@ -13,6 +13,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Read-only Kubernetes transport behind the default `kube` feature: `ClusterApi`
+  and `KubeClusterApi` cover pods, events, bounded logs, workloads, rollouts,
+  nodes, metrics, networking resources, ConfigMaps and namespaces, with explicit
+  contexts, RBAC namespace fallback and no write or Secret API
+  ([#572](https://github.com/devlawey/filar/issues/572)).
 - Kubernetes targets in the config: `[[kube_clusters]]` (`KubeCluster`,
   `Config::kube_clusters`) — a mandatory kubeconfig `context`, optional
   kubeconfig path, namespaces with a default, a per-request timeout and tags

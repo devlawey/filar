@@ -13,6 +13,8 @@
 //! - [`copy()`] — copy engine between two [`FileTransfer`] sides.
 
 mod auth;
+#[cfg(feature = "kube")]
+pub mod cluster;
 pub mod copy;
 pub mod cwd;
 pub mod error;
@@ -28,11 +30,25 @@ pub mod ssh;
 
 use std::time::Duration;
 
-use tokio::sync::mpsc;
 use filar_core::Result;
+use tokio::sync::mpsc;
 
 // Re-export key types.
-pub use copy::{copy, CopyEvent, CopyObserver, CopyReport, CopySource, OverwriteDecision, PART_SUFFIX};
+#[cfg(feature = "kube")]
+pub use cluster::{
+    ClusterApi, ConfigMapInfo, ContainerInfo, ContainerMetrics, EndpointInfo, EventInfo,
+    IngressInfo, KubeClusterApi, NamespaceInfo, NodeCondition, NodeInfo, PodInfo, PodLogs,
+    ResourceMetrics, RolloutRevision, ServiceInfo, ServicePortInfo, TerminationInfo, WorkloadInfo,
+    WorkloadKind, DEFAULT_CLUSTER_LIST_LIMIT,
+};
+pub use copy::{
+    copy, CopyEvent, CopyObserver, CopyReport, CopySource, OverwriteDecision, PART_SUFFIX,
+};
+pub use cwd::{
+    cd_input_for, cmd_osc7_prompt, is_safe_cwd, parse_pty_cwd_reply, posix_cd_command,
+    posix_cd_input, posix_shell_quote, shell_flavor, usable_proc_cwd, ForegroundCwd, ShellFlavor,
+    OSC7_PWD_PROBE, OSC7_RAW_HOST, POWERSHELL_OSC7_PROMPT, PTY_CWD_COMMAND,
+};
 pub use error::is_connection_lost;
 pub use file_transfer::{
     DirEntry, EntryKind, FileTransfer, LocalFileTransfer, Metadata, PathStyle, TransferReader,
@@ -41,16 +57,12 @@ pub use file_transfer::{
 #[cfg(feature = "local")]
 pub use interactive::LocalInteractive;
 pub use interactive::{InteractiveTerminal, SshInteractive};
-#[cfg(feature = "local")]
-pub use local::LocalExecutor;
-pub use cwd::{
-    cd_input_for, cmd_osc7_prompt, is_safe_cwd, parse_pty_cwd_reply, usable_proc_cwd, ForegroundCwd, PTY_CWD_COMMAND, posix_cd_command, posix_cd_input, posix_shell_quote,
-    shell_flavor, ShellFlavor, OSC7_PWD_PROBE, OSC7_RAW_HOST, POWERSHELL_OSC7_PROMPT,
-};
 pub use key::{
     fill_key_passphrase, key_passphrase_matches, key_protection, resolve_key_path, KeyPassphrase,
     KeyProtection,
 };
+#[cfg(feature = "local")]
+pub use local::LocalExecutor;
 pub use readonly::ReadOnlyExecutor;
 pub use secret::SecretSubstitutingExecutor;
 pub use sftp::SftpFileTransfer;

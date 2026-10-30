@@ -7,8 +7,9 @@ license.workspace = true
 [features]
 # Local PTY executor and interactive terminal (portable-pty).
 # Enabled by default for TUI/desktop; disabled for bot/mobile (SSH-only).
-default = ["local"]
+default = ["local", "kube"]
 local = ["dep:portable-pty"]
+kube = ["dep:kube", "dep:k8s-openapi", "dep:serde"]
 
 [dependencies]
 filar-core = { workspace = true }
@@ -24,9 +25,13 @@ bytes = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }
 dirs = { workspace = true }
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Integration tests in `tests/` do not inherit the regular dependencies, and
 # `fleet_catalog_readonly.rs` needs both the test runtime and the trait macro.
 tokio = { workspace = true }
 async-trait = { workspace = true }
+serde_json = { workspace = true }
