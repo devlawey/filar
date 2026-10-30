@@ -2879,14 +2879,10 @@ impl LauncherApp {
                 match validate_all_profile_fields(remaining) {
                     Err(msg) => self.set_profile_error(msg),
                     Ok(()) => {
-                        if let Err(msg) = self.persistable_kube_clusters() {
-                            self.set_other_error(msg);
-                        } else {
-                            delete_secret(&self.profiles[idx].key_env);
-                            self.profiles.remove(idx);
-                            self.selected_profile = idx.min(self.profiles.len().saturating_sub(1));
-                            self.save_profiles();
-                        }
+                        delete_secret(&self.profiles[idx].key_env);
+                        self.profiles.remove(idx);
+                        self.selected_profile = idx.min(self.profiles.len().saturating_sub(1));
+                        self.save_profiles();
                     }
                 }
             }
@@ -3518,31 +3514,23 @@ impl LauncherApp {
         }
         self.clear_profile_error();
         let p = self.profiles.get(self.selected_profile);
-        // Adding a model profile is independent of a half-edited cluster
-        // draft. Keep the last valid on-disk targets in that case instead of
-        // dropping the draft's data or refusing the unrelated profile save.
-        let (kube_profiles, last_kube) = match self.persistable_kube_clusters() {
-            Ok(clusters) => (clusters, self.selected_kube_name()),
-            Err(_) => {
-                let saved = Settings::load();
-                (saved.kube_profiles, saved.last_kube)
-            }
-        };
-        Settings {
-            model: p.map_or_else(String::new, |x| x.model.clone()),
-            api_base_url: p.map_or_else(String::new, |x| x.api_base_url.clone()),
-            ssh_profiles: self.persistable_ssh_profiles(),
-            kube_profiles,
-            last_kube,
-            ssh_list_version: SSH_LIST_VERSION,
-            last_ssh: self.persisted_last_ssh(),
-            temperature: p.map_or_else(String::new, |x| x.temperature.clone()),
-            extra_body: p.map_or_else(String::new, |x| x.extra_body.clone()),
-            profiles: self.profiles.iter().map(LlmProfileData::to_profile).collect(),
-            selected_profile: self.selected_profile,
-            save_dir: self.save_dir.clone(),
-            arbiter_profile: self.arbiter_profile.clone(),
-        }.save();
+        // Profile add/delete is independent of Kubernetes editing. Start
+        // from the saved settings and leave both kube fields untouched: an
+        // incomplete draft stays in memory, and Launch remains the operation
+        // that validates and persists the current cluster list.
+        let mut settings = Settings::load();
+        settings.model = p.map_or_else(String::new, |x| x.model.clone());
+        settings.api_base_url = p.map_or_else(String::new, |x| x.api_base_url.clone());
+        settings.ssh_profiles = self.persistable_ssh_profiles();
+        settings.ssh_list_version = SSH_LIST_VERSION;
+        settings.last_ssh = self.persisted_last_ssh();
+        settings.temperature = p.map_or_else(String::new, |x| x.temperature.clone());
+        settings.extra_body = p.map_or_else(String::new, |x| x.extra_body.clone());
+        settings.profiles = self.profiles.iter().map(LlmProfileData::to_profile).collect();
+        settings.selected_profile = self.selected_profile;
+        settings.save_dir = self.save_dir.clone();
+        settings.arbiter_profile = self.arbiter_profile.clone();
+        settings.save();
     }
 
     /// Check everything that must hold before a launch, reporting the first
