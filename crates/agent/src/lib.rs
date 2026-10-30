@@ -41,6 +41,7 @@ pub mod fleet_result;
 pub mod fleet_retry;
 pub mod fleet_run;
 pub mod fleet_view;
+pub mod kube_redact;
 pub mod long_wait;
 pub mod openai_compat;
 pub mod os_probe;
@@ -56,6 +57,9 @@ pub use agent::{Agent, AgentBuilder};
 pub use arbiter::{ArbiterContext, ArbiterVerdict, ARBITER_TIMEOUT_SECS};
 pub use compaction::{summarise_history, SummaryOutcome, COMPACTION_SYSTEM_PROMPT};
 pub use events::{AgentEvent, EventSink};
+pub use kube_redact::{
+    redact_logs, KubeToolOutput, CONFIGMAP_VALUE_MAX_CHARS, HIDDEN_VALUE, REVEALED_BY_CONFIG,
+};
 pub use openai_compat::OpenAiCompatClient;
 pub use os_probe::OsFamilyProbe;
 pub use preprocess::{

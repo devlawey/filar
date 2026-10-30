@@ -60,6 +60,27 @@ back only to namespaces explicitly configured on the target. Absent
 not-found errors are sanitized so credentials and kubeconfig contents do not
 leak. ConfigMap values still require the consumer's output-redaction policy.
 
+## Kubernetes output redaction
+
+`filar_agent::KubeToolOutput::redact_for_model` is the boundary between
+Kubernetes tool output and model messages, session history or exports. Structured
+objects lose `metadata.managedFields` and the last-applied-configuration
+annotation. Literal environment values become `«скрыто»`; `valueFrom` and
+`envFrom` retain only source references. Container commands and arguments mask
+`--password=`, `--token=` and URL userinfo. ConfigMap keys stay visible, while
+secret-like keys, credential-bearing URLs, high-entropy values and values of at
+least 256 characters are hidden. Binary ConfigMap payloads are always hidden.
+
+Log output first uses `filar_core::redact_secrets`, then masks bearer tokens and
+URL userinfo. `KubeCluster::reveal_configmaps` (`namespace/name`) and
+`KubeCluster::reveal_env` (`namespace/pod/VARIABLE`) are narrow, explicit
+exceptions; revealed values carry the visible `«раскрыто настройкой»` marker.
+No exception enables Kubernetes Secret reads.
+
+The transport remains independent of the agent's `SecretProvider`. Embedders
+that construct their own model messages from `ClusterApi` results must apply
+this boundary rather than serializing raw objects or logs directly.
+
 ## Cargo.toml example
 
 ```toml
@@ -637,6 +658,7 @@ let _agent = builder.risk_scorer(Some(scorer));
 | `KubeCluster`, `Config::kube_clusters`, `Config::kube_cluster(name)`, `KubeCluster::describe(namespace)`, `DEFAULT_KUBE_REQUEST_TIMEOUT_SECS`, `MAX_KUBE_REQUEST_TIMEOUT_SECS` (#562) | Nothing in the API — additive (struct literals of `Config` use `..Default::default()`) | Opt in: `[[kube_clusters]]` names a kubeconfig context plus namespaces |
 | `Config::load` rejects duplicate target names — across `[[ssh_targets]]` and `[[kube_clusters]]`, **including two SSH targets with the same name** (#562) | Existing **configurations**, not code: a config with duplicate SSH target names loaded before and now fails at startup, even without any `[[kube_clusters]]` | Rename duplicated targets so every name is unique before upgrading |
 | `ClusterApi`, `KubeClusterApi`, read-only cluster result types and the default `kube` transport feature (#572) | Dependency footprint for consumers using default features; no Rust API break | Disable default features for SSH-only/mobile builds, or enable only `kube` for cluster access |
+| `KubeToolOutput`, `redact_logs`, redaction markers and `KubeCluster::reveal_env` (#573) | Nothing — additive (struct literals of `KubeCluster` use `..Default::default()`) | Pass Kubernetes objects/logs through `KubeToolOutput::redact_for_model` before giving them to a model |
 
 `CommandExecutor` and `LlmClient` are unchanged.
 
