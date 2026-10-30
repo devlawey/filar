@@ -30,6 +30,20 @@ pub struct KubeClusterApi {
 }
 
 impl KubeClusterApi {
+    /// Read context names from a kubeconfig without contacting any cluster.
+    ///
+    /// The path follows the same explicit-path / `$KUBECONFIG` / `~/.kube/config`
+    /// order as [`connect`](Self::connect). Only names are returned: credentials
+    /// and the rest of the kubeconfig stay inside this module.
+    pub fn context_names(kubeconfig: Option<&Path>) -> Result<Vec<String>> {
+        let config = match kubeconfig {
+            Some(path) => Kubeconfig::read_from(expand_home(path)),
+            None => Kubeconfig::read(),
+        }
+        .map_err(|_| CoreError::Other("cannot read or parse the selected kubeconfig".into()))?;
+        Ok(config.contexts.into_iter().map(|context| context.name).collect())
+    }
+
     /// Connect using the target's explicit context and configured timeout.
     ///
     /// The kubeconfig path comes from the target, `$KUBECONFIG`, or
@@ -744,6 +758,24 @@ mod tests {
             namespaces: vec!["shop".into()],
             ..KubeCluster::default()
         }
+    }
+
+    #[test]
+    fn context_names_are_read_locally_without_copying_credentials() {
+        let path = std::env::temp_dir().join(format!(
+            "filar-kube-contexts-{}-{:?}.yaml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(
+            &path,
+            "apiVersion: v1\nkind: Config\ncontexts:\n- name: prod-eu\n  context:\n    cluster: prod\n    user: secret-user\n- name: staging\n  context:\n    cluster: staging\n    user: other-user\nusers:\n- name: secret-user\n  user:\n    token: must-not-be-returned\n",
+        )
+        .unwrap();
+        let contexts = KubeClusterApi::context_names(Some(&path)).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(contexts, vec!["prod-eu", "staging"]);
+        assert!(!contexts.iter().any(|name| name.contains("must-not-be-returned")));
     }
 
     #[test]

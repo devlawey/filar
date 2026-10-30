@@ -259,8 +259,9 @@ tags = ["prod", "k8s"]            # работают в [[tag_policies]] нар�
   пометку `«раскрыто настройкой»`.
 
 Секция разбирается и валидируется при запуске: невалидная цель — понятная
-ошибка на старте. Вкладка кластера в TUI и выбор кластера в лаунчере —
-следующие задачи вехи 3.0.0.
+ошибка на старте. Кластер можно выбрать в лаунчере, через `Ctrl+O` или сразу
+из CLI: `filar --target prod-eu` откроет namespace по умолчанию, а
+`filar --target prod-eu/shop` — сразу `shop`.
 
 ### 2.3. Режимы подтверждения
 
@@ -514,7 +515,7 @@ WARN filar: fleet check rejected: check #4 ('typo-key') in /.../fleet_checks.tom
 ```
 
 - **Recent sessions** — список до 10 последних сессий (клик восстанавливает)
-- **Target** — `local` или SSH-таргет из конфига
+- **Target** — `local`, SSH-таргет или Kubernetes-кластер из конфига
 - **LLM profile (preset)** — пресет из конфига; при выборе автозаполняет поля Model и URL
 - **Model** — имя модели (можно править вручную)
 - **API base URL** — адрес API (можно править вручную)
@@ -549,6 +550,22 @@ WARN filar: fleet check rejected: check #4 ('typo-key') in /.../fleet_checks.tom
 удаляет из хранилища ОС сохранённый пароль или фразу прежнего способа при
 следующем Launch. Ни пароль, ни фраза не попадают в `settings.json`,
 `config.toml` и `pending_launch.json`.
+
+**Kubernetes-кластеры** находятся в том же списке целей, под SSH-хостами.
+**+ Add cluster** добавляет цель с полями **Name**, **Kubeconfig**, **Context**,
+**Namespaces**, **Default namespace**, **Timeout** и **Tags**. Пустой путь
+kubeconfig означает обычный поиск через `$KUBECONFIG` и `~/.kube/config`;
+**Browse…** только выбирает файл, его содержимое не копируется. Список
+контекстов читается из выбранного kubeconfig локально, без обращения к API.
+Контекст обязателен: `current-context` специально не используется.
+
+Кнопка **Check** делает один read-only запрос списка подов в namespace по
+умолчанию и показывает либо `Available: N pod(s) in …`, либо понятную ошибку
+контекста, RBAC или соединения. При Launch метаданные целей записываются в
+`[[kube_clusters]]` в `config.toml` и передаются в TUI через
+`pending_launch.json`; сертификаты, токены и содержимое kubeconfig в эти файлы
+не попадают. Из CLI доступны `filar --target <кластер>` и
+`filar --target <кластер>/<namespace>`.
 
 **Оценка безопасности команд** — блок **Command safety score** под выбором
 арбитра (см. 4.5). Он не связан ни с LLM-профилями, ни с арбитром: у модели
@@ -616,7 +633,10 @@ WARN filar: fleet check rejected: check #4 ('typo-key') in /.../fleet_checks.tom
 ошибка с причиной (для CSV — с номером строки).
 
 Результат импорта виден под списком хостов, например:
-`Import: 20 added, 0 overwritten, 0 renamed, 0 skipped`.
+`Import: 20 added, 0 overwritten, 0 renamed, 0 skipped`. Записи
+`[[kube_clusters]]` пока не импортируются: их количество явно добавляется в
+результат как `N Kubernetes cluster(s) skipped`, включая файл только с
+кластерами.
 
 ### 3.2. Экспорт списка хостов
 
@@ -633,6 +653,9 @@ TOML-файл того же формата, который читает импо
   восстанавливаются.
 - Пустые строки-заготовки в списке пропускаются.
 - Результат виден под списком хостов: `Export: 5 hosts → D:\fleet.toml`.
+- Кластеры в SSH-инвентарь не записываются; результат экспорта явно сообщает
+  `N Kubernetes cluster(s) skipped`. Если SSH-хостов нет, сообщение появляется
+  без открытия диалога сохранения.
 
 Файл, записанный через **Export…**, читается обратно через **Import…**
 без потерь: адреса, порты, пользователи, теги, способ входа и путь к ключу
@@ -1435,7 +1458,7 @@ filar.exe
 Usage: filar [--target <name>] [--group <name>] [--llm <profile>] [--session <id>]
 
 Options:
-  --target <name>   Подключиться к таргету ('local' или имя SSH-таргета из конфига)
+  --target <name>   Подключиться к 'local', SSH-таргету или Kubernetes-кластеру (<кластер>[/namespace])
   --group <name>    Сразу открыть флот по группе из [[host_groups]] (см. 4.8)
   --llm <profile>   Использовать LLM-профиль ('default' или имя из [[llm_profiles]])
   --session <id>    Восстановить сессию по ID

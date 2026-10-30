@@ -79,7 +79,7 @@ fn parse_args() -> Args {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!(
-                    "  --target <name>   Connect to this target ('local' or an SSH target name)"
+                    "  --target <name>   Connect to 'local', an SSH target, or a Kubernetes cluster (optionally cluster/namespace)"
                 );
                 eprintln!("  --group <name>    Open the fleet layer over this host group ([[host_groups]])");
                 eprintln!(
@@ -217,6 +217,59 @@ fn gui_launch_target_name(
         Some(target) => target.name.clone(),
         None => launch_target.to_string(),
     }
+}
+
+enum CliTarget {
+    Local,
+    Ssh(filar_core::SshTarget),
+    Kube(filar_core::KubeSessionSnapshot),
+}
+
+/// Resolve `local`, an SSH target, or `cluster[/namespace]` for `--target`.
+fn resolve_cli_target(config: &Config, value: &str) -> filar_core::Result<CliTarget> {
+    if value == "local" {
+        return Ok(CliTarget::Local);
+    }
+    if let Some(target) = config.ssh_target(value) {
+        return Ok(CliTarget::Ssh(target.clone()));
+    }
+    let (name, explicit_namespace) = match value.split_once('/') {
+        Some((name, namespace)) => (name, Some(namespace)),
+        None => (value, None),
+    };
+    if let Some(cluster) = config.kube_cluster(name) {
+        if explicit_namespace.is_some_and(str::is_empty) {
+            return Err(CoreError::Other(
+                "Kubernetes namespace after '/' must not be empty".into(),
+            ));
+        }
+        if let Some(namespace) = explicit_namespace {
+            // `namespaces` is only the Ctrl+O selection list, not an RBAC
+            // allow-list. Validate an explicit CLI value on its own instead.
+            let mut probe = cluster.clone();
+            probe.namespaces.clear();
+            probe.default_namespace = Some(namespace.to_string());
+            probe.validate()?;
+        }
+        return Ok(CliTarget::Kube(filar_core::KubeSessionSnapshot {
+            target: cluster.name.clone(),
+            namespace: explicit_namespace
+                .map(str::to_string)
+                .or_else(|| cluster.default_namespace.clone()),
+        }));
+    }
+    Err(CoreError::Other(format!(
+        "Target '{value}' not found in [[ssh_targets]] or [[kube_clusters]]"
+    )))
+}
+
+/// Launcher-provided clusters replace the stale startup snapshot; an old
+/// handoff with no cluster field keeps the config-file fallback.
+fn session_kube_clusters(
+    launch: Option<Vec<filar_core::KubeCluster>>,
+    config: &[filar_core::KubeCluster],
+) -> Vec<filar_core::KubeCluster> {
+    launch.unwrap_or_else(|| config.to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -530,9 +583,11 @@ async fn run() -> anyhow::Result<()> {
         api_key,
         key_env_name,
         mut ssh_target,
+        launch_kube,
         gui_selected_profile,
         launch_profiles,
         launch_ssh_targets,
+        launch_kube_clusters,
         launch_save_dir,
         launch_arbiter_profile,
         launch_host_groups,
@@ -596,8 +651,10 @@ async fn run() -> anyhow::Result<()> {
                 // (since the struct now excludes secrets from serialization).
                 // Keyring key MUST match GUI/`ssh_cred_name` (#290), not legacy `ssh{slot}`.
                 let ssh_target = launch.ssh.map(|s| resolve_gui_ssh_target(&s));
-                // Session label: the alias (or SSH{n}) for SSH, `local`
-                // otherwise — never the transport literal (#406).
+                let launch_kube = launch.kube;
+                let launch_kube_clusters = launch.kube_clusters;
+                // Session label: the alias (or SSH{n}) for SSH, the cluster
+                // name for Kubernetes, `local` otherwise (#406/#566).
                 let target_name = gui_launch_target_name(ssh_target.as_ref(), &launch.target);
 
                 // Empty key_env = keyless local profile (#320): skip keyring lookup.
@@ -621,9 +678,11 @@ async fn run() -> anyhow::Result<()> {
                     api_key,
                     key_env_name,
                     ssh_target,
+                    launch_kube,
                     launch.selected_profile,
                     launch.profiles,
                     launch.ssh_targets,
+                    launch_kube_clusters,
                     launch.save_dir,
                     // Explicit `None` means "same as session" from the launcher —
                     // do not fall back to CWD/app-data config.toml (#360).
@@ -653,29 +712,32 @@ async fn run() -> anyhow::Result<()> {
             })?
         };
 
-        // Look up SSH target from config if not local.
-        let ssh_target = if target != "local" {
-            config.ssh_target(&target).cloned()
-        } else {
-            None
-        };
+        let (target_name, ssh_target, launch_kube) =
+            match resolve_cli_target(&config, &target).map_err(|e| anyhow::anyhow!(e))? {
+                CliTarget::Local => (target, None, None),
+                CliTarget::Ssh(ssh) => (ssh.name.clone(), Some(ssh), None),
+                CliTarget::Kube(snapshot) => (snapshot.target.clone(), None, Some(snapshot)),
+            };
 
         (
-            target,
+            target_name,
             args.session,
             llm_config,
             key,
             key_env,
             ssh_target,
+            launch_kube,
             None,
             config.llm_profiles.clone(),
             config.ssh_targets.clone(),
+            None,
             config.save_dir.clone(),
             config.arbiter_profile.clone(),
             None,
         )
     };
     let host_groups = session_host_groups(launch_host_groups, &config.host_groups);
+    let kube_clusters = session_kube_clusters(launch_kube_clusters, &config.kube_clusters);
 
     // Validate API key unless the profile is explicitly keyless (empty key_env).
     let requires_key = !key_env_name.trim().is_empty();
@@ -774,7 +836,7 @@ async fn run() -> anyhow::Result<()> {
         } else {
             ssh
         }
-    } else if target_name == "local" {
+    } else if target_name == "local" || launch_kube.is_some() {
         info!("initialising local command executor");
         Arc::new(
             LocalExecutor::with_timeout(command_timeout)
@@ -878,7 +940,7 @@ async fn run() -> anyhow::Result<()> {
         host_groups,
         initial_group: cli_group,
         initial_fleet: loaded.fleet,
-        initial_kube: loaded.kube,
+        initial_kube: launch_kube.or(loaded.kube),
         llm_profile: default_profile_name.clone(),
         initial_messages: loaded.messages,
         initial_input_history: loaded.input_history,
@@ -912,7 +974,7 @@ async fn run() -> anyhow::Result<()> {
             })
         },
         ssh_targets: launch_ssh_targets,
-        kube_clusters: config.kube_clusters.clone(),
+        kube_clusters,
         save_dir: launch_save_dir,
         save_runbook: config.save_runbook,
         command_timeout,
@@ -956,7 +1018,8 @@ mod tests {
 
     use super::{
         build_llm_client_from_profile, check_profile_api_key, gui_launch_target_name,
-        resolve_gui_ssh_target, session_host_groups,
+        resolve_cli_target, resolve_gui_ssh_target, session_host_groups, session_kube_clusters,
+        CliTarget,
     };
 
     fn group(name: &str, tag: &str) -> filar_core::HostGroup {
@@ -983,6 +1046,61 @@ mod tests {
     fn without_a_launcher_the_groups_come_from_the_config() {
         let config = vec![group("prod", "prod")];
         assert_eq!(session_host_groups(None, &config), config);
+    }
+
+    fn cluster(name: &str, default_namespace: Option<&str>) -> filar_core::KubeCluster {
+        filar_core::KubeCluster {
+            name: name.into(),
+            context: format!("kind-{name}"),
+            namespaces: vec!["default".into(), "shop".into()],
+            default_namespace: default_namespace.map(str::to_string),
+            ..filar_core::KubeCluster::default()
+        }
+    }
+
+    #[test]
+    fn cli_target_resolves_a_cluster_and_an_optional_namespace() {
+        let config = filar_core::Config {
+            kube_clusters: vec![cluster("prod-eu", Some("default"))],
+            ..filar_core::Config::default()
+        };
+        match resolve_cli_target(&config, "prod-eu").unwrap() {
+            CliTarget::Kube(snapshot) => {
+                assert_eq!(snapshot.target, "prod-eu");
+                assert_eq!(snapshot.namespace.as_deref(), Some("default"));
+            }
+            _ => panic!("expected a Kubernetes target"),
+        }
+        match resolve_cli_target(&config, "prod-eu/shop").unwrap() {
+            CliTarget::Kube(snapshot) => {
+                assert_eq!(snapshot.target, "prod-eu");
+                assert_eq!(snapshot.namespace.as_deref(), Some("shop"));
+            }
+            _ => panic!("expected a Kubernetes target"),
+        }
+        assert!(matches!(
+            resolve_cli_target(&config, "local").unwrap(),
+            CliTarget::Local
+        ));
+        match resolve_cli_target(&config, "prod-eu/kube-system").unwrap() {
+            CliTarget::Kube(snapshot) => {
+                assert_eq!(snapshot.namespace.as_deref(), Some("kube-system"));
+            }
+            _ => panic!("expected a Kubernetes target"),
+        }
+        assert!(resolve_cli_target(&config, "missing").is_err());
+        assert!(resolve_cli_target(&config, "prod-eu/").is_err());
+        assert!(resolve_cli_target(&config, "prod-eu/Shop").is_err());
+        assert!(resolve_cli_target(&config, "prod-eu/a/b").is_err());
+    }
+
+    #[test]
+    fn a_launch_brings_its_own_clusters_and_an_old_handoff_uses_the_config() {
+        let stale = vec![cluster("old", None)];
+        let fresh = vec![cluster("prod-eu", Some("shop"))];
+        assert_eq!(session_kube_clusters(Some(fresh.clone()), &stale), fresh);
+        assert!(session_kube_clusters(Some(vec![]), &stale).is_empty());
+        assert_eq!(session_kube_clusters(None, &stale), stale);
     }
 
     // ── GUI→TUI SSH keyring handoff (#290) ──────────────────────────────
