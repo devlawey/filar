@@ -11090,6 +11090,11 @@ RBAC. Metrics-server в живом кластере доступен, поэто
 Host engine-check с `--no-default-features` зелёный; Android target/cargo-ndk
 в окружении не установлены — проверка остаётся в `engine-targets` CI.
 
+**Review (PR #587).** Rollout-history дополнительно фильтрует ReplicaSets
+selector'ом Deployment; metrics не паникует на неполном `usage`; 404/quantity
+conversion покрыты unit-тестами; ReplicaSet/Job больше не подставляют чужие
+счётчики в `updated`.
+
 **Контракты.** `CommandExecutor` / `LlmClient` не менялись. Новые публичные
 `ClusterApi`, `KubeClusterApi` и result-типы; `kube` входит в default features,
 SSH-only consumers отключают defaults.

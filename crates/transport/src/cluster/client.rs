@@ -5,6 +5,7 @@ use std::time::Duration;
 use filar_core::{CoreError, KubeCluster, Result};
 use k8s_openapi::api::apps::v1::{Deployment, ReplicaSet};
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::NamespaceResourceScope;
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind, ListParams, LogParams};
 use kube::config::{KubeConfigOptions, Kubeconfig};
@@ -198,14 +199,23 @@ impl KubeClusterApi {
         resource: &str,
         namespace: Option<&str>,
     ) -> CoreError {
-        if matches!(&error, kube::Error::Api(status) if status.code == 404) {
-            return CoreError::Other(format!(
-                "Unsupported: metrics.k8s.io is not available for {resource} (context {})",
-                self.target.context
-            ));
-        }
-        self.api_error(error, "list", resource, namespace)
+        metrics_error(&self.target, error, resource, namespace)
     }
+}
+
+fn metrics_error(
+    target: &KubeCluster,
+    error: kube::Error,
+    resource: &str,
+    namespace: Option<&str>,
+) -> CoreError {
+    if matches!(&error, kube::Error::Api(status) if status.code == 404) {
+        return CoreError::Other(format!(
+            "Unsupported: metrics.k8s.io is not available for {resource} (context {})",
+            target.context
+        ));
+    }
+    api_error(target, error, "list", resource, namespace)
 }
 
 #[async_trait::async_trait]
@@ -332,8 +342,16 @@ impl ClusterApi for KubeClusterApi {
             .await
             .map_err(|error| self.api_error(error, "get", "deployments", Some(namespace)))?;
         let deployment_uid = deployment.metadata.uid.as_deref();
+        let selector = deployment
+            .spec
+            .as_ref()
+            .and_then(|spec| label_selector_string(&spec.selector));
         let replicasets = Api::<ReplicaSet>::namespaced(self.client.clone(), namespace)
-            .list(&bounded_list_params(None, None, DEFAULT_CLUSTER_LIST_LIMIT))
+            .list(&bounded_list_params(
+                selector.as_deref(),
+                None,
+                DEFAULT_CLUSTER_LIST_LIMIT,
+            ))
             .await
             .map_err(|error| self.api_error(error, "list", "replicasets", Some(namespace)))?;
         let mut revisions = replicasets
@@ -532,6 +550,41 @@ fn api_error(
     }
 }
 
+/// Convert a Deployment selector to the Kubernetes list selector syntax.
+/// Unknown requirement operators are omitted, which only broadens the page;
+/// owner-UID filtering still selects the Deployment's actual ReplicaSets.
+fn label_selector_string(selector: &LabelSelector) -> Option<String> {
+    let mut parts = selector
+        .match_labels
+        .iter()
+        .flatten()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    parts.extend(
+        selector
+            .match_expressions
+            .iter()
+            .flatten()
+            .filter_map(|requirement| {
+                let values = requirement
+                    .values
+                    .iter()
+                    .flatten()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                match requirement.operator.as_str() {
+                    "In" => Some(format!("{} in ({values})", requirement.key)),
+                    "NotIn" => Some(format!("{} notin ({values})", requirement.key)),
+                    "Exists" => Some(requirement.key.clone()),
+                    "DoesNotExist" => Some(format!("!{}", requirement.key)),
+                    _ => None,
+                }
+            }),
+    );
+    (!parts.is_empty()).then(|| parts.join(","))
+}
+
 fn bounded_list_params(
     selector: Option<&str>,
     field_selector: Option<&str>,
@@ -602,7 +655,8 @@ fn metrics_info(object: DynamicObject) -> ResourceMetrics {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let (cpu, memory) = if let Some(usage) = object.data["usage"].as_object() {
+    let usage = &object.data["usage"];
+    let (cpu, memory) = if usage.is_object() {
         (
             usage["cpu"].as_str().unwrap_or_default().to_owned(),
             usage["memory"].as_str().unwrap_or_default().to_owned(),
@@ -690,6 +744,79 @@ mod tests {
             namespaces: vec!["shop".into()],
             ..KubeCluster::default()
         }
+    }
+
+    #[test]
+    fn metrics_404_is_unsupported_and_other_errors_keep_their_classification() {
+        let missing = kube::Error::Api(Box::new(Status {
+            code: 404,
+            message: "the server could not find the requested resource".into(),
+            reason: "NotFound".into(),
+            ..Status::default()
+        }));
+        let text = metrics_error(&target(), missing, "pods", Some("shop")).to_string();
+        assert!(text.contains("Unsupported"), "{text}");
+        assert!(text.contains("prod-eu"), "{text}");
+
+        let denied = kube::Error::Api(Box::new(Status {
+            code: 403,
+            message: "pods is forbidden: User \"reader\" cannot list resource \"pods\" in API group \"\" in the namespace \"shop\"".into(),
+            reason: "Forbidden".into(),
+            ..Status::default()
+        }));
+        assert_eq!(
+            metrics_error(&target(), denied, "pods", Some("shop")).to_string(),
+            "нет права list на pods в namespace shop (контекст prod-eu)"
+        );
+    }
+
+    #[test]
+    fn sums_quantity_suffixes_and_tolerates_missing_usage_keys() {
+        assert_eq!(
+            sum_quantities(["1n", "2u", "3m", "4"].into_iter(), QuantityKind::Cpu),
+            "4003002001n"
+        );
+        assert_eq!(
+            sum_quantities(["1Ki", "2Mi", "3K", "4M"].into_iter(), QuantityKind::Memory),
+            "5958Ki"
+        );
+
+        let object = serde_json::from_value(serde_json::json!({
+            "apiVersion": "metrics.k8s.io/v1beta1",
+            "kind": "NodeMetrics",
+            "metadata": { "name": "node-a" },
+            "usage": {}
+        }))
+        .expect("valid dynamic metrics fixture");
+        let metrics = metrics_info(object);
+        assert_eq!(metrics.cpu, "");
+        assert_eq!(metrics.memory, "");
+    }
+
+    #[test]
+    fn rollout_selector_includes_labels_and_expressions() {
+        let selector = LabelSelector {
+            match_labels: Some(std::collections::BTreeMap::from([(
+                "app".into(),
+                "web".into(),
+            )])),
+            match_expressions: Some(vec![
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelectorRequirement {
+                    key: "tier".into(),
+                    operator: "In".into(),
+                    values: Some(vec!["frontend".into(), "backend".into()]),
+                },
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelectorRequirement {
+                    key: "legacy".into(),
+                    operator: "DoesNotExist".into(),
+                    values: None,
+                },
+            ]),
+        };
+        assert_eq!(
+            label_selector_string(&selector).as_deref(),
+            Some("app=web,tier in (frontend,backend),!legacy")
+        );
     }
 
     #[test]

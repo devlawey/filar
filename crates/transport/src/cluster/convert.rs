@@ -251,10 +251,7 @@ pub(super) fn replicaset_info(workload: ReplicaSet) -> WorkloadInfo {
             .status
             .as_ref()
             .and_then(|status| status.ready_replicas),
-        workload
-            .status
-            .as_ref()
-            .and_then(|status| status.fully_labeled_replicas),
+        None,
         workload
             .status
             .as_ref()
@@ -274,7 +271,7 @@ pub(super) fn job_info(workload: Job) -> WorkloadInfo {
         WorkloadKind::Job,
         workload.spec.as_ref().and_then(|spec| spec.parallelism),
         workload.status.as_ref().and_then(|status| status.ready),
-        workload.status.as_ref().and_then(|status| status.succeeded),
+        None,
         None,
         images,
     )
