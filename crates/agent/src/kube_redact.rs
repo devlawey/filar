@@ -409,9 +409,7 @@ fn redact_assignment_flags(text: &str) -> String {
             searched = flag_end;
             continue;
         }
-        let value_end = text[value_start..]
-            .find(char::is_whitespace)
-            .map_or(text.len(), |offset| value_start + offset);
+        let value_end = command_value_end(text, value_start);
         if value_end == value_start {
             searched = value_start;
             continue;
@@ -423,6 +421,29 @@ fn redact_assignment_flags(text: &str) -> String {
     }
     output.push_str(&text[copied..]);
     output
+}
+
+fn command_value_end(text: &str, start: usize) -> usize {
+    let Some(first) = text[start..].chars().next() else {
+        return start;
+    };
+    if matches!(first, '\'' | '"') {
+        let bytes = text.as_bytes();
+        let quote = first as u8;
+        let mut index = start + 1;
+        while index < bytes.len() {
+            if bytes[index] == quote && bytes[index - 1] != b'\\' {
+                return index + 1;
+            }
+            index += 1;
+        }
+        // An unterminated quoted value is hidden to the end: exposing a suffix
+        // is worse than hiding the rest of a malformed command.
+        return text.len();
+    }
+    text[start..]
+        .find(char::is_whitespace)
+        .map_or(text.len(), |offset| start + offset)
 }
 
 fn is_credential_flag(text: &str) -> bool {
@@ -833,7 +854,7 @@ mod tests {
                 "kind": "Pod",
                 "metadata": {"name": "api", "namespace": "shop"},
                 "spec": {"containers": [{
-                    "command": "start --password hunter2 --token   abc123 --verbose",
+                    "command": "start --password hunter2 --token   abc123 --password=\"my secret\" --token 'other secret' --verbose",
                     "args": ["--password", "hunter2", "--token", "abc123", "--verbose"]
                 }]}
             }),
@@ -842,7 +863,7 @@ mod tests {
         let container = &object["spec"]["containers"][0];
         assert_eq!(
             container["command"],
-            format!("start --password {HIDDEN_VALUE} --token   {HIDDEN_VALUE} --verbose")
+            format!("start --password {HIDDEN_VALUE} --token   {HIDDEN_VALUE} --password={HIDDEN_VALUE} --token {HIDDEN_VALUE} --verbose")
         );
         assert_eq!(
             container["args"],
@@ -856,6 +877,8 @@ mod tests {
         );
         assert!(!object.to_string().contains("hunter2"));
         assert!(!object.to_string().contains("abc123"));
+        assert!(!object.to_string().contains("my secret"));
+        assert!(!object.to_string().contains("other secret"));
     }
 
     #[test]
