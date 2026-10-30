@@ -63,6 +63,9 @@ npx promptfoo@latest view
 
 # smoke subset (CI-compatible, no retries):
 node eval/scripts/run-eval.js --smoke --filter-metadata smoke=true -c eval/promptfooconfig.yaml
+
+# Kubernetes read-only diagnostics (CrashLoopBackOff and OOMKilled):
+node eval/scripts/run-eval.js --smoke --filter-metadata smoke=true -c eval/promptfooconfig.kube.yaml
 ```
 
 To run fewer models, comment out their `- id: openrouter:...` block in

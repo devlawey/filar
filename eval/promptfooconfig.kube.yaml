@@ -1,0 +1,107 @@
+description: "filar Kubernetes agent eval — read-only diagnostics over ClusterApi"
+
+# The system prompt is synced with build_kube_system_prompt by a Rust test.
+prompts:
+  - file://prompts/kube-chat.json
+
+maxConcurrency: 1
+
+# Manual mirror of filar_agent::kube_tool_definitions(Always). No write tool
+# and no Secret kind are exposed to the model.
+tools: &kube_tools
+  - type: function
+    function:
+      name: k8s_get
+      description: "List Kubernetes resources as a compact table. Pod rows include phase, Ready, restarts, latest termination reason, age and node. Label and field selectors are supported for pods."
+      parameters:
+        type: object
+        properties:
+          kind: { type: string, enum: [Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob, Node, Service, Endpoints, Ingress, ConfigMap, Namespace] }
+          namespace: { type: string }
+          label_selector: { type: string }
+          field_selector: { type: string }
+          limit: { type: integer, minimum: 1, maximum: 100, default: 50 }
+          explanation: { type: string }
+        required: [kind]
+        additionalProperties: false
+  - type: function
+    function:
+      name: k8s_describe
+      description: "Return a filar-built object summary plus related events. Pod details include last termination and container resource requests/limits; this is not kubectl describe."
+      parameters:
+        type: object
+        properties:
+          kind: { type: string, enum: [Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob, Node, Service, Endpoints, Ingress, ConfigMap, Namespace] }
+          namespace: { type: string }
+          name: { type: string }
+          event_limit: { type: integer, minimum: 1, maximum: 100, default: 50 }
+          explanation: { type: string }
+        required: [kind, name]
+        additionalProperties: false
+  - type: function
+    function:
+      name: k8s_logs
+      description: "Read bounded, non-following pod logs. Set previous=true after restarts or CrashLoopBackOff to read the previous container instance."
+      parameters:
+        type: object
+        properties:
+          namespace: { type: string }
+          pod: { type: string }
+          container: { type: string }
+          previous: { type: boolean, default: false }
+          since: { type: string, description: "Duration such as 30m, 2h or 1d." }
+          tail: { type: integer, minimum: 1, maximum: 500, default: 100 }
+          limit_bytes: { type: integer, minimum: 1, maximum: 1048576, default: 65536 }
+          explanation: { type: string }
+        required: [pod]
+        additionalProperties: false
+  - type: function
+    function:
+      name: k8s_events
+      description: "List the latest Kubernetes events, sorted newest first, optionally for one involved object."
+      parameters:
+        type: object
+        properties:
+          namespace: { type: string }
+          involved_object: { type: string }
+          limit: { type: integer, minimum: 1, maximum: 100, default: 50 }
+          explanation: { type: string }
+        required: []
+        additionalProperties: false
+  - type: function
+    function:
+      name: k8s_top
+      description: "Read pod or node CPU and memory metrics. If the metrics API is absent, reports that metrics-server is not installed."
+      parameters:
+        type: object
+        properties:
+          resource: { type: string, enum: [pods, nodes] }
+          namespace: { type: string }
+          limit: { type: integer, minimum: 1, maximum: 100, default: 50 }
+          explanation: { type: string }
+        required: [resource]
+        additionalProperties: false
+  - type: function
+    function:
+      name: k8s_rollout_history
+      description: "List a Deployment's ReplicaSet-based rollout revisions, newest first."
+      parameters:
+        type: object
+        properties:
+          namespace: { type: string }
+          deployment: { type: string }
+          limit: { type: integer, minimum: 1, maximum: 100, default: 50 }
+          explanation: { type: string }
+        required: [deployment]
+        additionalProperties: false
+
+providers:
+  - id: openrouter:z-ai/glm-5.2
+    label: GLM-5.2 (OpenRouter)
+    config:
+      temperature: 0
+      max_tokens: 1024
+      timeoutMs: 300000
+      tools: *kube_tools
+
+tests: file://datasets/kube.yaml

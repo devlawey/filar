@@ -1,9 +1,9 @@
 name: Eval smoke
 
-# Regression smoke for filar's agent eval (methodology §10): runs a 12-case
-# smoke subset against one baseline model whenever the system prompt / agent loop /
-# dataset changes, and on manual dispatch. Skips (does not fail) on forks or
-# repos without the OPENROUTER_API_KEY secret.
+# Regression smoke for filar's agent eval (methodology §10): runs the 12-case
+# SSH subset and the Kubernetes diagnostic cases against one baseline model
+# whenever a system prompt / agent loop / dataset changes, and on manual dispatch.
+# Skips (does not fail) on forks or repos without the OPENROUTER_API_KEY secret.
 
 on:
   workflow_dispatch:
@@ -14,6 +14,7 @@ on:
       - 'crates/agent/src/**'
       - 'eval/datasets/**'
       - 'eval/promptfooconfig.yaml'
+      - 'eval/promptfooconfig.kube.yaml'
       - 'eval/asserts.js'
       # The runner scripts themselves were missing here, so the change that
       # broke the wrapper (#369) never triggered this workflow on its own PR.
@@ -142,6 +143,70 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: eval-smoke-report
+          path: |
+            eval/results.json
+            eval/results.retry.json
+          if-no-files-found: ignore
+
+  kube-smoke:
+    name: Kubernetes eval smoke (3 cases, GLM-5.2)
+    needs: check-secret
+    if: needs.check-secret.outputs.has_secret == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install promptfoo
+        run: npm install -g promptfoo@0.121.19
+
+      - name: Run Kubernetes diagnostic cases
+        env:
+          PROMPTFOO_BIN: promptfoo
+        run: |
+          node eval/scripts/run-eval.js --smoke \
+            --filter-metadata smoke=true \
+            --filter-providers 'glm-5.2' \
+            --no-cache \
+            -c eval/promptfooconfig.kube.yaml
+
+      - name: Assert Kubernetes results were produced
+        if: always()
+        run: |
+          if [ ! -s eval/results.json ]; then
+            echo "::error::eval/results.json is missing or empty — Kubernetes eval produced no results."
+            exit 1
+          fi
+
+      - name: Check Kubernetes pass rate (≥ 90%)
+        id: check
+        if: always()
+        continue-on-error: true
+        run: node eval/scripts/smoke-check.js eval/results.json 90
+
+      - name: Retry failed Kubernetes cases once (flakiness)
+        if: steps.check.outcome == 'failure'
+        run: |
+          promptfoo eval -c eval/promptfooconfig.kube.yaml \
+            --filter-failing eval/results.json \
+            --filter-providers 'glm-5.2' \
+            --no-cache \
+            -o eval/results.retry.json
+          node eval/scripts/smoke-check.js eval/results.retry.json 100
+
+      - name: Upload Kubernetes report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-kube-smoke-report
           path: |
             eval/results.json
             eval/results.retry.json

@@ -11130,3 +11130,26 @@ URL. Логи проходят `redact_secrets`, bearer-токены и URL user
 transport feature `kube`.
 
 **Next:** #574 (read-only Kubernetes tools поверх этой границы).
+
+## #574 — read-only Kubernetes agent tools
+
+**Сделано.** В `filar-agent` добавлен отдельный `KubeToolExecutor` поверх
+`ClusterApi`: шесть typed tools (`k8s_get`, `k8s_describe`, `k8s_logs`,
+`k8s_events`, `k8s_top`, `k8s_rollout_history`) без Secret и операций записи.
+Таблицы строятся через `PreprocessedOutput`; списки ограничены 100 строками,
+вывод — 10 000 символами, логи — 500 строками и 1 MiB, с явными маркерами
+усечения. Все объекты, события и логи проходят границу #573 перед выдачей
+модели. `Unsupported` для metrics превращается в сообщение об отсутствии
+metrics-server. Гейт учитывает все режимы подтверждения и только ужесточающие
+tag policies; confirmation context содержит tool, аргументы, context и namespace.
+Кластерный системный промпт синхронизирован с eval snapshot. В eval добавлены
+стадии CrashLoopBackOff (previous logs и events) и разбор OOMKilled с memory
+limit; `eval-smoke` запускает Kubernetes suite отдельно от SSH suite.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. Аддитивно:
+`KubeToolCall`, `KubeToolExecutor`, `KubeToolResult`, схемы/парсер/гейт/промпт
+и Kubernetes arbiter target. `ContainerInfo` получил resource requests/limits;
+`ArbiterContext` — optional Kubernetes target. Цель арбитра и `RiskInput`
+форматируется как `Kubernetes cluster prod-eu (namespace shop, tags: prod)`.
+
+**Next:** #575 (вкладка кластера в TUI и DoD с бинарником).

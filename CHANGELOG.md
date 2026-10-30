@@ -13,6 +13,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Read-only Kubernetes agent tools over `ClusterApi`: typed resource, event, log,
+  metrics and rollout calls with compact tables, bounded redacted output,
+  confirmation/tag policies, a cluster-tab prompt and CrashLoopBackOff/OOMKilled
+  eval coverage ([#574](https://github.com/devlawey/filar/issues/574)).
 - Kubernetes agent-output redaction for environment values, sensitive metadata, ConfigMaps, container arguments and logs, with narrowly scoped and visibly marked reveal settings ([#573](https://github.com/devlawey/filar/issues/573)).
 - Read-only Kubernetes transport behind the default `kube` feature: `ClusterApi`
   and `KubeClusterApi` cover pods, events, bounded logs, workloads, rollouts,

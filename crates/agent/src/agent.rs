@@ -18,7 +18,9 @@ use filar_core::{CommandConfirmMode, CoreError, Result, SecretProvider};
 use filar_transport::{CommandExecutor, SecretSubstitutingExecutor};
 
 use crate::{
-    arbiter::{self, ArbiterContext, ARBITER_TIMEOUT_SECS, HISTORY_TAIL_EXCHANGES},
+    arbiter::{
+        self, ArbiterContext, KubernetesArbiterTarget, ARBITER_TIMEOUT_SECS, HISTORY_TAIL_EXCHANGES,
+    },
     events::{AgentEvent, EventSink},
     risk::{RiskInput, RiskScorer},
     security::{self, CommandConfirmer, ConfirmDecision},
@@ -507,6 +509,7 @@ impl AgentBuilder {
         self.arbiter_context(ArbiterContext {
             is_local: true,
             ssh_info: None,
+            kubernetes: None,
         })
     }
 
@@ -515,6 +518,20 @@ impl AgentBuilder {
         self.arbiter_context(ArbiterContext {
             is_local: false,
             ssh_info,
+            kubernetes: None,
+        })
+    }
+
+    /// Convenience: set arbiter and risk-scorer context for a Kubernetes tab.
+    pub fn arbiter_kube_context(
+        self,
+        target: &filar_core::KubeCluster,
+        namespace: Option<&str>,
+    ) -> Self {
+        self.arbiter_context(ArbiterContext {
+            is_local: false,
+            ssh_info: None,
+            kubernetes: Some(KubernetesArbiterTarget::new(target, namespace)),
         })
     }
 
@@ -575,6 +592,7 @@ impl AgentBuilder {
             arbiter_context: self.arbiter_context.unwrap_or(ArbiterContext {
                 is_local: false,
                 ssh_info: None,
+                kubernetes: None,
             }),
             arbiter_model_name: self
                 .arbiter_model_name

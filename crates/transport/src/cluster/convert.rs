@@ -83,6 +83,22 @@ pub(super) fn pod_info(pod: Pod) -> PodInfo {
                 .map(|container| ContainerInfo {
                     name: container.name.clone(),
                     image: container.image.clone().unwrap_or_default(),
+                    resource_requests: container
+                        .resources
+                        .as_ref()
+                        .and_then(|resources| resources.requests.clone())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(name, quantity)| (name, quantity.0))
+                        .collect(),
+                    resource_limits: container
+                        .resources
+                        .as_ref()
+                        .and_then(|resources| resources.limits.clone())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(name, quantity)| (name, quantity.0))
+                        .collect(),
                 })
                 .collect()
         })
@@ -507,7 +523,10 @@ mod tests {
             "spec": {
                 "nodeName": "node-a",
                 "containers": [
-                    {"name": "main", "image": "example/web:1"},
+                    {"name": "main", "image": "example/web:1", "resources": {
+                        "requests": {"cpu": "100m", "memory": "64Mi"},
+                        "limits": {"cpu": "500m", "memory": "128Mi"}
+                    }},
                     {"name": "sidecar", "image": "example/side:2"}
                 ]
             },
@@ -543,6 +562,8 @@ mod tests {
         assert_eq!(info.restarts, 5);
         assert_eq!(info.node.as_deref(), Some("node-a"));
         assert_eq!(info.containers[0].image, "example/web:1");
+        assert_eq!(info.containers[0].resource_requests["memory"], "64Mi");
+        assert_eq!(info.containers[0].resource_limits["memory"], "128Mi");
         let termination = info.last_termination.unwrap();
         assert_eq!(termination.container, "main");
         assert_eq!(termination.reason.as_deref(), Some("OOMKilled"));
