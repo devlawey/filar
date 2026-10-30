@@ -244,13 +244,12 @@ fn resolve_cli_target(config: &Config, value: &str) -> filar_core::Result<CliTar
             ));
         }
         if let Some(namespace) = explicit_namespace {
-            if !cluster.namespaces.is_empty()
-                && !cluster.namespaces.iter().any(|allowed| allowed == namespace)
-            {
-                return Err(CoreError::Other(format!(
-                    "Namespace '{namespace}' is not configured for Kubernetes cluster '{name}'"
-                )));
-            }
+            // `namespaces` is only the Ctrl+O selection list, not an RBAC
+            // allow-list. Validate an explicit CLI value on its own instead.
+            let mut probe = cluster.clone();
+            probe.namespaces.clear();
+            probe.default_namespace = Some(namespace.to_string());
+            probe.validate()?;
         }
         return Ok(CliTarget::Kube(filar_core::KubeSessionSnapshot {
             target: cluster.name.clone(),
@@ -1083,9 +1082,16 @@ mod tests {
             resolve_cli_target(&config, "local").unwrap(),
             CliTarget::Local
         ));
+        match resolve_cli_target(&config, "prod-eu/kube-system").unwrap() {
+            CliTarget::Kube(snapshot) => {
+                assert_eq!(snapshot.namespace.as_deref(), Some("kube-system"));
+            }
+            _ => panic!("expected a Kubernetes target"),
+        }
         assert!(resolve_cli_target(&config, "missing").is_err());
         assert!(resolve_cli_target(&config, "prod-eu/").is_err());
-        assert!(resolve_cli_target(&config, "prod-eu/kube-system").is_err());
+        assert!(resolve_cli_target(&config, "prod-eu/Shop").is_err());
+        assert!(resolve_cli_target(&config, "prod-eu/a/b").is_err());
     }
 
     #[test]

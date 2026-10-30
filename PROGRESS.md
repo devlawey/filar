@@ -11197,6 +11197,8 @@ kubeconfig локально и выполняет Check одним namespaced po
 `KubeClusterApi::context_names` возвращает только имена контекстов.
 Тесты покрывают secret-free handoff/config, локальное чтение контекстов,
 разрешение CLI и уведомления импорта/экспорта. По ревью исправлены выбор Local
-при непустом SSH-списке и проверка явного namespace по configured allow-list.
+при непустом SSH-списке, DNS-1123-проверка явного namespace без превращения
+Ctrl+O-списка в allow-list, fallback Check и сохранение LLM-профилей при
+неполном черновике кластера.
 
 **Next:** #567.

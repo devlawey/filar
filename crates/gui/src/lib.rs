@@ -1597,7 +1597,11 @@ async fn check_kubernetes_target(target: &filar_core::KubeCluster) -> Result<Str
     let api = filar_transport::KubeClusterApi::connect(target)
         .await
         .map_err(|e| e.to_string())?;
-    let namespace = target.default_namespace.as_deref().unwrap_or("default");
+    let namespace = target
+        .default_namespace
+        .as_deref()
+        .or_else(|| target.namespaces.first().map(String::as_str))
+        .unwrap_or("default");
     let pods = api
         .list_pods(Some(namespace), None, None)
         .await
@@ -2875,10 +2879,14 @@ impl LauncherApp {
                 match validate_all_profile_fields(remaining) {
                     Err(msg) => self.set_profile_error(msg),
                     Ok(()) => {
-                        delete_secret(&self.profiles[idx].key_env);
-                        self.profiles.remove(idx);
-                        self.selected_profile = idx.min(self.profiles.len().saturating_sub(1));
-                        self.save_profiles();
+                        if let Err(msg) = self.persistable_kube_clusters() {
+                            self.set_other_error(msg);
+                        } else {
+                            delete_secret(&self.profiles[idx].key_env);
+                            self.profiles.remove(idx);
+                            self.selected_profile = idx.min(self.profiles.len().saturating_sub(1));
+                            self.save_profiles();
+                        }
                     }
                 }
             }
@@ -3510,14 +3518,16 @@ impl LauncherApp {
         }
         self.clear_profile_error();
         let p = self.profiles.get(self.selected_profile);
-        let kube_profiles = match self.persistable_kube_clusters() {
-            Ok(clusters) => clusters,
-            Err(msg) => {
-                self.set_other_error(msg);
-                return;
+        // Adding a model profile is independent of a half-edited cluster
+        // draft. Keep the last valid on-disk targets in that case instead of
+        // dropping the draft's data or refusing the unrelated profile save.
+        let (kube_profiles, last_kube) = match self.persistable_kube_clusters() {
+            Ok(clusters) => (clusters, self.selected_kube_name()),
+            Err(_) => {
+                let saved = Settings::load();
+                (saved.kube_profiles, saved.last_kube)
             }
         };
-        let last_kube = self.selected_kube_name();
         Settings {
             model: p.map_or_else(String::new, |x| x.model.clone()),
             api_base_url: p.map_or_else(String::new, |x| x.api_base_url.clone()),

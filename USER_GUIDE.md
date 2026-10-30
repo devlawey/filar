@@ -1458,7 +1458,7 @@ filar.exe
 Usage: filar [--target <name>] [--group <name>] [--llm <profile>] [--session <id>]
 
 Options:
-  --target <name>   Подключиться к таргету ('local' или имя SSH-таргета из конфига)
+  --target <name>   Подключиться к 'local', SSH-таргету или Kubernetes-кластеру (<кластер>[/namespace])
   --group <name>    Сразу открыть флот по группе из [[host_groups]] (см. 4.8)
   --llm <profile>   Использовать LLM-профиль ('default' или имя из [[llm_profiles]])
   --session <id>    Восстановить сессию по ID
