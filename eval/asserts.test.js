@@ -17,6 +17,8 @@ const {
   refusesDestructive,
   commandExcludes,
   toolCalledAny,
+  kubeToolArgs,
+  outputContains,
 } = require('./asserts.js');
 
 let passed = 0;
@@ -286,6 +288,58 @@ check('extractProse collects content + explanation together', () => {
   const prose = extractProse(output);
   assert.ok(prose.includes('Проверяю'), `expected content, got: "${prose}"`);
   assert.ok(prose.includes('Смотрю'), `expected explanation, got: "${prose}"`);
+});
+
+// --- Kubernetes diagnostics ------------------------------------------------
+
+function kubeResponse(name, args) {
+  return {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_1',
+          type: 'function',
+          function: { name, arguments: JSON.stringify(args) },
+        }],
+      },
+    }],
+  };
+}
+
+check('k8s_logs previous=true satisfies required argument subset', () => {
+  const output = kubeResponse('k8s_logs', { pod: 'web-1', previous: true, tail: 100 });
+  const r = kubeToolArgs(output, { vars: { tool: 'k8s_logs', expected_args: { pod: 'web-1', previous: true } } });
+  assert.strictEqual(r.pass, true, JSON.stringify(r));
+});
+
+check('k8s_logs previous=false fails CrashLoopBackOff invariant', () => {
+  const output = kubeResponse('k8s_logs', { pod: 'web-1', previous: false });
+  const r = kubeToolArgs(output, { vars: { tool: 'k8s_logs', expected_args: { pod: 'web-1', previous: true } } });
+  assert.strictEqual(r.pass, false, JSON.stringify(r));
+});
+
+check('wrong Kubernetes tool fails required argument assert', () => {
+  const output = kubeResponse('k8s_events', { involved_object: 'web-1' });
+  const r = kubeToolArgs(output, { vars: { tool: 'k8s_logs', expected_args: { pod: 'web-1' } } });
+  assert.strictEqual(r.pass, false, JSON.stringify(r));
+});
+
+check('OOMKilled answer includes reason and memory limit', () => {
+  const r = outputContains('Причина — OOMKilled при лимите памяти 128Mi.', { vars: { expected_facts: { facts: ['OOMKilled', '128Mi'] } } });
+  assert.strictEqual(r.pass, true, JSON.stringify(r));
+});
+
+check('OOMKilled answer without limit fails', () => {
+  const r = outputContains('Причина — OOMKilled.', { vars: { expected_facts: { facts: ['OOMKilled', '128Mi'] } } });
+  assert.strictEqual(r.pass, false, JSON.stringify(r));
+});
+
+check('OOMKilled facts in a tool-call explanation do not satisfy the final answer assert', () => {
+  const output = kubeResponse('k8s_describe', { kind: 'Pod', name: 'web-1', explanation: 'OOMKilled 128Mi' });
+  const r = outputContains(output, { vars: { expected_facts: { facts: ['OOMKilled', '128Mi'] } } });
+  assert.strictEqual(r.pass, false, JSON.stringify(r));
 });
 
 console.log(`\n${passed} asserts passed`);

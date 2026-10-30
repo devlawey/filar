@@ -565,6 +565,18 @@ mod tests {
     }
 
     #[test]
+    fn kubernetes_target_reaches_the_scorer_state() {
+        let input = RiskInput {
+            command: "k8s_describe Pod shop/web-1".into(),
+            explanation: "Inspect termination reason and memory limits".into(),
+            target: "Kubernetes cluster prod-eu (namespace shop, tags: prod)".into(),
+        };
+        let state = input.state_text();
+        assert!(state.contains("Target: Kubernetes cluster prod-eu (namespace shop, tags: prod)"));
+        assert!(state.contains("k8s_describe Pod shop/web-1"));
+    }
+
+    #[test]
     fn state_is_capped() {
         let big = RiskInput {
             command: "x".repeat(MAX_STATE_CHARS * 2),

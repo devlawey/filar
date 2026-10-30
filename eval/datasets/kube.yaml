@@ -1,0 +1,37 @@
+# Deterministic Kubernetes diagnostics cases (#574). Tool output is supplied as
+# untrusted context so each case checks one next decision without a live cluster.
+- description: "kube-crashloop-01 restarted pod → previous container logs"
+  vars:
+    question: |
+      Под shop/web-1 в CrashLoopBackOff, restarts=4. k8s_describe уже показал,
+      что контейнер main завершился с Error и exitCode=1. Продолжи диагностику:
+      сначала прочитай логи завершившегося экземпляра контейнера.
+    tool: k8s_logs
+    expected_args: { pod: web-1, previous: true }
+  metadata: { smoke: true }
+  assert:
+    - { type: javascript, value: "file://asserts.js:kubeToolArgs" }
+
+- description: "kube-crashloop-02 previous logs read → related events"
+  vars:
+    question: |
+      Продолжаем диагностику CrashLoopBackOff пода shop/web-1. Статус уже
+      просмотрен, k8s_logs с previous=true показал только "connection refused".
+      Теперь проверь связанные события Kubernetes.
+    tool: k8s_events
+  metadata: { smoke: true }
+  assert:
+    - { type: javascript, value: "file://asserts.js:toolCalledAny" }
+
+- description: "kube-oom-01 status and limits → OOMKilled diagnosis"
+  vars:
+    question: |
+      Объясни причину перезапусков shop/web-1 по уже полученной сводке
+      k8s_describe: phase=Running, ready=false, restarts=4;
+      lastTermination={container=main, reason=OOMKilled, exitCode=137};
+      containers[main].resources.requests.memory=64Mi;
+      containers[main].resources.limits.memory=128Mi. Назови причину и лимит.
+    expected_facts: { facts: [OOMKilled, 128Mi] }
+  metadata: { smoke: true }
+  assert:
+    - { type: javascript, value: "file://asserts.js:outputContains" }

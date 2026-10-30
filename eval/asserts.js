@@ -277,6 +277,77 @@ function toolCalledAny(output, context) {
   };
 }
 
+// Assert 7 — a Kubernetes tool was called with the required argument subset.
+// `expected_args` deliberately checks only diagnostic invariants (for example
+// previous=true), leaving optional namespace, tail and byte limits to the model.
+function kubeToolArgs(output, context) {
+  const wanted = context?.vars?.tool;
+  const expected = context?.vars?.expected_args;
+  if (!wanted || !expected || typeof expected !== 'object' || Array.isArray(expected)) {
+    return { pass: false, score: 0, reason: 'kubeToolArgs requires `tool` and object `expected_args` vars' };
+  }
+
+  const calls = extractToolCalls(output).filter((tc) => (tc.function || tc).name === wanted);
+  for (const tc of calls) {
+    const fn = tc.function || tc;
+    let args = fn.arguments;
+    if (typeof args === 'string') {
+      try { args = JSON.parse(args); } catch { args = null; }
+    }
+    if (!args || typeof args !== 'object') continue;
+    const mismatches = Object.entries(expected)
+      .filter(([key, value]) => JSON.stringify(args[key]) !== JSON.stringify(value));
+    if (mismatches.length === 0) {
+      return { pass: true, score: 1, reason: `${wanted} contains the required arguments` };
+    }
+  }
+  return {
+    pass: false,
+    score: 0,
+    reason: `expected ${wanted} with ${JSON.stringify(expected)}, got: ${JSON.stringify(calls.map((tc) => (tc.function || tc).arguments))}`,
+  };
+}
+
+// Extract final assistant content without tool-call explanations.
+function finalAssistantContent(output) {
+  if (typeof output === 'string') return output;
+  if (!output || Array.isArray(output)) return '';
+  const parts = [];
+  function add(content) {
+    if (typeof content === 'string') parts.push(content);
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (typeof part?.text === 'string') parts.push(part.text);
+      }
+    }
+  }
+  add(output.content);
+  if (Array.isArray(output.choices)) {
+    for (const choice of output.choices) add((choice.message || choice.delta || {}).content);
+  }
+  add(output.message);
+  add(output.message && output.message.content);
+  add(output.output);
+  add(output.output && output.output.content);
+  return parts.join('\n\n');
+}
+
+// Assert 8 — final diagnostic prose contains every required fact.
+function outputContains(output, context) {
+  const expected = context?.vars?.expected_facts?.facts;
+  if (!Array.isArray(expected) || expected.length === 0) {
+    return { pass: false, score: 0, reason: 'outputContains requires a non-empty `expected_facts.facts` array' };
+  }
+  const prose = finalAssistantContent(output);
+  const missing = expected.filter((value) => !prose.includes(String(value)));
+  const pass = missing.length === 0;
+  return {
+    pass,
+    score: pass ? 1 : 0,
+    reason: pass ? 'all required facts are present' : `missing facts: ${missing.join(', ')}`,
+  };
+}
+
 module.exports = {
   RUN_COMMAND,
   extractProse,
@@ -289,4 +360,6 @@ module.exports = {
   calledCorrectly,
   commandExcludes,
   toolCalledAny,
+  kubeToolArgs,
+  outputContains,
 };

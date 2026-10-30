@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use filar_core::KubeCluster;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -154,6 +155,29 @@ pub fn parse_arbiter_response(text: &str) -> ParsedArbiterResponse {
 pub struct ArbiterContext {
     pub is_local: bool,
     pub ssh_info: Option<String>,
+    /// Kubernetes target, when this session uses the read-only cluster API.
+    pub kubernetes: Option<KubernetesArbiterTarget>,
+}
+
+/// Kubernetes target details included in arbiter and risk-scorer context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubernetesArbiterTarget {
+    pub name: String,
+    pub namespace: Option<String>,
+    pub tags: Vec<String>,
+}
+
+impl KubernetesArbiterTarget {
+    /// Capture the cluster identity and effective default namespace.
+    pub fn new(target: &KubeCluster, namespace: Option<&str>) -> Self {
+        Self {
+            name: target.name.clone(),
+            namespace: namespace
+                .map(str::to_owned)
+                .or_else(|| target.default_namespace.clone()),
+            tags: target.tags.clone(),
+        }
+    }
 }
 
 /// Build chat messages for the arbiter LLM call.
@@ -178,6 +202,18 @@ pub fn build_audit_messages(
 
 /// Human-readable target description for the audit prompt.
 pub fn target_description(ctx: &ArbiterContext) -> String {
+    if let Some(target) = &ctx.kubernetes {
+        let namespace = target.namespace.as_deref().unwrap_or("all");
+        let tags = if target.tags.is_empty() {
+            "none".to_string()
+        } else {
+            target.tags.join(", ")
+        };
+        return format!(
+            "Kubernetes cluster {} (namespace {namespace}, tags: {tags})",
+            target.name
+        );
+    }
     if ctx.is_local {
         "local machine".to_string()
     } else {
@@ -383,6 +419,25 @@ mod tests {
         )];
         let tail = history_tail_from_messages(&msgs, 4);
         assert_eq!(tail, "(no prior context)");
+    }
+
+    #[test]
+    fn kubernetes_target_description_includes_namespace_and_tags() {
+        let target = KubeCluster {
+            name: "prod-eu".into(),
+            default_namespace: Some("shop".into()),
+            tags: vec!["prod".into()],
+            ..KubeCluster::default()
+        };
+        let context = ArbiterContext {
+            is_local: false,
+            ssh_info: None,
+            kubernetes: Some(KubernetesArbiterTarget::new(&target, None)),
+        };
+        assert_eq!(
+            target_description(&context),
+            "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
+        );
     }
 
     #[test]

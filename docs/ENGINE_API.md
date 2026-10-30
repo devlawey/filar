@@ -87,6 +87,32 @@ results to this boundary. The transport remains independent of the agent's
 `ClusterApi` results must apply this boundary rather than serializing raw
 objects or logs directly.
 
+## Read-only Kubernetes agent tools
+
+`filar_agent::kube_tool_definitions(mode)` returns the six cluster-tab tools:
+`k8s_get`, `k8s_describe`, `k8s_logs`, `k8s_events`, `k8s_top` and
+`k8s_rollout_history`. They accept only the fixed resource list exposed by
+`KubeResourceKind`; there is no Secret kind and no mutation tool. Parse a model
+call with `parse_kube_tool_call`, apply `kube_confirmation_decision` and show
+`KubeToolCall::confirmation_context` when approval is required, then pass the
+validated call to `KubeToolExecutor::execute`.
+
+The executor is a separate engine boundary from the SSH `Agent` and does not
+change `CommandExecutor` or `LlmClient`. It renders list-like results through
+`PreprocessedOutput`, limits tables to 100 rows and model output to 10,000
+characters, and adds explicit truncation markers. Logs accept at most 500 lines
+and 1 MiB per call. Every object, event, ConfigMap and log passes through
+`KubeToolOutput::redact_for_model` before the returned `KubeToolResult` can be
+added to model history. Missing metrics support is reported as
+`metrics-server не установлен`.
+
+`build_kube_system_prompt` describes this read-only tool surface, including
+previous-container logs after restarts and resource limits for OOMKilled
+analysis. `AgentBuilder::arbiter_kube_context` and
+`arbiter::KubernetesArbiterTarget` provide the same cluster, namespace and tags
+to arbiter and `RiskInput` target descriptions. `ContainerInfo` also exposes
+resource requests and limits for pod diagnostics.
+
 ## Cargo.toml example
 
 ```toml
@@ -665,6 +691,7 @@ let _agent = builder.risk_scorer(Some(scorer));
 | `Config::load` rejects duplicate target names — across `[[ssh_targets]]` and `[[kube_clusters]]`, **including two SSH targets with the same name** (#562) | Existing **configurations**, not code: a config with duplicate SSH target names loaded before and now fails at startup, even without any `[[kube_clusters]]` | Rename duplicated targets so every name is unique before upgrading |
 | `ClusterApi`, `KubeClusterApi`, read-only cluster result types and the default `kube` transport feature (#572) | Dependency footprint for consumers using default features; no Rust API break | Disable default features for SSH-only/mobile builds, or enable only `kube` for cluster access |
 | `KubeToolOutput`, `redact_logs`, redaction markers and `KubeCluster::reveal_env` (#573) | Nothing — additive (struct literals of `KubeCluster` use `..Default::default()`) | Pass Kubernetes objects/logs through `KubeToolOutput::redact_for_model` before giving them to a model |
+| `KubeToolExecutor`, six `k8s_*` tool definitions, typed calls/results, cluster prompt and Kubernetes arbiter context (#574) | `ContainerInfo` and `ArbiterContext` struct literals need the new resource-map / `kubernetes` fields; `CommandExecutor` and `LlmClient` are unchanged | Use `..` where practical, or populate the new fields; route cluster model output through `KubeToolExecutor` |
 
 `CommandExecutor` and `LlmClient` are unchanged.
 

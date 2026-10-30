@@ -24,6 +24,10 @@ pub struct ContainerInfo {
     pub name: String,
     /// Image reference, as declared by the pod.
     pub image: String,
+    /// Declared resource requests in Kubernetes quantity notation.
+    pub resource_requests: BTreeMap<String, String>,
+    /// Declared resource limits in Kubernetes quantity notation.
+    pub resource_limits: BTreeMap<String, String>,
 }
 
 /// The most recent terminated state reported for a container.

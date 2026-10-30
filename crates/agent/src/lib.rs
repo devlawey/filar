@@ -42,6 +42,7 @@ pub mod fleet_retry;
 pub mod fleet_run;
 pub mod fleet_view;
 pub mod kube_redact;
+pub mod kube_tools;
 pub mod long_wait;
 pub mod openai_compat;
 pub mod os_probe;
@@ -59,6 +60,11 @@ pub use compaction::{summarise_history, SummaryOutcome, COMPACTION_SYSTEM_PROMPT
 pub use events::{AgentEvent, EventSink};
 pub use kube_redact::{
     redact_logs, KubeToolOutput, CONFIGMAP_VALUE_MAX_CHARS, HIDDEN_VALUE, REVEALED_BY_CONFIG,
+};
+pub use kube_tools::{
+    build_kube_system_prompt, kube_confirmation_decision, kube_tool_definitions,
+    parse_kube_tool_call, KubeResourceKind, KubeToolCall, KubeToolExecutor, KubeToolResult,
+    KubeTopResource,
 };
 pub use openai_compat::OpenAiCompatClient;
 pub use os_probe::OsFamilyProbe;
