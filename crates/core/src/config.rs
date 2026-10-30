@@ -286,7 +286,7 @@ fn default_save_runbook() -> bool {
 // ---------------------------------------------------------------------------
 
 /// A named SSH connection target.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshTarget {
     /// Human-readable name (e.g. `"prod-web-1"`).
     pub name: String,
@@ -323,7 +323,7 @@ fn default_ssh_port() -> u16 {
 /// context — leaked it transitively through its own derived `Debug`. A
 /// single `{target:?}` in a log line or a panic message was enough, which
 /// invariant 3 of `AGENTS.md` forbids outright. Found in review of #426.
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SshAuth {
     /// Use a key file from disk (e.g. `~/.ssh/id_ed25519`).

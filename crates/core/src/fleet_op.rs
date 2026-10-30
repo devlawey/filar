@@ -48,7 +48,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::config::{select_hosts_for_group, HostGroup, HostGroupPolicy, SshTarget};
+use crate::config::{target_matches_group, HostGroup, HostGroupPolicy, SshTarget};
+use serde::{Deserialize, Serialize};
 
 /// Source of [`OperationId`] values, one per process.
 static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -136,24 +137,110 @@ impl HostHandle {
     }
 }
 
-/// One host taking part in an operation, with its progress.
+/// A pod selected into a fleet, frozen when the fleet opens (#567).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubePodRef {
+    /// Name of the entry in `[[kube_clusters]]`.
+    pub cluster: String,
+    /// Namespace containing the pod.
+    pub namespace: String,
+    /// Concrete pod name, not a selector.
+    pub pod: String,
+    /// Container within the pod.
+    pub container: String,
+}
+
+/// A cluster and namespace selected as one fleet member (#567).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubeScopeRef {
+    /// Name of the entry in `[[kube_clusters]]`.
+    pub cluster: String,
+    /// Namespace through which API operations are scoped.
+    pub namespace: String,
+}
+
+/// One member of a fleet (#567).
+///
+/// Kubernetes variants contain identities only: access is resolved from the
+/// user's kubeconfig and never from the SSH credential store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FleetTarget {
+    /// An ordinary SSH host.
+    Ssh(SshTarget),
+    /// A concrete pod and container.
+    KubePod(KubePodRef),
+    /// A cluster and namespace without a pod selector.
+    KubeCluster(KubeScopeRef),
+}
+
+impl FleetTarget {
+    /// The member name used by the existing fleet views and fold.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Ssh(target) => &target.name,
+            Self::KubePod(target) => &target.pod,
+            Self::KubeCluster(target) => &target.cluster,
+        }
+    }
+
+    /// The SSH target, or `None` for a Kubernetes member.
+    pub fn as_ssh(&self) -> Option<&SshTarget> {
+        match self {
+            Self::Ssh(target) => Some(target),
+            Self::KubePod(_) | Self::KubeCluster(_) => None,
+        }
+    }
+
+    /// An old session's name-only SSH member. Restore replaces this
+    /// placeholder with the currently configured target of the same name.
+    pub(crate) fn legacy_ssh(name: String) -> Self {
+        Self::Ssh(SshTarget {
+            name,
+            host: String::new(),
+            port: 22,
+            user: String::new(),
+            auth: Default::default(),
+            host_key_policy: Default::default(),
+            tags: Vec::new(),
+        })
+    }
+
+    fn selected_by(&self, group: &HostGroup) -> bool {
+        self.as_ssh().is_some_and(|target| target_matches_group(group, target))
+    }
+
+    fn same_identity(&self, saved: &Self) -> bool {
+        match (self, saved) {
+            (Self::Ssh(current), Self::Ssh(saved)) => current.name == saved.name,
+            _ => self == saved,
+        }
+    }
+}
+
+impl From<SshTarget> for FleetTarget {
+    fn from(target: SshTarget) -> Self {
+        Self::Ssh(target)
+    }
+}
+
+/// One target taking part in an operation, with its progress.
 #[derive(Debug, Clone)]
 pub struct FleetMember {
-    target: SshTarget,
+    target: FleetTarget,
     progress: HostProgress,
 }
 
 impl FleetMember {
-    /// The host as it was configured when the operation opened.
+    /// The target as it was configured when the operation opened.
     ///
     /// A snapshot: later edits to the config do not reach it.
-    pub fn target(&self) -> &SshTarget {
+    pub fn target(&self) -> &FleetTarget {
         &self.target
     }
 
-    /// The host's configured name, as the panel shows it.
+    /// The target's name, as the panel shows it.
     pub fn name(&self) -> &str {
-        &self.target.name
+        self.target.name()
     }
 
     /// How far this host has got.
@@ -193,11 +280,17 @@ impl FleetOperation {
     /// Hosts keep the order they have in `targets`, which is the order the
     /// config file lists them in, so two operations over the same group read
     /// the same way.
-    pub fn open(group: &HostGroup, targets: &[SshTarget]) -> Self {
-        let members = select_hosts_for_group(group, targets)
-            .into_iter()
+    pub fn open<T>(group: &HostGroup, targets: &[T]) -> Self
+    where
+        T: Clone + Into<FleetTarget>,
+    {
+        let members = targets
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .filter(|target| target.selected_by(group))
             .map(|target| FleetMember {
-                target: target.clone(),
+                target,
                 progress: HostProgress::default(),
             })
             .collect();
@@ -208,30 +301,54 @@ impl FleetOperation {
         }
     }
 
+    /// Open an operation over exactly `targets`, without applying a tag rule.
+    ///
+    /// This is the entry point for an already resolved Kubernetes composition:
+    /// concrete pods or cluster scopes are frozen here just like SSH members.
+    pub fn from_targets(group: &HostGroup, targets: &[FleetTarget]) -> Self {
+        Self {
+            id: OperationId::next(),
+            group: group.clone(),
+            members: targets
+                .iter()
+                .cloned()
+                .map(|target| FleetMember {
+                    target,
+                    progress: HostProgress::default(),
+                })
+                .collect(),
+        }
+    }
+
     /// Rebuild an operation over a composition saved earlier (#442), not
     /// over whatever `group`'s tag rule selects today.
     ///
-    /// `hosts` are the member names in their saved order. Each is looked up
-    /// by name in `targets` — the connection details come from the config
-    /// as it is now, the *membership* from the session — and the tag rule is
-    /// not consulted at all: a host retagged since keeps its place, a host
-    /// newly tagged does not gain one. That is the frozen-composition rule
-    /// of [`open`][Self::open] carried across a restart.
+    /// `saved` contains the member identities in their saved order. An SSH
+    /// member is looked up by name in `targets` — connection details come from
+    /// the config as it is now, the *membership* from the session — and the tag
+    /// rule is not consulted at all: a host retagged since keeps its place, a
+    /// host newly tagged does not gain one. Kubernetes references match their
+    /// complete frozen identity. That is the composition rule of
+    /// [`open`][Self::open] carried across a restart.
     ///
     /// A name with no target of that name any more is returned in the second
     /// element, in saved order, rather than silently dropped: the caller has
     /// to be able to say that the fleet it restored is smaller than the one
     /// that was saved. When several targets share a name, saved occurrences
     /// take them in config order, one each.
-    pub fn restore(group: &HostGroup, hosts: &[String], targets: &[SshTarget]) -> (Self, Vec<String>) {
+    pub fn restore(
+        group: &HostGroup,
+        saved: &[FleetTarget],
+        targets: &[FleetTarget],
+    ) -> (Self, Vec<String>) {
         let mut used = vec![false; targets.len()];
-        let mut members = Vec::with_capacity(hosts.len());
+        let mut members = Vec::with_capacity(saved.len());
         let mut missing = Vec::new();
-        for name in hosts {
+        for saved_target in saved {
             let found = targets
                 .iter()
                 .enumerate()
-                .find(|(i, target)| !used[*i] && &target.name == name);
+                .find(|(i, target)| !used[*i] && target.same_identity(saved_target));
             match found {
                 Some((i, target)) => {
                     used[i] = true;
@@ -240,7 +357,7 @@ impl FleetOperation {
                         progress: HostProgress::default(),
                     });
                 }
-                None => missing.push(name.clone()),
+                None => missing.push(saved_target.name().to_string()),
             }
         }
         let op = Self {
@@ -358,7 +475,7 @@ impl FleetOperation {
     pub fn handle_for(&self, name: &str) -> Option<HostHandle> {
         self.members
             .iter()
-            .position(|m| m.target.name == name)
+            .position(|m| m.target.name() == name)
             .map(|index| HostHandle {
                 operation: self.id,
                 index,
@@ -419,6 +536,17 @@ mod tests {
             host_key_policy: HostKeyPolicy::default(),
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
         }
+    }
+
+    fn fleet_targets(targets: &[SshTarget]) -> Vec<FleetTarget> {
+        targets.iter().cloned().map(FleetTarget::Ssh).collect()
+    }
+
+    fn saved_targets(names: &[&str]) -> Vec<FleetTarget> {
+        names
+            .iter()
+            .map(|name| FleetTarget::Ssh(target(name, &[])))
+            .collect()
     }
 
     fn names(op: &FleetOperation) -> Vec<&str> {
@@ -658,7 +786,8 @@ mod tests {
     fn a_restored_operation_keeps_the_saved_composition_not_the_tags() {
         // Since the save: web-2 lost its tag, web-9 gained it, web-3 is gone.
         let targets = vec![target("web-1", &["web"]), target("web-2", &[]), target("web-9", &["web"])];
-        let saved = vec!["web-1".to_string(), "web-2".to_string(), "web-3".to_string()];
+        let saved = saved_targets(&["web-1", "web-2", "web-3"]);
+        let targets = fleet_targets(&targets);
 
         let (op, missing) = FleetOperation::restore(&group("web", &["web"]), &saved, &targets);
         assert_eq!(names(&op), ["web-1", "web-2"], "membership comes from the session");
@@ -673,9 +802,14 @@ mod tests {
         a.host = "a".into();
         let mut b = target("dup", &[]);
         b.host = "b".into();
-        let saved = vec!["dup".to_string(), "dup".to_string(), "dup".to_string()];
-        let (op, missing) = FleetOperation::restore(&group("g", &[]), &saved, &[a, b]);
-        let hosts: Vec<_> = op.members().iter().map(|m| m.target().host.as_str()).collect();
+        let saved = saved_targets(&["dup", "dup", "dup"]);
+        let targets = fleet_targets(&[a, b]);
+        let (op, missing) = FleetOperation::restore(&group("g", &[]), &saved, &targets);
+        let hosts: Vec<_> = op
+            .members()
+            .iter()
+            .map(|m| m.target().as_ssh().expect("SSH member").host.as_str())
+            .collect();
         assert_eq!(hosts, ["a", "b"]);
         assert_eq!(missing, ["dup"]);
     }

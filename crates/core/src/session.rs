@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::chat::ChatBlock;
 use crate::config::CommandConfirmMode;
 use crate::error::{CoreError, Result};
+use crate::fleet_op::FleetTarget;
 
 /// Maximum number of sessions to retain on disk.
 pub const MAX_SESSIONS: usize = 10;
@@ -128,18 +129,124 @@ pub struct KubeSessionSnapshot {
     pub namespace: Option<String>,
 }
 
-/// The composition of a saved fleet session (#442).
+/// The composition of a saved fleet session (#442, #567).
 ///
-/// Host **names** only, in composition order. Connection details and
+/// Target identities only, in composition order. SSH connection details and
 /// credentials are resolved from the config and the OS credential store at
-/// restore time — nothing about how to reach a host, and no secret, is
-/// written into the session file.
+/// restore time; Kubernetes access comes from the user's kubeconfig. Nothing
+/// about how to reach a target, and no secret, is written into the session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetSnapshot {
     /// The group the fleet was opened over.
     pub group: String,
     /// Its members when the fleet was opened, in order.
-    pub hosts: Vec<String>,
+    #[serde(default, alias = "hosts", with = "fleet_snapshot_targets")]
+    pub targets: Vec<FleetTarget>,
+}
+
+/// Secret-free, backward-compatible serde for fleet member identities.
+mod fleet_snapshot_targets {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use crate::fleet_op::FleetTarget;
+
+    #[derive(Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum TargetRef<'a> {
+        Ssh {
+            name: &'a str,
+        },
+        KubePod {
+            cluster: &'a str,
+            namespace: &'a str,
+            pod: &'a str,
+            container: &'a str,
+        },
+        KubeCluster {
+            cluster: &'a str,
+            namespace: &'a str,
+        },
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StoredTarget {
+        Legacy(String),
+        Current(TaggedTarget),
+    }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum TaggedTarget {
+        Ssh {
+            name: String,
+        },
+        KubePod {
+            cluster: String,
+            namespace: String,
+            pod: String,
+            container: String,
+        },
+        KubeCluster {
+            cluster: String,
+            namespace: String,
+        },
+    }
+
+    pub fn serialize<S>(targets: &[FleetTarget], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let targets: Vec<_> = targets
+            .iter()
+            .map(|target| match target {
+                FleetTarget::Ssh(target) => TargetRef::Ssh {
+                    name: &target.name,
+                },
+                FleetTarget::KubePod(target) => TargetRef::KubePod {
+                    cluster: &target.cluster,
+                    namespace: &target.namespace,
+                    pod: &target.pod,
+                    container: &target.container,
+                },
+                FleetTarget::KubeCluster(target) => TargetRef::KubeCluster {
+                    cluster: &target.cluster,
+                    namespace: &target.namespace,
+                },
+            })
+            .collect();
+        targets.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<FleetTarget>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let targets = Vec::<StoredTarget>::deserialize(deserializer)?;
+        Ok(targets
+            .into_iter()
+            .map(|target| match target {
+                StoredTarget::Legacy(name) => FleetTarget::legacy_ssh(name),
+                StoredTarget::Current(TaggedTarget::Ssh { name }) => {
+                    FleetTarget::legacy_ssh(name)
+                }
+                StoredTarget::Current(TaggedTarget::KubePod {
+                    cluster,
+                    namespace,
+                    pod,
+                    container,
+                }) => FleetTarget::KubePod(crate::fleet_op::KubePodRef {
+                    cluster,
+                    namespace,
+                    pod,
+                    container,
+                }),
+                StoredTarget::Current(TaggedTarget::KubeCluster { cluster, namespace }) => {
+                    FleetTarget::KubeCluster(crate::fleet_op::KubeScopeRef { cluster, namespace })
+                }
+            })
+            .collect())
+    }
 }
 
 /// Lightweight metadata for listing sessions without loading full messages.
@@ -460,6 +567,69 @@ fn unix_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{SshAuth, SshTarget};
+    use crate::fleet_op::{KubePodRef, KubeScopeRef};
+
+    #[test]
+    fn legacy_fleet_session_fixture_reads_hosts_as_ssh_targets() {
+        let json = r#"{
+            "id":"legacy-fleet",
+            "timestamp":"2026-01-01 00:00:00",
+            "target":"fleet:web",
+            "messages":[],
+            "fleet":{"group":"web","hosts":["web-1","web-2"]}
+        }"#;
+
+        let session: Session = serde_json::from_str(json).unwrap();
+        let fleet = session.fleet.expect("legacy fleet snapshot");
+        let names: Vec<_> = fleet.targets.iter().map(FleetTarget::name).collect();
+        assert_eq!(names, ["web-1", "web-2"]);
+        assert!(fleet.targets.iter().all(|target| target.as_ssh().is_some()));
+    }
+
+    #[test]
+    fn fleet_snapshot_roundtrip_keeps_only_secret_free_target_identities() {
+        let snapshot = FleetSnapshot {
+            group: "mixed".into(),
+            targets: vec![
+                FleetTarget::Ssh(SshTarget {
+                    name: "web-1".into(),
+                    host: "secret-address.example".into(),
+                    port: 22,
+                    user: "admin".into(),
+                    auth: SshAuth::Password {
+                        password: Some("secret-password".into()),
+                    },
+                    host_key_policy: Default::default(),
+                    tags: vec!["web".into()],
+                }),
+                FleetTarget::KubePod(KubePodRef {
+                    cluster: "prod-eu".into(),
+                    namespace: "shop".into(),
+                    pod: "api-0".into(),
+                    container: "app".into(),
+                }),
+                FleetTarget::KubeCluster(KubeScopeRef {
+                    cluster: "prod-eu".into(),
+                    namespace: "shop".into(),
+                }),
+            ],
+        };
+
+        let json = serde_json::to_string(&snapshot).unwrap();
+        for private in ["secret-address.example", "secret-password", "admin"] {
+            assert!(!json.contains(private), "snapshot leaked {private}: {json}");
+        }
+
+        let restored: FleetSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.targets.len(), 3);
+        let ssh = restored.targets[0].as_ssh().expect("SSH target");
+        assert_eq!(ssh.name, "web-1");
+        assert!(ssh.host.is_empty());
+        assert!(ssh.user.is_empty());
+        assert_eq!(restored.targets[1], snapshot.targets[1]);
+        assert_eq!(restored.targets[2], snapshot.targets[2]);
+    }
 
     #[test]
     fn session_meta_from_session() {

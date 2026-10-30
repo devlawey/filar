@@ -67,10 +67,11 @@ use futures::stream::{self, StreamExt};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
 use filar_core::config::SshTarget;
 use filar_core::error::{CoreError, Result};
 use filar_core::fleet_checks::FleetCheck;
-use filar_core::fleet_op::{FleetOperation, OperationId};
+use filar_core::fleet_op::{FleetOperation, FleetTarget, OperationId};
 use filar_transport::readonly::check_read_only;
 use filar_transport::{is_connection_lost, CommandExecutor, CommandResult};
 
@@ -87,7 +88,7 @@ use crate::preprocess::PreprocessorRegistry;
 /// The executor it returns is used as is, so it must already carry the
 /// read-only wrapper (`filar_transport::readonly::ReadOnlyExecutor`).
 pub type HostConnector =
-    Arc<dyn Fn(SshTarget) -> BoxFuture<'static, Result<Arc<dyn CommandExecutor>>> + Send + Sync>;
+    Arc<dyn Fn(FleetTarget) -> BoxFuture<'static, Result<Arc<dyn CommandExecutor>>> + Send + Sync>;
 
 /// One `run` = one read-only question to every host of a fleet.
 pub struct FleetExecutor {
@@ -231,7 +232,7 @@ impl FleetExecutor {
         .map(|(i, target)| {
             let connect = Arc::clone(&self.connect);
             async move {
-                let name = target.name.clone();
+                let name = target.name().to_string();
                 let conn = match tokio::time::timeout(deadline, connect(target)).await {
                     Ok(result) => result,
                     Err(_) => Err(CoreError::ConnectionLost(format!(
@@ -535,16 +536,17 @@ mod tests {
         attempts: Arc<AtomicUsize>,
         runs: Arc<AtomicUsize>,
     ) -> HostConnector {
-        Arc::new(move |target: SshTarget| {
+        Arc::new(move |target: FleetTarget| {
             attempts.fetch_add(1, Ordering::SeqCst);
             let runs = Arc::clone(&runs);
             Box::pin(async move {
-                if down.contains(&target.name.as_str()) {
-                    return Err(CoreError::ConnectionLost(format!("{}: refused", target.name)));
+                let name = target.name().to_string();
+                if down.contains(&name.as_str()) {
+                    return Err(CoreError::ConnectionLost(format!("{name}: refused")));
                 }
                 let stdout = outputs
                     .iter()
-                    .find(|(n, _)| *n == target.name)
+                    .find(|(n, _)| *n == name.as_str())
                     .map(|(_, o)| *o)
                     .unwrap_or("same");
                 Ok(Arc::new(Fixed { stdout, runs }) as Arc<dyn CommandExecutor>)
@@ -669,7 +671,7 @@ mod tests {
     async fn a_dropped_connection_is_reopened_on_the_next_command() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&attempts);
-        let connect: HostConnector = Arc::new(move |_t: SshTarget| {
+        let connect: HostConnector = Arc::new(move |_t: FleetTarget| {
             counter.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
                 Ok(Arc::new(DropsAfterFirst { runs: Arc::new(AtomicUsize::new(0)) })
@@ -733,7 +735,10 @@ mod tests {
 
     /// Records `(host, password)` for every connection it opens.
     fn recording_connector(seen: Seen) -> HostConnector {
-        Arc::new(move |target: SshTarget| {
+        Arc::new(move |target: FleetTarget| {
+            let FleetTarget::Ssh(target) = target else {
+                panic!("SSH test target expected");
+            };
             let password = match &target.auth {
                 SshAuth::Password { password } => password.clone(),
                 _ => None,
@@ -840,10 +845,10 @@ mod tests {
     #[tokio::test]
     async fn cancel_stops_the_operation_and_run_returns_the_partial_summary() {
         let op = fleet(&["web-1", "web-2", "web-3"]);
-        let connect: HostConnector = Arc::new(|target: SshTarget| {
+        let connect: HostConnector = Arc::new(|target: FleetTarget| {
             Box::pin(async move {
                 Ok(Arc::new(UntilCancelled {
-                    hang: target.name != "web-1",
+                    hang: target.name() != "web-1",
                     cancelled: tokio::sync::Notify::new(),
                 }) as Arc<dyn CommandExecutor>)
             })

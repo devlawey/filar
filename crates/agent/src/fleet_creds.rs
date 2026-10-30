@@ -44,7 +44,7 @@ use std::fmt;
 
 use filar_core::config::{SshAuth, SshTarget};
 use filar_core::error::CoreError;
-use filar_core::fleet_op::{FleetOperation, HostHandle, OperationId};
+use filar_core::fleet_op::{FleetOperation, FleetTarget, HostHandle, OperationId};
 use filar_core::secrets::SecretProvider;
 
 /// Name of a target's password in the OS credential store.
@@ -88,7 +88,7 @@ pub struct FleetCredentials {
     operation: OperationId,
     /// In composition order: the target to connect with (a stored password
     /// already filled in), or why the member drops out.
-    hosts: Vec<Result<SshTarget, MissingCredentials>>,
+    hosts: Vec<Result<FleetTarget, MissingCredentials>>,
 }
 
 impl FleetCredentials {
@@ -113,7 +113,7 @@ impl FleetCredentials {
     }
 
     /// The target to connect member `index` with, if it has credentials.
-    pub(crate) fn ready(&self, index: usize) -> Option<&SshTarget> {
+    pub(crate) fn ready(&self, index: usize) -> Option<&FleetTarget> {
         self.hosts.get(index).and_then(|h| h.as_ref().ok())
     }
 
@@ -145,7 +145,21 @@ impl FleetCredentials {
     }
 }
 
-fn resolve_one(target: &SshTarget, store: &dyn SecretProvider) -> Result<SshTarget, MissingCredentials> {
+fn resolve_one(
+    target: &FleetTarget,
+    store: &dyn SecretProvider,
+) -> Result<FleetTarget, MissingCredentials> {
+    let FleetTarget::Ssh(target) = target else {
+        // Kubernetes access comes from kubeconfig, never keyring.
+        return Ok(target.clone());
+    };
+    resolve_ssh(target, store).map(FleetTarget::Ssh)
+}
+
+fn resolve_ssh(
+    target: &SshTarget,
+    store: &dyn SecretProvider,
+) -> Result<SshTarget, MissingCredentials> {
     match &target.auth {
         SshAuth::Key { path, passphrase } => {
             let key = filar_transport::resolve_key_path(path.as_deref());
@@ -235,7 +249,7 @@ mod tests {
 
         assert_eq!(creds.participants(&op), ["web-1", "web-3", "web-4"]);
         assert_eq!(creds.skipped(&op), [("web-2", MissingCredentials::NoPassword)]);
-        assert!(matches!(creds.ready(2).expect("web-3 ready").auth, SshAuth::Agent));
+        assert!(matches!(creds.ready(2).and_then(FleetTarget::as_ssh).expect("web-3 ready").auth, SshAuth::Agent));
         let handles: Vec<_> = op.handles().collect();
         assert_eq!(creds.missing(&op, handles[1]), Some(MissingCredentials::NoPassword));
         assert_eq!(creds.missing(&op, handles[0]), None);
@@ -287,7 +301,7 @@ mod tests {
 
         assert_eq!(creds.participants(&op), ["web-1"]);
         assert_eq!(creds.skipped(&op), [("web-2", MissingCredentials::NoPassphrase)]);
-        match &creds.ready(0).expect("web-1 ready").auth {
+        match &creds.ready(0).and_then(FleetTarget::as_ssh).expect("web-1 ready").auth {
             SshAuth::Key { passphrase, .. } => assert_eq!(passphrase.as_deref(), Some("per-host")),
             other => panic!("unexpected auth {other:?}"),
         }
@@ -314,7 +328,7 @@ mod tests {
         store.insert("SSH_PASSWORD", "shared-for-everyone");
         let creds = FleetCredentials::resolve(&op, &store);
 
-        match &creds.ready(0).expect("web-1 ready").auth {
+        match &creds.ready(0).and_then(FleetTarget::as_ssh).expect("web-1 ready").auth {
             SshAuth::Password { password } => assert_eq!(password.as_deref(), Some("only-web-1")),
             other => panic!("unexpected auth {other:?}"),
         }
@@ -340,6 +354,30 @@ mod tests {
         fn secret_names(&self) -> Vec<String> {
             Vec::new()
         }
+    }
+
+    #[test]
+    fn kubernetes_members_never_consult_the_credential_store() {
+        let targets = vec![
+            FleetTarget::KubePod(filar_core::KubePodRef {
+                cluster: "prod-eu".into(),
+                namespace: "shop".into(),
+                pod: "api-0".into(),
+                container: "app".into(),
+            }),
+            FleetTarget::KubeCluster(filar_core::KubeScopeRef {
+                cluster: "prod-eu".into(),
+                namespace: "shop".into(),
+            }),
+        ];
+        let op = FleetOperation::from_targets(&HostGroup::default(), &targets);
+
+        let creds = FleetCredentials::resolve(&op, &BrokenStore);
+
+        assert_eq!(creds.participants(&op), ["api-0", "prod-eu"]);
+        assert!(creds.skipped(&op).is_empty());
+        assert_eq!(creds.ready(0), Some(&targets[0]));
+        assert_eq!(creds.ready(1), Some(&targets[1]));
     }
 
     #[test]

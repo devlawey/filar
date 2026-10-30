@@ -11202,3 +11202,21 @@ Ctrl+O-списка в allow-list, fallback Check и сохранение LLM-п
 неполном черновике кластера.
 
 **Next:** #567.
+
+## #567 — FleetTarget для SSH и Kubernetes
+
+**Сделано.** Состав fleet теперь описывается `FleetTarget::{Ssh, KubePod,
+KubeCluster}`: pod и container фиксируются при входе, cluster-scope хранит
+cluster и namespace. `FleetOperation::from_targets` сохраняет уже разрешённый
+Kubernetes-состав без SSH tag selection. Kubernetes-участники не обращаются к
+keyring и не пропускаются из-за отсутствия SSH-секретов. Старые сессии с
+`fleet.hosts` читаются как SSH; новые snapshots хранят только name для SSH и
+secret-free identity для Kubernetes, без адресов, логинов, паролей и
+kubeconfig.
+
+**Контракты.** `FleetMember::target`, `HostConnector`,
+`FleetOperation::restore` и `FleetSnapshot` переведены на `FleetTarget`;
+изменение задокументировано в `docs/ENGINE_API.md`. `CommandExecutor` /
+`LlmClient` не менялись. SSH selection, restore и поведение fleet сохранены.
+
+**Next:** #568.

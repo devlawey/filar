@@ -584,7 +584,7 @@ pub struct Session {
     /// A restored fleet's composition exactly as it was saved (#442), in
     /// order, vanished hosts in their own places. What a later save writes,
     /// so neither membership nor order drifts across restore/save rounds.
-    pub fleet_saved_hosts: Option<Vec<String>>,
+    pub fleet_saved_targets: Option<Vec<filar_core::FleetTarget>>,
     /// The session file a restored fleet came from (#442). A later save
     /// writes back to it instead of a new file per run — otherwise each
     /// restore adds a copy, and the copies push older sessions out of the
@@ -1191,7 +1191,7 @@ impl Session {
             fleet_view: None,
             fleet_status: None,
             fleet_missing: Vec::new(),
-            fleet_saved_hosts: None,
+            fleet_saved_targets: None,
             fleet_saved_id: None,
             connecting: None,
         }
@@ -1294,13 +1294,13 @@ impl Session {
     /// ordinary tab.
     pub fn fleet_snapshot(&self) -> Option<filar_core::FleetSnapshot> {
         let op = self.fleet.as_ref()?;
-        let hosts = match &self.fleet_saved_hosts {
+        let targets = match &self.fleet_saved_targets {
             Some(saved) => saved.clone(),
-            None => op.members().iter().map(|m| m.name().to_string()).collect(),
+            None => op.members().iter().map(|m| m.target().clone()).collect(),
         };
         Some(filar_core::FleetSnapshot {
             group: op.group_name().to_string(),
-            hosts,
+            targets,
         })
     }
 }
@@ -3474,7 +3474,12 @@ impl App {
         // list with the hosts the config lost still in their places (#442).
         let members: Vec<String> = session
             .fleet_snapshot()
-            .map(|s| s.hosts)
+            .map(|s| {
+                s.targets
+                    .into_iter()
+                    .map(|target| target.name().to_string())
+                    .collect()
+            })
             .unwrap_or_default();
         // Which places of the saved list got no target. Positional, not by
         // name: with duplicate names only the occurrences past the ones
@@ -3580,7 +3585,7 @@ impl App {
                 let session = &self.sessions[self.active];
                 let fleet = session.fleet.as_ref().map(|op| {
                     let mut ids = filar_agent::FleetIdentifiers::from_targets(
-                        op.members().iter().map(|m| m.target()),
+                        op.members().iter().filter_map(|m| m.target().as_ssh()),
                     );
                     // A restored fleet's hosts the config lost are named in
                     // the feed too (#442) — scrubbed like the others.
@@ -6493,7 +6498,7 @@ pub(crate) fn test_fleet_view() -> filar_agent::fleet_view::FleetView {
     FleetView {
         operation: filar_core::FleetOperation::open(
             &filar_core::HostGroup::default(),
-            &[],
+            &[] as &[filar_core::SshTarget],
         )
         .id(),
         command: "cat /etc/os-release".into(),
@@ -6738,8 +6743,14 @@ impl App {
         if let Some(fi) = self.fleet_index() {
             self.close_fleet_session(fi);
         }
+        let targets: Vec<_> = self
+            .ssh_targets
+            .iter()
+            .cloned()
+            .map(filar_core::FleetTarget::Ssh)
+            .collect();
         let (op, missing) =
-            filar_core::FleetOperation::restore(&group, &snapshot.hosts, &self.ssh_targets);
+            filar_core::FleetOperation::restore(&group, &snapshot.targets, &targets);
         let base = &self.sessions[self.active];
         // The stricter of the saved dialogue's mode and the tab's: a restore
         // may tighten the confirm gate, never loosen it (review).
@@ -6786,7 +6797,7 @@ impl App {
         session.fleet = Some(op);
         session.fleet_credentials = Some(creds);
         session.fleet_missing = missing;
-        session.fleet_saved_hosts = Some(snapshot.hosts);
+        session.fleet_saved_targets = Some(snapshot.targets);
         session.fleet_saved_id = Some(saved.id);
         self.sessions.push(session);
         self.active = self.sessions.len() - 1;
@@ -14792,7 +14803,10 @@ mod tests {
             confirm_mode: None,
             fleet: Some(filar_core::FleetSnapshot {
                 group: group.into(),
-                hosts: hosts.iter().map(|h| h.to_string()).collect(),
+                targets: hosts
+                    .iter()
+                    .map(|name| filar_core::FleetTarget::Ssh(fleet_target(name, &[])))
+                    .collect(),
             }),
             kube: None,
         }
@@ -14878,7 +14892,8 @@ mod tests {
             .active_session()
             .fleet_snapshot()
             .expect("fleet session");
-        assert_eq!(snapshot.hosts, ["web-1", "web-7"]);
+        let names: Vec<_> = snapshot.targets.iter().map(filar_core::FleetTarget::name).collect();
+        assert_eq!(names, ["web-1", "web-7"]);
         assert_eq!(snapshot.group, "web");
         assert_eq!(
             app.active_session().fleet_saved_id.as_deref(),
@@ -14967,8 +14982,9 @@ mod tests {
             .active_session()
             .fleet_snapshot()
             .expect("fleet session");
+        let names: Vec<_> = snapshot.targets.iter().map(filar_core::FleetTarget::name).collect();
         assert_eq!(
-            snapshot.hosts,
+            names,
             ["web-7", "web-1", "web-2"],
             "order survives a save"
         );
@@ -15013,7 +15029,10 @@ mod tests {
             .to_vec();
         let skipped = vec![("app-1".to_string(), "no password".to_string())];
         let view = FleetView {
-            operation: filar_core::FleetOperation::open(&filar_core::HostGroup::default(), &[])
+            operation: filar_core::FleetOperation::open(
+                &filar_core::HostGroup::default(),
+                &[] as &[filar_core::SshTarget],
+            )
                 .id(),
             command: "uname -r".into(),
             headline: "operation #3: 3 of 6 hosts answered, 1 did not answer".into(),
@@ -15089,7 +15108,11 @@ mod tests {
         use filar_agent::fleet_view::FleetStatus;
         let view = test_fleet_view();
         let members: Vec<String> = ["web-1", "web-2", "web-3"].map(String::from).to_vec();
-        let later = filar_core::FleetOperation::open(&filar_core::HostGroup::default(), &[]).id();
+        let later = filar_core::FleetOperation::open(
+            &filar_core::HostGroup::default(),
+            &[] as &[filar_core::SshTarget],
+        )
+        .id();
         let status = |operation, running| FleetStatus {
             operation,
             answering: 1,
