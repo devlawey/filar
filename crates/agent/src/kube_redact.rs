@@ -301,7 +301,38 @@ fn configmap_value_is_sensitive(key: &str, value: &str) -> bool {
         return true;
     }
     let has_credentials = redact_bearer_and_urls(value) != value;
-    has_credentials || has_high_entropy(value) || embedded_json_is_sensitive(value)
+    has_credentials
+        || has_high_entropy(value)
+        || embedded_json_is_sensitive(value)
+        || has_sensitive_assignment(value)
+}
+
+fn has_sensitive_assignment(value: &str) -> bool {
+    value.lines().any(|line| {
+        let line = line.trim_start();
+        let line = line
+            .strip_prefix("export ")
+            .map_or(line, |line| line.trim_start());
+        let Some(separator) = line.find(|character| matches!(character, '=' | ':')) else {
+            return false;
+        };
+        let key = trim_matching_quotes(line[..separator].trim());
+        let assigned_value = line[separator + 1..].trim();
+        !key.is_empty() && !assigned_value.is_empty() && key_is_sensitive(key)
+    })
+}
+
+fn trim_matching_quotes(text: &str) -> &str {
+    if text.len() >= 2 {
+        let bytes = text.as_bytes();
+        if matches!(
+            (bytes[0], bytes[text.len() - 1]),
+            (b'\'', b'\'') | (b'"', b'"')
+        ) {
+            return text[1..text.len() - 1].trim();
+        }
+    }
+    text
 }
 
 fn key_is_sensitive(key: &str) -> bool {
@@ -381,19 +412,11 @@ fn redact_assignment_flags(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut copied = 0;
     let mut searched = 0;
-    while let Some((start, flag_length)) = find_next_flag(text, searched) {
-        let flag_end = start + flag_length;
-        if start > 0
-            && (is_identifier_byte(text.as_bytes()[start - 1])
-                || text.as_bytes()[start - 1] == b'-')
-        {
-            searched = flag_end;
-            continue;
-        }
-        let Some(delimiter) = text[flag_end..].chars().next() else {
+    while let Some((_, name_end)) = find_next_sensitive_assignment(text, searched) {
+        let Some(delimiter) = text[name_end..].chars().next() else {
             break;
         };
-        let mut value_start = flag_end;
+        let mut value_start = name_end;
         if delimiter == '=' {
             value_start += 1;
         } else if delimiter.is_whitespace() {
@@ -406,7 +429,7 @@ fn redact_assignment_flags(text: &str) -> String {
                 value_start += character.len_utf8();
             }
         } else {
-            searched = flag_end;
+            searched = name_end;
             continue;
         }
         let value_end = command_value_end(text, value_start);
@@ -432,8 +455,16 @@ fn command_value_end(text: &str, start: usize) -> usize {
         let quote = first as u8;
         let mut index = start + 1;
         while index < bytes.len() {
-            if bytes[index] == quote && bytes[index - 1] != b'\\' {
-                return index + 1;
+            if bytes[index] == quote {
+                let mut backslashes = 0;
+                let mut previous = index;
+                while previous > start + 1 && bytes[previous - 1] == b'\\' {
+                    backslashes += 1;
+                    previous -= 1;
+                }
+                if backslashes % 2 == 0 {
+                    return index + 1;
+                }
             }
             index += 1;
         }
@@ -447,19 +478,55 @@ fn command_value_end(text: &str, start: usize) -> usize {
 }
 
 fn is_credential_flag(text: &str) -> bool {
-    ["--password", "--token"]
-        .iter()
-        .any(|flag| text.eq_ignore_ascii_case(flag))
+    sensitive_flag_name_end(text, 0)
+        .is_some_and(|name_end| text[name_end..].chars().all(char::is_whitespace))
 }
 
-fn find_next_flag(text: &str, from: usize) -> Option<(usize, usize)> {
-    ["--password", "--token"]
-        .iter()
-        .filter_map(|flag| {
-            find_ascii_case_insensitive(&text[from..], flag)
-                .map(|offset| (from + offset, flag.len()))
-        })
-        .min_by_key(|(start, _)| *start)
+fn sensitive_flag_name_end(text: &str, start: usize) -> Option<usize> {
+    if !text[start..].starts_with("--") {
+        return None;
+    }
+    let name_start = start + 2;
+    let name_end = text[name_start..]
+        .find(|character: char| character == '=' || character.is_whitespace())
+        .map_or(text.len(), |offset| name_start + offset);
+    (name_end > name_start && key_is_sensitive(&text[name_start..name_end])).then_some(name_end)
+}
+
+fn find_next_sensitive_assignment(text: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut index = from;
+    while index < bytes.len() {
+        if bytes[index] == b'-'
+            && bytes.get(index + 1) == Some(&b'-')
+            && (index == 0 || (!is_identifier_byte(bytes[index - 1]) && bytes[index - 1] != b'-'))
+        {
+            if let Some(name_end) = sensitive_flag_name_end(text, index) {
+                return Some((index, name_end));
+            }
+        }
+        if is_identifier_start(bytes[index]) && is_env_assignment_boundary(bytes, index) {
+            let mut name_end = index + 1;
+            while name_end < bytes.len() && is_identifier_byte(bytes[name_end]) {
+                name_end += 1;
+            }
+            if bytes.get(name_end) == Some(&b'=') && key_is_sensitive(&text[index..name_end]) {
+                return Some((index, name_end));
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn is_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_env_assignment_boundary(bytes: &[u8], start: usize) -> bool {
+    start == 0
+        || bytes[start - 1].is_ascii_whitespace()
+        || matches!(bytes[start - 1], b';' | b'|' | b'&' | b'(' | b'\'' | b'"')
 }
 
 fn redact_bearer_tokens(text: &str) -> String {
@@ -879,6 +946,84 @@ mod tests {
         assert!(!object.to_string().contains("abc123"));
         assert!(!object.to_string().contains("my secret"));
         assert!(!object.to_string().contains("other secret"));
+    }
+
+    #[test]
+    fn configmap_multiline_sensitive_assignments_hide_the_whole_value() {
+        let object = redacted_object(
+            json!({
+                "kind": "ConfigMap",
+                "metadata": {"name": "settings", "namespace": "shop"},
+                "data": {
+                    "app.properties": "db.host=localhost\ndb.password=hunter2",
+                    "app.yaml": "database:\n  host: localhost\n  password: hunter2",
+                    ".env": "export MODE=prod\nexport DB_PASSWORD=x",
+                    "ordinary.yaml": "database:\n  host: localhost\n  port: 5432"
+                }
+            }),
+            &target(),
+        );
+        for key in ["app.properties", "app.yaml", ".env"] {
+            assert_eq!(object["data"][key], HIDDEN_VALUE, "{key}");
+        }
+        assert_eq!(
+            object["data"]["ordinary.yaml"],
+            "database:\n  host: localhost\n  port: 5432"
+        );
+    }
+
+    #[test]
+    fn credential_flag_names_and_sensitive_assignments_are_masked() {
+        let object = redacted_object(
+            json!({
+                "kind": "Pod",
+                "metadata": {"name": "api", "namespace": "shop"},
+                "spec": {"containers": [{
+                    "command": "DB_PASSWORD=x HOST=db.internal ./app --db-password=hunter2 --api-key abc --client-secret='two words'",
+                    "args": ["--api-token", "abc123", "--db-password=hunter2", "--verbose"]
+                }]}
+            }),
+            &target(),
+        );
+        let container = &object["spec"]["containers"][0];
+        assert_eq!(
+            container["command"],
+            format!("DB_PASSWORD={HIDDEN_VALUE} HOST=db.internal ./app --db-password={HIDDEN_VALUE} --api-key {HIDDEN_VALUE} --client-secret={HIDDEN_VALUE}")
+        );
+        assert_eq!(
+            container["args"],
+            json!([
+                "--api-token",
+                HIDDEN_VALUE,
+                format!("--db-password={HIDDEN_VALUE}"),
+                "--verbose"
+            ])
+        );
+        let serialized = object.to_string();
+        for secret in ["hunter2", "abc123", "abc", "two words", "DB_PASSWORD=x"] {
+            assert!(
+                !serialized.contains(secret),
+                "{secret} leaked: {serialized}"
+            );
+        }
+        assert!(serialized.contains("HOST=db.internal"));
+    }
+
+    #[test]
+    fn command_value_end_handles_quoted_edge_cases() {
+        let cases = [
+            (r#""a\"b" tail"#, r#""a\"b""#),
+            (r#""a\\" tail"#, r#""a\\""#),
+            (r#""a\\\"b" tail"#, r#""a\\\"b""#),
+            ("\"abc", "\"abc"),
+            ("\"\" tail", "\"\""),
+            ("\"it's fine\" tail", "\"it's fine\""),
+            ("'say \"hi\"' tail", "'say \"hi\"'"),
+        ];
+        for (input, expected_prefix) in cases {
+            let end = command_value_end(input, 0);
+            assert_eq!(&input[..end], expected_prefix, "{input}");
+        }
     }
 
     #[test]

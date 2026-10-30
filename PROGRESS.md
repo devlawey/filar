@@ -11109,14 +11109,15 @@ SSH-only consumers отключают defaults.
 только ссылками; last-applied и managedFields удаляются. ConfigMap сохраняет
 ключи, но скрывает секретные по имени/учётным данным/энтропии/длине значения;
 binaryData скрыт всегда. Известные секреты маскируются и в обычных строках
-объектов; вложенный JSON ConfigMap проверяется на секретные ключи. Аргументы
-маскируют inline и отдельные значения `--password`/`--token` и любой непустой
-userinfo URL. Логи проходят `redact_secrets`, bearer-токены и URL userinfo.
+объектов; вложенный JSON и многострочные YAML/.properties/.env ConfigMap
+проверяются на секретные присваивания. Аргументы маскируют inline и отдельные
+значения секретных `--`-флагов и `IDENT=value`, а также любой непустой userinfo
+URL. Логи проходят `redact_secrets`, bearer-токены и URL userinfo.
 Явные `reveal_configmaps` и новый `reveal_env = ["namespace/pod/VARIABLE"]`
 оставляют значение с пометкой `«раскрыто настройкой»`; env-исключение действует
 только на Pod, а не на вложенный шаблон Deployment.
 
-**Проверка.** 16 unit-тестов границы инструмента покрывают каждый тип редакции,
+**Проверка.** 19 unit-тестов границы инструмента покрывают каждый тип редакции,
 оба reveal, переходы `ConfigMapInfo`/`PodLogs` от `ClusterApi` и ложные
 срабатывания на портах, хостах, обычных URL и флагах; 12 config-тестов
 `KubeCluster`, `cargo build --workspace` и `cargo test --workspace` зелёные.

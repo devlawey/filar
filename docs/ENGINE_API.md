@@ -67,12 +67,13 @@ Kubernetes tool output and model messages, session history or exports. Structure
 objects lose `metadata.managedFields` and the last-applied-configuration
 annotation, and ordinary strings also pass through known-secret redaction.
 Literal environment values become `«скрыто»`; `valueFrom` and `envFrom` retain
-only source references. Container commands and arguments mask both inline and
-separate values of `--password` and `--token`, plus URL userinfo (with or
-without a colon). ConfigMap keys stay visible, while secret-like keys,
-credentials in embedded JSON, credential-bearing URLs, high-entropy values and
-values of at least 256 characters are hidden. Binary ConfigMap payloads are
-always hidden.
+only source references. Container commands and arguments mask inline and
+separate values of secret-like `--` flags and sensitive `IDENT=value`
+assignments, plus URL userinfo (with or without a colon). ConfigMap keys stay
+visible, while secret-like keys, sensitive assignments in multiline YAML,
+`.properties` and `.env` values, credentials in embedded JSON,
+credential-bearing URLs, high-entropy values and values of at least 256
+characters are hidden. Binary ConfigMap payloads are always hidden.
 
 Log output first uses `filar_core::redact_secrets`, then masks bearer tokens and
 URL userinfo. `KubeCluster::reveal_configmaps` (`namespace/name`) and
