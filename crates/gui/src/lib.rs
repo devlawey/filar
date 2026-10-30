@@ -2466,13 +2466,16 @@ impl LauncherApp {
                         });
                     }
                 });
+            let had_action = action.is_some();
             match action {
                 Some(HostAction::Up(i)) => self.move_host_up(i),
                 Some(HostAction::Down(i)) => self.move_host_down(i),
                 Some(HostAction::Remove(i)) => self.remove_host(i),
                 None => {}
             }
-            mode = self.target_mode;
+            if had_action {
+                mode = self.target_mode;
+            }
         }
 
         ui.horizontal(|ui| {

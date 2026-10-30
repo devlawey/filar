@@ -11196,6 +11196,7 @@ kubeconfig локально и выполняет Check одним namespaced po
 аддитивно добавлены optional `kube` и `kube_clusters`; публичный
 `KubeClusterApi::context_names` возвращает только имена контекстов.
 Тесты покрывают secret-free handoff/config, локальное чтение контекстов,
-разрешение CLI и уведомления импорта/экспорта.
+разрешение CLI и уведомления импорта/экспорта. По ревью исправлены выбор Local
+при непустом SSH-списке и проверка явного namespace по configured allow-list.
 
 **Next:** #567.

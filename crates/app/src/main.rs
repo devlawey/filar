@@ -243,6 +243,15 @@ fn resolve_cli_target(config: &Config, value: &str) -> filar_core::Result<CliTar
                 "Kubernetes namespace after '/' must not be empty".into(),
             ));
         }
+        if let Some(namespace) = explicit_namespace {
+            if !cluster.namespaces.is_empty()
+                && !cluster.namespaces.iter().any(|allowed| allowed == namespace)
+            {
+                return Err(CoreError::Other(format!(
+                    "Namespace '{namespace}' is not configured for Kubernetes cluster '{name}'"
+                )));
+            }
+        }
         return Ok(CliTarget::Kube(filar_core::KubeSessionSnapshot {
             target: cluster.name.clone(),
             namespace: explicit_namespace
@@ -1076,6 +1085,7 @@ mod tests {
         ));
         assert!(resolve_cli_target(&config, "missing").is_err());
         assert!(resolve_cli_target(&config, "prod-eu/").is_err());
+        assert!(resolve_cli_target(&config, "prod-eu/kube-system").is_err());
     }
 
     #[test]
