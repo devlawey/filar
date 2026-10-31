@@ -11273,3 +11273,24 @@ Explain radius и restore/save.
 реально доступные typed calls. Изменений SSH fleet и одиночного cluster tab нет.
 
 **Next:** пользовательский DoD против `docker/k8s`; далее веха 3.0.1.
+
+## Релиз 3.0.0 (2026-10-31)
+
+**Входит:** Kubernetes API-first — конфигурация кластеров (#562), read-only
+`ClusterApi` (#572), редакция вывода (#573), typed agent tools (#574), cluster tabs
+(#575), launcher/CLI (#566), typed fleet targets (#567), frozen Kubernetes fleets
+(#568) и их TUI (#569), а также дизайн и disposable integration stand (#560, #571).
+Полный пользовательский список — CHANGELOG `[3.0.0]`.
+
+**Preflight:** `main` (`6d3d788`) актуален; `cargo build --workspace` и
+`cargo test --workspace` зелёные, ignored docker/k8s-тесты не запускались. Release
+workflow покрывает Windows x86_64 и macOS aarch64; открытых issue milestone 3.0.0
+и существующих тегов/релиза `v3.0.0` нет.
+
+**Релизная бухгалтерия:** bump `2.0.7` → `3.0.0`; сравнительные ссылки CHANGELOG
+и примеры зависимостей `engine-v3.0.0` обновлены. Движок затронут: Upgrading
+секция фиксирует ломающие изменения fleet/config API и новые Kubernetes variants.
+Теги `v3.0.0` и `engine-v3.0.0` ставятся на один bump-коммит после push в `main`.
+
+**Ручная проверка:** полный SMOKE на Windows + macOS (#298), включая живой
+Kubernetes/fleet DoD против `docker/k8s`; unit-preflight эти сценарии не заменяет.

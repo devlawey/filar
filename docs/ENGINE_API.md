@@ -28,13 +28,13 @@ working example.
 Bots and mobile apps that only need SSH should disable default features:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.7", default-features = false }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.0", default-features = false }
 ```
 
 Desktop apps (TUI/GUI) should keep `local` enabled:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.7" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.0" }
 ```
 
 Consumers that need Kubernetes but not a local terminal can enable only `kube`:
@@ -117,9 +117,9 @@ resource requests and limits for pod diagnostics.
 
 ```toml
 [dependencies]
-filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.7" }
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.7", default-features = false }
-filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v2.0.7" }
+filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.0" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.0", default-features = false }
+filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.0" }
 
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"
@@ -689,7 +689,7 @@ let _agent = builder.risk_scorer(Some(scorer));
 - The decision model sees the command, the agent's explanation and the target
   description — the same data the session's LLM already has.
 
-## Upgrading to `engine-v3.0.0` (unreleased)
+## Upgrading to `engine-v3.0.0`
 
 | Change | Breaks | What to do |
 |--------|--------|------------|
@@ -699,6 +699,8 @@ let _agent = builder.risk_scorer(Some(scorer));
 | `KubeToolOutput`, `redact_logs`, redaction markers and `KubeCluster::reveal_env` (#573) | Nothing — additive (struct literals of `KubeCluster` use `..Default::default()`) | Pass Kubernetes objects/logs through `KubeToolOutput::redact_for_model` before giving them to a model |
 | `KubeToolExecutor`, six `k8s_*` tool definitions, typed calls/results, cluster prompt and Kubernetes arbiter context (#574) | `ContainerInfo` and `ArbiterContext` struct literals need the new resource-map / `kubernetes` fields; `CommandExecutor` and `LlmClient` are unchanged | Use `..` where practical, or populate the new fields; route cluster model output through `KubeToolExecutor` |
 | `FleetTarget::{Ssh, KubePod, KubeCluster}` and secret-free fleet snapshots (#567) | `FleetMember::target()` returns `&FleetTarget`; `HostConnector` and `FleetOperation::restore` use `FleetTarget`; `FleetSnapshot::hosts` is replaced by `targets`; target/member names and credential participant lists are owned `String` labels | Match the target variant in connectors and restore code; owned labels include Kubernetes scope; legacy session `hosts` arrays still deserialize as SSH targets |
+| `KubeFleet` and its typed approval/report API (#568) | Exhaustive matches on `CoreError`, `HostRun` and `HostState` need the new Kubernetes variants; the fleet API itself is additive | Handle access denial, disappearance/unavailability and typed text answers; use one `KubeFleetApproval` per exact frozen-fleet call |
+| `KubeAgent::new_fleet`, `KubeFleetObserver`, `KubeFleet::from_operation` and `KubeFleetReport::{view,status}` (#569) | Nothing — additive | Opt in to present frozen Kubernetes fleet results and restore exact membership without rediscovery |
 
 `CommandExecutor` and `LlmClient` are unchanged.
 
