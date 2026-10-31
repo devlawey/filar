@@ -23,7 +23,7 @@ working example.
 | Feature  | Default | What it enables                                   |
 |----------|---------|---------------------------------------------------|
 | `local`  | Yes     | `LocalExecutor`, `LocalInteractive` (requires `portable-pty`) |
-| `kube`   | Yes     | Read-only `ClusterApi` and `KubeClusterApi` (requires `kube-rs`) |
+| `kube`   | Yes     | Read-only `ClusterApi` / `KubeClusterApi` and the pod shell `KubeExecutor` (requires `kube-rs`) |
 
 Bots and mobile apps that only need SSH should disable default features:
 
@@ -59,6 +59,60 @@ back only to namespaces explicitly configured on the target. Absent
 `metrics.k8s.io` support is reported as `Unsupported`; RBAC, policy and
 not-found errors are sanitized so credentials and kubeconfig contents do not
 leak. ConfigMap values still require the consumer's output-redaction policy.
+
+## Pod shell — `KubeExecutor` (#563)
+
+With the `kube` feature, `KubeExecutor` is another `CommandExecutor`: a
+persistent shell inside a pod's container, reached through the API `exec`
+subresource. The trait is unchanged; everything that works on an SSH
+executor (`run`, `cancel`, `set_cwd`, `current_cwd`) works here.
+
+```rust,ignore
+use filar_core::{KubeCluster, PodRef};
+use filar_transport::{CommandExecutor, KubeExecutor};
+
+# async fn example(cluster: KubeCluster) -> filar_core::Result<()> {
+let target = PodRef::by_selector(&cluster.name, "shop", "app=web", Some("main"));
+let exec = KubeExecutor::connect(&cluster, &target).await?;
+let r = exec.run("cd /tmp && df -h .").await?;
+println!("{} — {}", exec.describe(), r.stdout);
+# Ok(()) }
+```
+
+- **Target.** `PodRef { cluster, namespace, pod, container }` (in
+  `filar-core`): `pod` is `PodSelector::Name` or `PodSelector::Labels`. A
+  selector picks the first `Running` + `Ready` pod by name. With no
+  container, the only container is used, else the
+  `kubectl.kubernetes.io/default-container` annotation; otherwise the error
+  lists the containers. `KubeCluster::describe_pod` gives the agent-facing line.
+- **Shell.** One `exec` of `/bin/sh` (`KubeExecConfig::shell`) with stdin and
+  no TTY, driven by the same marker protocol as SSH, so `cd` and `export`
+  persist. A container without the shell fails with a message pointing to an
+  ephemeral debug container.
+- **Cancel.** A second `exec` signals the shell's children (POSIX `ps`, `awk`,
+  `kill`). If that cannot be confirmed the stream is torn down and a new shell
+  opened; `cancel` then returns `SHELL_RECREATED_MESSAGE` (cd and variables
+  are reset) — it never silently fails.
+- **Reconnect.** A stream that closed **before** a command was sent is
+  reopened once (`KubeExecConfig::auto_reconnect`). With a selector, a
+  vanished pod is replaced by another ready one; the executor emits
+  `KubeExecEvent::PodChanged` (`subscribe()`) and `take_pod_change()` returns
+  the pair. A command that may have started is never retried.
+- **Limits.** `pod_limits()` returns `PodLimits` read from the already-fetched
+  pod spec: memory/CPU limits and requests of the container, effective
+  `runAsUser` / `runAsNonRoot`, `readOnlyRootFilesystem`, dropped
+  capabilities. `KubeExecEvent::Connected` carries them for the UI. Nothing is
+  run or measured in the container to obtain them.
+- **Denials.** A 403 from RBAC names the verb and resource
+  (`нет права create на pods/exec в namespace shop (контекст prod-eu)`); one
+  from an admission policy shows the policy's text
+  (`отказала политика допуска: …`). Neither is retried or worked around.
+  Errors carry the context and namespace, never credentials.
+- **Nothing is written** to the pod or the cluster; this executor never
+  creates ephemeral containers.
+
+The exec stream uses a client without read/write timeouts (an idle shell is
+normal); API reads keep the cluster's `request_timeout_secs`.
 
 ## Kubernetes output redaction
 
@@ -688,6 +742,12 @@ let _agent = builder.risk_scorer(Some(scorer));
   true`; the command is unaffected. The key is never part of an error.
 - The decision model sees the command, the agent's explanation and the target
   description — the same data the session's LLM already has.
+
+## Upgrading to the next engine release (unreleased)
+
+| Change | Breaks | What to do |
+|--------|--------|------------|
+| `KubeExecutor`, `KubeExecConfig`, `KubeExecEvent` under the `kube` feature; `PodRef`, `PodSelector`, `PodLimits` and `KubeCluster::describe_pod` in `filar-core` (#563) | Nothing — additive; `CommandExecutor` and `LlmClient` are unchanged | Use `KubeExecutor` wherever a `CommandExecutor` is expected for a pod shell |
 
 ## Upgrading to `engine-v3.0.0`
 

@@ -50,33 +50,17 @@ impl KubeClusterApi {
     /// `~/.kube/config`, in that order. `current-context` is never consulted.
     /// Exec credential plugins and proxy settings are handled by `kube-rs`.
     pub async fn connect(target: &KubeCluster) -> Result<Self> {
-        let kubeconfig = match target.kubeconfig.as_deref() {
-            Some(path) => Kubeconfig::read_from(expand_home(path)),
-            None => Kubeconfig::read(),
-        }
-        .map_err(|_| connect_error(target, "cannot read or parse the selected kubeconfig"))?;
-        let options = KubeConfigOptions {
-            context: Some(target.context.clone()),
-            ..KubeConfigOptions::default()
-        };
-        let mut config = Config::from_custom_kubeconfig(kubeconfig, &options)
-            .await
-            .map_err(|_| {
-                connect_error(
-                    target,
-                    "cannot load the explicit context or its credentials",
-                )
-            })?;
-        let timeout = Duration::from_secs(target.request_timeout_secs);
-        config.connect_timeout = Some(timeout);
-        config.read_timeout = Some(timeout);
-        config.write_timeout = Some(timeout);
-        let client = Client::try_from(config)
-            .map_err(|_| connect_error(target, "cannot initialize the Kubernetes client"))?;
+        let client = build_client(target, false).await?;
         Ok(Self {
             client,
             target: target.clone(),
         })
+    }
+
+    /// The bounded (request-timeout) client, for crate-internal callers that
+    /// need typed objects this read-only surface does not expose (#563).
+    pub(super) fn client(&self) -> &Client {
+        &self.client
     }
 
     async fn list_page<K, F, T>(
@@ -495,6 +479,41 @@ impl ClusterApi for KubeClusterApi {
     }
 }
 
+/// Build a client for `target`'s explicit context.
+///
+/// The kubeconfig path comes from the target, `$KUBECONFIG`, or
+/// `~/.kube/config`, in that order; `current-context` is never consulted.
+/// Exec credential plugins and proxy settings are handled by `kube-rs`.
+///
+/// `streaming` leaves the read and write timeouts unset: a long-lived exec
+/// stream (#563) is legitimately idle between commands, and a read timeout
+/// would tear the shell down. The connect timeout is always bounded.
+pub(super) async fn build_client(target: &KubeCluster, streaming: bool) -> Result<Client> {
+    let kubeconfig = match target.kubeconfig.as_deref() {
+        Some(path) => Kubeconfig::read_from(expand_home(path)),
+        None => Kubeconfig::read(),
+    }
+    .map_err(|_| connect_error(target, "cannot read or parse the selected kubeconfig"))?;
+    let options = KubeConfigOptions {
+        context: Some(target.context.clone()),
+        ..KubeConfigOptions::default()
+    };
+    let mut config = Config::from_custom_kubeconfig(kubeconfig, &options)
+        .await
+        .map_err(|_| connect_error(target, "cannot load the explicit context or its credentials"))?;
+    let timeout = Duration::from_secs(target.request_timeout_secs);
+    config.connect_timeout = Some(timeout);
+    if streaming {
+        config.read_timeout = None;
+        config.write_timeout = None;
+    } else {
+        config.read_timeout = Some(timeout);
+        config.write_timeout = Some(timeout);
+    }
+    Client::try_from(config)
+        .map_err(|_| connect_error(target, "cannot initialize the Kubernetes client"))
+}
+
 fn expand_home(path: &Path) -> PathBuf {
     if path == Path::new("~") {
         return dirs::home_dir().unwrap_or_else(|| path.to_path_buf());
@@ -518,11 +537,11 @@ fn is_rbac_denied(error: &kube::Error) -> bool {
     matches!(error, kube::Error::Api(status) if status.code == 403 && is_rbac_message(&status.message))
 }
 
-fn is_rbac_message(message: &str) -> bool {
+pub(super) fn is_rbac_message(message: &str) -> bool {
     message.contains("forbidden") && message.contains(" cannot ") && message.contains(" resource ")
 }
 
-fn api_error(
+pub(super) fn api_error(
     target: &KubeCluster,
     error: kube::Error,
     verb: &str,

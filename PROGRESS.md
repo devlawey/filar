@@ -11319,3 +11319,38 @@ ignored-тесты docker-sshd без изменений (ручные).
 **Контракты.** `CommandExecutor` / `LlmClient` не менялись.
 
 **Next:** #563 — `KubeExecutor` поверх `shell_protocol` и `EventSource` над exec-потоком.
+
+## Issue #563: `KubeExecutor` — персистентный шелл в поде (веха 3.0.1)
+
+**Сделано.** `crates/transport/src/cluster/exec.rs` (фича `kube`): один `exec`
+шелла (`/bin/sh`, `KubeExecConfig::shell`) со stdin и без TTY; потоки stdout/stderr
+превращаются в `shell_protocol::ChannelEvent` (UTF-8 склеивается между чтениями),
+`run` — маркер, код, `PWD`, добор stderr, таймаут → прерывание → ресинк.
+`cancel` — второй `exec` с `interrupt_command(pid)`; не подтвердился (нет `ps`/`awk`,
+нет PID) → поток рвётся, шелл открывается заново, ошибка
+`SHELL_RECREATED_MESSAGE`. Поток закрыт до отправки → один тихий реконнект; по
+селектору остаёмся в текущем поде, пока он Ready, иначе — первый готовый по имени,
+`KubeExecEvent::PodChanged` + `take_pod_change()` + WARN в ленту.
+
+**Решения.**
+- Exec-поток идёт через отдельный клиент без read/write-таймаутов
+  (`build_client(.., streaming = true)`), иначе простаивающий шелл рвался бы через
+  `request_timeout_secs`; чтения API — прежний ограниченный клиент.
+- Отказ WebSocket-апгрейда в kube-rs теряет тело `Status` (`ProtocolSwitch(403)`),
+  поэтому при 403 exec повторяется простым `POST` без апгрейда: API авторизует и
+  пропускает через admission так же, но апгрейд отклоняет — ничего не запускается.
+  Из ответа берутся глагол/ресурс RBAC или текст политики.
+- Выбор пода и `PodLimits` — из того же `get pod` (новых прав не нужно); лимиты
+  контейнера, `runAsUser`/`runAsNonRoot` контейнер → под, `readOnlyRootFilesystem`,
+  отброшенные capabilities.
+- `PodRef`/`PodSelector`/`PodLimits` и `KubeCluster::describe_pod` — в `filar-core`.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись; всё аддитивно
+(`docs/ENGINE_API.md`). Ничего не пишется ни в под, ни в кластер.
+
+**Проверка.** Юнит-тесты выбора пода/контейнера, 403 RBAC vs политика, нет шелла,
+`PodLimits`, отсутствие секретов в ошибках. `tests/kube_exec.rs` — `#[ignore]`
+против `docker/k8s` (cd/export, коды, stderr, cancel `sleep 30`, удаление пода,
+distroless, `no-exec`, `PodLimits`) — ручные, кластера в окружении агента нет.
+
+**Next:** #564 — промпт пода и kube-цель для арбитра; #565 — вкладка пода в TUI.
