@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use filar_core::{
-    CoreError, FleetCheck, FleetOperation, FleetTarget, HostGroup, KubeCluster, KubePodRef, KubeScopeRef, OperationId,
-    Result, SecretProvider,
+    CoreError, FleetCheck, FleetOperation, FleetTarget, HostGroup, KubeCluster, KubePodRef,
+    KubeScopeRef, OperationId, Result, SecretProvider,
 };
 use filar_transport::{ClusterApi, KubeClusterApi, PodInfo};
 use futures::stream::{self, FuturesUnordered, StreamExt};
@@ -21,6 +21,7 @@ use crate::fleet_fold::{fold, FoldedTable};
 use crate::fleet_gate::{radius_line, ApprovalScope, FleetGate};
 use crate::fleet_result::OperationResult;
 use crate::fleet_run::{FleetRunReport, HostRun};
+use crate::fleet_view::{FleetStatus, FleetView};
 use crate::kube_tools::{bind_fleet_call, KubeToolCall, KubeToolExecutor};
 use crate::preprocess::PreprocessorRegistry;
 
@@ -34,8 +35,16 @@ pub struct KubeFleetCluster {
 
 impl KubeFleetCluster {
     /// Bind an already connected read-only API to its configured target.
-    pub fn new(target: KubeCluster, api: Arc<dyn ClusterApi>, secrets: Arc<dyn SecretProvider>) -> Self {
-        Self { target, api, secrets }
+    pub fn new(
+        target: KubeCluster,
+        api: Arc<dyn ClusterApi>,
+        secrets: Arc<dyn SecretProvider>,
+    ) -> Self {
+        Self {
+            target,
+            api,
+            secrets,
+        }
     }
 
     /// Connect a configured target through the standard read-only transport.
@@ -118,14 +127,35 @@ impl KubeFleet {
                 })
                 .collect()
         };
-        let clusters = selected
+        Self::from_operation(FleetOperation::from_targets(group, &targets), selected)
+    }
+
+    /// Bind live cluster APIs to an existing frozen composition.
+    ///
+    /// Session restore uses this instead of discovery: saved pod and cluster
+    /// identities stay unchanged, and no new pod can join the restored fleet.
+    pub fn from_operation(fleet: FleetOperation, clusters: Vec<KubeFleetCluster>) -> Result<Self> {
+        let clusters: BTreeMap<String, KubeFleetCluster> = clusters
             .into_iter()
             .map(|cluster| (cluster.target.name.clone(), cluster))
             .collect();
-        Ok(Self {
-            fleet: FleetOperation::from_targets(group, &targets),
-            clusters,
-        })
+        for member in fleet.members() {
+            let cluster = match member.target() {
+                FleetTarget::KubePod(pod) => &pod.cluster,
+                FleetTarget::KubeCluster(scope) => &scope.cluster,
+                FleetTarget::Ssh(_) => {
+                    return Err(CoreError::Other(
+                        "SSH member found in a Kubernetes fleet".into(),
+                    ));
+                }
+            };
+            if !clusters.contains_key(cluster) {
+                return Err(CoreError::Config(format!(
+                    "no configured Kubernetes cluster API for fleet member {cluster}"
+                )));
+            }
+        }
+        Ok(Self { fleet, clusters })
     }
 
     /// The composition frozen at fleet entry.
@@ -135,7 +165,11 @@ impl KubeFleet {
 
     /// Scoped member labels shown in the single fleet-wide confirmation.
     pub fn radius(&self) -> Vec<String> {
-        self.fleet.members().iter().map(|member| member.name()).collect()
+        self.fleet
+            .members()
+            .iter()
+            .map(|member| member.name())
+            .collect()
     }
 
     /// Human-readable radius for confirmation dialogs and audit output.
@@ -179,7 +213,8 @@ impl KubeFleet {
         call: &KubeToolCall,
         approval: KubeFleetApproval,
     ) -> Result<KubeFleetReport> {
-        self.run_until(call, approval, &CancellationToken::new()).await
+        self.run_until(call, approval, &CancellationToken::new())
+            .await
     }
 
     /// [`run`](Self::run) with local cancellation of queued and running reads.
@@ -207,14 +242,14 @@ impl KubeFleet {
                 FleetTarget::KubePod(pod) => &pod.cluster,
                 FleetTarget::KubeCluster(scope) => &scope.cluster,
                 FleetTarget::Ssh(_) => {
-                    return Err(CoreError::Other("SSH member found in a Kubernetes fleet".into()));
+                    return Err(CoreError::Other(
+                        "SSH member found in a Kubernetes fleet".into(),
+                    ));
                 }
             };
-            let cluster = self
-                .clusters
-                .get(cluster_name)
-                .cloned()
-                .ok_or_else(|| CoreError::Other(format!("no API for Kubernetes cluster {cluster_name}")))?;
+            let cluster = self.clusters.get(cluster_name).cloned().ok_or_else(|| {
+                CoreError::Other(format!("no API for Kubernetes cluster {cluster_name}"))
+            })?;
             tasks.push((handle, KubeTask { target, cluster }));
         }
 
@@ -230,7 +265,13 @@ impl KubeFleet {
                 match queue.next() {
                     Some((index, (_, task))) => {
                         op.set_progress(handles[index], filar_core::HostProgress::Running);
-                        in_flight.push(run_one(index, task, call.clone(), deadline, cancel.clone()));
+                        in_flight.push(run_one(
+                            index,
+                            task,
+                            call.clone(),
+                            deadline,
+                            cancel.clone(),
+                        ));
                     }
                     None => break,
                 }
@@ -248,7 +289,10 @@ impl KubeFleet {
             finished.push((index, HostRun::Cancelled));
         }
         finished.sort_by_key(|(index, _)| *index);
-        let runs = finished.into_iter().map(|(index, run)| (handles[index], run)).collect();
+        let runs = finished
+            .into_iter()
+            .map(|(index, run)| (handles[index], run))
+            .collect();
         let run = FleetRunReport::from_runs(op.id(), runs);
         let mut result = OperationResult::build(&op, &run, &[])?;
         let check = FleetCheck::ad_hoc(call.tool_name()).map_err(CoreError::Other)?;
@@ -256,6 +300,7 @@ impl KubeFleet {
         let (new_pods, notices) = self.discover_changes(&op, cancel).await;
         Ok(KubeFleetReport {
             operation: op.id(),
+            fleet: op,
             result,
             run,
             folded,
@@ -271,11 +316,11 @@ impl KubeFleet {
     ) -> (Vec<String>, Vec<String>) {
         if cancel.is_cancelled()
             || op
-            .group()
-            .kube
-            .as_ref()
-            .and_then(|kube| kube.selector.as_ref())
-            .is_none()
+                .group()
+                .kube
+                .as_ref()
+                .and_then(|kube| kube.selector.as_ref())
+                .is_none()
         {
             return (Vec::new(), Vec::new());
         }
@@ -313,7 +358,10 @@ impl KubeFleet {
                 (new_pods, Vec::new())
             }
             Err(_) if cancel.is_cancelled() => (Vec::new(), Vec::new()),
-            Err(error) => (Vec::new(), vec![format!("не удалось проверить новые поды: {error}")]),
+            Err(error) => (
+                Vec::new(),
+                vec![format!("не удалось проверить новые поды: {error}")],
+            ),
         }
     }
 }
@@ -354,7 +402,9 @@ async fn run_one(
 
 fn classify_error(error: CoreError, target: &FleetTarget) -> CoreError {
     match error {
-        CoreError::NotFound(message) if !matches!(target, FleetTarget::KubePod(_)) => CoreError::Other(message),
+        CoreError::NotFound(message) if !matches!(target, FleetTarget::KubePod(_)) => {
+            CoreError::Other(message)
+        }
         other => other,
     }
 }
@@ -365,10 +415,12 @@ async fn discover_targets(
     deadline: Duration,
     cancel: &CancellationToken,
 ) -> Result<Vec<FleetTarget>> {
-    let kube = group
-        .kube
-        .as_ref()
-        .ok_or_else(|| CoreError::Config(format!("host group {} has no Kubernetes selection", group.name)))?;
+    let kube = group.kube.as_ref().ok_or_else(|| {
+        CoreError::Config(format!(
+            "host group {} has no Kubernetes selection",
+            group.name
+        ))
+    })?;
     let namespace = kube.namespace.clone();
     let selector = kube.selector.clone();
     let limit = group.max_parallel.max(1) as usize;
@@ -407,7 +459,9 @@ async fn discover_targets(
     for discovery in discovered {
         let (cluster, mut pods) = discovery?;
         pods.retain(|pod| pod.ready);
-        pods.sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+        pods.sort_by(|left, right| {
+            (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
+        });
         for pod in pods {
             let container = pod
                 .containers
@@ -437,6 +491,7 @@ fn pod_identity(pod: &KubePodRef) -> String {
 /// One completed Kubernetes fleet operation and its model-safe fold.
 pub struct KubeFleetReport {
     operation: OperationId,
+    fleet: FleetOperation,
     result: OperationResult,
     run: FleetRunReport,
     folded: FoldedTable,
@@ -470,6 +525,27 @@ impl KubeFleetReport {
         &self.new_pods
     }
 
+    /// Person-facing difference table, kept separate from the model result.
+    pub fn view(&self, command: &str) -> FleetView {
+        FleetView::build(
+            &self.fleet,
+            command,
+            &self.run,
+            &self.folded,
+            &self.result.summary(),
+        )
+    }
+
+    /// Final answered-member count for the frontend status bar.
+    pub fn status(&self) -> FleetStatus {
+        FleetStatus {
+            operation: self.operation,
+            answering: self.result.summary().answered(),
+            total: self.fleet.len(),
+            running: false,
+        }
+    }
+
     /// Render only the summary, fold and composition notices for the model.
     pub fn render(&self) -> String {
         let mut output = self.result.summary().headline();
@@ -498,8 +574,9 @@ mod tests {
     use async_trait::async_trait;
     use filar_core::{KubeGroup, StaticSecretProvider};
     use filar_transport::{
-        ConfigMapInfo, ContainerInfo, EndpointInfo, EventInfo, IngressInfo, NamespaceInfo, NodeInfo, PodLogs,
-        ResourceMetrics, RolloutRevision, ServiceInfo, WorkloadInfo, WorkloadKind,
+        ConfigMapInfo, ContainerInfo, EndpointInfo, EventInfo, IngressInfo, NamespaceInfo,
+        NodeInfo, PodLogs, ResourceMetrics, RolloutRevision, ServiceInfo, WorkloadInfo,
+        WorkloadKind,
     };
 
     use crate::fleet_result::HostState;
@@ -547,7 +624,12 @@ mod tests {
 
     #[async_trait]
     impl ClusterApi for MockCluster {
-        async fn list_pods(&self, _: Option<&str>, _: Option<&str>, _: Option<&str>) -> Result<Vec<PodInfo>> {
+        async fn list_pods(
+            &self,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Vec<PodInfo>> {
             self.pod_lists.fetch_add(1, Ordering::SeqCst);
             let delay = *self.delay.lock().unwrap_or_else(|p| p.into_inner());
             if !delay.is_zero() {
@@ -602,12 +684,15 @@ mod tests {
             _: u32,
             _: usize,
         ) -> Result<PodLogs> {
-            self.log_calls.lock().unwrap_or_else(|p| p.into_inner()).push((
-                namespace.into(),
-                pod.into(),
-                container.map(str::to_owned),
-                previous,
-            ));
+            self.log_calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((
+                    namespace.into(),
+                    pod.into(),
+                    container.map(str::to_owned),
+                    previous,
+                ));
             Ok(self
                 .logs
                 .lock()
@@ -620,7 +705,11 @@ mod tests {
                 }))
         }
 
-        async fn list_workloads(&self, _: Option<&str>, _: WorkloadKind) -> Result<Vec<WorkloadInfo>> {
+        async fn list_workloads(
+            &self,
+            _: Option<&str>,
+            _: WorkloadKind,
+        ) -> Result<Vec<WorkloadInfo>> {
             Ok(Vec::new())
         }
 
@@ -733,7 +822,10 @@ mod tests {
 
     async fn run_approved(fleet: &KubeFleet, call: &KubeToolCall) -> KubeFleetReport {
         let approval = fleet.approve(call).expect("call is approved");
-        fleet.run(call, approval).await.expect("operation completes")
+        fleet
+            .run(call, approval)
+            .await
+            .expect("operation completes")
     }
 
     #[tokio::test]
@@ -770,7 +862,10 @@ mod tests {
 
     #[tokio::test]
     async fn outcomes_keep_denial_disappearance_unavailability_and_timeout_distinct() {
-        let (cluster, mock) = cluster("prod-eu", vec![pod("ok"), pod("denied"), pod("gone"), pod("offline")]);
+        let (cluster, mock) = cluster(
+            "prod-eu",
+            vec![pod("ok"), pod("denied"), pod("gone"), pod("offline")],
+        );
         *mock.behaviour.lock().unwrap_or_else(|p| p.into_inner()) = BTreeMap::from([
             ("denied".into(), Behaviour::Denied),
             ("gone".into(), Behaviour::Gone),
@@ -780,7 +875,12 @@ mod tests {
             .await
             .expect("fleet opens");
         let report = run_approved(&fleet, &describe()).await;
-        let states: Vec<_> = report.result().rows().iter().map(|row| row.state()).collect();
+        let states: Vec<_> = report
+            .result()
+            .rows()
+            .iter()
+            .map(|row| row.state())
+            .collect();
         assert_eq!(
             states,
             [
@@ -793,6 +893,28 @@ mod tests {
         let rendered = report.render();
         assert!(rendered.contains("access denied"), "{rendered}");
         assert!(rendered.contains("pod disappeared"), "{rendered}");
+
+        let view = report.view("k8s_get pod");
+        assert_eq!(view.groups.len(), 1);
+        assert_eq!(view.groups[0].hosts, ["prod-eu/shop/ok/main"]);
+        let dropped: Vec<_> = view
+            .dropped
+            .iter()
+            .map(|row| (row.host.as_str(), row.state))
+            .collect();
+        assert_eq!(
+            dropped,
+            [
+                ("prod-eu/shop/denied/main", HostState::AccessDenied),
+                ("prod-eu/shop/gone/main", HostState::PodDisappeared),
+                ("prod-eu/shop/offline/main", HostState::NoContact),
+            ]
+        );
+        let status = report.status();
+        assert_eq!(status.operation, report.operation());
+        assert_eq!(status.answering, 3);
+        assert_eq!(status.total, 4);
+        assert!(!status.running);
     }
 
     #[tokio::test(start_paused = true)]
@@ -804,7 +926,9 @@ mod tests {
             .insert("slow".into(), Behaviour::Hang);
         let mut group = group(&["prod-eu"], Some("app=web"));
         group.per_host_timeout_secs = 1;
-        let fleet = KubeFleet::open(&group, vec![cluster]).await.expect("fleet opens");
+        let fleet = KubeFleet::open(&group, vec![cluster])
+            .await
+            .expect("fleet opens");
         let report = run_approved(&fleet, &describe()).await;
         assert_eq!(report.result().rows()[0].state(), HostState::TimedOut);
     }
@@ -854,7 +978,10 @@ mod tests {
         let fleet = KubeFleet::open(&group(&["prod-eu"], Some("app=web")), vec![cluster])
             .await
             .expect("fleet opens");
-        mock.pods.lock().unwrap_or_else(|p| p.into_inner()).push(pod("new"));
+        mock.pods
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(pod("new"));
         let report = run_approved(&fleet, &logs()).await;
         assert_eq!(report.result().rows().len(), 2);
         assert_eq!(report.new_pods(), ["prod-eu/shop/new/main"]);
@@ -924,7 +1051,11 @@ mod tests {
             Ok(_) => panic!("approval must not cover a substituted call"),
         };
         assert!(error.to_string().contains("does not match"), "{error}");
-        assert!(first_mock.log_calls.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+        assert!(first_mock
+            .log_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty());
     }
 
     #[tokio::test]
@@ -943,7 +1074,11 @@ mod tests {
             .await
             .expect("cancelled operation returns its partial result");
         assert_eq!(report.result().summary().cancelled(), 1);
-        assert_eq!(mock.pod_lists.load(Ordering::SeqCst), 1, "no rediscovery after cancellation");
+        assert_eq!(
+            mock.pod_lists.load(Ordering::SeqCst),
+            1,
+            "no rediscovery after cancellation"
+        );
         assert!(report.new_pods().is_empty());
     }
 

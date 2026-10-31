@@ -60,15 +60,15 @@ pub use agent::{Agent, AgentBuilder};
 pub use arbiter::{ArbiterContext, ArbiterVerdict, ARBITER_TIMEOUT_SECS};
 pub use compaction::{summarise_history, SummaryOutcome, COMPACTION_SYSTEM_PROMPT};
 pub use events::{AgentEvent, EventSink};
-pub use kube_agent::KubeAgent;
+pub use kube_agent::{KubeAgent, KubeFleetObserver};
 pub use kube_fleet::{KubeFleet, KubeFleetApproval, KubeFleetCluster, KubeFleetReport};
 pub use kube_redact::{
     redact_logs, KubeToolOutput, CONFIGMAP_VALUE_MAX_CHARS, HIDDEN_VALUE, REVEALED_BY_CONFIG,
 };
 pub use kube_tools::{
-    bind_fleet_call, build_kube_system_prompt, kube_confirmation_decision, kube_tool_definitions,
-    parse_kube_tool_call, KubeResourceKind, KubeToolCall, KubeToolExecutor, KubeToolResult,
-    KubeTopResource,
+    bind_fleet_call, build_kube_fleet_system_prompt, build_kube_system_prompt,
+    kube_confirmation_decision, kube_tool_definitions, parse_kube_tool_call, KubeResourceKind,
+    KubeToolCall, KubeToolExecutor, KubeToolResult, KubeTopResource,
 };
 pub use openai_compat::OpenAiCompatClient;
 pub use os_probe::OsFamilyProbe;

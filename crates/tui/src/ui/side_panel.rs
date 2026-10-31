@@ -73,8 +73,9 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
 
     // Header: the command and the headline, which always says how many
     // hosts did not answer (#428).
+    let prompt = if app.in_kube_fleet() { glyphs.kube } else { "$" };
     let mut head: Vec<Line> = vec![Line::from(Span::styled(
-        fit(&format!(" $ {}", one_line(&view.command)), width),
+        fit(&format!(" {prompt} {}", one_line(&view.command)), width),
         app.theme.command_style(),
     ))];
     for l in wrap_at_words(&view.headline, width.saturating_sub(1).max(1)) {
@@ -565,6 +566,61 @@ mod tests {
         app.side_panel.selected = 0;
         let text = render(&app, 60, 20, &Glyphs::UNICODE);
         assert!(text.contains("as of last poll"), "{text}");
+    }
+
+    #[test]
+    fn kubernetes_summary_names_members_and_distinguishes_failures() {
+        use filar_agent::fleet_result::HostState;
+        use filar_agent::fleet_view::{FleetView, GroupRole, ViewDropped, ViewGroup};
+
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let group = filar_core::HostGroup {
+            name: "web-prod".into(),
+            kube: Some(filar_core::KubeGroup {
+                clusters: vec!["prod-eu".into()],
+                namespace: "shop".into(),
+                selector: Some("app=web".into()),
+            }),
+            ..Default::default()
+        };
+        let operation = filar_core::FleetOperation::from_targets(&group, &[]);
+        app.active_session_mut().fleet = Some(operation.clone());
+        app.active_session_mut().fleet_view = Some(FleetView {
+            operation: operation.id(),
+            command: "k8s_get pod -l app=web".into(),
+            headline: "1/4 members answered".into(),
+            groups: vec![ViewGroup {
+                hosts: vec!["prod-eu/shop/web-a/main".into()],
+                sample: "RESTARTS 1".into(),
+                role: GroupRole::Baseline,
+            }],
+            dropped: vec![
+                ViewDropped {
+                    host: "prod-eu/shop/web-b/main".into(),
+                    state: HostState::AccessDenied,
+                    exit_code: None,
+                    reason: None,
+                },
+                ViewDropped {
+                    host: "prod-eu/shop/web-c/main".into(),
+                    state: HostState::PodDisappeared,
+                    exit_code: None,
+                    reason: None,
+                },
+                ViewDropped {
+                    host: "prod-eu/shop/web-d/main".into(),
+                    state: HostState::NoContact,
+                    exit_code: None,
+                    reason: None,
+                },
+            ],
+        });
+        let text = render(&app, 100, 24, &Glyphs::UNICODE);
+        assert!(text.contains("⎈ k8s_get pod -l app=web"), "{text}");
+        assert!(text.contains("prod-eu/shop/web-a/main"), "{text}");
+        assert!(text.contains("prod-eu/shop/web-b/main · access denied"), "{text}");
+        assert!(text.contains("prod-eu/shop/web-c/main · pod disappeared"), "{text}");
+        assert!(text.contains("prod-eu/shop/web-d/main · no contact"), "{text}");
     }
 
     #[test]

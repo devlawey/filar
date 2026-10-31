@@ -59,7 +59,10 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let audit_unavailable = confirm.audit_unavailable;
     let radius = confirm.radius.clone();
     let radius_expanded = confirm.radius_expanded;
-    let kubernetes = app.kube.is_some() && command.starts_with("k8s_");
+    let radius_kind = confirm.radius_kind;
+    let radius_context = confirm.radius_context.clone();
+    let kube_fleet = app.in_kube_fleet();
+    let kubernetes = (app.kube.is_some() || kube_fleet) && command.starts_with("k8s_");
     let kube_target = app.kube.as_ref().map(|kube| {
         (
             kube.target.name.clone(),
@@ -120,7 +123,12 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or(0);
     let command_rows = estimate_wrapped_rows(&command_text, inner_width);
     let empty_rows = 1; // separator line before buttons
-    let radius_rows = match radius_lines(&radius, radius_expanded) {
+    let radius_rows = match radius_lines(
+        &radius,
+        radius_kind,
+        radius_context.as_deref(),
+        radius_expanded,
+    ) {
         None => 0,
         Some((_, None)) => 1,
         Some((_, Some(list))) => 1 + estimate_wrapped_rows(&list, inner_width),
@@ -141,7 +149,12 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let max_content_rows = modal_height.saturating_sub(3) as usize;
 
     let lines = build_modal_lines(
-        radius_lines(&radius, radius_expanded),
+        radius_lines(
+            &radius,
+            radius_kind,
+            radius_context.as_deref(),
+            radius_expanded,
+        ),
         &explanation,
         &command_text,
         destructive,
@@ -184,7 +197,12 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         app.theme.warning
     };
-    let modal_title = if kubernetes {
+    let modal_title = if kubernetes && kube_fleet {
+        match radius.len() {
+            0 => " Confirm Kubernetes fleet ".to_string(),
+            n => format!(" Confirm Kubernetes on {n} {} ", radius_kind.noun(n)),
+        }
+    } else if kubernetes {
         match kube_target {
             Some((name, namespace, _)) => format!(
                 " Confirm Kubernetes: {} / {} ",
@@ -268,15 +286,26 @@ fn audit_display_rows(
     rows
 }
 
-/// The fleet radius as modal text (#435): the counter line, and the host
+/// The fleet radius as modal text (#435): the counter line, and the member
 /// list when expanded. `None` outside a fleet.
-fn radius_lines(radius: &[String], expanded: bool) -> Option<(String, Option<String>)> {
+fn radius_lines(
+    radius: &[String],
+    kind: crate::app::FleetRadiusKind,
+    context: Option<&str>,
+    expanded: bool,
+) -> Option<(String, Option<String>)> {
     if radius.is_empty() {
         return None;
     }
-    let noun = if radius.len() == 1 { "host" } else { "hosts" };
     let key = if expanded { "l: hide" } else { "l: list" };
-    let header = format!("Runs on {} {noun} — {key}", radius.len());
+    let context = context
+        .map(|context| format!(" ({context})"))
+        .unwrap_or_default();
+    let header = format!(
+        "Runs on {} {}{context} — {key}",
+        radius.len(),
+        kind.noun(radius.len())
+    );
     Some((header, expanded.then(|| radius.join(", "))))
 }
 
@@ -777,6 +806,52 @@ mod tests {
         assert!(
             !app.confirm_button_areas.is_empty(),
             "buttons stay on screen"
+        );
+    }
+
+    #[test]
+    fn kubernetes_radius_uses_pod_context_and_concrete_member_names() {
+        let pods = vec![
+            "prod-eu/shop/web-a/main".to_string(),
+            "prod-us/shop/web-c/main".to_string(),
+        ];
+        assert_eq!(
+            radius_lines(
+                &pods,
+                crate::app::FleetRadiusKind::Pods,
+                Some("prod-eu, prod-us / shop"),
+                false,
+            ),
+            Some((
+                "Runs on 2 pods (prod-eu, prod-us / shop) — l: list".into(),
+                None,
+            ))
+        );
+        assert_eq!(
+            radius_lines(
+                &pods,
+                crate::app::FleetRadiusKind::Pods,
+                Some("prod-eu, prod-us / shop"),
+                true,
+            ),
+            Some((
+                "Runs on 2 pods (prod-eu, prod-us / shop) — l: hide".into(),
+                Some("prod-eu/shop/web-a/main, prod-us/shop/web-c/main".into()),
+            ))
+        );
+    }
+
+    #[test]
+    fn cluster_scope_radius_uses_the_cluster_noun() {
+        let clusters = vec!["prod-eu/shop".to_string(), "prod-us/shop".to_string()];
+        assert_eq!(
+            radius_lines(
+                &clusters,
+                crate::app::FleetRadiusKind::Clusters,
+                None,
+                false,
+            ),
+            Some(("Runs on 2 clusters — l: list".into(), None))
         );
     }
 

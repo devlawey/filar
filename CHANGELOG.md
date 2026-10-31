@@ -13,6 +13,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Kubernetes fleet TUI: kube groups in Ctrl+O, pod/cluster-aware confirmation
+  radius and answered counts, full-member difference tables with distinct
+  RBAC/disappearance outcomes, and secret-free frozen-fleet session restore
+  ([#569](https://github.com/devlawey/filar/issues/569)).
 - Read-only Kubernetes fleets in `[[host_groups]]`: frozen ready-pod or
   cluster/namespace composition across configured clusters, bounded typed API
   fan-out with per-member deadlines, redacted difference folds, distinct
