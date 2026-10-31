@@ -11261,8 +11261,11 @@ pods/clusters и cluster/namespace-контекст, `l` раскрывает п
 Ctrl+J сохраняет полные ответы только для человека, различает `access denied`,
 `pod disappeared` и `no contact`, а статус считает ответившие pods/clusters.
 Сохранённая сессия восстанавливает frozen identities через `from_operation`
-без повторного discovery; live APIs и kubeconfig не сериализуются. Добавлены
-тесты Ctrl+O, confirm, status, side panel, report conversion и restore/save.
+без повторного discovery; live APIs и kubeconfig не сериализуются. Отмена
+возвращает partial report наблюдателю, неудачное discovery повторно запускается
+явным выбором группы через Ctrl+O, а Explain использует nouns pods/clusters.
+Добавлены тесты Ctrl+O, confirm, status, side panel, report conversion, retry,
+Explain radius и restore/save.
 
 **Контракты.** `CommandExecutor` / `LlmClient` не менялись. Аддитивно:
 `KubeAgent::new_fleet`, `KubeFleetObserver`, `KubeFleet::from_operation`,

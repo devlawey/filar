@@ -667,6 +667,8 @@ pub struct Session {
     pub fleet_credentials: Option<filar_agent::fleet_creds::FleetCredentials>,
     /// Monotonic id of asynchronous Kubernetes discovery/API binding.
     pub fleet_connection_id: Option<u64>,
+    /// Whether the last Kubernetes discovery/API binding failed and may be retried.
+    pub(crate) kube_fleet_failed: bool,
     /// The last fleet operation's person-facing view (#438), shown in the
     /// side panel. Never part of `messages`: it carries host output.
     pub fleet_view: Option<filar_agent::fleet_view::FleetView>,
@@ -1291,6 +1293,7 @@ impl Session {
             fleet: None,
             fleet_credentials: None,
             fleet_connection_id: None,
+            kube_fleet_failed: false,
             fleet_view: None,
             fleet_status: None,
             fleet_missing: Vec::new(),
@@ -6868,7 +6871,13 @@ impl App {
             self.close_path_picker();
         }
         if let Some(fi) = self.fleet_index() {
-            if self.fleet().map(|f| f.group_name()) == Some(group_name) {
+            let resume = !self.sessions[fi].kube_fleet_failed
+                && self.sessions[fi]
+                    .fleet
+                    .as_ref()
+                    .map(|fleet| fleet.group_name())
+                    == Some(group_name);
+            if resume {
                 self.active = fi;
                 self.sync_confirm_mode();
                 return true;
@@ -7099,6 +7108,7 @@ impl App {
         };
         session.fleet = Some(operation.clone());
         session.fleet_connection_id = None;
+        session.kube_fleet_failed = false;
         session.cancellation = None;
         session.messages.extend(
             kube_fleet_intro(operation)
@@ -7117,9 +7127,10 @@ impl App {
             return;
         };
         session.fleet_connection_id = None;
+        session.kube_fleet_failed = true;
         session.cancellation = None;
         session.messages.push(ChatBlock::Error(format!(
-            "Kubernetes fleet is not ready: {error}"
+            "Kubernetes fleet is not ready: {error}. Select the group again with Ctrl+O to retry."
         )));
         session.message_rev += 1;
     }
@@ -7200,11 +7211,16 @@ impl App {
     /// (#435): what is explained is the command on these hosts, and the
     /// transcript keeps that. Unchanged anywhere else.
     fn with_fleet_radius(&self, explanation: String) -> String {
-        let radius = self.fleet_radius();
+        let (radius, kind, _) = self.fleet_radius_details();
         if radius.is_empty() || self.active_session().confirm_mode != CommandConfirmMode::Explain {
             return explanation;
         }
-        let line = filar_agent::fleet_gate::radius_line(&radius);
+        let line = format!(
+            "on {} {}: {}",
+            radius.len(),
+            kind.noun(radius.len()),
+            radius.join(", ")
+        );
         if explanation.is_empty() {
             format!("Runs {line}.")
         } else {
@@ -15174,6 +15190,59 @@ mod tests {
         let clusters = filar_core::FleetOperation::from_targets(&kube_fleet_group(None), &[]);
         assert_eq!(fleet_radius_kind(&pods), FleetRadiusKind::Pods);
         assert_eq!(fleet_radius_kind(&clusters), FleetRadiusKind::Clusters);
+    }
+
+    #[test]
+    fn failed_kubernetes_discovery_can_be_retried_by_reselecting_the_group() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.host_groups = vec![kube_fleet_group(Some("app=web"))];
+        assert!(app.enter_fleet("web-prod"));
+        let first = app.take_pending_kube_fleets().remove(0);
+        let failed_session = first.session_id;
+        app.fail_kube_fleet(
+            first.session_id,
+            first.connection_id,
+            "API unavailable".into(),
+        );
+        assert!(app.messages.iter().any(|message| matches!(
+            message,
+            ChatBlock::Error(text) if text.contains("Ctrl+O") && text.contains("retry")
+        )));
+
+        assert!(app.enter_fleet("web-prod"));
+        let retry = app.take_pending_kube_fleets().remove(0);
+        assert!(retry.discover);
+        assert_ne!(retry.session_id, failed_session);
+        assert_ne!(retry.connection_id, first.connection_id);
+    }
+
+    #[test]
+    fn explain_mode_uses_kubernetes_member_nouns_in_the_radius() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Explain);
+        let pods = filar_core::FleetOperation::from_targets(
+            &kube_fleet_group(Some("app=web")),
+            &[saved_pod("prod-eu", "web-a"), saved_pod("prod-us", "web-c")],
+        );
+        app.active_session_mut().fleet = Some(pods);
+        assert_eq!(
+            app.with_fleet_radius("Inspect pods".into()),
+            "Inspect pods (runs on 2 pods: prod-eu/shop/web-a/main, prod-us/shop/web-c/main)"
+        );
+
+        let clusters = filar_core::FleetOperation::from_targets(
+            &kube_fleet_group(None),
+            &[filar_core::FleetTarget::KubeCluster(
+                filar_core::KubeScopeRef {
+                    cluster: "prod-eu".into(),
+                    namespace: "shop".into(),
+                },
+            )],
+        );
+        app.active_session_mut().fleet = Some(clusters);
+        assert_eq!(
+            app.with_fleet_radius("Inspect cluster".into()),
+            "Inspect cluster (runs on 1 cluster: prod-eu/shop)"
+        );
     }
 
     #[test]

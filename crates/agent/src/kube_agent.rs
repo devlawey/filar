@@ -349,7 +349,8 @@ impl KubeAgent {
                     .cancellation
                     .clone()
                     .unwrap_or_else(CancellationToken::new);
-                self.cancellable(fleet.run_until(&parsed, approval, &cancellation))
+                fleet
+                    .run_until(&parsed, approval, &cancellation)
                     .await
                     .map(|report| {
                         if let Some(observer) = observer {
