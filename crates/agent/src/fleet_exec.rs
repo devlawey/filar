@@ -204,11 +204,7 @@ impl FleetExecutor {
     /// Names of the hosts every command goes to — the radius the gate shows.
     /// A host without credentials is not in it: nothing is sent there.
     pub fn radius(&self) -> Vec<String> {
-        self.credentials
-            .participants(&self.fleet)
-            .into_iter()
-            .map(str::to_string)
-            .collect()
+        self.credentials.participants(&self.fleet)
     }
 
     /// An executor per member with credentials, `None` for the rest: cached
@@ -232,7 +228,7 @@ impl FleetExecutor {
         .map(|(i, target)| {
             let connect = Arc::clone(&self.connect);
             async move {
-                let name = target.name().to_string();
+                let name = target.name();
                 let conn = match tokio::time::timeout(deadline, connect(target)).await {
                     Ok(result) => result,
                     Err(_) => Err(CoreError::ConnectionLost(format!(
@@ -540,7 +536,7 @@ mod tests {
             attempts.fetch_add(1, Ordering::SeqCst);
             let runs = Arc::clone(&runs);
             Box::pin(async move {
-                let name = target.name().to_string();
+                let name = target.name();
                 if down.contains(&name.as_str()) {
                     return Err(CoreError::ConnectionLost(format!("{name}: refused")));
                 }

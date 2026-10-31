@@ -3491,7 +3491,7 @@ impl App {
             .map(|name| {
                 let nth = seen.entry(name.as_str()).or_insert(0);
                 *nth += 1;
-                let found = op.members().iter().filter(|m| m.name() == name).count();
+                let found = op.members().iter().filter(|m| m.name() == name.as_str()).count();
                 *nth > found
             })
             .collect();
@@ -6862,11 +6862,7 @@ impl App {
     pub fn fleet_radius(&self) -> Vec<String> {
         let session = self.active_session();
         match (&session.fleet, &session.fleet_credentials) {
-            (Some(op), Some(creds)) => creds
-                .participants(op)
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            (Some(op), Some(creds)) => creds.participants(op),
             _ => Vec::new(),
         }
     }
@@ -7457,7 +7453,7 @@ mod tests {
         assert!(app.in_fleet());
         let fleet = app.fleet().expect("fleet open");
         assert_eq!(fleet.group_name(), "web");
-        let names: Vec<&str> = fleet.members().iter().map(|m| m.name()).collect();
+        let names: Vec<String> = fleet.members().iter().map(|m| m.name()).collect();
         assert_eq!(names, ["web-1", "web-2"]);
         // Ordinary tabs are untouched and the fleet gets no executor.
         let tabs_after: Vec<SessionId> = app

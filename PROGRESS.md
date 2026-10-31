@@ -11212,11 +11212,13 @@ Kubernetes-состав без SSH tag selection. Kubernetes-участники 
 keyring и не пропускаются из-за отсутствия SSH-секретов. Старые сессии с
 `fleet.hosts` читаются как SSH; новые snapshots хранят только name для SSH и
 secret-free identity для Kubernetes, без адресов, логинов, паролей и
-kubeconfig.
+kubeconfig. После ревью label Kubernetes-участника включает cluster и namespace
+(и container для pod), поэтому одинаковые имена pod различимы в результатах.
 
 **Контракты.** `FleetMember::target`, `HostConnector`,
 `FleetOperation::restore` и `FleetSnapshot` переведены на `FleetTarget`;
-изменение задокументировано в `docs/ENGINE_API.md`. `CommandExecutor` /
+`name()` и списки участников возвращают owned `String` labels. Изменение
+задокументировано в `docs/ENGINE_API.md`. `CommandExecutor` /
 `LlmClient` не менялись. SSH selection, restore и поведение fleet сохранены.
 
 **Next:** #568.

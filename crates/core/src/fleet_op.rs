@@ -174,12 +174,15 @@ pub enum FleetTarget {
 }
 
 impl FleetTarget {
-    /// The member name used by the existing fleet views and fold.
-    pub fn name(&self) -> &str {
+    /// The member label used by the existing fleet views and fold.
+    pub fn name(&self) -> String {
         match self {
-            Self::Ssh(target) => &target.name,
-            Self::KubePod(target) => &target.pod,
-            Self::KubeCluster(target) => &target.cluster,
+            Self::Ssh(target) => target.name.clone(),
+            Self::KubePod(target) => format!(
+                "{}/{}/{}/{}",
+                target.cluster, target.namespace, target.pod, target.container
+            ),
+            Self::KubeCluster(target) => format!("{}/{}", target.cluster, target.namespace),
         }
     }
 
@@ -238,8 +241,8 @@ impl FleetMember {
         &self.target
     }
 
-    /// The target's name, as the panel shows it.
-    pub fn name(&self) -> &str {
+    /// The target's label, as the panel shows it.
+    pub fn name(&self) -> String {
         self.target.name()
     }
 
@@ -357,7 +360,7 @@ impl FleetOperation {
                         progress: HostProgress::default(),
                     });
                 }
-                None => missing.push(saved_target.name().to_string()),
+                None => missing.push(saved_target.name()),
             }
         }
         let op = Self {
@@ -549,7 +552,7 @@ mod tests {
             .collect()
     }
 
-    fn names(op: &FleetOperation) -> Vec<&str> {
+    fn names(op: &FleetOperation) -> Vec<String> {
         op.members().iter().map(FleetMember::name).collect()
     }
 
@@ -780,6 +783,39 @@ mod tests {
             second.id().to_string(),
             format!("#{}", second.id().as_u64())
         );
+    }
+
+    #[test]
+    fn kubernetes_member_names_include_cluster_and_namespace() {
+        let pod = |cluster: &str, namespace: &str| {
+            FleetTarget::KubePod(KubePodRef {
+                cluster: cluster.into(),
+                namespace: namespace.into(),
+                pod: "api-0".into(),
+                container: "app".into(),
+            })
+        };
+        let targets = vec![
+            pod("prod-eu", "shop"),
+            pod("prod-eu", "infra"),
+            pod("prod-us", "shop"),
+        ];
+
+        let op = FleetOperation::from_targets(&group("kubernetes", &[]), &targets);
+
+        assert_eq!(
+            names(&op),
+            [
+                "prod-eu/shop/api-0/app",
+                "prod-eu/infra/api-0/app",
+                "prod-us/shop/api-0/app",
+            ]
+        );
+        let scope = FleetTarget::KubeCluster(KubeScopeRef {
+            cluster: "prod-eu".into(),
+            namespace: "shop".into(),
+        });
+        assert_eq!(scope.name(), "prod-eu/shop");
     }
 
     #[test]
