@@ -101,15 +101,24 @@ println!("{} — {}", exec.describe(), r.stdout);
 - **Limits.** `pod_limits()` returns `PodLimits` read from the already-fetched
   pod spec: memory/CPU limits and requests of the container, effective
   `runAsUser` / `runAsNonRoot`, `readOnlyRootFilesystem`, dropped
-  capabilities. `KubeExecEvent::Connected` carries them for the UI. Nothing is
-  run or measured in the container to obtain them.
+  capabilities. Nothing is run or measured in the container to obtain them.
+  `KubeExecEvent::Connected` carries them on every **re**connect; the first
+  one is sent inside `connect()`, before any `subscribe()` can exist, so read
+  `pod()`, `container()` and `pod_limits()` right after `connect()`.
 - **Denials.** A 403 from RBAC names the verb and resource
   (`нет права create на pods/exec в namespace shop (контекст prod-eu)`); one
   from an admission policy shows the policy's text
-  (`отказала политика допуска: …`). Neither is retried or worked around.
+  (`отказала политика допуска: …`). A denial is never worked around. Because
+  kube-rs drops the API's status text when it refuses the WebSocket upgrade,
+  a refused exec is repeated once as a plain, non-upgrading `POST` to read
+  that text; the API authorizes and admits it the same way and then refuses
+  to upgrade, so nothing runs — but the probe can appear in API audit logs and
+  admission webhooks.
   Errors carry the context and namespace, never credentials.
-- **Nothing is written** to the pod or the cluster; this executor never
-  creates ephemeral containers.
+- **No Kubernetes resource is created or modified** by the executor, and it
+  never creates ephemeral containers. Commands sent to the shell can, of
+  course, change the container's files and processes — as over SSH, that is
+  what the confirmation gate is for.
 
 The exec stream uses a client without read/write timeouts (an idle shell is
 normal); API reads keep the cluster's `request_timeout_secs`.

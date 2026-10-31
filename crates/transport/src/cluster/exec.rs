@@ -8,9 +8,11 @@
 //! the shell's children; if that cannot be done the shell is recreated and the
 //! caller is told that its state was lost.
 //!
-//! Nothing is written to the pod or the cluster (invariant 1): the shell comes
-//! from the image, commands go through stdin, and this executor never creates
-//! ephemeral containers — that is a separate explicit user action (#576).
+//! The executor itself creates or modifies no Kubernetes resource and leaves
+//! nothing in the container (invariant 1): the shell comes from the image,
+//! commands go through stdin, and it never creates ephemeral containers —
+//! that is a separate explicit user action (#576). What the approved
+//! commands do in the container is, as over SSH, up to those commands.
 //! Errors name the context and namespace, never a token, certificate or
 //! kubeconfig contents.
 
@@ -325,8 +327,9 @@ impl ExecPlace {
         if let Ok(method) = "POST".parse() {
             *request.method_mut() = method;
         }
-        match self.client.request_text(request).await {
-            Err(kube::Error::Api(status)) if status.code == 403 => Some(status.message),
+        // The stream client has no read timeout: bound the probe ourselves.
+        match tokio::time::timeout(STARTUP_TIMEOUT, self.client.request_text(request)).await {
+            Ok(Err(kube::Error::Api(status))) if status.code == 403 => Some(status.message),
             _ => None,
         }
     }
@@ -437,13 +440,23 @@ struct PodShell {
 impl PodShell {
     async fn open(place: ExecPlace, command_timeout: Duration) -> Result<Self> {
         let command = vec![place.shell.clone()];
-        let mut process = match place
-            .pods
-            .exec(&place.pod, command.clone(), &place.attach_params(true))
-            .await
-        {
-            Ok(process) => process,
-            Err(error) => return Err(place.exec_error(error, &command).await),
+        // The stream client has no read timeout (an idle shell is normal), so
+        // the upgrade itself is bounded here: a server that accepts the
+        // connection and never answers must not hold a reconnect for ever.
+        let params = place.attach_params(true);
+        let exec = place.pods.exec(&place.pod, command.clone(), &params);
+        let mut process = match tokio::time::timeout(STARTUP_TIMEOUT, exec).await {
+            Ok(Ok(process)) => process,
+            Ok(Err(error)) => return Err(place.exec_error(error, &command).await),
+            Err(_) => {
+                return Err(CoreError::Unavailable(format!(
+                    "exec в под {}/{} не ответил за {} с (контекст {})",
+                    place.namespace,
+                    place.pod,
+                    STARTUP_TIMEOUT.as_secs(),
+                    place.context
+                )))
+            }
         };
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (process.stdin(), process.stdout(), process.stderr())
@@ -654,6 +667,7 @@ impl KubeExecutor {
         target: &PodRef,
         config: KubeExecConfig,
     ) -> Result<Self> {
+        check_target_cluster(cluster, target)?;
         let api = KubeClusterApi::connect(cluster).await?;
         let stream_client = build_client(cluster, true).await?;
         let (shell, identity) =
@@ -787,6 +801,18 @@ impl KubeExecutor {
 
 fn lock<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Fail closed when the pod target names another cluster than the one whose
+/// context and credentials would be used.
+fn check_target_cluster(cluster: &KubeCluster, target: &PodRef) -> Result<()> {
+    if target.cluster == cluster.name {
+        return Ok(());
+    }
+    Err(CoreError::Config(format!(
+        "pod target names cluster \"{}\" but cluster \"{}\" was given",
+        target.cluster, cluster.name
+    )))
 }
 
 /// Resolve the pod and container for `target` and open a shell there.
@@ -1055,6 +1081,19 @@ mod tests {
         let error = missing_shell_error("/bin/sh", "shop", "distroless-1", "prod-eu").to_string();
         assert!(error.contains("в контейнере нет /bin/sh") && error.contains("#576"), "{error}");
         assert!(error.contains("shop/distroless-1") && error.contains("prod-eu"), "{error}");
+    }
+
+    #[test]
+    fn a_target_for_another_cluster_is_refused() {
+        let cluster = KubeCluster {
+            name: "staging".into(),
+            ..KubeCluster::default()
+        };
+        let error = check_target_cluster(&cluster, &PodRef::named("prod-eu", "shop", "web", None))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("prod-eu") && error.contains("staging"), "{error}");
+        assert!(check_target_cluster(&cluster, &PodRef::named("staging", "shop", "web", None)).is_ok());
     }
 
     #[test]
