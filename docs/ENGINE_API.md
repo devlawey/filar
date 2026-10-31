@@ -229,13 +229,15 @@ own fleet (the TUI shows the group's frozen composition).
 Build a fleet agent only over a group-level executor, never over one host's:
 `fleet_exec::FleetExecutor::new(&operation, credentials, connector)?`
 implements `CommandExecutor` for a `FleetOperation`. `credentials` is
-`fleet_creds::FleetCredentials::resolve(&operation, &store)`: each host's own
-secret, looked up once under `ssh_target:<name>` in `store` (never the shared
-`SSH_PASSWORD`). A host without credentials gets no task, is never contacted,
-is left out of `radius()` and is reported as `skipped`; credentials resolved
-for another operation are refused. The connector receives each host's target
-with its password already filled in — pass the transport an empty
-`SecretProvider` so it cannot fall back to a shared one. An agent built with
+`fleet_creds::FleetCredentials::resolve(&operation, &store)`: each SSH host's
+own secret, looked up once under `ssh_target:<name>` in `store` (never the
+shared `SSH_PASSWORD`). An SSH host without credentials gets no task, is never
+contacted, is left out of `radius()` and is reported as `skipped`; credentials
+resolved for another operation are refused. Kubernetes members never consult
+the SSH credential store and are not skipped for missing SSH credentials. The
+connector receives a `FleetTarget`; an SSH target has its password already
+filled in — pass the transport an empty `SecretProvider` so it cannot fall back
+to a shared one. An agent built with
 `fleet(true)` ignores `secret_provider`: `$FILAR_SECRET_N` values are never
 substituted into fleet commands. Each `run` refuses non-read-only
 commands before any host is contacted, opens a fresh operation over the frozen
@@ -536,10 +538,14 @@ fleet front end: hand the model `fold(..)` / `fold_file(..)`, and route
 ### Persisted fleet sessions
 
 `Session::fleet: Option<FleetSnapshot>` (`#[serde(default)]`) marks a saved
-fleet dialogue and carries its group and the member host **names** in order —
-no addresses, no secrets (#442). Restore it with `FleetOperation::restore`
-against your current targets; the names it cannot find come back separately,
-so you can say that the restored fleet is smaller than the saved one.
+fleet dialogue and carries its group and member target identities in order
+(#442, #567). Legacy `hosts: ["name", ...]` arrays still load as SSH targets.
+New `targets` entries persist only SSH names or Kubernetes
+cluster/namespace/pod/container identities — no addresses, usernames,
+credentials or kubeconfig contents. Restore with `FleetOperation::restore`
+against current `FleetTarget` values; identities it cannot find come back
+separately, so you can say that the restored fleet is smaller than the saved
+one.
 
 ## Output preprocessors — typed tables instead of raw text
 
@@ -692,6 +698,7 @@ let _agent = builder.risk_scorer(Some(scorer));
 | `ClusterApi`, `KubeClusterApi`, read-only cluster result types and the default `kube` transport feature (#572) | Dependency footprint for consumers using default features; no Rust API break | Disable default features for SSH-only/mobile builds, or enable only `kube` for cluster access |
 | `KubeToolOutput`, `redact_logs`, redaction markers and `KubeCluster::reveal_env` (#573) | Nothing — additive (struct literals of `KubeCluster` use `..Default::default()`) | Pass Kubernetes objects/logs through `KubeToolOutput::redact_for_model` before giving them to a model |
 | `KubeToolExecutor`, six `k8s_*` tool definitions, typed calls/results, cluster prompt and Kubernetes arbiter context (#574) | `ContainerInfo` and `ArbiterContext` struct literals need the new resource-map / `kubernetes` fields; `CommandExecutor` and `LlmClient` are unchanged | Use `..` where practical, or populate the new fields; route cluster model output through `KubeToolExecutor` |
+| `FleetTarget::{Ssh, KubePod, KubeCluster}` and secret-free fleet snapshots (#567) | `FleetMember::target()` returns `&FleetTarget`; `HostConnector` and `FleetOperation::restore` use `FleetTarget`; `FleetSnapshot::hosts` is replaced by `targets`; target/member names and credential participant lists are owned `String` labels | Match the target variant in connectors and restore code; owned labels include Kubernetes scope; legacy session `hosts` arrays still deserialize as SSH targets |
 
 `CommandExecutor` and `LlmClient` are unchanged.
 

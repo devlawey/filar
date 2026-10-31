@@ -1344,8 +1344,13 @@ fn wrap_if_read_only(
 /// transport gets an empty secret provider, so the shared `SSH_PASSWORD`
 /// fallback a tab uses can never be sent to a fleet host.
 fn fleet_connector(command_timeout: Duration) -> filar_agent::fleet_exec::HostConnector {
-    Arc::new(move |target: filar_core::SshTarget| {
+    Arc::new(move |target: filar_core::FleetTarget| {
         Box::pin(async move {
+            let filar_core::FleetTarget::Ssh(target) = target else {
+                return Err(CoreError::Other(
+                    "this connector supports SSH fleet members only".into(),
+                ));
+            };
             let ssh = SshExecutor::connect_with_provider(
                 &target,
                 ssh_transport_config(command_timeout),
@@ -5175,7 +5180,8 @@ mod tests {
         assert_eq!(session.ssh_info, None);
         let fleet = session.fleet.clone().expect("the composition is saved");
         assert_eq!(fleet.group, "g");
-        assert_eq!(fleet.hosts, ["a", "b"]);
+        let names: Vec<_> = fleet.targets.iter().map(filar_core::FleetTarget::name).collect();
+        assert_eq!(names, ["a", "b"]);
         state.saved(rev);
         assert!(
             state.due(&app, "1790", "ts").is_none(),

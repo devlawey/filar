@@ -1039,7 +1039,7 @@ mod tests {
         );
         for (row, member) in result.rows().iter().zip(op.members()) {
             assert_eq!(row.host(), member.name());
-            assert_eq!(row.handle(), op.handle_for(member.name()).expect("member"));
+            assert_eq!(row.handle(), op.handle_for(&member.name()).expect("member"));
         }
     }
 

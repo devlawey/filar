@@ -38,7 +38,10 @@ pub use fleet_checks::{
     RejectedCheck, DEFAULT_COMMAND_KEY, USER_CATALOG_ENV, USER_CATALOG_FILE,
 };
 pub use fleet_file_check::{FileBaseline, FileProbe, FileReference};
-pub use fleet_op::{FleetMember, FleetOperation, HostHandle, HostProgress, OperationId};
+pub use fleet_op::{
+    FleetMember, FleetOperation, FleetTarget, HostHandle, HostProgress, KubePodRef, KubeScopeRef,
+    OperationId,
+};
 pub use os_family::{OsFamily, OS_RELEASE_COMMAND};
 pub use secrets::{
     redact, redact_secrets, ssh_cred_name, ssh_key_passphrase_name, ssh_target_display_name,

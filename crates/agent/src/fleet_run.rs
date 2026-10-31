@@ -1030,7 +1030,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_empty_operation_runs_nothing() {
-        let mut op = FleetOperation::open(&group(3, 30), &[]);
+        let mut op = FleetOperation::open(&group(3, 30), &[] as &[filar_core::SshTarget]);
 
         let report = run_on_fleet(&mut op, Vec::new()).await.expect("no tasks");
 
