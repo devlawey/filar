@@ -224,10 +224,18 @@ fn rbac_verb_and_resource(message: &str) -> Option<(String, String)> {
 /// A 403 from the API as a user-facing message: RBAC names the missing verb
 /// and resource; anything else is an admission policy, whose own text says
 /// why. The requesting user's name is never repeated.
-fn forbidden_error(message: &str, namespace: &str, context: &str) -> CoreError {
+///
+/// `requested` is the `(verb, resource)` of the refused request, used when the
+/// API text cannot be parsed — it is what was asked for, never a guess.
+fn forbidden_error(
+    message: &str,
+    requested: (&str, &str),
+    namespace: &str,
+    context: &str,
+) -> CoreError {
     if is_rbac_message(message) {
         let (verb, resource) = rbac_verb_and_resource(message)
-            .unwrap_or_else(|| ("create".into(), "pods/exec".into()));
+            .unwrap_or_else(|| (requested.0.to_string(), requested.1.to_string()));
         CoreError::AccessDenied(format!(
             "нет права {verb} на {resource} в namespace {namespace} (контекст {context})"
         ))
@@ -274,12 +282,14 @@ impl ExecPlace {
     async fn exec_error(&self, error: kube::Error, command: &[String]) -> CoreError {
         match error {
             kube::Error::Api(status) if status.code == 403 => {
-                forbidden_error(&status.message, &self.namespace, &self.context)
+                forbidden_error(&status.message, ("create", "pods/exec"), &self.namespace, &self.context)
             }
             kube::Error::UpgradeConnection(kube::client::UpgradeConnectionError::ProtocolSwitch(
                 code,
             )) if code.as_u16() == 403 => match self.probe_denial(command).await {
-                Some(message) => forbidden_error(&message, &self.namespace, &self.context),
+                Some(message) => {
+                    forbidden_error(&message, ("create", "pods/exec"), &self.namespace, &self.context)
+                }
                 None => CoreError::AccessDenied(format!(
                     "нет права create на pods/exec в namespace {} (контекст {})",
                     self.namespace, self.context
@@ -855,7 +865,7 @@ async fn open_shell(
 fn pod_api_error(cluster: &KubeCluster, error: kube::Error, verb: &str, namespace: &str) -> CoreError {
     match error {
         kube::Error::Api(status) if status.code == 403 => {
-            forbidden_error(&status.message, namespace, &cluster.context)
+            forbidden_error(&status.message, (verb, "pods"), namespace, &cluster.context)
         }
         other => api_error(cluster, other, verb, "pods", Some(namespace)),
     }
@@ -1009,7 +1019,7 @@ mod tests {
     #[test]
     fn rbac_and_policy_denials_have_distinct_messages() {
         let rbac = "pods \"web-1\" is forbidden: User \"system:serviceaccount:shop:no-exec\" cannot create resource \"pods/exec\" in API group \"\" in the namespace \"shop\"";
-        let error = forbidden_error(rbac, "shop", "prod-eu").to_string();
+        let error = forbidden_error(rbac, ("create", "pods/exec"), "shop", "prod-eu").to_string();
         assert!(
             error.contains("нет права create на pods/exec в namespace shop (контекст prod-eu)"),
             "{error}"
@@ -1017,10 +1027,17 @@ mod tests {
         assert!(!error.contains("no-exec"), "the user is not repeated: {error}");
 
         let list = "pods is forbidden: User \"u\" cannot list resource \"pods\" in API group \"\" in the namespace \"shop\"";
-        assert!(forbidden_error(list, "shop", "c").to_string().contains("нет права list на pods"));
+        assert!(forbidden_error(list, ("get", "pods"), "shop", "c")
+            .to_string()
+            .contains("нет права list на pods"));
+        // An RBAC text in an unexpected shape falls back to the refused request.
+        let odd = "pods/log is forbidden: User \"u\" cannot get this resource in the namespace";
+        assert!(forbidden_error(odd, ("get", "pods/log"), "shop", "c")
+            .to_string()
+            .contains("нет права get на pods/log в namespace shop"));
 
         let policy = "admission webhook \"validate.kyverno.svc\" denied the request: exec into pods is not allowed";
-        let error = forbidden_error(policy, "shop", "prod-eu").to_string();
+        let error = forbidden_error(policy, ("create", "pods/exec"), "shop", "prod-eu").to_string();
         assert!(error.contains("отказала политика допуска: "), "{error}");
         assert!(error.contains("exec into pods is not allowed"), "{error}");
     }
