@@ -11248,3 +11248,25 @@ fleet и точному вызову; начальное и повторное d
 fleet result различает `AccessDenied` и `PodDisappeared`.
 
 **Next:** #569 — TUI/launcher integration и пользовательский DoD.
+
+## #569 — Kubernetes fleet в TUI
+
+**Сделано.** `Ctrl+O` показывает kube-группы с `⎈`, namespace, selector и
+числом кластеров. Discovery и восстановление выполняются асинхронно; runner
+хранит живой `Arc<KubeFleet>`, отбрасывает устаревшие подключения и закрывает
+их вместе с сессией. `KubeAgent` использует тот же typed read-only цикл для одного
+кластера и флота, всегда требуя одно fleet-wide подтверждение. Радиус показывает
+pods/clusters и cluster/namespace-контекст, `l` раскрывает полные имена.
+`KubeFleetReport` напрямую отдаёт существующие `FleetView`/`FleetStatus`: панель
+Ctrl+J сохраняет полные ответы только для человека, различает `access denied`,
+`pod disappeared` и `no contact`, а статус считает ответившие pods/clusters.
+Сохранённая сессия восстанавливает frozen identities через `from_operation`
+без повторного discovery; live APIs и kubeconfig не сериализуются. Добавлены
+тесты Ctrl+O, confirm, status, side panel, report conversion и restore/save.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. Аддитивно:
+`KubeAgent::new_fleet`, `KubeFleetObserver`, `KubeFleet::from_operation`,
+`KubeFleetReport::{view,status}`; публичный system prompt флота описывает только
+реально доступные typed calls. Изменений SSH fleet и одиночного cluster tab нет.
+
+**Next:** пользовательский DoD против `docker/k8s`; далее веха 3.0.1.

@@ -9,22 +9,38 @@ use std::sync::Arc;
 use filar_core::{CommandConfirmMode, CoreError, KubeCluster, Result, TagPolicy};
 use tokio_util::sync::CancellationToken;
 
+use crate::fleet_gate::{ApprovalScope, FleetGate};
+use crate::fleet_view::{FleetStatus, FleetView};
 use crate::{
     build_kube_system_prompt, kube_confirmation_decision, kube_tool_definitions,
-    parse_kube_tool_call, AgentEvent, ChatMessage, ChatRequest, CommandConfirmer, ConfirmDecision,
-    EventSink, KubeToolExecutor, LlmClient, ToolCall,
+    kube_tools::build_kube_fleet_system_prompt, parse_kube_tool_call, AgentEvent, ChatMessage,
+    ChatRequest, CommandConfirmer, ConfirmDecision, EventSink, KubeFleet, KubeToolExecutor,
+    LlmClient, ToolCall,
 };
 
 const MAX_ITERATIONS: usize = 50;
 const MAX_MISSING_EXPLANATION_RETRIES: u32 = 2;
 static NEXT_PROPOSAL_ID: AtomicU64 = AtomicU64::new(1);
 
-/// LLM ↔ read-only Kubernetes API orchestration for one cluster tab.
+/// Receives the person-facing view and final status of a fleet operation.
+pub type KubeFleetObserver = Arc<dyn Fn(FleetView, FleetStatus) + Send + Sync>;
+
+enum KubeExecution {
+    Cluster {
+        executor: KubeToolExecutor,
+        target: KubeCluster,
+        namespace: Option<String>,
+    },
+    Fleet {
+        fleet: Arc<KubeFleet>,
+        observer: Option<KubeFleetObserver>,
+    },
+}
+
+/// LLM ↔ read-only Kubernetes API orchestration for a cluster or frozen fleet.
 pub struct KubeAgent {
     llm: Arc<dyn LlmClient>,
-    executor: KubeToolExecutor,
-    target: KubeCluster,
-    namespace: Option<String>,
+    execution: KubeExecution,
     confirmer: Arc<dyn CommandConfirmer>,
     confirm_mode: CommandConfirmMode,
     tag_policies: Vec<TagPolicy>,
@@ -45,15 +61,47 @@ impl KubeAgent {
     ) -> Self {
         Self {
             llm,
-            executor,
-            target,
-            namespace,
+            execution: KubeExecution::Cluster {
+                executor,
+                target,
+                namespace,
+            },
             confirmer,
             confirm_mode,
             tag_policies,
             event_sink: None,
             cancellation: None,
         }
+    }
+
+    /// Create an agent whose every approved typed call covers one frozen fleet.
+    pub fn new_fleet(
+        llm: Arc<dyn LlmClient>,
+        fleet: Arc<KubeFleet>,
+        confirmer: Arc<dyn CommandConfirmer>,
+        confirm_mode: CommandConfirmMode,
+        tag_policies: Vec<TagPolicy>,
+    ) -> Self {
+        Self {
+            llm,
+            execution: KubeExecution::Fleet {
+                fleet,
+                observer: None,
+            },
+            confirmer,
+            confirm_mode,
+            tag_policies,
+            event_sink: None,
+            cancellation: None,
+        }
+    }
+
+    /// Send full per-member answers only to the frontend's fleet panel.
+    pub fn fleet_observer(mut self, observer: KubeFleetObserver) -> Self {
+        if let KubeExecution::Fleet { observer: slot, .. } = &mut self.execution {
+            *slot = Some(observer);
+        }
+        self
     }
 
     /// Deliver progress and tool events to a frontend.
@@ -115,10 +163,13 @@ impl KubeAgent {
     }
 
     async fn run_loop(&self, user_prompt: &str, history: &[ChatMessage]) -> Result<String> {
-        let mut messages = vec![ChatMessage::system(build_kube_system_prompt(
-            &self.target,
-            self.namespace.as_deref(),
-        ))];
+        let prompt = match &self.execution {
+            KubeExecution::Cluster {
+                target, namespace, ..
+            } => build_kube_system_prompt(target, namespace.as_deref()),
+            KubeExecution::Fleet { fleet, .. } => build_kube_fleet_system_prompt(fleet.fleet()),
+        };
+        let mut messages = vec![ChatMessage::system(prompt)];
         messages.extend_from_slice(history);
         messages.push(ChatMessage::user(user_prompt));
         let tools = kube_tool_definitions(self.confirm_mode);
@@ -189,16 +240,24 @@ impl KubeAgent {
     }
 
     async fn process_tool_call(&self, call: &ToolCall) -> Result<ChatMessage> {
-        let parsed =
-            match parse_kube_tool_call(&call.name, &call.arguments, self.namespace.as_deref()) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    return Ok(ChatMessage::tool(
-                        &call.id,
-                        format!("Error: invalid Kubernetes tool call: {error}"),
-                    ));
-                }
-            };
+        let default_namespace = match &self.execution {
+            KubeExecution::Cluster { namespace, .. } => namespace.as_deref(),
+            KubeExecution::Fleet { fleet, .. } => fleet
+                .fleet()
+                .group()
+                .kube
+                .as_ref()
+                .map(|kube| kube.namespace.as_str()),
+        };
+        let parsed = match parse_kube_tool_call(&call.name, &call.arguments, default_namespace) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return Ok(ChatMessage::tool(
+                    &call.id,
+                    format!("Error: invalid Kubernetes tool call: {error}"),
+                ));
+            }
+        };
         let display = parsed.display_command();
         let explanation = call
             .arguments
@@ -206,13 +265,41 @@ impl KubeAgent {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("Read-only Kubernetes API request")
             .to_string();
-        let target_namespace = parsed.namespace().or(self.namespace.as_deref());
-        let confirmation_explanation = format!(
-            "{explanation}\n\n{}\nTarget: {} / {}",
-            parsed.confirmation_context(&self.target),
-            self.target.name,
-            target_namespace.unwrap_or("all / cluster-scoped"),
-        );
+        let (confirmation_explanation, decision) = match &self.execution {
+            KubeExecution::Cluster {
+                target, namespace, ..
+            } => {
+                let target_namespace = parsed.namespace().or(namespace.as_deref());
+                (
+                    format!(
+                        "{explanation}\n\n{}\nTarget: {} / {}",
+                        parsed.confirmation_context(target),
+                        target.name,
+                        target_namespace.unwrap_or("all / cluster-scoped"),
+                    ),
+                    kube_confirmation_decision(self.confirm_mode, target, &self.tag_policies),
+                )
+            }
+            KubeExecution::Fleet { fleet, .. } => {
+                let decision = match fleet.gate(&parsed) {
+                    FleetGate::Ask(ApprovalScope::Once) => ConfirmDecision::NeedsConfirmation,
+                    FleetGate::Ask(ApprovalScope::PerHost) => ConfirmDecision::Blocked(
+                        "Kubernetes fleets require one fleet-wide approval".into(),
+                    ),
+                    FleetGate::Refuse(reason) => ConfirmDecision::Blocked(reason),
+                };
+                (
+                    format!(
+                        "{explanation}\n\nTool: {}\nArguments: {}\nFleet: {} / {}",
+                        parsed.tool_name(),
+                        parsed.arguments(),
+                        fleet.fleet().group_name(),
+                        default_namespace.unwrap_or("all / cluster-scoped"),
+                    ),
+                    decision,
+                )
+            }
+        };
 
         self.emit(AgentEvent::CommandProposed {
             proposal_id: NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed),
@@ -225,7 +312,7 @@ impl KubeAgent {
             },
         });
 
-        match kube_confirmation_decision(self.confirm_mode, &self.target, &self.tag_policies) {
+        match decision {
             ConfirmDecision::NeedsConfirmation => {
                 let approved = self
                     .cancellable(
@@ -251,14 +338,35 @@ impl KubeAgent {
             }
         }
 
-        match self.cancellable(self.executor.execute(&parsed)).await {
-            Ok(result) => {
+        let outcome = match &self.execution {
+            KubeExecution::Cluster { executor, .. } => self
+                .cancellable(executor.execute(&parsed))
+                .await
+                .map(|result| result.content),
+            KubeExecution::Fleet { fleet, observer } => {
+                let approval = fleet.approve(&parsed)?;
+                let cancellation = self
+                    .cancellation
+                    .clone()
+                    .unwrap_or_else(CancellationToken::new);
+                self.cancellable(fleet.run_until(&parsed, approval, &cancellation))
+                    .await
+                    .map(|report| {
+                        if let Some(observer) = observer {
+                            observer(report.view(&display), report.status());
+                        }
+                        report.render()
+                    })
+            }
+        };
+        match outcome {
+            Ok(output) => {
                 self.emit(AgentEvent::CommandFinished {
                     command: display,
-                    output: result.content.clone(),
+                    output: output.clone(),
                     denied: false,
                 });
-                Ok(ChatMessage::tool(&call.id, result.content))
+                Ok(ChatMessage::tool(&call.id, output))
             }
             Err(error) if error.to_string() == "cancelled" => Err(error),
             Err(error) => {

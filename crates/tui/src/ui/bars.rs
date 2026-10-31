@@ -362,6 +362,7 @@ const EVICTION_ORDER: [Evictable; 5] = [
 fn fleet_segment(
     group: &str,
     total: usize,
+    kind: crate::app::FleetRadiusKind,
     status: Option<filar_agent::fleet_view::FleetStatus>,
     glyphs: &Glyphs,
 ) -> (String, String) {
@@ -369,9 +370,15 @@ fn fleet_segment(
         Some(st) => format!("{}/{}", st.answering, st.total),
         None => format!("?/{total}"),
     };
+    let progress = match kind {
+        crate::app::FleetRadiusKind::Hosts => "live".to_string(),
+        crate::app::FleetRadiusKind::Pods | crate::app::FleetRadiusKind::Clusters => {
+            format!("{} answered", kind.noun(total))
+        }
+    };
     (
         format!("fleet {group}"),
-        format!(" {} {count} live", glyphs.middle_dot),
+        format!(" {} {count} {progress}", glyphs.middle_dot),
     )
 }
 
@@ -435,15 +442,17 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // are answering (#439) — both kept to the last.
     // Only the fleet on screen: an open fleet in the background must not
     // label an ordinary tab, whose commands go to its own host.
-    let fleet_target = app
-        .active_session()
-        .fleet
-        .as_ref()
-        .map(|f| (f.group_name().to_string(), f.len()));
+    let fleet_target = app.active_session().fleet.as_ref().map(|f| {
+        (
+            f.group_name().to_string(),
+            f.len(),
+            crate::app::fleet_radius_kind(f),
+        )
+    });
     let (target, live) = match &fleet_target {
-        Some((group, total)) => {
+        Some((group, total, kind)) => {
             let status = app.active_session().fleet_status;
-            let (target, live) = fleet_segment(group, *total, status, glyphs);
+            let (target, live) = fleet_segment(group, *total, *kind, status, glyphs);
             let style = match status {
                 Some(st) if !st.running && st.answering < st.total => app.theme.warning_fg(),
                 Some(st) if !st.running => app.theme.success_fg(),
@@ -783,6 +792,42 @@ mod tests {
         assert_eq!(
             operations_counter(c, &Glyphs::ASCII).as_deref(),
             Some("ops >1 +1 !1 ~1")
+        );
+    }
+
+    #[test]
+    fn kubernetes_fleet_status_counts_answered_pods_and_clusters() {
+        let operation =
+            filar_core::FleetOperation::from_targets(&filar_core::HostGroup::default(), &[]);
+        let status = filar_agent::fleet_view::FleetStatus {
+            operation: operation.id(),
+            answering: 8,
+            total: 12,
+            running: false,
+        };
+        assert_eq!(
+            fleet_segment(
+                "web-prod",
+                12,
+                crate::app::FleetRadiusKind::Pods,
+                Some(status),
+                &Glyphs::UNICODE,
+            ),
+            ("fleet web-prod".into(), " · 8/12 pods answered".into())
+        );
+        assert_eq!(
+            fleet_segment(
+                "scopes",
+                2,
+                crate::app::FleetRadiusKind::Clusters,
+                Some(filar_agent::fleet_view::FleetStatus {
+                    answering: 2,
+                    total: 2,
+                    ..status
+                }),
+                &Glyphs::UNICODE,
+            ),
+            ("fleet scopes".into(), " · 2/2 clusters answered".into())
         );
     }
 
@@ -1176,11 +1221,18 @@ mod tests {
 
     #[test]
     fn the_fleet_segment_is_ascii_in_ascii_mode() {
-        let (target, live) = fleet_segment("web", 12, None, &Glyphs::ASCII);
+        let (target, live) = fleet_segment(
+            "web",
+            12,
+            crate::app::FleetRadiusKind::Hosts,
+            None,
+            &Glyphs::ASCII,
+        );
         assert_eq!(format!("{target}{live}"), "fleet web - ?/12 live");
         let (_, live) = fleet_segment(
             "web",
             12,
+            crate::app::FleetRadiusKind::Hosts,
             Some(filar_agent::fleet_view::FleetStatus {
                 answering: 11,
                 total: 12,
@@ -1384,7 +1436,11 @@ mod tests {
         assert!(unicode.contains('…'), "{unicode}");
         assert!(UnicodeWidthStr::width(unicode.as_str()) <= 56, "{unicode}");
         let wide = kube_component("中中中中中中中中中中中中中", 10, &Glyphs::UNICODE);
-        assert_eq!(UnicodeWidthStr::width(wide.as_str()), 9, "four wide glyphs plus the ellipsis fit the ten-cell budget");
+        assert_eq!(
+            UnicodeWidthStr::width(wide.as_str()),
+            9,
+            "four wide glyphs plus the ellipsis fit the ten-cell budget"
+        );
         assert!(kube_segment(&kube, None, &Glyphs::ASCII).is_ascii());
     }
 
@@ -1395,7 +1451,10 @@ mod tests {
         let row = render_status_row(&mut app, 120);
         assert!(row.contains("prod-eu") && row.contains("shop"), "{row}");
         assert!(row.contains("[prod]"), "{row}");
-        assert!(!row.contains("shop [prod] /"), "cluster tabs have no shell cwd: {row}");
+        assert!(
+            !row.contains("shop [prod] /"),
+            "cluster tabs have no shell cwd: {row}"
+        );
     }
 
     #[test]

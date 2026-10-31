@@ -628,6 +628,23 @@ struct KubeConnectionResult {
     result: std::result::Result<(Arc<dyn ClusterApi>, Vec<String>), String>,
 }
 
+/// Result of asynchronous Kubernetes fleet discovery or restored API binding.
+struct KubeFleetResult {
+    session_id: SessionId,
+    connection_id: u64,
+    result: std::result::Result<Arc<filar_agent::KubeFleet>, String>,
+}
+
+/// A single-cluster target or a frozen fleet executed by the same agent loop.
+enum KubeAgentTarget {
+    Cluster {
+        api: Arc<dyn ClusterApi>,
+        target: filar_core::KubeCluster,
+        namespace: Option<String>,
+    },
+    Fleet(Arc<filar_agent::KubeFleet>),
+}
+
 /// Start every queued cluster connection or namespace discovery (#575).
 fn start_pending_kube_connects(
     app: &mut App,
@@ -661,6 +678,87 @@ fn start_pending_kube_connects(
                 Err(error) => Err(error.to_string()),
             };
             let _ = tx.send(KubeConnectionResult {
+                session_id,
+                connection_id,
+                result,
+            });
+        });
+    }
+}
+
+/// Start every queued Kubernetes fleet discovery or restored API binding (#569).
+fn start_pending_kube_fleets(
+    app: &mut App,
+    kube_fleets: &mut HashMap<SessionId, Arc<filar_agent::KubeFleet>>,
+    kube_fleet_tx: &mpsc::UnboundedSender<KubeFleetResult>,
+) {
+    let configured = app.kube_clusters.clone();
+    let secrets: Arc<dyn SecretProvider> = app.secrets.clone();
+    for request in app.take_pending_kube_fleets() {
+        kube_fleets.remove(&request.session_id);
+        let session_id = request.session_id;
+        let connection_id = request.connection_id;
+        let operation = request.operation;
+        let discover = request.discover;
+        let cancellation = request.cancellation;
+        let mut names = if discover {
+            operation
+                .group()
+                .kube
+                .as_ref()
+                .map(|kube| kube.clusters.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !discover {
+            for member in operation.members() {
+                let name = match member.target() {
+                    filar_core::FleetTarget::KubePod(pod) => &pod.cluster,
+                    filar_core::FleetTarget::KubeCluster(scope) => &scope.cluster,
+                    filar_core::FleetTarget::Ssh(_) => continue,
+                };
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+
+        let tx = kube_fleet_tx.clone();
+        let configured = configured.clone();
+        let secrets = secrets.clone();
+        tokio::spawn(async move {
+            let result: std::result::Result<Arc<filar_agent::KubeFleet>, String> = async {
+                let mut clusters = Vec::with_capacity(names.len());
+                for name in names {
+                    let target = configured
+                        .iter()
+                        .find(|target| target.name == name)
+                        .cloned()
+                        .ok_or_else(|| format!("Kubernetes cluster '{name}' is not configured"))?;
+                    let cluster = tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            return Err("cancelled".to_string());
+                        }
+                        result = filar_agent::KubeFleetCluster::connect(
+                            target,
+                            Arc::clone(&secrets),
+                        ) => result.map_err(|error| error.to_string())?,
+                    };
+                    clusters.push(cluster);
+                }
+                let fleet = if discover {
+                    filar_agent::KubeFleet::open_until(operation.group(), clusters, &cancellation)
+                        .await
+                        .map_err(|error| error.to_string())?
+                } else {
+                    filar_agent::KubeFleet::from_operation(operation, clusters)
+                        .map_err(|error| error.to_string())?
+                };
+                Ok(Arc::new(fleet))
+            }
+            .await;
+            let _ = tx.send(KubeFleetResult {
                 session_id,
                 connection_id,
                 result,
@@ -1551,6 +1649,8 @@ async fn run_app(
     // Live typed Kubernetes APIs stay in the runner, never in persisted state.
     let (kube_tx, mut kube_rx) = mpsc::unbounded_channel::<KubeConnectionResult>();
     let mut kube_apis: HashMap<SessionId, Arc<dyn ClusterApi>> = HashMap::new();
+    let (kube_fleet_tx, mut kube_fleet_rx) = mpsc::unbounded_channel::<KubeFleetResult>();
+    let mut kube_fleets: HashMap<SessionId, Arc<filar_agent::KubeFleet>> = HashMap::new();
 
     // Channel for session-save progress (Ctrl+S, #234/#235).
     let (save_tx, mut save_rx) = tokio::sync::mpsc::unbounded_channel::<SaveProgress>();
@@ -1622,6 +1722,7 @@ async fn run_app(
         app.restore_kube_snapshot(snapshot);
     }
     start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
+    start_pending_kube_fleets(&mut app, &mut kube_fleets, &kube_fleet_tx);
     // The startup target may carry policy tags — tighten before the first
     // render so the bar and the confirm gate agree from the start (#414).
     app.sync_confirm_mode();
@@ -2005,8 +2106,9 @@ async fn run_app(
                     }
                 }
 
-                // Start a cluster selected by this key before consuming input.
+                // Start cluster or fleet work selected by this key before consuming input.
                 start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
+                start_pending_kube_fleets(&mut app, &mut kube_fleets, &kube_fleet_tx);
 
                 // Check if user sent input — spawn agent or execute shell escape.
                 if let Some(user_input) = app.take_input() {
@@ -2053,9 +2155,11 @@ async fn run_app(
                             app.cancellation = Some(cancel_token.clone());
                             spawn_kube_agent(
                                 session_llm,
-                                api,
-                                kube.target,
-                                kube.namespace,
+                                KubeAgentTarget::Cluster {
+                                    api,
+                                    target: kube.target,
+                                    namespace: kube.namespace,
+                                },
                                 app.confirm_mode,
                                 config.tag_policies.clone(),
                                 user_input,
@@ -2071,6 +2175,59 @@ async fn run_app(
                             );
                             app.sessions[app.active].pending_compaction = None;
                         }
+                    } else if app.in_kube_fleet() {
+                        let sid = app.sessions[app.active].id;
+                        let Some(fleet) = kube_fleets.get(&sid).cloned() else {
+                            app.push_error("Kubernetes fleet is not connected yet".into());
+                            app.mode = AppMode::Normal;
+                            app.agent_running = false;
+                            continue;
+                        };
+                        let pending_compaction = app.sessions[app.active].pending_compaction;
+                        let profile_name = app.sessions[app.active]
+                            .llm_profile
+                            .as_deref()
+                            .unwrap_or(&app.default_profile_name)
+                            .to_string();
+                        let session_llm = {
+                            let profile = app.profiles.iter().find(|p| p.name == profile_name);
+                            match profile {
+                                Some(p) => match (config.llm_factory)(p, &config.secret_provider) {
+                                    Ok(client) => client,
+                                    Err(error) => {
+                                        app.push_error(format!("Failed to create LLM client: {error}"));
+                                        app.mode = AppMode::Normal;
+                                        app.agent_running = false;
+                                        continue;
+                                    }
+                                },
+                                None => {
+                                    app.push_error(format!("Profile '{profile_name}' not found"));
+                                    app.mode = AppMode::Normal;
+                                    app.agent_running = false;
+                                    continue;
+                                }
+                            }
+                        };
+                        let cancel_token = CancellationToken::new();
+                        app.cancellation = Some(cancel_token.clone());
+                        spawn_kube_agent(
+                            session_llm,
+                            KubeAgentTarget::Fleet(fleet),
+                            app.confirm_mode,
+                            config.tag_policies.clone(),
+                            user_input,
+                            app.messages.clone(),
+                            app.active_session().history_epoch,
+                            agent_tx.clone(),
+                            cancel_token,
+                            config.secret_provider.clone(),
+                            sid,
+                            profile_name,
+                            app.active_session().compaction_exhausted,
+                            pending_compaction,
+                        );
+                        app.sessions[app.active].pending_compaction = None;
                     } else if let Some(stripped) = user_input.strip_prefix('!') {
                         // Shell escape: execute command directly without agent.
                         let cmd = stripped.trim().to_string();
@@ -2618,6 +2775,7 @@ async fn run_app(
             // every host connection it held (#435).
             fleet_executors.remove(&sid);
             kube_apis.remove(&sid);
+            kube_fleets.remove(&sid);
         }
 
         // Teardown interactive backends for tabs reset by session restore
@@ -2672,6 +2830,37 @@ async fn run_app(
                         }
                         Err(error) => {
                             app.fail_kube_connection(
+                                completed.session_id,
+                                completed.connection_id,
+                                error,
+                            );
+                            needs_redraw = true;
+                        }
+                    }
+                }
+            }
+
+            // Kubernetes fleet discovery and restored API binding results (#569).
+            maybe_kube_fleet = kube_fleet_rx.recv() => {
+                if let Some(completed) = maybe_kube_fleet {
+                    match completed.result {
+                        Ok(fleet) => {
+                            if app.kube_fleet_connection_is_current(
+                                completed.session_id,
+                                completed.connection_id,
+                            ) {
+                                let operation = fleet.fleet().clone();
+                                kube_fleets.insert(completed.session_id, fleet);
+                                app.complete_kube_fleet(
+                                    completed.session_id,
+                                    completed.connection_id,
+                                    &operation,
+                                );
+                                needs_redraw = true;
+                            }
+                        }
+                        Err(error) => {
+                            app.fail_kube_fleet(
                                 completed.session_id,
                                 completed.connection_id,
                                 error,
@@ -2933,8 +3122,9 @@ async fn run_app(
             }
         }
 
-        // Non-terminal events can also queue a restored or selected cluster.
+        // Non-terminal events can also queue a restored or selected target.
         start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
+        start_pending_kube_fleets(&mut app, &mut kube_fleets, &kube_fleet_tx);
 
         if app.should_quit {
             break;
@@ -3849,13 +4039,11 @@ fn spawn_agent(
     });
 }
 
-/// Spawn the typed Kubernetes agent, reusing chat history and compaction (#575).
+/// Spawn the typed Kubernetes agent, reusing chat history and compaction (#575/#569).
 #[allow(clippy::too_many_arguments)]
 fn spawn_kube_agent(
     llm: Arc<dyn LlmClient>,
-    api: Arc<dyn ClusterApi>,
-    target: filar_core::KubeCluster,
-    namespace: Option<String>,
+    target: KubeAgentTarget,
     confirm_mode: CommandConfirmMode,
     tag_policies: Vec<filar_core::TagPolicy>,
     user_input: String,
@@ -3902,24 +4090,60 @@ fn spawn_kube_agent(
         .await;
         let mut already_compacted = chat_history.len() < before_compaction;
         let secrets: Arc<dyn SecretProvider> = secret_provider;
+        let fleet_observer = match &target {
+            KubeAgentTarget::Fleet(_) => {
+                let observer_tx = tx.clone();
+                Some(Arc::new(move |view, status| {
+                    let _ = observer_tx.send(TuiEvent::FleetSummary {
+                        session_id: sid,
+                        view,
+                    });
+                    let _ = observer_tx.send(TuiEvent::FleetStatus {
+                        session_id: sid,
+                        status,
+                    });
+                }) as filar_agent::KubeFleetObserver)
+            }
+            KubeAgentTarget::Cluster { .. } => None,
+        };
 
         loop {
             let history = history_to_messages(without_current_prompt(&chat_history, &user_input));
-            let agent = filar_agent::KubeAgent::new(
-                Arc::clone(&llm),
-                filar_agent::KubeToolExecutor::new(
-                    Arc::clone(&api),
+            let agent = match &target {
+                KubeAgentTarget::Cluster {
+                    api,
+                    target,
+                    namespace,
+                } => filar_agent::KubeAgent::new(
+                    Arc::clone(&llm),
+                    filar_agent::KubeToolExecutor::new(
+                        Arc::clone(api),
+                        target.clone(),
+                        Arc::clone(&secrets),
+                    ),
                     target.clone(),
-                    Arc::clone(&secrets),
+                    namespace.clone(),
+                    Arc::clone(&confirmer),
+                    confirm_mode,
+                    tag_policies.clone(),
                 ),
-                target.clone(),
-                namespace.clone(),
-                Arc::clone(&confirmer),
-                confirm_mode,
-                tag_policies.clone(),
-            )
-            .event_sink(Arc::clone(&sink))
-            .cancellation(cancellation.clone());
+                KubeAgentTarget::Fleet(fleet) => {
+                    let agent = filar_agent::KubeAgent::new_fleet(
+                        Arc::clone(&llm),
+                        Arc::clone(fleet),
+                        Arc::clone(&confirmer),
+                        confirm_mode,
+                        tag_policies.clone(),
+                    );
+                    match &fleet_observer {
+                        Some(observer) => agent.fleet_observer(Arc::clone(observer)),
+                        None => agent,
+                    }
+                }
+            };
+            let agent = agent
+                .event_sink(Arc::clone(&sink))
+                .cancellation(cancellation.clone());
 
             *held_error
                 .lock()
@@ -5180,7 +5404,11 @@ mod tests {
         assert_eq!(session.ssh_info, None);
         let fleet = session.fleet.clone().expect("the composition is saved");
         assert_eq!(fleet.group, "g");
-        let names: Vec<_> = fleet.targets.iter().map(filar_core::FleetTarget::name).collect();
+        let names: Vec<_> = fleet
+            .targets
+            .iter()
+            .map(filar_core::FleetTarget::name)
+            .collect();
         assert_eq!(names, ["a", "b"]);
         state.saved(rev);
         assert!(

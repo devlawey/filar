@@ -173,10 +173,91 @@ pub struct PendingConfirm {
     /// approval covers all of them — the dialog shows the count, and the
     /// names on `l`.
     pub radius: Vec<String>,
-    /// The host list is expanded in the dialog.
+    /// The member list is expanded in the dialog.
     pub radius_expanded: bool,
+    /// Whether the radius contains SSH hosts, pods or cluster scopes.
+    pub(crate) radius_kind: FleetRadiusKind,
+    /// Cluster and namespace context shown next to a pod count.
+    pub(crate) radius_context: Option<String>,
     /// `proposal_id` of the command, to show its safety rating (#551).
     pub proposal_id: Option<u64>,
+}
+
+/// Member noun used by fleet confirmation and status displays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FleetRadiusKind {
+    Hosts,
+    Pods,
+    Clusters,
+}
+
+impl FleetRadiusKind {
+    pub(crate) fn noun(self, count: usize) -> &'static str {
+        match (self, count) {
+            (Self::Hosts, 1) => "host",
+            (Self::Hosts, _) => "hosts",
+            (Self::Pods, 1) => "pod",
+            (Self::Pods, _) => "pods",
+            (Self::Clusters, 1) => "cluster",
+            (Self::Clusters, _) => "clusters",
+        }
+    }
+}
+
+/// The member kind shown by fleet confirmation and status displays.
+pub(crate) fn fleet_radius_kind(operation: &filar_core::FleetOperation) -> FleetRadiusKind {
+    if operation
+        .members()
+        .iter()
+        .any(|member| matches!(member.target(), filar_core::FleetTarget::KubePod(_)))
+    {
+        FleetRadiusKind::Pods
+    } else if operation
+        .members()
+        .iter()
+        .any(|member| matches!(member.target(), filar_core::FleetTarget::KubeCluster(_)))
+    {
+        FleetRadiusKind::Clusters
+    } else {
+        match operation.group().kube.as_ref() {
+            Some(kube) if kube.selector.is_some() => FleetRadiusKind::Pods,
+            Some(_) => FleetRadiusKind::Clusters,
+            None => FleetRadiusKind::Hosts,
+        }
+    }
+}
+
+/// Whether an operation uses typed Kubernetes calls rather than SSH commands.
+pub(crate) fn is_kube_fleet(operation: &filar_core::FleetOperation) -> bool {
+    operation.group().kube.is_some()
+        || operation.members().iter().any(|member| {
+            matches!(
+                member.target(),
+                filar_core::FleetTarget::KubePod(_) | filar_core::FleetTarget::KubeCluster(_)
+            )
+        })
+}
+
+/// Cluster and namespace context for a pod fleet's confirmation radius.
+fn kube_radius_context(operation: &filar_core::FleetOperation) -> Option<String> {
+    if fleet_radius_kind(operation) != FleetRadiusKind::Pods {
+        return None;
+    }
+    let mut clusters = Vec::new();
+    let mut namespaces = Vec::new();
+    for member in operation.members() {
+        let filar_core::FleetTarget::KubePod(pod) = member.target() else {
+            continue;
+        };
+        if !clusters.contains(&pod.cluster) {
+            clusters.push(pod.cluster.clone());
+        }
+        if !namespaces.contains(&pod.namespace) {
+            namespaces.push(pod.namespace.clone());
+        }
+    }
+    (!clusters.is_empty() && !namespaces.is_empty())
+        .then(|| format!("{} / {}", clusters.join(", "), namespaces.join(", ")))
 }
 
 /// Safety rating of one proposed command by the risk scorer (#551).
@@ -271,6 +352,8 @@ impl PendingConfirm {
             audit_unavailable: false,
             radius: Vec::new(),
             radius_expanded: false,
+            radius_kind: FleetRadiusKind::Hosts,
+            radius_context: None,
             proposal_id: None,
         }
     }
@@ -342,6 +425,16 @@ pub struct KubeConnectRequest {
     pub namespace: Option<String>,
     pub connection_id: u64,
     pub discover: bool,
+}
+
+/// Kubernetes fleet discovery or restored-API binding queued for the runner.
+#[derive(Debug, Clone)]
+pub struct KubeFleetRequest {
+    pub session_id: SessionId,
+    pub connection_id: u64,
+    pub operation: filar_core::FleetOperation,
+    pub discover: bool,
+    pub cancellation: CancellationToken,
 }
 
 /// Namespace chooser shown after selecting a cluster, or while discovery runs.
@@ -429,6 +522,8 @@ pub struct App {
     pub kube_clusters: Vec<filar_core::KubeCluster>,
     /// Cluster connections and namespace discoveries awaiting the runner.
     pub pending_kube_connects: Vec<KubeConnectRequest>,
+    /// Kubernetes fleet discoveries and restored connections awaiting the runner.
+    pub pending_kube_fleets: Vec<KubeFleetRequest>,
     /// Namespace chooser for the active cluster tab, if any.
     pub kube_namespace_select: Option<KubeNamespaceSelect>,
     /// Monotonic id used to reject late results from abandoned connections.
@@ -567,10 +662,11 @@ pub struct Session {
     /// host group, kept apart from the tab row. Its composition is frozen at
     /// entry. A fleet session never gets an executor of its own.
     pub fleet: Option<filar_core::FleetOperation>,
-    /// Each fleet host's own credentials, resolved when the fleet was
-    /// entered (#436). Hosts without them take no part. `Some` exactly when
-    /// `fleet` is.
+    /// Each SSH fleet host's own credentials, resolved when the fleet was
+    /// entered (#436). Kubernetes fleets use their configured ClusterApi instead.
     pub fleet_credentials: Option<filar_agent::fleet_creds::FleetCredentials>,
+    /// Monotonic id of asynchronous Kubernetes discovery/API binding.
+    pub fleet_connection_id: Option<u64>,
     /// The last fleet operation's person-facing view (#438), shown in the
     /// side panel. Never part of `messages`: it carries host output.
     pub fleet_view: Option<filar_agent::fleet_view::FleetView>,
@@ -835,6 +931,7 @@ impl App {
             ssh_targets: Vec::new(),
             kube_clusters: Vec::new(),
             pending_kube_connects: Vec::new(),
+            pending_kube_fleets: Vec::new(),
             kube_namespace_select: None,
             next_kube_connection_id: 1,
             ctrl_o_selection: None,
@@ -1041,6 +1138,11 @@ impl App {
         std::mem::take(&mut self.pending_kube_connects)
     }
 
+    /// Take Kubernetes fleet discovery and restore work queued for the runner.
+    pub fn take_pending_kube_fleets(&mut self) -> Vec<KubeFleetRequest> {
+        std::mem::take(&mut self.pending_kube_fleets)
+    }
+
     /// Switch to the previous tab (wraps around). Ordinary tabs only: from
     /// the fleet layer this leaves the fleet for the tab it was entered from.
     pub fn prev_tab(&mut self) {
@@ -1188,6 +1290,7 @@ impl Session {
             transcript_error_shown: false,
             fleet: None,
             fleet_credentials: None,
+            fleet_connection_id: None,
             fleet_view: None,
             fleet_status: None,
             fleet_missing: Vec::new(),
@@ -2439,19 +2542,43 @@ impl App {
                 selection: base + cluster,
             }));
         }
-        // Host groups (#432): fleet entry points, after every target. The
-        // search matches the group name or its rule's tags; a tag filter
-        // keeps the groups whose rule names that tag.
+        // Host groups (#432): fleet entry points, after every target. SSH
+        // rules match their tags; Kubernetes groups also match their cluster,
+        // namespace, selector and the selected clusters' tags.
         let groups: Vec<usize> = self
             .host_groups
             .iter()
             .enumerate()
             .filter(|_| !for_panel)
             .filter(|(_, g)| {
-                tag.is_none_or(|tf| g.match_tags.iter().any(|t| t.eq_ignore_ascii_case(tf)))
-                    && (q.is_empty()
-                        || g.name.to_lowercase().contains(&q)
-                        || g.match_tags.iter().any(|t| t.to_lowercase().contains(&q)))
+                let kube_tag = |tf: &str| {
+                    g.kube.as_ref().is_some_and(|kube| {
+                        kube.clusters.iter().any(|name| {
+                            self.kube_clusters.iter().any(|target| {
+                                target.name == *name
+                                    && target.tags.iter().any(|t| t.eq_ignore_ascii_case(tf))
+                            })
+                        })
+                    })
+                };
+                let tag_hit = tag.is_none_or(|tf| {
+                    g.match_tags.iter().any(|t| t.eq_ignore_ascii_case(tf)) || kube_tag(tf)
+                });
+                let query_hit = q.is_empty()
+                    || g.name.to_lowercase().contains(&q)
+                    || g.match_tags.iter().any(|t| t.to_lowercase().contains(&q))
+                    || g.kube.as_ref().is_some_and(|kube| {
+                        kube.namespace.to_lowercase().contains(&q)
+                            || kube
+                                .selector
+                                .as_ref()
+                                .is_some_and(|selector| selector.to_lowercase().contains(&q))
+                            || kube
+                                .clusters
+                                .iter()
+                                .any(|cluster| cluster.to_lowercase().contains(&q))
+                    });
+                tag_hit && query_hit
             })
             .map(|(i, _)| i)
             .collect();
@@ -3491,7 +3618,11 @@ impl App {
             .map(|name| {
                 let nth = seen.entry(name.as_str()).or_insert(0);
                 *nth += 1;
-                let found = op.members().iter().filter(|m| m.name() == name.as_str()).count();
+                let found = op
+                    .members()
+                    .iter()
+                    .filter(|m| m.name() == name.as_str())
+                    .count();
                 *nth > found
             })
             .collect();
@@ -6003,9 +6134,12 @@ impl App {
                     pending.audit_unavailable = a.unavailable;
                 }
                 // The fleet gate (#435): the radius is the fleet's frozen
-                // composition — the same snapshot the fleet executor runs
-                // the command on.
-                pending.radius = self.fleet_radius();
+                // composition — the same snapshot the typed call or command
+                // runs on.
+                let (radius, radius_kind, radius_context) = self.fleet_radius_details();
+                pending.radius = radius;
+                pending.radius_kind = radius_kind;
+                pending.radius_context = radius_context;
                 pending.proposal_id = self
                     .pending_proposal
                     .as_ref()
@@ -6629,6 +6763,43 @@ fn fleet_intro(
     lines
 }
 
+/// Opening feed lines of a discovered or restored Kubernetes fleet.
+fn kube_fleet_intro(op: &filar_core::FleetOperation) -> Vec<String> {
+    let kind = fleet_radius_kind(op);
+    let policy = match op.policy() {
+        filar_core::HostGroupPolicy::ReadOnly => "read-only",
+    };
+    let mut lines = vec![format!(
+        "Fleet: {} — {} {}, {policy}, up to {} at a time, {}s per member.",
+        op.group_name(),
+        op.len(),
+        kind.noun(op.len()),
+        op.max_parallel(),
+        op.per_host_timeout().as_secs(),
+    )];
+    if op.is_empty() {
+        lines.push("The group matches no Kubernetes members right now.".into());
+    } else {
+        lines.push(format!(
+            "Members: {}",
+            op.members()
+                .iter()
+                .map(|member| member.name())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        lines.push(
+            "Fixed at entry: new pods do not join; vanished pods stay in the summary.".into(),
+        );
+    }
+    lines.push(format!(
+        "Ask read-only questions: one approval runs a typed request on every {}.",
+        kind.noun(2)
+    ));
+    lines.push("Ctrl+W: close fleet · Ctrl+N: new tab · Ctrl+Tab: back to tabs".into());
+    lines
+}
+
 impl App {
     /// Indices of the ordinary tabs — every session but the fleet's — in
     /// tab order. These are what tab numbers and `Ctrl+Tab` walk.
@@ -6649,6 +6820,21 @@ impl App {
     /// Whether the fleet layer is on screen.
     pub fn in_fleet(&self) -> bool {
         self.sessions[self.active].fleet.is_some()
+    }
+
+    /// Whether the active fleet uses typed Kubernetes calls.
+    pub fn in_kube_fleet(&self) -> bool {
+        let session = self.active_session();
+        session.fleet.as_ref().is_some_and(is_kube_fleet)
+            || session.fleet_saved_targets.as_ref().is_some_and(|targets| {
+                targets.iter().any(|target| {
+                    matches!(
+                        target,
+                        filar_core::FleetTarget::KubePod(_)
+                            | filar_core::FleetTarget::KubeCluster(_)
+                    )
+                })
+            })
     }
 
     /// The open fleet operation, shown or not.
@@ -6689,6 +6875,9 @@ impl App {
             }
             self.close_fleet_session(fi);
         }
+        if group.kube.is_some() {
+            return self.enter_kube_fleet(group);
+        }
         let op = filar_core::FleetOperation::open(&group, &self.ssh_targets);
         let base = &self.sessions[self.active];
         let mut session = Session::new(format!("fleet:{}", group.name), base.confirm_mode);
@@ -6708,6 +6897,39 @@ impl App {
         session.fleet_credentials = Some(creds);
         self.sessions.push(session);
         self.active = self.sessions.len() - 1;
+        self.sync_confirm_mode();
+        true
+    }
+
+    /// Queue asynchronous discovery before a Kubernetes fleet can accept input.
+    fn enter_kube_fleet(&mut self, group: filar_core::HostGroup) -> bool {
+        let op = filar_core::FleetOperation::from_targets(&group, &[]);
+        let base = &self.sessions[self.active];
+        let mut session = Session::new(format!("fleet:{}", group.name), base.confirm_mode);
+        session.llm_profile = op
+            .llm_profile()
+            .map(str::to_string)
+            .or_else(|| base.llm_profile.clone());
+        session.messages = vec![ChatBlock::System(format!(
+            "Discovering Kubernetes fleet {}…",
+            group.name
+        ))];
+        session.cwd = None;
+        session.fleet = Some(op.clone());
+        let session_id = session.id;
+        let connection_id = self.next_kube_id();
+        let cancellation = CancellationToken::new();
+        session.fleet_connection_id = Some(connection_id);
+        session.cancellation = Some(cancellation.clone());
+        self.sessions.push(session);
+        self.active = self.sessions.len() - 1;
+        self.pending_kube_fleets.push(KubeFleetRequest {
+            session_id,
+            connection_id,
+            operation: op,
+            discover: true,
+            cancellation,
+        });
         self.sync_confirm_mode();
         true
     }
@@ -6743,12 +6965,35 @@ impl App {
         if let Some(fi) = self.fleet_index() {
             self.close_fleet_session(fi);
         }
-        let targets: Vec<_> = self
+        let kubernetes = group.kube.is_some()
+            || snapshot.targets.iter().any(|target| {
+                matches!(
+                    target,
+                    filar_core::FleetTarget::KubePod(_) | filar_core::FleetTarget::KubeCluster(_)
+                )
+            });
+        let mut targets: Vec<_> = self
             .ssh_targets
             .iter()
             .cloned()
             .map(filar_core::FleetTarget::Ssh)
             .collect();
+        targets.extend(
+            snapshot
+                .targets
+                .iter()
+                .filter(|target| {
+                    let cluster = match target {
+                        filar_core::FleetTarget::KubePod(pod) => &pod.cluster,
+                        filar_core::FleetTarget::KubeCluster(scope) => &scope.cluster,
+                        filar_core::FleetTarget::Ssh(_) => return false,
+                    };
+                    self.kube_clusters
+                        .iter()
+                        .any(|configured| configured.name == *cluster)
+                })
+                .cloned(),
+        );
         let (op, missing) =
             filar_core::FleetOperation::restore(&group, &snapshot.targets, &targets);
         let base = &self.sessions[self.active];
@@ -6763,12 +7008,18 @@ impl App {
             .clone()
             .or_else(|| op.llm_profile().map(str::to_string))
             .or_else(|| base.llm_profile.clone());
-        let creds =
-            filar_agent::fleet_creds::FleetCredentials::resolve(&op, &*self.credential_store);
+        let creds = (!kubernetes).then(|| {
+            filar_agent::fleet_creds::FleetCredentials::resolve(&op, &*self.credential_store)
+        });
 
         let mut messages = saved.messages;
+        let restore_source = if kubernetes {
+            "members from the session, not from current selectors"
+        } else {
+            "hosts from the session, not from current tags"
+        };
         messages.push(ChatBlock::System(format!(
-            "Fleet session restored ({}): hosts from the session, not from current tags.",
+            "Fleet session restored ({}): {restore_source}.",
             saved.timestamp
         )));
         if group_gone {
@@ -6783,7 +7034,14 @@ impl App {
                 missing.join(", ")
             )));
         }
-        messages.extend(fleet_intro(&op, &creds).into_iter().map(ChatBlock::System));
+        if let Some(creds) = &creds {
+            messages.extend(fleet_intro(&op, creds).into_iter().map(ChatBlock::System));
+        } else {
+            messages.push(ChatBlock::System(format!(
+                "Reconnecting Kubernetes fleet {}…",
+                group.name
+            )));
+        }
         session.messages = messages;
         session.folded_history = saved.folded_history;
         session.input_history = saved.input_history;
@@ -6794,15 +7052,76 @@ impl App {
         session.last_served_model = saved.last_served_model;
         session.model_per_profile = saved.model_per_profile;
         session.cwd = None;
-        session.fleet = Some(op);
-        session.fleet_credentials = Some(creds);
+        session.fleet = Some(op.clone());
+        session.fleet_credentials = creds;
         session.fleet_missing = missing;
         session.fleet_saved_targets = Some(snapshot.targets);
         session.fleet_saved_id = Some(saved.id);
+        let session_id = session.id;
         self.sessions.push(session);
         self.active = self.sessions.len() - 1;
+        if kubernetes {
+            let connection_id = self.next_kube_id();
+            let cancellation = CancellationToken::new();
+            let session = self.active_session_mut();
+            session.fleet_connection_id = Some(connection_id);
+            session.cancellation = Some(cancellation.clone());
+            self.pending_kube_fleets.push(KubeFleetRequest {
+                session_id,
+                connection_id,
+                operation: op,
+                discover: false,
+                cancellation,
+            });
+        }
         self.sync_confirm_mode();
         true
+    }
+
+    /// Whether a fleet discovery/API-binding result still belongs to its session.
+    pub fn kube_fleet_connection_is_current(&self, sid: SessionId, connection_id: u64) -> bool {
+        self.sessions
+            .iter()
+            .any(|session| session.id == sid && session.fleet_connection_id == Some(connection_id))
+    }
+
+    /// Apply discovered or restored Kubernetes membership and its live operation.
+    pub fn complete_kube_fleet(
+        &mut self,
+        sid: SessionId,
+        connection_id: u64,
+        operation: &filar_core::FleetOperation,
+    ) -> bool {
+        let Some(session) = self.sessions.iter_mut().find(|session| {
+            session.id == sid && session.fleet_connection_id == Some(connection_id)
+        }) else {
+            return false;
+        };
+        session.fleet = Some(operation.clone());
+        session.fleet_connection_id = None;
+        session.cancellation = None;
+        session.messages.extend(
+            kube_fleet_intro(operation)
+                .into_iter()
+                .map(ChatBlock::System),
+        );
+        session.message_rev += 1;
+        true
+    }
+
+    /// Surface a discovery/connection failure without replacing saved membership.
+    pub fn fail_kube_fleet(&mut self, sid: SessionId, connection_id: u64, error: String) {
+        let Some(session) = self.sessions.iter_mut().find(|session| {
+            session.id == sid && session.fleet_connection_id == Some(connection_id)
+        }) else {
+            return;
+        };
+        session.fleet_connection_id = None;
+        session.cancellation = None;
+        session.messages.push(ChatBlock::Error(format!(
+            "Kubernetes fleet is not ready: {error}"
+        )));
+        session.message_rev += 1;
     }
 
     /// Leave the fleet layer for the tab it was entered from, keeping the
@@ -6857,13 +7176,23 @@ impl App {
         self.sync_confirm_mode();
     }
 
-    /// Hosts a command in the active session runs on: the fleet's members
-    /// that have credentials (#436), or nothing outside a fleet (#435).
+    /// Members a request in the active session runs on, or nothing outside a fleet.
+    /// SSH members without credentials are excluded (#436).
     pub fn fleet_radius(&self) -> Vec<String> {
+        self.fleet_radius_details().0
+    }
+
+    /// Frozen member names and their display metadata for the confirmation gate.
+    fn fleet_radius_details(&self) -> (Vec<String>, FleetRadiusKind, Option<String>) {
         let session = self.active_session();
         match (&session.fleet, &session.fleet_credentials) {
-            (Some(op), Some(creds)) => creds.participants(op),
-            _ => Vec::new(),
+            (Some(op), Some(creds)) => (creds.participants(op), FleetRadiusKind::Hosts, None),
+            (Some(op), None) if is_kube_fleet(op) => (
+                op.members().iter().map(|member| member.name()).collect(),
+                fleet_radius_kind(op),
+                kube_radius_context(op),
+            ),
+            _ => (Vec::new(), FleetRadiusKind::Hosts, None),
         }
     }
 
@@ -14817,6 +15146,80 @@ mod tests {
             .collect()
     }
 
+    fn kube_fleet_group(selector: Option<&str>) -> filar_core::HostGroup {
+        filar_core::HostGroup {
+            name: "web-prod".into(),
+            kube: Some(filar_core::KubeGroup {
+                clusters: vec!["prod-eu".into(), "prod-us".into()],
+                namespace: "shop".into(),
+                selector: selector.map(str::to_string),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn saved_pod(cluster: &str, pod: &str) -> filar_core::FleetTarget {
+        filar_core::FleetTarget::KubePod(filar_core::KubePodRef {
+            cluster: cluster.into(),
+            namespace: "shop".into(),
+            pod: pod.into(),
+            container: "main".into(),
+        })
+    }
+
+    #[test]
+    fn empty_kubernetes_fleets_keep_their_member_kind() {
+        let pods =
+            filar_core::FleetOperation::from_targets(&kube_fleet_group(Some("app=web")), &[]);
+        let clusters = filar_core::FleetOperation::from_targets(&kube_fleet_group(None), &[]);
+        assert_eq!(fleet_radius_kind(&pods), FleetRadiusKind::Pods);
+        assert_eq!(fleet_radius_kind(&clusters), FleetRadiusKind::Clusters);
+    }
+
+    #[test]
+    fn a_kubernetes_fleet_restores_exact_saved_members_without_discovery() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.host_groups = vec![kube_fleet_group(Some("app=web"))];
+        app.kube_clusters = ["prod-eu", "prod-us"]
+            .into_iter()
+            .map(|name| filar_core::KubeCluster {
+                name: name.into(),
+                context: name.into(),
+                ..Default::default()
+            })
+            .collect();
+        let saved_targets = vec![saved_pod("prod-eu", "web-a"), saved_pod("prod-us", "web-c")];
+        let mut saved = saved_fleet("web-prod", &[]);
+        saved.fleet.as_mut().expect("fleet snapshot").targets = saved_targets.clone();
+
+        assert!(app.restore_fleet(saved));
+        assert!(app.in_kube_fleet());
+        let requests = app.take_pending_kube_fleets();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(!request.discover, "restore must not rediscover pods");
+        let restored: Vec<_> = request
+            .operation
+            .members()
+            .iter()
+            .map(|member| member.target().clone())
+            .collect();
+        assert_eq!(restored, saved_targets);
+        assert!(app.complete_kube_fleet(
+            request.session_id,
+            request.connection_id,
+            &request.operation,
+        ));
+
+        let snapshot = app.fleet_snapshot().expect("fleet snapshot");
+        assert_eq!(snapshot.targets, saved_targets);
+        assert!(app.messages.iter().any(|message| matches!(
+            message,
+            ChatBlock::System(text)
+                if text.contains("members from the session, not from current selectors")
+        )));
+    }
+
     #[test]
     fn a_fleet_session_restores_with_its_saved_composition() {
         let mut app = App::new("local".into(), CommandConfirmMode::Always);
@@ -14888,7 +15291,11 @@ mod tests {
             .active_session()
             .fleet_snapshot()
             .expect("fleet session");
-        let names: Vec<_> = snapshot.targets.iter().map(filar_core::FleetTarget::name).collect();
+        let names: Vec<_> = snapshot
+            .targets
+            .iter()
+            .map(filar_core::FleetTarget::name)
+            .collect();
         assert_eq!(names, ["web-1", "web-7"]);
         assert_eq!(snapshot.group, "web");
         assert_eq!(
@@ -14978,12 +15385,12 @@ mod tests {
             .active_session()
             .fleet_snapshot()
             .expect("fleet session");
-        let names: Vec<_> = snapshot.targets.iter().map(filar_core::FleetTarget::name).collect();
-        assert_eq!(
-            names,
-            ["web-7", "web-1", "web-2"],
-            "order survives a save"
-        );
+        let names: Vec<_> = snapshot
+            .targets
+            .iter()
+            .map(filar_core::FleetTarget::name)
+            .collect();
+        assert_eq!(names, ["web-7", "web-1", "web-2"], "order survives a save");
     }
 
     // ── Fleet export (#441) ─────────────────────────────────────────
@@ -15029,7 +15436,7 @@ mod tests {
                 &filar_core::HostGroup::default(),
                 &[] as &[filar_core::SshTarget],
             )
-                .id(),
+            .id(),
             command: "uname -r".into(),
             headline: "operation #3: 3 of 6 hosts answered, 1 did not answer".into(),
             groups: vec![

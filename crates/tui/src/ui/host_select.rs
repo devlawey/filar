@@ -306,20 +306,38 @@ fn row_line(app: &App, row: &HostSelectRow, glyphs: &Glyphs) -> Line<'static> {
             };
             let is_current =
                 app.in_fleet() && app.fleet().map(|f| f.group_name()) == Some(g.name.as_str());
-            let members = filar_core::select_hosts_for_group(g, &app.ssh_targets).len();
-            let rule: Vec<String> = g.match_tags.iter().map(|t| format!("#{t}")).collect();
+            let (name, members, rule) = if let Some(kube) = &g.kube {
+                let mut rule = vec![kube.namespace.clone()];
+                if let Some(selector) = &kube.selector {
+                    rule.push(selector.clone());
+                }
+                (
+                    format!("{} {}", glyphs.kube, g.name),
+                    format!("{} cluster(s)", kube.clusters.len()),
+                    rule,
+                )
+            } else {
+                (
+                    g.name.clone(),
+                    format!(
+                        "{} host(s)",
+                        filar_core::select_hosts_for_group(g, &app.ssh_targets).len()
+                    ),
+                    g.match_tags.iter().map(|t| format!("#{t}")).collect(),
+                )
+            };
             Line::from(vec![
                 cursor_span(app, glyphs, *selection),
                 current_span(glyphs, is_current),
                 Span::raw(" "),
                 Span::styled(
-                    g.name.clone(),
+                    name,
                     Style::default()
                         .fg(app.theme.fg)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::styled(format!("{members} host(s)"), app.theme.muted()),
+                Span::styled(members, app.theme.muted()),
                 Span::raw("  "),
                 Span::styled(rule.join(" "), app.theme.dim()),
             ])
@@ -466,6 +484,36 @@ mod tests {
             text.contains("Esc clear"),
             "footer hints must survive the empty view: {text:?}"
         );
+    }
+
+    #[test]
+    fn kubernetes_groups_show_the_glyph_scope_and_selector() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.host_groups = vec![filar_core::HostGroup {
+            name: "web-prod".into(),
+            kube: Some(filar_core::KubeGroup {
+                clusters: vec!["prod-eu".into(), "prod-us".into()],
+                namespace: "shop".into(),
+                selector: Some("app=web".into()),
+            }),
+            ..Default::default()
+        }];
+        app.host_select_visible = true;
+        let text = render_to_text(&app, 100, 24, &Glyphs::UNICODE);
+        assert!(text.contains("⎈ web-prod"), "{text:?}");
+        assert!(text.contains("2 cluster(s)"), "{text:?}");
+        assert!(text.contains("shop app=web"), "{text:?}");
+
+        app.host_select_query = "app=web".into();
+        assert!(app
+            .host_select_rows()
+            .iter()
+            .any(|row| matches!(row, HostSelectRow::Group { group: 0, .. })));
+        app.host_select_query = "app=db".into();
+        assert!(!app
+            .host_select_rows()
+            .iter()
+            .any(|row| matches!(row, HostSelectRow::Group { .. })));
     }
 
     #[test]
