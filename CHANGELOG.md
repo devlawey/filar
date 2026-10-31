@@ -13,6 +13,11 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- Read-only Kubernetes fleets in `[[host_groups]]`: frozen ready-pod or
+  cluster/namespace composition across configured clusters, bounded typed API
+  fan-out with per-member deadlines, redacted difference folds, distinct
+  RBAC/disappearance outcomes, new-pod notices, one fleet-wide confirmation,
+  and pod-safe fleet runbooks ([#568](https://github.com/devlawey/filar/issues/568)).
 - Kubernetes clusters in the GUI launcher with local kubeconfig context discovery, a single-request Check, config/pending-launch persistence, explicit import/export skip notices, and `--target cluster[/namespace]` ([#566](https://github.com/devlawey/filar/issues/566)).
 - Kubernetes cluster tabs in the TUI: Ctrl+O target and namespace selection,
   typed read-only agent calls with collapsible API blocks, target-aware

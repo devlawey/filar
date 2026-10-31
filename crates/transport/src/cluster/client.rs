@@ -535,20 +535,20 @@ fn api_error(
                 let scope = namespace
                     .map(|namespace| format!("namespace {namespace}"))
                     .unwrap_or_else(|| "cluster scope".into());
-                CoreError::Other(format!(
+                CoreError::AccessDenied(format!(
                     "нет права {verb} на {resource} в {scope} (контекст {})",
                     target.context
                 ))
             } else {
                 // Admission/policy denials are intentionally preserved verbatim.
-                CoreError::Other(status.message)
+                CoreError::AccessDenied(status.message)
             }
         }
         kube::Error::Api(status) if status.code == 404 => {
             let scope = namespace
                 .map(|namespace| format!(" in namespace {namespace}"))
                 .unwrap_or_default();
-            CoreError::Other(format!(
+            CoreError::NotFound(format!(
                 "Kubernetes API returned 404 Not Found for {verb} {resource}{scope} (context {})",
                 target.context
             ))
@@ -557,7 +557,7 @@ fn api_error(
             "Kubernetes API rejected {verb} {resource} (context {}, HTTP {}, {})",
             target.context, status.code, status.reason
         )),
-        _ => CoreError::Other(format!(
+        _ => CoreError::Unavailable(format!(
             "Kubernetes API is unavailable or the {verb} {resource} request timed out (context {})",
             target.context
         )),

@@ -141,6 +141,9 @@ pub enum HostRun {
     /// Including when it answered badly: a non-zero exit code is an
     /// answer, and reading it is #428's job.
     Answered(CommandResult),
+    /// A typed API answered with already-redacted text (Kubernetes fleets).
+    /// This is deliberately not a synthetic shell `CommandResult`.
+    AnsweredText(String),
     /// The host's own deadline expired before an answer arrived. The
     /// command was asked to cancel, best-effort, so the host's shell is
     /// not left waiting on it.
@@ -194,6 +197,20 @@ pub struct FleetRunReport {
 }
 
 impl FleetRunReport {
+    /// Build a report for another typed fan-out in this crate.
+    ///
+    /// The caller supplies handles from `operation`; public construction stays
+    /// with the runner so external callers cannot invent cross-fleet handles.
+    pub(crate) fn from_runs(operation: OperationId, runs: Vec<(HostHandle, HostRun)>) -> Self {
+        Self {
+            operation,
+            outcomes: runs
+                .into_iter()
+                .map(|(handle, run)| HostOutcome { handle, run })
+                .collect(),
+        }
+    }
+
     /// The operation this report is about.
     pub fn operation(&self) -> OperationId {
         self.operation
@@ -256,7 +273,7 @@ impl FleetRunReport {
 
     /// How many hosts answered, well or badly.
     pub fn answered(&self) -> usize {
-        self.count(|run| matches!(run, HostRun::Answered(_)))
+        self.count(|run| matches!(run, HostRun::Answered(_) | HostRun::AnsweredText(_)))
     }
 
     /// How many hosts ran out of time.

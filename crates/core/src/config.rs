@@ -713,9 +713,57 @@ pub enum HostGroupPolicy {
     ReadOnly,
 }
 
-/// A named selection of SSH targets, from `[[host_groups]]` (#418).
+/// Kubernetes selection for a fleet host group (#568).
 ///
-/// The selection is a tag **intersection**: a target belongs to the group
+/// With a selector, fleet entry freezes the ready pods matching it in every
+/// listed cluster. Without one, each cluster/namespace pair is a member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubeGroup {
+    /// Names of entries in `[[kube_clusters]]`, in composition order.
+    pub clusters: Vec<String>,
+    /// Namespace shared by every member of the group.
+    pub namespace: String,
+    /// Optional Kubernetes label selector used to discover ready pods.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+}
+
+impl KubeGroup {
+    fn validate(&self, group_name: &str) -> Result<()> {
+        if self.clusters.is_empty() {
+            return Err(CoreError::Config(format!(
+                "host_groups: \"{group_name}\": kube.clusters must not be empty"
+            )));
+        }
+        for (index, cluster) in self.clusters.iter().enumerate() {
+            if cluster.trim().is_empty() {
+                return Err(CoreError::Config(format!(
+                    "host_groups: \"{group_name}\": kube.clusters contains an empty name"
+                )));
+            }
+            if self.clusters[..index].contains(cluster) {
+                return Err(CoreError::Config(format!(
+                    "host_groups: \"{group_name}\": kube.clusters contains duplicate \"{cluster}\""
+                )));
+            }
+        }
+        if self.namespace.trim().is_empty() {
+            return Err(CoreError::Config(format!(
+                "host_groups: \"{group_name}\": kube.namespace must not be empty"
+            )));
+        }
+        if self.selector.as_ref().is_some_and(|selector| selector.trim().is_empty()) {
+            return Err(CoreError::Config(format!(
+                "host_groups: \"{group_name}\": kube.selector must not be empty when present"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A named selection of SSH targets or Kubernetes scopes, from `[[host_groups]]`.
+///
+/// The SSH selection is a tag **intersection**: a target belongs to the group
 /// when **all** of [`match_tags`](Self::match_tags) are present among its
 /// [`SshTarget::tags`]. An empty `match` selects nothing — deliberately not
 /// the whole fleet: an unfinished rule must never widen the blast radius.
@@ -739,6 +787,9 @@ pub struct HostGroup {
     /// Deadline for one command on one host, in seconds (default: 30).
     #[serde(default = "default_per_host_timeout_secs")]
     pub per_host_timeout_secs: u64,
+    /// Kubernetes clusters and optional pod selector; mutually exclusive with `match`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kube: Option<KubeGroup>,
     /// LLM profile for the group's dialogue; `None` = the session profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_profile: Option<String>,
@@ -763,6 +814,7 @@ impl Default for HostGroup {
             policy: HostGroupPolicy::default(),
             max_parallel: default_max_parallel(),
             per_host_timeout_secs: default_per_host_timeout_secs(),
+            kube: None,
             llm_profile: None,
         }
     }
@@ -789,6 +841,15 @@ impl HostGroup {
                 "host_groups: \"{}\": per_host_timeout_secs must be greater than 0",
                 self.name
             )));
+        }
+        if self.kube.is_some() && !self.match_tags.is_empty() {
+            return Err(CoreError::Config(format!(
+                "host_groups: \"{}\": match and kube are mutually exclusive",
+                self.name
+            )));
+        }
+        if let Some(kube) = &self.kube {
+            kube.validate(&self.name)?;
         }
         Ok(())
     }
@@ -2435,6 +2496,76 @@ policy = "read-write"
         }
         .validate()
         .is_ok());
+    }
+
+    #[test]
+    fn config_loads_a_kubernetes_host_group() {
+        let file = TempConfig::new(
+            "kube-group",
+            r#"
+[[host_groups]]
+name = "web-prod"
+kube = { clusters = ["prod-eu", "prod-us"], namespace = "shop", selector = "app=web" }
+max_parallel = 5
+per_host_timeout_secs = 30
+"#,
+        );
+        let config = Config::load(file.path()).expect("Kubernetes host group loads");
+        let group = &config.host_groups[0];
+        assert_eq!(
+            group.kube,
+            Some(KubeGroup {
+                clusters: vec!["prod-eu".into(), "prod-us".into()],
+                namespace: "shop".into(),
+                selector: Some("app=web".into()),
+            })
+        );
+        assert_eq!(group.max_parallel, 5);
+    }
+
+    #[test]
+    fn kubernetes_host_group_validation_rejects_ambiguous_or_empty_selection() {
+        let valid = || KubeGroup {
+            clusters: vec!["prod-eu".into()],
+            namespace: "shop".into(),
+            selector: Some("app=web".into()),
+        };
+        let group = |kube| HostGroup {
+            name: "web-prod".into(),
+            kube: Some(kube),
+            ..HostGroup::default()
+        };
+        assert!(group(valid()).validate().is_ok());
+        assert!(HostGroup {
+            match_tags: vec!["prod".into()],
+            ..group(valid())
+        }
+        .validate()
+        .is_err());
+        assert!(group(KubeGroup {
+            clusters: Vec::new(),
+            ..valid()
+        })
+        .validate()
+        .is_err());
+        assert!(group(KubeGroup {
+            clusters: vec!["prod-eu".into(), "prod-eu".into()],
+            ..valid()
+        })
+        .validate()
+        .is_err());
+        assert!(group(KubeGroup {
+            namespace: " ".into(),
+            ..valid()
+        })
+        .validate()
+        .is_err());
+        assert!(group(KubeGroup {
+            selector: Some(" ".into()),
+            ..valid()
+        })
+        .validate()
+        .is_err());
     }
 
     #[test]

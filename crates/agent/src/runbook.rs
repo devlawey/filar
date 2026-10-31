@@ -7,7 +7,7 @@
 //! anything on the host either.
 
 use crate::{ChatMessage, ChatRequest, LlmClient, MessageRole, TokenUsage};
-use filar_core::{CoreError, Result};
+use filar_core::{CoreError, FleetTarget, Result};
 
 /// System prompt for the runbook call.
 ///
@@ -92,6 +92,30 @@ impl FleetIdentifiers {
             ids.hosts.push(target.name.clone());
             ids.hosts.push(target.host.clone());
             ids.users.push(target.user.clone());
+        }
+        ids
+    }
+
+    /// Identifiers of a mixed fleet, including concrete Kubernetes pod names.
+    ///
+    /// Cluster and namespace names remain available as useful group context;
+    /// a frozen pod and its full member label are host-specific and are
+    /// scrubbed just like SSH host identities.
+    pub fn from_fleet_targets<'a>(targets: impl IntoIterator<Item = &'a FleetTarget>) -> Self {
+        let mut ids = Self::default();
+        for target in targets {
+            match target {
+                FleetTarget::Ssh(target) => {
+                    ids.hosts.push(target.name.clone());
+                    ids.hosts.push(target.host.clone());
+                    ids.users.push(target.user.clone());
+                }
+                FleetTarget::KubePod(pod) => {
+                    ids.hosts.push(target.name());
+                    ids.hosts.push(pod.pod.clone());
+                }
+                FleetTarget::KubeCluster(_) => {}
+            }
         }
         ids
     }
@@ -305,6 +329,29 @@ mod tests {
             fleet_ids().scrub(text),
             "ssh <user>@<host>; <host> differs from <host> (<host>); the administrator of web-1x"
         );
+    }
+
+    #[test]
+    fn kubernetes_fleet_scrubbing_removes_pods_but_keeps_group_context() {
+        let pod = FleetTarget::KubePod(filar_core::KubePodRef {
+            cluster: "prod-eu".into(),
+            namespace: "shop".into(),
+            pod: "web-7d9c8b6f5-x2v4q".into(),
+            container: "main".into(),
+        });
+        let scope = FleetTarget::KubeCluster(filar_core::KubeScopeRef {
+            cluster: "prod-eu".into(),
+            namespace: "shop".into(),
+        });
+        let ids = FleetIdentifiers::from_fleet_targets([&pod, &scope]);
+        let text = "Group web-prod: prod-eu/shop/web-7d9c8b6f5-x2v4q/main and \
+                    web-7d9c8b6f5-x2v4q differ from prod-eu/shop";
+        let scrubbed = ids.scrub(text);
+        assert_eq!(
+            scrubbed,
+            "Group web-prod: <host> and <host> differ from prod-eu/shop"
+        );
+        assert!(!scrubbed.contains("web-7d9c8b6f5-x2v4q"));
     }
 
     #[test]

@@ -2004,6 +2004,7 @@ impl HostGroupDraft {
             policy: self.policy,
             max_parallel,
             per_host_timeout_secs,
+            kube: None,
             llm_profile: if llm_profile.is_empty() {
                 None
             } else {
@@ -6597,6 +6598,7 @@ host_key_policy = \"strict\"
             policy: filar_core::HostGroupPolicy::ReadOnly,
             max_parallel: 5,
             per_host_timeout_secs: 45,
+            kube: None,
             llm_profile: Some("glm".into()),
         };
         let draft = HostGroupDraft::from_group(&group);

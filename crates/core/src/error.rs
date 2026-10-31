@@ -39,6 +39,19 @@ pub enum CoreError {
     #[error("context overflow: {0}")]
     ContextOverflow(String),
 
+    /// Kubernetes RBAC or an admission/policy rule denied a read-only request.
+    /// The message is sanitized by the transport and contains no API credentials.
+    #[error("{0}")]
+    AccessDenied(String),
+
+    /// A Kubernetes object that was previously selected no longer exists.
+    #[error("{0}")]
+    NotFound(String),
+
+    /// The Kubernetes API could not be reached or did not answer in time.
+    #[error("{0}")]
+    Unavailable(String),
+
     /// Generic error for cases that don't fit a more specific variant.
     #[error("{0}")]
     Other(String),

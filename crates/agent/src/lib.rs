@@ -42,6 +42,7 @@ pub mod fleet_retry;
 pub mod fleet_run;
 pub mod fleet_view;
 pub mod kube_agent;
+pub mod kube_fleet;
 pub mod kube_redact;
 pub mod kube_tools;
 pub mod long_wait;
@@ -60,11 +61,12 @@ pub use arbiter::{ArbiterContext, ArbiterVerdict, ARBITER_TIMEOUT_SECS};
 pub use compaction::{summarise_history, SummaryOutcome, COMPACTION_SYSTEM_PROMPT};
 pub use events::{AgentEvent, EventSink};
 pub use kube_agent::KubeAgent;
+pub use kube_fleet::{KubeFleet, KubeFleetCluster, KubeFleetReport};
 pub use kube_redact::{
     redact_logs, KubeToolOutput, CONFIGMAP_VALUE_MAX_CHARS, HIDDEN_VALUE, REVEALED_BY_CONFIG,
 };
 pub use kube_tools::{
-    build_kube_system_prompt, kube_confirmation_decision, kube_tool_definitions,
+    bind_fleet_call, build_kube_system_prompt, kube_confirmation_decision, kube_tool_definitions,
     parse_kube_tool_call, KubeResourceKind, KubeToolCall, KubeToolExecutor, KubeToolResult,
     KubeTopResource,
 };

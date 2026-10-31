@@ -539,6 +539,16 @@ pub fn fold(
                     value,
                 });
             }
+            Some(HostRun::AnsweredText(output)) => {
+                let output = output.clone();
+                let value = ComparedValue::digest(&output);
+                answered.push(Answered {
+                    handle,
+                    host,
+                    output,
+                    value,
+                });
+            }
             // A row that says the host answered while the report has no
             // answer for it is a contradiction between the two inputs,
             // not a state to interpret. Refusing beats folding a value

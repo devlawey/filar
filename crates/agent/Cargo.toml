@@ -29,6 +29,9 @@ tokio = { workspace = true, features = ["test-util"] }
 russh = { workspace = true }
 # The risk eval runner reads its dataset (#553).
 toml = { workspace = true }
+# Live docker/k8s fleet tests manage their explicit pod-deletion fixture (#568).
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
 
 # Command safety rating eval (#553). `test = true` so its unit tests run
 # with `cargo test`; the eval itself only runs when invoked.
