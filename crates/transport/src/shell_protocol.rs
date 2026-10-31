@@ -198,7 +198,10 @@ pub(crate) fn parse_filar_marker(
     let end = rest.find("__")?;
     let code: i32 = rest[..end].trim().parse().ok()?;
     let after_code = &rest[end + 2..];
-    let line = after_code.split(['\n', '\r']).next().unwrap_or("");
+    // The marker line is complete only once its terminator has arrived;
+    // otherwise a read split inside `$PWD` would drop the cwd.
+    let line_end = after_code.find(['\n', '\r'])?;
+    let line = &after_code[..line_end];
     let cwd = line.strip_suffix("__").map(str::trim).and_then(|pwd| {
         if crate::is_safe_cwd(pwd) {
             Some(pwd.to_string())
@@ -303,6 +306,26 @@ mod tests {
         let (code, cwd, _) = parse_filar_marker(buf, tag).unwrap();
         assert_eq!(code, 0);
         assert_eq!(cwd.as_deref(), Some("/home/u/my__project"));
+    }
+
+    #[test]
+    fn an_unterminated_marker_line_is_not_accepted_yet() {
+        let tag = "__FILAR_req_1";
+        assert!(parse_filar_marker("out\n__FILAR_req_1__0__/sr", tag).is_none());
+        assert!(parse_filar_marker("out\n__FILAR_req_1__0__", tag).is_none());
+        let (code, cwd, _) = parse_filar_marker("out\n__FILAR_req_1__0__/srv__\r\n", tag).unwrap();
+        assert_eq!((code, cwd.as_deref()), (0, Some("/srv")));
+    }
+
+    #[tokio::test]
+    async fn a_marker_split_inside_pwd_keeps_the_cwd() {
+        let mut rx = source(vec![
+            ChannelEvent::Data("hi\n__FILAR_req_1__0__/sr".into()),
+            ChannelEvent::Data("v__\n".into()),
+        ]);
+        let (out, _, code, cwd) =
+            recv_until_marker(&mut rx, "__FILAR_req_1", Duration::from_secs(1)).await.unwrap();
+        assert_eq!((out.as_str(), code, cwd.as_deref()), ("hi", Some(0), Some("/srv")));
     }
 
     #[test]

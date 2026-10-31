@@ -11,6 +11,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- A command's working directory is no longer lost when the shell's marker line arrives split across two reads ([#561](https://github.com/devlawey/filar/issues/561)).
+
 ## [3.0.0] - 2026-10-31
 
 ### Added
