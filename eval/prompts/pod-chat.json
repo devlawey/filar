@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "file://prompts/pod-system.txt"
+  },
+  {
+    "role": "user",
+    "content": "{{question}}"
+  }
+]

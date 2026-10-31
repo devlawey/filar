@@ -19,7 +19,8 @@ use filar_transport::{CommandExecutor, SecretSubstitutingExecutor};
 
 use crate::{
     arbiter::{
-        self, ArbiterContext, KubernetesArbiterTarget, ARBITER_TIMEOUT_SECS, HISTORY_TAIL_EXCHANGES,
+        self, ArbiterContext, KubePodTarget, KubernetesArbiterTarget, ARBITER_TIMEOUT_SECS,
+        HISTORY_TAIL_EXCHANGES,
     },
     events::{AgentEvent, EventSink},
     risk::{RiskInput, RiskScorer},
@@ -166,6 +167,103 @@ Rules:
 ///   (e.g. "user@host:port") for remote sessions.
 /// - `is_windows`: true when running on a Windows host (affects shell and commands).
 fn build_system_prompt(is_local: bool, ssh_info: Option<&str>, is_windows: bool) -> String {
+    let (transport_desc, shell_desc) = host_prompt_parts(is_local, ssh_info, is_windows);
+    assemble_system_prompt(&transport_desc, &shell_desc)
+}
+
+/// Build the system prompt for a shell inside a pod's container (#564).
+///
+/// Matches what `KubeExecutor` (#563) actually does: one persistent POSIX
+/// shell over the API `exec`, reopened (cd and variables reset) only when the
+/// pod is replaced or a command could not be interrupted. Limits are stated as
+/// facts from the pod spec; unknown ones are not mentioned.
+fn build_kube_pod_prompt(target: &KubePodTarget) -> String {
+    let (transport_desc, shell_desc) = kube_pod_prompt_parts(target);
+    assemble_system_prompt(&transport_desc, &shell_desc)
+}
+
+/// Transport and shell paragraphs of the pod prompt.
+fn kube_pod_prompt_parts(target: &KubePodTarget) -> (String, String) {
+    let mut transport = format!(
+        "You are a system administration assistant working INSIDE container {container} of \
+         Kubernetes pod {pod} (namespace {namespace}, context {context}, cluster {cluster}). \
+         Commands are executed in that container through the Kubernetes API (exec), not over SSH. \
+         The container filesystem is ephemeral: anything written outside mounted volumes is lost \
+         when the pod is recreated. Do NOT install packages (apt, apk, yum, dnf, pip, npm and the like): \
+         a container is changed by changing its image, and an installed package would vanish with \
+         the pod — explain this to the user instead. `kubectl` and access to the Kubernetes API are \
+         most likely NOT available inside the container. The image is usually minimal: check that a \
+         utility exists with `command -v <tool>` before relying on it.",
+        container = target.container,
+        pod = target.pod,
+        namespace = target.namespace,
+        context = target.context,
+        cluster = target.cluster,
+    );
+
+    let limits = &target.limits;
+    let mut facts = Vec::new();
+    if let Some(memory) = &limits.memory_limit {
+        facts.push(format!("memory limit {memory}"));
+    }
+    if let Some(memory) = &limits.memory_request {
+        facts.push(format!("memory request {memory}"));
+    }
+    if let Some(cpu) = &limits.cpu_limit {
+        facts.push(format!("CPU limit {cpu}"));
+    }
+    if let Some(cpu) = &limits.cpu_request {
+        facts.push(format!("CPU request {cpu}"));
+    }
+    match (arbiter::runs_as_non_root(limits), limits.run_as_user) {
+        (Some(true), Some(uid)) => facts.push(format!("runs as non-root user {uid}")),
+        (Some(true), None) => facts.push("runs as a non-root user".into()),
+        (Some(false), _) => facts.push("runs as root (uid 0)".into()),
+        (None, _) => {}
+    }
+    if limits.read_only_root_filesystem == Some(true) {
+        facts.push("read-only root filesystem".into());
+    }
+    if !limits.dropped_capabilities.is_empty() {
+        facts.push(format!(
+            "dropped capabilities: {}",
+            limits.dropped_capabilities.join(", ")
+        ));
+    }
+    if !facts.is_empty() {
+        transport.push_str(&format!(
+            " Known settings of this container (from the pod spec): {}.",
+            facts.join("; ")
+        ));
+    }
+    transport.push_str(
+        " Processes you start share the memory and process limits with the application in this \
+         container. Exceeding the limit causes an OOM kill, and the process killed may be the \
+         application's — the pod restarts. Avoid heavy commands: `find /` over a large tree, \
+         reading big files whole, sorting large logs. Limit output (`head`, `tail -n`) and check \
+         sizes before reading.",
+    );
+    if arbiter::runs_as_non_root(limits) == Some(true) {
+        transport.push_str(" You are not root: `sudo` is most likely not available.");
+    }
+    if limits.read_only_root_filesystem == Some(true) {
+        transport.push_str(
+            " The root filesystem is read-only: writing is only possible to mounted volumes \
+             (for example /tmp, if it is an emptyDir).",
+        );
+    }
+
+    let shell = "You are running on a persistent POSIX shell inside the container (no TTY). \
+                 Shell state (cwd, env) DOES persist between calls: your `cd`, exported variables \
+                 and environment carry over to subsequent commands. If the pod is replaced or a \
+                 command cannot be interrupted, the shell is reopened and cd and variables are \
+                 reset — you will see this in the session."
+        .to_string();
+    (transport, shell)
+}
+
+/// Transport and shell paragraphs for the local and SSH prompts.
+fn host_prompt_parts(is_local: bool, ssh_info: Option<&str>, is_windows: bool) -> (String, String) {
     let transport_desc = if is_local {
         if is_windows {
             "You are a system administration assistant operating on the LOCAL Windows machine. \
@@ -209,7 +307,11 @@ fn build_system_prompt(is_local: bool, ssh_info: Option<&str>, is_windows: bool)
          and environment carry over to subsequent commands. Prefer using this (e.g. \
          `cd /var/log` then `ls`)."
     };
+    (transport_desc, shell_desc.to_string())
+}
 
+/// The common prompt body around the transport and shell paragraphs.
+fn assemble_system_prompt(transport_desc: &str, shell_desc: &str) -> String {
     format!(
         r#"{transport_desc} You have tools to run commands, read files, and list directories. IMPORTANT: Determine the language of the user's FIRST request in this conversation, and write ALL of your explanations, summaries, questions, and the final answer in that same language. Keep this language consistent for the entire session. Do NOT default to any fixed language. Note: raw command output (stdout/stderr) is passed through as-is and must NOT be translated — only your own prose around it follows the user's language.
 
@@ -533,6 +635,24 @@ impl AgentBuilder {
             ssh_info: None,
             kubernetes: Some(KubernetesArbiterTarget::new(target, namespace)),
         })
+    }
+
+    /// Convenience: set arbiter and risk-scorer context for a pod shell (#564).
+    pub fn arbiter_kube_pod_context(self, target: &KubePodTarget) -> Self {
+        self.arbiter_context(ArbiterContext {
+            is_local: false,
+            ssh_info: None,
+            kubernetes: Some(KubernetesArbiterTarget::pod(target)),
+        })
+    }
+
+    /// Convenience: a shell inside a pod's container (#564) — the pod system
+    /// prompt (with the container's known limits) and the matching arbiter
+    /// and risk-scorer context. Pair with a `KubeExecutor` as the executor.
+    pub fn kube_pod_mode(self, target: &KubePodTarget) -> Self {
+        self.system_prompt(build_kube_pod_prompt(target))
+            .is_local(false)
+            .arbiter_kube_pod_context(target)
     }
 
     /// Convenience: set the system prompt for local execution.
@@ -2446,6 +2566,116 @@ mod tests {
             snapshot.trim_end(),
             expected.trim_end(),
             "eval/prompts/agent-system.txt is out of sync with build_system_prompt(false, None, false)"
+        );
+    }
+
+    /// The pod used by the eval snapshot (`eval/prompts/pod-system.txt`):
+    /// a typical small, locked-down container.
+    fn eval_pod_target() -> KubePodTarget {
+        let cluster = filar_core::KubeCluster {
+            name: "prod-eu".into(),
+            context: "prod-eu".into(),
+            tags: vec!["prod".into()],
+            ..filar_core::KubeCluster::default()
+        };
+        KubePodTarget::new(
+            &cluster,
+            "shop",
+            "web-7f9c4d5b8-x2k9p",
+            "main",
+            filar_core::PodLimits {
+                memory_limit: Some("256Mi".into()),
+                memory_request: Some("128Mi".into()),
+                cpu_limit: None,
+                cpu_request: Some("100m".into()),
+                run_as_user: Some(65534),
+                run_as_non_root: Some(true),
+                read_only_root_filesystem: Some(true),
+                dropped_capabilities: vec!["ALL".into()],
+            },
+        )
+    }
+
+    #[test]
+    fn pod_prompt_states_where_it_runs_and_how_the_shell_behaves() {
+        let prompt = build_kube_pod_prompt(&eval_pod_target());
+        assert!(prompt.contains("INSIDE container main of Kubernetes pod web-7f9c4d5b8-x2k9p"));
+        assert!(prompt.contains("namespace shop, context prod-eu, cluster prod-eu"));
+        assert!(prompt.contains("ephemeral"));
+        assert!(prompt.contains("Do NOT install packages"));
+        assert!(prompt.contains("`kubectl`"));
+        assert!(prompt.contains("command -v <tool>"));
+        // KubeExecutor keeps one shell: state persists (AGENTS.md: prompt = behaviour).
+        assert!(prompt.contains("Shell state (cwd, env) DOES persist between calls"));
+        assert!(prompt.contains("cd and variables are reset"));
+        assert!(!prompt.contains("over an SSH connection"));
+        // The common rules are still there.
+        assert!(prompt.contains("Never put passwords or secrets directly in commands"));
+    }
+
+    #[test]
+    fn pod_prompt_states_known_limits_and_the_shared_memory_rule() {
+        let prompt = build_kube_pod_prompt(&eval_pod_target());
+        assert!(prompt.contains(
+            "Known settings of this container (from the pod spec): memory limit 256Mi; \
+             memory request 128Mi; CPU request 100m; runs as non-root user 65534; \
+             read-only root filesystem; dropped capabilities: ALL."
+        ), "{prompt}");
+        assert!(prompt.contains("share the memory and process limits with the application"));
+        assert!(prompt.contains("OOM kill"));
+        assert!(prompt.contains("`find /`"));
+        assert!(prompt.contains("`sudo` is most likely not available"));
+        assert!(prompt.contains("only possible to mounted volumes"));
+        assert!(!prompt.contains("CPU limit"), "unknown fields are not mentioned");
+    }
+
+    #[test]
+    fn pod_prompt_with_unknown_limits_mentions_none_of_them() {
+        let mut target = eval_pod_target();
+        target.limits = filar_core::PodLimits::default();
+        let prompt = build_kube_pod_prompt(&target);
+        assert!(!prompt.contains("Known settings"), "{prompt}");
+        assert!(!prompt.contains("sudo` is most likely"));
+        assert!(!prompt.contains("read-only root filesystem"));
+        assert!(!prompt.contains("only possible to mounted volumes"));
+        // The resource rule holds whatever the spec says.
+        assert!(prompt.contains("share the memory and process limits"));
+
+        target.limits.run_as_user = Some(0);
+        let prompt = build_kube_pod_prompt(&target);
+        assert!(prompt.contains("runs as root (uid 0)"));
+        assert!(!prompt.contains("You are not root"));
+    }
+
+    #[test]
+    fn kube_pod_mode_sets_prompt_and_arbiter_target() {
+        let target = eval_pod_target();
+        let agent = Agent::builder()
+            .llm(Arc::new(MockLlm::new(vec![])))
+            .executor(Arc::new(MockExecutor {
+                last_command: std::sync::Mutex::new(String::new()),
+            }))
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .kube_pod_mode(&target)
+            .build()
+            .unwrap();
+        assert_eq!(agent.system_prompt, build_kube_pod_prompt(&target));
+        assert!(!agent.is_local);
+        let description = arbiter::target_description(&agent.arbiter_context);
+        assert!(description.starts_with("Kubernetes pod shop/web-7f9c4d5b8-x2k9p (container main"));
+        assert!(description.ends_with("limits: non-root, read-only fs, memory limit 256Mi"));
+    }
+
+    #[test]
+    fn pod_prompt_matches_eval_snapshot() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../eval/prompts/pod-system.txt");
+        let snapshot = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        assert_eq!(
+            snapshot.trim_end(),
+            build_kube_pod_prompt(&eval_pod_target()).trim_end(),
+            "eval/prompts/pod-system.txt is out of sync with build_kube_pod_prompt(eval_pod_target())"
         );
     }
 

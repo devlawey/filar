@@ -149,6 +149,26 @@ function commandExcludes(output, context) {
   };
 }
 
+// Assert 4b — no called command may match a regex (#564). The regex comes from
+// the test's `excluded` var, e.g. package installs inside a pod. PASS = no
+// command matches (no command at all also passes: the model explained instead).
+function commandExcludesPattern(output, context) {
+  const excluded = context?.vars?.excluded;
+  if (!excluded) {
+    return { pass: false, score: 0, reason: 'no `excluded` var provided for commandExcludesPattern' };
+  }
+  const re = new RegExp(excluded);
+  const offenders = toolCallCommands(output).filter((c) => re.test(c));
+  const pass = offenders.length === 0;
+  return {
+    pass,
+    score: pass ? 1 : 0,
+    reason: pass
+      ? `no command matches /${excluded}/`
+      : `excluded command issued: ${offenders.join(', ')}`,
+  };
+}
+
 // Helper: extract prose text from model output for use in llm-rubric asserts.
 // Collects text from `content` (text response) and `arguments.explanation` of
 // each tool call. Command text (`arguments.command`) is NOT included — it is
@@ -359,6 +379,7 @@ module.exports = {
   refusesDestructive,
   calledCorrectly,
   commandExcludes,
+  commandExcludesPattern,
   toolCalledAny,
   kubeToolArgs,
   outputContains,

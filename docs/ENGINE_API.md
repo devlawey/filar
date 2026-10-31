@@ -176,6 +176,16 @@ analysis. `AgentBuilder::arbiter_kube_context` and
 to arbiter and `RiskInput` target descriptions. `ContainerInfo` also exposes
 resource requests and limits for pod diagnostics.
 
+For a shell inside a pod (`KubeExecutor`, #563), `AgentBuilder::kube_pod_mode`
+takes an `arbiter::KubePodTarget` (cluster, context, namespace, pod, container,
+tags and `PodLimits` from `KubeExecutor::pod_limits`). It sets the pod system
+prompt — the container is ephemeral, packages are not installed, `kubectl` is
+probably absent, the shell persists, the known limits as facts and the rule
+that the agent's processes share the container's memory limit with the
+application — and the arbiter/`RiskInput` target
+`Kubernetes pod <ns>/<pod> (container <c>, cluster <name>, tags: …); limits: non-root, read-only fs, memory limit 512Mi`
+(unknown limits are left out). The confirmation gate is unchanged.
+
 ## Cargo.toml example
 
 ```toml
@@ -757,6 +767,7 @@ let _agent = builder.risk_scorer(Some(scorer));
 | Change | Breaks | What to do |
 |--------|--------|------------|
 | `KubeExecutor`, `KubeExecConfig`, `KubeExecEvent` under the `kube` feature; `PodRef`, `PodSelector`, `PodLimits` and `KubeCluster::describe_pod` in `filar-core` (#563) | Nothing — additive; `CommandExecutor` and `LlmClient` are unchanged | Use `KubeExecutor` wherever a `CommandExecutor` is expected for a pod shell |
+| `AgentBuilder::kube_pod_mode` / `arbiter_kube_pod_context`, `KubePodTarget`, new field `KubernetesArbiterTarget::pod` (#564) | Struct literals of `KubernetesArbiterTarget` need `pod` (`None` for a cluster tab); `KubernetesArbiterTarget::new` is unchanged | Prefer `KubernetesArbiterTarget::new` / `::pod`, or add `pod: None` |
 
 ## Upgrading to `engine-v3.0.0`
 

@@ -4,8 +4,16 @@ description: "filar agent eval — tool-calling on filar tasks"
 # variant), synced with crates/agent/src/agent.rs via the
 # `system_prompt_matches_eval_snapshot` Rust test. agent-chat.json is a chat
 # prompt: system message loaded from agent-system.txt + user {{question}}.
+#
+# A second prompt (#564) is the pod variant (build_kube_pod_prompt for a fixed
+# example container), synced by the `pod_prompt_matches_eval_snapshot` test.
+# Every case runs against the SSH prompt (`defaultTest.prompts: [ssh]`) unless
+# it names `prompts: [pod]` itself.
 prompts:
-  - file://prompts/agent-chat.json
+  - id: file://prompts/agent-chat.json
+    label: ssh
+  - id: file://prompts/pod-chat.json
+    label: pod
 
 # Global throttling — limits parallelism to avoid 429 Too Many Requests from
 # OpenRouter. A full run is ~1000+ requests (100 cases × 10 models + judge
@@ -191,7 +199,7 @@ providers:
     maxConcurrency: 1
     delay: 3000
 
-# Dataset — 100 cases in three buckets (operations / safety / language), see
+# Dataset — 103 cases in three buckets (operations / safety / language), see
 # eval/datasets/filar.yaml. Each case carries vars.bucket + vars.priority for
 # filtering runs (e.g. only `operations`). The #72 smoke cases are now part of
 # the dataset.
@@ -201,6 +209,7 @@ tests: file://datasets/filar.yaml
 # methodology (§7.3) the judge must NOT be one of the compared models, so it is
 # a different family (Mistral) reached via the same OPENROUTER_API_KEY.
 defaultTest:
+  prompts: [ssh]
   options:
     provider:
       id: openrouter:mistralai/mistral-large
