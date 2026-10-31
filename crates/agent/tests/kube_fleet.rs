@@ -85,7 +85,9 @@ fn get_pod() -> KubeToolCall {
 #[ignore = "needs docker/k8s cluster"]
 async fn k8s_web_fleet_gets_and_folds_three_ready_pods() {
     let fleet = open_fleet("app=web", 3).await;
-    let report = fleet.run(&get_pod()).await.expect("fleet get succeeds");
+    let call = get_pod();
+    let approval = fleet.approve(&call).expect("approve fleet get");
+    let report = fleet.run(&call, approval).await.expect("fleet get succeeds");
 
     assert_eq!(report.result().rows().len(), 3);
     assert_eq!(report.folded().hosts(), 3);
@@ -114,7 +116,11 @@ async fn k8s_crashy_fleet_reads_previous_container_logs() {
 
     let mut last = String::new();
     for _ in 0..60 {
-        let report = fleet.run(&call).await.expect("previous-log operation completes");
+        let approval = fleet.approve(&call).expect("approve previous-log operation");
+        let report = fleet
+            .run(&call, approval)
+            .await
+            .expect("previous-log operation completes");
         last = report.render();
         if report.result().rows()[0].state() == HostState::Success && last.contains("crashy: exiting") {
             return;
@@ -149,7 +155,9 @@ async fn k8s_pod_deleted_after_fleet_entry_is_reported_as_disappeared() {
         .await
         .expect("delete the selected fixture pod");
 
-    let report = fleet.run(&get_pod()).await.expect("operation completes");
+    let call = get_pod();
+    let approval = fleet.approve(&call).expect("approve fleet get");
+    let report = fleet.run(&call, approval).await.expect("operation completes");
     assert_eq!(report.result().rows().len(), 3, "replacement pods never join");
     assert_eq!(report.result().summary().count(HostState::PodDisappeared), 1);
     assert!(report.render().contains("pod disappeared"), "{}", report.render());

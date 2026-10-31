@@ -11236,10 +11236,15 @@ difference fold; RBAC/policy denial, API unavailability/timeout и disappeared p
 требует одно подтверждение на полный радиус. Fleet runbook scrubbing удаляет
 конкретные pod names, сохраняя group/cluster/namespace context. Добавлены unit-
 тесты и три ignored live-теста для docker/k8s (web, crashy --previous, deletion).
+После ревью выполнение принимает одноразовый `KubeFleetApproval`, привязанный к
+fleet и точному вызову; начальное и повторное discovery ограничено deadline и
+отменяется, а после отмены новые pods не запрашиваются. GUI draft сохраняет `kube`
+при редактировании остальных полей группы.
 
 **Контракты.** `CommandExecutor` / `LlmClient` не менялись. Аддитивно: `KubeGroup`,
-`HostGroup::kube`, `KubeFleet`/`KubeFleetCluster`/`KubeFleetReport`,
-`bind_fleet_call`, typed `CoreError::{AccessDenied, NotFound, Unavailable}` и
-`HostRun::AnsweredText`; fleet result различает `AccessDenied` и `PodDisappeared`.
+`HostGroup::kube`, `KubeFleet`/`KubeFleetApproval`/`KubeFleetCluster`/
+`KubeFleetReport`, `KubeFleet::open_until`, `bind_fleet_call`, typed
+`CoreError::{AccessDenied, NotFound, Unavailable}` и `HostRun::AnsweredText`;
+fleet result различает `AccessDenied` и `PodDisappeared`.
 
 **Next:** #569 — TUI/launcher integration и пользовательский DoD.

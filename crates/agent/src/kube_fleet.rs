@@ -45,6 +45,16 @@ impl KubeFleetCluster {
     }
 }
 
+/// Proof that the caller explicitly approved one call over one frozen fleet.
+///
+/// The fields are private and the token is consumed by execution, so a call
+/// cannot be substituted or an approval reused for a later operation.
+#[derive(Debug)]
+pub struct KubeFleetApproval {
+    fleet: OperationId,
+    call: KubeToolCall,
+}
+
 /// A frozen Kubernetes fleet and the cluster APIs needed to question it.
 pub struct KubeFleet {
     fleet: FleetOperation,
@@ -52,12 +62,21 @@ pub struct KubeFleet {
 }
 
 impl KubeFleet {
-    /// Discover and freeze the group's members.
+    /// Discover and freeze the group's members with a per-cluster deadline.
     ///
     /// A selector freezes ready pods in cluster configuration order. Without a
     /// selector, each configured cluster/namespace scope is one member and no
     /// discovery request is needed.
     pub async fn open(group: &HostGroup, clusters: Vec<KubeFleetCluster>) -> Result<Self> {
+        Self::open_until(group, clusters, &CancellationToken::new()).await
+    }
+
+    /// [`open`](Self::open) with cancellation of in-flight discovery requests.
+    pub async fn open_until(
+        group: &HostGroup,
+        clusters: Vec<KubeFleetCluster>,
+        cancel: &CancellationToken,
+    ) -> Result<Self> {
         group.validate()?;
         let kube = group.kube.as_ref().ok_or_else(|| {
             CoreError::Config(format!(
@@ -81,7 +100,13 @@ impl KubeFleet {
         }
 
         let targets = if kube.selector.is_some() {
-            discover_targets(group, &selected).await?
+            discover_targets(
+                group,
+                &selected,
+                Duration::from_secs(group.per_host_timeout_secs),
+                cancel,
+            )
+            .await?
         } else {
             selected
                 .iter()
@@ -131,13 +156,44 @@ impl KubeFleet {
         FleetGate::Ask(ApprovalScope::Once)
     }
 
-    /// Run one typed call over the frozen composition.
-    pub async fn run(&self, call: &KubeToolCall) -> Result<KubeFleetReport> {
-        self.run_until(call, &CancellationToken::new()).await
+    /// Record explicit user approval for one typed call over the full radius.
+    ///
+    /// UI callers invoke this only after the confirmation is accepted. The
+    /// resulting capability is consumed by exactly one [`run`](Self::run).
+    pub fn approve(&self, call: &KubeToolCall) -> Result<KubeFleetApproval> {
+        match self.gate(call) {
+            FleetGate::Ask(ApprovalScope::Once) => Ok(KubeFleetApproval {
+                fleet: self.fleet.id(),
+                call: call.clone(),
+            }),
+            FleetGate::Ask(ApprovalScope::PerHost) => Err(CoreError::Other(
+                "Kubernetes fleets require one fleet-wide approval".into(),
+            )),
+            FleetGate::Refuse(reason) => Err(CoreError::Other(reason)),
+        }
+    }
+
+    /// Run one explicitly approved typed call over the frozen composition.
+    pub async fn run(
+        &self,
+        call: &KubeToolCall,
+        approval: KubeFleetApproval,
+    ) -> Result<KubeFleetReport> {
+        self.run_until(call, approval, &CancellationToken::new()).await
     }
 
     /// [`run`](Self::run) with local cancellation of queued and running reads.
-    pub async fn run_until(&self, call: &KubeToolCall, cancel: &CancellationToken) -> Result<KubeFleetReport> {
+    pub async fn run_until(
+        &self,
+        call: &KubeToolCall,
+        approval: KubeFleetApproval,
+        cancel: &CancellationToken,
+    ) -> Result<KubeFleetReport> {
+        if approval.fleet != self.fleet.id() || &approval.call != call {
+            return Err(CoreError::Other(
+                "Kubernetes fleet approval does not match this fleet and call".into(),
+            ));
+        }
         let mut op = self.fleet.reopen();
         // Reject an inapplicable call before any cluster is contacted.
         for member in op.members() {
@@ -197,7 +253,7 @@ impl KubeFleet {
         let mut result = OperationResult::build(&op, &run, &[])?;
         let check = FleetCheck::ad_hoc(call.tool_name()).map_err(CoreError::Other)?;
         let folded = fold(&check, &[], &run, &mut result, &PreprocessorRegistry::new())?;
-        let (new_pods, notices) = self.discover_changes(&op).await;
+        let (new_pods, notices) = self.discover_changes(&op, cancel).await;
         Ok(KubeFleetReport {
             operation: op.id(),
             result,
@@ -208,8 +264,13 @@ impl KubeFleet {
         })
     }
 
-    async fn discover_changes(&self, op: &FleetOperation) -> (Vec<String>, Vec<String>) {
-        if op
+    async fn discover_changes(
+        &self,
+        op: &FleetOperation,
+        cancel: &CancellationToken,
+    ) -> (Vec<String>, Vec<String>) {
+        if cancel.is_cancelled()
+            || op
             .group()
             .kube
             .as_ref()
@@ -237,7 +298,7 @@ impl KubeFleet {
                 _ => None,
             })
             .collect();
-        match discover_targets(op.group(), &clusters).await {
+        match discover_targets(op.group(), &clusters, op.per_host_timeout(), cancel).await {
             Ok(current) => {
                 let mut new_pods: Vec<_> = current
                     .into_iter()
@@ -251,6 +312,7 @@ impl KubeFleet {
                 new_pods.sort();
                 (new_pods, Vec::new())
             }
+            Err(_) if cancel.is_cancelled() => (Vec::new(), Vec::new()),
             Err(error) => (Vec::new(), vec![format!("не удалось проверить новые поды: {error}")]),
         }
     }
@@ -297,7 +359,12 @@ fn classify_error(error: CoreError, target: &FleetTarget) -> CoreError {
     }
 }
 
-async fn discover_targets(group: &HostGroup, clusters: &[KubeFleetCluster]) -> Result<Vec<FleetTarget>> {
+async fn discover_targets(
+    group: &HostGroup,
+    clusters: &[KubeFleetCluster],
+    deadline: Duration,
+    cancel: &CancellationToken,
+) -> Result<Vec<FleetTarget>> {
     let kube = group
         .kube
         .as_ref()
@@ -308,12 +375,28 @@ async fn discover_targets(group: &HostGroup, clusters: &[KubeFleetCluster]) -> R
     let discovered: Vec<Result<(String, Vec<PodInfo>)>> = stream::iter(clusters.iter().cloned().map(|cluster| {
         let namespace = namespace.clone();
         let selector = selector.clone();
+        let cancel = cancel.clone();
         async move {
-            let pods = cluster
-                .api
-                .list_pods(Some(&namespace), selector.as_deref(), None)
-                .await?;
-            Ok((cluster.target.name.clone(), pods))
+            let name = cluster.target.name.clone();
+            let request = async {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Err(CoreError::Other(format!(
+                        "Kubernetes fleet discovery for {name} was cancelled"
+                    ))),
+                    result = cluster.api.list_pods(Some(&namespace), selector.as_deref(), None) => result,
+                }
+            };
+            let pods = match tokio::time::timeout(deadline, request).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(CoreError::Unavailable(format!(
+                        "Kubernetes fleet discovery for {name} timed out after {}s",
+                        deadline.as_secs()
+                    )))
+                }
+            };
+            Ok((name, pods))
         }
     }))
     .buffered(limit)
@@ -443,6 +526,7 @@ mod tests {
         active: AtomicUsize,
         max_active: AtomicUsize,
         log_calls: Mutex<Vec<(String, String, Option<String>, bool)>>,
+        pod_lists: AtomicUsize,
     }
 
     struct Active<'a>(&'a AtomicUsize);
@@ -464,6 +548,11 @@ mod tests {
     #[async_trait]
     impl ClusterApi for MockCluster {
         async fn list_pods(&self, _: Option<&str>, _: Option<&str>, _: Option<&str>) -> Result<Vec<PodInfo>> {
+            self.pod_lists.fetch_add(1, Ordering::SeqCst);
+            let delay = *self.delay.lock().unwrap_or_else(|p| p.into_inner());
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             Ok(self.pods.lock().unwrap_or_else(|p| p.into_inner()).clone())
         }
 
@@ -642,6 +731,11 @@ mod tests {
         }
     }
 
+    async fn run_approved(fleet: &KubeFleet, call: &KubeToolCall) -> KubeFleetReport {
+        let approval = fleet.approve(call).expect("call is approved");
+        fleet.run(call, approval).await.expect("operation completes")
+    }
+
     #[tokio::test]
     async fn composition_freezes_ready_pods_across_clusters_or_cluster_scopes() {
         let (eu, _) = cluster(
@@ -685,7 +779,7 @@ mod tests {
         let fleet = KubeFleet::open(&group(&["prod-eu"], Some("app=web")), vec![cluster])
             .await
             .expect("fleet opens");
-        let report = fleet.run(&describe()).await.expect("operation completes");
+        let report = run_approved(&fleet, &describe()).await;
         let states: Vec<_> = report.result().rows().iter().map(|row| row.state()).collect();
         assert_eq!(
             states,
@@ -711,7 +805,7 @@ mod tests {
         let mut group = group(&["prod-eu"], Some("app=web"));
         group.per_host_timeout_secs = 1;
         let fleet = KubeFleet::open(&group, vec![cluster]).await.expect("fleet opens");
-        let report = fleet.run(&describe()).await.expect("operation completes");
+        let report = run_approved(&fleet, &describe()).await;
         assert_eq!(report.result().rows()[0].state(), HostState::TimedOut);
     }
 
@@ -744,7 +838,7 @@ mod tests {
         let fleet = KubeFleet::open(&group(&["prod-eu"], Some("app=web")), vec![cluster])
             .await
             .expect("fleet opens");
-        let report = fleet.run(&logs()).await.expect("operation completes");
+        let report = run_approved(&fleet, &logs()).await;
         assert_eq!(report.folded().groups().len(), 2);
         assert_eq!(report.folded().baseline().map(|group| group.len()), Some(2));
         assert_eq!(report.result().summary().count(HostState::Divergent), 1);
@@ -761,7 +855,7 @@ mod tests {
             .await
             .expect("fleet opens");
         mock.pods.lock().unwrap_or_else(|p| p.into_inner()).push(pod("new"));
-        let report = fleet.run(&logs()).await.expect("operation completes");
+        let report = run_approved(&fleet, &logs()).await;
         assert_eq!(report.result().rows().len(), 2);
         assert_eq!(report.new_pods(), ["prod-eu/shop/new/main"]);
         assert!(report
@@ -802,7 +896,89 @@ mod tests {
         let fleet = KubeFleet::open(&group(&["prod-eu"], Some("app=web")), vec![cluster])
             .await
             .expect("fleet opens");
-        fleet.run(&describe()).await.expect("operation completes");
+        run_approved(&fleet, &describe()).await;
         assert_eq!(mock.max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn approval_is_bound_to_one_fleet_and_one_exact_call() {
+        let (first_cluster, first_mock) = cluster("prod-eu", vec![pod("a")]);
+        let (second_cluster, _) = cluster("prod-us", vec![pod("b")]);
+        let first = KubeFleet::open(&group(&["prod-eu"], Some("app=web")), vec![first_cluster])
+            .await
+            .expect("first fleet opens");
+        let second = KubeFleet::open(&group(&["prod-us"], Some("app=web")), vec![second_cluster])
+            .await
+            .expect("second fleet opens");
+
+        let approval = first.approve(&describe()).expect("call is approved");
+        let error = match second.run(&describe(), approval).await {
+            Err(error) => error,
+            Ok(_) => panic!("another fleet's approval must not execute"),
+        };
+        assert!(error.to_string().contains("does not match"), "{error}");
+
+        let approval = first.approve(&describe()).expect("call is approved");
+        let error = match first.run(&logs(), approval).await {
+            Err(error) => error,
+            Ok(_) => panic!("approval must not cover a substituted call"),
+        };
+        assert!(error.to_string().contains("does not match"), "{error}");
+        assert!(first_mock.log_calls.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_skips_post_run_pod_discovery() {
+        let (cluster, mock) = cluster("prod-eu", vec![pod("a")]);
+        let fleet = KubeFleet::open(&group(&["prod-eu"], Some("app=web")), vec![cluster])
+            .await
+            .expect("fleet opens");
+        assert_eq!(mock.pod_lists.load(Ordering::SeqCst), 1);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let call = describe();
+        let approval = fleet.approve(&call).expect("call is approved");
+        let report = fleet
+            .run_until(&call, approval, &cancel)
+            .await
+            .expect("cancelled operation returns its partial result");
+        assert_eq!(report.result().summary().cancelled(), 1);
+        assert_eq!(mock.pod_lists.load(Ordering::SeqCst), 1, "no rediscovery after cancellation");
+        assert!(report.new_pods().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_discovery_has_a_per_cluster_deadline() {
+        let (cluster, mock) = cluster("prod-eu", vec![pod("a")]);
+        *mock.delay.lock().unwrap_or_else(|p| p.into_inner()) = Duration::from_secs(3600);
+        let mut group = group(&["prod-eu"], Some("app=web"));
+        group.per_host_timeout_secs = 1;
+        let error = match KubeFleet::open(&group, vec![cluster]).await {
+            Err(error) => error,
+            Ok(_) => panic!("hung discovery must time out"),
+        };
+        assert!(
+            matches!(&error, CoreError::Unavailable(message) if message.contains("timed out after 1s")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_discovery_honors_cancellation() {
+        let (cluster, mock) = cluster("prod-eu", vec![pod("a")]);
+        *mock.delay.lock().unwrap_or_else(|p| p.into_inner()) = Duration::from_secs(3600);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = match KubeFleet::open_until(
+            &group(&["prod-eu"], Some("app=web")),
+            vec![cluster],
+            &cancel,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled discovery must not open a fleet"),
+        };
+        assert!(error.to_string().contains("cancelled"), "{error}");
     }
 }

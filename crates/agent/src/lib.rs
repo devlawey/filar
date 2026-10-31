@@ -61,7 +61,7 @@ pub use arbiter::{ArbiterContext, ArbiterVerdict, ARBITER_TIMEOUT_SECS};
 pub use compaction::{summarise_history, SummaryOutcome, COMPACTION_SYSTEM_PROMPT};
 pub use events::{AgentEvent, EventSink};
 pub use kube_agent::KubeAgent;
-pub use kube_fleet::{KubeFleet, KubeFleetCluster, KubeFleetReport};
+pub use kube_fleet::{KubeFleet, KubeFleetApproval, KubeFleetCluster, KubeFleetReport};
 pub use kube_redact::{
     redact_logs, KubeToolOutput, CONFIGMAP_VALUE_MAX_CHARS, HIDDEN_VALUE, REVEALED_BY_CONFIG,
 };
