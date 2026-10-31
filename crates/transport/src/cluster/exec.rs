@@ -290,9 +290,10 @@ impl ExecPlace {
                 Some(message) => {
                     forbidden_error(&message, ("create", "pods/exec"), &self.namespace, &self.context)
                 }
+                // The reason could not be read: do not guess RBAC vs policy.
                 None => CoreError::AccessDenied(format!(
-                    "нет права create на pods/exec в namespace {} (контекст {})",
-                    self.namespace, self.context
+                    "exec в под {}/{} запрещён (HTTP 403, контекст {}); причину API не сообщил",
+                    self.namespace, self.pod, self.context
                 )),
             },
             kube::Error::UpgradeConnection(kube::client::UpgradeConnectionError::ProtocolSwitch(
@@ -573,7 +574,9 @@ impl PodShell {
                 warn!(error = %error, "pod command timed out, interrupting it and resyncing");
                 if let Err(e) = self.cancel().await {
                     warn!(error = %e, "could not interrupt the timed-out pod command");
-                    return Err(error);
+                    // Say that the shell (and its cd/variables) is gone, not
+                    // only that the command timed out.
+                    return Err(CoreError::Other(format!("{error}; {e}")));
                 }
                 let (sync_cmd, sync_marker) = sync_request();
                 let _ = self.write_tx.send(sync_cmd.into_bytes()).await;
