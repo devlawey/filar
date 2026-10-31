@@ -16,22 +16,22 @@ use russh::keys::*;
 use russh::{Channel, ChannelMsg, Disconnect};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use filar_core::{
     CoreError, EnvSecretProvider, HostKeyPolicy, Result, SecretProvider, SshTarget,
     DEFAULT_COMMAND_TIMEOUT_SECS,
 };
 
+use crate::shell_protocol::{
+    command_marker_tag, command_payload, interrupt_command, read_shell_pid,
+    recv_until_marker, recv_until_marker_simple, shell_pid_request, sync_request, ChannelEvent,
+    EventSource,
+};
 use crate::CommandResult;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// Unique prefix for marker lines. Chosen to be extremely unlikely to appear
-/// in normal command output.
-const MARKER_PREFIX: &str = "__FILAR_";
 
 /// Default keepalive interval — send a keepalive if nothing is received from
 /// the server for this long. Chosen well below typical NAT/idle-connection
@@ -218,17 +218,6 @@ enum ChannelCmd {
     Write(Vec<u8>),
 }
 
-/// Events received **from** the channel-owning reader task.
-#[derive(Debug)]
-enum ChannelEvent {
-    /// stdout data (`ChannelMsg::Data`).
-    Data(String),
-    /// stderr data (`ChannelMsg::ExtendedData` with `ext == 1`).
-    Stderr(String),
-    /// Channel was closed (EOF, Close, or `None` from `channel.wait()`).
-    Closed,
-}
-
 // ---------------------------------------------------------------------------
 // SshSession — persistent shell channel with reader-task
 // ---------------------------------------------------------------------------
@@ -402,24 +391,30 @@ impl SshSession {
         // ── Sync: drain initial shell output ───────────────────────────
         // Send a unique sync marker and wait for it to appear. This is done
         // directly on the channel BEFORE spawning the reader task.
-        let sync_id = format!("sync_{}", Uuid::new_v4().simple());
-        let sync_cmd = format!(
-            "printf '\\n{}{}\\n'\n",
-            MARKER_PREFIX, sync_id
-        );
+        let (sync_cmd, sync_marker) = sync_request();
         channel
             .data(sync_cmd.as_bytes())
             .await
             .map_err(|e| CoreError::Other(format!("failed to send sync marker: {e}")))?;
 
-        let sync_marker = format!("{}{}", MARKER_PREFIX, sync_id);
-        drain_until_marker(&mut channel, &sync_marker, Duration::from_secs(10))
-            .await?;
+        recv_until_marker_simple(
+            &mut ShellChannel(&mut channel),
+            &sync_marker,
+            Duration::from_secs(10),
+        )
+        .await?;
 
         // ── Learn the shell's PID (for `cancel`) ──────────────────────
         // Not fatal: without it a command cannot be interrupted, but it
         // still runs.
-        let shell_pid = read_shell_pid(&mut channel, Duration::from_secs(10)).await;
+        let (pid_cmd, pid_tag) = shell_pid_request();
+        let shell_pid = match channel.data(pid_cmd.as_bytes()).await {
+            Ok(()) => {
+                read_shell_pid(&mut ShellChannel(&mut channel), &pid_tag, Duration::from_secs(10))
+                    .await
+            }
+            Err(_) => None,
+        };
         if shell_pid.is_none() {
             warn!("SSH shell did not report its PID — commands cannot be interrupted");
         }
@@ -459,14 +454,10 @@ impl SshSession {
         let _guard = self.run_lock.lock().await;
 
         let req_id = self.req_counter.fetch_add(1, Ordering::Relaxed);
-        let marker_id = format!("req_{:08x}_{}", req_id, Uuid::new_v4().simple());
-        let marker_tag = format!("{}{}", MARKER_PREFIX, marker_id);
+        let marker_tag = command_marker_tag(req_id);
 
         // Build the full payload: <command>\n printf marker with exit + PWD\n
-        let payload = format!(
-            "{}\nprintf '\\n{}__%d__%s__\\n' \"$?\" \"$PWD\"\n",
-            command, marker_tag
-        );
+        let payload = command_payload(command, &marker_tag);
 
         let start = Instant::now();
 
@@ -502,7 +493,7 @@ impl SshSession {
 
         // Read events until we find the marker — without holding any lock
         // that `cancel()` needs.
-        match recv_until_marker(&mut event_rx, &marker_tag, self.command_timeout).await {
+        match recv_until_marker(&mut *event_rx, &marker_tag, self.command_timeout).await {
             Ok((stdout, stderr, exit_code, cwd)) => {
                 let duration = start.elapsed();
                 Ok(CommandResult {
@@ -521,17 +512,12 @@ impl SshSession {
                     warn!(error = %e, "could not interrupt the timed-out command");
                 }
                 // Drain any remaining output and resync.
-                let sync_id = format!("sync_{}", Uuid::new_v4().simple());
-                let sync_cmd = format!(
-                    "printf '\\n{}{}\\n'\n",
-                    MARKER_PREFIX, sync_id
-                );
+                let (sync_cmd, sync_marker) = sync_request();
                 let _ = self
                     .cmd_tx
                     .send(ChannelCmd::Write(sync_cmd.into_bytes()))
                     .await;
-                let sync_marker = format!("{}{}", MARKER_PREFIX, sync_id);
-                let _ = recv_until_marker_simple(&mut event_rx, &sync_marker, Duration::from_secs(10))
+                let _ = recv_until_marker_simple(&mut *event_rx, &sync_marker, Duration::from_secs(10))
                     .await;
                 Err(e)
             }
@@ -623,6 +609,29 @@ impl SshSession {
             .await;
         info!("SSH session closed");
         Ok(())
+    }
+}
+
+/// A russh shell channel read directly as an [`EventSource`] — only before
+/// the reader task takes it over (initial sync, the shell's PID). stdout and
+/// stderr (`ExtendedData` with `ext == 1`) become events; EOF and close become
+/// [`ChannelEvent::Closed`]; everything else is skipped.
+struct ShellChannel<'a>(&'a mut Channel<Msg>);
+
+impl EventSource for ShellChannel<'_> {
+    async fn next_event(&mut self) -> Option<ChannelEvent> {
+        loop {
+            match self.0.wait().await? {
+                ChannelMsg::Data { ref data } => {
+                    return Some(ChannelEvent::Data(String::from_utf8_lossy(data).to_string()))
+                }
+                ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    return Some(ChannelEvent::Stderr(String::from_utf8_lossy(data).to_string()))
+                }
+                ChannelMsg::Eof | ChannelMsg::Close => return Some(ChannelEvent::Closed),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1069,216 +1078,6 @@ fn check_host_key(
         None => HostKeyCheck::New,
     }
 }
-
-/// The remote command that interrupts whatever the shell `pid` is running:
-/// `SIGINT` to each of its direct children. POSIX `ps -A -o` and `awk`, so
-/// it works on any POSIX host without `pkill`; it writes nothing to disk.
-///
-/// Exits non-zero if `ps` fails or any `kill` fails. No children at all is
-/// success: nothing is running, so there is nothing to interrupt — a
-/// timeout that fires as the command finishes must not report a failure.
-fn interrupt_command(pid: u32) -> String {
-    format!(
-        "pids=$(ps -A -o pid= -o ppid= | awk -v pp={pid} '$2 == pp {{ print $1 }}') || exit 1; \
-         rc=0; for p in $pids; do kill -INT \"$p\" 2>/dev/null || rc=1; done; exit $rc"
-    )
-}
-
-/// Ask the shell for its PID (`$$`) and read the answer, bounded by
-/// `timeout`. `None` if it does not arrive or does not parse.
-async fn read_shell_pid(channel: &mut Channel<Msg>, timeout: Duration) -> Option<u32> {
-    let tag = format!("{}pid_{}", MARKER_PREFIX, Uuid::new_v4().simple());
-    let cmd = format!("printf '\\n{tag}__%s__\\n' \"$$\"\n");
-    channel.data(cmd.as_bytes()).await.ok()?;
-    let deadline = Instant::now() + timeout;
-    let mut buf = String::new();
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, channel.wait()).await {
-            Ok(Some(ChannelMsg::Data { ref data })) => {
-                buf.push_str(&String::from_utf8_lossy(data));
-                if let Some(pid) = parse_shell_pid(&buf, &tag) {
-                    return Some(pid);
-                }
-            }
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => return None,
-        }
-    }
-}
-
-/// Parse `<tag>__<pid>__` out of `buf` — the marker line, not the echo of
-/// the `printf` that produced it (a PTY-less shell does not echo, but the
-/// parse does not rely on that).
-fn parse_shell_pid(buf: &str, tag: &str) -> Option<u32> {
-    let mut rest = buf;
-    while let Some(pos) = rest.find(tag) {
-        let after = &rest[pos + tag.len()..];
-        if let Some(digits) = after.strip_prefix("__") {
-            if let Some(end) = digits.find("__") {
-                if let Ok(pid) = digits[..end].parse() {
-                    return Some(pid);
-                }
-            }
-        }
-        rest = after;
-    }
-    None
-}
-
-/// Read from the channel until `marker` is found in the accumulated output.
-/// Returns the output *before* the marker (discarded for sync).
-///
-/// This is used directly on the `Channel` in `connect()` **before** the
-/// reader task is spawned.
-async fn drain_until_marker(
-    channel: &mut Channel<Msg>,
-    marker: &str,
-    timeout: Duration,
-) -> Result<()> {
-    let mut buf = String::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        let msg = tokio::time::timeout_at(deadline, channel.wait())
-            .await
-            .map_err(|_| CoreError::Other(format!("timeout waiting for marker `{marker}`")))?
-            .ok_or_else(|| CoreError::Other("channel closed before marker received".into()))?;
-
-        match msg {
-            ChannelMsg::Data { ref data } => {
-                buf.push_str(&String::from_utf8_lossy(data.as_ref()));
-                if let Some(pos) = buf.find(marker) {
-                    // Found the marker — drain everything up to and including it.
-                    buf.drain(..=pos + marker.len());
-                    return Ok(());
-                }
-            }
-            ChannelMsg::ExtendedData { .. } => {
-                // Extended data (e.g. stderr) — drain silently during sync.
-                // Sync markers are sent via stdout, so we don't need to collect this.
-            }
-            ChannelMsg::Eof | ChannelMsg::Close => {
-                return Err(CoreError::Other(
-                    "channel closed before marker received".into(),
-                ));
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Read events from the reader task until a marker of the form
-/// `<marker_tag>__<exit_code>__[<pwd>__]` is found. Returns stdout, stderr,
-/// exit code, and optional `$PWD` from the marker.
-async fn recv_until_marker(
-    event_rx: &mut mpsc::UnboundedReceiver<ChannelEvent>,
-    marker_tag: &str,
-    timeout: Duration,
-) -> Result<(String, String, Option<i32>, Option<String>)> {
-    let mut buf = String::new();
-    let mut stderr_buf = String::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        let event = tokio::time::timeout_at(deadline, event_rx.recv())
-            .await
-            .map_err(|_| CoreError::Other(format!("timeout waiting for command marker `{marker_tag}`")))?
-            .ok_or_else(|| CoreError::Other("channel closed before marker received".into()))?;
-
-        match event {
-            ChannelEvent::Data(text) => {
-                buf.push_str(&text);
-
-                if let Some((code, cwd, line_start)) = parse_filar_marker(&buf, marker_tag) {
-                    let output = buf[..line_start].to_string();
-                    let output = output
-                        .strip_suffix('\n')
-                        .map(str::to_string)
-                        .unwrap_or(output);
-
-                    while let Ok(Some(ChannelEvent::Stderr(text))) =
-                        tokio::time::timeout(
-                            Duration::from_millis(50),
-                            event_rx.recv(),
-                        )
-                        .await
-                    {
-                        stderr_buf.push_str(&text);
-                    }
-                    return Ok((output, stderr_buf, Some(code), cwd));
-                }
-            }
-            ChannelEvent::Stderr(text) => {
-                stderr_buf.push_str(&text);
-            }
-            ChannelEvent::Closed => {
-                return Err(CoreError::Other(
-                    "channel closed before command marker received".into(),
-                ));
-            }
-        }
-    }
-}
-
-/// Parse `<marker_tag>__<exit>__` or `<marker_tag>__<exit>__<pwd>__`.
-///
-/// `pwd` is the text before the last `__` on the marker line (so names like
-/// `my__project` still parse).
-fn parse_filar_marker(buf: &str, marker_tag: &str) -> Option<(i32, Option<String>, usize)> {
-    let pos = buf.find(marker_tag)?;
-    let after_tag = &buf[pos + marker_tag.len()..];
-    let rest = after_tag.strip_prefix("__")?;
-    let end = rest.find("__")?;
-    let code: i32 = rest[..end].trim().parse().ok()?;
-    let after_code = &rest[end + 2..];
-    let line = after_code.split(['\n', '\r']).next().unwrap_or("");
-    let cwd = line.strip_suffix("__").map(str::trim).and_then(|pwd| {
-        if crate::is_safe_cwd(pwd) {
-            Some(pwd.to_string())
-        } else {
-            None
-        }
-    });
-    let line_start = buf[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
-    Some((code, cwd, line_start))
-}
-
-/// Read events from the reader task until `marker` is found. Used for
-/// resync after a timeout/cancel — output is discarded.
-async fn recv_until_marker_simple(
-    event_rx: &mut mpsc::UnboundedReceiver<ChannelEvent>,
-    marker: &str,
-    timeout: Duration,
-) -> Result<()> {
-    let mut buf = String::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        let event = tokio::time::timeout_at(deadline, event_rx.recv())
-            .await
-            .map_err(|_| CoreError::Other(format!("timeout waiting for marker `{marker}`")))?
-            .ok_or_else(|| CoreError::Other("channel closed before marker received".into()))?;
-
-        match event {
-            ChannelEvent::Data(text) => {
-                buf.push_str(&text);
-                if buf.find(marker).is_some() {
-                    return Ok(());
-                }
-            }
-            ChannelEvent::Stderr(_) => {
-                // Ignore stderr during sync.
-            }
-            ChannelEvent::Closed => {
-                return Err(CoreError::Other(
-                    "channel closed before marker received".into(),
-                ));
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1287,78 +1086,6 @@ async fn recv_until_marker_simple(
 mod tests {
     use super::*;
     use filar_core::SshAuth;
-
-    #[test]
-    fn marker_format() {
-        let marker_id = "req_00000001";
-        let marker_tag = format!("{}{}", MARKER_PREFIX, marker_id);
-        assert_eq!(marker_tag, "__FILAR_req_00000001");
-    }
-
-    #[test]
-    fn payload_format() {
-        let command = "echo hello";
-        let marker_tag = "__FILAR_req_00000001";
-        let payload = format!(
-            "{}\nprintf '\\n{}__%d__%s__\\n' \"$?\" \"$PWD\"\n",
-            command, marker_tag
-        );
-        assert!(payload.contains("echo hello"));
-        assert!(payload.contains("__FILAR_req_00000001__%d__%s__"));
-    }
-
-    #[test]
-    fn parse_marker_with_pwd() {
-        let tag = "__FILAR_req_00000001";
-        let buf = "hello\n__FILAR_req_00000001__0__/tmp/work__\n";
-        let (code, cwd, start) = parse_filar_marker(buf, tag).unwrap();
-        assert_eq!(code, 0);
-        assert_eq!(cwd.as_deref(), Some("/tmp/work"));
-        assert_eq!(&buf[..start], "hello\n");
-    }
-
-    #[test]
-    fn parse_marker_exit_only() {
-        let tag = "__FILAR_req_00000001";
-        let buf = "out\n__FILAR_req_00000001__1__\n";
-        let (code, cwd, _) = parse_filar_marker(buf, tag).unwrap();
-        assert_eq!(code, 1);
-        assert!(cwd.is_none());
-    }
-
-    #[test]
-    fn parse_marker_pwd_allows_double_underscore_in_name() {
-        let tag = "__FILAR_req_00000001";
-        let buf = "out\n__FILAR_req_00000001__0__/home/u/my__project__\n";
-        let (code, cwd, _) = parse_filar_marker(buf, tag).unwrap();
-        assert_eq!(code, 0);
-        assert_eq!(cwd.as_deref(), Some("/home/u/my__project"));
-    }
-
-    /// Integration test — requires a running SSH server.
-    /// Start one with: docker run -d -p 2222:22 --name filar-sshd filar-sshd
-    #[test]
-    fn the_shell_pid_is_read_from_its_marker_line() {
-        let tag = "__FILAR_pid_abc";
-        assert_eq!(parse_shell_pid("noise\n__FILAR_pid_abc__4242__\n", tag), Some(4242));
-        // An echo of the printf (a shell with echo on) is skipped.
-        let echoed = "printf '\\n__FILAR_pid_abc__%s__\\n' \"$$\"\n__FILAR_pid_abc__77__\n";
-        assert_eq!(parse_shell_pid(echoed, tag), Some(77));
-        assert_eq!(parse_shell_pid("__FILAR_pid_abc__", tag), None, "incomplete");
-        assert_eq!(parse_shell_pid("__FILAR_pid_other__1__", tag), None);
-    }
-
-    #[test]
-    fn the_interrupt_signals_the_shells_children_and_writes_nothing() {
-        let cmd = interrupt_command(4242);
-        assert!(cmd.contains("awk -v pp=4242"), "{cmd}");
-        assert!(cmd.contains("kill -INT"), "{cmd}");
-        // A failed `ps` or `kill` is reported, not swallowed.
-        assert!(cmd.contains("|| exit 1") && cmd.contains("|| rc=1") && cmd.ends_with("exit $rc"), "{cmd}");
-        // Zero-install: the only redirection is stderr to /dev/null.
-        assert_eq!(cmd.matches('>').count(), 1, "{cmd}");
-        assert!(cmd.contains("2>/dev/null"), "{cmd}");
-    }
 
     /// Integration test (#437): `cancel()` really stops a running command
     /// on the host, and the shell stays usable — the next command is not

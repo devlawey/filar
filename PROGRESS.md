@@ -11294,3 +11294,26 @@ workflow покрывает Windows x86_64 и macOS aarch64; открытых is
 
 **Ручная проверка:** полный SMOKE на Windows + macOS (#298), включая живой
 Kubernetes/fleet DoD против `docker/k8s`; unit-preflight эти сценарии не заменяет.
+
+## Issue #561: маркерный протокол шелла — общий модуль (веха 3.0.1)
+
+**Сделано.** Протокол персистентного шелла вынесен из `ssh.rs` в
+`crates/transport/src/shell_protocol.rs` (`pub(crate)`, без russh): маркер
+`printf '\n<tag>__%d__%s__\n' "$?" "$PWD"` (`command_marker_tag`,
+`command_payload`), sync-запрос (`sync_request`), `$$` шелла
+(`shell_pid_request`, `read_shell_pid`, `parse_shell_pid`), `interrupt_command`,
+`parse_filar_marker`, `recv_until_marker` с добором stderr и
+`recv_until_marker_simple` для ресинка. Всё читает события через трейт
+`EventSource` (`ChannelEvent::{Data,Stderr,Closed}`): его реализуют mpsc-приёмник
+reader-task'а и адаптер `ShellChannel` над russh-каналом в `ssh.rs` (стартовый
+sync и PID до запуска reader-task'а). Бывший `drain_until_marker` заменён тем же
+`recv_until_marker_simple` над адаптером — тексты ошибок совпадают.
+
+**Поведение SSH не менялось**, публичный API `filar-transport` тоже. Тесты
+протокола переехали в модуль, добавлены тесты сбора вывода/stderr/кода/cwd,
+закрытия, таймаута, ресинка и чтения PID над событиями: transport lib 141 → 147,
+ignored-тесты docker-sshd без изменений (ручные).
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись.
+
+**Next:** #563 — `KubeExecutor` поверх `shell_protocol` и `EventSource` над exec-потоком.

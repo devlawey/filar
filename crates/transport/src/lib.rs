@@ -27,6 +27,7 @@ pub mod readonly;
 pub mod secret;
 pub mod sftp;
 pub mod ssh;
+mod shell_protocol;
 
 use std::time::Duration;
 
