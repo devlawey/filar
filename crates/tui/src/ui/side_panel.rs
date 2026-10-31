@@ -272,9 +272,11 @@ fn pack_hint(parts: &[String], sep: &str, width: usize) -> Vec<String> {
 fn dropped_mark(app: &App, state: filar_agent::fleet_result::HostState, glyphs: &Glyphs) -> (&'static str, Style) {
     use filar_agent::fleet_result::HostState;
     match state {
-        HostState::NoContact | HostState::TimedOut | HostState::ExecutionError => {
-            (glyphs.op_failed, Style::default().fg(app.theme.danger))
-        }
+        HostState::NoContact
+        | HostState::TimedOut
+        | HostState::ExecutionError
+        | HostState::AccessDenied
+        | HostState::PodDisappeared => (glyphs.op_failed, Style::default().fg(app.theme.danger)),
         HostState::Cancelled => (glyphs.op_cancelled, app.theme.muted()),
         _ => (glyphs.middle_dot, app.theme.muted()),
     }

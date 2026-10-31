@@ -11222,3 +11222,29 @@ kubeconfig. После ревью label Kubernetes-участника включ
 `LlmClient` не менялись. SSH selection, restore и поведение fleet сохранены.
 
 **Next:** #568.
+
+## #568 — read-only Kubernetes fleets
+
+**Сделано.** `[[host_groups]]` принимает `kube = { clusters, namespace, selector? }`
+взаимоисключающе с SSH `match`. При selector состав замораживается из Ready pods
+всех перечисленных кластеров, без selector — из cluster/namespace scopes.
+`KubeFleet` выполняет typed read-only вызовы с structural `max_parallel`,
+per-member timeout и отменой; pod member жёстко связывает namespace/pod/container,
+cluster member — configured namespace. Ответы проходят существующую редакцию и
+difference fold; RBAC/policy denial, API unavailability/timeout и disappeared pod
+различаются. Новые pods только отмечаются и не входят в snapshot. Гейт всегда
+требует одно подтверждение на полный радиус. Fleet runbook scrubbing удаляет
+конкретные pod names, сохраняя group/cluster/namespace context. Добавлены unit-
+тесты и три ignored live-теста для docker/k8s (web, crashy --previous, deletion).
+После ревью выполнение принимает одноразовый `KubeFleetApproval`, привязанный к
+fleet и точному вызову; начальное и повторное discovery ограничено deadline и
+отменяется, а после отмены новые pods не запрашиваются. GUI draft сохраняет `kube`
+при редактировании остальных полей группы.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. Аддитивно: `KubeGroup`,
+`HostGroup::kube`, `KubeFleet`/`KubeFleetApproval`/`KubeFleetCluster`/
+`KubeFleetReport`, `KubeFleet::open_until`, `bind_fleet_call`, typed
+`CoreError::{AccessDenied, NotFound, Unavailable}` и `HostRun::AnsweredText`;
+fleet result различает `AccessDenied` и `PodDisappeared`.
+
+**Next:** #569 — TUI/launcher integration и пользовательский DoD.

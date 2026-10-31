@@ -86,6 +86,10 @@ pub enum HostState {
     /// [`Success`][Self::Success]: the host answered, and the answer is
     /// that the command did not work.
     ExecutionError,
+    /// Kubernetes RBAC or an admission/policy rule denied the request (#568).
+    AccessDenied,
+    /// A pod frozen into the fleet no longer exists (#568).
+    PodDisappeared,
     /// Asked, and its own deadline expired before an answer (#427).
     TimedOut,
     /// Never reached — the connection was lost or could not be made.
@@ -106,10 +110,12 @@ pub enum HostState {
 
 impl HostState {
     /// Every state, in the order a summary lists them.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::Success,
         Self::Divergent,
         Self::ExecutionError,
+        Self::AccessDenied,
+        Self::PodDisappeared,
         Self::TimedOut,
         Self::NoContact,
         Self::NotApplicable,
@@ -130,8 +136,12 @@ impl HostState {
                 Some(0) => Self::Success,
                 _ => Self::ExecutionError,
             },
+            HostRun::AnsweredText(_) => Self::Success,
             HostRun::TimedOut(_) => Self::TimedOut,
             HostRun::Cancelled => Self::Cancelled,
+            HostRun::Failed(CoreError::AccessDenied(_)) => Self::AccessDenied,
+            HostRun::Failed(CoreError::NotFound(_)) => Self::PodDisappeared,
+            HostRun::Failed(CoreError::Unavailable(_)) => Self::NoContact,
             HostRun::Failed(error) => {
                 if is_connection_lost(error) {
                     Self::NoContact
@@ -144,7 +154,14 @@ impl HostState {
 
     /// Whether the host said something back.
     pub fn answered(&self) -> bool {
-        matches!(self, Self::Success | Self::Divergent | Self::ExecutionError)
+        matches!(
+            self,
+            Self::Success
+                | Self::Divergent
+                | Self::ExecutionError
+                | Self::AccessDenied
+                | Self::PodDisappeared
+        )
     }
 
     /// Whether the host was asked and said nothing.
@@ -177,6 +194,8 @@ impl HostState {
             Self::Success => "ok",
             Self::Divergent => "differs",
             Self::ExecutionError => "error",
+            Self::AccessDenied => "access denied",
+            Self::PodDisappeared => "pod disappeared",
             Self::TimedOut => "timeout",
             Self::NoContact => "no contact",
             Self::NotApplicable => "n/a",

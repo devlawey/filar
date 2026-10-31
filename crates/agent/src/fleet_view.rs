@@ -114,6 +114,7 @@ impl FleetView {
                 .and_then(|(h, _)| report.run_for(h))
                 .map(|run| match run {
                     HostRun::Answered(result) => result.stdout.trim_end().to_string(),
+                    HostRun::AnsweredText(output) => output.trim_end().to_string(),
                     _ => String::new(),
                 })
                 .unwrap_or_default()

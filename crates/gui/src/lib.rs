@@ -1955,6 +1955,8 @@ struct HostGroupDraft {
     max_parallel: String,
     /// Per-host command deadline in seconds; empty = the built-in default.
     per_host_timeout_secs: String,
+    /// Kubernetes selection is preserved while editing the other fields.
+    kube: Option<filar_core::KubeGroup>,
     /// LLM profile name; empty = the session profile.
     llm_profile: String,
 }
@@ -1969,6 +1971,7 @@ impl HostGroupDraft {
             policy: group.policy,
             max_parallel: group.max_parallel.to_string(),
             per_host_timeout_secs: group.per_host_timeout_secs.to_string(),
+            kube: group.kube.clone(),
             llm_profile: group.llm_profile.clone().unwrap_or_default(),
         }
     }
@@ -2004,6 +2007,7 @@ impl HostGroupDraft {
             policy: self.policy,
             max_parallel,
             per_host_timeout_secs,
+            kube: self.kube.clone(),
             llm_profile: if llm_profile.is_empty() {
                 None
             } else {
@@ -3926,6 +3930,7 @@ impl LauncherApp {
             policy: filar_core::HostGroupPolicy::default(),
             max_parallel: defaults.max_parallel.to_string(),
             per_host_timeout_secs: defaults.per_host_timeout_secs.to_string(),
+            kube: None,
             llm_profile: String::new(),
         });
         self.active_tab = 1;
@@ -6585,6 +6590,7 @@ host_key_policy = \"strict\"
             policy: filar_core::HostGroupPolicy::ReadOnly,
             max_parallel: "3".into(),
             per_host_timeout_secs: "30".into(),
+            kube: None,
             llm_profile: String::new(),
         }
     }
@@ -6597,11 +6603,30 @@ host_key_policy = \"strict\"
             policy: filar_core::HostGroupPolicy::ReadOnly,
             max_parallel: 5,
             per_host_timeout_secs: 45,
+            kube: None,
             llm_profile: Some("glm".into()),
         };
         let draft = HostGroupDraft::from_group(&group);
         assert_eq!(draft.match_tags, "work, prod");
         assert_eq!(draft.to_group().unwrap(), group);
+    }
+
+    #[test]
+    fn group_draft_preserves_kubernetes_selection() {
+        let group = filar_core::HostGroup {
+            name: "web-prod".into(),
+            match_tags: Vec::new(),
+            policy: filar_core::HostGroupPolicy::ReadOnly,
+            max_parallel: 5,
+            per_host_timeout_secs: 45,
+            kube: Some(filar_core::KubeGroup {
+                clusters: vec!["prod-eu".into(), "prod-us".into()],
+                namespace: "shop".into(),
+                selector: Some("app=web".into()),
+            }),
+            llm_profile: None,
+        };
+        assert_eq!(HostGroupDraft::from_group(&group).to_group().unwrap(), group);
     }
 
     #[test]

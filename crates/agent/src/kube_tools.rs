@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use filar_core::{
-    tag_policy_floor, CommandConfirmMode, CoreError, KubeCluster, Result, SecretProvider, TagPolicy,
+    tag_policy_floor, CommandConfirmMode, CoreError, FleetTarget, KubeCluster, KubePodRef, Result,
+    SecretProvider, TagPolicy,
 };
 use filar_transport::{
     ClusterApi, ConfigMapInfo, EventInfo, NodeInfo, PodInfo, ResourceMetrics, RolloutRevision,
@@ -379,6 +380,112 @@ impl KubeToolCall {
     }
 }
 
+/// Bind one typed call to a frozen fleet member without widening its scope (#568).
+///
+/// Pod members accept only pod-bound reads. Cluster members keep every tool,
+/// with namespaced calls forced into the namespace frozen at fleet entry.
+pub fn bind_fleet_call(call: &KubeToolCall, target: &FleetTarget) -> Result<KubeToolCall> {
+    let namespace = match target {
+        FleetTarget::KubePod(pod) => pod.namespace.clone(),
+        FleetTarget::KubeCluster(scope) => scope.namespace.clone(),
+        FleetTarget::Ssh(_) => {
+            return Err(CoreError::Other(
+                "Kubernetes fleet calls cannot target an SSH member".into(),
+            ))
+        }
+    };
+    let mut bound = call.clone();
+    match (&mut bound, target) {
+        (KubeToolCall::Get { kind, namespace: ns, .. }, FleetTarget::KubeCluster(_))
+        | (KubeToolCall::Describe { kind, namespace: ns, .. }, FleetTarget::KubeCluster(_))
+            if kind.is_namespaced() =>
+        {
+            *ns = Some(namespace);
+        }
+        (KubeToolCall::Logs { namespace: ns, .. }, FleetTarget::KubeCluster(_))
+        | (KubeToolCall::RolloutHistory { namespace: ns, .. }, FleetTarget::KubeCluster(_)) => {
+            *ns = namespace;
+        }
+        (KubeToolCall::Events { namespace: ns, .. }, FleetTarget::KubeCluster(_))
+        | (KubeToolCall::Top { resource: KubeTopResource::Pods, namespace: ns, .. }, FleetTarget::KubeCluster(_)) => {
+            *ns = Some(namespace);
+        }
+        (KubeToolCall::Get { kind, namespace: ns, .. }, FleetTarget::KubePod(pod)) => {
+            if *kind != KubeResourceKind::Pod {
+                return Err(CoreError::Other(
+                    "a pod fleet member supports only k8s_get Pod".into(),
+                ));
+            }
+            *ns = Some(pod.namespace.clone());
+        }
+        (
+            KubeToolCall::Describe {
+                kind,
+                namespace: ns,
+                name,
+                ..
+            },
+            FleetTarget::KubePod(pod),
+        ) => {
+            if *kind != KubeResourceKind::Pod {
+                return Err(CoreError::Other(
+                    "a pod fleet member supports only k8s_describe Pod".into(),
+                ));
+            }
+            *ns = Some(pod.namespace.clone());
+            *name = pod.pod.clone();
+        }
+        (
+            KubeToolCall::Logs {
+                namespace: ns,
+                pod: name,
+                container,
+                ..
+            },
+            FleetTarget::KubePod(pod),
+        ) => {
+            *ns = pod.namespace.clone();
+            *name = pod.pod.clone();
+            *container = Some(pod.container.clone());
+        }
+        (
+            KubeToolCall::Events {
+                namespace: ns,
+                involved_object,
+                ..
+            },
+            FleetTarget::KubePod(pod),
+        ) => {
+            *ns = Some(pod.namespace.clone());
+            *involved_object = Some(pod.pod.clone());
+        }
+        (
+            KubeToolCall::Top {
+                resource,
+                namespace: ns,
+                limit,
+            },
+            FleetTarget::KubePod(pod),
+        ) => {
+            if *resource != KubeTopResource::Pods {
+                return Err(CoreError::Other(
+                    "a pod fleet member does not support node metrics".into(),
+                ));
+            }
+            *ns = Some(pod.namespace.clone());
+            *limit = 1;
+        }
+        (KubeToolCall::RolloutHistory { .. }, FleetTarget::KubePod(_)) => {
+            return Err(CoreError::Other(
+                "a pod fleet member does not support rollout history".into(),
+            ));
+        }
+        (_, FleetTarget::KubeCluster(_)) => {}
+        (_, FleetTarget::Ssh(_)) => unreachable!("SSH members were rejected above"),
+    }
+    Ok(bound)
+}
+
 /// Redacted and bounded tool output, safe for a model message or history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KubeToolResult {
@@ -674,6 +781,80 @@ impl KubeToolExecutor {
             target,
             secrets,
         }
+    }
+
+    /// Execute a call against one frozen fleet member (#568).
+    ///
+    /// Direct pod reads preserve a typed 404 when a member disappears. Metrics
+    /// and events check pod existence first so an empty API collection cannot
+    /// hide that disappearance.
+    pub async fn execute_for_fleet(
+        &self,
+        call: &KubeToolCall,
+        target: &FleetTarget,
+    ) -> Result<KubeToolResult> {
+        let cluster = match target {
+            FleetTarget::KubePod(pod) => &pod.cluster,
+            FleetTarget::KubeCluster(scope) => &scope.cluster,
+            FleetTarget::Ssh(_) => {
+                return Err(CoreError::Other(
+                    "Kubernetes fleet calls cannot target an SSH member".into(),
+                ))
+            }
+        };
+        if cluster != &self.target.name {
+            return Err(CoreError::Other(format!(
+                "Kubernetes executor for {} cannot read fleet member in {cluster}",
+                self.target.name
+            )));
+        }
+        let bound = bind_fleet_call(call, target)?;
+        match target {
+            FleetTarget::KubePod(pod) => match &bound {
+                KubeToolCall::Get { .. } => self.execute_pod_get(pod).await,
+                KubeToolCall::Top { .. } => self.execute_pod_top(pod).await,
+                KubeToolCall::Events { .. } => {
+                    self.api.get_pod(&pod.namespace, &pod.pod).await?;
+                    self.execute(&bound).await
+                }
+                _ => self.execute(&bound).await,
+            },
+            FleetTarget::KubeCluster(_) => self.execute(&bound).await,
+            FleetTarget::Ssh(_) => unreachable!("SSH members were rejected above"),
+        }
+    }
+
+    async fn execute_pod_get(&self, pod: &KubePodRef) -> Result<KubeToolResult> {
+        let object = self.redact_object(pod_object(
+            self.api.get_pod(&pod.namespace, &pod.pod).await?,
+        ));
+        let content = render_table(&resource_table(KubeResourceKind::Pod, &[object])?, 1, false)?;
+        let truncated = content.contains("[truncated: output character limit reached]");
+        Ok(KubeToolResult { content, truncated })
+    }
+
+    async fn execute_pod_top(&self, pod: &KubePodRef) -> Result<KubeToolResult> {
+        self.api.get_pod(&pod.namespace, &pod.pod).await?;
+        let metrics = self
+            .api
+            .top_pods(Some(&pod.namespace))
+            .await
+            .map_err(metrics_error)?
+            .into_iter()
+            .filter(|metric| {
+                metric.namespace.as_deref() == Some(pod.namespace.as_str()) && metric.name == pod.pod
+            })
+            .collect::<Vec<_>>();
+        let total = metrics.len();
+        let objects = self.redact_objects(
+            metrics
+                .into_iter()
+                .map(|metric| metrics_object(KubeTopResource::Pods, metric))
+                .collect(),
+        );
+        let content = render_table(&metrics_table(KubeTopResource::Pods, &objects)?, total, false)?;
+        let truncated = content.contains("[truncated: output character limit reached]");
+        Ok(KubeToolResult { content, truncated })
     }
 
     /// Execute one validated read-only call and return model-safe output.

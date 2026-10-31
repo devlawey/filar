@@ -99,6 +99,15 @@ type = "password"
 # reveal_configmaps = ["shop/feature-flags"]  # redaction opt-outs, namespace/name
 # reveal_env = ["shop/api/PUBLIC_MODE"]       # one literal pod variable; marked in output
 
+# Kubernetes fleet: ready app=web pods frozen on entry in both clusters.
+# Use either kube or match = [...] in a host group, never both. Without
+# selector, each cluster/namespace pair is itself one fleet member.
+# [[host_groups]]
+# name = "web-prod"
+# kube = { clusters = ["prod-eu", "prod-us"], namespace = "shop", selector = "app=web" }
+# max_parallel = 5
+# per_host_timeout_secs = 30
+
 # Example: key-based auth
 # [[ssh_targets]]
 # name = "my-server"

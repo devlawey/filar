@@ -3584,8 +3584,8 @@ impl App {
                     .unwrap_or_else(|| self.default_profile_name.clone());
                 let session = &self.sessions[self.active];
                 let fleet = session.fleet.as_ref().map(|op| {
-                    let mut ids = filar_agent::FleetIdentifiers::from_targets(
-                        op.members().iter().filter_map(|m| m.target().as_ssh()),
+                    let mut ids = filar_agent::FleetIdentifiers::from_fleet_targets(
+                        op.members().iter().map(|m| m.target()),
                     );
                     // A restored fleet's hosts the config lost are named in
                     // the feed too (#442) — scrubbed like the others.

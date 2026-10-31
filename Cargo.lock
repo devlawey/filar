@@ -1655,6 +1655,8 @@ dependencies = [
  "filar-core",
  "filar-transport",
  "futures",
+ "k8s-openapi",
+ "kube",
  "reqwest",
  "russh",
  "serde",
