@@ -1451,8 +1451,9 @@ LogsQL) и **Grafana Loki** (`kind = "loki"`, язык LogQL). OpenSearch/Elasti
 `tenant = "AccountID:ProjectID"`, по умолчанию `0:0`.
 
 У Loki тенант уходит в заголовок `X-Scope-OrgID`, а auth бывает `none`, `basic`
-или `bearer`. Запрос LogQL всегда начинается с селектора потока, например
-`{namespace="shop"} |= "error"`. Имена меток задаёт сборщик (Promtail, Alloy).
+или `bearer`. Запрос логов в LogQL начинается с селектора потока, например
+`{namespace="shop"} |= "error"`. Метрическое выражение содержит селектор
+внутри, например `sum by (pod) (count_over_time({namespace="shop"}[5m]))`. Имена меток задаёт сборщик (Promtail, Alloy).
 Метрические запросы (`count_over_time`, `rate`) возвращают не строки, а ряды:
 модель получает таблицу «ряд × точки» с min, max, последним значением и
 выборкой значений.

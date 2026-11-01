@@ -182,7 +182,7 @@ impl LogSource for LokiSource {
             return Ok(LogResult {
                 truncated: true,
                 note: Some(format!(
-                    "the answer was larger than {} bytes (max_response_bytes) and was dropped; lower the limit or narrow the selector",
+                    "the answer was larger than {} bytes (max_response_bytes) and was dropped; narrow the selector or the window (for log queries also lower the limit), or raise max_response_bytes",
                     limits.max_response_bytes
                 )),
                 ..Default::default()

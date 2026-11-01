@@ -295,8 +295,12 @@ pub fn fold_logs(name: &str, language: &str, query: &LogQuery, result: &LogResul
 fn number(v: f64) -> String {
     if v.fract() == 0.0 && v.abs() < 1e15 {
         format!("{}", v as i64)
-    } else {
+    } else if v.abs() >= 1.0 {
         format!("{v:.3}")
+    } else {
+        // Three significant digits, so a small rate never reads as zero.
+        let decimals = (-v.abs().log10()).ceil() as usize + 2;
+        format!("{v:.decimals$}")
     }
 }
 
@@ -320,9 +324,11 @@ pub fn fold_series(series: &[LogSeries], multi_day: bool) -> String {
             out.push_str(&format!("{{{}}} no points\n", labels.join(", ")));
             continue;
         };
-        let step = (values.len() as f64 / SERIES_SAMPLES as f64).max(1.0);
-        let sampled: Vec<String> = (0..values.len().min(SERIES_SAMPLES))
-            .map(|i| number(values[((i as f64 * step) as usize).min(values.len() - 1)]))
+        // Evenly over the whole series, first and newest point included.
+        let k = values.len().min(SERIES_SAMPLES);
+        let sampled: Vec<String> = (0..k)
+            .map(|i| if k == 1 { 0 } else { i * (values.len() - 1) / (k - 1) })
+            .map(|i| number(values[i]))
             .collect();
         out.push_str(&format!(
             "{{{}}} {} point(s) {} … {}: min {} max {} last {}; values {}\n",
@@ -337,4 +343,29 @@ pub fn fold_series(series: &[LogSeries], multi_day: bool) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod series_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn small_values_keep_significant_digits() {
+        assert_eq!(number(0.0004), "0.000400");
+        assert_eq!(number(0.25), "0.250");
+        assert_eq!(number(2.5), "2.500");
+        assert_eq!(number(5.0), "5");
+        assert_eq!(number(0.0), "0");
+    }
+
+    #[test]
+    fn samples_span_the_whole_series() {
+        let points: Vec<(DateTime<Utc>, f64)> = (0..13)
+            .map(|i| (Utc.timestamp_opt(1_793_557_500 + i * 60, 0).unwrap(), i as f64))
+            .collect();
+        let text = fold_series(&[LogSeries { labels: Default::default(), points }], false);
+        assert!(text.contains("values 0 "), "{text}");
+        assert!(text.trim_end().ends_with(" 12"), "the newest point is sampled: {text}");
+    }
 }
