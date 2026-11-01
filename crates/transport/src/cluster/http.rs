@@ -58,7 +58,9 @@ fn body_complete(raw: &[u8]) -> bool {
         return raw.len() - (end + 4) >= len;
     }
     if header_value(&head, "transfer-encoding").is_some_and(|v| v.contains("chunked")) {
-        return raw.windows(5).rev().take(64).any(|w| w == b"0\r\n\r\n");
+        // Walk the chunk framing: a `0\r\n\r\n` inside a chunk's data is
+        // not the end.
+        return dechunk(&raw[end + 4..]).1;
     }
     false
 }
@@ -94,11 +96,25 @@ pub(crate) fn parse_response(raw: &[u8], max_bytes: usize) -> Result<PodHttpResp
             .then(|| value.trim().to_string())
     });
     let rest = &raw[end + 4..];
+    // A body that stopped short of its own framing before the cap was
+    // reached was cut off by the connection: an error, not a short answer.
+    let cut_off = |got: usize| {
+        CoreError::ConnectionLost(format!(
+            "the pod's HTTP answer was cut off after {got} bytes of body"
+        ))
+    };
     let mut body = if header_value(&lower, "transfer-encoding").is_some_and(|v| v.contains("chunked")) {
-        dechunk(rest)
+        let (body, complete) = dechunk(rest);
+        if !complete && body.len() <= max_bytes {
+            return Err(cut_off(body.len()));
+        }
+        body
     } else if let Some(len) =
         header_value(&lower, "content-length").and_then(|v| v.parse::<usize>().ok())
     {
+        if rest.len() < len && rest.len() <= max_bytes {
+            return Err(cut_off(rest.len()));
+        }
         rest[..rest.len().min(len)].to_vec()
     } else {
         rest.to_vec()
@@ -113,8 +129,9 @@ pub(crate) fn parse_response(raw: &[u8], max_bytes: usize) -> Result<PodHttpResp
     })
 }
 
-/// Decode a chunked body; a cut-off last chunk keeps what arrived.
-fn dechunk(mut rest: &[u8]) -> Vec<u8> {
+/// Decode a chunked body: the data, and whether the terminating zero-size
+/// chunk was reached. A cut-off chunk keeps what arrived.
+fn dechunk(mut rest: &[u8]) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     loop {
         let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") else {
@@ -127,7 +144,7 @@ fn dechunk(mut rest: &[u8]) -> Vec<u8> {
         };
         rest = &rest[line_end + 2..];
         if size == 0 {
-            break;
+            return (out, true);
         }
         let take = size.min(rest.len());
         out.extend_from_slice(&rest[..take]);
@@ -136,7 +153,7 @@ fn dechunk(mut rest: &[u8]) -> Vec<u8> {
         }
         rest = &rest[size + 2..];
     }
-    out
+    (out, false)
 }
 
 #[cfg(test)]
@@ -168,6 +185,25 @@ mod tests {
         let r = parse_response(raw, 1024).unwrap();
         assert_eq!(r.body, b"Wikipedia");
         assert!(body_complete(raw));
+    }
+
+    #[test]
+    fn a_zero_chunk_pattern_inside_data_is_not_the_end() {
+        // One 10-byte chunk whose data contains "0\r\n\r\n", no terminator yet.
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na\r\nab0\r\n\r\ncde\r\n";
+        assert!(!body_complete(raw));
+        assert!(parse_response(raw, 1024).is_err(), "cut off, not complete");
+    }
+
+    #[test]
+    fn a_body_short_of_content_length_is_an_error_unless_capped() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc";
+        let err = parse_response(raw, 1024).unwrap_err().to_string();
+        assert!(err.contains("cut off after 3 bytes"), "{err}");
+        // Reading stopped at the cap: that is truncation, not a cut-off.
+        let capped = parse_response(raw, 2).unwrap();
+        assert!(capped.truncated);
+        assert_eq!(capped.body, b"ab");
     }
 
     #[test]

@@ -144,7 +144,19 @@ pub fn redact_sensitive_labels(text: &str) -> String {
         let key = rest[key_start..eq].to_ascii_lowercase();
         out.push_str(&rest[..eq + 2]);
         rest = &rest[eq + 2..];
-        let end = rest.find('"').unwrap_or(rest.len());
+        // The closing quote, skipping `\"` (and `\\`) escapes.
+        let mut end = rest.len();
+        let mut escaped = false;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '\\' if !escaped => escaped = true,
+                '"' if !escaped => {
+                    end = i;
+                    break;
+                }
+                _ => escaped = false,
+            }
+        }
         if SENSITIVE.iter().any(|s| key.replace('_', "").contains(s)) {
             out.push_str("***");
         } else {
@@ -307,6 +319,13 @@ mod tests {
         let text = "db_up{user=\"app\",password=\"hunter2\",db_token=\"t0k\"} 1";
         let out = redact_sensitive_labels(text);
         assert_eq!(out, "db_up{user=\"app\",password=\"***\",db_token=\"***\"} 1");
+    }
+
+    #[test]
+    fn escaped_quotes_do_not_leak_the_rest_of_a_secret_label() {
+        let text = r#"db_up{password="a\"b\\",user="app"} 1"#;
+        let out = redact_sensitive_labels(text);
+        assert_eq!(out, r#"db_up{password="***",user="app"} 1"#);
     }
 
     #[test]
