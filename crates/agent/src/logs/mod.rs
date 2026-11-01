@@ -21,6 +21,7 @@
 
 pub mod fold;
 pub mod tool;
+pub mod victorialogs;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use filar_core::{CoreError, LogAuth, LogSourceConfig, Result, SecretProvider};
+use filar_core::{CoreError, LogAuth, LogSourceConfig, LogSourceKind, Result, SecretProvider};
 use futures::StreamExt;
 
 pub use fold::fold_logs;
@@ -290,11 +291,13 @@ mod base64_lite {
 /// adapter yet are an error naming the kind.
 pub fn build_log_source(cfg: &LogSourceConfig, key: &str) -> Result<Arc<dyn LogSource>> {
     cfg.validate()?;
-    let _ = key;
-    Err(CoreError::Config(format!(
-        "log source \"{}\": kind \"{}\" has no adapter in this build",
-        cfg.name, cfg.kind
-    )))
+    match cfg.source_kind() {
+        Some(LogSourceKind::VictoriaLogs) => Ok(Arc::new(victorialogs::VictoriaLogsSource::new(cfg, key)?)),
+        _ => Err(CoreError::Config(format!(
+            "log source \"{}\": kind \"{}\" has no adapter in this build",
+            cfg.name, cfg.kind
+        ))),
+    }
 }
 
 /// The key of `cfg` from `secrets` under its `key_env`; empty for
