@@ -1302,4 +1302,25 @@ mod tests {
         assert_eq!(meta.model.as_deref(), Some("glm-5.1"));
         assert_eq!(meta.api_base_url.as_deref(), Some("https://example.com"));
     }
+
+    /// Sessions saved before pod tabs are cluster tabs; a pod tab keeps its
+    /// selector, never credentials (#565).
+    #[test]
+    fn kube_snapshot_pod_is_optional_and_round_trips() {
+        let old: KubeSessionSnapshot =
+            serde_json::from_str(r#"{"target":"prod-eu","namespace":"shop"}"#).unwrap();
+        assert!(old.pod.is_none());
+        let pod_tab = KubeSessionSnapshot {
+            target: "prod-eu".into(),
+            namespace: Some("shop".into()),
+            pod: Some(KubePodSnapshot {
+                pod: crate::PodSelector::Labels("app=web".into()),
+                container: Some("main".into()),
+            }),
+        };
+        let json = serde_json::to_string(&pod_tab).unwrap();
+        assert!(!json.contains("kubeconfig"), "{json}");
+        let back: KubeSessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, pod_tab);
+    }
 }

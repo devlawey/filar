@@ -418,7 +418,7 @@ pub use pod_tab::{KubePodConnectRequest, KubePodListRequest, KubePodSelect, PodC
 pub(crate) const ENTER_POD_SELECTION: usize = usize::MAX;
 
 /// Exact explanation for actions that require a shell in a cluster tab (#575).
-pub const KUBE_SHELL_REFUSAL: &str = "во вкладке кластера нет шелла; войдите в под — 3.0.1";
+pub const KUBE_SHELL_REFUSAL: &str = "во вкладке кластера нет шелла; войдите в под — Ctrl+E";
 
 /// Kubernetes identity and namespace of one tab. Live API clients stay in the runner.
 #[derive(Debug, Clone)]
