@@ -460,6 +460,22 @@ impl KubePodTabState {
         }
     }
 
+    /// Why Ctrl+T has no pod shell to open a terminal in (#605): the tab is
+    /// still connecting, or it is connected but its shell is gone (lost
+    /// connection, reconnect in progress).
+    pub fn terminal_unavailable_message(&self) -> String {
+        match &self.pod {
+            None => format!(
+                "под {} ещё подключается — повторите Ctrl+T после подключения",
+                self.display_pod()
+            ),
+            Some(pod) => format!(
+                "шелл пода {pod} недоступен (соединение потеряно или идёт переподключение) — \
+                 повторите Ctrl+T позже"
+            ),
+        }
+    }
+
     /// Pod name to show: the live one, else the requested name or selector.
     pub fn display_pod(&self) -> String {
         match (&self.pod, &self.pod_ref.pod) {

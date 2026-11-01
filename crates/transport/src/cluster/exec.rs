@@ -452,6 +452,11 @@ pub struct KubeInteractive {
     process: StdMutex<Option<AttachedProcess>>,
     /// The stdout reader, stopped on `close`.
     reader: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set by `close`: output still queued in the channel is dropped, so
+    /// `read_output` never yields bytes after the terminal was closed.
+    closed: AtomicBool,
+    /// Deadline for one write or resize; `TERMINAL_WRITE_TIMEOUT` live.
+    write_timeout: Duration,
     pod: String,
     container: String,
 }
@@ -521,9 +526,34 @@ impl KubeInteractive {
             resize: Mutex::new(resize),
             process: StdMutex::new(Some(process)),
             reader: StdMutex::new(Some(reader)),
+            closed: AtomicBool::new(false),
+            write_timeout: TERMINAL_WRITE_TIMEOUT,
             pod: place.pod,
             container: place.container,
         })
+    }
+
+    /// A terminal over given streams, without a live exec — for unit tests
+    /// of the input, resize and close paths.
+    #[cfg(test)]
+    fn from_parts(
+        stdin: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+        output: mpsc::Receiver<std::result::Result<Vec<u8>, String>>,
+        resize: Option<futures::channel::mpsc::Sender<TerminalSize>>,
+        reader: Option<tokio::task::JoinHandle<()>>,
+        write_timeout: Duration,
+    ) -> Self {
+        Self {
+            stdin: Mutex::new(stdin),
+            output: Mutex::new(output),
+            resize: Mutex::new(resize),
+            process: StdMutex::new(None),
+            reader: StdMutex::new(reader),
+            closed: AtomicBool::new(false),
+            write_timeout,
+            pod: "test-pod".into(),
+            container: "test".into(),
+        }
     }
 
     /// Pod the terminal runs in.
@@ -540,7 +570,16 @@ impl KubeInteractive {
 #[async_trait::async_trait]
 impl crate::InteractiveTerminal for KubeInteractive {
     async fn read_output(&self) -> Result<Option<Vec<u8>>> {
-        match self.output.lock().await.recv().await {
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let next = self.output.lock().await.recv().await;
+        // `close` may have run while this call waited: what the reader queued
+        // before it stopped belongs to a closed terminal.
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        match next {
             Some(Ok(bytes)) => Ok(Some(bytes)),
             Some(Err(error)) => Err(CoreError::ConnectionLost(format!("pod terminal: {error}"))),
             None => Ok(None),
@@ -548,12 +587,21 @@ impl crate::InteractiveTerminal for KubeInteractive {
     }
 
     async fn write_input(&self, data: &[u8]) -> Result<()> {
+        // One deadline covers both waiting for the stdin lock (a previous
+        // write may be stuck on a dead exec) and the write itself. A timed-out
+        // write is dropped together with its guard, so the lock is released
+        // and the next keystroke gets its own deadline.
+        let deadline = tokio::time::Instant::now() + self.write_timeout;
+        let Ok(mut stdin) = tokio::time::timeout_at(deadline, self.stdin.lock()).await else {
+            return Err(CoreError::ConnectionLost(
+                "pod terminal: input not accepted in time".into(),
+            ));
+        };
         let write = async {
-            let mut stdin = self.stdin.lock().await;
             stdin.write_all(data).await?;
             stdin.flush().await
         };
-        match tokio::time::timeout(TERMINAL_WRITE_TIMEOUT, write).await {
+        match tokio::time::timeout_at(deadline, write).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(CoreError::ConnectionLost(format!("pod terminal: {e}"))),
             Err(_) => Err(CoreError::ConnectionLost(
@@ -564,31 +612,31 @@ impl crate::InteractiveTerminal for KubeInteractive {
 
     async fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         use futures::SinkExt;
-        if let Some(sender) = self.resize.lock().await.as_mut() {
-            // A stalled exec must not block the UI loop on a full channel.
-            match tokio::time::timeout(TERMINAL_WRITE_TIMEOUT, sender.send(tty_size(cols, rows)))
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    return Err(CoreError::ConnectionLost(format!("pod terminal resize: {e}")))
-                }
-                Err(_) => {
-                    return Err(CoreError::ConnectionLost(
-                        "pod terminal resize: not accepted in time".into(),
-                    ))
-                }
-            }
+        // Clone the sender and release the guard before waiting: a stalled
+        // send must not hold the lock for every later resize.
+        let Some(mut sender) = self.resize.lock().await.clone() else {
+            return Ok(());
+        };
+        // A stalled exec must not block the UI loop on a full channel.
+        match tokio::time::timeout(self.write_timeout, sender.send(tty_size(cols, rows))).await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(CoreError::ConnectionLost(format!("pod terminal resize: {e}"))),
+            Err(_) => Err(CoreError::ConnectionLost(
+                "pod terminal resize: not accepted in time".into(),
+            )),
         }
-        Ok(())
     }
 
     async fn close(&self) -> Result<()> {
-        if let Some(process) = self.process.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            process.abort();
-        }
+        self.closed.store(true, Ordering::Release);
+        // The reader first: once the exec is aborted it could still push the
+        // last bytes it read into the channel.
         if let Some(reader) = self.reader.lock().unwrap_or_else(|e| e.into_inner()).take() {
             reader.abort();
+        }
+        if let Some(process) = self.process.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            process.abort();
         }
         Ok(())
     }
@@ -1388,5 +1436,119 @@ mod tests {
         assert_eq!((size.width, size.height), (120, 40));
         let size = tty_size(0, 0);
         assert_eq!((size.width, size.height), (1, 1));
+    }
+
+    /// A stdin whose writes never complete — a dead exec.
+    struct StuckWriter;
+
+    impl tokio::io::AsyncWrite for StuckWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    const TEST_TIMEOUT: Duration = Duration::from_millis(100);
+
+    #[tokio::test]
+    async fn pod_terminal_yields_no_output_after_close() {
+        use crate::InteractiveTerminal;
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(Ok(b"late".to_vec())).await.unwrap();
+        let reader = tokio::spawn(async move {
+            // Holds the sender as a live reader would.
+            let _tx = tx;
+            std::future::pending::<()>().await;
+        });
+        let term =
+            KubeInteractive::from_parts(Box::new(tokio::io::sink()), rx, None, Some(reader), TEST_TIMEOUT);
+        term.close().await.unwrap();
+        assert!(term.read_output().await.unwrap().is_none());
+        assert!(term.read_output().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pod_terminal_read_waiting_during_close_yields_nothing() {
+        use crate::InteractiveTerminal;
+        let (tx, rx) = mpsc::channel(4);
+        let term = Arc::new(KubeInteractive::from_parts(
+            Box::new(tokio::io::sink()),
+            rx,
+            None,
+            None,
+            TEST_TIMEOUT,
+        ));
+        let waiting = tokio::spawn({
+            let term = term.clone();
+            async move { term.read_output().await }
+        });
+        tokio::task::yield_now().await;
+        term.close().await.unwrap();
+        // The reader had queued bytes just before it stopped.
+        tx.send(Ok(b"late".to_vec())).await.unwrap();
+        assert!(waiting.await.unwrap().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stuck_pod_terminal_write_times_out_and_releases_stdin() {
+        use crate::InteractiveTerminal;
+        let (_tx, rx) = mpsc::channel(4);
+        let term = Arc::new(KubeInteractive::from_parts(
+            Box::new(StuckWriter),
+            rx,
+            None,
+            None,
+            TEST_TIMEOUT,
+        ));
+        let first = tokio::spawn({
+            let term = term.clone();
+            async move { term.write_input(b"a").await }
+        });
+        // A second keystroke while the first one holds stdin: it fails on
+        // its own deadline instead of waiting for the first one forever.
+        let started = Instant::now();
+        let second = term.write_input(b"b").await;
+        assert!(matches!(second, Err(CoreError::ConnectionLost(_))));
+        assert!(started.elapsed() < TEST_TIMEOUT * 5);
+        assert!(matches!(first.await.unwrap(), Err(CoreError::ConnectionLost(_))));
+        // The lock was released with the timed-out write.
+        let started = Instant::now();
+        assert!(matches!(term.write_input(b"c").await, Err(CoreError::ConnectionLost(_))));
+        assert!(started.elapsed() < TEST_TIMEOUT * 5);
+    }
+
+    #[tokio::test]
+    async fn pod_terminal_resize_sends_size_and_reports_closed_channel() {
+        use crate::InteractiveTerminal;
+        use futures::StreamExt;
+        let (_tx, rx) = mpsc::channel(4);
+        let (resize_tx, mut resize_rx) = futures::channel::mpsc::channel(1);
+        let term = KubeInteractive::from_parts(
+            Box::new(tokio::io::sink()),
+            rx,
+            Some(resize_tx),
+            None,
+            TEST_TIMEOUT,
+        );
+        term.resize(100, 30).await.unwrap();
+        let size = resize_rx.next().await.unwrap();
+        assert_eq!((size.width, size.height), (100, 30));
+        drop(resize_rx);
+        assert!(matches!(term.resize(80, 24).await, Err(CoreError::ConnectionLost(_))));
     }
 }
