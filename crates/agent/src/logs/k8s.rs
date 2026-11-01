@@ -77,7 +77,15 @@ pub fn parse_selector(selector: &str) -> Result<Vec<LabelTerm>> {
             )));
         };
         let (key, value) = (key.trim(), value.trim());
-        if key.is_empty() || value.is_empty() || key.contains(char::is_whitespace) || value.contains(char::is_whitespace) {
+        if value.is_empty() {
+            // Valid in Kubernetes, but log stores cannot tell a label with an
+            // empty value from a missing one: the filter would match the
+            // wrong pods in one store and none in another.
+            return Err(CoreError::Other(format!(
+                "selector term \"{part}\" has an empty value; log stores cannot match empty labels reliably — name the pods instead"
+            )));
+        }
+        if key.is_empty() || key.contains(char::is_whitespace) || value.contains(char::is_whitespace) {
             return Err(CoreError::Other(format!("selector term \"{part}\" is malformed")));
         }
         terms.push(LabelTerm {
@@ -261,7 +269,16 @@ pub fn build_scope_query(cfg: &LogSourceConfig, scopes: &[PodScope], filter: Opt
             let all = scopes.iter().any(|s| matches!(s.pick, PodPick::All));
             // One selector cannot say "every pod of A, only web-1 of B":
             // dropping the pod matcher would widen B to all its pods.
-            if all && namespaces.len() > 1 && scopes.iter().any(|s| matches!(s.pick, PodPick::Names(_))) {
+            let whole: BTreeSet<&str> = scopes
+                .iter()
+                .filter(|s| matches!(s.pick, PodPick::All))
+                .map(|s| s.namespace.as_str())
+                .collect();
+            // Pods in a namespace that is wanted whole are already covered.
+            let uncovered = scopes
+                .iter()
+                .any(|s| matches!(s.pick, PodPick::Names(_)) && !whole.contains(s.namespace.as_str()));
+            if all && namespaces.len() > 1 && uncovered {
                 return Err(CoreError::Other(
                     "whole namespaces and single pods in other namespaces cannot be one LogQL query".into(),
                 ));
@@ -696,6 +713,14 @@ mod tests {
         let whole = PodScope { namespace: "pay".into(), pick: PodPick::All, container: None };
         let err = build_scope_query(&cfg("loki", None), &[whole.clone(), pod("shop", "web-1")], None).unwrap_err();
         assert!(err.to_string().contains("cannot be one LogQL query"), "{err}");
+        // A pod of a namespace that is wanted whole is covered.
+        let covered = build_scope_query(
+            &cfg("loki", None),
+            &[whole.clone(), PodScope { namespace: "shop".into(), ..whole.clone() }, pod("shop", "web-1")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(covered, r#"{namespace=~"pay|shop"}"#);
         // In one namespace, every pod of it is exactly what was asked.
         let same = build_scope_query(&cfg("loki", None), &[PodScope { namespace: "shop".into(), ..whole }, pod("shop", "web-1")], None).unwrap();
         assert_eq!(same, r#"{namespace="shop"}"#);
