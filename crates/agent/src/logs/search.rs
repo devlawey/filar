@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use filar_core::{CoreError, LogSourceConfig, LogSourceKind, Result};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use super::{cap_line, read_limited, LogHttp, LogLine, LogQuery, LogResult, LogSource};
 

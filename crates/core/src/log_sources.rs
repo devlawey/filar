@@ -643,7 +643,8 @@ mod tests {
 
     #[test]
     fn limits_stay_in_range() {
-        let cases: [(&str, fn(&mut LogSourceConfig)); 6] = [
+        type Case = (&'static str, fn(&mut LogSourceConfig));
+        let cases: [Case; 6] = [
             ("max_window_hours", |c| c.max_window_hours = 0),
             ("max_window_hours", |c| c.max_window_hours = 24 * 30),
             ("max_lines", |c| c.max_lines = 100_000),
