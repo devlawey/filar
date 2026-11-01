@@ -467,13 +467,31 @@ impl App {
         self.push_message(ChatBlock::System(trace));
     }
 
-    /// The debug container could not be created (RBAC, policy, image,
-    /// timeout): the reason in the origin tab's feed.
-    pub fn debug_container_failed(&mut self, proposal: &DebugProposal, error: &str) {
+    /// The debug container failed: the reason in the origin tab's feed.
+    /// `added_at` is set when it already got into the pod spec (did not
+    /// start: image, timeout) — then the trace is recorded too, since the
+    /// container stays in the spec all the same.
+    pub fn debug_container_failed(
+        &mut self,
+        proposal: &DebugProposal,
+        error: &str,
+        added_at: Option<&str>,
+    ) {
+        let Some(at) = added_at else {
+            self.push_kube_message(
+                proposal.origin,
+                ChatBlock::Error(format!(
+                    "Debug-контейнер {} в поде {}/{} не создан: {error}",
+                    proposal.name, proposal.namespace, proposal.pod
+                )),
+            );
+            return;
+        };
+        self.push_kube_message(proposal.origin, ChatBlock::System(proposal.trace_text(at)));
         self.push_kube_message(
             proposal.origin,
             ChatBlock::Error(format!(
-                "Debug-контейнер {} в поде {}/{} не создан: {error}",
+                "Debug-контейнер {} добавлен в спецификацию пода {}/{}, но не запустился: {error}",
                 proposal.name, proposal.namespace, proposal.pod
             )),
         );
@@ -1467,6 +1485,33 @@ mod tests {
         assert!(origin_tab.messages.iter().any(|m| matches!(m, ChatBlock::System(t) if t.contains("След в кластере") && t.contains("filar-debug-ab12cd34") && t.contains("2026-11-01 16:00:00"))));
         app.complete_kube_pod_connection(request.session_id, request.connection_id, "distroless-1".into(), "filar-debug-ab12cd34".into(), PodLimits::default());
         assert_eq!(app.pod_agent_target().unwrap().debug_target.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn a_debug_container_that_got_into_the_spec_but_did_not_start_still_leaves_a_trace() {
+        let mut app = cluster_tab_with(&["busybox:1.37"]);
+        let origin = app.active_session().id;
+        let proposal = DebugProposal {
+            origin,
+            cluster: debug_cluster(&["busybox:1.37"]),
+            namespace: "shop".into(),
+            pod: "distroless-1".into(),
+            target_container: "main".into(),
+            image: "busybox:1.37".into(),
+            name: "filar-debug-ab12cd34".into(),
+        };
+        app.debug_container_failed(&proposal, "RBAC: forbidden", None);
+        app.debug_container_failed(&proposal, "ImagePullBackOff", Some("2026-11-01 16:00:00"));
+        let origin_tab = app.sessions.iter().find(|s| s.id == origin).unwrap();
+        let traces = origin_tab
+            .messages
+            .iter()
+            .filter(|m| matches!(m, ChatBlock::System(t) if t.contains("След в кластере")))
+            .count();
+        assert_eq!(traces, 1, "a refused patch leaves no trace, an added container does");
+        assert!(origin_tab.messages.iter().any(|m| matches!(m, ChatBlock::Error(t) if t.contains("не создан") && t.contains("RBAC"))));
+        assert!(origin_tab.messages.iter().any(|m| matches!(m, ChatBlock::Error(t) if t.contains("добавлен в спецификацию") && t.contains("не запустился"))));
+        assert!(app.take_pending_kube_pod_connects().is_empty());
     }
 
     #[test]

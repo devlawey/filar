@@ -172,14 +172,22 @@ pub fn debug_state(pod: &Pod, name: &str) -> DebugState {
 }
 
 impl KubeClusterApi {
-    /// Add the ephemeral debug container and wait until it runs (#576).
-    /// RBAC (`patch` on `pods/ephemeralcontainers`) and admission-policy
-    /// denials come back as distinct messages; nothing is retried around them.
+    /// Add the ephemeral debug container and wait until it runs (#576):
+    /// [`Self::add_debug_container`], then [`Self::wait_debug_container`].
     pub async fn create_debug_container(
         &self,
         spec: &DebugContainerSpec,
         wait: Duration,
     ) -> Result<()> {
+        self.add_debug_container(spec).await?;
+        self.wait_debug_container(spec, wait).await
+    }
+
+    /// Add the ephemeral debug container to the pod spec (#576). After `Ok`
+    /// the container is in the spec for good, whether or not it starts.
+    /// RBAC (`patch` on `pods/ephemeralcontainers`) and admission-policy
+    /// denials come back as distinct messages; nothing is retried around them.
+    pub async fn add_debug_container(&self, spec: &DebugContainerSpec) -> Result<()> {
         let target: &KubeCluster = self.target();
         let pods: Api<Pod> = Api::namespaced(self.client().clone(), &spec.namespace);
         let pod = pods.get(&spec.pod).await.map_err(|error| {
@@ -206,6 +214,14 @@ impl KubeClusterApi {
         .map_err(|error| {
             api_error(target, error, "patch", "pods/ephemeralcontainers", Some(&spec.namespace))
         })?;
+        Ok(())
+    }
+
+    /// Wait until the added debug container runs (#576). Errors here mean it
+    /// is already in the pod spec but did not start.
+    pub async fn wait_debug_container(&self, spec: &DebugContainerSpec, wait: Duration) -> Result<()> {
+        let target: &KubeCluster = self.target();
+        let pods: Api<Pod> = Api::namespaced(self.client().clone(), &spec.namespace);
         let deadline = Instant::now() + wait;
         loop {
             let pod = pods.get(&spec.pod).await.map_err(|error| {

@@ -11577,4 +11577,11 @@ exec-протокола (`tty_size` не даёт нулей), Ctrl+C уходи
 `DebugContainerSpec`, `debug_container_name`, `KubeClusterApi::create_debug_container`,
 `KubeCluster.debug_images`, `KubePodTarget.debug_target`.
 
+**Ревью (CodeRabbit).** `select_container` принимает эфемерный контейнер только
+по точному имени (иначе вкладка debug-контейнера не подключалась); раннер создаёт
+локальные исполнители и в ветке не-терминальных событий — до подключения пода
+из `DebugCreated`; `add_debug_container` / `wait_debug_container` разделены: если
+контейнер попал в спецификацию, но не запустился, след всё равно пишется в ленту.
+Промпт не считает PID 1 приложением безусловно (`shareProcessNamespace` → `pause`).
+
 **Next:** веха 3.0.1 закрыта по коду; ручные прогоны по `docs/SMOKE.md` против `docker/k8s`.

@@ -260,9 +260,12 @@ fn kube_pod_prompt_parts(target: &KubePodTarget) -> (String, String) {
         transport.push_str(&format!(
             " This container is an ephemeral DEBUG container the user added next to container \
              {target}: it has the debug tools of its own image and shares {target}'s process \
-             namespace. The application's main process is PID 1 here (confirm with \
-             `cat /proc/1/cmdline`); the application's files are visible under /proc/1/root/ \
-             (for example /proc/1/root/etc/), not in this container's own filesystem. You cannot \
+             namespace. The application's main process is usually PID 1 here: confirm with \
+             `cat /proc/1/cmdline`. If PID 1 is not the application (for example `pause` when the \
+             pod shares one process namespace), find the application's PID from \
+             /proc/*/cmdline and use that PID instead of 1 below. The application's files are \
+             visible under /proc/<pid>/root/ (for example /proc/1/root/etc/), not in this \
+             container's own filesystem. You cannot \
              create or remove debug containers; the one you are in stays in the pod spec until the \
              pod is recreated."
         ));
