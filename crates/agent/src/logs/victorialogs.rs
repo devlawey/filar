@@ -77,22 +77,40 @@ fn pipe_stages(query: &str) -> Vec<&str> {
     stages
 }
 
-/// Whether a LogsQL query already orders its results with a `sort` (or
-/// `order`) pipe.
-pub fn sorts_itself(query: &str) -> bool {
-    pipe_stages(query).into_iter().skip(1).any(|pipe| {
-        let word = pipe.split_whitespace().next().unwrap_or("");
-        word.eq_ignore_ascii_case("sort") || word.eq_ignore_ascii_case("order")
-    })
+fn stage_word(stage: &str) -> String {
+    stage.split_whitespace().next().unwrap_or("").to_ascii_lowercase()
 }
 
-/// The query sent to the server: the model's, newest first unless it sorts.
+/// Whether a LogsQL query already orders its results: a `sort`/`order`
+/// pipe, or `first`/`last`, which pick rows by an order of their own.
+pub fn sorts_itself(query: &str) -> bool {
+    pipe_stages(query)
+        .into_iter()
+        .skip(1)
+        .any(|pipe| matches!(stage_word(pipe).as_str(), "sort" | "order" | "first" | "last"))
+}
+
+/// The query sent to the server: the model's, newest first unless it
+/// sorts. The sort goes before the first `limit`/`head` stage, so a limit
+/// keeps the newest rows rather than an arbitrary few.
 pub fn server_query(query: &str) -> String {
     let query = query.trim();
     if sorts_itself(query) {
-        query.to_string()
-    } else {
-        format!("{query} | sort by (_time) desc")
+        return query.to_string();
+    }
+    let stages = pipe_stages(query);
+    let limit_at = stages
+        .iter()
+        .skip(1)
+        .position(|stage| matches!(stage_word(stage).as_str(), "limit" | "head"))
+        .map(|i| i + 1);
+    match limit_at {
+        Some(i) => {
+            let before = stages[..i].join("|");
+            let after = stages[i..].join("|");
+            format!("{} | sort by (_time) desc |{}", before.trim_end(), after)
+        }
+        None => format!("{query} | sort by (_time) desc"),
     }
 }
 
@@ -173,8 +191,8 @@ impl LogSource for VictoriaLogsSource {
         let limits = self.http.limits;
         let form = [
             ("query", server_query(&query.query)),
-            ("start", query.start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
-            ("end", query.end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            ("start", query.start.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+            ("end", query.end.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
             ("limit", query.limit.to_string()),
             ("timeout", format!("{}s", self.cfg.timeout_secs)),
         ];
@@ -210,6 +228,12 @@ mod tests {
         assert!(!sorts_itself(r#"_msg:~"error| sort by (x)""#), "a | inside a regex is not a pipe");
         assert!(!sorts_itself(r#"_msg:"a \" | order" x"#), "escaped quotes stay inside the string");
         assert!(sorts_itself(r#"_msg:~"a|b" | sort by (_time)"#));
+        assert_eq!(server_query("error | limit 10"), "error | sort by (_time) desc | limit 10");
+        assert_eq!(
+            server_query("error | fields _time, _msg | head 5 | fields _msg"),
+            "error | fields _time, _msg | sort by (_time) desc | head 5 | fields _msg"
+        );
+        assert_eq!(server_query("error | first 5 by (_time desc)"), "error | first 5 by (_time desc)");
         assert_eq!(
             server_query(r#"_msg:~"error|sort""#),
             r#"_msg:~"error|sort" | sort by (_time) desc"#
@@ -340,6 +364,17 @@ mod tests {
         assert_eq!(result.lines.len(), 2);
         assert!(result.truncated, "the limit was reached");
         assert_eq!(result.lines[0].message, "e1");
+    }
+
+    #[tokio::test]
+    async fn the_window_keeps_fractions_of_a_second() {
+        let (url, server) = serve_once("200 OK", String::new()).await;
+        let mut q = query();
+        q.end += chrono::Duration::milliseconds(500);
+        VictoriaLogsSource::new(&cfg(url), "tok-123").unwrap().query(&q).await.unwrap();
+        let seen = server.await.unwrap();
+        assert_eq!(form_value(&seen.body, "end"), "2026-11-01T11:00:00.500Z");
+        assert_eq!(form_value(&seen.body, "start"), "2026-11-01T10:00:00Z");
     }
 
     #[tokio::test]
