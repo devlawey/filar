@@ -239,7 +239,8 @@ fn kube_pod_prompt_parts(target: &KubePodTarget) -> (String, String) {
     transport.push_str(
         " Processes you start share the memory and process limits with the application in this \
          container. Exceeding the limit causes an OOM kill, and the process killed may be the \
-         application's — the pod restarts. Avoid heavy commands: `find /` over a large tree, \
+         application's — the container is restarted (its restart count grows) and this shell \
+         ends with it. Avoid heavy commands: `find /` over a large tree, \
          reading big files whole, sorting large logs. Limit output (`head`, `tail -n`) and check \
          sizes before reading.",
     );
@@ -255,8 +256,8 @@ fn kube_pod_prompt_parts(target: &KubePodTarget) -> (String, String) {
 
     let shell = "You are running on a persistent POSIX shell inside the container (no TTY). \
                  Shell state (cwd, env) DOES persist between calls: your `cd`, exported variables \
-                 and environment carry over to subsequent commands. If the pod is replaced or a \
-                 command cannot be interrupted, the shell is reopened and cd and variables are \
+                 and environment carry over to subsequent commands. If the container restarts, \
+                 the pod is replaced or a command cannot be interrupted, the shell is reopened and cd and variables are \
                  reset — you will see this in the session."
         .to_string();
     (transport, shell)
