@@ -20,6 +20,7 @@
 //! The model sees a folded view ([`fold`]), redacted like pod logs.
 
 pub mod fold;
+pub mod k8s;
 pub mod tool;
 pub mod loki;
 pub mod search;

@@ -5849,6 +5849,7 @@ impl App {
             && !self.in_fleet()
             && !filar_agent::kube_tools::is_kube_tool_name(&tool.name)
             && tool.name != filar_agent::TOOL_QUERY_LOGS
+            && tool.name != filar_agent::logs::k8s::TOOL_POD_LOGS_HISTORY
             && tool.name != filar_agent::tools::TOOL_BACKGROUND_JOB_STATUS
             && tool.name != filar_agent::tools::TOOL_LIST_BACKGROUND_JOBS
     }

@@ -511,3 +511,119 @@ pub(crate) fn stub_log_sources(lines: Vec<LogLine>) -> Arc<LogSources> {
 pub(crate) fn stub_line(minute: u32, message: &str) -> LogLine {
     line(minute, message)
 }
+
+// ---------------------------------------------------------------------------
+// pod_logs_history (#583)
+// ---------------------------------------------------------------------------
+
+fn pod_line(minute: u32, pod: &str, message: &str) -> LogLine {
+    LogLine {
+        fields: [("kubernetes.pod_name".to_string(), pod.to_string())].into(),
+        ..line(minute, message)
+    }
+}
+
+fn history_call(args: serde_json::Value) -> ToolCall {
+    ToolCall {
+        id: "h1".into(),
+        name: k8s::TOOL_POD_LOGS_HISTORY.into(),
+        arguments: args,
+    }
+}
+
+#[tokio::test]
+async fn a_pod_history_query_is_written_by_filar_and_framed() {
+    let (set, mock, _) = sources(vec![pod_line(10, "web-1", "boom")], Vec::new(), Vec::new());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let emit = move |e: AgentEvent| sink.lock().unwrap().push(e);
+    let msg = set
+        .process_pod_logs_history(
+            &history_call(json!({"selector": "app=web", "container": "app", "filter": "timeout", "since": "1h"})),
+            "prod-eu",
+            Some("shop"),
+            None,
+            CommandConfirmMode::Never,
+            &Answer(true, Mutex::new(0)),
+            &emit,
+            None,
+            7,
+        )
+        .await
+        .unwrap();
+    assert!(msg.content.contains("boom"), "{}", msg.content);
+    let seen = mock.seen.lock().unwrap();
+    assert_eq!(
+        seen[0].query,
+        r#""kubernetes.pod_namespace":="shop" "kubernetes.pod_labels.app":="web" "kubernetes.container_name":="app" "timeout""#
+    );
+    assert_eq!(seen[0].end - seen[0].start, chrono::Duration::hours(1));
+    let events = events.lock().unwrap();
+    let shown = events.iter().find_map(|e| match e {
+        AgentEvent::CommandProposed { command, tool, .. } => Some((command.clone(), tool.name.clone())),
+        _ => None,
+    });
+    let (command, tool) = shown.unwrap();
+    assert!(command.starts_with("pod_logs_history vlogs-prod --start "), "{command}");
+    assert!(command.contains("\"kubernetes.pod_labels.app\":=\"web\""), "the query is visible: {command}");
+    assert_eq!(tool, "pod_logs_history");
+}
+
+#[tokio::test]
+async fn a_cluster_without_a_linked_source_gets_a_clear_answer() {
+    let (set, mock, _) = sources(Vec::new(), Vec::new(), Vec::new());
+    let emit = |_: AgentEvent| {};
+    let msg = set
+        .process_pod_logs_history(
+            &history_call(json!({"pod": "web-1", "since": "1h"})),
+            "prod-us",
+            Some("shop"),
+            None,
+            CommandConfirmMode::Never,
+            &Answer(true, Mutex::new(0)),
+            &emit,
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    assert!(msg.content.contains("Для кластера prod-us не настроен источник логов"), "{}", msg.content);
+    assert!(msg.content.contains("clusters = [\"prod-us\"]"), "{}", msg.content);
+    assert!(mock.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_fleet_asks_once_and_answers_per_pod() {
+    let (set, mock, _) = sources(
+        vec![
+            pod_line(10, "web-1", "timeout after 30s"),
+            pod_line(11, "web-1", "timeout after 31s"),
+            pod_line(12, "web-2", "ok"),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let member = |cluster: &str, pod: &str| k8s::FleetLogMember {
+        cluster: cluster.into(),
+        namespace: "shop".into(),
+        pod: Some(pod.into()),
+    };
+    let members = [member("prod-eu", "web-1"), member("prod-eu", "web-2"), member("prod-eu", "web-3"), member("prod-us", "web-9")];
+    let asked = Answer(true, Mutex::new(0));
+    let emit = |_: AgentEvent| {};
+    let msg = set
+        .process_fleet_pod_logs(&history_call(json!({"since": "1h", "filter": "timeout"})), &members, &asked, &emit, None, 3)
+        .await
+        .unwrap();
+    // One request for the three linked pods, and the user was asked once,
+    // although `never` would have auto-approved a single tab.
+    let seen = mock.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].query.contains("\"web-1\"") && seen[0].query.contains("\"web-3\""), "{}", seen[0].query);
+    assert_eq!(*asked.1.lock().unwrap(), 1);
+    let text = &msg.content;
+    assert!(text.contains("web-1 | 2 | 1 | [2×] timeout after 30s"), "{text}");
+    assert!(text.contains("web-2 | 1 | 1 | [1×] ok"), "{text}");
+    assert!(text.contains("web-3 | 0 | 0 | —"), "{text}");
+    assert!(text.contains("No log source is linked to: prod-us"), "{text}");
+}

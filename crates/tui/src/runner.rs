@@ -2519,9 +2519,10 @@ async fn run_app(
                             profile_name,
                             app.active_session().compaction_exhausted,
                             pending_compaction,
-                            // A Kubernetes fleet: one approval there covers
-                            // many targets, so no `query_logs` (#579).
-                            None,
+                            // A Kubernetes fleet gets `pod_logs_history` (one
+                            // query, asked once, #583) but never `query_logs`;
+                            // `KubeAgent` makes that split.
+                            config.log_sources.clone(),
                         );
                         app.sessions[app.active].pending_compaction = None;
                     } else if let Some(stripped) = user_input.strip_prefix('!') {
@@ -4464,7 +4465,8 @@ fn spawn_kube_agent(
     profile_name: String,
     compaction_exhausted: bool,
     pending_compaction: Option<usize>,
-    // `query_logs` (#579) for a cluster tab; a fleet gets none.
+    // Log sources (#579, #583): `query_logs` for a cluster tab,
+    // `pod_logs_history` for a cluster tab and a fleet.
     log_sources: Option<Arc<filar_agent::LogSources>>,
 ) {
     let tx = event_tx.clone();

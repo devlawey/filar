@@ -14,7 +14,7 @@ use filar_core::{
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 
-use super::{build_log_source, fold_logs, resolve_log_key, LogQuery, LogSource};
+use super::{build_log_source, fold_logs, resolve_log_key, LogQuery, LogResult, LogSource};
 use crate::security::{CommandConfirmer, ConfirmDecision};
 use crate::{AgentEvent, ChatMessage, ToolCall, ToolDef};
 
@@ -89,6 +89,11 @@ impl LogSources {
 
     fn get(&self, name: &str) -> Option<&Arc<dyn LogSource>> {
         self.sources.iter().find(|s| s.config().name == name)
+    }
+
+    /// The `[[log_sources]]` entry of source `name`.
+    pub fn source_config(&self, name: &str) -> Option<&LogSourceConfig> {
+        self.get(name).map(|s| s.config())
     }
 
     /// The `query_logs` tool definition; `explanation` is required in
@@ -238,19 +243,40 @@ impl LogSources {
         }
     }
 
-    /// Run `call` and return the folded, redacted view for the model.
-    pub async fn execute(&self, call: &QueryLogsCall) -> Result<String> {
+    /// Run `call` and return the store's raw answer (not redacted).
+    pub async fn query_result(&self, call: &QueryLogsCall) -> Result<LogResult> {
         let source = self
             .get(&call.source)
             .ok_or_else(|| CoreError::Other(format!("unknown log source \"{}\"", call.source)))?;
-        let result = source.query(&call.query).await?;
-        let cfg = source.config();
-        let language = cfg.source_kind().map(|k| k.language()).unwrap_or("?");
-        let mut text = fold_logs(&cfg.name, language, &call.query, &result);
+        source.query(&call.query).await
+    }
+
+    /// The default model view of `result`: [`fold_logs`] plus a note when the
+    /// limit was lowered.
+    pub fn fold(&self, call: &QueryLogsCall, result: &LogResult) -> String {
+        let (name, language, max_lines) = match self.get(&call.source) {
+            Some(source) => {
+                let cfg = source.config();
+                (cfg.name.clone(), cfg.source_kind().map(|k| k.language()).unwrap_or("?"), cfg.max_lines)
+            }
+            None => (call.source.clone(), "?", call.query.limit),
+        };
+        let mut text = fold_logs(&name, language, &call.query, result);
         if let Some(asked) = call.limit_capped_from {
-            text.push_str(&format!("(limit {asked} lowered to this source's max_lines {})\n", cfg.max_lines));
+            text.push_str(&format!("(limit {asked} lowered to this source's max_lines {max_lines})\n"));
         }
-        Ok(crate::kube_redact::redact_logs(&text, self.secrets.as_ref()))
+        text
+    }
+
+    /// `text` with known secrets, bearer tokens and URL userinfo hidden.
+    pub fn redact(&self, text: &str) -> String {
+        crate::kube_redact::redact_logs(text, self.secrets.as_ref())
+    }
+
+    /// Run `call` and return the folded, redacted view for the model.
+    pub async fn execute(&self, call: &QueryLogsCall) -> Result<String> {
+        let result = self.query_result(call).await?;
+        Ok(self.redact(&self.fold(call, &result)))
     }
 
     /// Handle one `query_logs` tool call end to end: frame, gate, events,
@@ -273,6 +299,28 @@ impl LogSources {
             }
         };
         let display = parsed.display_command();
+        let render = |call: &QueryLogsCall, result: &LogResult| self.fold(call, result);
+        self.run_framed(call, &parsed, display, &render, mode, confirmer, emit, cancellation, proposal_id)
+            .await
+    }
+
+    /// Gate, announce, run and render one framed query. `display` is what the
+    /// feed and the confirmation show; `render` turns the answer into the
+    /// model's view (it is redacted afterwards). Shared by `query_logs` and
+    /// `pod_logs_history` (#583), so both get the same frame, gate and events.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_framed(
+        &self,
+        call: &ToolCall,
+        parsed: &QueryLogsCall,
+        display: String,
+        render: &(dyn Fn(&QueryLogsCall, &LogResult) -> String + Send + Sync),
+        mode: CommandConfirmMode,
+        confirmer: &dyn CommandConfirmer,
+        emit: &(dyn Fn(AgentEvent) + Send + Sync),
+        cancellation: Option<&CancellationToken>,
+        proposal_id: u64,
+    ) -> Result<ChatMessage> {
         let explanation = if parsed.explanation.is_empty() {
             "Read-only log search".to_string()
         } else {
@@ -289,7 +337,7 @@ impl LogSources {
             },
         });
         let cancelled = || CoreError::Other("cancelled".into());
-        match self.decision(mode, &parsed) {
+        match self.decision(mode, parsed) {
             ConfirmDecision::NeedsConfirmation => {
                 let context = self
                     .get(&parsed.source)
@@ -323,7 +371,7 @@ impl LogSources {
                 return Ok(ChatMessage::tool(&call.id, format!("Error: {reason}")));
             }
         }
-        let run = self.execute(&parsed);
+        let run = self.query_result(parsed);
         let outcome = match cancellation {
             // Dropping `run` drops the HTTP request and closes the
             // connection; stores such as VictoriaLogs then stop the query.
@@ -333,13 +381,11 @@ impl LogSources {
             },
             None => run.await,
         };
+        // The server's own reply may echo other known secrets: both paths
+        // are redacted.
         let output = match outcome {
-            Ok(text) => text,
-            // The server's own reply may echo other known secrets.
-            Err(error) => crate::kube_redact::redact_logs(
-                &format!("Error: log query failed: {error}"),
-                self.secrets.as_ref(),
-            ),
+            Ok(result) => self.redact(&render(parsed, &result)),
+            Err(error) => self.redact(&format!("Error: log query failed: {error}")),
         };
         emit(AgentEvent::CommandFinished {
             command: display,

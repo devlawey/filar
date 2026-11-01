@@ -398,6 +398,8 @@ pub struct Agent {
     pending_scores: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Log sources for `query_logs` (#579); `None` = the tool is not offered.
     log_sources: Option<Arc<crate::logs::LogSources>>,
+    /// The pod of a pod tab (#564): `pod_logs_history` defaults to it (#583).
+    kube_pod: Option<KubePodTarget>,
 }
 
 /// Upper bound on one safety rating, whatever the scorer's own timeout: the
@@ -444,6 +446,7 @@ pub struct AgentBuilder {
     fleet: bool,
     risk_scorer: Option<Arc<dyn RiskScorer>>,
     log_sources: Option<Arc<crate::logs::LogSources>>,
+    kube_pod: Option<KubePodTarget>,
 }
 
 impl AgentBuilder {
@@ -472,6 +475,7 @@ impl AgentBuilder {
             fleet: false,
             risk_scorer: None,
             log_sources: None,
+            kube_pod: None,
         }
     }
 
@@ -678,7 +682,8 @@ impl AgentBuilder {
     /// Convenience: a shell inside a pod's container (#564) — the pod system
     /// prompt (with the container's known limits) and the matching arbiter
     /// and risk-scorer context. Pair with a `KubeExecutor` as the executor.
-    pub fn kube_pod_mode(self, target: &KubePodTarget) -> Self {
+    pub fn kube_pod_mode(mut self, target: &KubePodTarget) -> Self {
+        self.kube_pod = Some(target.clone());
         self.system_prompt(build_kube_pod_prompt(target))
             .is_local(false)
             .arbiter_kube_pod_context(target)
@@ -726,6 +731,11 @@ impl AgentBuilder {
         };
         if let Some(sources) = &log_sources {
             system_prompt.push_str(&sources.prompt_section());
+            if self.kube_pod.is_some() {
+                system_prompt.push('\n');
+                system_prompt.push_str(crate::logs::k8s::POD_LOGS_HISTORY_PROMPT);
+                system_prompt.push('\n');
+            }
         }
         // Append SAFE MODE block in Explain mode.
         if self.confirm_mode == CommandConfirmMode::Explain {
@@ -764,6 +774,7 @@ impl AgentBuilder {
             risk_scorer: self.risk_scorer,
             pending_scores: Mutex::new(Vec::new()),
             log_sources,
+            kube_pod: self.kube_pod,
         })
     }
 }
@@ -1026,6 +1037,9 @@ impl Agent {
         };
         if let Some(sources) = &self.log_sources {
             tool_defs.push(sources.tool_definition(self.confirm_mode));
+            if self.kube_pod.is_some() {
+                tool_defs.push(crate::logs::k8s::pod_logs_history_definition(self.confirm_mode, false));
+            }
         }
 
         info!(prompt = %user_prompt, "agent loop started");
@@ -1094,7 +1108,9 @@ impl Agent {
                 if self.confirm_mode == CommandConfirmMode::Explain {
                     let mut errors: Vec<(String, String)> = Vec::new();
                     for tc in &tool_calls {
-                        let missing = if tc.name == crate::logs::TOOL_QUERY_LOGS {
+                        let missing = if tc.name == crate::logs::TOOL_QUERY_LOGS
+                            || tc.name == crate::logs::k8s::TOOL_POD_LOGS_HISTORY
+                        {
                             crate::logs::tool::explanation_error(&tc.arguments)
                         } else {
                             tools::check_explanation(&tc.name, &tc.arguments)
@@ -1182,6 +1198,27 @@ impl Agent {
         tc: &ToolCall,
         conversation: &[ChatMessage],
     ) -> Result<ChatMessage> {
+        // `pod_logs_history` (#583) in a pod tab: the same frame and gate as
+        // `query_logs`, the query written by filar for this pod.
+        if tc.name == crate::logs::k8s::TOOL_POD_LOGS_HISTORY {
+            let (Some(sources), Some(pod)) = (&self.log_sources, &self.kube_pod) else {
+                return Ok(ChatMessage::tool(&tc.id, "Error: pod_logs_history is available only in a pod tab with log sources."));
+            };
+            let emit = |event: AgentEvent| self.emit(event);
+            return sources
+                .process_pod_logs_history(
+                    tc,
+                    &pod.cluster,
+                    Some(&pod.namespace),
+                    Some(&pod.pod),
+                    self.confirm_mode,
+                    self.confirmer.as_ref(),
+                    &emit,
+                    self.cancellation.as_ref(),
+                    NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed),
+                )
+                .await;
+        }
         // `query_logs` (#579) is an HTTP search, not a command: its own
         // frame and gate, no arbiter, no safety rating.
         if tc.name == crate::logs::TOOL_QUERY_LOGS {
@@ -2819,6 +2856,27 @@ mod tests {
         let answer = &requests[1].messages.last().unwrap().content;
         assert!(answer.contains("disk full on /var"), "{answer}");
         assert!(executor.last_command.lock().unwrap().is_empty(), "nothing ran in the shell");
+    }
+
+    #[tokio::test]
+    async fn a_pod_tab_offers_pod_logs_history_for_its_pod() {
+        let llm = Arc::new(RecordingLlm {
+            inner: MockLlm::new(vec![ChatResponse::text("ok")]),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        let agent = Agent::builder()
+            .llm(llm.clone())
+            .executor(executor)
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .kube_pod_mode(&eval_pod_target())
+            .log_sources(Some(crate::logs::tests::stub_log_sources(Vec::new())))
+            .build()
+            .unwrap();
+        agent.run("x", &[]).await.unwrap();
+        let requests = llm.requests.lock().unwrap();
+        assert!(requests[0].tools.iter().any(|t| t.name == "pod_logs_history"));
+        assert!(requests[0].messages[0].content.contains("k8s_logs is only the short tail"));
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ fn client() -> reqwest::Client {
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
-/// Write `lines` (JSON objects) and wait until `marker` is searchable.
+/// Write `lines` (JSON objects) and wait until the LogsQL `marker` finds them.
 async fn ingest(lines: &[serde_json::Value], marker: &str) {
     let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
     let status = client()
@@ -104,4 +104,101 @@ async fn query_logs_finds_inserted_lines_folded_and_newest_first() {
         .unwrap();
     let err = sources.execute(&bad).await.unwrap_err().to_string();
     assert!(err.contains("400") && err.contains("cannot parse"), "{err}");
+}
+
+/// `pod_logs_history` (#583) against vlagent-shaped lines: filar writes the
+/// LogsQL from namespace, selector and container; a fleet gets a per-pod
+/// table from one query.
+#[tokio::test]
+#[ignore = "needs a VictoriaLogs at FILAR_TEST_VLOGS_URL (docker/logs/README.md)"]
+async fn pod_logs_history_reads_vlagent_lines_for_a_pod_and_a_fleet() {
+    use filar_agent::logs::k8s::FleetLogMember;
+    use filar_agent::{AgentEvent, CommandConfirmer, ToolCall};
+
+    struct Yes;
+    #[async_trait::async_trait]
+    impl CommandConfirmer for Yes {
+        async fn confirm(&self, _: &str, _: &str, _: bool) -> filar_core::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    let ns = format!("hist{}", std::process::id());
+    let now = chrono::Utc::now();
+    let line = |pod: &str, app: &str, msg: &str, ago: i64| {
+        serde_json::json!({
+            "_time": (now - chrono::Duration::seconds(ago)).to_rfc3339(),
+            "_msg": msg,
+            "kubernetes.pod_namespace": ns,
+            "kubernetes.pod_name": pod,
+            "kubernetes.container_name": "app",
+            "kubernetes.pod_labels.app": app,
+        })
+    };
+    let lines = vec![
+        line("web-1", "web", "timeout calling pay after 30s", 50),
+        line("web-1", "web", "timeout calling pay after 31s", 40),
+        line("web-2", "web", "request ok", 30),
+        line("pay-1", "pay", "payment accepted", 20),
+    ];
+    ingest(&lines, &format!("\"kubernetes.pod_namespace\":={ns}")).await;
+
+    let (sources, notes) = build_log_sources(
+        &[LogSourceConfig {
+            name: "vlogs-live".into(),
+            kind: "victorialogs".into(),
+            url: url(),
+            clusters: vec!["prod-eu".into()],
+            ..Default::default()
+        }],
+        Arc::new(StaticSecretProvider::new()),
+        Vec::new(),
+    );
+    assert!(notes.is_empty(), "{notes:?}");
+    let sources = sources.unwrap();
+    let emit = |_: AgentEvent| {};
+    let call = |args: serde_json::Value| ToolCall {
+        id: "h".into(),
+        name: "pod_logs_history".into(),
+        arguments: args,
+    };
+
+    let by_selector = sources
+        .process_pod_logs_history(
+            &call(serde_json::json!({"selector": "app=web", "since": "10m"})),
+            "prod-eu",
+            Some(&ns),
+            None,
+            filar_core::CommandConfirmMode::Never,
+            &Yes,
+            &emit,
+            None,
+            1,
+        )
+        .await
+        .unwrap()
+        .content;
+    assert!(by_selector.contains("3 line(s)"), "{by_selector}");
+    assert!(!by_selector.contains("payment accepted"), "{by_selector}");
+
+    let member = |pod: &str| FleetLogMember {
+        cluster: "prod-eu".into(),
+        namespace: ns.clone(),
+        pod: Some(pod.into()),
+    };
+    let fleet = sources
+        .process_fleet_pod_logs(
+            &call(serde_json::json!({"since": "10m"})),
+            &[member("web-1"), member("web-2"), member("web-3")],
+            &Yes,
+            &emit,
+            None,
+            2,
+        )
+        .await
+        .unwrap()
+        .content;
+    assert!(fleet.contains("web-1 | 2 | 1 | [2×] timeout calling pay"), "{fleet}");
+    assert!(fleet.contains("web-2 | 1 | 1 |"), "{fleet}");
+    assert!(fleet.contains("web-3 | 0 | 0 | —"), "{fleet}");
 }

@@ -108,8 +108,9 @@ impl KubeAgent {
         self
     }
 
-    /// Offer `query_logs` over these log sources (#579) in a cluster tab.
-    /// A fleet never gets them: one approval there covers many targets.
+    /// Log sources (#579, #583): `query_logs` in a cluster tab, and
+    /// `pod_logs_history` in a cluster tab and in a fleet (where it is one
+    /// query for all pods, asked once). A fleet never gets `query_logs`.
     pub fn log_sources(mut self, sources: Option<Arc<crate::logs::LogSources>>) -> Self {
         self.log_sources = sources.filter(|s| !s.is_empty());
         self
@@ -191,6 +192,11 @@ impl KubeAgent {
         if let Some(sources) = self.cluster_log_sources() {
             prompt.push_str(&sources.prompt_section());
         }
+        if self.log_sources.is_some() {
+            prompt.push('\n');
+            prompt.push_str(crate::logs::k8s::POD_LOGS_HISTORY_PROMPT);
+            prompt.push('\n');
+        }
         let mut messages = vec![ChatMessage::system(prompt)];
         messages.extend_from_slice(history);
         messages.push(ChatMessage::user(user_prompt));
@@ -202,6 +208,10 @@ impl KubeAgent {
         }
         if let Some(sources) = self.cluster_log_sources() {
             tools.push(sources.tool_definition(self.confirm_mode));
+        }
+        if self.log_sources.is_some() {
+            let fleet = matches!(self.execution, KubeExecution::Fleet { .. });
+            tools.push(crate::logs::k8s::pod_logs_history_definition(self.confirm_mode, fleet));
         }
         let mut missing_explanations = 0;
 
@@ -270,6 +280,47 @@ impl KubeAgent {
     }
 
     async fn process_tool_call(&self, call: &ToolCall) -> Result<ChatMessage> {
+        if call.name == crate::logs::k8s::TOOL_POD_LOGS_HISTORY {
+            let Some(sources) = &self.log_sources else {
+                return Ok(ChatMessage::tool(&call.id, "Error: no log sources are configured."));
+            };
+            let emit = |event: AgentEvent| self.emit(event);
+            let proposal_id = NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed);
+            return match &self.execution {
+                KubeExecution::Cluster { target, namespace, .. } => {
+                    // The cluster's own tag policies tighten the gate as for
+                    // every other request of this tab.
+                    let mode = filar_core::tag_policy_floor(self.confirm_mode, &self.tag_policies, &target.tags)
+                        .unwrap_or(self.confirm_mode);
+                    sources
+                        .process_pod_logs_history(
+                            call,
+                            &target.name,
+                            namespace.as_deref().or(target.default_namespace.as_deref()),
+                            None,
+                            mode,
+                            self.confirmer.as_ref(),
+                            &emit,
+                            self.cancellation.as_ref(),
+                            proposal_id,
+                        )
+                        .await
+                }
+                KubeExecution::Fleet { fleet, .. } => {
+                    let members = fleet_log_members(fleet.fleet());
+                    sources
+                        .process_fleet_pod_logs(
+                            call,
+                            &members,
+                            self.confirmer.as_ref(),
+                            &emit,
+                            self.cancellation.as_ref(),
+                            proposal_id,
+                        )
+                        .await
+                }
+            };
+        }
         if call.name == crate::logs::TOOL_QUERY_LOGS {
             let Some(sources) = self.cluster_log_sources() else {
                 return Ok(ChatMessage::tool(
@@ -430,6 +481,28 @@ impl KubeAgent {
             }
         }
     }
+}
+
+/// The fleet's Kubernetes members as `pod_logs_history` needs them; SSH
+/// members have no pod logs and are left out.
+fn fleet_log_members(fleet: &filar_core::FleetOperation) -> Vec<crate::logs::k8s::FleetLogMember> {
+    fleet
+        .members()
+        .iter()
+        .filter_map(|member| match member.target() {
+            filar_core::FleetTarget::KubePod(pod) => Some(crate::logs::k8s::FleetLogMember {
+                cluster: pod.cluster.clone(),
+                namespace: pod.namespace.clone(),
+                pod: Some(pod.pod.clone()),
+            }),
+            filar_core::FleetTarget::KubeCluster(scope) => Some(crate::logs::k8s::FleetLogMember {
+                cluster: scope.cluster.clone(),
+                namespace: scope.namespace.clone(),
+                pod: None,
+            }),
+            filar_core::FleetTarget::Ssh(_) => None,
+        })
+        .collect()
 }
 
 fn explanation_retry_messages(calls: &[ToolCall], errors: &[(String, String)]) -> Vec<ChatMessage> {
