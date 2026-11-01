@@ -60,7 +60,7 @@ fn body_complete(raw: &[u8]) -> bool {
     if header_value(&head, "transfer-encoding").is_some_and(|v| v.contains("chunked")) {
         // Walk the chunk framing: a `0\r\n\r\n` inside a chunk's data is
         // not the end.
-        return dechunk(&raw[end + 4..]).1;
+        return chunked_complete(&raw[end + 4..]);
     }
     false
 }
@@ -127,6 +127,29 @@ pub(crate) fn parse_response(raw: &[u8], max_bytes: usize) -> Result<PodHttpResp
         body,
         truncated,
     })
+}
+
+/// Whether the chunk framing in `rest` reaches the terminating zero-size
+/// chunk — walked without copying the data, as it runs on every read.
+fn chunked_complete(mut rest: &[u8]) -> bool {
+    loop {
+        let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") else {
+            return false;
+        };
+        let size_text = String::from_utf8_lossy(&rest[..line_end]);
+        let Ok(size) = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
+        else {
+            return false;
+        };
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            return true;
+        }
+        if rest.len() < size + 2 {
+            return false;
+        }
+        rest = &rest[size + 2..];
+    }
 }
 
 /// Decode a chunked body: the data, and whether the terminating zero-size
