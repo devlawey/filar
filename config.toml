@@ -120,7 +120,8 @@ type = "password"
 # timeout_secs = 20                  # 1–120
 # max_line_bytes = 4096              # longer lines are cut and marked
 # max_response_bytes = 2097152       # the answer is read as a stream and cut here
-# clusters = ["prod-eu"]             # [[kube_clusters]] whose logs it holds
+# clusters = ["prod-eu"]             # [[kube_clusters]] whose logs it holds: a hint for the
+#                                    # model, not access control — every single-target tab can query it
 # tags = ["prod"]                    # feed [[tag_policies]] like target tags
 
 # Kubernetes fleet: ready app=web pods frozen on entry in both clusters.

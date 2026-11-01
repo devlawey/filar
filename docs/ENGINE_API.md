@@ -795,7 +795,9 @@ let _agent = builder.log_sources(sources);
   dropped at the byte cap) and `cap_line`.
 - `LogSources` is the tool: `AgentBuilder::log_sources` and
   `KubeAgent::log_sources` add `query_logs` and a prompt section listing the
-  sources. Not in fleets. The frame is filar's: no window → not sent; window
+  sources. Not in fleets. A source's `clusters` only says whose logs it
+  holds (a prompt hint, and the link `pod_logs_history` uses); it does not
+  restrict which tab may query it. The frame is filar's: no window → not sent; window
   over `max_window_hours` → refused; `limit` lowered to `max_lines`.
 - Gate: confirmation in `always`/`explain`, none in `allowlist`/`never`;
   `[[tag_policies]]` matching a source's `tags` tighten it. No arbiter audit

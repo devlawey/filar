@@ -2519,6 +2519,8 @@ async fn run_app(
                             profile_name,
                             app.active_session().compaction_exhausted,
                             pending_compaction,
+                            // A Kubernetes fleet: one approval there covers
+                            // many targets, so no `query_logs` (#579).
                             None,
                         );
                         app.sessions[app.active].pending_compaction = None;
