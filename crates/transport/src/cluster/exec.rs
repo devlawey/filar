@@ -24,7 +24,7 @@ use filar_core::{
     CoreError, KubeCluster, PodLimits, PodRef, PodSelector, Result, DEFAULT_COMMAND_TIMEOUT_SECS,
 };
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{AttachParams, AttachedProcess};
+use kube::api::{AttachParams, AttachedProcess, TerminalSize};
 use kube::{Api, Client};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
@@ -423,6 +423,135 @@ async fn read_streams(
     let _ = events.send(ChannelEvent::Closed);
 }
 
+/// `TerminalSize` for an exec TTY; zero sizes become 1, as a terminal of
+/// zero cells is not a size the API accepts.
+fn tty_size(cols: u16, rows: u16) -> TerminalSize {
+    TerminalSize {
+        width: cols.max(1),
+        height: rows.max(1),
+    }
+}
+
+/// An interactive terminal in a pod's container (#577): `exec [shell]` with
+/// `tty=true`, as `kubectl exec -it`. Keys (Ctrl+C included) go in as bytes
+/// and the container's TTY line discipline handles them; window size
+/// changes go over the exec resize channel.
+pub struct KubeInteractive {
+    stdin: Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>,
+    output: Mutex<mpsc::Receiver<Vec<u8>>>,
+    resize: Mutex<Option<futures::channel::mpsc::Sender<TerminalSize>>>,
+    process: StdMutex<Option<AttachedProcess>>,
+    pod: String,
+    container: String,
+}
+
+impl KubeInteractive {
+    async fn open(place: ExecPlace, cols: u16, rows: u16) -> Result<Self> {
+        let command = vec![place.shell.clone()];
+        // With a TTY the API merges stderr into stdout: asking for both is
+        // an error.
+        let params = AttachParams::default()
+            .container(place.container.clone())
+            .stdin(true)
+            .stdout(true)
+            .stderr(false)
+            .tty(true);
+        let exec = place.pods.exec(&place.pod, command.clone(), &params);
+        let mut process = match tokio::time::timeout(STARTUP_TIMEOUT, exec).await {
+            Ok(Ok(process)) => process,
+            Ok(Err(error)) => return Err(place.exec_error(error, &command).await),
+            Err(_) => {
+                return Err(CoreError::Unavailable(format!(
+                    "терминал в поде {}/{} не открылся за {} с (контекст {})",
+                    place.namespace,
+                    place.pod,
+                    STARTUP_TIMEOUT.as_secs(),
+                    place.context
+                )))
+            }
+        };
+        let (Some(stdin), Some(mut stdout)) = (process.stdin(), process.stdout()) else {
+            process.abort();
+            return Err(CoreError::Other("pod terminal did not provide stdin/stdout".into()));
+        };
+        let mut resize = process.terminal_size();
+        if let Some(sender) = resize.as_mut() {
+            use futures::SinkExt;
+            let _ = sender.send(tty_size(cols, rows)).await;
+        }
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match stdout.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        info!(pod = %place.pod, container = %place.container, "pod terminal opened");
+        Ok(Self {
+            stdin: Mutex::new(Box::new(stdin)),
+            output: Mutex::new(rx),
+            resize: Mutex::new(resize),
+            process: StdMutex::new(Some(process)),
+            pod: place.pod,
+            container: place.container,
+        })
+    }
+
+    /// Pod the terminal runs in.
+    pub fn pod(&self) -> &str {
+        &self.pod
+    }
+
+    /// Container the terminal runs in.
+    pub fn container(&self) -> &str {
+        &self.container
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::InteractiveTerminal for KubeInteractive {
+    async fn read_output(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.output.lock().await.recv().await)
+    }
+
+    async fn write_input(&self, data: &[u8]) -> Result<()> {
+        let mut stdin = self.stdin.lock().await;
+        stdin
+            .write_all(data)
+            .await
+            .map_err(|e| CoreError::ConnectionLost(format!("pod terminal: {e}")))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| CoreError::ConnectionLost(format!("pod terminal: {e}")))
+    }
+
+    async fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        use futures::SinkExt;
+        if let Some(sender) = self.resize.lock().await.as_mut() {
+            sender
+                .send(tty_size(cols, rows))
+                .await
+                .map_err(|e| CoreError::ConnectionLost(format!("pod terminal resize: {e}")))?;
+        }
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<()> {
+        if let Some(process) = self.process.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            process.abort();
+        }
+        Ok(())
+    }
+}
+
 /// A live shell in one container.
 struct PodShell {
     place: ExecPlace,
@@ -731,6 +860,23 @@ impl KubeExecutor {
     pub async fn close(&self) -> Result<()> {
         self.shell.read().await.abort();
         Ok(())
+    }
+
+    /// Open an interactive terminal (`kubectl exec -it`) in the pod and
+    /// container this shell runs in now (#577): a second exec with a TTY,
+    /// independent of this shell — closing it leaves the agent's shell alone.
+    pub async fn open_terminal(&self, cols: u16, rows: u16) -> Result<KubeInteractive> {
+        let identity = self.identity();
+        let place = ExecPlace {
+            pods: Api::namespaced(self.stream_client.clone(), &self.target.namespace),
+            client: self.stream_client.clone(),
+            namespace: self.target.namespace.clone(),
+            pod: identity.pod,
+            container: identity.container,
+            shell: self.config.shell.clone(),
+            context: self.cluster.context.clone(),
+        };
+        KubeInteractive::open(place, cols, rows).await
     }
 
     fn identity(&self) -> ShellIdentity {
@@ -1176,5 +1322,13 @@ mod tests {
         assert_eq!(stream.push(&bytes[..3]), "д");
         assert_eq!(stream.push(&bytes[3..]), "ом");
         assert_eq!(stream.push(&[0xff, b'a']), "\u{fffd}a");
+    }
+
+    #[test]
+    fn tty_size_maps_columns_and_rows_and_never_zero() {
+        let size = tty_size(120, 40);
+        assert_eq!((size.width, size.height), (120, 40));
+        let size = tty_size(0, 0);
+        assert_eq!((size.width, size.height), (1, 1));
     }
 }

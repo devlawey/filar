@@ -15,7 +15,8 @@ mod exec;
 
 pub use client::KubeClusterApi;
 pub use exec::{
-    KubeExecConfig, KubeExecEvent, KubeExecutor, DEFAULT_POD_SHELL, SHELL_RECREATED_MESSAGE,
+    KubeExecConfig, KubeExecEvent, KubeExecutor, KubeInteractive, DEFAULT_POD_SHELL,
+    SHELL_RECREATED_MESSAGE,
 };
 
 /// Maximum number of objects returned by one cluster list operation.

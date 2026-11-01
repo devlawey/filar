@@ -38,7 +38,7 @@ use tokio::sync::mpsc;
 #[cfg(feature = "kube")]
 pub use cluster::{
     ClusterApi, ConfigMapInfo, ContainerInfo, ContainerMetrics, EndpointInfo, EventInfo,
-    IngressInfo, KubeClusterApi, KubeExecConfig, KubeExecEvent, KubeExecutor, NamespaceInfo, NodeCondition, NodeInfo, PodInfo, PodLogs,
+    IngressInfo, KubeClusterApi, KubeExecConfig, KubeExecEvent, KubeExecutor, KubeInteractive, NamespaceInfo, NodeCondition, NodeInfo, PodInfo, PodLogs,
     ResourceMetrics, RolloutRevision, ServiceInfo, ServicePortInfo, TerminationInfo, WorkloadInfo,
     WorkloadKind, DEFAULT_CLUSTER_LIST_LIMIT, DEFAULT_POD_SHELL, SHELL_RECREATED_MESSAGE,
 };
