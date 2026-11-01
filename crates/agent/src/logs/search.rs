@@ -32,6 +32,11 @@ pub struct SearchSource {
 impl SearchSource {
     /// Build the adapter for `cfg` with its resolved `key`.
     pub fn new(cfg: &LogSourceConfig, key: &str) -> Result<Self> {
+        // `validate` already demands an index; never fall back to `/_search`
+        // over every index if an unvalidated config gets here.
+        if cfg.index.as_deref().is_none_or(|i| i.trim().is_empty()) {
+            return Err(CoreError::Config(format!("log source \"{}\": index is required", cfg.name)));
+        }
         Ok(Self {
             cfg: cfg.clone(),
             http: LogHttp::new(cfg, key)?,
@@ -55,9 +60,10 @@ pub fn build_body(cfg: &LogSourceConfig, query: &LogQuery) -> Result<Value> {
     let must = if text.starts_with('{') {
         match serde_json::from_str::<Value>(text) {
             Ok(Value::Object(dsl)) => {
-                // A full request body pasted by habit: take its query.
+                // A full request body pasted by habit (`{"query": …, "size": …}`):
+                // take its query; size, sort and the rest are filar's.
                 match dsl.get("query") {
-                    Some(inner @ Value::Object(_)) if dsl.len() == 1 => inner.clone(),
+                    Some(inner @ Value::Object(_)) => inner.clone(),
                     _ => Value::Object(dsl),
                 }
             }
@@ -130,9 +136,13 @@ pub fn parse_hits(body: &[u8], time_field: &str, limit: usize, max_line_bytes: u
             .remove(time_field)
             .and_then(|t| DateTime::parse_from_rfc3339(&t).ok())
             .map(|t| t.with_timezone(&Utc));
-        let message = MESSAGE_FIELDS
+        // The first non-empty known message field; empty ones stay fields.
+        let message_field = MESSAGE_FIELDS
             .iter()
-            .find_map(|f| fields.remove(*f))
+            .copied()
+            .find(|f| fields.get(*f).is_some_and(|v| !v.trim().is_empty()));
+        let message = message_field
+            .and_then(|f| fields.remove(f))
             .unwrap_or_else(|| {
                 // No known message field: the document itself, compactly.
                 hit.get("_source").map(Value::to_string).unwrap_or_default()
@@ -286,10 +296,24 @@ mod tests {
         assert_eq!(body["sort"][0]["ts"]["order"], "desc");
         assert_eq!(body["_source"], json!(["message", "kubernetes.pod_name", "ts"]));
         // A whole request body pasted by habit contributes only its query.
-        let pasted = build_body(&c, &query(r#"{"query": {"term": {"pod": "web-1"}}}"#)).unwrap();
+        let pasted = build_body(&c, &query(r#"{"query": {"term": {"pod": "web-1"}}, "size": 10}"#)).unwrap();
         assert_eq!(pasted["query"]["bool"]["must"][0], json!({"term": {"pod": "web-1"}}));
         assert!(build_body(&c, &query("{ not json")).unwrap_err().to_string().contains("does not parse"));
         assert!(build_body(&c, &query("[1, 2]")).is_ok(), "not starting with {{ is query_string text");
+    }
+
+    #[test]
+    fn an_empty_message_field_falls_through_to_the_next() {
+        let body = r#"{"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_source":{"@timestamp":"2026-11-01T10:00:00Z","message":"","log":"real line"}}]}}"#;
+        let result = parse_hits(body.as_bytes(), "@timestamp", 10, 4096).unwrap();
+        assert_eq!(result.lines[0].message, "real line");
+    }
+
+    #[test]
+    fn a_source_without_an_index_is_refused() {
+        let mut c = cfg();
+        c.index = None;
+        assert!(SearchSource::new(&c, "").is_err());
     }
 
     #[test]
