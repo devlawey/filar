@@ -548,7 +548,7 @@ fn push_entry_lines(
 
 /// Wrap `text` to `width` terminal cells at word boundaries. A word wider
 /// than the whole width is cut; nothing is ever wider than `width`.
-fn wrap_words(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows: Vec<String> = Vec::new();
     let mut current = String::new();

@@ -156,8 +156,10 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         None => 0,
         // The pod target may wrap (long contexts such as EKS ARNs), within
         // the same cap `build_modal_lines` applies.
-        Some((line, None)) => estimate_wrapped_rows(&line, inner_width).min(HEADER_MAX_ROWS),
-        Some((_, Some(list))) => 1 + estimate_wrapped_rows(&list, inner_width),
+        Some((line, None)) => header_rows(&line, inner_width).len(),
+        Some((line, Some(list))) => {
+            header_rows(&line, inner_width).len() + estimate_wrapped_rows(&list, inner_width)
+        }
     };
 
     let natural_content = (radius_rows
@@ -337,6 +339,19 @@ fn radius_lines(
 /// which must not lose the pod and container to an ellipsis (#565 review).
 const HEADER_MAX_ROWS: usize = 3;
 
+/// The header above the command, word-wrapped to `width` and cut to
+/// [`HEADER_MAX_ROWS`] rows (the last one ends with `…` when cut).
+fn header_rows(text: &str, width: usize) -> Vec<String> {
+    let mut rows = crate::ui::help::wrap_words(text, width);
+    if rows.len() > HEADER_MAX_ROWS {
+        rows.truncate(HEADER_MAX_ROWS);
+        if let Some(last) = rows.last_mut() {
+            *last = truncate_to_rows(&format!("{last} …"), width, 1);
+        }
+    }
+    rows
+}
+
 /// Build modal body lines, truncating so wrapped height ≤ `max_rows`.
 ///
 /// The fleet radius comes first and its counter line is never truncated
@@ -381,13 +396,11 @@ fn build_modal_lines(
     };
 
     if let Some((header, list)) = radius {
-        let header = truncate_to_rows(&header, inner_width, HEADER_MAX_ROWS);
-        let _ = push(
-            &mut lines,
-            &mut used,
-            header,
-            warning.add_modifier(Modifier::BOLD),
-        );
+        // Wrapped here, by words, so the rows counted for the modal height
+        // are exactly the rows drawn.
+        for row in header_rows(&header, inner_width) {
+            let _ = push(&mut lines, &mut used, row, warning.add_modifier(Modifier::BOLD));
+        }
         if let Some(list) = list {
             // Leave room for the command line and the separator.
             let budget = max_rows.saturating_sub(used).saturating_sub(2).max(1);
@@ -1098,6 +1111,19 @@ mod tests {
         let screen = render_confirm(&mut app, 100, 30);
         assert!(screen.contains("container main"), "{screen}");
         assert!(screen.contains("$ cd /tmp && pwd"), "{screen}");
+    }
+
+    #[test]
+    fn a_wrapped_fleet_header_with_its_list_still_shows_the_command() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let mut confirm = fleet_pending(4, true);
+        confirm.radius_context =
+            Some("arn:aws:eks:eu-central-1:123456789012:cluster/prod-eu / shop".into());
+        app.pending_confirm = Some(confirm);
+        app.mode = AppMode::Confirming;
+        let screen = render_confirm(&mut app, 100, 30);
+        assert!(screen.contains("$ uname -r"), "{screen}");
+        assert!(screen.contains("web-04"), "{screen}");
     }
 
     #[test]
