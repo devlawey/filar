@@ -192,14 +192,26 @@ fn a_missing_key_is_named_by_variable_only() {
 
 #[test]
 fn a_kind_without_an_adapter_is_reported_not_built() {
+    let loki = LogSourceConfig {
+        kind: "loki".into(),
+        url: "http://loki:3100".into(),
+        ..vlogs("l")
+    };
     let (set, notes) = build_log_sources(
-        &[vlogs("v")],
+        &[loki],
         Arc::new(StaticSecretProvider::new()),
         Vec::new(),
     );
     assert!(set.is_none());
     assert_eq!(notes.len(), 1);
     assert!(notes[0].contains("no adapter"), "{}", notes[0]);
+}
+
+#[test]
+fn victorialogs_sources_are_built() {
+    let (set, notes) = build_log_sources(&[vlogs("v")], Arc::new(StaticSecretProvider::new()), Vec::new());
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(set.unwrap().names(), vec!["v".to_string()]);
 }
 
 // ---------------------------------------------------------------------------

@@ -11646,3 +11646,30 @@ exec-протокола (`tty_size` не даёт нулей), Ctrl+C уходи
 `filar_agent::logs::*`, `AgentBuilder::log_sources`, `KubeAgent::log_sources`.
 
 **Next:** #580 — адаптер VictoriaLogs (и DoD с бинарником).
+
+## Issue #580: адаптер VictoriaLogs (веха 3.0.2)
+
+**Сделано.** `crates/agent/src/logs/victorialogs.rs`: `VictoriaLogsSource` —
+`POST /select/logsql/query` (form: `query`, `start`/`end` RFC 3339, `limit`,
+`timeout`), заголовки `AccountID`/`ProjectID` из `tenant` (по умолчанию `0:0`),
+auth none/basic/bearer через `LogHttp`. Ответ — JSON-строки: `_msg` → сообщение
+(срез `max_line_bytes`), `_time` → время, остальные поля (кроме `_stream_id`) —
+в `fields`; не-JSON строка сохраняется как сообщение; при срезе тела по байтам
+неполная последняя строка отбрасывается. `| sort by (_time) desc` добавляется,
+если в запросе нет своего пайпа `sort`/`order`; иначе порядок запроса
+сохраняется. Ошибки сервера (400/422/5xx) уходят модели текстом, ключ вычищен.
+`describe()` — основы LogsQL и поля vlagent. `build_log_source` собирает
+victorialogs; прочие kind — по-прежнему «no adapter».
+
+**Решение по сортировке.** Тело issue допускает «добавить sort» или «сортировать
+на клиенте»; выбран серверный sort, а запрос с собственной сортировкой (например,
+`| sort by (duration)`) не пересортировывается — иначе сломался бы явный порядок.
+
+**Проверки.** Живой `#[ignore]` тест `crates/agent/tests/victorialogs.rs` прогнан
+против VictoriaLogs v1.36.1 (одиночный бинарник, `docker/logs/README.md`) —
+зелёный. DoD: бинарник в tmux, `--target local`, mock-LLM (OpenAI-совместимый,
+скриптованный tool call) → подтверждение `query_logs …` → свёрнутый ответ из
+VictoriaLogs → финальный ответ агента. Найден баг окна подтверждения (обрезка
+длинной команды без пометки) — вынесен в #608.
+
+**Next:** #582 (Loki), #581 (OpenSearch/ES).
