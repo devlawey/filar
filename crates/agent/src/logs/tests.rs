@@ -192,13 +192,14 @@ fn a_missing_key_is_named_by_variable_only() {
 
 #[test]
 fn a_kind_without_an_adapter_is_reported_not_built() {
-    let loki = LogSourceConfig {
-        kind: "loki".into(),
-        url: "http://loki:3100".into(),
-        ..vlogs("l")
+    let os = LogSourceConfig {
+        kind: "opensearch".into(),
+        url: "https://os:9200".into(),
+        index: Some("logs-*".into()),
+        ..vlogs("o")
     };
     let (set, notes) = build_log_sources(
-        &[loki],
+        &[os],
         Arc::new(StaticSecretProvider::new()),
         Vec::new(),
     );
@@ -259,7 +260,7 @@ fn folding_groups_similar_messages_with_counts_and_bounds() {
     let result = LogResult {
         lines,
         truncated: true,
-        note: None,
+        ..Default::default()
     };
     let text = fold_logs("vlogs", "LogsQL", &hour_query(31), &result);
     assert!(text.contains("31 line(s), limit 31"), "{text}");
@@ -302,8 +303,7 @@ impl LogSource for MockSource {
         self.seen.lock().unwrap().push(query.clone());
         Ok(LogResult {
             lines: self.lines.clone(),
-            truncated: false,
-            note: None,
+            ..Default::default()
         })
     }
 }

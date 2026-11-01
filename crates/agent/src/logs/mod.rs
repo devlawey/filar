@@ -21,6 +21,7 @@
 
 pub mod fold;
 pub mod tool;
+pub mod loki;
 pub mod victorialogs;
 
 use std::collections::BTreeMap;
@@ -63,11 +64,23 @@ pub struct LogLine {
     pub truncated: bool,
 }
 
+/// One series of a metric query (Loki `matrix`): labels and points.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LogSeries {
+    /// The series' labels.
+    pub labels: BTreeMap<String, String>,
+    /// `(time, value)` points, oldest first.
+    pub points: Vec<(DateTime<Utc>, f64)>,
+}
+
 /// What a query returned.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LogResult {
     /// The lines, newest first when the store sorts.
     pub lines: Vec<LogLine>,
+    /// Series of a metric query (e.g. LogQL `rate`, `count_over_time`);
+    /// empty for a log query.
+    pub series: Vec<LogSeries>,
     /// More data existed than was returned: the line limit was reached or the
     /// answer hit its byte cap.
     pub truncated: bool,
@@ -293,6 +306,7 @@ pub fn build_log_source(cfg: &LogSourceConfig, key: &str) -> Result<Arc<dyn LogS
     cfg.validate()?;
     match cfg.source_kind() {
         Some(LogSourceKind::VictoriaLogs) => Ok(Arc::new(victorialogs::VictoriaLogsSource::new(cfg, key)?)),
+        Some(LogSourceKind::Loki) => Ok(Arc::new(loki::LokiSource::new(cfg, key)?)),
         _ => Err(CoreError::Config(format!(
             "log source \"{}\": kind \"{}\" has no adapter in this build",
             cfg.name, cfg.kind

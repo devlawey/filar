@@ -1442,12 +1442,20 @@ RBAC или обрыв — сообщение об ошибке в ленте.
 На удалённые хосты ничего не ставится.
 
 Источник описывается в `config.toml` (`[[log_sources]]`, пример — в самом
-`config.toml`). Поддерживается **VictoriaLogs** (`kind = "victorialogs"`, язык
-LogsQL). OpenSearch/Elasticsearch и Loki появятся в следующих версиях. Ключ в
+`config.toml`). Поддерживаются **VictoriaLogs** (`kind = "victorialogs"`, язык
+LogsQL) и **Grafana Loki** (`kind = "loki"`, язык LogQL). OpenSearch/Elasticsearch
+появятся в следующих версиях. Ключ в
 конфиге не хранится: `key_env` — это имя, под которым ключ лежит в хранилище
 ОС или в переменной окружения. У VictoriaLogs своей авторизации нет: `basic`
 и `bearer` нужны, если перед ней стоит прокси (vmauth). Тенант задаётся как
 `tenant = "AccountID:ProjectID"`, по умолчанию `0:0`.
+
+У Loki тенант уходит в заголовок `X-Scope-OrgID`, а auth бывает `none`, `basic`
+или `bearer`. Запрос LogQL всегда начинается с селектора потока, например
+`{namespace="shop"} |= "error"`. Имена меток задаёт сборщик (Promtail, Alloy).
+Метрические запросы (`count_over_time`, `rate`) возвращают не строки, а ряды:
+модель получает таблицу «ряд × точки» с min, max, последним значением и
+выборкой значений.
 
 **Рамки ставит filar, модель их не обходит.**
 
