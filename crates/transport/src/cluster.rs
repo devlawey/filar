@@ -11,8 +11,12 @@ use filar_core::Result;
 
 mod client;
 mod convert;
+mod exec;
 
 pub use client::KubeClusterApi;
+pub use exec::{
+    KubeExecConfig, KubeExecEvent, KubeExecutor, DEFAULT_POD_SHELL, SHELL_RECREATED_MESSAGE,
+};
 
 /// Maximum number of objects returned by one cluster list operation.
 pub const DEFAULT_CLUSTER_LIST_LIMIT: u32 = 500;

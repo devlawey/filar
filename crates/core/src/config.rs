@@ -1116,6 +1116,21 @@ impl KubeCluster {
             self.name, self.context, ns, tags
         )
     }
+
+    /// One-line description of a pod shell in this cluster for the agent
+    /// (#563), e.g.
+    /// `Kubernetes pod shop/web-7f9c (container main, cluster prod-eu, tags: prod)`.
+    pub fn describe_pod(&self, namespace: &str, pod: &str, container: &str) -> String {
+        let tags = if self.tags.is_empty() {
+            "-".to_string()
+        } else {
+            self.tags.join(", ")
+        };
+        format!(
+            "Kubernetes pod {namespace}/{pod} (container {container}, cluster {}, tags: {tags})",
+            self.name
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,6 +1570,28 @@ reveal_env = ["shop/api/PUBLIC_MODE"]
         assert_eq!(
             c.describe(None),
             "Kubernetes cluster prod-eu (context prod-eu, namespace default, tags: -)"
+        );
+    }
+
+    #[test]
+    fn pod_description_names_namespace_pod_container_cluster_and_tags() {
+        let cluster = KubeCluster {
+            name: "prod-eu".into(),
+            context: "ctx".into(),
+            tags: vec!["prod".into(), "k8s".into()],
+            ..KubeCluster::default()
+        };
+        assert_eq!(
+            cluster.describe_pod("shop", "web-7f9c", "main"),
+            "Kubernetes pod shop/web-7f9c (container main, cluster prod-eu, tags: prod, k8s)"
+        );
+        let bare = KubeCluster {
+            name: "dev".into(),
+            ..KubeCluster::default()
+        };
+        assert_eq!(
+            bare.describe_pod("default", "p", "c"),
+            "Kubernetes pod default/p (container c, cluster dev, tags: -)"
         );
     }
 

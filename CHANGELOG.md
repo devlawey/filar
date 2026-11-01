@@ -11,6 +11,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- `KubeExecutor`: a persistent shell in a pod's container over the Kubernetes `exec` API — pod by name or selector, container choice, interrupt via a second exec or honest shell recreation, one silent reconnect with pod-change events, distinct RBAC/admission-policy denials, and `PodLimits` from the pod spec ([#563](https://github.com/devlawey/filar/issues/563)).
+
 ### Fixed
 
 - A command's working directory is no longer lost when the shell's marker line arrives split across two reads ([#561](https://github.com/devlawey/filar/issues/561)).
