@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: httpd
+  namespace: shop
+  labels:
+    app.kubernetes.io/part-of: filar-test-fixtures
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: httpd
+  template:
+    metadata:
+      labels:
+        app: httpd
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # A diagnostic HTTP endpoint for `pod_http_get` (#578): /metrics in
+        # Prometheus text and /healthz, served by BusyBox httpd.
+        - name: main
+          image: busybox:1.37.0
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /tmp/www
+              printf '# HELP up Up\n# TYPE up gauge\nup 1\nhttp_requests_total{code="200"} 7\n' > /tmp/www/metrics
+              printf 'ok\n' > /tmp/www/healthz
+              exec httpd -f -p 8080 -h /tmp/www
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

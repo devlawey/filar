@@ -49,6 +49,7 @@ pub mod long_wait;
 pub mod openai_compat;
 pub mod os_probe;
 pub mod password_prompt;
+pub mod pod_http;
 pub mod preprocess;
 pub mod risk;
 pub mod runbook;

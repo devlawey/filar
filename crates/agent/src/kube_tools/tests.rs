@@ -17,10 +17,23 @@ struct MockCluster {
     logs: Option<PodLogs>,
     metrics_unsupported: bool,
     log_call: Mutex<Option<(bool, u32, usize)>>,
+    /// Answer of `pod_http_get`; the request it got is recorded.
+    http: Option<filar_transport::PodHttpResponse>,
+    http_call: Mutex<Option<filar_transport::PodHttpRequest>>,
 }
 
 #[async_trait::async_trait]
 impl ClusterApi for MockCluster {
+    async fn pod_http_get(
+        &self,
+        request: &filar_transport::PodHttpRequest,
+    ) -> Result<filar_transport::PodHttpResponse> {
+        *self.http_call.lock().unwrap() = Some(request.clone());
+        self.http
+            .clone()
+            .ok_or_else(|| CoreError::Unavailable("no HTTP answer in this mock".into()))
+    }
+
     async fn list_pods(
         &self,
         _: Option<&str>,
@@ -136,6 +149,7 @@ fn pod(name: &str) -> PodInfo {
             image: "example/web:1".into(),
             resource_requests: BTreeMap::from([("memory".into(), "64Mi".into())]),
             resource_limits: BTreeMap::from([("memory".into(), "128Mi".into())]),
+            ports: Vec::new(),
         }],
     }
 }
@@ -161,9 +175,9 @@ fn executor(cluster: MockCluster) -> KubeToolExecutor {
 }
 
 #[test]
-fn exposes_exactly_six_read_only_tools_without_secret() {
+fn exposes_exactly_seven_read_only_tools_without_secret() {
     let defs = kube_tool_definitions(CommandConfirmMode::Always);
-    assert_eq!(defs.len(), 6);
+    assert_eq!(defs.len(), 7);
     assert_eq!(
         defs.iter().map(|def| def.name.as_str()).collect::<Vec<_>>(),
         vec![
@@ -172,7 +186,8 @@ fn exposes_exactly_six_read_only_tools_without_secret() {
             TOOL_K8S_LOGS,
             TOOL_K8S_EVENTS,
             TOOL_K8S_TOP,
-            TOOL_K8S_ROLLOUT_HISTORY
+            TOOL_K8S_ROLLOUT_HISTORY,
+            TOOL_POD_HTTP_GET
         ]
     );
     let schema =
@@ -420,4 +435,84 @@ async fn metrics_unsupported_has_actionable_message() {
         parse_kube_tool_call(TOOL_K8S_TOP, &json!({"resource": "pods"}), Some("shop")).unwrap();
     let error = executor.execute(&call).await.unwrap_err();
     assert!(error.to_string().contains("metrics-server не установлен"));
+}
+
+
+fn pod_with_port(name: &str) -> PodInfo {
+    let mut info = pod(name);
+    info.containers[0].ports = vec![filar_transport::ContainerPortInfo {
+        name: Some("metrics".into()),
+        port: 9090,
+    }];
+    info
+}
+
+fn http_call(args: serde_json::Value) -> Result<KubeToolCall> {
+    parse_kube_tool_call(TOOL_POD_HTTP_GET, &args, Some("shop"))
+}
+
+#[test]
+fn pod_http_get_refuses_other_methods_urls_and_binary_pprof() {
+    let ok = http_call(json!({"pod": "web-1", "port": 9090, "path": "/metrics"})).unwrap();
+    assert_eq!(ok.display_command(), "pod_http_get GET web-1:9090/metrics -n shop");
+    let post = http_call(json!({"pod": "web-1", "port": 9090, "path": "/x", "method": "POST"}));
+    assert!(post.unwrap_err().to_string().contains("only sends GET"));
+    let absolute = http_call(json!({"pod": "web-1", "port": 9090, "path": "http://evil/metrics"}));
+    assert!(absolute.is_err());
+    let binary = http_call(json!({"pod": "web-1", "port": 6060, "path": "/debug/pprof/heap"}));
+    assert!(binary.is_err());
+}
+
+#[tokio::test]
+async fn pod_http_get_needs_a_declared_or_allowed_port() {
+    let cluster = MockCluster {
+        pods: vec![pod_with_port("web-1")],
+        ..MockCluster::default()
+    };
+    let call = http_call(json!({"pod": "web-1", "port": 22, "path": "/"})).unwrap();
+    let err = executor(cluster).execute(&call).await.unwrap_err().to_string();
+    assert!(err.contains("diagnostic_ports"), "{err}");
+}
+
+#[tokio::test]
+async fn pod_http_get_shows_requested_metrics_redacted_and_marks_truncation() {
+    let body = "# HELP up Up\nup 1\ndb_up{password=\"hunter2\"} 1\nhttp_requests_total{code=\"200\"} 9\ntoken_leak supersecret\n";
+    let cluster = Arc::new(MockCluster {
+        pods: vec![pod_with_port("web-1")],
+        http: Some(filar_transport::PodHttpResponse {
+            status: 200,
+            content_type: Some("text/plain; version=0.0.4".into()),
+            body: body.as_bytes().to_vec(),
+            truncated: true,
+        }),
+        ..MockCluster::default()
+    });
+    let secrets = Arc::new(StaticSecretProvider::new());
+    secrets.insert("TEST_TOKEN", "supersecret");
+    let exec = KubeToolExecutor::new(cluster.clone(), target(), secrets);
+    let call = http_call(json!({"pod": "web-1", "port": "metrics", "path": "/metrics", "metrics": ["db_up", "token_leak"]})).unwrap();
+    let result = exec.execute(&call).await.unwrap();
+    assert!(result.truncated);
+    assert!(result.content.starts_with("HTTP 200 from shop/web-1:9090/metrics"), "{}", result.content);
+    assert!(result.content.contains("[truncated: the answer was longer than 1 MiB]"));
+    assert!(result.content.contains("password=\"***\""), "{}", result.content);
+    assert!(!result.content.contains("hunter2"));
+    assert!(!result.content.contains("supersecret"), "known secrets are masked");
+    assert!(!result.content.contains("http_requests_total"), "only the named metrics");
+    let sent = cluster.http_call.lock().unwrap().clone().unwrap();
+    assert_eq!((sent.port, sent.path.as_str()), (9090, "/metrics"));
+    assert_eq!(sent.max_bytes, crate::pod_http::MAX_POD_HTTP_BYTES);
+}
+
+#[test]
+fn pod_http_get_is_a_kube_tool_and_never_a_fleet_call() {
+    assert!(is_kube_tool_name(TOOL_POD_HTTP_GET));
+    assert!(is_kube_tool_name(TOOL_K8S_GET));
+    assert!(!is_kube_tool_name("run_command"));
+    let call = http_call(json!({"pod": "web-1", "port": 9090, "path": "/metrics"})).unwrap();
+    let member = filar_core::FleetTarget::KubeCluster(filar_core::KubeScopeRef {
+        cluster: "prod-eu".into(),
+        namespace: "shop".into(),
+    });
+    assert!(bind_fleet_call(&call, &member).is_err());
 }

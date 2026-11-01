@@ -27,6 +27,14 @@ pub const TOOL_K8S_LOGS: &str = "k8s_logs";
 pub const TOOL_K8S_EVENTS: &str = "k8s_events";
 pub const TOOL_K8S_TOP: &str = "k8s_top";
 pub const TOOL_K8S_ROLLOUT_HISTORY: &str = "k8s_rollout_history";
+pub use crate::pod_http::TOOL_POD_HTTP_GET;
+
+/// Whether `name` is one of the Kubernetes API tools (`k8s_*`, and
+/// `pod_http_get`, #578) — feed marker, confirmation and safety-rating rules
+/// treat them alike.
+pub fn is_kube_tool_name(name: &str) -> bool {
+    name.starts_with("k8s_") || name == TOOL_POD_HTTP_GET
+}
 
 pub const MAX_KUBE_LOG_TAIL: u32 = 500;
 pub const MAX_KUBE_LOG_BYTES: usize = 1024 * 1024;
@@ -178,6 +186,15 @@ pub enum KubeToolCall {
         deployment: String,
         limit: usize,
     },
+    /// One HTTP `GET` to a pod port through port-forward (#578).
+    PodHttpGet {
+        namespace: String,
+        pod: String,
+        port: crate::pod_http::PortRef,
+        path: String,
+        /// Prometheus metric names to keep; empty = top samples by value.
+        metrics: Vec<String>,
+    },
 }
 
 impl KubeToolCall {
@@ -189,6 +206,7 @@ impl KubeToolCall {
             Self::Events { .. } => TOOL_K8S_EVENTS,
             Self::Top { .. } => TOOL_K8S_TOP,
             Self::RolloutHistory { .. } => TOOL_K8S_ROLLOUT_HISTORY,
+            Self::PodHttpGet { .. } => TOOL_POD_HTTP_GET,
         }
     }
 
@@ -199,9 +217,9 @@ impl KubeToolCall {
             | Self::Describe { namespace, .. }
             | Self::Events { namespace, .. }
             | Self::Top { namespace, .. } => namespace.as_deref(),
-            Self::Logs { namespace, .. } | Self::RolloutHistory { namespace, .. } => {
-                Some(namespace)
-            }
+            Self::Logs { namespace, .. }
+            | Self::RolloutHistory { namespace, .. }
+            | Self::PodHttpGet { namespace, .. } => Some(namespace),
         }
     }
 
@@ -255,6 +273,13 @@ impl KubeToolCall {
                 deployment,
                 limit,
             } => json!({"namespace": namespace, "deployment": deployment, "limit": limit}),
+            Self::PodHttpGet {
+                namespace,
+                pod,
+                port,
+                path,
+                metrics,
+            } => json!({"namespace": namespace, "pod": pod, "port": port.to_string(), "path": path, "metrics": metrics, "method": "GET"}),
         }
     }
 
@@ -364,6 +389,16 @@ impl KubeToolCall {
                 push_flag(&mut command, "-n", namespace);
                 push_flag(&mut command, "--limit", &limit.to_string());
             }
+            Self::PodHttpGet {
+                namespace,
+                pod,
+                port,
+                path,
+                ..
+            } => {
+                command.push_str(&format!(" GET {pod}:{port}{path}"));
+                push_flag(&mut command, "-n", namespace);
+            }
         }
         command
     }
@@ -385,6 +420,11 @@ impl KubeToolCall {
 /// Pod members accept only pod-bound reads. Cluster members keep every tool,
 /// with namespaced calls forced into the namespace frozen at fleet entry.
 pub fn bind_fleet_call(call: &KubeToolCall, target: &FleetTarget) -> Result<KubeToolCall> {
+    if matches!(call, KubeToolCall::PodHttpGet { .. }) {
+        return Err(CoreError::Other(
+            "pod_http_get works on one pod of a cluster tab, not on a fleet".into(),
+        ));
+    }
     let namespace = match target {
         FleetTarget::KubePod(pod) => pod.namespace.clone(),
         FleetTarget::KubeCluster(scope) => scope.namespace.clone(),
@@ -505,6 +545,9 @@ pub fn bind_fleet_call(call: &KubeToolCall, target: &FleetTarget) -> Result<Kube
             return Err(CoreError::Other(
                 "a pod fleet member does not support rollout history".into(),
             ));
+        }
+        (KubeToolCall::PodHttpGet { .. }, _) => {
+            unreachable!("pod_http_get was rejected above")
         }
         (_, FleetTarget::KubeCluster(_)) => {}
         (_, FleetTarget::Ssh(_)) => unreachable!("SSH members were rejected above"),
@@ -631,6 +674,12 @@ pub fn kube_tool_definitions(mode: CommandConfirmMode) -> Vec<ToolDef> {
         definition(TOOL_K8S_ROLLOUT_HISTORY, "List a Deployment's ReplicaSet-based rollout revisions, newest first.", Map::from_iter([
             ("namespace".into(), namespace()), ("deployment".into(), name()), ("limit".into(), limit()),
         ]), vec!["deployment"], mode),
+        definition(TOOL_POD_HTTP_GET, "HTTP GET to a pod's own diagnostic endpoint through port-forward (no shell needed, nothing is created): /metrics (Prometheus), /healthz, /readyz, Spring Actuator, Go pprof index or text profiles (?debug=1, seconds ≤ 30). The port must be declared by the pod's containers (number or name) or allowed in the cluster's diagnostic_ports. Answers over 1 MiB are cut. For /metrics, name the metrics you need; otherwise only the top samples by value are shown.", Map::from_iter([
+            ("namespace".into(), namespace()), ("pod".into(), name()),
+            ("port".into(), json!({"type": ["integer", "string"], "description": "Container port number or port name, e.g. 8080 or \"http\"."})),
+            ("path".into(), json!({"type": "string", "description": "Relative path with optional query, e.g. /metrics or /debug/pprof/goroutine?debug=1."})),
+            ("metrics".into(), json!({"type": "array", "items": {"type": "string"}, "description": "Prometheus metric names to show (prefix match on name_)."})),
+        ]), vec!["pod", "port", "path"], mode),
     ]
 }
 
@@ -806,6 +855,48 @@ pub fn parse_kube_tool_call(
             deployment: required_string(args, "deployment")?,
             limit: limit()?,
         }),
+        TOOL_POD_HTTP_GET => {
+            if let Some(method) = args.get("method") {
+                if method.as_str().is_none_or(|m| !m.eq_ignore_ascii_case("GET")) {
+                    return Err(CoreError::Other(
+                        "pod_http_get only sends GET; other methods are refused".into(),
+                    ));
+                }
+            }
+            let metrics = match args.get("metrics") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .map(|item| {
+                        item.as_str()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(|| {
+                                CoreError::Other("metrics must be a list of metric names".into())
+                            })
+                    })
+                    .collect::<Result<_>>()?,
+                Some(_) => {
+                    return Err(CoreError::Other(
+                        "metrics must be a list of metric names".into(),
+                    ))
+                }
+            };
+            Ok(KubeToolCall::PodHttpGet {
+                namespace: namespace.ok_or_else(|| {
+                    CoreError::Other(
+                        "namespace is required for pod_http_get (no tab default is set)".into(),
+                    )
+                })?,
+                pod: required_string(args, "pod")?,
+                port: crate::pod_http::parse_port(
+                    args.get("port")
+                        .ok_or_else(|| CoreError::Other("missing required argument port".into()))?,
+                )?,
+                path: crate::pod_http::validate_path(&required_string(args, "path")?)?,
+                metrics,
+            })
+        }
         other => Err(CoreError::Other(format!(
             "unknown Kubernetes tool: {other}"
         ))),
@@ -874,6 +965,59 @@ impl KubeToolExecutor {
         }
     }
 
+    /// `pod_http_get` (#578): resolve the port against the pod spec and the
+    /// cluster's `diagnostic_ports`, GET through port-forward, redact, and
+    /// shrink Prometheus text to what was asked for.
+    async fn execute_pod_http_get(
+        &self,
+        namespace: &str,
+        pod: &str,
+        port: &crate::pod_http::PortRef,
+        path: &str,
+        metrics: &[String],
+    ) -> Result<KubeToolResult> {
+        use crate::pod_http as http;
+        let info = self.api.get_pod(namespace, pod).await?;
+        let number = http::resolve_port(&info, port, &self.target.diagnostic_ports)?;
+        let response = self
+            .api
+            .pod_http_get(&filar_transport::PodHttpRequest {
+                namespace: namespace.to_string(),
+                pod: pod.to_string(),
+                port: number,
+                path: path.to_string(),
+                max_bytes: http::MAX_POD_HTTP_BYTES,
+                timeout: Duration::from_secs(http::POD_HTTP_TIMEOUT_SECS),
+            })
+            .await?;
+        let text = String::from_utf8_lossy(&response.body);
+        let text = http::redact_sensitive_labels(&crate::kube_redact::redact_logs(
+            &text,
+            self.secrets.as_ref(),
+        ));
+        let body = if http::is_prometheus(path, response.content_type.as_deref()) {
+            http::prometheus_view(&text, metrics)
+        } else {
+            text
+        };
+        let mut content = format!(
+            "HTTP {} from {namespace}/{pod}:{number}{path}{}\n",
+            response.status,
+            response
+                .content_type
+                .as_deref()
+                .map(|ct| format!(" ({ct})"))
+                .unwrap_or_default()
+        );
+        if response.truncated {
+            content.push_str("[truncated: the answer was longer than 1 MiB]\n");
+        }
+        content.push_str(&body);
+        let truncated = response.truncated || content.chars().count() > MAX_KUBE_OUTPUT_CHARS;
+        truncate_output(&mut content);
+        Ok(KubeToolResult { content, truncated })
+    }
+
     async fn execute_pod_get(&self, pod: &KubePodRef) -> Result<KubeToolResult> {
         let object = self.redact_object(pod_object(
             self.api.get_pod(&pod.namespace, &pod.pod).await?,
@@ -915,6 +1059,13 @@ impl KubeToolExecutor {
     /// Execute one validated read-only call and return model-safe output.
     pub async fn execute(&self, call: &KubeToolCall) -> Result<KubeToolResult> {
         match call {
+            KubeToolCall::PodHttpGet {
+                namespace,
+                pod,
+                port,
+                path,
+                metrics,
+            } => self.execute_pod_http_get(namespace, pod, port, path, metrics).await,
             KubeToolCall::Get {
                 kind,
                 namespace,

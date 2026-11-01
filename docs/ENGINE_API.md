@@ -773,6 +773,7 @@ let _agent = builder.risk_scorer(Some(scorer));
 | `KubeExecutor`, `KubeExecConfig`, `KubeExecEvent` under the `kube` feature; `PodRef`, `PodSelector`, `PodLimits` and `KubeCluster::describe_pod` in `filar-core` (#563) | Nothing — additive; `CommandExecutor` and `LlmClient` are unchanged | Use `KubeExecutor` wherever a `CommandExecutor` is expected for a pod shell |
 | `AgentBuilder::kube_pod_mode` / `arbiter_kube_pod_context`, `KubePodTarget`, new field `KubernetesArbiterTarget::pod` (#564) | Struct literals of `KubernetesArbiterTarget` need `pod` (`None` for a cluster tab); `KubernetesArbiterTarget::new` is unchanged | Prefer `KubernetesArbiterTarget::new` / `::pod`, or add `pod: None` |
 | `filar_core::KubePodSnapshot`, new field `KubeSessionSnapshot::pod` (#565) | Struct literals of `KubeSessionSnapshot` need `pod` (`None` for a cluster tab); saved sessions without it deserialize as cluster tabs | Add `pod: None`, or `Some(KubePodSnapshot { pod, container })` for a pod tab |
+| `ClusterApi::pod_http_get`, `PodHttpRequest`/`PodHttpResponse`, `ContainerPortInfo`, new fields `ContainerInfo::ports` and `KubeCluster::diagnostic_ports`, tool `pod_http_get` (#578) | Struct literals of `ContainerInfo` need `ports`; `KubeCluster` literals without `..Default::default()` need `diagnostic_ports`; other `ClusterApi` implementations get a default `Unavailable` | Add `ports: Vec::new()` / `diagnostic_ports: Vec::new()`; implement `pod_http_get` only if your API can port-forward |
 
 ## Upgrading to `engine-v3.0.0`
 
