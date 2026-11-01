@@ -98,6 +98,7 @@ type = "password"
 # tags = ["prod", "k8s"]          # feed [[tag_policies]] exactly like SSH tags
 # reveal_configmaps = ["shop/feature-flags"]  # redaction opt-outs, namespace/name
 # reveal_env = ["shop/api/PUBLIC_MODE"]       # one literal pod variable; marked in output
+# debug_images = ["busybox:1.37"]  # images for an ephemeral debug container (Ctrl+B); empty = off
 
 # Kubernetes fleet: ready app=web pods frozen on entry in both clusters.
 # Use either kube or match = [...] in a host group, never both. Without

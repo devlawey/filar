@@ -11481,3 +11481,40 @@ Some(KubePodTabState { pod_ref, pod, container, limits })`, а исполнит�
 (реестры образов закрыты); пункты — в `docs/SMOKE.md`.
 
 **Next:** #577 — Ctrl+T в под (`KubeInteractive`), снять отказ терминала.
+
+## Issue #576: эфемерный debug-контейнер (веха 3.0.1)
+
+**Согласовано.** Евгений (мейнтейнер) подтвердил исключение из инварианта 1 для
+этой задачи; формулировка — в `AGENTS.md` (после исключения #531/#546) и в
+`USER_GUIDE.md` §4.12.
+
+**Сделано.**
+- Транспорт (`crates/transport/src/cluster/debug.rs`): `KubeClusterApi::create_debug_container`
+  — strategic-merge PATCH `pods/<pod>/ephemeralcontainers` (`filar-debug-<id>`,
+  `targetContainerName`, `command: [sh]`), затем ожидание `Running` (90 с;
+  `ErrImagePull`/`ImagePullBackOff`/… — понятная ошибка). `securityContext`
+  наследует пользователя/группу/runAsNonRoot/readOnly/seccomp цели, всегда
+  `privileged: false`, `allowPrivilegeEscalation: false`, `drop: [ALL]`. 403 —
+  через `api_error` (RBAC «нет права patch на pods/ephemeralcontainers» vs политика).
+- Core: `KubeCluster.debug_images` (`#[serde(default)]`, пустые/с пробелами — ошибка
+  конфига; протянуто через черновик GUI).
+- Агент: `KubePodTarget.debug_target` + `with_debug_target`; промпт пода получает
+  абзац о debug-контейнере (PID 1, `/proc/1/root/`, создавать/удалять нельзя).
+  Инструмента нет (тест).
+- TUI: `Ctrl+B` (кластер — выбор пода и контейнера, `debug: true` в
+  `KubePodSelect`; под — его под и контейнер), шаг `PodSelectStage::Images` при
+  нескольких образах, модальное окно `DebugProposal` (`y` создать, `n`/Esc отмена,
+  Enter — ничего), runner `start_pending_kube_debug_creates` → `DebugCreated` →
+  след в ленте исходной вкладки + вкладка пода в debug-контейнере
+  (`KubePodTabState.debug_target`, метка `debug` в статус-баре).
+
+**Отступление от issue.** PID цели не вычисляется отдельной командой (это была бы
+команда в под без подтверждения): с `targetContainerName` debug-контейнер входит
+в PID-namespace цели, где её главный процесс — PID 1; промпт просит проверить
+`cat /proc/1/cmdline`.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. Новые публичные:
+`DebugContainerSpec`, `debug_container_name`, `KubeClusterApi::create_debug_container`,
+`KubeCluster.debug_images`, `KubePodTarget.debug_target`.
+
+**Next:** веха 3.0.1 закрыта по коду; ручные прогоны по `docs/SMOKE.md` против `docker/k8s`.
