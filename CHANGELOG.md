@@ -18,6 +18,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- Background jobs on remote hosts and in pods pick a writable directory for their log (`$TMPDIR`, `/tmp`, `/dev/shm`) and fail with a clear message when there is none or the log cannot be created, instead of a job that "exits" with no output ([#599](https://github.com/devlawey/filar/issues/599)).
 - A command's working directory is no longer lost when the shell's marker line arrives split across two reads ([#561](https://github.com/devlawey/filar/issues/561)).
 
 ## [3.0.0] - 2026-10-31

@@ -12,12 +12,16 @@ The cluster contains:
   `CrashLoopBackOff`, leaving logs for `--previous`;
 - Deployment `distroless`: `registry.k8s.io/pause:3.10`, a single static binary
   with no shell;
+- Deployment `nowrite`: a BusyBox shell with no writable directory at all
+  (read-only root, no `/tmp` volume, `/dev/shm` mounted read-only) — for the
+  background-job refusal test (#599);
 - ServiceAccounts `reader` and `no-exec`, both bound only to `get`, `list`, and
   `watch` on `pods`, `pods/log`, and `events`. Neither has `pods/exec` or any
   write permission, and neither can read Secrets.
 
 All workload containers run as non-root with a read-only root filesystem, an
-`emptyDir` mounted at `/tmp`, dropped capabilities, and a memory limit.
+`emptyDir` mounted at `/tmp` (except `nowrite`), dropped capabilities, and a
+memory limit.
 
 ## Prerequisites
 
@@ -33,7 +37,7 @@ docker/k8s/up.sh
 ```
 
 The script creates cluster `filar-k8s-tests`, applies the manifests, waits for
-`web` and `distroless`, and prints the kubeconfig path. `crashy` is deliberately
+`web`, `distroless` and `nowrite`, and prints the kubeconfig path. `crashy` is deliberately
 excluded from readiness waits. Run it again to refresh fixtures and tokens.
 
 ```sh

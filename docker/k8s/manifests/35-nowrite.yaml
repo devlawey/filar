@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nowrite
+  namespace: shop
+  labels:
+    app.kubernetes.io/part-of: filar-test-fixtures
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nowrite
+  template:
+    metadata:
+      labels:
+        app: nowrite
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # A shell, but no writable directory for background-job logs (#599):
+        # read-only root (so /tmp too) and /dev/shm mounted read-only.
+        - name: main
+          image: busybox:1.37.0
+          command: ["sh", "-c", "trap 'exit 0' TERM; while true; do sleep 3600 & wait $!; done"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+              readOnly: true
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory

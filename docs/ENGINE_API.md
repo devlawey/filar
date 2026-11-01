@@ -278,8 +278,12 @@ background job tools for work that outlasts `[timeouts].command_secs`:
 
 Embedders must set `AgentBuilder::session_id` (unique per tab/session) so job
 state does not leak across concurrent agents. Set `AgentBuilder::is_local(true)`
-for local executors (affects spawn strategy). Background jobs on SSH use
-ephemeral `/tmp/filar-job-*` logs removed on completion; local jobs capture
+for local executors (affects spawn strategy). Background jobs on SSH and in
+pods use an ephemeral `filar-job-*` log in the first writable directory of
+`$TMPDIR`, `/tmp`, `/dev/shm` (probed once per session), removed on completion;
+with no writable directory `start_background_job` refuses. Call
+`background::reset_log_dir(session_id)` when a tab's target changes (reconnect,
+transport swap, pod replaced) so the next job probes again. Local jobs capture
 output in memory only.
 
 **Fleet mode.** `AgentBuilder::fleet(true)` marks an agent that works over a

@@ -391,10 +391,15 @@ struct TuiExecutor {
 }
 
 impl TuiExecutor {
-    /// Swap the inner executor to a new one (e.g. local → SSH).
-    async fn swap_executor(&self, new: Arc<dyn CommandExecutor>) {
+    /// Swap the inner executor of session `sid` to a new one (e.g. local →
+    /// SSH).
+    ///
+    /// The new target may have a different writable temp directory, so the
+    /// session's cached background-job log directory is dropped (#599).
+    async fn swap_executor(&self, sid: SessionId, new: Arc<dyn CommandExecutor>) {
         let mut guard = self.inner.write().await;
         *guard = new;
+        filar_agent::background::reset_log_dir(&sid.0.to_string());
     }
 }
 
@@ -2488,7 +2493,7 @@ async fn run_app(
                                         let exec_arc: Arc<dyn CommandExecutor> = ssh_exec.clone();
                                         let exec_arc =
                                             wrap_if_read_only(exec_arc, &target, &host_groups);
-                                        exec.swap_executor(exec_arc).await;
+                                        exec.swap_executor(sid, exec_arc).await;
                                         // Store the SshTarget so Ctrl+T can open a PTY
                                         // on the same host for this tab.
                                         *st.write().await = Some(target.clone());
@@ -2626,7 +2631,7 @@ async fn run_app(
                                 let exec_arc: Arc<dyn CommandExecutor> = ssh_exec.clone();
                                 let exec_arc =
                                     wrap_if_read_only(exec_arc, &target, &host_groups);
-                                exec.swap_executor(exec_arc).await;
+                                exec.swap_executor(sid, exec_arc).await;
                                 *st.write().await = Some(target);
                                 *se.write().await = Some(ssh_exec);
                             }
@@ -2696,7 +2701,7 @@ async fn run_app(
                             }
                         };
                         if let Some((ref exec, ref st, ref se)) = exec_entry {
-                            exec.swap_executor(Arc::new(local_exec) as Arc<dyn CommandExecutor>).await;
+                            exec.swap_executor(sid, Arc::new(local_exec) as Arc<dyn CommandExecutor>).await;
                             *st.write().await = None;
                             *se.write().await = None;
                         }
@@ -2735,7 +2740,7 @@ async fn run_app(
                                     let exec_arc: Arc<dyn CommandExecutor> = ssh_exec.clone();
                                     let exec_arc =
                                         wrap_if_read_only(exec_arc, &target, &host_groups);
-                                    exec.swap_executor(exec_arc).await;
+                                    exec.swap_executor(sid, exec_arc).await;
                                     *st.write().await = Some(target);
                                     *se.write().await = Some(ssh_exec);
                                 }
