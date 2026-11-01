@@ -16,11 +16,6 @@ use crate::ui::theme::Glyphs;
 pub const KUBE_POD_PANELS_REFUSAL: &str =
     "файловые панели (Ctrl+G) для пода пока недоступны — они работают с локальным диском и SSH";
 
-/// Refusal for the interactive terminal (Ctrl+T, interactive `!` commands)
-/// in a pod tab, until the pod terminal lands.
-pub const KUBE_POD_TERMINAL_REFUSAL: &str =
-    "интерактивный терминал (Ctrl+T) для пода пока недоступен — команды выполняются через агента или `!команда`";
-
 /// A pod list for the chooser, run by the runner over the cluster tab's API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KubePodListRequest {
@@ -1297,13 +1292,26 @@ mod tests {
     }
 
     #[test]
-    fn pod_tab_refuses_file_panels_and_terminal_with_pod_messages() {
+    fn pod_tab_refuses_file_panels_with_a_pod_message() {
         let (mut app, _, _) = connected_pod_tab();
         app.open_file_panels();
         assert!(app.file_panels.is_none());
         assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m == KUBE_POD_PANELS_REFUSAL));
+    }
+
+    /// Ctrl+T in a connected pod tab asks the runner for a terminal (#577);
+    /// before the shell is connected it waits, and nothing local opens.
+    #[test]
+    fn ctrl_t_opens_the_pod_terminal_only_once_connected() {
+        let mut app = app_in_cluster_tab();
+        app.open_pod_tab(cluster(), "shop".into(), PodRef::named("prod-eu", "shop", "web-1", None));
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
-        assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m == KUBE_POD_TERMINAL_REFUSAL));
+        assert!(!app.take_toggle_interactive(), "not while connecting");
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m.contains("ещё подключается")));
+
+        let (mut app, _, _) = connected_pod_tab();
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.take_toggle_interactive());
     }
 
     #[test]

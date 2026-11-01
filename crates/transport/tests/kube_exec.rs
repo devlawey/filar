@@ -183,6 +183,59 @@ async fn pod_limits_match_the_fixture_spec() {
     assert!(exec.describe().starts_with("Kubernetes pod shop/web-"));
 }
 
+/// Read terminal output until `needle` shows up or `limit` passes.
+async fn read_until(
+    term: &filar_transport::KubeInteractive,
+    needle: &str,
+    limit: Duration,
+) -> String {
+    use filar_transport::InteractiveTerminal;
+    let deadline = Instant::now() + limit;
+    let mut seen = String::new();
+    while Instant::now() < deadline && !seen.contains(needle) {
+        match tokio::time::timeout(Duration::from_millis(500), term.read_output()).await {
+            Ok(Ok(Some(bytes))) => seen.push_str(&String::from_utf8_lossy(&bytes)),
+            Ok(Ok(None)) | Ok(Err(_)) => break,
+            Err(_) => {}
+        }
+    }
+    seen
+}
+
+/// Ctrl+T in a pod (#577): an interactive `sh` with a TTY, the window size
+/// reaches `stty`, Ctrl+C interrupts `sleep`, and closing the terminal leaves
+/// the agent's shell working.
+#[tokio::test]
+#[ignore = "needs docker/k8s cluster"]
+async fn pod_terminal_is_interactive_resizable_and_interruptible() {
+    use filar_transport::InteractiveTerminal;
+    let exec = KubeExecutor::connect(&admin(), &web(Some("main"))).await.unwrap();
+    let term = exec.open_terminal(100, 30).await.unwrap();
+    assert_eq!(term.pod(), exec.pod());
+
+    term.write_input(b"echo tty-$((40+2))\n").await.unwrap();
+    assert!(read_until(&term, "tty-42", Duration::from_secs(10)).await.contains("tty-42"));
+
+    term.resize(132, 43).await.unwrap();
+    term.write_input(b"stty size\n").await.unwrap();
+    assert!(read_until(&term, "43 132", Duration::from_secs(10)).await.contains("43 132"));
+
+    let started = Instant::now();
+    // `sl""ept` prints `slept` only if it runs; the TTY echo shows the quotes.
+    term.write_input(b"sleep 30; echo sl\"\"ept\n").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    term.write_input(b"\x03").await.unwrap();
+    term.write_input(b"echo after-$((1+1))\n").await.unwrap();
+    let out = read_until(&term, "after-2", Duration::from_secs(10)).await;
+    assert!(out.contains("after-2"), "{out}");
+    assert!(!out.contains("slept"), "{out}");
+    assert!(started.elapsed() < Duration::from_secs(20));
+
+    term.close().await.unwrap();
+    let result = exec.run("echo agent-$((2+3))").await.unwrap();
+    assert_eq!(result.stdout.trim(), "agent-5", "the agent's shell is independent");
+}
+
 fn reader() -> KubeCluster {
     let path = admin_path()
         .parent()

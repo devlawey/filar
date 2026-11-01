@@ -4580,13 +4580,9 @@ impl App {
                                     // Stay in Normal mode — user needs to press Ctrl+P.
                                 } else if is_interactive_command(&cmd) {
                                     // Block interactive commands — they hang the executor.
-                                    let hint = if self.in_pod_tab() {
-                                        pod_tab::KUBE_POD_TERMINAL_REFUSAL.to_string()
-                                    } else {
-                                        "Use Ctrl+T to enter interactive terminal mode.".to_string()
-                                    };
                                     self.push_message(ChatBlock::System(format!(
-                                        "Interactive command '{cmd}' is not supported in shell escape. {hint}"
+                                        "Interactive command '{cmd}' is not supported in shell escape. \
+                                         Use Ctrl+T to enter interactive terminal mode."
                                     )));
                                     self.scroll = 0;
                                     self.input.clear();
@@ -4616,8 +4612,17 @@ impl App {
                     }
                 }
                 _ if ctrl_key('t', 'е') => {
-                    if self.kube.is_some() {
-                        self.refuse_kube_action(pod_tab::KUBE_POD_TERMINAL_REFUSAL);
+                    // A pod tab has a terminal in its pod (#577); a cluster
+                    // tab has no shell at all.
+                    if self.in_cluster_tab() {
+                        self.refuse_kube_shell();
+                        return;
+                    }
+                    if self.in_pod_tab() && self.pod_agent_target().is_none() {
+                        self.push_message(ChatBlock::System(format!(
+                            "Под {} ещё подключается: терминал откроется после подключения.",
+                            self.target_name
+                        )));
                         return;
                     }
                     // If the active session already has a live terminal,
@@ -5363,8 +5368,8 @@ impl App {
                 }
             }
             HelpAction::Terminal => {
-                if self.kube.is_some() {
-                    self.refuse_kube_action(pod_tab::KUBE_POD_TERMINAL_REFUSAL);
+                if self.in_cluster_tab() {
+                    self.refuse_kube_shell();
                 } else if self.in_fleet() {
                     self.fleet_refusal(FleetRefusal::Terminal);
                 } else if self.connecting.is_some() {
