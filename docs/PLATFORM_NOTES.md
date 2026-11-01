@@ -195,7 +195,7 @@ use `⌘` because they are not rendered in the Windows console.
 | Platform | Runner | Asset name |
 |----------|--------|------------|
 | Windows  | `windows-latest` | `filar-{tag}-windows-x86_64.exe` |
-| macOS    | `macos-14` (arm64) | `filar-{tag}-macos-aarch64` |
+| macOS    | `macos-15` (arm64) | `filar-{tag}-macos-aarch64` |
 
 ### Packaging decision for 1.0.0 (#297)
 
@@ -224,7 +224,8 @@ Same policy on both platforms: document the bypass; do not pretend the
 build is signed.
 
 > **Arch (#289):** macOS ships **one** architecture — `aarch64` (Apple Silicon).
-> The job pins `macos-14` and asserts `uname -m == arm64` before packaging.
+> The job pins `macos-15` and asserts `uname -m == arm64` before packaging.
+> (`macos-14` until its scheduled retirement on 2026-11-02.)
 
 After downloading the macOS asset from GitHub Releases:
 
