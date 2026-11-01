@@ -441,9 +441,15 @@ pub struct KubeInteractive {
     output: Mutex<mpsc::Receiver<Vec<u8>>>,
     resize: Mutex<Option<futures::channel::mpsc::Sender<TerminalSize>>>,
     process: StdMutex<Option<AttachedProcess>>,
+    /// The stdout reader, stopped on `close`.
+    reader: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     pod: String,
     container: String,
 }
+
+/// How long one keystroke write to the pod terminal may take before the
+/// terminal counts as lost — a dead exec must not hang the UI.
+const TERMINAL_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl KubeInteractive {
     async fn open(place: ExecPlace, cols: u16, rows: u16) -> Result<Self> {
@@ -477,10 +483,12 @@ impl KubeInteractive {
         let mut resize = process.terminal_size();
         if let Some(sender) = resize.as_mut() {
             use futures::SinkExt;
-            let _ = sender.send(tty_size(cols, rows)).await;
+            if let Err(error) = sender.send(tty_size(cols, rows)).await {
+                warn!(error = %error, "pod terminal: initial window size not sent");
+            }
         }
         let (tx, rx) = mpsc::channel(64);
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];
             loop {
                 match stdout.read(&mut buf).await {
@@ -499,6 +507,7 @@ impl KubeInteractive {
             output: Mutex::new(rx),
             resize: Mutex::new(resize),
             process: StdMutex::new(Some(process)),
+            reader: StdMutex::new(Some(reader)),
             pod: place.pod,
             container: place.container,
         })
@@ -522,15 +531,18 @@ impl crate::InteractiveTerminal for KubeInteractive {
     }
 
     async fn write_input(&self, data: &[u8]) -> Result<()> {
-        let mut stdin = self.stdin.lock().await;
-        stdin
-            .write_all(data)
-            .await
-            .map_err(|e| CoreError::ConnectionLost(format!("pod terminal: {e}")))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| CoreError::ConnectionLost(format!("pod terminal: {e}")))
+        let write = async {
+            let mut stdin = self.stdin.lock().await;
+            stdin.write_all(data).await?;
+            stdin.flush().await
+        };
+        match tokio::time::timeout(TERMINAL_WRITE_TIMEOUT, write).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(CoreError::ConnectionLost(format!("pod terminal: {e}"))),
+            Err(_) => Err(CoreError::ConnectionLost(
+                "pod terminal: input not accepted in time".into(),
+            )),
+        }
     }
 
     async fn resize(&self, cols: u16, rows: u16) -> Result<()> {
@@ -547,6 +559,9 @@ impl crate::InteractiveTerminal for KubeInteractive {
     async fn close(&self) -> Result<()> {
         if let Some(process) = self.process.lock().unwrap_or_else(|e| e.into_inner()).take() {
             process.abort();
+        }
+        if let Some(reader) = self.reader.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            reader.abort();
         }
         Ok(())
     }
