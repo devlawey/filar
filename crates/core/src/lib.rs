@@ -50,6 +50,6 @@ pub use secrets::{
     EnvSecretProvider, KeyringSecretProvider, SecretProvider, StaticSecretProvider,
 };
 pub use session::{
-    default_base_dir, FleetSnapshot, KubeSessionSnapshot, ProfileUsage, Session, SessionMeta,
+    default_base_dir, FleetSnapshot, KubePodSnapshot, KubeSessionSnapshot, ProfileUsage, Session, SessionMeta,
     SessionStore,
 };

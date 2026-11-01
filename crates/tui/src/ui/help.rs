@@ -301,6 +301,12 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
             available: |m| m == AppMode::Normal,
         },
         HelpEntry {
+            key: "^E",
+            desc: "Kubernetes: enter a pod from a cluster tab — choose a pod (or type a selector such as app=web) and a container; the pod opens in a new tab (also a row in ^O)",
+            section: "Input",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
             key: "^S",
             desc: "Save current session to .md file",
             section: "Input",
@@ -404,7 +410,7 @@ pub(crate) fn render_help_overlay(f: &mut Frame, app: &App, area: Rect) {
 /// is exactly one row on screen, so the scroll and the title count rows.
 fn overlay_lines(app: &App, inner_width: usize) -> Vec<Line<'static>> {
     let registry = help_registry();
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line> = pod_section_lines(app, inner_width);
     let mut current_section: Option<&str> = None;
 
     for entry in &registry {
@@ -454,6 +460,40 @@ fn overlay_lines(app: &App, inner_width: usize) -> Vec<Line<'static>> {
             lines.push(Line::from(Span::styled(format!("{}{row}", " ".repeat(indent)), style)));
         }
     }
+    lines
+}
+
+/// The pod tab's target and every known limit of its container, first in
+/// F1 (#565): the status bar only has room for the short form.
+fn pod_section_lines(app: &App, inner_width: usize) -> Vec<Line<'static>> {
+    let Some(kube) = app.kube.as_ref() else {
+        return Vec::new();
+    };
+    let Some(pod) = kube.pod.as_ref() else {
+        return Vec::new();
+    };
+    let glyphs = app.theme.glyphs();
+    let mut lines = vec![Line::from(Span::styled(
+        " Pod ".to_string(),
+        Style::default()
+            .fg(app.theme.accent)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    let mut text = Vec::new();
+    if let Some(target) = crate::app::pod_tab::pod_confirm_target_line(kube, glyphs) {
+        text.push(target);
+    }
+    match pod.limits.as_ref() {
+        Some(limits) => text.extend(crate::app::pod_tab::pod_limits_details(limits)),
+        None => text.push("connecting — limits are read from the pod spec once the shell opens".into()),
+    }
+    let room = inner_width.saturating_sub(2).max(1);
+    for item in text {
+        for row in wrap_words(&item, room) {
+            lines.push(Line::from(Span::styled(format!("  {row}"), app.theme.fg_style())));
+        }
+    }
+    lines.push(Line::raw(""));
     lines
 }
 
@@ -508,7 +548,7 @@ fn push_entry_lines(
 
 /// Wrap `text` to `width` terminal cells at word boundaries. A word wider
 /// than the whole width is cut; nothing is ever wider than `width`.
-fn wrap_words(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -842,5 +882,39 @@ mod tests {
         assert!(!always_available.contains(&"^N"));
         assert!(!always_available.contains(&"Enter"));
         assert!(!always_available.contains(&"!cmd"));
+    }
+
+    #[test]
+    fn pod_tab_lists_its_target_and_limits_first() {
+        let mut app = App::new("test".into(), filar_core::CommandConfirmMode::Always);
+        app.kube = Some(crate::app::KubeTabState {
+            target: filar_core::KubeCluster {
+                name: "prod-eu".into(),
+                context: "prod-eu".into(),
+                ..Default::default()
+            },
+            namespace: Some("shop".into()),
+            connection_id: 1,
+            pod: Some(crate::app::KubePodTabState {
+                pod_ref: filar_core::PodRef::named("prod-eu", "shop", "web-1", None),
+                pod: Some("web-1".into()),
+                container: Some("main".into()),
+                limits: Some(filar_core::PodLimits {
+                    memory_limit: Some("512Mi".into()),
+                    cpu_request: Some("100m".into()),
+                    run_as_user: Some(65534),
+                    ..Default::default()
+                }),
+            }),
+        });
+        let rows: Vec<String> = overlay_lines(&app, 80).iter().map(row_text).collect();
+        assert_eq!(rows[0].trim(), "Pod");
+        assert!(rows[1].contains("pod web-1") && rows[1].contains("container main"), "{rows:?}");
+        assert!(rows.iter().any(|r| r.trim() == "memory limit: 512Mi"), "{rows:?}");
+        assert!(rows.iter().any(|r| r.trim() == "CPU request: 100m"), "{rows:?}");
+        assert!(rows.iter().any(|r| r.trim() == "user: 65534"), "{rows:?}");
+        app.kube.as_mut().unwrap().pod = None;
+        let rows: Vec<String> = overlay_lines(&app, 80).iter().map(row_text).collect();
+        assert_ne!(rows[0].trim(), "Pod", "no pod section in a cluster tab");
     }
 }

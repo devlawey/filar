@@ -62,7 +62,10 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let radius_kind = confirm.radius_kind;
     let radius_context = confirm.radius_context.clone();
     let kube_fleet = app.in_kube_fleet();
-    let kubernetes = (app.kube.is_some() || kube_fleet) && command.starts_with("k8s_");
+    // Only a cluster tab runs `k8s_*` API tools; a pod tab's commands are
+    // shell commands, whatever they are called (#565 review).
+    let in_cluster = app.kube.as_ref().is_some_and(|kube| kube.pod.is_none());
+    let kubernetes = (in_cluster || kube_fleet) && command.starts_with("k8s_");
     let kube_target = app.kube.as_ref().map(|kube| {
         (
             kube.target.name.clone(),
@@ -73,6 +76,23 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
                 .any(|tag| tag.eq_ignore_ascii_case("prod")),
         )
     });
+    // Pod tab (#565): the target line goes above the command, and a `prod`
+    // tag or a tightening tag policy colours the dialog like a destructive
+    // command.
+    let pod_target = app
+        .kube
+        .as_ref()
+        .and_then(|kube| crate::app::pod_tab::pod_confirm_target_line(kube, app.theme.glyphs()));
+    let strict_pod = pod_target.is_some()
+        && app.kube.as_ref().is_some_and(|kube| {
+            kube.target.tags.iter().any(|tag| tag.eq_ignore_ascii_case("prod"))
+                || filar_core::tag_policy_floor(
+                    app.global_confirm_mode,
+                    &app.tag_policies,
+                    &kube.target.tags,
+                )
+                .is_some()
+        });
     // Safety rating (#551) — advisory, separate from the arbiter's audit.
     let safety = app.confirm_safety().map(|score| {
         let text = safety_line_text(score);
@@ -123,15 +143,23 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or(0);
     let command_rows = estimate_wrapped_rows(&command_text, inner_width);
     let empty_rows = 1; // separator line before buttons
-    let radius_rows = match radius_lines(
+    // The header line above the command: the fleet radius, or in a pod tab
+    // its target. Never truncated away (see `build_modal_lines`).
+    let header = radius_lines(
         &radius,
         radius_kind,
         radius_context.as_deref(),
         radius_expanded,
-    ) {
+    )
+    .or_else(|| pod_target.clone().map(|line| (line, None)));
+    let radius_rows = match header.clone() {
         None => 0,
-        Some((_, None)) => 1,
-        Some((_, Some(list))) => 1 + estimate_wrapped_rows(&list, inner_width),
+        // The pod target may wrap (long contexts such as EKS ARNs), within
+        // the same cap `build_modal_lines` applies.
+        Some((line, None)) => header_rows(&line, inner_width).len(),
+        Some((line, Some(list))) => {
+            header_rows(&line, inner_width).len() + estimate_wrapped_rows(&list, inner_width)
+        }
     };
 
     let natural_content = (radius_rows
@@ -149,12 +177,7 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let max_content_rows = modal_height.saturating_sub(3) as usize;
 
     let lines = build_modal_lines(
-        radius_lines(
-            &radius,
-            radius_kind,
-            radius_context.as_deref(),
-            radius_expanded,
-        ),
+        header,
         &explanation,
         &command_text,
         destructive,
@@ -192,7 +215,7 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Clear, modal_area);
 
     let production_kube = kubernetes && kube_target.as_ref().is_some_and(|(_, _, prod)| *prod);
-    let border_color = if destructive || production_kube {
+    let border_color = if destructive || production_kube || strict_pod {
         app.theme.danger
     } else {
         app.theme.warning
@@ -211,6 +234,8 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             None => " Confirm Kubernetes request ".to_string(),
         }
+    } else if pod_target.is_some() && radius.is_empty() {
+        " Confirm command in pod ".to_string()
     } else {
         match radius.len() {
             0 => " Confirm command ".to_string(),
@@ -309,6 +334,37 @@ fn radius_lines(
     Some((header, expanded.then(|| radius.join(", "))))
 }
 
+/// Rows the header above the command may wrap to: the fleet radius line or
+/// a pod tab's target line (`context … · namespace … · pod … · container …`),
+/// which must not lose the pod and container to an ellipsis (#565 review).
+///
+/// Ten rows hold the longest pod line Kubernetes allows at the narrowest
+/// dialog, word-wrapped: a context such as an EKS ARN, a namespace and a
+/// container (DNS labels, ≤ 63 characters) and a pod name (DNS subdomain,
+/// ≤ 253) — so the pod and container, at the end, are not the part cut
+/// away. On a short terminal the header gets fewer rows still: the command
+/// line always keeps its place (see `build_modal_lines`).
+const HEADER_MAX_ROWS: usize = 10;
+
+/// The header above the command, word-wrapped to `width` and cut to
+/// [`HEADER_MAX_ROWS`] rows (the last one ends with `…` when cut).
+fn header_rows(text: &str, width: usize) -> Vec<String> {
+    header_rows_within(text, width, HEADER_MAX_ROWS)
+}
+
+/// [`header_rows`] cut to at most `max` rows (at least one).
+fn header_rows_within(text: &str, width: usize, max: usize) -> Vec<String> {
+    let max = max.max(1);
+    let mut rows = crate::ui::help::wrap_words(text, width);
+    if rows.len() > max {
+        rows.truncate(max);
+        if let Some(last) = rows.last_mut() {
+            *last = truncate_to_rows(&format!("{last} …"), width, 1);
+        }
+    }
+    rows
+}
+
 /// Build modal body lines, truncating so wrapped height ≤ `max_rows`.
 ///
 /// The fleet radius comes first and its counter line is never truncated
@@ -353,13 +409,14 @@ fn build_modal_lines(
     };
 
     if let Some((header, list)) = radius {
-        let header = truncate_to_rows(&header, inner_width, 1);
-        let _ = push(
-            &mut lines,
-            &mut used,
-            header,
-            warning.add_modifier(Modifier::BOLD),
-        );
+        // Wrapped here, by words, so the rows counted for the modal height
+        // are exactly the rows drawn.
+        // Leave room for the command line and the separator below it, so a
+        // short terminal never trades the command for the header.
+        let room = max_rows.saturating_sub(2).min(HEADER_MAX_ROWS);
+        for row in header_rows_within(&header, inner_width, room) {
+            let _ = push(&mut lines, &mut used, row, warning.add_modifier(Modifier::BOLD));
+        }
         if let Some(list) = list {
             // Leave room for the command line and the separator.
             let budget = max_rows.saturating_sub(used).saturating_sub(2).max(1);
@@ -985,6 +1042,7 @@ mod tests {
             },
             namespace: Some("shop".into()),
             connection_id: 1,
+            pod: None,
         });
         let mut confirm = pending("k8s_get pods -l app=web", false);
         confirm.explanation = "Tool: k8s_get\nArguments: {\"selector\":\"app=web\"}".into();
@@ -999,6 +1057,147 @@ mod tests {
         assert!(screen.contains("Tool: k8s_get"), "{screen}");
         assert!(screen.contains("Arguments:"), "{screen}");
         assert!(screen.contains("k8s_get pods -l app=web"), "{screen}");
+    }
+
+    /// Colour of the dialog's rounded top-left corner.
+    fn confirm_border_color(app: &mut App) -> Option<ratatui::style::Color> {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let chat = Rect::new(0, 2, 100, 26);
+                app.chat_area = chat;
+                render_confirm_modal(f, app, chat);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| buf[(x, y)].symbol() == "╭")
+            .map(|(x, y)| buf[(x, y)].fg)
+    }
+
+    fn pod_app(tags: Vec<String>) -> App {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.kube = Some(crate::app::KubeTabState {
+            target: filar_core::KubeCluster {
+                name: "prod-eu".into(),
+                context: "prod-eu".into(),
+                tags,
+                ..Default::default()
+            },
+            namespace: Some("shop".into()),
+            connection_id: 1,
+            pod: Some(crate::app::KubePodTabState {
+                pod_ref: filar_core::PodRef::by_selector("prod-eu", "shop", "app=web", None),
+                pod: Some("web-7f9c".into()),
+                container: Some("main".into()),
+                limits: None,
+            }),
+        });
+        app.pending_confirm = Some(pending("cd /tmp && pwd", false));
+        app.mode = AppMode::Confirming;
+        app
+    }
+
+    #[test]
+    fn pod_confirmation_shows_the_target_above_the_command() {
+        let mut app = pod_app(vec![]);
+        let screen = render_confirm(&mut app, 100, 30);
+        assert!(screen.contains("Confirm command in pod"), "{screen}");
+        // The separator follows the active glyph set (ASCII on Windows conhost).
+        let dot = app.theme.glyphs().middle_dot;
+        assert!(
+            screen.contains(&format!(
+                "context prod-eu {dot} namespace shop {dot} pod web-7f9c {dot} container main"
+            )),
+            "{screen}"
+        );
+        let target_row = screen.lines().position(|l| l.contains("pod web-7f9c")).unwrap();
+        let command_row = screen.lines().position(|l| l.contains("$ cd /tmp && pwd")).unwrap();
+        assert!(target_row < command_row, "{screen}");
+        assert_eq!(confirm_border_color(&mut app), Some(app.theme.warning));
+    }
+
+    #[test]
+    fn a_long_pod_target_wraps_instead_of_losing_the_container() {
+        let mut app = pod_app(vec![]);
+        app.kube.as_mut().unwrap().target.context =
+            "arn:aws:eks:eu-central-1:123456789012:cluster/prod-eu".into();
+        let screen = render_confirm(&mut app, 100, 30);
+        assert!(screen.contains("container main"), "{screen}");
+        assert!(screen.contains("$ cd /tmp && pwd"), "{screen}");
+    }
+
+    #[test]
+    fn the_longest_pod_target_keeps_its_pod_and_container() {
+        let mut app = pod_app(vec![]);
+        {
+            let kube = app.kube.as_mut().unwrap();
+            kube.target.context =
+                "arn:aws:eks:eu-central-1:123456789012:cluster/payments-production-eu-central".into();
+            kube.namespace = Some("n".repeat(63));
+            let pod = kube.pod.as_mut().unwrap();
+            // The longest pod name Kubernetes accepts: 253 characters.
+            pod.pod = Some(format!("{}-7f9c4d5b8-x2k9p", "p".repeat(236)));
+            pod.container = Some("c".repeat(63));
+        }
+        let line = crate::app::pod_tab::pod_confirm_target_line(
+            app.kube.as_ref().unwrap(),
+            app.theme.glyphs(),
+        )
+        .unwrap();
+        let rows = header_rows(&line, 68);
+        assert!(rows.len() <= HEADER_MAX_ROWS, "{rows:?}");
+        let shown = rows.join(" ");
+        assert!(shown.contains(&"c".repeat(63)), "container kept: {rows:?}");
+        assert!(!shown.contains('…'), "nothing cut: {rows:?}");
+    }
+
+    #[test]
+    fn on_a_short_terminal_the_command_outranks_a_long_pod_header() {
+        let mut app = pod_app(vec![]);
+        app.kube.as_mut().unwrap().target.context =
+            "arn:aws:eks:eu-central-1:123456789012:cluster/payments-production-eu-central".into();
+        let screen = render_confirm(&mut app, 80, 12);
+        assert!(screen.contains("$ cd /tmp && pwd"), "{screen}");
+        assert!(screen.contains("Approve"), "{screen}");
+    }
+
+    #[test]
+    fn a_wrapped_fleet_header_with_its_list_still_shows_the_command() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let mut confirm = fleet_pending(4, true);
+        confirm.radius_context =
+            Some("arn:aws:eks:eu-central-1:123456789012:cluster/prod-eu / shop".into());
+        app.pending_confirm = Some(confirm);
+        app.mode = AppMode::Confirming;
+        let screen = render_confirm(&mut app, 100, 30);
+        assert!(screen.contains("$ uname -r"), "{screen}");
+        assert!(screen.contains("web-04"), "{screen}");
+    }
+
+    #[test]
+    fn a_k8s_named_shell_command_in_a_pod_tab_keeps_the_pod_dialog() {
+        let mut app = pod_app(vec![]);
+        app.pending_confirm = Some(pending("k8s_cleanup.sh --all", false));
+        let screen = render_confirm(&mut app, 100, 30);
+        assert!(screen.contains("Confirm command in pod"), "{screen}");
+        assert!(screen.contains("$ k8s_cleanup.sh --all"), "{screen}");
+        assert!(!screen.contains("Confirm Kubernetes"), "{screen}");
+    }
+
+    #[test]
+    fn prod_pod_or_a_tag_policy_colours_the_dialog_like_a_destructive_command() {
+        let mut prod = pod_app(vec!["prod".into()]);
+        assert_eq!(confirm_border_color(&mut prod), Some(prod.theme.danger));
+
+        let mut policed = pod_app(vec!["pci".into()]);
+        policed.tag_policies = vec![filar_core::TagPolicy {
+            tag: "pci".into(),
+            confirm_mode: CommandConfirmMode::Always,
+        }];
+        assert_eq!(confirm_border_color(&mut policed), Some(policed.theme.danger));
     }
 
     #[test]

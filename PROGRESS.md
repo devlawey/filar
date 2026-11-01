@@ -11434,3 +11434,50 @@ GitHub выводит образ macOS 14 2 ноября 2026 (брауноут�
 `background::reset_log_dir`.
 
 **Next:** #565 — вкладка пода (вызвать `reset_log_dir` по `PodChanged`).
+
+## Issue #565: вкладка пода в TUI (веха 3.0.1)
+
+**Сделано.** Вкладка пода — обычная вкладка, у которой `KubeTabState.pod =
+Some(KubePodTabState { pod_ref, pod, container, limits })`, а исполнитель
+вкладки (`TuiExecutor`) после подключения — `KubeExecutor`. Логика вынесена в
+`crates/tui/src/app/pod_tab.rs` (дочерний модуль `app`, `impl App`).
+
+- **Вход.** Во вкладке кластера с namespace — `Ctrl+E` или строка
+  `HostSelectRow::EnterPod` в Ctrl+O (selection index `ENTER_POD_SELECTION =
+  usize::MAX`, вне диапазона хостов). Выбор (`KubePodSelect`): запущенные поды
+  namespace через `ClusterApi::list_pods` вкладки кластера, фильтр по имени;
+  строка с `=` — селектор (`PodSelector::Labels`); при нескольких контейнерах —
+  второй шаг. Под открывается в новой вкладке, вкладка кластера не меняется.
+  `--target cluster/ns/<pod|selector>` → `KubeSessionSnapshot.pod`.
+- **Подключение** (runner): `KubeExecutor::connect` в фоне →
+  `swap_executor(sid, exec)`, `pod()/container()/pod_limits()` сразу после
+  connect (первый `Connected` до подписки не доходит), `subscribe()` →
+  `PodRunnerEvent::Shell`: `PodChanged` → строка в ленте, `reset_log_dir` (#599),
+  сброс cwd; `Connected` (реконнект) → обновление лимитов. Живые шеллы —
+  `pod_shells: HashMap<SessionId, PodShell>`; при закрытии вкладки, возврате на
+  кластер или переходе на SSH/local шелл закрывается (кластеру — локальная
+  заглушка, чтобы не держать exec-поток).
+- **До подключения** ввод отклоняется (`handle_pod_connecting_key`) и в runner
+  проверяется `pod_agent_target()`: команды не уйдут в локальную заглушку под
+  именем пода.
+- **Отказ подключения** (RBAC/политика/нет шелла) — ошибка в ленте, вкладка
+  возвращается на кластер и namespace (`pod = None`, переподключение API).
+- **Агент:** `spawn_agent(.., pod_target)` → `AgentBuilder::kube_pod_mode`.
+  `!команда` в поде идёт через исполнитель вкладки; интерактивные — отказ.
+- **UI:** статус-бар `⎈ c › ns › pod › container [tags]  non-root · ro-fs · mem
+  512Mi` (`pod_limits_summary`), F1 — раздел Pod (`pod_limits_details`), confirm
+  — строка цели заголовком (тем же местом, что радиус флота), красная рамка для
+  `prod` или совпавшей tag-политики, заголовок «Confirm command in pod».
+  Ctrl+T/Ctrl+G — отдельные отказы для пода; текст отказа вкладки кластера
+  теперь «войдите в под — Ctrl+E».
+- **Сессии:** `KubeSessionSnapshot.pod: Option<KubePodSnapshot { pod:
+  PodSelector, container }>` (`#[serde(default)]`); восстановление — заново
+  вход по селектору/имени.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. `filar_core`:
+новые `KubePodSnapshot` и поле `KubeSessionSnapshot.pod` (литералы структуры).
+
+**DoD.** Прогон в tmux против `docker/k8s` в окружении агента невозможен
+(реестры образов закрыты); пункты — в `docs/SMOKE.md`.
+
+**Next:** #577 — Ctrl+T в под (`KubeInteractive`), снять отказ терминала.

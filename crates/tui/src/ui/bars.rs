@@ -332,7 +332,9 @@ fn operations_counter(c: crate::ops::OpCounts, glyphs: &Glyphs) -> Option<String
 /// 2. the model slug;
 /// 3. the token counter;
 /// 4. the operations counter;
-/// 5. the SSH target's tags — last to go, since a hidden `prod` tag is the
+/// 5. a pod tab's container limits (`non-root · ro-fs · mem 512Mi`, #565) —
+///    also in F1, so they may go;
+/// 6. the SSH target's tags — last to go, since a hidden `prod` tag is the
 ///    one omission that can mislead.
 ///
 /// Never evicted: the target (in the fleet: the group and how many hosts
@@ -344,15 +346,17 @@ enum Evictable {
     Model,
     Tokens,
     Ops,
+    PodLimits,
     Tags,
 }
 
 /// See [`Evictable`].
-const EVICTION_ORDER: [Evictable; 5] = [
+const EVICTION_ORDER: [Evictable; 6] = [
     Evictable::Context,
     Evictable::Model,
     Evictable::Tokens,
     Evictable::Ops,
+    Evictable::PodLimits,
     Evictable::Tags,
 ];
 
@@ -406,18 +410,37 @@ fn kube_component(value: &str, max_cells: usize, glyphs: &Glyphs) -> String {
 }
 
 /// Cluster identity in the status bar: `⎈ prod-eu › shop [prod]` (#575).
+///
+/// A pod tab adds the pod and container: `⎈ prod-eu › shop › web-7f9c… ›
+/// main [prod]` (#565). Long parts are shortened; ASCII terminals get
+/// `k8s: … > …`. The container's limits are a separate, evictable segment
+/// ([`pod_limits_segment`]).
 fn kube_segment(kube: &crate::app::KubeTabState, tags: Option<&str>, glyphs: &Glyphs) -> String {
     let name = kube_component(&kube.target.name, 24, glyphs);
     let namespace = kube_component(kube.namespace.as_deref().unwrap_or("?"), 24, glyphs);
-    let mut out = format!(
-        "{} {name} {} {namespace}",
-        glyphs.kube, glyphs.kube_namespace_sep
-    );
+    let sep = glyphs.kube_namespace_sep;
+    let mut out = format!("{} {name} {sep} {namespace}", glyphs.kube);
+    if let Some(pod) = &kube.pod {
+        out.push_str(&format!(
+            " {sep} {}",
+            kube_component(&pod.display_pod(), 20, glyphs)
+        ));
+        if let Some(container) = pod.container.as_deref().or(pod.pod_ref.container.as_deref()) {
+            out.push_str(&format!(" {sep} {}", kube_component(container, 16, glyphs)));
+        }
+    }
     if let Some(tags) = tags.filter(|tags| !tags.is_empty()) {
         out.push(' ');
         out.push_str(tags);
     }
     out
+}
+
+/// Known limits of a pod tab's container for the status bar, after the
+/// target: `non-root · ro-fs · mem 512Mi` (#565). Evicted before the tags.
+fn pod_limits_segment(kube: Option<&crate::app::KubeTabState>, glyphs: &Glyphs) -> Option<String> {
+    let limits = kube?.pod.as_ref()?.limits.as_ref()?;
+    crate::app::pod_tab::pod_limits_summary(limits, glyphs)
 }
 
 /// Render the status bar (top line).
@@ -567,8 +590,22 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // room that is left.
     let mut kept = std::collections::BTreeSet::new();
     let mut tags_segment = None;
+    let pod_limits = if fleet_target.is_none() {
+        pod_limits_segment(app.kube.as_ref(), glyphs)
+    } else {
+        None
+    };
     for segment in EVICTION_ORDER.iter().rev() {
         match segment {
+            Evictable::PodLimits => {
+                if let Some(limits) = &pod_limits {
+                    let need = width(limits) + 2;
+                    if need <= budget {
+                        budget -= need;
+                        kept.insert(Evictable::PodLimits);
+                    }
+                }
+            }
             // Tags of the configured SSH target (#413), between host and
             // path. All or nothing: a truncated list could hide a `prod` tag.
             Evictable::Tags => {
@@ -635,6 +672,10 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     ];
     if let Some((text, style)) = live {
         spans.push(Span::styled(text, style));
+    }
+    if let (Some(limits), true) = (pod_limits, kept.contains(&Evictable::PodLimits)) {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(limits, app.theme.dim()));
     }
     if let Some(mt) = mode_text {
         let mode_color = app.theme.mode_color(app.mode);
@@ -1253,9 +1294,30 @@ mod tests {
                 Evictable::Model,
                 Evictable::Tokens,
                 Evictable::Ops,
+                Evictable::PodLimits,
                 Evictable::Tags,
             ]
         );
+    }
+
+    /// At 80 columns a pod tab keeps its target and `confirm_mode`; the
+    /// limits give way first (#565 review).
+    #[test]
+    fn pod_limits_give_way_before_confirm_mode_on_a_narrow_bar() {
+        let mut app = App::new("test".into(), filar_core::CommandConfirmMode::Always);
+        app.kube = Some(pod_state(Some(filar_core::PodLimits {
+            memory_limit: Some("512Mi".into()),
+            run_as_non_root: Some(true),
+            read_only_root_filesystem: Some(true),
+            ..Default::default()
+        })));
+        let wide = render_status_row(&mut app, 160);
+        assert!(wide.contains("non-root"), "{wide}");
+        assert!(wide.trim_end().ends_with("Always"), "{wide}");
+        let narrow = render_status_row(&mut app, 80);
+        assert!(narrow.contains("web-7f9c4d5b8-x2k9p"), "{narrow}");
+        assert!(!narrow.contains("non-root"), "{narrow}");
+        assert!(narrow.trim_end().ends_with("Always"), "{narrow}");
     }
 
     #[test]
@@ -1410,7 +1472,65 @@ mod tests {
             },
             namespace: Some(namespace.into()),
             connection_id: 1,
+            pod: None,
         }
+    }
+
+    fn pod_state(limits: Option<filar_core::PodLimits>) -> crate::app::KubeTabState {
+        let mut kube = kube_state("prod-eu", "shop");
+        kube.pod = Some(crate::app::KubePodTabState {
+            pod_ref: filar_core::PodRef::by_selector("prod-eu", "shop", "app=web", None),
+            pod: Some("web-7f9c4d5b8-x2k9p".into()),
+            container: Some("main".into()),
+            limits,
+        });
+        kube
+    }
+
+    #[test]
+    fn pod_segment_shows_pod_container_tags_and_limits() {
+        let limits = filar_core::PodLimits {
+            memory_limit: Some("512Mi".into()),
+            run_as_non_root: Some(true),
+            read_only_root_filesystem: Some(true),
+            ..Default::default()
+        };
+        let kube = pod_state(Some(limits));
+        assert_eq!(
+            kube_segment(&kube, Some("[prod]"), &Glyphs::UNICODE),
+            "⎈ prod-eu › shop › web-7f9c4d5b8-x2k9p › main [prod]"
+        );
+        assert_eq!(
+            pod_limits_segment(Some(&kube), &Glyphs::UNICODE).as_deref(),
+            Some("non-root · ro-fs · mem 512Mi")
+        );
+        let ascii = kube_segment(&kube, Some("[prod]"), &Glyphs::ASCII);
+        assert!(ascii.is_ascii(), "{ascii}");
+        assert!(ascii.starts_with("k8s: prod-eu > shop > web-7f9c4d5b8-x2k9p > main [prod]"), "{ascii}");
+        let mut long = kube.clone();
+        long.pod.as_mut().unwrap().pod = Some("checkout-api-7f9c4d5b8-x2k9p".into());
+        assert!(
+            kube_segment(&long, None, &Glyphs::UNICODE).contains("› checkout-api-7f9c4d… ›"),
+            "long pod names are shortened"
+        );
+    }
+
+    #[test]
+    fn pod_segment_omits_unknown_limits() {
+        let kube = pod_state(Some(filar_core::PodLimits::default()));
+        assert_eq!(
+            kube_segment(&kube, None, &Glyphs::UNICODE),
+            "⎈ prod-eu › shop › web-7f9c4d5b8-x2k9p › main"
+        );
+        assert_eq!(pod_limits_segment(Some(&kube), &Glyphs::UNICODE), None);
+        let mut connecting = pod_state(None);
+        connecting.pod.as_mut().unwrap().pod = None;
+        connecting.pod.as_mut().unwrap().container = None;
+        assert_eq!(
+            kube_segment(&connecting, None, &Glyphs::UNICODE),
+            "⎈ prod-eu › shop › app=web",
+            "before connect: the selector"
+        );
     }
 
     #[test]
