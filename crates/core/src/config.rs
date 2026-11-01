@@ -955,6 +955,10 @@ pub struct KubeCluster {
     /// `namespace/pod/VARIABLE`. Revealed values are visibly marked in output.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reveal_env: Vec<String>,
+    /// Pod ports `pod_http_get` may reach besides those declared in the
+    /// container spec (#578), e.g. `[8080, 6060]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_ports: Vec<u16>,
 }
 
 /// Manual `Default` matching the serde defaults — a derived one would give
@@ -971,6 +975,7 @@ impl Default for KubeCluster {
             tags: Vec::new(),
             reveal_configmaps: Vec::new(),
             reveal_env: Vec::new(),
+            diagnostic_ports: Vec::new(),
         }
     }
 }
@@ -1073,6 +1078,12 @@ impl KubeCluster {
                     self.name
                 )));
             }
+        }
+        if self.diagnostic_ports.contains(&0) {
+            return Err(CoreError::Config(format!(
+                "kube_clusters: \"{}\": diagnostic_ports must be ports 1–65535",
+                self.name
+            )));
         }
         for entry in &self.reveal_env {
             let mut parts = entry.split('/');
@@ -1644,6 +1655,11 @@ reveal_env = ["shop/api/PUBLIC_MODE"]
         assert!(kube_err("reveal_configmaps = [\"Shop/feature-flags\"]\n").contains("reveal_configmaps"));
         let cfg = load_str(&kube_toml("reveal_configmaps = [\"shop/feature-flags\"]\n"));
         assert_eq!(cfg.kube_cluster("prod-eu").unwrap().reveal_configmaps.len(), 1);
+    }
+
+    #[test]
+    fn kube_cluster_diagnostic_ports_parse_and_reject_zero() {
+        assert!(kube_err("diagnostic_ports = [0]\n").contains("diagnostic_ports"));
     }
 
     #[test]

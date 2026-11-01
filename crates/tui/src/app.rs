@@ -5811,7 +5811,7 @@ impl App {
     fn expects_safety_rating(&self, tool: &filar_core::ToolInvocation) -> bool {
         self.risk_scorer_on
             && !self.in_fleet()
-            && !tool.name.starts_with("k8s_")
+            && !filar_agent::kube_tools::is_kube_tool_name(&tool.name)
             && tool.name != filar_agent::tools::TOOL_BACKGROUND_JOB_STATUS
             && tool.name != filar_agent::tools::TOOL_LIST_BACKGROUND_JOBS
     }

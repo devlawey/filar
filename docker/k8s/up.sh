@@ -91,6 +91,7 @@ export KUBECONFIG="$KUBECONFIG_PATH"
 "$KUBECTL" -n shop rollout status deployment/web --timeout=5m
 "$KUBECTL" -n shop rollout status deployment/distroless --timeout=5m
 "$KUBECTL" -n shop rollout status deployment/nowrite --timeout=5m
+"$KUBECTL" -n shop rollout status deployment/httpd --timeout=5m
 
 make_sa_kubeconfig() {
     account=$1

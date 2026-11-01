@@ -172,7 +172,12 @@ impl KubeAgent {
         let mut messages = vec![ChatMessage::system(prompt)];
         messages.extend_from_slice(history);
         messages.push(ChatMessage::user(user_prompt));
-        let tools = kube_tool_definitions(self.confirm_mode);
+        let mut tools = kube_tool_definitions(self.confirm_mode);
+        // A fleet fans calls out to its members; one pod's HTTP endpoint is
+        // a cluster-tab tool (#578).
+        if matches!(self.execution, KubeExecution::Fleet { .. }) {
+            tools.retain(|tool| tool.name != crate::pod_http::TOOL_POD_HTTP_GET);
+        }
         let mut missing_explanations = 0;
 
         for _ in 0..MAX_ITERATIONS {

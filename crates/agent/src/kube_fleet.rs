@@ -767,6 +767,7 @@ mod tests {
                 image: "example/web:1".into(),
                 resource_requests: BTreeMap::new(),
                 resource_limits: BTreeMap::new(),
+                ports: Vec::new(),
             }],
         }
     }
