@@ -905,6 +905,7 @@ mod tests {
                     run_as_user: Some(65534),
                     ..Default::default()
                 }),
+                debug_target: None,
             }),
         });
         let rows: Vec<String> = overlay_lines(&app, 80).iter().map(row_text).collect();

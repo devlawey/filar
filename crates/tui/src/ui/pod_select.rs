@@ -73,6 +73,20 @@ pub(crate) fn render_pod_select(f: &mut Frame, app: &App, area: Rect) {
                     ),
                 )
             }
+            PodSelectStage::Images {
+                pod,
+                container,
+                images,
+                index,
+            } => (
+                format!(" Debug-образ {} {pod} / {container} ", glyphs.middle_dot),
+                images
+                    .iter()
+                    .map(|image| ListItem::new(format!("  {image}")))
+                    .collect(),
+                Some(*index),
+                format!(" Enter выбрать {} Esc отмена ", glyphs.middle_dot),
+            ),
             PodSelectStage::Containers {
                 pod,
                 containers,

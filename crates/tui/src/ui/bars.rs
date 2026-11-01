@@ -1483,6 +1483,7 @@ mod tests {
             pod: Some("web-7f9c4d5b8-x2k9p".into()),
             container: Some("main".into()),
             limits,
+            debug_target: None,
         });
         kube
     }
