@@ -48,10 +48,39 @@ impl VictoriaLogsSource {
     }
 }
 
+/// The query's pipe stages: split on `|` outside quoted strings (`"…"`,
+/// `'…'`, `` `…` ``, with `\` escapes), so a `|` inside a phrase or a
+/// regex (`_msg:~"error|sort"`) is not a pipe.
+fn pipe_stages(query: &str) -> Vec<&str> {
+    let mut stages = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut start = 0;
+    for (i, c) in query.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, c) {
+            (Some(_), '\\') => escaped = true,
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'' | '`') => quote = Some(c),
+            (None, '|') => {
+                stages.push(&query[start..i]);
+                start = i + 1;
+            }
+            (None, _) => {}
+        }
+    }
+    stages.push(&query[start..]);
+    stages
+}
+
 /// Whether a LogsQL query already orders its results with a `sort` (or
 /// `order`) pipe.
 pub fn sorts_itself(query: &str) -> bool {
-    query.split('|').skip(1).any(|pipe| {
+    pipe_stages(query).into_iter().skip(1).any(|pipe| {
         let word = pipe.split_whitespace().next().unwrap_or("");
         word.eq_ignore_ascii_case("sort") || word.eq_ignore_ascii_case("order")
     })
@@ -178,6 +207,13 @@ mod tests {
         assert_eq!(server_query("error | sort by (level)"), "error | sort by (level)");
         assert_eq!(server_query("x | stats count() by (pod)"), "x | stats count() by (pod) | sort by (_time) desc");
         assert!(!sorts_itself("message:\"sort by\""), "a word in a filter is not a pipe");
+        assert!(!sorts_itself(r#"_msg:~"error| sort by (x)""#), "a | inside a regex is not a pipe");
+        assert!(!sorts_itself(r#"_msg:"a \" | order" x"#), "escaped quotes stay inside the string");
+        assert!(sorts_itself(r#"_msg:~"a|b" | sort by (_time)"#));
+        assert_eq!(
+            server_query(r#"_msg:~"error|sort""#),
+            r#"_msg:~"error|sort" | sort by (_time) desc"#
+        );
     }
 
     #[test]
