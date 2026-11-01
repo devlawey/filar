@@ -2974,11 +2974,14 @@ async fn run_app(
                 .find_session_idx(sid)
                 .is_some_and(|idx| app.sessions[idx].kube.is_some());
             if back_to_cluster {
-                if let (Some(entry), Ok(local)) = (
-                    executors.get(&sid),
-                    filar_transport::LocalExecutor::with_timeout(command_timeout).await,
-                ) {
-                    entry.executor.swap_executor(sid, Arc::new(local)).await;
+                if let Some(entry) = executors.get(&sid) {
+                    match filar_transport::LocalExecutor::with_timeout(command_timeout).await {
+                        Ok(local) => entry.executor.swap_executor(sid, Arc::new(local)).await,
+                        // A cluster tab never runs commands through its
+                        // executor (`!` is refused, the agent uses the API),
+                        // so a closed pod shell left behind is inert.
+                        Err(error) => warn!(error = %error, "no local placeholder for a cluster tab"),
+                    }
                 }
             }
             if let Some(shell) = pod_shells.remove(&sid) {
@@ -3095,11 +3098,15 @@ async fn run_app(
                         PodRunnerEvent::Shell { session_id, connection_id, event } => match event {
                             filar_transport::KubeExecEvent::PodChanged { old, new } => {
                                 // Another pod: its writable dirs are its own (#599).
-                                filar_agent::background::reset_log_dir(&session_id.0.to_string());
-                                app.kube_pod_changed(session_id, connection_id, &old, &new);
+                                if app.kube_pod_changed(session_id, connection_id, &old, &new) {
+                                    filar_agent::background::reset_log_dir(&session_id.0.to_string());
+                                }
                             }
                             filar_transport::KubeExecEvent::Connected { pod, container, limits } => {
-                                app.kube_pod_identity(session_id, connection_id, pod, container, limits);
+                                // A reconnect is a fresh shell, even in the same pod (#599).
+                                if app.kube_pod_identity(session_id, connection_id, pod, container, limits) {
+                                    filar_agent::background::reset_log_dir(&session_id.0.to_string());
+                                }
                             }
                         },
                     }

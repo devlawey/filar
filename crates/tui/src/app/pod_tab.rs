@@ -569,9 +569,16 @@ impl App {
     }
 
     /// The pod behind the tab was replaced and the shell moved (#563).
-    pub fn kube_pod_changed(&mut self, sid: SessionId, connection_id: u64, old: &str, new: &str) {
+    /// Returns `false` for an event of a shell the tab no longer uses.
+    pub fn kube_pod_changed(
+        &mut self,
+        sid: SessionId,
+        connection_id: u64,
+        old: &str,
+        new: &str,
+    ) -> bool {
         let Some(idx) = self.current_pod_tab(sid, connection_id) else {
-            return;
+            return false;
         };
         let session = &mut self.sessions[idx];
         if let Some(state) = session.kube.as_mut().and_then(|kube| kube.pod.as_mut()) {
@@ -581,9 +588,13 @@ impl App {
         // The shell is a fresh one: its cwd is unknown again.
         session.cwd = None;
         self.push_kube_message(sid, ChatBlock::System(pod_changed_message(old, new)));
+        true
     }
 
-    /// The shell (re)connected: refresh pod, container and limits.
+    /// The shell reconnected (a fresh shell, in the same pod or the one a
+    /// selector picked): refresh pod, container and limits, and forget the
+    /// cwd — `cd` and variables do not survive a new shell. Returns `false`
+    /// for an event of a shell the tab no longer uses.
     pub fn kube_pod_identity(
         &mut self,
         sid: SessionId,
@@ -591,17 +602,19 @@ impl App {
         pod: String,
         container: String,
         limits: PodLimits,
-    ) {
+    ) -> bool {
         let Some(idx) = self.current_pod_tab(sid, connection_id) else {
-            return;
+            return false;
         };
         let session = &mut self.sessions[idx];
+        session.cwd = None;
         if let Some(state) = session.kube.as_mut().and_then(|kube| kube.pod.as_mut()) {
             state.pod = Some(pod.clone());
             state.container = Some(container);
             state.limits = Some(limits);
         }
         session.target_name = pod;
+        true
     }
 
     /// What the agent is told about the active pod tab's target, once its
@@ -913,7 +926,8 @@ mod tests {
     fn pod_change_is_announced_and_updates_the_tab() {
         let (mut app, sid, connection_id) = connected_pod_tab();
         app.cwd = Some("/tmp".into());
-        app.kube_pod_changed(sid, connection_id, "web-7f9c", "web-a1b2");
+        assert!(app.kube_pod_changed(sid, connection_id, "web-7f9c", "web-a1b2"));
+        assert!(!app.kube_pod_changed(sid, connection_id + 100, "web-a1b2", "web-x"), "stale shell");
         assert_eq!(app.target_name, "web-a1b2");
         assert!(app.cwd.is_none(), "fresh shell, cwd unknown");
         assert_eq!(app.pod_agent_target().unwrap().pod, "web-a1b2");
@@ -1015,5 +1029,15 @@ mod tests {
             request.pod_ref,
             PodRef::by_selector("prod-eu", "shop", "app=web", Some("main"))
         );
+    }
+
+    #[test]
+    fn reconnect_forgets_the_cwd_and_ignores_stale_shells() {
+        let (mut app, sid, connection_id) = connected_pod_tab();
+        app.cwd = Some("/srv".into());
+        assert!(!app.kube_pod_identity(sid, connection_id + 1, "web-x".into(), "main".into(), PodLimits::default()));
+        assert_eq!(app.cwd.as_deref(), Some("/srv"), "stale event changes nothing");
+        assert!(app.kube_pod_identity(sid, connection_id, "web-7f9c".into(), "main".into(), PodLimits::default()));
+        assert!(app.cwd.is_none(), "a fresh shell starts in its own cwd");
     }
 }
