@@ -44,7 +44,8 @@ jobs:
   # Decision for #289: one macOS arch for now — aarch64 (Apple Silicon).
   # Pin `macos-15` (arm64), not the floating `macos-latest` alias, so the
   # asset name `*-macos-aarch64` cannot drift if GitHub retargets the alias.
-  # `macos-14` was retired on 2026-11-02 (brownouts cancelled jobs before that).
+  # `macos-14` was scheduled for retirement on 2026-11-02 (its brownouts
+  # were already cancelling jobs).
   # Intel (x86_64) / universal binary left for follow-up (#297).
   build-macos:
     runs-on: macos-15

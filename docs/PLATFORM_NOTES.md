@@ -225,7 +225,7 @@ build is signed.
 
 > **Arch (#289):** macOS ships **one** architecture — `aarch64` (Apple Silicon).
 > The job pins `macos-15` and asserts `uname -m == arm64` before packaging.
-> (`macos-14` until its retirement on 2026-11-02.)
+> (`macos-14` until its scheduled retirement on 2026-11-02.)
 
 After downloading the macOS asset from GitHub Releases:
 
