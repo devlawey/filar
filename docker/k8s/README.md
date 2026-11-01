@@ -15,6 +15,9 @@ The cluster contains:
 - Deployment `nowrite`: a BusyBox shell with no writable directory at all
   (read-only root, no `/tmp` volume, `/dev/shm` mounted read-only) — for the
   background-job refusal test (#599);
+- Deployment `httpd`: BusyBox `httpd` on the declared port `http` (8080)
+  serving `/metrics` (Prometheus text) and `/healthz` — for `pod_http_get`
+  through port-forward (#578);
 - ServiceAccounts `reader` and `no-exec`, both bound only to `get`, `list`, and
   `watch` on `pods`, `pods/log`, and `events`. Neither has `pods/exec` or any
   write permission, and neither can read Secrets.

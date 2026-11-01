@@ -959,6 +959,10 @@ pub struct KubeCluster {
     /// `["busybox:1.37"]`. Empty = the action is unavailable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub debug_images: Vec<String>,
+    /// Pod ports `pod_http_get` may reach besides those declared in the
+    /// container spec (#578), e.g. `[8080, 6060]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_ports: Vec<u16>,
 }
 
 /// Manual `Default` matching the serde defaults — a derived one would give
@@ -976,6 +980,7 @@ impl Default for KubeCluster {
             reveal_configmaps: Vec::new(),
             reveal_env: Vec::new(),
             debug_images: Vec::new(),
+            diagnostic_ports: Vec::new(),
         }
     }
 }
@@ -1086,6 +1091,12 @@ impl KubeCluster {
         {
             return Err(CoreError::Config(format!(
                 "kube_clusters: \"{}\": debug_images entry \"{bad}\" must be an image reference without spaces",
+                self.name
+            )));
+        }
+        if self.diagnostic_ports.contains(&0) {
+            return Err(CoreError::Config(format!(
+                "kube_clusters: \"{}\": diagnostic_ports must be ports 1–65535",
                 self.name
             )));
         }
@@ -1665,6 +1676,11 @@ reveal_env = ["shop/api/PUBLIC_MODE"]
     fn kube_cluster_debug_images_reject_blank_entries() {
         assert!(kube_err("debug_images = [\"\"]\n").contains("debug_images"));
         assert!(kube_err("debug_images = [\"busy box\"]\n").contains("debug_images"));
+    }
+
+    #[test]
+    fn kube_cluster_diagnostic_ports_parse_and_reject_zero() {
+        assert!(kube_err("diagnostic_ports = [0]\n").contains("diagnostic_ports"));
     }
 
     #[test]

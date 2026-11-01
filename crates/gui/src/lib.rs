@@ -1481,6 +1481,7 @@ struct KubeSlot {
     reveal_configmaps: Vec<String>,
     reveal_env: Vec<String>,
     debug_images: Vec<String>,
+    diagnostic_ports: Vec<u16>,
     check_status: String,
     check_in_flight: bool,
 }
@@ -1502,6 +1503,7 @@ impl KubeSlot {
             reveal_configmaps: Vec::new(),
             reveal_env: Vec::new(),
             debug_images: Vec::new(),
+            diagnostic_ports: Vec::new(),
             check_status: String::new(),
             check_in_flight: false,
         }
@@ -1527,6 +1529,7 @@ impl KubeSlot {
             reveal_configmaps: cluster.reveal_configmaps.clone(),
             reveal_env: cluster.reveal_env.clone(),
             debug_images: cluster.debug_images.clone(),
+            diagnostic_ports: cluster.diagnostic_ports.clone(),
             check_status: String::new(),
             check_in_flight: false,
         }
@@ -1562,6 +1565,7 @@ impl KubeSlot {
             reveal_configmaps: self.reveal_configmaps.clone(),
             reveal_env: self.reveal_env.clone(),
             debug_images: self.debug_images.clone(),
+            diagnostic_ports: self.diagnostic_ports.clone(),
         };
         cluster.validate().map_err(|e| e.to_string())?;
         Ok(cluster)

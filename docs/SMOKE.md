@@ -95,6 +95,13 @@
 - [ ] Закрыть вкладку → в исходной вкладке след остался; `kubectl get pod distroless-… -o jsonpath='{.spec.ephemeralContainers[*].name}'` показывает контейнер
 - [ ] kubeconfig `reader` → `Ctrl+B` → `y` → понятный отказ RBAC про `pods/ephemeralcontainers`
 
+## Kubernetes: HTTP-диагностика пода (3.0.1)
+
+- [ ] Вкладка кластера `shop` → «покажи метрики пода httpd» → подтверждение `pod_http_get GET httpd-…:8080/metrics -n shop` с контекстом; ответ `HTTP 200`, видны запрошенные метрики, а не весь `/metrics`
+- [ ] Порт, не объявленный в поде и не перечисленный в `diagnostic_ports` → понятный отказ; добавить порт в `diagnostic_ports` → запрос проходит
+- [ ] Просьба «сделай POST на /admin» или «сними бинарный профиль pprof» → агент отвечает отказом инструмента, запрос не отправляется
+- [ ] kubeconfig `reader` (нет `pods/portforward`) → понятная ошибка RBAC
+
 ## Kubernetes: вкладка пода (3.0.1)
 
 Тот же кластер `docker/k8s`, LLM-профиль, режим `always`. Удаление пода

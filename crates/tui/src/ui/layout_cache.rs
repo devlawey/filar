@@ -197,7 +197,7 @@ impl ChatLayoutCache {
                     }
                     let marker = if tool
                         .as_ref()
-                        .is_some_and(|tool| tool.name.starts_with("k8s_"))
+                        .is_some_and(|tool| filar_agent::kube_tools::is_kube_tool_name(&tool.name))
                     {
                         format!("{} ", glyphs.kube)
                     } else {

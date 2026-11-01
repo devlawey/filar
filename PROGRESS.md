@@ -11508,6 +11508,40 @@ exec-протокола (`tty_size` не даёт нулей), Ctrl+C уходи
 менялись; новые публичные `KubeInteractive` и `KubeExecutor::open_terminal`.
 
 **Next:** #578 — `pod_http_get` через port-forward.
+
+## Issue #578: HTTP-диагностика пода через port-forward (веха 3.0.1)
+
+**Сделано.** Инструмент `pod_http_get` агента вкладки кластера (`crates/agent/src/pod_http.rs`
++ `KubeToolCall::PodHttpGet` в `kube_tools.rs`): под, порт (номер или имя
+`ports[].name`), путь, необязательные `metrics`.
+- Валидация (`validate_path`): только относительный путь с `/`, без схемы, хоста,
+  пробелов и управляющих символов; pprof — индекс или `?debug=1`, `seconds ≤ 30`.
+  Любой `method` кроме GET — отказ.
+- Порт (`resolve_port`): объявлен в спецификации контейнера (по номеру или имени)
+  или в новом `KubeCluster::diagnostic_ports` (core, `#[serde(default)]`, 0 — ошибка
+  конфига; протянут через черновик кластера в GUI).
+- Транспорт: `ClusterApi::pod_http_get(&PodHttpRequest)` с реализацией по умолчанию
+  `Unavailable`; `KubeClusterApi` — `Api::<Pod>::portforward` на streaming-клиенте,
+  один HTTP/1.1-запрос `Connection: close` (`cluster/http.rs`: Content-Length,
+  chunked, до EOF), туннель закрывается сразу, локальный порт не открывается;
+  ответ ≤ 1 МБ (`truncated`), общий таймаут 20 с. `ContainerInfo.ports` (новое поле).
+- Вывод: `redact_logs` (известные секреты) + маскирование меток `password`/`token`/…;
+  для Prometheus — только запрошенные метрики (по имени и префиксу `name_`) или
+  топ-40 сэмплов по значению; общий лимит символов как у других API-инструментов.
+- Гейт — как у остальных API-инструментов (`kube_confirmation_decision`). Во флоте
+  инструмент не предлагается и `bind_fleet_call` его отклоняет.
+- TUI: признак Kubernetes-инструмента теперь `kube_tools::is_kube_tool_name`
+  (`k8s_*` и `pod_http_get`) — маркер в ленте, confirm, оценка безопасности.
+
+**Фикстура** `docker/k8s/manifests/36-httpd.yaml` (BusyBox httpd, порт `http`
+8080, `/metrics`, `/healthz`), live-тест `crates/agent/tests/kube_http.rs`.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. `ClusterApi` — новый
+метод с реализацией по умолчанию; `ContainerInfo.ports` и
+`KubeCluster.diagnostic_ports` — новые поля (литералы структур).
+
+**Next:** #576 — debug-контейнер (исключение инварианта 1 согласовано).
+
 ## Issue #576: эфемерный debug-контейнер (веха 3.0.1)
 
 **Согласовано.** Евгений (мейнтейнер) подтвердил исключение из инварианта 1 для

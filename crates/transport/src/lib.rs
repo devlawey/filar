@@ -37,10 +37,13 @@ use tokio::sync::mpsc;
 // Re-export key types.
 #[cfg(feature = "kube")]
 pub use cluster::{
-    debug_container_name, ClusterApi, ConfigMapInfo, DebugContainerSpec, DEBUG_CONTAINER_PREFIX, ContainerInfo, ContainerMetrics, EndpointInfo, EventInfo,
-    IngressInfo, KubeClusterApi, KubeExecConfig, KubeExecEvent, KubeExecutor, KubeInteractive, NamespaceInfo, NodeCondition, NodeInfo, PodInfo, PodLogs,
-    ResourceMetrics, RolloutRevision, ServiceInfo, ServicePortInfo, TerminationInfo, WorkloadInfo,
-    WorkloadKind, DEFAULT_CLUSTER_LIST_LIMIT, DEFAULT_POD_SHELL, SHELL_RECREATED_MESSAGE,
+    debug_container_name, ClusterApi, ConfigMapInfo, ContainerInfo, ContainerMetrics,
+    ContainerPortInfo, DebugContainerSpec, EndpointInfo, EventInfo, IngressInfo, KubeClusterApi,
+    KubeExecConfig, KubeExecEvent, KubeExecutor, KubeInteractive, NamespaceInfo, NodeCondition,
+    NodeInfo, PodHttpRequest, PodHttpResponse, PodInfo, PodLogs, ResourceMetrics,
+    RolloutRevision, ServiceInfo, ServicePortInfo, TerminationInfo, WorkloadInfo, WorkloadKind,
+    DEBUG_CONTAINER_PREFIX, DEFAULT_CLUSTER_LIST_LIMIT, DEFAULT_POD_SHELL,
+    SHELL_RECREATED_MESSAGE,
 };
 pub use copy::{
     copy, CopyEvent, CopyObserver, CopyReport, CopySource, OverwriteDecision, PART_SUFFIX,

@@ -13,6 +13,7 @@ mod client;
 mod convert;
 mod debug;
 mod exec;
+mod http;
 
 pub use client::KubeClusterApi;
 pub use debug::{
@@ -37,6 +38,48 @@ pub struct ContainerInfo {
     pub resource_requests: BTreeMap<String, String>,
     /// Declared resource limits in Kubernetes quantity notation.
     pub resource_limits: BTreeMap<String, String>,
+    /// Declared container ports (`containerPort` and optional `name`).
+    pub ports: Vec<ContainerPortInfo>,
+}
+
+/// A port declared in a container spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerPortInfo {
+    /// Port name, when declared.
+    pub name: Option<String>,
+    /// `containerPort`.
+    pub port: u16,
+}
+
+/// One HTTP `GET` to a pod port through the API server's port-forward
+/// (#578): no local port is opened and nothing is created in the cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodHttpRequest {
+    /// Pod namespace.
+    pub namespace: String,
+    /// Pod name.
+    pub pod: String,
+    /// Port number inside the pod.
+    pub port: u16,
+    /// Path with optional query, starting with `/`.
+    pub path: String,
+    /// Body bytes kept; the rest is dropped and `truncated` is set.
+    pub max_bytes: usize,
+    /// Deadline for the whole exchange.
+    pub timeout: std::time::Duration,
+}
+
+/// Answer of a [`PodHttpRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodHttpResponse {
+    /// HTTP status code.
+    pub status: u16,
+    /// `Content-Type`, when sent.
+    pub content_type: Option<String>,
+    /// Body, at most `max_bytes`.
+    pub body: Vec<u8>,
+    /// The body was longer than `max_bytes`.
+    pub truncated: bool,
 }
 
 /// The most recent terminated state reported for a container.
@@ -375,6 +418,16 @@ pub trait ClusterApi: Send + Sync {
 
     /// Read pod metrics, or `Unsupported` when the metrics API is absent.
     async fn top_pods(&self, namespace: Option<&str>) -> Result<Vec<ResourceMetrics>>;
+
+    /// One HTTP `GET` to a pod port through port-forward (#578). The tunnel
+    /// lives inside the process and closes after the answer. The default is
+    /// `Unsupported`, so other implementations need nothing.
+    async fn pod_http_get(&self, request: &PodHttpRequest) -> Result<PodHttpResponse> {
+        let _ = request;
+        Err(filar_core::CoreError::Unavailable(
+            "HTTP diagnostics through port-forward are not supported by this cluster API".into(),
+        ))
+    }
 
     /// Read node metrics, or `Unsupported` when the metrics API is absent.
     async fn top_nodes(&self) -> Result<Vec<ResourceMetrics>>;

@@ -65,7 +65,8 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     // Only a cluster tab runs `k8s_*` API tools; a pod tab's commands are
     // shell commands, whatever they are called (#565 review).
     let in_cluster = app.kube.as_ref().is_some_and(|kube| kube.pod.is_none());
-    let kubernetes = (in_cluster || kube_fleet) && command.starts_with("k8s_");
+    let kubernetes = (in_cluster || kube_fleet)
+        && filar_agent::kube_tools::is_kube_tool_name(command.split_whitespace().next().unwrap_or(""));
     let kube_target = app.kube.as_ref().map(|kube| {
         (
             kube.target.name.clone(),
