@@ -57,7 +57,7 @@ pub mod tools;
 
 // Re-export key types for convenience.
 pub use agent::{Agent, AgentBuilder};
-pub use arbiter::{ArbiterContext, ArbiterVerdict, ARBITER_TIMEOUT_SECS};
+pub use arbiter::{ArbiterContext, ArbiterVerdict, KubePodTarget, ARBITER_TIMEOUT_SECS};
 pub use compaction::{summarise_history, SummaryOutcome, COMPACTION_SYSTEM_PROMPT};
 pub use events::{AgentEvent, EventSink};
 pub use kube_agent::{KubeAgent, KubeFleetObserver};

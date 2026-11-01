@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use filar_core::KubeCluster;
+use filar_core::{KubeCluster, PodLimits};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -165,6 +165,8 @@ pub struct KubernetesArbiterTarget {
     pub name: String,
     pub namespace: Option<String>,
     pub tags: Vec<String>,
+    /// The pod shell, when the session runs inside a container (#564).
+    pub pod: Option<KubePodTarget>,
 }
 
 impl KubernetesArbiterTarget {
@@ -176,8 +178,112 @@ impl KubernetesArbiterTarget {
                 .map(str::to_owned)
                 .or_else(|| target.default_namespace.clone()),
             tags: target.tags.clone(),
+            pod: None,
         }
     }
+
+    /// The target of a pod shell session (#564).
+    pub fn pod(target: &KubePodTarget) -> Self {
+        Self {
+            name: target.cluster.clone(),
+            namespace: Some(target.namespace.clone()),
+            tags: target.tags.clone(),
+            pod: Some(target.clone()),
+        }
+    }
+}
+
+/// A shell inside a pod's container (#563, #564): what the agent prompt, the
+/// arbiter and the safety rating are told about the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubePodTarget {
+    /// Name of the entry in `[[kube_clusters]]`.
+    pub cluster: String,
+    /// kubeconfig context of that cluster.
+    pub context: String,
+    /// Namespace of the pod.
+    pub namespace: String,
+    /// Pod name.
+    pub pod: String,
+    /// Container the shell runs in.
+    pub container: String,
+    /// Tags of the cluster.
+    pub tags: Vec<String>,
+    /// Limits and security settings of the container, from the pod spec.
+    pub limits: PodLimits,
+}
+
+impl KubePodTarget {
+    /// Collect the target from the cluster entry and what the executor
+    /// reports (`KubeExecutor::pod`, `container`, `pod_limits`).
+    pub fn new(
+        cluster: &KubeCluster,
+        namespace: &str,
+        pod: &str,
+        container: &str,
+        limits: PodLimits,
+    ) -> Self {
+        Self {
+            cluster: cluster.name.clone(),
+            context: cluster.context.clone(),
+            namespace: namespace.into(),
+            pod: pod.into(),
+            container: container.into(),
+            tags: cluster.tags.clone(),
+            limits,
+        }
+    }
+
+    /// `Kubernetes pod <ns>/<pod> (container <c>, cluster <name>, tags: …)`,
+    /// the same line as `KubeCluster::describe_pod`, followed by the known
+    /// limits in short form, e.g. `; limits: non-root, read-only fs, memory limit 512Mi`.
+    pub fn describe(&self) -> String {
+        let tags = if self.tags.is_empty() {
+            "-".to_string()
+        } else {
+            self.tags.join(", ")
+        };
+        let mut line = format!(
+            "Kubernetes pod {}/{} (container {}, cluster {}, tags: {tags})",
+            self.namespace, self.pod, self.container, self.cluster
+        );
+        let limits = limits_summary(&self.limits);
+        if !limits.is_empty() {
+            line.push_str("; limits: ");
+            line.push_str(&limits.join(", "));
+        }
+        line
+    }
+}
+
+/// Whether the container runs as a non-root user, as far as the spec says.
+pub(crate) fn runs_as_non_root(limits: &PodLimits) -> Option<bool> {
+    match limits.run_as_user {
+        Some(0) => Some(false),
+        Some(_) => Some(true),
+        None => limits.run_as_non_root.filter(|non_root| *non_root),
+    }
+}
+
+/// Known limits in short form: `non-root` / `root`, `read-only fs`,
+/// `memory limit X`, `cpu limit Y`. Unknown fields are left out.
+pub(crate) fn limits_summary(limits: &PodLimits) -> Vec<String> {
+    let mut parts = Vec::new();
+    match runs_as_non_root(limits) {
+        Some(true) => parts.push("non-root".to_string()),
+        Some(false) => parts.push("root".to_string()),
+        None => {}
+    }
+    if limits.read_only_root_filesystem == Some(true) {
+        parts.push("read-only fs".into());
+    }
+    if let Some(memory) = &limits.memory_limit {
+        parts.push(format!("memory limit {memory}"));
+    }
+    if let Some(cpu) = &limits.cpu_limit {
+        parts.push(format!("cpu limit {cpu}"));
+    }
+    parts
 }
 
 /// Build chat messages for the arbiter LLM call.
@@ -202,6 +308,9 @@ pub fn build_audit_messages(
 
 /// Human-readable target description for the audit prompt.
 pub fn target_description(ctx: &ArbiterContext) -> String {
+    if let Some(pod) = ctx.kubernetes.as_ref().and_then(|target| target.pod.as_ref()) {
+        return pod.describe();
+    }
     if let Some(target) = &ctx.kubernetes {
         let namespace = target.namespace.as_deref().unwrap_or("all");
         let tags = if target.tags.is_empty() {
@@ -438,6 +547,56 @@ mod tests {
             target_description(&context),
             "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
         );
+    }
+
+    fn pod_target(limits: PodLimits) -> KubePodTarget {
+        let cluster = KubeCluster {
+            name: "prod-eu".into(),
+            context: "prod-eu-ctx".into(),
+            tags: vec!["prod".into()],
+            ..KubeCluster::default()
+        };
+        KubePodTarget::new(&cluster, "shop", "web-7f9c", "main", limits)
+    }
+
+    #[test]
+    fn pod_target_description_names_the_pod_and_its_limits() {
+        let target = pod_target(PodLimits {
+            memory_limit: Some("512Mi".into()),
+            run_as_user: Some(65534),
+            read_only_root_filesystem: Some(true),
+            ..PodLimits::default()
+        });
+        let context = ArbiterContext {
+            is_local: false,
+            ssh_info: None,
+            kubernetes: Some(KubernetesArbiterTarget::pod(&target)),
+        };
+        assert_eq!(
+            target_description(&context),
+            "Kubernetes pod shop/web-7f9c (container main, cluster prod-eu, tags: prod); \
+             limits: non-root, read-only fs, memory limit 512Mi"
+        );
+    }
+
+    #[test]
+    fn pod_target_description_omits_unknown_limits() {
+        assert_eq!(
+            pod_target(PodLimits::default()).describe(),
+            "Kubernetes pod shop/web-7f9c (container main, cluster prod-eu, tags: prod)"
+        );
+        let root = pod_target(PodLimits {
+            run_as_user: Some(0),
+            cpu_limit: Some("500m".into()),
+            ..PodLimits::default()
+        });
+        assert!(root.describe().ends_with("; limits: root, cpu limit 500m"), "{}", root.describe());
+        // `runAsNonRoot: false` alone does not say the user is root.
+        let unknown = pod_target(PodLimits {
+            run_as_non_root: Some(false),
+            ..PodLimits::default()
+        });
+        assert!(!unknown.describe().contains("limits"), "{}", unknown.describe());
     }
 
     #[test]

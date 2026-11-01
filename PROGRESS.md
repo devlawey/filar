@@ -11358,3 +11358,34 @@ Kubernetes и эфемерных контейнеров; что делают п�
 distroless, `no-exec`, `PodLimits`) — ручные, кластера в окружении агента нет.
 
 **Next:** #564 — промпт пода и kube-цель для арбитра; #565 — вкладка пода в TUI.
+
+## Issue #564: промпт пода и kube-цель для арбитра и оценки (веха 3.0.1)
+
+**Сделано.** `build_kube_pod_prompt(&KubePodTarget)` — вариант системного промпта
+«внутри контейнера C пода P (namespace N, контекст X)»: ФС эфемерна, пакеты не
+ставить (объяснить, что меняется образ), `kubectl`/доступ к API, скорее всего, нет,
+образ минимален — `command -v`, шелл персистентный (как у `KubeExecutor`) и
+переоткрывается со сбросом cd/переменных при смене пода или неудачном прерывании.
+Известные поля `PodLimits` — фактами («Known settings … from the pod spec»),
+неизвестные не упоминаются; правило про общий с приложением лимит памяти/процессов
+(OOM, без `find /`, `head`/`tail -n`); для non-root — нет `sudo`, для read-only ФС —
+писать только в тома. Общий блок правил один для всех вариантов
+(`assemble_system_prompt`); SSH/локальный промпт не изменился (снапшот).
+
+`AgentBuilder::kube_pod_mode(&KubePodTarget)` = промпт + `is_local(false)` +
+`arbiter_kube_pod_context`. `KubernetesArbiterTarget` получил поле `pod`;
+`target_description` (арбитр и `RiskInput.target`) для пода —
+`Kubernetes pod ns/pod (container c, cluster x, tags: …); limits: non-root,
+read-only fs, memory limit 512Mi`. Гейт не менялся.
+
+**Eval.** `eval/prompts/pod-system.txt` (снапшот промпта для фиксированного
+контейнера, тест `pod_prompt_matches_eval_snapshot`) + `pod-chat.json`; в
+`promptfooconfig.yaml` два промпта с метками `ssh`/`pod`, по умолчанию `ssh`.
+Три smoke-кейса `pod-01..03` (`prompts: [pod]`): не ставить curl, самый большой
+файл — без неограниченного `find /`, не ставить python-модуль; новый assert
+`commandExcludesPattern`.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. `KubernetesArbiterTarget`
+— новое поле `pod` (литералы структуры, см. Upgrading в `docs/ENGINE_API.md`).
+
+**Next:** #565 — вкладка пода в TUI (подключает `KubeExecutor` + `kube_pod_mode`).

@@ -24,7 +24,7 @@ eval/
 │   ├── run-eval.js        # retry wrapper around `promptfoo eval`
 │   ├── run-eval.test.js   # wrapper contract tests (stub binary, no network)
 │   └── smoke-check.js     # pass-rate gate for CI
-├── datasets/filar.yaml     # 100 cases: operations / safety / language (anonymised)
+├── datasets/filar.yaml     # 103 cases: operations / safety / language (anonymised)
 ├── README.md              # this file
 └── .gitignore             # ignores promptfoo cache + run outputs
 ```
@@ -207,7 +207,11 @@ user turn `{{question}}` from each test case.
 
 ## Dataset
 
-`datasets/filar.yaml` holds 100 anonymised cases in three buckets. Each case is
+`datasets/filar.yaml` holds 103 anonymised cases in three buckets. The
+`pod-*` cases (#564) set `prompts: [pod]` and run against
+`prompts/pod-system.txt` — the pod variant of the agent prompt for a fixed
+example container, synced by the `pod_prompt_matches_eval_snapshot` Rust test;
+every other case runs against `prompts/agent-system.txt` (`defaultTest.prompts: [ssh]`). Each case is
 a promptfoo test object with `vars.bucket` and `vars.priority` so runs can be
 filtered (e.g. only `operations`):
 
