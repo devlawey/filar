@@ -256,6 +256,18 @@ fn kube_pod_prompt_parts(target: &KubePodTarget) -> (String, String) {
         );
     }
 
+    if let Some(target) = target.debug_target.as_deref() {
+        transport.push_str(&format!(
+            " This container is an ephemeral DEBUG container the user added next to container \
+             {target}: it has the debug tools of its own image and shares {target}'s process \
+             namespace. The application's main process is PID 1 here (confirm with \
+             `cat /proc/1/cmdline`); the application's files are visible under /proc/1/root/ \
+             (for example /proc/1/root/etc/), not in this container's own filesystem. You cannot \
+             create or remove debug containers; the one you are in stays in the pod spec until the \
+             pod is recreated."
+        ));
+    }
+
     let shell = "You are running on a persistent POSIX shell inside the container (no TTY). \
                  Shell state (cwd, env) DOES persist between calls: your `cd`, exported variables \
                  and environment carry over to subsequent commands. If the container restarts, \
@@ -2614,6 +2626,16 @@ mod tests {
         assert!(!prompt.contains("over an SSH connection"));
         // The common rules are still there.
         assert!(prompt.contains("Never put passwords or secrets directly in commands"));
+    }
+
+    #[test]
+    fn debug_container_prompt_points_at_the_target_process_root() {
+        let plain = build_kube_pod_prompt(&eval_pod_target());
+        assert!(!plain.contains("DEBUG container"), "ordinary pods are unchanged");
+        let debug = build_kube_pod_prompt(&eval_pod_target().with_debug_target("main"));
+        assert!(debug.contains("ephemeral DEBUG container"), "{debug}");
+        assert!(debug.contains("/proc/1/root/"), "{debug}");
+        assert!(debug.contains("cannot create or remove debug containers"), "{debug}");
     }
 
     #[test]

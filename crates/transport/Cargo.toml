@@ -9,7 +9,7 @@ license.workspace = true
 # Enabled by default for TUI/desktop; disabled for bot/mobile (SSH-only).
 default = ["local", "kube"]
 local = ["dep:portable-pty"]
-kube = ["dep:kube", "dep:k8s-openapi", "dep:serde"]
+kube = ["dep:kube", "dep:k8s-openapi", "dep:serde", "dep:serde_json"]
 
 [dependencies]
 filar-core = { workspace = true }
@@ -28,6 +28,7 @@ dirs = { workspace = true }
 kube = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Integration tests in `tests/` do not inherit the regular dependencies, and

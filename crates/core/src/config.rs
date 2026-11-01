@@ -955,6 +955,10 @@ pub struct KubeCluster {
     /// `namespace/pod/VARIABLE`. Revealed values are visibly marked in output.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reveal_env: Vec<String>,
+    /// Images allowed for an ephemeral debug container (#576), e.g.
+    /// `["busybox:1.37"]`. Empty = the action is unavailable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub debug_images: Vec<String>,
 }
 
 /// Manual `Default` matching the serde defaults — a derived one would give
@@ -971,6 +975,7 @@ impl Default for KubeCluster {
             tags: Vec::new(),
             reveal_configmaps: Vec::new(),
             reveal_env: Vec::new(),
+            debug_images: Vec::new(),
         }
     }
 }
@@ -1073,6 +1078,16 @@ impl KubeCluster {
                     self.name
                 )));
             }
+        }
+        if let Some(bad) = self
+            .debug_images
+            .iter()
+            .find(|image| image.trim().is_empty() || image.chars().any(char::is_whitespace))
+        {
+            return Err(CoreError::Config(format!(
+                "kube_clusters: \"{}\": debug_images entry \"{bad}\" must be an image reference without spaces",
+                self.name
+            )));
         }
         for entry in &self.reveal_env {
             let mut parts = entry.split('/');
@@ -1644,6 +1659,12 @@ reveal_env = ["shop/api/PUBLIC_MODE"]
         assert!(kube_err("reveal_configmaps = [\"Shop/feature-flags\"]\n").contains("reveal_configmaps"));
         let cfg = load_str(&kube_toml("reveal_configmaps = [\"shop/feature-flags\"]\n"));
         assert_eq!(cfg.kube_cluster("prod-eu").unwrap().reveal_configmaps.len(), 1);
+    }
+
+    #[test]
+    fn kube_cluster_debug_images_reject_blank_entries() {
+        assert!(kube_err("debug_images = [\"\"]\n").contains("debug_images"));
+        assert!(kube_err("debug_images = [\"busy box\"]\n").contains("debug_images"));
     }
 
     #[test]

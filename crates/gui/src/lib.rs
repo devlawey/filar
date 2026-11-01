@@ -1480,6 +1480,7 @@ struct KubeSlot {
     tags: String,
     reveal_configmaps: Vec<String>,
     reveal_env: Vec<String>,
+    debug_images: Vec<String>,
     check_status: String,
     check_in_flight: bool,
 }
@@ -1500,6 +1501,7 @@ impl KubeSlot {
             tags: String::new(),
             reveal_configmaps: Vec::new(),
             reveal_env: Vec::new(),
+            debug_images: Vec::new(),
             check_status: String::new(),
             check_in_flight: false,
         }
@@ -1524,6 +1526,7 @@ impl KubeSlot {
             tags: cluster.tags.join(", "),
             reveal_configmaps: cluster.reveal_configmaps.clone(),
             reveal_env: cluster.reveal_env.clone(),
+            debug_images: cluster.debug_images.clone(),
             check_status: String::new(),
             check_in_flight: false,
         }
@@ -1558,6 +1561,7 @@ impl KubeSlot {
             tags: parse_tags(&self.tags),
             reveal_configmaps: self.reveal_configmaps.clone(),
             reveal_env: self.reveal_env.clone(),
+            debug_images: self.debug_images.clone(),
         };
         cluster.validate().map_err(|e| e.to_string())?;
         Ok(cluster)
