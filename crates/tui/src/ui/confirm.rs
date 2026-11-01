@@ -1094,6 +1094,7 @@ mod tests {
                 pod: Some("web-7f9c".into()),
                 container: Some("main".into()),
                 limits: None,
+                debug_target: None,
             }),
         });
         app.pending_confirm = Some(pending("cd /tmp && pwd", false));

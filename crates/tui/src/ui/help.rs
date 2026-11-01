@@ -307,6 +307,12 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
             available: |m| m == AppMode::Normal,
         },
         HelpEntry {
+            key: "^B",
+            desc: "Kubernetes: add an ephemeral debug container (image from debug_images) next to a pod's container — for distroless pods; it stays in the pod spec until the pod is recreated, so it asks first",
+            section: "Input",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
             key: "^S",
             desc: "Save current session to .md file",
             section: "Input",
@@ -905,6 +911,7 @@ mod tests {
                     run_as_user: Some(65534),
                     ..Default::default()
                 }),
+                debug_target: None,
             }),
         });
         let rows: Vec<String> = overlay_lines(&app, 80).iter().map(row_text).collect();

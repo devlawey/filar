@@ -83,6 +83,18 @@
 - [ ] `Ctrl+T`, `Ctrl+G`, `!cmd` → «во вкладке кластера нет шелла; войдите в под — Ctrl+E», терминал/панели не открываются
 - [ ] `Ctrl+Q` → повторный запуск → `F3` → сессия кластера: имя и namespace восстановлены, соединение установлено заново; в JSON нет kubeconfig и учётных данных
 
+## Kubernetes: debug-контейнер (3.0.1)
+
+В конфиге кластера `debug_images = ["busybox:1.37.0"]`. Под `distroless` из
+`docker/k8s` — без шелла.
+
+- [ ] Без `debug_images` → `Ctrl+B` отвечает «Debug-контейнер недоступен: … не задан debug_images»
+- [ ] Вкладка кластера `shop` → `Ctrl+B` → `distroless-…` → окно «В под shop/distroless-… будет добавлен эфемерный контейнер filar-debug-… (образ busybox:1.37.0, target main). Он останется … удалить его нельзя. Создать?», рамка красная (`prod`); `Enter` ничего не делает, `n` — «не создан»
+- [ ] Повторить → `y` → в ленте «След в кластере: … filar-debug-… (… время)»; открылась вкладка `… › distroless-… › filar-debug-… debug`
+- [ ] «Покажи процесс приложения и его файлы» → агент читает `/proc/1/cmdline` и `/proc/1/root/…`; `Ctrl+T` — терминал в debug-контейнере
+- [ ] Закрыть вкладку → в исходной вкладке след остался; `kubectl get pod distroless-… -o jsonpath='{.spec.ephemeralContainers[*].name}'` показывает контейнер
+- [ ] kubeconfig `reader` → `Ctrl+B` → `y` → понятный отказ RBAC про `pods/ephemeralcontainers`
+
 ## Kubernetes: HTTP-диагностика пода (3.0.1)
 
 - [ ] Вкладка кластера `shop` → «покажи метрики пода httpd» → подтверждение `pod_http_get GET httpd-…:8080/metrics -n shop` с контекстом; ответ `HTTP 200`, видны запрошенные метрики, а не весь `/metrics`

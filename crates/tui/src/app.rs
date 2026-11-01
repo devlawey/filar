@@ -411,7 +411,7 @@ impl HostSelectRow {
 }
 
 pub mod pod_tab;
-pub use pod_tab::{KubePodConnectRequest, KubePodListRequest, KubePodSelect, PodChoice};
+pub use pod_tab::{DebugProposal, KubePodConnectRequest, KubePodListRequest, KubePodSelect, PodChoice};
 
 /// Flat Ctrl+O selection index of [`HostSelectRow::EnterPod`]: outside the
 /// host range, so it can never be taken for a target (#565).
@@ -443,6 +443,9 @@ pub struct KubePodTabState {
     pub container: Option<String>,
     /// Limits and security settings of that container, from the pod spec.
     pub limits: Option<filar_core::PodLimits>,
+    /// `Some(target)` when the tab's container is an ephemeral debug
+    /// container attached to container `target` (#576).
+    pub debug_target: Option<String>,
 }
 
 impl KubePodTabState {
@@ -453,6 +456,7 @@ impl KubePodTabState {
             pod: None,
             container: None,
             limits: None,
+            debug_target: None,
         }
     }
 
@@ -577,6 +581,10 @@ pub struct App {
     pub pending_kube_pod_connects: Vec<pod_tab::KubePodConnectRequest>,
     /// Pod and container chooser opened from a cluster tab (#565).
     pub kube_pod_select: Option<pod_tab::KubePodSelect>,
+    /// A debug container waiting for the user's explicit yes (#576).
+    pub debug_proposal: Option<pod_tab::DebugProposal>,
+    /// Approved debug containers, created by the runner (#576).
+    pub pending_kube_debug_creates: Vec<pod_tab::DebugProposal>,
     /// Kubernetes fleet discoveries and restored connections awaiting the runner.
     pub pending_kube_fleets: Vec<KubeFleetRequest>,
     /// Namespace chooser for the active cluster tab, if any.
@@ -991,6 +999,8 @@ impl App {
             pending_kube_pod_lists: Vec::new(),
             pending_kube_pod_connects: Vec::new(),
             kube_pod_select: None,
+            debug_proposal: None,
+            pending_kube_debug_creates: Vec::new(),
             pending_kube_fleets: Vec::new(),
             kube_namespace_select: None,
             next_kube_connection_id: 1,
@@ -2957,6 +2967,10 @@ impl App {
                         container: pod.container,
                     };
                     self.start_pod_connection(target, namespace, pod_ref);
+                    // A restored debug tab keeps its debug prompt (#576).
+                    if let Some(state) = self.kube.as_mut().and_then(|kube| kube.pod.as_mut()) {
+                        state.debug_target = pod.debug_target;
+                    }
                 }
                 None => self.queue_kube_connection(target, snapshot.namespace),
             },
@@ -4171,6 +4185,12 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        // The debug-container confirmation is modal (#576).
+        if self.debug_proposal.is_some() {
+            self.handle_debug_proposal_key(key);
             return;
         }
 

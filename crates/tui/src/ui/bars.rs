@@ -428,6 +428,10 @@ fn kube_segment(kube: &crate::app::KubeTabState, tags: Option<&str>, glyphs: &Gl
         if let Some(container) = pod.container.as_deref().or(pod.pod_ref.container.as_deref()) {
             out.push_str(&format!(" {sep} {}", kube_component(container, 16, glyphs)));
         }
+        // A debug container (#576) is labelled as such.
+        if pod.debug_target.is_some() {
+            out.push_str(" debug");
+        }
     }
     if let Some(tags) = tags.filter(|tags| !tags.is_empty()) {
         out.push(' ');
@@ -1483,6 +1487,7 @@ mod tests {
             pod: Some("web-7f9c4d5b8-x2k9p".into()),
             container: Some("main".into()),
             limits,
+            debug_target: None,
         });
         kube
     }

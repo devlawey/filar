@@ -65,6 +65,17 @@ pub enum PodSelectStage {
         /// Highlighted container.
         index: usize,
     },
+    /// Debug image for `pod`/`container` (#576), from `debug_images`.
+    Images {
+        /// The chosen pod.
+        pod: String,
+        /// The target container.
+        container: String,
+        /// The cluster's `debug_images`.
+        images: Vec<String>,
+        /// Highlighted image.
+        index: usize,
+    },
 }
 
 /// The pod and container chooser of a cluster tab (#565).
@@ -90,6 +101,64 @@ pub struct KubePodSelect {
     pub index: usize,
     /// Pod list or container list.
     pub stage: PodSelectStage,
+    /// Chooser for a debug container (#576): a concrete pod, its target
+    /// container, then an image from `debug_images`.
+    pub debug: bool,
+}
+
+/// A debug container waiting for the user's explicit yes (#576), and,
+/// once approved, the runner's request to create it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugProposal {
+    /// The tab the action came from (its feed records the trace).
+    pub origin: SessionId,
+    /// The cluster.
+    pub cluster: filar_core::KubeCluster,
+    /// Pod namespace.
+    pub namespace: String,
+    /// Pod name.
+    pub pod: String,
+    /// Container whose processes the debug container shares.
+    pub target_container: String,
+    /// Image from `debug_images`.
+    pub image: String,
+    /// `filar-debug-<id>`.
+    pub name: String,
+}
+
+impl DebugProposal {
+    /// The confirmation text, without softening: what is added, where, and
+    /// that it cannot be removed.
+    pub fn confirmation_text(&self) -> String {
+        format!(
+            "В под {}/{} будет добавлен эфемерный контейнер {} (образ {}, target {}). \
+             Он останется в спецификации пода до его пересоздания; удалить его нельзя. Создать?",
+            self.namespace, self.pod, self.name, self.image, self.target_container
+        )
+    }
+
+    /// The trace line for the feed and the session export.
+    pub fn trace_text(&self, at: &str) -> String {
+        format!(
+            "След в кластере: в под {}/{} добавлен эфемерный контейнер {} (образ {}, target {}, {at}). \
+             Он останется в спецификации пода до его пересоздания.",
+            self.namespace, self.pod, self.name, self.image, self.target_container
+        )
+    }
+
+    /// Whether the cluster is tagged `prod` (the dialog is highlighted).
+    pub fn is_prod(&self) -> bool {
+        self.cluster.tags.iter().any(|t| t.eq_ignore_ascii_case("prod"))
+    }
+}
+
+/// Short id for `filar-debug-<id>`: the low hex digits of the clock.
+fn debug_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{:08x}", (nanos & 0xffff_ffff) as u32)
 }
 
 /// A row of the pod list.
@@ -255,6 +324,180 @@ impl App {
 
     /// Open the pod chooser of the active cluster tab (Ctrl+E, Ctrl+O row).
     pub fn open_pod_select(&mut self) {
+        self.open_pod_chooser(false);
+    }
+
+    /// Ctrl+B: a debug container (#576). In a pod tab it is proposed for the
+    /// tab's pod and container at once; in a cluster tab the chooser asks for
+    /// a pod and a target container first. Unavailable without
+    /// `debug_images` in the cluster's config.
+    pub fn open_debug_select(&mut self) {
+        let Some(kube) = self.kube.clone() else {
+            return;
+        };
+        if kube.target.debug_images.is_empty() {
+            self.push_message(ChatBlock::System(format!(
+                "Debug-контейнер недоступен: для кластера {} не задан debug_images в [[kube_clusters]]",
+                kube.target.name
+            )));
+            return;
+        }
+        if let Some(state) = kube.pod.as_ref() {
+            if state.debug_target.is_some() {
+                self.push_message(ChatBlock::System(
+                    "Это уже вкладка debug-контейнера".into(),
+                ));
+                return;
+            }
+            let (Some(pod), Some(container)) = (state.pod.clone(), state.container.clone()) else {
+                self.push_message(ChatBlock::System(format!(
+                    "Под {} ещё подключается — debug-контейнер можно добавить после подключения \
+                     или из вкладки кластера (Ctrl+B)",
+                    self.target_name
+                )));
+                return;
+            };
+            let namespace = kube.namespace.clone().unwrap_or(state.pod_ref.namespace.clone());
+            self.choose_debug_image(kube.target, namespace, pod, container);
+            return;
+        }
+        self.open_pod_chooser(true);
+    }
+
+    /// Image step, then the confirmation (#576).
+    fn choose_debug_image(
+        &mut self,
+        cluster: filar_core::KubeCluster,
+        namespace: String,
+        pod: String,
+        container: String,
+    ) {
+        if cluster.debug_images.len() == 1 {
+            let image = cluster.debug_images[0].clone();
+            self.propose_debug(cluster, namespace, pod, container, image);
+            return;
+        }
+        let session_id = self.active_session().id;
+        let select_id = self.next_kube_id();
+        let images = cluster.debug_images.clone();
+        self.kube_pod_select = Some(KubePodSelect {
+            session_id,
+            select_id,
+            cluster,
+            namespace,
+            loading: false,
+            error: None,
+            pods: Vec::new(),
+            filter: String::new(),
+            index: 0,
+            stage: PodSelectStage::Images {
+                pod,
+                container,
+                images,
+                index: 0,
+            },
+            debug: true,
+        });
+    }
+
+    /// Show the confirmation for a debug container.
+    fn propose_debug(
+        &mut self,
+        cluster: filar_core::KubeCluster,
+        namespace: String,
+        pod: String,
+        target_container: String,
+        image: String,
+    ) {
+        self.kube_pod_select = None;
+        self.debug_proposal = Some(DebugProposal {
+            origin: self.active_session().id,
+            cluster,
+            namespace,
+            pod,
+            target_container,
+            image,
+            name: filar_transport::debug_container_name(&debug_id()),
+        });
+    }
+
+    /// Keys of the debug confirmation: `y` creates, `n` / Esc cancels;
+    /// Enter alone does nothing, so a stray key never writes to a cluster.
+    pub(crate) fn handle_debug_proposal_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y' | 'Y' | 'н' | 'Н') => {
+                if let Some(proposal) = self.debug_proposal.take() {
+                    self.push_message(ChatBlock::System(format!(
+                        "Создаю debug-контейнер {} в поде {}/{}…",
+                        proposal.name, proposal.namespace, proposal.pod
+                    )));
+                    self.pending_kube_debug_creates.push(proposal);
+                }
+            }
+            KeyCode::Char('n' | 'N' | 'т' | 'Т') | KeyCode::Esc => {
+                self.debug_proposal = None;
+                self.push_message(ChatBlock::System(
+                    "Debug-контейнер не создан.".into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    /// Take the approved debug containers (runner).
+    pub fn take_pending_kube_debug_creates(&mut self) -> Vec<DebugProposal> {
+        std::mem::take(&mut self.pending_kube_debug_creates)
+    }
+
+    /// The debug container runs: record the trace in the origin tab and open
+    /// a pod tab in it.
+    pub fn debug_container_created(&mut self, proposal: DebugProposal, at: &str) {
+        let trace = proposal.trace_text(at);
+        self.push_kube_message(proposal.origin, ChatBlock::System(trace.clone()));
+        let pod_ref = PodRef::named(
+            &proposal.cluster.name,
+            &proposal.namespace,
+            &proposal.pod,
+            Some(&proposal.name),
+        );
+        self.open_pod_tab(proposal.cluster, proposal.namespace, pod_ref);
+        if let Some(state) = self.kube.as_mut().and_then(|kube| kube.pod.as_mut()) {
+            state.debug_target = Some(proposal.target_container);
+        }
+        self.push_message(ChatBlock::System(trace));
+    }
+
+    /// The debug container failed: the reason in the origin tab's feed.
+    /// `added_at` is set when it already got into the pod spec (did not
+    /// start: image, timeout) — then the trace is recorded too, since the
+    /// container stays in the spec all the same.
+    pub fn debug_container_failed(
+        &mut self,
+        proposal: &DebugProposal,
+        error: &str,
+        added_at: Option<&str>,
+    ) {
+        let Some(at) = added_at else {
+            self.push_kube_message(
+                proposal.origin,
+                ChatBlock::Error(format!(
+                    "Debug-контейнер {} в поде {}/{} не создан: {error}",
+                    proposal.name, proposal.namespace, proposal.pod
+                )),
+            );
+            return;
+        };
+        self.push_kube_message(proposal.origin, ChatBlock::System(proposal.trace_text(at)));
+        self.push_kube_message(
+            proposal.origin,
+            ChatBlock::Error(format!(
+                "Debug-контейнер {} добавлен в спецификацию пода {}/{}, но не запустился: {error}",
+                proposal.name, proposal.namespace, proposal.pod
+            )),
+        );
+    }
+
+    fn open_pod_chooser(&mut self, debug: bool) {
         let Some(kube) = self.kube.clone() else {
             return;
         };
@@ -283,6 +526,7 @@ impl App {
             filter: String::new(),
             index: 0,
             stage: PodSelectStage::Pods,
+            debug,
         });
         self.pending_kube_pod_lists.push(KubePodListRequest {
             session_id,
@@ -335,6 +579,17 @@ impl App {
             (PodSelectStage::Containers { .. }, KeyCode::Esc) => {
                 select.stage = PodSelectStage::Pods;
             }
+            (PodSelectStage::Images { .. }, KeyCode::Esc) => {
+                self.kube_pod_select = None;
+            }
+            (PodSelectStage::Images { index, .. }, KeyCode::Up) => {
+                *index = index.saturating_sub(1);
+            }
+            (PodSelectStage::Images { index, images, .. }, KeyCode::Down) => {
+                if *index + 1 < images.len() {
+                    *index += 1;
+                }
+            }
             (PodSelectStage::Pods, KeyCode::Esc) => {
                 if select.filter.is_empty() {
                     self.kube_pod_select = None;
@@ -377,6 +632,36 @@ impl App {
             return;
         };
         match &select.stage {
+            PodSelectStage::Images {
+                pod,
+                container,
+                images,
+                index,
+            } => {
+                if let Some(image) = images.get(*index).cloned() {
+                    self.propose_debug(
+                        select.cluster.clone(),
+                        select.namespace.clone(),
+                        pod.clone(),
+                        container.clone(),
+                        image,
+                    );
+                }
+            }
+            PodSelectStage::Containers {
+                pod,
+                containers,
+                index,
+            } if select.debug => {
+                if let Some(container) = containers.get(*index).cloned() {
+                    self.choose_debug_image(
+                        select.cluster.clone(),
+                        select.namespace.clone(),
+                        pod.clone(),
+                        container,
+                    );
+                }
+            }
             PodSelectStage::Containers {
                 pod,
                 containers,
@@ -395,6 +680,30 @@ impl App {
             PodSelectStage::Pods => {
                 let rows = select.rows();
                 match rows.get(select.index) {
+                    Some(PodSelectRow::Selector(_)) if select.debug => {
+                        self.push_message(ChatBlock::System(
+                            "Для debug-контейнера выберите конкретный под из списка".into(),
+                        ));
+                    }
+                    Some(PodSelectRow::Pod(i)) if select.debug => {
+                        let Some(choice) = select.pods.get(*i).cloned() else {
+                            return;
+                        };
+                        if choice.containers.len() == 1 {
+                            self.choose_debug_image(
+                                select.cluster.clone(),
+                                select.namespace.clone(),
+                                choice.name,
+                                choice.containers[0].clone(),
+                            );
+                        } else if let Some(open) = self.kube_pod_select.as_mut() {
+                            open.stage = PodSelectStage::Containers {
+                                pod: choice.name,
+                                containers: choice.containers,
+                                index: 0,
+                            };
+                        }
+                    }
                     Some(PodSelectRow::Selector(selector)) => {
                         self.kube_pod_select = None;
                         let pod_ref = PodRef {
@@ -617,13 +926,17 @@ impl App {
     pub fn pod_agent_target(&self) -> Option<filar_agent::KubePodTarget> {
         let kube = self.kube.as_ref()?;
         let state = kube.pod.as_ref()?;
-        Some(filar_agent::KubePodTarget::new(
+        let target = filar_agent::KubePodTarget::new(
             &kube.target,
             kube.namespace.as_deref().unwrap_or(&state.pod_ref.namespace),
             state.pod.as_deref()?,
             state.container.as_deref()?,
             state.limits.clone().unwrap_or_default(),
-        ))
+        );
+        Some(match state.debug_target.as_deref() {
+            Some(debug_target) => target.with_debug_target(debug_target),
+            None => target,
+        })
     }
 
     /// The pod tab is not connected yet: commands would run on the tab's
@@ -655,13 +968,15 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Normal mode only: in a confirmation or password prompt the chooser
         // would take over the keys meant for it (#565 review).
-        if self.mode != super::AppMode::Normal
-            || !(ctrl && matches!(key.code, KeyCode::Char('e' | 'у')))
-            || self.kube.is_none()
-        {
+        if self.mode != super::AppMode::Normal || !ctrl || self.kube.is_none() {
             return false;
         }
-        self.open_pod_select();
+        match key.code {
+            KeyCode::Char('e' | 'у') => self.open_pod_select(),
+            // Debug container (#576) — a user action only.
+            KeyCode::Char('b' | 'и') => self.open_debug_select(),
+            _ => return false,
+        }
         true
     }
 
@@ -674,6 +989,7 @@ impl App {
                 .container
                 .clone()
                 .or_else(|| state.container.clone()),
+            debug_target: state.debug_target.clone(),
         }
     }
 }
@@ -1034,6 +1350,7 @@ mod tests {
             pod: Some(filar_core::KubePodSnapshot {
                 pod: PodSelector::Labels("app=web".into()),
                 container: Some("main".into()),
+                debug_target: None,
             }),
         });
         assert!(app.in_pod_tab());
@@ -1073,5 +1390,154 @@ mod tests {
         app.mode = crate::app::AppMode::Confirming;
         assert!(!app.handle_pod_tab_key(&KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)));
         assert!(app.kube_pod_select.is_none());
+    }
+
+    // --- #576: debug containers --------------------------------------------
+
+    fn debug_cluster(images: &[&str]) -> filar_core::KubeCluster {
+        let mut c = cluster();
+        c.debug_images = images.iter().map(|i| i.to_string()).collect();
+        c
+    }
+
+    fn cluster_tab_with(images: &[&str]) -> App {
+        let mut app = app_in_cluster_tab();
+        app.kube.as_mut().unwrap().target = debug_cluster(images);
+        app
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn debug_needs_configured_images() {
+        let mut app = cluster_tab_with(&[]);
+        app.handle_key(ctrl('b'));
+        assert!(app.kube_pod_select.is_none());
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m.contains("debug_images")));
+    }
+
+    #[test]
+    fn debug_from_a_cluster_tab_asks_pod_then_confirms_with_the_trace_text() {
+        let mut app = cluster_tab_with(&["busybox:1.37"]);
+        app.handle_key(ctrl('b'));
+        let select = app.kube_pod_select.clone().expect("chooser");
+        assert!(select.debug);
+        app.take_pending_kube_pod_lists();
+        app.complete_pod_list(select.session_id, select.select_id, Ok(vec![choice("web-1", true, &["main"])]));
+        app.handle_pod_select_key(key(KeyCode::Enter));
+        let proposal = app.debug_proposal.clone().expect("confirmation shown");
+        assert_eq!(proposal.target_container, "main");
+        assert!(proposal.name.starts_with("filar-debug-"));
+        let text = proposal.confirmation_text();
+        assert!(text.starts_with("В под shop/web-1 будет добавлен эфемерный контейнер filar-debug-"), "{text}");
+        assert!(text.contains("(образ busybox:1.37, target main)"), "{text}");
+        assert!(text.contains("останется в спецификации пода до его пересоздания; удалить его нельзя. Создать?"), "{text}");
+        assert!(proposal.is_prod());
+        // Enter alone never creates.
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.debug_proposal.is_some());
+        assert!(app.take_pending_kube_debug_creates().is_empty());
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(app.debug_proposal.is_none());
+        assert!(app.take_pending_kube_debug_creates().is_empty(), "cancelled");
+    }
+
+    #[test]
+    fn several_images_are_chosen_and_yes_queues_the_creation() {
+        let mut app = cluster_tab_with(&["busybox:1.37", "registry.local/tools/netshoot:v0.13"]);
+        app.handle_key(ctrl('b'));
+        let select = app.kube_pod_select.clone().unwrap();
+        app.complete_pod_list(select.session_id, select.select_id, Ok(vec![choice("web-1", true, &["main", "sidecar"])]));
+        app.handle_pod_select_key(key(KeyCode::Enter));
+        app.handle_pod_select_key(key(KeyCode::Down));
+        app.handle_pod_select_key(key(KeyCode::Enter));
+        assert!(matches!(app.kube_pod_select.as_ref().unwrap().stage, PodSelectStage::Images { .. }));
+        app.handle_pod_select_key(key(KeyCode::Down));
+        app.handle_pod_select_key(key(KeyCode::Enter));
+        let proposal = app.debug_proposal.clone().unwrap();
+        assert_eq!(proposal.target_container, "sidecar");
+        assert_eq!(proposal.image, "registry.local/tools/netshoot:v0.13");
+        app.handle_key(key(KeyCode::Char('y')));
+        let queued = app.take_pending_kube_debug_creates();
+        assert_eq!(queued, vec![proposal]);
+    }
+
+    #[test]
+    fn a_created_debug_container_opens_a_debug_tab_and_records_the_trace() {
+        let mut app = cluster_tab_with(&["busybox:1.37"]);
+        let origin = app.active_session().id;
+        let proposal = DebugProposal {
+            origin,
+            cluster: debug_cluster(&["busybox:1.37"]),
+            namespace: "shop".into(),
+            pod: "distroless-1".into(),
+            target_container: "main".into(),
+            image: "busybox:1.37".into(),
+            name: "filar-debug-ab12cd34".into(),
+        };
+        app.debug_container_created(proposal, "2026-11-01 16:00:00");
+        let request = app.take_pending_kube_pod_connects().remove(0);
+        assert_eq!(request.pod_ref, PodRef::named("prod-eu", "shop", "distroless-1", Some("filar-debug-ab12cd34")));
+        assert_eq!(app.kube.as_ref().unwrap().pod.as_ref().unwrap().debug_target.as_deref(), Some("main"));
+        let origin_tab = app.sessions.iter().find(|s| s.id == origin).unwrap();
+        assert!(origin_tab.messages.iter().any(|m| matches!(m, ChatBlock::System(t) if t.contains("След в кластере") && t.contains("filar-debug-ab12cd34") && t.contains("2026-11-01 16:00:00"))));
+        app.complete_kube_pod_connection(request.session_id, request.connection_id, "distroless-1".into(), "filar-debug-ab12cd34".into(), PodLimits::default());
+        assert_eq!(app.pod_agent_target().unwrap().debug_target.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn a_debug_container_that_got_into_the_spec_but_did_not_start_still_leaves_a_trace() {
+        let mut app = cluster_tab_with(&["busybox:1.37"]);
+        let origin = app.active_session().id;
+        let proposal = DebugProposal {
+            origin,
+            cluster: debug_cluster(&["busybox:1.37"]),
+            namespace: "shop".into(),
+            pod: "distroless-1".into(),
+            target_container: "main".into(),
+            image: "busybox:1.37".into(),
+            name: "filar-debug-ab12cd34".into(),
+        };
+        app.debug_container_failed(&proposal, "RBAC: forbidden", None);
+        app.debug_container_failed(&proposal, "ImagePullBackOff", Some("2026-11-01 16:00:00"));
+        let origin_tab = app.sessions.iter().find(|s| s.id == origin).unwrap();
+        let traces = origin_tab
+            .messages
+            .iter()
+            .filter(|m| matches!(m, ChatBlock::System(t) if t.contains("След в кластере")))
+            .count();
+        assert_eq!(traces, 1, "a refused patch leaves no trace, an added container does");
+        assert!(origin_tab.messages.iter().any(|m| matches!(m, ChatBlock::Error(t) if t.contains("не создан") && t.contains("RBAC"))));
+        assert!(origin_tab.messages.iter().any(|m| matches!(m, ChatBlock::Error(t) if t.contains("добавлен в спецификацию") && t.contains("не запустился"))));
+        assert!(app.take_pending_kube_pod_connects().is_empty());
+    }
+
+    #[test]
+    fn the_agent_has_no_way_to_create_a_debug_container() {
+        let names: Vec<String> = filar_agent::kube_tools::kube_tool_definitions(CommandConfirmMode::Always)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert!(names.iter().all(|n| !n.contains("debug") && !n.contains("ephemeral")), "{names:?}");
+        let call = filar_agent::kube_tools::parse_kube_tool_call("k8s_debug", &serde_json::json!({}), Some("shop"));
+        assert!(call.is_err());
+    }
+
+    #[test]
+    fn a_debug_tab_survives_save_and_restore_with_its_debug_prompt() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.kube_clusters = vec![cluster()];
+        let mut state = KubePodTabState::pending(PodRef::named("prod-eu", "shop", "distroless-1", Some("filar-debug-ab12cd34")));
+        state.debug_target = Some("main".into());
+        let snapshot = App::pod_snapshot(&state);
+        assert_eq!(snapshot.debug_target.as_deref(), Some("main"));
+        app.restore_kube_snapshot(filar_core::KubeSessionSnapshot {
+            target: "prod-eu".into(),
+            namespace: Some("shop".into()),
+            pod: Some(snapshot),
+        });
+        assert_eq!(app.kube.as_ref().unwrap().pod.as_ref().unwrap().debug_target.as_deref(), Some("main"));
     }
 }

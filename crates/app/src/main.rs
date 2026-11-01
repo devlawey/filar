@@ -259,6 +259,7 @@ fn resolve_cli_target(config: &Config, value: &str) -> filar_core::Result<CliTar
                 Some(pod) => Some(filar_core::KubePodSnapshot {
                     pod,
                     container: None,
+                    debug_target: None,
                 }),
                 None => {
                     return Err(CoreError::Other(

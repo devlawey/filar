@@ -148,10 +148,18 @@ fn select_container(pod: &Pod, requested: Option<&str>) -> Result<String> {
         .as_ref()
         .map(|spec| spec.containers.iter().map(|c| c.name.as_str()).collect())
         .unwrap_or_default();
+    // An ephemeral (debug, #576) container is entered only by its exact
+    // name: it never becomes the implicit or default choice.
+    let ephemeral: Vec<&str> = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.ephemeral_containers.as_ref())
+        .map(|list| list.iter().map(|c| c.name.as_str()).collect())
+        .unwrap_or_default();
     let pod_name = pod.metadata.name.as_deref().unwrap_or("?");
     let listed = || names.join(", ");
     if let Some(requested) = requested {
-        return if names.contains(&requested) {
+        return if names.contains(&requested) || ephemeral.contains(&requested) {
             Ok(requested.to_string())
         } else {
             Err(CoreError::NotFound(format!(
@@ -1223,6 +1231,22 @@ mod tests {
         assert!(ambiguous.contains("main, side"), "{ambiguous}");
         // An annotation naming no real container is ignored.
         assert!(select_container(&pod(&["main", "side"], Some("ghost")), None).is_err());
+    }
+
+    #[test]
+    fn an_ephemeral_debug_container_is_entered_only_by_name() {
+        use k8s_openapi::api::core::v1::EphemeralContainer;
+        let mut with_debug = pod(&["main"], None);
+        with_debug.spec.as_mut().unwrap().ephemeral_containers = Some(vec![EphemeralContainer {
+            name: "filar-debug-ab12".into(),
+            ..Default::default()
+        }]);
+        assert_eq!(
+            select_container(&with_debug, Some("filar-debug-ab12")).unwrap(),
+            "filar-debug-ab12"
+        );
+        // Never the implicit choice: the only regular container still wins.
+        assert_eq!(select_container(&with_debug, None).unwrap(), "main");
     }
 
     #[test]

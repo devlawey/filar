@@ -11,10 +11,14 @@ use filar_core::Result;
 
 mod client;
 mod convert;
+mod debug;
 mod exec;
 mod http;
 
 pub use client::KubeClusterApi;
+pub use debug::{
+    debug_container_name, DebugContainerSpec, DEBUG_CONTAINER_PREFIX,
+};
 pub use exec::{
     KubeExecConfig, KubeExecEvent, KubeExecutor, KubeInteractive, DEFAULT_POD_SHELL,
     SHELL_RECREATED_MESSAGE,

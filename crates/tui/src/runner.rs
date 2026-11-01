@@ -670,6 +670,18 @@ enum PodRunnerEvent {
         connection_id: u64,
         error: String,
     },
+    /// An approved debug container runs (#576).
+    DebugCreated {
+        proposal: crate::app::DebugProposal,
+    },
+    /// An approved debug container could not be created (#576).
+    DebugFailed {
+        proposal: crate::app::DebugProposal,
+        error: String,
+        /// The container got into the pod spec but did not start: the
+        /// trace still goes to the feed and the export.
+        added: bool,
+    },
     /// The shell reconnected or followed its selector to another pod.
     Shell {
         session_id: SessionId,
@@ -734,6 +746,84 @@ fn start_pending_kube_pod_lists(
                 session_id: request.session_id,
                 select_id: request.select_id,
                 result,
+            });
+        });
+    }
+}
+
+/// How long a new debug container may take to reach Running (#576).
+const DEBUG_CONTAINER_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Create local executors for tabs signalled via `new_tab()`. Runs before
+/// any connect that swaps a tab's executor: a tab opened by a key or by a
+/// runner event (a debug container, #576) must have its executor in place
+/// before its pod or host connection completes.
+async fn create_pending_local_executors(
+    app: &mut App,
+    executors: &mut HashMap<SessionId, ExecutorEntry>,
+    command_timeout: Duration,
+) {
+    for sid in app.take_pending_local_executors() {
+        match filar_transport::LocalExecutor::with_timeout(command_timeout).await {
+            Ok(local) => {
+                executors.insert(
+                    sid,
+                    ExecutorEntry {
+                        executor: Arc::new(TuiExecutor {
+                            inner: Arc::new(tokio::sync::RwLock::new(Arc::new(local))),
+                        }),
+                        ssh_target: Arc::new(tokio::sync::RwLock::new(None)),
+                        ssh_exec: Arc::new(tokio::sync::RwLock::new(None)),
+                    },
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to create local executor for sid={sid:?}");
+                if let Some(s) = app.sessions.iter_mut().find(|s| s.id == sid) {
+                    s.ssh_info = None;
+                }
+                app.push_error(format!(
+                    "Failed to create local executor for new tab: {e}"
+                ));
+                app.pending_local_executors.push(sid);
+            }
+        }
+    }
+}
+
+/// Create every debug container the user approved (#576): the only write to
+/// a cluster filar makes, and only from this explicit action.
+fn start_pending_kube_debug_creates(
+    app: &mut App,
+    pod_tx: &mpsc::UnboundedSender<PodRunnerEvent>,
+) {
+    for proposal in app.take_pending_kube_debug_creates() {
+        let tx = pod_tx.clone();
+        tokio::spawn(async move {
+            let spec = filar_transport::DebugContainerSpec {
+                namespace: proposal.namespace.clone(),
+                pod: proposal.pod.clone(),
+                target_container: proposal.target_container.clone(),
+                image: proposal.image.clone(),
+                name: proposal.name.clone(),
+            };
+            let result = match KubeClusterApi::connect(&proposal.cluster).await {
+                Ok(api) => match api.add_debug_container(&spec).await {
+                    Ok(()) => api
+                        .wait_debug_container(&spec, DEBUG_CONTAINER_WAIT)
+                        .await
+                        .map_err(|error| (error, true)),
+                    Err(error) => Err((error, false)),
+                },
+                Err(error) => Err((error, false)),
+            };
+            let _ = tx.send(match result {
+                Ok(()) => PodRunnerEvent::DebugCreated { proposal },
+                Err((error, added)) => PodRunnerEvent::DebugFailed {
+                    proposal,
+                    error: error.to_string(),
+                    added,
+                },
             });
         });
     }
@@ -1881,6 +1971,7 @@ async fn run_app(
     start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
     start_pending_kube_fleets(&mut app, &mut kube_fleets, &kube_fleet_tx);
     start_pending_kube_pod_connects(&mut app, &pod_tx);
+    start_pending_kube_debug_creates(&mut app, &pod_tx);
     // The startup target may carry policy tags — tighten before the first
     // render so the bar and the confirm gate agree from the start (#414).
     app.sync_confirm_mode();
@@ -2295,6 +2386,7 @@ async fn run_app(
                 start_pending_kube_fleets(&mut app, &mut kube_fleets, &kube_fleet_tx);
                 start_pending_kube_pod_lists(&mut app, &kube_apis, &pod_tx);
                 start_pending_kube_pod_connects(&mut app, &pod_tx);
+                start_pending_kube_debug_creates(&mut app, &pod_tx);
 
                 // Check if user sent input — spawn agent or execute shell escape.
                 if let Some(user_input) = app.take_input() {
@@ -2737,32 +2829,7 @@ async fn run_app(
         // fleet, #433). Connecting first would find no executor to swap, and
         // the local one created afterwards would run the tab's commands on
         // this machine under the host's name.
-        for sid in app.take_pending_local_executors() {
-            match filar_transport::LocalExecutor::with_timeout(command_timeout).await {
-                Ok(local) => {
-                    executors.insert(
-                        sid,
-                        ExecutorEntry {
-                            executor: Arc::new(TuiExecutor {
-                                inner: Arc::new(tokio::sync::RwLock::new(Arc::new(local))),
-                            }),
-                            ssh_target: Arc::new(tokio::sync::RwLock::new(None)),
-                            ssh_exec: Arc::new(tokio::sync::RwLock::new(None)),
-                        },
-                    );
-                }
-                Err(e) => {
-                    warn!(error = %e, "failed to create local executor for sid={sid:?}");
-                    if let Some(s) = app.sessions.iter_mut().find(|s| s.id == sid) {
-                        s.ssh_info = None;
-                    }
-                    app.push_error(format!(
-                        "Failed to create local executor for new tab: {e}"
-                    ));
-                    app.pending_local_executors.push(sid);
-                }
-            }
-        }
+        create_pending_local_executors(&mut app, &mut executors, command_timeout).await;
 
         // ── Ctrl+O delayed host connection ─────────────────────────
         if app.ctrl_o_needs_connect {
@@ -3120,6 +3187,14 @@ async fn run_app(
                                 );
                             }
                         }
+                        PodRunnerEvent::DebugCreated { proposal } => {
+                            let at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                            app.debug_container_created(proposal, &at);
+                        }
+                        PodRunnerEvent::DebugFailed { proposal, error, added } => {
+                            let at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                            app.debug_container_failed(&proposal, &error, added.then_some(at.as_str()));
+                        }
                         PodRunnerEvent::Failed { session_id, connection_id, error } => {
                             app.fail_kube_pod_connection(session_id, connection_id, error);
                         }
@@ -3428,7 +3503,10 @@ async fn run_app(
         start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
         start_pending_kube_fleets(&mut app, &mut kube_fleets, &kube_fleet_tx);
         start_pending_kube_pod_lists(&mut app, &kube_apis, &pod_tx);
+        // A runner event (a created debug container) can open a tab too.
+        create_pending_local_executors(&mut app, &mut executors, command_timeout).await;
         start_pending_kube_pod_connects(&mut app, &pod_tx);
+        start_pending_kube_debug_creates(&mut app, &pod_tx);
 
         if app.should_quit {
             break;

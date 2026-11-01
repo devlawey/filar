@@ -235,3 +235,64 @@ async fn pod_terminal_is_interactive_resizable_and_interruptible() {
     let result = exec.run("echo agent-$((2+3))").await.unwrap();
     assert_eq!(result.stdout.trim(), "agent-5", "the agent's shell is independent");
 }
+
+fn reader() -> KubeCluster {
+    let path = admin_path()
+        .parent()
+        .expect("admin kubeconfig has a parent directory")
+        .join("reader.kubeconfig");
+    fixture(&path)
+}
+
+/// #576: a debug container next to the shell-less `distroless` pod sees the
+/// target's files through `/proc/1/root`; a service account without
+/// `pods/ephemeralcontainers` gets an RBAC message, not a workaround.
+#[tokio::test]
+#[ignore = "needs docker/k8s cluster"]
+async fn debug_container_reads_the_target_root_and_rbac_refuses_without_the_right() {
+    use filar_transport::{debug_container_name, DebugContainerSpec};
+    let admin_api = filar_transport::KubeClusterApi::connect(&admin()).await.unwrap();
+    let pod = filar_transport::ClusterApi::list_pods(
+        &admin_api,
+        Some("shop"),
+        Some("app=distroless"),
+        Some("status.phase=Running"),
+    )
+    .await
+    .unwrap()
+    .remove(0)
+    .name;
+    let id = format!("{:x}", Instant::now().elapsed().as_nanos() ^ u128::from(std::process::id()));
+    let spec = DebugContainerSpec {
+        namespace: "shop".into(),
+        pod: pod.clone(),
+        target_container: "main".into(),
+        image: "busybox:1.37.0".into(),
+        name: debug_container_name(&id),
+    };
+    admin_api
+        .create_debug_container(&spec, Duration::from_secs(90))
+        .await
+        .unwrap();
+    let exec = KubeExecutor::connect(
+        &admin(),
+        &PodRef::named("filar-tests", "shop", &pod, Some(&spec.name)),
+    )
+    .await
+    .unwrap();
+    let result = exec.run("ls /proc/1/root/ | head -5; cat /proc/1/cmdline | tr '\\0' ' '").await.unwrap();
+    assert!(result.stdout.contains("pause"), "{}", result.stdout);
+    exec.close().await.unwrap();
+
+    let reader_api = filar_transport::KubeClusterApi::connect(&reader()).await.unwrap();
+    let mut denied = spec.clone();
+    // A different name: `debug_container_name` keeps only 8 characters.
+    denied.name = debug_container_name(&format!("{:08x}", std::process::id() ^ 0xdead_beef));
+    assert_ne!(denied.name, spec.name);
+    let error = reader_api
+        .create_debug_container(&denied, Duration::from_secs(10))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("pods/ephemeralcontainers"), "{error}");
+}

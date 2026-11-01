@@ -211,9 +211,19 @@ pub struct KubePodTarget {
     pub tags: Vec<String>,
     /// Limits and security settings of the container, from the pod spec.
     pub limits: PodLimits,
+    /// `Some(target)` when `container` is an ephemeral debug container
+    /// attached to container `target` of the pod (#576).
+    pub debug_target: Option<String>,
 }
 
 impl KubePodTarget {
+    /// Mark this target as an ephemeral debug container attached to
+    /// `target_container` (#576).
+    pub fn with_debug_target(mut self, target_container: &str) -> Self {
+        self.debug_target = Some(target_container.to_string());
+        self
+    }
+
     /// Collect the target from the cluster entry and what the executor
     /// reports (`KubeExecutor::pod`, `container`, `pod_limits`).
     pub fn new(
@@ -231,6 +241,7 @@ impl KubePodTarget {
             container: container.into(),
             tags: cluster.tags.clone(),
             limits,
+            debug_target: None,
         }
     }
 
