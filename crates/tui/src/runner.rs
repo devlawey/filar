@@ -2283,17 +2283,20 @@ async fn run_app(
                             .get(&toggle_sid)
                             .filter(|shell| Some(shell.connection_id) == current)
                             .map(|shell| shell.exec.clone());
-                        let in_pod = app
+                        // `Some` in a pod tab: why there is no shell to open
+                        // a terminal in, if there is none (#605).
+                        let pod_unavailable = app
                             .find_session_idx(toggle_sid)
                             .and_then(|idx| app.sessions[idx].kube.as_ref())
-                            .is_some_and(|kube| kube.pod.is_some());
+                            .and_then(|kube| kube.pod.as_ref())
+                            .map(|pod| pod.terminal_unavailable_message());
                         let term_result: Result<Arc<dyn InteractiveTerminal>> =
                             if let Some(exec) = pod_shell.as_ref() {
                                 exec.open_terminal(cols, rows)
                                     .await
                                     .map(|t| Arc::new(t) as Arc<dyn InteractiveTerminal>)
-                            } else if in_pod {
-                                Err(CoreError::Unavailable("под ещё не подключён".into()))
+                            } else if let Some(message) = pod_unavailable {
+                                Err(CoreError::Unavailable(message))
                             } else if let Some(ref target) = ssh_target {
                                 SshInteractive::connect(target, cols, rows)
                                     .await

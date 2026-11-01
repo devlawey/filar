@@ -1000,6 +1000,18 @@ mod tests {
     use crate::ui::theme::Glyphs;
     use filar_core::CommandConfirmMode;
 
+    #[test]
+    fn pod_terminal_refusal_tells_connecting_from_lost_shell() {
+        let mut state = KubePodTabState::pending(PodRef::named("prod-eu", "shop", "web-1", None));
+        let connecting = state.terminal_unavailable_message();
+        assert!(connecting.contains("ещё подключается"), "{connecting}");
+        assert!(connecting.contains("web-1"), "{connecting}");
+        state.pod = Some("web-1".into());
+        let lost = state.terminal_unavailable_message();
+        assert!(lost.contains("недоступен"), "{lost}");
+        assert!(!lost.contains("подключается"), "{lost}");
+    }
+
     fn cluster() -> filar_core::KubeCluster {
         filar_core::KubeCluster {
             name: "prod-eu".into(),
