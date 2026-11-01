@@ -101,6 +101,29 @@ type = "password"
 # debug_images = ["busybox:1.37"]  # images for an ephemeral debug container (Ctrl+B); empty = off
 # diagnostic_ports = [8080, 6060]  # pod ports pod_http_get may reach besides declared ones
 
+# ── Log sources (query_logs) ───────────────────────────────────────
+# Centralised log stores the agent may search over their HTTP API, from any
+# single-target tab. Read-only; filar frames every query (window, lines,
+# bytes, timeout). The key is never stored here — only the name it is looked
+# up under (OS keyring, then environment).
+# [[log_sources]]
+# name = "vlogs-prod"
+# kind = "victorialogs"              # victorialogs | opensearch | elasticsearch | loki
+# url = "https://vlogs.example.com"
+# auth = "bearer"                    # none | basic | bearer | api-key (Elasticsearch)
+# key_env = "FILAR_LOGS_VLOGS_PROD"  # name of the key, never the key
+# user = "reader"                    # basic only
+# tenant = "0:0"                     # VictoriaLogs AccountID:ProjectID / Loki X-Scope-OrgID
+# index = "logs-*"                   # OpenSearch / Elasticsearch only
+# max_window_hours = 24              # 1–168: longest query window
+# max_lines = 500                    # 1–10000: most lines per query
+# timeout_secs = 20                  # 1–120
+# max_line_bytes = 4096              # longer lines are cut and marked
+# max_response_bytes = 2097152       # the answer is read as a stream and cut here
+# clusters = ["prod-eu"]             # [[kube_clusters]] whose logs it holds: a hint for the
+#                                    # model, not access control — every single-target tab can query it
+# tags = ["prod"]                    # feed [[tag_policies]] like target tags
+
 # Kubernetes fleet: ready app=web pods frozen on entry in both clusters.
 # Use either kube or match = [...] in a host group, never both. Without
 # selector, each cluster/namespace pair is itself one fleet member.

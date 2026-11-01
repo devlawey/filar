@@ -725,7 +725,7 @@ fn optional_bool(args: &Value, key: &str) -> Result<bool> {
     }
 }
 
-fn parse_since(value: Option<String>) -> Result<Option<Duration>> {
+pub(crate) fn parse_since(value: Option<String>) -> Result<Option<Duration>> {
     let Some(value) = value else { return Ok(None) };
     let split = value
         .find(|c: char| !c.is_ascii_digit())

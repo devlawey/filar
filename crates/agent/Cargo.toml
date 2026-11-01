@@ -19,6 +19,7 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 tokio-util = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) gives the fleet fan-out tests a

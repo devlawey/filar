@@ -396,6 +396,8 @@ pub struct Agent {
     /// Ratings still in flight; awaited before `Finished`/`Error`, aborted
     /// on cancellation, so no event follows the terminal one.
     pending_scores: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Log sources for `query_logs` (#579); `None` = the tool is not offered.
+    log_sources: Option<Arc<crate::logs::LogSources>>,
 }
 
 /// Upper bound on one safety rating, whatever the scorer's own timeout: the
@@ -441,6 +443,7 @@ pub struct AgentBuilder {
     is_local: bool,
     fleet: bool,
     risk_scorer: Option<Arc<dyn RiskScorer>>,
+    log_sources: Option<Arc<crate::logs::LogSources>>,
 }
 
 impl AgentBuilder {
@@ -468,6 +471,7 @@ impl AgentBuilder {
             is_local: false,
             fleet: false,
             risk_scorer: None,
+            log_sources: None,
         }
     }
 
@@ -618,6 +622,13 @@ impl AgentBuilder {
         self
     }
 
+    /// Offer `query_logs` over these log sources (#579). Ignored in a fleet;
+    /// an empty set offers nothing. The system prompt lists the sources.
+    pub fn log_sources(mut self, sources: Option<Arc<crate::logs::LogSources>>) -> Self {
+        self.log_sources = sources;
+        self
+    }
+
     /// Mark whether the executor targets the local machine (affects background spawn).
     pub fn is_local(mut self, is_local: bool) -> Self {
         self.is_local = is_local;
@@ -706,6 +717,16 @@ impl AgentBuilder {
             system_prompt.push('\n');
             system_prompt.push_str(FLEET_PROMPT);
         }
+        // Log sources (#579): single-target tabs only; the prompt names
+        // exactly the sources the tool accepts.
+        let log_sources = if self.fleet {
+            None
+        } else {
+            self.log_sources.filter(|sources| !sources.is_empty())
+        };
+        if let Some(sources) = &log_sources {
+            system_prompt.push_str(&sources.prompt_section());
+        }
         // Append SAFE MODE block in Explain mode.
         if self.confirm_mode == CommandConfirmMode::Explain {
             system_prompt.push('\n');
@@ -742,6 +763,7 @@ impl AgentBuilder {
             fleet: self.fleet,
             risk_scorer: self.risk_scorer,
             pending_scores: Mutex::new(Vec::new()),
+            log_sources,
         })
     }
 }
@@ -997,11 +1019,14 @@ impl Agent {
         messages.extend_from_slice(history);
         messages.push(ChatMessage::user(user_prompt));
 
-        let tool_defs = if self.fleet {
+        let mut tool_defs = if self.fleet {
             tools::fleet_tool_definitions(self.confirm_mode)
         } else {
             tools::tool_definitions(self.confirm_mode)
         };
+        if let Some(sources) = &self.log_sources {
+            tool_defs.push(sources.tool_definition(self.confirm_mode));
+        }
 
         info!(prompt = %user_prompt, "agent loop started");
 
@@ -1069,7 +1094,12 @@ impl Agent {
                 if self.confirm_mode == CommandConfirmMode::Explain {
                     let mut errors: Vec<(String, String)> = Vec::new();
                     for tc in &tool_calls {
-                        if let Some(err) = tools::check_explanation(&tc.name, &tc.arguments) {
+                        let missing = if tc.name == crate::logs::TOOL_QUERY_LOGS {
+                            crate::logs::tool::explanation_error(&tc.arguments)
+                        } else {
+                            tools::check_explanation(&tc.name, &tc.arguments)
+                        };
+                        if let Some(err) = missing {
                             errors.push((tc.id.clone(), err));
                         }
                     }
@@ -1152,6 +1182,27 @@ impl Agent {
         tc: &ToolCall,
         conversation: &[ChatMessage],
     ) -> Result<ChatMessage> {
+        // `query_logs` (#579) is an HTTP search, not a command: its own
+        // frame and gate, no arbiter, no safety rating.
+        if tc.name == crate::logs::TOOL_QUERY_LOGS {
+            let Some(sources) = &self.log_sources else {
+                return Ok(ChatMessage::tool(
+                    &tc.id,
+                    "Error: no log sources are available in this tab.",
+                ));
+            };
+            let emit = |event: AgentEvent| self.emit(event);
+            return sources
+                .process(
+                    tc,
+                    self.confirm_mode,
+                    self.confirmer.as_ref(),
+                    &emit,
+                    self.cancellation.as_ref(),
+                    NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed),
+                )
+                .await;
+        }
         // Parse the tool call.
         let parsed = match tools::parse_tool_call(&tc.id, &tc.name, &tc.arguments) {
             Ok(p) => p,
@@ -2730,6 +2781,88 @@ mod tests {
             agent.system_prompt.contains("SAFE MODE IS ACTIVE"),
             "system prompt must contain SAFE MODE block in Explain mode"
         );
+    }
+
+    // ── Log sources (#579) ─────────────────────────────────────────────
+
+    fn query_logs_call() -> ChatResponse {
+        ChatResponse::tool_calls(
+            "",
+            vec![ToolCall {
+                id: "q1".into(),
+                name: crate::logs::TOOL_QUERY_LOGS.into(),
+                arguments: serde_json::json!({"source": "vlogs-prod", "query": "error", "since": "1h", "explanation": "find the errors"}),
+            }],
+        )
+    }
+
+    #[tokio::test]
+    async fn query_logs_is_offered_and_answered_outside_fleets() {
+        let llm = Arc::new(RecordingLlm {
+            inner: MockLlm::new(vec![query_logs_call(), ChatResponse::text("done")]),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        let sources = crate::logs::tests::stub_log_sources(vec![crate::logs::tests::stub_line(1, "disk full on /var")]);
+        let agent = Agent::builder()
+            .llm(llm.clone())
+            .executor(executor.clone())
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .confirm_mode(CommandConfirmMode::Always)
+            .log_sources(Some(sources))
+            .build()
+            .unwrap();
+        agent.run("why is the app failing?", &[]).await.unwrap();
+        let requests = llm.requests.lock().unwrap();
+        assert!(requests[0].tools.iter().any(|t| t.name == "query_logs"));
+        assert!(requests[0].messages[0].content.contains("vlogs-prod — victorialogs, language LogsQL"));
+        let answer = &requests[1].messages.last().unwrap().content;
+        assert!(answer.contains("disk full on /var"), "{answer}");
+        assert!(executor.last_command.lock().unwrap().is_empty(), "nothing ran in the shell");
+    }
+
+    #[tokio::test]
+    async fn a_fleet_agent_gets_no_log_sources() {
+        let llm = Arc::new(RecordingLlm {
+            inner: MockLlm::new(vec![ChatResponse::text("ok")]),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        let agent = Agent::builder()
+            .llm(llm.clone())
+            .executor(executor)
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .fleet(true)
+            .log_sources(Some(crate::logs::tests::stub_log_sources(Vec::new())))
+            .build()
+            .unwrap();
+        agent.run("x", &[]).await.unwrap();
+        let requests = llm.requests.lock().unwrap();
+        assert!(!requests[0].tools.iter().any(|t| t.name == "query_logs"));
+        assert!(!requests[0].messages[0].content.contains("LOG SOURCES"));
+    }
+
+    #[tokio::test]
+    async fn explain_mode_wants_an_explanation_for_query_logs() {
+        let mut call = query_logs_call();
+        call.tool_calls[0].arguments = serde_json::json!({"source": "vlogs-prod", "query": "error", "since": "1h"});
+        let llm = Arc::new(RecordingLlm {
+            inner: MockLlm::new(vec![call, ChatResponse::text("ok")]),
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        let agent = Agent::builder()
+            .llm(llm.clone())
+            .executor(executor)
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .confirm_mode(CommandConfirmMode::Explain)
+            .log_sources(Some(crate::logs::tests::stub_log_sources(Vec::new())))
+            .build()
+            .unwrap();
+        agent.run("x", &[]).await.unwrap();
+        let requests = llm.requests.lock().unwrap();
+        let reply = &requests[1].messages.last().unwrap().content;
+        assert!(reply.contains("query_logs requires an `explanation`"), "{reply}");
     }
 
     // ── Fleet tool set (#434) ─────────────────────────────────────────

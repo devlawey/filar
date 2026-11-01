@@ -624,6 +624,12 @@ pub struct TuiConfig {
     /// Shown once at start-up when the scorer is configured but cannot be
     /// used (invalid section, missing key). Never contains a secret.
     pub risk_scorer_note: Option<String>,
+    /// Log sources from `[[log_sources]]` with a working adapter (#579):
+    /// `query_logs` in every single-target tab. `None` = no tool.
+    pub log_sources: Option<Arc<filar_agent::LogSources>>,
+    /// Shown once at start-up, one per source that cannot be used (no key,
+    /// no adapter). Never contains a secret.
+    pub log_source_notes: Vec<String>,
 }
 
 /// Result of an asynchronous cluster connection or namespace discovery (#575).
@@ -1879,6 +1885,9 @@ async fn run_app(
     if let Some(note) = config.risk_scorer_note.take() {
         app.push_message(ChatBlock::System(note));
     }
+    for note in std::mem::take(&mut config.log_source_notes) {
+        app.push_message(ChatBlock::System(note));
+    }
     // Host groups are fleet entry points in Ctrl+O; `--group` opens the fleet
     // layer straight away, over the start-up tab (#432).
     app.host_groups = config.host_groups.clone();
@@ -2455,6 +2464,7 @@ async fn run_app(
                                 profile_name,
                                 app.active_session().compaction_exhausted,
                                 pending_compaction,
+                                config.log_sources.clone(),
                             );
                             app.sessions[app.active].pending_compaction = None;
                         }
@@ -2509,6 +2519,9 @@ async fn run_app(
                             profile_name,
                             app.active_session().compaction_exhausted,
                             pending_compaction,
+                            // A Kubernetes fleet: one approval there covers
+                            // many targets, so no `query_logs` (#579).
+                            None,
                         );
                         app.sessions[app.active].pending_compaction = None;
                     } else if let Some(stripped) = user_input.strip_prefix('!') {
@@ -2719,6 +2732,7 @@ async fn run_app(
                             pending_compaction,
                             in_fleet,
                             app.pod_agent_target(),
+                            config.log_sources.clone(),
                         );
                         // Consumed by this run: the summary comes back as an
                         // event, and a leftover flag would fold the history a
@@ -4275,6 +4289,8 @@ fn spawn_agent(
     // A pod tab (#565): `executor` is the pod's shell and the agent gets the
     // pod prompt, arbiter context and safety target.
     pod_target: Option<filar_agent::KubePodTarget>,
+    // `query_logs` (#579); the builder drops it for a fleet.
+    log_sources: Option<Arc<filar_agent::LogSources>>,
 ) {
     let tx = event_tx.clone();
     let confirmer = Arc::new(TuiConfirmer::new(event_tx.clone(), sid)) as Arc<dyn CommandConfirmer>;
@@ -4339,7 +4355,8 @@ fn spawn_agent(
                 .arbiter_enabled(arbiter_enabled)
                 .arbiter_llm(arbiter_llm.clone())
                 .arbiter_model_name(arbiter_model_name.clone())
-                .risk_scorer(risk_scorer.clone());
+                .risk_scorer(risk_scorer.clone())
+                .log_sources(log_sources.clone());
             if let Some(target) = pod_target.as_ref() {
                 builder = builder.kube_pod_mode(target);
             } else if is_local {
@@ -4447,6 +4464,8 @@ fn spawn_kube_agent(
     profile_name: String,
     compaction_exhausted: bool,
     pending_compaction: Option<usize>,
+    // `query_logs` (#579) for a cluster tab; a fleet gets none.
+    log_sources: Option<Arc<filar_agent::LogSources>>,
 ) {
     let tx = event_tx.clone();
     let confirmer = Arc::new(TuiConfirmer::new(event_tx, sid)) as Arc<dyn CommandConfirmer>;
@@ -4534,7 +4553,8 @@ fn spawn_kube_agent(
             };
             let agent = agent
                 .event_sink(Arc::clone(&sink))
-                .cancellation(cancellation.clone());
+                .cancellation(cancellation.clone())
+                .log_sources(log_sources.clone());
 
             *held_error
                 .lock()
@@ -6277,6 +6297,8 @@ mod tests {
             risk_scorer: None,
             risk_thresholds: (70, 40),
             risk_scorer_note: None,
+            log_sources: None,
+            log_source_notes: Vec::new(),
         }
     }
 

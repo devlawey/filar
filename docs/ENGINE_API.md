@@ -766,6 +766,50 @@ let _agent = builder.risk_scorer(Some(scorer));
 - The decision model sees the command, the agent's explanation and the target
   description — the same data the session's LLM already has.
 
+## Log sources — `LogSource` and `query_logs` (#579)
+
+Centralised log stores (VictoriaLogs, OpenSearch/Elasticsearch, Loki) are
+queried over their HTTP search APIs, straight from the embedder's process.
+`[[log_sources]]` entries are `filar_core::LogSourceConfig` (validated by
+`Config::load`; keys are referenced by `key_env` only).
+
+```rust,no_run
+# use std::sync::Arc;
+# use filar_agent::{AgentBuilder, build_log_sources};
+# use filar_core::{Config, StaticSecretProvider};
+# fn example(builder: AgentBuilder, config: &Config) {
+let secrets = Arc::new(StaticSecretProvider::new());
+secrets.insert("FILAR_LOGS_VLOGS_PROD", "token-from-your-store");
+let (sources, notes) = build_log_sources(&config.log_sources, secrets, config.tag_policies.clone());
+for note in notes { eprintln!("{note}"); } // a source without key or adapter; never a key
+let _agent = builder.log_sources(sources);
+# }
+```
+
+- `LogSource` (trait, `filar_agent::logs`) — `config()`, `describe()` (query
+  language and main fields for the prompt) and `async fn query(&LogQuery) ->
+  Result<LogResult>`. `LogQuery` carries the query text **in the store's language**,
+  a window `start..end` and `limit`; `LogResult` holds `LogLine`s (time,
+  message, fields, cut flag) and a `truncated` flag. Adapters use `LogHttp`
+  (timeout, auth, key scrubbing), `read_limited` (streamed body, connection
+  dropped at the byte cap) and `cap_line`.
+- `LogSources` is the tool: `AgentBuilder::log_sources` and
+  `KubeAgent::log_sources` add `query_logs` and a prompt section listing the
+  sources. Not in fleets. A source's `clusters` only says whose logs it
+  holds (a prompt hint, and the link `pod_logs_history` uses); it does not
+  restrict which tab may query it. The frame is filar's: no window → not sent; window
+  over `max_window_hours` → refused; `limit` lowered to `max_lines`.
+- Gate: confirmation in `always`/`explain`, none in `allowlist`/`never`;
+  `[[tag_policies]]` matching a source's `tags` tighten it. No arbiter audit
+  and no safety rating — it is not a shell command.
+- The model gets a folded view (`fold_logs`): messages grouped after
+  normalising numbers, UUIDs, hex ids and timestamps, with counts, first/last
+  occurrence and a time distribution; then `redact_logs` (#573).
+- Dropping or cancelling the query drops the HTTP request and closes the
+  connection. Whether the store then stops the query depends on the backend
+  and any proxy in front of it (VictoriaLogs documents that it does). Kinds without an adapter in the
+  build are reported by `build_log_sources` and not offered.
+
 ## Upgrading to the next engine release (unreleased)
 
 | Change | Breaks | What to do |
@@ -775,6 +819,7 @@ let _agent = builder.risk_scorer(Some(scorer));
 | `filar_core::KubePodSnapshot`, new field `KubeSessionSnapshot::pod` (#565) | Struct literals of `KubeSessionSnapshot` need `pod` (`None` for a cluster tab); saved sessions without it deserialize as cluster tabs | Add `pod: None`, or `Some(KubePodSnapshot { pod, container })` for a pod tab |
 | `KubeInteractive`, `KubeExecutor::open_terminal` under the `kube` feature (#577) | Nothing — additive; `InteractiveTerminal` is unchanged | Use `open_terminal(cols, rows)` for an interactive TTY shell in the executor's pod |
 | `ClusterApi::pod_http_get`, `PodHttpRequest`/`PodHttpResponse`, `ContainerPortInfo`, new fields `ContainerInfo::ports` and `KubeCluster::diagnostic_ports`, tool `pod_http_get` (#578) | Struct literals of `ContainerInfo` need `ports`; `KubeCluster` literals without `..Default::default()` need `diagnostic_ports`; other `ClusterApi` implementations get a default `Unavailable` | Add `ports: Vec::new()` / `diagnostic_ports: Vec::new()`; implement `pod_http_get` only if your API can port-forward |
+| `filar_core::LogSourceConfig`/`LogSourceKind`/`LogAuth`, new field `Config::log_sources`; `filar_agent::logs` (`LogSource`, `LogSources`, `build_log_sources`, tool `query_logs`), `AgentBuilder::log_sources`, `KubeAgent::log_sources` (#579) | `Config` literals without `..Default::default()` need `log_sources` | Add `log_sources: Vec::new()`; opt in with `build_log_sources` |
 | `KubeClusterApi::create_debug_container`, `DebugContainerSpec`, `debug_container_name`; new fields `KubeCluster::debug_images` and `KubePodTarget::debug_target` (#576) | `KubeCluster` literals without `..Default::default()` need `debug_images`; `KubePodTarget` built by `new` is unchanged | Add `debug_images: Vec::new()`; use `with_debug_target` for a debug container |
 
 ## Upgrading to `engine-v3.0.0`
