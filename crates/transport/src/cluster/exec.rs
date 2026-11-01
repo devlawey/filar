@@ -438,7 +438,8 @@ fn tty_size(cols: u16, rows: u16) -> TerminalSize {
 /// changes go over the exec resize channel.
 pub struct KubeInteractive {
     stdin: Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>,
-    output: Mutex<mpsc::Receiver<Vec<u8>>>,
+    /// Output chunks; `Err` when the exec stream failed (not a clean EOF).
+    output: Mutex<mpsc::Receiver<std::result::Result<Vec<u8>, String>>>,
     resize: Mutex<Option<futures::channel::mpsc::Sender<TerminalSize>>>,
     process: StdMutex<Option<AttachedProcess>>,
     /// The stdout reader, stopped on `close`.
@@ -492,11 +493,15 @@ impl KubeInteractive {
             let mut buf = vec![0u8; 8192];
             loop {
                 match stdout.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).await.is_err() {
+                        if tx.send(Ok(buf[..n].to_vec())).await.is_err() {
                             break;
                         }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error.to_string())).await;
+                        break;
                     }
                 }
             }
@@ -527,7 +532,11 @@ impl KubeInteractive {
 #[async_trait::async_trait]
 impl crate::InteractiveTerminal for KubeInteractive {
     async fn read_output(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self.output.lock().await.recv().await)
+        match self.output.lock().await.recv().await {
+            Some(Ok(bytes)) => Ok(Some(bytes)),
+            Some(Err(error)) => Err(CoreError::ConnectionLost(format!("pod terminal: {error}"))),
+            None => Ok(None),
+        }
     }
 
     async fn write_input(&self, data: &[u8]) -> Result<()> {
@@ -548,10 +557,20 @@ impl crate::InteractiveTerminal for KubeInteractive {
     async fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         use futures::SinkExt;
         if let Some(sender) = self.resize.lock().await.as_mut() {
-            sender
-                .send(tty_size(cols, rows))
+            // A stalled exec must not block the UI loop on a full channel.
+            match tokio::time::timeout(TERMINAL_WRITE_TIMEOUT, sender.send(tty_size(cols, rows)))
                 .await
-                .map_err(|e| CoreError::ConnectionLost(format!("pod terminal resize: {e}")))?;
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(CoreError::ConnectionLost(format!("pod terminal resize: {e}")))
+                }
+                Err(_) => {
+                    return Err(CoreError::ConnectionLost(
+                        "pod terminal resize: not accepted in time".into(),
+                    ))
+                }
+            }
         }
         Ok(())
     }

@@ -221,7 +221,8 @@ async fn pod_terminal_is_interactive_resizable_and_interruptible() {
     assert!(read_until(&term, "43 132", Duration::from_secs(10)).await.contains("43 132"));
 
     let started = Instant::now();
-    term.write_input(b"sleep 30; echo slept\n").await.unwrap();
+    // `sl""ept` prints `slept` only if it runs; the TTY echo shows the quotes.
+    term.write_input(b"sleep 30; echo sl\"\"ept\n").await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     term.write_input(b"\x03").await.unwrap();
     term.write_input(b"echo after-$((1+1))\n").await.unwrap();
