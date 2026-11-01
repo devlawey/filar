@@ -52,7 +52,7 @@ impl VictoriaLogsSource {
 /// `order`) pipe.
 pub fn sorts_itself(query: &str) -> bool {
     query.split('|').skip(1).any(|pipe| {
-        let word = pipe.trim_start().split_whitespace().next().unwrap_or("");
+        let word = pipe.split_whitespace().next().unwrap_or("");
         word.eq_ignore_ascii_case("sort") || word.eq_ignore_ascii_case("order")
     })
 }
