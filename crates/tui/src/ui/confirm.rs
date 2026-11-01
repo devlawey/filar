@@ -1066,8 +1066,12 @@ mod tests {
         let mut app = pod_app(vec![]);
         let screen = render_confirm(&mut app, 100, 30);
         assert!(screen.contains("Confirm command in pod"), "{screen}");
+        // The separator follows the active glyph set (ASCII on Windows conhost).
+        let dot = app.theme.glyphs().middle_dot;
         assert!(
-            screen.contains("context prod-eu · namespace shop · pod web-7f9c · container main"),
+            screen.contains(&format!(
+                "context prod-eu {dot} namespace shop {dot} pod web-7f9c {dot} container main"
+            )),
             "{screen}"
         );
         let target_row = screen.lines().position(|l| l.contains("pod web-7f9c")).unwrap();
