@@ -151,10 +151,11 @@ fn chunked_complete(mut rest: &[u8]) -> bool {
         if size == 0 {
             return trailer_complete(rest);
         }
-        if rest.len() < size + 2 {
+        // The size comes from the pod: a huge one must not overflow.
+        let Some(next) = size.checked_add(2).filter(|next| *next <= rest.len()) else {
             return false;
-        }
-        rest = &rest[size + 2..];
+        };
+        rest = &rest[next..];
     }
 }
 
@@ -214,6 +215,13 @@ mod tests {
         let r = parse_response(raw, 1024).unwrap();
         assert_eq!(r.body, b"Wikipedia");
         assert!(body_complete(raw));
+    }
+
+    #[test]
+    fn a_huge_chunk_size_is_incomplete_not_a_panic() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nab";
+        assert!(!body_complete(raw));
+        assert!(parse_response(raw, 64).is_err());
     }
 
     #[test]

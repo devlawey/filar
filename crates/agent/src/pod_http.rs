@@ -78,6 +78,11 @@ pub fn validate_path(path: &str) -> Result<String> {
     if path.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return refuse("whitespace and control characters are not allowed");
     }
+    // A server decodes `%xx` before routing: `/%64ebug/pprof/heap` would be
+    // `/debug/pprof/heap` there and slip past the checks below.
+    if path.contains('%') {
+        return refuse("percent-encoded paths and queries are not allowed");
+    }
     let (route, query) = path.split_once('?').unwrap_or((path, ""));
     if route.starts_with("/debug/pprof") {
         let index = route == "/debug/pprof" || route == "/debug/pprof/";
@@ -288,6 +293,12 @@ mod tests {
         ] {
             assert!(validate_path(bad).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    #[test]
+    fn percent_encoding_cannot_smuggle_a_binary_profile() {
+        assert!(validate_path("/%64ebug/pprof/heap").is_err());
+        assert!(validate_path("/debug/pprof/heap?%64ebug=1").is_err());
     }
 
     #[test]

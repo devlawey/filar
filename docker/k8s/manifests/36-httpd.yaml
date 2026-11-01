@@ -31,10 +31,12 @@ spec:
             - sh
             - -c
             - |
-              mkdir -p /tmp/www
+              # The airgap image links only sh/date/hostname/sleep: call the
+              # other applets through busybox itself.
+              /bin/busybox mkdir -p /tmp/www
               printf '# HELP up Up\n# TYPE up gauge\nup 1\nhttp_requests_total{code="200"} 7\n' > /tmp/www/metrics
               printf 'ok\n' > /tmp/www/healthz
-              exec httpd -f -p 8080 -h /tmp/www
+              exec /bin/busybox httpd -f -p 8080 -h /tmp/www
           ports:
             - name: http
               containerPort: 8080
