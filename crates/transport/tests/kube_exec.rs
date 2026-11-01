@@ -233,7 +233,9 @@ async fn debug_container_reads_the_target_root_and_rbac_refuses_without_the_righ
 
     let reader_api = filar_transport::KubeClusterApi::connect(&reader()).await.unwrap();
     let mut denied = spec.clone();
-    denied.name = debug_container_name(&format!("{id}r"));
+    // A different name: `debug_container_name` keeps only 8 characters.
+    denied.name = debug_container_name(&format!("{:08x}", std::process::id() ^ 0xdead_beef));
+    assert_ne!(denied.name, spec.name);
     let error = reader_api
         .create_debug_container(&denied, Duration::from_secs(10))
         .await

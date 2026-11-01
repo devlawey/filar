@@ -2967,6 +2967,10 @@ impl App {
                         container: pod.container,
                     };
                     self.start_pod_connection(target, namespace, pod_ref);
+                    // A restored debug tab keeps its debug prompt (#576).
+                    if let Some(state) = self.kube.as_mut().and_then(|kube| kube.pod.as_mut()) {
+                        state.debug_target = pod.debug_target;
+                    }
                 }
                 None => self.queue_kube_connection(target, snapshot.namespace),
             },

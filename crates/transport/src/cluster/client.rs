@@ -57,13 +57,13 @@ impl KubeClusterApi {
         })
     }
 
-    /// The bounded (request-timeout) client, for crate-internal callers that
-    /// need typed objects this read-only surface does not expose (#563).
     /// The configured cluster entry this API is bound to.
     pub(super) fn target(&self) -> &KubeCluster {
         &self.target
     }
 
+    /// The bounded (request-timeout) client, for crate-internal callers that
+    /// need typed objects this read-only surface does not expose (#563).
     pub(super) fn client(&self) -> &Client {
         &self.client
     }

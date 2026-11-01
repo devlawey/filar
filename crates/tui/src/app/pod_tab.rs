@@ -976,6 +976,7 @@ impl App {
                 .container
                 .clone()
                 .or_else(|| state.container.clone()),
+            debug_target: state.debug_target.clone(),
         }
     }
 }
@@ -1323,6 +1324,7 @@ mod tests {
             pod: Some(filar_core::KubePodSnapshot {
                 pod: PodSelector::Labels("app=web".into()),
                 container: Some("main".into()),
+                debug_target: None,
             }),
         });
         assert!(app.in_pod_tab());
@@ -1468,5 +1470,21 @@ mod tests {
         assert!(names.iter().all(|n| !n.contains("debug") && !n.contains("ephemeral")), "{names:?}");
         let call = filar_agent::kube_tools::parse_kube_tool_call("k8s_debug", &serde_json::json!({}), Some("shop"));
         assert!(call.is_err());
+    }
+
+    #[test]
+    fn a_debug_tab_survives_save_and_restore_with_its_debug_prompt() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.kube_clusters = vec![cluster()];
+        let mut state = KubePodTabState::pending(PodRef::named("prod-eu", "shop", "distroless-1", Some("filar-debug-ab12cd34")));
+        state.debug_target = Some("main".into());
+        let snapshot = App::pod_snapshot(&state);
+        assert_eq!(snapshot.debug_target.as_deref(), Some("main"));
+        app.restore_kube_snapshot(filar_core::KubeSessionSnapshot {
+            target: "prod-eu".into(),
+            namespace: Some("shop".into()),
+            pod: Some(snapshot),
+        });
+        assert_eq!(app.kube.as_ref().unwrap().pod.as_ref().unwrap().debug_target.as_deref(), Some("main"));
     }
 }

@@ -17,6 +17,10 @@ use serde_json::{json, Value};
 
 use super::client::{api_error, KubeClusterApi};
 
+/// User the debug container runs as when the target's user is not in the
+/// spec: `nobody`.
+pub const NOBODY_UID: i64 = 65534;
+
 /// Prefix of debug container names: `filar-debug-<id>`.
 pub const DEBUG_CONTAINER_PREFIX: &str = "filar-debug-";
 
@@ -51,6 +55,11 @@ pub fn debug_container_name(id: &str) -> String {
 /// and group (the container's, else the pod's), non-root when the target is,
 /// no privilege escalation, every capability dropped, never privileged — so
 /// it is never wider than the target.
+///
+/// When the spec does not name the target's user (it comes from the image's
+/// `USER`), the debug image's own default — often root — could be wider, so
+/// the debug container runs as [`NOBODY_UID`] instead: never wider than any
+/// target, at worst narrower.
 pub fn debug_security_context(target: &Container, pod: Option<&PodSecurityContext>) -> Value {
     let own = target.security_context.as_ref();
     let run_as_user = own.and_then(|c| c.run_as_user).or(pod.and_then(|p| p.run_as_user));
@@ -58,6 +67,14 @@ pub fn debug_security_context(target: &Container, pod: Option<&PodSecurityContex
     let run_as_non_root = own
         .and_then(|c| c.run_as_non_root)
         .or(pod.and_then(|p| p.run_as_non_root));
+    let (run_as_user, run_as_group, run_as_non_root) = match run_as_user {
+        Some(uid) => (Some(uid), run_as_group, run_as_non_root),
+        None => (
+            Some(NOBODY_UID),
+            run_as_group.or(Some(NOBODY_UID)),
+            Some(true),
+        ),
+    };
     let mut ctx = json!({
         "allowPrivilegeEscalation": false,
         "privileged": false,
@@ -272,6 +289,19 @@ mod tests {
         assert_eq!(ctx["privileged"], false, "never privileged, whatever the target says");
         assert_eq!(ctx["allowPrivilegeEscalation"], false);
         assert_eq!(ctx["capabilities"], json!({"drop": ["ALL"]}), "no added capabilities");
+    }
+
+    #[test]
+    fn a_target_without_an_explicit_user_gets_nobody_not_the_image_default() {
+        let target = Container {
+            name: "main".into(),
+            ..Default::default()
+        };
+        let ctx = debug_security_context(&target, None);
+        assert_eq!(ctx["runAsUser"], NOBODY_UID);
+        assert_eq!(ctx["runAsGroup"], NOBODY_UID);
+        assert_eq!(ctx["runAsNonRoot"], true);
+        assert_eq!(ctx["capabilities"], json!({"drop": ["ALL"]}));
     }
 
     fn pod_with(state: ContainerState) -> Pod {

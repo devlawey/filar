@@ -142,6 +142,10 @@ pub struct KubePodSnapshot {
     /// Container to enter; `None` picks the default one.
     #[serde(default)]
     pub container: Option<String>,
+    /// `Some(target)` when `container` is an ephemeral debug container next
+    /// to container `target` (#576), so a restored tab keeps its debug prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_target: Option<String>,
 }
 
 /// The composition of a saved fleet session (#442, #567).
@@ -1316,6 +1320,7 @@ mod tests {
             pod: Some(KubePodSnapshot {
                 pod: crate::PodSelector::Labels("app=web".into()),
                 container: Some("main".into()),
+                debug_target: None,
             }),
         };
         let json = serde_json::to_string(&pod_tab).unwrap();
