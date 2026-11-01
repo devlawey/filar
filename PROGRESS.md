@@ -11401,3 +11401,36 @@ GitHub выводит образ macOS 14 2 ноября 2026 (брауноут�
 
 **Next:** на следующем релизе проверить, что `build-macos` на `macos-15` собрал
 ассет `filar-{tag}-macos-aarch64` (arm64) и прошёл SMOKE (#298).
+
+## Issue #599: фоновые задачи в read-only подах (веха 3.0.1)
+
+**Сделано.** Удалённый путь `background.rs` больше не хардкодит `/tmp`. Перед
+первой задачей сессии read-only проба (`test -d && test -w`, ничего не создаёт)
+выбирает каталог лога: `$TMPDIR` → `/tmp` → `/dev/shm`. Выбор кешируется в
+`SessionJobs::log_dir`. Нет кандидата — `start_background_job` отказывает
+(«background job unavailable: no writable directory …»), задача не регистрируется.
+Старт сначала создаёт лог в подшелле (`if ( : > LOG ) 2>/dev/null; then nohup …`):
+сбой редиректа — ошибка старта, а не «exited» без вывода. Подшелл обязателен —
+ошибка редиректа у спецвстроенной `:` завершила бы неинтерактивный персистентный
+шелл. При неудаче кеш сбрасывается, проба повторяется один раз (самовосстановление
+после смены пода), затем понятная ошибка. Пути лога в `tail`/`rm -f` квотируются
+(`$TMPDIR` с пробелами). На SSH без `$TMPDIR` команды и путь прежние (тест).
+
+**Сброс кеша.** Новый `filar_agent::background::reset_log_dir(session_id)`.
+`TuiExecutor::swap_executor` теперь принимает `SessionId` и сбрасывает кеш при
+смене транспорта. `KubeExecEvent::PodChanged` в TUI ещё не подключён — #565
+должна вызвать `reset_log_dir` по этому событию; до того спасает повторная проба.
+
+**Промпт пода.** Требование `test -w /tmp` убрано: промпт говорит, что задаче
+нужен пишущий каталог ($TMPDIR, /tmp, /dev/shm) и что без него она откажет.
+Снапшот `eval/prompts/pod-system.txt` обновлён.
+
+**Фикстуры.** `docker/k8s/manifests/35-nowrite.yaml` — BusyBox без пишущего
+каталога (read-only корень, без тома на `/tmp`, `/dev/shm` смонтирован read-only:
+в k8s он по умолчанию tmpfs 1777). Live-тесты `crates/agent/tests/kube_background.rs`
+(`#[ignore = "needs docker/k8s cluster"]`): задача в `web/main`, отказ в `nowrite`.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. Новый публичный
+`background::reset_log_dir`.
+
+**Next:** #565 — вкладка пода (вызвать `reset_log_dir` по `PodChanged`).

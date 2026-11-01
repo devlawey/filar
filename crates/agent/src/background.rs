@@ -7,10 +7,13 @@
 //! **Local:** child is spawned via `tokio::process` (Unix: `setsid`); stdout/stderr
 //! are captured in an in-memory buffer — no log files on disk.
 //!
-//! **SSH (zero-install):** start uses `nohup sh -c … & echo $!` through the
-//! executor; output is read via short `tail` polls against an ephemeral
-//! `/tmp/filar-job-{session}-{id}.log` removed when the job finishes or is
-//! cancelled.
+//! **SSH / pod (zero-install):** start uses `nohup sh -c … & echo $!` through
+//! the executor; output is read via short `tail` polls against an ephemeral
+//! `<dir>/filar-job-{session}-{id}.log` removed when the job finishes or is
+//! cancelled. `<dir>` is chosen per session by a read-only probe — `$TMPDIR`,
+//! then `/tmp`, then `/dev/shm`, the first that exists and is writable (#599)
+//! — so read-only containers get an honest refusal instead of a job that
+//! "exits" without output.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -65,6 +68,9 @@ struct JobRecord {
 struct SessionJobs {
     next_num: u32,
     jobs: HashMap<String, JobRecord>,
+    /// Remote jobs: directory for job logs, chosen by [`probe_log_dir`] before
+    /// the first job and reused until [`reset_log_dir`] (#599).
+    log_dir: Option<String>,
 }
 
 fn registry() -> &'static Mutex<HashMap<String, SessionJobs>> {
@@ -90,8 +96,69 @@ fn job_id_for(session: &mut SessionJobs) -> String {
     format!("job-{}", session.next_num)
 }
 
-fn remote_log_path(session_id: &str, job_id: &str) -> String {
-    format!("/tmp/filar-job-{session_id}-{job_id}.log")
+fn remote_log_path(log_dir: &str, session_id: &str, job_id: &str) -> String {
+    let dir = log_dir.trim_end_matches('/');
+    format!("{dir}/filar-job-{session_id}-{job_id}.log")
+}
+
+/// Marker the log-directory probe prints before the chosen directory.
+const LOG_DIR_MARKER: &str = "__FILAR_LOGDIR__=";
+/// Marker the start command prints before the job's PID.
+const PID_MARKER: &str = "__FILAR_PID__=";
+/// Marker the start command prints when the log file cannot be created.
+const LOG_FAILED_MARKER: &str = "__FILAR_LOG_FAILED__";
+
+/// Read-only probe for a writable log directory: `$TMPDIR`, `/tmp`,
+/// `/dev/shm`, first match wins. Uses only `test`, so nothing is created on
+/// the host (invariant 1).
+const LOG_DIR_PROBE: &str = "for __filar_d in \"${TMPDIR:-}\" /tmp /dev/shm; do \
+     if [ -n \"$__filar_d\" ] && [ -d \"$__filar_d\" ] && [ -w \"$__filar_d\" ]; then \
+     echo \"__FILAR_LOGDIR__=$__filar_d\"; break; fi; done; unset __filar_d";
+
+/// Refusal when no candidate directory is writable (#599).
+const NO_WRITABLE_DIR_MESSAGE: &str = "background job unavailable: no writable directory \
+     for its log in this container or host (checked $TMPDIR, /tmp, /dev/shm) — run a short \
+     command directly instead";
+
+/// Clears the cached log directory of `session_id`, so the next remote job
+/// probes again (#599).
+///
+/// Call it when the session's target changes under the same tab: a
+/// reconnect, a transport swap, or a pod replaced by the Kubernetes executor
+/// (`KubeExecEvent::PodChanged`). Running jobs keep their recorded log paths.
+pub fn reset_log_dir(session_id: &str) {
+    let _ = with_session(session_id, |session| {
+        session.log_dir = None;
+        Ok(())
+    });
+}
+
+/// Runs [`LOG_DIR_PROBE`] and returns the chosen directory, or `None` when
+/// none of the candidates is writable.
+async fn probe_log_dir(executor: &dyn CommandExecutor) -> Result<Option<String>> {
+    let result = executor.run(LOG_DIR_PROBE).await?;
+    Ok(result
+        .stdout
+        .lines()
+        .find_map(|line| line.trim_end().strip_prefix(LOG_DIR_MARKER))
+        .map(str::to_string)
+        .filter(|dir| !dir.is_empty()))
+}
+
+/// Cached log directory of the session, probing on first use.
+async fn session_log_dir(executor: &dyn CommandExecutor, session_id: &str) -> Result<String> {
+    if let Some(dir) = with_session(session_id, |session| Ok(session.log_dir.clone()))? {
+        return Ok(dir);
+    }
+    let dir = probe_log_dir(executor)
+        .await?
+        .ok_or_else(|| CoreError::Other(NO_WRITABLE_DIR_MESSAGE.into()))?;
+    debug!(session_id, dir = %dir, "background job log directory chosen");
+    with_session(session_id, |session| {
+        session.log_dir = Some(dir.clone());
+        Ok(())
+    })?;
+    Ok(dir)
 }
 
 /// Escape a string for embedding in a single-quoted POSIX `sh -c` argument.
@@ -279,29 +346,89 @@ fn local_output_snapshot(record: &JobRecord) -> String {
 // Remote (SSH) helpers
 // ---------------------------------------------------------------------------
 
+/// Result of one attempt to start a remote job.
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteStart {
+    /// The log was created and the job runs with this PID.
+    Started(u32),
+    /// The log file could not be created; the job was not started.
+    LogNotWritable,
+}
+
+/// Shell command that starts `command` in the background with its output in
+/// `log`.
+///
+/// The log is created first, in a subshell (a failed redirection on `:`
+/// would otherwise end a non-interactive persistent shell), and the job is
+/// started only if that worked. A failed redirect is thus reported as a
+/// start error instead of surfacing later as a job that "exited" with no
+/// output (#599).
+///
+/// The markers are spliced in unquoted: they must stay plain shell words
+/// (checked by `markers_are_plain_shell_words`).
+fn remote_start_command(log: &str, command: &str) -> String {
+    let log_quoted = sh_single_quote(log);
+    let command_quoted = sh_single_quote(command);
+    format!(
+        "if ( : > {log_quoted} ) 2>/dev/null; then nohup sh -c {command_quoted} \
+         > {log_quoted} 2>&1 & echo \"{PID_MARKER}$!\"; else echo {LOG_FAILED_MARKER}; fi"
+    )
+}
+
 async fn start_remote_job(
+    executor: &dyn CommandExecutor,
+    log: &str,
+    command: &str,
+) -> Result<RemoteStart> {
+    let result = executor.run(&remote_start_command(log, command)).await?;
+    parse_remote_start(&result.stdout)
+}
+
+fn parse_remote_start(stdout: &str) -> Result<RemoteStart> {
+    for line in stdout.lines().map(str::trim) {
+        if line == LOG_FAILED_MARKER {
+            return Ok(RemoteStart::LogNotWritable);
+        }
+        if let Some(pid) = line.strip_prefix(PID_MARKER) {
+            return pid.trim().parse().map(RemoteStart::Started).map_err(|_| {
+                CoreError::Other(format!("failed to parse background job PID from: {pid:?}"))
+            });
+        }
+    }
+    Err(CoreError::Other(format!(
+        "background job failed to start: unexpected shell output {:?}",
+        stdout.trim()
+    )))
+}
+
+/// Starts a remote job in the session's log directory.
+///
+/// If the log cannot be created there (the directory became read-only, the
+/// pod behind the tab was replaced), the cached directory is dropped and the
+/// probe runs once more before giving up with a clear start error (#599).
+async fn start_remote_job_in_session(
     executor: &dyn CommandExecutor,
     session_id: &str,
     job_id: &str,
     command: &str,
-) -> Result<u32> {
-    let log = remote_log_path(session_id, job_id);
-    let quoted = sh_single_quote(command);
-    let start_cmd = format!("nohup sh -c {quoted} > {log} 2>&1 & echo $!");
-    let result = executor.run(&start_cmd).await?;
-    let pid_str = result.stdout.trim();
-    let pid: u32 = pid_str
-        .lines()
-        .last()
-        .unwrap_or(pid_str)
-        .trim()
-        .parse()
-        .map_err(|_| {
-            CoreError::Other(format!(
-                "failed to parse background job PID from: {pid_str:?}"
-            ))
-        })?;
-    Ok(pid)
+) -> Result<(u32, String)> {
+    let mut last_log = String::new();
+    for attempt in 0..2 {
+        let dir = session_log_dir(executor, session_id).await?;
+        let log = remote_log_path(&dir, session_id, job_id);
+        match start_remote_job(executor, &log, command).await? {
+            RemoteStart::Started(pid) => return Ok((pid, log)),
+            RemoteStart::LogNotWritable => {
+                warn!(session_id, log = %log, attempt, "background job log not writable");
+                reset_log_dir(session_id);
+                last_log = log;
+            }
+        }
+    }
+    Err(CoreError::Other(format!(
+        "background job failed to start: cannot create its log {last_log} (the directory \
+         is not writable) — run a short command directly instead"
+    )))
 }
 
 async fn poll_remote_job(
@@ -310,6 +437,7 @@ async fn poll_remote_job(
     log_path: &str,
     tail_lines: u32,
 ) -> Result<(JobState, String)> {
+    let log_path = sh_single_quote(log_path);
     let poll_cmd = format!(
         "if kill -0 {pid} 2>/dev/null; then echo __FILAR_STATUS__=running; else \
          wait {pid} 2>/dev/null; ec=$?; echo __FILAR_STATUS__=finished; echo __FILAR_EXIT__=$ec; fi; \
@@ -356,13 +484,15 @@ async fn cancel_remote_job(
     pid: u32,
     log_path: &str,
 ) -> Result<()> {
-    let cmd = format!("kill {pid} 2>/dev/null; rm -f {log_path}");
+    let cmd = format!("kill {pid} 2>/dev/null; rm -f {}", sh_single_quote(log_path));
     executor.run(&cmd).await?;
     Ok(())
 }
 
 async fn cleanup_remote_log(executor: &dyn CommandExecutor, log_path: &str) {
-    let _ = executor.run(&format!("rm -f {log_path}")).await;
+    let _ = executor
+        .run(&format!("rm -f {}", sh_single_quote(log_path)))
+        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -399,8 +529,8 @@ pub async fn start_job(
         })?;
         pid
     } else {
-        let log_path = remote_log_path(session_id, &job_id);
-        let pid = start_remote_job(executor, session_id, &job_id, command).await?;
+        let (pid, log_path) =
+            start_remote_job_in_session(executor, session_id, &job_id, command).await?;
         with_session(session_id, |session| {
             session.jobs.insert(
                 job_id.clone(),
@@ -782,6 +912,23 @@ mod tests {
         }
     }
 
+    fn ok(stdout: &str) -> CommandResult {
+        CommandResult {
+            stdout: stdout.into(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: Duration::from_millis(1),
+            cwd: None,
+        }
+    }
+
+    fn mock(responses: Vec<CommandResult>) -> MockExecutor {
+        MockExecutor {
+            responses: StdMutex::new(responses),
+            commands: StdMutex::new(vec![]),
+        }
+    }
+
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_SESSION_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -822,8 +969,9 @@ mod tests {
         let sid = test_session();
         let exec = MockExecutor {
             responses: StdMutex::new(vec![
+                ok("__FILAR_LOGDIR__=/tmp\n"),
                 CommandResult {
-                    stdout: "12345\n".into(),
+                    stdout: "__FILAR_PID__=12345\n".into(),
                     stderr: String::new(),
                     exit_code: Some(0),
                     duration: Duration::from_millis(1),
@@ -875,7 +1023,8 @@ mod tests {
         assert!(status_done.contains("done"));
 
         let cmds = exec.commands.lock().unwrap();
-        assert!(cmds[0].contains("nohup sh -c"));
+        assert_eq!(cmds[0], LOG_DIR_PROBE);
+        assert!(cmds[1].contains("nohup sh -c"));
         assert!(cmds.iter().any(|c| c.contains("rm -f")));
     }
 
@@ -898,13 +1047,10 @@ mod tests {
     async fn snapshot_reflects_remote_jobs_without_touching_the_host() {
         let sid = test_session();
         let exec = MockExecutor {
-            responses: StdMutex::new(vec![CommandResult {
-                stdout: "4242\n".into(),
-                stderr: String::new(),
-                exit_code: Some(0),
-                duration: Duration::from_millis(1),
-                cwd: None,
-            }]),
+            responses: StdMutex::new(vec![
+                ok("__FILAR_LOGDIR__=/tmp\n"),
+                ok("__FILAR_PID__=4242\n"),
+            ]),
             commands: StdMutex::new(vec![]),
         };
         start_job(&sid, "sleep 100", false, &exec).await.unwrap();
@@ -996,5 +1142,147 @@ mod tests {
         let list = list_jobs(&sid).unwrap();
         assert!(list.contains("job-1"));
         assert!(list.contains("cancelled"));
+    }
+
+    // --- #599: log directory for remote jobs ---------------------------------
+
+    /// On a plain SSH host without `$TMPDIR` the probe yields `/tmp`: the log
+    /// path and the commands are the same as before #599.
+    #[tokio::test]
+    async fn ssh_host_with_writable_tmp_keeps_the_tmp_log_path() {
+        let sid = test_session();
+        let exec = mock(vec![ok("__FILAR_LOGDIR__=/tmp\n"), ok("__FILAR_PID__=77\n")]);
+        start_job(&sid, "sleep 5", false, &exec).await.unwrap();
+        let cmds = exec.commands.lock().unwrap().clone();
+        assert_eq!(cmds.len(), 2);
+        assert!(cmds[0].contains("${TMPDIR:-}\" /tmp /dev/shm"), "{}", cmds[0]);
+        let log = format!("/tmp/filar-job-{sid}-job-1.log");
+        assert!(cmds[1].contains(&format!("( : > {log} )")), "{}", cmds[1]);
+        assert!(cmds[1].contains(&format!("> {log} 2>&1 &")), "{}", cmds[1]);
+    }
+
+    #[test]
+    fn probe_only_tests_and_never_writes() {
+        assert!(LOG_DIR_PROBE.contains("[ -d \"$__filar_d\" ] && [ -w \"$__filar_d\" ]"));
+        for writer in ["mkdir", "touch", ">", "rm "] {
+            assert!(!LOG_DIR_PROBE.contains(writer), "probe must be read-only: {writer}");
+        }
+    }
+
+    /// The directory is probed once per session and reused for later jobs.
+    #[tokio::test]
+    async fn log_dir_is_cached_per_session_and_follows_tmpdir() {
+        let sid = test_session();
+        let exec = mock(vec![
+            ok("__FILAR_LOGDIR__=/var/run/app tmp/\n"),
+            ok("__FILAR_PID__=1\n"),
+            ok("__FILAR_PID__=2\n"),
+        ]);
+        start_job(&sid, "sleep 1", false, &exec).await.unwrap();
+        start_job(&sid, "sleep 2", false, &exec).await.unwrap();
+        let cmds = exec.commands.lock().unwrap().clone();
+        assert_eq!(cmds.len(), 3, "second job must not probe again: {cmds:?}");
+        assert!(cmds[1].contains(&format!("'/var/run/app tmp/filar-job-{sid}-job-1.log'")));
+        assert!(cmds[2].contains(&format!("'/var/run/app tmp/filar-job-{sid}-job-2.log'")));
+    }
+
+    /// `reset_log_dir` (reconnect, pod change) makes the next job probe again.
+    #[tokio::test]
+    async fn reset_log_dir_forces_a_new_probe() {
+        let sid = test_session();
+        let exec = mock(vec![
+            ok("__FILAR_LOGDIR__=/tmp\n"),
+            ok("__FILAR_PID__=1\n"),
+            ok("__FILAR_LOGDIR__=/dev/shm\n"),
+            ok("__FILAR_PID__=2\n"),
+        ]);
+        start_job(&sid, "sleep 1", false, &exec).await.unwrap();
+        reset_log_dir(&sid);
+        start_job(&sid, "sleep 2", false, &exec).await.unwrap();
+        let cmds = exec.commands.lock().unwrap().clone();
+        assert_eq!(cmds[2], LOG_DIR_PROBE);
+        assert!(cmds[3].contains(&format!("/dev/shm/filar-job-{sid}-job-2.log")));
+    }
+
+    /// No writable candidate: an honest refusal, nothing is started or
+    /// registered.
+    #[tokio::test]
+    async fn no_writable_dir_refuses_without_starting_a_job() {
+        let sid = test_session();
+        let exec = mock(vec![ok("")]);
+        let err = start_job(&sid, "sleep 1", false, &exec).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("background job unavailable"), "{msg}");
+        assert!(msg.contains("$TMPDIR, /tmp, /dev/shm"), "{msg}");
+        assert!(msg.contains("run a short command directly"), "{msg}");
+        assert_eq!(exec.commands.lock().unwrap().len(), 1, "only the probe ran");
+        assert!(snapshot(&sid, 10).is_empty(), "no phantom job");
+    }
+
+    /// A failed redirect is a start error, not a job that "exited" silently:
+    /// the probe runs once more, and a second failure gives up.
+    #[tokio::test]
+    async fn log_creation_failure_is_a_start_error() {
+        let sid = test_session();
+        let exec = mock(vec![
+            ok("__FILAR_LOGDIR__=/tmp\n"),
+            ok("__FILAR_LOG_FAILED__\n"),
+            ok("__FILAR_LOGDIR__=/tmp\n"),
+            ok("__FILAR_LOG_FAILED__\n"),
+        ]);
+        let err = start_job(&sid, "sleep 1", false, &exec).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("background job failed to start"), "{msg}");
+        assert!(msg.contains("not writable"), "{msg}");
+        let cmds = exec.commands.lock().unwrap().clone();
+        assert_eq!(cmds.len(), 4, "{cmds:?}");
+        assert!(cmds.iter().all(|c| !c.contains("nohup") || c.starts_with("if ( : >")));
+        assert!(snapshot(&sid, 10).is_empty(), "no phantom job");
+    }
+
+    /// A stale cached directory (pod replaced, volume gone) recovers on the
+    /// re-probe.
+    #[tokio::test]
+    async fn stale_cached_dir_recovers_after_reprobe() {
+        let sid = test_session();
+        let exec = mock(vec![
+            ok("__FILAR_LOGDIR__=/tmp\n"),
+            ok("__FILAR_LOG_FAILED__\n"),
+            ok("__FILAR_LOGDIR__=/dev/shm\n"),
+            ok("__FILAR_PID__=99\n"),
+        ]);
+        let out = start_job(&sid, "sleep 1", false, &exec).await.unwrap();
+        assert!(out.contains("pid: 99"), "{out}");
+        let cmds = exec.commands.lock().unwrap().clone();
+        assert!(cmds[3].contains(&format!("/dev/shm/filar-job-{sid}-job-1.log")));
+    }
+
+    /// Cancelling removes the log in the chosen directory.
+    #[tokio::test]
+    async fn cancel_removes_the_log_in_the_chosen_dir() {
+        let sid = test_session();
+        let exec = mock(vec![ok("__FILAR_LOGDIR__=/dev/shm\n"), ok("__FILAR_PID__=5\n")]);
+        start_job(&sid, "sleep 60", false, &exec).await.unwrap();
+        cancel_job(&sid, "job-1", false, &exec).await.unwrap();
+        let cmds = exec.commands.lock().unwrap().clone();
+        let last = cmds.last().unwrap();
+        assert_eq!(last, &format!("kill 5 2>/dev/null; rm -f /dev/shm/filar-job-{sid}-job-1.log"));
+    }
+
+    /// Markers are spliced into shell commands unquoted.
+    #[test]
+    fn markers_are_plain_shell_words() {
+        for marker in [LOG_DIR_MARKER, PID_MARKER, LOG_FAILED_MARKER] {
+            assert!(
+                marker.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c == '='),
+                "{marker} must need no shell quoting"
+            );
+        }
+    }
+
+    #[test]
+    fn unexpected_start_output_is_an_error() {
+        assert!(parse_remote_start("sh: nohup: not found\n").is_err());
+        assert_eq!(parse_remote_start("noise\n__FILAR_PID__=12\n").unwrap(), RemoteStart::Started(12));
     }
 }
