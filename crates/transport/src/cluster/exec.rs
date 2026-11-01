@@ -1573,6 +1573,8 @@ mod tests {
         let _held = term.stdin.lock().await;
         let started = Instant::now();
         let result = term.write_input(b"x").await;
+        // `ConnectionLost` is the contract: the TUI treats it as a lost
+        // terminal and closes it.
         assert!(matches!(result, Err(CoreError::ConnectionLost(_))));
         assert!(started.elapsed() < TEST_TIMEOUT * 5, "{:?}", started.elapsed());
     }
@@ -1594,7 +1596,9 @@ mod tests {
         {
             let mut stored = term.resize.lock().await;
             let sender = stored.as_mut().unwrap();
-            while sender.try_send(tty_size(1, 1)).is_ok() {}
+            // Bounded: a channel of capacity 1 parks after two messages.
+            let accepted = (0..16).take_while(|_| sender.try_send(tty_size(1, 1)).is_ok()).count();
+            assert!(accepted < 16, "the resize channel must be bounded");
         }
         let pending = tokio::spawn({
             let term = term.clone();
