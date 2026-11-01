@@ -69,8 +69,12 @@ async fn background_job_runs_in_a_read_only_pod_with_tmp_volume() {
     assert!(status.contains("status: done"), "{status}");
     assert!(status.contains("filar-bg-ok"), "{status}");
 
+    // The log directory is chosen by a probe: look in every candidate.
     let left = exec
-        .run(&format!("ls /tmp/filar-job-{sid}-* 2>/dev/null | wc -l"))
+        .run(&format!(
+            "for d in \"${{TMPDIR:-}}\" /tmp /dev/shm; do [ -n \"$d\" ] && \
+             ls \"$d\"/filar-job-{sid}-* 2>/dev/null; done | wc -l"
+        ))
         .await
         .unwrap();
     assert_eq!(left.stdout.trim(), "0", "log must be removed after completion");

@@ -363,12 +363,15 @@ enum RemoteStart {
 /// started only if that worked. A failed redirect is thus reported as a
 /// start error instead of surfacing later as a job that "exited" with no
 /// output (#599).
+///
+/// The markers are spliced in unquoted: they must stay plain shell words
+/// (checked by `markers_are_plain_shell_words`).
 fn remote_start_command(log: &str, command: &str) -> String {
-    let log = sh_single_quote(log);
-    let quoted = sh_single_quote(command);
+    let log_quoted = sh_single_quote(log);
+    let command_quoted = sh_single_quote(command);
     format!(
-        "if ( : > {log} ) 2>/dev/null; then nohup sh -c {quoted} > {log} 2>&1 & \
-         echo \"{PID_MARKER}$!\"; else echo {LOG_FAILED_MARKER}; fi"
+        "if ( : > {log_quoted} ) 2>/dev/null; then nohup sh -c {command_quoted} \
+         > {log_quoted} 2>&1 & echo \"{PID_MARKER}$!\"; else echo {LOG_FAILED_MARKER}; fi"
     )
 }
 
@@ -1264,6 +1267,17 @@ mod tests {
         let cmds = exec.commands.lock().unwrap().clone();
         let last = cmds.last().unwrap();
         assert_eq!(last, &format!("kill 5 2>/dev/null; rm -f /dev/shm/filar-job-{sid}-job-1.log"));
+    }
+
+    /// Markers are spliced into shell commands unquoted.
+    #[test]
+    fn markers_are_plain_shell_words() {
+        for marker in [LOG_DIR_MARKER, PID_MARKER, LOG_FAILED_MARKER] {
+            assert!(
+                marker.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c == '='),
+                "{marker} must need no shell quoting"
+            );
+        }
     }
 
     #[test]

@@ -14,6 +14,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 ### Added
 
 - `KubeExecutor`: a persistent shell in a pod's container over the Kubernetes `exec` API — pod by name or selector, container choice, interrupt via a second exec or honest shell recreation, one silent reconnect with pod-change events, distinct RBAC/admission-policy denials, and `PodLimits` from the pod spec ([#563](https://github.com/devlawey/filar/issues/563)).
+- `filar_agent::background::reset_log_dir(session_id)` for embedders: drops a session's cached background-job log directory when its target changes (reconnect, transport swap, replaced pod) so the next job probes again ([#599](https://github.com/devlawey/filar/issues/599)).
 - Pod-shell agent mode: a system prompt for working inside a container (ephemeral filesystem, no package installs, persistent shell, known `PodLimits` as facts and the shared-memory-limit rule) and a pod target with its limits for the arbiter and safety rating ([#564](https://github.com/devlawey/filar/issues/564)).
 
 ### Fixed
