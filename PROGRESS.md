@@ -11695,3 +11695,32 @@ v3.5.7 (одиночный бинарник, filesystem storage, `docker/logs/RE
 push → поиск строк → метрический запрос → ошибка синтаксиса — зелёный.
 
 **Next:** #581 (OpenSearch/Elasticsearch).
+
+## Issue #581: адаптер OpenSearch / Elasticsearch (веха 3.0.2)
+
+**Сделано.**
+- Core: в `LogSourceConfig` добавлены `time_field`, `fields`, `ca_file`,
+  `k8s_fields`. `time_field` и `fields` — только для OpenSearch/ES. Пресеты
+  `K8sFieldPreset` (vlagent, fluent-bit, filebeat, promtail → `K8sFields`
+  pod/namespace/container/labels_prefix), по умолчанию по `kind`.
+- `LogHttp`: `ca_file` → `add_root_certificate` (верификация не отключается);
+  `send_explained` — краткое объяснение ответа-ошибки.
+- `crates/agent/src/logs/search.rs`: `SearchSource` — только
+  `POST /{index}/_search`. Тело: `bool.filter.range` по `time_field`, затем
+  `query_string` либо JSON DSL в `bool.must` (полный body с одним `query` —
+  берётся его `query`). `size = limit`, `sort` desc, `track_total_hits` 10000,
+  `_source = fields`. `hits` разворачиваются в плоские поля, сообщение берётся
+  из `message`/`log`/`msg`/`@message`/`_msg`. `explain_error` формирует
+  `тип: причина` по `root_cause`.
+
+**Проверки.**
+- Юнит-тесты: тела в обоих режимах, путь, пресеты.
+- `tests/opensearch_mock.rs` на mock-сервере с фикстурами в формате ответа
+  OpenSearch 2.x (`tests/fixtures/opensearch`): разбор hits, свёртка, basic и
+  ApiKey, DSL, ошибки 400/404/401 без ключа.
+- Живой OpenSearch/ES из окружения агента недоступен (artifacts.* закрыты
+  прокси) — ручной пункт в `docs/SMOKE.md`.
+- DoD: бинарник в tmux, mock-OpenSearch + mock-LLM → подтверждение →
+  свёрнутый ответ → ответ агента.
+
+**Next:** #583 — связка Kubernetes и логов (пресеты `k8s_fields` уже есть).

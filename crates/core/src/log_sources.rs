@@ -92,6 +92,91 @@ impl LogSourceKind {
     }
 }
 
+/// Which Kubernetes field names a log collector writes (`k8s_fields`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum K8sFieldPreset {
+    /// VictoriaLogs vlagent: `kubernetes.pod_name`, `kubernetes.pod_namespace`, …
+    Vlagent,
+    /// Fluent Bit: `kubernetes.pod_name`, `kubernetes.namespace_name`, …
+    FluentBit,
+    /// Filebeat / Elastic Agent: `kubernetes.pod.name`, `kubernetes.namespace`, …
+    Filebeat,
+    /// Promtail / Grafana Alloy labels: `pod`, `namespace`, `container`.
+    Promtail,
+}
+
+/// Kubernetes field names of one collector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct K8sFields {
+    /// Pod name field.
+    pub pod: &'static str,
+    /// Namespace field.
+    pub namespace: &'static str,
+    /// Container name field.
+    pub container: &'static str,
+    /// Prefix of pod label fields (the label name follows it).
+    pub labels_prefix: &'static str,
+}
+
+impl K8sFieldPreset {
+    /// Every preset.
+    pub const ALL: [K8sFieldPreset; 4] = [Self::Vlagent, Self::FluentBit, Self::Filebeat, Self::Promtail];
+
+    /// Parse the `k8s_fields` value.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.as_str() == s.trim())
+    }
+
+    /// The `k8s_fields` value as written in the config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vlagent => "vlagent",
+            Self::FluentBit => "fluent-bit",
+            Self::Filebeat => "filebeat",
+            Self::Promtail => "promtail",
+        }
+    }
+
+    /// The field names this collector writes.
+    pub fn fields(self) -> K8sFields {
+        match self {
+            Self::Vlagent => K8sFields {
+                pod: "kubernetes.pod_name",
+                namespace: "kubernetes.pod_namespace",
+                container: "kubernetes.container_name",
+                labels_prefix: "kubernetes.pod_labels.",
+            },
+            Self::FluentBit => K8sFields {
+                pod: "kubernetes.pod_name",
+                namespace: "kubernetes.namespace_name",
+                container: "kubernetes.container_name",
+                labels_prefix: "kubernetes.labels.",
+            },
+            Self::Filebeat => K8sFields {
+                pod: "kubernetes.pod.name",
+                namespace: "kubernetes.namespace",
+                container: "kubernetes.container.name",
+                labels_prefix: "kubernetes.labels.",
+            },
+            Self::Promtail => K8sFields {
+                pod: "pod",
+                namespace: "namespace",
+                container: "container",
+                labels_prefix: "",
+            },
+        }
+    }
+
+    /// The usual collector for `kind` when `k8s_fields` is not set.
+    pub fn default_for(kind: LogSourceKind) -> Self {
+        match kind {
+            LogSourceKind::VictoriaLogs => Self::Vlagent,
+            LogSourceKind::OpenSearch | LogSourceKind::Elasticsearch => Self::FluentBit,
+            LogSourceKind::Loki => Self::Promtail,
+        }
+    }
+}
+
 /// How a source authenticates (`auth`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LogAuth {
@@ -182,6 +267,22 @@ pub struct LogSourceConfig {
     /// Free-form tags: they feed tag policies like a target's tags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Time field of the documents (OpenSearch / Elasticsearch); `@timestamp`
+    /// when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_field: Option<String>,
+    /// Document fields to fetch (`_source`) — OpenSearch / Elasticsearch;
+    /// empty = whole documents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+    /// Extra CA certificate (PEM) trusted for this source, e.g. a private
+    /// OpenSearch CA. TLS verification itself is never switched off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<std::path::PathBuf>,
+    /// Kubernetes field names the collector writes: `vlagent`, `fluent-bit`,
+    /// `filebeat` or `promtail`; unset = the usual one for `kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k8s_fields: Option<String>,
 }
 
 fn default_auth() -> String {
@@ -222,6 +323,10 @@ impl Default for LogSourceConfig {
             max_response_bytes: default_max_response_bytes(),
             clusters: Vec::new(),
             tags: Vec::new(),
+            time_field: None,
+            fields: Vec::new(),
+            ca_file: None,
+            k8s_fields: None,
         }
     }
 }
@@ -235,6 +340,19 @@ impl LogSourceConfig {
     /// The parsed `auth`; [`validate`](Self::validate) guarantees it.
     pub fn auth_kind(&self) -> Option<LogAuth> {
         LogAuth::parse(&self.auth)
+    }
+
+    /// The document time field (OpenSearch / Elasticsearch).
+    pub fn time_field_name(&self) -> &str {
+        self.time_field.as_deref().map(str::trim).filter(|f| !f.is_empty()).unwrap_or("@timestamp")
+    }
+
+    /// The Kubernetes field preset: `k8s_fields`, else the usual one for `kind`.
+    pub fn k8s_preset(&self) -> Option<K8sFieldPreset> {
+        match self.k8s_fields.as_deref() {
+            Some(name) => K8sFieldPreset::parse(name),
+            None => self.source_kind().map(K8sFieldPreset::default_for),
+        }
     }
 
     /// Reject entries that cannot work or would surprise. Every error names
@@ -341,6 +459,26 @@ impl LogSourceConfig {
         let (lo, hi) = LOG_MAX_RESPONSE_BYTES_RANGE;
         if !(lo..=hi).contains(&self.max_response_bytes) {
             return err(format!("max_response_bytes must be between {lo} and {hi}"));
+        }
+        let search = matches!(kind, LogSourceKind::OpenSearch | LogSourceKind::Elasticsearch);
+        if !search && (self.time_field.is_some() || !self.fields.is_empty()) {
+            return err(format!("time_field and fields are not used by {}", kind.as_str()));
+        }
+        let field_ok = |f: &str| !f.trim().is_empty() && !f.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"');
+        if self.time_field.as_deref().is_some_and(|f| !field_ok(f)) {
+            return err("time_field must be a field name".into());
+        }
+        if self.fields.iter().any(|f| !field_ok(f)) {
+            return err("fields entries must be field names".into());
+        }
+        if let Some(preset) = self.k8s_fields.as_deref() {
+            if K8sFieldPreset::parse(preset).is_none() {
+                let all: Vec<&str> = K8sFieldPreset::ALL.iter().map(|p| p.as_str()).collect();
+                return err(format!("k8s_fields \"{preset}\" is not one of {}", all.join(", ")));
+            }
+        }
+        if self.ca_file.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
+            return err("ca_file must be a path to a PEM file".into());
         }
         if self.clusters.iter().any(|c| c.trim().is_empty()) {
             return err("clusters entries must not be empty".into());
@@ -472,6 +610,35 @@ mod tests {
             ..Default::default()
         };
         loki.validate().unwrap();
+    }
+
+    #[test]
+    fn search_options_and_presets() {
+        let mut os = LogSourceConfig {
+            name: "os".into(),
+            kind: "opensearch".into(),
+            url: "https://os:9200".into(),
+            index: Some("logs-*".into()),
+            ..Default::default()
+        };
+        assert_eq!(os.time_field_name(), "@timestamp");
+        assert_eq!(os.k8s_preset(), Some(K8sFieldPreset::FluentBit));
+        os.time_field = Some("ts".into());
+        os.fields = vec!["message".into(), "kubernetes.pod_name".into()];
+        os.k8s_fields = Some("filebeat".into());
+        os.validate().unwrap();
+        assert_eq!(os.time_field_name(), "ts");
+        assert_eq!(os.k8s_preset().unwrap().fields().pod, "kubernetes.pod.name");
+        os.k8s_fields = Some("logstash".into());
+        assert!(err(&os).contains("k8s_fields \"logstash\""));
+        os.k8s_fields = None;
+        os.fields = vec!["bad field".into()];
+        assert!(err(&os).contains("fields entries"));
+
+        let mut v = vlogs();
+        v.time_field = Some("ts".into());
+        assert!(err(&v).contains("not used by victorialogs"));
+        assert_eq!(vlogs().k8s_preset(), Some(K8sFieldPreset::Vlagent));
     }
 
     #[test]

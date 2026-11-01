@@ -120,6 +120,16 @@
 - [ ] «сколько ошибок по подам за час?» → метрический запрос (`count_over_time`), в ленте `Metric result: N series` с min/max/last
 - [ ] LogQL без селектора или с синтаксической ошибкой → текст ошибки Loki (400) в ленте
 
+## Источники логов: OpenSearch / Elasticsearch (3.0.2)
+
+Живого стенда в окружении агента нет — проверка вручную против своего кластера.
+
+- [ ] `[[log_sources]]` `kind = "opensearch"`, `index = "logs-*"`, `auth = "basic"` (ключ в keyring) → «какие ошибки были за последний час в shop?» → подтверждение с `query_string`, ответ свёрнут, видны поля `kubernetes.*`
+- [ ] Elasticsearch с `auth = "api-key"` → запрос проходит; неверный ключ → «authentication failed (401)» без ключа
+- [ ] Просьба сформулировать запрос в JSON DSL → в подтверждении JSON, окно добавлено filar
+- [ ] Неверный `index` → `index_not_found_exception: no such index […]`; синтаксическая ошибка → `parsing_exception`/`query_shard_exception`
+- [ ] Свой CA через `ca_file` → HTTPS работает; без него — ошибка TLS (проверка не отключается)
+
 ## Kubernetes: вкладка пода (3.0.1)
 
 Тот же кластер `docker/k8s`, LLM-профиль, режим `always`. Удаление пода

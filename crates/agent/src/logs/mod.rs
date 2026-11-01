@@ -22,6 +22,7 @@
 pub mod fold;
 pub mod tool;
 pub mod loki;
+pub mod search;
 pub mod victorialogs;
 
 use std::collections::BTreeMap;
@@ -205,9 +206,20 @@ impl LogHttp {
     /// Build the client for `cfg` with the already resolved `key` (empty
     /// when `auth = "none"`).
     pub fn new(cfg: &LogSourceConfig, key: &str) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_secs))
-            .connect_timeout(Duration::from_secs(cfg.timeout_secs.min(10)))
+            .connect_timeout(Duration::from_secs(cfg.timeout_secs.min(10)));
+        // An extra trusted CA (`ca_file`); verification stays on.
+        if let Some(path) = &cfg.ca_file {
+            let pem = std::fs::read(path).map_err(|e| {
+                CoreError::Config(format!("log source \"{}\": cannot read ca_file {}: {e}", cfg.name, path.display()))
+            })?;
+            let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| {
+                CoreError::Config(format!("log source \"{}\": ca_file {} is not a PEM certificate: {e}", cfg.name, path.display()))
+            })?;
+            builder = builder.add_root_certificate(cert);
+        }
+        let client = builder
             .build()
             .map_err(|e| CoreError::Other(format!("log source \"{}\": HTTP client: {e}", cfg.name)))?;
         Ok(Self {
@@ -235,6 +247,17 @@ impl LogHttp {
     /// Send `request`; a non-2xx status becomes an error carrying the start of
     /// the server's answer (the key scrubbed), 401/403 named as such.
     pub async fn send(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        self.send_explained(request, |_| None).await
+    }
+
+    /// [`send`](Self::send), with `explain` turning the start of an error
+    /// reply into a short reason (e.g. Elasticsearch's `type: reason`); the
+    /// raw text is used when it returns `None`.
+    pub async fn send_explained(
+        &self,
+        request: reqwest::RequestBuilder,
+        explain: impl Fn(&str) -> Option<String>,
+    ) -> Result<reqwest::Response> {
         let response = request
             .send()
             .await
@@ -244,7 +267,8 @@ impl LogHttp {
             return Ok(response);
         }
         let body = read_limited(response, 2048).await.unwrap_or_default();
-        let text = String::from_utf8_lossy(&body.bytes).trim().to_string();
+        let raw = String::from_utf8_lossy(&body.bytes).trim().to_string();
+        let text = explain(&raw).unwrap_or(raw);
         let what = match status.as_u16() {
             401 => "authentication failed (401) — check the key and auth".to_string(),
             403 => "access denied (403) — the key lacks rights for this search".to_string(),
@@ -307,6 +331,9 @@ pub fn build_log_source(cfg: &LogSourceConfig, key: &str) -> Result<Arc<dyn LogS
     match cfg.source_kind() {
         Some(LogSourceKind::VictoriaLogs) => Ok(Arc::new(victorialogs::VictoriaLogsSource::new(cfg, key)?)),
         Some(LogSourceKind::Loki) => Ok(Arc::new(loki::LokiSource::new(cfg, key)?)),
+        Some(LogSourceKind::OpenSearch | LogSourceKind::Elasticsearch) => {
+            Ok(Arc::new(search::SearchSource::new(cfg, key)?))
+        }
         _ => Err(CoreError::Config(format!(
             "log source \"{}\": kind \"{}\" has no adapter in this build",
             cfg.name, cfg.kind

@@ -191,21 +191,18 @@ fn a_missing_key_is_named_by_variable_only() {
 }
 
 #[test]
-fn a_kind_without_an_adapter_is_reported_not_built() {
+fn a_source_that_cannot_be_built_is_reported_not_offered() {
     let os = LogSourceConfig {
         kind: "opensearch".into(),
         url: "https://os:9200".into(),
         index: Some("logs-*".into()),
+        ca_file: Some("/nonexistent/filar-ca.pem".into()),
         ..vlogs("o")
     };
-    let (set, notes) = build_log_sources(
-        &[os],
-        Arc::new(StaticSecretProvider::new()),
-        Vec::new(),
-    );
+    let (set, notes) = build_log_sources(&[os], Arc::new(StaticSecretProvider::new()), Vec::new());
     assert!(set.is_none());
     assert_eq!(notes.len(), 1);
-    assert!(notes[0].contains("no adapter"), "{}", notes[0]);
+    assert!(notes[0].contains("cannot read ca_file"), "{}", notes[0]);
 }
 
 #[test]
