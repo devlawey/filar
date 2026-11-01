@@ -1706,7 +1706,9 @@ dependencies = [
 name = "filar-gui"
 version = "3.0.0"
 dependencies = [
+ "chrono",
  "eframe",
+ "filar-agent",
  "filar-core",
  "filar-transport",
  "image",

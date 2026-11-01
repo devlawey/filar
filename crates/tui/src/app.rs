@@ -417,6 +417,52 @@ pub use pod_tab::{DebugProposal, KubePodConnectRequest, KubePodListRequest, Kube
 /// host range, so it can never be taken for a target (#565).
 pub(crate) const ENTER_POD_SELECTION: usize = usize::MAX;
 
+/// What the feed shows about one answered log query (#584).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogDetail {
+    /// The call's command line (links the detail to its block).
+    pub command: String,
+    /// Source name.
+    pub source: String,
+    /// Query language.
+    pub language: String,
+    /// Window start and end, RFC 3339 UTC.
+    pub start: String,
+    /// Window end.
+    pub end: String,
+    /// Lines returned.
+    pub lines: usize,
+    /// More data existed.
+    pub truncated: bool,
+    /// The returned lines, redacted.
+    pub raw: Vec<String>,
+}
+
+impl LogDetail {
+    /// The one-line summary under the block header.
+    pub fn summary(&self) -> String {
+        let clock = |t: &str| t.get(11..16).unwrap_or(t).to_string();
+        let mut out = format!(
+            "{} · {} · {}–{} UTC · {} line{}",
+            self.source,
+            self.language,
+            clock(&self.start),
+            clock(&self.end),
+            self.lines,
+            if self.lines == 1 { "" } else { "s" }
+        );
+        if self.truncated {
+            out.push_str(" · truncated");
+        }
+        out
+    }
+}
+
+/// Whether `tool` is a log query (#579, #583).
+pub fn is_log_tool(tool: &str) -> bool {
+    tool == filar_agent::TOOL_QUERY_LOGS || tool == filar_agent::logs::k8s::TOOL_POD_LOGS_HISTORY
+}
+
 /// Exact explanation for actions that require a shell in a cluster tab (#575).
 pub const KUBE_SHELL_REFUSAL: &str = "во вкладке кластера нет шелла; войдите в под — Ctrl+E";
 
@@ -954,6 +1000,13 @@ pub struct Session {
     pub block_proposals: HashMap<usize, (u64, String)>,
     /// Safety ratings received in this session (for F1).
     pub risk_ratings: u64,
+    /// Log queries per source in this session (#584, for F1).
+    pub log_queries: std::collections::BTreeMap<String, u64>,
+    /// Log query details by command block index (#584): the summary line
+    /// and the raw lines behind the folded output. Not saved with a session.
+    pub log_details: HashMap<usize, LogDetail>,
+    /// The detail of the log query whose `CommandFinished` is next.
+    pub pending_log_detail: Option<LogDetail>,
     /// Their cost in USD, when reported.
     pub risk_cost_usd: Option<f64>,
     /// Command confirmation mode for this tab (per-session, toggled via F2).
@@ -1369,6 +1422,9 @@ impl Session {
             block_proposals: HashMap::new(),
             risk_ratings: 0,
             risk_cost_usd: None,
+            log_queries: std::collections::BTreeMap::new(),
+            log_details: HashMap::new(),
+            pending_log_detail: None,
             confirm_mode,
             prev_confirm_mode: CommandConfirmMode::Allowlist,
             transcript_path: None,
@@ -3395,6 +3451,10 @@ impl App {
         self.pending_proposal_id = None;
         self.risk_ratings = 0;
         self.risk_cost_usd = None;
+        // Log details point at the replaced history's blocks (#584).
+        self.log_details.clear();
+        self.pending_log_detail = None;
+        self.log_queries.clear();
         // Restored alongside the context it was folded out of, so reopening a
         // compacted session does not quietly shorten its transcript. Sessions
         // saved before #379 carry none, which is simply an empty archive.
@@ -5848,8 +5908,7 @@ impl App {
         self.risk_scorer_on
             && !self.in_fleet()
             && !filar_agent::kube_tools::is_kube_tool_name(&tool.name)
-            && tool.name != filar_agent::TOOL_QUERY_LOGS
-            && tool.name != filar_agent::logs::k8s::TOOL_POD_LOGS_HISTORY
+            && !is_log_tool(&tool.name)
             && tool.name != filar_agent::tools::TOOL_BACKGROUND_JOB_STATUS
             && tool.name != filar_agent::tools::TOOL_LIST_BACKGROUND_JOBS
     }
@@ -6108,6 +6167,29 @@ impl App {
                         unavailable,
                     });
                 }
+                filar_agent::AgentEvent::LogQueryFinished {
+                    command,
+                    source,
+                    language,
+                    start,
+                    end,
+                    lines,
+                    truncated,
+                    raw,
+                    ..
+                } => {
+                    *self.log_queries.entry(source.clone()).or_insert(0) += 1;
+                    self.pending_log_detail = Some(LogDetail {
+                        command,
+                        source,
+                        language,
+                        start,
+                        end,
+                        lines,
+                        truncated,
+                        raw,
+                    });
+                }
                 filar_agent::AgentEvent::CommandFinished {
                     command,
                     output,
@@ -6135,6 +6217,7 @@ impl App {
                             .rposition(|b| !matches!(b, ChatBlock::System(_)))
                             .filter(|&i| matches!(&self.messages[i],
                                 ChatBlock::Command { command: cmd, output: None, .. } if *cmd == command));
+                        let mut block_idx = None;
                         if let Some(ChatBlock::Command {
                             output: ref mut o,
                             approved: ref mut a,
@@ -6144,6 +6227,7 @@ impl App {
                             *o = Some(output.clone());
                             *a = true;
                             updated = true;
+                            block_idx = pending;
                             self.message_rev = self.message_rev.wrapping_add(1);
                         }
                         if updated {
@@ -6159,6 +6243,18 @@ impl App {
                             });
                             let idx = self.messages.len() - 1;
                             self.link_block_to_proposal(idx, &command);
+                            block_idx = Some(idx);
+                        }
+                        // A log query's summary and raw lines (#584).
+                        if let Some(detail) = self
+                            .pending_log_detail
+                            .take()
+                            .filter(|detail| detail.command == command)
+                        {
+                            if let Some(idx) = block_idx {
+                                self.log_details.insert(idx, detail);
+                                self.message_rev = self.message_rev.wrapping_add(1);
+                            }
                         }
                     } else {
                         // A denial the user did not make carries its reason
@@ -17357,6 +17453,76 @@ mod tests {
             app.operations.iter().all(|op| op.id != "copy-1"),
             "a finished copy leaves Ctrl+J (#545)"
         );
+    }
+
+    // ── Log query block (#584) ───────────────────────────────────────
+
+    fn log_query_done(app: &mut App, command: &str) {
+        let session_id = app.sessions[app.active].id;
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id,
+            event: filar_agent::AgentEvent::LogQueryFinished {
+                command: command.into(),
+                source: "vlogs-prod".into(),
+                language: "LogsQL".into(),
+                query: "error".into(),
+                start: "2026-11-01T10:00:00Z".into(),
+                end: "2026-11-01T11:00:00Z".into(),
+                lines: 2,
+                truncated: true,
+                raw: vec![
+                    "2026-11-01 10:05:00 connection refused".into(),
+                    "2026-11-01 10:06:00 connection refused".into(),
+                ],
+            },
+        });
+    }
+
+    #[test]
+    fn a_log_query_gets_its_summary_raw_lines_and_f1_count() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Never);
+        app.risk_scorer_on = true;
+        let command = "query_logs vlogs-prod --start 2026-11-01T10:00:00Z --end 2026-11-01T11:00:00Z --limit 200: error";
+        propose(&mut app, 901, command, "query_logs");
+        assert!(app.safety_scores.get(&901).is_none(), "a log query is never rated");
+        log_query_done(&mut app, command);
+        finished(&mut app, command);
+        let idx = app.messages.len() - 1;
+        let detail = app.log_details.get(&idx).expect("detail linked to the block");
+        assert_eq!(detail.summary(), "vlogs-prod · LogsQL · 10:00–11:00 UTC · 2 lines · truncated");
+        assert_eq!(app.log_queries.get("vlogs-prod"), Some(&1));
+
+        let theme = crate::ui::theme::Theme::default_dark();
+        let mut cache = crate::ui::layout_cache::ChatLayoutCache::new();
+        cache.log_details = app.log_details.clone();
+        let text = |cache: &crate::ui::layout_cache::ChatLayoutCache| {
+            cache
+                .lines
+                .iter()
+                .map(|l| l.line.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Collapsed: the summary, not the raw lines.
+        let collapsed: std::collections::HashSet<usize> = [idx].into();
+        cache.rebuild(&app.messages, 120, &theme, &collapsed, 1);
+        let shown = text(&cache);
+        assert!(shown.contains("vlogs-prod · LogsQL · 10:00–11:00 UTC · 2 lines · truncated"), "{shown}");
+        assert!(!shown.contains("lines (2 of 2)"), "{shown}");
+        // Expanded: the lines behind the fold.
+        cache.rebuild(&app.messages, 120, &theme, &std::collections::HashSet::new(), 2);
+        let shown = text(&cache);
+        assert!(shown.contains("lines (2 of 2):"), "{shown}");
+        assert!(shown.contains("2026-11-01 10:06:00 connection refused"), "{shown}");
+    }
+
+    #[test]
+    fn a_detail_for_another_command_is_not_linked() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Never);
+        propose(&mut app, 902, "query_logs a", "query_logs");
+        log_query_done(&mut app, "query_logs b");
+        finished(&mut app, "query_logs a");
+        assert!(app.log_details.is_empty());
     }
 
     // ── Safety rating (#551) ─────────────────────────────────────────

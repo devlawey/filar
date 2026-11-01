@@ -24,6 +24,9 @@ pub const TOOL_QUERY_LOGS: &str = "query_logs";
 /// Heading of the log-source section of the system prompt.
 pub const LOG_SOURCES_PROMPT_HEADER: &str = "LOG SOURCES (query_logs)";
 
+/// Raw lines sent to the UI with [`AgentEvent::LogQueryFinished`].
+pub const UI_LINES: usize = 400;
+
 /// Lines asked for when the model names no limit.
 const DEFAULT_QUERY_LINES: usize = 200;
 
@@ -384,7 +387,34 @@ impl LogSources {
         // The server's own reply may echo other known secrets: both paths
         // are redacted.
         let output = match outcome {
-            Ok(result) => self.redact(&render(parsed, &result)),
+            Ok(result) => {
+                let raw = result
+                    .lines
+                    .iter()
+                    .take(UI_LINES)
+                    .map(|line| {
+                        let time = line.time.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default();
+                        self.redact(format!("{time} {}", line.message.replace('\n', " ")).trim())
+                    })
+                    .collect();
+                let language = self
+                    .source_config(&parsed.source)
+                    .and_then(|cfg| cfg.source_kind())
+                    .map(|k| k.language())
+                    .unwrap_or("?");
+                emit(AgentEvent::LogQueryFinished {
+                    command: display.clone(),
+                    source: parsed.source.clone(),
+                    language: language.to_string(),
+                    query: parsed.query.query.clone(),
+                    start: parsed.query.start.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    end: parsed.query.end.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    lines: result.lines.len(),
+                    truncated: result.truncated,
+                    raw,
+                });
+                self.redact(&render(parsed, &result))
+            }
             Err(error) => self.redact(&format!("Error: log query failed: {error}")),
         };
         emit(AgentEvent::CommandFinished {

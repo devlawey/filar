@@ -643,6 +643,19 @@ fn append_usage_summary(lines: &mut Vec<Line<'static>>, app: &App) {
         lines.push(Line::from(Span::styled(risk, app.theme.dim())));
     }
 
+    // Log queries per source (#584).
+    if !app.log_queries.is_empty() {
+        let parts: Vec<String> = app
+            .log_queries
+            .iter()
+            .map(|(source, n)| format!("{source} {n}"))
+            .collect();
+        lines.push(Line::from(Span::styled(
+            format!("  Log queries: {}", parts.join(", ")),
+            app.theme.dim(),
+        )));
+    }
+
     if let Some(cost) = app.cost_usd {
         if cost > 0.0 {
             lines.push(Line::from(Span::styled(

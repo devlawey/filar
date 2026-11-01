@@ -65,6 +65,8 @@ pub struct Glyphs {
     pub fleet_split: &'static str,
     /// Kubernetes target/tool marker: `⎈` or `k8s:` (#575).
     pub kube: &'static str,
+    /// Marker of a log query block (#584).
+    pub logs: &'static str,
     /// Cluster/namespace separator: `›` or `>` (#575).
     pub kube_namespace_sep: &'static str,
 }
@@ -96,6 +98,7 @@ impl Glyphs {
         fleet_differs: "≠",
         fleet_split: "≈",
         kube: "⎈",
+        logs: "⌕",
         kube_namespace_sep: "›",
     };
 
@@ -125,6 +128,7 @@ impl Glyphs {
         fleet_differs: "!=",
         fleet_split: "~",
         kube: "k8s:",
+        logs: "logs:",
         kube_namespace_sep: ">",
     };
 
