@@ -555,7 +555,7 @@ impl App {
         self.push_kube_message(
             sid,
             ChatBlock::Error(format!(
-                "Не удалось войти в под {pod}: {error}. Вкладка осталась на кластере {}.",
+                "Не удалось войти в под {pod}, вкладка осталась на кластере {}: {error}",
                 target.name
             )),
         );

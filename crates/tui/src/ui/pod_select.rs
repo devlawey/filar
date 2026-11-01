@@ -20,9 +20,12 @@ pub(crate) fn render_pod_select(f: &mut Frame, app: &App, area: Rect) {
         match &select.stage {
             PodSelectStage::Pods => {
                 let rows = select.rows();
-                let items: Vec<ListItem> = if select.loading {
+                // A typed selector works without the pod list, so it is
+                // offered even while the list loads or failed.
+                let selector_typed = select.filter.contains('=');
+                let items: Vec<ListItem> = if select.loading && !selector_typed {
                     vec![ListItem::new("  Загрузка подов...")]
-                } else if let Some(error) = &select.error {
+                } else if let Some(error) = select.error.as_ref().filter(|_| !selector_typed) {
                     vec![ListItem::new(format!("  {error}"))]
                 } else if rows.is_empty() {
                     vec![ListItem::new(
@@ -54,8 +57,9 @@ pub(crate) fn render_pod_select(f: &mut Frame, app: &App, area: Rect) {
                         })
                         .collect()
                 };
-                let selected = (!select.loading && select.error.is_none() && !rows.is_empty())
-                    .then_some(select.index.min(rows.len().saturating_sub(1)));
+                let selected = ((selector_typed || (!select.loading && select.error.is_none()))
+                    && !rows.is_empty())
+                .then_some(select.index.min(rows.len().saturating_sub(1)));
                 (
                     format!(
                         " Под {} {} / {} ",
