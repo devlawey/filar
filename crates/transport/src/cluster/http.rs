@@ -1,0 +1,204 @@
+//! A minimal HTTP/1.1 `GET` over one port-forward stream (#578).
+//!
+//! Only what diagnostics need: one request, `Connection: close`, a status
+//! line, headers, and a body that is either `Content-Length`, chunked or
+//! read to EOF — capped at `max_bytes`.
+
+use filar_core::{CoreError, Result};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use super::PodHttpResponse;
+
+/// Largest header block accepted.
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// The request bytes for `path` (already validated: starts with `/`, no
+/// whitespace or control characters).
+pub(crate) fn request_bytes(path: &str) -> Vec<u8> {
+    format!(
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nUser-Agent: filar\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+/// Send `GET path` on `stream` and read the answer, keeping at most
+/// `max_bytes` of body.
+pub(crate) async fn get_over<S>(stream: &mut S, path: &str, max_bytes: usize) -> Result<PodHttpResponse>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let io = |e: std::io::Error| CoreError::ConnectionLost(format!("port-forward: {e}"));
+    stream.write_all(&request_bytes(path)).await.map_err(io)?;
+    stream.flush().await.map_err(io)?;
+    // Read until the body is complete or clearly over the cap: headers,
+    // then max_bytes of body plus chunk framing slack.
+    let budget = MAX_HEADER_BYTES + max_bytes + 64 * 1024;
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let n = stream.read(&mut buf).await.map_err(io)?;
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+        if raw.len() >= budget || body_complete(&raw) {
+            break;
+        }
+    }
+    parse_response(&raw, max_bytes)
+}
+
+/// Whether `raw` already holds a whole response with a known length.
+fn body_complete(raw: &[u8]) -> bool {
+    let Some(end) = header_end(raw) else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+    if let Some(len) = header_value(&head, "content-length").and_then(|v| v.parse::<usize>().ok()) {
+        return raw.len() - (end + 4) >= len;
+    }
+    if header_value(&head, "transfer-encoding").is_some_and(|v| v.contains("chunked")) {
+        return raw.windows(5).rev().take(64).any(|w| w == b"0\r\n\r\n");
+    }
+    false
+}
+
+fn header_end(raw: &[u8]) -> Option<usize> {
+    raw.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == name).then(|| value.trim())
+    })
+}
+
+/// Parse a raw response into status, content type and a capped body.
+pub(crate) fn parse_response(raw: &[u8], max_bytes: usize) -> Result<PodHttpResponse> {
+    let end = header_end(raw).ok_or_else(|| {
+        CoreError::Other("the pod answered without a complete HTTP header".into())
+    })?;
+    let head = String::from_utf8_lossy(&raw[..end]).to_string();
+    let lower = head.to_ascii_lowercase();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| CoreError::Other("the pod's answer is not HTTP".into()))?;
+    let content_type = head.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case("content-type")
+            .then(|| value.trim().to_string())
+    });
+    let rest = &raw[end + 4..];
+    let mut body = if header_value(&lower, "transfer-encoding").is_some_and(|v| v.contains("chunked")) {
+        dechunk(rest)
+    } else if let Some(len) =
+        header_value(&lower, "content-length").and_then(|v| v.parse::<usize>().ok())
+    {
+        rest[..rest.len().min(len)].to_vec()
+    } else {
+        rest.to_vec()
+    };
+    let truncated = body.len() > max_bytes;
+    body.truncate(max_bytes);
+    Ok(PodHttpResponse {
+        status,
+        content_type,
+        body,
+        truncated,
+    })
+}
+
+/// Decode a chunked body; a cut-off last chunk keeps what arrived.
+fn dechunk(mut rest: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") else {
+            break;
+        };
+        let size_text = String::from_utf8_lossy(&rest[..line_end]);
+        let size_hex = size_text.split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size_hex, 16) else {
+            break;
+        };
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            break;
+        }
+        let take = size.min(rest.len());
+        out.extend_from_slice(&rest[..take]);
+        if take < size || rest.len() < size + 2 {
+            break;
+        }
+        rest = &rest[size + 2..];
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_is_a_plain_get_that_closes() {
+        let text = String::from_utf8(request_bytes("/metrics")).unwrap();
+        assert!(text.starts_with("GET /metrics HTTP/1.1\r\n"));
+        assert!(text.contains("Connection: close\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn content_length_body_and_type() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: 5\r\n\r\nhelloEXTRA";
+        let r = parse_response(raw, 1024).unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(r.content_type.as_deref(), Some("text/plain; version=0.0.4"));
+        assert_eq!(r.body, b"hello");
+        assert!(!r.truncated);
+        assert!(body_complete(raw));
+    }
+
+    #[test]
+    fn chunked_body_is_decoded() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+        let r = parse_response(raw, 1024).unwrap();
+        assert_eq!(r.body, b"Wikipedia");
+        assert!(body_complete(raw));
+    }
+
+    #[test]
+    fn body_over_the_cap_is_truncated() {
+        let raw = b"HTTP/1.0 503 Service Unavailable\r\n\r\n0123456789";
+        let r = parse_response(raw, 4).unwrap();
+        assert_eq!(r.status, 503);
+        assert_eq!(r.body, b"0123");
+        assert!(r.truncated);
+    }
+
+    #[test]
+    fn non_http_answer_is_an_error() {
+        assert!(parse_response(b"SSH-2.0-OpenSSH\r\n\r\n", 10).is_err());
+        assert!(parse_response(b"HTTP/1.1 200", 10).is_err());
+    }
+
+    #[tokio::test]
+    async fn get_over_a_duplex_stream() {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let mut req = vec![0u8; 1024];
+            let n = server.read(&mut req).await.unwrap();
+            assert!(String::from_utf8_lossy(&req[..n]).starts_with("GET /healthz HTTP/1.1"));
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        let r = get_over(&mut client, "/healthz", 1024).await.unwrap();
+        server_task.await.unwrap();
+        assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
+    }
+}

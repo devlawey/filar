@@ -15,8 +15,8 @@ use serde::de::DeserializeOwned;
 use super::convert;
 use super::{
     ClusterApi, ConfigMapInfo, ContainerMetrics, EndpointInfo, EventInfo, IngressInfo,
-    NamespaceInfo, NodeInfo, PodInfo, PodLogs, ResourceMetrics, RolloutRevision, ServiceInfo,
-    WorkloadInfo, WorkloadKind, DEFAULT_CLUSTER_LIST_LIMIT,
+    NamespaceInfo, NodeInfo, PodHttpRequest, PodHttpResponse, PodInfo, PodLogs, ResourceMetrics,
+    RolloutRevision, ServiceInfo, WorkloadInfo, WorkloadKind, DEFAULT_CLUSTER_LIST_LIMIT,
 };
 
 /// [`ClusterApi`] implementation backed by a kubeconfig-selected API server.
@@ -218,6 +218,38 @@ fn metrics_error(
 
 #[async_trait::async_trait]
 impl ClusterApi for KubeClusterApi {
+    async fn pod_http_get(&self, request: &PodHttpRequest) -> Result<PodHttpResponse> {
+        // Port-forward is a streaming upgrade: it needs the client without a
+        // read timeout, bounded here by the request's own deadline.
+        let client = super::client::build_client(&self.target, true).await?;
+        let pods: Api<Pod> = Api::namespaced(client, &request.namespace);
+        let exchange = async {
+            let mut forwarder = pods
+                .portforward(&request.pod, &[request.port])
+                .await
+                .map_err(|error| {
+                    self.api_error(error, "create", "pods/portforward", Some(&request.namespace))
+                })?;
+            let mut stream = forwarder.take_stream(request.port).ok_or_else(|| {
+                CoreError::Other("port-forward did not provide a stream".into())
+            })?;
+            let result = super::http::get_over(&mut stream, &request.path, request.max_bytes).await;
+            drop(stream);
+            forwarder.abort();
+            result
+        };
+        match tokio::time::timeout(request.timeout, exchange).await {
+            Ok(result) => result,
+            Err(_) => Err(CoreError::Unavailable(format!(
+                "pod {}/{} port {} did not answer within {} s",
+                request.namespace,
+                request.pod,
+                request.port,
+                request.timeout.as_secs()
+            ))),
+        }
+    }
+
     async fn list_pods(
         &self,
         namespace: Option<&str>,

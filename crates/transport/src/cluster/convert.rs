@@ -99,6 +99,17 @@ pub(super) fn pod_info(pod: Pod) -> PodInfo {
                         .into_iter()
                         .map(|(name, quantity)| (name, quantity.0))
                         .collect(),
+                    ports: container
+                        .ports
+                        .iter()
+                        .flatten()
+                        .filter_map(|port| {
+                            Some(super::ContainerPortInfo {
+                                name: port.name.clone(),
+                                port: u16::try_from(port.container_port).ok()?,
+                            })
+                        })
+                        .collect(),
                 })
                 .collect()
         })
