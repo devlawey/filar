@@ -77,7 +77,7 @@ pub fn parse_selector(selector: &str) -> Result<Vec<LabelTerm>> {
             )));
         };
         let (key, value) = (key.trim(), value.trim());
-        if key.is_empty() || key.contains(char::is_whitespace) || value.contains(char::is_whitespace) {
+        if key.is_empty() || value.is_empty() || key.contains(char::is_whitespace) || value.contains(char::is_whitespace) {
             return Err(CoreError::Other(format!("selector term \"{part}\" is malformed")));
         }
         terms.push(LabelTerm {
@@ -259,6 +259,13 @@ pub fn build_scope_query(cfg: &LogSourceConfig, scopes: &[PodScope], filter: Opt
                 .flatten()
                 .collect();
             let all = scopes.iter().any(|s| matches!(s.pick, PodPick::All));
+            // One selector cannot say "every pod of A, only web-1 of B":
+            // dropping the pod matcher would widen B to all its pods.
+            if all && namespaces.len() > 1 && scopes.iter().any(|s| matches!(s.pick, PodPick::Names(_))) {
+                return Err(CoreError::Other(
+                    "whole namespaces and single pods in other namespaces cannot be one LogQL query".into(),
+                ));
+            }
             if !pods.is_empty() && !all {
                 let pod_label = loki_label(f.pod);
                 if pods.len() == 1 {
@@ -625,6 +632,7 @@ mod tests {
         assert!(parse_selector("app in (web,api)").is_err());
         assert!(parse_selector("app").is_err());
         assert!(parse_selector(" ").is_err());
+        assert!(parse_selector("app=").is_err(), "an empty value would match nothing useful");
     }
 
     #[test]
@@ -681,6 +689,19 @@ mod tests {
         assert_eq!(loki, r#"{namespace=~"pay|shop", pod=~"api\\.v2-1|web-1|web-2"}"#);
         let os = build_scope_query(&cfg("opensearch", None), &scopes, None).unwrap();
         assert!(os.starts_with("((kubernetes.namespace_name:\"shop\" AND kubernetes.pod_name:(\"web-1\"))"), "{os}");
+    }
+
+    #[test]
+    fn loki_never_widens_a_mix_of_namespaces_and_pods() {
+        let whole = PodScope { namespace: "pay".into(), pick: PodPick::All, container: None };
+        let err = build_scope_query(&cfg("loki", None), &[whole.clone(), pod("shop", "web-1")], None).unwrap_err();
+        assert!(err.to_string().contains("cannot be one LogQL query"), "{err}");
+        // In one namespace, every pod of it is exactly what was asked.
+        let same = build_scope_query(&cfg("loki", None), &[PodScope { namespace: "shop".into(), ..whole }, pod("shop", "web-1")], None).unwrap();
+        assert_eq!(same, r#"{namespace="shop"}"#);
+        // Other languages keep each scope apart.
+        let vl = build_scope_query(&cfg("victorialogs", None), &[PodScope { namespace: "pay".into(), pick: PodPick::All, container: None }, pod("shop", "web-1")], None).unwrap();
+        assert!(vl.contains(r#"("kubernetes.pod_namespace":="pay")"#) && vl.contains(r#""kubernetes.pod_name":="web-1""#), "{vl}");
     }
 
     #[test]
