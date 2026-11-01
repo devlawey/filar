@@ -11619,7 +11619,7 @@ exec-протокола (`tty_size` не даёт нулей), Ctrl+C уходи
   `Config::log_sources`, `Config::validate_log_sources` (уникальные имена,
   `clusters` — существующие `[[kube_clusters]]`).
 - Agent (`crates/agent/src/logs/`): трейт `LogSource` (`config`, `describe`,
-  `query(&LogQuery) -> LogResult`), `LogHttp` (таймаут, auth, вычистка ключа
+  `async fn query(&LogQuery) -> Result<LogResult>`), `LogHttp` (таймаут, auth, вычистка ключа
   и basic-токена из ошибок), `read_limited` (тело потоком, обрыв соединения на
   лимите), `cap_line`; `fold_logs` — нормализация (`<time>`, `<uuid>`, `<hex>`,
   `<n>`), группы со счётчиками, первое/последнее вхождение, распределение по

@@ -10,8 +10,8 @@
 //! - at most `max_lines` lines;
 //! - a byte cap per line and per answer — the body is read as a stream and
 //!   the connection is dropped at the cap ([`read_limited`]);
-//! - a timeout; cancelling drops the request, closing the connection, so the
-//!   server stops the query.
+//! - a timeout; cancelling drops the request and closes the connection
+//!   (whether the store then stops the query depends on the backend).
 //!
 //! Adapters only ever call search endpoints: read-only by construction. The
 //! request goes straight from the user's machine to the user's store

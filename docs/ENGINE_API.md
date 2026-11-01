@@ -787,8 +787,8 @@ let _agent = builder.log_sources(sources);
 ```
 
 - `LogSource` (trait, `filar_agent::logs`) — `config()`, `describe()` (query
-  language and main fields for the prompt) and `query(&LogQuery) ->
-  LogResult`. `LogQuery` carries the query text **in the store's language**,
+  language and main fields for the prompt) and `async fn query(&LogQuery) ->
+  Result<LogResult>`. `LogQuery` carries the query text **in the store's language**,
   a window `start..end` and `limit`; `LogResult` holds `LogLine`s (time,
   message, fields, cut flag) and a `truncated` flag. Adapters use `LogHttp`
   (timeout, auth, key scrubbing), `read_limited` (streamed body, connection
@@ -803,8 +803,9 @@ let _agent = builder.log_sources(sources);
 - The model gets a folded view (`fold_logs`): messages grouped after
   normalising numbers, UUIDs, hex ids and timestamps, with counts, first/last
   occurrence and a time distribution; then `redact_logs` (#573).
-- Dropping or cancelling the query drops the HTTP request; the connection
-  closes and the store stops the query. Kinds without an adapter in the
+- Dropping or cancelling the query drops the HTTP request and closes the
+  connection. Whether the store then stops the query depends on the backend
+  and any proxy in front of it (VictoriaLogs documents that it does). Kinds without an adapter in the
   build are reported by `build_log_sources` and not offered.
 
 ## Upgrading to the next engine release (unreleased)

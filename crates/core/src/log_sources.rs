@@ -245,8 +245,8 @@ impl LogSourceConfig {
         if name.is_empty() {
             return Err(CoreError::Config("log_sources: name must not be empty".into()));
         }
-        if name.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            return err("name must not contain whitespace".into());
+        if self.name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return err("name must not contain whitespace (leading or trailing included)".into());
         }
         let Some(kind) = self.source_kind() else {
             let all: Vec<&str> = LogSourceKind::ALL.iter().map(|k| k.as_str()).collect();
@@ -384,6 +384,13 @@ mod tests {
         assert_eq!(cfg.max_line_bytes, 4096);
         assert_eq!(cfg.max_response_bytes, 2 * 1024 * 1024);
         assert_eq!(cfg.source_kind(), Some(LogSourceKind::VictoriaLogs));
+    }
+
+    #[test]
+    fn a_name_with_surrounding_spaces_is_refused() {
+        let mut cfg = vlogs();
+        cfg.name = " vlogs ".into();
+        assert!(err(&cfg).contains("whitespace"));
     }
 
     #[test]

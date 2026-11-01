@@ -347,6 +347,55 @@ fn the_frame_requires_a_window_within_the_cap_and_caps_the_limit() {
 }
 
 #[test]
+fn a_huge_since_is_an_error_not_a_panic() {
+    let (set, _, _) = sources(Vec::new(), Vec::new(), Vec::new());
+    let err = set
+        .parse_call(&json!({"source": "vlogs-prod", "query": "x", "since": "9000000000000s"}), now())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("too large") || err.contains("longer"), "{err}");
+}
+
+/// A source whose query fails with a server reply echoing a secret.
+struct FailingSource(LogSourceConfig);
+
+#[async_trait]
+impl LogSource for FailingSource {
+    fn config(&self) -> &LogSourceConfig {
+        &self.0
+    }
+    fn describe(&self) -> String {
+        String::new()
+    }
+    async fn query(&self, _: &LogQuery) -> filar_core::Result<LogResult> {
+        Err(filar_core::CoreError::Other("HTTP 502: upstream said token=other-secret-42".into()))
+    }
+}
+
+#[tokio::test]
+async fn an_error_reply_is_redacted_before_the_model() {
+    let secrets = StaticSecretProvider::new();
+    secrets.insert("SOME_OTHER_KEY", "other-secret-42");
+    let set = LogSources::new(
+        vec![Arc::new(FailingSource(vlogs("down"))) as Arc<dyn LogSource>],
+        Arc::new(secrets),
+        Vec::new(),
+    );
+    let call = ToolCall {
+        id: "c".into(),
+        name: TOOL_QUERY_LOGS.into(),
+        arguments: json!({"source": "down", "query": "x", "since": "5m"}),
+    };
+    let emit = |_: AgentEvent| {};
+    let msg = set
+        .process(&call, CommandConfirmMode::Never, &Answer(true, Mutex::new(0)), &emit, None, 1)
+        .await
+        .unwrap();
+    assert!(msg.content.contains("502"), "{}", msg.content);
+    assert!(!msg.content.contains("other-secret-42"), "{}", msg.content);
+}
+
+#[test]
 fn the_gate_asks_in_always_and_explain_and_tags_tighten() {
     let (set, _, _) = sources(Vec::new(), vec!["prod".into()], vec![TagPolicy {
         tag: "prod".into(),

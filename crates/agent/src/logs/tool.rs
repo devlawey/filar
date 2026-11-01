@@ -181,7 +181,10 @@ impl LogSources {
                 let span = crate::kube_tools::parse_since(Some(since))?
                     .ok_or_else(|| CoreError::Other("since must be a duration such as 15m".into()))?;
                 let span = Duration::from_std(span).map_err(|_| CoreError::Other("since is too large".into()))?;
-                (now - span, now)
+                let start = now
+                    .checked_sub_signed(span)
+                    .ok_or_else(|| CoreError::Other("since is too large".into()))?;
+                (start, now)
             }
             (None, Some(start), end) => {
                 let start = parse_time("start", &start)?;
@@ -322,8 +325,8 @@ impl LogSources {
         }
         let run = self.execute(&parsed);
         let outcome = match cancellation {
-            // Dropping `run` drops the HTTP request: the connection closes
-            // and the store stops the query.
+            // Dropping `run` drops the HTTP request and closes the
+            // connection; stores such as VictoriaLogs then stop the query.
             Some(token) => tokio::select! {
                 _ = token.cancelled() => return Err(cancelled()),
                 outcome = run => outcome,
@@ -332,7 +335,11 @@ impl LogSources {
         };
         let output = match outcome {
             Ok(text) => text,
-            Err(error) => format!("Error: log query failed: {error}"),
+            // The server's own reply may echo other known secrets.
+            Err(error) => crate::kube_redact::redact_logs(
+                &format!("Error: log query failed: {error}"),
+                self.secrets.as_ref(),
+            ),
         };
         emit(AgentEvent::CommandFinished {
             command: display,
