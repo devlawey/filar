@@ -88,10 +88,8 @@ pub fn build_body(cfg: &LogSourceConfig, query: &LogQuery) -> Result<Value> {
     });
     if !cfg.fields.is_empty() {
         let mut source: Vec<String> = cfg.fields.clone();
-        for wanted in [time_field.to_string()] {
-            if !source.contains(&wanted) {
-                source.push(wanted);
-            }
+        if !source.iter().any(|f| f == time_field) {
+            source.push(time_field.to_string());
         }
         body["_source"] = json!(source);
     }
