@@ -339,18 +339,25 @@ fn radius_lines(
 /// which must not lose the pod and container to an ellipsis (#565 review).
 ///
 /// Ten rows hold the longest pod line Kubernetes allows at the narrowest
-/// dialog, word-wrapped: a context such as an EKS ARN plus namespace, pod
-/// and container names of up to 63 characters each — so the pod and
-/// container, at the end, are never the part cut away. The cap only guards
-/// against runaway text; the terminal height still bounds the dialog.
+/// dialog, word-wrapped: a context such as an EKS ARN, a namespace and a
+/// container (DNS labels, ≤ 63 characters) and a pod name (DNS subdomain,
+/// ≤ 253) — so the pod and container, at the end, are not the part cut
+/// away. On a short terminal the header gets fewer rows still: the command
+/// line always keeps its place (see `build_modal_lines`).
 const HEADER_MAX_ROWS: usize = 10;
 
 /// The header above the command, word-wrapped to `width` and cut to
 /// [`HEADER_MAX_ROWS`] rows (the last one ends with `…` when cut).
 fn header_rows(text: &str, width: usize) -> Vec<String> {
+    header_rows_within(text, width, HEADER_MAX_ROWS)
+}
+
+/// [`header_rows`] cut to at most `max` rows (at least one).
+fn header_rows_within(text: &str, width: usize, max: usize) -> Vec<String> {
+    let max = max.max(1);
     let mut rows = crate::ui::help::wrap_words(text, width);
-    if rows.len() > HEADER_MAX_ROWS {
-        rows.truncate(HEADER_MAX_ROWS);
+    if rows.len() > max {
+        rows.truncate(max);
         if let Some(last) = rows.last_mut() {
             *last = truncate_to_rows(&format!("{last} …"), width, 1);
         }
@@ -404,7 +411,10 @@ fn build_modal_lines(
     if let Some((header, list)) = radius {
         // Wrapped here, by words, so the rows counted for the modal height
         // are exactly the rows drawn.
-        for row in header_rows(&header, inner_width) {
+        // Leave room for the command line and the separator below it, so a
+        // short terminal never trades the command for the header.
+        let room = max_rows.saturating_sub(2).min(HEADER_MAX_ROWS);
+        for row in header_rows_within(&header, inner_width, room) {
             let _ = push(&mut lines, &mut used, row, warning.add_modifier(Modifier::BOLD));
         }
         if let Some(list) = list {
@@ -1128,7 +1138,8 @@ mod tests {
                 "arn:aws:eks:eu-central-1:123456789012:cluster/payments-production-eu-central".into();
             kube.namespace = Some("n".repeat(63));
             let pod = kube.pod.as_mut().unwrap();
-            pod.pod = Some(format!("{}-7f9c4d5b8-x2k9p", "p".repeat(46)));
+            // The longest pod name Kubernetes accepts: 253 characters.
+            pod.pod = Some(format!("{}-7f9c4d5b8-x2k9p", "p".repeat(236)));
             pod.container = Some("c".repeat(63));
         }
         let line = crate::app::pod_tab::pod_confirm_target_line(
@@ -1141,6 +1152,16 @@ mod tests {
         let shown = rows.join(" ");
         assert!(shown.contains(&"c".repeat(63)), "container kept: {rows:?}");
         assert!(!shown.contains('…'), "nothing cut: {rows:?}");
+    }
+
+    #[test]
+    fn on_a_short_terminal_the_command_outranks_a_long_pod_header() {
+        let mut app = pod_app(vec![]);
+        app.kube.as_mut().unwrap().target.context =
+            "arn:aws:eks:eu-central-1:123456789012:cluster/payments-production-eu-central".into();
+        let screen = render_confirm(&mut app, 80, 12);
+        assert!(screen.contains("$ cd /tmp && pwd"), "{screen}");
+        assert!(screen.contains("Approve"), "{screen}");
     }
 
     #[test]
