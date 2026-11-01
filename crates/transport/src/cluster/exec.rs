@@ -1533,6 +1533,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_write_waiting_for_stdin_proceeds_once_the_lock_is_released() {
+        use crate::InteractiveTerminal;
+        let (_tx, rx) = mpsc::channel(4);
+        let budget = Duration::from_millis(600);
+        let term = Arc::new(KubeInteractive::from_parts(
+            Box::new(tokio::io::sink()),
+            rx,
+            None,
+            None,
+            budget,
+        ));
+        // Another keystroke holds stdin.
+        let guard = term.stdin.lock().await;
+        let started = Instant::now();
+        let waiter = tokio::spawn({
+            let term = term.clone();
+            async move { term.write_input(b"x").await }
+        });
+        tokio::time::sleep(budget / 3).await;
+        assert!(!waiter.is_finished(), "the write must wait for the lock");
+        drop(guard);
+        waiter.await.unwrap().unwrap();
+        // Done within the one deadline that started before the lock wait.
+        assert!(started.elapsed() < budget, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_write_never_waits_for_stdin_past_its_deadline() {
+        use crate::InteractiveTerminal;
+        let (_tx, rx) = mpsc::channel(4);
+        let term = KubeInteractive::from_parts(
+            Box::new(tokio::io::sink()),
+            rx,
+            None,
+            None,
+            TEST_TIMEOUT,
+        );
+        let _held = term.stdin.lock().await;
+        let started = Instant::now();
+        let result = term.write_input(b"x").await;
+        assert!(matches!(result, Err(CoreError::ConnectionLost(_))));
+        assert!(started.elapsed() < TEST_TIMEOUT * 5, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_pending_resize_does_not_hold_the_resize_lock() {
+        use crate::InteractiveTerminal;
+        use futures::StreamExt;
+        let (_tx, rx) = mpsc::channel(4);
+        let (resize_tx, mut resize_rx) = futures::channel::mpsc::channel(1);
+        let term = Arc::new(KubeInteractive::from_parts(
+            Box::new(tokio::io::sink()),
+            rx,
+            Some(resize_tx),
+            None,
+            Duration::from_secs(5),
+        ));
+        // A stalled exec: fill the channel until the stored sender is parked.
+        {
+            let mut stored = term.resize.lock().await;
+            let sender = stored.as_mut().unwrap();
+            while sender.try_send(tty_size(1, 1)).is_ok() {}
+        }
+        let pending = tokio::spawn({
+            let term = term.clone();
+            async move { term.resize(100, 30).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!pending.is_finished(), "the send must be waiting on the full channel");
+        assert!(term.resize.try_lock().is_ok(), "the guard must not be held across send");
+        // The exec catches up: the waiting resize completes.
+        let wanted = loop {
+            let size = resize_rx.next().await.unwrap();
+            if size.width == 100 {
+                break size;
+            }
+        };
+        assert_eq!(wanted.height, 30);
+        pending.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn pod_terminal_resize_sends_size_and_reports_closed_channel() {
         use crate::InteractiveTerminal;
         use futures::StreamExt;
