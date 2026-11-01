@@ -63,7 +63,7 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
         // ── Modes ─────────────────────────────────────────────────────
         HelpEntry {
             key: "^T",
-            desc: "Toggle interactive terminal",
+            desc: "Toggle interactive terminal (in a pod tab: a TTY shell in the pod)",
             section: "Modes",
             available: |m| m != AppMode::PasswordInput,
         },

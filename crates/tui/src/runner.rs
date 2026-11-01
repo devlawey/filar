@@ -681,6 +681,8 @@ enum PodRunnerEvent {
 /// A pod tab's live shell and the task forwarding its events.
 struct PodShell {
     exec: Arc<filar_transport::KubeExecutor>,
+    /// The tab's connection generation this shell belongs to.
+    connection_id: u64,
     events: tokio::task::JoinHandle<()>,
 }
 
@@ -2176,8 +2178,32 @@ async fn run_app(
                                 }
                             }
                         }
+                        // A pod tab's terminal is a second exec in its pod
+                        // (#577), never a local PTY under the pod's name.
+                        // Only the shell of the tab's current, connected pod:
+                        // a retained shell of a previous target never opens
+                        // under the new tab's label.
+                        let current = app
+                            .find_session_idx(toggle_sid)
+                            .and_then(|idx| app.sessions[idx].kube.as_ref())
+                            .filter(|kube| kube.pod.as_ref().is_some_and(|pod| pod.pod.is_some()))
+                            .map(|kube| kube.connection_id);
+                        let pod_shell = pod_shells
+                            .get(&toggle_sid)
+                            .filter(|shell| Some(shell.connection_id) == current)
+                            .map(|shell| shell.exec.clone());
+                        let in_pod = app
+                            .find_session_idx(toggle_sid)
+                            .and_then(|idx| app.sessions[idx].kube.as_ref())
+                            .is_some_and(|kube| kube.pod.is_some());
                         let term_result: Result<Arc<dyn InteractiveTerminal>> =
-                            if let Some(ref target) = ssh_target {
+                            if let Some(exec) = pod_shell.as_ref() {
+                                exec.open_terminal(cols, rows)
+                                    .await
+                                    .map(|t| Arc::new(t) as Arc<dyn InteractiveTerminal>)
+                            } else if in_pod {
+                                Err(CoreError::Unavailable("под ещё не подключён".into()))
+                            } else if let Some(ref target) = ssh_target {
                                 SshInteractive::connect(target, cols, rows)
                                     .await
                                     .map(|t| Arc::new(t) as Arc<dyn InteractiveTerminal>)
@@ -2188,7 +2214,9 @@ async fn run_app(
                             };
                         match term_result {
                             Ok(term) => {
-                                if ssh_target.is_some() {
+                                // The agent's cd follows into the terminal, as
+                                // over SSH (#493, #577).
+                                if ssh_target.is_some() || pod_shell.is_some() {
                                     if let Some(input) = tab_cwd.as_deref().and_then(posix_cd_input)
                                     {
                                         let _ = term.write_input(input.as_bytes()).await;
@@ -3072,7 +3100,7 @@ async fn run_app(
                                 let events =
                                     forward_pod_events(&exec, session_id, connection_id, pod_tx.clone());
                                 let previous = pod_shells
-                                    .insert(session_id, PodShell { exec: exec.clone(), events });
+                                    .insert(session_id, PodShell { exec: exec.clone(), connection_id, events });
                                 if let Some(previous) = previous {
                                     previous.release().await;
                                 }

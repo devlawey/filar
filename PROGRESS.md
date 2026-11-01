@@ -11481,3 +11481,30 @@ Some(KubePodTabState { pod_ref, pod, container, limits })`, а исполнит�
 (реестры образов закрыты); пункты — в `docs/SMOKE.md`.
 
 **Next:** #577 — Ctrl+T в под (`KubeInteractive`), снять отказ терминала.
+
+## Issue #577: Ctrl+T в под (веха 3.0.1)
+
+**Сделано.** `KubeInteractive: InteractiveTerminal` (`crates/transport/src/cluster/exec.rs`,
+фича `kube`): `exec [shell]` с `tty=true`, stdin/stdout (stderr при TTY
+сливается в stdout, запрашивать его нельзя), resize через канал `TerminalSize`
+exec-протокола (`tty_size` не даёт нулей), Ctrl+C уходит байтом и обрабатывается
+линейной дисциплиной TTY контейнера, `close` — `abort` процесса. Открывается
+`KubeExecutor::open_terminal(cols, rows)` в текущих поде и контейнере шелла
+агента; отказы 403 (RBAC/политика), нет шелла и таймаут апгрейда — тем же
+`ExecPlace::exec_error`, что у шелла агента.
+
+**TUI.** Ctrl+T во вкладке пода больше не отказывает: runner берёт `KubeExecutor`
+вкладки из `pod_shells` и открывает терминал; `cd` агента переносится в терминал
+(как у SSH). Пока под не подключён — сообщение «ещё подключается», и в runner
+нет падения на локальный PTY (`in_pod` → ошибка). Вкладка кластера по-прежнему
+без шелла.
+
+**Не сделано здесь.** Ctrl+T во вкладке debug-контейнера — вместе с #576 (там
+вкладка пода с `KubeExecutor` в debug-контейнере, терминал заработает тем же
+путём). Особенностей conhost/Windows Terminal не выявлено — `PLATFORM_NOTES.md`
+не менялся.
+
+**Контракты.** `CommandExecutor` / `LlmClient` / `InteractiveTerminal` не
+менялись; новые публичные `KubeInteractive` и `KubeExecutor::open_terminal`.
+
+**Next:** #578 — `pod_http_get` через port-forward.
