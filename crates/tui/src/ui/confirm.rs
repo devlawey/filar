@@ -337,7 +337,13 @@ fn radius_lines(
 /// Rows the header above the command may wrap to: the fleet radius line or
 /// a pod tab's target line (`context … · namespace … · pod … · container …`),
 /// which must not lose the pod and container to an ellipsis (#565 review).
-const HEADER_MAX_ROWS: usize = 3;
+///
+/// Ten rows hold the longest pod line Kubernetes allows at the narrowest
+/// dialog, word-wrapped: a context such as an EKS ARN plus namespace, pod
+/// and container names of up to 63 characters each — so the pod and
+/// container, at the end, are never the part cut away. The cap only guards
+/// against runaway text; the terminal height still bounds the dialog.
+const HEADER_MAX_ROWS: usize = 10;
 
 /// The header above the command, word-wrapped to `width` and cut to
 /// [`HEADER_MAX_ROWS`] rows (the last one ends with `…` when cut).
@@ -1111,6 +1117,30 @@ mod tests {
         let screen = render_confirm(&mut app, 100, 30);
         assert!(screen.contains("container main"), "{screen}");
         assert!(screen.contains("$ cd /tmp && pwd"), "{screen}");
+    }
+
+    #[test]
+    fn the_longest_pod_target_keeps_its_pod_and_container() {
+        let mut app = pod_app(vec![]);
+        {
+            let kube = app.kube.as_mut().unwrap();
+            kube.target.context =
+                "arn:aws:eks:eu-central-1:123456789012:cluster/payments-production-eu-central".into();
+            kube.namespace = Some("n".repeat(63));
+            let pod = kube.pod.as_mut().unwrap();
+            pod.pod = Some(format!("{}-7f9c4d5b8-x2k9p", "p".repeat(46)));
+            pod.container = Some("c".repeat(63));
+        }
+        let line = crate::app::pod_tab::pod_confirm_target_line(
+            app.kube.as_ref().unwrap(),
+            app.theme.glyphs(),
+        )
+        .unwrap();
+        let rows = header_rows(&line, 68);
+        assert!(rows.len() <= HEADER_MAX_ROWS, "{rows:?}");
+        let shown = rows.join(" ");
+        assert!(shown.contains(&"c".repeat(63)), "container kept: {rows:?}");
+        assert!(!shown.contains('…'), "nothing cut: {rows:?}");
     }
 
     #[test]
