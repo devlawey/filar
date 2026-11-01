@@ -217,6 +217,16 @@ mod tests {
     }
 
     #[test]
+    fn lines_without_a_time_come_last() {
+        let body = r#"{"status":"success","data":{"resultType":"streams","result":[
+            {"stream":{},"values":[["bad","no time"],["1793557516000000000","newest"],["1793557510000000000","older"]]}
+        ]}}"#;
+        let result = parse_answer(body.as_bytes(), 10, 4096).unwrap();
+        let messages: Vec<&str> = result.lines.iter().map(|l| l.message.as_str()).collect();
+        assert_eq!(messages, ["newest", "older", "no time"]);
+    }
+
+    #[test]
     fn a_matrix_becomes_series() {
         let body = r#"{"status":"success","data":{"resultType":"matrix","result":[
             {"metric":{"pod":"web-1"},"values":[[1793557500,"2"],[1793557560,"5"]]},
