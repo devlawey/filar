@@ -1443,8 +1443,9 @@ RBAC или обрыв — сообщение об ошибке в ленте.
 
 Источник описывается в `config.toml` (`[[log_sources]]`, пример — в самом
 `config.toml`). Поддерживаются **VictoriaLogs** (`kind = "victorialogs"`, язык
-LogsQL) и **Grafana Loki** (`kind = "loki"`, язык LogQL). OpenSearch/Elasticsearch
-появятся в следующих версиях. Ключ в
+LogsQL), **Grafana Loki** (`kind = "loki"`, язык LogQL) и **OpenSearch /
+Elasticsearch** (`kind = "opensearch"` / `"elasticsearch"`, `query_string` или
+JSON query DSL). Ключ в
 конфиге не хранится: `key_env` — это имя, под которым ключ лежит в хранилище
 ОС или в переменной окружения. У VictoriaLogs своей авторизации нет: `basic`
 и `bearer` нужны, если перед ней стоит прокси (vmauth). Тенант задаётся как
@@ -1457,6 +1458,27 @@ LogsQL) и **Grafana Loki** (`kind = "loki"`, язык LogQL). OpenSearch/Elasti
 Метрические запросы (`count_over_time`, `rate`) возвращают не строки, а ряды:
 модель получает таблицу «ряд × точки» с min, max, последним значением и
 выборкой значений.
+
+У OpenSearch и Elasticsearch filar обращается только к `POST /{index}/_search`
+(`index` обязателен). Окно накладывается фильтром по полю времени `time_field`
+(по умолчанию `@timestamp`), сортировка — от новых к старым. Текст модели уходит
+в `query_string`. Готовый JSON query DSL попадает в `bool.must`, окно filar
+добавляет сам. `fields` ограничивает загружаемые поля (`_source`). Свой
+удостоверяющий центр подключается через `ca_file`, проверку TLS отключить нельзя.
+
+Аутентификация:
+- Elasticsearch: `basic`, `bearer` или `api-key` (`Authorization: ApiKey …`);
+- OpenSearch: `basic` или `bearer`.
+
+`k8s_fields` говорит модели, как называются поля Kubernetes у вашего сборщика:
+- `fluent-bit` (по умолчанию для OpenSearch/ES): `kubernetes.pod_name`,
+  `kubernetes.namespace_name`;
+- `filebeat`: `kubernetes.pod.name`, `kubernetes.namespace`;
+- `vlagent`;
+- `promtail`.
+
+Ошибки хранилища (`parsing_exception`, `index_not_found_exception`,
+401/403) показываются коротко, как `тип: причина`.
 
 **Рамки ставит filar, модель их не обходит.**
 

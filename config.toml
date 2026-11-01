@@ -123,6 +123,10 @@ type = "password"
 # clusters = ["prod-eu"]             # [[kube_clusters]] whose logs it holds: a hint for the
 #                                    # model, not access control — every single-target tab can query it
 # tags = ["prod"]                    # feed [[tag_policies]] like target tags
+# time_field = "@timestamp"         # OpenSearch / Elasticsearch document time field
+# fields = ["message", "kubernetes.pod_name"]  # OpenSearch / ES: _source fields to fetch
+# ca_file = "/etc/ssl/private-ca.pem" # extra trusted CA (PEM); TLS checks stay on
+# k8s_fields = "fluent-bit"          # vlagent | fluent-bit | filebeat | promtail
 
 # Kubernetes fleet: ready app=web pods frozen on entry in both clusters.
 # Use either kube or match = [...] in a host group, never both. Without

@@ -1,0 +1,62 @@
+{
+  "took": 7,
+  "timed_out": false,
+  "_shards": {"total": 3, "successful": 3, "skipped": 0, "failed": 0},
+  "hits": {
+    "total": {"value": 214, "relation": "eq"},
+    "max_score": null,
+    "hits": [
+      {
+        "_index": "logs-2026.11.01",
+        "_id": "kJ3x0pQBc1",
+        "_score": null,
+        "_source": {
+          "@timestamp": "2026-11-01T10:58:31.412Z",
+          "log": "ERROR connection refused to db-2:5432 after 3012ms",
+          "stream": "stderr",
+          "kubernetes": {
+            "pod_name": "web-7d9f6c-2xk4p",
+            "namespace_name": "shop",
+            "container_name": "web",
+            "labels": {"app": "web", "pod-template-hash": "7d9f6c"}
+          }
+        },
+        "sort": [1793530711412]
+      },
+      {
+        "_index": "logs-2026.11.01",
+        "_id": "kJ3x0pQBc0",
+        "_score": null,
+        "_source": {
+          "@timestamp": "2026-11-01T10:58:29.007Z",
+          "log": "ERROR connection refused to db-1:5432 after 3009ms",
+          "stream": "stderr",
+          "kubernetes": {
+            "pod_name": "web-7d9f6c-9q2mz",
+            "namespace_name": "shop",
+            "container_name": "web",
+            "labels": {"app": "web", "pod-template-hash": "7d9f6c"}
+          }
+        },
+        "sort": [1793530709007]
+      },
+      {
+        "_index": "logs-2026.11.01",
+        "_id": "kJ3x0pQBbz",
+        "_score": null,
+        "_source": {
+          "@timestamp": "2026-11-01T10:41:02.551Z",
+          "log": "ERROR payment provider timeout order=81723 after 30000ms",
+          "stream": "stderr",
+          "kubernetes": {
+            "pod_name": "pay-5b8c7d-ll2tq",
+            "namespace_name": "shop",
+            "container_name": "pay",
+            "labels": {"app": "pay"}
+          }
+        },
+        "sort": [1793529662551]
+      }
+    ]
+  }
+}

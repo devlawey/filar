@@ -45,7 +45,7 @@ pub use fleet_op::{
     OperationId,
 };
 pub use kube_pod::{PodLimits, PodRef, PodSelector};
-pub use log_sources::{LogAuth, LogSourceConfig, LogSourceKind};
+pub use log_sources::{K8sFieldPreset, K8sFields, LogAuth, LogSourceConfig, LogSourceKind};
 pub use os_family::{OsFamily, OS_RELEASE_COMMAND};
 pub use secrets::{
     redact, redact_secrets, ssh_cred_name, ssh_key_passphrase_name, ssh_target_display_name,
