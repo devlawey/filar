@@ -129,6 +129,12 @@ pub(crate) fn parse_response(raw: &[u8], max_bytes: usize) -> Result<PodHttpResp
     })
 }
 
+/// After the zero-size chunk: the empty line that ends the (optional)
+/// trailer section has arrived — `\r\n` at once, or after trailer lines.
+fn trailer_complete(rest: &[u8]) -> bool {
+    rest.starts_with(b"\r\n") || rest.windows(4).any(|w| w == b"\r\n\r\n")
+}
+
 /// Whether the chunk framing in `rest` reaches the terminating zero-size
 /// chunk — walked without copying the data, as it runs on every read.
 fn chunked_complete(mut rest: &[u8]) -> bool {
@@ -143,7 +149,7 @@ fn chunked_complete(mut rest: &[u8]) -> bool {
         };
         rest = &rest[line_end + 2..];
         if size == 0 {
-            return true;
+            return trailer_complete(rest);
         }
         if rest.len() < size + 2 {
             return false;
@@ -167,7 +173,7 @@ fn dechunk(mut rest: &[u8]) -> (Vec<u8>, bool) {
         };
         rest = &rest[line_end + 2..];
         if size == 0 {
-            return (out, true);
+            return (out, trailer_complete(rest));
         }
         let take = size.min(rest.len());
         out.extend_from_slice(&rest[..take]);
@@ -208,6 +214,19 @@ mod tests {
         let r = parse_response(raw, 1024).unwrap();
         assert_eq!(r.body, b"Wikipedia");
         assert!(body_complete(raw));
+    }
+
+    #[test]
+    fn the_zero_chunk_needs_its_closing_empty_line() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n".to_vec();
+        assert!(!body_complete(&head), "0\\r\\n alone is not the end");
+        let mut done = head.clone();
+        done.extend_from_slice(b"\r\n");
+        assert!(body_complete(&done));
+        let mut trailer = head;
+        trailer.extend_from_slice(b"X-Trace: 1\r\n\r\n");
+        assert!(body_complete(&trailer), "trailers end with an empty line");
+        assert_eq!(parse_response(&trailer, 64).unwrap().body, b"ok");
     }
 
     #[test]
