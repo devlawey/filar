@@ -4436,7 +4436,9 @@ impl App {
         }
 
         // Ctrl+Shift+F / Ctrl+Shift+D — in-TUI file/folder picker (#344, #351).
-        if self.mode == AppMode::Normal {
+        // Not in a pod tab: the picker would list the local disk under the
+        // pod's name (#565 review).
+        if self.mode == AppMode::Normal && !self.in_pod_tab() {
             let ctrl_shift_key = |en: char, ru: char| {
                 key.modifiers.contains(KeyModifiers::CONTROL)
                     && key.modifiers.contains(KeyModifiers::SHIFT)
@@ -4624,8 +4626,10 @@ impl App {
                     self.history_pos = None;
                     // In the fleet `/` is just a character: the picker
                     // browses one host (#432).
+                    // Nor in a pod tab: the picker reads the local disk (#565).
                     if c == '/'
                         && !self.in_fleet()
+                        && !self.in_pod_tab()
                         && crate::path_picker::path_token_starts_at_cursor(
                             &self.input,
                             self.cursor_pos,

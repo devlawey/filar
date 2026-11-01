@@ -658,7 +658,12 @@ impl App {
     /// Ctrl+E: enter a pod from a cluster tab. Returns `true` when handled.
     pub(crate) fn handle_pod_tab_key(&mut self, key: &KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if !(ctrl && matches!(key.code, KeyCode::Char('e' | 'у'))) || self.kube.is_none() {
+        // Normal mode only: in a confirmation or password prompt the chooser
+        // would take over the keys meant for it (#565 review).
+        if self.mode != super::AppMode::Normal
+            || !(ctrl && matches!(key.code, KeyCode::Char('e' | 'у')))
+            || self.kube.is_none()
+        {
             return false;
         }
         self.open_pod_select();
@@ -1039,5 +1044,26 @@ mod tests {
         assert_eq!(app.cwd.as_deref(), Some("/srv"), "stale event changes nothing");
         assert!(app.kube_pod_identity(sid, connection_id, "web-7f9c".into(), "main".into(), PodLimits::default()));
         assert!(app.cwd.is_none(), "a fresh shell starts in its own cwd");
+    }
+
+    #[test]
+    fn pod_tab_never_opens_the_local_path_picker() {
+        let (mut app, _, _) = connected_pod_tab();
+        app.handle_key(key(KeyCode::Char('/')));
+        assert!(app.pending_path_picker.is_none());
+        assert_eq!(app.input, "/", "just a character");
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('F'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(app.pending_path_picker.is_none());
+    }
+
+    #[test]
+    fn ctrl_e_is_ignored_outside_normal_mode() {
+        let mut app = app_in_cluster_tab();
+        app.mode = crate::app::AppMode::Confirming;
+        assert!(!app.handle_pod_tab_key(&KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)));
+        assert!(app.kube_pod_select.is_none());
     }
 }

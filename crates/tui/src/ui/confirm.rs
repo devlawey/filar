@@ -62,7 +62,10 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let radius_kind = confirm.radius_kind;
     let radius_context = confirm.radius_context.clone();
     let kube_fleet = app.in_kube_fleet();
-    let kubernetes = (app.kube.is_some() || kube_fleet) && command.starts_with("k8s_");
+    // Only a cluster tab runs `k8s_*` API tools; a pod tab's commands are
+    // shell commands, whatever they are called (#565 review).
+    let in_cluster = app.kube.as_ref().is_some_and(|kube| kube.pod.is_none());
+    let kubernetes = (in_cluster || kube_fleet) && command.starts_with("k8s_");
     let kube_target = app.kube.as_ref().map(|kube| {
         (
             kube.target.name.clone(),
@@ -151,7 +154,9 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     .or_else(|| pod_target.clone().map(|line| (line, None)));
     let radius_rows = match header.clone() {
         None => 0,
-        Some((_, None)) => 1,
+        // The pod target may wrap (long contexts such as EKS ARNs), within
+        // the same cap `build_modal_lines` applies.
+        Some((line, None)) => estimate_wrapped_rows(&line, inner_width).min(HEADER_MAX_ROWS),
         Some((_, Some(list))) => 1 + estimate_wrapped_rows(&list, inner_width),
     };
 
@@ -327,6 +332,11 @@ fn radius_lines(
     Some((header, expanded.then(|| radius.join(", "))))
 }
 
+/// Rows the header above the command may wrap to: the fleet radius line or
+/// a pod tab's target line (`context … · namespace … · pod … · container …`),
+/// which must not lose the pod and container to an ellipsis (#565 review).
+const HEADER_MAX_ROWS: usize = 3;
+
 /// Build modal body lines, truncating so wrapped height ≤ `max_rows`.
 ///
 /// The fleet radius comes first and its counter line is never truncated
@@ -371,7 +381,7 @@ fn build_modal_lines(
     };
 
     if let Some((header, list)) = radius {
-        let header = truncate_to_rows(&header, inner_width, 1);
+        let header = truncate_to_rows(&header, inner_width, HEADER_MAX_ROWS);
         let _ = push(
             &mut lines,
             &mut used,
@@ -1078,6 +1088,26 @@ mod tests {
         let command_row = screen.lines().position(|l| l.contains("$ cd /tmp && pwd")).unwrap();
         assert!(target_row < command_row, "{screen}");
         assert_eq!(confirm_border_color(&mut app), Some(app.theme.warning));
+    }
+
+    #[test]
+    fn a_long_pod_target_wraps_instead_of_losing_the_container() {
+        let mut app = pod_app(vec![]);
+        app.kube.as_mut().unwrap().target.context =
+            "arn:aws:eks:eu-central-1:123456789012:cluster/prod-eu".into();
+        let screen = render_confirm(&mut app, 100, 30);
+        assert!(screen.contains("container main"), "{screen}");
+        assert!(screen.contains("$ cd /tmp && pwd"), "{screen}");
+    }
+
+    #[test]
+    fn a_k8s_named_shell_command_in_a_pod_tab_keeps_the_pod_dialog() {
+        let mut app = pod_app(vec![]);
+        app.pending_confirm = Some(pending("k8s_cleanup.sh --all", false));
+        let screen = render_confirm(&mut app, 100, 30);
+        assert!(screen.contains("Confirm command in pod"), "{screen}");
+        assert!(screen.contains("$ k8s_cleanup.sh --all"), "{screen}");
+        assert!(!screen.contains("Confirm Kubernetes"), "{screen}");
     }
 
     #[test]
