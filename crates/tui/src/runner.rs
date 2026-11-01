@@ -670,6 +670,15 @@ enum PodRunnerEvent {
         connection_id: u64,
         error: String,
     },
+    /// An approved debug container runs (#576).
+    DebugCreated {
+        proposal: crate::app::DebugProposal,
+    },
+    /// An approved debug container could not be created (#576).
+    DebugFailed {
+        proposal: crate::app::DebugProposal,
+        error: String,
+    },
     /// The shell reconnected or followed its selector to another pod.
     Shell {
         session_id: SessionId,
@@ -732,6 +741,40 @@ fn start_pending_kube_pod_lists(
                 session_id: request.session_id,
                 select_id: request.select_id,
                 result,
+            });
+        });
+    }
+}
+
+/// How long a new debug container may take to reach Running (#576).
+const DEBUG_CONTAINER_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Create every debug container the user approved (#576): the only write to
+/// a cluster filar makes, and only from this explicit action.
+fn start_pending_kube_debug_creates(
+    app: &mut App,
+    pod_tx: &mpsc::UnboundedSender<PodRunnerEvent>,
+) {
+    for proposal in app.take_pending_kube_debug_creates() {
+        let tx = pod_tx.clone();
+        tokio::spawn(async move {
+            let spec = filar_transport::DebugContainerSpec {
+                namespace: proposal.namespace.clone(),
+                pod: proposal.pod.clone(),
+                target_container: proposal.target_container.clone(),
+                image: proposal.image.clone(),
+                name: proposal.name.clone(),
+            };
+            let result = match KubeClusterApi::connect(&proposal.cluster).await {
+                Ok(api) => api.create_debug_container(&spec, DEBUG_CONTAINER_WAIT).await,
+                Err(error) => Err(error),
+            };
+            let _ = tx.send(match result {
+                Ok(()) => PodRunnerEvent::DebugCreated { proposal },
+                Err(error) => PodRunnerEvent::DebugFailed {
+                    proposal,
+                    error: error.to_string(),
+                },
             });
         });
     }
@@ -1879,6 +1922,7 @@ async fn run_app(
     start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
     start_pending_kube_fleets(&mut app, &mut kube_fleets, &kube_fleet_tx);
     start_pending_kube_pod_connects(&mut app, &pod_tx);
+    start_pending_kube_debug_creates(&mut app, &pod_tx);
     // The startup target may carry policy tags — tighten before the first
     // render so the bar and the confirm gate agree from the start (#414).
     app.sync_confirm_mode();
@@ -2267,6 +2311,7 @@ async fn run_app(
                 start_pending_kube_fleets(&mut app, &mut kube_fleets, &kube_fleet_tx);
                 start_pending_kube_pod_lists(&mut app, &kube_apis, &pod_tx);
                 start_pending_kube_pod_connects(&mut app, &pod_tx);
+        start_pending_kube_debug_creates(&mut app, &pod_tx);
 
                 // Check if user sent input — spawn agent or execute shell escape.
                 if let Some(user_input) = app.take_input() {
@@ -3092,6 +3137,13 @@ async fn run_app(
                                 );
                             }
                         }
+                        PodRunnerEvent::DebugCreated { proposal } => {
+                            let at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                            app.debug_container_created(proposal, &at);
+                        }
+                        PodRunnerEvent::DebugFailed { proposal, error } => {
+                            app.debug_container_failed(&proposal, &error);
+                        }
                         PodRunnerEvent::Failed { session_id, connection_id, error } => {
                             app.fail_kube_pod_connection(session_id, connection_id, error);
                         }
@@ -3401,6 +3453,7 @@ async fn run_app(
         start_pending_kube_fleets(&mut app, &mut kube_fleets, &kube_fleet_tx);
         start_pending_kube_pod_lists(&mut app, &kube_apis, &pod_tx);
         start_pending_kube_pod_connects(&mut app, &pod_tx);
+        start_pending_kube_debug_creates(&mut app, &pod_tx);
 
         if app.should_quit {
             break;

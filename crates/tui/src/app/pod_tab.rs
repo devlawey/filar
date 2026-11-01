@@ -1363,4 +1363,110 @@ mod tests {
         assert!(!app.handle_pod_tab_key(&KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)));
         assert!(app.kube_pod_select.is_none());
     }
+
+    // --- #576: debug containers --------------------------------------------
+
+    fn debug_cluster(images: &[&str]) -> filar_core::KubeCluster {
+        let mut c = cluster();
+        c.debug_images = images.iter().map(|i| i.to_string()).collect();
+        c
+    }
+
+    fn cluster_tab_with(images: &[&str]) -> App {
+        let mut app = app_in_cluster_tab();
+        app.kube.as_mut().unwrap().target = debug_cluster(images);
+        app
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn debug_needs_configured_images() {
+        let mut app = cluster_tab_with(&[]);
+        app.handle_key(ctrl('b'));
+        assert!(app.kube_pod_select.is_none());
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m.contains("debug_images")));
+    }
+
+    #[test]
+    fn debug_from_a_cluster_tab_asks_pod_then_confirms_with_the_trace_text() {
+        let mut app = cluster_tab_with(&["busybox:1.37"]);
+        app.handle_key(ctrl('b'));
+        let select = app.kube_pod_select.clone().expect("chooser");
+        assert!(select.debug);
+        app.take_pending_kube_pod_lists();
+        app.complete_pod_list(select.session_id, select.select_id, Ok(vec![choice("web-1", true, &["main"])]));
+        app.handle_pod_select_key(key(KeyCode::Enter));
+        let proposal = app.debug_proposal.clone().expect("confirmation shown");
+        assert_eq!(proposal.target_container, "main");
+        assert!(proposal.name.starts_with("filar-debug-"));
+        let text = proposal.confirmation_text();
+        assert!(text.starts_with("В под shop/web-1 будет добавлен эфемерный контейнер filar-debug-"), "{text}");
+        assert!(text.contains("(образ busybox:1.37, target main)"), "{text}");
+        assert!(text.contains("останется в спецификации пода до его пересоздания; удалить его нельзя. Создать?"), "{text}");
+        assert!(proposal.is_prod());
+        // Enter alone never creates.
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.debug_proposal.is_some());
+        assert!(app.take_pending_kube_debug_creates().is_empty());
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(app.debug_proposal.is_none());
+        assert!(app.take_pending_kube_debug_creates().is_empty(), "cancelled");
+    }
+
+    #[test]
+    fn several_images_are_chosen_and_yes_queues_the_creation() {
+        let mut app = cluster_tab_with(&["busybox:1.37", "registry.local/tools/netshoot:v0.13"]);
+        app.handle_key(ctrl('b'));
+        let select = app.kube_pod_select.clone().unwrap();
+        app.complete_pod_list(select.session_id, select.select_id, Ok(vec![choice("web-1", true, &["main", "sidecar"])]));
+        app.handle_pod_select_key(key(KeyCode::Enter));
+        app.handle_pod_select_key(key(KeyCode::Down));
+        app.handle_pod_select_key(key(KeyCode::Enter));
+        assert!(matches!(app.kube_pod_select.as_ref().unwrap().stage, PodSelectStage::Images { .. }));
+        app.handle_pod_select_key(key(KeyCode::Down));
+        app.handle_pod_select_key(key(KeyCode::Enter));
+        let proposal = app.debug_proposal.clone().unwrap();
+        assert_eq!(proposal.target_container, "sidecar");
+        assert_eq!(proposal.image, "registry.local/tools/netshoot:v0.13");
+        app.handle_key(key(KeyCode::Char('y')));
+        let queued = app.take_pending_kube_debug_creates();
+        assert_eq!(queued, vec![proposal]);
+    }
+
+    #[test]
+    fn a_created_debug_container_opens_a_debug_tab_and_records_the_trace() {
+        let mut app = cluster_tab_with(&["busybox:1.37"]);
+        let origin = app.active_session().id;
+        let proposal = DebugProposal {
+            origin,
+            cluster: debug_cluster(&["busybox:1.37"]),
+            namespace: "shop".into(),
+            pod: "distroless-1".into(),
+            target_container: "main".into(),
+            image: "busybox:1.37".into(),
+            name: "filar-debug-ab12cd34".into(),
+        };
+        app.debug_container_created(proposal, "2026-11-01 16:00:00");
+        let request = app.take_pending_kube_pod_connects().remove(0);
+        assert_eq!(request.pod_ref, PodRef::named("prod-eu", "shop", "distroless-1", Some("filar-debug-ab12cd34")));
+        assert_eq!(app.kube.as_ref().unwrap().pod.as_ref().unwrap().debug_target.as_deref(), Some("main"));
+        let origin_tab = app.sessions.iter().find(|s| s.id == origin).unwrap();
+        assert!(origin_tab.messages.iter().any(|m| matches!(m, ChatBlock::System(t) if t.contains("След в кластере") && t.contains("filar-debug-ab12cd34") && t.contains("2026-11-01 16:00:00"))));
+        app.complete_kube_pod_connection(request.session_id, request.connection_id, "distroless-1".into(), "filar-debug-ab12cd34".into(), PodLimits::default());
+        assert_eq!(app.pod_agent_target().unwrap().debug_target.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn the_agent_has_no_way_to_create_a_debug_container() {
+        let names: Vec<String> = filar_agent::kube_tools::kube_tool_definitions(CommandConfirmMode::Always)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert!(names.iter().all(|n| !n.contains("debug") && !n.contains("ephemeral")), "{names:?}");
+        let call = filar_agent::kube_tools::parse_kube_tool_call("k8s_debug", &serde_json::json!({}), Some("shop"));
+        assert!(call.is_err());
+    }
 }

@@ -36,6 +36,7 @@ mod help;
 mod host_select;
 mod input;
 mod namespace_select;
+mod debug_confirm;
 mod pod_select;
 mod path_picker_overlay;
 mod save_overlay;
@@ -161,6 +162,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // The pod chooser of a cluster tab (#565).
     if app.kube_pod_select.is_some() {
         pod_select::render_pod_select(f, app, f.area());
+    }
+    // The debug-container confirmation (#576) — above everything.
+    if app.debug_proposal.is_some() {
+        debug_confirm::render_debug_confirm(f, app, f.area());
     }
 
     // Render session-selection overlay on top of everything if active.
@@ -297,6 +302,10 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
     // The pod chooser of a cluster tab (#565).
     if app.kube_pod_select.is_some() {
         pod_select::render_pod_select(f, app, f.area());
+    }
+    // The debug-container confirmation (#576) — above everything.
+    if app.debug_proposal.is_some() {
+        debug_confirm::render_debug_confirm(f, app, f.area());
     }
 
     // Render session-selection overlay on top of everything if active.
