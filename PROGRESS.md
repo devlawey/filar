@@ -11389,3 +11389,12 @@ read-only fs, memory limit 512Mi`. Гейт не менялся.
 — новое поле `pod` (литералы структуры, см. Upgrading в `docs/ENGINE_API.md`).
 
 **Next:** #565 — вкладка пода в TUI (подключает `KubeExecutor` + `kube_pod_mode`).
+
+## CI: macOS-раннер `macos-14` → `macos-15` (2026-11-01)
+
+GitHub выводит образ macOS 14 2 ноября 2026 (брауноуты в октябре отменяли
+`Build & test (macos-aarch64)` на всех PR). `ci.yml` и `release.yml` закреплены
+на `macos-15` (arm64; проверка `uname -m == arm64` в релизе остаётся),
+`docs/PLATFORM_NOTES.md` обновлён. Плавающий `macos-latest` (= `macos-26`)
+сознательно не берём — имя ассета `*-macos-aarch64` не должно зависеть от алиаса.
+Код не менялся; CHANGELOG не нужен (только CI).

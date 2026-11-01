@@ -55,7 +55,7 @@ jobs:
         include:
           - os: windows-latest
             name: windows-x86_64
-          - os: macos-14
+          - os: macos-15
             name: macos-aarch64
 
     steps:
