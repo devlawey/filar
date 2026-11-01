@@ -36,6 +36,7 @@ mod help;
 mod host_select;
 mod input;
 mod namespace_select;
+mod pod_select;
 mod path_picker_overlay;
 mod save_overlay;
 mod session_select;
@@ -156,6 +157,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // Namespace selection follows cluster selection and stays above the feed.
     if app.kube_namespace_select.is_some() {
         namespace_select::render_namespace_select(f, app, f.area());
+    }
+    // The pod chooser of a cluster tab (#565).
+    if app.kube_pod_select.is_some() {
+        pod_select::render_pod_select(f, app, f.area());
     }
 
     // Render session-selection overlay on top of everything if active.
@@ -288,6 +293,10 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
     // Namespace selection follows cluster selection and stays above the feed.
     if app.kube_namespace_select.is_some() {
         namespace_select::render_namespace_select(f, app, f.area());
+    }
+    // The pod chooser of a cluster tab (#565).
+    if app.kube_pod_select.is_some() {
+        pod_select::render_pod_select(f, app, f.area());
     }
 
     // Render session-selection overlay on top of everything if active.

@@ -406,16 +406,36 @@ fn kube_component(value: &str, max_cells: usize, glyphs: &Glyphs) -> String {
 }
 
 /// Cluster identity in the status bar: `⎈ prod-eu › shop [prod]` (#575).
+///
+/// A pod tab adds the pod and container, then the container's known limits:
+/// `⎈ prod-eu › shop › web-7f9c… › main [prod]  non-root · ro-fs · mem 512Mi`
+/// (#565). Long parts are shortened; ASCII terminals get `k8s: … > …`.
 fn kube_segment(kube: &crate::app::KubeTabState, tags: Option<&str>, glyphs: &Glyphs) -> String {
     let name = kube_component(&kube.target.name, 24, glyphs);
     let namespace = kube_component(kube.namespace.as_deref().unwrap_or("?"), 24, glyphs);
-    let mut out = format!(
-        "{} {name} {} {namespace}",
-        glyphs.kube, glyphs.kube_namespace_sep
-    );
+    let sep = glyphs.kube_namespace_sep;
+    let mut out = format!("{} {name} {sep} {namespace}", glyphs.kube);
+    if let Some(pod) = &kube.pod {
+        out.push_str(&format!(
+            " {sep} {}",
+            kube_component(&pod.display_pod(), 20, glyphs)
+        ));
+        if let Some(container) = pod.container.as_deref().or(pod.pod_ref.container.as_deref()) {
+            out.push_str(&format!(" {sep} {}", kube_component(container, 16, glyphs)));
+        }
+    }
     if let Some(tags) = tags.filter(|tags| !tags.is_empty()) {
         out.push(' ');
         out.push_str(tags);
+    }
+    if let Some(limits) = kube
+        .pod
+        .as_ref()
+        .and_then(|pod| pod.limits.as_ref())
+        .and_then(|limits| crate::app::pod_tab::pod_limits_summary(limits, glyphs))
+    {
+        out.push_str("  ");
+        out.push_str(&limits);
     }
     out
 }
@@ -1410,7 +1430,60 @@ mod tests {
             },
             namespace: Some(namespace.into()),
             connection_id: 1,
+            pod: None,
         }
+    }
+
+    fn pod_state(limits: Option<filar_core::PodLimits>) -> crate::app::KubeTabState {
+        let mut kube = kube_state("prod-eu", "shop");
+        kube.pod = Some(crate::app::KubePodTabState {
+            pod_ref: filar_core::PodRef::by_selector("prod-eu", "shop", "app=web", None),
+            pod: Some("web-7f9c4d5b8-x2k9p".into()),
+            container: Some("main".into()),
+            limits,
+        });
+        kube
+    }
+
+    #[test]
+    fn pod_segment_shows_pod_container_tags_and_limits() {
+        let limits = filar_core::PodLimits {
+            memory_limit: Some("512Mi".into()),
+            run_as_non_root: Some(true),
+            read_only_root_filesystem: Some(true),
+            ..Default::default()
+        };
+        let kube = pod_state(Some(limits));
+        assert_eq!(
+            kube_segment(&kube, Some("[prod]"), &Glyphs::UNICODE),
+            "⎈ prod-eu › shop › web-7f9c4d5b8-x2k9p › main [prod]  non-root · ro-fs · mem 512Mi"
+        );
+        let ascii = kube_segment(&kube, Some("[prod]"), &Glyphs::ASCII);
+        assert!(ascii.is_ascii(), "{ascii}");
+        assert!(ascii.starts_with("k8s: prod-eu > shop > web-7f9c4d5b8-x2k9p > main [prod]"), "{ascii}");
+        let mut long = kube.clone();
+        long.pod.as_mut().unwrap().pod = Some("checkout-api-7f9c4d5b8-x2k9p".into());
+        assert!(
+            kube_segment(&long, None, &Glyphs::UNICODE).contains("› checkout-api-7f9c4d… ›"),
+            "long pod names are shortened"
+        );
+    }
+
+    #[test]
+    fn pod_segment_omits_unknown_limits() {
+        let kube = pod_state(Some(filar_core::PodLimits::default()));
+        assert_eq!(
+            kube_segment(&kube, None, &Glyphs::UNICODE),
+            "⎈ prod-eu › shop › web-7f9c4d5b8-x2k9p › main"
+        );
+        let mut connecting = pod_state(None);
+        connecting.pod.as_mut().unwrap().pod = None;
+        connecting.pod.as_mut().unwrap().container = None;
+        assert_eq!(
+            kube_segment(&connecting, None, &Glyphs::UNICODE),
+            "⎈ prod-eu › shop › app=web",
+            "before connect: the selector"
+        );
     }
 
     #[test]

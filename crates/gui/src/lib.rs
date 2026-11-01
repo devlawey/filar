@@ -3993,6 +3993,7 @@ impl LauncherApp {
                 .map(|cluster| filar_core::KubeSessionSnapshot {
                     target: cluster.name.clone(),
                     namespace: cluster.default_namespace.clone(),
+                    pod: None,
                 })
         });
         if let Some(snapshot) = &kube {
@@ -4421,6 +4422,7 @@ mod tests {
             kube: Some(filar_core::KubeSessionSnapshot {
                 target: "prod-eu".into(),
                 namespace: Some("shop".into()),
+                pod: None,
             }),
             kube_clusters: Some(vec![cluster.clone()]),
             model: "local".into(),

@@ -127,6 +127,21 @@ pub struct KubeSessionSnapshot {
     pub target: String,
     /// Namespace selected in the tab, if one was chosen.
     pub namespace: Option<String>,
+    /// The pod a pod tab runs its shell in (#565); `None` for a cluster tab.
+    /// `#[serde(default)]`: sessions saved before it existed are cluster tabs.
+    #[serde(default)]
+    pub pod: Option<KubePodSnapshot>,
+}
+
+/// The pod of a saved pod tab (#565): how to find it again, not a live name
+/// that may be gone by the time the session is restored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubePodSnapshot {
+    /// The pod, by name or by label selector.
+    pub pod: crate::PodSelector,
+    /// Container to enter; `None` picks the default one.
+    #[serde(default)]
+    pub container: Option<String>,
 }
 
 /// The composition of a saved fleet session (#442, #567).
@@ -770,6 +785,7 @@ mod tests {
             kube: Some(KubeSessionSnapshot {
                 target: "prod-eu".into(),
                 namespace: Some("shop".into()),
+                pod: None,
             }),
         };
 
@@ -1222,6 +1238,7 @@ mod tests {
             kube: Some(KubeSessionSnapshot {
                 target: "prod-eu".into(),
                 namespace: Some("shop".into()),
+                pod: None,
             }),
         };
         let json = serde_json::to_string(&session).unwrap();
@@ -1231,6 +1248,7 @@ mod tests {
             Some(KubeSessionSnapshot {
                 target: "prod-eu".into(),
                 namespace: Some("shop".into()),
+                pod: None,
             })
         );
         assert_eq!(restored.ssh_info.as_deref(), Some("root@10.0.0.5:22"));

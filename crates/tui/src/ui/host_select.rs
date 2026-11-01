@@ -204,6 +204,29 @@ fn row_line(app: &App, row: &HostSelectRow, glyphs: &Glyphs) -> Line<'static> {
                 ),
             ])
         }
+        HostSelectRow::EnterPod => {
+            let namespace = app
+                .kube
+                .as_ref()
+                .and_then(|kube| kube.namespace.clone())
+                .unwrap_or_default();
+            Line::from(vec![
+                cursor_span(app, glyphs, crate::app::ENTER_POD_SELECTION),
+                current_span(glyphs, false),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{} Войти в под…", glyphs.kube),
+                    Style::default()
+                        .fg(app.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("namespace {namespace} {} Ctrl+E", glyphs.middle_dot),
+                    app.theme.muted(),
+                ),
+            ])
+        }
         HostSelectRow::Local => Line::from(vec![
             cursor_span(app, glyphs, 0),
             current_span(

@@ -73,6 +73,23 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
                 .any(|tag| tag.eq_ignore_ascii_case("prod")),
         )
     });
+    // Pod tab (#565): the target line goes above the command, and a `prod`
+    // tag or a tightening tag policy colours the dialog like a destructive
+    // command.
+    let pod_target = app
+        .kube
+        .as_ref()
+        .and_then(|kube| crate::app::pod_tab::pod_confirm_target_line(kube, app.theme.glyphs()));
+    let strict_pod = pod_target.is_some()
+        && app.kube.as_ref().is_some_and(|kube| {
+            kube.target.tags.iter().any(|tag| tag.eq_ignore_ascii_case("prod"))
+                || filar_core::tag_policy_floor(
+                    app.global_confirm_mode,
+                    &app.tag_policies,
+                    &kube.target.tags,
+                )
+                .is_some()
+        });
     // Safety rating (#551) — advisory, separate from the arbiter's audit.
     let safety = app.confirm_safety().map(|score| {
         let text = safety_line_text(score);
@@ -123,12 +140,16 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or(0);
     let command_rows = estimate_wrapped_rows(&command_text, inner_width);
     let empty_rows = 1; // separator line before buttons
-    let radius_rows = match radius_lines(
+    // The header line above the command: the fleet radius, or in a pod tab
+    // its target. Never truncated away (see `build_modal_lines`).
+    let header = radius_lines(
         &radius,
         radius_kind,
         radius_context.as_deref(),
         radius_expanded,
-    ) {
+    )
+    .or_else(|| pod_target.clone().map(|line| (line, None)));
+    let radius_rows = match header.clone() {
         None => 0,
         Some((_, None)) => 1,
         Some((_, Some(list))) => 1 + estimate_wrapped_rows(&list, inner_width),
@@ -149,12 +170,7 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let max_content_rows = modal_height.saturating_sub(3) as usize;
 
     let lines = build_modal_lines(
-        radius_lines(
-            &radius,
-            radius_kind,
-            radius_context.as_deref(),
-            radius_expanded,
-        ),
+        header,
         &explanation,
         &command_text,
         destructive,
@@ -192,7 +208,7 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Clear, modal_area);
 
     let production_kube = kubernetes && kube_target.as_ref().is_some_and(|(_, _, prod)| *prod);
-    let border_color = if destructive || production_kube {
+    let border_color = if destructive || production_kube || strict_pod {
         app.theme.danger
     } else {
         app.theme.warning
@@ -211,6 +227,8 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             None => " Confirm Kubernetes request ".to_string(),
         }
+    } else if pod_target.is_some() && radius.is_empty() {
+        " Confirm command in pod ".to_string()
     } else {
         match radius.len() {
             0 => " Confirm command ".to_string(),
@@ -985,6 +1003,7 @@ mod tests {
             },
             namespace: Some("shop".into()),
             connection_id: 1,
+            pod: None,
         });
         let mut confirm = pending("k8s_get pods -l app=web", false);
         confirm.explanation = "Tool: k8s_get\nArguments: {\"selector\":\"app=web\"}".into();
@@ -999,6 +1018,75 @@ mod tests {
         assert!(screen.contains("Tool: k8s_get"), "{screen}");
         assert!(screen.contains("Arguments:"), "{screen}");
         assert!(screen.contains("k8s_get pods -l app=web"), "{screen}");
+    }
+
+    /// Colour of the dialog's rounded top-left corner.
+    fn confirm_border_color(app: &mut App) -> Option<ratatui::style::Color> {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let chat = Rect::new(0, 2, 100, 26);
+                app.chat_area = chat;
+                render_confirm_modal(f, app, chat);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| buf[(x, y)].symbol() == "╭")
+            .map(|(x, y)| buf[(x, y)].fg)
+    }
+
+    fn pod_app(tags: Vec<String>) -> App {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.kube = Some(crate::app::KubeTabState {
+            target: filar_core::KubeCluster {
+                name: "prod-eu".into(),
+                context: "prod-eu".into(),
+                tags,
+                ..Default::default()
+            },
+            namespace: Some("shop".into()),
+            connection_id: 1,
+            pod: Some(crate::app::KubePodTabState {
+                pod_ref: filar_core::PodRef::by_selector("prod-eu", "shop", "app=web", None),
+                pod: Some("web-7f9c".into()),
+                container: Some("main".into()),
+                limits: None,
+            }),
+        });
+        app.pending_confirm = Some(pending("cd /tmp && pwd", false));
+        app.mode = AppMode::Confirming;
+        app
+    }
+
+    #[test]
+    fn pod_confirmation_shows_the_target_above_the_command() {
+        let mut app = pod_app(vec![]);
+        let screen = render_confirm(&mut app, 100, 30);
+        assert!(screen.contains("Confirm command in pod"), "{screen}");
+        assert!(
+            screen.contains("context prod-eu · namespace shop · pod web-7f9c · container main"),
+            "{screen}"
+        );
+        let target_row = screen.lines().position(|l| l.contains("pod web-7f9c")).unwrap();
+        let command_row = screen.lines().position(|l| l.contains("$ cd /tmp && pwd")).unwrap();
+        assert!(target_row < command_row, "{screen}");
+        assert_eq!(confirm_border_color(&mut app), Some(app.theme.warning));
+    }
+
+    #[test]
+    fn prod_pod_or_a_tag_policy_colours_the_dialog_like_a_destructive_command() {
+        let mut prod = pod_app(vec!["prod".into()]);
+        assert_eq!(confirm_border_color(&mut prod), Some(prod.theme.danger));
+
+        let mut policed = pod_app(vec!["pci".into()]);
+        policed.tag_policies = vec![filar_core::TagPolicy {
+            tag: "pci".into(),
+            confirm_mode: CommandConfirmMode::Always,
+        }];
+        assert_eq!(confirm_border_color(&mut policed), Some(policed.theme.danger));
     }
 
     #[test]

@@ -369,6 +369,9 @@ impl PendingConfirm {
 /// model the overlay renders and navigation walks (headers are skipped).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HostSelectRow {
+    /// "Enter a pod" in a cluster tab with a namespace (#565). Selection
+    /// index [`ENTER_POD_SELECTION`], never a host.
+    EnterPod,
     /// Non-selectable group header. `tag: None` is the trailing untagged
     /// bucket; `count` is the group's host count.
     Header { tag: Option<String>, count: usize },
@@ -397,6 +400,7 @@ impl HostSelectRow {
             HostSelectRow::Header { .. }
             | HostSelectRow::KubeHeader { .. }
             | HostSelectRow::GroupsHeader { .. } => None,
+            HostSelectRow::EnterPod => Some(ENTER_POD_SELECTION),
             HostSelectRow::Local => Some(0),
             HostSelectRow::Target(i) => Some(i + 1),
             HostSelectRow::Kube { selection, .. } | HostSelectRow::Group { selection, .. } => {
@@ -405,6 +409,13 @@ impl HostSelectRow {
         }
     }
 }
+
+pub mod pod_tab;
+pub use pod_tab::{KubePodConnectRequest, KubePodListRequest, KubePodSelect, PodChoice};
+
+/// Flat Ctrl+O selection index of [`HostSelectRow::EnterPod`]: outside the
+/// host range, so it can never be taken for a target (#565).
+pub(crate) const ENTER_POD_SELECTION: usize = usize::MAX;
 
 /// Exact explanation for actions that require a shell in a cluster tab (#575).
 pub const KUBE_SHELL_REFUSAL: &str = "во вкладке кластера нет шелла; войдите в под — 3.0.1";
@@ -415,6 +426,44 @@ pub struct KubeTabState {
     pub target: filar_core::KubeCluster,
     pub namespace: Option<String>,
     pub connection_id: u64,
+    /// `Some` for a pod tab: a shell in a pod's container (#565). `None` for
+    /// a cluster tab, which has no shell.
+    pub pod: Option<KubePodTabState>,
+}
+
+/// The pod of a pod tab (#565): how to find it and what its shell reports.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KubePodTabState {
+    /// Address the tab connects and reconnects by.
+    pub pod_ref: filar_core::PodRef,
+    /// Pod the shell runs in, once connected (it changes when the pod is
+    /// replaced and the shell follows the selector).
+    pub pod: Option<String>,
+    /// Container the shell runs in, once connected.
+    pub container: Option<String>,
+    /// Limits and security settings of that container, from the pod spec.
+    pub limits: Option<filar_core::PodLimits>,
+}
+
+impl KubePodTabState {
+    /// A pod tab that has not connected yet.
+    pub fn pending(pod_ref: filar_core::PodRef) -> Self {
+        Self {
+            pod_ref,
+            pod: None,
+            container: None,
+            limits: None,
+        }
+    }
+
+    /// Pod name to show: the live one, else the requested name or selector.
+    pub fn display_pod(&self) -> String {
+        match (&self.pod, &self.pod_ref.pod) {
+            (Some(pod), _) => pod.clone(),
+            (None, filar_core::PodSelector::Name(name)) => name.clone(),
+            (None, filar_core::PodSelector::Labels(selector)) => selector.clone(),
+        }
+    }
 }
 
 /// A connection or namespace-discovery request consumed by the runner (#575).
@@ -522,6 +571,12 @@ pub struct App {
     pub kube_clusters: Vec<filar_core::KubeCluster>,
     /// Cluster connections and namespace discoveries awaiting the runner.
     pub pending_kube_connects: Vec<KubeConnectRequest>,
+    /// Pod lists for the pod chooser, consumed by the runner (#565).
+    pub pending_kube_pod_lists: Vec<pod_tab::KubePodListRequest>,
+    /// Pod shell connections, consumed by the runner (#565).
+    pub pending_kube_pod_connects: Vec<pod_tab::KubePodConnectRequest>,
+    /// Pod and container chooser opened from a cluster tab (#565).
+    pub kube_pod_select: Option<pod_tab::KubePodSelect>,
     /// Kubernetes fleet discoveries and restored connections awaiting the runner.
     pub pending_kube_fleets: Vec<KubeFleetRequest>,
     /// Namespace chooser for the active cluster tab, if any.
@@ -933,6 +988,9 @@ impl App {
             ssh_targets: Vec::new(),
             kube_clusters: Vec::new(),
             pending_kube_connects: Vec::new(),
+            pending_kube_pod_lists: Vec::new(),
+            pending_kube_pod_connects: Vec::new(),
+            kube_pod_select: None,
             pending_kube_fleets: Vec::new(),
             kube_namespace_select: None,
             next_kube_connection_id: 1,
@@ -2473,6 +2531,14 @@ impl App {
         } else {
             self.sessions[self.active].fleet.as_ref()
         };
+        let can_enter_pod = !for_panel
+            && fleet.is_none()
+            && tag.is_none()
+            && self.in_cluster_tab()
+            && self.kube.as_ref().is_some_and(|kube| kube.namespace.is_some());
+        if can_enter_pod && (q.is_empty() || "войти в под enter pod".contains(&q)) {
+            rows.push(HostSelectRow::EnterPod);
+        }
         if fleet.is_none() && tag.is_none() && (q.is_empty() || "local".contains(&q)) {
             rows.push(HostSelectRow::Local);
         }
@@ -2693,6 +2759,10 @@ impl App {
         }
         let idx = self.host_select_index;
         self.host_select_visible = false;
+        if idx == ENTER_POD_SELECTION {
+            self.open_pod_select();
+            return;
+        }
 
         // Ctrl+O inside the file panels picks that panel's source (#535);
         // the tab's own host is not touched.
@@ -2801,6 +2871,7 @@ impl App {
             target: target.clone(),
             namespace: None,
             connection_id,
+            pod: None,
         });
         self.sync_confirm_mode();
         if target.namespaces.is_empty() {
@@ -2851,6 +2922,7 @@ impl App {
             target: target.clone(),
             namespace: namespace.clone(),
             connection_id,
+            pod: None,
         });
         self.pending_kube_connects.push(KubeConnectRequest {
             session_id: sid,
@@ -2871,7 +2943,23 @@ impl App {
             .find(|target| target.name == snapshot.target)
             .cloned()
         {
-            Some(target) => self.queue_kube_connection(target, snapshot.namespace),
+            Some(target) => match snapshot.pod {
+                // A pod tab reconnects by its saved selector or name (#565).
+                Some(pod) => {
+                    let namespace = snapshot
+                        .namespace
+                        .or_else(|| target.default_namespace.clone())
+                        .unwrap_or_else(|| "default".to_string());
+                    let pod_ref = filar_core::PodRef {
+                        cluster: target.name.clone(),
+                        namespace: namespace.clone(),
+                        pod: pod.pod,
+                        container: pod.container,
+                    };
+                    self.start_pod_connection(target, namespace, pod_ref);
+                }
+                None => self.queue_kube_connection(target, snapshot.namespace),
+            },
             None => {
                 self.kube = None;
                 self.push_error(format!(
@@ -2973,7 +3061,7 @@ impl App {
     /// show, so the host overlay opens for the right panel at once.
     pub fn open_file_panels(&mut self) {
         if self.kube.is_some() {
-            self.refuse_kube_shell();
+            self.refuse_kube_action(pod_tab::KUBE_POD_PANELS_REFUSAL);
             return;
         }
         use crate::file_panels::{FilePanels, PanelSource, Side};
@@ -4086,6 +4174,12 @@ impl App {
             return;
         }
 
+        // The pod chooser is modal too (#565).
+        if self.kube_pod_select.is_some() {
+            self.handle_pod_select_key(key);
+            return;
+        }
+
         // F1 toggles the help overlay — except in PasswordInput where
         // the overlay would steal Esc from the password-cancel flow.
         if key.code == KeyCode::F(1) && self.mode != AppMode::PasswordInput {
@@ -4321,7 +4415,10 @@ impl App {
             return;
         }
         // A tab mid-switch still runs on its old executor (#433).
-        if self.handle_connecting_key(&key) {
+        if self.handle_pod_tab_key(&key)
+            || self.handle_pod_connecting_key(&key)
+            || self.handle_connecting_key(&key)
+        {
             return;
         }
 
@@ -4422,7 +4519,9 @@ impl App {
                         }
                         self.history_pos = None;
                         if let Some(stripped) = text.strip_prefix('!') {
-                            if self.kube.is_some() {
+                            // A cluster tab has no shell; a pod tab runs `!`
+                            // in its pod like an SSH tab on its host (#565).
+                            if self.in_cluster_tab() {
                                 self.input.clear();
                                 self.cursor_pos = 0;
                                 self.refuse_kube_shell();
@@ -4459,9 +4558,13 @@ impl App {
                                     // Stay in Normal mode — user needs to press Ctrl+P.
                                 } else if is_interactive_command(&cmd) {
                                     // Block interactive commands — they hang the executor.
+                                    let hint = if self.in_pod_tab() {
+                                        pod_tab::KUBE_POD_TERMINAL_REFUSAL.to_string()
+                                    } else {
+                                        "Use Ctrl+T to enter interactive terminal mode.".to_string()
+                                    };
                                     self.push_message(ChatBlock::System(format!(
-                                        "Interactive command '{cmd}' is not supported in shell escape. \
-                                         Use Ctrl+T to enter interactive terminal mode."
+                                        "Interactive command '{cmd}' is not supported in shell escape. {hint}"
                                     )));
                                     self.scroll = 0;
                                     self.input.clear();
@@ -4492,7 +4595,7 @@ impl App {
                 }
                 _ if ctrl_key('t', 'е') => {
                     if self.kube.is_some() {
-                        self.refuse_kube_shell();
+                        self.refuse_kube_action(pod_tab::KUBE_POD_TERMINAL_REFUSAL);
                         return;
                     }
                     // If the active session already has a live terminal,
@@ -5237,7 +5340,7 @@ impl App {
             }
             HelpAction::Terminal => {
                 if self.kube.is_some() {
-                    self.refuse_kube_shell();
+                    self.refuse_kube_action(pod_tab::KUBE_POD_TERMINAL_REFUSAL);
                 } else if self.in_fleet() {
                     self.fleet_refusal(FleetRefusal::Terminal);
                 } else if self.connecting.is_some() {
@@ -17514,6 +17617,7 @@ mod tests {
         app.restore_kube_snapshot(filar_core::KubeSessionSnapshot {
             target: "prod-eu".into(),
             namespace: Some("shop".into()),
+            pod: None,
         });
         let requests = app.take_pending_kube_connects();
         assert_eq!(requests.len(), 1);
@@ -17532,6 +17636,7 @@ mod tests {
         app.restore_kube_snapshot(filar_core::KubeSessionSnapshot {
             target: "prod-eu".into(),
             namespace: Some("shop".into()),
+            pod: None,
         });
         let request = app.take_pending_kube_connects().remove(0);
         app.fail_kube_connection(
@@ -17552,6 +17657,7 @@ mod tests {
             target: kube_test_target(&["shop"]),
             namespace: Some("shop".into()),
             connection_id: 1,
+            pod: None,
         });
         app
     }

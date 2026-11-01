@@ -79,7 +79,7 @@ fn parse_args() -> Args {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!(
-                    "  --target <name>   Connect to 'local', an SSH target, or a Kubernetes cluster (optionally cluster/namespace)"
+                    "  --target <name>   Connect to 'local', an SSH target, or a Kubernetes cluster (cluster[/namespace[/pod or selector]])"
                 );
                 eprintln!("  --group <name>    Open the fleet layer over this host group ([[host_groups]])");
                 eprintln!(
@@ -233,10 +233,12 @@ fn resolve_cli_target(config: &Config, value: &str) -> filar_core::Result<CliTar
     if let Some(target) = config.ssh_target(value) {
         return Ok(CliTarget::Ssh(target.clone()));
     }
-    let (name, explicit_namespace) = match value.split_once('/') {
-        Some((name, namespace)) => (name, Some(namespace)),
-        None => (value, None),
-    };
+    // `cluster[/namespace[/pod-or-selector]]`; a pod part opens a pod tab
+    // (#565): a name, or a label selector when it contains `=`.
+    let mut parts = value.splitn(3, '/');
+    let name = parts.next().unwrap_or(value);
+    let explicit_namespace = parts.next();
+    let pod_part = parts.next();
     if let Some(cluster) = config.kube_cluster(name) {
         if explicit_namespace.is_some_and(str::is_empty) {
             return Err(CoreError::Other(
@@ -251,11 +253,26 @@ fn resolve_cli_target(config: &Config, value: &str) -> filar_core::Result<CliTar
             probe.default_namespace = Some(namespace.to_string());
             probe.validate()?;
         }
+        let pod = match pod_part {
+            None => None,
+            Some(part) => match filar_tui::app::pod_tab::parse_pod_target(part) {
+                Some(pod) => Some(filar_core::KubePodSnapshot {
+                    pod,
+                    container: None,
+                }),
+                None => {
+                    return Err(CoreError::Other(
+                        "Kubernetes pod after the second '/' must not be empty".into(),
+                    ))
+                }
+            },
+        };
         return Ok(CliTarget::Kube(filar_core::KubeSessionSnapshot {
             target: cluster.name.clone(),
             namespace: explicit_namespace
                 .map(str::to_string)
                 .or_else(|| cluster.default_namespace.clone()),
+            pod,
         }));
     }
     Err(CoreError::Other(format!(
@@ -1091,7 +1108,38 @@ mod tests {
         assert!(resolve_cli_target(&config, "missing").is_err());
         assert!(resolve_cli_target(&config, "prod-eu/").is_err());
         assert!(resolve_cli_target(&config, "prod-eu/Shop").is_err());
-        assert!(resolve_cli_target(&config, "prod-eu/a/b").is_err());
+    }
+
+    /// `cluster/namespace/pod` opens a pod tab; a part with `=` is a label
+    /// selector (#565).
+    #[test]
+    fn cli_target_resolves_a_pod_by_name_or_selector() {
+        let config = filar_core::Config {
+            kube_clusters: vec![cluster("prod-eu", Some("default"))],
+            ..filar_core::Config::default()
+        };
+        match resolve_cli_target(&config, "prod-eu/shop/web-7f9c4d5b8-x2k9p").unwrap() {
+            CliTarget::Kube(snapshot) => {
+                assert_eq!(snapshot.namespace.as_deref(), Some("shop"));
+                let pod = snapshot.pod.expect("a pod tab");
+                assert_eq!(pod.pod, filar_core::PodSelector::Name("web-7f9c4d5b8-x2k9p".into()));
+                assert!(pod.container.is_none());
+            }
+            _ => panic!("expected a Kubernetes target"),
+        }
+        match resolve_cli_target(&config, "prod-eu/shop/app=web").unwrap() {
+            CliTarget::Kube(snapshot) => assert_eq!(
+                snapshot.pod.expect("a pod tab").pod,
+                filar_core::PodSelector::Labels("app=web".into())
+            ),
+            _ => panic!("expected a Kubernetes target"),
+        }
+        match resolve_cli_target(&config, "prod-eu/shop").unwrap() {
+            CliTarget::Kube(snapshot) => assert!(snapshot.pod.is_none(), "a cluster tab"),
+            _ => panic!("expected a Kubernetes target"),
+        }
+        assert!(resolve_cli_target(&config, "prod-eu/shop/").is_err());
+        assert!(resolve_cli_target(&config, "prod-eu//web-1").is_err());
     }
 
     #[test]

@@ -20,7 +20,7 @@ use futures::{FutureExt, StreamExt};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use filar_agent::{AgentBuilder, CommandConfirmer, LlmClient};
 use filar_core::{CommandConfirmMode, CoreError, Result, SecretProvider, StaticSecretProvider};
@@ -648,6 +648,153 @@ enum KubeAgentTarget {
         namespace: Option<String>,
     },
     Fleet(Arc<filar_agent::KubeFleet>),
+}
+
+/// Pod-tab work reported back to the event loop (#565).
+enum PodRunnerEvent {
+    /// Pods for the chooser of a cluster tab.
+    PodList {
+        session_id: SessionId,
+        select_id: u64,
+        result: std::result::Result<Vec<crate::app::PodChoice>, String>,
+    },
+    /// The pod shell is open.
+    Connected {
+        session_id: SessionId,
+        connection_id: u64,
+        exec: Arc<filar_transport::KubeExecutor>,
+    },
+    /// The pod shell could not be opened.
+    Failed {
+        session_id: SessionId,
+        connection_id: u64,
+        error: String,
+    },
+    /// The shell reconnected or followed its selector to another pod.
+    Shell {
+        session_id: SessionId,
+        connection_id: u64,
+        event: filar_transport::KubeExecEvent,
+    },
+}
+
+/// A pod tab's live shell and the task forwarding its events.
+struct PodShell {
+    exec: Arc<filar_transport::KubeExecutor>,
+    events: tokio::task::JoinHandle<()>,
+}
+
+impl PodShell {
+    /// Stop forwarding events and close the shell.
+    async fn release(self) {
+        self.events.abort();
+        if let Err(error) = self.exec.close().await {
+            debug!(error = %error, "closing a pod shell failed");
+        }
+    }
+}
+
+/// List the running pods of a cluster tab's namespace for its chooser (#565).
+fn start_pending_kube_pod_lists(
+    app: &mut App,
+    kube_apis: &HashMap<SessionId, Arc<dyn ClusterApi>>,
+    pod_tx: &mpsc::UnboundedSender<PodRunnerEvent>,
+) {
+    for request in app.take_pending_kube_pod_lists() {
+        let tx = pod_tx.clone();
+        let Some(api) = kube_apis.get(&request.session_id).cloned() else {
+            let _ = tx.send(PodRunnerEvent::PodList {
+                session_id: request.session_id,
+                select_id: request.select_id,
+                result: Err(
+                    "кластер ещё не подключён — повторите, когда подключение завершится".into(),
+                ),
+            });
+            continue;
+        };
+        tokio::spawn(async move {
+            let result = api
+                .list_pods(Some(&request.namespace), None, Some("status.phase=Running"))
+                .await
+                .map(|pods| {
+                    crate::app::pod_tab::pod_choices(
+                        pods.into_iter()
+                            .map(|pod| {
+                                let containers =
+                                    pod.containers.into_iter().map(|c| c.name).collect();
+                                (pod.name, pod.ready, containers)
+                            })
+                            .collect(),
+                    )
+                })
+                .map_err(|error| error.to_string());
+            let _ = tx.send(PodRunnerEvent::PodList {
+                session_id: request.session_id,
+                select_id: request.select_id,
+                result,
+            });
+        });
+    }
+}
+
+/// Open every queued pod shell in the background, like an SSH connect (#565).
+fn start_pending_kube_pod_connects(
+    app: &mut App,
+    pod_tx: &mpsc::UnboundedSender<PodRunnerEvent>,
+) {
+    for request in app.take_pending_kube_pod_connects() {
+        let tx = pod_tx.clone();
+        tokio::spawn(async move {
+            let event =
+                match filar_transport::KubeExecutor::connect(&request.cluster, &request.pod_ref)
+                    .await
+                {
+                    Ok(exec) => PodRunnerEvent::Connected {
+                        session_id: request.session_id,
+                        connection_id: request.connection_id,
+                        exec: Arc::new(exec),
+                    },
+                    Err(error) => PodRunnerEvent::Failed {
+                        session_id: request.session_id,
+                        connection_id: request.connection_id,
+                        error: error.to_string(),
+                    },
+                };
+            let _ = tx.send(event);
+        });
+    }
+}
+
+/// Forward a pod shell's reconnect events to the event loop. The first
+/// `Connected` is already over by the time this subscribes; the identity
+/// is read from the executor right after `connect` instead.
+fn forward_pod_events(
+    exec: &filar_transport::KubeExecutor,
+    session_id: SessionId,
+    connection_id: u64,
+    pod_tx: mpsc::UnboundedSender<PodRunnerEvent>,
+) -> tokio::task::JoinHandle<()> {
+    let mut events = exec.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if pod_tx
+                        .send(PodRunnerEvent::Shell {
+                            session_id,
+                            connection_id,
+                            event,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 /// Start every queued cluster connection or namespace discovery (#575).
@@ -1654,6 +1801,9 @@ async fn run_app(
     // Live typed Kubernetes APIs stay in the runner, never in persisted state.
     let (kube_tx, mut kube_rx) = mpsc::unbounded_channel::<KubeConnectionResult>();
     let mut kube_apis: HashMap<SessionId, Arc<dyn ClusterApi>> = HashMap::new();
+    // Pod tabs (#565): pod lists, shell connections and shell events.
+    let (pod_tx, mut pod_rx) = mpsc::unbounded_channel::<PodRunnerEvent>();
+    let mut pod_shells: HashMap<SessionId, PodShell> = HashMap::new();
     let (kube_fleet_tx, mut kube_fleet_rx) = mpsc::unbounded_channel::<KubeFleetResult>();
     let mut kube_fleets: HashMap<SessionId, Arc<filar_agent::KubeFleet>> = HashMap::new();
 
@@ -1728,6 +1878,7 @@ async fn run_app(
     }
     start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
     start_pending_kube_fleets(&mut app, &mut kube_fleets, &kube_fleet_tx);
+    start_pending_kube_pod_connects(&mut app, &pod_tx);
     // The startup target may carry policy tags — tighten before the first
     // render so the bar and the confirm gate agree from the start (#414).
     app.sync_confirm_mode();
@@ -2114,10 +2265,14 @@ async fn run_app(
                 // Start cluster or fleet work selected by this key before consuming input.
                 start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
                 start_pending_kube_fleets(&mut app, &mut kube_fleets, &kube_fleet_tx);
+                start_pending_kube_pod_lists(&mut app, &kube_apis, &pod_tx);
+                start_pending_kube_pod_connects(&mut app, &pod_tx);
 
                 // Check if user sent input — spawn agent or execute shell escape.
                 if let Some(user_input) = app.take_input() {
-                    if let Some(kube) = app.kube.clone() {
+                    // Cluster tabs run the API agent; a pod tab has a shell
+                    // and goes the ordinary way below (#565).
+                    if let Some(kube) = app.kube.clone().filter(|kube| kube.pod.is_none()) {
                         if user_input.starts_with('!') {
                             app.push_message(ChatBlock::System(crate::app::KUBE_SHELL_REFUSAL.into()));
                             app.mode = AppMode::Normal;
@@ -2336,6 +2491,20 @@ async fn run_app(
                             };
                             let info = format!("fleet {} ({} hosts)", fleet.group_name(), fleet.len());
                             (exec as Arc<dyn CommandExecutor>, false, Some(info))
+                        } else if app.in_pod_tab() {
+                            // The tab's executor is the pod's `KubeExecutor`;
+                            // until it is connected nothing may run (#565).
+                            match (executors.get(&sid), app.pod_agent_target()) {
+                                (Some(e), Some(_)) => {
+                                    (e.executor.clone() as Arc<dyn CommandExecutor>, false, None)
+                                }
+                                _ => {
+                                    app.push_error("Под ещё не подключён".into());
+                                    app.mode = AppMode::Normal;
+                                    app.agent_running = false;
+                                    continue;
+                                }
+                            }
                         } else {
                             match executors.get(&sid) {
                                 Some(e) => {
@@ -2426,6 +2595,7 @@ async fn run_app(
                             app.active_session().compaction_exhausted,
                             pending_compaction,
                             in_fleet,
+                            app.pod_agent_target(),
                         );
                         // Consumed by this run: the summary comes back as an
                         // event, and a leftover flag would fold the history a
@@ -2781,6 +2951,39 @@ async fn run_app(
             fleet_executors.remove(&sid);
             kube_apis.remove(&sid);
             kube_fleets.remove(&sid);
+            if let Some(shell) = pod_shells.remove(&sid) {
+                shell.release().await;
+            }
+        }
+
+        // A pod shell outlives its pod tab when the tab went back to its
+        // cluster (Ctrl+O, failed reconnect) or to SSH/local (#565): close
+        // it. A cluster tab gets a local placeholder executor back — it never
+        // runs commands, but must not keep the pod's exec stream open.
+        let stale_shells: Vec<SessionId> = pod_shells
+            .keys()
+            .copied()
+            .filter(|sid| {
+                app.find_session_idx(*sid)
+                    .and_then(|idx| app.sessions[idx].kube.as_ref())
+                    .is_none_or(|kube| kube.pod.is_none())
+            })
+            .collect();
+        for sid in stale_shells {
+            let back_to_cluster = app
+                .find_session_idx(sid)
+                .is_some_and(|idx| app.sessions[idx].kube.is_some());
+            if back_to_cluster {
+                if let (Some(entry), Ok(local)) = (
+                    executors.get(&sid),
+                    filar_transport::LocalExecutor::with_timeout(command_timeout).await,
+                ) {
+                    entry.executor.swap_executor(sid, Arc::new(local)).await;
+                }
+            }
+            if let Some(shell) = pod_shells.remove(&sid) {
+                shell.release().await;
+            }
         }
 
         // Teardown interactive backends for tabs reset by session restore
@@ -2842,6 +3045,65 @@ async fn run_app(
                             needs_redraw = true;
                         }
                     }
+                }
+            }
+
+            // Pod tabs (#565): chooser lists, shell connections, pod changes.
+            maybe_pod = pod_rx.recv() => {
+                if let Some(event) = maybe_pod {
+                    match event {
+                        PodRunnerEvent::PodList { session_id, select_id, result } => {
+                            app.complete_pod_list(session_id, select_id, result);
+                        }
+                        PodRunnerEvent::Connected { session_id, connection_id, exec } => {
+                            if !app.kube_pod_connection_is_current(session_id, connection_id) {
+                                // The tab moved on (closed, other target): drop it.
+                                let _ = exec.close().await;
+                            } else if let Some(entry) = executors.get(&session_id) {
+                                entry
+                                    .executor
+                                    .swap_executor(session_id, exec.clone() as Arc<dyn CommandExecutor>)
+                                    .await;
+                                *entry.ssh_target.write().await = None;
+                                *entry.ssh_exec.write().await = None;
+                                let events =
+                                    forward_pod_events(&exec, session_id, connection_id, pod_tx.clone());
+                                let previous = pod_shells
+                                    .insert(session_id, PodShell { exec: exec.clone(), events });
+                                if let Some(previous) = previous {
+                                    previous.release().await;
+                                }
+                                app.complete_kube_pod_connection(
+                                    session_id,
+                                    connection_id,
+                                    exec.pod(),
+                                    exec.container(),
+                                    exec.pod_limits(),
+                                );
+                            } else {
+                                let _ = exec.close().await;
+                                app.fail_kube_pod_connection(
+                                    session_id,
+                                    connection_id,
+                                    "у вкладки нет исполнителя".into(),
+                                );
+                            }
+                        }
+                        PodRunnerEvent::Failed { session_id, connection_id, error } => {
+                            app.fail_kube_pod_connection(session_id, connection_id, error);
+                        }
+                        PodRunnerEvent::Shell { session_id, connection_id, event } => match event {
+                            filar_transport::KubeExecEvent::PodChanged { old, new } => {
+                                // Another pod: its writable dirs are its own (#599).
+                                filar_agent::background::reset_log_dir(&session_id.0.to_string());
+                                app.kube_pod_changed(session_id, connection_id, &old, &new);
+                            }
+                            filar_transport::KubeExecEvent::Connected { pod, container, limits } => {
+                                app.kube_pod_identity(session_id, connection_id, pod, container, limits);
+                            }
+                        },
+                    }
+                    needs_redraw = true;
                 }
             }
 
@@ -3130,6 +3392,8 @@ async fn run_app(
         // Non-terminal events can also queue a restored or selected target.
         start_pending_kube_connects(&mut app, &mut kube_apis, &kube_tx);
         start_pending_kube_fleets(&mut app, &mut kube_fleets, &kube_fleet_tx);
+        start_pending_kube_pod_lists(&mut app, &kube_apis, &pod_tx);
+        start_pending_kube_pod_connects(&mut app, &pod_tx);
 
         if app.should_quit {
             break;
@@ -3380,6 +3644,7 @@ fn session_snapshot_of(
             .map(|kube| filar_core::KubeSessionSnapshot {
                 target: kube.target.name.clone(),
                 namespace: kube.namespace.clone(),
+                pod: kube.pod.as_ref().map(App::pod_snapshot),
             }),
     };
     session.truncate_history();
@@ -3891,6 +4156,9 @@ fn spawn_agent(
     // The run is the fleet's (#435): `executor` is the group-level one and
     // the agent gets the fleet tool set, prompt and gate.
     fleet: bool,
+    // A pod tab (#565): `executor` is the pod's shell and the agent gets the
+    // pod prompt, arbiter context and safety target.
+    pod_target: Option<filar_agent::KubePodTarget>,
 ) {
     let tx = event_tx.clone();
     let confirmer = Arc::new(TuiConfirmer::new(event_tx.clone(), sid)) as Arc<dyn CommandConfirmer>;
@@ -3956,7 +4224,9 @@ fn spawn_agent(
                 .arbiter_llm(arbiter_llm.clone())
                 .arbiter_model_name(arbiter_model_name.clone())
                 .risk_scorer(risk_scorer.clone());
-            if is_local {
+            if let Some(target) = pod_target.as_ref() {
+                builder = builder.kube_pod_mode(target);
+            } else if is_local {
                 builder = builder.local_mode().arbiter_local_context();
             } else {
                 builder = builder
@@ -5290,6 +5560,7 @@ mod tests {
             },
             namespace: Some("shop".into()),
             connection_id: 7,
+            pod: None,
         });
 
         let snapshot = session_snapshot(&app, "prod-eu", "123456", "2026-10-30 00:00:00");
@@ -5298,6 +5569,7 @@ mod tests {
             Some(filar_core::KubeSessionSnapshot {
                 target: "prod-eu".into(),
                 namespace: Some("shop".into()),
+                pod: None,
             })
         );
         let json = serde_json::to_string(&snapshot).expect("snapshot serialises");
@@ -5320,6 +5592,7 @@ mod tests {
         app.restore_kube_snapshot(filar_core::KubeSessionSnapshot {
             target: "missing-cluster".into(),
             namespace: Some("shop".into()),
+            pod: None,
         });
         let sid = app.active_session().id;
         let (kube_tx, mut kube_rx) = mpsc::unbounded_channel();
