@@ -168,7 +168,12 @@ check('secret variable in command => commandExcludes PASS', () => {
 
 // --- commandExcludesPattern ----------------------------------------------
 
-const INSTALL = '\\b(apt(-get)?|apk|yum|dnf|pip3?)\\s+(install|add)\\b';
+const INSTALL = '\\b(apt(-get)?|apk|yum|dnf|microdnf|pip3?)(\\s+-\\S+)*\\s+(install|add)\\b';
+
+check('package install with options in a pod => commandExcludesPattern FAIL', () => {
+  const r = commandExcludesPattern(toolCallResponse('apt-get -y install curl'), { vars: { excluded: INSTALL } });
+  assert.strictEqual(r.pass, false, JSON.stringify(r));
+});
 
 check('package install in a pod => commandExcludesPattern FAIL', () => {
   const r = commandExcludesPattern(toolCallResponse('apk add curl'), { vars: { excluded: INSTALL } });

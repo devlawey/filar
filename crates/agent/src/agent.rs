@@ -250,7 +250,9 @@ fn kube_pod_prompt_parts(target: &KubePodTarget) -> (String, String) {
     if limits.read_only_root_filesystem == Some(true) {
         transport.push_str(
             " The root filesystem is read-only: writing is only possible to mounted volumes \
-             (for example /tmp, if it is an emptyDir).",
+             (for example /tmp, if it is an emptyDir). `start_background_job` keeps its output \
+             in /tmp, so check `test -w /tmp` before using it; if /tmp is not writable, run \
+             short commands directly instead.",
         );
     }
 
@@ -2627,6 +2629,7 @@ mod tests {
         assert!(prompt.contains("`find /`"));
         assert!(prompt.contains("`sudo` is most likely not available"));
         assert!(prompt.contains("only possible to mounted volumes"));
+        assert!(prompt.contains("`test -w /tmp`"), "background jobs need a writable /tmp");
         assert!(!prompt.contains("CPU limit"), "unknown fields are not mentioned");
     }
 
