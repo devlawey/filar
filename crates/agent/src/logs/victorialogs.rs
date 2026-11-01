@@ -209,7 +209,12 @@ impl LogSource for VictoriaLogsSource {
         let note = body.truncated.then(|| {
             format!("the answer was cut at {} bytes (max_response_bytes)", limits.max_response_bytes)
         });
-        Ok(LogResult { lines, truncated, note })
+        Ok(LogResult {
+            lines,
+            truncated,
+            note,
+            ..Default::default()
+        })
     }
 }
 

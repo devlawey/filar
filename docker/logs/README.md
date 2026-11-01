@@ -41,3 +41,49 @@ name = "vlogs-local"
 kind = "victorialogs"
 url = "http://127.0.0.1:9428"
 ```
+
+## Grafana Loki (#582)
+
+```sh
+LOKI=v3.5.7
+curl -fsSLO https://github.com/grafana/loki/releases/download/$LOKI/loki-linux-amd64.zip
+unzip loki-linux-amd64.zip
+cat > loki.yaml <<'YAML'
+auth_enabled: false
+server: {http_listen_address: 127.0.0.1, http_listen_port: 3100, grpc_listen_address: 127.0.0.1, grpc_listen_port: 9096}
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /tmp/filar-loki
+  storage: {filesystem: {chunks_directory: /tmp/filar-loki/chunks, rules_directory: /tmp/filar-loki/rules}}
+  replication_factor: 1
+  ring: {kvstore: {store: inmemory}}
+schema_config:
+  configs: [{from: 2024-01-01, store: tsdb, object_store: filesystem, schema: v13, index: {prefix: index_, period: 24h}}]
+analytics: {reporting_enabled: false}
+YAML
+./loki-linux-amd64 -config.file=loki.yaml &
+curl -s --noproxy '*' http://127.0.0.1:3100/ready   # "ready" after ~15 s
+```
+
+Live tests push their own lines through `/loki/api/v1/push`:
+
+```sh
+FILAR_TEST_LOKI_URL=http://127.0.0.1:3100 \
+  cargo test -p filar-agent --test loki -- --ignored
+```
+
+Sample data:
+
+```sh
+ns=$(date +%s%N)
+curl -s --noproxy '*' -H 'Content-Type: application/json' http://127.0.0.1:3100/loki/api/v1/push \
+  -d '{"streams":[{"stream":{"namespace":"shop","pod":"web-1"},"values":[["'"$ns"'","level=error msg=\"connection refused to db-1:5432\""]]}]}'
+```
+
+```toml
+[[log_sources]]
+name = "loki-local"
+kind = "loki"
+url = "http://127.0.0.1:3100"
+# tenant = "team-a"   # X-Scope-OrgID when auth_enabled: true
+```

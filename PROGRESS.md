@@ -11673,3 +11673,25 @@ VictoriaLogs → финальный ответ агента. Найден баг
 длинной команды без пометки) — вынесен в #608.
 
 **Next:** #582 (Loki), #581 (OpenSearch/ES).
+
+## Issue #582: адаптер Grafana Loki (веха 3.0.2)
+
+**Сделано.** `crates/agent/src/logs/loki.rs`: `LokiSource` — `GET
+/loki/api/v1/query_range` (`query`, `start`/`end` в наносекундах, `limit`,
+`direction=backward`), `X-Scope-OrgID` из `tenant`, auth none/basic/bearer.
+`streams` → строки с метками потока в `fields`, сортировка по времени (новые
+первыми), срез до `limit` с флагом «обрезано»; `matrix`/`vector` → новые
+`LogSeries` в `LogResult.series`; `fold_series` — таблица «ряд × точки»: метки,
+число точек, min/max/last и до 12 значений, топ-30 рядов по последнему значению.
+Ответ больше `max_response_bytes` не разбирается (обрезанный JSON) — пометка
+модели «сузить запрос». Ошибки Loki (400, 429 «too many outstanding requests»,
+лимиты) уходят текстом, ключ и basic-токен вычищены.
+
+**Контракт.** `LogResult` получил поле `series` (и потерял `Eq` — там f64).
+Литералы — через `..Default::default()`.
+
+**Проверки.** Живой `#[ignore]` тест `crates/agent/tests/loki.rs` против Loki
+v3.5.7 (одиночный бинарник, filesystem storage, `docker/logs/README.md`):
+push → поиск строк → метрический запрос → ошибка синтаксиса — зелёный.
+
+**Next:** #581 (OpenSearch/Elasticsearch).

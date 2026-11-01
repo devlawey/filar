@@ -10,7 +10,12 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use super::{LogLine, LogQuery, LogResult};
+use super::{LogLine, LogQuery, LogResult, LogSeries};
+
+/// Series shown from a metric query, largest last value first.
+pub const MAX_FOLD_SERIES: usize = 30;
+/// Values sampled per series.
+const SERIES_SAMPLES: usize = 12;
 
 /// Groups shown, most frequent first.
 pub const MAX_FOLD_GROUPS: usize = 40;
@@ -186,6 +191,12 @@ pub fn fold_logs(name: &str, language: &str, query: &LogQuery, result: &LogResul
     if cut_lines > 0 {
         out.push_str(&format!("{cut_lines} line(s) were longer than the per-line cap and are cut.\n"));
     }
+    if !result.series.is_empty() {
+        out.push_str(&fold_series(&result.series, multi_day));
+        if result.lines.is_empty() {
+            return out;
+        }
+    }
     if result.lines.is_empty() {
         out.push_str("No lines matched in this window.\n");
         return out;
@@ -279,4 +290,82 @@ pub fn fold_logs(name: &str, language: &str, query: &LogQuery, result: &LogResul
         out.push_str(&format!("… {} more group(s), {rest} line(s)\n", distinct - MAX_FOLD_GROUPS));
     }
     out
+}
+
+fn number(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else if v.abs() >= 1.0 {
+        format!("{v:.3}")
+    } else {
+        // Three significant digits, so a small rate never reads as zero.
+        let decimals = (-v.abs().log10()).ceil() as usize + 2;
+        format!("{v:.decimals$}")
+    }
+}
+
+/// A metric answer as a table: one row per series with its labels, point
+/// count, min/max/last and up to 12 evenly sampled values.
+pub fn fold_series(series: &[LogSeries], multi_day: bool) -> String {
+    let last = |s: &LogSeries| s.points.last().map(|p| p.1).unwrap_or(f64::MIN);
+    let mut ranked: Vec<&LogSeries> = series.iter().collect();
+    ranked.sort_by(|a, b| last(b).total_cmp(&last(a)));
+    let mut out = format!(
+        "Metric result: {} series{}\n",
+        series.len(),
+        if series.len() > MAX_FOLD_SERIES { format!(", top {MAX_FOLD_SERIES} by last value shown") } else { String::new() }
+    );
+    for s in ranked.iter().take(MAX_FOLD_SERIES) {
+        let labels: Vec<String> = s.labels.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
+        let values: Vec<f64> = s.points.iter().map(|p| p.1).collect();
+        let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let (Some(first), Some(end)) = (s.points.first(), s.points.last()) else {
+            out.push_str(&format!("{{{}}} no points\n", labels.join(", ")));
+            continue;
+        };
+        // Evenly over the whole series, first and newest point included.
+        let k = values.len().min(SERIES_SAMPLES);
+        let sampled: Vec<String> = (0..k)
+            .map(|i| if k == 1 { 0 } else { i * (values.len() - 1) / (k - 1) })
+            .map(|i| number(values[i]))
+            .collect();
+        out.push_str(&format!(
+            "{{{}}} {} point(s) {} … {}: min {} max {} last {}; values {}\n",
+            labels.join(", "),
+            values.len(),
+            clock(Some(first.0), multi_day),
+            clock(Some(end.0), multi_day),
+            number(min),
+            number(max),
+            number(end.1),
+            sampled.join(" ")
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod series_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn small_values_keep_significant_digits() {
+        assert_eq!(number(0.0004), "0.000400");
+        assert_eq!(number(0.25), "0.250");
+        assert_eq!(number(2.5), "2.500");
+        assert_eq!(number(5.0), "5");
+        assert_eq!(number(0.0), "0");
+    }
+
+    #[test]
+    fn samples_span_the_whole_series() {
+        let points: Vec<(DateTime<Utc>, f64)> = (0..13)
+            .map(|i| (Utc.timestamp_opt(1_793_557_500 + i * 60, 0).unwrap(), i as f64))
+            .collect();
+        let text = fold_series(&[LogSeries { labels: Default::default(), points }], false);
+        assert!(text.contains("values 0 "), "{text}");
+        assert!(text.trim_end().ends_with(" 12"), "the newest point is sampled: {text}");
+    }
 }
