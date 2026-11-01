@@ -97,6 +97,12 @@ pub struct Config {
     /// path and the context name live here — never its contents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kube_clusters: Vec<KubeCluster>,
+
+    /// Centralised log stores from `[[log_sources]]` (#579), queried by the
+    /// agent's `query_logs` tool from any tab. Keys are referenced by name
+    /// (`key_env`) only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log_sources: Vec<crate::log_sources::LogSourceConfig>,
 }
 
 impl Default for Config {
@@ -116,6 +122,7 @@ impl Default for Config {
             risk_scorer: None,
             risk_scorer_error: None,
             kube_clusters: Vec::new(),
+            log_sources: Vec::new(),
         }
     }
 }
@@ -1192,6 +1199,7 @@ impl Config {
             cluster.validate()?;
         }
         cfg.validate_target_names()?;
+        cfg.validate_log_sources()?;
         cfg.check_risk_scorer();
         Ok(cfg)
     }
@@ -1335,6 +1343,37 @@ impl Config {
     /// Look up an SSH target by name.
     pub fn ssh_target(&self, name: &str) -> Option<&SshTarget> {
         self.ssh_targets.iter().find(|t| t.name == name)
+    }
+
+    /// Look up a log source by name (#579).
+    pub fn log_source(&self, name: &str) -> Option<&crate::log_sources::LogSourceConfig> {
+        self.log_sources.iter().find(|s| s.name == name)
+    }
+
+    /// Validate every `[[log_sources]]` entry, their names (unique) and the
+    /// clusters they are linked to (must exist in `[[kube_clusters]]`).
+    pub fn validate_log_sources(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for source in &self.log_sources {
+            source.validate()?;
+            if !seen.insert(source.name.trim()) {
+                return Err(CoreError::Config(format!(
+                    "log_sources: duplicate name \"{}\"",
+                    source.name.trim()
+                )));
+            }
+            if let Some(cluster) = source
+                .clusters
+                .iter()
+                .find(|c| self.kube_cluster(c.trim()).is_none())
+            {
+                return Err(CoreError::Config(format!(
+                    "log_sources: \"{}\": clusters: \"{cluster}\" is not a [[kube_clusters]] name",
+                    source.name.trim()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Look up a Kubernetes cluster by name (#562).
@@ -1521,6 +1560,40 @@ confirm_mode = "explain"
 
     fn kube_err(extra: &str) -> String {
         kube_err_raw(&kube_toml(extra))
+    }
+
+    #[test]
+    fn log_sources_load_and_link_to_known_clusters() {
+        let ok = "[[kube_clusters]]\nname = \"prod-eu\"\ncontext = \"prod-eu\"\n\
+                  [[log_sources]]\nname = \"vlogs\"\nkind = \"victorialogs\"\n\
+                  url = \"https://vlogs.example.com\"\nclusters = [\"prod-eu\"]\n";
+        let dir = std::env::temp_dir().join(format!("filar-logsrc-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, ok).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(cfg.log_sources.len(), 1);
+        assert!(cfg.log_source("vlogs").is_some());
+
+        let unknown = kube_err_raw(
+            "[[log_sources]]\nname = \"vlogs\"\nkind = \"victorialogs\"\n\
+             url = \"https://v\"\nclusters = [\"nope\"]\n",
+        );
+        assert!(unknown.contains("\"nope\" is not a [[kube_clusters]] name"), "{unknown}");
+        let dup = kube_err_raw(
+            "[[log_sources]]\nname = \"v\"\nkind = \"loki\"\nurl = \"http://l\"\n\
+             [[log_sources]]\nname = \"v\"\nkind = \"loki\"\nurl = \"http://m\"\n",
+        );
+        assert!(dup.contains("duplicate name \"v\""), "{dup}");
+        let bad = kube_err_raw("[[log_sources]]\nname = \"v\"\nkind = \"loki\"\nurl = \"l\"\n");
+        assert!(bad.contains("url"), "{bad}");
+    }
+
+    #[test]
+    fn log_sources_are_not_written_when_absent() {
+        let text = toml::to_string(&Config::default()).unwrap();
+        assert!(!text.contains("log_sources"), "{text}");
     }
 
     fn kube_err_raw(toml: &str) -> String {

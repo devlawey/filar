@@ -1652,6 +1652,7 @@ name = "filar-agent"
 version = "3.0.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "filar-core",
  "filar-transport",
  "futures",

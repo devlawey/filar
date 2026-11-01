@@ -16,6 +16,7 @@ pub mod fleet_checks;
 pub mod fleet_file_check;
 pub mod fleet_op;
 pub mod kube_pod;
+pub mod log_sources;
 pub mod os_family;
 pub mod secrets;
 pub mod session;
@@ -44,6 +45,7 @@ pub use fleet_op::{
     OperationId,
 };
 pub use kube_pod::{PodLimits, PodRef, PodSelector};
+pub use log_sources::{LogAuth, LogSourceConfig, LogSourceKind};
 pub use os_family::{OsFamily, OS_RELEASE_COMMAND};
 pub use secrets::{
     redact, redact_secrets, ssh_cred_name, ssh_key_passphrase_name, ssh_target_display_name,

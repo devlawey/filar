@@ -6,6 +6,8 @@
 //! - Tool definitions (`run_command`, `read_file`, `list_dir`, background jobs) (Stage 5).
 //! - Security layer: confirmation, destructive command detection (Stage 5).
 //! - Command safety scoring by a decision model, advisory only (#549).
+//! - Log sources and the `query_logs` tool: centralised log stores queried
+//!   over HTTP inside a fixed frame, answers folded and redaction applied (#579).
 //! - Output preprocessors: machine-format command output → typed tables; raw
 //!   text remains the fallback (Stage 2.0, fleet).
 //! - OS-family detection per host, cached for the session (Stage 2.0, fleet).
@@ -45,6 +47,7 @@ pub mod kube_agent;
 pub mod kube_fleet;
 pub mod kube_redact;
 pub mod kube_tools;
+pub mod logs;
 pub mod long_wait;
 pub mod openai_compat;
 pub mod os_probe;
@@ -70,6 +73,9 @@ pub use kube_tools::{
     bind_fleet_call, build_kube_fleet_system_prompt, build_kube_system_prompt,
     kube_confirmation_decision, kube_tool_definitions, parse_kube_tool_call, KubeResourceKind,
     KubeToolCall, KubeToolExecutor, KubeToolResult, KubeTopResource,
+};
+pub use logs::{
+    build_log_sources, LogLine, LogQuery, LogResult, LogSource, LogSources, TOOL_QUERY_LOGS,
 };
 pub use openai_compat::OpenAiCompatClient;
 pub use os_probe::OsFamilyProbe;

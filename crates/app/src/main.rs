@@ -425,6 +425,43 @@ fn build_risk_scorer_for_launch(
     }
 }
 
+/// The log sources of `config` (#579), with one start-up note per source
+/// that cannot be used.
+///
+/// Each key is looked up like the risk scorer's: in-memory `sp` → OS
+/// credential store → environment, under the source's own `key_env`, and
+/// cached in `sp` so that output echoing it is masked. Neither the sources'
+/// errors nor the notes ever carry a key.
+fn build_log_sources_for_launch(
+    config: &filar_core::Config,
+    sp: &filar_core::StaticSecretProvider,
+) -> (Option<std::sync::Arc<filar_agent::LogSources>>, Vec<String>) {
+    use filar_core::SecretProvider;
+    for source in &config.log_sources {
+        let key_env = source.key_env.trim();
+        let needs_key = source.auth_kind().is_some_and(filar_core::LogAuth::needs_key);
+        if !needs_key || key_env.is_empty() {
+            continue;
+        }
+        let non_empty = |k: filar_core::Result<String>| k.ok().filter(|k| !k.is_empty());
+        let found = non_empty(sp.get(key_env))
+            .or_else(|| non_empty(filar_core::KeyringSecretProvider::new().get(key_env)))
+            .or_else(|| non_empty(filar_core::EnvSecretProvider::new().get(key_env)));
+        if let Some(key) = found {
+            sp.insert(key_env, &key);
+        }
+    }
+    let (sources, notes) = filar_agent::build_log_sources(
+        &config.log_sources,
+        std::sync::Arc::new(sp.clone()),
+        config.tag_policies.clone(),
+    );
+    if let Some(sources) = &sources {
+        info!(sources = ?sources.names(), "log sources initialised");
+    }
+    (sources, notes)
+}
+
 /// The API key of `profile`: in-memory `sp` → OS credential store →
 /// environment, each under [`secrets::llm_key_lookup_names`] of its
 /// `key_env` (the default name falls back to its legacy one, #490). A key
@@ -941,6 +978,9 @@ async fn run() -> anyhow::Result<()> {
     let (risk_scorer, risk_thresholds, risk_scorer_note) =
         build_risk_scorer_for_launch(&config, &secret_provider);
 
+    // ── Log sources (#579) ─────────────────────────────────────────────
+    let (log_sources, log_source_notes) = build_log_sources_for_launch(&config, &secret_provider);
+
     // ── Launch TUI ─────────────────────────────────────────────────────
     let default_profile_name = resolve_startup_profile(
         &launch_profiles,
@@ -1003,6 +1043,8 @@ async fn run() -> anyhow::Result<()> {
         risk_scorer,
         risk_thresholds,
         risk_scorer_note,
+        log_sources,
+        log_source_notes,
     };
 
     info!("launching TUI");

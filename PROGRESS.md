@@ -11605,3 +11605,44 @@ exec-протокола (`tty_size` не даёт нулей), Ctrl+C уходи
 **Контракты.** Публичные API не менялись.
 
 **Next:** веха 3.0.2 — #579 (источники логов).
+## Issue #579: источники логов `[[log_sources]]`, `LogSource`, `query_logs` (веха 3.0.2)
+
+**Сделано.**
+- Core (`crates/core/src/log_sources.rs`): `LogSourceConfig` + `LogSourceKind`
+  (victorialogs/opensearch/elasticsearch/loki, язык запросов) + `LogAuth`
+  (none/basic/bearer/api-key; api-key только у Elasticsearch). Валидация: URL
+  `http(s)://` с хостом и без userinfo, `key_env` — имя переменной (не значение),
+  basic → `user`, тенант под kind (VictoriaLogs `A:P`, Loki без пробелов,
+  у OpenSearch/ES — ошибка), `index` обязателен для OpenSearch/ES и запрещён у
+  остальных, лимиты: окно 1–168 ч, строки 1–10000, таймаут 1–120 с, строка
+  256 Б–64 КиБ (умолч. 4 КиБ), ответ 64 КиБ–32 МиБ (умолч. 2 МиБ).
+  `Config::log_sources`, `Config::validate_log_sources` (уникальные имена,
+  `clusters` — существующие `[[kube_clusters]]`).
+- Agent (`crates/agent/src/logs/`): трейт `LogSource` (`config`, `describe`,
+  `query(&LogQuery) -> LogResult`), `LogHttp` (таймаут, auth, вычистка ключа
+  и basic-токена из ошибок), `read_limited` (тело потоком, обрыв соединения на
+  лимите), `cap_line`; `fold_logs` — нормализация (`<time>`, `<uuid>`, `<hex>`,
+  `<n>`), группы со счётчиками, первое/последнее вхождение, распределение по
+  12 корзинам окна; `LogSources` — инструмент `query_logs` (рамки: без окна не
+  отправляется, окно > max — отказ, `limit` срезается до `max_lines`), гейт
+  (always/explain — подтверждение, allowlist/never — авто, теги источника
+  ужесточают через `tag_policy_floor`), редакция `redact_logs` (#573), отмена —
+  drop запроса. `build_log_sources` / `resolve_log_key` / `build_log_source`.
+- Встроено в `Agent` (`AgentBuilder::log_sources`; не во флоте; без арбитра и
+  без оценки безопасности) и `KubeAgent::log_sources` (только вкладка кластера).
+  Промпт получает секцию `LOG SOURCES (query_logs)` только при наличии источников.
+- App: `build_log_sources_for_launch` — ключ как у оценщика: память → keyring →
+  env, кэш в `StaticSecretProvider` (маскирование вывода). TUI: `TuiConfig.log_sources`
+  / `log_source_notes` (заметка на старте для источника без ключа/адаптера),
+  передача в оба спавна агентов; `query_logs` не ждёт оценки безопасности.
+
+**Решения.** Адаптеров в этой задаче нет: `build_log_source` для любого kind
+возвращает «no adapter in this build», источник не предлагается модели — фича
+станет видна с #580. `k8s_fields` (пресеты полей) не заведено — в теле #579 его
+нет, оно приходит с #581/#583. Окно — UTC, `since` как у `k8s_logs`.
+
+**Контракты.** `CommandExecutor` / `LlmClient` не менялись. Новые публичные:
+`LogSourceConfig`, `LogSourceKind`, `LogAuth`, `Config::log_sources`,
+`filar_agent::logs::*`, `AgentBuilder::log_sources`, `KubeAgent::log_sources`.
+
+**Next:** #580 — адаптер VictoriaLogs (и DoD с бинарником).

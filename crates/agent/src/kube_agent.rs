@@ -46,6 +46,8 @@ pub struct KubeAgent {
     tag_policies: Vec<TagPolicy>,
     event_sink: Option<EventSink>,
     cancellation: Option<CancellationToken>,
+    /// Log sources for `query_logs` (#579); cluster tabs only.
+    log_sources: Option<Arc<crate::logs::LogSources>>,
 }
 
 impl KubeAgent {
@@ -71,6 +73,7 @@ impl KubeAgent {
             tag_policies,
             event_sink: None,
             cancellation: None,
+            log_sources: None,
         }
     }
 
@@ -93,6 +96,7 @@ impl KubeAgent {
             tag_policies,
             event_sink: None,
             cancellation: None,
+            log_sources: None,
         }
     }
 
@@ -102,6 +106,20 @@ impl KubeAgent {
             *slot = Some(observer);
         }
         self
+    }
+
+    /// Offer `query_logs` over these log sources (#579) in a cluster tab.
+    /// A fleet never gets them: one approval there covers many targets.
+    pub fn log_sources(mut self, sources: Option<Arc<crate::logs::LogSources>>) -> Self {
+        self.log_sources = sources.filter(|s| !s.is_empty());
+        self
+    }
+
+    fn cluster_log_sources(&self) -> Option<&Arc<crate::logs::LogSources>> {
+        match self.execution {
+            KubeExecution::Cluster { .. } => self.log_sources.as_ref(),
+            KubeExecution::Fleet { .. } => None,
+        }
     }
 
     /// Deliver progress and tool events to a frontend.
@@ -169,6 +187,10 @@ impl KubeAgent {
             } => build_kube_system_prompt(target, namespace.as_deref()),
             KubeExecution::Fleet { fleet, .. } => build_kube_fleet_system_prompt(fleet.fleet()),
         };
+        let mut prompt = prompt;
+        if let Some(sources) = self.cluster_log_sources() {
+            prompt.push_str(&sources.prompt_section());
+        }
         let mut messages = vec![ChatMessage::system(prompt)];
         messages.extend_from_slice(history);
         messages.push(ChatMessage::user(user_prompt));
@@ -177,6 +199,9 @@ impl KubeAgent {
         // a cluster-tab tool (#578).
         if matches!(self.execution, KubeExecution::Fleet { .. }) {
             tools.retain(|tool| tool.name != crate::pod_http::TOOL_POD_HTTP_GET);
+        }
+        if let Some(sources) = self.cluster_log_sources() {
+            tools.push(sources.tool_definition(self.confirm_mode));
         }
         let mut missing_explanations = 0;
 
@@ -245,6 +270,25 @@ impl KubeAgent {
     }
 
     async fn process_tool_call(&self, call: &ToolCall) -> Result<ChatMessage> {
+        if call.name == crate::logs::TOOL_QUERY_LOGS {
+            let Some(sources) = self.cluster_log_sources() else {
+                return Ok(ChatMessage::tool(
+                    &call.id,
+                    "Error: no log sources are available here.",
+                ));
+            };
+            let emit = |event: AgentEvent| self.emit(event);
+            return sources
+                .process(
+                    call,
+                    self.confirm_mode,
+                    self.confirmer.as_ref(),
+                    &emit,
+                    self.cancellation.as_ref(),
+                    NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed),
+                )
+                .await;
+        }
         let default_namespace = match &self.execution {
             KubeExecution::Cluster { namespace, .. } => namespace.as_deref(),
             KubeExecution::Fleet { fleet, .. } => fleet
