@@ -108,7 +108,7 @@ pub fn parse_answer(body: &[u8], limit: usize, max_line_bytes: usize) -> Result<
                     });
                 }
             }
-            lines.sort_by(|a, b| b.time.cmp(&a.time));
+            lines.sort_by_key(|l| std::cmp::Reverse(l.time));
             result.truncated = lines.len() >= limit;
             lines.truncate(limit);
             result.lines = lines;
