@@ -441,7 +441,16 @@ pub struct LogDetail {
 impl LogDetail {
     /// The one-line summary under the block header.
     pub fn summary(&self) -> String {
-        let clock = |t: &str| t.get(11..16).unwrap_or(t).to_string();
+        // Dates only when the window crosses a UTC day, else it reads as
+        // running backwards (23:55–00:05).
+        let same_day = self.start.get(..10) == self.end.get(..10);
+        let clock = |t: &str| {
+            if same_day {
+                t.get(11..16).unwrap_or(t).to_string()
+            } else {
+                format!("{} {}", t.get(5..10).unwrap_or(""), t.get(11..16).unwrap_or(t)).trim().to_string()
+            }
+        };
         let mut out = format!(
             "{} · {} · {}–{} UTC · {} line{}",
             self.source,
@@ -2355,6 +2364,13 @@ impl App {
             .into_iter()
             .filter(|(idx, _)| *idx >= boundary)
             .map(|(idx, link)| (idx - shift, link))
+            .collect();
+        // Log query details likewise (#584): folded blocks lose theirs.
+        let details = std::mem::take(&mut self.active_session_mut().log_details);
+        self.active_session_mut().log_details = details
+            .into_iter()
+            .filter(|(idx, _)| *idx >= boundary)
+            .map(|(idx, detail)| (idx - shift, detail))
             .collect();
         // The stored figure described the context that was just folded away.
         // Left in place, the status bar would show the pre-compaction fill —
@@ -17524,6 +17540,21 @@ mod tests {
     }
 
     #[test]
+    fn a_window_across_midnight_shows_its_dates() {
+        let detail = LogDetail {
+            command: String::new(),
+            source: "v".into(),
+            language: "LogsQL".into(),
+            start: "2026-11-01T23:55:00Z".into(),
+            end: "2026-11-02T00:05:00Z".into(),
+            lines: 1,
+            truncated: false,
+            raw: Vec::new(),
+        };
+        assert_eq!(detail.summary(), "v · LogsQL · 11-01 23:55–11-02 00:05 UTC · 1 line");
+    }
+
+    #[test]
     fn details_are_matched_by_command_not_by_order() {
         let mut app = App::new("local".into(), CommandConfirmMode::Never);
         propose(&mut app, 902, "query_logs a", "query_logs");
@@ -17709,6 +17740,25 @@ mod tests {
         let badges = app.safety_badges();
         assert_eq!(badges.len(), 1, "{badges:?}");
         assert_eq!(badges.get(&2).map(|b| b.0.as_str()), Some("90%"));
+    }
+
+    #[test]
+    fn log_details_follow_their_blocks_through_compaction() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Never);
+        app.messages.clear();
+        app.messages.push(ChatBlock::User("old".into()));
+        app.messages.push(ChatBlock::Agent("old".into()));
+        propose(&mut app, 611, "query_logs old", "query_logs");
+        log_query_done(&mut app, "query_logs old");
+        finished(&mut app, "query_logs old"); // index 2 — folded away
+        app.messages.push(ChatBlock::User("new".into()));
+        propose(&mut app, 612, "query_logs new", "query_logs");
+        log_query_done(&mut app, "query_logs new");
+        finished(&mut app, "query_logs new"); // index 4 — kept
+        app.active_session_mut().pending_compaction = Some(3);
+        app.apply_compaction(3, "summary".into());
+        assert_eq!(app.log_details.len(), 1, "the folded block's detail is gone");
+        assert_eq!(app.log_details.get(&2).map(|d| d.command.as_str()), Some("query_logs new"));
     }
 
     #[test]

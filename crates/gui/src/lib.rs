@@ -3433,7 +3433,9 @@ impl LauncherApp {
                         }
                     });
                     if d.auth.needs_key() {
-                        if d.key_env.trim().is_empty() {
+                        // Only once the source has a name: an early generic
+                        // name would stay and two sources would share a key.
+                        if d.key_env.trim().is_empty() && !d.name.trim().is_empty() {
                             d.key_env = suggested_log_key_env(&d.name);
                         }
                         ui.horizontal(|ui| {
@@ -3532,7 +3534,7 @@ impl LauncherApp {
                 });
         }
         if let Some(i) = check {
-            self.start_log_check(i);
+            self.start_log_check(i, ui.ctx().clone());
         }
         if let Some(i) = remove {
             self.log_sources.remove(i);
@@ -3544,7 +3546,7 @@ impl LauncherApp {
         }
     }
 
-    fn start_log_check(&mut self, idx: usize) {
+    fn start_log_check(&mut self, idx: usize, ctx: egui::Context) {
         let Some(d) = self.log_sources.get_mut(idx) else {
             return;
         };
@@ -3570,6 +3572,8 @@ impl LauncherApp {
                 Err(e) => Err(format!("cannot start the check runtime: {e}")),
             };
             let _ = tx.send(LogCheckResult { id, config: cfg, result });
+            // Wake the UI: nothing else would until the next input event.
+            ctx.request_repaint();
         });
     }
 
