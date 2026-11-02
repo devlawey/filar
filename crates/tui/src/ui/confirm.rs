@@ -1419,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_rows_count_matches_the_estimate() {
+    fn wrapped_rows_never_exceed_the_width() {
         for (text, width) in [
             ("", 10),
             ("a\n\nb", 10),
@@ -1427,13 +1427,48 @@ mod tests {
             ("abcdefghijk", 10),
             ("日本語のテキスト", 5),
         ] {
-            let rows = wrapped_rows(text, width);
-            assert_eq!(rows.len(), estimate_wrapped_rows(text, width), "{text:?}");
-            for row in &rows {
+            for row in wrapped_rows(text, width) {
                 use unicode_width::UnicodeWidthStr;
                 assert!(row.width() <= width, "{row:?} wider than {width}");
             }
         }
         assert_eq!(wrapped_rows("a\n\nb", 10), vec!["a", "", "b"]);
+        assert_eq!(wrapped_rows("日本語のテキスト", 5).len(), 4);
+    }
+
+    #[test]
+    fn the_estimated_rows_are_the_rows_drawn() {
+        // The modal is sized from `estimate_wrapped_rows`; the rows actually
+        // drawn between its top border and the buttons must match it (#608
+        // review), wide characters and blank lines included.
+        let explanation = "Why:\n\nто, что проверяем — 日本語のテキスト".to_string();
+        let command = format!("echo {}", "ab日本".repeat(40));
+        let mut confirm = pending(&command, false);
+        confirm.explanation = explanation.clone();
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(confirm);
+        app.mode = AppMode::Confirming;
+        let screen = render_confirm(&mut app, 100, 40);
+        let rows = screen_rows(&screen);
+        let top = rows
+            .iter()
+            .position(|r| r.contains("╭"))
+            .unwrap_or_else(|| panic!("no dialog\n{screen}"));
+        let buttons = rows
+            .iter()
+            .position(|r| r.contains("[ Approve (a) ]"))
+            .unwrap_or_else(|| panic!("no buttons\n{screen}"));
+        let drawn = buttons - top - 1;
+        let inner_width = 68; // 70-column dialog minus its borders
+        let expected = estimate_wrapped_rows(&explanation, inner_width)
+            + estimate_wrapped_rows(&format!("$ {command}"), inner_width)
+            + 1; // separator above the buttons
+        assert_eq!(drawn, expected, "{screen}");
+        // A wide character's second cell reads as a space in `TestBackend`.
+        let no_spaces = |t: &str| t.replace(' ', "");
+        assert!(
+            no_spaces(&dialog_text(&screen)).contains(&no_spaces(&command)),
+            "the whole command is drawn\n{screen}"
+        );
     }
 }
