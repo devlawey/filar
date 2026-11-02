@@ -606,7 +606,10 @@ fn push_line(
         return false;
     }
     *used += rows.len();
-    lines.extend(rows.into_iter().map(|row| Line::from(Span::styled(row, style))));
+    lines.extend(
+        rows.into_iter()
+            .map(|row| Line::from(Span::styled(row, style))),
+    );
     true
 }
 
@@ -1404,7 +1407,9 @@ mod tests {
             "lines glued together\n{screen}"
         );
         assert!(
-            rows[first + 1].trim_matches(|c: char| c == '│' || c.is_whitespace()).is_empty(),
+            rows[first + 1]
+                .trim_matches(|c: char| c == '│' || c.is_whitespace())
+                .is_empty(),
             "the blank line is kept\n{screen}"
         );
         assert!(
