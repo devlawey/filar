@@ -311,19 +311,57 @@ pub fn build_scope_query(cfg: &LogSourceConfig, scopes: &[PodScope], filter: Opt
     }
 }
 
-/// The pod field of lines from a source with `cfg`.
-pub fn pod_field(cfg: &LogSourceConfig) -> &'static str {
-    cfg.k8s_preset().map(|p| p.fields().pod).unwrap_or("pod")
+/// The pod field of lines from a source with `cfg`, as the store names it:
+/// Loki keys lines by stream label, so a dotted preset field becomes the
+/// sanitised label (`kubernetes.pod_name` → `kubernetes_pod_name`).
+pub fn pod_field(cfg: &LogSourceConfig) -> String {
+    store_field(cfg, cfg.k8s_preset().map(|p| p.fields().pod).unwrap_or("pod"))
 }
 
-/// A fleet answer folded by pod: one row per expected pod (lines, distinct
-/// messages, most frequent message), pods without lines included, and lines
-/// from pods outside the fleet counted apart.
-pub fn fold_by_pod(source: &str, query: &LogQuery, result: &LogResult, pod_field: &str, pods: &[String]) -> String {
-    let mut per_pod: BTreeMap<String, Vec<&str>> = pods.iter().map(|p| (p.clone(), Vec::new())).collect();
+/// The namespace field of lines from a source with `cfg` (see [`pod_field`]).
+pub fn namespace_field(cfg: &LogSourceConfig) -> String {
+    store_field(cfg, cfg.k8s_preset().map(|p| p.fields().namespace).unwrap_or("namespace"))
+}
+
+fn store_field(cfg: &LogSourceConfig, field: &str) -> String {
+    match cfg.source_kind() {
+        Some(LogSourceKind::Loki) => loki_label(field),
+        _ => field.to_string(),
+    }
+}
+
+/// A fleet answer folded by pod: one row per expected `namespace/pod`
+/// (lines, distinct messages, most frequent message), pods without lines
+/// included, and lines from pods outside the fleet counted apart. A line
+/// without a namespace field is matched by pod name when only one member has
+/// that name.
+pub fn fold_by_pod(
+    source: &str,
+    query: &LogQuery,
+    result: &LogResult,
+    pod_field: &str,
+    namespace_field: &str,
+    pods: &[(String, String)],
+) -> String {
+    let key = |ns: &str, pod: &str| format!("{ns}/{pod}");
+    let mut per_pod: BTreeMap<String, Vec<&str>> = pods.iter().map(|(ns, p)| (key(ns, p), Vec::new())).collect();
     let mut other = 0usize;
     for line in &result.lines {
-        match line.fields.get(pod_field).and_then(|p| per_pod.get_mut(p)) {
+        let Some(pod) = line.fields.get(pod_field) else {
+            other += 1;
+            continue;
+        };
+        let member = match line.fields.get(namespace_field) {
+            Some(ns) => Some(key(ns, pod)),
+            None => {
+                let mut same = pods.iter().filter(|(_, p)| p == pod);
+                match (same.next(), same.next()) {
+                    (Some((ns, p)), None) => Some(key(ns, p)),
+                    _ => None,
+                }
+            }
+        };
+        match member.and_then(|m| per_pod.get_mut(&m)) {
             Some(lines) => lines.push(line.message.as_str()),
             None => other += 1,
         }
@@ -359,7 +397,9 @@ pub fn fold_by_pod(source: &str, query: &LogQuery, result: &LogResult, pod_field
         out.push_str(&format!("{pod} | {} | {} | [{count}×] {sample}\n", lines.len(), groups.len()));
     }
     if other > 0 {
-        out.push_str(&format!("{other} line(s) came from pods outside the fleet (field {pod_field})\n"));
+        out.push_str(&format!(
+            "{other} line(s) came from pods outside the fleet (fields {namespace_field}, {pod_field})\n"
+        ));
     }
     out
 }
@@ -542,15 +582,23 @@ impl super::LogSources {
         // Group the members by the source linked to their cluster.
         let mut by_source: BTreeMap<String, Vec<&FleetLogMember>> = BTreeMap::new();
         let mut unlinked: BTreeSet<&str> = BTreeSet::new();
+        // Other refusals (several linked sources and no `source`, a `source`
+        // not linked to the cluster) keep their own message.
+        let mut refused: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        let requested = args.get("source").and_then(Value::as_str);
         for member in members {
-            match self.pick_linked(&member.cluster, args.get("source").and_then(Value::as_str)) {
+            match self.pick_linked(&member.cluster, requested) {
                 Ok(source) => by_source.entry(source).or_default().push(member),
-                Err(_) => {
+                Err(_) if self.linked(&member.cluster).is_empty() => {
                     unlinked.insert(member.cluster.as_str());
                 }
+                Err(message) => refused.entry(message).or_default().push(member.cluster.as_str()),
             }
         }
         if by_source.is_empty() {
+            if let Some(message) = refused.keys().next() {
+                return Ok(crate::ChatMessage::tool(&call.id, message.clone()));
+            }
             let clusters: Vec<&str> = unlinked.into_iter().collect();
             return Ok(crate::ChatMessage::tool(&call.id, no_linked_source(&clusters.join(", "))));
         }
@@ -566,16 +614,19 @@ impl super::LogSources {
                     container: container.map(str::to_owned),
                 })
                 .collect();
-            let pods: Vec<String> = members.iter().filter_map(|m| m.pod.clone()).collect();
+            let pods: Vec<(String, String)> = members
+                .iter()
+                .filter_map(|m| m.pod.clone().map(|p| (m.namespace.clone(), p)))
+                .collect();
             let built = (|| -> Result<_> {
                 let cfg = self
                     .source_config(&source)
                     .ok_or_else(|| CoreError::Other(format!("unknown log source \"{source}\"")))?;
                 let query = build_scope_query(cfg, &scopes, filter)?;
                 let parsed = self.parse_call(&query_logs_arguments(&source, &query, args), chrono::Utc::now())?;
-                Ok((parsed, pod_field(cfg)))
+                Ok((parsed, pod_field(cfg), namespace_field(cfg)))
             })();
-            let (parsed, field) = match built {
+            let (parsed, field, ns_field) = match built {
                 Ok(built) => built,
                 Err(error) => {
                     answers.push(format!("Error: invalid pod_logs_history call for {source}: {error}"));
@@ -591,7 +642,7 @@ impl super::LogSources {
                 if pods.is_empty() {
                     self.fold(c, r)
                 } else {
-                    fold_by_pod(&c.source, &c.query, r, field, &pods)
+                    fold_by_pod(&c.source, &c.query, r, &field, &ns_field, &pods)
                 }
             };
             let message = self
@@ -612,6 +663,11 @@ impl super::LogSources {
         if !unlinked.is_empty() {
             let clusters: Vec<&str> = unlinked.into_iter().collect();
             answers.push(format!("No log source is linked to: {}; their pods are not in this answer.", clusters.join(", ")));
+        }
+        for (message, clusters) in refused {
+            let clusters: BTreeSet<&str> = clusters.into_iter().collect();
+            let clusters: Vec<&str> = clusters.into_iter().collect();
+            answers.push(format!("Pods of {} are not in this answer: {message}", clusters.join(", ")));
         }
         Ok(crate::ChatMessage::tool(&call.id, answers.join("\n")))
     }
@@ -730,6 +786,38 @@ mod tests {
     }
 
     #[test]
+    fn same_pod_names_in_two_namespaces_stay_apart_and_loki_fields_are_labels() {
+        use chrono::TimeZone;
+        let line = |ns: &str, pod: &str, msg: &str| super::super::LogLine {
+            message: msg.into(),
+            fields: [
+                ("kubernetes_namespace_name".to_string(), ns.to_string()),
+                ("kubernetes_pod_name".to_string(), pod.to_string()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let loki = cfg("loki", Some("fluent-bit"));
+        assert_eq!(pod_field(&loki), "kubernetes_pod_name");
+        assert_eq!(namespace_field(&loki), "kubernetes_namespace_name");
+        assert_eq!(pod_field(&cfg("victorialogs", None)), "kubernetes.pod_name");
+        let result = LogResult {
+            lines: vec![line("shop", "web-1", "a"), line("pay", "web-1", "b"), line("pay", "web-1", "b")],
+            ..Default::default()
+        };
+        let query = LogQuery {
+            query: String::new(),
+            start: chrono::Utc.with_ymd_and_hms(2026, 11, 1, 10, 0, 0).unwrap(),
+            end: chrono::Utc.with_ymd_and_hms(2026, 11, 1, 11, 0, 0).unwrap(),
+            limit: 100,
+        };
+        let pods = [("shop".to_string(), "web-1".to_string()), ("pay".to_string(), "web-1".to_string())];
+        let text = fold_by_pod("loki", &query, &result, &pod_field(&loki), &namespace_field(&loki), &pods);
+        assert!(text.contains("shop/web-1 | 1 | 1 | [1×] a"), "{text}");
+        assert!(text.contains("pay/web-1 | 2 | 1 | [2×] b"), "{text}");
+    }
+
+    #[test]
     fn scope_from_arguments_uses_tab_defaults() {
         let s = scope_from_arguments(&json!({"selector": "app=web"}), Some("shop"), None).unwrap();
         assert_eq!(s.namespace, "shop");
@@ -764,9 +852,10 @@ mod tests {
             end: chrono::Utc.with_ymd_and_hms(2026, 11, 1, 11, 0, 0).unwrap(),
             limit: 100,
         };
-        let text = fold_by_pod("vlogs", &query, &result, "kubernetes.pod_name", &["web-1".into(), "web-2".into()]);
-        assert!(text.contains("web-1 | 3 | 2 | [2×] timeout after 30s"), "{text}");
-        assert!(text.contains("web-2 | 0 | 0 | —"), "{text}");
+        let pods = [("shop".to_string(), "web-1".to_string()), ("shop".to_string(), "web-2".to_string())];
+        let text = fold_by_pod("vlogs", &query, &result, "kubernetes.pod_name", "kubernetes.pod_namespace", &pods);
+        assert!(text.contains("shop/web-1 | 3 | 2 | [2×] timeout after 30s"), "{text}");
+        assert!(text.contains("shop/web-2 | 0 | 0 | —"), "{text}");
         assert!(text.contains("1 line(s) came from pods outside the fleet"), "{text}");
     }
 }

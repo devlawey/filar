@@ -627,3 +627,28 @@ async fn a_fleet_asks_once_and_answers_per_pod() {
     assert!(text.contains("web-3 | 0 | 0 | —"), "{text}");
     assert!(text.contains("No log source is linked to: prod-us"), "{text}");
 }
+
+#[tokio::test]
+async fn a_fleet_keeps_the_real_reason_when_a_source_is_not_linked() {
+    let (set, mock, _) = sources(Vec::new(), Vec::new(), Vec::new());
+    let members = [k8s::FleetLogMember {
+        cluster: "prod-eu".into(),
+        namespace: "shop".into(),
+        pod: Some("web-1".into()),
+    }];
+    let emit = |_: AgentEvent| {};
+    let msg = set
+        .process_fleet_pod_logs(
+            &history_call(json!({"since": "1h", "source": "other"})),
+            &members,
+            &Answer(true, Mutex::new(0)),
+            &emit,
+            None,
+            4,
+        )
+        .await
+        .unwrap();
+    assert!(msg.content.contains("log source \"other\" is not linked to cluster prod-eu"), "{}", msg.content);
+    assert!(!msg.content.contains("не настроен"), "the cluster has a source: {}", msg.content);
+    assert!(mock.seen.lock().unwrap().is_empty());
+}
