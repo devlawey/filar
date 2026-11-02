@@ -17,11 +17,15 @@
 //!
 //! Long commands/explanations are truncated so the modal never exceeds the
 //! available area (avoids ratatui buffer OOB panics — #324).
+//!
+//! Text is wrapped here, one [`Line`] per terminal row (#608): the rows
+//! counted for the modal height are exactly the rows drawn, and a `\n` in an
+//! explanation starts a new row instead of being swallowed by a `Span`.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -177,7 +181,7 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let modal_height = natural_height.min(area.height).max(MIN_MODAL_HEIGHT);
     let max_content_rows = modal_height.saturating_sub(3) as usize;
 
-    let lines = build_modal_lines(
+    let (lines, used) = build_modal_lines(
         header,
         &explanation,
         &command_text,
@@ -198,7 +202,9 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         inner_width,
         max_content_rows,
     );
-    let content_height = max_content_rows.min(lines.len()).max(1) as u16;
+    // Rows, not logical lines (#608): every line below is one terminal row.
+    debug_assert_eq!(lines.len(), used);
+    let content_height = max_content_rows.min(used).max(1) as u16;
 
     // Center within the area (height already ≤ area.height).
     let modal_x = area.x + (area.width.saturating_sub(modal_width)) / 2;
@@ -270,7 +276,8 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Length(content_len), Constraint::Length(1)])
         .split(inner);
 
-    let content = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // Already wrapped to `inner_width` by `build_modal_lines`; no re-wrap.
+    let content = Paragraph::new(lines);
     f.render_widget(content, chunks[0]);
     render_buttons(f, app, chunks[1]);
 }
@@ -368,6 +375,8 @@ fn header_rows_within(text: &str, width: usize, max: usize) -> Vec<String> {
 
 /// Build modal body lines, truncating so wrapped height ≤ `max_rows`.
 ///
+/// Returns the lines and the rows they take: one line per row (#608).
+///
 /// The fleet radius comes first and its counter line is never truncated
 /// away: approving without seeing how many hosts it covers is exactly what
 /// the gate exists to prevent.
@@ -391,22 +400,16 @@ fn build_modal_lines(
     accent: ratatui::style::Color,
     inner_width: usize,
     max_rows: usize,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, usize) {
     if max_rows == 0 {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut used = 0usize;
 
     let push = |lines: &mut Vec<Line<'static>>, used: &mut usize, text: String, style: Style| {
-        let rows = estimate_wrapped_rows(&text, inner_width);
-        if *used + rows > max_rows {
-            return false;
-        }
-        lines.push(Line::from(Span::styled(text, style)));
-        *used += rows;
-        true
+        push_line(lines, used, max_rows, inner_width, text, style)
     };
 
     if let Some((header, list)) = radius {
@@ -426,23 +429,40 @@ fn build_modal_lines(
         }
     }
 
-    if !explanation.is_empty() && used < max_rows {
-        let budget = max_rows.saturating_sub(used).saturating_sub(2).max(1);
-        let truncated = truncate_to_rows(explanation, inner_width, budget);
-        if !push(&mut lines, &mut used, truncated, fg) && max_rows > 0 {
-            lines.push(Line::from(Span::styled(
+    // Everything between the header and the command leaves the command at
+    // least one row: approving a command that is not on screen is what the
+    // gate exists to prevent (#608 review).
+    let before_command = max_rows.saturating_sub(1);
+    let push_before_command =
+        |lines: &mut Vec<Line<'static>>, used: &mut usize, text: String, style: Style| {
+            push_line(lines, used, before_command, inner_width, text, style)
+        };
+
+    if !explanation.is_empty() && used < before_command {
+        // Also leave the separator row below the command when there is one.
+        let budget = before_command.saturating_sub(used).saturating_sub(1);
+        let shown = budget > 0
+            && push_before_command(
+                &mut lines,
+                &mut used,
+                truncate_to_rows(explanation, inner_width, budget),
+                fg,
+            );
+        if !shown {
+            let _ = push_before_command(
+                &mut lines,
+                &mut used,
                 "… (explanation truncated)".to_string(),
                 muted,
-            )));
-            used = used.saturating_add(1).min(max_rows);
+            );
         }
     }
 
-    if used < max_rows {
+    if used < before_command {
         append_audit_lines(
             &mut lines,
             &mut used,
-            max_rows,
+            before_command,
             inner_width,
             audit_unavailable,
             audit_verdict,
@@ -458,13 +478,13 @@ fn build_modal_lines(
     }
 
     if let Some((text, style)) = safety {
-        if used < max_rows {
-            let _ = push(&mut lines, &mut used, text, style);
+        if used < before_command {
+            let _ = push_before_command(&mut lines, &mut used, text, style);
         }
     }
 
-    if destructive && used < max_rows {
-        let _ = push(
+    if destructive && used < before_command {
+        let _ = push_before_command(
             &mut lines,
             &mut used,
             "WARNING: This command may be destructive!".to_string(),
@@ -491,9 +511,10 @@ fn build_modal_lines(
     // Trailing blank separator when there is room.
     if used < max_rows {
         lines.push(Line::from(""));
+        used += 1;
     }
 
-    lines
+    (lines, used)
 }
 
 fn append_audit_lines(
@@ -583,6 +604,8 @@ fn append_audit_lines(
     }
 }
 
+/// Push `text` as one [`Line`] per wrapped row, if all of them fit in
+/// `max_rows`; otherwise push nothing and return `false`.
 fn push_line(
     lines: &mut Vec<Line<'static>>,
     used: &mut usize,
@@ -594,13 +617,37 @@ fn push_line(
     if *used >= max_rows {
         return false;
     }
-    let rows = estimate_wrapped_rows(&text, inner_width);
-    if *used + rows > max_rows {
+    let rows = wrapped_rows(&text, inner_width);
+    if *used + rows.len() > max_rows {
         return false;
     }
-    lines.push(Line::from(Span::styled(text, style)));
-    *used += rows;
+    *used += rows.len();
+    lines.extend(
+        rows.into_iter()
+            .map(|row| Line::from(Span::styled(row, style))),
+    );
     true
+}
+
+/// `text` split on `\n` and hard-wrapped to `width` display columns: the
+/// rows exactly as the dialog draws them (#608). Never empty.
+fn wrapped_rows(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let rows: Vec<String> = text
+        .split('\n')
+        .flat_map(|line| {
+            if line.is_empty() {
+                vec![String::new()]
+            } else {
+                crate::ui::text::wrap_text(line, width)
+            }
+        })
+        .collect();
+    if rows.is_empty() {
+        vec![String::new()]
+    } else {
+        rows
+    }
 }
 
 /// Truncate `text` so its wrapped row count is ≤ `max_rows`.
@@ -635,10 +682,12 @@ fn truncate_to_rows(text: &str, width: usize, max_rows: usize) -> String {
         if remain == 0 {
             break;
         }
-        let take = remain.saturating_mul(width).saturating_sub(1);
-        let mut prefix: String = line.chars().take(take).collect();
-        prefix.push('…');
-        kept.push(prefix);
+        let mut pieces = wrapped_rows(line, width);
+        pieces.truncate(remain);
+        if let Some(last) = pieces.last_mut() {
+            *last = with_ellipsis(last, width);
+        }
+        kept.extend(pieces);
         return kept.join("\n");
     }
 
@@ -652,6 +701,20 @@ fn truncate_to_rows(text: &str, width: usize, max_rows: usize) -> String {
         "…".to_string()
     } else {
         kept.join("\n")
+    }
+}
+
+/// `row` ending in `…` within `width` columns: appended when it fits,
+/// otherwise in place of the last characters.
+fn with_ellipsis(row: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let mut chars: Vec<char> = row.chars().collect();
+    loop {
+        let candidate: String = chars.iter().collect::<String>() + "…";
+        if chars.is_empty() || candidate.width() <= width {
+            return candidate;
+        }
+        chars.pop();
     }
 }
 
@@ -773,24 +836,13 @@ fn render_buttons(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Estimate how many terminal rows `text` will occupy after wrapping at
-/// `width` columns.  Uses char count (not byte length) for correctness with
-/// multi-byte glyphs, matching ratatui's `Wrap { trim: false }` behaviour.
+/// How many terminal rows `text` takes in the dialog at `width` columns:
+/// the length of [`wrapped_rows`], so estimate and drawing agree (#608).
 fn estimate_wrapped_rows(text: &str, width: usize) -> usize {
     if width == 0 {
         return 1;
     }
-    text.split('\n')
-        .map(|line| {
-            let chars = line.chars().count();
-            if chars == 0 {
-                1
-            } else {
-                chars.div_ceil(width)
-            }
-        })
-        .sum::<usize>()
-        .max(1)
+    wrapped_rows(text, width).len()
 }
 
 #[cfg(test)]
@@ -1294,5 +1346,165 @@ mod tests {
             "overflow rows: {out:?}"
         );
         assert!(out.contains('…') || out == "…");
+    }
+
+    /// The screen with each row's trailing padding removed.
+    fn screen_rows(screen: &str) -> Vec<String> {
+        screen.lines().map(|l| l.trim_end().to_string()).collect()
+    }
+
+    /// The dialog rows between its side borders, joined without line breaks:
+    /// what the user can read of a hard-wrapped command.
+    fn dialog_text(screen: &str) -> String {
+        screen
+            .lines()
+            .filter_map(|row| {
+                let start = row.find('│')?;
+                let end = row.rfind('│')?;
+                (end > start).then(|| row[start + '│'.len_utf8()..end].trim_end().to_string())
+            })
+            .collect::<String>()
+    }
+
+    #[test]
+    fn a_long_command_is_drawn_whole_not_cut_after_its_first_row() {
+        // #608: a query_logs call wider than three dialog rows.
+        let query = format!(
+            "query_logs vlogs-local --start 2026-11-01T00:00:00Z --end 2026-11-01T06:00:00Z --query '{}'",
+            (1..=12)
+                .map(|i| format!("service:api-{i:02} AND level:error"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        );
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(pending(&query, false));
+        app.mode = AppMode::Confirming;
+        let screen = render_confirm(&mut app, 100, 40);
+        let text = dialog_text(&screen);
+        assert!(
+            text.contains(&query) || text.contains("… (command truncated)"),
+            "the whole command, or a visible notice\n{screen}"
+        );
+        // Plenty of room here: the command must not be cut at all.
+        assert!(text.contains(&query), "{screen}");
+        assert!(text.contains("service:api-12 AND level:error'"), "{screen}");
+        assert!(screen.contains("[ Approve (a) ]"), "{screen}");
+    }
+
+    #[test]
+    fn a_long_command_on_a_short_terminal_says_it_was_cut() {
+        let query = format!("query_logs vlogs-local --query '{}'", "x".repeat(2000));
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(pending(&query, false));
+        app.mode = AppMode::Confirming;
+        let screen = render_confirm(&mut app, 100, 14);
+        assert!(screen.contains("… (command truncated)"), "{screen}");
+        assert!(screen.contains("[ Approve (a) ]"), "{screen}");
+    }
+
+    #[test]
+    fn an_explanation_with_blank_lines_is_drawn_on_separate_rows() {
+        // #608: "{explanation}\n\nLog source: …" used to render glued.
+        let mut confirm = pending("query_logs vlogs-local", false);
+        confirm.explanation =
+            "Errors from the api service over the last hour\n\nLog source: vlogs-local (VictoriaLogs)"
+                .into();
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(confirm);
+        app.mode = AppMode::Confirming;
+        let screen = render_confirm(&mut app, 100, 30);
+        let rows = screen_rows(&screen);
+        let first = rows
+            .iter()
+            .position(|r| r.contains("Errors from the api service over the last hour"))
+            .unwrap_or_else(|| panic!("explanation missing\n{screen}"));
+        assert!(
+            !rows[first].contains("Log source"),
+            "lines glued together\n{screen}"
+        );
+        assert!(
+            rows[first + 1]
+                .trim_matches(|c: char| c == '│' || c.is_whitespace())
+                .is_empty(),
+            "the blank line is kept\n{screen}"
+        );
+        assert!(
+            rows[first + 2].contains("Log source: vlogs-local (VictoriaLogs)"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn wrapped_rows_never_exceed_the_width() {
+        for (text, width) in [
+            ("", 10),
+            ("a\n\nb", 10),
+            ("abcdefghij", 10),
+            ("abcdefghijk", 10),
+            ("日本語のテキスト", 5),
+        ] {
+            for row in wrapped_rows(text, width) {
+                use unicode_width::UnicodeWidthStr;
+                assert!(row.width() <= width, "{row:?} wider than {width}");
+            }
+        }
+        assert_eq!(wrapped_rows("a\n\nb", 10), vec!["a", "", "b"]);
+        assert_eq!(wrapped_rows("日本語のテキスト", 5).len(), 4);
+    }
+
+    #[test]
+    fn with_one_content_row_the_command_outranks_the_explanation() {
+        // #608 review: a four-row dialog has one content row; the explanation
+        // must not take it and leave Approve under no command at all.
+        let mut confirm = pending("systemctl restart nginx", true);
+        confirm.explanation = "Restart the web server to apply the new config".into();
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(confirm);
+        app.mode = AppMode::Confirming;
+        for height in [8, 9, 10] {
+            let screen = render_confirm(&mut app, 100, height);
+            assert!(screen.contains("[ Approve (a) ]"), "{screen}");
+            assert!(
+                screen.contains("$ systemctl restart nginx"),
+                "height {height}: the command keeps its row\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_estimated_rows_are_the_rows_drawn() {
+        // The modal is sized from `estimate_wrapped_rows`; the rows actually
+        // drawn between its top border and the buttons must match it (#608
+        // review), wide characters and blank lines included.
+        let explanation = "Why:\n\nто, что проверяем — 日本語のテキスト".to_string();
+        let command = format!("echo {}", "ab日本".repeat(40));
+        let mut confirm = pending(&command, false);
+        confirm.explanation = explanation.clone();
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(confirm);
+        app.mode = AppMode::Confirming;
+        let screen = render_confirm(&mut app, 100, 40);
+        let rows = screen_rows(&screen);
+        let top = rows
+            .iter()
+            .position(|r| r.contains("╭"))
+            .unwrap_or_else(|| panic!("no dialog\n{screen}"));
+        let buttons = rows
+            .iter()
+            .position(|r| r.contains("[ Approve (a) ]"))
+            .unwrap_or_else(|| panic!("no buttons\n{screen}"));
+        let drawn = buttons - top - 1;
+        // Between the dialog's rounded corners, read off the drawn border.
+        let inner_width = rows[top].trim().chars().count().saturating_sub(2);
+        let expected = estimate_wrapped_rows(&explanation, inner_width)
+            + estimate_wrapped_rows(&format!("$ {command}"), inner_width)
+            + 1; // separator above the buttons
+        assert_eq!(drawn, expected, "{screen}");
+        // A wide character's second cell reads as a space in `TestBackend`.
+        let no_spaces = |t: &str| t.replace(' ', "");
+        assert!(
+            no_spaces(&dialog_text(&screen)).contains(&no_spaces(&command)),
+            "the whole command is drawn\n{screen}"
+        );
     }
 }
