@@ -596,11 +596,13 @@ impl super::LogSources {
             }
         }
         if by_source.is_empty() {
-            if let Some(message) = refused.keys().next() {
-                return Ok(crate::ChatMessage::tool(&call.id, message.clone()));
+            // Nothing to query: every reason, not just the first.
+            let mut reasons: Vec<String> = refused.keys().cloned().collect();
+            if !unlinked.is_empty() {
+                let clusters: Vec<&str> = unlinked.into_iter().collect();
+                reasons.push(no_linked_source(&clusters.join(", ")));
             }
-            let clusters: Vec<&str> = unlinked.into_iter().collect();
-            return Ok(crate::ChatMessage::tool(&call.id, no_linked_source(&clusters.join(", "))));
+            return Ok(crate::ChatMessage::tool(&call.id, reasons.join("\n")));
         }
         let container = args.get("container").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty());
         let filter = args.get("filter").and_then(Value::as_str);

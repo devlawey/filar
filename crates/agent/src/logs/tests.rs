@@ -631,11 +631,13 @@ async fn a_fleet_asks_once_and_answers_per_pod() {
 #[tokio::test]
 async fn a_fleet_keeps_the_real_reason_when_a_source_is_not_linked() {
     let (set, mock, _) = sources(Vec::new(), Vec::new(), Vec::new());
-    let members = [k8s::FleetLogMember {
-        cluster: "prod-eu".into(),
+    let member = |cluster: &str| k8s::FleetLogMember {
+        cluster: cluster.into(),
         namespace: "shop".into(),
         pod: Some("web-1".into()),
-    }];
+    };
+    // prod-eu has a source (not the one asked for); prod-us has none.
+    let members = [member("prod-eu"), member("prod-us")];
     let emit = |_: AgentEvent| {};
     let msg = set
         .process_fleet_pod_logs(
@@ -649,6 +651,7 @@ async fn a_fleet_keeps_the_real_reason_when_a_source_is_not_linked() {
         .await
         .unwrap();
     assert!(msg.content.contains("log source \"other\" is not linked to cluster prod-eu"), "{}", msg.content);
-    assert!(!msg.content.contains("не настроен"), "the cluster has a source: {}", msg.content);
+    assert!(msg.content.contains("Для кластера prod-us не настроен источник логов"), "every reason: {}", msg.content);
+    assert!(!msg.content.contains("кластера prod-eu не настроен"), "prod-eu has a source: {}", msg.content);
     assert!(mock.seen.lock().unwrap().is_empty());
 }
