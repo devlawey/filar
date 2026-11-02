@@ -1005,8 +1005,9 @@ pub struct Session {
     /// Log query details by command block index (#584): the summary line
     /// and the raw lines behind the folded output. Not saved with a session.
     pub log_details: HashMap<usize, LogDetail>,
-    /// The detail of the log query whose `CommandFinished` is next.
-    pub pending_log_detail: Option<LogDetail>,
+    /// Details of answered log queries waiting for their `CommandFinished`,
+    /// matched by command; a few at most (bounded).
+    pub pending_log_details: Vec<LogDetail>,
     /// Their cost in USD, when reported.
     pub risk_cost_usd: Option<f64>,
     /// Command confirmation mode for this tab (per-session, toggled via F2).
@@ -1424,7 +1425,7 @@ impl Session {
             risk_cost_usd: None,
             log_queries: std::collections::BTreeMap::new(),
             log_details: HashMap::new(),
-            pending_log_detail: None,
+            pending_log_details: Vec::new(),
             confirm_mode,
             prev_confirm_mode: CommandConfirmMode::Allowlist,
             transcript_path: None,
@@ -3453,7 +3454,7 @@ impl App {
         self.risk_cost_usd = None;
         // Log details point at the replaced history's blocks (#584).
         self.log_details.clear();
-        self.pending_log_detail = None;
+        self.pending_log_details.clear();
         self.log_queries.clear();
         // Restored alongside the context it was folded out of, so reopening a
         // compacted session does not quietly shorten its transcript. Sessions
@@ -6179,7 +6180,12 @@ impl App {
                     ..
                 } => {
                     *self.log_queries.entry(source.clone()).or_insert(0) += 1;
-                    self.pending_log_detail = Some(LogDetail {
+                    // Bounded: details whose block never came are dropped
+                    // oldest first.
+                    if self.pending_log_details.len() >= 8 {
+                        self.pending_log_details.remove(0);
+                    }
+                    self.pending_log_details.push(LogDetail {
                         command,
                         source,
                         language,
@@ -6247,9 +6253,10 @@ impl App {
                         }
                         // A log query's summary and raw lines (#584).
                         if let Some(detail) = self
-                            .pending_log_detail
-                            .take()
-                            .filter(|detail| detail.command == command)
+                            .pending_log_details
+                            .iter()
+                            .position(|detail| detail.command == command)
+                            .map(|pos| self.pending_log_details.remove(pos))
                         {
                             if let Some(idx) = block_idx {
                                 self.log_details.insert(idx, detail);
@@ -17517,12 +17524,17 @@ mod tests {
     }
 
     #[test]
-    fn a_detail_for_another_command_is_not_linked() {
+    fn details_are_matched_by_command_not_by_order() {
         let mut app = App::new("local".into(), CommandConfirmMode::Never);
         propose(&mut app, 902, "query_logs a", "query_logs");
         log_query_done(&mut app, "query_logs b");
         finished(&mut app, "query_logs a");
-        assert!(app.log_details.is_empty());
+        assert!(app.log_details.is_empty(), "another command's detail is not linked");
+        assert_eq!(app.pending_log_details.len(), 1, "and it is kept for its own block");
+        propose(&mut app, 903, "query_logs b", "query_logs");
+        finished(&mut app, "query_logs b");
+        assert_eq!(app.log_details.len(), 1);
+        assert!(app.pending_log_details.is_empty());
     }
 
     // ── Safety rating (#551) ─────────────────────────────────────────

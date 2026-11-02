@@ -3593,10 +3593,13 @@ impl LauncherApp {
     /// Every log source must be complete, uniquely named, and linked only to
     /// clusters the launcher knows (#584).
     fn validate_log_sources(&self) -> Result<Vec<filar_core::LogSourceConfig>, String> {
+        // By name: a cluster row with other problems is reported by the
+        // cluster validation itself, not as "not in the list" here.
         let known: std::collections::HashSet<String> = self
             .kube_slots
             .iter()
-            .filter_map(|k| k.to_cluster().ok().map(|c| c.name))
+            .map(|k| k.name.trim().to_string())
+            .filter(|name| !name.is_empty())
             .collect();
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
