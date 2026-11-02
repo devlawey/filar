@@ -429,11 +429,27 @@ fn build_modal_lines(
         }
     }
 
-    if !explanation.is_empty() && used < max_rows {
-        let budget = max_rows.saturating_sub(used).saturating_sub(2).max(1);
-        let truncated = truncate_to_rows(explanation, inner_width, budget);
-        if !push(&mut lines, &mut used, truncated, fg) {
-            let _ = push(
+    // Everything between the header and the command leaves the command at
+    // least one row: approving a command that is not on screen is what the
+    // gate exists to prevent (#608 review).
+    let before_command = max_rows.saturating_sub(1);
+    let push_before_command =
+        |lines: &mut Vec<Line<'static>>, used: &mut usize, text: String, style: Style| {
+            push_line(lines, used, before_command, inner_width, text, style)
+        };
+
+    if !explanation.is_empty() && used < before_command {
+        // Also leave the separator row below the command when there is one.
+        let budget = before_command.saturating_sub(used).saturating_sub(1);
+        let shown = budget > 0
+            && push_before_command(
+                &mut lines,
+                &mut used,
+                truncate_to_rows(explanation, inner_width, budget),
+                fg,
+            );
+        if !shown {
+            let _ = push_before_command(
                 &mut lines,
                 &mut used,
                 "… (explanation truncated)".to_string(),
@@ -442,11 +458,11 @@ fn build_modal_lines(
         }
     }
 
-    if used < max_rows {
+    if used < before_command {
         append_audit_lines(
             &mut lines,
             &mut used,
-            max_rows,
+            before_command,
             inner_width,
             audit_unavailable,
             audit_verdict,
@@ -462,13 +478,13 @@ fn build_modal_lines(
     }
 
     if let Some((text, style)) = safety {
-        if used < max_rows {
-            let _ = push(&mut lines, &mut used, text, style);
+        if used < before_command {
+            let _ = push_before_command(&mut lines, &mut used, text, style);
         }
     }
 
-    if destructive && used < max_rows {
-        let _ = push(
+    if destructive && used < before_command {
+        let _ = push_before_command(
             &mut lines,
             &mut used,
             "WARNING: This command may be destructive!".to_string(),
@@ -1437,6 +1453,25 @@ mod tests {
     }
 
     #[test]
+    fn with_one_content_row_the_command_outranks_the_explanation() {
+        // #608 review: a four-row dialog has one content row; the explanation
+        // must not take it and leave Approve under no command at all.
+        let mut confirm = pending("systemctl restart nginx", true);
+        confirm.explanation = "Restart the web server to apply the new config".into();
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(confirm);
+        app.mode = AppMode::Confirming;
+        for height in [8, 9, 10] {
+            let screen = render_confirm(&mut app, 100, height);
+            assert!(screen.contains("[ Approve (a) ]"), "{screen}");
+            assert!(
+                screen.contains("$ systemctl restart nginx"),
+                "height {height}: the command keeps its row\n{screen}"
+            );
+        }
+    }
+
+    #[test]
     fn the_estimated_rows_are_the_rows_drawn() {
         // The modal is sized from `estimate_wrapped_rows`; the rows actually
         // drawn between its top border and the buttons must match it (#608
@@ -1459,7 +1494,8 @@ mod tests {
             .position(|r| r.contains("[ Approve (a) ]"))
             .unwrap_or_else(|| panic!("no buttons\n{screen}"));
         let drawn = buttons - top - 1;
-        let inner_width = 68; // 70-column dialog minus its borders
+        // Between the dialog's rounded corners, read off the drawn border.
+        let inner_width = rows[top].trim().chars().count().saturating_sub(2);
         let expected = estimate_wrapped_rows(&explanation, inner_width)
             + estimate_wrapped_rows(&format!("$ {command}"), inner_width)
             + 1; // separator above the buttons

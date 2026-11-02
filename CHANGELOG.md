@@ -29,7 +29,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
-- The confirmation dialog shows a long command whole (or marks it `… (command truncated)`) instead of silently cutting it after its first row, and draws line breaks in the explanation instead of gluing the lines together ([#608](https://github.com/devlawey/filar/issues/608)).
+- The confirmation dialog shows a long command whole (or marks it `… (command truncated)`) instead of silently cutting it after its first row, draws line breaks in the explanation instead of gluing the lines together, and keeps the command on screen when the dialog has room for a single row ([#608](https://github.com/devlawey/filar/issues/608)).
 - Pod terminal (Ctrl+T): no output after it is closed, a stuck keystroke or resize no longer holds the input or resize lock for later ones, and the refusal in a pod tab without a shell tells "still connecting" from "shell lost" ([#605](https://github.com/devlawey/filar/issues/605)).
 - Background jobs on remote hosts and in pods pick a writable directory for their log (`$TMPDIR`, `/tmp`, `/dev/shm`) and fail with a clear message when there is none or the log cannot be created, instead of a job that "exits" with no output ([#599](https://github.com/devlawey/filar/issues/599)).
 - A command's working directory is no longer lost when the shell's marker line arrives split across two reads ([#561](https://github.com/devlawey/filar/issues/561)).
