@@ -139,6 +139,13 @@
 - [ ] Флот `web-prod` → «у каких подов ошибки?» → одно подтверждение, один запрос, таблица `pod | lines | distinct | most frequent message`, поды без строк — с `0`
 - [ ] Кластер без связанного источника → ответ «для кластера … не настроен источник логов» с подсказкой про `clusters`
 
+## Источники логов: лаунчер и лента (3.0.2)
+
+- [ ] Лаунчер → вкладка Logs → Add source: VictoriaLogs `http://127.0.0.1:9428` → Check → «Available, data found»; неверный URL → «Check failed: …»
+- [ ] `auth = bearer`, ключ в маскированном поле → Launch → в `config.toml` и `pending_launch.json` есть `key_env`, ключа нет; ключ в хранилище ОС («saved» при следующем запуске)
+- [ ] Remove source → Launch → секции в `config.toml` больше нет
+- [ ] В ленте блок `⌕ query_logs …` со сводкой (источник · язык · окно · строки · truncated); клик раскрывает строки; F1 → Usage → `Log queries: <источник> N`
+
 ## Kubernetes: вкладка пода (3.0.1)
 
 Тот же кластер `docker/k8s`, LLM-профиль, режим `always`. Удаление пода

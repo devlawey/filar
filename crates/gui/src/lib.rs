@@ -433,6 +433,12 @@ pub struct LaunchConfig {
     /// Never carries the key — only `key_env`, the name it is stored under.
     #[serde(default)]
     pub risk_scorer: Option<RiskScorerLaunch>,
+    /// `[[log_sources]]` as the launcher left them (#584): `Some(vec![])`
+    /// means every source was removed; `None` (a file from before #584)
+    /// means "not said" and the session keeps `config.toml`'s. Never carries
+    /// a key — only `key_env`, the name it is stored under.
+    #[serde(default)]
+    pub log_sources: Option<Vec<filar_core::LogSourceConfig>>,
 }
 
 /// The launcher's choice for the command safety scorer (#552).
@@ -1391,6 +1397,7 @@ fn save_config_toml(
     settings: &Settings,
     host_groups: &[filar_core::HostGroup],
     risk_scorer: Option<&filar_core::RiskScorerConfig>,
+    log_sources: &[filar_core::LogSourceConfig],
 ) {
     let base = match filar_core::default_base_dir() {
         Ok(b) => b,
@@ -1442,6 +1449,9 @@ fn save_config_toml(
     // `[risk_scorer]` likewise (#552): the launcher owns it, switched off =
     // no section. Never a key — only `key_env`.
     config.risk_scorer = risk_scorer.cloned();
+    // `[[log_sources]]` likewise (#584): the Logs tab owns them; keys are
+    // only named (`key_env`), never written.
+    config.log_sources = log_sources.to_vec();
 
     if let Err(e) = std::fs::create_dir_all(&app_dir) {
         tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");
@@ -1945,6 +1955,212 @@ impl RiskScorerDraft {
 }
 
 // ---------------------------------------------------------------------------
+// Log sources (#584)
+// ---------------------------------------------------------------------------
+
+/// Launcher working copy of one `[[log_sources]]` entry (#584). Numbers and
+/// lists are kept as typed text, like the other launcher fields. No `Debug`:
+/// it holds a typed key.
+#[derive(Clone, PartialEq)]
+struct LogSourceDraft {
+    /// Stable id of the row (for check results).
+    id: u64,
+    name: String,
+    kind: filar_core::LogSourceKind,
+    url: String,
+    auth: filar_core::LogAuth,
+    /// Name the key is stored under (OS store / environment).
+    key_env: String,
+    /// A newly typed key — saved to the OS store at launch, never to a file.
+    key: String,
+    /// A key is already stored under `key_checked_for`.
+    key_saved: bool,
+    /// The key name `key_saved` was checked under.
+    key_checked_for: String,
+    user: String,
+    tenant: String,
+    index: String,
+    /// `k8s_fields` preset name; empty = the usual one for the kind.
+    k8s_fields: String,
+    max_window_hours: String,
+    max_lines: String,
+    timeout_secs: String,
+    /// Comma-separated `[[kube_clusters]]` names.
+    clusters: String,
+    /// Comma-separated tags.
+    tags: String,
+    /// Fields the launcher does not edit (`time_field`, `fields`, `ca_file`,
+    /// byte caps), carried over from `config.toml`.
+    base: filar_core::LogSourceConfig,
+    /// Result of the last Check.
+    check_status: String,
+    check_in_flight: bool,
+}
+
+/// The key name suggested for a source: `FILAR_LOGS_<NAME>`.
+fn suggested_log_key_env(name: &str) -> String {
+    let upper: String = name
+        .trim()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect();
+    format!("FILAR_LOGS_{}", if upper.is_empty() { "SOURCE".into() } else { upper })
+}
+
+fn split_list(text: &str) -> Vec<String> {
+    text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect()
+}
+
+impl LogSourceDraft {
+    /// A new, empty VictoriaLogs row.
+    fn blank(id: u64) -> Self {
+        let mut d = Self::from_config(
+            &filar_core::LogSourceConfig {
+                kind: "victorialogs".into(),
+                ..Default::default()
+            },
+            id,
+        );
+        d.key_env.clear();
+        d
+    }
+
+    /// From a `config.toml` entry; `key_saved` is filled in by the caller.
+    fn from_config(cfg: &filar_core::LogSourceConfig, id: u64) -> Self {
+        Self {
+            id,
+            name: cfg.name.clone(),
+            kind: cfg.source_kind().unwrap_or(filar_core::LogSourceKind::VictoriaLogs),
+            url: cfg.url.clone(),
+            auth: cfg.auth_kind().unwrap_or(filar_core::LogAuth::None),
+            key_env: cfg.key_env.clone(),
+            key: String::new(),
+            key_saved: false,
+            key_checked_for: String::new(),
+            user: cfg.user.clone().unwrap_or_default(),
+            tenant: cfg.tenant.clone().unwrap_or_default(),
+            index: cfg.index.clone().unwrap_or_default(),
+            k8s_fields: cfg.k8s_fields.clone().unwrap_or_default(),
+            max_window_hours: cfg.max_window_hours.to_string(),
+            max_lines: cfg.max_lines.to_string(),
+            timeout_secs: cfg.timeout_secs.to_string(),
+            clusters: cfg.clusters.join(", "),
+            tags: cfg.tags.join(", "),
+            base: cfg.clone(),
+            check_status: String::new(),
+            check_in_flight: false,
+        }
+    }
+
+    /// Whether a key is stored under the name as it reads now.
+    fn key_saved_now(&self) -> bool {
+        self.key_saved && self.key_env.trim() == self.key_checked_for
+    }
+
+    /// Look the key name up in the OS store once (no-op in unit tests).
+    fn refresh_key_saved(&mut self) {
+        let name = self.key_env.trim().to_string();
+        self.key_saved = !name.is_empty() && !load_secret(&name).is_empty();
+        self.key_checked_for = name;
+    }
+
+    /// The entry to write and launch with, or the first problem, worded for
+    /// the launcher. Never contains a key.
+    fn to_config(&self) -> Result<filar_core::LogSourceConfig, String> {
+        let label = if self.name.trim().is_empty() { "new source".to_string() } else { self.name.trim().to_string() };
+        let number = |raw: &str, field: &str| -> Result<u64, String> {
+            raw.trim()
+                .parse::<u64>()
+                .map_err(|_| format!("Log source {label}: {field} must be a whole number"))
+        };
+        let opt = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
+        let search = matches!(self.kind, filar_core::LogSourceKind::OpenSearch | filar_core::LogSourceKind::Elasticsearch);
+        let cfg = filar_core::LogSourceConfig {
+            name: self.name.trim().to_string(),
+            kind: self.kind.as_str().to_string(),
+            url: self.url.trim().to_string(),
+            auth: self.auth.as_str().to_string(),
+            key_env: if self.auth.needs_key() { self.key_env.trim().to_string() } else { String::new() },
+            user: if self.auth == filar_core::LogAuth::Basic { opt(&self.user) } else { None },
+            tenant: if search { None } else { opt(&self.tenant) },
+            index: if search { opt(&self.index) } else { None },
+            k8s_fields: opt(&self.k8s_fields),
+            max_window_hours: number(&self.max_window_hours, "max window (hours)")?,
+            max_lines: number(&self.max_lines, "max lines")? as usize,
+            timeout_secs: number(&self.timeout_secs, "timeout (s)")?,
+            clusters: split_list(&self.clusters),
+            tags: split_list(&self.tags),
+            time_field: if search { self.base.time_field.clone() } else { None },
+            fields: if search { self.base.fields.clone() } else { Vec::new() },
+            ..self.base.clone()
+        };
+        cfg.validate()
+            .map_err(|e| format!("Log source {label}: {}", e.to_string().trim_start_matches("config error: ").trim_start_matches("log_sources: ")))?;
+        Ok(cfg)
+    }
+
+    /// A key to store at launch: `(key_env, key)` when one was typed.
+    fn key_to_save(&self) -> Option<(String, String)> {
+        let key = sanitize_secret_clipboard(&self.key);
+        let env = self.key_env.trim().to_string();
+        (self.auth.needs_key() && !env.is_empty() && !key.is_empty()).then_some((env, key))
+    }
+
+    /// The key for a Check: the typed one, else the stored one, else the
+    /// environment. Empty when the source needs none.
+    fn key_for_check(&self) -> String {
+        if !self.auth.needs_key() {
+            return String::new();
+        }
+        let typed = sanitize_secret_clipboard(&self.key);
+        if !typed.is_empty() {
+            return typed;
+        }
+        let name = self.key_env.trim();
+        let stored = load_secret(name);
+        if !stored.is_empty() {
+            return stored;
+        }
+        std::env::var(name).unwrap_or_default()
+    }
+}
+
+/// The query a Check sends: anything at all in the last 5 minutes.
+fn log_check_query(cfg: &filar_core::LogSourceConfig) -> String {
+    match cfg.source_kind() {
+        Some(filar_core::LogSourceKind::Loki) => {
+            let label = cfg.k8s_preset().map(|p| p.fields().namespace).unwrap_or("namespace");
+            format!("{{{label}=~\".+\"}}")
+        }
+        _ => "*".to_string(),
+    }
+}
+
+/// One Check of a log source: a query over the last 5 minutes with limit 1.
+async fn check_log_source(cfg: &filar_core::LogSourceConfig, key: &str) -> Result<String, String> {
+    let source = filar_agent::logs::build_log_source(cfg, key).map_err(|e| e.to_string())?;
+    let end = chrono::Utc::now();
+    let query = filar_agent::LogQuery {
+        query: log_check_query(cfg),
+        start: end - chrono::Duration::minutes(5),
+        end,
+        limit: 1,
+    };
+    let result = source.query(&query).await.map_err(|e| e.to_string())?;
+    Ok(if result.lines.is_empty() && result.series.is_empty() {
+        "Available, but no lines in the last 5 minutes.".to_string()
+    } else {
+        "Available, data found.".to_string()
+    })
+}
+
+struct LogCheckResult {
+    id: u64,
+    config: filar_core::LogSourceConfig,
+    result: Result<String, String>,
+}
+
+// ---------------------------------------------------------------------------
 // Host groups (#418)
 // ---------------------------------------------------------------------------
 
@@ -2111,6 +2327,11 @@ struct LauncherApp {
     arbiter_profile: Option<String>,
     /// Command safety scorer settings (#552).
     risk_scorer: RiskScorerDraft,
+    /// Working copies of `[[log_sources]]` (#584).
+    log_sources: Vec<LogSourceDraft>,
+    next_log_source_id: u64,
+    log_check_tx: std::sync::mpsc::Sender<LogCheckResult>,
+    log_check_rx: std::sync::mpsc::Receiver<LogCheckResult>,
     /// Staged import waiting for the collision policy choice (#416).
     import_dialog: Option<ImportDialog>,
     /// Result of the last host-file operation — import or export (#416/#417),
@@ -2118,7 +2339,8 @@ struct LauncherApp {
     file_status: String,
     /// Working copies of the `[[host_groups]]` definitions (#418).
     host_groups: Vec<HostGroupDraft>,
-    /// Active central tab: 0 = session & hosts, 1 = groups (#418).
+    /// Active central tab: 0 = session & hosts, 1 = groups (#418), 2 = log
+    /// sources (#584).
     active_tab: usize,
     /// Last "is this key encrypted?" answer for the key login fields (#489).
     key_probe: Option<KeyProbe>,
@@ -3145,6 +3367,259 @@ impl LauncherApp {
             });
     }
 
+    /// The Logs tab (#584): `[[log_sources]]` the agent may search with
+    /// `query_logs`, each with a Check.
+    fn render_log_sources(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Log sources").strong());
+        ui.label(
+            egui::RichText::new(
+                "Centralised log stores the agent searches with query_logs (read-only). \
+                 Keys go to the OS credential store at Launch, never to config.toml.",
+            )
+            .small()
+            .weak(),
+        );
+        let mut remove = None;
+        let mut check = None;
+        let cluster_names: Vec<String> = self.kube_slots.iter().map(|k| k.name.clone()).collect();
+        for (i, d) in self.log_sources.iter_mut().enumerate() {
+            let title = format!(
+                "{} ({})",
+                if d.name.trim().is_empty() { "new source" } else { d.name.trim() },
+                d.kind.as_str()
+            );
+            egui::CollapsingHeader::new(title)
+                .id_salt(("log_source", d.id))
+                .default_open(d.name.trim().is_empty())
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        let resp = ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(160.0));
+                        if resp.lost_focus() && d.key_env.trim().is_empty() && d.auth.needs_key() {
+                            d.key_env = suggested_log_key_env(&d.name);
+                        }
+                        ui.label("Kind:");
+                        egui::ComboBox::from_id_salt(("log_kind", d.id))
+                            .selected_text(d.kind.as_str())
+                            .show_ui(ui, |ui| {
+                                for kind in filar_core::LogSourceKind::ALL {
+                                    ui.selectable_value(&mut d.kind, kind, kind.as_str());
+                                }
+                            });
+                    });
+                    if !d.kind.auths().contains(&d.auth) {
+                        d.auth = filar_core::LogAuth::None;
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("URL:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.url)
+                                .hint_text("https://vlogs.example.com")
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Auth:");
+                        egui::ComboBox::from_id_salt(("log_auth", d.id))
+                            .selected_text(d.auth.as_str())
+                            .show_ui(ui, |ui| {
+                                for auth in d.kind.auths() {
+                                    ui.selectable_value(&mut d.auth, *auth, auth.as_str());
+                                }
+                            });
+                        if d.auth == filar_core::LogAuth::Basic {
+                            ui.label("User:");
+                            ui.add(egui::TextEdit::singleline(&mut d.user).desired_width(120.0));
+                        }
+                    });
+                    if d.auth.needs_key() {
+                        // Only once the source has a name: an early generic
+                        // name would stay and two sources would share a key.
+                        if d.key_env.trim().is_empty() && !d.name.trim().is_empty() {
+                            d.key_env = suggested_log_key_env(&d.name);
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("Key name:");
+                            let resp = ui
+                                .add(egui::TextEdit::singleline(&mut d.key_env).desired_width(200.0))
+                                .on_hover_text("Environment variable / OS store entry the key is kept under.");
+                            if resp.lost_focus() && d.key_env.trim() != d.key_checked_for {
+                                d.refresh_key_saved();
+                            }
+                        });
+                        let saved = d.key_saved_now();
+                        ui.horizontal(|ui| {
+                            ui.label("Key:");
+                            let id = ui.make_persistent_id(("log_source_key", d.id));
+                            apply_focused_secret_paste(ui, id, &mut d.key);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.key)
+                                    .id(id)
+                                    .password(true)
+                                    .hint_text(if saved { "saved — type to replace" } else { "not set" })
+                                    .desired_width(200.0),
+                            );
+                            ui.label(egui::RichText::new(if saved { "saved" } else { "not set" }).small().weak());
+                        });
+                    }
+                    ui.horizontal(|ui| match d.kind {
+                        filar_core::LogSourceKind::VictoriaLogs => {
+                            ui.label("Tenant:");
+                            ui.add(egui::TextEdit::singleline(&mut d.tenant).hint_text("0:0").desired_width(80.0));
+                        }
+                        filar_core::LogSourceKind::Loki => {
+                            ui.label("Tenant (X-Scope-OrgID):");
+                            ui.add(egui::TextEdit::singleline(&mut d.tenant).desired_width(120.0));
+                        }
+                        filar_core::LogSourceKind::OpenSearch | filar_core::LogSourceKind::Elasticsearch => {
+                            ui.label("Index:");
+                            ui.add(egui::TextEdit::singleline(&mut d.index).hint_text("logs-*").desired_width(160.0));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Kubernetes fields:");
+                        let shown = if d.k8s_fields.is_empty() {
+                            format!(
+                                "default ({})",
+                                filar_core::K8sFieldPreset::default_for(d.kind).as_str()
+                            )
+                        } else {
+                            d.k8s_fields.clone()
+                        };
+                        egui::ComboBox::from_id_salt(("log_k8s", d.id))
+                            .selected_text(shown)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut d.k8s_fields, String::new(), "default");
+                                for preset in filar_core::K8sFieldPreset::ALL {
+                                    ui.selectable_value(&mut d.k8s_fields, preset.as_str().to_string(), preset.as_str());
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Max window (h):");
+                        ui.add(egui::TextEdit::singleline(&mut d.max_window_hours).desired_width(40.0));
+                        ui.label("Max lines:");
+                        ui.add(egui::TextEdit::singleline(&mut d.max_lines).desired_width(50.0));
+                        ui.label("Timeout (s):");
+                        ui.add(egui::TextEdit::singleline(&mut d.timeout_secs).desired_width(40.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Clusters:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut d.clusters)
+                                .hint_text(cluster_names.join(", "))
+                                .desired_width(200.0),
+                        )
+                        .on_hover_text("[[kube_clusters]] whose logs this source holds — enables pod_logs_history there.");
+                        ui.label("Tags:");
+                        ui.add(egui::TextEdit::singleline(&mut d.tags).desired_width(120.0));
+                    });
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!d.check_in_flight, egui::Button::new("Check"))
+                            .on_hover_text("One query over the last 5 minutes with limit 1.")
+                            .clicked()
+                        {
+                            check = Some(i);
+                        }
+                        if ui.button("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                        if d.check_in_flight {
+                            ui.label(egui::RichText::new("checking…").small().weak());
+                        } else if !d.check_status.is_empty() {
+                            ui.label(egui::RichText::new(&d.check_status).small());
+                        }
+                    });
+                });
+        }
+        if let Some(i) = check {
+            self.start_log_check(i, ui.ctx().clone());
+        }
+        if let Some(i) = remove {
+            self.log_sources.remove(i);
+        }
+        if ui.button("Add source").clicked() {
+            let id = self.next_log_source_id;
+            self.next_log_source_id += 1;
+            self.log_sources.push(LogSourceDraft::blank(id));
+        }
+    }
+
+    fn start_log_check(&mut self, idx: usize, ctx: egui::Context) {
+        let Some(d) = self.log_sources.get_mut(idx) else {
+            return;
+        };
+        let cfg = match d.to_config() {
+            Ok(cfg) => cfg,
+            Err(msg) => {
+                d.check_status = msg;
+                return;
+            }
+        };
+        let key = d.key_for_check();
+        if cfg.auth_kind().is_some_and(filar_core::LogAuth::needs_key) && key.is_empty() {
+            d.check_status = format!("Check failed: no key under {} (type it above)", cfg.key_env);
+            return;
+        }
+        d.check_in_flight = true;
+        d.check_status.clear();
+        let id = d.id;
+        let tx = self.log_check_tx.clone();
+        std::thread::spawn(move || {
+            let result = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => runtime.block_on(check_log_source(&cfg, &key)),
+                Err(e) => Err(format!("cannot start the check runtime: {e}")),
+            };
+            let _ = tx.send(LogCheckResult { id, config: cfg, result });
+            // Wake the UI: nothing else would until the next input event.
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_log_checks(&mut self, ctx: &egui::Context) {
+        while let Ok(done) = self.log_check_rx.try_recv() {
+            if let Some(d) = self.log_sources.iter_mut().find(|d| d.id == done.id) {
+                d.check_in_flight = false;
+                d.check_status = if d.to_config().ok().as_ref() == Some(&done.config) {
+                    match done.result {
+                        Ok(message) => message,
+                        Err(message) => format!("Check failed: {message}"),
+                    }
+                } else {
+                    "Check result discarded: the source fields changed.".to_string()
+                };
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    /// Every log source must be complete, uniquely named, and linked only to
+    /// clusters the launcher knows (#584).
+    fn validate_log_sources(&self) -> Result<Vec<filar_core::LogSourceConfig>, String> {
+        // By name: a cluster row with other problems is reported by the
+        // cluster validation itself, not as "not in the list" here.
+        let known: std::collections::HashSet<String> = self
+            .kube_slots
+            .iter()
+            .map(|k| k.name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for d in &self.log_sources {
+            let cfg = d.to_config()?;
+            if !seen.insert(cfg.name.clone()) {
+                return Err(format!("Log source {}: the name is used twice", cfg.name));
+            }
+            if let Some(cluster) = cfg.clusters.iter().find(|c| !known.contains(*c)) {
+                return Err(format!("Log source {}: cluster {cluster} is not in the cluster list", cfg.name));
+            }
+            out.push(cfg);
+        }
+        Ok(out)
+    }
+
     /// Folder picker for the Ctrl+S session export directory.
     fn render_save_dir_field(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -3609,6 +4084,10 @@ impl LauncherApp {
             self.set_other_error(msg);
             return false;
         }
+        if let Err(msg) = self.validate_log_sources() {
+            self.set_other_error(msg);
+            return false;
+        }
         true
     }
 
@@ -4042,10 +4521,23 @@ impl LauncherApp {
             RiskScorerLaunch::On { config } => Some(config.clone()),
             RiskScorerLaunch::Off => None,
         };
+        let log_sources = match self.validate_log_sources() {
+            Ok(sources) => sources,
+            // validate_launch already refused it; never launch half-set.
+            Err(msg) => {
+                self.set_other_error(msg);
+                return;
+            }
+        };
         settings.save();
-        save_config_toml(&settings, &host_groups, risk_section.as_ref());
+        save_config_toml(&settings, &host_groups, risk_section.as_ref(), &log_sources);
         if let Some((key_env, key)) = self.risk_scorer.key_to_save() {
             save_secret(&key_env, &key);
+        }
+        for d in &self.log_sources {
+            if let Some((key_env, key)) = d.key_to_save() {
+                save_secret(&key_env, &key);
+            }
         }
         for prof in &self.profiles {
             if !prof.key_env.trim().is_empty() && !prof.api_key.is_empty() {
@@ -4079,6 +4571,7 @@ impl LauncherApp {
             arbiter_profile: self.arbiter_profile.clone(),
             host_groups: Some(host_groups),
             risk_scorer: Some(risk_scorer),
+            log_sources: Some(log_sources),
         };
         save_pending_launch(&cfg);
         std::process::exit(0);
@@ -4090,6 +4583,7 @@ impl eframe::App for LauncherApp {
         // Dark theme matching the TUI accent palette.
         configure_theme(ctx);
         self.poll_kube_checks(ctx);
+        self.poll_log_checks(ctx);
 
         // Fixed bottom panel: Launch/Cancel always visible, regardless of
         // window height. The rest of the content scrolls above it.
@@ -4131,11 +4625,14 @@ impl eframe::App for LauncherApp {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.active_tab, 0, "Hosts");
                     ui.selectable_value(&mut self.active_tab, 1, "Groups");
+                    ui.selectable_value(&mut self.active_tab, 2, "Logs");
                 });
                 ui.separator();
 
                 if self.active_tab == 1 {
                     self.render_groups(ui);
+                } else if self.active_tab == 2 {
+                    self.render_log_sources(ui);
                 } else {
                     self.render_session_list(ui);
                     ui.separator();
@@ -4196,6 +4693,21 @@ pub fn run_launcher(config: &Config) {
         kube_slots.iter().position(|slot| slot.name == *name)
     });
     let (kube_check_tx, kube_check_rx) = std::sync::mpsc::channel();
+    let (log_check_tx, log_check_rx) = std::sync::mpsc::channel();
+    let log_sources: Vec<LogSourceDraft> = config
+        .log_sources
+        .iter()
+        .enumerate()
+        .map(|(i, cfg)| {
+            let mut d = LogSourceDraft::from_config(cfg, i as u64);
+            // One OS-store read per keyed source at start-up, not per frame.
+            if d.auth.needs_key() {
+                d.refresh_key_saved();
+            }
+            d
+        })
+        .collect();
+    let next_log_source_id = log_sources.len() as u64;
 
     // Build profile list. Migrate old flat settings into a default profile
     // on first upgrade, preserving existing api_key.
@@ -4289,6 +4801,10 @@ pub fn run_launcher(config: &Config) {
             }
             d
         },
+        log_sources,
+        next_log_source_id,
+        log_check_tx,
+        log_check_rx,
         import_dialog: None,
         file_status: String::new(),
         host_groups: config.host_groups.iter().map(HostGroupDraft::from_group).collect(),
@@ -4387,6 +4903,7 @@ mod tests {
             arbiter_profile: None,
             host_groups: None,
             risk_scorer: None,
+            log_sources: None,
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(!json.contains("supersecret"));
@@ -4447,6 +4964,7 @@ mod tests {
             arbiter_profile: None,
             host_groups: None,
             risk_scorer: None,
+            log_sources: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let loaded: LaunchConfig = serde_json::from_str(&json).unwrap();
@@ -4570,6 +5088,7 @@ mod tests {
             arbiter_profile: None,
             host_groups: None,
             risk_scorer: None,
+            log_sources: None,
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(!json.contains("\"password\":"), "must not emit password key when None, got: {json}");
@@ -4664,6 +5183,7 @@ mod tests {
             arbiter_profile: None,
             host_groups: None,
             risk_scorer: None,
+            log_sources: None,
         };
 
         let json = serde_json::to_string(&cfg).unwrap();
@@ -4914,6 +5434,7 @@ mod tests {
             arbiter_profile: Some("arbiter-b".into()),
             host_groups: None,
             risk_scorer: None,
+            log_sources: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let loaded: LaunchConfig = serde_json::from_str(&json).unwrap();
@@ -5301,6 +5822,7 @@ mod tests {
 
     fn make_app(meta: SessionMeta) -> LauncherApp {
         let (kube_check_tx, kube_check_rx) = std::sync::mpsc::channel();
+        let (log_check_tx, log_check_rx) = std::sync::mpsc::channel();
         LauncherApp {
             sessions: vec![meta],
             selected_session: None,
@@ -5339,6 +5861,10 @@ mod tests {
             show_api_key: false,
             arbiter_profile: None,
             risk_scorer: RiskScorerDraft::from_config(None),
+            log_sources: Vec::new(),
+            next_log_source_id: 0,
+            log_check_tx,
+            log_check_rx,
             import_dialog: None,
             file_status: String::new(),
             host_groups: Vec::new(),
@@ -6800,6 +7326,7 @@ host_key_policy = \"strict\"
             arbiter_profile: None,
             host_groups: None,
             risk_scorer: Some(d.to_launch().unwrap()),
+            log_sources: None,
         };
         let json = serde_json::to_string(&launch).unwrap();
         assert!(!json.contains("SECRET"), "{json}");
@@ -6870,4 +7397,106 @@ host_key_policy = \"strict\"
         d.set_chat_logprobs(true);
         assert_eq!(d.base_url, "https://my-proxy.example/v1", "a typed address is kept");
     }
+
+    // ── Log sources (#584) ───────────────────────────────────────────
+
+    fn vlogs_draft() -> LogSourceDraft {
+        let mut d = LogSourceDraft::blank(1);
+        d.name = "vlogs-prod".into();
+        d.url = "https://vlogs.example.com".into();
+        d.auth = filar_core::LogAuth::Bearer;
+        d.key_env = "FILAR_LOGS_VLOGS_PROD".into();
+        d.key = "SECRET-LOG-KEY".into();
+        d
+    }
+
+    #[test]
+    fn a_log_source_draft_round_trips_without_its_key() {
+        let d = vlogs_draft();
+        let cfg = d.to_config().unwrap();
+        assert_eq!(cfg.key_env, "FILAR_LOGS_VLOGS_PROD");
+        assert_eq!(d.key_to_save(), Some(("FILAR_LOGS_VLOGS_PROD".into(), "SECRET-LOG-KEY".into())));
+        let back = LogSourceDraft::from_config(&cfg, 7);
+        assert_eq!(back.to_config().unwrap(), cfg);
+        assert!(back.key.is_empty());
+
+        let config = filar_core::Config {
+            log_sources: vec![cfg.clone()],
+            ..Default::default()
+        };
+        let toml_text = toml::to_string_pretty(&config).unwrap();
+        assert!(toml_text.contains("[[log_sources]]") && !toml_text.contains("SECRET-LOG-KEY"), "{toml_text}");
+        let launch = LaunchConfig {
+            target: "local".into(),
+            ssh: None,
+            kube: None,
+            kube_clusters: None,
+            model: "m".into(),
+            api_base_url: String::new(),
+            api_key: String::new(),
+            session_id: None,
+            temperature: String::new(),
+            extra_body: String::new(),
+            selected_profile: None,
+            key_env: String::new(),
+            save_dir: None,
+            profiles: vec![],
+            ssh_targets: vec![],
+            arbiter_profile: None,
+            host_groups: None,
+            risk_scorer: None,
+            log_sources: Some(vec![cfg]),
+        };
+        let json = serde_json::to_string(&launch).unwrap();
+        assert!(json.contains("vlogs-prod") && !json.contains("SECRET-LOG-KEY"), "{json}");
+        let read: LaunchConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(read.log_sources, launch.log_sources);
+    }
+
+    #[test]
+    fn log_source_drafts_are_validated_like_the_config() {
+        let mut d = vlogs_draft();
+        d.url = "vlogs.example.com".into();
+        assert!(d.to_config().unwrap_err().contains("url"));
+        let mut d = vlogs_draft();
+        d.max_lines = "many".into();
+        assert!(d.to_config().unwrap_err().contains("max lines"));
+        let mut d = vlogs_draft();
+        d.kind = filar_core::LogSourceKind::OpenSearch;
+        assert!(d.to_config().unwrap_err().contains("needs index"));
+        d.index = "logs-*".into();
+        d.tenant = "0:0".into();
+        assert!(d.to_config().unwrap().tenant.is_none(), "a tenant field of another kind is dropped");
+        let mut d = vlogs_draft();
+        d.auth = filar_core::LogAuth::None;
+        assert_eq!(d.to_config().unwrap().key_env, "", "no key name without a keyed auth");
+        assert_eq!(d.key_to_save(), None);
+    }
+
+    #[test]
+    fn launch_refuses_log_sources_linked_to_unknown_clusters_or_named_twice() {
+        let mut app = make_app(make_meta(None, None, None, None));
+        let mut d = vlogs_draft();
+        d.clusters = "prod-eu".into();
+        app.log_sources = vec![d.clone()];
+        assert!(app.validate_log_sources().unwrap_err().contains("cluster prod-eu is not in the cluster list"));
+        d.clusters.clear();
+        let mut twin = d.clone();
+        twin.id = 2;
+        app.log_sources = vec![d, twin];
+        assert!(app.validate_log_sources().unwrap_err().contains("used twice"));
+    }
+
+    #[test]
+    fn suggested_key_names_and_check_queries() {
+        assert_eq!(suggested_log_key_env("vlogs-prod"), "FILAR_LOGS_VLOGS_PROD");
+        assert_eq!(suggested_log_key_env(""), "FILAR_LOGS_SOURCE");
+        let loki = filar_core::LogSourceConfig {
+            kind: "loki".into(),
+            ..Default::default()
+        };
+        assert_eq!(log_check_query(&loki), r#"{namespace=~".+"}"#);
+        assert_eq!(log_check_query(&vlogs_draft().to_config().unwrap()), "*");
+    }
+
 }

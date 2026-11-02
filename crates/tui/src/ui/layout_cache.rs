@@ -71,6 +71,8 @@ pub struct ChatLayoutCache {
     /// (label, level). Set before each rebuild; a new rating bumps
     /// `message_rev`, which triggers the rebuild.
     pub safety_badges: HashMap<usize, (String, SafetyLevel)>,
+    /// Log query details by block index (#584): summary and raw lines.
+    pub log_details: HashMap<usize, crate::app::LogDetail>,
 }
 
 /// Maximum number of rendered lines to cache.
@@ -90,6 +92,7 @@ impl ChatLayoutCache {
             last_block_rev: 0,
             fleet: false,
             safety_badges: HashMap::new(),
+            log_details: HashMap::new(),
         }
     }
 
@@ -195,7 +198,10 @@ impl ChatLayoutCache {
                         };
                         header.push(Span::styled(format!("[{label}] "), style));
                     }
-                    let marker = if tool
+                    let is_logs = tool.as_ref().is_some_and(|tool| crate::app::is_log_tool(&tool.name));
+                    let marker = if is_logs {
+                        format!("{} ", glyphs.logs)
+                    } else if tool
                         .as_ref()
                         .is_some_and(|tool| filar_agent::kube_tools::is_kube_tool_name(&tool.name))
                     {
@@ -213,6 +219,12 @@ impl ChatLayoutCache {
                     if !explanation.is_empty() {
                         for wrapped in wrap_text(&strip_emoji(explanation), output_width) {
                             self.push_output(idx, format!("  {} {}", glyphs.gutter, wrapped));
+                        }
+                    }
+                    let detail = if is_logs { self.log_details.get(&idx).cloned() } else { None };
+                    if let Some(detail) = &detail {
+                        for wrapped in wrap_text(&detail.summary(), output_width) {
+                            self.push_output(idx, format!("  {} {} {}", glyphs.gutter, glyphs.logs, wrapped));
                         }
                     }
 
@@ -263,7 +275,20 @@ impl ChatLayoutCache {
                                     format!("  ... truncated ({} more lines)", remaining),
                                 );
                             }
-                            if total > 5 {
+                            // Expanded log query: the lines behind the fold.
+                            if let Some(detail) = detail.as_ref().filter(|d| !d.raw.is_empty()) {
+                                self.push_output(
+                                    idx,
+                                    format!("  {} lines ({} of {}):", glyphs.gutter, detail.raw.len(), detail.lines),
+                                );
+                                for raw in &detail.raw {
+                                    let raw = sanitize_output(raw);
+                                    for wrapped in wrap_text(&raw, output_width) {
+                                        self.push_output(idx, format!("  {}   {}", glyphs.gutter, wrapped));
+                                    }
+                                }
+                            }
+                            if total > 5 || detail.as_ref().is_some_and(|d| !d.raw.is_empty()) {
                                 self.push_output_toggle(
                                     idx,
                                     format!("  {} collapse", glyphs.expand_arrow),

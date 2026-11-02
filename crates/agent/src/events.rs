@@ -90,6 +90,31 @@ pub enum AgentEvent {
         unavailable: bool,
     },
 
+    /// A log query (`query_logs`, `pod_logs_history`) answered (#584) — for
+    /// the UI only, never part of the conversation. Sent just before the
+    /// matching [`AgentEvent::CommandFinished`], whose `command` it repeats.
+    LogQueryFinished {
+        /// The command line of the call, as in `CommandFinished`.
+        command: String,
+        /// Log source name.
+        source: String,
+        /// Its query language.
+        language: String,
+        /// The query sent to the store.
+        query: String,
+        /// Window start, RFC 3339 UTC.
+        start: String,
+        /// Window end, RFC 3339 UTC.
+        end: String,
+        /// Lines returned.
+        lines: usize,
+        /// More data existed than was returned.
+        truncated: bool,
+        /// The returned lines, redacted, at most [`crate::logs::tool::UI_LINES`],
+        /// as `time message` — what the folded view stands for.
+        raw: Vec<String>,
+    },
+
     /// A command was executed (or did not run — see `denied`).
     CommandFinished {
         /// The command that was processed.

@@ -359,6 +359,18 @@ fn config_with_launch_risk_scorer(
     config
 }
 
+/// `config` with the launcher's `[[log_sources]]` (#584) when it said
+/// anything; `None` keeps `config.toml`'s.
+fn config_with_launch_log_sources(
+    mut config: filar_core::Config,
+    launch: Option<Vec<filar_core::LogSourceConfig>>,
+) -> filar_core::Config {
+    if let Some(sources) = launch {
+        config.log_sources = sources;
+    }
+    config
+}
+
 /// The scorer, the display thresholds `(warn_below, danger_below)` and the
 /// start-up note (if the scorer cannot be used).
 type LaunchRiskScorer = (
@@ -627,6 +639,8 @@ async fn run() -> anyhow::Result<()> {
     // The launcher's command-safety choice (#552); `None` = not said (CLI
     // launch, or a pending_launch.json from before #552) → config.toml.
     let mut launch_risk_scorer: Option<filar_gui::RiskScorerLaunch> = None;
+    // The launcher's `[[log_sources]]` (#584); `None` = not said → config.toml.
+    let mut launch_log_sources: Option<Vec<filar_core::LogSourceConfig>> = None;
 
     // ── Determine launch parameters ──────────────────────────────────
     // When no CLI args, check for pending launch from a previous GUI
@@ -726,6 +740,7 @@ async fn run() -> anyhow::Result<()> {
                 };
 
                 launch_risk_scorer = launch.risk_scorer.clone();
+                launch_log_sources = launch.log_sources.clone();
                 (
                     target_name,
                     launch.session_id,
@@ -978,7 +993,8 @@ async fn run() -> anyhow::Result<()> {
     let (risk_scorer, risk_thresholds, risk_scorer_note) =
         build_risk_scorer_for_launch(&config, &secret_provider);
 
-    // ── Log sources (#579) ─────────────────────────────────────────────
+    // ── Log sources (#579, #584) ───────────────────────────────────────
+    let config = config_with_launch_log_sources(config, launch_log_sources);
     let (log_sources, log_source_notes) = build_log_sources_for_launch(&config, &secret_provider);
 
     // ── Launch TUI ─────────────────────────────────────────────────────
@@ -1088,6 +1104,25 @@ mod tests {
 
     /// #501: the session uses the groups the launcher just saved, not the
     /// snapshot of config.toml read before the launcher opened.
+    #[test]
+    fn a_launch_brings_its_own_log_sources() {
+        let source = |name: &str| filar_core::LogSourceConfig {
+            name: name.into(),
+            kind: "victorialogs".into(),
+            url: "http://v".into(),
+            ..Default::default()
+        };
+        let config = filar_core::Config {
+            log_sources: vec![source("from-config")],
+            ..Default::default()
+        };
+        let kept = super::config_with_launch_log_sources(config.clone(), None);
+        assert_eq!(kept.log_sources, config.log_sources);
+        let replaced = super::config_with_launch_log_sources(config.clone(), Some(vec![source("from-launcher")]));
+        assert_eq!(replaced.log_sources[0].name, "from-launcher");
+        assert!(super::config_with_launch_log_sources(config, Some(vec![])).log_sources.is_empty());
+    }
+
     #[test]
     fn a_launch_brings_its_own_host_groups() {
         let stale = vec![group("old", "x")];

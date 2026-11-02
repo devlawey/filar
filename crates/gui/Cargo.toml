@@ -8,6 +8,9 @@ license.workspace = true
 filar-core = { workspace = true }
 # Key-file checks and read-only Kubernetes checks; no local PTY.
 filar-transport = { workspace = true, features = ["kube"] }
+# The log-source Check runs one query through the agent's adapters (#584).
+filar-agent = { workspace = true }
+chrono = { workspace = true }
 eframe = { workspace = true }
 rfd = { workspace = true }
 tracing = { workspace = true }
