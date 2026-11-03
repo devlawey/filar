@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [3.0.2] - 2026-11-03
+
 ### Added
 
 - Log sources in the launcher and the feed: a Logs tab to add, remove and Check `[[log_sources]]` (keys masked, saved to the OS store at Launch; `config.toml` and `pending_launch.json` carry only `key_env`), a log query block in the TUI feed with a summary line (source, language, window, lines, truncated) and the raw lines on expand, and log query counts per source in F1 → Usage; `AgentEvent::LogQueryFinished` for embedders ([#584](https://github.com/devlawey/filar/issues/584)).
@@ -1492,7 +1494,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v3.0.2...HEAD
+[3.0.2]: https://github.com/devlawey/filar/compare/v3.0.0...v3.0.2
 [3.0.0]: https://github.com/devlawey/filar/compare/v2.0.7...v3.0.0
 [2.0.7]: https://github.com/devlawey/filar/compare/v2.0.6...v2.0.7
 [2.0.6]: https://github.com/devlawey/filar/compare/v2.0.5...v2.0.6

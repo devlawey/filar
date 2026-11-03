@@ -11830,3 +11830,28 @@ vlagent: селектор `app=web` и таблица флота — зелён�
 **Контракты.** Публичные API не менялись.
 
 **Next:** выпуск 3.0.2.
+
+---
+
+## Подготовка релиза 3.0.2
+
+**Preflight.** `main` на `edebefd`: после очистки пересоздаваемых Cargo-артефактов
+`cargo build --workspace` и `cargo test --workspace` зелёные с
+`CARGO_INCREMENTAL=0`; `#[ignore]` Docker/Kubernetes-проверки не запускались.
+`release.yml` покрывает Windows и macOS (Apple Silicon); milestone 3.0.2 закрыт
+по всем 6 issue; теги и GitHub Release 3.0.2 отсутствовали.
+
+**Состав.** Постоянный shell и интерактивный терминал в подах, pod tabs и
+pod-shell agent mode, ephemeral debug containers и `pod_http_get`; централизованные
+источники логов VictoriaLogs/OpenSearch/Elasticsearch/Loki, `query_logs`,
+`pod_logs_history`, launcher/TUI-интеграция; исправления фоновых логов, pod terminal,
+маркера cwd и окна подтверждения.
+
+**Решения.** Версия workspace `3.0.0 → 3.0.2`; движок менялся, поэтому примеры
+зависимостей и upgrading-раздел обновлены до `engine-v3.0.2`, включая новые поля
+`LogSourceConfig`/`LogResult`. Теги `v3.0.2` и `engine-v3.0.2` ставятся на один
+bump-коммит.
+
+**Next.** Опубликовать GitHub Release и дождаться обоих бинарников. Ручной smoke
+Windows/macOS и живые Kubernetes/log-source сценарии по `docs/SMOKE.md` остаются
+обязательными.

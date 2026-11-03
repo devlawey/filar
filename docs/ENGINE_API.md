@@ -28,13 +28,13 @@ working example.
 Bots and mobile apps that only need SSH should disable default features:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.0", default-features = false }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.2", default-features = false }
 ```
 
 Desktop apps (TUI/GUI) should keep `local` enabled:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.0" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.2" }
 ```
 
 Consumers that need Kubernetes but not a local terminal can enable only `kube`:
@@ -190,9 +190,9 @@ application — and the arbiter/`RiskInput` target
 
 ```toml
 [dependencies]
-filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.0" }
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.0", default-features = false }
-filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.0" }
+filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.2" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.2", default-features = false }
+filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.2" }
 
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"
@@ -810,7 +810,7 @@ let _agent = builder.log_sources(sources);
   and any proxy in front of it (VictoriaLogs documents that it does). Kinds without an adapter in the
   build are reported by `build_log_sources` and not offered.
 
-## Upgrading to the next engine release (unreleased)
+## Upgrading to `engine-v3.0.2`
 
 | Change | Breaks | What to do |
 |--------|--------|------------|
@@ -820,9 +820,14 @@ let _agent = builder.log_sources(sources);
 | `KubeInteractive`, `KubeExecutor::open_terminal` under the `kube` feature (#577) | Nothing — additive; `InteractiveTerminal` is unchanged | Use `open_terminal(cols, rows)` for an interactive TTY shell in the executor's pod |
 | `ClusterApi::pod_http_get`, `PodHttpRequest`/`PodHttpResponse`, `ContainerPortInfo`, new fields `ContainerInfo::ports` and `KubeCluster::diagnostic_ports`, tool `pod_http_get` (#578) | Struct literals of `ContainerInfo` need `ports`; `KubeCluster` literals without `..Default::default()` need `diagnostic_ports`; other `ClusterApi` implementations get a default `Unavailable` | Add `ports: Vec::new()` / `diagnostic_ports: Vec::new()`; implement `pod_http_get` only if your API can port-forward |
 | `filar_core::LogSourceConfig`/`LogSourceKind`/`LogAuth`, new field `Config::log_sources`; `filar_agent::logs` (`LogSource`, `LogSources`, `build_log_sources`, tool `query_logs`), `AgentBuilder::log_sources`, `KubeAgent::log_sources` (#579) | `Config` literals without `..Default::default()` need `log_sources` | Add `log_sources: Vec::new()`; opt in with `build_log_sources` |
+| New `LogSourceConfig` fields `time_field`, `fields`, `ca_file`, `k8s_fields`; `K8sFieldPreset`/`K8sFields` and the OpenSearch/Elasticsearch adapter (#581) | `LogSourceConfig` literals without `..Default::default()` need the new fields | Use `..Default::default()` or populate the fields; private CAs are added to verification, never used to disable it |
+| `LogResult::series` and `LogSeries` for Loki metric queries (#582) | `LogResult` literals need `series`; `LogResult` no longer implements `Eq` because series contain `f64` | Add `series: Vec::new()` or `..Default::default()`; use approximate comparison for metric values |
 | `filar_agent::logs::k8s` (`pod_logs_history`, `build_scope_query`, `PodScope`/`PodPick`, `FleetLogMember`), `LogSources::process_pod_logs_history` / `process_fleet_pod_logs` / `linked`; `AgentBuilder::kube_pod_mode` keeps the pod for it (#583) | Nothing — additive | Pass log sources to `KubeAgent` in fleets too: it offers `pod_logs_history` there and never `query_logs` |
 | `AgentEvent::LogQueryFinished` (UI-only details of a log query: source, language, query, window, line count, truncated, raw lines) emitted before the matching `CommandFinished` (#584) | Nothing — `AgentEvent` is `#[non_exhaustive]` | Show it or ignore it; it never reaches the model |
 | `KubeClusterApi::create_debug_container`, `DebugContainerSpec`, `debug_container_name`; new fields `KubeCluster::debug_images` and `KubePodTarget::debug_target` (#576) | `KubeCluster` literals without `..Default::default()` need `debug_images`; `KubePodTarget` built by `new` is unchanged | Add `debug_images: Vec::new()`; use `with_debug_target` for a debug container |
+| `filar_agent::background::reset_log_dir(session_id)` (#599) | Nothing — additive | Call it after replacing a session's target so the next background job probes the new target's writable log directory |
+
+`CommandExecutor` and `LlmClient` are unchanged.
 
 ## Upgrading to `engine-v3.0.0`
 
