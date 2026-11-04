@@ -4,7 +4,7 @@
 //! adapts Kubernetes operations to shell commands or `CommandExecutor`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use filar_core::{CommandConfirmMode, CoreError, KubeCluster, Result, TagPolicy};
@@ -29,12 +29,22 @@ static NEXT_PROPOSAL_ID: AtomicU64 = AtomicU64::new(1);
 /// confirmer reaches the log-source paths too, which confirm on their own.
 struct AuditedConfirmer<'a> {
     agent: &'a KubeAgent,
+    /// This run's conversation up to the call: the arbiter's recent context.
+    /// Passed down rather than kept on the agent, whose `run` takes `&self`
+    /// and may serve two turns at once.
+    conversation: &'a [ChatMessage],
 }
 
 #[async_trait::async_trait]
 impl CommandConfirmer for AuditedConfirmer<'_> {
     async fn confirm(&self, command: &str, explanation: &str, destructive: bool) -> Result<bool> {
-        self.agent.audit(command, explanation, destructive).await;
+        self.agent
+            .audit(command, explanation, destructive, self.conversation)
+            .await;
+        // A turn cancelled while the arbiter was busy asks nobody.
+        if self.agent.cancelled() {
+            return Err(CoreError::Other("cancelled".into()));
+        }
         self.agent
             .confirmer
             .confirm(command, explanation, destructive)
@@ -70,9 +80,6 @@ pub struct KubeAgent {
     log_sources: Option<Arc<crate::logs::LogSources>>,
     /// Independent command arbiter (#620), as in [`crate::Agent`].
     arbiter: Option<KubeArbiter>,
-    /// The conversation as of the call being confirmed — the arbiter's
-    /// "recent session context".
-    conversation: Mutex<Vec<ChatMessage>>,
 }
 
 /// The arbiter of a [`KubeAgent`] (#620).
@@ -107,7 +114,6 @@ impl KubeAgent {
             cancellation: None,
             log_sources: None,
             arbiter: None,
-            conversation: Mutex::new(Vec::new()),
         }
     }
 
@@ -132,7 +138,6 @@ impl KubeAgent {
             cancellation: None,
             log_sources: None,
             arbiter: None,
-            conversation: Mutex::new(Vec::new()),
         }
     }
 
@@ -197,20 +202,21 @@ impl KubeAgent {
     }
 
     /// Run the arbiter on a request about to be shown for confirmation.
-    async fn audit(&self, command: &str, explanation: &str, destructive: bool) {
+    async fn audit(
+        &self,
+        command: &str,
+        explanation: &str,
+        destructive: bool,
+        conversation: &[ChatMessage],
+    ) {
         if self.confirm_mode == CommandConfirmMode::Never {
             return;
         }
         let Some(audit_by) = &self.arbiter else {
             return;
         };
-        let history_tail = {
-            let conversation = self
-                .conversation
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            arbiter::history_tail_from_messages(&conversation, HISTORY_TAIL_EXCHANGES)
-        };
+        let history_tail =
+            arbiter::history_tail_from_messages(conversation, HISTORY_TAIL_EXCHANGES);
         let messages = arbiter::build_audit_messages(
             command,
             explanation,
@@ -389,11 +395,8 @@ impl KubeAgent {
             }
 
             for call in &response.tool_calls {
-                *self
-                    .conversation
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = messages.clone();
-                messages.push(self.process_tool_call(call).await?);
+                let reply = self.process_tool_call(call, &messages).await?;
+                messages.push(reply);
             }
         }
 
@@ -402,10 +405,17 @@ impl KubeAgent {
         )))
     }
 
-    async fn process_tool_call(&self, call: &ToolCall) -> Result<ChatMessage> {
+    async fn process_tool_call(
+        &self,
+        call: &ToolCall,
+        conversation: &[ChatMessage],
+    ) -> Result<ChatMessage> {
         // Every confirmation of this call — typed request or log query —
         // goes through the arbiter first (#620).
-        let confirmer = AuditedConfirmer { agent: self };
+        let confirmer = AuditedConfirmer {
+            agent: self,
+            conversation,
+        };
         if call.name == crate::logs::k8s::TOOL_POD_LOGS_HISTORY {
             let Some(sources) = &self.log_sources else {
                 return Ok(ChatMessage::tool(&call.id, "Error: no log sources are configured."));
@@ -713,6 +723,7 @@ mod tests {
 
     use crate::kube_tools::tests::{executor, target, MockCluster};
     use crate::ChatResponse;
+    use std::sync::Mutex;
 
     /// Answers a scripted sequence; records every request.
     struct ScriptedLlm {
@@ -870,6 +881,45 @@ mod tests {
         assert_eq!(requests.len(), 1, "one audit for the one fleet-wide approval");
         let audit = &requests[0].messages[1].content;
         assert!(audit.contains("Kubernetes fleet web-prod"), "{audit}");
+    }
+
+    /// An arbiter during whose audit the user cancels the turn.
+    struct CancellingArbiter(CancellationToken);
+
+    #[async_trait::async_trait]
+    impl LlmClient for CancellingArbiter {
+        async fn chat(&self, _: &ChatRequest) -> Result<ChatResponse> {
+            self.0.cancel();
+            Ok(ChatResponse::text(r#"{"verdict":"OK"}"#))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_cancelled_during_the_audit_asks_nobody() {
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let confirmer = Arc::new(RecordingConfirmer {
+            events: Arc::clone(&events),
+            audited_before: Mutex::new(Vec::new()),
+        });
+        let token = CancellationToken::new();
+        let result = KubeAgent::new(
+            ScriptedLlm::new(vec![get_pods(), ChatResponse::text("Done.")]),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::clone(&confirmer) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Always,
+            Vec::new(),
+        )
+        .cancellation(token.clone())
+        .arbiter(Some(Arc::new(CancellingArbiter(token)) as Arc<dyn LlmClient>), true, "judge")
+        .run("show pods", &[])
+        .await;
+        assert!(result.is_err(), "the turn ends cancelled");
+        assert!(
+            confirmer.audited_before.lock().unwrap().is_empty(),
+            "no confirmation dialog after a cancel"
+        );
     }
 
     #[tokio::test]

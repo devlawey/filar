@@ -4466,14 +4466,15 @@ fn resolve_arbiter(
         arbiter_enabled,
         ..Default::default()
     };
+    // Off: no audit, so no word about its profile either (#620 review).
+    if !arbiter_enabled {
+        return (None, profile_name.to_string());
+    }
     let (arbiter_profile_name, fallback_msg) =
         arbiter_cfg.resolve_arbiter_profile(profile_name, &app.profiles);
     let arbiter_profile_name = arbiter_profile_name.to_string();
     if let Some(msg) = fallback_msg {
         app.push_message(ChatBlock::System(msg));
-    }
-    if !arbiter_enabled {
-        return (None, profile_name.to_string());
     }
     match app.profiles.iter().find(|p| p.name == arbiter_profile_name) {
         Some(p) => match make_client(p) {
