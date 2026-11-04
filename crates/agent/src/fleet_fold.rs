@@ -494,6 +494,52 @@ pub fn fold(
     result: &mut OperationResult,
     registry: &PreprocessorRegistry,
 ) -> Result<FoldedTable> {
+    let command_for = |handle: HostHandle| {
+        tasks
+            .iter()
+            .find(|task| task.handle() == handle)
+            .map(|task| task.command().to_string())
+    };
+    fold_with(check, &command_for, &|_| None, report, result, registry)
+}
+
+/// [`fold`] for a fleet whose members are not run through executors —
+/// Kubernetes fleets (#619): every member answers the check's single
+/// command ([`CommandSpec::Same`](filar_core::CommandSpec::Same)), so no
+/// [`HostTask`] is needed to know what was asked.
+///
+/// `error_reason` names why a member failed when the failure is filar's
+/// own (a missing metrics API, say): its text is a short fixed reason, not
+/// something a host printed, so it is shown even when the check does not
+/// quote host output. `None` leaves the member with its state alone.
+pub fn fold_uniform(
+    check: &FleetCheck,
+    report: &FleetRunReport,
+    result: &mut OperationResult,
+    registry: &PreprocessorRegistry,
+    error_reason: &dyn Fn(&CoreError) -> Option<String>,
+) -> Result<FoldedTable> {
+    let command = match check.command_spec() {
+        filar_core::fleet_checks::CommandSpec::Same(command) => command.clone(),
+        _ => {
+            return Err(CoreError::Other(format!(
+                "fleet fold: check {} has per-OS commands, which a uniform fold cannot pair with members",
+                check.name()
+            )))
+        }
+    };
+    let command_for = move |_: HostHandle| Some(command.clone());
+    fold_with(check, &command_for, error_reason, report, result, registry)
+}
+
+fn fold_with(
+    check: &FleetCheck,
+    command_for: &dyn Fn(HostHandle) -> Option<String>,
+    error_reason: &dyn Fn(&CoreError) -> Option<String>,
+    report: &FleetRunReport,
+    result: &mut OperationResult,
+    registry: &PreprocessorRegistry,
+) -> Result<FoldedTable> {
     let operation = result.operation();
     if report.operation() != operation {
         return Err(CoreError::Other(format!(
@@ -514,6 +560,9 @@ pub fn fold(
 
     let mut answered = Vec::new();
     let mut dropped = Vec::new();
+    // Per dropped host: whether its failure reason is filar's own (#619)
+    // rather than a host's output — such a reason is never withheld.
+    let mut own_reason = Vec::new();
     for (handle, host, state) in rows {
         // A host with a value is one that answered cleanly. An execution
         // error answered too, but with a non-zero exit there is no value
@@ -521,11 +570,16 @@ pub fn fold(
         // dropped here with its reason rather than folded into a group.
         let comparable = matches!(state, HostState::Success | HostState::Divergent);
         if !comparable {
-            let failure = match (state, report.run_for(handle)) {
-                (HostState::ExecutionError, Some(HostRun::Answered(result))) => Some(Failure::of(result)),
-                _ => None,
+            let (failure, own) = match (state, report.run_for(handle)) {
+                (HostState::ExecutionError, Some(HostRun::Answered(result))) => (Some(Failure::of(result)), false),
+                (HostState::ExecutionError, Some(HostRun::Failed(error))) => (
+                    error_reason(error).map(|reason| Failure { exit_code: None, reason: Some(reason) }),
+                    true,
+                ),
+                _ => (None, false),
             };
             dropped.push(DroppedHost { handle, host, state, failure });
+            own_reason.push(own);
             continue;
         }
         match report.run_for(handle) {
@@ -561,7 +615,7 @@ pub fn fold(
         }
     }
 
-    let comparison = compare_answers(check, tasks, &mut answered, registry);
+    let comparison = compare_answers(check, command_for, &mut answered, registry);
     // A check that compares raw text by design quotes its short answers
     // (#505). One whose preprocessor declined does not: that is the
     // fail-closed path for output that would not parse — possibly forged —
@@ -573,7 +627,12 @@ pub fn fold(
     } else {
         // The same rule for why a host failed: only a raw-by-design check
         // quotes what a host printed (#513); elsewhere the exit code alone.
-        for host in dropped.iter_mut() {
+        for (index, host) in dropped.iter_mut().enumerate() {
+            // Fail closed: a host without a flag is treated as a host's own
+            // output, whose reason is withheld.
+            if own_reason.get(index).copied().unwrap_or(false) {
+                continue;
+            }
             if let Some(failure) = host.failure.as_mut() {
                 failure.reason = None;
             }
@@ -648,7 +707,7 @@ pub fn fold(
 /// at all, and a wrong table is worse than no table.
 fn compare_answers(
     check: &FleetCheck,
-    tasks: &[HostTask],
+    command_for: &dyn Fn(HostHandle) -> Option<String>,
     answered: &mut [Answered],
     registry: &PreprocessorRegistry,
 ) -> Comparison {
@@ -664,14 +723,10 @@ fn compare_answers(
 
     let mut rows = Vec::with_capacity(answered.len());
     for answer in answered.iter() {
-        let Some(command) = tasks
-            .iter()
-            .find(|task| task.handle() == answer.handle)
-            .map(HostTask::command)
-        else {
+        let Some(command) = command_for(answer.handle) else {
             return declined;
         };
-        match registry.preprocess(command, &answer.output) {
+        match registry.preprocess(&command, &answer.output) {
             // The registry answers with whichever preprocessor claimed
             // the command. When that is not the one the check declares,
             // its columns are not the columns `compare` names, so the

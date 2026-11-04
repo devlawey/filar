@@ -1268,9 +1268,13 @@ impl KubeToolExecutor {
     }
 }
 
+/// filar's own error for a cluster without the metrics API; the fleet fold
+/// recognises it by this exact text (#619).
+pub(crate) const METRICS_UNAVAILABLE: &str = "metrics-server не установлен: metrics.k8s.io is unavailable";
+
 fn metrics_error(error: CoreError) -> CoreError {
     if error.to_string().starts_with("Unsupported:") {
-        CoreError::Other("metrics-server не установлен: metrics.k8s.io is unavailable".into())
+        CoreError::Other(METRICS_UNAVAILABLE.into())
     } else {
         error
     }

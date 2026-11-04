@@ -45,6 +45,7 @@ pub mod fleet_run;
 pub mod fleet_view;
 pub mod kube_agent;
 pub mod kube_fleet;
+pub mod kube_fleet_fold;
 pub mod kube_redact;
 pub mod kube_tools;
 pub mod logs;

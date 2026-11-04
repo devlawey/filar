@@ -272,6 +272,34 @@ impl FleetCheck {
         })
     }
 
+    /// Name every [`kubernetes`](Self::kubernetes) check carries.
+    pub const KUBERNETES_NAME: &'static str = "kubernetes";
+
+    /// A typed Kubernetes call put to a fleet (#619), compared as rows:
+    /// `command` names the call (the same for every member), `preprocessor`
+    /// reads its answer into a table and `compare` names the columns whose
+    /// values are compared. The answer is filar's own rendering of API
+    /// objects, already redacted — not a host's free text — which is why it
+    /// may be read into rows at all.
+    pub fn kubernetes(
+        command: &str,
+        preprocessor: &str,
+        compare: &[&str],
+    ) -> std::result::Result<Self, String> {
+        if preprocessor.trim().is_empty() || compare.is_empty() {
+            return Err("a Kubernetes check needs a preprocessor and compared columns".into());
+        }
+        Ok(Self {
+            name: Self::KUBERNETES_NAME.to_owned(),
+            description: "typed Kubernetes call put to the fleet by the agent".to_owned(),
+            command: CommandSpec::Same(validate_one_command(command, "command")?),
+            preprocessor: Some(preprocessor.to_owned()),
+            compare: compare.iter().map(|c| (*c).to_owned()).collect(),
+            file: None,
+            source: CheckSource::AdHoc,
+        })
+    }
+
     /// Name every [`for_file`](Self::for_file) check carries.
     pub const FILE_BASELINE_NAME: &'static str = "file-baseline";
 
