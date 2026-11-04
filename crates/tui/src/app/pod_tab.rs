@@ -152,7 +152,6 @@ impl DebugProposal {
     }
 }
 
-/// Short id for `filar-debug-<id>`: the low hex digits of the clock.
 /// Where `debug_images` is set, for messages about Ctrl+B (#618). Short:
 /// a system line in the feed is one row, cut at the terminal width.
 const DEBUG_IMAGES_WHERE: &str = "лаунчер → Hosts → Debug images";
@@ -175,6 +174,7 @@ fn no_shell_hints(target: &filar_core::KubeCluster) -> Vec<String> {
     ]
 }
 
+/// Short id for `filar-debug-<id>`: the low hex digits of the clock.
 fn debug_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
