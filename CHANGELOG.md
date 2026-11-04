@@ -11,6 +11,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- A blank row left by Add source on the launcher's Logs tab no longer blocks Launch: it is skipped like blank host and group rows and never written to `config.toml`; log-source errors now name the Logs tab ([#616](https://github.com/devlawey/filar/issues/616)).
+
 ## [3.0.2] - 2026-11-03
 
 ### Added

@@ -1997,6 +1997,17 @@ struct LogSourceDraft {
     check_in_flight: bool,
 }
 
+/// A log-source problem worded so the user knows where to look (#616):
+/// `Logs tab: log source …`.
+fn logs_tab_error(message: &str) -> String {
+    let rest = message.strip_prefix("Log source").unwrap_or(message);
+    if rest.len() == message.len() {
+        format!("Logs tab: {message}")
+    } else {
+        format!("Logs tab: log source{rest}")
+    }
+}
+
 /// The key name suggested for a source: `FILAR_LOGS_<NAME>`.
 fn suggested_log_key_env(name: &str) -> String {
     let upper: String = name
@@ -2050,6 +2061,33 @@ impl LogSourceDraft {
             check_status: String::new(),
             check_in_flight: false,
         }
+    }
+
+    /// A row nobody has filled in — what Add source leaves behind (#616).
+    /// Like a blank host or group row (#411/#418) it is an in-UI scratch
+    /// entry: not validated, not written to `config.toml`. Kind and auth are
+    /// picked from lists and carry no typed value, so they do not count. The
+    /// numeric limits come pre-filled: only one changed from its starting
+    /// value is input — a typo there must be reported, not dropped.
+    fn is_blank(&self) -> bool {
+        let limits_untouched = self.max_window_hours.trim() == self.base.max_window_hours.to_string()
+            && self.max_lines.trim() == self.base.max_lines.to_string()
+            && self.timeout_secs.trim() == self.base.timeout_secs.to_string();
+        limits_untouched
+            && [
+            &self.name,
+            &self.url,
+            &self.key_env,
+            &self.key,
+            &self.user,
+            &self.tenant,
+            &self.index,
+            &self.k8s_fields,
+            &self.clusters,
+            &self.tags,
+        ]
+        .iter()
+        .all(|field| field.trim().is_empty())
     }
 
     /// Whether a key is stored under the name as it reads now.
@@ -3607,13 +3645,16 @@ impl LauncherApp {
             .collect();
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
-        for d in &self.log_sources {
-            let cfg = d.to_config()?;
+        for d in self.log_sources.iter().filter(|d| !d.is_blank()) {
+            let cfg = d.to_config().map_err(|e| logs_tab_error(&e))?;
             if !seen.insert(cfg.name.clone()) {
-                return Err(format!("Log source {}: the name is used twice", cfg.name));
+                return Err(logs_tab_error(&format!("Log source {}: the name is used twice", cfg.name)));
             }
             if let Some(cluster) = cfg.clusters.iter().find(|c| !known.contains(*c)) {
-                return Err(format!("Log source {}: cluster {cluster} is not in the cluster list", cfg.name));
+                return Err(logs_tab_error(&format!(
+                    "Log source {}: cluster {cluster} is not in the cluster list",
+                    cfg.name
+                )));
             }
             out.push(cfg);
         }
@@ -4534,7 +4575,7 @@ impl LauncherApp {
         if let Some((key_env, key)) = self.risk_scorer.key_to_save() {
             save_secret(&key_env, &key);
         }
-        for d in &self.log_sources {
+        for d in self.log_sources.iter().filter(|d| !d.is_blank()) {
             if let Some((key_env, key)) = d.key_to_save() {
                 save_secret(&key_env, &key);
             }
@@ -7485,6 +7526,55 @@ host_key_policy = \"strict\"
         twin.id = 2;
         app.log_sources = vec![d, twin];
         assert!(app.validate_log_sources().unwrap_err().contains("used twice"));
+    }
+
+    #[test]
+    fn a_blank_log_source_row_neither_blocks_launch_nor_reaches_the_config() {
+        let mut app = app_with_profiles(vec![LlmProfileData { name: "one".into(), ..edited_profile() }]);
+        app.log_sources = vec![LogSourceDraft::blank(7)];
+        assert!(app.log_sources[0].is_blank());
+        assert!(app.validate_launch(), "got {:?}", app.validation_error);
+        assert_eq!(app.validate_log_sources().unwrap(), Vec::new(), "nothing to write to config.toml");
+
+        // Next to a real source the blank row is skipped, the real one kept.
+        app.log_sources.push(vlogs_draft());
+        let written = app.validate_log_sources().unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].name, vlogs_draft().name.trim());
+    }
+
+    #[test]
+    fn a_partly_filled_log_source_still_blocks_launch_and_names_the_logs_tab() {
+        let mut app = app_with_profiles(vec![LlmProfileData { name: "one".into(), ..edited_profile() }]);
+        let mut d = LogSourceDraft::blank(7);
+        d.url = "http://vlogs:9428".into();
+        assert!(!d.is_blank());
+        app.log_sources = vec![d];
+        assert!(!app.validate_launch());
+        assert!(
+            app.validation_error.starts_with("Logs tab: log source new source:"),
+            "{:?}",
+            app.validation_error
+        );
+        for typed in [
+            |d: &mut LogSourceDraft| d.tags = "prod".into(),
+            |d: &mut LogSourceDraft| d.key = "k".into(),
+            |d: &mut LogSourceDraft| d.clusters = "c".into(),
+            |d: &mut LogSourceDraft| d.index = "logs-*".into(),
+        ] {
+            let mut d = LogSourceDraft::blank(1);
+            typed(&mut d);
+            assert!(!d.is_blank(), "a typed field makes the row real");
+        }
+        let mut d = LogSourceDraft::blank(1);
+        d.kind = filar_core::LogSourceKind::Loki;
+        d.auth = filar_core::LogAuth::Bearer;
+        assert!(d.is_blank(), "kind and auth picked from lists are not input");
+        let default_lines = d.max_lines.clone();
+        d.max_lines = "many".into();
+        assert!(!d.is_blank(), "a changed limit is input");
+        d.max_lines = format!(" {default_lines} ");
+        assert!(d.is_blank(), "the starting value back is not");
     }
 
     #[test]
