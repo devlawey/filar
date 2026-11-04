@@ -1525,7 +1525,9 @@ impl Session {
     }
 
     /// Format the tab label: `local-N` for local sessions, `user@host` for
-    /// remote (port omitted when it is 22).
+    /// remote (port omitted when it is 22), `cluster/namespace` for a
+    /// Kubernetes cluster tab (#617) and the pod for a pod tab. Two tabs can
+    /// still share a label; [`App::tab_labels`] tells them apart.
     pub fn tab_label(&self, _index: usize) -> String {
         match &self.ssh_info {
             Some(info) => {
@@ -1535,7 +1537,15 @@ impl Session {
                     info.clone()
                 }
             }
-            None => self.target_name.clone(),
+            None => match &self.kube {
+                Some(kube) if kube.pod.is_none() => {
+                    match kube.namespace.as_deref().or(kube.target.default_namespace.as_deref()) {
+                        Some(namespace) => format!("{}/{namespace}", kube.target.name),
+                        None => kube.target.name.clone(),
+                    }
+                }
+                _ => self.target_name.clone(),
+            },
         }
     }
 
@@ -1559,6 +1569,29 @@ impl Session {
             targets,
         })
     }
+}
+
+/// Widest tab label in columns (#617); a longer one ends in `…`.
+pub const MAX_TAB_LABEL_WIDTH: usize = 32;
+
+/// Cut `label` to `max` display columns, ending in `…` when cut.
+fn truncate_label(label: &str, max: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if label.width() <= max {
+        return label.to_string();
+    }
+    let mut out = String::new();
+    let mut width = 0;
+    for c in label.chars() {
+        let w = c.width().unwrap_or(0);
+        if width + w + 1 > max {
+            break;
+        }
+        out.push(c);
+        width += w;
+    }
+    out.push('\u{2026}');
+    out
 }
 
 // ── Session-save helpers (Ctrl+S, #234) ──────────────────────────────
@@ -7552,6 +7585,28 @@ impl App {
         })
     }
 
+    /// Labels of every tab in order, as the tab bar shows them (#617):
+    /// [`SessionState::tab_label`] cut to [`MAX_TAB_LABEL_WIDTH`] columns, and
+    /// a repeated label numbered from its second occurrence (`… #2`), so tabs
+    /// on the same target stay distinguishable.
+    pub fn tab_labels(&self) -> Vec<String> {
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        self.sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let label = truncate_label(&s.tab_label(i), MAX_TAB_LABEL_WIDTH);
+                let count = seen.entry(label.clone()).or_insert(0);
+                *count += 1;
+                if *count == 1 {
+                    label
+                } else {
+                    format!("{label} #{count}")
+                }
+            })
+            .collect()
+    }
+
     /// [`App::refresh_operations`] with the job source injected (tests).
     ///
     /// The agent's session id for a tab is the tab's [`SessionId`] as a
@@ -7562,8 +7617,8 @@ impl App {
         F: FnMut(SessionId) -> Vec<filar_agent::background::JobSnapshot>,
     {
         let mut ops = Vec::new();
-        for (i, s) in self.sessions.iter().enumerate() {
-            let host = s.tab_label(i);
+        let labels = self.tab_labels();
+        for (s, host) in self.sessions.iter().zip(labels) {
             ops.extend(crate::ops::from_background_jobs(s.id, &host, fetch(s.id)));
             // Copies from the file panels (#536) are operations of the tab
             // they were started from.
@@ -12052,6 +12107,85 @@ mod tests {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.sessions[0].ssh_info = Some("admin@devbox".into());
         assert_eq!(app.sessions[0].tab_label(0), "admin@devbox");
+    }
+
+    fn kube_tab(cluster: &str, namespace: Option<&str>) -> KubeTabState {
+        KubeTabState {
+            target: filar_core::KubeCluster {
+                name: cluster.into(),
+                default_namespace: Some("default".into()),
+                ..filar_core::KubeCluster::default()
+            },
+            namespace: namespace.map(str::to_owned),
+            connection_id: 1,
+            pod: None,
+        }
+    }
+
+    #[test]
+    fn a_cluster_tab_label_names_the_namespace() {
+        let mut app = App::new("kind-filar-k8s".into(), CommandConfirmMode::Always);
+        app.sessions[0].kube = Some(kube_tab("kind-filar-k8s", Some("filar-k8s")));
+        assert_eq!(app.sessions[0].tab_label(0), "kind-filar-k8s/filar-k8s");
+        // No namespace chosen: the cluster's default one.
+        app.sessions[0].kube = Some(kube_tab("kind-filar-k8s", None));
+        assert_eq!(app.sessions[0].tab_label(0), "kind-filar-k8s/default");
+    }
+
+    #[test]
+    fn a_pod_tab_label_stays_the_pod() {
+        let mut app = App::new("web-7f9c".into(), CommandConfirmMode::Always);
+        let mut kube = kube_tab("prod-eu", Some("shop"));
+        kube.pod = Some(KubePodTabState::pending(filar_core::PodRef {
+            cluster: "prod-eu".into(),
+            namespace: "shop".into(),
+            pod: filar_core::PodSelector::Name("web-7f9c".into()),
+            container: None,
+        }));
+        app.sessions[0].kube = Some(kube);
+        assert_eq!(app.sessions[0].tab_label(0), "web-7f9c");
+    }
+
+    #[test]
+    fn tabs_on_the_same_target_are_numbered_apart() {
+        let mut app = App::new("kind-filar-k8s".into(), CommandConfirmMode::Always);
+        for _ in 0..3 {
+            app.new_tab();
+        }
+        for (i, ns) in ["filar-k8s", "filar-k8s", "kube-system", "filar-k8s"].iter().enumerate() {
+            app.sessions[i].kube = Some(kube_tab("kind-filar-k8s", Some(ns)));
+        }
+        assert_eq!(
+            app.tab_labels(),
+            vec![
+                "kind-filar-k8s/filar-k8s",
+                "kind-filar-k8s/filar-k8s #2",
+                "kind-filar-k8s/kube-system",
+                "kind-filar-k8s/filar-k8s #3",
+            ]
+        );
+    }
+
+    #[test]
+    fn local_and_ssh_labels_are_unchanged_by_the_tab_bar() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.new_tab();
+        app.sessions[1].ssh_info = Some("root@10.0.0.5:22".into());
+        assert_eq!(app.tab_labels(), vec!["local", "root@10.0.0.5"]);
+    }
+
+    #[test]
+    fn a_long_tab_label_is_cut_by_display_width() {
+        let mut app = App::new("x".into(), CommandConfirmMode::Always);
+        app.sessions[0].kube = Some(kube_tab(
+            "arn:aws:eks:eu-central-1:123456789012:cluster/production",
+            Some("payments"),
+        ));
+        let label = &app.tab_labels()[0];
+        assert!(label.ends_with('\u{2026}'), "{label}");
+        assert_eq!(unicode_width::UnicodeWidthStr::width(label.as_str()), MAX_TAB_LABEL_WIDTH);
+        assert_eq!(truncate_label("кластер/ns", 32), "кластер/ns");
+        assert_eq!(unicode_width::UnicodeWidthStr::width(truncate_label("集群集群集群", 7).as_str()), 7);
     }
 
     // ── Help overlay tests ────────────────────────────────────────────

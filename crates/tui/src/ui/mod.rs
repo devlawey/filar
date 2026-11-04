@@ -349,6 +349,7 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(format!("[fleet: {name} ({n})]"), style));
     }
     let mut number = 0usize;
+    let labels = app.tab_labels();
     for (i, s) in app.sessions.iter().enumerate() {
         if s.fleet.is_some() {
             continue;
@@ -373,7 +374,7 @@ fn render_tab_bar(f: &mut Frame, app: &App, area: Rect) {
         } else {
             ""
         };
-        let label = format!("{}{}. {}", marker, number, s.tab_label(i));
+        let label = format!("{}{}. {}", marker, number, labels[i]);
         let style = if i == active {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
