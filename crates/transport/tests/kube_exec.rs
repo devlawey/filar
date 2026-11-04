@@ -148,7 +148,7 @@ async fn a_container_without_shell_points_to_debug_containers() {
         Ok(_) => panic!("distroless has no shell"),
         Err(error) => error.to_string(),
     };
-    assert!(error.contains("нет /bin/sh") && error.contains("#576"), "{error}");
+    assert!(error.contains("нет /bin/sh") && error.contains("debug-контейнер"), "{error}");
 }
 
 #[tokio::test]

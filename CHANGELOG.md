@@ -14,6 +14,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 ### Fixed
 
 - Kubernetes groups can be created and edited in the launcher: the Groups tab switches between SSH hosts by tags and Kubernetes pods (clusters, namespace, selector), previews the Kubernetes scope instead of "0 hosts", refuses `match` and `kube` together naming the field, and points out a cluster tag typed into Match ([#615](https://github.com/devlawey/filar/issues/615)).
+- The launcher edits a cluster's `debug_images`, `diagnostic_ports`, `reveal_configmaps` and `reveal_env` (ports checked 1–65535); a pod without a shell now gets a hint — Ctrl+B, or where to set `debug_images` — and a reminder that its logs, describe and events still work; `filar_transport::MISSING_SHELL_MARK` for embedders ([#618](https://github.com/devlawey/filar/issues/618)).
 - A blank row left by Add source on the launcher's Logs tab no longer blocks Launch: it is skipped like blank host and group rows and never written to `config.toml`; log-source errors now name the Logs tab ([#616](https://github.com/devlawey/filar/issues/616)).
 - Tabs of the same Kubernetes cluster are now distinguishable: a cluster tab is labelled `cluster/namespace`, a repeated label gets `#2`, `#3`, and long labels are cut to 32 columns ([#617](https://github.com/devlawey/filar/issues/617)).
 

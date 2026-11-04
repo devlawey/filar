@@ -88,7 +88,9 @@
 В конфиге кластера `debug_images = ["busybox:1.37.0"]`. Под `distroless` из
 `docker/k8s` — без шелла.
 
-- [ ] Без `debug_images` → `Ctrl+B` отвечает «Debug-контейнер недоступен: … не задан debug_images»
+- [ ] Без `debug_images` → `Ctrl+B` отвечает «Debug-контейнер недоступен: у кластера … пуст debug_images (лаунчер → Hosts → Debug images)»
+- [ ] Без `debug_images` → войти в `distroless-…` (Ctrl+E) → ошибка «в контейнере нет /bin/sh» и подсказка: Ctrl+B, где задать образы, логи/describe доступны без шелла
+- [ ] Лаунчер → Hosts → кластер → Debug images `busybox:1.37.0`, Diagnostic ports `8080` → Launch → в `config.toml` у кластера `debug_images` и `diagnostic_ports`; `Ctrl+B` доступен
 - [ ] Вкладка кластера `shop` → `Ctrl+B` → `distroless-…` → окно «В под shop/distroless-… будет добавлен эфемерный контейнер filar-debug-… (образ busybox:1.37.0, target main). Он останется … удалить его нельзя. Создать?», рамка красная (`prod`); `Enter` ничего не делает, `n` — «не создан»
 - [ ] Повторить → `y` → в ленте «След в кластере: … filar-debug-… (… время)»; открылась вкладка `… › distroless-… › filar-debug-… debug`
 - [ ] «Покажи процесс приложения и его файлы» → агент читает `/proc/1/cmdline` и `/proc/1/root/…`; `Ctrl+T` — терминал в debug-контейнере
