@@ -1505,6 +1505,11 @@ mod tests {
     }
 
     fn last_system_lines(app: &App, n: usize) -> Vec<String> {
+        assert!(
+            app.messages.len() > n,
+            "expected an error and {n} hint lines, got {:?}",
+            app.messages
+        );
         let lines: Vec<String> = app.messages[app.messages.len() - n..]
             .iter()
             .map(|m| match m {
