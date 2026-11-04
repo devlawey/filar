@@ -17,7 +17,7 @@ use filar_transport::{ClusterApi, KubeClusterApi, PodInfo};
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use tokio_util::sync::CancellationToken;
 
-use crate::fleet_fold::{fold, FoldedTable};
+use crate::fleet_fold::{fold_uniform, FoldedTable};
 use crate::fleet_gate::{radius_line, ApprovalScope, FleetGate};
 use crate::fleet_result::OperationResult;
 use crate::fleet_run::{FleetRunReport, HostRun};
@@ -295,8 +295,24 @@ impl KubeFleet {
             .collect();
         let run = FleetRunReport::from_runs(op.id(), runs);
         let mut result = OperationResult::build(&op, &run, &[])?;
-        let check = FleetCheck::ad_hoc(call.tool_name()).map_err(CoreError::Other)?;
-        let folded = fold(&check, &[], &run, &mut result, &PreprocessorRegistry::new())?;
+        // Pod describe/get/top are compared as rows (#619); anything else
+        // folds as before, by digest with short answers quoted. Either way
+        // a member's failure carries filar's own reason, not API text.
+        let members: Vec<FleetTarget> = op.members().iter().map(|m| m.target().clone()).collect();
+        let (check, registry) = match crate::kube_fleet_fold::check_for(call, &members) {
+            Some(check) => (check, crate::kube_fleet_fold::registry()),
+            None => (
+                FleetCheck::ad_hoc(call.tool_name()).map_err(CoreError::Other)?,
+                PreprocessorRegistry::new(),
+            ),
+        };
+        let folded = fold_uniform(
+            &check,
+            &run,
+            &mut result,
+            &registry,
+            &crate::kube_fleet_fold::error_reason,
+        )?;
         let (new_pods, notices) = self.discover_changes(&op, cancel).await;
         Ok(KubeFleetReport {
             operation: op.id(),
@@ -604,6 +620,8 @@ mod tests {
         max_active: AtomicUsize,
         log_calls: Mutex<Vec<(String, String, Option<String>, bool)>>,
         pod_lists: AtomicUsize,
+        /// `top_pods` answers like a cluster without metrics-server.
+        no_metrics: std::sync::atomic::AtomicBool,
     }
 
     struct Active<'a>(&'a AtomicUsize);
@@ -722,6 +740,11 @@ mod tests {
         }
 
         async fn top_pods(&self, _: Option<&str>) -> Result<Vec<ResourceMetrics>> {
+            if self.no_metrics.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(CoreError::Other(
+                    "Unsupported: metrics.k8s.io is not available for pods (context ctx)".into(),
+                ));
+            }
             Ok(Vec::new())
         }
 
@@ -932,6 +955,90 @@ mod tests {
             .expect("fleet opens");
         let report = run_approved(&fleet, &describe()).await;
         assert_eq!(report.result().rows()[0].state(), HostState::TimedOut);
+    }
+
+    fn sized_pod(name: &str, image: &str, memory_limit: &str) -> PodInfo {
+        let mut p = pod(name);
+        p.restarts = 2;
+        p.containers[0].image = image.into();
+        p.containers[0].resource_requests =
+            BTreeMap::from([("cpu".into(), "100m".into()), ("memory".into(), "64Mi".into())]);
+        p.containers[0].resource_limits =
+            BTreeMap::from([("cpu".into(), "500m".into()), ("memory".into(), memory_limit.into())]);
+        p
+    }
+
+    fn describe_pod() -> KubeToolCall {
+        KubeToolCall::Describe {
+            kind: KubeResourceKind::Pod,
+            namespace: Some("shop".into()),
+            name: "ignored".into(),
+            event_limit: 20,
+        }
+    }
+
+    #[tokio::test]
+    async fn pod_describe_is_compared_as_rows_with_requests_limits_and_image() {
+        let (cluster, _) = cluster(
+            "prod-eu",
+            vec![
+                sized_pod("a", "example/web:1", "128Mi"),
+                sized_pod("b", "example/web:1", "128Mi"),
+                sized_pod("c", "example/web:2", "256Mi"),
+            ],
+        );
+        let fleet = KubeFleet::open(&group(&["prod-eu"], Some("app=web")), vec![cluster])
+            .await
+            .expect("fleet opens");
+        let report = run_approved(&fleet, &describe_pod()).await;
+        let text = report.render();
+        assert!(text.contains("compared on: CONTAINER, IMAGE, CPU REQUEST"), "{text}");
+        assert!(!text.contains("digest"), "no digests for a pod describe: {text}");
+        assert!(text.contains("example/web:1") && text.contains("128Mi") && text.contains("100m"), "{text}");
+        assert!(text.contains("example/web:2") || text.contains("256Mi"), "the odd pod shows its values: {text}");
+        assert_eq!(report.folded().baseline().map(|group| group.len()), Some(2));
+    }
+
+    #[tokio::test]
+    async fn pod_get_compares_state_not_names() {
+        let (cluster, _) = cluster("prod-eu", vec![pod("a"), pod("b")]);
+        let fleet = KubeFleet::open(&group(&["prod-eu"], Some("app=web")), vec![cluster])
+            .await
+            .expect("fleet opens");
+        let get = KubeToolCall::Get {
+            kind: KubeResourceKind::Pod,
+            namespace: None,
+            label_selector: None,
+            field_selector: None,
+            limit: 50,
+        };
+        let report = run_approved(&fleet, &get).await;
+        let text = report.render();
+        assert!(text.contains("compared on: PHASE, READY, RESTARTS, LAST REASON, NODE"), "{text}");
+        assert_eq!(report.folded().groups().len(), 1, "same state, one group: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_metrics_api_is_one_named_reason_for_every_member() {
+        let (cluster, mock) = cluster("prod-eu", vec![pod("a"), pod("b"), pod("c"), pod("d")]);
+        mock.no_metrics.store(true, std::sync::atomic::Ordering::SeqCst);
+        let fleet = KubeFleet::open(&group(&["prod-eu"], Some("app=web")), vec![cluster])
+            .await
+            .expect("fleet opens");
+        let top = KubeToolCall::Top {
+            resource: crate::kube_tools::KubeTopResource::Pods,
+            namespace: None,
+            limit: 20,
+        };
+        let report = run_approved(&fleet, &top).await;
+        let text = report.render();
+        assert_eq!(
+            text.matches("metrics-server is not installed").count(),
+            1,
+            "one line for all four: {text}"
+        );
+        assert!(text.contains("on 4 ("), "{text}");
+        assert!(!text.contains("context ctx"), "no API text: {text}");
     }
 
     #[tokio::test]
