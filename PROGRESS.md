@@ -11947,7 +11947,8 @@ Windows/macOS и живые Kubernetes/log-source сценарии по `docs/SM
   - top — CPU и память.
 - Участник, упавший на ошибке самого filar, получает в свёртке короткую
   фиксированную причину (`kube_fleet_fold::error_reason`): нет metrics-server,
-  отказ RBAC, общая ошибка API. Одинаковая причина у всех — одна строка.
+  общая ошибка API. Одинаковая причина у всех — одна строка. Отказ RBAC —
+  отдельное состояние `access denied` (`CoreError::AccessDenied`), без причины.
 - Движок:
   - `FleetCheck::kubernetes(command, preprocessor, compare)`;
   - `fleet_fold::fold_uniform` — свёртка без `HostTask`, когда команда одна на
