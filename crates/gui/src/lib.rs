@@ -2217,8 +2217,15 @@ struct HostGroupDraft {
     max_parallel: String,
     /// Per-host command deadline in seconds; empty = the built-in default.
     per_host_timeout_secs: String,
-    /// Kubernetes selection is preserved while editing the other fields.
-    kube: Option<filar_core::KubeGroup>,
+    /// The group selects Kubernetes pods (`kube`), not SSH hosts by tags
+    /// (#615). `match` and `kube` are mutually exclusive.
+    kube: bool,
+    /// `kube.clusters`: `[[kube_clusters]]` names, in composition order.
+    kube_clusters: Vec<String>,
+    /// `kube.namespace`.
+    kube_namespace: String,
+    /// `kube.selector`; empty = every ready pod of the namespace.
+    kube_selector: String,
     /// LLM profile name; empty = the session profile.
     llm_profile: String,
 }
@@ -2233,15 +2240,63 @@ impl HostGroupDraft {
             policy: group.policy,
             max_parallel: group.max_parallel.to_string(),
             per_host_timeout_secs: group.per_host_timeout_secs.to_string(),
-            kube: group.kube.clone(),
+            kube: group.kube.is_some(),
+            kube_clusters: group.kube.as_ref().map(|k| k.clusters.clone()).unwrap_or_default(),
+            kube_namespace: group.kube.as_ref().map(|k| k.namespace.clone()).unwrap_or_default(),
+            kube_selector: group
+                .kube
+                .as_ref()
+                .and_then(|k| k.selector.clone())
+                .unwrap_or_default(),
             llm_profile: group.llm_profile.clone().unwrap_or_default(),
         }
+    }
+
+    /// Whether any Kubernetes selector field holds a value (#615).
+    fn has_kube_selection(&self) -> bool {
+        !self.kube_clusters.is_empty()
+            || !self.kube_namespace.trim().is_empty()
+            || !self.kube_selector.trim().is_empty()
     }
 
     /// A row with neither a name nor a rule is an in-UI scratch entry: it is
     /// not persisted, like a blank host row (#411/#418).
     fn is_blank(&self) -> bool {
-        self.name.trim().is_empty() && self.match_tags.trim().is_empty()
+        self.name.trim().is_empty() && self.match_tags.trim().is_empty() && !self.has_kube_selection()
+    }
+
+    /// The `kube` selection of a Kubernetes group, validated (#615), or
+    /// `None` for an SSH group. Errors name the field.
+    fn kube_group(&self) -> Result<Option<filar_core::KubeGroup>, String> {
+        let match_tags = parse_tags(&self.match_tags);
+        if !self.kube {
+            if self.has_kube_selection() {
+                return Err(
+                    "Match tags and the Kubernetes selection are mutually exclusive: clear the Kubernetes clusters, namespace and selector"
+                        .to_string(),
+                );
+            }
+            return Ok(None);
+        }
+        if !match_tags.is_empty() {
+            return Err(
+                "Match tags and the Kubernetes selection are mutually exclusive: clear Match tags for a Kubernetes group"
+                    .to_string(),
+            );
+        }
+        if self.kube_clusters.is_empty() {
+            return Err("Kubernetes clusters: pick at least one cluster".to_string());
+        }
+        let namespace = self.kube_namespace.trim();
+        if namespace.is_empty() {
+            return Err("Kubernetes namespace must not be empty".to_string());
+        }
+        let selector = self.kube_selector.trim();
+        Ok(Some(filar_core::KubeGroup {
+            clusters: self.kube_clusters.clone(),
+            namespace: namespace.to_string(),
+            selector: (!selector.is_empty()).then(|| selector.to_string()),
+        }))
     }
 
     /// Convert into the config form, validating it (#418).
@@ -2263,13 +2318,14 @@ impl HostGroupDraft {
             parse_group_limit(&self.per_host_timeout_secs, "per_host_timeout_secs")?
                 .unwrap_or(defaults.per_host_timeout_secs);
         let llm_profile = clean_tag(&self.llm_profile);
+        let kube = self.kube_group()?;
         Ok(filar_core::HostGroup {
             name,
             match_tags: parse_tags(&self.match_tags),
             policy: self.policy,
             max_parallel,
             per_host_timeout_secs,
-            kube: self.kube.clone(),
+            kube,
             llm_profile: if llm_profile.is_empty() {
                 None
             } else {
@@ -2323,6 +2379,38 @@ fn group_preview_line(match_tags: &str, targets: &[filar_core::SshTarget]) -> St
         line.push_str(&format!(", +{} more", matched.len() - shown.len()));
     }
     line
+}
+
+/// The preview of a Kubernetes group (#615): what the selector covers, in
+/// the words of Ctrl+O. Pods are discovered at entry, so the launcher shows
+/// the scope rather than a count of hosts.
+fn kube_group_preview_line(draft: &HostGroupDraft) -> String {
+    if draft.kube_clusters.is_empty() {
+        return "Effective now: no Kubernetes cluster picked yet.".to_string();
+    }
+    let namespace = draft.kube_namespace.trim();
+    let namespace = if namespace.is_empty() { "(not set)" } else { namespace };
+    let selector = draft.kube_selector.trim();
+    let pods = if selector.is_empty() {
+        "every ready pod".to_string()
+    } else {
+        format!("selector {selector}")
+    };
+    format!(
+        "Effective now: {} cluster(s) ({}), namespace {namespace}, {pods}",
+        draft.kube_clusters.len(),
+        draft.kube_clusters.join(", ")
+    )
+}
+
+/// Match tags of an SSH group that are tags of a Kubernetes cluster (#615):
+/// `match` looks at SSH hosts only, so such a tag silently selects nothing
+/// from the cluster.
+fn cluster_tags_in_match(match_tags: &str, cluster_tags: &[String]) -> Vec<String> {
+    parse_tags(match_tags)
+        .into_iter()
+        .filter(|tag| cluster_tags.iter().any(|t| t == tag))
+        .collect()
 }
 
 struct LauncherApp {
@@ -3793,8 +3881,8 @@ impl LauncherApp {
         });
         ui.label(
             egui::RichText::new(
-                "A host joins the group when it carries all of the tags below. \
-                 The group carries the policy and limits for the fleet dialogue.",
+                "A group selects SSH hosts that carry all of its tags, or the pods of \
+                 Kubernetes clusters. It carries the policy and limits for the fleet dialogue.",
             )
             .small()
             .weak(),
@@ -3810,6 +3898,19 @@ impl LauncherApp {
         // once before the loop — current tag edits included (#418).
         let targets = self.launch_ssh_targets();
         let profile_names: Vec<String> = self.profiles.iter().map(|p| p.name.clone()).collect();
+        // Kubernetes clusters a group can select (#615), and their tags for
+        // the "this is a cluster tag" hint.
+        let cluster_names: Vec<String> = self
+            .kube_slots
+            .iter()
+            .map(|k| k.name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect();
+        let cluster_tags: Vec<String> = self
+            .kube_slots
+            .iter()
+            .flat_map(|k| parse_tags(&k.tags))
+            .collect();
         let count = self.host_groups.len();
         for i in 0..count {
             let draft = &mut self.host_groups[i];
@@ -3839,14 +3940,94 @@ impl LauncherApp {
                         action = Some(GroupAction::Remove(i));
                     }
                 });
+                // SSH by tags or Kubernetes (#615): `match` and `kube` are
+                // mutually exclusive, so a side with values cannot be left
+                // for the other until it is cleared.
                 ui.horizontal(|ui| {
-                    ui.label("Match tags (all must match):");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.match_tags)
-                            .hint_text("work, prod (comma-separated)")
-                            .desired_width(200.0),
-                    );
+                    ui.label("Selects:");
+                    let ssh_free = !draft.has_kube_selection();
+                    let kube_free = draft.match_tags.trim().is_empty();
+                    if ui
+                        .add_enabled(ssh_free || !draft.kube, egui::RadioButton::new(!draft.kube, "SSH hosts by tags"))
+                        .on_disabled_hover_text("Clear the Kubernetes clusters, namespace and selector first")
+                        .clicked()
+                    {
+                        draft.kube = false;
+                    }
+                    if ui
+                        .add_enabled(kube_free || draft.kube, egui::RadioButton::new(draft.kube, "Kubernetes pods"))
+                        .on_disabled_hover_text("Clear Match tags first")
+                        .clicked()
+                    {
+                        draft.kube = true;
+                    }
                 });
+                if draft.kube {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Clusters:");
+                        let mut shown = cluster_names.clone();
+                        for name in &draft.kube_clusters {
+                            if !shown.contains(name) {
+                                shown.push(name.clone());
+                            }
+                        }
+                        if shown.is_empty() {
+                            ui.label(
+                                egui::RichText::new("add a cluster on the Hosts tab first").weak(),
+                            );
+                        }
+                        for name in shown {
+                            let mut on = draft.kube_clusters.contains(&name);
+                            let label = if cluster_names.contains(&name) {
+                                name.clone()
+                            } else {
+                                format!("{name} (not in the cluster list)")
+                            };
+                            if ui.checkbox(&mut on, label).changed() {
+                                if on {
+                                    draft.kube_clusters.push(name);
+                                } else {
+                                    draft.kube_clusters.retain(|c| *c != name);
+                                }
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Namespace:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.kube_namespace)
+                                .hint_text("shop")
+                                .desired_width(140.0),
+                        );
+                        ui.label("Selector:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.kube_selector)
+                                .hint_text("app=web (empty = every ready pod)")
+                                .desired_width(200.0),
+                        );
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("Match tags (all must match):");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.match_tags)
+                                .hint_text("work, prod (comma-separated)")
+                                .desired_width(200.0),
+                        );
+                    });
+                    let cluster_only = cluster_tags_in_match(&draft.match_tags, &cluster_tags);
+                    if !cluster_only.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} is a Kubernetes cluster tag: Match tags select SSH hosts only. \
+                                 For a Kubernetes group choose \"Kubernetes pods\" above.",
+                                cluster_only.join(", ")
+                            ))
+                            .color(egui::Color32::from_rgb(220, 160, 60))
+                            .small(),
+                        );
+                    }
+                }
                 ui.horizontal(|ui| {
                     ui.label("Policy:");
                     egui::ComboBox::from_id_salt(format!("group_policy_{i}"))
@@ -3896,11 +4077,12 @@ impl LauncherApp {
                 });
                 // Live preview (#418): recomputed every frame, so a tag edit
                 // in the Hosts tab shows up here immediately.
-                ui.label(
-                    egui::RichText::new(group_preview_line(&draft.match_tags, &targets))
-                        .weak()
-                        .small(),
-                );
+                let preview = if draft.kube {
+                    kube_group_preview_line(draft)
+                } else {
+                    group_preview_line(&draft.match_tags, &targets)
+                };
+                ui.label(egui::RichText::new(preview).weak().small());
             });
             ui.add_space(4.0);
         }
@@ -4211,6 +4393,18 @@ impl LauncherApp {
             let group = draft
                 .to_group()
                 .map_err(|e| format!("Group #{}: {e}", i + 1))?;
+            if let Some(kube) = &group.kube {
+                if let Some(missing) = kube
+                    .clusters
+                    .iter()
+                    .find(|c| !self.kube_slots.iter().any(|k| k.name.trim() == c.as_str()))
+                {
+                    return Err(format!(
+                        "Group \"{}\": Kubernetes cluster {missing} is not in the cluster list",
+                        group.name
+                    ));
+                }
+            }
             if !seen.insert(group.name.clone()) {
                 return Err(format!(
                     "Duplicate group name \"{}\". Names must be unique.",
@@ -4458,7 +4652,10 @@ impl LauncherApp {
             policy: filar_core::HostGroupPolicy::default(),
             max_parallel: defaults.max_parallel.to_string(),
             per_host_timeout_secs: defaults.per_host_timeout_secs.to_string(),
-            kube: None,
+            kube: false,
+            kube_clusters: Vec::new(),
+            kube_namespace: String::new(),
+            kube_selector: String::new(),
             llm_profile: String::new(),
         });
         self.active_tab = 1;
@@ -7167,7 +7364,10 @@ host_key_policy = \"strict\"
             policy: filar_core::HostGroupPolicy::ReadOnly,
             max_parallel: "3".into(),
             per_host_timeout_secs: "30".into(),
-            kube: None,
+            kube: false,
+            kube_clusters: Vec::new(),
+            kube_namespace: String::new(),
+            kube_selector: String::new(),
             llm_profile: String::new(),
         }
     }
@@ -7204,6 +7404,97 @@ host_key_policy = \"strict\"
             llm_profile: None,
         };
         assert_eq!(HostGroupDraft::from_group(&group).to_group().unwrap(), group);
+    }
+
+    // ── Kubernetes groups in the launcher (#615) ───────────────
+
+    fn kube_group_draft(name: &str, clusters: &[&str], namespace: &str, selector: &str) -> HostGroupDraft {
+        HostGroupDraft {
+            kube: true,
+            kube_clusters: clusters.iter().map(|c| (*c).to_string()).collect(),
+            kube_namespace: namespace.into(),
+            kube_selector: selector.into(),
+            ..group_draft(name, "")
+        }
+    }
+
+    fn app_with_cluster(name: &str, tags: &str) -> LauncherApp {
+        let mut app = make_app(make_meta(None, None, None, None));
+        let mut slot = KubeSlot::blank(1);
+        slot.name = name.into();
+        slot.tags = tags.into();
+        app.kube_slots = vec![slot];
+        app
+    }
+
+    #[test]
+    fn a_kube_group_made_in_the_launcher_survives_launch() {
+        let mut app = app_with_cluster("kind-filar-k8s", "k8s, kind");
+        app.host_groups = vec![kube_group_draft("k8s-pods", &["kind-filar-k8s"], " filar-k8s ", "app=filar-k8s")];
+        assert_eq!(app.validate_host_groups(), Ok(()));
+        let groups = app.persistable_host_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].match_tags.is_empty());
+        assert_eq!(
+            groups[0].kube,
+            Some(filar_core::KubeGroup {
+                clusters: vec!["kind-filar-k8s".into()],
+                namespace: "filar-k8s".into(),
+                selector: Some("app=filar-k8s".into()),
+            })
+        );
+        // What the config file gets back passes the core rule (`match` xor `kube`).
+        assert_eq!(groups[0].validate().map_err(|e| e.to_string()), Ok(()));
+        // And the reloaded draft is the same Kubernetes group.
+        let again = HostGroupDraft::from_group(&groups[0]);
+        assert!(again.kube);
+        assert_eq!(again.to_group().unwrap(), groups[0]);
+    }
+
+    #[test]
+    fn a_kube_group_preview_shows_its_scope_not_zero_hosts() {
+        let draft = kube_group_draft("k8s-pods", &["kind-filar-k8s"], "filar-k8s", "app=filar-k8s");
+        assert_eq!(
+            kube_group_preview_line(&draft),
+            "Effective now: 1 cluster(s) (kind-filar-k8s), namespace filar-k8s, selector app=filar-k8s"
+        );
+        let all = kube_group_draft("all", &["a", "b"], "shop", "");
+        assert_eq!(
+            kube_group_preview_line(&all),
+            "Effective now: 2 cluster(s) (a, b), namespace shop, every ready pod"
+        );
+        let none = kube_group_draft("x", &[], "", "");
+        assert!(kube_group_preview_line(&none).contains("no Kubernetes cluster picked"));
+        assert!(!kube_group_preview_line(&draft).contains("0 hosts"));
+    }
+
+    #[test]
+    fn match_and_kube_together_are_refused_naming_the_field() {
+        let mut both = kube_group_draft("k8s-pods", &["kind-filar-k8s"], "filar-k8s", "");
+        both.match_tags = "k8s".into();
+        assert!(both.to_group().unwrap_err().contains("clear Match tags"));
+        let mut ssh = group_draft("prod", "prod");
+        ssh.kube_namespace = "shop".into();
+        assert!(ssh.to_group().unwrap_err().contains("clear the Kubernetes clusters, namespace and selector"));
+    }
+
+    #[test]
+    fn an_incomplete_or_unknown_kube_selection_is_refused() {
+        assert!(kube_group_draft("g", &[], "shop", "").to_group().unwrap_err().contains("Kubernetes clusters"));
+        assert!(kube_group_draft("g", &["c"], "  ", "").to_group().unwrap_err().contains("namespace"));
+        let mut app = app_with_cluster("kind-filar-k8s", "");
+        app.host_groups = vec![kube_group_draft("g", &["prod-eu"], "shop", "")];
+        let error = app.validate_host_groups().unwrap_err();
+        assert!(error.contains("prod-eu is not in the cluster list"), "{error}");
+        // A kube selection alone is not a blank scratch row.
+        assert!(!kube_group_draft("", &["c"], "", "").is_blank());
+    }
+
+    #[test]
+    fn a_cluster_tag_in_match_is_pointed_out() {
+        let tags = vec!["k8s".to_string(), "kind".to_string()];
+        assert_eq!(cluster_tags_in_match("k8s", &tags), vec!["k8s".to_string()]);
+        assert!(cluster_tags_in_match("work, prod", &tags).is_empty());
     }
 
     #[test]
