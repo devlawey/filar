@@ -2293,7 +2293,7 @@ impl HostGroupDraft {
         }
         let selector = self.kube_selector.trim();
         Ok(Some(filar_core::KubeGroup {
-            clusters: self.kube_clusters.clone(),
+            clusters: self.kube_clusters.iter().map(|c| c.trim().to_string()).collect(),
             namespace: namespace.to_string(),
             selector: (!selector.is_empty()).then(|| selector.to_string()),
         }))
@@ -7430,7 +7430,7 @@ host_key_policy = \"strict\"
     #[test]
     fn a_kube_group_made_in_the_launcher_survives_launch() {
         let mut app = app_with_cluster("kind-filar-k8s", "k8s, kind");
-        app.host_groups = vec![kube_group_draft("k8s-pods", &["kind-filar-k8s"], " filar-k8s ", "app=filar-k8s")];
+        app.host_groups = vec![kube_group_draft("k8s-pods", &[" kind-filar-k8s "], " filar-k8s ", "app=filar-k8s")];
         assert_eq!(app.validate_host_groups(), Ok(()));
         let groups = app.persistable_host_groups().unwrap();
         assert_eq!(groups.len(), 1);
