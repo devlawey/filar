@@ -11986,4 +11986,4 @@ Windows/macOS и живые Kubernetes/log-source сценарии по `docs/SM
 - `AgentBuilder::arbiter_kube_context` оставлен: это публичный API движка, а
   вкладка кластера обслуживается `KubeAgent`, не `Agent`.
 
-**Next.** #617.
+**Next.** #619, затем релиз 3.0.3.
