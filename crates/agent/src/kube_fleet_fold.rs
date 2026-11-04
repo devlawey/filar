@@ -108,7 +108,9 @@ pub fn error_reason(error: &CoreError) -> Option<String> {
         CoreError::Other(text) if text == crate::kube_tools::METRICS_UNAVAILABLE => Some(
             "metrics-server is not installed: the metrics API (metrics.k8s.io) is unavailable".into(),
         ),
-        CoreError::Other(text) if text == "cancelled" => None,
+        // A cancelled member is `HostRun::Cancelled`, never an execution
+        // error; a "cancelled" text that still arrives here stays reasonless.
+        CoreError::Other(text) if text.to_ascii_lowercase().contains("cancel") => None,
         _ => Some("Kubernetes API request failed".into()),
     }
 }

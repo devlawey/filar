@@ -627,9 +627,10 @@ fn fold_with(
     } else {
         // The same rule for why a host failed: only a raw-by-design check
         // quotes what a host printed (#513); elsewhere the exit code alone.
-        debug_assert_eq!(dropped.len(), own_reason.len(), "one own-reason flag per dropped host");
-        for (host, own) in dropped.iter_mut().zip(&own_reason) {
-            if *own {
+        for (index, host) in dropped.iter_mut().enumerate() {
+            // Fail closed: a host without a flag is treated as a host's own
+            // output, whose reason is withheld.
+            if own_reason.get(index).copied().unwrap_or(false) {
                 continue;
             }
             if let Some(failure) = host.failure.as_mut() {
