@@ -2443,6 +2443,13 @@ async fn run_app(
                                     }
                                 }
                             };
+                            let arbiter = resolve_arbiter(
+                                &mut app,
+                                config.arbiter_profile.clone(),
+                                config.arbiter_enabled,
+                                |p| (config.llm_factory)(p, &config.secret_provider),
+                                &profile_name,
+                            );
                             let cancel_token = CancellationToken::new();
                             app.cancellation = Some(cancel_token.clone());
                             spawn_kube_agent(
@@ -2465,6 +2472,8 @@ async fn run_app(
                                 app.active_session().compaction_exhausted,
                                 pending_compaction,
                                 config.log_sources.clone(),
+                                arbiter,
+                                config.arbiter_enabled,
                             );
                             app.sessions[app.active].pending_compaction = None;
                         }
@@ -2502,6 +2511,13 @@ async fn run_app(
                                 }
                             }
                         };
+                        let arbiter = resolve_arbiter(
+                                &mut app,
+                                config.arbiter_profile.clone(),
+                                config.arbiter_enabled,
+                                |p| (config.llm_factory)(p, &config.secret_provider),
+                                &profile_name,
+                            );
                         let cancel_token = CancellationToken::new();
                         app.cancellation = Some(cancel_token.clone());
                         spawn_kube_agent(
@@ -2523,6 +2539,8 @@ async fn run_app(
                             // query, asked once, #583) but never `query_logs`;
                             // `KubeAgent` makes that split.
                             config.log_sources.clone(),
+                            arbiter,
+                            config.arbiter_enabled,
                         );
                         app.sessions[app.active].pending_compaction = None;
                     } else if let Some(stripped) = user_input.strip_prefix('!') {
@@ -2684,33 +2702,14 @@ async fn run_app(
                                 }
                             }
                         };
-                        let arbiter_cfg = filar_core::Config {
-                            arbiter_profile: config.arbiter_profile.clone(),
-                            arbiter_enabled: config.arbiter_enabled,
-                            ..Default::default()
-                        };
-                        let (arbiter_profile_name, fallback_msg) = arbiter_cfg
-                            .resolve_arbiter_profile(&profile_name, &app.profiles);
-                        let arbiter_profile_name = arbiter_profile_name.to_string();
-                        if let Some(msg) = fallback_msg {
-                            app.push_message(ChatBlock::System(msg));
-                        }
-                        let (arbiter_llm, arbiter_model_name) = if config.arbiter_enabled {
-                            match app.profiles.iter().find(|p| p.name == arbiter_profile_name) {
-                                Some(p) => match (config.llm_factory)(p, &config.secret_provider) {
-                                    Ok(c) => (Some(c), p.name.clone()),
-                                    Err(e) => {
-                                        app.push_message(ChatBlock::System(format!(
-                                            "Arbiter LLM unavailable ({e}) — confirmation proceeds without audit."
-                                        )));
-                                        (None, arbiter_profile_name.clone())
-                                    }
-                                },
-                                None => (None, profile_name.clone()),
-                            }
-                        } else {
-                            (None, profile_name.clone())
-                        };
+                        let (arbiter_llm, arbiter_model_name) =
+                            resolve_arbiter(
+                                &mut app,
+                                config.arbiter_profile.clone(),
+                                config.arbiter_enabled,
+                                |p| (config.llm_factory)(p, &config.secret_provider),
+                                &profile_name,
+                            );
                         spawn_agent(
                             session_llm,
                             config.risk_scorer.clone(),
@@ -4448,6 +4447,48 @@ fn spawn_agent(
     });
 }
 
+/// The arbiter client and profile name for a turn of `profile_name`
+/// (#353/#360): the configured arbiter profile or the session's own, `None`
+/// when the arbiter is off or its client cannot be built (said in the feed).
+/// Shared by shell, pod, cluster and Kubernetes-fleet tabs (#620).
+///
+/// Takes the config fields rather than `TuiConfig`, which the event loop
+/// holds partially moved.
+fn resolve_arbiter(
+    app: &mut App,
+    arbiter_profile: Option<String>,
+    arbiter_enabled: bool,
+    make_client: impl Fn(&filar_core::LlmProfile) -> std::result::Result<Arc<dyn LlmClient>, CoreError>,
+    profile_name: &str,
+) -> (Option<Arc<dyn LlmClient>>, String) {
+    let arbiter_cfg = filar_core::Config {
+        arbiter_profile,
+        arbiter_enabled,
+        ..Default::default()
+    };
+    let (arbiter_profile_name, fallback_msg) =
+        arbiter_cfg.resolve_arbiter_profile(profile_name, &app.profiles);
+    let arbiter_profile_name = arbiter_profile_name.to_string();
+    if let Some(msg) = fallback_msg {
+        app.push_message(ChatBlock::System(msg));
+    }
+    if !arbiter_enabled {
+        return (None, profile_name.to_string());
+    }
+    match app.profiles.iter().find(|p| p.name == arbiter_profile_name) {
+        Some(p) => match make_client(p) {
+            Ok(c) => (Some(c), p.name.clone()),
+            Err(e) => {
+                app.push_message(ChatBlock::System(format!(
+                    "Arbiter LLM unavailable ({e}) — confirmation proceeds without audit."
+                )));
+                (None, arbiter_profile_name)
+            }
+        },
+        None => (None, profile_name.to_string()),
+    }
+}
+
 /// Spawn the typed Kubernetes agent, reusing chat history and compaction (#575/#569).
 #[allow(clippy::too_many_arguments)]
 fn spawn_kube_agent(
@@ -4468,6 +4509,9 @@ fn spawn_kube_agent(
     // Log sources (#579, #583): `query_logs` for a cluster tab,
     // `pod_logs_history` for a cluster tab and a fleet.
     log_sources: Option<Arc<filar_agent::LogSources>>,
+    // Arbiter client and profile name (#620), from `resolve_arbiter`.
+    arbiter: (Option<Arc<dyn LlmClient>>, String),
+    arbiter_enabled: bool,
 ) {
     let tx = event_tx.clone();
     let confirmer = Arc::new(TuiConfirmer::new(event_tx, sid)) as Arc<dyn CommandConfirmer>;
@@ -4556,7 +4600,8 @@ fn spawn_kube_agent(
             let agent = agent
                 .event_sink(Arc::clone(&sink))
                 .cancellation(cancellation.clone())
-                .log_sources(log_sources.clone());
+                .log_sources(log_sources.clone())
+                .arbiter(arbiter.0.clone(), arbiter_enabled, arbiter.1.clone());
 
             *held_error
                 .lock()
