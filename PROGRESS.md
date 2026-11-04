@@ -11877,3 +11877,27 @@ Windows/macOS и живые Kubernetes/log-source сценарии по `docs/SM
 случайный клик, её лучше показать ошибкой, чем молча выбросить.
 
 **Next.** #620.
+
+---
+
+## Issue #615: kube-группы в лаунчере (веха 3.0.3)
+
+**Сделано.**
+- Вкладка Groups: переключатель «SSH hosts by tags / Kubernetes pods»; для
+  Kubernetes — чекбоксы кластеров из вкладки Hosts, namespace, selector.
+- `HostGroupDraft` хранит kube-селектор как редактируемые поля (`kube`,
+  `kube_clusters`, `kube_namespace`, `kube_selector`), `to_group` собирает
+  `KubeGroup`.
+- Preview kube-группы: `Effective now: N cluster(s) (…), namespace …, selector …`
+  или `every ready pod`; без кластеров — «no Kubernetes cluster picked yet».
+- Подсказка, если в Match введён тег Kubernetes-кластера.
+
+**Решения.**
+- `match` и `kube` взаимоисключающие: переключиться на другую сторону нельзя,
+  пока у текущей есть значения (радиокнопка недоступна с подсказкой). `to_group`
+  отклоняет смесь с ошибкой, называющей поле. Кластер группы, которого нет в
+  списке кластеров, отклоняется при Launch.
+- Чекбокс кластера, которого нет в списке (переименован), показывается с
+  пометкой, чтобы его можно было снять.
+
+**Next.** #618.
