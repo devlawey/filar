@@ -42,7 +42,7 @@ pub use cluster::{
     KubeExecConfig, KubeExecEvent, KubeExecutor, KubeInteractive, NamespaceInfo, NodeCondition,
     NodeInfo, PodHttpRequest, PodHttpResponse, PodInfo, PodLogs, ResourceMetrics,
     RolloutRevision, ServiceInfo, ServicePortInfo, TerminationInfo, WorkloadInfo, WorkloadKind,
-    DEBUG_CONTAINER_PREFIX, DEFAULT_CLUSTER_LIST_LIMIT, DEFAULT_POD_SHELL,
+    DEBUG_CONTAINER_PREFIX, DEFAULT_CLUSTER_LIST_LIMIT, DEFAULT_POD_SHELL, MISSING_SHELL_MARK,
     SHELL_RECREATED_MESSAGE,
 };
 pub use copy::{

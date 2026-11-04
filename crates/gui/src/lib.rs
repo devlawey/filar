@@ -1488,10 +1488,14 @@ struct KubeSlot {
     default_namespace: String,
     timeout: String,
     tags: String,
-    reveal_configmaps: Vec<String>,
-    reveal_env: Vec<String>,
-    debug_images: Vec<String>,
-    diagnostic_ports: Vec<u16>,
+    /// `reveal_configmaps` (#573), comma-separated `namespace/name`.
+    reveal_configmaps: String,
+    /// `reveal_env` (#573), comma-separated `namespace/pod/VARIABLE`.
+    reveal_env: String,
+    /// `debug_images` (#576, #618), comma-separated image references.
+    debug_images: String,
+    /// `diagnostic_ports` (#578, #618), comma-separated ports, as typed.
+    diagnostic_ports: String,
     check_status: String,
     check_in_flight: bool,
 }
@@ -1510,10 +1514,10 @@ impl KubeSlot {
             default_namespace: String::new(),
             timeout: filar_core::DEFAULT_KUBE_REQUEST_TIMEOUT_SECS.to_string(),
             tags: String::new(),
-            reveal_configmaps: Vec::new(),
-            reveal_env: Vec::new(),
-            debug_images: Vec::new(),
-            diagnostic_ports: Vec::new(),
+            reveal_configmaps: String::new(),
+            reveal_env: String::new(),
+            debug_images: String::new(),
+            diagnostic_ports: String::new(),
             check_status: String::new(),
             check_in_flight: false,
         }
@@ -1536,10 +1540,15 @@ impl KubeSlot {
             default_namespace: cluster.default_namespace.clone().unwrap_or_default(),
             timeout: cluster.request_timeout_secs.to_string(),
             tags: cluster.tags.join(", "),
-            reveal_configmaps: cluster.reveal_configmaps.clone(),
-            reveal_env: cluster.reveal_env.clone(),
-            debug_images: cluster.debug_images.clone(),
-            diagnostic_ports: cluster.diagnostic_ports.clone(),
+            reveal_configmaps: cluster.reveal_configmaps.join(", "),
+            reveal_env: cluster.reveal_env.join(", "),
+            debug_images: cluster.debug_images.join(", "),
+            diagnostic_ports: cluster
+                .diagnostic_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
             check_status: String::new(),
             check_in_flight: false,
         }
@@ -1552,6 +1561,27 @@ impl KubeSlot {
             && self.namespaces.trim().is_empty()
             && self.default_namespace.trim().is_empty()
             && self.tags.trim().is_empty()
+            && self.reveal_configmaps.trim().is_empty()
+            && self.reveal_env.trim().is_empty()
+            && self.debug_images.trim().is_empty()
+            && self.diagnostic_ports.trim().is_empty()
+    }
+
+    /// `diagnostic_ports` as typed: comma- or space-separated ports 1–65535,
+    /// or the first bad entry named with its field (#618).
+    fn parse_diagnostic_ports(&self) -> Result<Vec<u16>, String> {
+        self.diagnostic_ports
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| match p.parse::<u16>() {
+                Ok(port) if port > 0 => Ok(port),
+                _ => Err(format!(
+                    "Kubernetes cluster '{}': Diagnostic ports: \"{p}\" is not a port from 1 to 65535",
+                    self.name.trim()
+                )),
+            })
+            .collect()
     }
 
     fn to_cluster(&self) -> Result<filar_core::KubeCluster, String> {
@@ -1572,10 +1602,10 @@ impl KubeSlot {
                 .then(|| self.default_namespace.trim().to_string()),
             request_timeout_secs: timeout,
             tags: parse_tags(&self.tags),
-            reveal_configmaps: self.reveal_configmaps.clone(),
-            reveal_env: self.reveal_env.clone(),
-            debug_images: self.debug_images.clone(),
-            diagnostic_ports: self.diagnostic_ports.clone(),
+            reveal_configmaps: split_list(&self.reveal_configmaps),
+            reveal_env: split_list(&self.reveal_env),
+            debug_images: split_list(&self.debug_images),
+            diagnostic_ports: self.parse_diagnostic_ports()?,
         };
         cluster.validate().map_err(|e| e.to_string())?;
         Ok(cluster)
@@ -2007,6 +2037,12 @@ fn logs_tab_error(message: &str) -> String {
         format!("Logs tab: log source{rest}")
     }
 }
+
+/// What a debug image is for, next to the field (#618): the same trace
+/// warning the Ctrl+B confirmation gives (#576).
+const DEBUG_IMAGES_HINT: &str = "Images Ctrl+B may add to a pod as an ephemeral debug container. \
+The container stays in the pod spec until the pod is recreated and cannot be removed. \
+Empty = the action is unavailable.";
 
 /// The key name suggested for a source: `FILAR_LOGS_<NAME>`.
 fn suggested_log_key_env(name: &str) -> String {
@@ -3093,6 +3129,40 @@ impl LauncherApp {
                         .hint_text("prod, k8s (comma-separated)")
                         .desired_width(180.0),
                 );
+                ui.end_row();
+                // Fields that used to be config.toml-only (#618).
+                ui.label("Debug images:")
+                    .on_hover_text(DEBUG_IMAGES_HINT);
+                ui.add(
+                    egui::TextEdit::singleline(&mut slot.debug_images)
+                        .hint_text("busybox:1.37 (empty = Ctrl+B unavailable)")
+                        .desired_width(220.0),
+                )
+                .on_hover_text(DEBUG_IMAGES_HINT);
+                ui.end_row();
+                ui.label("Diagnostic ports:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut slot.diagnostic_ports)
+                        .hint_text("8080, 6060 (besides declared ports)")
+                        .desired_width(180.0),
+                )
+                .on_hover_text("Pod ports pod_http_get may read besides those declared in the container spec");
+                ui.end_row();
+                ui.label("Reveal ConfigMaps:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut slot.reveal_configmaps)
+                        .hint_text("shop/app-config (empty = redact all)")
+                        .desired_width(220.0),
+                )
+                .on_hover_text("ConfigMaps shown without secret redaction, as namespace/name");
+                ui.end_row();
+                ui.label("Reveal env:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut slot.reveal_env)
+                        .hint_text("shop/web-1/LOG_LEVEL (empty = redact all)")
+                        .desired_width(220.0),
+                )
+                .on_hover_text("Pod environment values shown without redaction, as namespace/pod/VARIABLE");
                 ui.end_row();
                 ui.label("Connection:");
                 check = ui
@@ -7353,6 +7423,62 @@ host_key_policy = \"strict\"
         let text = export_hosts_toml(&refs).unwrap();
         assert!(!text.contains("scratch"), "got {text}");
         assert!(text.contains("web-1"), "got {text}");
+    }
+
+    // ── Kubernetes cluster fields once config-only (#618) ──────
+
+    #[test]
+    fn debug_images_and_diagnostic_ports_survive_launch() {
+        let cluster = filar_core::KubeCluster {
+            name: "kind-filar-k8s".into(),
+            context: "kind-filar-k8s".into(),
+            reveal_configmaps: vec!["shop/app-config".into()],
+            reveal_env: vec!["shop/web-1/LOG_LEVEL".into()],
+            debug_images: vec!["busybox:1.37".into(), "nicolaka/netshoot:v0.13".into()],
+            diagnostic_ports: vec![8080, 6060],
+            ..filar_core::KubeCluster::default()
+        };
+        let slot = KubeSlot::from_cluster(1, &cluster);
+        assert_eq!(slot.debug_images, "busybox:1.37, nicolaka/netshoot:v0.13");
+        assert_eq!(slot.diagnostic_ports, "8080, 6060");
+        assert_eq!(slot.to_cluster().unwrap(), cluster);
+    }
+
+    #[test]
+    fn debug_images_typed_in_the_launcher_reach_the_cluster() {
+        let mut slot = KubeSlot::blank(1);
+        slot.name = "kind".into();
+        slot.context = "kind".into();
+        slot.debug_images = " busybox:1.37 ,, ".into();
+        slot.diagnostic_ports = "8080 6060,".into();
+        let cluster = slot.to_cluster().unwrap();
+        assert_eq!(cluster.debug_images, vec!["busybox:1.37".to_string()]);
+        assert_eq!(cluster.diagnostic_ports, vec![8080, 6060]);
+        // Emptied again: the action is unavailable, which is valid.
+        slot.debug_images.clear();
+        slot.diagnostic_ports.clear();
+        let cluster = slot.to_cluster().unwrap();
+        assert!(cluster.debug_images.is_empty() && cluster.diagnostic_ports.is_empty());
+    }
+
+    #[test]
+    fn a_bad_diagnostic_port_is_refused_naming_the_field() {
+        let mut slot = KubeSlot::blank(1);
+        slot.name = "kind".into();
+        slot.context = "kind".into();
+        for bad in ["0", "65536", "http", "-1"] {
+            slot.diagnostic_ports = format!("8080, {bad}");
+            let error = slot.to_cluster().unwrap_err();
+            assert!(error.contains("Diagnostic ports") && error.contains(bad), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_debug_image_alone_is_not_a_blank_cluster_row() {
+        let mut slot = KubeSlot::blank(1);
+        assert!(slot.is_blank());
+        slot.debug_images = "busybox:1.37".into();
+        assert!(!slot.is_blank());
     }
 
     // ── Host groups (#418) ─────────────────────────────────────

@@ -260,10 +260,14 @@ fn is_missing_shell(message: &str) -> bool {
     lower.contains("executable file not found") || lower.contains("no such file or directory")
 }
 
+/// How the error for a container without a shell starts, so a frontend can
+/// add what the user can do about it (#618).
+pub const MISSING_SHELL_MARK: &str = "в контейнере нет ";
+
 /// The error for a shell that could not be started in the container.
 fn missing_shell_error(shell: &str, namespace: &str, pod: &str, context: &str) -> CoreError {
     CoreError::Unavailable(format!(
-        "в контейнере нет {shell} — войти можно через эфемерный debug-контейнер (#576) \
+        "{MISSING_SHELL_MARK}{shell} — войти можно только через эфемерный debug-контейнер \
          (под {namespace}/{pod}, контекст {context})"
     ))
 }
@@ -1331,7 +1335,9 @@ mod tests {
         assert!(is_missing_shell("executable file not found in $PATH"));
         assert!(!is_missing_shell("command terminated with non-zero exit code"));
         let error = missing_shell_error("/bin/sh", "shop", "distroless-1", "prod-eu").to_string();
-        assert!(error.contains("в контейнере нет /bin/sh") && error.contains("#576"), "{error}");
+        assert!(error.starts_with(MISSING_SHELL_MARK), "{error}");
+        assert!(error.contains("в контейнере нет /bin/sh") && error.contains("debug-контейнер"), "{error}");
+        assert!(!error.contains('#'), "no issue numbers in a user message: {error}");
         assert!(error.contains("shop/distroless-1") && error.contains("prod-eu"), "{error}");
     }
 

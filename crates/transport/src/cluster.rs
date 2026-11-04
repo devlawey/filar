@@ -21,7 +21,7 @@ pub use debug::{
 };
 pub use exec::{
     KubeExecConfig, KubeExecEvent, KubeExecutor, KubeInteractive, DEFAULT_POD_SHELL,
-    SHELL_RECREATED_MESSAGE,
+    MISSING_SHELL_MARK, SHELL_RECREATED_MESSAGE,
 };
 
 /// Maximum number of objects returned by one cluster list operation.

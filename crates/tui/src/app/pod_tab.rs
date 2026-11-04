@@ -152,6 +152,28 @@ impl DebugProposal {
     }
 }
 
+/// Where `debug_images` is set, for messages about Ctrl+B (#618). Short:
+/// a system line in the feed is one row, cut at the terminal width.
+const DEBUG_IMAGES_WHERE: &str = "лаунчер → Hosts → Debug images";
+
+/// What the user can do about a pod without a shell (#618), one feed line
+/// each: Ctrl+B when the cluster has debug images, else where to set them —
+/// and that the API tools work for the pod either way.
+fn no_shell_hints(target: &filar_core::KubeCluster) -> Vec<String> {
+    let way_in = if target.debug_images.is_empty() {
+        format!(
+            "Войти можно через debug-контейнер (Ctrl+B), но у {} пуст debug_images: {DEBUG_IMAGES_WHERE}",
+            target.name
+        )
+    } else {
+        "Войти в такой под можно через debug-контейнер: Ctrl+B".to_string()
+    };
+    vec![
+        way_in,
+        "Логи, describe и события пода агент читает и без шелла — спросите во вкладке кластера".to_string(),
+    ]
+}
+
 /// Short id for `filar-debug-<id>`: the low hex digits of the clock.
 fn debug_id() -> String {
     let nanos = std::time::SystemTime::now()
@@ -337,7 +359,7 @@ impl App {
         };
         if kube.target.debug_images.is_empty() {
             self.push_message(ChatBlock::System(format!(
-                "Debug-контейнер недоступен: для кластера {} не задан debug_images в [[kube_clusters]]",
+                "Debug-контейнер недоступен: у кластера {} пуст debug_images ({DEBUG_IMAGES_WHERE})",
                 kube.target.name
             )));
             return;
@@ -863,6 +885,11 @@ impl App {
                 target.name
             )),
         );
+        if error.contains(filar_transport::MISSING_SHELL_MARK) {
+            for hint in no_shell_hints(&target) {
+                self.push_kube_message(sid, ChatBlock::System(hint));
+            }
+        }
         self.pending_kube_connects.push(super::KubeConnectRequest {
             session_id: sid,
             target,
@@ -1428,6 +1455,79 @@ mod tests {
         app.handle_key(ctrl('b'));
         assert!(app.kube_pod_select.is_none());
         assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m.contains("debug_images")));
+    }
+
+    #[test]
+    fn debug_without_images_says_where_to_set_them() {
+        let mut app = cluster_tab_with(&[]);
+        app.handle_key(ctrl('b'));
+        assert!(matches!(
+            app.messages.last(),
+            Some(ChatBlock::System(m)) if m.contains("Debug images") && m.contains("пуст debug_images")
+        ));
+    }
+
+    /// The transport's error for a container without a shell (#618).
+    fn no_shell_error() -> String {
+        format!(
+            "{}/bin/sh — войти можно только через эфемерный debug-контейнер (под shop/noshell-1, контекст prod-eu-ctx)",
+            filar_transport::MISSING_SHELL_MARK
+        )
+    }
+
+    fn fail_with_no_shell(images: &[&str]) -> App {
+        let mut app = cluster_tab_with(images);
+        app.open_pod_tab(
+            debug_cluster(images),
+            "shop".into(),
+            PodRef::named("prod-eu", "shop", "noshell-1", None),
+        );
+        let request = app.take_pending_kube_pod_connects().remove(0);
+        app.fail_kube_pod_connection(request.session_id, request.connection_id, no_shell_error());
+        app
+    }
+
+    #[test]
+    fn a_pod_without_a_shell_points_to_ctrl_b_when_images_are_set() {
+        let app = fail_with_no_shell(&["busybox:1.37"]);
+        let hints = last_system_lines(&app, 2);
+        assert!(hints[0].contains("Ctrl+B") && !hints[0].contains("пуст"), "{hints:?}");
+        assert!(hints[1].contains("Логи, describe и события"), "{hints:?}");
+        assert!(hints.iter().all(|h| !h.contains('#') && h.chars().count() <= 110), "{hints:?}");
+    }
+
+    #[test]
+    fn a_pod_without_a_shell_says_where_to_set_debug_images() {
+        let app = fail_with_no_shell(&[]);
+        let hints = last_system_lines(&app, 2);
+        assert!(hints[0].contains("Ctrl+B") && hints[0].contains("Debug images"), "{hints:?}");
+        assert!(hints.iter().all(|h| h.chars().count() <= 110), "{hints:?}");
+    }
+
+    fn last_system_lines(app: &App, n: usize) -> Vec<String> {
+        assert!(
+            app.messages.len() > n,
+            "expected an error and {n} hint lines, got {:?}",
+            app.messages
+        );
+        let lines: Vec<String> = app.messages[app.messages.len() - n..]
+            .iter()
+            .map(|m| match m {
+                ChatBlock::System(text) => text.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(matches!(&app.messages[app.messages.len() - n - 1], ChatBlock::Error(e) if e.contains("нет /bin/sh")));
+        lines
+    }
+
+    #[test]
+    fn other_pod_failures_get_no_shell_hint() {
+        let mut app = app_in_cluster_tab();
+        app.open_pod_tab(cluster(), "shop".into(), PodRef::named("prod-eu", "shop", "web-1", None));
+        let request = app.take_pending_kube_pod_connects().remove(0);
+        app.fail_kube_pod_connection(request.session_id, request.connection_id, "RBAC: denied".into());
+        assert!(matches!(app.messages.last(), Some(ChatBlock::Error(_))));
     }
 
     #[test]
