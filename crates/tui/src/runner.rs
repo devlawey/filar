@@ -2474,6 +2474,7 @@ async fn run_app(
                                 config.log_sources.clone(),
                                 arbiter,
                                 config.arbiter_enabled,
+                                config.risk_scorer.clone(),
                             );
                             app.sessions[app.active].pending_compaction = None;
                         }
@@ -2541,6 +2542,8 @@ async fn run_app(
                             config.log_sources.clone(),
                             arbiter,
                             config.arbiter_enabled,
+                            // Fleets are not rated, as SSH fleets (#631).
+                            None,
                         );
                         app.sessions[app.active].pending_compaction = None;
                     } else if let Some(stripped) = user_input.strip_prefix('!') {
@@ -4513,6 +4516,9 @@ fn spawn_kube_agent(
     // Arbiter client and profile name (#620), from `resolve_arbiter`.
     arbiter: (Option<Arc<dyn LlmClient>>, String),
     arbiter_enabled: bool,
+    // Command safety scorer (#631): a cluster tab rates every request; a
+    // fleet is never rated (`KubeAgent` ignores it there).
+    risk_scorer: Option<Arc<dyn filar_agent::RiskScorer>>,
 ) {
     let tx = event_tx.clone();
     let confirmer = Arc::new(TuiConfirmer::new(event_tx, sid)) as Arc<dyn CommandConfirmer>;
@@ -4602,7 +4608,8 @@ fn spawn_kube_agent(
                 .event_sink(Arc::clone(&sink))
                 .cancellation(cancellation.clone())
                 .log_sources(log_sources.clone())
-                .arbiter(arbiter.0.clone(), arbiter_enabled, arbiter.1.clone());
+                .arbiter(arbiter.0.clone(), arbiter_enabled, arbiter.1.clone())
+                .risk_scorer(risk_scorer.clone());
 
             *held_error
                 .lock()

@@ -12052,3 +12052,43 @@ Kubernetes-флотов, аудит арбитра и поддержка `NO_PRO
 
 **Next.** Ручной smoke Windows и macOS по `docs/SMOKE.md` (#298), включая
 живые сценарии Kubernetes и источников логов.
+
+---
+
+## Issue #631: оценка безопасности во вкладке кластера (веха 3.0.4)
+
+**Сделано.** `KubeAgent::risk_scorer(Option<Arc<dyn RiskScorer>>)`: во вкладке
+кластера каждое предложение — typed `k8s_*`, `pod_http_get`, `query_logs`,
+`pod_logs_history` — сразу после `CommandProposed` уходит на оценку в
+отдельной задаче. Режим подтверждения на это не влияет. Результат приходит
+событием `CommandScored` с тем же `proposal_id`, ошибка и таймаут дают
+`unavailable: true`. Цель для оценщика та же, что у арбитра: кластер,
+namespace и теги. Kube-флот не оценивается, как SSH-флот. Runner передаёт
+`config.risk_scorer` в `spawn_kube_agent`, флоту — `None`.
+`App::expects_safety_rating` знает, что вкладка кластера оценивает typed-запросы
+и запросы к логам, а шелл- и под-вкладки — только команды.
+
+**Решения.**
+- Задачи оценки в полёте вынесены из `Agent` в общий
+  `risk::PendingScores` (`spawn` / `settle`). Оба агента одинаково ждут
+  оценки до терминального события и снимают их при отмене.
+- Пути логов сами эмитят `CommandProposed`. Оценка к ним подключена через
+  обёртку sink (`emit_and_rate`), без правок в `logs`.
+- `RISK_QUESTION` и инструкция `chat-logprobs` сформулированы нейтрально:
+  «command or API request». Вид запроса оценщик видит по строке цели. В
+  `eval/risk/commands.toml` добавлены read-only `k8s_*` с целью-кластером и
+  `kubectl get` по SSH для сравнения.
+
+- По ревью:
+  - цель для оценщика берёт namespace самого запроса (`-n kube-system`), как
+    окно подтверждения;
+  - id предложений общий для `Agent` и `KubeAgent` (`agent::next_proposal_id`);
+  - отмена, пришедшая, пока оценки досчитываются, завершает ход событием
+    `Cancelled`, а не `Finished`;
+  - TUI на `Cancelled` убирает бейджи, оставшиеся в `rating…` (касается и
+    шелл-вкладок).
+
+**Контракты.** `CommandExecutor` и `LlmClient` не менялись. Новый публичный
+метод — `KubeAgent::risk_scorer`.
+
+**Next.** #632, #633.
