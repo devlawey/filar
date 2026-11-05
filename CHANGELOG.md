@@ -14,7 +14,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 ### Fixed
 
 - The command safety rating (`[risk_scorer]`) now covers a Kubernetes cluster tab: every typed `k8s_*` request, `pod_http_get`, `query_logs` and `pod_logs_history` is rated with the cluster, namespace and tags as the target, in every confirmation mode; Kubernetes fleets stay unrated like SSH fleets; `KubeAgent::risk_scorer` for embedders ([#631](https://github.com/devlawey/filar/issues/631)).
-- Launcher field hints are no longer cut off: the grey text in a field is a short example value and the field is always wide enough for it; what a field means (comma-separated, what an empty value does) moved to the hover text of the label and the field, an empty Debug images list says `Empty = Ctrl+B unavailable.` under the field, and list fields (tags, namespaces, images, ports, reveal lists, selectors, key file) take the width of the row ([#632](https://github.com/devlawey/filar/issues/632)).
+- Launcher field hints are no longer cut off: the grey text in a field is a short example value and the field is always wide enough for it; what a field means (comma-separated, what an empty value does) moved to the hover text of the label and the field, an empty Debug images list says `Empty = Ctrl+B unavailable.` under the field, list fields (tags, namespaces, images, ports, reveal lists, selectors, key file) take the width of the row, the SSH key file shows its default path on hover, and the empty Kubernetes group Selector is now explained correctly — no pod discovery, one member per cluster/namespace ([#632](https://github.com/devlawey/filar/issues/632)).
 
 ## [3.0.3] - 2026-11-05
 
