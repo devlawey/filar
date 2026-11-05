@@ -12,11 +12,15 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use filar_core::ChatBlock;
 
-use super::text::{render_markdown_line, sanitize_output, strip_emoji, wrap_text, MarkdownState};
+use super::text::{
+    expand_tabs, render_markdown_line, sanitize_output, strip_emoji, wrap_text, MarkdownState,
+};
 use super::theme::Theme;
 use crate::app::SafetyLevel;
 
@@ -300,28 +304,12 @@ impl ChatLayoutCache {
                 }
 
                 ChatBlock::Error(text) => {
-                    let text = strip_emoji(text);
-                    self.push_header(
-                        idx,
-                        vec![
-                            Span::raw("  "),
-                            Span::styled(format!("{} ", glyphs.danger), theme.error_style()),
-                            Span::styled(text, theme.error_style()),
-                        ],
-                    );
+                    self.push_marked(idx, glyphs.danger, theme.error_style(), &strip_emoji(text), inner);
                     self.push_spacer();
                 }
 
                 ChatBlock::System(text) => {
-                    let text = strip_emoji(text);
-                    self.push_header(
-                        idx,
-                        vec![
-                            Span::raw("  "),
-                            Span::styled(format!("{} ", glyphs.middle_dot), theme.muted()),
-                            Span::styled(text, theme.muted()),
-                        ],
-                    );
+                    self.push_marked(idx, glyphs.middle_dot, theme.muted(), &strip_emoji(text), inner);
                     self.push_spacer();
                 }
 
@@ -399,6 +387,44 @@ impl ChatLayoutCache {
         });
     }
 
+    /// A system line or an error (#628): `  <marker> text`, wrapped to
+    /// `width` columns. The marker is on the first row only; continuation
+    /// rows are indented under the text, in the same style. A line break in
+    /// the text starts a new row; trailing empty lines are dropped.
+    fn push_marked(&mut self, idx: usize, marker: &str, style: Style, text: &str, width: usize) {
+        let lead = format!("  {marker} ");
+        let lead_width = UnicodeWidthStr::width(lead.as_str());
+        // A terminal too narrow for the lead and a character of text keeps
+        // the text and drops the marker and indent: the words are the point
+        // (#628 review).
+        let compact = width <= lead_width;
+        let indent = if compact { 0 } else { lead_width };
+        let text_width = width.saturating_sub(indent).max(1);
+        let mut rows: Vec<String> = text
+            .trim_end()
+            .lines()
+            .flat_map(|line| wrap_words(&expand_tabs(line), text_width))
+            .collect();
+        if rows.is_empty() {
+            rows.push(String::new());
+        }
+        let mut rows = rows.into_iter();
+        let first = rows.next().unwrap_or_default();
+        let first_row = if compact {
+            vec![Span::styled(first, style)]
+        } else {
+            vec![
+                Span::raw("  "),
+                Span::styled(format!("{marker} "), style),
+                Span::styled(first, style),
+            ]
+        };
+        self.push_header(idx, first_row);
+        for row in rows {
+            self.push_body_spans(idx, vec![Span::raw(" ".repeat(indent)), Span::styled(row, style)]);
+        }
+    }
+
     fn push_body_spans(&mut self, idx: usize, spans: Vec<Span<'static>>) {
         self.lines.push(RenderedLine {
             line: Line::from(spans),
@@ -436,6 +462,64 @@ impl Default for ChatLayoutCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Wrap `line` to `width` columns at spaces (#628); a word wider than the
+/// row is cut by [`wrap_text`]. Messages are prose with paths and names, and
+/// a break inside "Hosts" reads worse than a short row.
+fn wrap_words(line: &str, width: usize) -> Vec<String> {
+    // Each word with the spaces before it: indentation and repeated spaces
+    // are kept; only the run of spaces at a break is dropped (#628 review).
+    let mut tokens: Vec<(&str, &str)> = Vec::new();
+    let mut rest = line;
+    while !rest.is_empty() {
+        let spaces = rest.len() - rest.trim_start_matches(' ').len();
+        let (sep, after) = rest.split_at(spaces);
+        let end = after.find(' ').unwrap_or(after.len());
+        let (word, tail) = after.split_at(end);
+        tokens.push((sep, word));
+        rest = tail;
+    }
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    let mut started = false; // a row of this line is open (even if empty)
+    for (sep, word) in tokens {
+        // The line's own indentation stays; a break eats the spaces before
+        // the word that starts the new row.
+        let piece = if !started || !current.is_empty() {
+            format!("{sep}{word}")
+        } else {
+            word.to_string()
+        };
+        let piece_width = UnicodeWidthStr::width(piece.as_str());
+        if current_width + piece_width <= width {
+            current.push_str(&piece);
+            current_width += piece_width;
+            started = true;
+            continue;
+        }
+        let piece = if current.is_empty() { piece } else { word.to_string() };
+        if !current.is_empty() {
+            rows.push(std::mem::take(&mut current));
+        }
+        started = true;
+        let piece_width = UnicodeWidthStr::width(piece.as_str());
+        if piece_width <= width {
+            current = piece;
+            current_width = piece_width;
+        } else {
+            let mut pieces = wrap_text(&piece, width);
+            let last = pieces.pop().unwrap_or_default();
+            rows.extend(pieces);
+            current_width = UnicodeWidthStr::width(last.as_str());
+            current = last;
+        }
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -513,6 +597,134 @@ mod tests {
         // Rebuild anyway to verify line count is stable.
         cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
         assert_eq!(cache.lines.len(), line_count);
+    }
+
+    fn row_text(line: &RenderedLine) -> String {
+        line.line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn block_rows(cache: &ChatLayoutCache, idx: usize) -> Vec<String> {
+        cache
+            .lines
+            .iter()
+            .filter(|l| l.block_index == Some(idx))
+            .map(row_text)
+            .collect()
+    }
+
+    #[test]
+    fn long_system_lines_and_errors_wrap_instead_of_being_cut() {
+        let theme = Theme::default_dark();
+        let mut cache = ChatLayoutCache::new();
+        let hint = "Debug-контейнер недоступен: у кластера kind-filar-k8s пуст debug_images (лаунчер → Hosts → Debug images)";
+        let error = "Не удалось войти в под filar-k8s-noshell-1, вкладка осталась на кластере kind-filar-k8s: в контейнере нет /bin/sh";
+        let msgs = vec![ChatBlock::System(hint.into()), ChatBlock::Error(error.into())];
+        cache.rebuild(&msgs, 40, &theme, &HashSet::new(), 1);
+        for (idx, text) in [(0, hint), (1, error)] {
+            let rows = block_rows(&cache, idx);
+            assert!(rows.len() > 1, "{rows:?}");
+            for row in &rows {
+                assert!(UnicodeWidthStr::width(row.as_str()) <= 40, "{row:?}");
+            }
+            // The ASCII theme (Windows conhost, CI) uses `-` as the dot, which
+            // the text itself contains: compare row prefixes, not substrings.
+            let marker = if idx == 0 { theme.glyphs().middle_dot } else { theme.glyphs().danger };
+            let lead = format!("  {marker} ");
+            let indent = " ".repeat(UnicodeWidthStr::width(lead.as_str()));
+            assert!(rows[0].starts_with(&lead), "{rows:?}");
+            assert!(
+                rows[1..].iter().all(|r| r.starts_with(&indent) && !r.starts_with(&lead)),
+                "marker only first, continuations indented: {rows:?}"
+            );
+            // A break eats exactly one space here (the text has single
+            // spaces), so the rows joined by one space are the text.
+            let joined = std::iter::once(&rows[0][lead.len()..])
+                .chain(rows[1..].iter().map(|r| &r[indent.len()..]))
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(joined, text, "whole text kept, spaces included");
+        }
+        let first_block_rows = cache.lines.iter().filter(|l| l.block_index == Some(0)).count();
+        assert_eq!(cache.lines[0].region, LineRegion::Header);
+        assert!(cache.lines[1..first_block_rows].iter().all(|l| l.region == LineRegion::Body));
+    }
+
+    #[test]
+    fn line_breaks_in_a_system_line_are_rows_and_short_lines_are_unchanged() {
+        let theme = Theme::default_dark();
+        let mut cache = ChatLayoutCache::new();
+        let msgs = vec![
+            ChatBlock::System("first\nsecond\n\n".into()),
+            ChatBlock::System("connected".into()),
+        ];
+        cache.rebuild(&msgs, 80, &theme, &HashSet::new(), 1);
+        let dot = theme.glyphs().middle_dot;
+        assert_eq!(block_rows(&cache, 0), vec![format!("  {dot} first"), "    second".to_string()]);
+        assert_eq!(block_rows(&cache, 1), vec![format!("  {dot} connected")]);
+    }
+
+    #[test]
+    fn the_ascii_dot_is_not_confused_with_a_hyphen_in_the_text() {
+        // What Windows conhost (and CI there) renders; the text has hyphens.
+        let theme = Theme::default_dark();
+        let dot = super::super::theme::Glyphs::ASCII.middle_dot;
+        let mut cache = ChatLayoutCache::new();
+        cache.push_marked(0, dot, theme.muted(), "Debug-контейнер недоступен: у кластера kind-filar-k8s", 30);
+        let rows = block_rows(&cache, 0);
+        assert!(rows[0].starts_with(&format!("  {dot} Debug-")), "{rows:?}");
+        assert!(rows[1..].iter().all(|r| r.starts_with("    ") && !r.starts_with(&format!("  {dot} "))), "{rows:?}");
+    }
+
+    #[test]
+    fn a_terminal_narrower_than_the_marker_keeps_all_the_text() {
+        let theme = Theme::default_dark();
+        for width in [1usize, 2, 3, 4] {
+            let mut cache = ChatLayoutCache::new();
+            cache.push_marked(0, theme.glyphs().middle_dot, theme.muted(), "abc def ghi", width);
+            let rows = block_rows(&cache, 0);
+            for row in &rows {
+                assert!(UnicodeWidthStr::width(row.as_str()) <= width, "{width}: {rows:?}");
+            }
+            assert_eq!(rows.concat().replace(' ', ""), "abcdefghi", "{width}: nothing cut away: {rows:?}");
+        }
+        // Wide enough for the lead and text: the marker is back.
+        let mut cache = ChatLayoutCache::new();
+        cache.push_marked(0, theme.glyphs().middle_dot, theme.muted(), "abc", 5);
+        assert!(block_rows(&cache, 0)[0].starts_with(&format!("  {} ", theme.glyphs().middle_dot)));
+    }
+
+    #[test]
+    fn indentation_repeated_spaces_and_tabs_survive_wrapping() {
+        assert_eq!(wrap_words("   indented  twice", 40), vec!["   indented  twice"]);
+        assert_eq!(wrap_words("  key:   value  next", 14), vec!["  key:   value", "next"]);
+        let theme = Theme::default_dark();
+        let mut cache = ChatLayoutCache::new();
+        cache.push_marked(0, theme.glyphs().middle_dot, theme.muted(), "a\tb", 40);
+        let rows = block_rows(&cache, 0);
+        assert_eq!(rows[0], format!("  {} a       b", theme.glyphs().middle_dot), "tab expanded to a stop");
+    }
+
+    #[test]
+    fn system_lines_break_between_words() {
+        assert_eq!(
+            wrap_words("пуст debug_images (лаунчер → Hosts → Debug images)", 20),
+            vec!["пуст debug_images", "(лаунчер → Hosts →", "Debug images)"]
+        );
+        // A word wider than the row is cut, and the rest continues after it.
+        assert_eq!(wrap_words("ab /very/long/path cd", 6), vec!["ab", "/very/", "long/p", "ath cd"]);
+        assert_eq!(wrap_words("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn wide_characters_wrap_by_width_not_by_count() {
+        let theme = Theme::default_dark();
+        let mut cache = ChatLayoutCache::new();
+        // The feed strips CJK (`strip_emoji`), so the wrapping helper is
+        // driven directly: width is counted in columns.
+        cache.push_marked(0, theme.glyphs().danger, theme.error_style(), "集群集群集群集群集群集群", 14);
+        let rows = block_rows(&cache, 0);
+        assert!(rows.len() >= 3, "{rows:?}");
+        assert!(rows.iter().all(|r| UnicodeWidthStr::width(r.as_str()) <= 14), "{rows:?}");
     }
 
     #[test]
