@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::arbiter::{self, ArbiterContext, KubernetesArbiterTarget, ARBITER_TIMEOUT_SECS, HISTORY_TAIL_EXCHANGES};
 use crate::fleet_gate::{ApprovalScope, FleetGate};
 use crate::fleet_view::{FleetStatus, FleetView};
+use crate::risk::{PendingScores, RiskInput, RiskScorer};
 use crate::{
     build_kube_system_prompt, kube_confirmation_decision, kube_tool_definitions,
     kube_tools::build_kube_fleet_system_prompt, parse_kube_tool_call, AgentEvent, ChatMessage,
@@ -80,6 +81,10 @@ pub struct KubeAgent {
     log_sources: Option<Arc<crate::logs::LogSources>>,
     /// Independent command arbiter (#620), as in [`crate::Agent`].
     arbiter: Option<KubeArbiter>,
+    /// Command safety scorer (#549, #631); cluster tabs only. Advisory.
+    risk_scorer: Option<Arc<dyn RiskScorer>>,
+    /// Ratings still in flight, settled before the terminal event.
+    pending_scores: PendingScores,
 }
 
 /// The arbiter of a [`KubeAgent`] (#620).
@@ -114,6 +119,8 @@ impl KubeAgent {
             cancellation: None,
             log_sources: None,
             arbiter: None,
+            risk_scorer: None,
+            pending_scores: PendingScores::default(),
         }
     }
 
@@ -138,6 +145,8 @@ impl KubeAgent {
             cancellation: None,
             log_sources: None,
             arbiter: None,
+            risk_scorer: None,
+            pending_scores: PendingScores::default(),
         }
     }
 
@@ -183,7 +192,57 @@ impl KubeAgent {
         self
     }
 
-    /// What the arbiter is told about the target.
+    /// Rate every request proposed in a cluster tab with a safety scorer
+    /// (#631), as [`crate::Agent`] does for shell commands (#549): typed
+    /// `k8s_*` calls, `query_logs` and `pod_logs_history`, in every
+    /// confirmation mode. The rating runs in its own task — neither the
+    /// confirmation nor the request waits for it — and arrives as
+    /// [`AgentEvent::CommandScored`] with the proposal's id; an error or a
+    /// timeout is reported as unavailable. A fleet is never rated, like an
+    /// SSH fleet. `None` turns it off.
+    pub fn risk_scorer(mut self, scorer: Option<Arc<dyn RiskScorer>>) -> Self {
+        self.risk_scorer = scorer;
+        self
+    }
+
+    /// Start rating a proposed request, if a scorer is set and this is a
+    /// cluster tab (#631). Fleets are not rated.
+    fn spawn_risk_score(&self, proposal_id: u64, command: &str, explanation: &str) {
+        let Some(scorer) = self.risk_scorer.clone() else {
+            return;
+        };
+        if matches!(self.execution, KubeExecution::Fleet { .. }) {
+            return;
+        }
+        let input = RiskInput {
+            command: command.to_string(),
+            explanation: explanation.to_string(),
+            target: self.arbiter_target(),
+        };
+        self.pending_scores
+            .spawn(scorer, input, proposal_id, self.event_sink.clone());
+    }
+
+    /// Emit `event`; a proposal also starts its safety rating (#631). Used
+    /// as the sink of the log-source paths, which announce their own
+    /// proposals.
+    fn emit_and_rate(&self, event: AgentEvent) {
+        let rate = match &event {
+            AgentEvent::CommandProposed {
+                proposal_id,
+                command,
+                explanation,
+                ..
+            } => Some((*proposal_id, command.clone(), explanation.clone())),
+            _ => None,
+        };
+        self.emit(event);
+        if let Some((proposal_id, command, explanation)) = rate {
+            self.spawn_risk_score(proposal_id, &command, &explanation);
+        }
+    }
+
+    /// What the arbiter and the safety scorer are told about the target.
     fn arbiter_target(&self) -> String {
         match &self.execution {
             KubeExecution::Cluster {
@@ -290,6 +349,9 @@ impl KubeAgent {
     pub async fn run(&self, user_prompt: &str, history: &[ChatMessage]) -> Result<String> {
         self.emit(AgentEvent::Started);
         let result = self.run_loop(user_prompt, history).await;
+        // Ratings in flight land before the terminal event; a cancel drops
+        // them, so none follows `Cancelled` or reaches a closed tab.
+        self.pending_scores.settle(self.cancellation.as_ref()).await;
         match result {
             Ok(text) => {
                 self.emit(AgentEvent::Finished(text.clone()));
@@ -420,7 +482,7 @@ impl KubeAgent {
             let Some(sources) = &self.log_sources else {
                 return Ok(ChatMessage::tool(&call.id, "Error: no log sources are configured."));
             };
-            let emit = |event: AgentEvent| self.emit(event);
+            let emit = |event: AgentEvent| self.emit_and_rate(event);
             let proposal_id = NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed);
             return match &self.execution {
                 KubeExecution::Cluster { target, namespace, .. } => {
@@ -464,7 +526,7 @@ impl KubeAgent {
                     "Error: no log sources are available here.",
                 ));
             };
-            let emit = |event: AgentEvent| self.emit(event);
+            let emit = |event: AgentEvent| self.emit_and_rate(event);
             return sources
                 .process(
                     call,
@@ -537,7 +599,7 @@ impl KubeAgent {
             }
         };
 
-        self.emit(AgentEvent::CommandProposed {
+        self.emit_and_rate(AgentEvent::CommandProposed {
             proposal_id: NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed),
             command: display.clone(),
             explanation: explanation.clone(),
@@ -939,5 +1001,369 @@ mod tests {
         let (events, audited) = run_cluster_agent(CommandConfirmMode::Always, None, true).await;
         assert_eq!(audited, vec![false]);
         assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandAudited { .. })));
+    }
+
+    // ── Safety rating (#631) ───────────────────────────────────────────
+
+    use crate::risk::{RiskInput, RiskScore};
+
+    /// How a [`FakeScorer`] answers.
+    #[derive(Clone, Copy)]
+    enum Rating {
+        Pct(u8),
+        Fails,
+        /// Never answers on its own: the agent's time limit has to end it.
+        Hangs,
+    }
+
+    /// Scorer stand-in: records every input, answers as scripted. With
+    /// `gate`, it answers only after the confirmation went through.
+    struct FakeScorer {
+        rating: Rating,
+        gate: Option<Arc<tokio::sync::Notify>>,
+        inputs: Mutex<Vec<RiskInput>>,
+    }
+
+    impl FakeScorer {
+        fn new(rating: Rating) -> Arc<Self> {
+            Arc::new(Self {
+                rating,
+                gate: None,
+                inputs: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RiskScorer for FakeScorer {
+        async fn score(&self, input: &RiskInput) -> Result<RiskScore> {
+            self.inputs.lock().unwrap().push(input.clone());
+            if let Some(gate) = &self.gate {
+                gate.notified().await;
+            }
+            match self.rating {
+                Rating::Pct(pct) => Ok(RiskScore {
+                    safety_pct: pct,
+                    confidence: Some(0.9),
+                    probabilities: Default::default(),
+                    cost_usd: None,
+                    model: "fake-decider".into(),
+                }),
+                Rating::Fails => Err(CoreError::Other("HTTP 503".into())),
+                Rating::Hangs => std::future::pending().await,
+            }
+        }
+
+        fn model_name(&self) -> &str {
+            "fake-decider"
+        }
+    }
+
+    /// Approves; with `release`, lets the gated scorer answer only now —
+    /// a confirmation that waited for the rating would never get here.
+    struct ReleasingConfirmer(Option<Arc<tokio::sync::Notify>>);
+
+    #[async_trait::async_trait]
+    impl CommandConfirmer for ReleasingConfirmer {
+        async fn confirm(&self, _: &str, _: &str, _: bool) -> Result<bool> {
+            if let Some(release) = &self.0 {
+                release.notify_one();
+            }
+            Ok(true)
+        }
+    }
+
+    fn sink_into(events: &Arc<Mutex<Vec<AgentEvent>>>) -> EventSink {
+        let events = Arc::clone(events);
+        Arc::new(move |event| events.lock().unwrap().push(event))
+    }
+
+    fn proposals(events: &[AgentEvent]) -> Vec<u64> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::CommandProposed { proposal_id, .. } => Some(*proposal_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn scored(events: &[AgentEvent]) -> Vec<(u64, Option<u8>, bool)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::CommandScored {
+                    proposal_id,
+                    safety_pct,
+                    unavailable,
+                    ..
+                } => Some((*proposal_id, *safety_pct, *unavailable)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One `k8s_get` turn in a cluster tab (`prod-eu`, namespace `shop`).
+    async fn rate_cluster_request(
+        mode: CommandConfirmMode,
+        scorer: Arc<FakeScorer>,
+    ) -> Vec<AgentEvent> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let release = scorer.gate.clone();
+        KubeAgent::new(
+            ScriptedLlm::new(vec![get_pods(), ChatResponse::text("Done.")]),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::new(ReleasingConfirmer(release)) as Arc<dyn CommandConfirmer>,
+            mode,
+            Vec::new(),
+        )
+        .event_sink(sink_into(&events))
+        .risk_scorer(Some(scorer as Arc<dyn RiskScorer>))
+        .run("show pods", &[])
+        .await
+        .unwrap();
+        let events = events.lock().unwrap().clone();
+        events
+    }
+
+    #[tokio::test]
+    async fn every_mode_rates_the_cluster_request_without_waiting() {
+        for mode in [
+            CommandConfirmMode::Always,
+            CommandConfirmMode::Allowlist,
+            CommandConfirmMode::Never,
+        ] {
+            let scorer = Arc::new(FakeScorer {
+                rating: Rating::Pct(97),
+                // In `always` the scorer answers only once the user has been
+                // asked: a confirmation waiting for it would hang the turn.
+                gate: (mode == CommandConfirmMode::Always)
+                    .then(|| Arc::new(tokio::sync::Notify::new())),
+                inputs: Mutex::new(Vec::new()),
+            });
+            let events = tokio::time::timeout(
+                Duration::from_secs(10),
+                rate_cluster_request(mode, Arc::clone(&scorer)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{mode:?}: the confirmation waited for the rating"));
+            let ids = proposals(&events);
+            assert_eq!(ids.len(), 1, "{mode:?}: {events:?}");
+            assert_eq!(scored(&events), vec![(ids[0], Some(97), false)], "{mode:?}");
+            let finished = events
+                .iter()
+                .position(|e| matches!(e, AgentEvent::Finished(_)))
+                .unwrap();
+            let rated = events
+                .iter()
+                .position(|e| matches!(e, AgentEvent::CommandScored { .. }))
+                .unwrap();
+            assert!(
+                rated < finished,
+                "{mode:?}: the rating lands before the turn ends"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_scorer_is_told_the_cluster_namespace_and_the_request() {
+        let scorer = FakeScorer::new(Rating::Pct(90));
+        rate_cluster_request(CommandConfirmMode::Never, Arc::clone(&scorer)).await;
+        let inputs = scorer.inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(
+            inputs[0].target,
+            "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
+        );
+        assert_eq!(inputs[0].command, "k8s_get pod -n shop --limit 50");
+        assert_eq!(inputs[0].explanation, "List the pods in shop");
+    }
+
+    #[tokio::test]
+    async fn a_failed_rating_is_unavailable_and_the_request_still_runs() {
+        let events =
+            rate_cluster_request(CommandConfirmMode::Always, FakeScorer::new(Rating::Fails)).await;
+        let id = proposals(&events)[0];
+        assert_eq!(scored(&events), vec![(id, None, true)]);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::CommandFinished { denied: false, .. })),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rating_that_never_comes_is_unavailable_and_the_request_still_runs() {
+        let events =
+            rate_cluster_request(CommandConfirmMode::Never, FakeScorer::new(Rating::Hangs)).await;
+        let id = proposals(&events)[0];
+        assert_eq!(scored(&events), vec![(id, None, true)]);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::CommandFinished { denied: false, .. })));
+    }
+
+    #[tokio::test]
+    async fn log_queries_of_a_cluster_tab_are_rated() {
+        let query = ChatResponse::tool_calls(
+            "",
+            vec![
+                ToolCall {
+                    id: "q".into(),
+                    name: crate::logs::TOOL_QUERY_LOGS.into(),
+                    arguments: serde_json::json!({"source": "vlogs-prod", "query": "error", "since": "1h", "explanation": "Recent errors"}),
+                },
+                ToolCall {
+                    id: "h".into(),
+                    name: crate::logs::k8s::TOOL_POD_LOGS_HISTORY.into(),
+                    arguments: serde_json::json!({"pod": "web-1", "since": "1h", "explanation": "Last hour of web-1"}),
+                },
+            ],
+        );
+        let scorer = FakeScorer::new(Rating::Pct(95));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        KubeAgent::new(
+            ScriptedLlm::new(vec![query, ChatResponse::text("Done.")]),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::new(ReleasingConfirmer(None)) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Always,
+            Vec::new(),
+        )
+        .event_sink(sink_into(&events))
+        .log_sources(Some(crate::logs::tests::stub_log_sources(Vec::new())))
+        .risk_scorer(Some(Arc::clone(&scorer) as Arc<dyn RiskScorer>))
+        .run("why errors", &[])
+        .await
+        .unwrap();
+        let events = events.lock().unwrap().clone();
+        let ids = proposals(&events);
+        assert_eq!(ids.len(), 2, "{events:?}");
+        let mut rated: Vec<u64> = scored(&events).iter().map(|(id, _, _)| *id).collect();
+        rated.sort_unstable();
+        let mut expected = ids.clone();
+        expected.sort_unstable();
+        assert_eq!(rated, expected, "each log query gets its own rating");
+        let inputs = scorer.inputs.lock().unwrap();
+        assert!(
+            inputs
+                .iter()
+                .all(|i| i.target.starts_with("Kubernetes cluster prod-eu")),
+            "{inputs:?}"
+        );
+        assert!(
+            inputs.iter().any(|i| i.explanation == "Recent errors"),
+            "{inputs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kubernetes_fleet_is_not_rated() {
+        use crate::kube_fleet::tests as fleet;
+        let (eu, _) = fleet::cluster("prod-eu", vec![fleet::pod("web-1"), fleet::pod("web-2")]);
+        let kube_fleet = KubeFleet::open(&fleet::group(&["prod-eu"], None), vec![eu])
+            .await
+            .unwrap();
+        let describe = ChatResponse::tool_calls(
+            "",
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "k8s_describe".into(),
+                arguments: serde_json::json!({"kind": "Pod", "name": "x", "explanation": "Describe every pod"}),
+            }],
+        );
+        let scorer = FakeScorer::new(Rating::Pct(99));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        KubeAgent::new_fleet(
+            ScriptedLlm::new(vec![describe, ChatResponse::text("Done.")]),
+            Arc::new(kube_fleet),
+            Arc::new(ReleasingConfirmer(None)) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Always,
+            Vec::new(),
+        )
+        .event_sink(sink_into(&events))
+        .risk_scorer(Some(Arc::clone(&scorer) as Arc<dyn RiskScorer>))
+        .run("describe pods", &[])
+        .await
+        .unwrap();
+        let events = events.lock().unwrap().clone();
+        assert_eq!(proposals(&events).len(), 1, "{events:?}");
+        assert!(scored(&events).is_empty(), "{events:?}");
+        assert!(scorer.inputs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_scorer_nothing_is_rated() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        KubeAgent::new(
+            ScriptedLlm::new(vec![get_pods(), ChatResponse::text("Done.")]),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::new(ReleasingConfirmer(None)) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Always,
+            Vec::new(),
+        )
+        .event_sink(sink_into(&events))
+        .run("show pods", &[])
+        .await
+        .unwrap();
+        assert!(scored(&events.lock().unwrap()).is_empty());
+    }
+
+    /// A scorer that cancels the turn and then never answers.
+    struct CancellingScorer(CancellationToken);
+
+    #[async_trait::async_trait]
+    impl RiskScorer for CancellingScorer {
+        async fn score(&self, _: &RiskInput) -> Result<RiskScore> {
+            self.0.cancel();
+            std::future::pending().await
+        }
+
+        fn model_name(&self) -> &str {
+            "fake-decider"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_drops_its_ratings() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let token = CancellationToken::new();
+        let result = KubeAgent::new(
+            ScriptedLlm::new(vec![get_pods(), ChatResponse::text("Done.")]),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::new(ReleasingConfirmer(None)) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Never,
+            Vec::new(),
+        )
+        .event_sink(sink_into(&events))
+        .cancellation(token.clone())
+        .risk_scorer(Some(
+            Arc::new(CancellingScorer(token.clone())) as Arc<dyn RiskScorer>
+        ))
+        .run("show pods", &[])
+        .await;
+        // Whether the cancel lands before or after the model's last answer,
+        // the rating in flight is dropped rather than awaited.
+        assert!(token.is_cancelled(), "the scorer ran");
+        let events = events.lock().unwrap();
+        assert!(
+            scored(&events).is_empty(),
+            "no rating after a cancel: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Cancelled | AgentEvent::Finished(_))
+            ),
+            "{result:?}: {events:?}"
+        );
     }
 }

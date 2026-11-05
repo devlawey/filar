@@ -37,8 +37,11 @@ pub const RISK_LEVELS: [&str; 5] = [
     "Irreversible and/or system-wide: destroys data or affects the whole system with no way back.",
 ];
 
-/// The question asked about every command.
-pub const RISK_QUESTION: &str = "How dangerous is it to run this shell command on the described target? \
+/// The question asked about every command. Worded for both shell commands
+/// and typed requests (Kubernetes API calls, log queries; #631) — the target
+/// line of the state says which kind it is.
+pub const RISK_QUESTION: &str =
+    "How dangerous is it to run this command or API request on the described target? \
 Place it on the ordered scale from the safest level to the most dangerous one.";
 
 /// Name of the question in the Decisions API request.
@@ -267,7 +270,7 @@ impl RiskScorer for DecisionsApiScorer {
 /// numbered, and a one-digit answer.
 pub fn chat_logprob_instruction() -> String {
     let mut s = String::from(
-        "You rate how dangerous it is to run a shell command on the described target.\n\
+        "You rate how dangerous it is to run a command or API request on the described target.\n\
          Danger levels, from safest to most dangerous:\n",
     );
     for (i, level) in RISK_LEVELS.iter().enumerate() {
@@ -511,6 +514,138 @@ pub fn build_risk_scorer(
             timeout,
         )?)),
         _ => Err(CoreError::Config("[risk_scorer] unsupported kind".into())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ratings in flight
+// ---------------------------------------------------------------------------
+
+/// Upper bound on one safety rating, whatever the scorer's own timeout: an
+/// agent waits for in-flight ratings before its terminal event, so a scorer
+/// that never answers must not hold `Finished` back for ever.
+pub(crate) const RISK_SCORE_MAX_WAIT: Duration =
+    Duration::from_secs(filar_core::MAX_RISK_SCORER_TIMEOUT_SECS + 2);
+
+/// The safety ratings an agent turn started and has not seen finish (#549,
+/// #631). Shared by [`crate::Agent`] and [`crate::KubeAgent`]: each rating
+/// runs in its own task and ends as one `CommandScored` event; the turn waits
+/// for them before its terminal event and drops them on cancellation, so no
+/// rating follows `Finished`, `Error` or `Cancelled`.
+#[derive(Default)]
+pub(crate) struct PendingScores(std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>);
+
+impl PendingScores {
+    /// Rate `input` with `scorer` in a separate task, without waiting:
+    /// neither confirmation nor execution waits for it. The result goes to
+    /// `sink` as `CommandScored` with `proposal_id`; any error or a timeout
+    /// becomes `unavailable: true`.
+    pub(crate) fn spawn(
+        &self,
+        scorer: std::sync::Arc<dyn RiskScorer>,
+        input: RiskInput,
+        proposal_id: u64,
+        sink: Option<crate::EventSink>,
+    ) {
+        let handle = tokio::spawn(async move {
+            let model = scorer.model_name().to_string();
+            let result = match tokio::time::timeout(RISK_SCORE_MAX_WAIT, scorer.score(&input)).await
+            {
+                Ok(r) => r,
+                Err(_) => Err(CoreError::Other("risk scorer: no answer in time".into())),
+            };
+            let event = match result {
+                Ok(score) => crate::AgentEvent::CommandScored {
+                    proposal_id,
+                    safety_pct: Some(score.safety_pct),
+                    confidence: score.confidence,
+                    model: score.model,
+                    cost_usd: score.cost_usd,
+                    unavailable: false,
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "command safety rating unavailable");
+                    crate::AgentEvent::CommandScored {
+                        proposal_id,
+                        safety_pct: None,
+                        confidence: None,
+                        model,
+                        cost_usd: None,
+                        unavailable: true,
+                    }
+                }
+            };
+            if let Some(sink) = sink {
+                sink(event);
+            }
+        });
+        let mut pending = self.lock();
+        pending.retain(|h| !h.is_finished());
+        pending.push(handle);
+    }
+
+    /// Lock the list. A poisoned lock is taken over rather than skipped:
+    /// waiting for or aborting the ratings must never be lost.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<tokio::task::JoinHandle<()>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Settle the ratings at the end of a turn: wait for them (each is
+    /// bounded by [`RISK_SCORE_MAX_WAIT`]) unless the turn is or becomes
+    /// cancelled, in which case the rest are aborted — `Cancelled` is
+    /// terminal, no rating may follow it.
+    pub(crate) async fn settle(&self, cancellation: Option<&tokio_util::sync::CancellationToken>) {
+        if cancellation.is_some_and(|t| t.is_cancelled()) {
+            self.abort().await;
+            return;
+        }
+        self.wait(cancellation).await;
+        if cancellation.is_some_and(|t| t.is_cancelled()) {
+            self.abort().await;
+        }
+    }
+
+    /// Wait for every rating still in flight. A cancellation that arrives
+    /// while waiting aborts the rest.
+    async fn wait(&self, cancellation: Option<&tokio_util::sync::CancellationToken>) {
+        let handles: Vec<_> = self.lock().drain(..).collect();
+        let mut handles = handles.into_iter();
+        while let Some(mut h) = handles.next() {
+            let cancelled = match cancellation {
+                Some(token) => tokio::select! {
+                    _ = &mut h => false,
+                    _ = token.cancelled() => true,
+                },
+                None => {
+                    let _ = (&mut h).await;
+                    false
+                }
+            };
+            if cancelled {
+                h.abort();
+                let _ = h.await;
+                abort_and_join(handles.by_ref().collect()).await;
+                return;
+            }
+        }
+    }
+
+    /// Drop every rating still in flight and wait until the tasks are gone:
+    /// `abort` only requests it, and a task already inside the sink would
+    /// otherwise emit after `Cancelled`.
+    async fn abort(&self) {
+        let handles: Vec<_> = self.lock().drain(..).collect();
+        abort_and_join(handles).await;
+    }
+}
+
+/// Abort `handles` and wait until each task has actually stopped.
+async fn abort_and_join(handles: Vec<tokio::task::JoinHandle<()>>) {
+    for h in &handles {
+        h.abort();
+    }
+    for h in handles {
+        let _ = h.await;
     }
 }
 

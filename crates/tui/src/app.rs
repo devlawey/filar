@@ -5951,14 +5951,22 @@ impl App {
         })
     }
 
-    /// Whether a proposal of `tool` will get a safety rating (#551): a
-    /// scorer is configured, this is not a fleet run, and the tool runs a
-    /// command (job bookkeeping is not rated) — mirrors the agent.
+    /// Whether a proposal of `tool` will get a safety rating (#551, #631):
+    /// a scorer is configured, this is not a fleet run (SSH or Kubernetes),
+    /// and the tool is one the agent rates — mirrors the agents. A cluster
+    /// tab rates its typed requests and log queries (`KubeAgent`); a shell
+    /// or pod tab rates commands, not log queries or job bookkeeping
+    /// (`Agent`).
     fn expects_safety_rating(&self, tool: &filar_core::ToolInvocation) -> bool {
-        self.risk_scorer_on
-            && !self.in_fleet()
-            && !filar_agent::kube_tools::is_kube_tool_name(&tool.name)
-            && !is_log_tool(&tool.name)
+        if !self.risk_scorer_on || self.in_fleet() || self.in_kube_fleet() {
+            return false;
+        }
+        let typed =
+            filar_agent::kube_tools::is_kube_tool_name(&tool.name) || is_log_tool(&tool.name);
+        if self.kube.as_ref().is_some_and(|kube| kube.pod.is_none()) {
+            return typed;
+        }
+        !typed
             && tool.name != filar_agent::tools::TOOL_BACKGROUND_JOB_STATUS
             && tool.name != filar_agent::tools::TOOL_LIST_BACKGROUND_JOBS
     }
@@ -18069,6 +18077,33 @@ mod tests {
             pod: None,
         });
         app
+    }
+
+    #[test]
+    fn a_cluster_tab_expects_a_rating_for_typed_requests_and_log_queries() {
+        let mut app = connected_kube_app();
+        app.risk_scorer_on = true;
+        propose(&mut app, 631, "k8s_get pod -n shop --limit 50", "k8s_get");
+        assert_eq!(app.safety_scores.get(&631), Some(&SafetyScore::Pending));
+        propose(&mut app, 632, "query_logs vlogs-prod: error", "query_logs");
+        assert_eq!(app.safety_scores.get(&632), Some(&SafetyScore::Pending));
+        propose(&mut app, 633, "pod_logs_history web-1", "pod_logs_history");
+        assert_eq!(app.safety_scores.get(&633), Some(&SafetyScore::Pending));
+        // The block gets its badge once the rating lands.
+        finished(&mut app, "pod_logs_history web-1");
+        scored(&mut app, 633, Some(96));
+        let idx = app.messages.len() - 1;
+        assert_eq!(
+            app.safety_badges()
+                .get(&idx)
+                .map(|(label, _)| label.as_str()),
+            Some("96%")
+        );
+
+        // Without `[risk_scorer]` nothing is pending.
+        let mut off = connected_kube_app();
+        propose(&mut off, 634, "k8s_get pod -n shop --limit 50", "k8s_get");
+        assert!(off.safety_scores.is_empty());
     }
 
     fn assert_shell_refusal(app: &App) {
