@@ -12,7 +12,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use filar_core::ChatBlock;
 
@@ -300,28 +302,12 @@ impl ChatLayoutCache {
                 }
 
                 ChatBlock::Error(text) => {
-                    let text = strip_emoji(text);
-                    self.push_header(
-                        idx,
-                        vec![
-                            Span::raw("  "),
-                            Span::styled(format!("{} ", glyphs.danger), theme.error_style()),
-                            Span::styled(text, theme.error_style()),
-                        ],
-                    );
+                    self.push_marked(idx, glyphs.danger, theme.error_style(), &strip_emoji(text), inner);
                     self.push_spacer();
                 }
 
                 ChatBlock::System(text) => {
-                    let text = strip_emoji(text);
-                    self.push_header(
-                        idx,
-                        vec![
-                            Span::raw("  "),
-                            Span::styled(format!("{} ", glyphs.middle_dot), theme.muted()),
-                            Span::styled(text, theme.muted()),
-                        ],
-                    );
+                    self.push_marked(idx, glyphs.middle_dot, theme.muted(), &strip_emoji(text), inner);
                     self.push_spacer();
                 }
 
@@ -399,6 +385,37 @@ impl ChatLayoutCache {
         });
     }
 
+    /// A system line or an error (#628): `  <marker> text`, wrapped to
+    /// `width` columns. The marker is on the first row only; continuation
+    /// rows are indented under the text, in the same style. A line break in
+    /// the text starts a new row; trailing empty lines are dropped.
+    fn push_marked(&mut self, idx: usize, marker: &str, style: Style, text: &str, width: usize) {
+        let lead = format!("  {marker} ");
+        let indent = UnicodeWidthStr::width(lead.as_str());
+        let text_width = width.saturating_sub(indent).max(1);
+        let mut rows: Vec<String> = text
+            .trim_end()
+            .lines()
+            .flat_map(|line| wrap_words(line, text_width))
+            .collect();
+        if rows.is_empty() {
+            rows.push(String::new());
+        }
+        let mut rows = rows.into_iter();
+        let first = rows.next().unwrap_or_default();
+        self.push_header(
+            idx,
+            vec![
+                Span::raw("  "),
+                Span::styled(format!("{marker} "), style),
+                Span::styled(first, style),
+            ],
+        );
+        for row in rows {
+            self.push_body_spans(idx, vec![Span::raw(" ".repeat(indent)), Span::styled(row, style)]);
+        }
+    }
+
     fn push_body_spans(&mut self, idx: usize, spans: Vec<Span<'static>>) {
         self.lines.push(RenderedLine {
             line: Line::from(spans),
@@ -436,6 +453,46 @@ impl Default for ChatLayoutCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Wrap `line` to `width` columns at spaces (#628); a word wider than the
+/// row is cut by [`wrap_text`]. Messages are prose with paths and names, and
+/// a break inside "Hosts" reads worse than a short row.
+fn wrap_words(line: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for word in line.split(' ') {
+        let word_width = UnicodeWidthStr::width(word);
+        let gap = usize::from(!current.is_empty());
+        if current_width + gap + word_width <= width {
+            if gap == 1 {
+                current.push(' ');
+            }
+            current.push_str(word);
+            current_width += gap + word_width;
+            continue;
+        }
+        if !current.is_empty() {
+            rows.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        if word_width <= width {
+            current.push_str(word);
+            current_width = word_width;
+        } else {
+            let mut pieces = wrap_text(word, width);
+            if let Some(last) = pieces.pop() {
+                rows.extend(pieces);
+                current_width = UnicodeWidthStr::width(last.as_str());
+                current = last;
+            }
+        }
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -513,6 +570,84 @@ mod tests {
         // Rebuild anyway to verify line count is stable.
         cache.rebuild(&msgs, 80, &theme, &collapsed, 1);
         assert_eq!(cache.lines.len(), line_count);
+    }
+
+    fn row_text(line: &RenderedLine) -> String {
+        line.line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn block_rows(cache: &ChatLayoutCache, idx: usize) -> Vec<String> {
+        cache
+            .lines
+            .iter()
+            .filter(|l| l.block_index == Some(idx))
+            .map(row_text)
+            .collect()
+    }
+
+    #[test]
+    fn long_system_lines_and_errors_wrap_instead_of_being_cut() {
+        let theme = Theme::default_dark();
+        let mut cache = ChatLayoutCache::new();
+        let hint = "Debug-контейнер недоступен: у кластера kind-filar-k8s пуст debug_images (лаунчер → Hosts → Debug images)";
+        let error = "Не удалось войти в под filar-k8s-noshell-1, вкладка осталась на кластере kind-filar-k8s: в контейнере нет /bin/sh";
+        let msgs = vec![ChatBlock::System(hint.into()), ChatBlock::Error(error.into())];
+        cache.rebuild(&msgs, 40, &theme, &HashSet::new(), 1);
+        for (idx, text) in [(0, hint), (1, error)] {
+            let rows = block_rows(&cache, idx);
+            assert!(rows.len() > 1, "{rows:?}");
+            for row in &rows {
+                assert!(UnicodeWidthStr::width(row.as_str()) <= 40, "{row:?}");
+            }
+            let marker = if idx == 0 { theme.glyphs().middle_dot } else { theme.glyphs().danger };
+            assert!(rows[0].starts_with(&format!("  {marker} ")), "{rows:?}");
+            assert!(rows[1..].iter().all(|r| !r.contains(marker)), "marker only first: {rows:?}");
+            let joined: String = rows
+                .iter()
+                .map(|r| r.trim_start().trim_start_matches(marker).trim_start())
+                .collect();
+            assert_eq!(joined.replace(' ', ""), text.replace(' ', ""), "whole text kept");
+        }
+        let first_block_rows = cache.lines.iter().filter(|l| l.block_index == Some(0)).count();
+        assert_eq!(cache.lines[0].region, LineRegion::Header);
+        assert!(cache.lines[1..first_block_rows].iter().all(|l| l.region == LineRegion::Body));
+    }
+
+    #[test]
+    fn line_breaks_in_a_system_line_are_rows_and_short_lines_are_unchanged() {
+        let theme = Theme::default_dark();
+        let mut cache = ChatLayoutCache::new();
+        let msgs = vec![
+            ChatBlock::System("first\nsecond\n\n".into()),
+            ChatBlock::System("connected".into()),
+        ];
+        cache.rebuild(&msgs, 80, &theme, &HashSet::new(), 1);
+        let dot = theme.glyphs().middle_dot;
+        assert_eq!(block_rows(&cache, 0), vec![format!("  {dot} first"), "    second".to_string()]);
+        assert_eq!(block_rows(&cache, 1), vec![format!("  {dot} connected")]);
+    }
+
+    #[test]
+    fn system_lines_break_between_words() {
+        assert_eq!(
+            wrap_words("пуст debug_images (лаунчер → Hosts → Debug images)", 20),
+            vec!["пуст debug_images", "(лаунчер → Hosts →", "Debug images)"]
+        );
+        // A word wider than the row is cut, and the rest continues after it.
+        assert_eq!(wrap_words("ab /very/long/path cd", 6), vec!["ab", "/very/", "long/p", "ath cd"]);
+        assert_eq!(wrap_words("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn wide_characters_wrap_by_width_not_by_count() {
+        let theme = Theme::default_dark();
+        let mut cache = ChatLayoutCache::new();
+        // The feed strips CJK (`strip_emoji`), so the wrapping helper is
+        // driven directly: width is counted in columns.
+        cache.push_marked(0, theme.glyphs().danger, theme.error_style(), "集群集群集群集群集群集群", 14);
+        let rows = block_rows(&cache, 0);
+        assert!(rows.len() >= 3, "{rows:?}");
+        assert!(rows.iter().all(|r| UnicodeWidthStr::width(r.as_str()) <= 14), "{rows:?}");
     }
 
     #[test]
