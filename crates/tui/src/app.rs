@@ -6417,7 +6417,13 @@ impl App {
                     self.cancellation = None;
                     self.active_session_mut().background_activity = false;
                 }
-                filar_agent::AgentEvent::Cancelled => {}
+                filar_agent::AgentEvent::Cancelled => {
+                    // A cancelled turn drops its ratings still in flight
+                    // (#631): no `CommandScored` follows, so a badge left at
+                    // "rating…" would never resolve.
+                    self.safety_scores
+                        .retain(|_, score| !matches!(score, SafetyScore::Pending));
+                }
                 _ => {}
             },
             TuiEvent::Thinking => {
@@ -18098,6 +18104,25 @@ mod tests {
                 .get(&idx)
                 .map(|(label, _)| label.as_str()),
             Some("96%")
+        );
+
+        // A cancelled turn leaves no badge at "rating…".
+        propose(
+            &mut app,
+            635,
+            "k8s_describe pod web-1 -n shop",
+            "k8s_describe",
+        );
+        assert_eq!(app.safety_scores.get(&635), Some(&SafetyScore::Pending));
+        let session_id = app.sessions[app.active].id;
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id,
+            event: filar_agent::AgentEvent::Cancelled,
+        });
+        assert_eq!(app.safety_scores.get(&635), None);
+        assert!(
+            matches!(app.safety_scores.get(&633), Some(SafetyScore::Ready { .. })),
+            "ratings that arrived stay"
         );
 
         // Without `[risk_scorer]` nothing is pending.

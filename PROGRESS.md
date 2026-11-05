@@ -12079,6 +12079,15 @@ namespace и теги. Kube-флот не оценивается, как SSH-ф�
   `eval/risk/commands.toml` добавлены read-only `k8s_*` с целью-кластером и
   `kubectl get` по SSH для сравнения.
 
+- По ревью:
+  - цель для оценщика берёт namespace самого запроса (`-n kube-system`), как
+    окно подтверждения;
+  - id предложений общий для `Agent` и `KubeAgent` (`agent::next_proposal_id`);
+  - отмена, пришедшая, пока оценки досчитываются, завершает ход событием
+    `Cancelled`, а не `Finished`;
+  - TUI на `Cancelled` убирает бейджи, оставшиеся в `rating…` (касается и
+    шелл-вкладок).
+
 **Контракты.** `CommandExecutor` и `LlmClient` не менялись. Новый публичный
 метод — `KubeAgent::risk_scorer`.
 

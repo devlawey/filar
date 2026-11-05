@@ -406,6 +406,13 @@ pub struct Agent {
 /// agents, since a frontend typically builds a new agent per prompt.
 static NEXT_PROPOSAL_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The next [`AgentEvent::CommandProposed`] id. Shared by [`Agent`] and
+/// [`crate::KubeAgent`] (#631), so a rating can never land on another
+/// agent's proposal.
+pub(crate) fn next_proposal_id() -> u64 {
+    NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Builder for [`Agent`].
 pub struct AgentBuilder {
     llm: Option<Arc<dyn LlmClient>>,

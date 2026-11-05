@@ -3,7 +3,6 @@
 //! The loop executes only typed, read-only [`KubeToolCall`] values. It never
 //! adapts Kubernetes operations to shell commands or `CommandExecutor`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +22,6 @@ use crate::{
 
 const MAX_ITERATIONS: usize = 50;
 const MAX_MISSING_EXPLANATION_RETRIES: u32 = 2;
-static NEXT_PROPOSAL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The agent's confirmer with the arbiter in front of it (#620): the audit
 /// runs, its verdict is emitted, then the user is asked. Wrapping the
@@ -206,29 +204,47 @@ impl KubeAgent {
     }
 
     /// Start rating a proposed request, if a scorer is set and this is a
-    /// cluster tab (#631). Fleets are not rated.
-    fn spawn_risk_score(&self, proposal_id: u64, command: &str, explanation: &str) {
+    /// cluster tab (#631). Fleets are not rated. `namespace` is the
+    /// request's own namespace when it names one (`-n kube-system`); the
+    /// tab's otherwise — as the confirmation dialog shows it.
+    fn spawn_risk_score(
+        &self,
+        proposal_id: u64,
+        command: &str,
+        explanation: &str,
+        namespace: Option<&str>,
+    ) {
         let Some(scorer) = self.risk_scorer.clone() else {
             return;
         };
-        if matches!(self.execution, KubeExecution::Fleet { .. }) {
+        let KubeExecution::Cluster {
+            target,
+            namespace: tab_namespace,
+            ..
+        } = &self.execution
+        else {
             return;
-        }
+        };
+        let namespace = namespace.or(tab_namespace.as_deref());
         let input = RiskInput {
             command: command.to_string(),
             explanation: explanation.to_string(),
-            target: self.arbiter_target(),
+            target: arbiter::target_description(&ArbiterContext {
+                is_local: false,
+                ssh_info: None,
+                kubernetes: Some(KubernetesArbiterTarget::new(target, namespace)),
+            }),
         };
         self.pending_scores
             .spawn(scorer, input, proposal_id, self.event_sink.clone());
     }
 
-    /// Emit `event`; a proposal also starts its safety rating (#631). Used
-    /// as the sink of the log-source paths, which announce their own
-    /// proposals.
-    fn emit_and_rate(&self, event: AgentEvent) {
-        let rates = self.risk_scorer.is_some()
-            && matches!(self.execution, KubeExecution::Cluster { .. });
+    /// Emit `event`; a proposal also starts its safety rating (#631), with
+    /// `namespace` as in [`Self::spawn_risk_score`]. The log-source paths,
+    /// which announce their own proposals, use it as their sink.
+    fn emit_and_rate(&self, event: AgentEvent, namespace: Option<&str>) {
+        let rates =
+            self.risk_scorer.is_some() && matches!(self.execution, KubeExecution::Cluster { .. });
         // Copy the proposal only when it is going to be rated.
         let rate = match &event {
             AgentEvent::CommandProposed {
@@ -241,7 +257,7 @@ impl KubeAgent {
         };
         self.emit(event);
         if let Some((proposal_id, command, explanation)) = rate {
-            self.spawn_risk_score(proposal_id, &command, &explanation);
+            self.spawn_risk_score(proposal_id, &command, &explanation, namespace);
         }
     }
 
@@ -356,6 +372,14 @@ impl KubeAgent {
         // them, so none follows `Cancelled` or reaches a closed tab.
         self.pending_scores.settle(self.cancellation.as_ref()).await;
         match result {
+            // A cancel that lands while ratings settle ends the turn as
+            // cancelled for the frontend — a late `Finished` would clear the
+            // state of a request started since — while the caller still
+            // gets the answer.
+            Ok(text) if self.cancelled() => {
+                self.emit(AgentEvent::Cancelled);
+                Ok(text)
+            }
             Ok(text) => {
                 self.emit(AgentEvent::Finished(text.clone()));
                 Ok(text)
@@ -485,8 +509,8 @@ impl KubeAgent {
             let Some(sources) = &self.log_sources else {
                 return Ok(ChatMessage::tool(&call.id, "Error: no log sources are configured."));
             };
-            let emit = |event: AgentEvent| self.emit_and_rate(event);
-            let proposal_id = NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed);
+            let emit = |event: AgentEvent| self.emit_and_rate(event, None);
+            let proposal_id = crate::agent::next_proposal_id();
             return match &self.execution {
                 KubeExecution::Cluster { target, namespace, .. } => {
                     // The cluster's own tag policies tighten the gate as for
@@ -529,7 +553,7 @@ impl KubeAgent {
                     "Error: no log sources are available here.",
                 ));
             };
-            let emit = |event: AgentEvent| self.emit_and_rate(event);
+            let emit = |event: AgentEvent| self.emit_and_rate(event, None);
             return sources
                 .process(
                     call,
@@ -537,7 +561,7 @@ impl KubeAgent {
                     &confirmer,
                     &emit,
                     self.cancellation.as_ref(),
-                    NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed),
+                    crate::agent::next_proposal_id(),
                 )
                 .await;
         }
@@ -602,16 +626,19 @@ impl KubeAgent {
             }
         };
 
-        self.emit_and_rate(AgentEvent::CommandProposed {
-            proposal_id: NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed),
-            command: display.clone(),
-            explanation: explanation.clone(),
-            destructive: false,
-            tool: filar_core::ToolInvocation {
-                name: call.name.clone(),
-                arguments: call.arguments.clone(),
+        self.emit_and_rate(
+            AgentEvent::CommandProposed {
+                proposal_id: crate::agent::next_proposal_id(),
+                command: display.clone(),
+                explanation: explanation.clone(),
+                destructive: false,
+                tool: filar_core::ToolInvocation {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                },
             },
-        });
+            parsed.namespace(),
+        );
 
         match decision {
             ConfirmDecision::NeedsConfirmation => {
@@ -1185,6 +1212,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_scorer_is_told_the_namespace_the_request_names() {
+        let other = ChatResponse::tool_calls(
+            "",
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "k8s_get".into(),
+                arguments: serde_json::json!({"kind": "Pod", "namespace": "kube-system", "explanation": "System pods"}),
+            }],
+        );
+        let scorer = FakeScorer::new(Rating::Pct(90));
+        KubeAgent::new(
+            ScriptedLlm::new(vec![other, ChatResponse::text("Done.")]),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::new(ReleasingConfirmer(None)) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Never,
+            Vec::new(),
+        )
+        .risk_scorer(Some(Arc::clone(&scorer) as Arc<dyn RiskScorer>))
+        .run("system pods", &[])
+        .await
+        .unwrap();
+        let inputs = scorer.inputs.lock().unwrap();
+        assert_eq!(
+            inputs[0].target, "Kubernetes cluster prod-eu (namespace kube-system, tags: prod)",
+            "the request's own namespace, as the confirmation shows it"
+        );
+    }
+
+    #[tokio::test]
     async fn a_failed_rating_is_unavailable_and_the_request_still_runs() {
         let events =
             rate_cluster_request(CommandConfirmMode::Always, FakeScorer::new(Rating::Fails)).await;
@@ -1362,11 +1420,8 @@ mod tests {
             "no rating after a cancel: {events:?}"
         );
         assert!(
-            matches!(
-                events.last(),
-                Some(AgentEvent::Cancelled | AgentEvent::Finished(_))
-            ),
-            "{result:?}: {events:?}"
+            matches!(events.last(), Some(AgentEvent::Cancelled)),
+            "a cancelled turn never ends as Finished: {result:?}: {events:?}"
         );
     }
 }
