@@ -11,6 +11,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Changed
+
+- New Kubernetes guide `docs/KUBERNETES.md`: the target model, connecting a cluster (kind, cloud, exec plugins, `NO_PROXY`), every field of the launcher's cluster card, the cluster and pod tabs, the debug container with the RBAC it needs (steps, a minimal `Role` and `RoleBinding`, `kubectl auth can-i`), Kubernetes groups and pod fleets with a real comparison, logs and common problems; `USER_GUIDE.md` 2.2, 3, 3.3, 4.8 and 4.10–4.13 link to it ([#633](https://github.com/devlawey/filar/issues/633)).
+
 ### Fixed
 
 - The command safety rating (`[risk_scorer]`) now covers a Kubernetes cluster tab: every typed `k8s_*` request, `pod_http_get`, `query_logs` and `pod_logs_history` is rated with the cluster, namespace and tags as the target, in every confirmation mode; Kubernetes fleets stay unrated like SSH fleets; `KubeAgent::risk_scorer` for embedders ([#631](https://github.com/devlawey/filar/issues/631)).
