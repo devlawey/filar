@@ -2126,7 +2126,8 @@ fn list_field<'t>(
 }
 
 /// A short grey note under a field, in a two-column grid: an explanation
-/// that matters without hovering (#632).
+/// that matters without hovering (#632). It is a row of its own — call it
+/// after the field's row has ended; it ends its own row.
 fn grid_note(ui: &mut egui::Ui, note: &str) {
     ui.label("");
     ui.label(egui::RichText::new(note).small().weak());
@@ -8086,17 +8087,31 @@ host_key_policy = \"strict\"
 
     // ── Field hints (#632) ─────────────────────────────────────────────
 
-    /// Short example hints of the launcher fields, longest first.
+    /// Every literal example hint of the launcher fields (the default key
+    /// path, the defaults of Max tokens and Compact at and the cluster names
+    /// of a log source are computed at run time).
     const EXAMPLE_HINTS: &[&str] = &[
         "e.g. http://localhost:11434/v1",
         "shop/web-1/LOG_LEVEL",
         "deploy (required)",
         "prod-eu (required)",
+        "DEEPSEEK_API_KEY",
         "shop/app-config",
+        "~/.kube/config",
         "busybox:1.37",
         "8080, 6060",
-        "~/.kube/config",
+        "prod, web",
+        "prod, k8s",
+        "shop, pay",
+        "work, prod",
+        "app=web",
+        "shop",
+        "0.9",
     ];
+
+    /// egui's inner margin of a single-line `TextEdit`, both sides: the
+    /// least a field needs around its hint text.
+    const TEXT_EDIT_MARGIN: f32 = 2.0 * 4.0;
 
     /// Lay out one frame of a panel `width` points wide at `scale` and run
     /// `check` inside it.
@@ -8133,14 +8148,14 @@ host_key_policy = \"strict\"
                     // A minimum far below what the hint needs.
                     let field = ui.add(example_field(ui, &mut value, hint, 20.0));
                     assert!(
-                        field.rect.width() >= text_width(ui, hint) + 8.0,
+                        field.rect.width() >= text_width(ui, hint) + TEXT_EDIT_MARGIN,
                         "{scale}: {hint:?} gets {} for {}",
                         field.rect.width(),
                         text_width(ui, hint)
                     );
                     let list = ui.add(list_field(ui, &mut value, hint, 20.0));
                     assert!(
-                        list.rect.width() >= text_width(ui, hint) + 8.0,
+                        list.rect.width() >= text_width(ui, hint) + TEXT_EDIT_MARGIN,
                         "{scale}: {hint:?}"
                     );
                 }
