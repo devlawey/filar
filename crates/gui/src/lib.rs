@@ -2071,7 +2071,8 @@ mod hint {
     pub const REVEAL_ENV: &str =
         "Pod environment values shown without redaction, as namespace/pod/VARIABLE, \
 comma-separated. Empty = redact all.";
-    pub const SELECTOR: &str = "Label selector of the pods. Empty = every ready pod.";
+    pub const SELECTOR: &str = "Label selector of the pods; their ready pods are the members. \
+Empty = no pod discovery: each cluster/namespace is one member.";
     pub const MATCH_TAGS: &str = "Comma-separated tags; a host must have all of them.";
     pub const KEY_ENV: &str =
         "Environment variable / OS store entry the key is kept under. Empty = no key (local).";
@@ -2094,7 +2095,8 @@ fn hint_width(ui: &egui::Ui, hint: &str) -> f32 {
 }
 
 /// A single-line field with a short example `hint`: `min_width` wide, wider
-/// when the hint needs it, so the hint is never cut (#632).
+/// when the hint needs it, so the hint is not cut as long as the row has
+/// room for it (egui clamps a field to the row's width) (#632).
 fn example_field<'t>(
     ui: &egui::Ui,
     text: &'t mut String,
@@ -2108,7 +2110,8 @@ fn example_field<'t>(
 }
 
 /// A single-line field for a list of images, paths or ports (#632): it
-/// takes the rest of the row, at least `min_width`, and never cuts its hint.
+/// takes the rest of the row, at least `min_width`, and is never narrower than
+/// its hint while the row has room for it.
 fn list_field<'t>(
     ui: &egui::Ui,
     text: &'t mut String,
@@ -3075,9 +3078,13 @@ impl LauncherApp {
                         }
                         SlotAuth::Key => {
                             let default_key = filar_transport::resolve_key_path(None);
-                            ui.label("Key file:");
-                            let default_hint = format!("{} (default)", default_key.display());
-                            ui.add(list_field(ui, &mut slot.key_path, &default_hint, 240.0));
+                            // The default path can be longer than the window:
+                            // the hint stays short, the path is on hover.
+                            let explain =
+                                format!("Empty = the default key: {}", default_key.display());
+                            ui.label("Key file:").on_hover_text(&explain);
+                            ui.add(list_field(ui, &mut slot.key_path, "default key", 240.0))
+                                .on_hover_text(explain);
                             ui.end_row();
                         }
                         SlotAuth::Agent => {}
@@ -8105,6 +8112,7 @@ host_key_policy = \"strict\"
         "shop, pay",
         "work, prod",
         "app=web",
+        "default key",
         "shop",
         "0.9",
     ];
@@ -8200,7 +8208,7 @@ host_key_policy = \"strict\"
             (hint::NAMESPACES, "Empty = discover"),
             (hint::DEFAULT_NAMESPACE, "Empty = default"),
             (hint::KUBECONFIG, "$KUBECONFIG / ~/.kube/config"),
-            (hint::SELECTOR, "Empty = every ready pod"),
+            (hint::SELECTOR, "each cluster/namespace is one member"),
             (hint::SSH_TAGS, "Comma-separated"),
             (hint::KUBE_TAGS, "Comma-separated"),
             (hint::MATCH_TAGS, "Comma-separated"),
