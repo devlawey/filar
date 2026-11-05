@@ -2044,6 +2044,99 @@ const DEBUG_IMAGES_HINT: &str = "Images Ctrl+B may add to a pod as an ephemeral 
 The container stays in the pod spec until the pod is recreated and cannot be removed. \
 Empty = the action is unavailable.";
 
+// ── Field hints (#632) ───────────────────────────────────────────────
+//
+// The grey hint inside a field is only a short example of a value. What
+// the field means — "comma-separated", what an empty value does — lives in
+// the hover text of the label and the field, and, where it matters without
+// hovering, in a short grey line under the field. A hint is never cut: the
+// field is at least as wide as its hint needs at the current font and scale.
+
+/// Explanations moved out of the field hints (#632). Same meaning as the
+/// old in-field text.
+mod hint {
+    pub const SSH_TAGS: &str =
+        "Comma-separated tags. They select hosts for groups and feed [[tag_policies]].";
+    pub const KUBECONFIG: &str = "Empty = $KUBECONFIG / ~/.kube/config.";
+    pub const NAMESPACES: &str =
+        "Comma-separated namespaces Ctrl+O offers. Empty = discover them from the cluster.";
+    pub const DEFAULT_NAMESPACE: &str = "Namespace a new tab opens in. Empty = default.";
+    pub const KUBE_TAGS: &str =
+        "Comma-separated tags. They feed [[tag_policies]] exactly like SSH tags.";
+    pub const DEBUG_IMAGES_EMPTY: &str = "Empty = Ctrl+B unavailable.";
+    pub const DIAGNOSTIC_PORTS: &str =
+        "Comma-separated pod ports pod_http_get may read besides those declared in the container spec.";
+    pub const REVEAL_CONFIGMAPS: &str =
+        "ConfigMaps shown without secret redaction, as namespace/name, comma-separated. Empty = redact all.";
+    pub const REVEAL_ENV: &str =
+        "Pod environment values shown without redaction, as namespace/pod/VARIABLE, \
+comma-separated. Empty = redact all.";
+    pub const SELECTOR: &str = "Label selector of the pods; their ready pods are the members. \
+Empty = no pod discovery: each cluster/namespace is one member.";
+    pub const MATCH_TAGS: &str = "Comma-separated tags; a host must have all of them.";
+    pub const KEY_ENV: &str =
+        "Environment variable / OS store entry the key is kept under. Empty = no key (local).";
+}
+
+/// Inner horizontal margin of a single-line `TextEdit` (egui's default
+/// `Margin::symmetric(4.0, 2.0)`), both sides, plus room for the cursor.
+const FIELD_PADDING: f32 = 2.0 * 4.0 + 4.0;
+
+/// Width a single-line field needs to show `hint` uncut at the current font
+/// and scale.
+fn hint_width(ui: &egui::Ui, hint: &str) -> f32 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let text = ui.fonts(|f| {
+        f.layout_no_wrap(hint.to_owned(), font, egui::Color32::PLACEHOLDER)
+            .size()
+            .x
+    });
+    text + FIELD_PADDING
+}
+
+/// A single-line field with a short example `hint`: `min_width` wide, wider
+/// when the hint needs it, so the hint is not cut as long as the row has
+/// room for it (egui clamps a field to the row's width) (#632).
+fn example_field<'t>(
+    ui: &egui::Ui,
+    text: &'t mut String,
+    hint: &str,
+    min_width: f32,
+) -> egui::TextEdit<'t> {
+    let width = min_width.max(hint_width(ui, hint));
+    egui::TextEdit::singleline(text)
+        .hint_text(hint)
+        .desired_width(width)
+}
+
+/// A single-line field for a list of images, paths or ports (#632): it
+/// takes the rest of the row, at least `min_width`, and is never narrower than
+/// its hint while the row has room for it.
+fn list_field<'t>(
+    ui: &egui::Ui,
+    text: &'t mut String,
+    hint: &str,
+    min_width: f32,
+) -> egui::TextEdit<'t> {
+    // Stop short of a vertical scroll bar the row may run under (egui's
+    // bars float over the content, so they take no width of their own).
+    let scroll = &ui.spacing().scroll;
+    let room = ui.available_width() - (scroll.bar_width + scroll.bar_outer_margin);
+    let width = room.max(min_width).max(hint_width(ui, hint));
+    egui::TextEdit::singleline(text)
+        .hint_text(hint)
+        .desired_width(width)
+}
+
+/// A short grey note under a field, in a two-column grid: an explanation
+/// that matters without hovering (#632). It is a row of its own — call it
+/// after the field's row has ended; it ends its own row.
+fn grid_note(ui: &mut egui::Ui, note: &str) {
+    ui.label("");
+    ui.label(egui::RichText::new(note).small().weak());
+    ui.end_row();
+}
+
 /// The key name suggested for a source: `FILAR_LOGS_<NAME>`.
 fn suggested_log_key_env(name: &str) -> String {
     let upper: String = name
@@ -2956,18 +3049,16 @@ impl LauncherApp {
                     );
                     ui.end_row();
                     ui.label("Alias:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut slot.alias)
-                            .hint_text("deploy (required)")
-                            .desired_width(120.0),
-                    );
+                    ui.add(example_field(
+                        ui,
+                        &mut slot.alias,
+                        "deploy (required)",
+                        120.0,
+                    ));
                     ui.end_row();
-                    ui.label("Tags:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut slot.tags)
-                            .hint_text("prod, web (comma-separated)")
-                            .desired_width(160.0),
-                    );
+                    ui.label("Tags:").on_hover_text(hint::SSH_TAGS);
+                    ui.add(list_field(ui, &mut slot.tags, "prod, web", 160.0))
+                        .on_hover_text(hint::SSH_TAGS);
                     ui.end_row();
                     ui.label("Login:");
                     ui.horizontal(|ui| {
@@ -2987,12 +3078,13 @@ impl LauncherApp {
                         }
                         SlotAuth::Key => {
                             let default_key = filar_transport::resolve_key_path(None);
-                            ui.label("Key file:");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut slot.key_path)
-                                    .hint_text(format!("{} (default)", default_key.display()))
-                                    .desired_width(240.0),
-                            );
+                            // The default path can be longer than the window:
+                            // the hint stays short, the path is on hover.
+                            let explain =
+                                format!("Empty = the default key: {}", default_key.display());
+                            ui.label("Key file:").on_hover_text(&explain);
+                            ui.add(list_field(ui, &mut slot.key_path, "default key", 240.0))
+                                .on_hover_text(explain);
                             ui.end_row();
                         }
                         SlotAuth::Agent => {}
@@ -3072,19 +3164,25 @@ impl LauncherApp {
             .spacing([10.0, 6.0])
             .show(ui, |ui| {
                 ui.label("Name:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut slot.name)
-                        .hint_text("prod-eu (required)")
-                        .desired_width(180.0),
-                );
+                ui.add(example_field(
+                    ui,
+                    &mut slot.name,
+                    "prod-eu (required)",
+                    180.0,
+                ));
                 ui.end_row();
-                ui.label("Kubeconfig:");
+                ui.label("Kubeconfig:").on_hover_text(hint::KUBECONFIG);
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut slot.kubeconfig)
-                            .hint_text("empty = $KUBECONFIG / ~/.kube/config")
-                            .desired_width(220.0),
-                    );
+                    // Leave room for the Browse… button on the same row.
+                    let browse = hint_width(ui, "Browse…") + ui.spacing().item_spacing.x + 8.0;
+                    let width = (ui.available_width() - browse).max(220.0);
+                    ui.add(example_field(
+                        ui,
+                        &mut slot.kubeconfig,
+                        "~/.kube/config",
+                        width,
+                    ))
+                    .on_hover_text(hint::KUBECONFIG);
                     if ui.button("Browse…").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
                             slot.kubeconfig = path.to_string_lossy().into_owned();
@@ -3106,63 +3204,69 @@ impl LauncherApp {
                         }
                     });
                 ui.end_row();
-                ui.label("Namespaces:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut slot.namespaces)
-                        .hint_text("shop, pay (empty = discover)")
-                        .desired_width(200.0),
-                );
+                ui.label("Namespaces:").on_hover_text(hint::NAMESPACES);
+                ui.add(list_field(ui, &mut slot.namespaces, "shop, pay", 200.0))
+                    .on_hover_text(hint::NAMESPACES);
                 ui.end_row();
-                ui.label("Default namespace:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut slot.default_namespace)
-                        .hint_text("shop (empty = default)")
-                        .desired_width(160.0),
-                );
+                ui.label("Default namespace:")
+                    .on_hover_text(hint::DEFAULT_NAMESPACE);
+                ui.add(example_field(
+                    ui,
+                    &mut slot.default_namespace,
+                    "shop",
+                    160.0,
+                ))
+                .on_hover_text(hint::DEFAULT_NAMESPACE);
                 ui.end_row();
                 ui.label("Timeout, sec:");
                 ui.add(egui::TextEdit::singleline(&mut slot.timeout).desired_width(60.0));
                 ui.end_row();
-                ui.label("Tags:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut slot.tags)
-                        .hint_text("prod, k8s (comma-separated)")
-                        .desired_width(180.0),
-                );
+                ui.label("Tags:").on_hover_text(hint::KUBE_TAGS);
+                ui.add(list_field(ui, &mut slot.tags, "prod, k8s", 180.0))
+                    .on_hover_text(hint::KUBE_TAGS);
                 ui.end_row();
                 // Fields that used to be config.toml-only (#618).
-                ui.label("Debug images:")
-                    .on_hover_text(DEBUG_IMAGES_HINT);
-                ui.add(
-                    egui::TextEdit::singleline(&mut slot.debug_images)
-                        .hint_text("busybox:1.37 (empty = Ctrl+B unavailable)")
-                        .desired_width(220.0),
-                )
+                ui.label("Debug images:").on_hover_text(DEBUG_IMAGES_HINT);
+                ui.add(list_field(
+                    ui,
+                    &mut slot.debug_images,
+                    "busybox:1.37",
+                    220.0,
+                ))
                 .on_hover_text(DEBUG_IMAGES_HINT);
                 ui.end_row();
-                ui.label("Diagnostic ports:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut slot.diagnostic_ports)
-                        .hint_text("8080, 6060 (besides declared ports)")
-                        .desired_width(180.0),
-                )
-                .on_hover_text("Pod ports pod_http_get may read besides those declared in the container spec");
+                // What an empty list means matters without hovering.
+                if slot.debug_images.trim().is_empty() {
+                    grid_note(ui, hint::DEBUG_IMAGES_EMPTY);
+                }
+                ui.label("Diagnostic ports:")
+                    .on_hover_text(hint::DIAGNOSTIC_PORTS);
+                ui.add(list_field(
+                    ui,
+                    &mut slot.diagnostic_ports,
+                    "8080, 6060",
+                    180.0,
+                ))
+                .on_hover_text(hint::DIAGNOSTIC_PORTS);
                 ui.end_row();
-                ui.label("Reveal ConfigMaps:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut slot.reveal_configmaps)
-                        .hint_text("shop/app-config (empty = redact all)")
-                        .desired_width(220.0),
-                )
-                .on_hover_text("ConfigMaps shown without secret redaction, as namespace/name");
+                ui.label("Reveal ConfigMaps:")
+                    .on_hover_text(hint::REVEAL_CONFIGMAPS);
+                ui.add(list_field(
+                    ui,
+                    &mut slot.reveal_configmaps,
+                    "shop/app-config",
+                    220.0,
+                ))
+                .on_hover_text(hint::REVEAL_CONFIGMAPS);
                 ui.end_row();
-                ui.label("Reveal env:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut slot.reveal_env)
-                        .hint_text("shop/web-1/LOG_LEVEL (empty = redact all)")
-                        .desired_width(220.0),
-                )
-                .on_hover_text("Pod environment values shown without redaction, as namespace/pod/VARIABLE");
+                ui.label("Reveal env:").on_hover_text(hint::REVEAL_ENV);
+                ui.add(list_field(
+                    ui,
+                    &mut slot.reveal_env,
+                    "shop/web-1/LOG_LEVEL",
+                    220.0,
+                ))
+                .on_hover_text(hint::REVEAL_ENV);
                 ui.end_row();
                 ui.label("Connection:");
                 check = ui
@@ -3324,11 +3428,12 @@ impl LauncherApp {
             ui.horizontal(|ui| { ui.label("Model:"); ui.text_edit_singleline(&mut p.model); });
             ui.horizontal(|ui| {
                 ui.label("API URL:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut p.api_base_url)
-                        .hint_text("e.g. http://localhost:11434/v1")
-                        .desired_width(280.0),
-                );
+                ui.add(example_field(
+                    ui,
+                    &mut p.api_base_url,
+                    "e.g. http://localhost:11434/v1",
+                    280.0,
+                ));
             });
             ui.horizontal(|ui| {
                 ui.label("API key:");
@@ -3341,12 +3446,9 @@ impl LauncherApp {
                 );
             });
             ui.horizontal(|ui| {
-                ui.label("Key env:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut p.key_env)
-                        .hint_text("empty = no key (local)")
-                        .desired_width(200.0),
-                );
+                ui.label("Key env:").on_hover_text(hint::KEY_ENV);
+                ui.add(example_field(ui, &mut p.key_env, "DEEPSEEK_API_KEY", 200.0))
+                    .on_hover_text(hint::KEY_ENV);
             });
             if p.key_env.trim().is_empty() {
                 let url = if p.api_base_url.trim().is_empty() {
@@ -3368,44 +3470,37 @@ impl LauncherApp {
             }
             ui.horizontal(|ui| { ui.label("Temp:"); ui.text_edit_singleline(&mut p.temperature); });
             ui.horizontal(|ui| {
-                ui.label("Max tokens:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut p.max_tokens)
-                        .hint_text(format!("{} — default when empty", filar_core::DEFAULT_MAX_TOKENS))
-                        .desired_width(160.0),
-                )
-                .on_hover_text(
-                    "Upper bound on the length of a single reply, in tokens. \
-                     Raise it if long answers are being cut off; leave empty \
-                     for the default.",
-                );
+                let explain = "Upper bound on the length of a single reply, in tokens. \
+                     Raise it if long answers are being cut off. Empty = the \
+                     default shown in grey.";
+                ui.label("Max tokens:").on_hover_text(explain);
+                ui.add(example_field(
+                    ui,
+                    &mut p.max_tokens,
+                    &filar_core::DEFAULT_MAX_TOKENS.to_string(),
+                    160.0,
+                ))
+                .on_hover_text(explain);
             });
             ui.horizontal(|ui| {
-                ui.label("Top-p:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut p.top_p)
-                        .hint_text("provider default when empty")
-                        .desired_width(160.0),
-                )
-                .on_hover_text(
-                    "Nucleus sampling: above 0.0 and up to 1.0. Leave empty to \
-                     let the provider decide.",
-                );
+                let explain = "Nucleus sampling: above 0.0 and up to 1.0. Empty = \
+                     the provider decides.";
+                ui.label("Top-p:").on_hover_text(explain);
+                ui.add(example_field(ui, &mut p.top_p, "0.9", 160.0))
+                    .on_hover_text(explain);
             });
             ui.horizontal(|ui| {
-                ui.label("Compact at:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut p.compact_at_tokens)
-                        .hint_text(format!(
-                            "{} — default when empty, 0 = off",
-                            filar_core::DEFAULT_COMPACT_AT_TOKENS
-                        )),
-                )
-                .on_hover_text(
-                    "Prompt tokens at which the session history is compacted. \
-                     Set below the model's context window. Leave empty for the \
-                     default; enter 0 to disable compaction for this profile.",
-                );
+                let explain = "Prompt tokens at which the session history is compacted. \
+                     Set below the model's context window. Empty = the default \
+                     shown in grey; 0 = off for this profile.";
+                ui.label("Compact at:").on_hover_text(explain);
+                ui.add(example_field(
+                    ui,
+                    &mut p.compact_at_tokens,
+                    &filar_core::DEFAULT_COMPACT_AT_TOKENS.to_string(),
+                    160.0,
+                ))
+                .on_hover_text(explain);
             });
             ui.label("Extra body (JSON):");
             ui.add(egui::TextEdit::multiline(&mut p.extra_body)
@@ -3701,11 +3796,7 @@ impl LauncherApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Clusters:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut d.clusters)
-                                .hint_text(cluster_names.join(", "))
-                                .desired_width(200.0),
-                        )
+                        ui.add(example_field(ui, &mut d.clusters, &cluster_names.join(", "), 200.0))
                         .on_hover_text("[[kube_clusters]] whose logs this source holds — enables pod_logs_history there.");
                         ui.label("Tags:");
                         ui.add(egui::TextEdit::singleline(&mut d.tags).desired_width(120.0));
@@ -4069,21 +4160,16 @@ impl LauncherApp {
                                 .hint_text("shop")
                                 .desired_width(140.0),
                         );
-                        ui.label("Selector:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut draft.kube_selector)
-                                .hint_text("app=web (empty = every ready pod)")
-                                .desired_width(200.0),
-                        );
+                        ui.label("Selector:").on_hover_text(hint::SELECTOR);
+                        ui.add(list_field(ui, &mut draft.kube_selector, "app=web", 200.0))
+                            .on_hover_text(hint::SELECTOR);
                     });
                 } else {
                     ui.horizontal(|ui| {
-                        ui.label("Match tags (all must match):");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut draft.match_tags)
-                                .hint_text("work, prod (comma-separated)")
-                                .desired_width(200.0),
-                        );
+                        ui.label("Match tags (all must match):")
+                            .on_hover_text(hint::MATCH_TAGS);
+                        ui.add(list_field(ui, &mut draft.match_tags, "work, prod", 200.0))
+                            .on_hover_text(hint::MATCH_TAGS);
                     });
                     let cluster_only = cluster_tags_in_match(&draft.match_tags, &cluster_tags);
                     if !cluster_only.is_empty() {
@@ -8006,4 +8092,130 @@ host_key_policy = \"strict\"
         assert_eq!(log_check_query(&vlogs_draft().to_config().unwrap()), "*");
     }
 
+    // ── Field hints (#632) ─────────────────────────────────────────────
+
+    /// Every literal example hint of the launcher fields (the default key
+    /// path, the defaults of Max tokens and Compact at and the cluster names
+    /// of a log source are computed at run time).
+    const EXAMPLE_HINTS: &[&str] = &[
+        "e.g. http://localhost:11434/v1",
+        "shop/web-1/LOG_LEVEL",
+        "deploy (required)",
+        "prod-eu (required)",
+        "DEEPSEEK_API_KEY",
+        "shop/app-config",
+        "~/.kube/config",
+        "busybox:1.37",
+        "8080, 6060",
+        "prod, web",
+        "prod, k8s",
+        "shop, pay",
+        "work, prod",
+        "app=web",
+        "default key",
+        "shop",
+        "0.9",
+    ];
+
+    /// egui's inner margin of a single-line `TextEdit`, both sides: the
+    /// least a field needs around its hint text.
+    const TEXT_EDIT_MARGIN: f32 = 2.0 * 4.0;
+
+    /// Lay out one frame of a panel `width` points wide at `scale` and run
+    /// `check` inside it.
+    fn in_panel(scale: f32, width: f32, check: impl Fn(&mut egui::Ui)) {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(scale);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| check(ui));
+        });
+    }
+
+    fn text_width(ui: &egui::Ui, text: &str) -> f32 {
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        ui.fonts(|f| {
+            f.layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE)
+                .size()
+                .x
+        })
+    }
+
+    #[test]
+    fn a_field_is_wide_enough_for_its_hint_at_100_and_150_percent() {
+        for scale in [1.0, 1.5] {
+            in_panel(scale, 460.0, |ui| {
+                for hint in EXAMPLE_HINTS {
+                    let mut value = String::new();
+                    // A minimum far below what the hint needs.
+                    let field = ui.add(example_field(ui, &mut value, hint, 20.0));
+                    assert!(
+                        field.rect.width() >= text_width(ui, hint) + TEXT_EDIT_MARGIN,
+                        "{scale}: {hint:?} gets {} for {}",
+                        field.rect.width(),
+                        text_width(ui, hint)
+                    );
+                    let list = ui.add(list_field(ui, &mut value, hint, 20.0));
+                    assert!(
+                        list.rect.width() >= text_width(ui, hint) + TEXT_EDIT_MARGIN,
+                        "{scale}: {hint:?}"
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn a_list_field_takes_the_row_but_not_the_scroll_bar() {
+        in_panel(1.0, 460.0, |ui| {
+            let mut value = String::new();
+            let room = ui.available_width();
+            let field = ui.add(list_field(ui, &mut value, "busybox:1.37", 220.0));
+            assert!(
+                field.rect.width() > 300.0,
+                "stretches: {} of {room}",
+                field.rect.width()
+            );
+            assert!(
+                field.rect.right() <= ui.max_rect().right(),
+                "stays inside the row"
+            );
+        });
+    }
+
+    #[test]
+    fn hints_are_examples_and_explanations_moved_to_hover() {
+        for hint in EXAMPLE_HINTS {
+            for word in ["empty", "comma-separated", "besides", "default when"] {
+                assert!(
+                    !hint.to_lowercase().contains(word),
+                    "{hint:?} explains instead of showing"
+                );
+            }
+        }
+        // The old in-field explanations, same meaning, now on hover.
+        for (text, says) in [
+            (hint::DEBUG_IMAGES_EMPTY, "Ctrl+B unavailable"),
+            (hint::DIAGNOSTIC_PORTS, "besides those declared"),
+            (hint::REVEAL_CONFIGMAPS, "Empty = redact all"),
+            (hint::REVEAL_ENV, "Empty = redact all"),
+            (hint::NAMESPACES, "Empty = discover"),
+            (hint::DEFAULT_NAMESPACE, "Empty = default"),
+            (hint::KUBECONFIG, "$KUBECONFIG / ~/.kube/config"),
+            (hint::SELECTOR, "each cluster/namespace is one member"),
+            (hint::SSH_TAGS, "Comma-separated"),
+            (hint::KUBE_TAGS, "Comma-separated"),
+            (hint::MATCH_TAGS, "Comma-separated"),
+            (hint::KEY_ENV, "Empty = no key (local)"),
+        ] {
+            assert!(text.contains(says), "{text:?}");
+        }
+        assert!(DEBUG_IMAGES_HINT.contains("Empty = the action is unavailable"));
+    }
 }
