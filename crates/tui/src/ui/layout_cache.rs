@@ -599,12 +599,18 @@ mod tests {
             for row in &rows {
                 assert!(UnicodeWidthStr::width(row.as_str()) <= 40, "{row:?}");
             }
+            // The ASCII theme (Windows conhost, CI) uses `-` as the dot, which
+            // the text itself contains: compare row prefixes, not substrings.
             let marker = if idx == 0 { theme.glyphs().middle_dot } else { theme.glyphs().danger };
-            assert!(rows[0].starts_with(&format!("  {marker} ")), "{rows:?}");
-            assert!(rows[1..].iter().all(|r| !r.contains(marker)), "marker only first: {rows:?}");
-            let joined: String = rows
-                .iter()
-                .map(|r| r.trim_start().trim_start_matches(marker).trim_start())
+            let lead = format!("  {marker} ");
+            let indent = " ".repeat(UnicodeWidthStr::width(lead.as_str()));
+            assert!(rows[0].starts_with(&lead), "{rows:?}");
+            assert!(
+                rows[1..].iter().all(|r| r.starts_with(&indent) && !r.starts_with(&lead)),
+                "marker only first, continuations indented: {rows:?}"
+            );
+            let joined: String = std::iter::once(&rows[0][lead.len()..])
+                .chain(rows[1..].iter().map(|r| &r[indent.len()..]))
                 .collect();
             assert_eq!(joined.replace(' ', ""), text.replace(' ', ""), "whole text kept");
         }
@@ -625,6 +631,18 @@ mod tests {
         let dot = theme.glyphs().middle_dot;
         assert_eq!(block_rows(&cache, 0), vec![format!("  {dot} first"), "    second".to_string()]);
         assert_eq!(block_rows(&cache, 1), vec![format!("  {dot} connected")]);
+    }
+
+    #[test]
+    fn the_ascii_dot_is_not_confused_with_a_hyphen_in_the_text() {
+        // What Windows conhost (and CI there) renders; the text has hyphens.
+        let theme = Theme::default_dark();
+        let dot = super::super::theme::Glyphs::ASCII.middle_dot;
+        let mut cache = ChatLayoutCache::new();
+        cache.push_marked(0, dot, theme.muted(), "Debug-контейнер недоступен: у кластера kind-filar-k8s", 30);
+        let rows = block_rows(&cache, 0);
+        assert!(rows[0].starts_with(&format!("  {dot} Debug-")), "{rows:?}");
+        assert!(rows[1..].iter().all(|r| r.starts_with("    ") && !r.starts_with(&format!("  {dot} "))), "{rows:?}");
     }
 
     #[test]
