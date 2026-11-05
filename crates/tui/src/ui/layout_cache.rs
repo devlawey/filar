@@ -391,7 +391,10 @@ impl ChatLayoutCache {
     /// the text starts a new row; trailing empty lines are dropped.
     fn push_marked(&mut self, idx: usize, marker: &str, style: Style, text: &str, width: usize) {
         let lead = format!("  {marker} ");
-        let indent = UnicodeWidthStr::width(lead.as_str());
+        // On a terminal narrower than the lead itself the continuation
+        // indent shrinks so that rows still fit; the first row is cut by
+        // `pad_line_to_width` like any other over-wide line (#333).
+        let indent = UnicodeWidthStr::width(lead.as_str()).min(width.saturating_sub(1));
         let text_width = width.saturating_sub(indent).max(1);
         let mut rows: Vec<String> = text
             .trim_end()
@@ -643,6 +646,20 @@ mod tests {
         let rows = block_rows(&cache, 0);
         assert!(rows[0].starts_with(&format!("  {dot} Debug-")), "{rows:?}");
         assert!(rows[1..].iter().all(|r| r.starts_with("    ") && !r.starts_with(&format!("  {dot} "))), "{rows:?}");
+    }
+
+    #[test]
+    fn a_terminal_narrower_than_the_marker_does_not_overflow_continuations() {
+        let theme = Theme::default_dark();
+        for width in [1usize, 2, 3, 4] {
+            let mut cache = ChatLayoutCache::new();
+            cache.push_marked(0, theme.glyphs().middle_dot, theme.muted(), "abc def ghi", width);
+            let rows = block_rows(&cache, 0);
+            assert!(rows.len() > 1, "{width}: {rows:?}");
+            for row in &rows[1..] {
+                assert!(UnicodeWidthStr::width(row.as_str()) <= width, "{width}: {rows:?}");
+            }
+        }
     }
 
     #[test]
