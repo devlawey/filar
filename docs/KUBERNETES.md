@@ -526,8 +526,9 @@ distroless-подами.
 ### 6.2. Создание группы
 
 **В лаунчере:** вкладка **Groups** → **+ Add group** → **Selects: Kubernetes
-pods**. Затем отметьте кластеры, укажите **Namespace** и **Selector** (пусто —
-каждый готовый под).
+pods**. Затем отметьте кластеры, укажите **Namespace** и **Selector**.
+Пустой Selector означает, что поды не ищутся: членом флота становится каждая
+пара кластер/namespace ([6.3](#63-как-фиксируются-члены)).
 
 ![Kube-группа на вкладке Groups](images/kubernetes/launcher-group.png)
 
@@ -682,5 +683,5 @@ prod-eu не настроен источник логов» с подсказк�
 | `cannot load the explicit context or its credentials` | нет контекста в файле или не сработал exec-плагин | проверить `kubectl --context … get ns` в том же окружении |
 | `Kubernetes API is unavailable or the … request timed out` | сеть, прокси, таймаут | проверить `HTTPS_PROXY` / `NO_PROXY` ([2.3](#23-прокси-и-no_proxy)) и `request_timeout_secs` |
 | В под не войти: в образе нет шелла | distroless / `FROM scratch` | `Ctrl+B` ([5.2](#52-debug-контейнер-ctrlb)); логи, describe и события читаются и без шелла |
-| Kube-группа без членов | селектор не нашёл готовых подов | проверить **Selector** и метки: `kubectl get pods -l app=web -n shop`; пустой селектор берёт каждый готовый под |
+| Флот подов пуст: `[fleet: web-prod (0)]` | селектор не нашёл готовых подов | проверить **Selector**, метки и готовность: `kubectl get pods -l app=web -n shop`. Пустой Selector не ищет поды — членами становятся пары кластер/namespace |
 | Запрос ушёл «не туда» после `kubectl config use-context` | так не бывает: filar не читает `current-context` | — |
