@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [3.0.3] - 2026-11-05
+
 ### Fixed
 
 - The Kubernetes client honours `NO_PROXY` / `no_proxy` (host, domain suffix, IP, CIDR, `*`, host:port) for the API server, as `kubectl` does: a proxy from `HTTPS_PROXY` is no longer used for an exempt server; a kubeconfig `proxy-url` still wins ([#627](https://github.com/devlawey/filar/issues/627)).
@@ -1505,7 +1507,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v3.0.2...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v3.0.3...HEAD
+[3.0.3]: https://github.com/devlawey/filar/compare/v3.0.2...v3.0.3
 [3.0.2]: https://github.com/devlawey/filar/compare/v3.0.0...v3.0.2
 [3.0.0]: https://github.com/devlawey/filar/compare/v2.0.7...v3.0.0
 [2.0.7]: https://github.com/devlawey/filar/compare/v2.0.6...v2.0.7
