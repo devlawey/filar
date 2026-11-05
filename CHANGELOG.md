@@ -11,6 +11,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- Launcher field hints are no longer cut off: the grey text in a field is a short example value and the field is always wide enough for it; what a field means (comma-separated, what an empty value does) moved to the hover text of the label and the field, an empty Debug images list says `Empty = Ctrl+B unavailable.` under the field, and list fields (tags, namespaces, images, ports, reveal lists, selectors, key file) take the width of the row ([#632](https://github.com/devlawey/filar/issues/632)).
+
 ## [3.0.3] - 2026-11-05
 
 ### Fixed
