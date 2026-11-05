@@ -28,9 +28,14 @@ namespace. Поды эфемерны: их выбирают уже внутри 
 кластера у модели нет шелла и нет `kubectl`. Она вызывает инструменты
 `k8s_get`, `k8s_describe`, `k8s_logs`, `k8s_events`, `k8s_top`,
 `k8s_rollout_history`, `pod_http_get`, а при настроенных источниках логов —
-ещё `query_logs` и `pod_logs_history`. Все они только читают. Изменить,
-перезапустить, удалить или создать что-то в кластере агент не может.
-Объекты `Secret` недоступны вовсе.
+ещё `query_logs` и `pod_logs_history`. К API кластера они обращаются только
+на чтение: изменить, перезапустить, удалить или создать что-то в кластере
+агент не может. Объекты `Secret` недоступны вовсе. Исключение по смыслу —
+`pod_http_get`: это `GET` к эндпоинту самого приложения, и что делает
+эндпоинт, решает приложение. Если `GET /reset` у вас что-то меняет, держите
+такой кластер в режиме `always` или под политикой тега
+([4.2](#42-когда-спрашивается-подтверждение)) — в `allowlist` и `never` запросы
+выполняются без вопроса.
 
 **Что живёт только у вас.** В `config.toml` записываются имя кластера, путь к
 kubeconfig и имя контекста. Содержимое kubeconfig — сертификаты, токены,
@@ -65,7 +70,7 @@ namespace, а у вкладки пода — селектор или имя по
 | Что делает агент | команды шелла | типизированные read-only запросы к API |
 | Подтверждение | каждой команды по режиму confirm | каждого запроса по тем же правилам ([4.2](#42-когда-спрашивается-подтверждение)) |
 | Шелл | постоянный шелл хоста | только во вкладке пода, шелл из образа контейнера |
-| Запись на цель | только файлы, которые вы сами передали (`Ctrl+G`) | только debug-контейнер по `Ctrl+B` |
+| Изменения на цели | команды агента могут менять хост — после подтверждения по режиму confirm (в `never` — сразу); файлы — только переданные вами (`Ctrl+G`) | вкладка кластера — только чтение API; вкладка пода — команды в контейнере, как на SSH-хосте; в спецификацию пода — только debug-контейнер по `Ctrl+B` |
 
 Инварианты AGENTS.md для Kubernetes означают следующее:
 
@@ -379,8 +384,9 @@ filar --target prod-eu/shop/app=web              # первый готовый �
   спросите во вкладке кластера».
 
 **Что происходит.** `Ctrl+B` добавляет в под эфемерный контейнер с
-инструментами, как `kubectl debug --target`. Он делит пространство процессов с
-целевым контейнером: процесс приложения обычно PID 1, его файлы видны в
+инструментами, как `kubectl debug --target`. Если container runtime узла
+поддерживает `targetContainerName` (containerd и CRI-O — да), он делит
+пространство процессов с целевым контейнером: процесс приложения обычно PID 1, его файлы видны в
 `/proc/1/root/…`. Если в поде включён `shareProcessNamespace`, PID 1 — это
 `pause`, и агент ищет процесс приложения по `/proc/*/cmdline`. После запуска
 открывается вкладка пода в debug-контейнере с меткой `debug` в статус-баре;
@@ -426,7 +432,7 @@ filar --target prod-eu/shop/app=web              # первый готовый �
 | прочитать под и его securityContext | `GET pods/<pod>` | `get` на `pods` |
 | добавить эфемерный контейнер | `PATCH pods/<pod>/ephemeralcontainers` (strategic merge) | `patch` на `pods/ephemeralcontainers` |
 | дождаться запуска | `GET pods/<pod>` в цикле, до 90 с | `get` на `pods` |
-| открыть шелл | `exec` в `filar-debug-<id>` | `create` на `pods/exec` |
+| открыть шелл | `exec` в `filar-debug-<id>` | `create` на `pods/exec` (и `get`, если API-сервер авторизует exec по WebSocket как `get`) |
 
 Минимальные `Role` и `RoleBinding` на один namespace:
 
@@ -445,7 +451,7 @@ rules:
     verbs: ["patch"]
   - apiGroups: [""]
     resources: ["pods/exec"]
-    verbs: ["create"]
+    verbs: ["create", "get"]   # get — для exec по WebSocket в новых API-серверах
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -472,6 +478,9 @@ roleRef:
   пропускает сам под.
 - Узел должен скачать образ из `debug_images`: нужен доступ к registry, а для
   приватного — `imagePullSecrets` пода.
+- Container runtime узла должен поддерживать общее пространство процессов с
+  целью (`targetContainerName`); иначе контейнер запустится без доступа к
+  процессам приложения.
 
 **Что увидите при отказе.** Сообщения разные, без повторов:
 
@@ -492,8 +501,10 @@ roleRef:
 **Проверить права заранее:**
 
 ```bash
-kubectl auth can-i patch pods/ephemeralcontainers -n shop --context prod-eu
-kubectl auth can-i create pods/exec -n shop --context prod-eu
+# --context и --kubeconfig — те же, что у кластера в filar (поля Context и Kubeconfig)
+kubectl auth can-i patch pods/ephemeralcontainers -n shop --context <контекст> --kubeconfig <файл>
+kubectl auth can-i create pods/exec -n shop --context <контекст> --kubeconfig <файл>
+kubectl auth can-i get pods/exec -n shop --context <контекст> --kubeconfig <файл>
 ```
 
 На kind контекст по умолчанию — `cluster-admin`, поэтому `Ctrl+B` работает
@@ -616,7 +627,10 @@ dropped:
 - `access denied` — отказ RBAC или политики;
 - `no contact` / `timeout` — API-сервер недоступен или не ответил за
   `per_host_timeout_secs`;
-- `pod disappeared` — под удалён после входа во флот.
+- `pod disappeared` — запрос вернул 404: обычно под удалён после входа во
+  флот. У `k8s_describe` 404 может прийти и от запроса событий пода, если
+  API-сервер их не отдаёт; тогда под может существовать — проверьте его
+  `k8s_get`.
 
 ### 6.5. Чем kube-флот отличается от SSH-флота
 
