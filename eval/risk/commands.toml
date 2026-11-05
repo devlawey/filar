@@ -63,6 +63,33 @@ note = "sudo, but only reads"
 command = "ss -tlnp"
 level = 0
 
+# Kubernetes (#631): a cluster tab rates typed, read-only API requests in
+# the form the feed shows them, with the cluster as target. They should
+# score like their kubectl counterpart on an SSH host.
+[[case]]
+command = "kubectl get pods -n shop"
+level = 0
+
+[[case]]
+command = "k8s_get pod -n shop -l app=web --limit 50"
+level = 0
+target = "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
+
+[[case]]
+command = "k8s_describe pod web-7f9c -n shop"
+level = 0
+target = "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
+
+[[case]]
+command = "k8s_logs web-7f9c -n shop --since 3600s --tail 200"
+level = 0
+target = "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
+
+[[case]]
+command = "k8s_top pods -n shop --limit 50"
+level = 0
+target = "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
+
 # ── 1: reversible local change ───────────────────────────────────────
 [[case]]
 command = "mkdir -p /tmp/work"
