@@ -7,8 +7,10 @@
 //!
 //! - a comma-separated list, case-insensitive, blanks ignored;
 //! - `*` matches every host;
-//! - an exact host name, or a domain suffix (`corp`, `.corp` and `*.corp` all
-//!   match `corp` and `api.corp`);
+//! - a host name matches itself and its subdomains (`corp` matches `corp` and
+//!   `api.corp`); a leading dot or `*.` means subdomains only (`.corp` and
+//!   `*.corp` match `api.corp`, not `corp`) — as in Go's `httpproxy`, which
+//!   client-go uses;
 //! - an IP address, or a CIDR block (`10.0.0.0/8`, `fd00::/8`);
 //! - an entry with a port (`host:6443`, `[::1]:6443`) matches that port only.
 //!
@@ -50,18 +52,28 @@ fn entry_matches(entry: &str, host: &str, host_ip: Option<IpAddr>, port: u16) ->
     if let Ok(ip) = name.parse::<IpAddr>() {
         return host_ip == Some(ip);
     }
+    let subdomains_only = name.starts_with('.') || name.starts_with("*.");
     let domain = name.trim_start_matches("*.").trim_start_matches('.');
     if domain.is_empty() {
         return false;
     }
-    host == domain || host.strip_suffix(domain).is_some_and(|rest| rest.ends_with('.'))
+    let subdomain = host.strip_suffix(domain).is_some_and(|rest| rest.ends_with('.'));
+    subdomain || (!subdomains_only && host == domain)
 }
 
 /// `name:port` or `[v6]:port` → (name, port); anything else is all name.
 fn split_port(entry: &str) -> (&str, Option<u16>) {
     if let Some(rest) = entry.strip_prefix('[') {
         if let Some((addr, tail)) = rest.split_once(']') {
-            return (addr, tail.strip_prefix(':').and_then(|p| p.parse().ok()));
+            return match tail {
+                "" => (addr, None),
+                // A port that does not parse matches no port at all, rather
+                // than every port (#627 review).
+                tail => match tail.strip_prefix(':').and_then(|p| p.parse().ok()) {
+                    Some(port) => (addr, Some(port)),
+                    None => (addr, Some(0)),
+                },
+            };
         }
     }
     match entry.rsplit_once(':') {
@@ -124,12 +136,51 @@ pub(super) fn kubeconfig_proxy(kubeconfig: &Kubeconfig, context: &str) -> Option
         .filter(|p| !p.trim().is_empty())
 }
 
-/// `NO_PROXY`, else `no_proxy`, when set and non-empty.
-pub(super) fn no_proxy_from_env() -> Option<String> {
-    ["NO_PROXY", "no_proxy"]
-        .into_iter()
-        .filter_map(|name| std::env::var(name).ok())
-        .find(|value| !value.trim().is_empty())
+/// The proxy settings of the environment: `HTTPS_PROXY` / `https_proxy`
+/// and `NO_PROXY` / `no_proxy`, upper case first, empty values ignored.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ProxyEnv {
+    pub https_proxy: Option<String>,
+    pub no_proxy: Option<String>,
+}
+
+impl ProxyEnv {
+    /// Read from the process environment.
+    pub(super) fn from_process() -> Self {
+        let first = |names: [&str; 2]| {
+            names
+                .into_iter()
+                .filter_map(|name| std::env::var(name).ok())
+                .find(|value| !value.trim().is_empty())
+        };
+        Self {
+            https_proxy: first(["HTTPS_PROXY", "https_proxy"]),
+            no_proxy: first(["NO_PROXY", "no_proxy"]),
+        }
+    }
+}
+
+/// Set the proxy of `config` (loaded from the kubeconfig): the cluster's own
+/// `proxy-url` when it has one, else the environment's `HTTPS_PROXY` unless
+/// the server is in `NO_PROXY`. Errors only on an unparsable `HTTPS_PROXY`.
+pub(super) fn choose_proxy(
+    config: &mut Config,
+    explicit_proxy: bool,
+    env: &ProxyEnv,
+) -> Result<(), ()> {
+    if explicit_proxy {
+        return Ok(());
+    }
+    // kube-rs has already read the process environment; the choice is made
+    // again from `env` so that it is the same one the caller passed.
+    config.proxy_url = env
+        .https_proxy
+        .as_deref()
+        .map(|proxy| proxy.parse())
+        .transpose()
+        .map_err(|_| ())?;
+    apply_no_proxy(config, false, env.no_proxy.as_deref());
+    Ok(())
 }
 
 /// Drop a proxy that came from the environment when the API server is in
@@ -161,9 +212,11 @@ mod tests {
     fn names_and_domain_suffixes() {
         for no_proxy in ["corp", ".corp", "*.corp", " CORP "] {
             assert!(bypasses_proxy(no_proxy, "api.corp", 443), "{no_proxy}");
-            assert!(bypasses_proxy(no_proxy, "corp", 443), "{no_proxy}");
             assert!(!bypasses_proxy(no_proxy, "notcorp", 443), "{no_proxy}");
         }
+        assert!(bypasses_proxy("corp", "corp", 443), "a bare name matches itself");
+        assert!(!bypasses_proxy(".corp", "corp", 443), "a leading dot is subdomains only");
+        assert!(!bypasses_proxy("*.corp", "corp", 443), "so is *.");
         assert!(bypasses_proxy("k8s.example.com", "K8S.example.com", 6443));
         assert!(!bypasses_proxy("k8s.example.com", "api.example.com", 6443));
     }
@@ -187,6 +240,9 @@ mod tests {
         assert!(!bypasses_proxy("api.corp:6443", "api.corp", 443));
         assert!(bypasses_proxy("[::1]:6443", "::1", 6443));
         assert!(!bypasses_proxy("[::1]:6443", "::1", 443));
+        assert!(!bypasses_proxy("[::1]:65536", "::1", 6443), "a bad port matches no port");
+        assert!(!bypasses_proxy("[::1]x", "::1", 6443));
+        assert!(bypasses_proxy("[::1]", "::1", 6443));
         assert!(bypasses_proxy("127.0.0.1:18443", "127.0.0.1", 18443));
         assert!(bypasses_proxy("*", "anything.example", 443));
         assert!(!bypasses_proxy("", "127.0.0.1", 443));
