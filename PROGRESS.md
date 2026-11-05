@@ -11987,3 +11987,27 @@ Windows/macOS и живые Kubernetes/log-source сценарии по `docs/SM
   вкладка кластера обслуживается `KubeAgent`, не `Agent`.
 
 **Next.** Релиз 3.0.3.
+
+---
+
+## Issue #627: NO_PROXY для API-сервера Kubernetes (веха 3.0.3)
+
+**Сделано.** `transport::cluster::no_proxy`: разбор `NO_PROXY` / `no_proxy` по
+правилам client-go и curl — имя, суффикс домена, IP, CIDR, `*`, запись с
+портом. `build_client` после загрузки kubeconfig снимает прокси, если он из
+окружения, а хост `cluster_url` подходит под `NO_PROXY`. Через `build_client`
+идут все пути, поэтому это касается и exec, терминала, и port-forward.
+`USER_GUIDE.md` 4.10 описывает, откуда берётся прокси.
+
+**Решения.**
+- `proxy-url` кластера в kubeconfig сильнее `NO_PROXY` — как в client-go:
+  его задали для этого кластера явно.
+- Разбор без новых зависимостей, CIDR на `std::net`.
+- Правила — как у Go `httpproxy` (его использует client-go), а не curl: `.corp`
+  и `*.corp` — только поддомены, `corp` — и сам хост. CIDR и `*` без порта,
+  как там же. Нераспознанный порт в `[v6]:…` не совпадает ни с чем.
+- Выбор прокси вынесен в `load_config(target, streaming, &ProxyEnv)`: окружение
+  передаётся явно, поэтому весь путь через kubeconfig покрыт тестом без
+  зависимости от окружения процесса.
+
+**Next.** #628, затем релиз 3.0.3.

@@ -520,17 +520,33 @@ impl ClusterApi for KubeClusterApi {
 ///
 /// The kubeconfig path comes from the target, `$KUBECONFIG`, or
 /// `~/.kube/config`, in that order; `current-context` is never consulted.
-/// Exec credential plugins and proxy settings are handled by `kube-rs`.
+/// Exec credential plugins are handled by `kube-rs`. The proxy is
+/// `kube-rs`'s choice (kubeconfig `proxy-url`, else `HTTPS_PROXY`) except
+/// that an environment proxy is dropped for a server listed in `NO_PROXY`
+/// (#627), as `kubectl` does.
 ///
 /// `streaming` leaves the read and write timeouts unset: a long-lived exec
 /// stream (#563) is legitimately idle between commands, and a read timeout
 /// would tear the shell down. The connect timeout is always bounded.
 pub(super) async fn build_client(target: &KubeCluster, streaming: bool) -> Result<Client> {
+    let config = load_config(target, streaming, &super::no_proxy::ProxyEnv::from_process()).await?;
+    Client::try_from(config)
+        .map_err(|_| connect_error(target, "cannot initialize the Kubernetes client"))
+}
+
+/// The client configuration [`build_client`] uses, with the proxy
+/// environment passed in rather than read, so the choice is testable.
+async fn load_config(
+    target: &KubeCluster,
+    streaming: bool,
+    proxy_env: &super::no_proxy::ProxyEnv,
+) -> Result<Config> {
     let kubeconfig = match target.kubeconfig.as_deref() {
         Some(path) => Kubeconfig::read_from(expand_home(path)),
         None => Kubeconfig::read(),
     }
     .map_err(|_| connect_error(target, "cannot read or parse the selected kubeconfig"))?;
+    let explicit_proxy = super::no_proxy::kubeconfig_proxy(&kubeconfig, &target.context).is_some();
     let options = KubeConfigOptions {
         context: Some(target.context.clone()),
         ..KubeConfigOptions::default()
@@ -538,6 +554,8 @@ pub(super) async fn build_client(target: &KubeCluster, streaming: bool) -> Resul
     let mut config = Config::from_custom_kubeconfig(kubeconfig, &options)
         .await
         .map_err(|_| connect_error(target, "cannot load the explicit context or its credentials"))?;
+    super::no_proxy::choose_proxy(&mut config, explicit_proxy, proxy_env)
+        .map_err(|_| connect_error(target, "the HTTPS_PROXY address cannot be parsed"))?;
     let timeout = Duration::from_secs(target.request_timeout_secs);
     config.connect_timeout = Some(timeout);
     if streaming {
@@ -547,8 +565,7 @@ pub(super) async fn build_client(target: &KubeCluster, streaming: bool) -> Resul
         config.read_timeout = Some(timeout);
         config.write_timeout = Some(timeout);
     }
-    Client::try_from(config)
-        .map_err(|_| connect_error(target, "cannot initialize the Kubernetes client"))
+    Ok(config)
 }
 
 fn expand_home(path: &Path) -> PathBuf {
@@ -804,6 +821,69 @@ fn sum_quantities<'a>(values: impl Iterator<Item = &'a str>, kind: QuantityKind)
 
 #[cfg(test)]
 mod tests {
+
+    // ── Proxy choice through the kubeconfig (#627) ─────────────────────
+
+    async fn proxy_for(context: &str, env: &super::super::no_proxy::ProxyEnv) -> Option<String> {
+        let dir = std::env::temp_dir().join(format!("filar-no-proxy-{}-{context}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config");
+        std::fs::write(
+            &path,
+            r#"apiVersion: v1
+kind: Config
+clusters:
+- name: local
+  cluster: { server: "https://127.0.0.1:6443" }
+- name: remote
+  cluster: { server: "https://k8s.example.com" }
+- name: pinned
+  cluster: { server: "https://127.0.0.1:7443", proxy-url: "http://pinned:3128" }
+contexts:
+- name: local
+  context: { cluster: local, user: u }
+- name: remote
+  context: { cluster: remote, user: u }
+- name: pinned
+  context: { cluster: pinned, user: u }
+users:
+- name: u
+  user: { token: not-a-secret }
+"#,
+        )
+        .unwrap();
+        let target = KubeCluster {
+            name: context.into(),
+            context: context.into(),
+            kubeconfig: Some(path),
+            ..KubeCluster::default()
+        };
+        let config = load_config(&target, false, env).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        config.proxy_url.map(|uri| uri.to_string())
+    }
+
+    #[tokio::test]
+    async fn the_client_skips_an_environment_proxy_for_no_proxy_servers() {
+        use super::super::no_proxy::ProxyEnv;
+        let env = ProxyEnv {
+            https_proxy: Some("http://corp-proxy:3128".into()),
+            no_proxy: Some("127.0.0.1,localhost".into()),
+        };
+        assert_eq!(proxy_for("local", &env).await, None, "exempt server goes direct");
+        assert_eq!(
+            proxy_for("remote", &env).await.as_deref(),
+            Some("http://corp-proxy:3128/"),
+            "other servers use the proxy"
+        );
+        assert_eq!(
+            proxy_for("pinned", &env).await.as_deref(),
+            Some("http://pinned:3128/"),
+            "a kubeconfig proxy-url wins over NO_PROXY"
+        );
+        let no_env = ProxyEnv::default();
+        assert_eq!(proxy_for("remote", &no_env).await, None, "no proxy configured, none used");
+    }
     use super::*;
     use kube::core::response::Status;
 
