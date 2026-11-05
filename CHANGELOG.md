@@ -18,6 +18,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 - Kubernetes fleets compare pod `k8s_describe` / `k8s_get` / `k8s_top` answers as rows (image, requests and limits, phase, readiness, restarts, CPU and memory) instead of digests, and a member that failed with an execution error shows filar's own short reason (no metrics-server, or a generic Kubernetes API failure) — one line when every member failed the same way, while RBAC-denied members keep their own `access denied` state; `FleetCheck::kubernetes` and `fleet_fold::fold_uniform` for embedders ([#619](https://github.com/devlawey/filar/issues/619)).
 - A blank row left by Add source on the launcher's Logs tab no longer blocks Launch: it is skipped like blank host and group rows and never written to `config.toml`; log-source errors now name the Logs tab ([#616](https://github.com/devlawey/filar/issues/616)).
 - Tabs of the same Kubernetes cluster are now distinguishable: a cluster tab is labelled `cluster/namespace`, a repeated label gets `#2`, `#3`, and long labels are cut to 32 columns ([#617](https://github.com/devlawey/filar/issues/617)).
+- The command arbiter now audits requests in Kubernetes cluster tabs and fleets too (typed `k8s_*` calls, `query_logs`, `pod_logs_history`): the verdict appears in the confirmation, never blocks or approves; `KubeAgent::arbiter` for embedders ([#620](https://github.com/devlawey/filar/issues/620)).
 
 ## [3.0.2] - 2026-11-03
 

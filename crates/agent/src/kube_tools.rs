@@ -1679,4 +1679,4 @@ fn truncate_output(output: &mut String) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

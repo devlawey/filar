@@ -11,7 +11,7 @@ use serde_json::json;
 use super::*;
 
 #[derive(Default)]
-struct MockCluster {
+pub(crate) struct MockCluster {
     pods: Vec<PodInfo>,
     events: Vec<EventInfo>,
     logs: Option<PodLogs>,
@@ -117,7 +117,7 @@ impl ClusterApi for MockCluster {
     }
 }
 
-fn target() -> KubeCluster {
+pub(crate) fn target() -> KubeCluster {
     KubeCluster {
         name: "prod-eu".into(),
         context: "prod-eu-admin".into(),
@@ -168,7 +168,7 @@ fn event(name: &str, timestamp: &str, message: &str) -> EventInfo {
     }
 }
 
-fn executor(cluster: MockCluster) -> KubeToolExecutor {
+pub(crate) fn executor(cluster: MockCluster) -> KubeToolExecutor {
     let secrets = Arc::new(StaticSecretProvider::new());
     secrets.insert("TEST_TOKEN", "supersecret");
     KubeToolExecutor::new(Arc::new(cluster), target(), secrets)

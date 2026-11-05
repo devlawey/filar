@@ -5,10 +5,12 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use filar_core::{CommandConfirmMode, CoreError, KubeCluster, Result, TagPolicy};
 use tokio_util::sync::CancellationToken;
 
+use crate::arbiter::{self, ArbiterContext, KubernetesArbiterTarget, ARBITER_TIMEOUT_SECS, HISTORY_TAIL_EXCHANGES};
 use crate::fleet_gate::{ApprovalScope, FleetGate};
 use crate::fleet_view::{FleetStatus, FleetView};
 use crate::{
@@ -21,6 +23,34 @@ use crate::{
 const MAX_ITERATIONS: usize = 50;
 const MAX_MISSING_EXPLANATION_RETRIES: u32 = 2;
 static NEXT_PROPOSAL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The agent's confirmer with the arbiter in front of it (#620): the audit
+/// runs, its verdict is emitted, then the user is asked. Wrapping the
+/// confirmer reaches the log-source paths too, which confirm on their own.
+struct AuditedConfirmer<'a> {
+    agent: &'a KubeAgent,
+    /// This run's conversation up to the call: the arbiter's recent context.
+    /// Passed down rather than kept on the agent, whose `run` takes `&self`
+    /// and may serve two turns at once.
+    conversation: &'a [ChatMessage],
+}
+
+#[async_trait::async_trait]
+impl CommandConfirmer for AuditedConfirmer<'_> {
+    async fn confirm(&self, command: &str, explanation: &str, destructive: bool) -> Result<bool> {
+        self.agent
+            .audit(command, explanation, destructive, self.conversation)
+            .await;
+        // A turn cancelled while the arbiter was busy asks nobody.
+        if self.agent.cancelled() {
+            return Err(CoreError::Other("cancelled".into()));
+        }
+        self.agent
+            .confirmer
+            .confirm(command, explanation, destructive)
+            .await
+    }
+}
 
 /// Receives the person-facing view and final status of a fleet operation.
 pub type KubeFleetObserver = Arc<dyn Fn(FleetView, FleetStatus) + Send + Sync>;
@@ -48,6 +78,15 @@ pub struct KubeAgent {
     cancellation: Option<CancellationToken>,
     /// Log sources for `query_logs` (#579); cluster tabs only.
     log_sources: Option<Arc<crate::logs::LogSources>>,
+    /// Independent command arbiter (#620), as in [`crate::Agent`].
+    arbiter: Option<KubeArbiter>,
+}
+
+/// The arbiter of a [`KubeAgent`] (#620).
+struct KubeArbiter {
+    llm: Arc<dyn LlmClient>,
+    /// Arbiter profile name, for `CommandAudited` (see `Agent`).
+    model_name: String,
 }
 
 impl KubeAgent {
@@ -74,6 +113,7 @@ impl KubeAgent {
             event_sink: None,
             cancellation: None,
             log_sources: None,
+            arbiter: None,
         }
     }
 
@@ -97,6 +137,7 @@ impl KubeAgent {
             event_sink: None,
             cancellation: None,
             log_sources: None,
+            arbiter: None,
         }
     }
 
@@ -120,6 +161,90 @@ impl KubeAgent {
         match self.execution {
             KubeExecution::Cluster { .. } => self.log_sources.as_ref(),
             KubeExecution::Fleet { .. } => None,
+        }
+    }
+
+    /// Audit every request this agent asks the user to confirm with an
+    /// independent model (#620): typed `k8s_*` calls, `query_logs`,
+    /// `pod_logs_history`, in a cluster tab and in a fleet. The verdict is
+    /// emitted as [`AgentEvent::CommandAudited`] before the confirmation; it
+    /// never blocks or approves anything, and a failed audit is reported as
+    /// unavailable. `None` or `enabled = false` turns it off.
+    pub fn arbiter(
+        mut self,
+        llm: Option<Arc<dyn LlmClient>>,
+        enabled: bool,
+        model_name: impl Into<String>,
+    ) -> Self {
+        let model_name = model_name.into();
+        self.arbiter = llm
+            .filter(|_| enabled)
+            .map(|llm| KubeArbiter { llm, model_name });
+        self
+    }
+
+    /// What the arbiter is told about the target.
+    fn arbiter_target(&self) -> String {
+        match &self.execution {
+            KubeExecution::Cluster {
+                target, namespace, ..
+            } => arbiter::target_description(&ArbiterContext {
+                is_local: false,
+                ssh_info: None,
+                kubernetes: Some(KubernetesArbiterTarget::new(target, namespace.as_deref())),
+            }),
+            KubeExecution::Fleet { fleet, .. } => format!(
+                "Kubernetes fleet {} (read-only API, one approval for every member; {})",
+                fleet.fleet().group_name(),
+                fleet.confirmation_radius()
+            ),
+        }
+    }
+
+    /// Run the arbiter on a request about to be shown for confirmation.
+    async fn audit(
+        &self,
+        command: &str,
+        explanation: &str,
+        destructive: bool,
+        conversation: &[ChatMessage],
+    ) {
+        if self.confirm_mode == CommandConfirmMode::Never {
+            return;
+        }
+        let Some(audit_by) = &self.arbiter else {
+            return;
+        };
+        let history_tail =
+            arbiter::history_tail_from_messages(conversation, HISTORY_TAIL_EXCHANGES);
+        let messages = arbiter::build_audit_messages(
+            command,
+            explanation,
+            destructive,
+            &self.arbiter_target(),
+            &history_tail,
+        );
+        let audit = arbiter::run_audit(
+            audit_by.llm.as_ref(),
+            messages,
+            Duration::from_secs(ARBITER_TIMEOUT_SECS),
+            self.cancellation.as_ref(),
+        )
+        .await;
+        self.emit(AgentEvent::CommandAudited {
+            verdict: audit.verdict.label().to_string(),
+            reason: audit.reason.clone(),
+            arbiter_model: Some(audit_by.model_name.clone()),
+            unavailable: audit.unavailable,
+        });
+        if audit.tokens_in > 0 || audit.tokens_out > 0 {
+            self.emit(AgentEvent::TokenUsage {
+                tokens_in: audit.tokens_in,
+                tokens_out: audit.tokens_out,
+                cost: audit.cost,
+                model: audit.model,
+                arbiter: true,
+            });
         }
     }
 
@@ -270,7 +395,8 @@ impl KubeAgent {
             }
 
             for call in &response.tool_calls {
-                messages.push(self.process_tool_call(call).await?);
+                let reply = self.process_tool_call(call, &messages).await?;
+                messages.push(reply);
             }
         }
 
@@ -279,7 +405,17 @@ impl KubeAgent {
         )))
     }
 
-    async fn process_tool_call(&self, call: &ToolCall) -> Result<ChatMessage> {
+    async fn process_tool_call(
+        &self,
+        call: &ToolCall,
+        conversation: &[ChatMessage],
+    ) -> Result<ChatMessage> {
+        // Every confirmation of this call — typed request or log query —
+        // goes through the arbiter first (#620).
+        let confirmer = AuditedConfirmer {
+            agent: self,
+            conversation,
+        };
         if call.name == crate::logs::k8s::TOOL_POD_LOGS_HISTORY {
             let Some(sources) = &self.log_sources else {
                 return Ok(ChatMessage::tool(&call.id, "Error: no log sources are configured."));
@@ -299,7 +435,7 @@ impl KubeAgent {
                             namespace.as_deref().or(target.default_namespace.as_deref()),
                             None,
                             mode,
-                            self.confirmer.as_ref(),
+                            &confirmer,
                             &emit,
                             self.cancellation.as_ref(),
                             proposal_id,
@@ -312,7 +448,7 @@ impl KubeAgent {
                         .process_fleet_pod_logs(
                             call,
                             &members,
-                            self.confirmer.as_ref(),
+                            &confirmer,
                             &emit,
                             self.cancellation.as_ref(),
                             proposal_id,
@@ -333,7 +469,7 @@ impl KubeAgent {
                 .process(
                     call,
                     self.confirm_mode,
-                    self.confirmer.as_ref(),
+                    &confirmer,
                     &emit,
                     self.cancellation.as_ref(),
                     NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed),
@@ -416,8 +552,7 @@ impl KubeAgent {
             ConfirmDecision::NeedsConfirmation => {
                 let approved = self
                     .cancellable(
-                        self.confirmer
-                            .confirm(&display, &confirmation_explanation, false),
+                        confirmer.confirm(&display, &confirmation_explanation, false),
                     )
                     .await?;
                 if !approved {
@@ -582,5 +717,227 @@ mod tests {
         assert!(explanation_error(&call)
             .unwrap()
             .contains("no Kubernetes request was executed"));
+    }
+
+    // ── Arbiter (#620) ─────────────────────────────────────────────────
+
+    use crate::kube_tools::tests::{executor, target, MockCluster};
+    use crate::ChatResponse;
+    use std::sync::Mutex;
+
+    /// Answers a scripted sequence; records every request.
+    struct ScriptedLlm {
+        answers: Mutex<Vec<ChatResponse>>,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    impl ScriptedLlm {
+        fn new(mut answers: Vec<ChatResponse>) -> Arc<Self> {
+            answers.reverse();
+            Arc::new(Self {
+                answers: Mutex::new(answers),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for ScriptedLlm {
+        async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(self
+                .answers
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or_else(|| ChatResponse::text("Done.")))
+        }
+    }
+
+    /// Approves, and records whether the audit was already emitted.
+    struct RecordingConfirmer {
+        events: Arc<Mutex<Vec<AgentEvent>>>,
+        audited_before: Mutex<Vec<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandConfirmer for RecordingConfirmer {
+        async fn confirm(&self, _: &str, _: &str, _: bool) -> Result<bool> {
+            let audited = self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, AgentEvent::CommandAudited { .. }));
+            self.audited_before.lock().unwrap().push(audited);
+            Ok(true)
+        }
+    }
+
+    fn get_pods() -> ChatResponse {
+        ChatResponse::tool_calls(
+            "",
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "k8s_get".into(),
+                arguments: serde_json::json!({"kind": "Pod", "explanation": "List the pods in shop"}),
+            }],
+        )
+    }
+
+    async fn run_cluster_agent(
+        mode: CommandConfirmMode,
+        arbiter: Option<Arc<ScriptedLlm>>,
+        enabled: bool,
+    ) -> (Vec<AgentEvent>, Vec<bool>) {
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let confirmer = Arc::new(RecordingConfirmer {
+            events: Arc::clone(&events),
+            audited_before: Mutex::new(Vec::new()),
+        });
+        let sink_events = Arc::clone(&events);
+        let sink: EventSink = Arc::new(move |event| sink_events.lock().unwrap().push(event));
+        let agent = KubeAgent::new(
+            ScriptedLlm::new(vec![get_pods(), ChatResponse::text("Done.")]),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::clone(&confirmer) as Arc<dyn CommandConfirmer>,
+            mode,
+            Vec::new(),
+        )
+        .event_sink(sink)
+        .arbiter(arbiter.map(|a| a as Arc<dyn LlmClient>), enabled, "judge");
+        agent.run("show pods", &[]).await.unwrap();
+        let events = events.lock().unwrap().clone();
+        let audited_before = confirmer.audited_before.lock().unwrap().clone();
+        (events, audited_before)
+    }
+
+    #[tokio::test]
+    async fn a_cluster_request_is_audited_before_it_is_confirmed() {
+        let arbiter = ScriptedLlm::new(vec![ChatResponse::text(
+            r#"{"verdict":"MISMATCH","reason":"lists all namespaces"}"#,
+        )]);
+        let (events, audited_before) =
+            run_cluster_agent(CommandConfirmMode::Always, Some(Arc::clone(&arbiter)), true).await;
+        assert_eq!(audited_before, vec![true], "the verdict comes before the question");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::CommandAudited { verdict, arbiter_model: Some(model), unavailable: false, .. }
+                    if verdict == "MISMATCH" && model == "judge"
+            )),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::CommandFinished { denied: false, .. })),
+            "a verdict never denies: {events:?}"
+        );
+        let requests = arbiter.requests.lock().unwrap();
+        let audit = &requests[0].messages[1].content;
+        assert!(audit.contains("k8s_get pod"), "{audit}");
+        assert!(audit.contains("Kubernetes cluster prod-eu (namespace shop, tags: prod)"), "{audit}");
+        assert!(audit.contains("List the pods in shop"), "{audit}");
+    }
+
+    #[tokio::test]
+    async fn a_fleet_request_is_audited_once_with_the_fleet_as_target() {
+        use crate::kube_fleet::tests as fleet;
+        let (eu, _) = fleet::cluster("prod-eu", vec![fleet::pod("web-1"), fleet::pod("web-2")]);
+        let kube_fleet = KubeFleet::open(&fleet::group(&["prod-eu"], None), vec![eu])
+            .await
+            .unwrap();
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let confirmer = Arc::new(RecordingConfirmer {
+            events: Arc::clone(&events),
+            audited_before: Mutex::new(Vec::new()),
+        });
+        let sink_events = Arc::clone(&events);
+        let sink: EventSink = Arc::new(move |event| sink_events.lock().unwrap().push(event));
+        let arbiter = ScriptedLlm::new(vec![ChatResponse::text(r#"{"verdict":"OK"}"#)]);
+        let describe = ChatResponse::tool_calls(
+            "",
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "k8s_describe".into(),
+                arguments: serde_json::json!({"kind": "Pod", "name": "x", "explanation": "Describe every pod"}),
+            }],
+        );
+        KubeAgent::new_fleet(
+            ScriptedLlm::new(vec![describe, ChatResponse::text("Done.")]),
+            Arc::new(kube_fleet),
+            Arc::clone(&confirmer) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Always,
+            Vec::new(),
+        )
+        .event_sink(sink)
+        .arbiter(Some(Arc::clone(&arbiter) as Arc<dyn LlmClient>), true, "judge")
+        .run("describe pods", &[])
+        .await
+        .unwrap();
+        assert_eq!(*confirmer.audited_before.lock().unwrap(), vec![true]);
+        let requests = arbiter.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "one audit for the one fleet-wide approval");
+        let audit = &requests[0].messages[1].content;
+        assert!(audit.contains("Kubernetes fleet web-prod"), "{audit}");
+    }
+
+    /// An arbiter during whose audit the user cancels the turn.
+    struct CancellingArbiter(CancellationToken);
+
+    #[async_trait::async_trait]
+    impl LlmClient for CancellingArbiter {
+        async fn chat(&self, _: &ChatRequest) -> Result<ChatResponse> {
+            self.0.cancel();
+            Ok(ChatResponse::text(r#"{"verdict":"OK"}"#))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_cancelled_during_the_audit_asks_nobody() {
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let confirmer = Arc::new(RecordingConfirmer {
+            events: Arc::clone(&events),
+            audited_before: Mutex::new(Vec::new()),
+        });
+        let token = CancellationToken::new();
+        let result = KubeAgent::new(
+            ScriptedLlm::new(vec![get_pods(), ChatResponse::text("Done.")]),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::clone(&confirmer) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Always,
+            Vec::new(),
+        )
+        .cancellation(token.clone())
+        .arbiter(Some(Arc::new(CancellingArbiter(token)) as Arc<dyn LlmClient>), true, "judge")
+        .run("show pods", &[])
+        .await;
+        assert!(result.is_err(), "the turn ends cancelled");
+        assert!(
+            confirmer.audited_before.lock().unwrap().is_empty(),
+            "no confirmation dialog after a cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_audit_without_an_arbiter_when_disabled_or_in_never_mode() {
+        for (mode, enabled) in [
+            (CommandConfirmMode::Always, false),
+            (CommandConfirmMode::Never, true),
+        ] {
+            let arbiter = ScriptedLlm::new(vec![ChatResponse::text(r#"{"verdict":"OK"}"#)]);
+            let (events, _) = run_cluster_agent(mode, Some(Arc::clone(&arbiter)), enabled).await;
+            assert!(
+                !events.iter().any(|e| matches!(e, AgentEvent::CommandAudited { .. })),
+                "{mode:?}/{enabled}: {events:?}"
+            );
+            assert!(arbiter.requests.lock().unwrap().is_empty());
+        }
+        let (events, audited) = run_cluster_agent(CommandConfirmMode::Always, None, true).await;
+        assert_eq!(audited, vec![false]);
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandAudited { .. })));
     }
 }

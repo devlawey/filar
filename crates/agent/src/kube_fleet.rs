@@ -582,7 +582,7 @@ impl KubeFleetReport {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -611,7 +611,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct MockCluster {
+    pub(crate) struct MockCluster {
         pods: Mutex<Vec<PodInfo>>,
         behaviour: Mutex<BTreeMap<String, Behaviour>>,
         logs: Mutex<BTreeMap<String, PodLogs>>,
@@ -773,7 +773,7 @@ mod tests {
         }
     }
 
-    fn pod(name: &str) -> PodInfo {
+    pub(crate) fn pod(name: &str) -> PodInfo {
         PodInfo {
             namespace: "shop".into(),
             name: name.into(),
@@ -795,7 +795,7 @@ mod tests {
         }
     }
 
-    fn cluster(name: &str, pods: Vec<PodInfo>) -> (KubeFleetCluster, Arc<MockCluster>) {
+    pub(crate) fn cluster(name: &str, pods: Vec<PodInfo>) -> (KubeFleetCluster, Arc<MockCluster>) {
         let mock = Arc::new(MockCluster {
             pods: Mutex::new(pods),
             ..MockCluster::default()
@@ -809,7 +809,7 @@ mod tests {
         (KubeFleetCluster::new(target, mock.clone(), secrets), mock)
     }
 
-    fn group(clusters: &[&str], selector: Option<&str>) -> HostGroup {
+    pub(crate) fn group(clusters: &[&str], selector: Option<&str>) -> HostGroup {
         HostGroup {
             name: "web-prod".into(),
             kube: Some(KubeGroup {
