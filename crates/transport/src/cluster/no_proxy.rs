@@ -46,8 +46,10 @@ fn entry_matches(entry: &str, host: &str, host_ip: Option<IpAddr>, port: u16) ->
         return host_ip == Some(ip);
     }
     let (name, entry_port) = split_port(entry);
-    if entry_port.is_some_and(|p| p != port) {
-        return false;
+    match entry_port {
+        PortMatch::Any => {}
+        PortMatch::Exact(p) if p == port => {}
+        PortMatch::Exact(_) | PortMatch::Never => return false,
     }
     if let Ok(ip) = name.parse::<IpAddr>() {
         return host_ip == Some(ip);
@@ -61,27 +63,37 @@ fn entry_matches(entry: &str, host: &str, host_ip: Option<IpAddr>, port: u16) ->
     subdomain || (!subdomains_only && host == domain)
 }
 
-/// `name:port` or `[v6]:port` → (name, port); anything else is all name.
-fn split_port(entry: &str) -> (&str, Option<u16>) {
+/// Which ports a `NO_PROXY` entry covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortMatch {
+    /// No port in the entry: every port.
+    Any,
+    /// `host:port`: that port only.
+    Exact(u16),
+    /// A port was written but does not parse: no port at all, rather than
+    /// every port (#627 review).
+    Never,
+}
+
+/// `name:port` or `[v6]:port` → (name, ports); anything else is all name.
+fn split_port(entry: &str) -> (&str, PortMatch) {
     if let Some(rest) = entry.strip_prefix('[') {
         if let Some((addr, tail)) = rest.split_once(']') {
             return match tail {
-                "" => (addr, None),
-                // A port that does not parse matches no port at all, rather
-                // than every port (#627 review).
+                "" => (addr, PortMatch::Any),
                 tail => match tail.strip_prefix(':').and_then(|p| p.parse().ok()) {
-                    Some(port) => (addr, Some(port)),
-                    None => (addr, Some(0)),
+                    Some(port) => (addr, PortMatch::Exact(port)),
+                    None => (addr, PortMatch::Never),
                 },
             };
         }
     }
     match entry.rsplit_once(':') {
         Some((name, port)) if !name.contains(':') => match port.parse() {
-            Ok(port) => (name, Some(port)),
-            Err(_) => (entry, None),
+            Ok(port) => (name, PortMatch::Exact(port)),
+            Err(_) => (entry, PortMatch::Any),
         },
-        _ => (entry, None),
+        _ => (entry, PortMatch::Any),
     }
 }
 
@@ -163,6 +175,12 @@ impl ProxyEnv {
 /// Set the proxy of `config` (loaded from the kubeconfig): the cluster's own
 /// `proxy-url` when it has one, else the environment's `HTTPS_PROXY` unless
 /// the server is in `NO_PROXY`. Errors only on an unparsable `HTTPS_PROXY`.
+///
+/// Without a kubeconfig `proxy-url` the proxy is rebuilt from `env` alone,
+/// overwriting what `kube-rs` set. That is exact today: `kube-rs` 4.2 has no
+/// other source (`HTTPS_PROXY` / `https_proxy` only, no `ALL_PROXY` or system
+/// settings). A new source in `kube-rs` must be added to [`ProxyEnv`], or it
+/// would be dropped here.
 pub(super) fn choose_proxy(
     config: &mut Config,
     explicit_proxy: bool,
