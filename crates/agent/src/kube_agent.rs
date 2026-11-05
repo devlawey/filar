@@ -227,13 +227,16 @@ impl KubeAgent {
     /// as the sink of the log-source paths, which announce their own
     /// proposals.
     fn emit_and_rate(&self, event: AgentEvent) {
+        let rates = self.risk_scorer.is_some()
+            && matches!(self.execution, KubeExecution::Cluster { .. });
+        // Copy the proposal only when it is going to be rated.
         let rate = match &event {
             AgentEvent::CommandProposed {
                 proposal_id,
                 command,
                 explanation,
                 ..
-            } => Some((*proposal_id, command.clone(), explanation.clone())),
+            } if rates => Some((*proposal_id, command.clone(), explanation.clone())),
             _ => None,
         };
         self.emit(event);
