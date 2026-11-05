@@ -520,7 +520,10 @@ impl ClusterApi for KubeClusterApi {
 ///
 /// The kubeconfig path comes from the target, `$KUBECONFIG`, or
 /// `~/.kube/config`, in that order; `current-context` is never consulted.
-/// Exec credential plugins and proxy settings are handled by `kube-rs`.
+/// Exec credential plugins are handled by `kube-rs`. The proxy is
+/// `kube-rs`'s choice (kubeconfig `proxy-url`, else `HTTPS_PROXY`) except
+/// that an environment proxy is dropped for a server listed in `NO_PROXY`
+/// (#627), as `kubectl` does.
 ///
 /// `streaming` leaves the read and write timeouts unset: a long-lived exec
 /// stream (#563) is legitimately idle between commands, and a read timeout
@@ -531,6 +534,7 @@ pub(super) async fn build_client(target: &KubeCluster, streaming: bool) -> Resul
         None => Kubeconfig::read(),
     }
     .map_err(|_| connect_error(target, "cannot read or parse the selected kubeconfig"))?;
+    let explicit_proxy = super::no_proxy::kubeconfig_proxy(&kubeconfig, &target.context).is_some();
     let options = KubeConfigOptions {
         context: Some(target.context.clone()),
         ..KubeConfigOptions::default()
@@ -538,6 +542,11 @@ pub(super) async fn build_client(target: &KubeCluster, streaming: bool) -> Resul
     let mut config = Config::from_custom_kubeconfig(kubeconfig, &options)
         .await
         .map_err(|_| connect_error(target, "cannot load the explicit context or its credentials"))?;
+    super::no_proxy::apply_no_proxy(
+        &mut config,
+        explicit_proxy,
+        super::no_proxy::no_proxy_from_env().as_deref(),
+    );
     let timeout = Duration::from_secs(target.request_timeout_secs);
     config.connect_timeout = Some(timeout);
     if streaming {

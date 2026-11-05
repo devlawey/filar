@@ -13,6 +13,7 @@ mod client;
 mod convert;
 mod debug;
 mod exec;
+mod no_proxy;
 mod http;
 
 pub use client::KubeClusterApi;
