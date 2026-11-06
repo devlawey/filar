@@ -28,13 +28,13 @@ working example.
 Bots and mobile apps that only need SSH should disable default features:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.3", default-features = false }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.4", default-features = false }
 ```
 
 Desktop apps (TUI/GUI) should keep `local` enabled:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.3" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.4" }
 ```
 
 Consumers that need Kubernetes but not a local terminal can enable only `kube`:
@@ -190,9 +190,9 @@ application — and the arbiter/`RiskInput` target
 
 ```toml
 [dependencies]
-filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.3" }
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.3", default-features = false }
-filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.3" }
+filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.4" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.4", default-features = false }
+filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.4" }
 
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"

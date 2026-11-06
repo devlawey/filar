@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [3.0.4] - 2026-11-06
+
 ### Changed
 
 - New Kubernetes guide `docs/KUBERNETES.md`: the target model, connecting a cluster (kind, cloud, exec plugins, `NO_PROXY`), every field of the launcher's cluster card, the cluster and pod tabs, the debug container with the RBAC it needs (steps, a minimal `Role` and `RoleBinding`, `kubectl auth can-i`), Kubernetes groups and pod fleets with a real comparison, logs and common problems; `USER_GUIDE.md` 2.2, 3, 3.3, 4.8 and 4.10–4.13 link to it ([#633](https://github.com/devlawey/filar/issues/633)).
@@ -1516,7 +1518,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v3.0.3...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v3.0.4...HEAD
+[3.0.4]: https://github.com/devlawey/filar/compare/v3.0.3...v3.0.4
 [3.0.3]: https://github.com/devlawey/filar/compare/v3.0.2...v3.0.3
 [3.0.2]: https://github.com/devlawey/filar/compare/v3.0.0...v3.0.2
 [3.0.0]: https://github.com/devlawey/filar/compare/v2.0.7...v3.0.0
