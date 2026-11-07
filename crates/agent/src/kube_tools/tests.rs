@@ -19,9 +19,16 @@ pub(crate) struct MockCluster {
     log_call: Mutex<Option<(bool, u32, usize)>>,
     /// Answer of `pod_http_get`; the request it got is recorded.
     http: Option<filar_transport::PodHttpResponse>,
-    pub(crate) http_call: Mutex<Option<filar_transport::PodHttpRequest>>,
+    http_call: Mutex<Option<filar_transport::PodHttpRequest>>,
     /// When set, `list_events` fails with this error (#645).
     events_error: Option<fn() -> CoreError>,
+}
+
+impl MockCluster {
+    /// The `pod_http_get` request this mock received, if any.
+    pub(crate) fn last_http_request(&self) -> Option<filar_transport::PodHttpRequest> {
+        self.http_call.lock().unwrap().clone()
+    }
 }
 
 #[async_trait::async_trait]

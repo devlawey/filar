@@ -1556,7 +1556,7 @@ mod tests {
         assert!(asked[0].0.contains("GET web-1:8080/reset"), "{asked:?}");
         assert!(asked[0].1.contains(APPLICATION_STATE_WARNING), "{asked:?}");
         assert!(
-            cluster.http_call.lock().unwrap().is_none(),
+            cluster.last_http_request().is_none(),
             "a denied request is not sent"
         );
     }

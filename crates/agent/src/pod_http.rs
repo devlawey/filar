@@ -126,10 +126,11 @@ const DIAGNOSTIC_PATHS: [&str; 9] = [
 /// [`validate_path`] bounds them. Any other path is the application's own
 /// business and may change its state, so it is always confirmed.
 pub fn is_diagnostic_path(path: &str) -> bool {
-    if validate_path(path).is_err() {
+    // Judge the path exactly as it would be sent: the validated form.
+    let Ok(path) = validate_path(path) else {
         return false;
-    }
-    let (route, query) = path.trim().split_once('?').unwrap_or((path.trim(), ""));
+    };
+    let (route, query) = path.split_once('?').unwrap_or((&path, ""));
     if route == "/debug/pprof" || route.starts_with("/debug/pprof/") {
         return true;
     }
@@ -361,6 +362,8 @@ mod tests {
             "/healthz/",
             "/health?full=true",
             "/debug/pprofx?debug=1",
+            // A binary profile: `validate_path` refuses it, so it is
+            // never diagnostic.
             "/debug/pprof/heap",
             "/",
             "metrics",
