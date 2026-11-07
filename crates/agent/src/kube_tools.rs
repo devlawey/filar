@@ -1544,7 +1544,7 @@ fn events_unavailable(error: &CoreError) -> String {
         CoreError::AccessDenied(_) => "access denied by RBAC or policy",
         CoreError::NotFound(_) => "the API answered 404 for events",
         CoreError::Unavailable(_) | CoreError::ConnectionLost(_) => {
-            "the API did not answer in time"
+            "the API was unreachable or did not answer in time"
         }
         _ => "the events request failed",
     };

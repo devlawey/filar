@@ -382,7 +382,7 @@ async fn describe_survives_a_failed_events_request() {
         ),
         (
             || CoreError::Unavailable("timed out".into()),
-            "did not answer",
+            "unreachable or did not answer",
         ),
     ];
     for (error, cause) in cases {
