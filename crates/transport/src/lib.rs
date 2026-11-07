@@ -37,7 +37,11 @@ use tokio::sync::mpsc;
 // Re-export key types.
 #[cfg(feature = "kube")]
 pub use cluster::{
-    debug_container_name, ClusterApi, ConfigMapInfo, ContainerInfo, ContainerMetrics,
+    debug_container_name, hide_secret_values, parse_manifest, AppliedObject, ApplyAction,
+    ClusterApi, ClusterWriteApi, DeleteOptions, DeleteOutcome, DeleteTarget, DeletedObject,
+    ObjectKind, ObjectRef, Propagation, RestartKind, ScaleKind, ScaleOutcome, SecretKeyChange,
+    SecretKeyState, UndoOutcome, WriteOutcome, FIELD_MANAGER, MAX_DELETE_OBJECTS,
+    RESTARTED_AT_ANNOTATION, SECRET_HIDDEN, ConfigMapInfo, ContainerInfo, ContainerMetrics,
     ContainerPortInfo, DebugContainerSpec, EndpointInfo, EventInfo, IngressInfo, KubeClusterApi,
     KubeExecConfig, KubeExecEvent, KubeExecutor, KubeInteractive, NamespaceInfo, NodeCondition,
     NodeInfo, PodHttpRequest, PodHttpResponse, PodInfo, PodLogs, ResourceMetrics,

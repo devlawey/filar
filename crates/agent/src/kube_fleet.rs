@@ -35,6 +35,21 @@ pub struct KubeFleetCluster {
 
 impl KubeFleetCluster {
     /// Bind an already connected read-only API to its configured target.
+    ///
+    /// A fleet only ever gets [`ClusterApi`]: write access
+    /// ([`filar_transport::ClusterWriteApi`], #638) does not fit here, so a
+    /// fleet cannot write by type.
+    ///
+    /// ```compile_fail
+    /// # use std::sync::Arc;
+    /// # fn fleet(write: Arc<dyn filar_transport::ClusterWriteApi>) {
+    /// let _ = filar_agent::KubeFleetCluster::new(
+    ///     filar_core::KubeCluster::default(),
+    ///     write,
+    ///     Arc::new(filar_core::StaticSecretProvider::new()),
+    /// );
+    /// # }
+    /// ```
     pub fn new(
         target: KubeCluster,
         api: Arc<dyn ClusterApi>,

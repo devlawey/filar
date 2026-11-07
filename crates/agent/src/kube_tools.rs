@@ -940,6 +940,20 @@ pub struct KubeToolExecutor {
 
 impl KubeToolExecutor {
     /// Bind the executor to one cluster API, target and secret-redaction source.
+    ///
+    /// The read-only tools get only [`ClusterApi`]; write access
+    /// ([`filar_transport::ClusterWriteApi`], #638) does not fit here.
+    ///
+    /// ```compile_fail
+    /// # use std::sync::Arc;
+    /// # fn tools(write: Arc<dyn filar_transport::ClusterWriteApi>) {
+    /// let _ = filar_agent::KubeToolExecutor::new(
+    ///     write,
+    ///     filar_core::KubeCluster::default(),
+    ///     Arc::new(filar_core::StaticSecretProvider::new()),
+    /// );
+    /// # }
+    /// ```
     pub fn new(
         api: Arc<dyn ClusterApi>,
         target: KubeCluster,

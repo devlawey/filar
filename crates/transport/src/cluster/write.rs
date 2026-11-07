@@ -1,0 +1,1059 @@
+//! Write access to the Kubernetes API (#638).
+//!
+//! [`ClusterWriteApi`] is a separate trait from the read-only
+//! [`ClusterApi`](super::ClusterApi): fleets and read-only paths are handed
+//! only `ClusterApi`, so they cannot write by type, not by a runtime check.
+//! [`KubeClusterApi`](super::KubeClusterApi) implements both.
+//!
+//! filar keeps no list of forbidden kinds or operations: the limit is the
+//! RBAC of the kubeconfig context, and the protection is the confirmation
+//! gate of the caller (dry-run, diff, explicit approval). Every method takes
+//! `dry_run` (`dryRun=All` on the API server).
+//!
+//! `Secret` objects are written and deleted like any other, but their values
+//! never leave this module: in every returned object `data` and `stringData`
+//! values are replaced by [`SECRET_HIDDEN`], and a diff gets
+//! [`SecretKeyChange`]s — keys and whether a value changed — instead.
+
+use std::collections::BTreeMap;
+
+use filar_core::{CoreError, KubeCluster, Result};
+use k8s_openapi::api::apps::v1::{Deployment, ReplicaSet};
+use kube::api::{
+    ApiResource, DeleteParams, DynamicObject, GroupVersionKind, ListParams, Patch, PatchParams,
+    PostParams, PropagationPolicy, ValidationDirective,
+};
+use kube::discovery::{ApiCapabilities, Discovery, Scope};
+use kube::{Api, Client};
+use serde_json::{json, Value};
+
+use super::client::{api_error, is_rbac_message};
+use super::KubeClusterApi;
+
+/// The field manager of every filar write (server-side apply ownership).
+pub const FIELD_MANAGER: &str = "filar";
+
+/// What a `Secret` value is replaced with in everything this module returns.
+pub const SECRET_HIDDEN: &str = "«скрыто»";
+
+/// Most objects a selector delete may touch; a broader selector is refused
+/// rather than cut, so the dry-run list is always the full list.
+pub const MAX_DELETE_OBJECTS: usize = 2000;
+
+/// The annotation `kubectl rollout restart` sets on the pod template.
+pub const RESTARTED_AT_ANNOTATION: &str = "kubectl.kubernetes.io/restartedAt";
+
+/// The ReplicaSet/Deployment annotation holding the rollout revision.
+const REVISION_ANNOTATION: &str = "deployment.kubernetes.io/revision";
+
+/// A kind named by the caller: `kind` alone (resolved through discovery,
+/// core group first) or with `apiVersion` (`apps/v1`, `v1`, `example.com/v1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectKind {
+    /// `apiVersion`, when known.
+    pub api_version: Option<String>,
+    /// Kind (`Deployment`), resource plural (`deployments`) or singular,
+    /// case-insensitive.
+    pub kind: String,
+}
+
+/// One object addressed by a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRef {
+    /// `apiVersion` of the object.
+    pub api_version: String,
+    /// Kind of the object.
+    pub kind: String,
+    /// Namespace; `None` for cluster-scoped objects.
+    pub namespace: Option<String>,
+    /// Object name.
+    pub name: String,
+}
+
+/// What server-side apply did (or, in a dry run, would do) to one object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplyAction {
+    /// The object did not exist.
+    Created,
+    /// The object existed and its content changes.
+    Configured,
+    /// The object existed and nothing but bookkeeping changes.
+    Unchanged,
+}
+
+impl ApplyAction {
+    /// `created`, `configured` or `unchanged`, as `kubectl apply` says.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Configured => "configured",
+            Self::Unchanged => "unchanged",
+        }
+    }
+}
+
+/// How one key of a `Secret` changes; the values themselves are never shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretKeyState {
+    /// The key is new.
+    Added,
+    /// The key stays and its value changes.
+    Changed,
+    /// The key and its value stay.
+    Unchanged,
+    /// The key goes away.
+    Removed,
+}
+
+/// One key of a `Secret` in a diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretKeyChange {
+    /// The key.
+    pub key: String,
+    /// What happens to it.
+    pub state: SecretKeyState,
+}
+
+/// One object of an apply, in manifest order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppliedObject {
+    /// The object.
+    pub object: ObjectRef,
+    /// What apply does to it.
+    pub action: ApplyAction,
+    /// The object before (`None` when created), with Secret values hidden.
+    pub live: Option<Value>,
+    /// The object after, as the API server returned it, Secret values hidden.
+    pub result: Value,
+    /// For a `Secret`: its keys and whether each value changes.
+    pub secret_keys: Vec<SecretKeyChange>,
+}
+
+/// Workload kinds with a `scale` subresource that filar scales.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleKind {
+    /// `apps/v1` Deployment.
+    Deployment,
+    /// `apps/v1` StatefulSet.
+    StatefulSet,
+    /// `apps/v1` ReplicaSet.
+    ReplicaSet,
+}
+
+impl ScaleKind {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Deployment => "Deployment",
+            Self::StatefulSet => "StatefulSet",
+            Self::ReplicaSet => "ReplicaSet",
+        }
+    }
+}
+
+/// Result of a scale: replicas before and after.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScaleOutcome {
+    /// The workload.
+    pub object: ObjectRef,
+    /// `spec.replicas` before.
+    pub from: i32,
+    /// `spec.replicas` after.
+    pub to: i32,
+}
+
+/// Workload kinds `rollout restart` applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartKind {
+    /// `apps/v1` Deployment.
+    Deployment,
+    /// `apps/v1` StatefulSet.
+    StatefulSet,
+    /// `apps/v1` DaemonSet.
+    DaemonSet,
+}
+
+impl RestartKind {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Deployment => "Deployment",
+            Self::StatefulSet => "StatefulSet",
+            Self::DaemonSet => "DaemonSet",
+        }
+    }
+}
+
+/// A patched object before and after the write.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteOutcome {
+    /// The object.
+    pub object: ObjectRef,
+    /// Before.
+    pub live: Value,
+    /// After, as the API server returned it.
+    pub result: Value,
+}
+
+/// Result of a rollout undo.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UndoOutcome {
+    /// The Deployment before and after.
+    pub write: WriteOutcome,
+    /// Revision the Deployment was on.
+    pub from_revision: i64,
+    /// Revision whose template it gets back.
+    pub to_revision: i64,
+}
+
+/// What a delete addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteTarget {
+    /// One object by name.
+    Name(String),
+    /// Every object matching the selectors (`kubectl delete -l …`). The
+    /// matching objects are listed first and deleted by name.
+    Selector {
+        /// Label selector.
+        labels: Option<String>,
+        /// Field selector.
+        fields: Option<String>,
+    },
+    /// Exactly these names — what a dry run listed. A name gone since is
+    /// reported, not an error; nothing beyond these names is deleted.
+    Names(Vec<String>),
+}
+
+/// Garbage-collection policy of a delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Propagation {
+    /// Dependents are deleted in the background (default).
+    #[default]
+    Background,
+    /// Dependents are deleted first.
+    Foreground,
+    /// Dependents are left.
+    Orphan,
+}
+
+/// Options of a delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeleteOptions {
+    /// `propagationPolicy`.
+    pub propagation: Propagation,
+    /// `gracePeriodSeconds`; `None` = the object's default.
+    pub grace_period_seconds: Option<u32>,
+    /// Force: `gracePeriodSeconds=0`.
+    pub force: bool,
+}
+
+/// What a delete did (or would do) to one object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// Dry run: would be deleted.
+    WouldDelete,
+    /// Deleted.
+    Deleted,
+    /// Deletion started; finalizers or a grace period keep it for now.
+    Pending,
+    /// Already gone when its turn came.
+    AlreadyGone,
+}
+
+/// One object of a delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedObject {
+    /// The object.
+    pub object: ObjectRef,
+    /// What happened.
+    pub outcome: DeleteOutcome,
+}
+
+/// Write access to Kubernetes objects (#638). Separate from
+/// [`ClusterApi`](super::ClusterApi): fleets and read-only paths never get it.
+///
+/// Every method takes `dry_run`: the API server validates and admits the
+/// request and answers as if it ran, but persists nothing (`dryRun=All`).
+#[async_trait::async_trait]
+pub trait ClusterWriteApi: Send + Sync {
+    /// Server-side apply of a YAML or JSON manifest, one or more documents,
+    /// in order (`fieldManager=filar`, no force, `fieldValidation=Strict`).
+    /// A namespaced object without `metadata.namespace` goes to
+    /// `default_namespace`.
+    async fn apply(
+        &self,
+        manifest: &str,
+        default_namespace: Option<&str>,
+        dry_run: bool,
+    ) -> Result<Vec<AppliedObject>>;
+
+    /// Set `spec.replicas` through the `scale` subresource.
+    async fn scale(
+        &self,
+        kind: ScaleKind,
+        namespace: &str,
+        name: &str,
+        replicas: i32,
+        dry_run: bool,
+    ) -> Result<ScaleOutcome>;
+
+    /// Restart a rollout as `kubectl rollout restart`: the pod template gets
+    /// a fresh [`RESTARTED_AT_ANNOTATION`].
+    async fn rollout_restart(
+        &self,
+        kind: RestartKind,
+        namespace: &str,
+        name: &str,
+        dry_run: bool,
+    ) -> Result<WriteOutcome>;
+
+    /// Roll a Deployment back as `kubectl rollout undo`: its pod template
+    /// becomes the template of the ReplicaSet of `to_revision`, or of the
+    /// revision before the current one.
+    async fn rollout_undo(
+        &self,
+        namespace: &str,
+        name: &str,
+        to_revision: Option<i64>,
+        dry_run: bool,
+    ) -> Result<UndoOutcome>;
+
+    /// Delete objects of any kind, cluster-scoped ones included. A selector
+    /// is resolved to names first; in a dry run the result is the full list.
+    async fn delete(
+        &self,
+        kind: &ObjectKind,
+        namespace: Option<&str>,
+        target: &DeleteTarget,
+        options: &DeleteOptions,
+        dry_run: bool,
+    ) -> Result<Vec<DeletedObject>>;
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a manifest: YAML (one or more `---` documents) or JSON. Empty
+/// documents are skipped; each object needs `apiVersion`, `kind` and
+/// `metadata.name`. A `List` is not unpacked: send its items as documents.
+pub fn parse_manifest(manifest: &str) -> Result<Vec<Value>> {
+    let documents: Vec<Value> = serde_saphyr::from_multiple(manifest)
+        .map_err(|error| CoreError::Other(format!("the manifest is not valid YAML: {error}")))?;
+    let objects: Vec<Value> = documents.into_iter().filter(|doc| !doc.is_null()).collect();
+    if objects.is_empty() {
+        return Err(CoreError::Other("the manifest has no objects".into()));
+    }
+    for (index, object) in objects.iter().enumerate() {
+        let field = |pointer: &str| object.pointer(pointer).and_then(Value::as_str);
+        let missing = ["/apiVersion", "/kind", "/metadata/name"]
+            .into_iter()
+            .find(|pointer| field(pointer).is_none_or(str::is_empty));
+        if let Some(pointer) = missing {
+            return Err(CoreError::Other(format!(
+                "manifest document {} has no {}",
+                index + 1,
+                pointer.trim_start_matches('/').replace('/', ".")
+            )));
+        }
+    }
+    Ok(objects)
+}
+
+/// Replace every `data` and `stringData` value of a `Secret` with
+/// [`SECRET_HIDDEN`]. Other kinds are left alone.
+pub fn hide_secret_values(object: &mut Value) {
+    if object.get("kind").and_then(Value::as_str) != Some("Secret") {
+        return;
+    }
+    for field in ["data", "stringData"] {
+        if let Some(Value::Object(map)) = object.get_mut(field) {
+            for value in map.values_mut() {
+                *value = Value::String(SECRET_HIDDEN.into());
+            }
+        }
+    }
+    // `kubectl apply` keeps the whole last applied object here, values too.
+    if let Some(Value::Object(annotations)) = object.pointer_mut("/metadata/annotations") {
+        annotations.remove("kubectl.kubernetes.io/last-applied-configuration");
+    }
+}
+
+/// Keys of a `Secret` before and after, and whether each value changes.
+/// `stringData` values count as their `data` keys. Called on unredacted
+/// objects only, inside this module.
+fn secret_key_changes(live: Option<&Value>, result: &Value) -> Vec<SecretKeyChange> {
+    let values = |object: &Value| -> BTreeMap<String, Value> {
+        let mut out = BTreeMap::new();
+        for field in ["data", "stringData"] {
+            if let Some(Value::Object(map)) = object.get(field) {
+                for (key, value) in map {
+                    out.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        out
+    };
+    let before = live.map(values).unwrap_or_default();
+    let after = values(result);
+    let mut changes: Vec<SecretKeyChange> = after
+        .iter()
+        .map(|(key, value)| SecretKeyChange {
+            key: key.clone(),
+            state: match before.get(key) {
+                None => SecretKeyState::Added,
+                Some(old) if old == value => SecretKeyState::Unchanged,
+                Some(_) => SecretKeyState::Changed,
+            },
+        })
+        .collect();
+    changes.extend(
+        before
+            .keys()
+            .filter(|key| !after.contains_key(*key))
+            .map(|key| SecretKeyChange {
+                key: key.clone(),
+                state: SecretKeyState::Removed,
+            }),
+    );
+    changes.sort_by(|a, b| a.key.cmp(&b.key));
+    changes
+}
+
+/// The object without what changes on every write: bookkeeping metadata and
+/// status. Two objects equal here differ in nothing a user changed.
+fn content(object: &Value) -> Value {
+    let mut object = object.clone();
+    if let Some(Value::Object(metadata)) = object.get_mut("metadata") {
+        for field in [
+            "managedFields",
+            "resourceVersion",
+            "generation",
+            "creationTimestamp",
+            "uid",
+            "selfLink",
+        ] {
+            metadata.remove(field);
+        }
+    }
+    if let Value::Object(map) = &mut object {
+        map.remove("status");
+    }
+    object
+}
+
+fn apply_action(live: Option<&Value>, result: &Value) -> ApplyAction {
+    match live {
+        None => ApplyAction::Created,
+        Some(live) if content(live) == content(result) => ApplyAction::Unchanged,
+        Some(_) => ApplyAction::Configured,
+    }
+}
+
+fn to_value<T: serde::Serialize>(object: &T) -> Result<Value> {
+    serde_json::to_value(object).map_err(|error| CoreError::Other(error.to_string()))
+}
+
+fn gvk_of(api_version: &str, kind: &str) -> GroupVersionKind {
+    match api_version.split_once('/') {
+        Some((group, version)) => GroupVersionKind::gvk(group, version, kind),
+        None => GroupVersionKind::gvk("", api_version, kind),
+    }
+}
+
+fn now_rfc3339() -> String {
+    k8s_openapi::jiff::Timestamp::now()
+        .round(k8s_openapi::jiff::Unit::Second)
+        .map(|t| t.to_string())
+        .unwrap_or_else(|_| k8s_openapi::jiff::Timestamp::now().to_string())
+}
+
+/// A write error in the style of the read errors: RBAC as «нет права …»,
+/// an admission denial verbatim, a server-side apply conflict with the
+/// owning manager, a validation failure with the server's text.
+pub(super) fn write_error(
+    target: &KubeCluster,
+    error: kube::Error,
+    verb: &str,
+    resource: &str,
+    namespace: Option<&str>,
+) -> CoreError {
+    match error {
+        kube::Error::Api(status) if status.code == 409 && verb == "apply" => {
+            CoreError::Other(format!(
+                "server-side apply conflict on {resource}: {} — another field manager owns these fields; filar does not force (context {})",
+                status.message, target.context
+            ))
+        }
+        kube::Error::Api(status) if status.code == 409 => CoreError::Other(format!(
+            "Kubernetes API conflict on {verb} {resource}: {} (context {})",
+            status.message, target.context
+        )),
+        kube::Error::Api(status)
+            if matches!(status.code, 400 | 422)
+                || (status.code == 403 && !is_rbac_message(&status.message)) =>
+        {
+            // Validation (fieldValidation=Strict) and admission denials:
+            // the server's own words are the explanation.
+            CoreError::AccessDenied(format!(
+                "Kubernetes API refused {verb} {resource}: {} (context {})",
+                status.message, target.context
+            ))
+        }
+        other => api_error(target, other, verb, resource, namespace),
+    }
+}
+
+/// Resource name for messages: `deployments`, `deployments.apps`.
+fn resource_label(resource: &ApiResource) -> String {
+    if resource.group.is_empty() {
+        resource.plural.clone()
+    } else {
+        format!("{}.{}", resource.plural, resource.group)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KubeClusterApi
+// ---------------------------------------------------------------------------
+
+impl KubeClusterApi {
+    fn write_error(
+        &self,
+        error: kube::Error,
+        verb: &str,
+        resource: &str,
+        namespace: Option<&str>,
+    ) -> CoreError {
+        write_error(self.target(), error, verb, resource, namespace)
+    }
+
+    /// Resolve `kind` (and optional `apiVersion`) to a resource and scope.
+    async fn resolve_kind(&self, kind: &ObjectKind) -> Result<(ApiResource, ApiCapabilities)> {
+        let client = self.client().clone();
+        if let Some(api_version) = kind.api_version.as_deref() {
+            return resolve_gvk(&client, self.target(), &gvk_of(api_version, &kind.kind)).await;
+        }
+        let discovery = Discovery::new(client)
+            .run()
+            .await
+            .map_err(|error| api_error(self.target(), error, "discover", "API resources", None))?;
+        let wanted = kind.kind.to_ascii_lowercase();
+        let mut found: Vec<(ApiResource, ApiCapabilities)> = Vec::new();
+        for group in discovery.groups() {
+            for (resource, caps) in group.recommended_resources() {
+                let matches = resource.kind.to_ascii_lowercase() == wanted
+                    || resource.plural == wanted
+                    || resource.plural.trim_end_matches('s') == wanted
+                    || resource_label(&resource) == wanted;
+                if matches
+                    && !found.iter().any(|(r, _)| {
+                        r.api_version == resource.api_version && r.kind == resource.kind
+                    })
+                {
+                    found.push((resource, caps));
+                }
+            }
+        }
+        if let Some(core) = found
+            .iter()
+            .position(|(resource, _)| resource.group.is_empty())
+        {
+            return Ok(found.swap_remove(core));
+        }
+        match found.len() {
+            1 => Ok(found.remove(0)),
+            0 => Err(CoreError::NotFound(format!(
+                "the cluster has no kind {} (context {})",
+                kind.kind,
+                self.target().context
+            ))),
+            _ => Err(CoreError::Other(format!(
+                "kind {} exists in several API groups ({}); name the apiVersion",
+                kind.kind,
+                found
+                    .iter()
+                    .map(|(resource, _)| resource.api_version.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+
+    fn dynamic_api(
+        &self,
+        resource: &ApiResource,
+        caps: &ApiCapabilities,
+        namespace: Option<&str>,
+    ) -> Result<Api<DynamicObject>> {
+        let client = self.client().clone();
+        match (&caps.scope, namespace) {
+            (Scope::Namespaced, Some(namespace)) => {
+                Ok(Api::namespaced_with(client, namespace, resource))
+            }
+            (Scope::Namespaced, None) => Err(CoreError::Other(format!(
+                "{} is namespaced: name the namespace",
+                resource.kind
+            ))),
+            (Scope::Cluster, _) => Ok(Api::all_with(client, resource)),
+        }
+    }
+
+    async fn apply_one(
+        &self,
+        document: &Value,
+        default_namespace: Option<&str>,
+        dry_run: bool,
+    ) -> Result<AppliedObject> {
+        let api_version = document["apiVersion"].as_str().unwrap_or_default();
+        let kind = document["kind"].as_str().unwrap_or_default();
+        let name = document["metadata"]["name"].as_str().unwrap_or_default();
+        let (resource, caps) =
+            resolve_gvk(self.client(), self.target(), &gvk_of(api_version, kind)).await?;
+        let label = resource_label(&resource);
+        let namespace = match caps.scope {
+            Scope::Namespaced => Some(
+                document
+                    .pointer("/metadata/namespace")
+                    .and_then(Value::as_str)
+                    .filter(|ns| !ns.is_empty())
+                    .or(default_namespace)
+                    .ok_or_else(|| {
+                        CoreError::Other(format!(
+                            "{kind} {name} is namespaced: set metadata.namespace or a default namespace"
+                        ))
+                    })?
+                    .to_string(),
+            ),
+            Scope::Cluster => None,
+        };
+        let mut document = document.clone();
+        if let (Some(namespace), Some(Value::Object(metadata))) =
+            (namespace.as_deref(), document.get_mut("metadata"))
+        {
+            metadata.insert("namespace".into(), Value::String(namespace.into()));
+        }
+        let api = self.dynamic_api(&resource, &caps, namespace.as_deref())?;
+        let live = api
+            .get_opt(name)
+            .await
+            .map_err(|error| self.write_error(error, "get", &label, namespace.as_deref()))?
+            .map(|object| to_value(&object))
+            .transpose()?;
+        let params = PatchParams {
+            dry_run,
+            force: false,
+            field_manager: Some(FIELD_MANAGER.into()),
+            field_validation: Some(ValidationDirective::Strict),
+        };
+        let result = api
+            .patch(name, &params, &Patch::Apply(&document))
+            .await
+            .map_err(|error| self.write_error(error, "apply", &label, namespace.as_deref()))?;
+        let mut result = to_value(&result)?;
+        let mut live = live;
+        let action = apply_action(live.as_ref(), &result);
+        let secret_keys = if kind == "Secret" && resource.group.is_empty() {
+            secret_key_changes(live.as_ref(), &result)
+        } else {
+            Vec::new()
+        };
+        hide_secret_values(&mut result);
+        if let Some(live) = live.as_mut() {
+            hide_secret_values(live);
+        }
+        Ok(AppliedObject {
+            object: ObjectRef {
+                api_version: api_version.into(),
+                kind: kind.into(),
+                namespace,
+                name: name.into(),
+            },
+            action,
+            live,
+            result,
+            secret_keys,
+        })
+    }
+
+    async fn list_names(
+        &self,
+        api: &Api<DynamicObject>,
+        labels: Option<&str>,
+        fields: Option<&str>,
+        label: &str,
+        namespace: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        let mut params = ListParams::default().limit(500);
+        if let Some(labels) = labels.filter(|s| !s.is_empty()) {
+            params = params.labels(labels);
+        }
+        if let Some(fields) = fields.filter(|s| !s.is_empty()) {
+            params = params.fields(fields);
+        }
+        loop {
+            let page = api
+                .list(&params)
+                .await
+                .map_err(|error| self.write_error(error, "list", label, namespace))?;
+            names.extend(
+                page.items
+                    .into_iter()
+                    .filter_map(|object| object.metadata.name),
+            );
+            if names.len() > MAX_DELETE_OBJECTS {
+                return Err(CoreError::Other(format!(
+                    "the selector matches more than {MAX_DELETE_OBJECTS} {label}; narrow it"
+                )));
+            }
+            match page.metadata.continue_.filter(|token| !token.is_empty()) {
+                Some(token) => params = params.continue_token(&token),
+                None => return Ok(names),
+            }
+        }
+    }
+}
+
+async fn resolve_gvk(
+    client: &Client,
+    target: &KubeCluster,
+    gvk: &GroupVersionKind,
+) -> Result<(ApiResource, ApiCapabilities)> {
+    kube::discovery::pinned_kind(client, gvk)
+        .await
+        .map_err(|error| match error {
+            kube::Error::Discovery(_) => CoreError::NotFound(format!(
+                "the cluster has no kind {} in {} (context {})",
+                gvk.kind,
+                gvk.api_version(),
+                target.context
+            )),
+            kube::Error::Api(status) if status.code == 404 => CoreError::NotFound(format!(
+                "the cluster has no API {} for kind {} (context {})",
+                gvk.api_version(),
+                gvk.kind,
+                target.context
+            )),
+            other => api_error(target, other, "discover", &gvk.api_version(), None),
+        })
+}
+
+#[async_trait::async_trait]
+impl ClusterWriteApi for KubeClusterApi {
+    async fn apply(
+        &self,
+        manifest: &str,
+        default_namespace: Option<&str>,
+        dry_run: bool,
+    ) -> Result<Vec<AppliedObject>> {
+        let documents = parse_manifest(manifest)?;
+        let total = documents.len();
+        let mut applied = Vec::with_capacity(total);
+        for document in &documents {
+            match self.apply_one(document, default_namespace, dry_run).await {
+                Ok(object) => applied.push(object),
+                Err(error) => {
+                    let name = format!(
+                        "{} {}",
+                        document["kind"].as_str().unwrap_or_default(),
+                        document["metadata"]["name"].as_str().unwrap_or_default()
+                    );
+                    let done = applied.len();
+                    let note = if done == 0 || dry_run {
+                        String::new()
+                    } else {
+                        format!(" ({done} of {total} objects before it were applied)")
+                    };
+                    return Err(match error {
+                        CoreError::AccessDenied(m) => {
+                            CoreError::AccessDenied(format!("{name}: {m}{note}"))
+                        }
+                        CoreError::NotFound(m) => CoreError::NotFound(format!("{name}: {m}{note}")),
+                        other => CoreError::Other(format!("{name}: {other}{note}")),
+                    });
+                }
+            }
+        }
+        Ok(applied)
+    }
+
+    async fn scale(
+        &self,
+        kind: ScaleKind,
+        namespace: &str,
+        name: &str,
+        replicas: i32,
+        dry_run: bool,
+    ) -> Result<ScaleOutcome> {
+        if replicas < 0 {
+            return Err(CoreError::Other("replicas must be 0 or more".into()));
+        }
+        let (resource, caps) = resolve_gvk(
+            self.client(),
+            self.target(),
+            &GroupVersionKind::gvk("apps", "v1", kind.kind()),
+        )
+        .await?;
+        let label = format!("{}/scale", resource_label(&resource));
+        let api = self.dynamic_api(&resource, &caps, Some(namespace))?;
+        let before = api
+            .get_scale(name)
+            .await
+            .map_err(|error| self.write_error(error, "get", &label, Some(namespace)))?;
+        let params = PatchParams {
+            dry_run,
+            field_manager: Some(FIELD_MANAGER.into()),
+            ..PatchParams::default()
+        };
+        let after = api
+            .patch_scale(
+                name,
+                &params,
+                &Patch::Merge(json!({"spec": {"replicas": replicas}})),
+            )
+            .await
+            .map_err(|error| self.write_error(error, "patch", &label, Some(namespace)))?;
+        let replicas_of = |scale: &k8s_openapi::api::autoscaling::v1::Scale| {
+            scale
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.replicas)
+                .unwrap_or(0)
+        };
+        Ok(ScaleOutcome {
+            object: ObjectRef {
+                api_version: "apps/v1".into(),
+                kind: kind.kind().into(),
+                namespace: Some(namespace.into()),
+                name: name.into(),
+            },
+            from: replicas_of(&before),
+            to: replicas_of(&after),
+        })
+    }
+
+    async fn rollout_restart(
+        &self,
+        kind: RestartKind,
+        namespace: &str,
+        name: &str,
+        dry_run: bool,
+    ) -> Result<WriteOutcome> {
+        let (resource, caps) = resolve_gvk(
+            self.client(),
+            self.target(),
+            &GroupVersionKind::gvk("apps", "v1", kind.kind()),
+        )
+        .await?;
+        let label = resource_label(&resource);
+        let api = self.dynamic_api(&resource, &caps, Some(namespace))?;
+        let live = api
+            .get(name)
+            .await
+            .map_err(|error| self.write_error(error, "get", &label, Some(namespace)))?;
+        let params = PatchParams {
+            dry_run,
+            field_manager: Some(FIELD_MANAGER.into()),
+            ..PatchParams::default()
+        };
+        let patch = json!({"spec": {"template": {"metadata": {"annotations": {
+            RESTARTED_AT_ANNOTATION: now_rfc3339()
+        }}}}});
+        let result = api
+            .patch(name, &params, &Patch::Merge(&patch))
+            .await
+            .map_err(|error| self.write_error(error, "patch", &label, Some(namespace)))?;
+        Ok(WriteOutcome {
+            object: ObjectRef {
+                api_version: "apps/v1".into(),
+                kind: kind.kind().into(),
+                namespace: Some(namespace.into()),
+                name: name.into(),
+            },
+            live: to_value(&live)?,
+            result: to_value(&result)?,
+        })
+    }
+
+    async fn rollout_undo(
+        &self,
+        namespace: &str,
+        name: &str,
+        to_revision: Option<i64>,
+        dry_run: bool,
+    ) -> Result<UndoOutcome> {
+        let client = self.client().clone();
+        let deployments = Api::<Deployment>::namespaced(client.clone(), namespace);
+        let deployment = deployments
+            .get(name)
+            .await
+            .map_err(|error| self.write_error(error, "get", "deployments", Some(namespace)))?;
+        let revision_of = |annotations: Option<&BTreeMap<String, String>>| {
+            annotations
+                .and_then(|a| a.get(REVISION_ANNOTATION))
+                .and_then(|r| r.parse::<i64>().ok())
+        };
+        let current = revision_of(deployment.metadata.annotations.as_ref()).unwrap_or(0);
+        let uid = deployment.metadata.uid.clone();
+        let replicasets = Api::<ReplicaSet>::namespaced(client, namespace)
+            .list(&ListParams::default().limit(super::DEFAULT_CLUSTER_LIST_LIMIT))
+            .await
+            .map_err(|error| self.write_error(error, "list", "replicasets", Some(namespace)))?;
+        let mut owned: Vec<(i64, ReplicaSet)> = replicasets
+            .items
+            .into_iter()
+            .filter(|rs| {
+                uid.is_some()
+                    && rs.metadata.owner_references.as_ref().is_some_and(|owners| {
+                        owners
+                            .iter()
+                            .any(|o| o.kind == "Deployment" && Some(&o.uid) == uid.as_ref())
+                    })
+            })
+            .filter_map(|rs| revision_of(rs.metadata.annotations.as_ref()).map(|r| (r, rs)))
+            .collect();
+        owned.sort_by_key(|(revision, _)| *revision);
+        let target = match to_revision {
+            Some(wanted) => owned.into_iter().find(|(revision, _)| *revision == wanted),
+            None => owned
+                .into_iter()
+                .rev()
+                .find(|(revision, _)| *revision < current),
+        };
+        let Some((target_revision, replicaset)) = target else {
+            return Err(CoreError::NotFound(match to_revision {
+                Some(r) => format!("deployment {name} has no revision {r}"),
+                None => {
+                    format!("deployment {name} has no revision before {current} to roll back to")
+                }
+            }));
+        };
+        if target_revision == current {
+            return Err(CoreError::Other(format!(
+                "deployment {name} is already at revision {current}"
+            )));
+        }
+        let mut template = replicaset
+            .spec
+            .and_then(|spec| spec.template)
+            .ok_or_else(|| {
+                CoreError::Other(format!("revision {target_revision} has no pod template"))
+            })?;
+        if let Some(labels) = template
+            .metadata
+            .as_mut()
+            .and_then(|metadata| metadata.labels.as_mut())
+        {
+            labels.remove("pod-template-hash");
+        }
+        let mut updated = deployment.clone();
+        if let Some(spec) = updated.spec.as_mut() {
+            spec.template = template;
+        }
+        let params = PostParams {
+            dry_run,
+            field_manager: Some(FIELD_MANAGER.into()),
+        };
+        let result = deployments
+            .replace(name, &params, &updated)
+            .await
+            .map_err(|error| self.write_error(error, "update", "deployments", Some(namespace)))?;
+        Ok(UndoOutcome {
+            write: WriteOutcome {
+                object: ObjectRef {
+                    api_version: "apps/v1".into(),
+                    kind: "Deployment".into(),
+                    namespace: Some(namespace.into()),
+                    name: name.into(),
+                },
+                live: to_value(&deployment)?,
+                result: to_value(&result)?,
+            },
+            from_revision: current,
+            to_revision: target_revision,
+        })
+    }
+
+    async fn delete(
+        &self,
+        kind: &ObjectKind,
+        namespace: Option<&str>,
+        target: &DeleteTarget,
+        options: &DeleteOptions,
+        dry_run: bool,
+    ) -> Result<Vec<DeletedObject>> {
+        let (resource, caps) = self.resolve_kind(kind).await?;
+        let namespace = match caps.scope {
+            Scope::Namespaced => namespace,
+            Scope::Cluster => None,
+        };
+        let label = resource_label(&resource);
+        let api = self.dynamic_api(&resource, &caps, namespace)?;
+        let (names, missing_is_error) = match target {
+            DeleteTarget::Name(name) => (vec![name.clone()], true),
+            DeleteTarget::Names(names) => (names.clone(), false),
+            DeleteTarget::Selector { labels, fields } => (
+                self.list_names(
+                    &api,
+                    labels.as_deref(),
+                    fields.as_deref(),
+                    &label,
+                    namespace,
+                )
+                .await?,
+                false,
+            ),
+        };
+        let params = DeleteParams {
+            dry_run,
+            grace_period_seconds: if options.force {
+                Some(0)
+            } else {
+                options.grace_period_seconds
+            },
+            propagation_policy: Some(match options.propagation {
+                Propagation::Background => PropagationPolicy::Background,
+                Propagation::Foreground => PropagationPolicy::Foreground,
+                Propagation::Orphan => PropagationPolicy::Orphan,
+            }),
+            preconditions: None,
+        };
+        let mut deleted = Vec::with_capacity(names.len());
+        for name in names {
+            let object = ObjectRef {
+                api_version: resource.api_version.clone(),
+                kind: resource.kind.clone(),
+                namespace: namespace.map(str::to_owned),
+                name: name.clone(),
+            };
+            let outcome = match api.delete(&name, &params).await {
+                Ok(_) if dry_run => DeleteOutcome::WouldDelete,
+                Ok(answer) => match answer.left() {
+                    Some(object) if object.metadata.deletion_timestamp.is_some() => {
+                        DeleteOutcome::Pending
+                    }
+                    _ => DeleteOutcome::Deleted,
+                },
+                Err(kube::Error::Api(status)) if status.code == 404 && !missing_is_error => {
+                    DeleteOutcome::AlreadyGone
+                }
+                Err(error) => {
+                    let error = self.write_error(error, "delete", &label, namespace);
+                    let done = deleted.len();
+                    return Err(if done == 0 || dry_run {
+                        error
+                    } else {
+                        CoreError::Other(format!(
+                            "{error} ({done} objects before {name} were already deleted)"
+                        ))
+                    });
+                }
+            };
+            deleted.push(DeletedObject { object, outcome });
+        }
+        Ok(deleted)
+    }
+}
+
+#[cfg(test)]
+#[path = "write_tests.rs"]
+mod tests;

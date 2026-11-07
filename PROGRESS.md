@@ -12319,3 +12319,57 @@ zero-install. Замысел Евгения: zero-install — про то, чт�
 `.filar-part`, где виден путь. Замечание CodeRabbit в #650.
 
 **Next.** #638 → #639.
+
+## Issue #638: ClusterWriteApi — запись в Kubernetes API за отдельным трейтом (веха 3.0.5)
+
+**Сделано.** Новый модуль `crates/transport/src/cluster/write.rs`: трейт
+`ClusterWriteApi` и его реализация для `KubeClusterApi`. Каждый метод принимает
+`dry_run` (`dryRun=All`):
+- `apply(manifest, default_namespace, dry_run)` — server-side apply YAML/JSON,
+  несколько документов по порядку, `fieldManager=filar`, без `force`,
+  `fieldValidation=Strict`. Вид разрешается через discovery (`pinned_kind`),
+  поэтому подходит любой вид, включая CRD и cluster-scoped. По каждому объекту
+  возвращаются `ObjectRef`, действие (created/configured/unchanged — по
+  сравнению живого объекта с результатом без служебных полей и `status`),
+  `live` и `result` для diff;
+- `scale` — субресурс `scale` (Deployment/StatefulSet/ReplicaSet), было/стало;
+- `rollout_restart` — merge-патч аннотации `kubectl.kubernetes.io/restartedAt`
+  (Deployment/StatefulSet/DaemonSet);
+- `rollout_undo` — шаблон ReplicaSet нужной ревизии (или предыдущей) без
+  `pod-template-hash`, `replace` Deployment с `resourceVersion`
+  (оптимистичная блокировка);
+- `delete(kind, namespace, target, options, dry_run)` — любой вид.
+  `DeleteTarget::Name`, `Selector` (список всех страниц, затем удаление по
+  именам; больше `MAX_DELETE_OBJECTS`=2000 — отказ) или `Names` (ровно то, что
+  показал dry-run; пропавший объект — `AlreadyGone`, а не ошибка).
+  `propagationPolicy` по умолчанию `Background`, force = `gracePeriodSeconds=0`.
+
+**Secret.** Значения `data`/`stringData` не покидают модуль: во всех
+возвращаемых объектах они заменены на `«скрыто»` (`SECRET_HIDDEN`),
+аннотация `last-applied-configuration` убрана. Для diff есть
+`secret_keys` — ключи и признак изменения (added/changed/unchanged/removed).
+Тела запросов не логируются.
+
+**Ошибки** (`write_error`): RBAC 403 — «нет права <verb> на <resource> …»
+(общий `api_error`); admission 403 и валидация 400/422 — текст сервера
+дословно; 409 у apply — «server-side apply conflict … filar does not force»
+с владельцем поля из ответа; неизвестный вид — «the cluster has no kind …».
+Ошибка в середине манифеста называет объект и сколько объектов уже применено.
+
+**Решения.**
+- `ClusterApi` не менялся и остаётся read-only. `KubeFleetCluster::new` и
+  `KubeToolExecutor::new` принимают только `Arc<dyn ClusterApi>`;
+  `compile_fail`-доктесты это проверяют, а их положительная пара (с
+  `ClusterApi`) проверена вручную.
+- YAML — через `serde-saphyr` 0.0.29: он уже был в дереве через `kube-client`,
+  теперь прямая зависимость фичи `kube`.
+- Тесты — встроенный фейковый API-сервер на `TcpListener`
+  (`cluster/write_tests.rs`): discovery, apply, merge-патч, PUT, DELETE,
+  список по селектору, dry-run. Live-тест `tests/cluster_write.rs`
+  (`#[ignore]`, `docker/k8s`) — ручной.
+- `CHANGELOG.md` не меняется: видимого эффекта до #639/#640 нет.
+
+**Контракты.** Новый публичный трейт `ClusterWriteApi` и типы (см.
+`docs/ENGINE_API.md`). `CommandExecutor`, `LlmClient`, `ClusterApi` не менялись.
+
+**Next.** #639 — гейт записи.

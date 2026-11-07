@@ -9,7 +9,7 @@ license.workspace = true
 # Enabled by default for TUI/desktop; disabled for bot/mobile (SSH-only).
 default = ["local", "kube"]
 local = ["dep:portable-pty"]
-kube = ["dep:kube", "dep:k8s-openapi", "dep:serde", "dep:serde_json"]
+kube = ["dep:kube", "dep:k8s-openapi", "dep:serde", "dep:serde_json", "dep:serde-saphyr"]
 
 [dependencies]
 filar-core = { workspace = true }
@@ -29,6 +29,9 @@ kube = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+# Multi-document YAML manifests for ClusterWriteApi::apply (#638); already in
+# the tree through kube-client.
+serde-saphyr = { version = "0.0.29", optional = true }
 
 [dev-dependencies]
 # Integration tests in `tests/` do not inherit the regular dependencies, and
