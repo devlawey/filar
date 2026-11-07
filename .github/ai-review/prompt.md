@@ -13,8 +13,10 @@ Prioritise, in this order:
 1. **Correctness bugs** — logic errors, wrong indices/offsets, off-by-one, incorrect
    state transitions, race conditions, deadlocks, `select!` starvation, missed wakeups.
 2. **Project invariants** (from the rules section, if provided) — violating one is a
-   blocker. In particular: nothing written to the remote host (zero-install), no command
-   execution without user confirmation, secrets only from env / never logged or echoed,
+   blocker. In particular: filar installs, copies or runs nothing of its own on the remote
+   side and leaves no files, caches, processes or sidecars there for itself (zero-install;
+   changes the user asked for are allowed and go through the confirmation gate), no command
+   or cluster write without user confirmation, secrets only from env / never logged or echoed,
    isolation behind the `CommandExecutor` / `LlmClient` traits, host key always verified.
 3. **Panics and error handling** — `unwrap()` / `expect()` / indexing / slicing on paths
    that can fail at runtime; swallowed errors; missing context.

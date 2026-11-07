@@ -8,7 +8,8 @@
 //!   `list_background_jobs` — long-running work without blocking tool timeouts.
 //!
 //! All tools are implemented as wrappers over shell commands to maintain the
-//! **zero-install** invariant — no files are created on the remote machine.
+//! **zero-install** invariant — filar puts nothing of its own on the remote
+//! machine (no agent, helper scripts or state files).
 
 use serde::Deserialize;
 use tracing::{debug, info};
