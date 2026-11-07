@@ -115,6 +115,15 @@ pub enum AgentEvent {
         raw: Vec<String>,
     },
 
+    /// A write to a Kubernetes cluster was executed (#639): one trace line
+    /// per changed object, «Изменение в кластере: <действие> <вид> <ns>/<имя>
+    /// (контекст …, время)». For the feed and the session export, like the
+    /// debug-container trace; never part of the conversation.
+    ClusterChanged {
+        /// The trace line.
+        trace: String,
+    },
+
     /// A command was executed (or did not run — see `denied`).
     CommandFinished {
         /// The command that was processed.

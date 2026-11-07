@@ -12399,3 +12399,53 @@ zero-install. Замысел Евгения: zero-install — про то, чт�
 `docs/ENGINE_API.md`). `CommandExecutor`, `LlmClient`, `ClusterApi` не менялись.
 
 **Next.** #639 — гейт записи.
+
+## Issue #639: гейт записи в кластер (веха 3.0.5)
+
+**Сделано.** Новый модуль `crates/agent/src/kube_write.rs`:
+- `KubeWriteCall` — типизированная запись (Apply, Scale, RolloutRestart,
+  RolloutUndo, Delete) поверх `ClusterWriteApi` (#638);
+- `kube_write_confirmation_decision` — всегда `NeedsConfirmation`, в любом
+  режиме; политики тегов только ужесточают, а строже некуда;
+- `preview` — dry run и текст окна (действие и diff по объекту), `execute` —
+  реальная запись. Удаление по селектору получает ровно имена из dry run;
+- `diff` — построчный LCS по отсортированному JSON без шума (`managedFields`,
+  `resourceVersion`, `generation`, `uid`, `status`, last-applied, revision),
+  контекст в одну строку, до 80 строк;
+- `trace_line` — «Изменение в кластере: <действие> <вид> <ns>/<имя>
+  (контекст …, время)»;
+- `kube_write_tool_definitions` / `parse_kube_write_call` пока пусты:
+  инструменты добавят #640–#642.
+
+`KubeAgent::cluster_writer` — запись только во вкладке кластера; у флота
+писатель игнорируется, инструменты записи не предлагаются, а вызов
+отвергается. `process_write`: `CommandProposed` (с оценкой безопасности) →
+dry run (отказ — `CommandFinished { denied: true }` с «Dry run refused», окна
+нет) → окно через арбитра (`AuditedConfirmer`), `destructive` у удаления и
+масштабирования до 0 → запись → `AgentEvent::ClusterChanged { trace }` на
+каждый изменённый объект → `CommandFinished` с итогом (через
+`redact_logs`). Аргументы вызова для ленты — без манифеста
+(`redacted_arguments`); в командной строке apply только виды и имена.
+
+Промпт: `build_kube_write_system_prompt` (запись только инструментами записи,
+dry run и подтверждение всегда, сначала диагностика, потом минимальное
+изменение, проверка чтением после; значения Secret не показываются, но
+создать или изменить Secret по просьбе можно). Вкладка без инструментов записи
+получает прежний read-only промпт — он остаётся правдой.
+
+TUI: `runner.rs` держит `kube_writers` рядом с `kube_apis` (один
+`KubeClusterApi` на оба), передаёт писателя только во вкладку кластера;
+`ClusterChanged` → `ChatBlock::System` в ленте (и в экспорте).
+`eval/risk/commands.toml`: четыре write-кейса с целью-кластером.
+
+**Решения.**
+- Красное окно для `prod` уже было у окна вкладки кластера (`confirm.rs`,
+  `production_kube`); деструктивность — через флаг `destructive` окна.
+- Прогон бинарника из DoD — вместе с первым инструментом записи в #640: без
+  него гейт не вызвать из UI.
+
+**Контракты.** Новое: `AgentEvent::ClusterChanged`, `KubeAgent::cluster_writer`,
+модуль `kube_write`, `build_kube_write_system_prompt`. `CommandExecutor`,
+`LlmClient` не менялись.
+
+**Next.** #640 — `k8s_apply`.

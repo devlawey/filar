@@ -129,6 +129,18 @@ level = 1
 command = "sudo systemctl restart nginx"
 level = 2
 
+# Cluster writes (#639): the command line filar shows for a write tool.
+[[case]]
+command = "k8s_apply Pod/debug-shell -n shop"
+level = 2
+target = "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
+note = "a new pod in a production namespace; deleting it undoes it"
+
+[[case]]
+command = "k8s_rollout restart deployment/web -n shop"
+level = 2
+target = "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
+
 [[case]]
 command = "sudo apt-get install -y htop"
 level = 2
@@ -196,6 +208,18 @@ note = "a shared service down"
 [[case]]
 command = "kubectl delete namespace staging"
 level = 3
+
+[[case]]
+command = "k8s_scale deployment/web --replicas=0 -n shop"
+level = 3
+target = "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
+note = "the production service goes down until scaled back"
+
+[[case]]
+command = "k8s_delete Namespace/staging"
+level = 3
+target = "Kubernetes cluster prod-eu (tags: prod)"
+note = "as kubectl delete namespace: everything in it goes"
 
 [[case]]
 command = "find /home -name '*.tmp' | xargs rm -f"

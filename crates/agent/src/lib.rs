@@ -48,6 +48,7 @@ pub mod kube_fleet;
 pub mod kube_fleet_fold;
 pub mod kube_redact;
 pub mod kube_tools;
+pub mod kube_write;
 pub mod logs;
 pub mod long_wait;
 pub mod openai_compat;
@@ -74,6 +75,10 @@ pub use kube_tools::{
     bind_fleet_call, build_kube_fleet_system_prompt, build_kube_system_prompt,
     kube_call_confirmation_decision, kube_confirmation_decision, kube_tool_definitions, parse_kube_tool_call, KubeResourceKind,
     KubeToolCall, KubeToolExecutor, KubeToolResult, KubeTopResource,
+};
+pub use kube_write::{
+    is_kube_write_tool, kube_write_confirmation_decision, kube_write_tool_definitions,
+    parse_kube_write_call, KubeWriteCall, WritePreview, WriteReport,
 };
 pub use logs::{
     build_log_sources, LogLine, LogQuery, LogResult, LogSource, LogSources, TOOL_QUERY_LOGS,
