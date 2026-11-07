@@ -22,6 +22,9 @@ pub(crate) struct MockCluster {
     http_call: Mutex<Option<filar_transport::PodHttpRequest>>,
     /// When set, `list_events` fails with this error (#645).
     events_error: Option<fn() -> CoreError>,
+    /// Answers of successive `list_workloads` calls; the last one repeats
+    /// (#641).
+    pub(crate) workload_reads: Mutex<std::collections::VecDeque<Vec<WorkloadInfo>>>,
 }
 
 impl MockCluster {
@@ -90,7 +93,12 @@ impl ClusterApi for MockCluster {
     }
 
     async fn list_workloads(&self, _: Option<&str>, _: WorkloadKind) -> Result<Vec<WorkloadInfo>> {
-        Ok(vec![])
+        let mut reads = self.workload_reads.lock().unwrap();
+        Ok(match reads.len() {
+            0 => Vec::new(),
+            1 => reads[0].clone(),
+            _ => reads.pop_front().unwrap_or_default(),
+        })
     }
     async fn rollout_history(&self, _: &str, _: &str) -> Result<Vec<RolloutRevision>> {
         Ok(vec![])
@@ -370,7 +378,7 @@ fn prompt_matches_capabilities_and_eval_snapshot() {
         .map(|tool| tool.name)
         .collect();
     let prompt = crate::kube_tools::build_kube_write_system_prompt(&target(), None, &writes);
-    for expected in ["only through the write tools (k8s_apply)", "dry run", "previous=true", "OOMKilled"] {
+    for expected in ["only through the write tools (k8s_apply, k8s_scale, k8s_rollout)", "dry run", "previous=true", "OOMKilled"] {
         assert!(prompt.contains(expected), "missing {expected:?}: {prompt}");
     }
     let path =

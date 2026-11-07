@@ -16,8 +16,8 @@
 
 use filar_core::{CommandConfirmMode, CoreError, KubeCluster, Result, TagPolicy};
 use filar_transport::{
-    AppliedObject, ClusterWriteApi, DeleteOptions, DeleteOutcome, DeleteTarget, DeletedObject,
-    ObjectKind, ObjectRef, RestartKind, ScaleKind, SecretKeyState,
+    AppliedObject, ClusterApi, ClusterWriteApi, DeleteOptions, DeleteOutcome, DeleteTarget,
+    DeletedObject, ObjectKind, ObjectRef, RestartKind, ScaleKind, SecretKeyState, WorkloadKind,
 };
 use serde_json::{Map, Value};
 
@@ -168,7 +168,7 @@ impl KubeWriteCall {
                 name,
                 replicas,
             } => format!(
-                "k8s_scale {}/{name} --replicas={replicas}{}",
+                "k8s_scale {}/{name}{} →{replicas}",
                 scale_kind(*kind),
                 ns(Some(namespace))
             ),
@@ -187,10 +187,10 @@ impl KubeWriteCall {
                 to_revision,
             } => format!(
                 "k8s_rollout undo deployment/{name}{}{}",
+                ns(Some(namespace)),
                 to_revision
-                    .map(|r| format!(" --to-revision={r}"))
-                    .unwrap_or_default(),
-                ns(Some(namespace))
+                    .map(|r| format!(" --to-revision {r}"))
+                    .unwrap_or_default()
             ),
             Self::Delete {
                 kind,
@@ -238,10 +238,28 @@ fn restart_kind(kind: RestartKind) -> &'static str {
 /// Tool name of a server-side apply (#640).
 pub const TOOL_K8S_APPLY: &str = "k8s_apply";
 
+/// Tool name of a scale (#641).
+pub const TOOL_K8S_SCALE: &str = "k8s_scale";
+
+/// Tool name of a rollout restart or undo (#641).
+pub const TOOL_K8S_ROLLOUT: &str = "k8s_rollout";
+
+/// Most replicas `k8s_scale` asks for; a bigger number is a typo more often
+/// than a plan.
+pub const MAX_SCALE_REPLICAS: i64 = 1000;
+
+/// How long a scale, restart or undo waits for its rollout (#641).
+pub const ROLLOUT_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How often the rollout is read while waiting.
+pub const ROLLOUT_POLL: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The write tools offered in a cluster tab with write access; a fleet
 /// never gets them. More come with #641–#642.
 pub fn kube_write_tool_definitions(mode: CommandConfirmMode) -> Vec<ToolDef> {
-    vec![crate::kube_tools::definition(
+    let namespace = || serde_json::json!({"type": "string", "description": "Namespace; omit for the tab namespace."});
+    vec![
+        crate::kube_tools::definition(
         TOOL_K8S_APPLY,
         "Create or change Kubernetes objects from a YAML manifest (server-side apply, field manager filar), \
          one or more documents separated by ---. Any kind the user's RBAC allows: Pod, PersistentVolumeClaim, \
@@ -256,7 +274,38 @@ pub fn kube_write_tool_definitions(mode: CommandConfirmMode) -> Vec<ToolDef> {
         )]),
         vec!["manifest"],
         mode,
-    )]
+    ),
+        crate::kube_tools::definition(
+            TOOL_K8S_SCALE,
+            "Set the replicas of a Deployment, StatefulSet or ReplicaSet through its scale subresource. \
+             Dry-run first and confirmed by the user, as every write; scaling to 0 stops the workload and is shown as destructive. \
+             After the scale filar waits a bounded time for the rollout and reports ready/desired; check events if it is not ready.",
+            Map::from_iter([
+                ("kind".to_string(), serde_json::json!({"type": "string", "enum": ["Deployment", "StatefulSet", "ReplicaSet"]})),
+                ("name".to_string(), serde_json::json!({"type": "string"})),
+                ("namespace".to_string(), namespace()),
+                ("replicas".to_string(), serde_json::json!({"type": "integer", "minimum": 0, "maximum": MAX_SCALE_REPLICAS})),
+            ]),
+            vec!["kind", "name", "replicas"],
+            mode,
+        ),
+        crate::kube_tools::definition(
+            TOOL_K8S_ROLLOUT,
+            "Restart a rollout (Deployment, StatefulSet, DaemonSet: every pod is replaced, as kubectl rollout restart) \
+             or undo a Deployment to an earlier revision (its pod template comes back, as kubectl rollout undo). \
+             Read k8s_rollout_history before an undo. Dry-run first and confirmed by the user, as every write. \
+             After it filar waits a bounded time for the rollout and reports ready/desired; check events if it is not ready.",
+            Map::from_iter([
+                ("action".to_string(), serde_json::json!({"type": "string", "enum": ["restart", "undo"]})),
+                ("kind".to_string(), serde_json::json!({"type": "string", "enum": ["Deployment", "StatefulSet", "DaemonSet"], "description": "undo works only for Deployment"})),
+                ("name".to_string(), serde_json::json!({"type": "string"})),
+                ("namespace".to_string(), namespace()),
+                ("to_revision".to_string(), serde_json::json!({"type": "integer", "minimum": 1, "description": "undo only; omit for the revision before the current one"})),
+            ]),
+            vec!["action", "kind", "name"],
+            mode,
+        ),
+    ]
 }
 
 /// Tool-call arguments as the feed and the session may keep them: a
@@ -304,9 +353,180 @@ pub fn parse_kube_write_call(
                 namespace: default_namespace.map(str::to_owned),
             })
         }
+        TOOL_K8S_SCALE => {
+            let kind = match required_str(args, "kind")?.to_ascii_lowercase().as_str() {
+                "deployment" => ScaleKind::Deployment,
+                "statefulset" => ScaleKind::StatefulSet,
+                "replicaset" => ScaleKind::ReplicaSet,
+                other => {
+                    return Err(CoreError::Other(format!(
+                        "k8s_scale works on Deployment, StatefulSet or ReplicaSet, not {other}"
+                    )))
+                }
+            };
+            let replicas = args
+                .get("replicas")
+                .and_then(Value::as_i64)
+                .filter(|r| (0..=MAX_SCALE_REPLICAS).contains(r))
+                .ok_or_else(|| {
+                    CoreError::Other(format!(
+                        "replicas must be an integer from 0 to {MAX_SCALE_REPLICAS}"
+                    ))
+                })?;
+            Ok(KubeWriteCall::Scale {
+                kind,
+                namespace: namespace_of(args, default_namespace)?,
+                name: required_str(args, "name")?,
+                replicas: replicas as i32,
+            })
+        }
+        TOOL_K8S_ROLLOUT => {
+            let kind = required_str(args, "kind")?.to_ascii_lowercase();
+            let namespace = namespace_of(args, default_namespace)?;
+            let name = required_str(args, "name")?;
+            match required_str(args, "action")?.as_str() {
+                "restart" => Ok(KubeWriteCall::RolloutRestart {
+                    kind: match kind.as_str() {
+                        "deployment" => RestartKind::Deployment,
+                        "statefulset" => RestartKind::StatefulSet,
+                        "daemonset" => RestartKind::DaemonSet,
+                        other => {
+                            return Err(CoreError::Other(format!(
+                                "rollout restart works on Deployment, StatefulSet or DaemonSet, not {other}"
+                            )))
+                        }
+                    },
+                    namespace,
+                    name,
+                }),
+                "undo" => {
+                    if kind != "deployment" {
+                        return Err(CoreError::Other(
+                            "rollout undo works only on a Deployment".into(),
+                        ));
+                    }
+                    let to_revision = match args.get("to_revision") {
+                        None | Some(Value::Null) => None,
+                        Some(value) => Some(value.as_i64().filter(|r| *r >= 1).ok_or_else(
+                            || CoreError::Other("to_revision must be a revision number from 1".into()),
+                        )?),
+                    };
+                    Ok(KubeWriteCall::RolloutUndo {
+                        namespace,
+                        name,
+                        to_revision,
+                    })
+                }
+                other => Err(CoreError::Other(format!(
+                    "action must be restart or undo, not {other}"
+                ))),
+            }
+        }
         other => Err(CoreError::Other(format!(
             "unknown Kubernetes write tool {other}"
         ))),
+    }
+}
+
+fn required_str(args: &Value, key: &str) -> Result<String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| CoreError::Other(format!("missing required argument {key}")))
+}
+
+fn namespace_of(args: &Value, default_namespace: Option<&str>) -> Result<String> {
+    args.get("namespace")
+        .and_then(Value::as_str)
+        .filter(|ns| !ns.is_empty())
+        .or(default_namespace)
+        .map(str::to_owned)
+        .ok_or_else(|| CoreError::Other("namespace is required (the tab has none)".into()))
+}
+
+/// The workload a scale, restart or undo leaves rolling out (#641).
+pub fn rollout_target(call: &KubeWriteCall) -> Option<(WorkloadKind, &str, &str)> {
+    match call {
+        KubeWriteCall::Scale {
+            kind,
+            namespace,
+            name,
+            ..
+        } => Some((
+            match kind {
+                ScaleKind::Deployment => WorkloadKind::Deployment,
+                ScaleKind::StatefulSet => WorkloadKind::StatefulSet,
+                ScaleKind::ReplicaSet => WorkloadKind::ReplicaSet,
+            },
+            namespace,
+            name,
+        )),
+        KubeWriteCall::RolloutRestart {
+            kind,
+            namespace,
+            name,
+        } => Some((
+            match kind {
+                RestartKind::Deployment => WorkloadKind::Deployment,
+                RestartKind::StatefulSet => WorkloadKind::StatefulSet,
+                RestartKind::DaemonSet => WorkloadKind::DaemonSet,
+            },
+            namespace,
+            name,
+        )),
+        KubeWriteCall::RolloutUndo {
+            namespace, name, ..
+        } => Some((WorkloadKind::Deployment, namespace, name)),
+        _ => None,
+    }
+}
+
+/// Wait for a rollout by reading the workload every `poll`, at most `wait`:
+/// done when ready and updated replicas reach the desired count, seen on
+/// the second read or later (the first may still show the old state). The
+/// caller makes it cancellable. Returns one line for the model.
+pub async fn wait_rollout(
+    api: &dyn ClusterApi,
+    kind: WorkloadKind,
+    namespace: &str,
+    name: &str,
+    wait: std::time::Duration,
+    poll: std::time::Duration,
+) -> String {
+    let started = tokio::time::Instant::now();
+    let mut reads = 0usize;
+    let mut last: String;
+    loop {
+        if reads > 0 {
+            tokio::time::sleep(poll).await;
+        }
+        reads += 1;
+        match api.list_workloads(Some(namespace), kind).await {
+            Ok(workloads) => match workloads.into_iter().find(|w| w.name == name) {
+                Some(workload) => {
+                    let desired = workload.desired.unwrap_or(0);
+                    let ready = workload.ready.unwrap_or(0);
+                    let updated = workload.updated.unwrap_or(desired);
+                    last = format!("{ready}/{desired} ready, {updated} updated");
+                    if reads >= 2 && ready == desired && updated == desired {
+                        return format!(
+                            "rollout of {name} complete: {last} (after {} s)",
+                            started.elapsed().as_secs()
+                        );
+                    }
+                }
+                None => last = format!("{name} not found while waiting"),
+            },
+            Err(error) => last = format!("status unreadable: {error}"),
+        }
+        if started.elapsed() >= wait {
+            return format!(
+                "rollout of {name} not finished after {} s: {last}; check k8s_get, k8s_describe and events",
+                wait.as_secs()
+            );
+        }
     }
 }
 
@@ -331,6 +551,9 @@ pub struct WritePreview {
     /// For a selector delete: the names the dry run listed. The real delete
     /// gets exactly these.
     pub names: Option<Vec<String>>,
+    /// A better command line than the call alone gives, once the dry run
+    /// knows more (`k8s_scale deployment/web -n shop 3→5`).
+    pub display: Option<String>,
     /// For an undo: the revision the dry run rolled back to. The real undo
     /// gets exactly this one, even if a rollout finished meanwhile.
     pub undo_revision: Option<i64>,
@@ -375,6 +598,7 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
     let mut destructive = false;
     let mut names = None;
     let mut undo_revision = None;
+    let mut display = None;
     match call {
         KubeWriteCall::Apply {
             manifest,
@@ -413,6 +637,12 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
             // Every scale to 0 is destructive, already-empty or not: the
             // window and the proposal must agree.
             destructive = *replicas == 0;
+            display = Some(format!(
+                "k8s_scale {}/{name} -n {namespace} {}→{}",
+                scale_kind(*kind),
+                outcome.from,
+                outcome.to
+            ));
             text.push_str(&format!(
                 "scale {}: replicas {} → {}\n",
                 object_label(&outcome.object),
@@ -475,6 +705,7 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
         destructive,
         names,
         undo_revision,
+        display,
     })
 }
 
@@ -955,7 +1186,7 @@ mod tests {
         };
         assert_eq!(
             scale.display_command(),
-            "k8s_scale deployment/web --replicas=0 -n shop"
+            "k8s_scale deployment/web -n shop →0"
         );
         let delete = KubeWriteCall::Delete {
             kind: ObjectKind {
@@ -1104,6 +1335,139 @@ mod tests {
         );
         assert!(!list.contains("user"), "{list}");
     }
+
+    #[test]
+    fn k8s_scale_takes_scalable_kinds_and_bounded_replicas() {
+        let parse = |args: Value| parse_kube_write_call(TOOL_K8S_SCALE, &args, Some("shop"));
+        let call = parse(json!({"kind": "Deployment", "name": "web", "replicas": 5})).unwrap();
+        assert_eq!(
+            call.display_command(),
+            "k8s_scale deployment/web -n shop →5"
+        );
+        assert_eq!(
+            rollout_target(&call),
+            Some((WorkloadKind::Deployment, "shop", "web"))
+        );
+        for kind in ["StatefulSet", "replicaset"] {
+            assert!(
+                parse(json!({"kind": kind, "name": "x", "replicas": 0})).is_ok(),
+                "{kind}"
+            );
+        }
+        for bad in [
+            json!({"kind": "DaemonSet", "name": "x", "replicas": 1}),
+            json!({"kind": "Deployment", "name": "x", "replicas": -1}),
+            json!({"kind": "Deployment", "name": "x", "replicas": MAX_SCALE_REPLICAS + 1}),
+            json!({"kind": "Deployment", "name": "x", "replicas": "3"}),
+            json!({"kind": "Deployment", "replicas": 1}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+        assert!(
+            parse_kube_write_call(
+                TOOL_K8S_SCALE,
+                &json!({"kind": "Deployment", "name": "x", "replicas": 1}),
+                None
+            )
+            .is_err(),
+            "no namespace"
+        );
+    }
+
+    #[test]
+    fn k8s_rollout_restarts_workloads_and_undoes_deployments() {
+        let parse = |args: Value| parse_kube_write_call(TOOL_K8S_ROLLOUT, &args, Some("shop"));
+        let restart =
+            parse(json!({"action": "restart", "kind": "DaemonSet", "name": "agent"})).unwrap();
+        assert_eq!(
+            restart.display_command(),
+            "k8s_rollout restart daemonset/agent -n shop"
+        );
+        let undo =
+            parse(json!({"action": "undo", "kind": "Deployment", "name": "web", "to_revision": 7}))
+                .unwrap();
+        assert_eq!(
+            undo.display_command(),
+            "k8s_rollout undo deployment/web -n shop --to-revision 7"
+        );
+        let previous =
+            parse(json!({"action": "undo", "kind": "Deployment", "name": "web"})).unwrap();
+        assert_eq!(
+            previous.display_command(),
+            "k8s_rollout undo deployment/web -n shop"
+        );
+        for bad in [
+            json!({"action": "undo", "kind": "StatefulSet", "name": "db"}),
+            json!({"action": "undo", "kind": "Deployment", "name": "web", "to_revision": 0}),
+            json!({"action": "restart", "kind": "ReplicaSet", "name": "web"}),
+            json!({"action": "pause", "kind": "Deployment", "name": "web"}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+        let names: Vec<_> = kube_write_tool_definitions(CommandConfirmMode::Always)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(names, [TOOL_K8S_APPLY, TOOL_K8S_SCALE, TOOL_K8S_ROLLOUT]);
+    }
+
+    fn workload(ready: i32, updated: i32) -> filar_transport::WorkloadInfo {
+        filar_transport::WorkloadInfo {
+            namespace: "shop".into(),
+            name: "web".into(),
+            kind: WorkloadKind::Deployment,
+            desired: Some(5),
+            ready: Some(ready),
+            updated: Some(updated),
+            available: Some(ready),
+            age_seconds: None,
+            images: Vec::new(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_rollout_wait_reports_completion_or_the_last_status() {
+        use crate::kube_tools::tests::MockCluster;
+        let cluster = MockCluster::default();
+        // The first read still shows the old state as "complete": not trusted.
+        *cluster.workload_reads.lock().unwrap() = [
+            vec![workload(5, 5)],
+            vec![workload(3, 5)],
+            vec![workload(5, 5)],
+        ]
+        .into_iter()
+        .collect();
+        let done = wait_rollout(
+            &cluster,
+            WorkloadKind::Deployment,
+            "shop",
+            "web",
+            ROLLOUT_WAIT,
+            ROLLOUT_POLL,
+        )
+        .await;
+        assert!(
+            done.starts_with("rollout of web complete: 5/5 ready, 5 updated"),
+            "{done}"
+        );
+
+        let stuck = MockCluster::default();
+        *stuck.workload_reads.lock().unwrap() = [vec![workload(2, 5)]].into_iter().collect();
+        let late = wait_rollout(
+            &stuck,
+            WorkloadKind::Deployment,
+            "shop",
+            "web",
+            ROLLOUT_WAIT,
+            ROLLOUT_POLL,
+        )
+        .await;
+        assert!(
+            late.starts_with("rollout of web not finished after 120 s: 2/5 ready"),
+            "{late}"
+        );
+        assert!(late.contains("events"), "{late}");
+    }
 }
 
 #[cfg(test)]
@@ -1127,6 +1491,7 @@ mod destructive_tests {
             text: String::new(),
             destructive: false,
             names: None,
+            display: None,
             undo_revision: Some(2),
         };
         let undo = |to_revision| KubeWriteCall::RolloutUndo {

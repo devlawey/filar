@@ -90,6 +90,8 @@ pub struct KubeAgent {
     risk_scorer: Option<Arc<dyn RiskScorer>>,
     /// Write access (#639); cluster tabs only. `None` = read-only tab.
     writer: Option<Arc<dyn ClusterWriteApi>>,
+    /// How long a scale, restart or undo waits for its rollout (#641).
+    rollout_wait: Duration,
 }
 
 /// The arbiter of a [`KubeAgent`] (#620).
@@ -126,6 +128,7 @@ impl KubeAgent {
             arbiter: None,
             risk_scorer: None,
             writer: None,
+            rollout_wait: crate::kube_write::ROLLOUT_WAIT,
         }
     }
 
@@ -152,6 +155,7 @@ impl KubeAgent {
             arbiter: None,
             risk_scorer: None,
             writer: None,
+            rollout_wait: crate::kube_write::ROLLOUT_WAIT,
         }
     }
 
@@ -273,6 +277,13 @@ impl KubeAgent {
     /// ignores it: write tools are never offered to fleets.
     pub fn cluster_writer(mut self, writer: Option<Arc<dyn ClusterWriteApi>>) -> Self {
         self.writer = writer;
+        self
+    }
+
+    /// How long a scale, restart or undo waits for its rollout before the
+    /// agent gets the status as it is (#641). Default [`crate::kube_write::ROLLOUT_WAIT`].
+    pub fn rollout_wait(mut self, wait: Duration) -> Self {
+        self.rollout_wait = wait;
         self
     }
 
@@ -854,22 +865,34 @@ impl KubeAgent {
                 "Error: writes to the cluster are not available here (read-only tab or fleet).",
             ));
         };
-        let display = call.display_command();
+        // The dry run comes first: it is what the window shows, and it can
+        // tell the command line more than the call alone (`3→5`).
+        let preview = self
+            .cancellable(crate::kube_write::preview(writer.as_ref(), call))
+            .await;
+        let display = match &preview {
+            Ok(preview) => preview
+                .display
+                .clone()
+                .unwrap_or_else(|| call.display_command()),
+            Err(_) => call.display_command(),
+        };
+        let destructive = match &preview {
+            Ok(preview) => preview.destructive,
+            Err(_) => call.is_destructive(),
+        };
         self.emit_and_rate(
             scores,
             AgentEvent::CommandProposed {
                 proposal_id: crate::agent::next_proposal_id(),
                 command: display.clone(),
                 explanation: explanation.to_string(),
-                destructive: call.is_destructive(),
+                destructive,
                 tool,
             },
             call.namespace(),
         );
-        let preview = match self
-            .cancellable(crate::kube_write::preview(writer.as_ref(), call))
-            .await
-        {
+        let preview = match preview {
             Ok(preview) => preview,
             Err(error) if error.to_string() == "cancelled" => return Err(error),
             Err(error) => {
@@ -943,7 +966,39 @@ impl KubeAgent {
                 trace: crate::kube_write::trace_line(change, target, &at),
             });
         }
-        let output = crate::kube_redact::redact_logs(&report.summary, executor.secrets().as_ref());
+        let mut summary = report.summary;
+        // A scale, restart or undo is followed until its pods are ready or a
+        // bounded wait ends (#641); Ctrl+C cancels the wait, not the change.
+        if let Some((kind, ns, name)) = crate::kube_write::rollout_target(call) {
+            let status = self
+                .cancellable(async {
+                    Ok(crate::kube_write::wait_rollout(
+                        executor.api().as_ref(),
+                        kind,
+                        ns,
+                        name,
+                        self.rollout_wait,
+                        crate::kube_write::ROLLOUT_POLL,
+                    )
+                    .await)
+                })
+                .await;
+            match status {
+                Ok(status) => {
+                    summary.push_str(&status);
+                    summary.push('\n');
+                }
+                Err(error) => {
+                    self.emit(AgentEvent::CommandFinished {
+                        command: display,
+                        output: format!("{summary}rollout wait cancelled"),
+                        denied: false,
+                    });
+                    return Err(error);
+                }
+            }
+        }
+        let output = crate::kube_redact::redact_logs(&summary, executor.secrets().as_ref());
         self.emit(AgentEvent::CommandFinished {
             command: display,
             output: output.clone(),
@@ -1938,7 +1993,8 @@ mod tests {
             Vec::new(),
         )
         .event_sink(sink_into(&events))
-        .cluster_writer(Some(writer as Arc<dyn ClusterWriteApi>));
+        .cluster_writer(Some(writer as Arc<dyn ClusterWriteApi>))
+        .rollout_wait(Duration::ZERO);
         let scores = PendingScores::default();
         let tool = filar_core::ToolInvocation {
             name: "k8s_scale".into(),
@@ -2169,7 +2225,7 @@ mod tests {
             .collect();
         assert!(offered.contains(&"k8s_apply".to_string()), "{offered:?}");
         let system = &llm.requests.lock().unwrap()[0].messages[0].content;
-        assert!(system.contains("only through the write tools (k8s_apply)"), "{system}");
+        assert!(system.contains("only through the write tools (k8s_apply, k8s_scale, k8s_rollout)"), "{system}");
         assert_eq!(
             *writer.calls.lock().unwrap(),
             [("apply".to_string(), true), ("apply".to_string(), false)]
@@ -2237,5 +2293,65 @@ mod tests {
             assert!(answer.contains("invalid Kubernetes write call"), "{manifest:?}: {answer}");
         }
         assert!(writer.calls.lock().unwrap().is_empty(), "nothing reached the API");
+    }
+
+    // ── k8s_scale / k8s_rollout (#641) ─────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_during_the_rollout_wait_keeps_the_change_and_its_trace() {
+        let writer = Arc::new(RecordingWriter::default());
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let token = CancellationToken::new();
+        let confirmer = Arc::new(WindowConfirmer {
+            approve: true,
+            writer: Arc::clone(&writer),
+            seen: Mutex::new(Vec::new()),
+        });
+        let call = ChatResponse::tool_calls(
+            "",
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "k8s_scale".into(),
+                arguments: serde_json::json!({"kind": "Deployment", "name": "web", "replicas": 5, "explanation": "more capacity"}),
+            }],
+        );
+        let agent = KubeAgent::new(
+            ScriptedLlm::new(vec![call, ChatResponse::text("Done.")]),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::clone(&confirmer) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Never,
+            Vec::new(),
+        )
+        .event_sink(sink_into(&events))
+        .cancellation(token.clone())
+        .cluster_writer(Some(Arc::clone(&writer) as Arc<dyn ClusterWriteApi>));
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            token.cancel();
+        });
+        let started = tokio::time::Instant::now();
+        let outcome = agent.run("scale web to 5", &[]).await;
+        canceller.await.unwrap();
+        assert!(outcome.is_err(), "cancelled");
+        assert!(started.elapsed() < crate::kube_write::ROLLOUT_WAIT, "the wait was cut short");
+        assert_eq!(
+            *writer.calls.lock().unwrap(),
+            [("scale web".to_string(), true), ("scale web".to_string(), false)],
+            "the change itself stays done"
+        );
+        let events = events.lock().unwrap();
+        let proposed = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::CommandProposed { command, .. } => Some(command.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(proposed, "k8s_scale deployment/web -n shop 3→5", "from the dry run");
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ClusterChanged { trace } if trace.contains("scaled Deployment shop/web 3 → 5"))));
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::CommandFinished { output, .. } if output.contains("rollout wait cancelled"))));
+        assert!(matches!(events.last(), Some(AgentEvent::Cancelled)), "{events:?}");
     }
 }

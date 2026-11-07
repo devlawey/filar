@@ -968,6 +968,11 @@ pub struct KubeToolExecutor {
 }
 
 impl KubeToolExecutor {
+    /// The read-only API this executor reads with.
+    pub(crate) fn api(&self) -> &Arc<dyn ClusterApi> {
+        &self.api
+    }
+
     /// The known-secret source this executor redacts with.
     pub(crate) fn secrets(&self) -> &Arc<dyn SecretProvider> {
         &self.secrets

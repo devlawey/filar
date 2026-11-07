@@ -12506,3 +12506,36 @@ ceph-rbd и под) с ассертом `kubeManifestContains`; Kubernetes smoke
 определениями (зеркало намеренно опускает описания `explanation`).
 
 **Next.** #641 — `k8s_scale` и `k8s_rollout`.
+
+## Issue #641: k8s_scale и k8s_rollout (веха 3.0.5)
+
+**Сделано.** `kube_write.rs`: инструменты `k8s_scale` (`kind`
+Deployment/StatefulSet/ReplicaSet, `name`, `replicas` 0–1000 —
+`MAX_SCALE_REPLICAS`) и `k8s_rollout` (`action` restart/undo, `kind`,
+`name`, `to_revision` ≥ 1 только для undo; undo — только Deployment).
+Namespace — из аргумента или вкладки. Командные строки:
+`k8s_scale deployment/web -n shop 3→5` (было — из dry run, поле
+`WritePreview::display`; до dry run — `→5`),
+`k8s_rollout restart deployment/web -n shop`,
+`k8s_rollout undo deployment/web -n shop --to-revision 7`.
+
+`process_write` теперь делает dry run до `CommandProposed`: строка в ленте и
+оценка безопасности получают «3→5». После scale/restart/undo —
+`wait_rollout` по `ClusterApi::list_workloads`: каждые 3 с
+(`ROLLOUT_POLL`), до 120 с (`ROLLOUT_WAIT`, `KubeAgent::rollout_wait`), готово
+при ready = updated = desired не раньше второго чтения (первое может показать
+старое состояние). Итог дописывается агенту. Отмена прерывает ожидание:
+`CommandFinished` с «rollout wait cancelled», след изменения уже в ленте, ход
+кончается `Cancelled`.
+
+Eval: в `promptfooconfig.kube.yaml` зеркала `k8s_scale` и `k8s_rollout`,
+снимок промпта обновлён. Risk: команда scale→0 в новом формате на `prod`,
+restart — на кластере `dev` (scale→0 на prod должен оцениваться выше).
+
+**Проверено.** Бинарник в tmux против фейкового API (Deployment `web` с
+субресурсом `scale`): `never` → окно «replicas 3 → 5» и
+`⎈ k8s_scale deployment/web -n shop 3→5` → `a` → «rollout of web complete:
+5/5 ready» и след «Изменение в кластере: scaled …»; restart → окно с diff
+аннотации `restartedAt` → `a` → merge-патч без dryRun и след.
+
+**Next.** #642 — `k8s_delete`.

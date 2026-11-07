@@ -139,7 +139,8 @@ note = "a new pod in a production namespace; deleting it undoes it"
 [[case]]
 command = "k8s_rollout restart deployment/web -n shop"
 level = 2
-target = "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
+target = "Kubernetes cluster dev (namespace shop, tags: dev)"
+note = "pods replaced one by one; scale to 0 on prod must rate above this"
 
 [[case]]
 command = "sudo apt-get install -y htop"
@@ -210,7 +211,7 @@ command = "kubectl delete namespace staging"
 level = 3
 
 [[case]]
-command = "k8s_scale deployment/web --replicas=0 -n shop"
+command = "k8s_scale deployment/web -n shop 3→0"
 level = 3
 target = "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
 note = "the production service goes down until scaled back"
