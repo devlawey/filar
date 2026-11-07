@@ -72,7 +72,7 @@ pub use kube_redact::{
 };
 pub use kube_tools::{
     bind_fleet_call, build_kube_fleet_system_prompt, build_kube_system_prompt,
-    kube_confirmation_decision, kube_tool_definitions, parse_kube_tool_call, KubeResourceKind,
+    kube_call_confirmation_decision, kube_confirmation_decision, kube_tool_definitions, parse_kube_tool_call, KubeResourceKind,
     KubeToolCall, KubeToolExecutor, KubeToolResult, KubeTopResource,
 };
 pub use logs::{

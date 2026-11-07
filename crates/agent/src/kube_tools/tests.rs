@@ -24,6 +24,13 @@ pub(crate) struct MockCluster {
     events_error: Option<fn() -> CoreError>,
 }
 
+impl MockCluster {
+    /// The `pod_http_get` request this mock received, if any.
+    pub(crate) fn last_http_request(&self) -> Option<filar_transport::PodHttpRequest> {
+        self.http_call.lock().unwrap().clone()
+    }
+}
+
 #[async_trait::async_trait]
 impl ClusterApi for MockCluster {
     async fn pod_http_get(
@@ -255,6 +262,49 @@ fn tag_policies_only_tighten_the_gate() {
     }];
     assert_eq!(
         kube_confirmation_decision(CommandConfirmMode::Always, &target(), &loosening),
+        ConfirmDecision::NeedsConfirmation
+    );
+}
+
+#[test]
+fn pod_http_get_outside_diagnostic_paths_is_asked_in_every_mode() {
+    let metrics = http_call(json!({"pod": "web-1", "port": 9090, "path": "/metrics"})).unwrap();
+    let pprof =
+        http_call(json!({"pod": "web-1", "port": 6060, "path": "/debug/pprof/goroutine?debug=1"}))
+            .unwrap();
+    let reset = http_call(json!({"pod": "web-1", "port": 8080, "path": "/reset"})).unwrap();
+    let get = parse_kube_tool_call(TOOL_K8S_GET, &json!({"kind": "Pod"}), Some("shop")).unwrap();
+    for mode in [CommandConfirmMode::Allowlist, CommandConfirmMode::Never] {
+        for call in [&metrics, &pprof, &get] {
+            assert_eq!(
+                kube_call_confirmation_decision(call, mode, &target(), &[]),
+                ConfirmDecision::AutoApproved,
+                "{mode:?}: {}",
+                call.display_command()
+            );
+        }
+    }
+    for mode in [
+        CommandConfirmMode::Always,
+        CommandConfirmMode::Explain,
+        CommandConfirmMode::Allowlist,
+        CommandConfirmMode::Never,
+    ] {
+        assert_eq!(
+            kube_call_confirmation_decision(&reset, mode, &target(), &[]),
+            ConfirmDecision::NeedsConfirmation,
+            "{mode:?}"
+        );
+    }
+    assert!(reset.may_change_application_state());
+    assert!(!metrics.may_change_application_state() && !get.may_change_application_state());
+    // A tag policy still tightens: a safe path is asked on a `prod` cluster.
+    let policies = [TagPolicy {
+        tag: "prod".into(),
+        confirm_mode: CommandConfirmMode::Always,
+    }];
+    assert_eq!(
+        kube_call_confirmation_decision(&metrics, CommandConfirmMode::Never, &target(), &policies),
         ConfirmDecision::NeedsConfirmation
     );
 }
