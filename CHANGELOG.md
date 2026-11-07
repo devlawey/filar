@@ -11,6 +11,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Engine: `ClusterWriteApi` in `filar-transport`, implemented by `KubeClusterApi` — server-side apply of YAML/JSON manifests, scale, rollout restart and undo, delete by name, selector or an exact list of names, every method with a server dry run; any kind the RBAC allows; returned objects never carry Secret values. `ClusterApi` stays read-only and fleets get only it ([#638](https://github.com/devlawey/filar/issues/638)).
+
 ### Changed
 
 - `pod_http_get` outside the diagnostic paths (`/metrics`, `/healthz`, `/livez`, `/readyz`, `/health`, `/ready`, `/actuator/health`, `/actuator/info`, `/actuator/prometheus`, pprof at `/debug/pprof` and under `/debug/pprof/`; exact path, no query — not even an empty one — except pprof, never a `.`/`..` segment; pprof `debug` and `seconds` at most once) is now confirmed in every mode, `allowlist` and `never` included, and its confirmation window says the application may change its state; tag policies still only tighten ([#643](https://github.com/devlawey/filar/issues/643)).

@@ -12367,7 +12367,9 @@ zero-install. Замысел Евгения: zero-install — про то, чт�
   (`cluster/write_tests.rs`): discovery, apply, merge-патч, PUT, DELETE,
   список по селектору, dry-run. Live-тест `tests/cluster_write.rs`
   (`#[ignore]`, `docker/k8s`) — ручной.
-- `CHANGELOG.md` не меняется: видимого эффекта до #639/#640 нет.
+- `CHANGELOG.md`: строка в `Added` про движок. В issue было «нет», но
+  AGENTS.md требует запись для изменения публичного контракта, а
+  `filar-transport` — крейт движка для встраивающих (замечание ai-review).
 
 **Контракты.** Новый публичный трейт `ClusterWriteApi` и типы (см.
 `docs/ENGINE_API.md`). `CommandExecutor`, `LlmClient`, `ClusterApi` не менялись.
