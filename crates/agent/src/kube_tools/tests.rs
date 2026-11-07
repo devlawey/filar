@@ -351,7 +351,7 @@ fn confirmation_context_names_tool_arguments_context_and_namespace() {
 
 #[test]
 fn prompt_matches_capabilities_and_eval_snapshot() {
-    let prompt = build_kube_system_prompt(&target(), None);
+    let read_only = build_kube_system_prompt(&target(), None);
     for expected in [
         "Kubernetes cluster prod-eu",
         "default namespace shop",
@@ -362,6 +362,15 @@ fn prompt_matches_capabilities_and_eval_snapshot() {
         "Secrets are unavailable",
         "Environment variable values",
     ] {
+        assert!(read_only.contains(expected), "missing {expected:?}: {read_only}");
+    }
+    // The eval runs a cluster tab with write access: the prompt it gets.
+    let writes: Vec<String> = crate::kube_write::kube_write_tool_definitions(CommandConfirmMode::Always)
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    let prompt = crate::kube_tools::build_kube_write_system_prompt(&target(), None, &writes);
+    for expected in ["only through the write tools (k8s_apply)", "dry run", "previous=true", "OOMKilled"] {
         assert!(prompt.contains(expected), "missing {expected:?}: {prompt}");
     }
     let path =

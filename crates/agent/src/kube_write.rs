@@ -26,6 +26,9 @@ use crate::{security::ConfirmDecision, ToolDef};
 /// Longest diff shown in the confirmation window, in lines.
 pub const MAX_DIFF_LINES: usize = 80;
 
+/// Diff lines of all objects of one apply together in the window.
+const MAX_APPLY_DIFF_LINES: usize = 160;
+
 /// Most objects of a delete listed by name in the window.
 const MAX_LISTED_OBJECTS: usize = 25;
 
@@ -136,10 +139,13 @@ impl KubeWriteCall {
                                 )
                             })
                             .collect::<Vec<_>>()
-                            .join(" ")
+                            .join(", ")
                     })
-                    .unwrap_or_else(|_| "-f <manifest>".into());
-                format!("k8s_apply {objects}{}", ns(namespace.as_deref()))
+                    .unwrap_or_else(|_| "<manifest>".into());
+                match namespace {
+                    Some(namespace) => format!("k8s_apply -n {namespace}: {objects}"),
+                    None => format!("k8s_apply: {objects}"),
+                }
             }
             Self::Scale {
                 kind,
@@ -214,10 +220,28 @@ fn restart_kind(kind: RestartKind) -> &'static str {
     }
 }
 
-/// The write tools offered in a cluster tab with write access. Empty until
-/// the tools of #640–#642 are added; a fleet never gets them.
-pub fn kube_write_tool_definitions(_mode: CommandConfirmMode) -> Vec<ToolDef> {
-    Vec::new()
+/// Tool name of a server-side apply (#640).
+pub const TOOL_K8S_APPLY: &str = "k8s_apply";
+
+/// The write tools offered in a cluster tab with write access; a fleet
+/// never gets them. More come with #641–#642.
+pub fn kube_write_tool_definitions(mode: CommandConfirmMode) -> Vec<ToolDef> {
+    vec![crate::kube_tools::definition(
+        TOOL_K8S_APPLY,
+        "Create or change Kubernetes objects from a YAML manifest (server-side apply, field manager filar), \
+         one or more documents separated by ---. Any kind the user's RBAC allows: Pod, PersistentVolumeClaim, \
+         Deployment, Service, ConfigMap, Job, RBAC, custom resources, cluster-scoped objects. Objects without \
+         metadata.namespace go to the tab namespace. Every apply is first run as a server dry run and shown to \
+         the user as a diff; nothing changes until the user approves. Secret values may be written but are never \
+         shown back. A running pod cannot get new volumes or most spec changes: create a new pod or a Deployment. \
+         After the apply, check the result by reading (k8s_get, k8s_describe, events).",
+        Map::from_iter([(
+            "manifest".to_string(),
+            serde_json::json!({"type": "string", "description": "YAML manifest, one or more documents."}),
+        )]),
+        vec!["manifest"],
+        mode,
+    )]
 }
 
 /// Tool-call arguments as the feed and the session may keep them: a
@@ -239,16 +263,30 @@ pub fn is_kube_write_tool(name: &str) -> bool {
     )
 }
 
-/// Parse a write tool call. The tools come with #640–#642; until then every
-/// name is unknown.
+/// Parse a write tool call. A manifest that is not valid YAML or has no
+/// objects is refused here, before any request (#640).
 pub fn parse_kube_write_call(
     name: &str,
-    _args: &Value,
-    _default_namespace: Option<&str>,
+    args: &Value,
+    default_namespace: Option<&str>,
 ) -> Result<KubeWriteCall> {
-    Err(CoreError::Other(format!(
-        "unknown Kubernetes write tool {name}"
-    )))
+    match name {
+        TOOL_K8S_APPLY => {
+            let manifest = args
+                .get("manifest")
+                .and_then(Value::as_str)
+                .filter(|manifest| !manifest.trim().is_empty())
+                .ok_or_else(|| CoreError::Other("missing required argument manifest".into()))?;
+            filar_transport::parse_manifest(manifest)?;
+            Ok(KubeWriteCall::Apply {
+                manifest: manifest.to_string(),
+                namespace: default_namespace.map(str::to_owned),
+            })
+        }
+        other => Err(CoreError::Other(format!(
+            "unknown Kubernetes write tool {other}"
+        ))),
+    }
 }
 
 /// The confirmation policy of a cluster write (#639): always asked, in every
@@ -321,9 +359,27 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
             manifest,
             namespace,
         } => {
-            let applied = api.apply(manifest, namespace.as_deref(), true).await?;
+            let applied = api
+                .apply(manifest, namespace.as_deref(), true)
+                .await
+                .map_err(explain_apply_error)?;
+            text.push_str(&applied_list(&applied));
+            let mut budget = MAX_APPLY_DIFF_LINES;
             for object in &applied {
-                text.push_str(&applied_text(object));
+                let section = applied_text(object);
+                let lines = section.lines().count();
+                if lines <= budget {
+                    text.push('\n');
+                    text.push_str(&section);
+                    budget -= lines;
+                } else {
+                    text.push_str(&format!(
+                        "\n{} {}: diff not shown (window limit); read it after the apply\n",
+                        object.action.as_str(),
+                        object_label(&object.object)
+                    ));
+                    budget = 0;
+                }
             }
         }
         KubeWriteCall::Scale {
@@ -529,6 +585,33 @@ fn key_state(state: SecretKeyState) -> &'static str {
         SecretKeyState::Unchanged => "unchanged",
         SecretKeyState::Removed => "removed",
     }
+}
+
+/// The objects of an apply, one line each, before their diffs: a long
+/// manifest is first seen as a list.
+fn applied_list(objects: &[AppliedObject]) -> String {
+    let mut text = format!("apply {} object(s):\n", objects.len());
+    for object in objects {
+        text.push_str(&format!(
+            "  {} {}\n",
+            object.action.as_str(),
+            object_label(&object.object)
+        ));
+    }
+    text
+}
+
+/// A refused apply the model can act on: a running pod's spec is mostly
+/// immutable, so a new pod or a Deployment is the way, not a retry (#640).
+fn explain_apply_error(error: CoreError) -> CoreError {
+    let text = error.to_string();
+    if text.contains("pod updates may not change fields") || text.contains("Forbidden: pod updates")
+    {
+        return CoreError::Other(format!(
+            "{text} — a running pod cannot get new volumes or most spec changes: create a new pod (another name) or a Deployment instead of retrying"
+        ));
+    }
+    error
 }
 
 fn applied_text(object: &AppliedObject) -> String {
@@ -819,7 +902,7 @@ mod tests {
         };
         assert_eq!(
             apply.display_command(),
-            "k8s_apply -f <manifest> -n shop",
+            "k8s_apply -n shop: <manifest>",
             "not an object"
         );
         let apply = KubeWriteCall::Apply {
@@ -828,7 +911,7 @@ mod tests {
         };
         assert_eq!(
             apply.display_command(),
-            "k8s_apply Secret/db Pod/debug -n shop"
+            "k8s_apply -n shop: Secret/db, Pod/debug"
         );
         let scale = KubeWriteCall::Scale {
             kind: ScaleKind::Deployment,
@@ -871,6 +954,61 @@ mod tests {
             trace_line("configured Deployment shop/web", &target, "12:00:00"),
             "Изменение в кластере: configured Deployment shop/web (контекст prod-eu-admin, 12:00:00)"
         );
+    }
+
+    #[test]
+    fn k8s_apply_parses_multi_document_yaml_into_the_tab_namespace() {
+        let manifest = "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata: {name: data}\n---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata: {name: reader}\nrules: []\n";
+        let call = parse_kube_write_call(
+            TOOL_K8S_APPLY,
+            &json!({"manifest": manifest, "explanation": "storage and a role"}),
+            Some("shop"),
+        )
+        .unwrap();
+        assert_eq!(
+            call,
+            KubeWriteCall::Apply {
+                manifest: manifest.into(),
+                namespace: Some("shop".into())
+            }
+        );
+        assert_eq!(
+            call.display_command(),
+            "k8s_apply -n shop: PersistentVolumeClaim/data, ClusterRole/reader"
+        );
+        let no_tab =
+            parse_kube_write_call(TOOL_K8S_APPLY, &json!({"manifest": manifest}), None).unwrap();
+        assert_eq!(
+            no_tab.display_command(),
+            "k8s_apply: PersistentVolumeClaim/data, ClusterRole/reader"
+        );
+        for bad in [
+            json!({}),
+            json!({"manifest": "  "}),
+            json!({"manifest": "---\n"}),
+            json!({"manifest": "a: [b"}),
+        ] {
+            assert!(
+                parse_kube_write_call(TOOL_K8S_APPLY, &bad, Some("shop")).is_err(),
+                "{bad}"
+            );
+        }
+        let definitions = kube_write_tool_definitions(CommandConfirmMode::Explain);
+        assert_eq!(definitions[0].name, TOOL_K8S_APPLY);
+        assert_eq!(
+            definitions[0].parameters["required"],
+            json!(["manifest", "explanation"])
+        );
+    }
+
+    #[test]
+    fn a_running_pod_refusal_says_what_to_do_instead() {
+        let error = explain_apply_error(CoreError::AccessDenied(
+            "Pod \"web\" is invalid: spec: Forbidden: pod updates may not change fields other than `spec.containers[*].image`".into(),
+        ));
+        assert!(error.to_string().contains("create a new pod"), "{error}");
+        let other = explain_apply_error(CoreError::AccessDenied("forbidden".into()));
+        assert_eq!(other.to_string(), "forbidden");
     }
 }
 

@@ -328,6 +328,34 @@ function kubeToolArgs(output, context) {
   };
 }
 
+// Assert 8 — a manifest tool (k8s_apply, #640) was called and its manifest
+// mentions every expected fact (case-insensitive): kinds, a storage class, a
+// size. Checks the decision, not the exact YAML.
+function kubeManifestContains(output, context) {
+  const wanted = context?.vars?.tool || 'k8s_apply';
+  const facts = context?.vars?.expected_facts?.facts;
+  if (!Array.isArray(facts) || facts.length === 0) {
+    return { pass: false, score: 0, reason: 'kubeManifestContains requires expected_facts.facts' };
+  }
+  const calls = extractToolCalls(output).filter((tc) => (tc.function || tc).name === wanted);
+  for (const tc of calls) {
+    let args = (tc.function || tc).arguments;
+    if (typeof args === 'string') {
+      try { args = JSON.parse(args); } catch { args = null; }
+    }
+    const manifest = String(args?.manifest || '').toLowerCase();
+    const missing = facts.filter((fact) => !manifest.includes(String(fact).toLowerCase()));
+    if (manifest && missing.length === 0) {
+      return { pass: true, score: 1, reason: `${wanted} manifest has ${facts.join(', ')}` };
+    }
+  }
+  return {
+    pass: false,
+    score: 0,
+    reason: `expected ${wanted} with a manifest containing ${facts.join(', ')}, got: ${JSON.stringify(calls.map((tc) => (tc.function || tc).arguments)) || 'no call'}`,
+  };
+}
+
 // Extract final assistant content without tool-call explanations.
 function finalAssistantContent(output) {
   if (typeof output === 'string') return output;
@@ -382,5 +410,6 @@ module.exports = {
   commandExcludesPattern,
   toolCalledAny,
   kubeToolArgs,
+  kubeManifestContains,
   outputContains,
 };

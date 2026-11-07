@@ -1800,11 +1800,31 @@ mod tests {
     impl ClusterWriteApi for RecordingWriter {
         async fn apply(
             &self,
-            _: &str,
-            _: Option<&str>,
-            _: bool,
+            manifest: &str,
+            namespace: Option<&str>,
+            dry_run: bool,
         ) -> Result<Vec<filar_transport::AppliedObject>> {
-            Err(CoreError::Other("not in this mock".into()))
+            self.calls.lock().unwrap().push(("apply".into(), dry_run));
+            filar_transport::parse_manifest(manifest)?
+                .into_iter()
+                .map(|object| {
+                    let kind = object["kind"].as_str().unwrap_or_default().to_string();
+                    let name = object["metadata"]["name"].as_str().unwrap_or_default().to_string();
+                    Ok(filar_transport::AppliedObject {
+                        object: filar_transport::ObjectRef {
+                            api_version: object["apiVersion"].as_str().unwrap_or_default().into(),
+                            kind,
+                            namespace: namespace.map(str::to_owned),
+                            name,
+                        },
+                        action: filar_transport::ApplyAction::Created,
+                        live: None,
+                        result: object,
+                        secret_keys: Vec::new(),
+                        status_is_content: false,
+                    })
+                })
+                .collect()
         }
 
         async fn scale(
@@ -2104,5 +2124,118 @@ mod tests {
         assert!(prompt.contains("Secrets are never shown to you"));
         let read_only = build_kube_system_prompt(&target(), Some("shop"));
         assert!(read_only.contains("You cannot change"), "a tab without writes stays read-only");
+    }
+
+    // ── k8s_apply (#640) ───────────────────────────────────────────────
+
+    const STORAGE: &str = "apiVersion: v1\nkind: PersistentVolumeClaim\nmetadata: {name: data}\nspec:\n  storageClassName: ceph-rbd\n  accessModes: [ReadWriteOnce]\n  resources: {requests: {storage: 1Gi}}\n---\napiVersion: v1\nkind: Pod\nmetadata: {name: storage-test}\nspec:\n  containers: [{name: main, image: busybox, volumeMounts: [{name: data, mountPath: /data}]}]\n  volumes: [{name: data, persistentVolumeClaim: {claimName: data}}]\n";
+
+    #[tokio::test]
+    async fn k8s_apply_goes_dry_run_window_apply_trace() {
+        let writer = Arc::new(RecordingWriter::default());
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let confirmer = Arc::new(WindowConfirmer {
+            approve: true,
+            writer: Arc::clone(&writer),
+            seen: Mutex::new(Vec::new()),
+        });
+        let call = ChatResponse::tool_calls(
+            "",
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "k8s_apply".into(),
+                arguments: serde_json::json!({"manifest": STORAGE, "explanation": "PVC on ceph-rbd and a pod that mounts it"}),
+            }],
+        );
+        let llm = ScriptedLlm::new(vec![call, ChatResponse::text("Done.")]);
+        KubeAgent::new(
+            llm.clone(),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::clone(&confirmer) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Never,
+            Vec::new(),
+        )
+        .event_sink(sink_into(&events))
+        .cluster_writer(Some(Arc::clone(&writer) as Arc<dyn ClusterWriteApi>))
+        .run("создай PVC на 1Gi в ceph-rbd и под с ним", &[])
+        .await
+        .unwrap();
+        let offered: Vec<String> = llm.requests.lock().unwrap()[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        assert!(offered.contains(&"k8s_apply".to_string()), "{offered:?}");
+        let system = &llm.requests.lock().unwrap()[0].messages[0].content;
+        assert!(system.contains("only through the write tools (k8s_apply)"), "{system}");
+        assert_eq!(
+            *writer.calls.lock().unwrap(),
+            [("apply".to_string(), true), ("apply".to_string(), false)]
+        );
+        let seen = confirmer.seen.lock().unwrap();
+        let (window, destructive, _) = &seen[0];
+        assert!(window.contains("apply 2 object(s):"), "{window}");
+        assert!(window.contains("created PersistentVolumeClaim shop/data"), "{window}");
+        assert!(window.contains("created Pod shop/storage-test"), "{window}");
+        assert!(window.contains("ceph-rbd"), "the diff shows the new object: {window}");
+        assert!(!destructive);
+        let events = events.lock().unwrap();
+        let traces: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ClusterChanged { trace } => Some(trace.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(traces.len(), 2, "{traces:?}");
+        assert!(traces[0].contains("created PersistentVolumeClaim shop/data"));
+        let proposed = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::CommandProposed { command, tool, .. } => Some((command.clone(), tool.clone())),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(proposed.0, "k8s_apply -n shop: PersistentVolumeClaim/data, Pod/storage-test");
+        assert!(
+            proposed.1.arguments["manifest"].as_str().unwrap().contains("not shown"),
+            "the manifest stays out of the feed: {:?}",
+            proposed.1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_manifest_is_refused_before_any_request() {
+        let writer = Arc::new(RecordingWriter::default());
+        for manifest in ["", "---\n", "kind: [unclosed", "apiVersion: v1\nkind: Pod\nmetadata: {}\n"] {
+            let call = ChatResponse::tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "k8s_apply".into(),
+                    arguments: serde_json::json!({"manifest": manifest, "explanation": "x"}),
+                }],
+            );
+            let llm = ScriptedLlm::new(vec![call, ChatResponse::text("Done.")]);
+            KubeAgent::new(
+                llm.clone(),
+                executor(MockCluster::default()),
+                target(),
+                Some("shop".into()),
+                Arc::new(ReleasingConfirmer(None)) as Arc<dyn CommandConfirmer>,
+                CommandConfirmMode::Always,
+                Vec::new(),
+            )
+            .cluster_writer(Some(Arc::clone(&writer) as Arc<dyn ClusterWriteApi>))
+            .run("apply", &[])
+            .await
+            .unwrap();
+            let requests = llm.requests.lock().unwrap();
+            let answer = &requests[1].messages.last().unwrap().content;
+            assert!(answer.contains("invalid Kubernetes write call"), "{manifest:?}: {answer}");
+        }
+        assert!(writer.calls.lock().unwrap().is_empty(), "nothing reached the API");
     }
 }

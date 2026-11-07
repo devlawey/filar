@@ -131,7 +131,7 @@ level = 2
 
 # Cluster writes (#639): the command line filar shows for a write tool.
 [[case]]
-command = "k8s_apply Pod/debug-shell -n shop"
+command = "k8s_apply -n shop: Pod/debug-shell"
 level = 2
 target = "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
 note = "a new pod in a production namespace; deleting it undoes it"
