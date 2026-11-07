@@ -537,21 +537,23 @@ pub(crate) const RISK_SCORE_MAX_WAIT: Duration =
 /// turns of the same agent never settle or abort each other's ratings. When
 /// the `run` future is dropped without a cancel (an embedder's `select!`
 /// with a timeout), dropping the set closes its sink gate and aborts its
-/// tasks: after the drop returns no rating of the turn reaches the sink.
+/// tasks: after the drop returns no rating of the turn reaches the sink,
+/// except one already entering it.
 #[derive(Default)]
 pub(crate) struct PendingScores {
     ratings: std::sync::Mutex<Vec<Rating>>,
-    /// Closed when the set is dropped. A rating task holds this lock while
-    /// it checks the flag and calls the sink, so a drop waits for a sink
-    /// call already in progress and none can start after it: `abort` alone
-    /// cannot stop a task that is already running past its last `await` on
-    /// another worker thread.
-    closed: std::sync::Arc<std::sync::Mutex<bool>>,
+    /// Set when the set is dropped; a rating task checks it right before
+    /// the sink. `abort` alone cannot stop a task already running past its
+    /// last `await` on another worker thread. A flag, not a lock held over
+    /// the sink: `Drop` must not wait for a caller's sink, which may itself
+    /// wait for a lock held by whoever drops the turn.
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for PendingScores {
     fn drop(&mut self) {
-        *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         // The ratings are aborted as they drop with the list.
     }
 }
@@ -612,8 +614,7 @@ impl PendingScores {
                 }
             };
             if let Some(sink) = sink {
-                let closed = closed.lock().unwrap_or_else(|e| e.into_inner());
-                if !*closed {
+                if !closed.load(std::sync::atomic::Ordering::SeqCst) {
                     sink(event);
                 }
             }
@@ -1007,5 +1008,67 @@ mod tests {
         };
         let s = build_risk_scorer(&cfg, &filar_core::secrets::StaticSecretProvider::new()).unwrap();
         assert_eq!(s.model_name(), "qwen");
+    }
+
+    /// Answers at once with a fixed rating.
+    struct InstantScorer;
+
+    #[async_trait::async_trait]
+    impl RiskScorer for InstantScorer {
+        async fn score(&self, _: &RiskInput) -> Result<RiskScore> {
+            Ok(RiskScore {
+                safety_pct: 90,
+                confidence: None,
+                probabilities: Default::default(),
+                cost_usd: None,
+                model: "instant".into(),
+            })
+        }
+
+        fn model_name(&self) -> &str {
+            "instant"
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_turn_never_waits_for_a_sink_in_progress() {
+        // The embedder's sink waits for a lock that the thread dropping the
+        // turn holds. The drop must not wait for the sink (#644, review of
+        // #648): with a lock held over the sink this would deadlock.
+        let lock = Arc::new(Mutex::new(()));
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink: crate::EventSink = {
+            let (lock, entered) = (Arc::clone(&lock), Arc::clone(&entered));
+            Arc::new(move |_| {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+            })
+        };
+        let held = lock.lock().unwrap();
+        let scores = PendingScores::default();
+        scores.spawn(Arc::new(InstantScorer), input(), 1, Some(sink));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "the rating never reached the sink");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let dropped = std::time::Instant::now();
+        drop(scores);
+        assert!(dropped.elapsed() < Duration::from_secs(1), "the drop waited for the sink");
+        drop(held);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_set_emits_nothing_more() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink: crate::EventSink = {
+            let events = Arc::clone(&events);
+            Arc::new(move |e| events.lock().unwrap().push(e))
+        };
+        let scores = PendingScores::default();
+        scores.spawn(Arc::new(InstantScorer), input(), 1, Some(sink));
+        drop(scores);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(events.lock().unwrap().is_empty());
     }
 }
