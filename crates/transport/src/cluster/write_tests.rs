@@ -190,7 +190,8 @@ fn discovery(path: &str) -> Option<Value> {
             json!({"kind": "APIResourceList", "groupVersion": "v1", "resources": [
             resource("pods", "Pod", true), resource("secrets", "Secret", true),
             resource("configmaps", "ConfigMap", true), resource("namespaces", "Namespace", false),
-            resource("persistentvolumes", "PersistentVolume", false)]}),
+            resource("persistentvolumes", "PersistentVolume", false),
+            resource("persistentvolumeclaims", "PersistentVolumeClaim", true)]}),
         ),
         "/apis/apps/v1" => Some(
             json!({"kind": "APIResourceList", "apiVersion": "v1", "groupVersion": "apps/v1", "resources": [
@@ -342,6 +343,7 @@ fn is_collection(path: &str) -> bool {
         "configmaps",
         "namespaces",
         "persistentvolumes",
+        "persistentvolumeclaims",
         "deployments",
         "statefulsets",
         "replicasets",
@@ -1491,4 +1493,53 @@ fn a_yaml_error_names_the_position_not_the_text() {
     let error = parse_manifest(manifest).unwrap_err().to_string();
     assert!(!error.contains("hunter22secret"), "{error}");
     assert!(error.contains("not valid YAML"), "{error}");
+}
+
+// ── deletion impact (#642) ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_impact_of_a_delete_is_read_from_the_cluster() {
+    let api = fake().await;
+    api.put("/api/v1/namespaces/shop", json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "shop"}}));
+    for name in ["web-1", "web-2"] {
+        let mut p = pod(name, "web");
+        p["metadata"]["ownerReferences"] = json!([{"apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "web-7f9c", "uid": "u", "controller": true}]);
+        api.put(&format!("{PODS}/{name}"), p);
+    }
+    api.put("/api/v1/namespaces/shop/configmaps/cfg", json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cfg", "namespace": "shop"}}));
+    api.put(&format!("{DEPLOY}/web"), deployment("web", 2));
+    api.put("/api/v1/persistentvolumes/pv-1", json!({"apiVersion": "v1", "kind": "PersistentVolume", "metadata": {"name": "pv-1"}, "spec": {"persistentVolumeReclaimPolicy": "Delete"}}));
+    api.put("/api/v1/namespaces/shop/persistentvolumeclaims/data", json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": "data", "namespace": "shop"}, "spec": {"volumeName": "pv-1"}}));
+    let writes = api.api();
+    async fn dry(writes: &KubeClusterApi, kind: &str, name: &str) -> DeletedObject {
+        let kind = ObjectKind { api_version: Some("v1".into()), kind: kind.into() };
+        writes
+            .delete(&kind, Some("shop"), &DeleteTarget::Name(name.into()), &DeleteOptions::default(), true)
+            .await
+            .unwrap()
+            .remove(0)
+    }
+
+    let pod = dry(&writes, "Pod", "web-1").await;
+    assert!(pod.live.is_some(), "the dry run answers with the object");
+    let impact = writes.deletion_impact(&pod).await;
+    assert_eq!(impact.controller.as_deref(), Some("ReplicaSet web-7f9c"));
+
+    let namespace = dry(&writes, "Namespace", "shop").await;
+    let impact = writes.deletion_impact(&namespace).await;
+    assert_eq!(
+        impact.contents,
+        [
+            ("ConfigMap".to_string(), 1, false),
+            ("Deployment".to_string(), 1, false),
+            ("PersistentVolumeClaim".to_string(), 1, false),
+            ("Pod".to_string(), 2, false),
+        ]
+    );
+
+    let claim = dry(&writes, "PersistentVolumeClaim", "data").await;
+    assert_eq!(writes.deletion_impact(&claim).await.reclaim_policy.as_deref(), Some("Delete"));
+    let volume = dry(&writes, "PersistentVolume", "pv-1").await;
+    assert_eq!(writes.deletion_impact(&volume).await.reclaim_policy.as_deref(), Some("Delete"));
+    assert!(api.get(&format!("{PODS}/web-1")).is_some(), "all dry runs");
 }

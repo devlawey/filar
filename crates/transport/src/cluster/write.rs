@@ -275,6 +275,26 @@ pub struct DeletedObject {
     pub object: ObjectRef,
     /// What happened.
     pub outcome: DeleteOutcome,
+    /// The object as the API server answered the delete, when it did
+    /// (owner, reclaim policy, …), Secret values hidden (#642).
+    pub live: Option<Value>,
+}
+
+/// What else a delete takes with it or puts at risk (#642), as far as
+/// reading shows. Empty fields mean nothing known, not nothing at risk.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeletionImpact {
+    /// The controller that recreates the object (`ReplicaSet web-7f9c`).
+    pub controller: Option<String>,
+    /// For a Namespace: objects in it by kind, `(kind, count, more)`;
+    /// `more` = the count stopped at a page limit.
+    pub contents: Vec<(String, usize, bool)>,
+    /// For a CustomResourceDefinition: its objects in all namespaces.
+    pub custom_objects: Option<(usize, bool)>,
+    /// For a PVC or PV: the volume's reclaim policy (`Delete`, `Retain`).
+    pub reclaim_policy: Option<String>,
+    /// For a Node: pods scheduled on it.
+    pub node_pods: Option<(usize, bool)>,
 }
 
 /// Write access to Kubernetes objects (#638). Separate from
@@ -336,6 +356,15 @@ pub trait ClusterWriteApi: Send + Sync {
         options: &DeleteOptions,
         dry_run: bool,
     ) -> Result<Vec<DeletedObject>>;
+
+    /// What deleting `object` (from a dry run) takes with it, by reading:
+    /// the controller that recreates it, the contents of a Namespace, the
+    /// objects of a CRD, a volume's reclaim policy, a node's pods (#642).
+    /// Unreadable parts stay empty. The default knows nothing.
+    async fn deletion_impact(&self, object: &DeletedObject) -> DeletionImpact {
+        let _ = object;
+        DeletionImpact::default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,24 +1281,35 @@ impl ClusterWriteApi for KubeClusterApi {
                 namespace: namespace.map(str::to_owned),
                 name: name.clone(),
             };
+            let mut live = None;
             let outcome = match api.delete(&name, &params).await {
-                Ok(_) if dry_run => DeleteOutcome::WouldDelete,
-                Ok(answer) => match answer.left() {
-                    Some(object) if object.metadata.deletion_timestamp.is_some() => {
-                        DeleteOutcome::Pending
+                Ok(answer) => {
+                    let object = answer.left();
+                    let pending = object
+                        .as_ref()
+                        .map(|o| o.metadata.deletion_timestamp.is_some());
+                    if let Some(object) = object {
+                        let mut value = to_value(&object)?;
+                        hide_secret_values(&mut value);
+                        live = Some(value);
                     }
-                    Some(_) => DeleteOutcome::Deleted,
-                    // A bare `Status` (aggregated APIs, async deletes) says
-                    // the request was accepted, not that the object is gone.
-                    None => match api.get_opt(&name).await {
-                        Ok(Some(_)) => DeleteOutcome::Pending,
-                        Ok(None) => DeleteOutcome::Deleted,
-                        Err(error) => {
-                            tracing::debug!(%error, "post-delete check of {name} failed");
-                            DeleteOutcome::Pending
-                        }
-                    },
-                },
+                    match pending {
+                        _ if dry_run => DeleteOutcome::WouldDelete,
+                        Some(true) => DeleteOutcome::Pending,
+                        Some(false) => DeleteOutcome::Deleted,
+                        // A bare `Status` (aggregated APIs, async deletes)
+                        // says the request was accepted, not that the
+                        // object is gone.
+                        None => match api.get_opt(&name).await {
+                            Ok(Some(_)) => DeleteOutcome::Pending,
+                            Ok(None) => DeleteOutcome::Deleted,
+                            Err(error) => {
+                                tracing::debug!(%error, "post-delete check of {name} failed");
+                                DeleteOutcome::Pending
+                            }
+                        },
+                    }
+                }
                 Err(kube::Error::Api(status)) if status.code == 404 && !missing_is_error => {
                     DeleteOutcome::AlreadyGone
                 }
@@ -1285,10 +1325,175 @@ impl ClusterWriteApi for KubeClusterApi {
                     });
                 }
             };
-            deleted.push(DeletedObject { object, outcome });
+            deleted.push(DeletedObject {
+                object,
+                outcome,
+                live,
+            });
         }
         Ok(deleted)
     }
+
+    async fn deletion_impact(&self, object: &DeletedObject) -> DeletionImpact {
+        impact_of(self, object).await
+    }
+}
+
+impl KubeClusterApi {
+    /// Count the objects of `resource` in `namespace` (or everywhere), one
+    /// page at most: `(count, more)`.
+    async fn count_objects(
+        &self,
+        resource: &ApiResource,
+        caps: &ApiCapabilities,
+        namespace: Option<&str>,
+        params: &ListParams,
+    ) -> Option<(usize, bool)> {
+        let client = self.client().clone();
+        let api: Api<DynamicObject> = match (&caps.scope, namespace) {
+            (Scope::Namespaced, Some(namespace)) => {
+                Api::namespaced_with(client, namespace, resource)
+            }
+            _ => Api::all_with(client, resource),
+        };
+        let page = api.list(&params.clone().limit(500)).await.ok()?;
+        let more = page
+            .metadata
+            .continue_
+            .as_deref()
+            .is_some_and(|token| !token.is_empty());
+        Some((page.items.len(), more))
+    }
+
+    async fn namespace_contents(&self, namespace: &str) -> Vec<(String, usize, bool)> {
+        let Ok(discovery) = Discovery::new(self.client().clone()).run().await else {
+            return Vec::new();
+        };
+        let mut contents = Vec::new();
+        for group in discovery.groups() {
+            for (resource, caps) in group.recommended_resources() {
+                let listable = caps.operations.iter().any(|verb| verb == "list");
+                if caps.scope != Scope::Namespaced || !listable || resource.kind == "Event" {
+                    continue;
+                }
+                if let Some((count, more)) = self
+                    .count_objects(&resource, &caps, Some(namespace), &ListParams::default())
+                    .await
+                {
+                    if count > 0 {
+                        contents.push((resource.kind.clone(), count, more));
+                    }
+                }
+            }
+        }
+        contents.sort();
+        contents
+    }
+
+    async fn reclaim_policy(&self, kind: &str, live: &Value) -> Option<String> {
+        let client = self.client().clone();
+        let field = |object: &Value, pointer: &str| {
+            object.pointer(pointer).and_then(Value::as_str).map(str::to_owned)
+        };
+        if kind == "PersistentVolume" {
+            return field(live, "/spec/persistentVolumeReclaimPolicy");
+        }
+        if let Some(volume) = field(live, "/spec/volumeName") {
+            let pv = ApiResource::from_gvk_with_plural(
+                &GroupVersionKind::gvk("", "v1", "PersistentVolume"),
+                "persistentvolumes",
+            );
+            let object = Api::<DynamicObject>::all_with(client.clone(), &pv)
+                .get(&volume)
+                .await
+                .ok()?;
+            return field(&to_value(&object).ok()?, "/spec/persistentVolumeReclaimPolicy");
+        }
+        let class = field(live, "/spec/storageClassName")?;
+        let sc = ApiResource::from_gvk_with_plural(
+            &GroupVersionKind::gvk("storage.k8s.io", "v1", "StorageClass"),
+            "storageclasses",
+        );
+        let object = Api::<DynamicObject>::all_with(client, &sc).get(&class).await.ok()?;
+        // A StorageClass without reclaimPolicy deletes.
+        Some(field(&to_value(&object).ok()?, "/reclaimPolicy").unwrap_or_else(|| "Delete".into()))
+    }
+}
+
+/// Fill a [`DeletionImpact`] for one object of a dry-run delete.
+async fn impact_of(api: &KubeClusterApi, object: &DeletedObject) -> DeletionImpact {
+    let mut impact = DeletionImpact::default();
+    let Some(live) = object.live.as_ref() else {
+        return impact;
+    };
+    impact.controller = live
+        .pointer("/metadata/ownerReferences")
+        .and_then(Value::as_array)
+        .and_then(|owners| {
+            owners
+                .iter()
+                .find(|owner| owner.get("controller").and_then(Value::as_bool) == Some(true))
+        })
+        .map(|owner| {
+            format!(
+                "{} {}",
+                owner["kind"].as_str().unwrap_or_default(),
+                owner["name"].as_str().unwrap_or_default()
+            )
+        });
+    match object.object.kind.as_str() {
+        "Namespace" => impact.contents = api.namespace_contents(&object.object.name).await,
+        "CustomResourceDefinition" => {
+            let group = live.pointer("/spec/group").and_then(Value::as_str);
+            let plural = live.pointer("/spec/names/plural").and_then(Value::as_str);
+            let kind = live.pointer("/spec/names/kind").and_then(Value::as_str);
+            let version = live
+                .pointer("/spec/versions")
+                .and_then(Value::as_array)
+                .and_then(|versions| {
+                    versions
+                        .iter()
+                        .find(|v| v.get("storage").and_then(Value::as_bool) == Some(true))
+                })
+                .and_then(|v| v.get("name"))
+                .and_then(Value::as_str);
+            if let (Some(group), Some(plural), Some(kind), Some(version)) =
+                (group, plural, kind, version)
+            {
+                let resource = ApiResource::from_gvk_with_plural(
+                    &GroupVersionKind::gvk(group, version, kind),
+                    plural,
+                );
+                let caps = ApiCapabilities {
+                    scope: Scope::Cluster,
+                    subresources: Vec::new(),
+                    operations: Vec::new(),
+                };
+                impact.custom_objects = api
+                    .count_objects(&resource, &caps, None, &ListParams::default())
+                    .await;
+            }
+        }
+        "PersistentVolumeClaim" | "PersistentVolume" => {
+            impact.reclaim_policy = api.reclaim_policy(&object.object.kind, live).await;
+        }
+        "Node" => {
+            let pods = ApiResource::from_gvk_with_plural(
+                &GroupVersionKind::gvk("", "v1", "Pod"),
+                "pods",
+            );
+            let caps = ApiCapabilities {
+                scope: Scope::Cluster,
+                subresources: Vec::new(),
+                operations: Vec::new(),
+            };
+            let params =
+                ListParams::default().fields(&format!("spec.nodeName={}", object.object.name));
+            impact.node_pods = api.count_objects(&pods, &caps, None, &params).await;
+        }
+        _ => {}
+    }
+    impact
 }
 
 #[cfg(test)]
