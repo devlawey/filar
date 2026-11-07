@@ -81,8 +81,6 @@ pub struct KubeAgent {
     arbiter: Option<KubeArbiter>,
     /// Command safety scorer (#549, #631); cluster tabs only. Advisory.
     risk_scorer: Option<Arc<dyn RiskScorer>>,
-    /// Ratings still in flight, settled before the terminal event.
-    pending_scores: PendingScores,
 }
 
 /// The arbiter of a [`KubeAgent`] (#620).
@@ -118,7 +116,6 @@ impl KubeAgent {
             log_sources: None,
             arbiter: None,
             risk_scorer: None,
-            pending_scores: PendingScores::default(),
         }
     }
 
@@ -144,7 +141,6 @@ impl KubeAgent {
             log_sources: None,
             arbiter: None,
             risk_scorer: None,
-            pending_scores: PendingScores::default(),
         }
     }
 
@@ -209,6 +205,7 @@ impl KubeAgent {
     /// tab's otherwise — as the confirmation dialog shows it.
     fn spawn_risk_score(
         &self,
+        scores: &PendingScores,
         proposal_id: u64,
         command: &str,
         explanation: &str,
@@ -235,14 +232,13 @@ impl KubeAgent {
                 kubernetes: Some(KubernetesArbiterTarget::new(target, namespace)),
             }),
         };
-        self.pending_scores
-            .spawn(scorer, input, proposal_id, self.event_sink.clone());
+        scores.spawn(scorer, input, proposal_id, self.event_sink.clone());
     }
 
     /// Emit `event`; a proposal also starts its safety rating (#631), with
     /// `namespace` as in [`Self::spawn_risk_score`]. The log-source paths,
     /// which announce their own proposals, use it as their sink.
-    fn emit_and_rate(&self, event: AgentEvent, namespace: Option<&str>) {
+    fn emit_and_rate(&self, scores: &PendingScores, event: AgentEvent, namespace: Option<&str>) {
         let rates =
             self.risk_scorer.is_some() && matches!(self.execution, KubeExecution::Cluster { .. });
         // Copy the proposal only when it is going to be rated.
@@ -257,7 +253,7 @@ impl KubeAgent {
         };
         self.emit(event);
         if let Some((proposal_id, command, explanation)) = rate {
-            self.spawn_risk_score(proposal_id, &command, &explanation, namespace);
+            self.spawn_risk_score(scores, proposal_id, &command, &explanation, namespace);
         }
     }
 
@@ -367,10 +363,14 @@ impl KubeAgent {
     /// Run one user turn, including any approved Kubernetes API calls.
     pub async fn run(&self, user_prompt: &str, history: &[ChatMessage]) -> Result<String> {
         self.emit(AgentEvent::Started);
-        let result = self.run_loop(user_prompt, history).await;
+        // The ratings belong to this turn (#644): a dropped `run` future
+        // aborts them with it, and another turn of the same agent never
+        // touches them.
+        let scores = PendingScores::default();
+        let result = self.run_loop(user_prompt, history, &scores).await;
         // Ratings in flight land before the terminal event; a cancel drops
         // them, so none follows `Cancelled` or reaches a closed tab.
-        self.pending_scores.settle(self.cancellation.as_ref()).await;
+        scores.settle(self.cancellation.as_ref()).await;
         match result {
             // A cancel that lands while ratings settle ends the turn as
             // cancelled for the frontend — a late `Finished` would clear the
@@ -395,7 +395,12 @@ impl KubeAgent {
         }
     }
 
-    async fn run_loop(&self, user_prompt: &str, history: &[ChatMessage]) -> Result<String> {
+    async fn run_loop(
+        &self,
+        user_prompt: &str,
+        history: &[ChatMessage],
+        scores: &PendingScores,
+    ) -> Result<String> {
         let prompt = match &self.execution {
             KubeExecution::Cluster {
                 target, namespace, ..
@@ -484,7 +489,7 @@ impl KubeAgent {
             }
 
             for call in &response.tool_calls {
-                let reply = self.process_tool_call(call, &messages).await?;
+                let reply = self.process_tool_call(call, &messages, scores).await?;
                 messages.push(reply);
             }
         }
@@ -498,6 +503,7 @@ impl KubeAgent {
         &self,
         call: &ToolCall,
         conversation: &[ChatMessage],
+        scores: &PendingScores,
     ) -> Result<ChatMessage> {
         // Every confirmation of this call — typed request or log query —
         // goes through the arbiter first (#620).
@@ -509,7 +515,7 @@ impl KubeAgent {
             let Some(sources) = &self.log_sources else {
                 return Ok(ChatMessage::tool(&call.id, "Error: no log sources are configured."));
             };
-            let emit = |event: AgentEvent| self.emit_and_rate(event, None);
+            let emit = |event: AgentEvent| self.emit_and_rate(scores, event, None);
             let proposal_id = crate::agent::next_proposal_id();
             return match &self.execution {
                 KubeExecution::Cluster { target, namespace, .. } => {
@@ -553,7 +559,7 @@ impl KubeAgent {
                     "Error: no log sources are available here.",
                 ));
             };
-            let emit = |event: AgentEvent| self.emit_and_rate(event, None);
+            let emit = |event: AgentEvent| self.emit_and_rate(scores, event, None);
             return sources
                 .process(
                     call,
@@ -627,6 +633,7 @@ impl KubeAgent {
         };
 
         self.emit_and_rate(
+            scores,
             AgentEvent::CommandProposed {
                 proposal_id: crate::agent::next_proposal_id(),
                 command: display.clone(),
@@ -1423,5 +1430,43 @@ mod tests {
             matches!(events.last(), Some(AgentEvent::Cancelled)),
             "a cancelled turn never ends as Finished: {result:?}: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_turn_takes_its_ratings_with_it() {
+        // An embedder drops the `run` future without a cancel; the rating is
+        // released right after — it must not reach the abandoned turn's
+        // sink (#644).
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let scorer = Arc::new(FakeScorer {
+            rating: Rating::Pct(90),
+            gate: Some(gate.clone()),
+            inputs: Mutex::new(Vec::new()),
+        });
+        let agent = KubeAgent::new(
+            ScriptedLlm::new(vec![get_pods(), ChatResponse::text("Done.")]),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::new(ReleasingConfirmer(None)) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Never,
+            Vec::new(),
+        )
+        .event_sink(sink_into(&events))
+        .risk_scorer(Some(scorer.clone() as Arc<dyn RiskScorer>));
+        tokio::select! {
+            _ = agent.run("show pods", &[]) => panic!("the turn waits for its rating"),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        assert_eq!(
+            scorer.inputs.lock().unwrap().len(),
+            1,
+            "the rating was in flight"
+        );
+        gate.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let events = events.lock().unwrap();
+        assert!(scored(&events).is_empty(), "{events:?}");
     }
 }
