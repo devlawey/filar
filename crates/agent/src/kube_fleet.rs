@@ -622,6 +622,8 @@ pub(crate) mod tests {
         pod_lists: AtomicUsize,
         /// `top_pods` answers like a cluster without metrics-server.
         no_metrics: std::sync::atomic::AtomicBool,
+        /// `list_events` answers 404, like an API without `events` (#645).
+        no_events: std::sync::atomic::AtomicBool,
     }
 
     struct Active<'a>(&'a AtomicUsize);
@@ -689,6 +691,9 @@ pub(crate) mod tests {
         }
 
         async fn list_events(&self, _: Option<&str>, _: Option<&str>) -> Result<Vec<EventInfo>> {
+            if self.no_events.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(CoreError::NotFound("events: 404 page not found".into()));
+            }
             Ok(Vec::new())
         }
 
@@ -996,6 +1001,45 @@ pub(crate) mod tests {
         assert!(!text.contains("digest"), "no digests for a pod describe: {text}");
         assert!(text.contains("example/web:1") && text.contains("128Mi") && text.contains("100m"), "{text}");
         assert!(text.contains("example/web:2") || text.contains("256Mi"), "the odd pod shows its values: {text}");
+        assert_eq!(report.folded().baseline().map(|group| group.len()), Some(2));
+    }
+
+    #[tokio::test]
+    async fn pod_describe_without_events_compares_rows_not_pod_disappeared() {
+        let (cluster, mock) = cluster(
+            "prod-eu",
+            vec![
+                sized_pod("a", "example/web:1", "128Mi"),
+                sized_pod("b", "example/web:1", "128Mi"),
+                sized_pod("c", "example/web:2", "256Mi"),
+                sized_pod("gone", "example/web:1", "128Mi"),
+            ],
+        );
+        mock.no_events
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        mock.behaviour
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert("gone".into(), Behaviour::Gone);
+        let fleet = KubeFleet::open(&group(&["prod-eu"], Some("app=web")), vec![cluster])
+            .await
+            .expect("fleet opens");
+        let report = run_approved(&fleet, &describe_pod()).await;
+        let summary = report.result().summary();
+        assert_eq!(
+            summary.count(HostState::PodDisappeared),
+            1,
+            "only the pod that is really gone"
+        );
+        let text = report.render();
+        assert!(
+            text.contains("compared on: CONTAINER, IMAGE, CPU REQUEST"),
+            "{text}"
+        );
+        assert!(
+            text.contains("example/web:2") || text.contains("256Mi"),
+            "{text}"
+        );
         assert_eq!(report.folded().baseline().map(|group| group.len()), Some(2));
     }
 
