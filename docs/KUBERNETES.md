@@ -28,7 +28,13 @@ namespace. Поды эфемерны: их выбирают уже внутри 
 модели нет шелла и нет `kubectl`. Читает она инструментами `k8s_get`,
 `k8s_describe`, `k8s_logs`, `k8s_events`, `k8s_top`, `k8s_rollout_history`,
 `pod_http_get`, а при настроенных источниках логов — ещё `query_logs` и
-`pod_logs_history`. Значения объектов `Secret` агенту недоступны.
+`pod_logs_history`. Объекты `Secret` агент видит только как метаданные:
+тип, имена ключей с размером значения, владельца (например cert-manager
+`Certificate`), время создания и последнего изменения, метки и аннотации, а у
+TLS-секрета — субъект, SAN, издателя и сроки сертификата с пометкой «истёк /
+истекает в течение 30 дней». Значения отрезаются ещё в транспорте и не
+попадают ни в модель, ни в историю, ни в экспорт, ни в логи; `tls.key` не
+разбирается вовсе.
 
 **Запись в кластер** (3.0.5) идёт только через отдельные инструменты записи —
 `k8s_apply`, `k8s_scale`, `k8s_rollout`, `k8s_delete` (гейт — #639, инструменты
@@ -254,8 +260,8 @@ context or its credentials`. Проверьте плагин в том же те
 
 | Инструмент | Что делает | Ограничения |
 |---|---|---|
-| `k8s_get` | Список объектов: Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob, Node, Service, Endpoints, Ingress, ConfigMap, Namespace | селекторы меток и полей, до 100 строк; `Secret` нет |
-| `k8s_describe` | Один объект с событиями: причины завершения, requests и limits контейнеров | те же виды объектов |
+| `k8s_get` | Список объектов: Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob, Node, Service, Endpoints, Ingress, ConfigMap, Namespace, Secret | селекторы меток и полей, до 100 строк; `Secret` — только метаданные: тип, ключи с размером, последнее изменение, срок TLS |
+| `k8s_describe` | Один объект с событиями: причины завершения, requests и limits контейнеров; у пода — какие секреты он берёт (env, envFrom, тома, `imagePullSecrets`) и есть ли они и их ключи | те же виды объектов; у `Secret` — метаданные и сертификат, без значений |
 | `k8s_logs` | Хвост лога контейнера, текущего или предыдущего запуска (`--previous`) | до 500 строк и 1 МиБ, после редакции |
 | `k8s_events` | События namespace или объекта | лимит строк |
 | `k8s_top` | Потребление CPU и памяти подов или нод | нужен metrics-server |
@@ -884,3 +890,5 @@ prod-eu не настроен источник логов» с подсказк�
 | В под не войти: в образе нет шелла | distroless / `FROM scratch` | `Ctrl+B` ([5.2](#52-debug-контейнер-ctrlb)); логи, describe и события читаются и без шелла |
 | Флот подов пуст: `[fleet: web-prod (0)]` | селектор не нашёл готовых подов | проверить **Selector**, метки и готовность: `kubectl get pods -l app=web -n shop`. Пустой Selector не ищет поды — членами становятся пары кластер/namespace |
 | Запрос ушёл «не туда» после `kubectl config use-context` | так не бывает: filar не читает `current-context` | — |
+| Под в `CreateContainerConfigError`: `couldn't find key … in Secret` | ссылка на несуществующий секрет или ключ (часто регистр: `password` против `PASSWORD`) | `k8s_describe` пода показывает в `secretRefs` статус `key not found (keys: …)` или `secret not found`; поправить ссылку или ключ (`k8s_apply`) |
+| `нет права list на secrets в namespace shop` | RBAC не даёт читать секреты | остальные инструменты работают; для метаданных секретов нужно право `list`/`get` на `secrets` |

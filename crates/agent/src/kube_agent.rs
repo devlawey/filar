@@ -2227,7 +2227,7 @@ mod tests {
         assert!(!prompt.contains("cannot change"));
         assert!(prompt.contains("only through the write tools (k8s_apply)"));
         assert!(prompt.contains("dry run"));
-        assert!(prompt.contains("Secrets are never shown to you"));
+        assert!(prompt.contains("their values are never shown to you"));
         let read_only = build_kube_system_prompt(&target(), Some("shop"));
         assert!(read_only.contains("You cannot change"), "a tab without writes stays read-only");
     }

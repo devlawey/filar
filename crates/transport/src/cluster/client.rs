@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use filar_core::{CoreError, KubeCluster, Result};
 use k8s_openapi::api::apps::v1::{Deployment, ReplicaSet};
-use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::NamespaceResourceScope;
 use kube::api::{ApiResource, DynamicObject, GroupVersionKind, ListParams, LogParams};
@@ -16,7 +16,8 @@ use super::convert;
 use super::{
     ClusterApi, ConfigMapInfo, ContainerMetrics, EndpointInfo, EventInfo, IngressInfo,
     NamespaceInfo, NodeInfo, PodHttpRequest, PodHttpResponse, PodInfo, PodLogs, ResourceMetrics,
-    RolloutRevision, ServiceInfo, WorkloadInfo, WorkloadKind, DEFAULT_CLUSTER_LIST_LIMIT,
+    RolloutRevision, SecretInfo, SecretRef, ServiceInfo, WorkloadInfo, WorkloadKind,
+    DEFAULT_CLUSTER_LIST_LIMIT,
 };
 
 /// [`ClusterApi`] implementation backed by a kubeconfig-selected API server.
@@ -494,6 +495,28 @@ impl ClusterApi for KubeClusterApi {
     async fn list_configmaps(&self, namespace: Option<&str>) -> Result<Vec<ConfigMapInfo>> {
         self.list_namespaced(namespace, "configmaps", None, None, convert::configmap_info)
             .await
+    }
+
+    async fn list_secrets(&self, namespace: Option<&str>) -> Result<Vec<SecretInfo>> {
+        // Values are dropped in `secret_info`, page by page.
+        self.list_namespaced(namespace, "secrets", None, None, super::secret::secret_info)
+            .await
+    }
+
+    async fn get_secret(&self, namespace: &str, name: &str) -> Result<SecretInfo> {
+        Api::<Secret>::namespaced(self.client.clone(), namespace)
+            .get(name)
+            .await
+            .map(super::secret::secret_info)
+            .map_err(|error| self.api_error(error, "get", "secrets", Some(namespace)))
+    }
+
+    async fn pod_secret_refs(&self, namespace: &str, pod: &str) -> Result<Vec<SecretRef>> {
+        Api::<Pod>::namespaced(self.client.clone(), namespace)
+            .get(pod)
+            .await
+            .map(|pod| super::secret::pod_secret_refs(&pod))
+            .map_err(|error| self.api_error(error, "get", "pods", Some(namespace)))
     }
 
     async fn namespaces(&self) -> Result<Vec<NamespaceInfo>> {
