@@ -12257,6 +12257,13 @@ change its state.`
   `/actuator/env` спрашиваются. У pprof query разрешён — его уже ограничивает
   `validate_path` (индекс и `?debug=1`, `seconds ≤ 30`); маршрут — ровно
   `/debug/pprof` или под `/debug/pprof/` (`/debug/pprofx` не диагностический).
+- По ревью CodeRabbit (#649): сегменты `.`/`..` и `\` в маршруте делают путь
+  не диагностическим (`/debug/pprof/../../reset` сервер нормализует в
+  `/reset`); пустой `?` — уже query; `validate_path` отклоняет повторные
+  `debug` и `seconds` (какое значение победит, решает сервер).
+  `kube_confirmation_decision` не видит вызова — в doc-комментарии и
+  `docs/ENGINE_API.md` встраивающим указано переходить на
+  `kube_call_confirmation_decision`.
 - Флага `destructive` нет: окно обычное, предупреждение — строкой. Арбитр и
   оценщик — как раньше.
 - Флот `pod_http_get` не получает (#578), гейт флота не менялся.

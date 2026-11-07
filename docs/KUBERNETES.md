@@ -318,10 +318,13 @@ context or its credentials`. Проверьте плагин в том же те
 - `/metrics`;
 - `/healthz`, `/livez`, `/readyz`, `/health`, `/ready`;
 - `/actuator/health`, `/actuator/info`, `/actuator/prometheus`;
-- pprof: индекс `/debug/pprof/` и текстовые профили в границах выше.
+- pprof: индекс `/debug/pprof` и `/debug/pprof/` и текстовые профили в
+  границах выше; `debug` и `seconds` — не больше одного раза.
 
-Путь сравнивается целиком и без query (`/metrics?x=1` и `/healthz/` уже не
-диагностические); у pprof query разрешён. В `allowlist` и `never` такие
+Путь сравнивается целиком и без query, даже пустого (`/metrics?`,
+`/metrics?x=1` и `/healthz/` уже не диагностические); у pprof query разрешён.
+Путь с сегментом `.` или `..` или с обратной косой чертой не диагностический
+никогда: сервер превратит `/debug/pprof/../../reset` в `/reset`. В `allowlist` и `never` такие
 запросы уходят без вопроса. Любой другой путь подтверждается **в любом
 режиме**, и окно подтверждения добавляет строку `Path is not on the diagnostic
 list: the application may change its state.` Политики тегов по-прежнему только

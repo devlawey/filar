@@ -13,7 +13,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Changed
 
-- `pod_http_get` outside the diagnostic paths (`/metrics`, `/healthz`, `/livez`, `/readyz`, `/health`, `/ready`, `/actuator/health`, `/actuator/info`, `/actuator/prometheus`, pprof under `/debug/pprof/`; exact path, no query except pprof) is now confirmed in every mode, `allowlist` and `never` included, and its confirmation window says the application may change its state; tag policies still only tighten ([#643](https://github.com/devlawey/filar/issues/643)).
+- `pod_http_get` outside the diagnostic paths (`/metrics`, `/healthz`, `/livez`, `/readyz`, `/health`, `/ready`, `/actuator/health`, `/actuator/info`, `/actuator/prometheus`, pprof at `/debug/pprof` and under `/debug/pprof/`; exact path, no query — not even an empty one — except pprof, never a `.`/`..` segment; pprof `debug` and `seconds` at most once) is now confirmed in every mode, `allowlist` and `never` included, and its confirmation window says the application may change its state; tag policies still only tighten ([#643](https://github.com/devlawey/filar/issues/643)).
 
 ### Fixed
 

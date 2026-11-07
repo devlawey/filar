@@ -156,9 +156,15 @@ objects or logs directly.
 `k8s_get`, `k8s_describe`, `k8s_logs`, `k8s_events`, `k8s_top` and
 `k8s_rollout_history`. They accept only the fixed resource list exposed by
 `KubeResourceKind`; there is no Secret kind and no mutation tool. Parse a model
-call with `parse_kube_tool_call`, apply `kube_confirmation_decision` and show
+call with `parse_kube_tool_call`, apply `kube_call_confirmation_decision`
+(call, mode, cluster, tag policies) and show
 `KubeToolCall::confirmation_context` when approval is required, then pass the
-validated call to `KubeToolExecutor::execute`.
+validated call to `KubeToolExecutor::execute`. `kube_call_confirmation_decision`
+asks for `pod_http_get` outside the diagnostic paths
+(`pod_http::is_diagnostic_path`) in every mode (#643); the older
+`kube_confirmation_decision(mode, cluster, policies)` does not see the call and
+would let such a request through in `allowlist`/`never` — an embedder that
+offers `pod_http_get` migrates to the new function.
 
 The executor is a separate engine boundary from the SSH `Agent` and does not
 change `CommandExecutor` or `LlmClient`. It renders list-like results through
@@ -819,6 +825,7 @@ let _agent = builder.log_sources(sources);
 | `filar_core::KubePodSnapshot`, new field `KubeSessionSnapshot::pod` (#565) | Struct literals of `KubeSessionSnapshot` need `pod` (`None` for a cluster tab); saved sessions without it deserialize as cluster tabs | Add `pod: None`, or `Some(KubePodSnapshot { pod, container })` for a pod tab |
 | `KubeInteractive`, `KubeExecutor::open_terminal` under the `kube` feature (#577) | Nothing — additive; `InteractiveTerminal` is unchanged | Use `open_terminal(cols, rows)` for an interactive TTY shell in the executor's pod |
 | `ClusterApi::pod_http_get`, `PodHttpRequest`/`PodHttpResponse`, `ContainerPortInfo`, new fields `ContainerInfo::ports` and `KubeCluster::diagnostic_ports`, tool `pod_http_get` (#578) | Struct literals of `ContainerInfo` need `ports`; `KubeCluster` literals without `..Default::default()` need `diagnostic_ports`; other `ClusterApi` implementations get a default `Unavailable` | Add `ports: Vec::new()` / `diagnostic_ports: Vec::new()`; implement `pod_http_get` only if your API can port-forward |
+| `kube_call_confirmation_decision`, `KubeToolCall::may_change_application_state`, `pod_http::is_diagnostic_path` (#643) | Nothing — additive; `kube_confirmation_decision` is unchanged but does not see the call | If you offer `pod_http_get`, use `kube_call_confirmation_decision`: it asks for any path outside the diagnostic list in every mode |
 | `filar_core::LogSourceConfig`/`LogSourceKind`/`LogAuth`, new field `Config::log_sources`; `filar_agent::logs` (`LogSource`, `LogSources`, `build_log_sources`, tool `query_logs`), `AgentBuilder::log_sources`, `KubeAgent::log_sources` (#579) | `Config` literals without `..Default::default()` need `log_sources` | Add `log_sources: Vec::new()`; opt in with `build_log_sources` |
 | New `LogSourceConfig` fields `time_field`, `fields`, `ca_file`, `k8s_fields`; `K8sFieldPreset`/`K8sFields` and the OpenSearch/Elasticsearch adapter (#581) | `LogSourceConfig` literals without `..Default::default()` need the new fields | Use `..Default::default()` or populate the fields; private CAs are added to verification, never used to disable it |
 | `LogResult::series` and `LogSeries` for Loki metric queries (#582) | `LogResult` literals need `series`; `LogResult` no longer implements `Eq` because series contain `f64` | Add `series: Vec::new()` or `..Default::default()`; use approximate comparison for metric values |

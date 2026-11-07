@@ -91,6 +91,14 @@ pub fn validate_path(path: &str) -> Result<String> {
             .filter(|p| !p.is_empty())
             .map(|p| p.split_once('=').unwrap_or((p, "")))
             .collect();
+        // One value per parameter: servers disagree on which of repeated
+        // values wins, so `?debug=1&debug=0` or `seconds=1&seconds=600`
+        // would not mean what was checked.
+        for key in ["debug", "seconds"] {
+            if params.iter().filter(|(k, _)| *k == key).count() > 1 {
+                return refuse("pprof `debug` and `seconds` may be given once");
+            }
+        }
         let debug_text = params.iter().any(|(k, v)| *k == "debug" && *v == "1");
         if !index && !debug_text {
             return refuse("pprof profiles are fetched only as text (`?debug=1`); binary profiles are not requested");
@@ -122,19 +130,28 @@ const DIAGNOSTIC_PATHS: [&str; 9] = [
 
 /// Whether `path` is a diagnostic endpoint that may go without a question in
 /// `allowlist` and `never` (#643): one of [`DIAGNOSTIC_PATHS`] without a
-/// query, or pprof under `/debug/pprof/` — its index and text profiles, as
-/// [`validate_path`] bounds them. Any other path is the application's own
-/// business and may change its state, so it is always confirmed.
+/// query (not even an empty `?`), or pprof — `/debug/pprof`, or under
+/// `/debug/pprof/` — its index and text profiles, as [`validate_path`]
+/// bounds them. A route with a `.` or `..` segment or a backslash is never
+/// diagnostic: a server normalises `/debug/pprof/../../reset` to `/reset`.
+/// Any other path is the application's own business and may change its
+/// state, so it is always confirmed.
 pub fn is_diagnostic_path(path: &str) -> bool {
     // Judge the path exactly as it would be sent: the validated form.
     let Ok(path) = validate_path(path) else {
         return false;
     };
-    let (route, query) = path.split_once('?').unwrap_or((&path, ""));
+    let (route, query) = match path.split_once('?') {
+        Some((route, query)) => (route, Some(query)),
+        None => (path.as_str(), None),
+    };
+    if route.contains('\\') || route.split('/').any(|s| s == "." || s == "..") {
+        return false;
+    }
     if route == "/debug/pprof" || route.starts_with("/debug/pprof/") {
         return true;
     }
-    query.is_empty() && DIAGNOSTIC_PATHS.contains(&route)
+    query.is_none() && DIAGNOSTIC_PATHS.contains(&route)
 }
 
 /// The port number for `port` in `pod`: declared by a container (by number
@@ -362,6 +379,12 @@ mod tests {
             "/healthz/",
             "/health?full=true",
             "/debug/pprofx?debug=1",
+            "/metrics?",
+            "/debug/pprof/../../reset?debug=1",
+            "/debug/pprof/./goroutine?debug=1",
+            "/debug/pprof/..",
+            "/debug/pprof/goroutine?debug=1&debug=0",
+            "/debug/pprof/profile?debug=1&seconds=1&seconds=600",
             // A binary profile: `validate_path` refuses it, so it is
             // never diagnostic.
             "/debug/pprof/heap",
@@ -380,6 +403,9 @@ mod tests {
         assert!(validate_path("/debug/pprof/heap").is_err(), "binary profile");
         assert!(validate_path("/debug/pprof/profile?debug=1&seconds=60").is_err());
         assert!(validate_path("/debug/pprof/profile?seconds=10").is_err());
+        // Repeated parameters: which value wins is up to the server.
+        assert!(validate_path("/debug/pprof/goroutine?debug=1&debug=0").is_err());
+        assert!(validate_path("/debug/pprof/profile?debug=1&seconds=1&seconds=600").is_err());
     }
 
     #[test]

@@ -572,6 +572,10 @@ pub struct KubeToolResult {
 }
 
 /// Apply the read-only confirmation policy, including tag-based tightening.
+///
+/// It does not see the call, so it cannot tell a `pod_http_get` to a path
+/// that may change the application (#643); a caller that offers that tool
+/// uses [`kube_call_confirmation_decision`].
 pub fn kube_confirmation_decision(
     mode: CommandConfirmMode,
     target: &KubeCluster,
