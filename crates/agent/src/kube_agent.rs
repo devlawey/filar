@@ -503,6 +503,9 @@ impl KubeAgent {
         )))
     }
 
+    /// One model tool call: parse it, put it through the confirmation gate
+    /// (with the application-state warning for `pod_http_get` outside the
+    /// diagnostic paths, #643), run it and answer the model.
     async fn process_tool_call(
         &self,
         call: &ToolCall,
