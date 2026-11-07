@@ -23,7 +23,7 @@ use crate::{
         HISTORY_TAIL_EXCHANGES,
     },
     events::{AgentEvent, EventSink},
-    risk::{RiskInput, RiskScorer},
+    risk::{PendingScores, RiskInput, RiskScorer},
     security::{self, CommandConfirmer, ConfirmDecision},
     tools::{self},
     ChatMessage, ChatRequest, LlmClient, ToolCall,
@@ -393,9 +393,6 @@ pub struct Agent {
     fleet: bool,
     /// Optional command safety scorer (#549). Advisory only.
     risk_scorer: Option<Arc<dyn RiskScorer>>,
-    /// Ratings still in flight; awaited before `Finished`/`Error`, aborted
-    /// on cancellation, so no event follows the terminal one.
-    pending_scores: crate::risk::PendingScores,
     /// Log sources for `query_logs` (#579); `None` = the tool is not offered.
     log_sources: Option<Arc<crate::logs::LogSources>>,
     /// The pod of a pod tab (#564): `pod_logs_history` defaults to it (#583).
@@ -763,7 +760,6 @@ impl AgentBuilder {
             is_local: self.is_local,
             fleet: self.fleet,
             risk_scorer: self.risk_scorer,
-            pending_scores: crate::risk::PendingScores::default(),
             log_sources,
             kube_pod: self.kube_pod,
         })
@@ -880,7 +876,13 @@ impl Agent {
     /// Runs in a separate task: neither confirmation nor execution waits for
     /// it. The result is emitted as [`AgentEvent::CommandScored`]; any error
     /// becomes `unavailable: true`. Never called for fleet runs.
-    fn spawn_risk_score(&self, proposal_id: u64, command: &str, explanation: &str) {
+    fn spawn_risk_score(
+        &self,
+        scores: &PendingScores,
+        proposal_id: u64,
+        command: &str,
+        explanation: &str,
+    ) {
         let Some(scorer) = self.risk_scorer.clone() else {
             return;
         };
@@ -889,8 +891,7 @@ impl Agent {
             explanation: explanation.to_string(),
             target: arbiter::target_description(&self.arbiter_context),
         };
-        self.pending_scores
-            .spawn(scorer, input, proposal_id, self.event_sink.clone());
+        scores.spawn(scorer, input, proposal_id, self.event_sink.clone());
     }
 
     /// Check whether the cancellation token has been triggered.
@@ -912,12 +913,16 @@ impl Agent {
     /// [`AgentEvent::Finished`] (success) or [`AgentEvent::Error`] (failure).
     pub async fn run(&self, user_prompt: &str, history: &[ChatMessage]) -> Result<String> {
         self.emit(AgentEvent::Started);
-        let result = self.run_loop(user_prompt, history).await;
+        // The ratings belong to this turn (#644): a dropped `run` future
+        // aborts them with it, and another turn of the same agent never
+        // touches them.
+        let scores = PendingScores::default();
+        let result = self.run_loop(user_prompt, history, &scores).await;
         // Ratings still in flight land before the terminal event; each is
         // bounded by the scorer's own timeout. Waiting watches the
         // cancellation token, so a cancel before or during the wait aborts
         // them instead — `Cancelled` is terminal, no rating may follow it.
-        self.pending_scores.settle(self.cancellation.as_ref()).await;
+        scores.settle(self.cancellation.as_ref()).await;
         match result {
             Ok(text) => {
                 self.emit(AgentEvent::Finished(text.clone()));
@@ -936,7 +941,12 @@ impl Agent {
 
     /// Inner agent loop — does NOT emit `Started`/`Finished`/`Error` events.
     /// The caller ([`run`](Self::run)) wraps this to emit those events.
-    async fn run_loop(&self, user_prompt: &str, history: &[ChatMessage]) -> Result<String> {
+    async fn run_loop(
+        &self,
+        user_prompt: &str,
+        history: &[ChatMessage],
+        scores: &PendingScores,
+    ) -> Result<String> {
         // Build initial message history: system prompt + prior context + new user message.
         let mut messages: Vec<ChatMessage> = vec![ChatMessage::system(&self.system_prompt)];
         messages.extend_from_slice(history);
@@ -1052,7 +1062,7 @@ impl Agent {
 
                 // Process each tool call.
                 for tc in &tool_calls {
-                    let result = self.process_tool_call(tc, &messages).await?;
+                    let result = self.process_tool_call(tc, &messages, scores).await?;
                     messages.push(result);
                 }
                 // The frontend starts a new answer block after a command.
@@ -1109,6 +1119,7 @@ impl Agent {
         &self,
         tc: &ToolCall,
         conversation: &[ChatMessage],
+        scores: &PendingScores,
     ) -> Result<ChatMessage> {
         // `pod_logs_history` (#583) in a pod tab: the same frame and gate as
         // `query_logs`, the query written by filar for this pod.
@@ -1230,7 +1241,7 @@ impl Agent {
                 tools::ToolKind::BackgroundJobStatus | tools::ToolKind::ListBackgroundJobs
             )
         {
-            self.spawn_risk_score(proposal_id, &display_command, &parsed.explanation);
+            self.spawn_risk_score(scores, proposal_id, &display_command, &parsed.explanation);
         }
 
         if let Some(crate::fleet_gate::FleetGate::Refuse(msg)) = fleet_gate {
@@ -3627,5 +3638,111 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let events = events.lock().unwrap();
         assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandScored { .. })), "{events:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_run_takes_its_ratings_with_it() {
+        // An embedder drops the `run` future (a `select!` with a timeout)
+        // without cancelling the token: the rating in flight must not reach
+        // the sink of the abandoned turn (#644).
+        let scorer = FakeScorer::new(Ok(10), Duration::from_secs(5));
+        let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> = Arc::default();
+        let ev = events.clone();
+        let agent = Agent::builder()
+            .llm(one_command_llm("echo hi"))
+            .executor(Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) }))
+            .confirmer(Arc::new(MockConfirmer { approve: true }))
+            .confirm_mode(CommandConfirmMode::Never)
+            .event_sink(Arc::new(move |e| ev.lock().unwrap().push(e)))
+            .risk_scorer(Some(scorer.clone() as Arc<dyn crate::risk::RiskScorer>))
+            .build()
+            .unwrap();
+        tokio::select! {
+            _ = agent.run("go", &[]) => panic!("the run waits for the rating"),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        assert_eq!(scorer.calls.load(std::sync::atomic::Ordering::SeqCst), 1, "the rating was in flight");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let events = events.lock().unwrap();
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandScored { .. })), "{events:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn turns_of_one_agent_keep_their_own_ratings() {
+        // Two turns of the same agent with ratings in flight at once: the
+        // first is held in its confirmation, the second settles. The
+        // second's settle must not land the first's rating, and dropping the
+        // first must not take the second's (#644). With one agent-wide set
+        // the second turn would wait out and emit both.
+        struct HoldFirst;
+        #[async_trait::async_trait]
+        impl CommandConfirmer for HoldFirst {
+            async fn confirm(&self, command: &str, _: &str, _: bool) -> Result<bool> {
+                if command.contains("first") {
+                    std::future::pending::<()>().await;
+                }
+                Ok(true)
+            }
+        }
+        let scorer = FakeScorer::new(Ok(70), Duration::from_millis(300));
+        let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> = Arc::default();
+        let ev = events.clone();
+        let call = |command: &str| ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({ "command": command, "explanation": "why" }),
+        }]);
+        let agent = Agent::builder()
+            // The first turn stops at its confirmation; the second runs
+            // through: tool call, answer.
+            .llm(Arc::new(MockLlm::new(vec![
+                call("echo first"),
+                call("echo second"),
+                ChatResponse::text("Done!"),
+            ])))
+            .executor(Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) }))
+            .confirmer(Arc::new(HoldFirst))
+            .confirm_mode(CommandConfirmMode::Always)
+            .event_sink(Arc::new(move |e| ev.lock().unwrap().push(e)))
+            .risk_scorer(Some(scorer.clone() as Arc<dyn crate::risk::RiskScorer>))
+            .build()
+            .unwrap();
+        let first = async {
+            tokio::select! {
+                _ = agent.run("one", &[]) => panic!("the first turn is held in its confirmation"),
+                // Dropped while both ratings (300 ms) are still in flight and
+                // the second turn is already waiting for its own.
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        };
+        let (_, second) = tokio::join!(first, agent.run("two", &[]));
+        assert!(second.is_ok(), "{second:?}");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(scorer.calls.load(std::sync::atomic::Ordering::SeqCst), 2, "both were rated at once");
+        let events = events.lock().unwrap();
+        let id_of = |command: &str| {
+            events
+                .iter()
+                .find_map(|e| match e {
+                    AgentEvent::CommandProposed { proposal_id, command: c, .. } if c == command => {
+                        Some(*proposal_id)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no proposal of {command}: {events:?}"))
+        };
+        let scored = |id: u64| {
+            events.iter().position(
+                |e| matches!(e, AgentEvent::CommandScored { proposal_id, .. } if *proposal_id == id),
+            )
+        };
+        let (first_id, second_id) = (id_of("echo first"), id_of("echo second"));
+        let finished = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Finished(_)))
+            .expect("the second turn finished");
+        assert!(scored(first_id).is_none(), "the first turn's rating landed: {events:?}");
+        let second_scored = scored(second_id).expect("the second turn keeps its rating");
+        assert!(second_scored < finished, "{events:?}");
     }
 }

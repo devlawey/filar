@@ -527,13 +527,50 @@ pub fn build_risk_scorer(
 pub(crate) const RISK_SCORE_MAX_WAIT: Duration =
     Duration::from_secs(filar_core::MAX_RISK_SCORER_TIMEOUT_SECS + 2);
 
-/// The safety ratings an agent turn started and has not seen finish (#549,
+/// The safety ratings one agent turn started and has not seen finish (#549,
 /// #631). Shared by [`crate::Agent`] and [`crate::KubeAgent`]: each rating
 /// runs in its own task and ends as one `CommandScored` event; the turn waits
 /// for them before its terminal event and drops them on cancellation, so no
 /// rating follows `Finished`, `Error` or `Cancelled`.
+///
+/// A set belongs to one turn, not to the agent (#644): `run` creates it, so
+/// turns of the same agent never settle or abort each other's ratings. When
+/// the `run` future is dropped without a cancel (an embedder's `select!`
+/// with a timeout), dropping the set closes its sink gate and aborts its
+/// tasks: after the drop returns no rating of the turn reaches the sink,
+/// except one already entering it.
 #[derive(Default)]
-pub(crate) struct PendingScores(std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>);
+pub(crate) struct PendingScores {
+    ratings: std::sync::Mutex<Vec<Rating>>,
+    /// Set when the set is dropped; a rating task checks it right before
+    /// the sink. `abort` alone cannot stop a task already running past its
+    /// last `await` on another worker thread. A flag, not a lock held over
+    /// the sink: `Drop` must not wait for a caller's sink, which may itself
+    /// wait for a lock held by whoever drops the turn.
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for PendingScores {
+    fn drop(&mut self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // The ratings are aborted as they drop with the list.
+    }
+}
+
+/// One rating task, aborted when dropped (#644). A plain `JoinHandle`
+/// detaches its task on drop, and the handles do not only live in the list:
+/// `settle` takes them out to wait, so a `run` future dropped mid-wait must
+/// abort them from there too. Aborting a finished task does nothing; a task
+/// already past its last `await` is held back by the sink gate of
+/// [`PendingScores`].
+struct Rating(tokio::task::JoinHandle<()>);
+
+impl Drop for Rating {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 impl PendingScores {
     /// Rate `input` with `scorer` in a separate task, without waiting:
@@ -547,6 +584,7 @@ impl PendingScores {
         proposal_id: u64,
         sink: Option<crate::EventSink>,
     ) {
+        let closed = std::sync::Arc::clone(&self.closed);
         let handle = tokio::spawn(async move {
             let model = scorer.model_name().to_string();
             let result = match tokio::time::timeout(RISK_SCORE_MAX_WAIT, scorer.score(&input)).await
@@ -576,18 +614,20 @@ impl PendingScores {
                 }
             };
             if let Some(sink) = sink {
-                sink(event);
+                if !closed.load(std::sync::atomic::Ordering::SeqCst) {
+                    sink(event);
+                }
             }
         });
         let mut pending = self.lock();
-        pending.retain(|h| !h.is_finished());
-        pending.push(handle);
+        pending.retain(|h| !h.0.is_finished());
+        pending.push(Rating(handle));
     }
 
     /// Lock the list. A poisoned lock is taken over rather than skipped:
     /// waiting for or aborting the ratings must never be lost.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<tokio::task::JoinHandle<()>>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Rating>> {
+        self.ratings.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Settle the ratings at the end of a turn: wait for them (each is
@@ -613,17 +653,17 @@ impl PendingScores {
         while let Some(mut h) = handles.next() {
             let cancelled = match cancellation {
                 Some(token) => tokio::select! {
-                    _ = &mut h => false,
+                    _ = &mut h.0 => false,
                     _ = token.cancelled() => true,
                 },
                 None => {
-                    let _ = (&mut h).await;
+                    let _ = (&mut h.0).await;
                     false
                 }
             };
             if cancelled {
-                h.abort();
-                let _ = h.await;
+                h.0.abort();
+                let _ = (&mut h.0).await;
                 abort_and_join(handles.by_ref().collect()).await;
                 return;
             }
@@ -640,12 +680,12 @@ impl PendingScores {
 }
 
 /// Abort `handles` and wait until each task has actually stopped.
-async fn abort_and_join(handles: Vec<tokio::task::JoinHandle<()>>) {
+async fn abort_and_join(handles: Vec<Rating>) {
     for h in &handles {
-        h.abort();
+        h.0.abort();
     }
-    for h in handles {
-        let _ = h.await;
+    for mut h in handles {
+        let _ = (&mut h.0).await;
     }
 }
 
@@ -968,5 +1008,67 @@ mod tests {
         };
         let s = build_risk_scorer(&cfg, &filar_core::secrets::StaticSecretProvider::new()).unwrap();
         assert_eq!(s.model_name(), "qwen");
+    }
+
+    /// Answers at once with a fixed rating.
+    struct InstantScorer;
+
+    #[async_trait::async_trait]
+    impl RiskScorer for InstantScorer {
+        async fn score(&self, _: &RiskInput) -> Result<RiskScore> {
+            Ok(RiskScore {
+                safety_pct: 90,
+                confidence: None,
+                probabilities: Default::default(),
+                cost_usd: None,
+                model: "instant".into(),
+            })
+        }
+
+        fn model_name(&self) -> &str {
+            "instant"
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_turn_never_waits_for_a_sink_in_progress() {
+        // The embedder's sink waits for a lock that the thread dropping the
+        // turn holds. The drop must not wait for the sink (#644, review of
+        // #648): with a lock held over the sink this would deadlock.
+        let lock = Arc::new(Mutex::new(()));
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink: crate::EventSink = {
+            let (lock, entered) = (Arc::clone(&lock), Arc::clone(&entered));
+            Arc::new(move |_| {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+            })
+        };
+        let held = lock.lock().unwrap();
+        let scores = PendingScores::default();
+        scores.spawn(Arc::new(InstantScorer), input(), 1, Some(sink));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "the rating never reached the sink");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let dropped = std::time::Instant::now();
+        drop(scores);
+        assert!(dropped.elapsed() < Duration::from_secs(1), "the drop waited for the sink");
+        drop(held);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_set_emits_nothing_more() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink: crate::EventSink = {
+            let events = Arc::clone(&events);
+            Arc::new(move |e| events.lock().unwrap().push(e))
+        };
+        let scores = PendingScores::default();
+        scores.spawn(Arc::new(InstantScorer), input(), 1, Some(sink));
+        drop(scores);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(events.lock().unwrap().is_empty());
     }
 }
