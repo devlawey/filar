@@ -12238,3 +12238,32 @@ successfully`. Причина — фиксированный текст filar п
 **Контракты.** Публичных изменений нет; `CommandExecutor`, `LlmClient` не менялись.
 
 **Next.** #643.
+
+## Issue #643: pod_http_get вне диагностических путей всегда подтверждается (веха 3.0.5)
+
+**Сделано.** `pod_http::is_diagnostic_path` — список путей без побочных
+эффектов по соглашению (`/metrics`, health-пробы, `/actuator/health|info|prometheus`,
+pprof под `/debug/pprof/`). `KubeToolCall::may_change_application_state` —
+`pod_http_get` к пути вне списка. Новая публичная
+`kube_call_confirmation_decision(call, mode, target, policies)`: для такого
+вызова — `NeedsConfirmation` в любом режиме, иначе прежняя
+`kube_confirmation_decision` (она не менялась, чтобы не ломать встраивающих).
+`KubeAgent` во вкладке кластера берёт решение из новой функции; в окне
+подтверждения — строка `Path is not on the diagnostic list: the application may
+change its state.`
+
+**Решения.**
+- Путь сравнивается точно и без query: `/metrics?x=1`, `/healthz/`,
+  `/actuator/env` спрашиваются. У pprof query разрешён — его уже ограничивает
+  `validate_path` (индекс и `?debug=1`, `seconds ≤ 30`); маршрут — ровно
+  `/debug/pprof` или под `/debug/pprof/` (`/debug/pprofx` не диагностический).
+- Флага `destructive` нет: окно обычное, предупреждение — строкой. Арбитр и
+  оценщик — как раньше.
+- Флот `pod_http_get` не получает (#578), гейт флота не менялся.
+- `docs/KUBERNETES.md` разделы 1, 4.2 и 4.5: оговорка заменена описанием гейта.
+
+**Контракты.** Добавлены `kube_call_confirmation_decision`,
+`KubeToolCall::may_change_application_state`, `pod_http::is_diagnostic_path`.
+`CommandExecutor`, `LlmClient` не менялись.
+
+**Next.** #637.

@@ -14,7 +14,7 @@ use crate::fleet_gate::{ApprovalScope, FleetGate};
 use crate::fleet_view::{FleetStatus, FleetView};
 use crate::risk::{PendingScores, RiskInput, RiskScorer};
 use crate::{
-    build_kube_system_prompt, kube_confirmation_decision, kube_tool_definitions,
+    build_kube_system_prompt, kube_call_confirmation_decision, kube_tool_definitions,
     kube_tools::build_kube_fleet_system_prompt, parse_kube_tool_call, AgentEvent, ChatMessage,
     ChatRequest, CommandConfirmer, ConfirmDecision, EventSink, KubeFleet, KubeToolExecutor,
     LlmClient, ToolCall,
@@ -22,6 +22,10 @@ use crate::{
 
 const MAX_ITERATIONS: usize = 50;
 const MAX_MISSING_EXPLANATION_RETRIES: u32 = 2;
+/// The confirmation line for a `pod_http_get` outside the diagnostic paths
+/// (#643).
+const APPLICATION_STATE_WARNING: &str =
+    "Path is not on the diagnostic list: the application may change its state.";
 
 /// The agent's confirmer with the arbiter in front of it (#620): the audit
 /// runs, its verdict is emitted, then the user is asked. Wrapping the
@@ -601,14 +605,26 @@ impl KubeAgent {
                 target, namespace, ..
             } => {
                 let target_namespace = parsed.namespace().or(namespace.as_deref());
+                // A path outside the diagnostic list is asked in every mode,
+                // and the window says why (#643).
+                let warning = if parsed.may_change_application_state() {
+                    format!("\n{APPLICATION_STATE_WARNING}")
+                } else {
+                    String::new()
+                };
                 (
                     format!(
-                        "{explanation}\n\n{}\nTarget: {} / {}",
+                        "{explanation}\n\n{}\nTarget: {} / {}{warning}",
                         parsed.confirmation_context(target),
                         target.name,
                         target_namespace.unwrap_or("all / cluster-scoped"),
                     ),
-                    kube_confirmation_decision(self.confirm_mode, target, &self.tag_policies),
+                    kube_call_confirmation_decision(
+                        &parsed,
+                        self.confirm_mode,
+                        target,
+                        &self.tag_policies,
+                    ),
                 )
             }
             KubeExecution::Fleet { fleet, .. } => {
@@ -1468,5 +1484,86 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let events = events.lock().unwrap();
         assert!(scored(&events).is_empty(), "{events:?}");
+    }
+
+    // ── pod_http_get gate (#643) ───────────────────────────────────────
+
+    /// Answers as told and records what the window showed.
+    struct AnsweringConfirmer {
+        approve: bool,
+        asked: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandConfirmer for AnsweringConfirmer {
+        async fn confirm(&self, command: &str, explanation: &str, _: bool) -> Result<bool> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((command.into(), explanation.into()));
+            Ok(self.approve)
+        }
+    }
+
+    fn http_get(path: &str) -> ChatResponse {
+        ChatResponse::tool_calls(
+            "",
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: crate::pod_http::TOOL_POD_HTTP_GET.into(),
+                arguments: serde_json::json!({
+                    "pod": "web-1", "port": 8080, "path": path, "explanation": "check the app"
+                }),
+            }],
+        )
+    }
+
+    async fn run_http_get(
+        path: &str,
+        mode: CommandConfirmMode,
+        approve: bool,
+    ) -> (Arc<AnsweringConfirmer>, Arc<MockCluster>) {
+        let cluster = Arc::new(MockCluster::default());
+        let confirmer = Arc::new(AnsweringConfirmer {
+            approve,
+            asked: Mutex::new(Vec::new()),
+        });
+        let executor = KubeToolExecutor::new(
+            cluster.clone(),
+            target(),
+            Arc::new(filar_core::StaticSecretProvider::new()),
+        );
+        KubeAgent::new(
+            ScriptedLlm::new(vec![http_get(path), ChatResponse::text("Done.")]),
+            executor,
+            target(),
+            Some("shop".into()),
+            confirmer.clone() as Arc<dyn CommandConfirmer>,
+            mode,
+            Vec::new(),
+        )
+        .run("check the app", &[])
+        .await
+        .unwrap();
+        (confirmer, cluster)
+    }
+
+    #[tokio::test]
+    async fn pod_http_get_outside_diagnostic_paths_waits_for_approval_in_never_mode() {
+        let (confirmer, cluster) = run_http_get("/reset", CommandConfirmMode::Never, false).await;
+        let asked = confirmer.asked.lock().unwrap();
+        assert_eq!(asked.len(), 1, "the request was put to the user");
+        assert!(asked[0].0.contains("GET web-1:8080/reset"), "{asked:?}");
+        assert!(asked[0].1.contains(APPLICATION_STATE_WARNING), "{asked:?}");
+        assert!(
+            cluster.http_call.lock().unwrap().is_none(),
+            "a denied request is not sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn pod_http_get_to_a_diagnostic_path_goes_without_a_question_in_never_mode() {
+        let (confirmer, _) = run_http_get("/metrics", CommandConfirmMode::Never, false).await;
+        assert!(confirmer.asked.lock().unwrap().is_empty(), "no window for /metrics");
     }
 }

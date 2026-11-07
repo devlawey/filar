@@ -11,6 +11,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Changed
+
+- `pod_http_get` outside the diagnostic paths (`/metrics`, `/healthz`, `/livez`, `/readyz`, `/health`, `/ready`, `/actuator/health`, `/actuator/info`, `/actuator/prometheus`, pprof under `/debug/pprof/`; exact path, no query except pprof) is now confirmed in every mode, `allowlist` and `never` included, and its confirmation window says the application may change its state; tag policies still only tighten ([#643](https://github.com/devlawey/filar/issues/643)).
+
 ### Fixed
 
 - `k8s_describe` no longer reports an existing object as missing when only its events request fails (404 behind a proxy or a trimmed API, RBAC, timeout): the object is returned with `events unavailable: <cause>` in place of the events, and a pod fleet compares such members by their columns instead of marking them `pod disappeared` ([#645](https://github.com/devlawey/filar/issues/645)).

@@ -105,6 +105,37 @@ pub fn validate_path(path: &str) -> Result<String> {
     Ok(path.to_string())
 }
 
+/// Paths that by convention only report and change nothing: Prometheus,
+/// health probes and Spring Actuator's read endpoints (#643). Matched
+/// exactly, without a query.
+const DIAGNOSTIC_PATHS: [&str; 9] = [
+    "/metrics",
+    "/healthz",
+    "/livez",
+    "/readyz",
+    "/health",
+    "/ready",
+    "/actuator/health",
+    "/actuator/info",
+    "/actuator/prometheus",
+];
+
+/// Whether `path` is a diagnostic endpoint that may go without a question in
+/// `allowlist` and `never` (#643): one of [`DIAGNOSTIC_PATHS`] without a
+/// query, or pprof under `/debug/pprof/` — its index and text profiles, as
+/// [`validate_path`] bounds them. Any other path is the application's own
+/// business and may change its state, so it is always confirmed.
+pub fn is_diagnostic_path(path: &str) -> bool {
+    if validate_path(path).is_err() {
+        return false;
+    }
+    let (route, query) = path.trim().split_once('?').unwrap_or((path.trim(), ""));
+    if route == "/debug/pprof" || route.starts_with("/debug/pprof/") {
+        return true;
+    }
+    query.is_empty() && DIAGNOSTIC_PATHS.contains(&route)
+}
+
 /// The port number for `port` in `pod`: declared by a container (by number
 /// or name), or listed in the cluster's `diagnostic_ports`.
 pub fn resolve_port(pod: &PodInfo, port: &PortRef, diagnostic_ports: &[u16]) -> Result<u16> {
@@ -299,6 +330,43 @@ mod tests {
     fn percent_encoding_cannot_smuggle_a_binary_profile() {
         assert!(validate_path("/%64ebug/pprof/heap").is_err());
         assert!(validate_path("/debug/pprof/heap?%64ebug=1").is_err());
+    }
+
+    #[test]
+    fn diagnostic_paths_are_exact_and_without_query() {
+        for path in [
+            "/metrics",
+            "/healthz",
+            "/livez",
+            "/readyz",
+            "/health",
+            "/ready",
+            "/actuator/health",
+            "/actuator/info",
+            "/actuator/prometheus",
+            "/debug/pprof/",
+            "/debug/pprof",
+            "/debug/pprof/goroutine?debug=1",
+            "/debug/pprof/profile?debug=1&seconds=30",
+        ] {
+            assert!(is_diagnostic_path(path), "{path}");
+        }
+        for path in [
+            "/reset",
+            "/admin/flush-cache",
+            "/actuator/shutdown",
+            "/actuator/env",
+            "/metrics/reset",
+            "/metrics?reset=1",
+            "/healthz/",
+            "/health?full=true",
+            "/debug/pprofx?debug=1",
+            "/debug/pprof/heap",
+            "/",
+            "metrics",
+        ] {
+            assert!(!is_diagnostic_path(path), "{path}");
+        }
     }
 
     #[test]

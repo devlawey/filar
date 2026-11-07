@@ -403,6 +403,13 @@ impl KubeToolCall {
         command
     }
 
+    /// Whether the call may change the state of an application: a
+    /// `pod_http_get` to a path outside the diagnostic list (#643). Every
+    /// other call only reads the Kubernetes API.
+    pub fn may_change_application_state(&self) -> bool {
+        matches!(self, Self::PodHttpGet { path, .. } if !crate::pod_http::is_diagnostic_path(path))
+    }
+
     /// Tool, normalized arguments, kubeconfig context and namespace for approval.
     pub fn confirmation_context(&self, target: &KubeCluster) -> String {
         format!(
@@ -577,6 +584,23 @@ pub fn kube_confirmation_decision(
         }
         CommandConfirmMode::Allowlist | CommandConfirmMode::Never => ConfirmDecision::AutoApproved,
     }
+}
+
+/// The confirmation policy for one call of a cluster tab (#643): as
+/// [`kube_confirmation_decision`], except that `pod_http_get` outside the
+/// diagnostic paths ([`crate::pod_http::is_diagnostic_path`]) is always put
+/// to the user, whatever the mode — what an application endpoint does is
+/// the application's business.
+pub fn kube_call_confirmation_decision(
+    call: &KubeToolCall,
+    mode: CommandConfirmMode,
+    target: &KubeCluster,
+    policies: &[TagPolicy],
+) -> ConfirmDecision {
+    if call.may_change_application_state() {
+        return ConfirmDecision::NeedsConfirmation;
+    }
+    kube_confirmation_decision(mode, target, policies)
 }
 
 /// Cluster-tab system prompt. It describes only capabilities that exist here.
