@@ -536,17 +536,32 @@ pub(crate) const RISK_SCORE_MAX_WAIT: Duration =
 /// A set belongs to one turn, not to the agent (#644): `run` creates it, so
 /// turns of the same agent never settle or abort each other's ratings. When
 /// the `run` future is dropped without a cancel (an embedder's `select!`
-/// with a timeout), dropping the set aborts its tasks: after the drop
-/// returns no rating reaches the sink, except one already inside it.
+/// with a timeout), dropping the set closes its sink gate and aborts its
+/// tasks: after the drop returns no rating of the turn reaches the sink.
 #[derive(Default)]
-pub(crate) struct PendingScores(std::sync::Mutex<Vec<Rating>>);
+pub(crate) struct PendingScores {
+    ratings: std::sync::Mutex<Vec<Rating>>,
+    /// Closed when the set is dropped. A rating task holds this lock while
+    /// it checks the flag and calls the sink, so a drop waits for a sink
+    /// call already in progress and none can start after it: `abort` alone
+    /// cannot stop a task that is already running past its last `await` on
+    /// another worker thread.
+    closed: std::sync::Arc<std::sync::Mutex<bool>>,
+}
+
+impl Drop for PendingScores {
+    fn drop(&mut self) {
+        *self.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        // The ratings are aborted as they drop with the list.
+    }
+}
 
 /// One rating task, aborted when dropped (#644). A plain `JoinHandle`
 /// detaches its task on drop, and the handles do not only live in the list:
 /// `settle` takes them out to wait, so a `run` future dropped mid-wait must
-/// abort them from there too. Synchronous by necessity — a `Drop` cannot
-/// wait — so a task already inside the sink may still finish. Aborting a
-/// finished task does nothing.
+/// abort them from there too. Aborting a finished task does nothing; a task
+/// already past its last `await` is held back by the sink gate of
+/// [`PendingScores`].
 struct Rating(tokio::task::JoinHandle<()>);
 
 impl Drop for Rating {
@@ -567,6 +582,7 @@ impl PendingScores {
         proposal_id: u64,
         sink: Option<crate::EventSink>,
     ) {
+        let closed = std::sync::Arc::clone(&self.closed);
         let handle = tokio::spawn(async move {
             let model = scorer.model_name().to_string();
             let result = match tokio::time::timeout(RISK_SCORE_MAX_WAIT, scorer.score(&input)).await
@@ -596,7 +612,10 @@ impl PendingScores {
                 }
             };
             if let Some(sink) = sink {
-                sink(event);
+                let closed = closed.lock().unwrap_or_else(|e| e.into_inner());
+                if !*closed {
+                    sink(event);
+                }
             }
         });
         let mut pending = self.lock();
@@ -607,7 +626,7 @@ impl PendingScores {
     /// Lock the list. A poisoned lock is taken over rather than skipped:
     /// waiting for or aborting the ratings must never be lost.
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Rating>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.ratings.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Settle the ratings at the end of a turn: wait for them (each is

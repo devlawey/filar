@@ -3669,9 +3669,21 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn turns_of_one_agent_keep_their_own_ratings() {
-        // Two turns of the same agent at once: dropping the first does not
-        // abort the second's rating, and the second's settle does not land
-        // the first's (#644).
+        // Two turns of the same agent with ratings in flight at once: the
+        // first is held in its confirmation, the second settles. The
+        // second's settle must not land the first's rating, and dropping the
+        // first must not take the second's (#644). With one agent-wide set
+        // the second turn would wait out and emit both.
+        struct HoldFirst;
+        #[async_trait::async_trait]
+        impl CommandConfirmer for HoldFirst {
+            async fn confirm(&self, command: &str, _: &str, _: bool) -> Result<bool> {
+                if command.contains("first") {
+                    std::future::pending::<()>().await;
+                }
+                Ok(true)
+            }
+        }
         let scorer = FakeScorer::new(Ok(70), Duration::from_millis(300));
         let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> = Arc::default();
         let ev = events.clone();
@@ -3681,31 +3693,32 @@ mod tests {
             arguments: serde_json::json!({ "command": command, "explanation": "why" }),
         }]);
         let agent = Agent::builder()
+            // The first turn stops at its confirmation; the second runs
+            // through: tool call, answer.
             .llm(Arc::new(MockLlm::new(vec![
-                // The first turn runs up to its wait for the rating before
-                // the second is polled, so the answers come in turn order.
                 call("echo first"),
-                ChatResponse::text("Done!"),
                 call("echo second"),
                 ChatResponse::text("Done!"),
             ])))
             .executor(Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) }))
-            .confirmer(Arc::new(MockConfirmer { approve: true }))
-            .confirm_mode(CommandConfirmMode::Never)
+            .confirmer(Arc::new(HoldFirst))
+            .confirm_mode(CommandConfirmMode::Always)
             .event_sink(Arc::new(move |e| ev.lock().unwrap().push(e)))
             .risk_scorer(Some(scorer.clone() as Arc<dyn crate::risk::RiskScorer>))
             .build()
             .unwrap();
         let first = async {
             tokio::select! {
-                _ = agent.run("one", &[]) => panic!("the first turn waits for its rating"),
+                _ = agent.run("one", &[]) => panic!("the first turn is held in its confirmation"),
+                // Dropped while both ratings (300 ms) are still in flight and
+                // the second turn is already waiting for its own.
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
         };
         let (_, second) = tokio::join!(first, agent.run("two", &[]));
         assert!(second.is_ok(), "{second:?}");
         tokio::time::sleep(Duration::from_secs(60)).await;
-        assert_eq!(scorer.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(scorer.calls.load(std::sync::atomic::Ordering::SeqCst), 2, "both were rated at once");
         let events = events.lock().unwrap();
         let id_of = |command: &str| {
             events
@@ -3724,9 +3737,12 @@ mod tests {
             )
         };
         let (first_id, second_id) = (id_of("echo first"), id_of("echo second"));
-        assert!(scored(first_id).is_none(), "the dropped turn's rating landed: {events:?}");
-        let finished = events.iter().position(|e| matches!(e, AgentEvent::Finished(_)));
+        let finished = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Finished(_)))
+            .expect("the second turn finished");
+        assert!(scored(first_id).is_none(), "the first turn's rating landed: {events:?}");
         let second_scored = scored(second_id).expect("the second turn keeps its rating");
-        assert!(second_scored < finished.expect("the second turn finished"), "{events:?}");
+        assert!(second_scored < finished, "{events:?}");
     }
 }
