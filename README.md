@@ -14,7 +14,7 @@ Filar is a Rust-based terminal application that integrates an AI agent (LLM) wit
 ## Features
 
 - **AI Agent** — powered by any OpenAI-compatible LLM (cloud or local), with tool calling support
-- **SSH Remote Execution** — agent manages remote machines via SSH, zero-install (filar puts nothing of its own on the remote: no agent, daemon or helper files)
+- **SSH Remote Execution** — agent manages remote machines via SSH, zero-install (filar puts nothing of its own on the remote: no agent, daemon or helper files; a background job's temporary log is removed when the job ends)
 - **Local Mode** — run commands on your own machine (PowerShell on Windows; POSIX `sh -c` on macOS)
 - **TUI Interface** — built with [ratatui](https://ratatui.rs/) + [crossterm](https://github.com/crossterm-rs/crossterm)
 - **Mouse Support** — scroll wheel, click-to-expand command blocks, drag-to-select and copy text
@@ -543,7 +543,7 @@ filar/
 ### Key Design Decisions
 
 - **Swappable Executor** — `CommandExecutor` trait allows switching between Local and SSH at runtime; since v0.6.1, each tab has its own executor, so `!ssh` reconnects only the current tab
-- **Zero-Install SSH** — filar installs, copies and runs nothing of its own on the remote machine; all commands are injected via the SSH channel, and changes you ask for go through confirmation
+- **Zero-Install SSH** — filar installs, copies and runs nothing of its own on the remote machine; all commands are injected via the SSH channel; changes you ask for are confirmed according to the confirmation mode (`never` runs them without asking)
 - **Secure by Default** — all commands require confirmation; destructive commands are detected and blocked
 - **Dynamic System Prompt** — the agent's system prompt adapts to local/SSH context and OS/shell type
 - **OS Credential Storage** — API keys and SSH passwords stored via `keyring`
