@@ -1120,33 +1120,35 @@ impl KubeToolExecutor {
                             CoreError::Other(format!("{} {name} was not found", kind.as_str()))
                         })?
                 };
-                let mut events = self
-                    .api
-                    .list_events(namespace.as_deref(), Some(name))
-                    .await?;
-                events.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
-                let event_count = events.len();
+                // The object is the answer; its events are an addition. A
+                // failed events request (404 behind a proxy, RBAC, timeout)
+                // must not turn an existing object into "not found" (#645).
+                let (events_text, events_cut) =
+                    match self.api.list_events(namespace.as_deref(), Some(name)).await {
+                        Ok(mut events) => {
+                            events.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
+                            let event_count = events.len();
+                            let events = self.redact_objects(
+                                events
+                                    .into_iter()
+                                    .take(*event_limit)
+                                    .map(event_object)
+                                    .collect(),
+                            );
+                            let cut = event_count > *event_limit;
+                            (render_table(&event_table(&events)?, event_count, cut)?, cut)
+                        }
+                        Err(error) => (events_unavailable(&error), false),
+                    };
                 let object = self.redact_object(object);
-                let events = self.redact_objects(
-                    events
-                        .into_iter()
-                        .take(*event_limit)
-                        .map(event_object)
-                        .collect(),
-                );
                 let mut content = format!(
                     "Object ({}):\n{}\n\nEvents:\n{}",
                     kind.as_str(),
                     serde_json::to_string_pretty(&object)
                         .map_err(|e| CoreError::Other(e.to_string()))?,
-                    render_table(
-                        &event_table(&events)?,
-                        event_count,
-                        event_count > *event_limit
-                    )?
+                    events_text
                 );
-                let truncated =
-                    event_count > *event_limit || content.chars().count() > MAX_KUBE_OUTPUT_CHARS;
+                let truncated = events_cut || content.chars().count() > MAX_KUBE_OUTPUT_CHARS;
                 truncate_output(&mut content);
                 Ok(KubeToolResult { content, truncated })
             }
@@ -1533,6 +1535,20 @@ fn resource_table(kind: KubeResourceKind, objects: &[Value]) -> Result<Preproces
                 .collect(),
         ),
     }
+}
+
+/// The events section of `k8s_describe` when the events request failed: a
+/// fixed filar text per cause, so the object above it still stands (#645).
+fn events_unavailable(error: &CoreError) -> String {
+    let cause = match error {
+        CoreError::AccessDenied(_) => "access denied by RBAC or policy",
+        CoreError::NotFound(_) => "the API answered 404 for events",
+        CoreError::Unavailable(_) | CoreError::ConnectionLost(_) => {
+            "the API did not answer in time"
+        }
+        _ => "the events request failed",
+    };
+    format!("events unavailable: {cause}; the object above was read successfully")
 }
 
 fn event_table(objects: &[Value]) -> Result<PreprocessedOutput> {

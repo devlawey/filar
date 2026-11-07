@@ -11,6 +11,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- `k8s_describe` no longer reports an existing object as missing when only its events request fails (404 behind a proxy or a trimmed API, RBAC, timeout): the object is returned with `events unavailable: <cause>` in place of the events, and a pod fleet compares such members by their columns instead of marking them `pod disappeared` ([#645](https://github.com/devlawey/filar/issues/645)).
+
 ## [3.0.4] - 2026-11-06
 
 ### Changed

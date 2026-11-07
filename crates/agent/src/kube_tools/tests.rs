@@ -20,6 +20,8 @@ pub(crate) struct MockCluster {
     /// Answer of `pod_http_get`; the request it got is recorded.
     http: Option<filar_transport::PodHttpResponse>,
     http_call: Mutex<Option<filar_transport::PodHttpRequest>>,
+    /// When set, `list_events` fails with this error (#645).
+    events_error: Option<fn() -> CoreError>,
 }
 
 #[async_trait::async_trait]
@@ -52,6 +54,9 @@ impl ClusterApi for MockCluster {
     }
 
     async fn list_events(&self, _: Option<&str>, involved: Option<&str>) -> Result<Vec<EventInfo>> {
+        if let Some(error) = self.events_error {
+            return Err(error());
+        }
         Ok(self
             .events
             .iter()
@@ -365,6 +370,62 @@ async fn describe_contains_oom_reason_limits_and_redacted_sorted_events() {
     assert!(!result.content.contains("old event"));
     assert!(!result.content.contains("supersecret"));
     assert!(result.truncated);
+}
+
+#[tokio::test]
+async fn describe_survives_a_failed_events_request() {
+    let cases: [(fn() -> CoreError, &str); 3] = [
+        (|| CoreError::NotFound("events not found".into()), "404"),
+        (
+            || CoreError::AccessDenied("forbidden: events".into()),
+            "access denied",
+        ),
+        (
+            || CoreError::Unavailable("timed out".into()),
+            "did not answer",
+        ),
+    ];
+    for (error, cause) in cases {
+        let executor = executor(MockCluster {
+            pods: vec![pod("web-1")],
+            events_error: Some(error),
+            ..MockCluster::default()
+        });
+        let call = KubeToolCall::Describe {
+            kind: KubeResourceKind::Pod,
+            namespace: Some("shop".into()),
+            name: "web-1".into(),
+            event_limit: 20,
+        };
+        let result = executor
+            .execute(&call)
+            .await
+            .expect("describe still answers");
+        let content = &result.content;
+        assert!(content.starts_with("Object (Pod):\n"), "{content}");
+        assert!(content.contains("\"name\": \"web-1\""), "{content}");
+        assert!(
+            content.contains("\n\nEvents:\nevents unavailable: "),
+            "{content}"
+        );
+        assert!(content.contains(cause), "{cause}: {content}");
+        assert!(!result.truncated);
+    }
+}
+
+#[tokio::test]
+async fn describe_of_a_missing_pod_still_fails() {
+    let executor = executor(MockCluster {
+        events_error: Some(|| CoreError::NotFound("events not found".into())),
+        ..MockCluster::default()
+    });
+    let call = KubeToolCall::Describe {
+        kind: KubeResourceKind::Pod,
+        namespace: Some("shop".into()),
+        name: "gone".into(),
+        event_limit: 20,
+    };
+    assert!(executor.execute(&call).await.is_err());
 }
 
 #[tokio::test]
