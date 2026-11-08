@@ -19,6 +19,7 @@ const {
   commandExcludesPattern,
   toolCalledAny,
   kubeToolArgs,
+  kubeManifestContains,
   outputContains,
 } = require('./asserts.js');
 
@@ -348,6 +349,25 @@ check('k8s_logs previous=false fails CrashLoopBackOff invariant', () => {
 check('wrong Kubernetes tool fails required argument assert', () => {
   const output = kubeResponse('k8s_events', { involved_object: 'web-1' });
   const r = kubeToolArgs(output, { vars: { tool: 'k8s_logs', expected_args: { pod: 'web-1' } } });
+  assert.strictEqual(r.pass, false, JSON.stringify(r));
+});
+
+check('k8s_apply manifest with every fact passes', () => {
+  const manifest = 'kind: PersistentVolumeClaim\nspec:\n  storageClassName: ceph-rbd\n  resources: {requests: {storage: 1Gi}}\n---\nkind: Pod\n';
+  const output = kubeResponse('k8s_apply', { manifest, explanation: 'x' });
+  const r = kubeManifestContains(output, { vars: { tool: 'k8s_apply', expected_facts: { facts: ['PersistentVolumeClaim', 'ceph-rbd', '1Gi', 'kind: Pod'] } } });
+  assert.strictEqual(r.pass, true, JSON.stringify(r));
+});
+
+check('k8s_apply manifest missing the storage class fails', () => {
+  const output = kubeResponse('k8s_apply', { manifest: 'kind: PersistentVolumeClaim\n', explanation: 'x' });
+  const r = kubeManifestContains(output, { vars: { tool: 'k8s_apply', expected_facts: { facts: ['ceph-rbd'] } } });
+  assert.strictEqual(r.pass, false, JSON.stringify(r));
+});
+
+check('no k8s_apply call fails the manifest assert', () => {
+  const output = kubeResponse('k8s_get', { kind: 'Pod' });
+  const r = kubeManifestContains(output, { vars: { tool: 'k8s_apply', expected_facts: { facts: ['Pod'] } } });
   assert.strictEqual(r.pass, false, JSON.stringify(r));
 });
 

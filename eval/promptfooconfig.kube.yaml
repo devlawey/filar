@@ -1,13 +1,15 @@
-description: "filar Kubernetes agent eval — read-only diagnostics over ClusterApi"
+description: "filar Kubernetes agent eval — diagnostics over ClusterApi and gated writes (#640)"
 
-# The system prompt is synced with build_kube_system_prompt by a Rust test.
+# The system prompt is synced with build_kube_write_system_prompt (a cluster
+# tab with write access) by a Rust test.
 prompts:
   - file://prompts/kube-chat.json
 
 maxConcurrency: 1
 
-# Manual mirror of filar_agent::kube_tool_definitions(Always). No write tool
-# and no Secret kind are exposed to the model.
+# Manual mirror of filar_agent::kube_tool_definitions(Always) plus
+# kube_write_tool_definitions(Always). No Secret kind is exposed to the
+# model for reading.
 tools: &kube_tools
   - type: function
     function:
@@ -93,6 +95,17 @@ tools: &kube_tools
           limit: { type: integer, minimum: 1, maximum: 100, default: 50 }
           explanation: { type: string }
         required: [deployment]
+        additionalProperties: false
+  - type: function
+    function:
+      name: k8s_apply
+      description: "Create or change Kubernetes objects from a YAML manifest (server-side apply, field manager filar), one or more documents separated by ---. Any kind the user's RBAC allows: Pod, PersistentVolumeClaim, Deployment, Service, ConfigMap, Job, RBAC, custom resources, cluster-scoped objects. Objects without metadata.namespace go to the tab namespace. Every apply is first run as a server dry run and shown to the user as a diff; nothing changes until the user approves. Secret values may be written but are never shown back. A running pod cannot get new volumes or most spec changes: create a new pod or a Deployment. After the apply, check the result by reading (k8s_get, k8s_describe, events)."
+      parameters:
+        type: object
+        properties:
+          manifest: { type: string, description: "YAML manifest, one or more documents." }
+          explanation: { type: string }
+        required: [manifest]
         additionalProperties: false
 
 providers:

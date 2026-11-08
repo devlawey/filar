@@ -149,7 +149,7 @@ jobs:
           if-no-files-found: ignore
 
   kube-smoke:
-    name: Kubernetes eval smoke (3 cases, GLM-5.2)
+    name: Kubernetes eval smoke (4 cases, GLM-5.2)
     needs: check-secret
     if: needs.check-secret.outputs.has_secret == 'true'
     runs-on: ubuntu-latest

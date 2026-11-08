@@ -682,7 +682,7 @@ fn explanation_property() -> Value {
     json!({"type": "string", "description": "Why this read-only Kubernetes API call is needed now."})
 }
 
-fn definition(
+pub(crate) fn definition(
     name: &str,
     description: &str,
     mut properties: Map<String, Value>,

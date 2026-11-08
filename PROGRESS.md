@@ -12462,3 +12462,47 @@ TUI: `runner.rs` держит `kube_writers` рядом с `kube_apis` (один
 risk-eval (eval необязательный, порог попадания задан намеренно).
 
 **Next.** #640 — `k8s_apply`.
+
+## Issue #640: k8s_apply — применить манифест во вкладке кластера (веха 3.0.5)
+
+**Сделано.** `kube_write.rs`: инструмент `k8s_apply` (`manifest`,
+`explanation`) в `kube_write_tool_definitions`, разбор в
+`parse_kube_write_call`. Невалидный и пустой YAML отклоняется до запроса
+(`filar_transport::parse_manifest`). Namespace по умолчанию — вкладки.
+`display_command`: `k8s_apply -n shop: Pod/storage-test, PersistentVolumeClaim/data`
+(виды и имена, без содержимого). Окно: список объектов с действием, затем diff
+каждого в общем бюджете 160 строк; дальше — «diff not shown (window limit)».
+Отказ API на изменение живого пода дополняется подсказкой «создай новый под
+или Deployment» (`explain_apply_error`).
+
+Вкладка кластера с писателем теперь предлагает `k8s_apply` и получает
+`build_kube_write_system_prompt`. Eval: `eval/prompts/kube-system.txt` —
+снимок промпта записи (синхронизирован тестом), в
+`promptfooconfig.kube.yaml` — `k8s_apply`, кейс `kube-apply-01` (PVC на
+ceph-rbd и под) с ассертом `kubeManifestContains`; Kubernetes smoke — 4 кейса.
+`eval/risk/commands.toml`: команда apply в новом формате.
+
+**Решения.**
+- Окно подтверждения не сворачиваемое: «список сворачивается, diff
+  раскрывается» сделано порядком (сначала список) и бюджетом строк; блок в
+  ленте после ответа можно развернуть целиком.
+- В ленту аргументы вызова идут без манифеста (#639, `redacted_arguments`).
+  В истории диалога для модели манифест остаётся — модель его и написала.
+
+**Проверено.** Бинарник в tmux против фейкового API (`scratchpad/dod/stubs.py`
+с discovery и SSA): `never` — окно всё равно открылось, два объекта и diff;
+`a` — два PATCH без `dryRun`, PVC появился, в ленте и в экспорте `Ctrl+S` две
+строки «Изменение в кластере: created …»; кластер с тегом `prod` — красная
+рамка; `d` — только dry-run PATCH, PVC не создан.
+
+**Ревью (раунд 1, CodeRabbit).** Окно не прокручивается, поэтому один
+`k8s_apply` берёт не больше 20 объектов (`MAX_APPLY_OBJECTS`, отказ до
+запроса к API с советом разделить манифест), а список объектов в начале окна
+несёт изменённые ключи Secret — всё, что одобряется, видно до одобрения,
+даже если diff не поместился. Команда в ленте после пятого объекта —
+«and N more». Не сделано: другой формат `-n` для cluster-scoped объектов
+(`-n` — namespace по умолчанию, как у `kubectl apply -n`; итоговый scope
+каждого объекта в окне уже виден), сравнение схем eval-зеркала с
+определениями (зеркало намеренно опускает описания `explanation`).
+
+**Next.** #641 — `k8s_scale` и `k8s_rollout`.

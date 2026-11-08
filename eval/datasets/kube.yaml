@@ -35,3 +35,14 @@
   metadata: { smoke: true }
   assert:
     - { type: javascript, value: "file://asserts.js:outputContains" }
+
+- description: "kube-apply-01 storage request → one k8s_apply with PVC and pod"
+  vars:
+    question: |
+      Создай в namespace shop PVC data на 1Gi в storageClass ceph-rbd и под
+      storage-test (образ busybox, sleep 3600), который монтирует его в /data.
+    tool: k8s_apply
+    expected_facts: { facts: [PersistentVolumeClaim, ceph-rbd, 1Gi, "kind: Pod", claimName] }
+  metadata: { smoke: true }
+  assert:
+    - { type: javascript, value: "file://asserts.js:kubeManifestContains" }
