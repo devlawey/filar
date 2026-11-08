@@ -734,15 +734,10 @@ mod tests {
     #[test]
     fn the_four_groups_partition_every_state() {
         for state in HostState::ALL {
-            let groups = [
-                state.answered(),
-                state.unanswered(),
-                state.not_asked(),
-                state.cancelled(),
-            ]
-            .into_iter()
-            .filter(|in_group| *in_group)
-            .count();
+            let groups = [state.answered(), state.unanswered(), state.not_asked(), state.cancelled()]
+                .into_iter()
+                .filter(|in_group| *in_group)
+                .count();
             assert_eq!(groups, 1, "{state} must be in exactly one group");
         }
     }
@@ -765,10 +760,7 @@ mod tests {
         .await;
 
         let handles: Vec<HostHandle> = op.handles().collect();
-        assert!(
-            result.mark_divergent(handles[1]),
-            "a clean answer can differ"
-        );
+        assert!(result.mark_divergent(handles[1]), "a clean answer can differ");
 
         let summary = result.summary();
         assert_eq!(summary.hosts(), 8);
@@ -801,10 +793,7 @@ mod tests {
         assert_eq!(summary.hosts(), 12);
         assert_eq!(summary.answered(), 11);
         assert_eq!(summary.unanswered(), 1);
-        assert!(
-            !summary.is_failed(),
-            "eleven answers are a summary, not a failure"
-        );
+        assert!(!summary.is_failed(), "eleven answers are a summary, not a failure");
 
         let handles: Vec<HostHandle> = op.handles().collect();
         assert_eq!(
@@ -961,9 +950,12 @@ mod tests {
             "got: {error}"
         );
 
-        let error =
-            OperationResult::build(&mine, &report, &[(handles[0], NotAsked::NotApplicable)])
-                .expect_err("a host cannot be both asked and not asked");
+        let error = OperationResult::build(
+            &mine,
+            &report,
+            &[(handles[0], NotAsked::NotApplicable)],
+        )
+        .expect_err("a host cannot be both asked and not asked");
         assert!(
             error.to_string().contains("both asked and not asked"),
             "got: {error}"

@@ -17,7 +17,8 @@ pub const OSC7_RAW_HOST: &str = "filar-raw";
 /// No files are created. The PTY is typically closed immediately after, so the
 /// command does not stay in the user's session. The path is raw, hence
 /// [`OSC7_RAW_HOST`].
-pub const OSC7_PWD_PROBE: &[u8] = b"printf '\\033]7;file://filar-raw%s\\007' \"$(pwd)\"\n";
+pub const OSC7_PWD_PROBE: &[u8] =
+    b"printf '\\033]7;file://filar-raw%s\\007' \"$(pwd)\"\n";
 
 /// Where an interactive terminal's foreground program is, learned without
 /// typing anything into the terminal (#499).
@@ -124,10 +125,7 @@ pub fn shell_flavor(program: &str) -> ShellFlavor {
 /// percent-encoded: spaces and non-ASCII arrive as they are, which the OSC 7
 /// reader accepts.
 pub fn cmd_osc7_prompt(existing: Option<&str>) -> String {
-    let visible = existing
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .unwrap_or("$P$G");
+    let visible = existing.map(str::trim).filter(|p| !p.is_empty()).unwrap_or("$P$G");
     format!("$E]7;file://{OSC7_RAW_HOST}/$P$E\\{visible}")
 }
 
@@ -217,11 +215,7 @@ mod tests {
     fn the_pty_cwd_command_is_one_line_any_login_shell_can_pass_on() {
         assert!(!PTY_CWD_COMMAND.contains('\n'));
         assert!(!PTY_CWD_COMMAND.contains('\\'));
-        assert_eq!(
-            PTY_CWD_COMMAND.matches('\'').count(),
-            2,
-            "only the outer quotes"
-        );
+        assert_eq!(PTY_CWD_COMMAND.matches('\'').count(), 2, "only the outer quotes");
         assert!(PTY_CWD_COMMAND.starts_with("sh -c '") && PTY_CWD_COMMAND.ends_with('\''));
     }
 
@@ -229,17 +223,11 @@ mod tests {
     fn the_pty_cwd_reply_is_parsed() {
         assert_eq!(
             parse_pty_cwd_reply("filar-cwd:1:/var/log"),
-            Some(ForegroundCwd {
-                path: "/var/log".into(),
-                at_prompt: true
-            })
+            Some(ForegroundCwd { path: "/var/log".into(), at_prompt: true })
         );
         assert_eq!(
             parse_pty_cwd_reply("banner\nfilar-cwd:0:/srv/a b:c"),
-            Some(ForegroundCwd {
-                path: "/srv/a b:c".into(),
-                at_prompt: false
-            })
+            Some(ForegroundCwd { path: "/srv/a b:c".into(), at_prompt: false })
         );
     }
 
@@ -261,15 +249,9 @@ mod tests {
     #[test]
     fn the_shell_flavor_comes_from_the_program_name() {
         assert_eq!(shell_flavor("cmd.exe"), ShellFlavor::Cmd);
-        assert_eq!(
-            shell_flavor(r"C:\Windows\System32\CMD.EXE"),
-            ShellFlavor::Cmd
-        );
+        assert_eq!(shell_flavor(r"C:\Windows\System32\CMD.EXE"), ShellFlavor::Cmd);
         assert_eq!(shell_flavor("powershell.exe"), ShellFlavor::PowerShell);
-        assert_eq!(
-            shell_flavor(r"C:\Program Files\PowerShell\7\pwsh.exe"),
-            ShellFlavor::PowerShell
-        );
+        assert_eq!(shell_flavor(r"C:\Program Files\PowerShell\7\pwsh.exe"), ShellFlavor::PowerShell);
         assert_eq!(shell_flavor("/usr/bin/pwsh"), ShellFlavor::PowerShell);
         assert_eq!(shell_flavor("/bin/bash"), ShellFlavor::Posix);
         assert_eq!(shell_flavor("sh"), ShellFlavor::Posix);
@@ -278,10 +260,7 @@ mod tests {
     #[test]
     fn the_cmd_prompt_reports_osc7_and_keeps_the_users_prompt() {
         assert_eq!(cmd_osc7_prompt(None), "$E]7;file://filar-raw/$P$E\\$P$G");
-        assert_eq!(
-            cmd_osc7_prompt(Some("  ")),
-            "$E]7;file://filar-raw/$P$E\\$P$G"
-        );
+        assert_eq!(cmd_osc7_prompt(Some("  ")), "$E]7;file://filar-raw/$P$E\\$P$G");
         assert_eq!(
             cmd_osc7_prompt(Some("[$T] $P$G")),
             "$E]7;file://filar-raw/$P$E\\[$T] $P$G"
@@ -290,9 +269,7 @@ mod tests {
 
     #[test]
     fn the_hooks_mark_their_raw_paths() {
-        assert!(std::str::from_utf8(OSC7_PWD_PROBE)
-            .unwrap()
-            .contains("file://filar-raw%s"));
+        assert!(std::str::from_utf8(OSC7_PWD_PROBE).unwrap().contains("file://filar-raw%s"));
         assert!(cmd_osc7_prompt(None).contains("file://filar-raw/$P"));
         assert!(POWERSHELL_OSC7_PROMPT.contains("file://filar-raw/"));
     }
@@ -301,10 +278,7 @@ mod tests {
     fn the_powershell_prompt_is_one_line_and_5_1_compatible() {
         assert!(!POWERSHELL_OSC7_PROMPT.contains('\n'));
         assert!(POWERSHELL_OSC7_PROMPT.contains("[char]27"));
-        assert!(
-            !POWERSHELL_OSC7_PROMPT.contains("`e"),
-            "PowerShell 5.1 has no `e"
-        );
+        assert!(!POWERSHELL_OSC7_PROMPT.contains("`e"), "PowerShell 5.1 has no `e");
         assert!(POWERSHELL_OSC7_PROMPT.contains("ProviderPath"));
     }
 
@@ -351,6 +325,9 @@ mod tests {
     fn cd_input_none_when_unsafe() {
         assert!(posix_cd_input("").is_none());
         assert_eq!(posix_cd_input("/opt/app").as_deref(), Some("cd /opt/app\n"));
-        assert_eq!(posix_cd_command("/opt/app").as_deref(), Some("cd /opt/app"));
+        assert_eq!(
+            posix_cd_command("/opt/app").as_deref(),
+            Some("cd /opt/app")
+        );
     }
 }

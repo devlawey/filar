@@ -16,21 +16,24 @@ mod client;
 mod convert;
 mod debug;
 mod exec;
-mod http;
 mod no_proxy;
+mod http;
 mod write;
 
 pub use client::KubeClusterApi;
-pub use debug::{debug_container_name, DebugContainerSpec, DEBUG_CONTAINER_PREFIX};
+pub use write::{
+    hide_secret_values, parse_manifest, AppliedObject, ApplyAction, ClusterWriteApi,
+    DeleteOptions, DeleteOutcome, DeleteTarget, DeletedObject, ObjectKind, ObjectRef,
+    Propagation, RestartKind, ScaleKind, ScaleOutcome, SecretKeyChange, SecretKeyState,
+    UndoOutcome, WriteOutcome, FIELD_MANAGER, MAX_DELETE_OBJECTS, RESTARTED_AT_ANNOTATION,
+    SECRET_HIDDEN,
+};
+pub use debug::{
+    debug_container_name, DebugContainerSpec, DEBUG_CONTAINER_PREFIX,
+};
 pub use exec::{
     KubeExecConfig, KubeExecEvent, KubeExecutor, KubeInteractive, DEFAULT_POD_SHELL,
     MISSING_SHELL_MARK, SHELL_RECREATED_MESSAGE,
-};
-pub use write::{
-    hide_secret_values, parse_manifest, AppliedObject, ApplyAction, ClusterWriteApi, DeleteOptions,
-    DeleteOutcome, DeleteTarget, DeletedObject, ObjectKind, ObjectRef, Propagation, RestartKind,
-    ScaleKind, ScaleOutcome, SecretKeyChange, SecretKeyState, UndoOutcome, WriteOutcome,
-    FIELD_MANAGER, MAX_DELETE_OBJECTS, RESTARTED_AT_ANNOTATION, SECRET_HIDDEN,
 };
 
 /// Maximum number of objects returned by one cluster list operation.

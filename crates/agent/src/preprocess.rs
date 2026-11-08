@@ -303,14 +303,7 @@ impl fmt::Debug for PreprocessorRegistry {
 }
 
 /// Columns produced by [`DfPreprocessor`].
-const DF_COLUMNS: [&str; 6] = [
-    "filesystem",
-    "size",
-    "used",
-    "avail",
-    "use_percent",
-    "mount",
-];
+const DF_COLUMNS: [&str; 6] = ["filesystem", "size", "used", "avail", "use_percent", "mount"];
 
 /// Characters whose presence means the command is more than a simple
 /// invocation: compound separators, pipelines, redirection, substitution.
@@ -528,10 +521,7 @@ impl OutputPreprocessor for LsblkPreprocessor {
         let has_json = tokens
             .iter()
             .any(|token| *token == "--json" || *token == "-J");
-        has_json
-            && !tokens
-                .iter()
-                .any(|token| lsblk_option_changes_format(token))
+        has_json && !tokens.iter().any(|token| lsblk_option_changes_format(token))
     }
 
     fn preprocess(
@@ -556,10 +546,7 @@ impl OutputPreprocessor for LsblkPreprocessor {
         if rows.is_empty() {
             return Err(PreprocessError::new("lsblk reported no block devices"));
         }
-        let columns = LSBLK_COLUMNS
-            .iter()
-            .map(|column| column.to_string())
-            .collect();
+        let columns = LSBLK_COLUMNS.iter().map(|column| column.to_string()).collect();
         PreprocessedOutput::new(columns, rows)
     }
 }
@@ -589,8 +576,9 @@ fn collect_lsblk_rows(
         .get("name")
         .and_then(|value| value.as_str())
         .ok_or_else(|| PreprocessError::new("a block device is missing `name`"))?;
-    let size = lsblk_scalar(device.get("size"))
-        .ok_or_else(|| PreprocessError::new(format!("block device `{name}` is missing `size`")))?;
+    let size = lsblk_scalar(device.get("size")).ok_or_else(|| {
+        PreprocessError::new(format!("block device `{name}` is missing `size`"))
+    })?;
     let device_type = device
         .get("type")
         .and_then(|value| value.as_str())
@@ -898,11 +886,7 @@ impl OutputPreprocessor for VersionPreprocessor {
             .collect();
         PreprocessedOutput::new(
             columns,
-            vec![vec![
-                program.to_string(),
-                version.to_string(),
-                line.to_string(),
-            ]],
+            vec![vec![program.to_string(), version.to_string(), line.to_string()]],
         )
     }
 }
@@ -1178,10 +1162,10 @@ impl OutputPreprocessor for SsPreprocessor {
                 ),
                 other => {
                     return Err(PreprocessError::new(format!(
-                    "line {} has {other} field(s); a socket row has 6 (internet) or 8 (unix): {}",
-                    index + 1,
-                    preview(line)
-                )))
+                        "line {} has {other} field(s); a socket row has 6 (internet) or 8 (unix): {}",
+                        index + 1,
+                        preview(line)
+                    )))
                 }
             };
             if !is_all_digits(fields[2]) || !is_all_digits(fields[3]) {
@@ -1314,19 +1298,13 @@ impl OutputPreprocessor for JournalctlPreprocessor {
                     return Err(PreprocessError::new(format!(
                         "entry {} has no string `MESSAGE` (binary payload?): {}",
                         index + 1,
-                        other
-                            .map(|value| preview(&value.to_string()))
-                            .unwrap_or_default()
+                        other.map(|value| preview(&value.to_string())).unwrap_or_default()
                     )))
                 }
             };
             rows.push(vec![timestamp, unit, priority, message]);
         }
-        table(
-            &JOURNALCTL_COLUMNS,
-            rows,
-            "no journal entries in the output",
-        )
+        table(&JOURNALCTL_COLUMNS, rows, "no journal entries in the output")
     }
 }
 
@@ -1535,10 +1513,7 @@ fn table(
     if rows.is_empty() {
         return Err(PreprocessError::new(empty_reason.to_string()));
     }
-    PreprocessedOutput::new(
-        columns.iter().map(|column| column.to_string()).collect(),
-        rows,
-    )
+    PreprocessedOutput::new(columns.iter().map(|column| column.to_string()).collect(), rows)
 }
 
 #[cfg(test)]
@@ -1583,8 +1558,11 @@ mod tests {
     }
 
     fn one_field_table(field: &str) -> PreprocessedOutput {
-        PreprocessedOutput::new(vec!["value".to_string()], vec![vec![field.to_string()]])
-            .expect("valid stub table")
+        PreprocessedOutput::new(
+            vec!["value".to_string()],
+            vec![vec![field.to_string()]],
+        )
+        .expect("valid stub table")
     }
 
     const DF_SAMPLE: &str = "\
@@ -1612,21 +1590,11 @@ tmpfs            3986548       0   3986548   0% /dev/shm
         assert_eq!(registry.len(), 10);
         let outcome = registry.preprocess("/bin/df -h", DF_SAMPLE);
         match outcome {
-            PreprocessOutcome::Structured {
-                preprocessor,
-                table,
-            } => {
+            PreprocessOutcome::Structured { preprocessor, table } => {
                 assert_eq!(preprocessor, "df");
                 assert_eq!(
                     table.columns(),
-                    [
-                        "filesystem",
-                        "size",
-                        "used",
-                        "avail",
-                        "use_percent",
-                        "mount"
-                    ]
+                    ["filesystem", "size", "used", "avail", "use_percent", "mount"]
                 );
                 assert_eq!(table.column_index("mount"), Some(5));
                 assert_eq!(table.column_index("missing"), None);
@@ -1789,12 +1757,7 @@ tmpfs            3986548       0   3986548
     #[test]
     fn compound_and_redirected_dfs_are_not_claimed() {
         let registry = PreprocessorRegistry::default();
-        for command in [
-            "df -h | sort",
-            "df; uptime",
-            "df > /tmp/df.txt",
-            "df -h && echo ok",
-        ] {
+        for command in ["df -h | sort", "df; uptime", "df > /tmp/df.txt", "df -h && echo ok"] {
             assert_eq!(
                 registry.preprocess(command, DF_SAMPLE),
                 PreprocessOutcome::Raw {
@@ -1828,10 +1791,7 @@ tmpfs            3986548       0   3986548
             Ok(one_field_table("through the stub")),
         ));
         match registry.preprocess("uptime", "some output") {
-            PreprocessOutcome::Structured {
-                preprocessor,
-                table,
-            } => {
+            PreprocessOutcome::Structured { preprocessor, table } => {
                 assert_eq!(preprocessor, "uptime");
                 assert_eq!(table.rows()[0][0], "through the stub");
             }
@@ -1934,13 +1894,12 @@ tmpfs            3986548       0   3986548
     #[test]
     fn df_canonical_output_flag_is_claimed_and_parsed() {
         let registry = PreprocessorRegistry::default();
-        let outcome =
-            registry.preprocess("df --output=source,size,used,avail,pcent,target", DF_SAMPLE);
+        let outcome = registry.preprocess(
+            "df --output=source,size,used,avail,pcent,target",
+            DF_SAMPLE,
+        );
         match outcome {
-            PreprocessOutcome::Structured {
-                preprocessor,
-                table,
-            } => {
+            PreprocessOutcome::Structured { preprocessor, table } => {
                 assert_eq!(preprocessor, "df");
                 assert_eq!(table.row_count(), 2);
                 assert_eq!(table.rows()[0][0], "/dev/sda1");
@@ -2100,10 +2059,7 @@ tmpfs                    65536         0     65536   0% /dev
         let registry = PreprocessorRegistry::default();
         let outcome = registry.preprocess("lsblk --json", LSBLK_SAMPLE_SINGULAR);
         match outcome {
-            PreprocessOutcome::Structured {
-                preprocessor,
-                table,
-            } => {
+            PreprocessOutcome::Structured { preprocessor, table } => {
                 assert_eq!(preprocessor, "lsblk");
                 assert_eq!(table.columns(), ["name", "size", "type", "mountpoint"]);
                 assert_eq!(table.row_count(), 4);
@@ -2322,8 +2278,7 @@ tmpfs                    65536         0     65536   0% /dev
             let _ = registry.preprocess("lsblk --json", output);
         }
         // Deeply nested children must not blow the stack in a normal test run.
-        let mut nested =
-            String::from(r#"{"blockdevices": [{"name": "d0", "size": "1G", "type": "disk""#);
+        let mut nested = String::from(r#"{"blockdevices": [{"name": "d0", "size": "1G", "type": "disk""#);
         for i in 1..200 {
             nested.push_str(&format!(
                 r#", "children": [{{"name": "d{i}", "size": "1G", "type": "part""#
@@ -2370,10 +2325,7 @@ util-linux\t0:2.37.4-18.el9
     fn dpkg_output_becomes_a_package_table() {
         let registry = PreprocessorRegistry::default();
         match registry.preprocess(DPKG_COMMAND, DPKG_SAMPLE) {
-            PreprocessOutcome::Structured {
-                preprocessor,
-                table,
-            } => {
+            PreprocessOutcome::Structured { preprocessor, table } => {
                 assert_eq!(preprocessor, "dpkg-query");
                 assert_eq!(table.columns(), ["package", "version"]);
                 assert_eq!(table.row_count(), 6);
@@ -2390,10 +2342,7 @@ util-linux\t0:2.37.4-18.el9
     fn rpm_output_becomes_a_package_table() {
         let registry = PreprocessorRegistry::default();
         match registry.preprocess(RPM_COMMAND, RPM_SAMPLE) {
-            PreprocessOutcome::Structured {
-                preprocessor,
-                table,
-            } => {
+            PreprocessOutcome::Structured { preprocessor, table } => {
                 assert_eq!(preprocessor, "rpm");
                 assert_eq!(table.columns(), ["package", "version"]);
                 assert_eq!(table.row_count(), 6);
@@ -2425,9 +2374,7 @@ util-linux\t0:2.37.4-18.el9
         let registry = PreprocessorRegistry::default();
         let dpkg_by_path = r"/usr/bin/dpkg-query -W  -f='${Package}\t${Version}\n'";
         assert!(
-            registry
-                .preprocess(dpkg_by_path, DPKG_SAMPLE)
-                .is_structured(),
+            registry.preprocess(dpkg_by_path, DPKG_SAMPLE).is_structured(),
             "a path-qualified dpkg-query with extra spacing must still be claimed"
         );
         let rpm_by_path = r"/usr/bin/rpm -qa --qf='%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n'";
@@ -2454,10 +2401,7 @@ util-linux\t0:2.37.4-18.el9
             (r"rpm -qa --qf='%{NAME}\n'", RPM_SAMPLE),
             // The pre-epoch template is not kept as an alternative: it
             // cannot tell `1:2.0-3` from `2:2.0-3`.
-            (
-                r"rpm -qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\n'",
-                RPM_SAMPLE,
-            ),
+            (r"rpm -qa --qf='%{NAME}\t%{VERSION}-%{RELEASE}\n'", RPM_SAMPLE),
             // `%{EPOCH}` renders an unset epoch as the literal `(none)`,
             // which is not comparable across hosts.
             (
@@ -2551,10 +2495,7 @@ util-linux\t0:2.37.4-18.el9
     fn nginx_version_banner_is_parsed() {
         let registry = PreprocessorRegistry::default();
         match registry.preprocess("nginx -v", "nginx version: nginx/1.24.0\n") {
-            PreprocessOutcome::Structured {
-                preprocessor,
-                table,
-            } => {
+            PreprocessOutcome::Structured { preprocessor, table } => {
                 assert_eq!(preprocessor, "app-version");
                 assert_eq!(table.columns(), ["program", "version", "raw"]);
                 assert_eq!(
@@ -2568,10 +2509,8 @@ util-linux\t0:2.37.4-18.el9
 
     #[test]
     fn nginx_version_with_distro_suffix_is_parsed() {
-        let outcome = PreprocessorRegistry::default().preprocess(
-            "/usr/sbin/nginx -v",
-            "nginx version: nginx/1.18.0 (Ubuntu)\n",
-        );
+        let outcome = PreprocessorRegistry::default()
+            .preprocess("/usr/sbin/nginx -v", "nginx version: nginx/1.18.0 (Ubuntu)\n");
         match outcome {
             PreprocessOutcome::Structured { table, .. } => {
                 assert_eq!(table.rows()[0][0], "nginx");
@@ -2622,10 +2561,7 @@ Zend Engine v4.2.7, Copyright (c) Zend Technologies
         let cases = [
             ("nginx -v", "nginx: command not found"),
             ("nginx -v", "nginx version: rolling"),
-            (
-                "php -v",
-                "php: error while loading shared libraries: libx.so",
-            ),
+            ("php -v", "php: error while loading shared libraries: libx.so"),
             ("php -v", "PHP built from git"),
             ("nginx -v", "Segmentation fault"),
             // A line that merely mentions a version-shaped path is not a
@@ -2641,10 +2577,7 @@ Zend Engine v4.2.7, Copyright (c) Zend Technologies
         ];
         for (command, output) in cases {
             match registry.preprocess(command, output) {
-                PreprocessOutcome::Structured {
-                    preprocessor,
-                    table,
-                } => {
+                PreprocessOutcome::Structured { preprocessor, table } => {
                     assert_eq!(preprocessor, "app-version", "{output:?}");
                     assert_eq!(table.row_count(), 1, "{output:?}");
                     assert_eq!(
@@ -2653,8 +2586,7 @@ Zend Engine v4.2.7, Copyright (c) Zend Technologies
                         "an unparsed version must be empty, not guessed: {output:?}"
                     );
                     assert_eq!(
-                        table.rows()[0][2],
-                        output,
+                        table.rows()[0][2], output,
                         "the raw line must be preserved: {output:?}"
                     );
                 }
@@ -2803,10 +2735,7 @@ u_str ESTAB 0      0      /run/systemd/journal/stdout 21456 * 21455
     #[test]
     fn systemctl_json_becomes_unit_rows() {
         match PreprocessorRegistry::default().preprocess(SYSTEMCTL_COMMAND, SYSTEMCTL_SAMPLE) {
-            PreprocessOutcome::Structured {
-                preprocessor,
-                table,
-            } => {
+            PreprocessOutcome::Structured { preprocessor, table } => {
                 assert_eq!(preprocessor, "systemctl");
                 assert_eq!(
                     table.columns(),
@@ -2881,25 +2810,13 @@ u_str ESTAB 0      0      /run/systemd/journal/stdout 21456 * 21455
     #[test]
     fn ps_output_becomes_process_rows() {
         match PreprocessorRegistry::default().preprocess(PS_COMMAND, PS_SAMPLE) {
-            PreprocessOutcome::Structured {
-                preprocessor,
-                table,
-            } => {
+            PreprocessOutcome::Structured { preprocessor, table } => {
                 assert_eq!(preprocessor, "ps");
-                assert_eq!(
-                    table.columns(),
-                    ["pid", "ppid", "user", "rss", "pcpu", "comm"]
-                );
+                assert_eq!(table.columns(), ["pid", "ppid", "user", "rss", "pcpu", "comm"]);
                 assert_eq!(table.row_count(), 4);
-                assert_eq!(
-                    table.rows()[0],
-                    ["1", "0", "root", "4760", "1.3", "process_api"]
-                );
+                assert_eq!(table.rows()[0], ["1", "0", "root", "4760", "1.3", "process_api"]);
                 assert_eq!(table.rows()[2][5], "kworker/R-rcu_gp");
-                assert_eq!(
-                    table.rows()[3],
-                    ["914", "870", "www-data", "8321", "0.4", "nginx"]
-                );
+                assert_eq!(table.rows()[3], ["914", "870", "www-data", "8321", "0.4", "nginx"]);
             }
             other => panic!("expected a structured ps table, got {other:?}"),
         }
@@ -2951,10 +2868,7 @@ u_str ESTAB 0      0      /run/systemd/journal/stdout 21456 * 21455
     #[test]
     fn ss_reads_both_internet_and_unix_socket_shapes() {
         match PreprocessorRegistry::default().preprocess(SS_COMMAND, SS_SAMPLE) {
-            PreprocessOutcome::Structured {
-                preprocessor,
-                table,
-            } => {
+            PreprocessOutcome::Structured { preprocessor, table } => {
                 assert_eq!(preprocessor, "ss");
                 assert_eq!(
                     table.columns(),
@@ -2964,14 +2878,7 @@ u_str ESTAB 0      0      /run/systemd/journal/stdout 21456 * 21455
                 // Six-field internet row: address and port already joined.
                 assert_eq!(
                     table.rows()[0],
-                    [
-                        "tcp",
-                        "ESTAB",
-                        "0",
-                        "0",
-                        "192.0.2.2:44438",
-                        "198.51.100.7:443"
-                    ]
+                    ["tcp", "ESTAB", "0", "0", "192.0.2.2:44438", "198.51.100.7:443"]
                 );
                 assert_eq!(table.rows()[1][4], "0.0.0.0:22");
                 assert_eq!(table.rows()[2][4], "[2001:db8::1]:8080");
@@ -3037,9 +2944,7 @@ u_str ESTAB 0      0      /run/systemd/journal/stdout 21456 * 21455
         // check that only asked whether parsing worked would have let a
         // value `ps` never prints into the numeric column.
         let registry = PreprocessorRegistry::default();
-        for pcpu in [
-            "NaN", "nan", "inf", "-inf", "infinity", "1e5", "-1.0", "+1.0", "1.2.3",
-        ] {
+        for pcpu in ["NaN", "nan", "inf", "-inf", "infinity", "1e5", "-1.0", "+1.0", "1.2.3"] {
             let output = format!(
                 "  PID  PPID USER       RSS %CPU COMMAND\n    1     0 root      4760  {pcpu} init\n"
             );
@@ -3112,15 +3017,9 @@ u_str ESTAB 0      0      /run/systemd/journal/stdout 21456 * 21455
     #[test]
     fn journalctl_json_lines_become_log_rows() {
         match PreprocessorRegistry::default().preprocess(JOURNALCTL_COMMAND, JOURNALCTL_SAMPLE) {
-            PreprocessOutcome::Structured {
-                preprocessor,
-                table,
-            } => {
+            PreprocessOutcome::Structured { preprocessor, table } => {
                 assert_eq!(preprocessor, "journalctl");
-                assert_eq!(
-                    table.columns(),
-                    ["timestamp", "unit", "priority", "message"]
-                );
+                assert_eq!(table.columns(), ["timestamp", "unit", "priority", "message"]);
                 assert_eq!(table.row_count(), 3);
                 assert_eq!(table.rows()[0][1], "ssh.service");
                 assert_eq!(table.rows()[1][2], "3");
@@ -3228,10 +3127,7 @@ u_str ESTAB 0      0      /run/systemd/journal/stdout 21456 * 21455
     #[test]
     fn ip_json_flattens_addresses_into_rows() {
         match PreprocessorRegistry::default().preprocess(IP_COMMAND, IP_SAMPLE) {
-            PreprocessOutcome::Structured {
-                preprocessor,
-                table,
-            } => {
+            PreprocessOutcome::Structured { preprocessor, table } => {
                 assert_eq!(preprocessor, "ip");
                 assert_eq!(
                     table.columns(),
@@ -3336,10 +3232,7 @@ u_str ESTAB 0      0      /run/systemd/journal/stdout 21456 * 21455
             // Shell syntax in the program word, and compound forms.
             ("$(which ps) -eo pid,ppid,user,rss,pcpu,comm", PS_SAMPLE),
             ("ss -H -n | wc -l", SS_SAMPLE),
-            (
-                "systemctl list-units --output=json > /tmp/u",
-                SYSTEMCTL_SAMPLE,
-            ),
+            ("systemctl list-units --output=json > /tmp/u", SYSTEMCTL_SAMPLE),
         ];
         for (command, output) in cases {
             assert_eq!(

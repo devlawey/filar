@@ -183,7 +183,10 @@ pub(crate) fn render_save_overlay(f: &mut Frame, app: &App, area: Rect) {
         "Done!".to_string()
     };
     if let Some(row) = row_area(inner, status_dy) {
-        f.render_widget(Paragraph::new(Span::styled(status, app.theme.muted())), row);
+        f.render_widget(
+            Paragraph::new(Span::styled(status, app.theme.muted())),
+            row,
+        );
     }
 
     // Last row inside border: footer hint.
@@ -239,7 +242,9 @@ fn draw_runbook_bar(f: &mut Frame, area: Rect, bar: RunbookBar, app: &App) {
         | RunbookBar::Waiting
         | RunbookBar::Skipped
         | RunbookBar::Cancelled
-        | RunbookBar::Failed => 0..0,
+        | RunbookBar::Failed => {
+            0..0
+        }
     };
     let (filled_style, track_style) = match bar {
         RunbookBar::Generating => (app.theme.warning_fg(), app.theme.dim()),
@@ -331,10 +336,7 @@ mod tests {
     fn overlay_shows_saving_when_progress_zero() {
         let app = app_with_overlay(0);
         let text = render_save_text(&app);
-        assert!(
-            text.contains("Saving..."),
-            "must show Saving... when progress=0"
-        );
+        assert!(text.contains("Saving..."), "must show Saving... when progress=0");
     }
 
     #[test]
@@ -365,10 +367,7 @@ mod tests {
         let app = app_with_overlay(100);
         let text = render_save_text(&app);
         assert!(text.contains("Done!"));
-        assert!(
-            !text.contains("Runbook"),
-            "no runbook story, no runbook bar"
-        );
+        assert!(!text.contains("Runbook"), "no runbook story, no runbook bar");
         assert!(
             !text.contains("Export"),
             "the export caption only exists beside a runbook bar"
@@ -382,10 +381,7 @@ mod tests {
         app.save_error = Some("disk full".into());
         let text = render_save_text(&app);
         assert!(text.contains("Error: disk full"));
-        assert!(
-            !text.contains("Runbook"),
-            "a failed export must not promise a runbook"
-        );
+        assert!(!text.contains("Runbook"), "a failed export must not promise a runbook");
     }
 
     #[test]
@@ -441,10 +437,7 @@ mod tests {
         let mut app = app_with_overlay(100);
         app.runbook_state = Some(RunbookState::Saved);
         let text = render_save_text(&app);
-        assert!(
-            text.contains("Done!"),
-            "a saved runbook is still a done save"
-        );
+        assert!(text.contains("Done!"), "a saved runbook is still a done save");
         assert!(text.contains("Runbook: saved"));
     }
 
@@ -456,10 +449,7 @@ mod tests {
         let first = render_save_text(&app);
         app.tick = 100;
         let second = render_save_text(&app);
-        assert_ne!(
-            first, second,
-            "the indeterminate window must move with the tick"
-        );
+        assert_ne!(first, second, "the indeterminate window must move with the tick");
     }
 
     #[test]
@@ -470,10 +460,7 @@ mod tests {
         app.runbook_state = Some(RunbookState::Generating);
         app.tick = 30; // a non-empty sweep, so the bar itself is on screen
         let text = render_save_text_sized(&app, 30, 12);
-        assert!(
-            text.contains("Export 100%"),
-            "export row must fit, got: {text}"
-        );
+        assert!(text.contains("Export 100%"), "export row must fit, got: {text}");
         assert!(text.contains("Runbook:"), "caption must fit, got: {text}");
         assert!(
             text.contains(crate::ui::theme::Glyphs::detect().bar_full),

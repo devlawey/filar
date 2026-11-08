@@ -16,14 +16,12 @@ fn admin() -> KubeCluster {
     let path = std::env::var_os("FILAR_TEST_KUBECONFIG")
         .map(PathBuf::from)
         .expect("FILAR_TEST_KUBECONFIG must point to docker/k8s admin kubeconfig");
-    let context = std::env::var("FILAR_TEST_KUBE_CONTEXT")
-        .ok()
-        .unwrap_or_else(|| {
-            Kubeconfig::read_from(&path)
-                .ok()
-                .and_then(|config| config.current_context)
-                .expect("test kubeconfig must have a current context")
-        });
+    let context = std::env::var("FILAR_TEST_KUBE_CONTEXT").ok().unwrap_or_else(|| {
+        Kubeconfig::read_from(&path)
+            .ok()
+            .and_then(|config| config.current_context)
+            .expect("test kubeconfig must have a current context")
+    });
     KubeCluster {
         name: "filar-tests".into(),
         context,
@@ -42,11 +40,7 @@ async fn pod_http_get_reads_metrics_through_port_forward() {
     let target = admin();
     let api: Arc<dyn ClusterApi> = Arc::new(KubeClusterApi::connect(&target).await.unwrap());
     let pod = api
-        .list_pods(
-            Some("shop"),
-            Some("app=httpd"),
-            Some("status.phase=Running"),
-        )
+        .list_pods(Some("shop"), Some("app=httpd"), Some("status.phase=Running"))
         .await
         .unwrap()
         .into_iter()
@@ -64,11 +58,7 @@ async fn pod_http_get_reads_metrics_through_port_forward() {
     let result = executor.execute(&call).await.unwrap();
     assert!(result.content.starts_with("HTTP 200"), "{}", result.content);
     assert!(result.content.contains("up 1"), "{}", result.content);
-    assert!(
-        !result.content.contains("http_requests_total"),
-        "{}",
-        result.content
-    );
+    assert!(!result.content.contains("http_requests_total"), "{}", result.content);
 
     let undeclared = parse_kube_tool_call(
         TOOL_POD_HTTP_GET,

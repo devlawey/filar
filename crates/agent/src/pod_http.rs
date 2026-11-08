@@ -41,8 +41,7 @@ impl std::fmt::Display for PortRef {
 
 /// Parse the `port` argument: a JSON number or a string (digits → number).
 pub fn parse_port(value: &serde_json::Value) -> Result<PortRef> {
-    let bad =
-        || CoreError::Other("port must be a port number 1–65535 or a container port name".into());
+    let bad = || CoreError::Other("port must be a port number 1–65535 or a container port name".into());
     match value {
         serde_json::Value::Number(n) => n
             .as_u64()
@@ -57,8 +56,7 @@ pub fn parse_port(value: &serde_json::Value) -> Result<PortRef> {
             }
             let valid = !s.is_empty()
                 && s.len() <= 15
-                && s.chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+                && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
             valid.then(|| PortRef::Name(s.to_string())).ok_or_else(bad)
         }
         _ => Err(bad()),
@@ -70,11 +68,7 @@ pub fn parse_port(value: &serde_json::Value) -> Result<PortRef> {
 /// within the index and text profiles of at most [`MAX_PPROF_SECONDS`].
 pub fn validate_path(path: &str) -> Result<String> {
     let path = path.trim();
-    let refuse = |why: &str| {
-        Err(CoreError::Other(format!(
-            "pod_http_get path refused: {why}"
-        )))
-    };
+    let refuse = |why: &str| Err(CoreError::Other(format!("pod_http_get path refused: {why}")));
     if !path.starts_with('/') || path.starts_with("//") {
         return refuse("it must be a relative path starting with `/`, without scheme or host");
     }
@@ -188,10 +182,7 @@ pub fn resolve_port(pod: &PodInfo, port: &PortRef, diagnostic_ports: &[u16]) -> 
 /// Whether an answer is Prometheus text exposition.
 pub fn is_prometheus(path: &str, content_type: Option<&str>) -> bool {
     content_type.is_some_and(|ct| ct.contains("version=0.0.4") || ct.contains("openmetrics"))
-        || path
-            .split('?')
-            .next()
-            .is_some_and(|p| p.ends_with("/metrics"))
+        || path.split('?').next().is_some_and(|p| p.ends_with("/metrics"))
 }
 
 /// Mask label values whose name says they hold a secret
@@ -253,9 +244,7 @@ pub fn prometheus_view(text: &str, metrics: &[String]) -> String {
             .copied()
             .filter(|l| {
                 let name = name_of(l);
-                metrics
-                    .iter()
-                    .any(|m| name == *m || name.starts_with(&format!("{m}_")))
+                metrics.iter().any(|m| name == *m || name.starts_with(&format!("{m}_")))
             })
             .collect();
         return format!(
@@ -322,10 +311,7 @@ mod tests {
     fn ports_parse_as_numbers_or_names() {
         assert_eq!(parse_port(&json!(8080)).unwrap(), PortRef::Number(8080));
         assert_eq!(parse_port(&json!("8080")).unwrap(), PortRef::Number(8080));
-        assert_eq!(
-            parse_port(&json!("http")).unwrap(),
-            PortRef::Name("http".into())
-        );
+        assert_eq!(parse_port(&json!("http")).unwrap(), PortRef::Name("http".into()));
         assert!(parse_port(&json!(0)).is_err());
         assert!(parse_port(&json!(70000)).is_err());
         assert!(parse_port(&json!("Bad Name")).is_err());
@@ -334,21 +320,10 @@ mod tests {
     #[test]
     fn only_declared_or_allowed_ports_are_reachable() {
         let pod = pod();
-        assert_eq!(
-            resolve_port(&pod, &PortRef::Number(8080), &[]).unwrap(),
-            8080
-        );
-        assert_eq!(
-            resolve_port(&pod, &PortRef::Name("http".into()), &[]).unwrap(),
-            8080
-        );
-        assert_eq!(
-            resolve_port(&pod, &PortRef::Number(6060), &[6060]).unwrap(),
-            6060
-        );
-        let err = resolve_port(&pod, &PortRef::Number(22), &[6060])
-            .unwrap_err()
-            .to_string();
+        assert_eq!(resolve_port(&pod, &PortRef::Number(8080), &[]).unwrap(), 8080);
+        assert_eq!(resolve_port(&pod, &PortRef::Name("http".into()), &[]).unwrap(), 8080);
+        assert_eq!(resolve_port(&pod, &PortRef::Number(6060), &[6060]).unwrap(), 6060);
+        let err = resolve_port(&pod, &PortRef::Number(22), &[6060]).unwrap_err().to_string();
         assert!(err.contains("diagnostic_ports"), "{err}");
         assert!(resolve_port(&pod, &PortRef::Name("admin".into()), &[]).is_err());
     }
@@ -356,10 +331,7 @@ mod tests {
     #[test]
     fn paths_must_be_relative_and_plain() {
         assert_eq!(validate_path("/metrics").unwrap(), "/metrics");
-        assert_eq!(
-            validate_path("/healthz?verbose=1").unwrap(),
-            "/healthz?verbose=1"
-        );
+        assert_eq!(validate_path("/healthz?verbose=1").unwrap(), "/healthz?verbose=1");
         for bad in [
             "metrics",
             "http://evil/metrics",
@@ -428,10 +400,7 @@ mod tests {
         assert!(validate_path("/debug/pprof/").is_ok());
         assert!(validate_path("/debug/pprof/goroutine?debug=1").is_ok());
         assert!(validate_path("/debug/pprof/profile?debug=1&seconds=30").is_ok());
-        assert!(
-            validate_path("/debug/pprof/heap").is_err(),
-            "binary profile"
-        );
+        assert!(validate_path("/debug/pprof/heap").is_err(), "binary profile");
         assert!(validate_path("/debug/pprof/profile?debug=1&seconds=60").is_err());
         assert!(validate_path("/debug/pprof/profile?seconds=10").is_err());
         // Repeated parameters: which value wins is up to the server.
@@ -457,10 +426,7 @@ mod tests {
     fn sensitive_labels_are_masked() {
         let text = "db_up{user=\"app\",password=\"hunter2\",db_token=\"t0k\"} 1";
         let out = redact_sensitive_labels(text);
-        assert_eq!(
-            out,
-            "db_up{user=\"app\",password=\"***\",db_token=\"***\"} 1"
-        );
+        assert_eq!(out, "db_up{user=\"app\",password=\"***\",db_token=\"***\"} 1");
     }
 
     #[test]
@@ -472,10 +438,7 @@ mod tests {
 
     #[test]
     fn prometheus_is_detected_by_type_or_path() {
-        assert!(is_prometheus(
-            "/x",
-            Some("text/plain; version=0.0.4; charset=utf-8")
-        ));
+        assert!(is_prometheus("/x", Some("text/plain; version=0.0.4; charset=utf-8")));
         assert!(is_prometheus("/metrics?x=1", None));
         assert!(!is_prometheus("/healthz", Some("text/plain")));
     }

@@ -5,8 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
-use super::text::wrap_text;
 use crate::app::{App, AppMode};
+use super::text::wrap_text;
 
 /// Render the input area or confirmation dialog.
 pub(crate) fn render_input_area(f: &mut Frame, app: &mut App, area: Rect) {
@@ -99,11 +99,7 @@ fn render_normal_input(f: &mut Frame, app: &mut App, area: Rect) {
 /// Thinking mode: spinner + muted label.
 fn render_thinking(f: &mut Frame, app: &App, area: Rect) {
     let spinner = app.spinner_char();
-    let label = if app.streaming {
-        "writing..."
-    } else {
-        "thinking..."
-    };
+    let label = if app.streaming { "writing..." } else { "thinking..." };
     let line = Line::from(vec![
         Span::styled(format!("{spinner} "), app.theme.warning_fg()),
         Span::styled(label, app.theme.muted()),
@@ -133,10 +129,7 @@ fn render_password_input(f: &mut Frame, app: &mut App, area: Rect) {
     if masked.is_empty() {
         let line = Line::from(vec![
             Span::styled(prompt, app.theme.user_style()),
-            Span::styled(
-                "type password, press enter to send (hidden), esc to cancel",
-                app.theme.muted(),
-            ),
+            Span::styled("type password, press enter to send (hidden), esc to cancel", app.theme.muted()),
         ]);
         f.render_widget(Paragraph::new(line), area);
     } else {

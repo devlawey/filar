@@ -176,7 +176,10 @@ mod tests {
         let mock = Arc::new(MockExecutor::new("user:s3cr3t-p@ss"));
         let exec = SecretSubstitutingExecutor::new(mock.clone(), provider_trait);
 
-        let result = exec.run("echo user:$FILAR_SECRET_1").await.unwrap();
+        let result = exec
+            .run("echo user:$FILAR_SECRET_1")
+            .await
+            .unwrap();
 
         // The inner executor received the substituted command.
         assert_eq!(*mock.last_command.lock().unwrap(), "echo user:s3cr3t-p@ss");
@@ -250,10 +253,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(*mock.last_command.lock().unwrap(), "echo alice and bob");
-        assert_eq!(
-            result.stdout,
-            "$FILAR_SECRET_1 and $FILAR_SECRET_2 are here"
-        );
+        assert_eq!(result.stdout, "$FILAR_SECRET_1 and $FILAR_SECRET_2 are here");
     }
 
     /// A mock executor that always returns an error containing the
@@ -317,9 +317,15 @@ mod tests {
             .unwrap();
 
         // Both secrets should be correctly substituted in the command.
-        assert_eq!(*mock.last_command.lock().unwrap(), "echo one and ten");
+        assert_eq!(
+            *mock.last_command.lock().unwrap(),
+            "echo one and ten"
+        );
         // Both should be correctly masked in the output.
-        assert_eq!(result.stdout, "$FILAR_SECRET_1 and $FILAR_SECRET_10");
+        assert_eq!(
+            result.stdout,
+            "$FILAR_SECRET_1 and $FILAR_SECRET_10"
+        );
     }
 
     #[tokio::test]
@@ -335,7 +341,10 @@ mod tests {
         let _ = exec.run("echo GLM_API_KEY").await.unwrap();
 
         // GLM_API_KEY is NOT substituted because it lacks the $ prefix.
-        assert_eq!(*mock.last_command.lock().unwrap(), "echo GLM_API_KEY");
+        assert_eq!(
+            *mock.last_command.lock().unwrap(),
+            "echo GLM_API_KEY"
+        );
     }
 
     #[tokio::test]
@@ -347,7 +356,10 @@ mod tests {
         let mock = Arc::new(MockExecutor::new("auth=env-pw-42"));
         let exec = SecretSubstitutingExecutor::new(mock.clone(), provider);
 
-        let result = exec.run("echo auth=$FILAR_SECRET_TESTENV").await.unwrap();
+        let result = exec
+            .run("echo auth=$FILAR_SECRET_TESTENV")
+            .await
+            .unwrap();
 
         // The inner executor received the substituted command.
         assert_eq!(*mock.last_command.lock().unwrap(), "echo auth=env-pw-42");

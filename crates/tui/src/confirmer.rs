@@ -31,7 +31,12 @@ impl TuiConfirmer {
 
 #[async_trait::async_trait]
 impl CommandConfirmer for TuiConfirmer {
-    async fn confirm(&self, command: &str, explanation: &str, destructive: bool) -> Result<bool> {
+    async fn confirm(
+        &self,
+        command: &str,
+        explanation: &str,
+        destructive: bool,
+    ) -> Result<bool> {
         debug!(command = %command, "TUI confirmer: sending confirmation request");
 
         let (respond_tx, respond_rx) = oneshot::channel();
@@ -44,10 +49,12 @@ impl CommandConfirmer for TuiConfirmer {
                 destructive,
                 respond_to: respond_tx,
             })
-            .map_err(|_| CoreError::Other("failed to send confirmation request to TUI".into()))?;
+            .map_err(|_| {
+                CoreError::Other("failed to send confirmation request to TUI".into())
+            })?;
 
-        respond_rx
-            .await
-            .map_err(|_| CoreError::Other("confirmation response channel closed".into()))
+        respond_rx.await.map_err(|_| {
+            CoreError::Other("confirmation response channel closed".into())
+        })
     }
 }

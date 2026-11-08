@@ -37,11 +37,7 @@ pub(crate) fn render_debug_confirm(f: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(color))
         .style(Style::default().bg(app.theme.bg))
         .title(Span::styled(
-            format!(
-                " Debug-контейнер {} {} ",
-                app.theme.glyphs().middle_dot,
-                proposal.cluster.name
-            ),
+            format!(" Debug-контейнер {} {} ", app.theme.glyphs().middle_dot, proposal.cluster.name),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(overlay);

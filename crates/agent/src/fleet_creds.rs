@@ -120,9 +120,7 @@ impl FleetCredentials {
     /// Why member `handle` drops out, or `None` if it takes part.
     pub fn missing(&self, op: &FleetOperation, handle: HostHandle) -> Option<MissingCredentials> {
         let index = op.handles().position(|h| h == handle)?;
-        self.hosts
-            .get(index)
-            .and_then(|h| h.as_ref().err().copied())
+        self.hosts.get(index).and_then(|h| h.as_ref().err().copied())
     }
 
     /// Names of the members that drop out, with the reason, in composition
@@ -179,10 +177,7 @@ fn resolve_ssh(
                     other => other,
                 })?;
             let mut ready = target.clone();
-            ready.auth = SshAuth::Key {
-                path: path.clone(),
-                passphrase: Some(passphrase),
-            };
+            ready.auth = SshAuth::Key { path: path.clone(), passphrase: Some(passphrase) };
             Ok(ready)
         }
         // The SSH agent needs nothing resolved up front: each member's
@@ -243,13 +238,7 @@ mod tests {
     #[test]
     fn a_host_without_credentials_drops_out_and_the_rest_take_part() {
         let op = fleet(&[
-            target(
-                "web-1",
-                SshAuth::Key {
-                    path: None,
-                    passphrase: None,
-                },
-            ),
+            target("web-1", SshAuth::Key { path: None, passphrase: None }),
             target("web-2", SshAuth::Password { password: None }),
             target("web-3", SshAuth::Agent),
             target("web-4", SshAuth::Password { password: None }),
@@ -259,23 +248,10 @@ mod tests {
         let creds = FleetCredentials::resolve(&op, &store);
 
         assert_eq!(creds.participants(&op), ["web-1", "web-3", "web-4"]);
-        assert_eq!(
-            creds.skipped(&op),
-            [("web-2".to_string(), MissingCredentials::NoPassword)]
-        );
-        assert!(matches!(
-            creds
-                .ready(2)
-                .and_then(FleetTarget::as_ssh)
-                .expect("web-3 ready")
-                .auth,
-            SshAuth::Agent
-        ));
+        assert_eq!(creds.skipped(&op), [("web-2".to_string(), MissingCredentials::NoPassword)]);
+        assert!(matches!(creds.ready(2).and_then(FleetTarget::as_ssh).expect("web-3 ready").auth, SshAuth::Agent));
         let handles: Vec<_> = op.handles().collect();
-        assert_eq!(
-            creds.missing(&op, handles[1]),
-            Some(MissingCredentials::NoPassword)
-        );
+        assert_eq!(creds.missing(&op, handles[1]), Some(MissingCredentials::NoPassword));
         assert_eq!(creds.missing(&op, handles[0]), None);
     }
 
@@ -299,17 +275,15 @@ mod tests {
         let key = PrivateKey::from(Ed25519Keypair::from_seed(&[4u8; 32]))
             .encrypt_with(
                 Cipher::Aes256Ctr,
-                Kdf::Bcrypt {
-                    salt: [2u8; 16].to_vec(),
-                    rounds: 1,
-                },
+                Kdf::Bcrypt { salt: [2u8; 16].to_vec(), rounds: 1 },
                 1,
                 passphrase,
             )
             .expect("encrypt");
         let pem = key.to_openssh(LineEnding::LF).expect("encode");
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("filar-fleet-key-{}-{n}", std::process::id()));
+        let path = std::env::temp_dir()
+            .join(format!("filar-fleet-key-{}-{n}", std::process::id()));
         std::fs::write(&path, pem.as_bytes()).expect("write");
         TempKey(path)
     }
@@ -317,10 +291,7 @@ mod tests {
     #[test]
     fn an_encrypted_key_takes_part_only_with_its_own_stored_passphrase() {
         let key = encrypted_key("per-host");
-        let key_auth = || SshAuth::Key {
-            path: Some(key.0.clone()),
-            passphrase: None,
-        };
+        let key_auth = || SshAuth::Key { path: Some(key.0.clone()), passphrase: None };
         let op = fleet(&[target("web-1", key_auth()), target("web-2", key_auth())]);
         let store = StaticSecretProvider::new();
         store.insert("ssh_key_passphrase:web-1", "per-host");
@@ -329,16 +300,8 @@ mod tests {
         let creds = FleetCredentials::resolve(&op, &store);
 
         assert_eq!(creds.participants(&op), ["web-1"]);
-        assert_eq!(
-            creds.skipped(&op),
-            [("web-2".to_string(), MissingCredentials::NoPassphrase)]
-        );
-        match &creds
-            .ready(0)
-            .and_then(FleetTarget::as_ssh)
-            .expect("web-1 ready")
-            .auth
-        {
+        assert_eq!(creds.skipped(&op), [("web-2".to_string(), MissingCredentials::NoPassphrase)]);
+        match &creds.ready(0).and_then(FleetTarget::as_ssh).expect("web-1 ready").auth {
             SshAuth::Key { passphrase, .. } => assert_eq!(passphrase.as_deref(), Some("per-host")),
             other => panic!("unexpected auth {other:?}"),
         }
@@ -347,18 +310,9 @@ mod tests {
     #[test]
     fn an_encrypted_key_with_an_unusable_store_says_so() {
         let key = encrypted_key("x");
-        let op = fleet(&[target(
-            "web-1",
-            SshAuth::Key {
-                path: Some(key.0.clone()),
-                passphrase: None,
-            },
-        )]);
+        let op = fleet(&[target("web-1", SshAuth::Key { path: Some(key.0.clone()), passphrase: None })]);
         let creds = FleetCredentials::resolve(&op, &BrokenStore);
-        assert_eq!(
-            creds.skipped(&op),
-            [("web-1".to_string(), MissingCredentials::StoreUnavailable)]
-        );
+        assert_eq!(creds.skipped(&op), [("web-1".to_string(), MissingCredentials::StoreUnavailable)]);
     }
 
     #[test]
@@ -374,12 +328,7 @@ mod tests {
         store.insert("SSH_PASSWORD", "shared-for-everyone");
         let creds = FleetCredentials::resolve(&op, &store);
 
-        match &creds
-            .ready(0)
-            .and_then(FleetTarget::as_ssh)
-            .expect("web-1 ready")
-            .auth
-        {
+        match &creds.ready(0).and_then(FleetTarget::as_ssh).expect("web-1 ready").auth {
             SshAuth::Password { password } => assert_eq!(password.as_deref(), Some("only-web-1")),
             other => panic!("unexpected auth {other:?}"),
         }
@@ -438,25 +387,13 @@ mod tests {
     fn an_unreachable_store_is_not_reported_as_a_missing_password() {
         let op = fleet(&[
             target("web-1", SshAuth::Password { password: None }),
-            target(
-                "web-2",
-                SshAuth::Key {
-                    path: None,
-                    passphrase: None,
-                },
-            ),
+            target("web-2", SshAuth::Key { path: None, passphrase: None }),
         ]);
         let creds = FleetCredentials::resolve(&op, &BrokenStore);
-        assert_eq!(
-            creds.skipped(&op),
-            [("web-1".to_string(), MissingCredentials::StoreUnavailable)]
-        );
+        assert_eq!(creds.skipped(&op), [("web-1".to_string(), MissingCredentials::StoreUnavailable)]);
         assert_eq!(creds.participants(&op), ["web-2"]);
         let reason = MissingCredentials::StoreUnavailable.to_string();
-        assert!(
-            !reason.contains("Secret Service unreachable"),
-            "no store error text: {reason}"
-        );
+        assert!(!reason.contains("Secret Service unreachable"), "no store error text: {reason}");
     }
 
     #[test]

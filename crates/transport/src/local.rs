@@ -60,10 +60,7 @@ impl LocalExecutor {
 
     /// Create a local executor with an explicit command timeout.
     pub async fn with_timeout(timeout: Duration) -> Result<Self> {
-        info!(
-            timeout_secs = timeout.as_secs(),
-            "local subprocess executor ready"
-        );
+        info!(timeout_secs = timeout.as_secs(), "local subprocess executor ready");
         Ok(Self {
             cancel_notify: Arc::new(Notify::new()),
             timeout,
@@ -189,18 +186,13 @@ impl crate::CommandExecutor for LocalExecutor {
             stderr,
             exit_code,
             duration,
-            cwd: self
-                .cwd
-                .lock()
-                .ok()
-                .and_then(|g| g.as_ref().map(|p| p.to_string_lossy().into_owned())),
+            cwd: self.cwd.lock().ok().and_then(|g| {
+                g.as_ref().map(|p| p.to_string_lossy().into_owned())
+            }),
         })
     }
 
-    async fn run_streaming(
-        &self,
-        command: &str,
-    ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+    async fn run_streaming(&self, command: &str) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
         let result = self.run(command).await?;
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
@@ -224,10 +216,9 @@ impl crate::CommandExecutor for LocalExecutor {
         if !crate::is_safe_cwd(path) {
             return Err(CoreError::Other("invalid cwd".into()));
         }
-        let mut guard = self
-            .cwd
-            .lock()
-            .map_err(|_| CoreError::Other("cwd lock poisoned".into()))?;
+        let mut guard = self.cwd.lock().map_err(|_| {
+            CoreError::Other("cwd lock poisoned".into())
+        })?;
         *guard = Some(PathBuf::from(path.trim()));
         Ok(())
     }
@@ -367,14 +358,8 @@ mod tests {
     #[test]
     fn build_shell_command_contains_user_command_and_marker() {
         let result = build_shell_command("echo hello", M);
-        assert!(
-            result.contains("echo hello\n"),
-            "a newline must end the user command: {result}"
-        );
-        assert!(
-            result.contains(M),
-            "must report cwd with the marker: {result}"
-        );
+        assert!(result.contains("echo hello\n"), "a newline must end the user command: {result}");
+        assert!(result.contains(M), "must report cwd with the marker: {result}");
     }
 
     #[test]
@@ -387,10 +372,7 @@ mod tests {
             ),
             "Windows command must have the OutputEncoding prefix, got: {result}"
         );
-        assert!(
-            result.contains("} 2>&1 | Out-Default\n"),
-            "stderr merged and flushed: {result}"
-        );
+        assert!(result.contains("} 2>&1 | Out-Default\n"), "stderr merged and flushed: {result}");
         assert!(result.contains("Get-Location -PSProvider FileSystem"));
     }
 
@@ -437,31 +419,16 @@ mod tests {
         #[cfg(unix)]
         let (cd, pwd) = (format!("cd '{dir_str}'"), "pwd");
         let first = exec.run(&cd).await.unwrap();
-        assert!(
-            !first.stdout.contains("__filar_cwd_"),
-            "marker leaked: {:?}",
-            first.stdout
-        );
-        assert!(
-            first.cwd.as_deref().is_some_and(|c| c.contains(&marker)),
-            "{:?}",
-            first.cwd
-        );
-        assert!(exec
-            .current_cwd()
-            .await
-            .is_some_and(|c| c.contains(&marker)));
+        assert!(!first.stdout.contains("__filar_cwd_"), "marker leaked: {:?}", first.stdout);
+        assert!(first.cwd.as_deref().is_some_and(|c| c.contains(&marker)), "{:?}", first.cwd);
+        assert!(exec.current_cwd().await.is_some_and(|c| c.contains(&marker)));
         let second = exec.run(pwd).await.unwrap();
         assert!(
             second.stdout.contains(&marker),
             "pwd after cd: {:?} should contain {marker}",
             second.stdout
         );
-        assert!(
-            !second.stdout.contains("__filar_cwd_"),
-            "marker leaked: {:?}",
-            second.stdout
-        );
+        assert!(!second.stdout.contains("__filar_cwd_"), "marker leaked: {:?}", second.stdout);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -482,10 +449,7 @@ mod tests {
         #[cfg(windows)]
         {
             assert_eq!(exec.run("cmd /c exit 7").await.unwrap().exit_code, Some(7));
-            assert_eq!(
-                exec.run("Write-Output ok").await.unwrap().exit_code,
-                Some(0)
-            );
+            assert_eq!(exec.run("Write-Output ok").await.unwrap().exit_code, Some(0));
         }
     }
 
@@ -525,28 +489,18 @@ mod tests {
         assert_eq!(run("Write-Error boom").2, Some(1));
         assert_eq!(run("exit 4").2, Some(4));
         let (out, cwd, code) = run("'hi' # note }");
-        assert_eq!(
-            (out.trim(), cwd.as_deref(), code),
-            ("hi", Some("/"), Some(0))
-        );
+        assert_eq!((out.trim(), cwd.as_deref(), code), ("hi", Some("/"), Some(0)));
         // A `}` inside a string or comment does not close the wrapper's
         // block; a bare one is a parse error in PowerShell anyway.
         let (out, cwd, code) = run("Write-Output '}' \"{ }\"\n<# } #>");
-        assert_eq!(
-            (out.trim(), cwd.as_deref(), code),
-            ("}\n{ }", Some("/"), Some(0))
-        );
+        assert_eq!((out.trim(), cwd.as_deref(), code), ("}\n{ }", Some("/"), Some(0)));
     }
 
     /// Cancel kills the command, not only the wrapping shell (#493).
     #[tokio::test]
     #[cfg(unix)]
     async fn cancel_kills_the_whole_process_group() {
-        let exec = Arc::new(
-            LocalExecutor::with_timeout(Duration::from_secs(20))
-                .await
-                .unwrap(),
-        );
+        let exec = Arc::new(LocalExecutor::with_timeout(Duration::from_secs(20)).await.unwrap());
         let tag = format!("filar_cancel_{}", std::process::id());
         let run = {
             let exec = exec.clone();
@@ -557,10 +511,7 @@ mod tests {
         exec.cancel().await.unwrap();
         assert!(run.await.unwrap().is_err());
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let ps = std::process::Command::new("ps")
-            .args(["-eo", "args"])
-            .output()
-            .unwrap();
+        let ps = std::process::Command::new("ps").args(["-eo", "args"]).output().unwrap();
         let ps = String::from_utf8_lossy(&ps.stdout);
         assert!(!ps.contains(&tag), "command survived cancel:\n{ps}");
     }

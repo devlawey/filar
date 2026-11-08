@@ -21,10 +21,7 @@ fn client() -> reqwest::Client {
 async fn ingest(lines: &[serde_json::Value], marker: &str) {
     let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
     let status = client()
-        .post(format!(
-            "{}/insert/jsonline?_stream_fields=kubernetes.pod_namespace",
-            url()
-        ))
+        .post(format!("{}/insert/jsonline?_stream_fields=kubernetes.pod_namespace", url()))
         .header("Content-Type", "application/stream+json")
         .body(body)
         .send()
@@ -93,10 +90,7 @@ async fn query_logs_finds_inserted_lines_folded_and_newest_first() {
     let text = sources.execute(&call).await.unwrap();
     assert!(text.contains("7 line(s)"), "{text}");
     assert!(text.contains("[6×]"), "{text}");
-    assert!(
-        text.contains("[1×]") && text.contains("OOMKilled worker"),
-        "{text}"
-    );
+    assert!(text.contains("[1×]") && text.contains("OOMKilled worker"), "{text}");
     // Groups come by count: the six refusals before the single OOMKilled.
     let first_group = text.lines().find(|l| l.starts_with('[')).unwrap();
     assert!(first_group.starts_with("[6×]"), "groups by count: {text}");
@@ -204,10 +198,7 @@ async fn pod_logs_history_reads_vlagent_lines_for_a_pod_and_a_fleet() {
         .await
         .unwrap()
         .content;
-    assert!(
-        fleet.contains("web-1 | 2 | 1 | [2×] timeout calling pay"),
-        "{fleet}"
-    );
+    assert!(fleet.contains("web-1 | 2 | 1 | [2×] timeout calling pay"), "{fleet}");
     assert!(fleet.contains("web-2 | 1 | 1 |"), "{fleet}");
     assert!(fleet.contains("web-3 | 0 | 0 | —"), "{fleet}");
 }

@@ -133,19 +133,11 @@ fn footer_hint(kind: PathPickerKind, width: u16) -> Cow<'static, str> {
         ],
     };
     let fits = |v: &&&str| v.chars().count() <= width as usize;
-    match variants
-        .iter()
-        .filter(fits)
-        .max_by_key(|v| v.chars().count())
-    {
+    match variants.iter().filter(fits).max_by_key(|v| v.chars().count()) {
         Some(v) => Cow::Borrowed(v),
         // Narrower than every variant: the shortest, cut to the width.
         None => {
-            let shortest = variants
-                .iter()
-                .min_by_key(|v| v.chars().count())
-                .copied()
-                .unwrap_or("");
+            let shortest = variants.iter().min_by_key(|v| v.chars().count()).copied().unwrap_or("");
             Cow::Owned(shortest.chars().take(width as usize).collect())
         }
     }

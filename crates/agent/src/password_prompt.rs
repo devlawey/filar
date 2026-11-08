@@ -126,9 +126,7 @@ mod tests {
     fn detects_sudo_heredoc_stdin_conflict() {
         let cmd = "printf '%s\\n' \"$FILAR_SECRET_1\" | sudo -S tee /tmp/f >/dev/null <<'EOF'\ncontent\nEOF";
         assert!(sudo_heredoc_stdin_conflict(cmd));
-        assert!(sudo_heredoc_stdin_conflict(
-            "echo x | sudo -S sh <<'EOF'\ntrue\nEOF"
-        ));
+        assert!(sudo_heredoc_stdin_conflict("echo x | sudo -S sh <<'EOF'\ntrue\nEOF"));
         // No heredoc → no conflict.
         assert!(!sudo_heredoc_stdin_conflict(
             "printf '%s\\n' \"$FILAR_SECRET_1\" | sudo -S true"
@@ -142,10 +140,7 @@ mod tests {
     #[test]
     fn enrich_for_command_appends_heredoc_guidance_on_failure() {
         let cmd = "printf '%s\\n' \"$FILAR_SECRET_2\" | sudo -S tee /tmp/f <<'EOF'\n<x/>\nEOF";
-        let out = enrich_password_prompt_message_for_command(
-            cmd,
-            "Password:Sorry, try again.\nsudo: 3 incorrect password attempts",
-        );
+        let out = enrich_password_prompt_message_for_command(cmd, "Password:Sorry, try again.\nsudo: 3 incorrect password attempts");
         assert!(out.contains(PASSWORD_PROMPT_GUIDANCE));
         assert!(out.contains(SUDO_HEREDOC_GUIDANCE));
         // Keep UI-friendly: combined guidance stays bounded.

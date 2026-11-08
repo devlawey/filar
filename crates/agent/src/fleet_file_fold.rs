@@ -166,29 +166,13 @@ impl FileFoldTable {
 
         let mut line = |label: &str, hosts: Vec<String>| {
             if !hosts.is_empty() {
-                out.push_str(&format!(
-                    "{label} ({}): {}\n",
-                    hosts.len(),
-                    hosts.join(", ")
-                ));
+                out.push_str(&format!("{label} ({}): {}\n", hosts.len(), hosts.join(", ")));
             }
         };
-        line(
-            "matches",
-            self.hosts_where(|v| matches!(v, FileVerdict::Matches)),
-        );
-        line(
-            "missing",
-            self.hosts_where(|v| matches!(v, FileVerdict::Missing)),
-        );
-        line(
-            "absent",
-            self.hosts_where(|v| matches!(v, FileVerdict::Absent)),
-        );
-        line(
-            "unreadable",
-            self.hosts_where(|v| matches!(v, FileVerdict::Unreadable)),
-        );
+        line("matches", self.hosts_where(|v| matches!(v, FileVerdict::Matches)));
+        line("missing", self.hosts_where(|v| matches!(v, FileVerdict::Missing)));
+        line("absent", self.hosts_where(|v| matches!(v, FileVerdict::Absent)));
+        line("unreadable", self.hosts_where(|v| matches!(v, FileVerdict::Unreadable)));
         line(
             "unrecognised answer",
             self.hosts_where(|v| matches!(v, FileVerdict::Unrecognised)),
@@ -278,10 +262,12 @@ pub fn fold_file(
             // "the reference is: no file" would call every other host that
             // cannot see it a match — so it is no reference at all.
             // Raised in review.
-            Some((_, _, Some(FileProbe::Missing))) => {
-                Expected::Unavailable(format!("{name} has no such file, or cannot see it"))
+            Some((_, _, Some(FileProbe::Missing))) => Expected::Unavailable(format!(
+                "{name} has no such file, or cannot see it"
+            )),
+            Some((_, _, _)) => {
+                Expected::Unavailable(format!("{name} could not hash its copy"))
             }
-            Some((_, _, _)) => Expected::Unavailable(format!("{name} could not hash its copy")),
             None if dropped.iter().any(|(host, _)| host == name) => {
                 Expected::Unavailable(format!("{name} gave no answer"))
             }
@@ -352,19 +338,14 @@ mod tests {
     #[filar_transport::async_trait]
     impl CommandExecutor for Fake {
         async fn run(&self, command: &str) -> filar_core::error::Result<CommandResult> {
-            assert!(
-                command.contains("sha256sum"),
-                "only the hash is asked for: {command}"
-            );
+            assert!(command.contains("sha256sum"), "only the hash is asked for: {command}");
             let (stdout, code) = match &self.0 {
                 Has::File(digest) => (format!("present\n{digest}  /etc/app.conf\n"), 0),
                 Has::Missing => (String::new(), 1),
                 Has::Unreadable => ("present\n".into(), 1),
                 Has::Prints(text) => ((*text).into(), 0),
                 Has::Gone => {
-                    return Err(filar_core::error::CoreError::ConnectionLost(
-                        "no route".into(),
-                    ))
+                    return Err(filar_core::error::CoreError::ConnectionLost("no route".into()))
                 }
             };
             Ok(CommandResult {
@@ -427,49 +408,26 @@ mod tests {
     async fn a_host_that_differs_from_the_golden_host_is_named() {
         let (table, result) = run(
             FileReference::Host("web-1".into()),
-            &[
-                Has::File(GOLD),
-                Has::File(GOLD),
-                Has::File(DRIFT),
-                Has::File(DRIFT),
-            ],
+            &[Has::File(GOLD), Has::File(GOLD), Has::File(DRIFT), Has::File(DRIFT)],
         )
         .await;
         let text = table.render();
-        assert!(
-            text.contains("reference host web-1 (sha256 aaaaaaaaaaaa)"),
-            "{text}"
-        );
+        assert!(text.contains("reference host web-1 (sha256 aaaaaaaaaaaa)"), "{text}");
         assert!(text.contains("matches (2): web-1, web-2"), "{text}");
-        assert!(
-            text.contains("differs sha256 bbbbbbbbbbbb (2): web-3, web-4"),
-            "{text}"
-        );
+        assert!(text.contains("differs sha256 bbbbbbbbbbbb (2): web-3, web-4"), "{text}");
         assert_eq!(
             states(&result),
-            [
-                HostState::Success,
-                HostState::Success,
-                HostState::Divergent,
-                HostState::Divergent
-            ],
+            [HostState::Success, HostState::Success, HostState::Divergent, HostState::Divergent],
             "the reference decides, not the majority"
         );
     }
 
     #[tokio::test]
     async fn a_missing_file_is_its_own_state_not_an_error() {
-        let (table, result) = run(
-            FileReference::Sha256(GOLD.into()),
-            &[Has::File(GOLD), Has::Missing],
-        )
-        .await;
+        let (table, result) =
+            run(FileReference::Sha256(GOLD.into()), &[Has::File(GOLD), Has::Missing]).await;
         assert_eq!(table.rows()[1].verdict(), &FileVerdict::Missing);
-        assert!(
-            table.render().contains("missing (1): web-2"),
-            "{}",
-            table.render()
-        );
+        assert!(table.render().contains("missing (1): web-2"), "{}", table.render());
         assert_eq!(states(&result), [HostState::Success, HostState::Divergent]);
         assert_eq!(result.summary().count(HostState::ExecutionError), 0);
     }
@@ -484,14 +442,9 @@ mod tests {
         )
         .await;
         assert!(matches!(table.expected(), Expected::Unavailable(_)));
-        assert!(table
-            .render()
-            .contains("web-1 has no such file, or cannot see it"));
+        assert!(table.render().contains("web-1 has no such file, or cannot see it"));
         assert!(!table.render().contains("matches"), "{}", table.render());
-        assert_eq!(
-            states(&result),
-            [HostState::Success, HostState::Success, HostState::Success]
-        );
+        assert_eq!(states(&result), [HostState::Success, HostState::Success, HostState::Success]);
     }
 
     #[tokio::test]
@@ -504,10 +457,7 @@ mod tests {
         let text = table.render();
         assert!(text.contains("unreadable (1): web-1"), "{text}");
         assert!(text.contains("unrecognised answer (1): web-2"), "{text}");
-        assert_eq!(
-            states(&result),
-            [HostState::ExecutionError, HostState::ExecutionError]
-        );
+        assert_eq!(states(&result), [HostState::ExecutionError, HostState::ExecutionError]);
     }
 
     #[tokio::test]
@@ -519,28 +469,16 @@ mod tests {
         .await;
         let text = table.render();
         assert!(text.contains("unavailable: web-1 gave no answer"), "{text}");
-        assert!(
-            text.contains("has sha256 aaaaaaaaaaaa (1): web-2"),
-            "{text}"
-        );
+        assert!(text.contains("has sha256 aaaaaaaaaaaa (1): web-2"), "{text}");
         assert!(text.contains("absent (1): web-4"), "{text}");
         assert!(text.contains("no verdict: web-1 (no contact)"), "{text}");
         assert_eq!(
             states(&result),
-            [
-                HostState::NoContact,
-                HostState::Success,
-                HostState::Success,
-                HostState::Success
-            ]
+            [HostState::NoContact, HostState::Success, HostState::Success, HostState::Success]
         );
 
         let (table, _) = run(FileReference::Host("db-1".into()), &[Has::File(GOLD)]).await;
-        assert!(
-            table.render().contains("db-1 is not in this fleet"),
-            "{}",
-            table.render()
-        );
+        assert!(table.render().contains("db-1 is not in this fleet"), "{}", table.render());
     }
 
     #[tokio::test]
@@ -557,13 +495,7 @@ mod tests {
         )
         .await;
         let text = table.render();
-        for leaked in [
-            "hunter2",
-            "instructions",
-            "listen",
-            "server",
-            "5d5c3712955042",
-        ] {
+        for leaked in ["hunter2", "instructions", "listen", "server", "5d5c3712955042"] {
             assert!(!text.contains(leaked), "{leaked:?} leaked into: {text}");
         }
         assert!(text.contains("unrecognised answer (2)"), "{text}");

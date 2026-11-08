@@ -319,11 +319,7 @@ pub fn build_audit_messages(
 
 /// Human-readable target description for the audit prompt.
 pub fn target_description(ctx: &ArbiterContext) -> String {
-    if let Some(pod) = ctx
-        .kubernetes
-        .as_ref()
-        .and_then(|target| target.pod.as_ref())
-    {
+    if let Some(pod) = ctx.kubernetes.as_ref().and_then(|target| target.pod.as_ref()) {
         return pod.describe();
     }
     if let Some(target) = &ctx.kubernetes {
@@ -478,11 +474,7 @@ pub async fn run_audit(
         reason: parsed.reason,
         model: response.model,
         unavailable,
-        tokens_in: response
-            .usage
-            .as_ref()
-            .and_then(|u| u.prompt_tokens)
-            .unwrap_or(0),
+        tokens_in: response.usage.as_ref().and_then(|u| u.prompt_tokens).unwrap_or(0),
         tokens_out: response
             .usage
             .as_ref()
@@ -542,7 +534,9 @@ mod tests {
 
     #[test]
     fn history_tail_skips_password_prompts() {
-        let msgs = vec![ChatMessage::system("Enter SSH password for root@host:22")];
+        let msgs = vec![ChatMessage::system(
+            "Enter SSH password for root@host:22",
+        )];
         let tail = history_tail_from_messages(&msgs, 4);
         assert_eq!(tail, "(no prior context)");
     }
@@ -607,32 +601,18 @@ mod tests {
             cpu_limit: Some("500m".into()),
             ..PodLimits::default()
         });
-        assert!(
-            root.describe().ends_with("; limits: root, cpu limit 500m"),
-            "{}",
-            root.describe()
-        );
+        assert!(root.describe().ends_with("; limits: root, cpu limit 500m"), "{}", root.describe());
         // `runAsNonRoot: false` alone does not say the user is root.
         let unknown = pod_target(PodLimits {
             run_as_non_root: Some(false),
             ..PodLimits::default()
         });
-        assert!(
-            !unknown.describe().contains("limits"),
-            "{}",
-            unknown.describe()
-        );
+        assert!(!unknown.describe().contains("limits"), "{}", unknown.describe());
     }
 
     #[test]
     fn build_audit_messages_includes_command_and_explanation() {
-        let msgs = build_audit_messages(
-            "rm -rf /tmp/x",
-            "Remove temp dir",
-            true,
-            "local machine",
-            "ctx",
-        );
+        let msgs = build_audit_messages("rm -rf /tmp/x", "Remove temp dir", true, "local machine", "ctx");
         assert_eq!(msgs.len(), 2);
         assert!(msgs[1].content.contains("rm -rf /tmp/x"));
         assert!(msgs[1].content.contains("Remove temp dir"));

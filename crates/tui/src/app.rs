@@ -411,9 +411,7 @@ impl HostSelectRow {
 }
 
 pub mod pod_tab;
-pub use pod_tab::{
-    DebugProposal, KubePodConnectRequest, KubePodListRequest, KubePodSelect, PodChoice,
-};
+pub use pod_tab::{DebugProposal, KubePodConnectRequest, KubePodListRequest, KubePodSelect, PodChoice};
 
 /// Flat Ctrl+O selection index of [`HostSelectRow::EnterPod`]: outside the
 /// host range, so it can never be taken for a target (#565).
@@ -450,13 +448,7 @@ impl LogDetail {
             if same_day {
                 t.get(11..16).unwrap_or(t).to_string()
             } else {
-                format!(
-                    "{} {}",
-                    t.get(5..10).unwrap_or(""),
-                    t.get(11..16).unwrap_or(t)
-                )
-                .trim()
-                .to_string()
+                format!("{} {}", t.get(5..10).unwrap_or(""), t.get(11..16).unwrap_or(t)).trim().to_string()
             }
         };
         let mut out = format!(
@@ -1547,11 +1539,7 @@ impl Session {
             }
             None => match &self.kube {
                 Some(kube) if kube.pod.is_none() => {
-                    match kube
-                        .namespace
-                        .as_deref()
-                        .or(kube.target.default_namespace.as_deref())
-                    {
+                    match kube.namespace.as_deref().or(kube.target.default_namespace.as_deref()) {
                         Some(namespace) => format!("{}/{namespace}", kube.target.name),
                         None => kube.target.name.clone(),
                     }
@@ -2679,10 +2667,7 @@ impl App {
             && fleet.is_none()
             && tag.is_none()
             && self.in_cluster_tab()
-            && self
-                .kube
-                .as_ref()
-                .is_some_and(|kube| kube.namespace.is_some());
+            && self.kube.as_ref().is_some_and(|kube| kube.namespace.is_some());
         if can_enter_pod && (q.is_empty() || "войти в под enter pod".contains(&q)) {
             rows.push(HostSelectRow::EnterPod);
         }
@@ -12181,10 +12166,7 @@ mod tests {
         for _ in 0..3 {
             app.new_tab();
         }
-        for (i, ns) in ["filar-k8s", "filar-k8s", "kube-system", "filar-k8s"]
-            .iter()
-            .enumerate()
-        {
+        for (i, ns) in ["filar-k8s", "filar-k8s", "kube-system", "filar-k8s"].iter().enumerate() {
             app.sessions[i].kube = Some(kube_tab("kind-filar-k8s", Some(ns)));
         }
         assert_eq!(
@@ -12215,15 +12197,9 @@ mod tests {
         ));
         let label = &app.tab_labels()[0];
         assert!(label.ends_with('\u{2026}'), "{label}");
-        assert_eq!(
-            unicode_width::UnicodeWidthStr::width(label.as_str()),
-            MAX_TAB_LABEL_WIDTH
-        );
+        assert_eq!(unicode_width::UnicodeWidthStr::width(label.as_str()), MAX_TAB_LABEL_WIDTH);
         assert_eq!(truncate_label("кластер/ns", 32), "кластер/ns");
-        assert_eq!(
-            unicode_width::UnicodeWidthStr::width(truncate_label("集群集群集群", 7).as_str()),
-            7
-        );
+        assert_eq!(unicode_width::UnicodeWidthStr::width(truncate_label("集群集群集群", 7).as_str()), 7);
     }
 
     // ── Help overlay tests ────────────────────────────────────────────
@@ -17679,21 +17655,12 @@ mod tests {
         app.risk_scorer_on = true;
         let command = "query_logs vlogs-prod --start 2026-11-01T10:00:00Z --end 2026-11-01T11:00:00Z --limit 200: error";
         propose(&mut app, 901, command, "query_logs");
-        assert!(
-            app.safety_scores.get(&901).is_none(),
-            "a log query is never rated"
-        );
+        assert!(app.safety_scores.get(&901).is_none(), "a log query is never rated");
         log_query_done(&mut app, command);
         finished(&mut app, command);
         let idx = app.messages.len() - 1;
-        let detail = app
-            .log_details
-            .get(&idx)
-            .expect("detail linked to the block");
-        assert_eq!(
-            detail.summary(),
-            "vlogs-prod · LogsQL · 10:00–11:00 UTC · 2 lines · truncated"
-        );
+        let detail = app.log_details.get(&idx).expect("detail linked to the block");
+        assert_eq!(detail.summary(), "vlogs-prod · LogsQL · 10:00–11:00 UTC · 2 lines · truncated");
         assert_eq!(app.log_queries.get("vlogs-prod"), Some(&1));
 
         let theme = crate::ui::theme::Theme::default_dark();
@@ -17703,13 +17670,7 @@ mod tests {
             cache
                 .lines
                 .iter()
-                .map(|l| {
-                    l.line
-                        .spans
-                        .iter()
-                        .map(|s| s.content.as_ref())
-                        .collect::<String>()
-                })
+                .map(|l| l.line.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -17717,25 +17678,13 @@ mod tests {
         let collapsed: std::collections::HashSet<usize> = [idx].into();
         cache.rebuild(&app.messages, 120, &theme, &collapsed, 1);
         let shown = text(&cache);
-        assert!(
-            shown.contains("vlogs-prod · LogsQL · 10:00–11:00 UTC · 2 lines · truncated"),
-            "{shown}"
-        );
+        assert!(shown.contains("vlogs-prod · LogsQL · 10:00–11:00 UTC · 2 lines · truncated"), "{shown}");
         assert!(!shown.contains("lines (2 of 2)"), "{shown}");
         // Expanded: the lines behind the fold.
-        cache.rebuild(
-            &app.messages,
-            120,
-            &theme,
-            &std::collections::HashSet::new(),
-            2,
-        );
+        cache.rebuild(&app.messages, 120, &theme, &std::collections::HashSet::new(), 2);
         let shown = text(&cache);
         assert!(shown.contains("lines (2 of 2):"), "{shown}");
-        assert!(
-            shown.contains("2026-11-01 10:06:00 connection refused"),
-            "{shown}"
-        );
+        assert!(shown.contains("2026-11-01 10:06:00 connection refused"), "{shown}");
     }
 
     #[test]
@@ -17750,10 +17699,7 @@ mod tests {
             truncated: false,
             raw: Vec::new(),
         };
-        assert_eq!(
-            detail.summary(),
-            "v · LogsQL · 11-01 23:55–11-02 00:05 UTC · 1 line"
-        );
+        assert_eq!(detail.summary(), "v · LogsQL · 11-01 23:55–11-02 00:05 UTC · 1 line");
     }
 
     #[test]
@@ -17762,15 +17708,8 @@ mod tests {
         propose(&mut app, 902, "query_logs a", "query_logs");
         log_query_done(&mut app, "query_logs b");
         finished(&mut app, "query_logs a");
-        assert!(
-            app.log_details.is_empty(),
-            "another command's detail is not linked"
-        );
-        assert_eq!(
-            app.pending_log_details.len(),
-            1,
-            "and it is kept for its own block"
-        );
+        assert!(app.log_details.is_empty(), "another command's detail is not linked");
+        assert_eq!(app.pending_log_details.len(), 1, "and it is kept for its own block");
         propose(&mut app, 903, "query_logs b", "query_logs");
         finished(&mut app, "query_logs b");
         assert_eq!(app.log_details.len(), 1);
@@ -17966,15 +17905,8 @@ mod tests {
         finished(&mut app, "query_logs new"); // index 4 — kept
         app.active_session_mut().pending_compaction = Some(3);
         app.apply_compaction(3, "summary".into());
-        assert_eq!(
-            app.log_details.len(),
-            1,
-            "the folded block's detail is gone"
-        );
-        assert_eq!(
-            app.log_details.get(&2).map(|d| d.command.as_str()),
-            Some("query_logs new")
-        );
+        assert_eq!(app.log_details.len(), 1, "the folded block's detail is gone");
+        assert_eq!(app.log_details.get(&2).map(|d| d.command.as_str()), Some("query_logs new"));
     }
 
     #[test]

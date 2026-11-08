@@ -202,9 +202,7 @@ impl ChatLayoutCache {
                         };
                         header.push(Span::styled(format!("[{label}] "), style));
                     }
-                    let is_logs = tool
-                        .as_ref()
-                        .is_some_and(|tool| crate::app::is_log_tool(&tool.name));
+                    let is_logs = tool.as_ref().is_some_and(|tool| crate::app::is_log_tool(&tool.name));
                     let marker = if is_logs {
                         format!("{} ", glyphs.logs)
                     } else if tool
@@ -227,17 +225,10 @@ impl ChatLayoutCache {
                             self.push_output(idx, format!("  {} {}", glyphs.gutter, wrapped));
                         }
                     }
-                    let detail = if is_logs {
-                        self.log_details.get(&idx).cloned()
-                    } else {
-                        None
-                    };
+                    let detail = if is_logs { self.log_details.get(&idx).cloned() } else { None };
                     if let Some(detail) = &detail {
                         for wrapped in wrap_text(&detail.summary(), output_width) {
-                            self.push_output(
-                                idx,
-                                format!("  {} {} {}", glyphs.gutter, glyphs.logs, wrapped),
-                            );
+                            self.push_output(idx, format!("  {} {} {}", glyphs.gutter, glyphs.logs, wrapped));
                         }
                     }
 
@@ -292,20 +283,12 @@ impl ChatLayoutCache {
                             if let Some(detail) = detail.as_ref().filter(|d| !d.raw.is_empty()) {
                                 self.push_output(
                                     idx,
-                                    format!(
-                                        "  {} lines ({} of {}):",
-                                        glyphs.gutter,
-                                        detail.raw.len(),
-                                        detail.lines
-                                    ),
+                                    format!("  {} lines ({} of {}):", glyphs.gutter, detail.raw.len(), detail.lines),
                                 );
                                 for raw in &detail.raw {
                                     let raw = sanitize_output(raw);
                                     for wrapped in wrap_text(&raw, output_width) {
-                                        self.push_output(
-                                            idx,
-                                            format!("  {}   {}", glyphs.gutter, wrapped),
-                                        );
+                                        self.push_output(idx, format!("  {}   {}", glyphs.gutter, wrapped));
                                     }
                                 }
                             }
@@ -321,24 +304,12 @@ impl ChatLayoutCache {
                 }
 
                 ChatBlock::Error(text) => {
-                    self.push_marked(
-                        idx,
-                        glyphs.danger,
-                        theme.error_style(),
-                        &strip_emoji(text),
-                        inner,
-                    );
+                    self.push_marked(idx, glyphs.danger, theme.error_style(), &strip_emoji(text), inner);
                     self.push_spacer();
                 }
 
                 ChatBlock::System(text) => {
-                    self.push_marked(
-                        idx,
-                        glyphs.middle_dot,
-                        theme.muted(),
-                        &strip_emoji(text),
-                        inner,
-                    );
+                    self.push_marked(idx, glyphs.middle_dot, theme.muted(), &strip_emoji(text), inner);
                     self.push_spacer();
                 }
 
@@ -450,10 +421,7 @@ impl ChatLayoutCache {
         };
         self.push_header(idx, first_row);
         for row in rows {
-            self.push_body_spans(
-                idx,
-                vec![Span::raw(" ".repeat(indent)), Span::styled(row, style)],
-            );
+            self.push_body_spans(idx, vec![Span::raw(" ".repeat(indent)), Span::styled(row, style)]);
         }
     }
 
@@ -531,11 +499,7 @@ fn wrap_words(line: &str, width: usize) -> Vec<String> {
             started = true;
             continue;
         }
-        let piece = if current.is_empty() {
-            piece
-        } else {
-            word.to_string()
-        };
+        let piece = if current.is_empty() { piece } else { word.to_string() };
         if !current.is_empty() {
             rows.push(std::mem::take(&mut current));
         }
@@ -654,10 +618,7 @@ mod tests {
         let mut cache = ChatLayoutCache::new();
         let hint = "Debug-контейнер недоступен: у кластера kind-filar-k8s пуст debug_images (лаунчер → Hosts → Debug images)";
         let error = "Не удалось войти в под filar-k8s-noshell-1, вкладка осталась на кластере kind-filar-k8s: в контейнере нет /bin/sh";
-        let msgs = vec![
-            ChatBlock::System(hint.into()),
-            ChatBlock::Error(error.into()),
-        ];
+        let msgs = vec![ChatBlock::System(hint.into()), ChatBlock::Error(error.into())];
         cache.rebuild(&msgs, 40, &theme, &HashSet::new(), 1);
         for (idx, text) in [(0, hint), (1, error)] {
             let rows = block_rows(&cache, idx);
@@ -667,18 +628,12 @@ mod tests {
             }
             // The ASCII theme (Windows conhost, CI) uses `-` as the dot, which
             // the text itself contains: compare row prefixes, not substrings.
-            let marker = if idx == 0 {
-                theme.glyphs().middle_dot
-            } else {
-                theme.glyphs().danger
-            };
+            let marker = if idx == 0 { theme.glyphs().middle_dot } else { theme.glyphs().danger };
             let lead = format!("  {marker} ");
             let indent = " ".repeat(UnicodeWidthStr::width(lead.as_str()));
             assert!(rows[0].starts_with(&lead), "{rows:?}");
             assert!(
-                rows[1..]
-                    .iter()
-                    .all(|r| r.starts_with(&indent) && !r.starts_with(&lead)),
+                rows[1..].iter().all(|r| r.starts_with(&indent) && !r.starts_with(&lead)),
                 "marker only first, continuations indented: {rows:?}"
             );
             // A break eats exactly one space here (the text has single
@@ -689,15 +644,9 @@ mod tests {
                 .join(" ");
             assert_eq!(joined, text, "whole text kept, spaces included");
         }
-        let first_block_rows = cache
-            .lines
-            .iter()
-            .filter(|l| l.block_index == Some(0))
-            .count();
+        let first_block_rows = cache.lines.iter().filter(|l| l.block_index == Some(0)).count();
         assert_eq!(cache.lines[0].region, LineRegion::Header);
-        assert!(cache.lines[1..first_block_rows]
-            .iter()
-            .all(|l| l.region == LineRegion::Body));
+        assert!(cache.lines[1..first_block_rows].iter().all(|l| l.region == LineRegion::Body));
     }
 
     #[test]
@@ -710,10 +659,7 @@ mod tests {
         ];
         cache.rebuild(&msgs, 80, &theme, &HashSet::new(), 1);
         let dot = theme.glyphs().middle_dot;
-        assert_eq!(
-            block_rows(&cache, 0),
-            vec![format!("  {dot} first"), "    second".to_string()]
-        );
+        assert_eq!(block_rows(&cache, 0), vec![format!("  {dot} first"), "    second".to_string()]);
         assert_eq!(block_rows(&cache, 1), vec![format!("  {dot} connected")]);
     }
 
@@ -723,21 +669,10 @@ mod tests {
         let theme = Theme::default_dark();
         let dot = super::super::theme::Glyphs::ASCII.middle_dot;
         let mut cache = ChatLayoutCache::new();
-        cache.push_marked(
-            0,
-            dot,
-            theme.muted(),
-            "Debug-контейнер недоступен: у кластера kind-filar-k8s",
-            30,
-        );
+        cache.push_marked(0, dot, theme.muted(), "Debug-контейнер недоступен: у кластера kind-filar-k8s", 30);
         let rows = block_rows(&cache, 0);
         assert!(rows[0].starts_with(&format!("  {dot} Debug-")), "{rows:?}");
-        assert!(
-            rows[1..]
-                .iter()
-                .all(|r| r.starts_with("    ") && !r.starts_with(&format!("  {dot} "))),
-            "{rows:?}"
-        );
+        assert!(rows[1..].iter().all(|r| r.starts_with("    ") && !r.starts_with(&format!("  {dot} "))), "{rows:?}");
     }
 
     #[test]
@@ -745,25 +680,12 @@ mod tests {
         let theme = Theme::default_dark();
         for width in [1usize, 2, 3, 4] {
             let mut cache = ChatLayoutCache::new();
-            cache.push_marked(
-                0,
-                theme.glyphs().middle_dot,
-                theme.muted(),
-                "abc def ghi",
-                width,
-            );
+            cache.push_marked(0, theme.glyphs().middle_dot, theme.muted(), "abc def ghi", width);
             let rows = block_rows(&cache, 0);
             for row in &rows {
-                assert!(
-                    UnicodeWidthStr::width(row.as_str()) <= width,
-                    "{width}: {rows:?}"
-                );
+                assert!(UnicodeWidthStr::width(row.as_str()) <= width, "{width}: {rows:?}");
             }
-            assert_eq!(
-                rows.concat().replace(' ', ""),
-                "abcdefghi",
-                "{width}: nothing cut away: {rows:?}"
-            );
+            assert_eq!(rows.concat().replace(' ', ""), "abcdefghi", "{width}: nothing cut away: {rows:?}");
         }
         // Wide enough for the lead and text: the marker is back.
         let mut cache = ChatLayoutCache::new();
@@ -773,23 +695,13 @@ mod tests {
 
     #[test]
     fn indentation_repeated_spaces_and_tabs_survive_wrapping() {
-        assert_eq!(
-            wrap_words("   indented  twice", 40),
-            vec!["   indented  twice"]
-        );
-        assert_eq!(
-            wrap_words("  key:   value  next", 14),
-            vec!["  key:   value", "next"]
-        );
+        assert_eq!(wrap_words("   indented  twice", 40), vec!["   indented  twice"]);
+        assert_eq!(wrap_words("  key:   value  next", 14), vec!["  key:   value", "next"]);
         let theme = Theme::default_dark();
         let mut cache = ChatLayoutCache::new();
         cache.push_marked(0, theme.glyphs().middle_dot, theme.muted(), "a\tb", 40);
         let rows = block_rows(&cache, 0);
-        assert_eq!(
-            rows[0],
-            format!("  {} a       b", theme.glyphs().middle_dot),
-            "tab expanded to a stop"
-        );
+        assert_eq!(rows[0], format!("  {} a       b", theme.glyphs().middle_dot), "tab expanded to a stop");
     }
 
     #[test]
@@ -799,10 +711,7 @@ mod tests {
             vec!["пуст debug_images", "(лаунчер → Hosts →", "Debug images)"]
         );
         // A word wider than the row is cut, and the rest continues after it.
-        assert_eq!(
-            wrap_words("ab /very/long/path cd", 6),
-            vec!["ab", "/very/", "long/p", "ath cd"]
-        );
+        assert_eq!(wrap_words("ab /very/long/path cd", 6), vec!["ab", "/very/", "long/p", "ath cd"]);
         assert_eq!(wrap_words("", 10), vec![String::new()]);
     }
 
@@ -812,20 +721,10 @@ mod tests {
         let mut cache = ChatLayoutCache::new();
         // The feed strips CJK (`strip_emoji`), so the wrapping helper is
         // driven directly: width is counted in columns.
-        cache.push_marked(
-            0,
-            theme.glyphs().danger,
-            theme.error_style(),
-            "集群集群集群集群集群集群",
-            14,
-        );
+        cache.push_marked(0, theme.glyphs().danger, theme.error_style(), "集群集群集群集群集群集群", 14);
         let rows = block_rows(&cache, 0);
         assert!(rows.len() >= 3, "{rows:?}");
-        assert!(
-            rows.iter()
-                .all(|r| UnicodeWidthStr::width(r.as_str()) <= 14),
-            "{rows:?}"
-        );
+        assert!(rows.iter().all(|r| UnicodeWidthStr::width(r.as_str()) <= 14), "{rows:?}");
     }
 
     #[test]

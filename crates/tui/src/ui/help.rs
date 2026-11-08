@@ -463,10 +463,7 @@ fn overlay_lines(app: &App, inner_width: usize) -> Vec<Line<'static>> {
         let indent = text.len() - text.trim_start().len();
         let room = inner_width.saturating_sub(indent).max(1);
         for row in wrap_words(text.trim_start(), room) {
-            lines.push(Line::from(Span::styled(
-                format!("{}{row}", " ".repeat(indent)),
-                style,
-            )));
+            lines.push(Line::from(Span::styled(format!("{}{row}", " ".repeat(indent)), style)));
         }
     }
     lines
@@ -494,17 +491,12 @@ fn pod_section_lines(app: &App, inner_width: usize) -> Vec<Line<'static>> {
     }
     match pod.limits.as_ref() {
         Some(limits) => text.extend(crate::app::pod_tab::pod_limits_details(limits)),
-        None => {
-            text.push("connecting — limits are read from the pod spec once the shell opens".into())
-        }
+        None => text.push("connecting — limits are read from the pod spec once the shell opens".into()),
     }
     let room = inner_width.saturating_sub(2).max(1);
     for item in text {
         for row in wrap_words(&item, room) {
-            lines.push(Line::from(Span::styled(
-                format!("  {row}"),
-                app.theme.fg_style(),
-            )));
+            lines.push(Line::from(Span::styled(format!("  {row}"), app.theme.fg_style())));
         }
     }
     lines.push(Line::raw(""));
@@ -556,10 +548,7 @@ fn push_entry_lines(
     let room = inner_width.saturating_sub(STACKED_INDENT).max(1);
     let indent = " ".repeat(STACKED_INDENT.min(inner_width.saturating_sub(1)));
     for row in wrap_words(entry.desc, room) {
-        lines.push(Line::from(Span::styled(
-            format!("{indent}{row}"),
-            desc_style,
-        )));
+        lines.push(Line::from(Span::styled(format!("{indent}{row}"), desc_style)));
     }
 }
 
@@ -644,11 +633,7 @@ fn append_usage_summary(lines: &mut Vec<Line<'static>>, app: &App) {
 
     // Safety ratings (#551): their own line — a separate model and cost.
     if app.risk_ratings > 0 {
-        let noun = if app.risk_ratings == 1 {
-            "rating"
-        } else {
-            "ratings"
-        };
+        let noun = if app.risk_ratings == 1 { "rating" } else { "ratings" };
         let mut risk = format!("  Risk scorer: {} {noun}", app.risk_ratings);
         if let Some(cost) = app.risk_cost_usd {
             if cost > 0.0 {
@@ -688,18 +673,8 @@ mod tests {
     #[test]
     fn registry_descriptions_carry_no_manual_layout() {
         for e in help_registry() {
-            assert!(
-                !e.desc.contains('\n'),
-                "{}: line break in {:?}",
-                e.key,
-                e.desc
-            );
-            assert!(
-                !e.desc.contains("  "),
-                "{}: double space in {:?}",
-                e.key,
-                e.desc
-            );
+            assert!(!e.desc.contains('\n'), "{}: line break in {:?}", e.key, e.desc);
+            assert!(!e.desc.contains("  "), "{}: double space in {:?}", e.key, e.desc);
             assert_eq!(e.desc.trim(), e.desc, "{}: padded description", e.key);
         }
     }
@@ -721,8 +696,7 @@ mod tests {
 
     /// Inner width of the overlay on a terminal `cols` wide.
     fn inner_width(cols: u16) -> usize {
-        (OVERLAY_MAX_WIDTH.min(cols.saturating_sub(2 * OVERLAY_H_MARGIN)) as usize)
-            .saturating_sub(2)
+        (OVERLAY_MAX_WIDTH.min(cols.saturating_sub(2 * OVERLAY_H_MARGIN)) as usize).saturating_sub(2)
     }
 
     #[test]
@@ -735,10 +709,7 @@ mod tests {
             let mut continuations = 0;
             for line in &lines {
                 let text = row_text(line);
-                assert!(
-                    text.width() <= width,
-                    "{cols}: {text:?} is wider than {width}"
-                );
+                assert!(text.width() <= width, "{cols}: {text:?} is wider than {width}");
                 if line.spans.len() == 2 && line.spans[0].content.trim().is_empty() {
                     continuations += 1;
                     assert_eq!(line.spans[0].content.width(), DESC_COL, "{cols}: {text:?}");
@@ -783,10 +754,7 @@ mod tests {
             }
         }
         let lines = overlay_lines(&app, 30);
-        let at = lines
-            .iter()
-            .position(|l| row_text(l) == "  F2")
-            .expect("F2 on its own row");
+        let at = lines.iter().position(|l| row_text(l) == "  F2").expect("F2 on its own row");
         assert!(row_text(&lines[at + 1]).starts_with("    Toggle safe mode"));
     }
 
@@ -797,16 +765,10 @@ mod tests {
         let mut app = App::new("t".into(), CommandConfirmMode::Always);
         app.help_scroll = scroll;
         let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
-        terminal
-            .draw(|f| render_help_overlay(f, &app, f.area()))
-            .unwrap();
+        terminal.draw(|f| render_help_overlay(f, &app, f.area())).unwrap();
         let buf = terminal.backend().buffer().clone();
         (0..rows)
-            .map(|y| {
-                (0..cols)
-                    .map(|x| buf[(x, y)].symbol().to_string())
-                    .collect::<String>()
-            })
+            .map(|y| (0..cols).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
             .collect()
     }
 
@@ -817,14 +779,8 @@ mod tests {
         for cols in [20u16, 60, 80, 120] {
             let total = overlay_lines(&app, inner_width(cols)).len();
             let screen = rendered(cols, 24, 0);
-            let title = screen
-                .iter()
-                .find(|r| r.contains("Help ("))
-                .expect("title row");
-            assert!(
-                title.contains(&format!("1/{total},")) || cols < 60,
-                "{cols}: {title}"
-            );
+            let title = screen.iter().find(|r| r.contains("Help (")).expect("title row");
+            assert!(title.contains(&format!("1/{total},")) || cols < 60, "{cols}: {title}");
 
             // Scrolled to the end, the last row of the overlay body is the
             // last line of the content (the usage header at least).
@@ -841,15 +797,10 @@ mod tests {
     #[test]
     fn rendered_continuations_sit_under_the_description() {
         let screen = rendered(80, 40, 0);
-        let first = screen
-            .iter()
-            .position(|r| r.contains("Toggle safe mode"))
-            .expect("F2 row");
+        let first = screen.iter().position(|r| r.contains("Toggle safe mode")).expect("F2 row");
         let col = screen[first].find("Toggle").unwrap();
         let next = &screen[first + 1];
-        let next_col = next
-            .find(|c: char| c.is_alphanumeric())
-            .expect("continuation text");
+        let next_col = next.find(|c: char| c.is_alphanumeric()).expect("continuation text");
         assert_eq!(next_col, col, "{}\n{next}", screen[first]);
     }
 
@@ -896,14 +847,12 @@ mod tests {
     #[test]
     fn registry_has_key_sections() {
         let r = help_registry();
-        let sections: std::collections::HashSet<&str> = r.iter().map(|e| e.section).collect();
+        let sections: std::collections::HashSet<&str> =
+            r.iter().map(|e| e.section).collect();
         assert!(sections.contains("Modes"), "must have Modes section");
         assert!(sections.contains("Tabs"), "must have Tabs section");
         assert!(sections.contains("Agent"), "must have Agent section");
-        assert!(
-            sections.contains("Scrolling"),
-            "must have Scrolling section"
-        );
+        assert!(sections.contains("Scrolling"), "must have Scrolling section");
         assert!(sections.contains("Input"), "must have Input section");
         assert!(sections.contains("Exit"), "must have Exit section");
     }
@@ -931,10 +880,7 @@ mod tests {
         assert!(available.contains(&"Up / Down"));
         // These are NOT in Normal:
         assert!(!available.contains(&"^Z")); // only Thinking/Confirming
-        assert!(
-            !available.contains(&"Tab"),
-            "Tab switch is only for Confirming"
-        );
+        assert!(!available.contains(&"Tab"), "Tab switch is only for Confirming");
     }
 
     #[test]
@@ -983,18 +929,9 @@ mod tests {
         });
         let rows: Vec<String> = overlay_lines(&app, 80).iter().map(row_text).collect();
         assert_eq!(rows[0].trim(), "Pod");
-        assert!(
-            rows[1].contains("pod web-1") && rows[1].contains("container main"),
-            "{rows:?}"
-        );
-        assert!(
-            rows.iter().any(|r| r.trim() == "memory limit: 512Mi"),
-            "{rows:?}"
-        );
-        assert!(
-            rows.iter().any(|r| r.trim() == "CPU request: 100m"),
-            "{rows:?}"
-        );
+        assert!(rows[1].contains("pod web-1") && rows[1].contains("container main"), "{rows:?}");
+        assert!(rows.iter().any(|r| r.trim() == "memory limit: 512Mi"), "{rows:?}");
+        assert!(rows.iter().any(|r| r.trim() == "CPU request: 100m"), "{rows:?}");
         assert!(rows.iter().any(|r| r.trim() == "user: 65534"), "{rows:?}");
         app.kube.as_mut().unwrap().pod = None;
         let rows: Vec<String> = overlay_lines(&app, 80).iter().map(row_text).collect();

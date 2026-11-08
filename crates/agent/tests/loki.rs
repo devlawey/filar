@@ -23,16 +23,8 @@ async fn query_logs_finds_pushed_lines_and_counts_them() {
     let marker = format!("filartest{}", std::process::id());
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap();
     let values: Vec<serde_json::Value> = (0..5)
-        .map(|i| {
-            serde_json::json!([
-                (now - (5 - i) * 1_000_000_000).to_string(),
-                format!("level=error msg=\"{marker} connection refused to db-{i}:5432\"")
-            ])
-        })
-        .chain(std::iter::once(serde_json::json!([
-            now.to_string(),
-            format!("level=info msg=\"{marker} ok\"")
-        ])))
+        .map(|i| serde_json::json!([(now - (5 - i) * 1_000_000_000).to_string(), format!("level=error msg=\"{marker} connection refused to db-{i}:5432\"")]))
+        .chain(std::iter::once(serde_json::json!([now.to_string(), format!("level=info msg=\"{marker} ok\"")])))
         .collect();
     let push = serde_json::json!({"streams": [{"stream": {"namespace": "shop", "pod": "web-1", "test": marker}, "values": values}]});
     let status = client()
@@ -81,9 +73,7 @@ async fn query_logs_finds_pushed_lines_and_counts_them() {
     assert!(text.contains("pod=web-1"), "labels as fields: {text}");
 
     let metric = sources
-        .execute(&call(format!(
-            "sum by (pod) (count_over_time({{test=\"{marker}\"}}[10m]))"
-        )))
+        .execute(&call(format!("sum by (pod) (count_over_time({{test=\"{marker}\"}}[10m]))")))
         .await
         .unwrap();
     assert!(metric.contains("Metric result: 1 series"), "{metric}");

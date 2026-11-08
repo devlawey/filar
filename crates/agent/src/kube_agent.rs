@@ -9,9 +9,7 @@ use std::time::Duration;
 use filar_core::{CommandConfirmMode, CoreError, KubeCluster, Result, TagPolicy};
 use tokio_util::sync::CancellationToken;
 
-use crate::arbiter::{
-    self, ArbiterContext, KubernetesArbiterTarget, ARBITER_TIMEOUT_SECS, HISTORY_TAIL_EXCHANGES,
-};
+use crate::arbiter::{self, ArbiterContext, KubernetesArbiterTarget, ARBITER_TIMEOUT_SECS, HISTORY_TAIL_EXCHANGES};
 use crate::fleet_gate::{ApprovalScope, FleetGate};
 use crate::fleet_view::{FleetStatus, FleetView};
 use crate::risk::{PendingScores, RiskInput, RiskScorer};
@@ -436,10 +434,7 @@ impl KubeAgent {
         }
         if self.log_sources.is_some() {
             let fleet = matches!(self.execution, KubeExecution::Fleet { .. });
-            tools.push(crate::logs::k8s::pod_logs_history_definition(
-                self.confirm_mode,
-                fleet,
-            ));
+            tools.push(crate::logs::k8s::pod_logs_history_definition(self.confirm_mode, fleet));
         }
         let mut missing_explanations = 0;
 
@@ -525,25 +520,16 @@ impl KubeAgent {
         };
         if call.name == crate::logs::k8s::TOOL_POD_LOGS_HISTORY {
             let Some(sources) = &self.log_sources else {
-                return Ok(ChatMessage::tool(
-                    &call.id,
-                    "Error: no log sources are configured.",
-                ));
+                return Ok(ChatMessage::tool(&call.id, "Error: no log sources are configured."));
             };
             let emit = |event: AgentEvent| self.emit_and_rate(scores, event, None);
             let proposal_id = crate::agent::next_proposal_id();
             return match &self.execution {
-                KubeExecution::Cluster {
-                    target, namespace, ..
-                } => {
+                KubeExecution::Cluster { target, namespace, .. } => {
                     // The cluster's own tag policies tighten the gate as for
                     // every other request of this tab.
-                    let mode = filar_core::tag_policy_floor(
-                        self.confirm_mode,
-                        &self.tag_policies,
-                        &target.tags,
-                    )
-                    .unwrap_or(self.confirm_mode);
+                    let mode = filar_core::tag_policy_floor(self.confirm_mode, &self.tag_policies, &target.tags)
+                        .unwrap_or(self.confirm_mode);
                     sources
                         .process_pod_logs_history(
                             call,
@@ -683,7 +669,9 @@ impl KubeAgent {
         match decision {
             ConfirmDecision::NeedsConfirmation => {
                 let approved = self
-                    .cancellable(confirmer.confirm(&display, &confirmation_explanation, false))
+                    .cancellable(
+                        confirmer.confirm(&display, &confirmation_explanation, false),
+                    )
                     .await?;
                 if !approved {
                     self.emit(AgentEvent::CommandFinished {
@@ -951,11 +939,7 @@ mod tests {
         )]);
         let (events, audited_before) =
             run_cluster_agent(CommandConfirmMode::Always, Some(Arc::clone(&arbiter)), true).await;
-        assert_eq!(
-            audited_before,
-            vec![true],
-            "the verdict comes before the question"
-        );
+        assert_eq!(audited_before, vec![true], "the verdict comes before the question");
         assert!(
             events.iter().any(|e| matches!(
                 e,
@@ -965,18 +949,13 @@ mod tests {
             "{events:?}"
         );
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::CommandFinished { denied: false, .. })),
+            events.iter().any(|e| matches!(e, AgentEvent::CommandFinished { denied: false, .. })),
             "a verdict never denies: {events:?}"
         );
         let requests = arbiter.requests.lock().unwrap();
         let audit = &requests[0].messages[1].content;
         assert!(audit.contains("k8s_get pod"), "{audit}");
-        assert!(
-            audit.contains("Kubernetes cluster prod-eu (namespace shop, tags: prod)"),
-            "{audit}"
-        );
+        assert!(audit.contains("Kubernetes cluster prod-eu (namespace shop, tags: prod)"), "{audit}");
         assert!(audit.contains("List the pods in shop"), "{audit}");
     }
 
@@ -1011,21 +990,13 @@ mod tests {
             Vec::new(),
         )
         .event_sink(sink)
-        .arbiter(
-            Some(Arc::clone(&arbiter) as Arc<dyn LlmClient>),
-            true,
-            "judge",
-        )
+        .arbiter(Some(Arc::clone(&arbiter) as Arc<dyn LlmClient>), true, "judge")
         .run("describe pods", &[])
         .await
         .unwrap();
         assert_eq!(*confirmer.audited_before.lock().unwrap(), vec![true]);
         let requests = arbiter.requests.lock().unwrap();
-        assert_eq!(
-            requests.len(),
-            1,
-            "one audit for the one fleet-wide approval"
-        );
+        assert_eq!(requests.len(), 1, "one audit for the one fleet-wide approval");
         let audit = &requests[0].messages[1].content;
         assert!(audit.contains("Kubernetes fleet web-prod"), "{audit}");
     }
@@ -1059,11 +1030,7 @@ mod tests {
             Vec::new(),
         )
         .cancellation(token.clone())
-        .arbiter(
-            Some(Arc::new(CancellingArbiter(token)) as Arc<dyn LlmClient>),
-            true,
-            "judge",
-        )
+        .arbiter(Some(Arc::new(CancellingArbiter(token)) as Arc<dyn LlmClient>), true, "judge")
         .run("show pods", &[])
         .await;
         assert!(result.is_err(), "the turn ends cancelled");
@@ -1082,18 +1049,14 @@ mod tests {
             let arbiter = ScriptedLlm::new(vec![ChatResponse::text(r#"{"verdict":"OK"}"#)]);
             let (events, _) = run_cluster_agent(mode, Some(Arc::clone(&arbiter)), enabled).await;
             assert!(
-                !events
-                    .iter()
-                    .any(|e| matches!(e, AgentEvent::CommandAudited { .. })),
+                !events.iter().any(|e| matches!(e, AgentEvent::CommandAudited { .. })),
                 "{mode:?}/{enabled}: {events:?}"
             );
             assert!(arbiter.requests.lock().unwrap().is_empty());
         }
         let (events, audited) = run_cluster_agent(CommandConfirmMode::Always, None, true).await;
         assert_eq!(audited, vec![false]);
-        assert!(!events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::CommandAudited { .. })));
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandAudited { .. })));
     }
 
     // ── Safety rating (#631) ───────────────────────────────────────────
@@ -1604,9 +1567,6 @@ mod tests {
     #[tokio::test]
     async fn pod_http_get_to_a_diagnostic_path_goes_without_a_question_in_never_mode() {
         let (confirmer, _) = run_http_get("/metrics", CommandConfirmMode::Never, false).await;
-        assert!(
-            confirmer.asked.lock().unwrap().is_empty(),
-            "no window for /metrics"
-        );
+        assert!(confirmer.asked.lock().unwrap().is_empty(), "no window for /metrics");
     }
 }

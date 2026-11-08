@@ -31,14 +31,14 @@ pub fn interactive_grid_rows(total_height: u16) -> u16 {
 mod bars;
 mod chat;
 mod confirm;
-mod debug_confirm;
 mod file_panels;
 mod help;
 mod host_select;
 mod input;
 mod namespace_select;
-mod path_picker_overlay;
+mod debug_confirm;
 mod pod_select;
+mod path_picker_overlay;
 mod save_overlay;
 mod session_select;
 mod side_panel;

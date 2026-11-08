@@ -196,12 +196,7 @@ fn pod_limits(pod: &Pod, container: &str) -> PodLimits {
     let Some(c) = spec.containers.iter().find(|c| c.name == container) else {
         return PodLimits::default();
     };
-    let quantity = |map: Option<
-        &std::collections::BTreeMap<
-            String,
-            k8s_openapi::apimachinery::pkg::api::resource::Quantity,
-        >,
-    >,
+    let quantity = |map: Option<&std::collections::BTreeMap<String, k8s_openapi::apimachinery::pkg::api::resource::Quantity>>,
                     key: &str| map.and_then(|m| m.get(key)).map(|q| q.0.clone());
     let resources = c.resources.as_ref();
     let limits = resources.and_then(|r| r.limits.as_ref());
@@ -232,12 +227,7 @@ fn pod_limits(pod: &Pod, container: &str) -> PodLimits {
 fn rbac_verb_and_resource(message: &str) -> Option<(String, String)> {
     let after = message.split(" cannot ").nth(1)?;
     let verb = after.split_whitespace().next()?.to_string();
-    let resource = after
-        .split("resource \"")
-        .nth(1)?
-        .split('"')
-        .next()?
-        .to_string();
+    let resource = after.split("resource \"").nth(1)?.split('"').next()?.to_string();
     Some((verb, resource))
 }
 
@@ -305,30 +295,24 @@ impl ExecPlace {
     /// to upgrade — nothing runs) to tell RBAC from an admission policy.
     async fn exec_error(&self, error: kube::Error, command: &[String]) -> CoreError {
         match error {
-            kube::Error::Api(status) if status.code == 403 => forbidden_error(
-                &status.message,
-                ("create", "pods/exec"),
-                &self.namespace,
-                &self.context,
-            ),
-            kube::Error::UpgradeConnection(
-                kube::client::UpgradeConnectionError::ProtocolSwitch(code),
-            ) if code.as_u16() == 403 => match self.probe_denial(command).await {
-                Some(message) => forbidden_error(
-                    &message,
-                    ("create", "pods/exec"),
-                    &self.namespace,
-                    &self.context,
-                ),
+            kube::Error::Api(status) if status.code == 403 => {
+                forbidden_error(&status.message, ("create", "pods/exec"), &self.namespace, &self.context)
+            }
+            kube::Error::UpgradeConnection(kube::client::UpgradeConnectionError::ProtocolSwitch(
+                code,
+            )) if code.as_u16() == 403 => match self.probe_denial(command).await {
+                Some(message) => {
+                    forbidden_error(&message, ("create", "pods/exec"), &self.namespace, &self.context)
+                }
                 // The reason could not be read: do not guess RBAC vs policy.
                 None => CoreError::AccessDenied(format!(
                     "exec в под {}/{} запрещён (HTTP 403, контекст {}); причину API не сообщил",
                     self.namespace, self.pod, self.context
                 )),
             },
-            kube::Error::UpgradeConnection(
-                kube::client::UpgradeConnectionError::ProtocolSwitch(code),
-            ) if code.as_u16() == 404 => CoreError::NotFound(format!(
+            kube::Error::UpgradeConnection(kube::client::UpgradeConnectionError::ProtocolSwitch(
+                code,
+            )) if code.as_u16() == 404 => CoreError::NotFound(format!(
                 "под {}/{} не найден (контекст {})",
                 self.namespace, self.pod, self.context
             )),
@@ -338,13 +322,7 @@ impl ExecPlace {
                     context: self.context.clone(),
                     ..KubeCluster::default()
                 };
-                api_error(
-                    &fallback,
-                    other,
-                    "create",
-                    "pods/exec",
-                    Some(&self.namespace),
-                )
+                api_error(&fallback, other, "create", "pods/exec", Some(&self.namespace))
             }
         }
     }
@@ -352,10 +330,12 @@ impl ExecPlace {
     /// Repeat a refused exec as a plain `POST` to read the API's denial text.
     async fn probe_denial(&self, command: &[String]) -> Option<String> {
         let params = self.attach_params(true);
-        let mut request =
-            kube::core::Request::new(format!("/api/v1/namespaces/{}/pods", self.namespace))
-                .exec(&self.pod, command.to_vec(), &params)
-                .ok()?;
+        let mut request = kube::core::Request::new(format!(
+            "/api/v1/namespaces/{}/pods",
+            self.namespace
+        ))
+        .exec(&self.pod, command.to_vec(), &params)
+        .ok()?;
         if let Ok(method) = "POST".parse() {
             *request.method_mut() = method;
         }
@@ -516,9 +496,7 @@ impl KubeInteractive {
         };
         let (Some(stdin), Some(mut stdout)) = (process.stdin(), process.stdout()) else {
             process.abort();
-            return Err(CoreError::Other(
-                "pod terminal did not provide stdin/stdout".into(),
-            ));
+            return Err(CoreError::Other("pod terminal did not provide stdin/stdout".into()));
         };
         let mut resize = process.terminal_size();
         if let Some(sender) = resize.as_mut() {
@@ -644,11 +622,10 @@ impl crate::InteractiveTerminal for KubeInteractive {
             return Ok(());
         };
         // A stalled exec must not block the UI loop on a full channel.
-        match tokio::time::timeout(self.write_timeout, sender.send(tty_size(cols, rows))).await {
+        match tokio::time::timeout(self.write_timeout, sender.send(tty_size(cols, rows))).await
+        {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(CoreError::ConnectionLost(format!(
-                "pod terminal resize: {e}"
-            ))),
+            Ok(Err(e)) => Err(CoreError::ConnectionLost(format!("pod terminal resize: {e}"))),
             Err(_) => Err(CoreError::ConnectionLost(
                 "pod terminal resize: not accepted in time".into(),
             )),
@@ -662,12 +639,7 @@ impl crate::InteractiveTerminal for KubeInteractive {
         if let Some(reader) = self.reader.lock().unwrap_or_else(|e| e.into_inner()).take() {
             reader.abort();
         }
-        if let Some(process) = self
-            .process
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+        if let Some(process) = self.process.lock().unwrap_or_else(|e| e.into_inner()).take() {
             process.abort();
         }
         Ok(())
@@ -712,9 +684,7 @@ impl PodShell {
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (process.stdin(), process.stdout(), process.stderr())
         else {
-            return Err(CoreError::Other(
-                "pod exec did not provide stdin/stdout/stderr".into(),
-            ));
+            return Err(CoreError::Other("pod exec did not provide stdin/stdout/stderr".into()));
         };
 
         let closed = Arc::new(AtomicBool::new(false));
@@ -758,10 +728,7 @@ impl PodShell {
             // The exec's status may trail the stream closure slightly.
             let deadline = Instant::now() + Duration::from_millis(500);
             let failure = loop {
-                let failure = exit_status
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                let failure = exit_status.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 if failure.is_some() || Instant::now() >= deadline {
                     break failure;
                 }
@@ -873,12 +840,7 @@ impl PodShell {
 
     fn abort(&self) {
         self.closed.store(true, Ordering::Relaxed);
-        if let Some(process) = self
-            .process
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+        if let Some(process) = self.process.lock().unwrap_or_else(|e| e.into_inner()).take() {
             process.abort();
         }
     }
@@ -980,10 +942,7 @@ impl KubeExecutor {
 
     /// The last pod change `(old, new)`, cleared by reading it.
     pub fn take_pod_change(&self) -> Option<(String, String)> {
-        self.pod_change
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
+        self.pod_change.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// Receive [`KubeExecEvent`]s from now on.
@@ -1015,10 +974,7 @@ impl KubeExecutor {
     }
 
     fn identity(&self) -> ShellIdentity {
-        self.identity
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.identity.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Open a fresh shell (same pod if it is still ready; for a selector,
@@ -1137,7 +1093,9 @@ async fn open_shell(
             match kept {
                 Some(pod) => pod,
                 None => {
-                    let listed = api.list_pods(Some(namespace), Some(selector), None).await?;
+                    let listed = api
+                        .list_pods(Some(namespace), Some(selector), None)
+                        .await?;
                     get(select_ready_pod(&listed, selector, namespace, context)?).await?
                 }
             }
@@ -1173,12 +1131,7 @@ async fn open_shell(
 }
 
 /// A pods API error with RBAC and policy denials told apart.
-fn pod_api_error(
-    cluster: &KubeCluster,
-    error: kube::Error,
-    verb: &str,
-    namespace: &str,
-) -> CoreError {
+fn pod_api_error(cluster: &KubeCluster, error: kube::Error, verb: &str, namespace: &str) -> CoreError {
     match error {
         kube::Error::Api(status) if status.code == 403 => {
             forbidden_error(&status.message, (verb, "pods"), namespace, &cluster.context)
@@ -1221,8 +1174,8 @@ impl crate::CommandExecutor for KubeExecutor {
     }
 
     async fn set_cwd(&self, path: &str) -> Result<()> {
-        let _ =
-            crate::posix_cd_command(path).ok_or_else(|| CoreError::Other("invalid cwd".into()))?;
+        let _ = crate::posix_cd_command(path)
+            .ok_or_else(|| CoreError::Other("invalid cwd".into()))?;
         let path = path.trim().to_string();
         *lock(&self.pending_cwd) = Some(path.clone());
         *lock(&self.last_cwd) = Some(path);
@@ -1238,7 +1191,8 @@ impl crate::CommandExecutor for KubeExecutor {
 mod tests {
     use super::*;
     use k8s_openapi::api::core::v1::{
-        Capabilities, Container, PodSecurityContext, PodSpec, ResourceRequirements, SecurityContext,
+        Capabilities, Container, PodSecurityContext, PodSpec, ResourceRequirements,
+        SecurityContext,
     };
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
     use std::collections::BTreeMap;
@@ -1289,10 +1243,7 @@ mod tests {
             info("web-b", "Pending", true),
             info("web-d", "Running", true),
         ];
-        assert_eq!(
-            select_ready_pod(&pods, "app=web", "shop", "prod-eu").unwrap(),
-            "web-c"
-        );
+        assert_eq!(select_ready_pod(&pods, "app=web", "shop", "prod-eu").unwrap(), "web-c");
     }
 
     #[test]
@@ -1312,32 +1263,16 @@ mod tests {
     #[test]
     fn a_pod_that_is_not_ready_is_refused() {
         assert!(ensure_ready(&info("web-a", "Running", true), "ctx").is_ok());
-        let error = ensure_ready(&info("web-a", "Pending", false), "ctx")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("shop/web-a") && error.contains("не готов"),
-            "{error}"
-        );
+        let error = ensure_ready(&info("web-a", "Pending", false), "ctx").unwrap_err().to_string();
+        assert!(error.contains("shop/web-a") && error.contains("не готов"), "{error}");
     }
 
     #[test]
     fn container_choice_follows_target_single_annotation_then_error() {
-        assert_eq!(
-            select_container(&pod(&["main", "side"], None), Some("side")).unwrap(),
-            "side"
-        );
-        let missing = select_container(&pod(&["main"], None), Some("nope"))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            missing.contains("nope") && missing.contains("main"),
-            "{missing}"
-        );
-        assert_eq!(
-            select_container(&pod(&["main"], None), None).unwrap(),
-            "main"
-        );
+        assert_eq!(select_container(&pod(&["main", "side"], None), Some("side")).unwrap(), "side");
+        let missing = select_container(&pod(&["main"], None), Some("nope")).unwrap_err().to_string();
+        assert!(missing.contains("nope") && missing.contains("main"), "{missing}");
+        assert_eq!(select_container(&pod(&["main"], None), None).unwrap(), "main");
         assert_eq!(
             select_container(&pod(&["main", "side"], Some("side")), None).unwrap(),
             "side"
@@ -1374,10 +1309,7 @@ mod tests {
             error.contains("нет права create на pods/exec в namespace shop (контекст prod-eu)"),
             "{error}"
         );
-        assert!(
-            !error.contains("no-exec"),
-            "the user is not repeated: {error}"
-        );
+        assert!(!error.contains("no-exec"), "the user is not repeated: {error}");
 
         let list = "pods is forbidden: User \"u\" cannot list resource \"pods\" in API group \"\" in the namespace \"shop\"";
         assert!(forbidden_error(list, ("get", "pods"), "shop", "c")
@@ -1401,23 +1333,12 @@ mod tests {
             "OCI runtime exec failed: exec failed: unable to start container process: exec: \"/bin/sh\": stat /bin/sh: no such file or directory: unknown"
         ));
         assert!(is_missing_shell("executable file not found in $PATH"));
-        assert!(!is_missing_shell(
-            "command terminated with non-zero exit code"
-        ));
+        assert!(!is_missing_shell("command terminated with non-zero exit code"));
         let error = missing_shell_error("/bin/sh", "shop", "distroless-1", "prod-eu").to_string();
         assert!(error.starts_with(MISSING_SHELL_MARK), "{error}");
-        assert!(
-            error.contains("в контейнере нет /bin/sh") && error.contains("debug-контейнер"),
-            "{error}"
-        );
-        assert!(
-            !error.contains('#'),
-            "no issue numbers in a user message: {error}"
-        );
-        assert!(
-            error.contains("shop/distroless-1") && error.contains("prod-eu"),
-            "{error}"
-        );
+        assert!(error.contains("в контейнере нет /bin/sh") && error.contains("debug-контейнер"), "{error}");
+        assert!(!error.contains('#'), "no issue numbers in a user message: {error}");
+        assert!(error.contains("shop/distroless-1") && error.contains("prod-eu"), "{error}");
     }
 
     #[test]
@@ -1429,13 +1350,8 @@ mod tests {
         let error = check_target_cluster(&cluster, &PodRef::named("prod-eu", "shop", "web", None))
             .unwrap_err()
             .to_string();
-        assert!(
-            error.contains("prod-eu") && error.contains("staging"),
-            "{error}"
-        );
-        assert!(
-            check_target_cluster(&cluster, &PodRef::named("staging", "shop", "web", None)).is_ok()
-        );
+        assert!(error.contains("prod-eu") && error.contains("staging"), "{error}");
+        assert!(check_target_cluster(&cluster, &PodRef::named("staging", "shop", "web", None)).is_ok());
     }
 
     #[test]
@@ -1448,10 +1364,7 @@ mod tests {
         let source = std::io::Error::other("token=super-secret certificate=PRIVATE-KEY");
         let error =
             pod_api_error(&cluster, kube::Error::Service(source.into()), "get", "shop").to_string();
-        assert!(
-            !error.contains("super-secret") && !error.contains("PRIVATE-KEY"),
-            "{error}"
-        );
+        assert!(!error.contains("super-secret") && !error.contains("PRIVATE-KEY"), "{error}");
         assert!(error.contains("prod-eu"), "{error}");
     }
 
@@ -1506,18 +1419,11 @@ mod tests {
             }
         );
         let side = pod_limits(&p, "side");
-        assert_eq!(
-            side.run_as_user,
-            Some(1000),
-            "the container overrides the pod"
-        );
+        assert_eq!(side.run_as_user, Some(1000), "the container overrides the pod");
         assert_eq!(side.run_as_non_root, Some(false));
         assert_eq!(side.memory_limit, None);
         assert!(side.dropped_capabilities.is_empty());
-        assert_eq!(
-            pod_limits(&pod(&["main"], None), "main"),
-            PodLimits::default()
-        );
+        assert_eq!(pod_limits(&pod(&["main"], None), "main"), PodLimits::default());
         assert_eq!(pod_limits(&p, "ghost"), PodLimits::default());
     }
 
@@ -1575,13 +1481,8 @@ mod tests {
             let _tx = tx;
             std::future::pending::<()>().await;
         });
-        let term = KubeInteractive::from_parts(
-            Box::new(tokio::io::sink()),
-            rx,
-            None,
-            Some(reader),
-            TEST_TIMEOUT,
-        );
+        let term =
+            KubeInteractive::from_parts(Box::new(tokio::io::sink()), rx, None, Some(reader), TEST_TIMEOUT);
         term.close().await.unwrap();
         assert!(term.read_output().await.unwrap().is_none());
         assert!(term.read_output().await.unwrap().is_none());
@@ -1630,16 +1531,10 @@ mod tests {
         let second = term.write_input(b"b").await;
         assert!(matches!(second, Err(CoreError::ConnectionLost(_))));
         assert!(started.elapsed() < TEST_TIMEOUT * 5);
-        assert!(matches!(
-            first.await.unwrap(),
-            Err(CoreError::ConnectionLost(_))
-        ));
+        assert!(matches!(first.await.unwrap(), Err(CoreError::ConnectionLost(_))));
         // The lock was released with the timed-out write.
         let started = Instant::now();
-        assert!(matches!(
-            term.write_input(b"c").await,
-            Err(CoreError::ConnectionLost(_))
-        ));
+        assert!(matches!(term.write_input(b"c").await, Err(CoreError::ConnectionLost(_))));
         assert!(started.elapsed() < TEST_TIMEOUT * 5);
     }
 
@@ -1674,19 +1569,20 @@ mod tests {
     async fn a_write_never_waits_for_stdin_past_its_deadline() {
         use crate::InteractiveTerminal;
         let (_tx, rx) = mpsc::channel(4);
-        let term =
-            KubeInteractive::from_parts(Box::new(tokio::io::sink()), rx, None, None, TEST_TIMEOUT);
+        let term = KubeInteractive::from_parts(
+            Box::new(tokio::io::sink()),
+            rx,
+            None,
+            None,
+            TEST_TIMEOUT,
+        );
         let _held = term.stdin.lock().await;
         let started = Instant::now();
         let result = term.write_input(b"x").await;
         // `ConnectionLost` is the contract: the TUI treats it as a lost
         // terminal and closes it.
         assert!(matches!(result, Err(CoreError::ConnectionLost(_))));
-        assert!(
-            started.elapsed() < TEST_TIMEOUT * 5,
-            "{:?}",
-            started.elapsed()
-        );
+        assert!(started.elapsed() < TEST_TIMEOUT * 5, "{:?}", started.elapsed());
     }
 
     #[tokio::test]
@@ -1707,9 +1603,7 @@ mod tests {
             let mut stored = term.resize.lock().await;
             let sender = stored.as_mut().unwrap();
             // Bounded: a channel of capacity 1 parks after two messages.
-            let accepted = (0..16)
-                .take_while(|_| sender.try_send(tty_size(1, 1)).is_ok())
-                .count();
+            let accepted = (0..16).take_while(|_| sender.try_send(tty_size(1, 1)).is_ok()).count();
             assert!(accepted < 16, "the resize channel must be bounded");
         }
         let pending = tokio::spawn({
@@ -1717,14 +1611,8 @@ mod tests {
             async move { term.resize(100, 30).await }
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            !pending.is_finished(),
-            "the send must be waiting on the full channel"
-        );
-        assert!(
-            term.resize.try_lock().is_ok(),
-            "the guard must not be held across send"
-        );
+        assert!(!pending.is_finished(), "the send must be waiting on the full channel");
+        assert!(term.resize.try_lock().is_ok(), "the guard must not be held across send");
         // The exec catches up: the waiting resize completes.
         let wanted = loop {
             let size = resize_rx.next().await.unwrap();
@@ -1753,9 +1641,6 @@ mod tests {
         let size = resize_rx.next().await.unwrap();
         assert_eq!((size.width, size.height), (100, 30));
         drop(resize_rx);
-        assert!(matches!(
-            term.resize(80, 24).await,
-            Err(CoreError::ConnectionLost(_))
-        ));
+        assert!(matches!(term.resize(80, 24).await, Err(CoreError::ConnectionLost(_))));
     }
 }

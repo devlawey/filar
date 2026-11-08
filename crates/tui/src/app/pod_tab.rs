@@ -148,10 +148,7 @@ impl DebugProposal {
 
     /// Whether the cluster is tagged `prod` (the dialog is highlighted).
     pub fn is_prod(&self) -> bool {
-        self.cluster
-            .tags
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case("prod"))
+        self.cluster.tags.iter().any(|t| t.eq_ignore_ascii_case("prod"))
     }
 }
 
@@ -173,8 +170,7 @@ fn no_shell_hints(target: &filar_core::KubeCluster) -> Vec<String> {
     };
     vec![
         way_in,
-        "Логи, describe и события пода агент читает и без шелла — спросите во вкладке кластера"
-            .to_string(),
+        "Логи, describe и события пода агент читает и без шелла — спросите во вкладке кластера".to_string(),
     ]
 }
 
@@ -281,9 +277,7 @@ pub fn pod_limits_details(limits: &PodLimits) -> Vec<String> {
     push("user", limits.run_as_user.map(|uid| uid.to_string()));
     push(
         "non-root",
-        limits
-            .run_as_non_root
-            .map(|v| if v { "yes" } else { "no" }.to_string()),
+        limits.run_as_non_root.map(|v| if v { "yes" } else { "no" }.to_string()),
     );
     push(
         "read-only root filesystem",
@@ -318,11 +312,7 @@ pub fn pod_confirm_target_line(kube: &KubeTabState, glyphs: &Glyphs) -> Option<S
         ),
         format!("pod {}", pod.display_pod()),
     ];
-    if let Some(container) = pod
-        .container
-        .as_deref()
-        .or(pod.pod_ref.container.as_deref())
-    {
+    if let Some(container) = pod.container.as_deref().or(pod.pod_ref.container.as_deref()) {
         parts.push(format!("container {container}"));
     }
     Some(parts.join(&sep))
@@ -376,7 +366,9 @@ impl App {
         }
         if let Some(state) = kube.pod.as_ref() {
             if state.debug_target.is_some() {
-                self.push_message(ChatBlock::System("Это уже вкладка debug-контейнера".into()));
+                self.push_message(ChatBlock::System(
+                    "Это уже вкладка debug-контейнера".into(),
+                ));
                 return;
             }
             let (Some(pod), Some(container)) = (state.pod.clone(), state.container.clone()) else {
@@ -387,10 +379,7 @@ impl App {
                 )));
                 return;
             };
-            let namespace = kube
-                .namespace
-                .clone()
-                .unwrap_or(state.pod_ref.namespace.clone());
+            let namespace = kube.namespace.clone().unwrap_or(state.pod_ref.namespace.clone());
             self.choose_debug_image(kube.target, namespace, pod, container);
             return;
         }
@@ -469,7 +458,9 @@ impl App {
             }
             KeyCode::Char('n' | 'N' | 'т' | 'Т') | KeyCode::Esc => {
                 self.debug_proposal = None;
-                self.push_message(ChatBlock::System("Debug-контейнер не создан.".into()));
+                self.push_message(ChatBlock::System(
+                    "Debug-контейнер не создан.".into(),
+                ));
             }
             _ => {}
         }
@@ -605,9 +596,7 @@ impl App {
         let Some(select) = self.kube_pod_select.as_mut() else {
             return;
         };
-        let ctrl = key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let ctrl = key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match (&mut select.stage, key.code) {
             (PodSelectStage::Containers { .. }, KeyCode::Esc) => {
                 select.stage = PodSelectStage::Pods;
@@ -634,12 +623,7 @@ impl App {
             (PodSelectStage::Containers { index, .. }, KeyCode::Up) => {
                 *index = index.saturating_sub(1);
             }
-            (
-                PodSelectStage::Containers {
-                    index, containers, ..
-                },
-                KeyCode::Down,
-            ) => {
+            (PodSelectStage::Containers { index, containers, .. }, KeyCode::Down) => {
                 if *index + 1 < containers.len() {
                     *index += 1;
                 }
@@ -889,11 +873,7 @@ impl App {
         let Some(kube) = session.kube.as_mut() else {
             return;
         };
-        let pod = kube
-            .pod
-            .take()
-            .map(|state| state.display_pod())
-            .unwrap_or_default();
+        let pod = kube.pod.take().map(|state| state.display_pod()).unwrap_or_default();
         kube.connection_id = new_id;
         let target = kube.target.clone();
         let namespace = kube.namespace.clone();
@@ -975,9 +955,7 @@ impl App {
         let state = kube.pod.as_ref()?;
         let target = filar_agent::KubePodTarget::new(
             &kube.target,
-            kube.namespace
-                .as_deref()
-                .unwrap_or(&state.pod_ref.namespace),
+            kube.namespace.as_deref().unwrap_or(&state.pod_ref.namespace),
             state.pod.as_deref()?,
             state.container.as_deref()?,
             state.limits.clone().unwrap_or_default(),
@@ -1121,14 +1099,8 @@ mod tests {
 
     #[test]
     fn pod_target_is_a_name_or_a_selector() {
-        assert_eq!(
-            parse_pod_target("web-1"),
-            Some(PodSelector::Name("web-1".into()))
-        );
-        assert_eq!(
-            parse_pod_target("app=web"),
-            Some(PodSelector::Labels("app=web".into()))
-        );
+        assert_eq!(parse_pod_target("web-1"), Some(PodSelector::Name("web-1".into())));
+        assert_eq!(parse_pod_target("app=web"), Some(PodSelector::Labels("app=web".into())));
         assert_eq!(parse_pod_target(" "), None);
     }
 
@@ -1153,10 +1125,7 @@ mod tests {
         let mut app = app_in_cluster_tab();
         opened_select(
             &mut app,
-            vec![
-                choice("web-1", true, &["main"]),
-                choice("db-0", true, &["pg"]),
-            ],
+            vec![choice("web-1", true, &["main"]), choice("db-0", true, &["pg"])],
         );
         type_text(&mut app, "web");
         let select = app.kube_pod_select.clone().unwrap();
@@ -1176,15 +1145,9 @@ mod tests {
         assert_ne!(app.active_session().id, cluster_sid, "a new tab");
         assert!(app.in_pod_tab());
         let cluster_tab = app.sessions.iter().find(|s| s.id == cluster_sid).unwrap();
-        assert!(
-            cluster_tab.kube.as_ref().unwrap().pod.is_none(),
-            "cluster tab untouched"
-        );
+        assert!(cluster_tab.kube.as_ref().unwrap().pod.is_none(), "cluster tab untouched");
         let request = app.take_pending_kube_pod_connects().remove(0);
-        assert_eq!(
-            request.pod_ref,
-            PodRef::named("prod-eu", "shop", "web-1", Some("main"))
-        );
+        assert_eq!(request.pod_ref, PodRef::named("prod-eu", "shop", "web-1", Some("main")));
         assert_eq!(request.session_id, app.active_session().id);
     }
 
@@ -1227,10 +1190,7 @@ mod tests {
     #[test]
     fn ctrl_o_offers_enter_pod_only_in_a_cluster_tab() {
         let mut app = app_in_cluster_tab();
-        assert_eq!(
-            app.host_select_rows().first(),
-            Some(&super::super::HostSelectRow::EnterPod)
-        );
+        assert_eq!(app.host_select_rows().first(), Some(&super::super::HostSelectRow::EnterPod));
         app.host_select_index = super::super::ENTER_POD_SELECTION;
         app.host_select_visible = true;
         app.handle_key(key(KeyCode::Enter));
@@ -1277,19 +1237,13 @@ mod tests {
         assert_eq!(target.container, "main");
         assert_eq!(target.context, "prod-eu-ctx");
         assert_eq!(target.tags, vec!["prod".to_string()]);
-        assert!(
-            matches!(app.messages.last(), Some(ChatBlock::System(m)) if m.contains("Подключено к поду web-7f9c"))
-        );
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m.contains("Подключено к поду web-7f9c")));
     }
 
     #[test]
     fn sending_before_the_shell_is_connected_is_refused() {
         let mut app = app_in_cluster_tab();
-        app.open_pod_tab(
-            cluster(),
-            "shop".into(),
-            PodRef::named("prod-eu", "shop", "web-1", None),
-        );
+        app.open_pod_tab(cluster(), "shop".into(), PodRef::named("prod-eu", "shop", "web-1", None));
         assert!(app.pod_agent_target().is_none());
         app.input = "uptime".into();
         assert!(app.handle_pod_connecting_key(&key(KeyCode::Enter)));
@@ -1299,11 +1253,7 @@ mod tests {
     #[test]
     fn failed_connection_keeps_the_tab_on_the_cluster() {
         let mut app = app_in_cluster_tab();
-        app.open_pod_tab(
-            cluster(),
-            "shop".into(),
-            PodRef::named("prod-eu", "shop", "web-1", None),
-        );
+        app.open_pod_tab(cluster(), "shop".into(), PodRef::named("prod-eu", "shop", "web-1", None));
         let request = app.take_pending_kube_pod_connects().remove(0);
         app.fail_kube_pod_connection(
             request.session_id,
@@ -1312,9 +1262,7 @@ mod tests {
         );
         assert!(app.in_cluster_tab(), "back on the cluster");
         assert_eq!(app.target_name, "prod-eu");
-        assert!(
-            matches!(app.messages.last(), Some(ChatBlock::Error(m)) if m.contains("pods/exec") && m.contains("кластере prod-eu"))
-        );
+        assert!(matches!(app.messages.last(), Some(ChatBlock::Error(m)) if m.contains("pods/exec") && m.contains("кластере prod-eu")));
         let reconnect = app.take_pending_kube_connects().remove(0);
         assert_eq!(reconnect.namespace.as_deref(), Some("shop"));
         assert!(!reconnect.discover);
@@ -1334,10 +1282,7 @@ mod tests {
         let (mut app, sid, connection_id) = connected_pod_tab();
         app.cwd = Some("/tmp".into());
         assert!(app.kube_pod_changed(sid, connection_id, "web-7f9c", "web-a1b2"));
-        assert!(
-            !app.kube_pod_changed(sid, connection_id + 100, "web-a1b2", "web-x"),
-            "stale shell"
-        );
+        assert!(!app.kube_pod_changed(sid, connection_id + 100, "web-a1b2", "web-x"), "stale shell");
         assert_eq!(app.target_name, "web-a1b2");
         assert!(app.cwd.is_none(), "fresh shell, cwd unknown");
         assert_eq!(app.pod_agent_target().unwrap().pod, "web-a1b2");
@@ -1361,18 +1306,12 @@ mod tests {
         );
         let ascii = pod_limits_summary(&limits, &Glyphs::ASCII).unwrap();
         assert!(ascii.is_ascii(), "{ascii}");
-        assert_eq!(
-            pod_limits_summary(&PodLimits::default(), &Glyphs::UNICODE),
-            None
-        );
+        assert_eq!(pod_limits_summary(&PodLimits::default(), &Glyphs::UNICODE), None);
         let root = PodLimits {
             run_as_user: Some(0),
             ..Default::default()
         };
-        assert_eq!(
-            pod_limits_summary(&root, &Glyphs::UNICODE).as_deref(),
-            Some("root")
-        );
+        assert_eq!(pod_limits_summary(&root, &Glyphs::UNICODE).as_deref(), Some("root"));
     }
 
     #[test]
@@ -1414,9 +1353,7 @@ mod tests {
         let (mut app, _, _) = connected_pod_tab();
         app.open_file_panels();
         assert!(app.file_panels.is_none());
-        assert!(
-            matches!(app.messages.last(), Some(ChatBlock::System(m)) if m == KUBE_POD_PANELS_REFUSAL)
-        );
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m == KUBE_POD_PANELS_REFUSAL));
     }
 
     /// Ctrl+T in a connected pod tab asks the runner for a terminal (#577);
@@ -1424,16 +1361,10 @@ mod tests {
     #[test]
     fn ctrl_t_opens_the_pod_terminal_only_once_connected() {
         let mut app = app_in_cluster_tab();
-        app.open_pod_tab(
-            cluster(),
-            "shop".into(),
-            PodRef::named("prod-eu", "shop", "web-1", None),
-        );
+        app.open_pod_tab(cluster(), "shop".into(), PodRef::named("prod-eu", "shop", "web-1", None));
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert!(!app.take_toggle_interactive(), "not while connecting");
-        assert!(
-            matches!(app.messages.last(), Some(ChatBlock::System(m)) if m.contains("ещё подключается"))
-        );
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m.contains("ещё подключается")));
 
         let (mut app, _, _) = connected_pod_tab();
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
@@ -1473,25 +1404,9 @@ mod tests {
     fn reconnect_forgets_the_cwd_and_ignores_stale_shells() {
         let (mut app, sid, connection_id) = connected_pod_tab();
         app.cwd = Some("/srv".into());
-        assert!(!app.kube_pod_identity(
-            sid,
-            connection_id + 1,
-            "web-x".into(),
-            "main".into(),
-            PodLimits::default()
-        ));
-        assert_eq!(
-            app.cwd.as_deref(),
-            Some("/srv"),
-            "stale event changes nothing"
-        );
-        assert!(app.kube_pod_identity(
-            sid,
-            connection_id,
-            "web-7f9c".into(),
-            "main".into(),
-            PodLimits::default()
-        ));
+        assert!(!app.kube_pod_identity(sid, connection_id + 1, "web-x".into(), "main".into(), PodLimits::default()));
+        assert_eq!(app.cwd.as_deref(), Some("/srv"), "stale event changes nothing");
+        assert!(app.kube_pod_identity(sid, connection_id, "web-7f9c".into(), "main".into(), PodLimits::default()));
         assert!(app.cwd.is_none(), "a fresh shell starts in its own cwd");
     }
 
@@ -1539,9 +1454,7 @@ mod tests {
         let mut app = cluster_tab_with(&[]);
         app.handle_key(ctrl('b'));
         assert!(app.kube_pod_select.is_none());
-        assert!(
-            matches!(app.messages.last(), Some(ChatBlock::System(m)) if m.contains("debug_images"))
-        );
+        assert!(matches!(app.messages.last(), Some(ChatBlock::System(m)) if m.contains("debug_images")));
     }
 
     #[test]
@@ -1578,27 +1491,16 @@ mod tests {
     fn a_pod_without_a_shell_points_to_ctrl_b_when_images_are_set() {
         let app = fail_with_no_shell(&["busybox:1.37"]);
         let hints = last_system_lines(&app, 2);
-        assert!(
-            hints[0].contains("Ctrl+B") && !hints[0].contains("пуст"),
-            "{hints:?}"
-        );
+        assert!(hints[0].contains("Ctrl+B") && !hints[0].contains("пуст"), "{hints:?}");
         assert!(hints[1].contains("Логи, describe и события"), "{hints:?}");
-        assert!(
-            hints
-                .iter()
-                .all(|h| !h.contains('#') && h.chars().count() <= 110),
-            "{hints:?}"
-        );
+        assert!(hints.iter().all(|h| !h.contains('#') && h.chars().count() <= 110), "{hints:?}");
     }
 
     #[test]
     fn a_pod_without_a_shell_says_where_to_set_debug_images() {
         let app = fail_with_no_shell(&[]);
         let hints = last_system_lines(&app, 2);
-        assert!(
-            hints[0].contains("Ctrl+B") && hints[0].contains("Debug images"),
-            "{hints:?}"
-        );
+        assert!(hints[0].contains("Ctrl+B") && hints[0].contains("Debug images"), "{hints:?}");
         assert!(hints.iter().all(|h| h.chars().count() <= 110), "{hints:?}");
     }
 
@@ -1615,26 +1517,16 @@ mod tests {
                 other => panic!("{other:?}"),
             })
             .collect();
-        assert!(
-            matches!(&app.messages[app.messages.len() - n - 1], ChatBlock::Error(e) if e.contains("нет /bin/sh"))
-        );
+        assert!(matches!(&app.messages[app.messages.len() - n - 1], ChatBlock::Error(e) if e.contains("нет /bin/sh")));
         lines
     }
 
     #[test]
     fn other_pod_failures_get_no_shell_hint() {
         let mut app = app_in_cluster_tab();
-        app.open_pod_tab(
-            cluster(),
-            "shop".into(),
-            PodRef::named("prod-eu", "shop", "web-1", None),
-        );
+        app.open_pod_tab(cluster(), "shop".into(), PodRef::named("prod-eu", "shop", "web-1", None));
         let request = app.take_pending_kube_pod_connects().remove(0);
-        app.fail_kube_pod_connection(
-            request.session_id,
-            request.connection_id,
-            "RBAC: denied".into(),
-        );
+        app.fail_kube_pod_connection(request.session_id, request.connection_id, "RBAC: denied".into());
         assert!(matches!(app.messages.last(), Some(ChatBlock::Error(_))));
     }
 
@@ -1645,27 +1537,15 @@ mod tests {
         let select = app.kube_pod_select.clone().expect("chooser");
         assert!(select.debug);
         app.take_pending_kube_pod_lists();
-        app.complete_pod_list(
-            select.session_id,
-            select.select_id,
-            Ok(vec![choice("web-1", true, &["main"])]),
-        );
+        app.complete_pod_list(select.session_id, select.select_id, Ok(vec![choice("web-1", true, &["main"])]));
         app.handle_pod_select_key(key(KeyCode::Enter));
         let proposal = app.debug_proposal.clone().expect("confirmation shown");
         assert_eq!(proposal.target_container, "main");
         assert!(proposal.name.starts_with("filar-debug-"));
         let text = proposal.confirmation_text();
-        assert!(
-            text.starts_with("В под shop/web-1 будет добавлен эфемерный контейнер filar-debug-"),
-            "{text}"
-        );
+        assert!(text.starts_with("В под shop/web-1 будет добавлен эфемерный контейнер filar-debug-"), "{text}");
         assert!(text.contains("(образ busybox:1.37, target main)"), "{text}");
-        assert!(
-            text.contains(
-                "останется в спецификации пода до его пересоздания; удалить его нельзя. Создать?"
-            ),
-            "{text}"
-        );
+        assert!(text.contains("останется в спецификации пода до его пересоздания; удалить его нельзя. Создать?"), "{text}");
         assert!(proposal.is_prod());
         // Enter alone never creates.
         app.handle_key(key(KeyCode::Enter));
@@ -1673,10 +1553,7 @@ mod tests {
         assert!(app.take_pending_kube_debug_creates().is_empty());
         app.handle_key(key(KeyCode::Char('n')));
         assert!(app.debug_proposal.is_none());
-        assert!(
-            app.take_pending_kube_debug_creates().is_empty(),
-            "cancelled"
-        );
+        assert!(app.take_pending_kube_debug_creates().is_empty(), "cancelled");
     }
 
     #[test]
@@ -1684,18 +1561,11 @@ mod tests {
         let mut app = cluster_tab_with(&["busybox:1.37", "registry.local/tools/netshoot:v0.13"]);
         app.handle_key(ctrl('b'));
         let select = app.kube_pod_select.clone().unwrap();
-        app.complete_pod_list(
-            select.session_id,
-            select.select_id,
-            Ok(vec![choice("web-1", true, &["main", "sidecar"])]),
-        );
+        app.complete_pod_list(select.session_id, select.select_id, Ok(vec![choice("web-1", true, &["main", "sidecar"])]));
         app.handle_pod_select_key(key(KeyCode::Enter));
         app.handle_pod_select_key(key(KeyCode::Down));
         app.handle_pod_select_key(key(KeyCode::Enter));
-        assert!(matches!(
-            app.kube_pod_select.as_ref().unwrap().stage,
-            PodSelectStage::Images { .. }
-        ));
+        assert!(matches!(app.kube_pod_select.as_ref().unwrap().stage, PodSelectStage::Images { .. }));
         app.handle_pod_select_key(key(KeyCode::Down));
         app.handle_pod_select_key(key(KeyCode::Enter));
         let proposal = app.debug_proposal.clone().unwrap();
@@ -1721,39 +1591,12 @@ mod tests {
         };
         app.debug_container_created(proposal, "2026-11-01 16:00:00");
         let request = app.take_pending_kube_pod_connects().remove(0);
-        assert_eq!(
-            request.pod_ref,
-            PodRef::named(
-                "prod-eu",
-                "shop",
-                "distroless-1",
-                Some("filar-debug-ab12cd34")
-            )
-        );
-        assert_eq!(
-            app.kube
-                .as_ref()
-                .unwrap()
-                .pod
-                .as_ref()
-                .unwrap()
-                .debug_target
-                .as_deref(),
-            Some("main")
-        );
+        assert_eq!(request.pod_ref, PodRef::named("prod-eu", "shop", "distroless-1", Some("filar-debug-ab12cd34")));
+        assert_eq!(app.kube.as_ref().unwrap().pod.as_ref().unwrap().debug_target.as_deref(), Some("main"));
         let origin_tab = app.sessions.iter().find(|s| s.id == origin).unwrap();
         assert!(origin_tab.messages.iter().any(|m| matches!(m, ChatBlock::System(t) if t.contains("След в кластере") && t.contains("filar-debug-ab12cd34") && t.contains("2026-11-01 16:00:00"))));
-        app.complete_kube_pod_connection(
-            request.session_id,
-            request.connection_id,
-            "distroless-1".into(),
-            "filar-debug-ab12cd34".into(),
-            PodLimits::default(),
-        );
-        assert_eq!(
-            app.pod_agent_target().unwrap().debug_target.as_deref(),
-            Some("main")
-        );
+        app.complete_kube_pod_connection(request.session_id, request.connection_id, "distroless-1".into(), "filar-debug-ab12cd34".into(), PodLimits::default());
+        assert_eq!(app.pod_agent_target().unwrap().debug_target.as_deref(), Some("main"));
     }
 
     #[test]
@@ -1777,35 +1620,20 @@ mod tests {
             .iter()
             .filter(|m| matches!(m, ChatBlock::System(t) if t.contains("След в кластере")))
             .count();
-        assert_eq!(
-            traces, 1,
-            "a refused patch leaves no trace, an added container does"
-        );
-        assert!(origin_tab.messages.iter().any(
-            |m| matches!(m, ChatBlock::Error(t) if t.contains("не создан") && t.contains("RBAC"))
-        ));
+        assert_eq!(traces, 1, "a refused patch leaves no trace, an added container does");
+        assert!(origin_tab.messages.iter().any(|m| matches!(m, ChatBlock::Error(t) if t.contains("не создан") && t.contains("RBAC"))));
         assert!(origin_tab.messages.iter().any(|m| matches!(m, ChatBlock::Error(t) if t.contains("добавлен в спецификацию") && t.contains("не запустился"))));
         assert!(app.take_pending_kube_pod_connects().is_empty());
     }
 
     #[test]
     fn the_agent_has_no_way_to_create_a_debug_container() {
-        let names: Vec<String> =
-            filar_agent::kube_tools::kube_tool_definitions(CommandConfirmMode::Always)
-                .into_iter()
-                .map(|d| d.name)
-                .collect();
-        assert!(
-            names
-                .iter()
-                .all(|n| !n.contains("debug") && !n.contains("ephemeral")),
-            "{names:?}"
-        );
-        let call = filar_agent::kube_tools::parse_kube_tool_call(
-            "k8s_debug",
-            &serde_json::json!({}),
-            Some("shop"),
-        );
+        let names: Vec<String> = filar_agent::kube_tools::kube_tool_definitions(CommandConfirmMode::Always)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert!(names.iter().all(|n| !n.contains("debug") && !n.contains("ephemeral")), "{names:?}");
+        let call = filar_agent::kube_tools::parse_kube_tool_call("k8s_debug", &serde_json::json!({}), Some("shop"));
         assert!(call.is_err());
     }
 
@@ -1813,12 +1641,7 @@ mod tests {
     fn a_debug_tab_survives_save_and_restore_with_its_debug_prompt() {
         let mut app = App::new("test".into(), CommandConfirmMode::Always);
         app.kube_clusters = vec![cluster()];
-        let mut state = KubePodTabState::pending(PodRef::named(
-            "prod-eu",
-            "shop",
-            "distroless-1",
-            Some("filar-debug-ab12cd34"),
-        ));
+        let mut state = KubePodTabState::pending(PodRef::named("prod-eu", "shop", "distroless-1", Some("filar-debug-ab12cd34")));
         state.debug_target = Some("main".into());
         let snapshot = App::pod_snapshot(&state);
         assert_eq!(snapshot.debug_target.as_deref(), Some("main"));
@@ -1827,16 +1650,6 @@ mod tests {
             namespace: Some("shop".into()),
             pod: Some(snapshot),
         });
-        assert_eq!(
-            app.kube
-                .as_ref()
-                .unwrap()
-                .pod
-                .as_ref()
-                .unwrap()
-                .debug_target
-                .as_deref(),
-            Some("main")
-        );
+        assert_eq!(app.kube.as_ref().unwrap().pod.as_ref().unwrap().debug_target.as_deref(), Some("main"));
     }
 }

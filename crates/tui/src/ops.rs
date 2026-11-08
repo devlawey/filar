@@ -164,14 +164,7 @@ mod tests {
     }
 
     fn host(state: HostOpState) -> OpHost {
-        OpHost {
-            name: "h".into(),
-            state,
-            exit_code: None,
-            tail: String::new(),
-            stale: false,
-            settled: true,
-        }
+        OpHost { name: "h".into(), state, exit_code: None, tail: String::new(), stale: false, settled: true }
     }
 
     #[test]
@@ -188,10 +181,7 @@ mod tests {
         assert_eq!(ops[0].hosts.len(), 1);
         assert_eq!(ops[0].hosts[0].name, "web-01");
         assert_eq!(ops[0].label, "cmd job-1");
-        assert!(
-            ops[0].hosts[0].stale,
-            "running remote job is only as fresh as the last poll"
-        );
+        assert!(ops[0].hosts[0].stale, "running remote job is only as fresh as the last poll");
         assert_eq!(ops[1].state(), HostOpState::Failed);
         assert_eq!(ops[1].hosts[0].exit_code, Some(3));
         assert!(!ops[1].hosts[0].stale);
@@ -217,10 +207,7 @@ mod tests {
         };
         use HostOpState::*;
         assert_eq!(op(vec![host(Done), host(Running)]).state(), Running);
-        assert_eq!(
-            op(vec![host(Done), host(Failed), host(Cancelled)]).state(),
-            Failed
-        );
+        assert_eq!(op(vec![host(Done), host(Failed), host(Cancelled)]).state(), Failed);
         assert_eq!(op(vec![host(Done), host(Cancelled)]).state(), Cancelled);
         assert_eq!(op(vec![host(Done), host(Done)]).state(), Done);
     }

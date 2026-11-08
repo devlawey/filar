@@ -190,13 +190,7 @@ impl FleetExecutor {
         let id = self.runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let token = CancellationToken::new();
         *self.current.lock().unwrap_or_else(|p| p.into_inner()) = Some((id, token.clone()));
-        (
-            CurrentRun {
-                slot: &self.current,
-                id,
-            },
-            token,
-        )
+        (CurrentRun { slot: &self.current, id }, token)
     }
 
     /// The operation this executor was built from. A caller holding one
@@ -353,12 +347,7 @@ impl FleetExecutor {
         let status = self.status.clone();
         let emit = |answering: usize, running: bool| {
             if let Some(status) = &status {
-                status(FleetStatus {
-                    operation,
-                    answering,
-                    total,
-                    running,
-                });
+                status(FleetStatus { operation, answering, total, running });
             }
         };
         emit(0, true);
@@ -405,10 +394,7 @@ impl FleetExecutor {
     /// to compare with. Refuses a check that is not a file check.
     pub async fn run_file_check(&self, check: &FleetCheck) -> Result<CommandResult> {
         let baseline = check.file_baseline().ok_or_else(|| {
-            CoreError::Other(format!(
-                "fleet check '{}' is not a file check",
-                check.name()
-            ))
+            CoreError::Other(format!("fleet check '{}' is not a file check", check.name()))
         })?;
         let mut done = self.operate(&baseline.command()).await?;
         let table = fold_file(baseline, &done.report, &mut done.result)?;
@@ -419,11 +405,7 @@ impl FleetExecutor {
         Ok(CommandResult {
             stdout: format!("{}\n{}", summary.headline(), table),
             stderr: String::new(),
-            exit_code: Some(if summary.is_failed() || !compared {
-                1
-            } else {
-                0
-            }),
+            exit_code: Some(if summary.is_failed() || !compared { 1 } else { 0 }),
             duration: done.started.elapsed(),
             cwd: None,
         })
@@ -436,22 +418,10 @@ impl CommandExecutor for FleetExecutor {
         let check = FleetCheck::ad_hoc(command).map_err(CoreError::Other)?;
         let mut done = self.operate(command).await?;
         let registry = PreprocessorRegistry::with_builtins();
-        let table = fold(
-            &check,
-            &done.tasks,
-            &done.report,
-            &mut done.result,
-            &registry,
-        )?;
+        let table = fold(&check, &done.tasks, &done.report, &mut done.result, &registry)?;
         let summary = done.result.summary();
         if let Some(observer) = &self.observer {
-            observer(FleetView::build(
-                &done.op,
-                command,
-                &done.report,
-                &table,
-                &summary,
-            ));
+            observer(FleetView::build(&done.op, command, &done.report, &table, &summary));
         }
 
         Ok(CommandResult {
@@ -466,11 +436,7 @@ impl CommandExecutor for FleetExecutor {
 
     async fn cancel(&self) -> Result<()> {
         // A run in flight stops as an operation, and returns what it has.
-        let current = self
-            .current
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let current = self.current.lock().unwrap_or_else(|p| p.into_inner()).clone();
         if let Some((_, token)) = current {
             token.cancel();
             return Ok(());
@@ -544,10 +510,7 @@ mod tests {
                 host: format!("{n}.example"),
                 port: 22,
                 user: "admin".into(),
-                auth: SshAuth::Key {
-                    path: None,
-                    passphrase: None,
-                },
+                auth: SshAuth::Key { path: None, passphrase: None },
                 host_key_policy: Default::default(),
                 tags: vec!["web".into()],
             })
@@ -588,7 +551,8 @@ mod tests {
     }
 
     /// More lines than a short answer may have (#505): digest only.
-    const LONG_ANSWER: &str = "SECRET-LOOKING TEXT\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n";
+    const LONG_ANSWER: &str =
+        "SECRET-LOOKING TEXT\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n";
 
     #[tokio::test]
     async fn one_run_asks_every_host_and_returns_the_fold_not_the_output() {
@@ -596,37 +560,17 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         let exec = executor(
             &fleet(&["web-1", "web-2", "web-3"]),
-            connector(
-                &[],
-                &[("web-3", LONG_ANSWER)],
-                attempts.clone(),
-                runs.clone(),
-            ),
+            connector(&[], &[("web-3", LONG_ANSWER)], attempts.clone(), runs.clone()),
         );
         assert_eq!(exec.radius(), ["web-1", "web-2", "web-3"]);
 
         let out = exec.run("uname -r").await.expect("fleet run");
         assert_eq!(runs.load(Ordering::SeqCst), 3);
-        assert!(
-            out.stdout.contains("3 of 3 hosts answered"),
-            "{}",
-            out.stdout
-        );
-        assert!(
-            out.stdout.contains("same on 2 (web-1, web-2)"),
-            "{}",
-            out.stdout
-        );
+        assert!(out.stdout.contains("3 of 3 hosts answered"), "{}", out.stdout);
+        assert!(out.stdout.contains("same on 2 (web-1, web-2)"), "{}", out.stdout);
         assert!(out.stdout.contains("web-3 differs"), "{}", out.stdout);
-        assert!(
-            !out.stdout.contains("SECRET-LOOKING"),
-            "a long answer never reaches the model"
-        );
-        assert!(
-            out.stdout.contains("same on 2 (web-1, web-2):\n  | same\n"),
-            "{}",
-            out.stdout
-        );
+        assert!(!out.stdout.contains("SECRET-LOOKING"), "a long answer never reaches the model");
+        assert!(out.stdout.contains("same on 2 (web-1, web-2):\n  | same\n"), "{}", out.stdout);
         assert_eq!(out.exit_code, Some(0));
 
         exec.run("uname -r").await.expect("second run");
@@ -656,24 +600,10 @@ mod tests {
             .await
             .expect("file check runs");
         assert_eq!(runs.load(Ordering::SeqCst), 2);
-        assert!(
-            out.stdout
-                .contains("2 of 3 hosts answered, 1 did not answer"),
-            "{}",
-            out.stdout
-        );
+        assert!(out.stdout.contains("2 of 3 hosts answered, 1 did not answer"), "{}", out.stdout);
         assert!(out.stdout.contains("matches (1): web-1"), "{}", out.stdout);
-        assert!(
-            out.stdout
-                .contains("differs sha256 bbbbbbbbbbbb (1): web-2"),
-            "{}",
-            out.stdout
-        );
-        assert!(
-            out.stdout.contains("no verdict: web-3 (no contact)"),
-            "{}",
-            out.stdout
-        );
+        assert!(out.stdout.contains("differs sha256 bbbbbbbbbbbb (1): web-2"), "{}", out.stdout);
+        assert!(out.stdout.contains("no verdict: web-3 (no contact)"), "{}", out.stdout);
 
         assert_eq!(out.exit_code, Some(0));
 
@@ -685,11 +615,7 @@ mod tests {
             .run_file_check(&FleetCheck::for_file(elsewhere))
             .await
             .expect("file check runs");
-        assert!(
-            out.stdout.contains("db-1 is not in this fleet"),
-            "{}",
-            out.stdout
-        );
+        assert!(out.stdout.contains("db-1 is not in this fleet"), "{}", out.stdout);
         assert_eq!(out.exit_code, Some(1));
 
         let not_a_file_check = FleetCheck::ad_hoc("uname -r").unwrap();
@@ -705,20 +631,11 @@ mod tests {
             connector(&["web-2"], &[], attempts.clone(), runs.clone()),
         );
         let out = exec.run("uptime").await.expect("fleet run");
-        assert!(
-            out.stdout
-                .contains("1 of 2 hosts answered, 1 did not answer"),
-            "{}",
-            out.stdout
-        );
+        assert!(out.stdout.contains("1 of 2 hosts answered, 1 did not answer"), "{}", out.stdout);
         assert!(out.stdout.contains("no contact"), "{}", out.stdout);
 
         exec.run("uptime").await.expect("second run");
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            3,
-            "the failed host is tried again"
-        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 3, "the failed host is tried again");
     }
 
     /// Answers once, then behaves like a dropped SSH session.
@@ -753,9 +670,8 @@ mod tests {
         let connect: HostConnector = Arc::new(move |_t: FleetTarget| {
             counter.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
-                Ok(Arc::new(DropsAfterFirst {
-                    runs: Arc::new(AtomicUsize::new(0)),
-                }) as Arc<dyn CommandExecutor>)
+                Ok(Arc::new(DropsAfterFirst { runs: Arc::new(AtomicUsize::new(0)) })
+                    as Arc<dyn CommandExecutor>)
             })
         });
         let exec = executor(&fleet(&["web-1"]), connect);
@@ -763,23 +679,11 @@ mod tests {
         exec.run("uptime").await.expect("first run answers");
         let lost = exec.run("uptime").await.expect("second run reports");
         assert!(lost.stdout.contains("no contact"), "{}", lost.stdout);
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            1,
-            "the dead session is still cached here"
-        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "the dead session is still cached here");
 
         let back = exec.run("uptime").await.expect("third run");
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            2,
-            "the lost host was reconnected"
-        );
-        assert!(
-            back.stdout.contains("1 of 1 hosts answered"),
-            "{}",
-            back.stdout
-        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "the lost host was reconnected");
+        assert!(back.stdout.contains("1 of 1 hosts answered"), "{}", back.stdout);
     }
 
     #[tokio::test]
@@ -790,19 +694,11 @@ mod tests {
             &fleet(&["web-1", "web-2"]),
             connector(&[], &[], attempts.clone(), runs.clone()),
         );
-        for cmd in [
-            "rm -rf /tmp/x",
-            "uname -r && reboot",
-            "cat $(echo /etc/passwd)",
-        ] {
+        for cmd in ["rm -rf /tmp/x", "uname -r && reboot", "cat $(echo /etc/passwd)"] {
             let err = exec.run(cmd).await.expect_err(cmd);
             assert!(err.to_string().contains("not sent to any host"), "{err}");
         }
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            0,
-            "no host was even contacted"
-        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 0, "no host was even contacted");
         assert_eq!(runs.load(Ordering::SeqCst), 0);
     }
 
@@ -843,14 +739,10 @@ mod tests {
                 SshAuth::Password { password } => password.clone(),
                 _ => None,
             };
-            seen.lock()
-                .expect("lock")
-                .push((target.name.clone(), password));
+            seen.lock().expect("lock").push((target.name.clone(), password));
             Box::pin(async {
-                Ok(Arc::new(Fixed {
-                    stdout: "same",
-                    runs: Arc::new(AtomicUsize::new(0)),
-                }) as Arc<dyn CommandExecutor>)
+                Ok(Arc::new(Fixed { stdout: "same", runs: Arc::new(AtomicUsize::new(0)) })
+                    as Arc<dyn CommandExecutor>)
             })
         })
     }
@@ -868,34 +760,14 @@ mod tests {
             recording_connector(Arc::clone(&seen)),
         )
         .expect("executor");
-        assert_eq!(
-            exec.radius(),
-            ["web-1", "web-3"],
-            "the radius names only who is asked"
-        );
+        assert_eq!(exec.radius(), ["web-1", "web-3"], "the radius names only who is asked");
 
         let out = exec.run("uname -r").await.expect("fleet run");
-        assert!(
-            out.stdout.contains("2 of 3 hosts answered"),
-            "{}",
-            out.stdout
-        );
+        assert!(out.stdout.contains("2 of 3 hosts answered"), "{}", out.stdout);
         assert!(out.stdout.contains("1 skipped"), "{}", out.stdout);
-        assert_eq!(
-            out.exit_code,
-            Some(0),
-            "a skipped host does not fail the fleet"
-        );
-        let contacted: Vec<String> = seen
-            .lock()
-            .expect("lock")
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect();
-        assert!(
-            !contacted.contains(&"web-2".to_string()),
-            "web-2 was never contacted"
-        );
+        assert_eq!(out.exit_code, Some(0), "a skipped host does not fail the fleet");
+        let contacted: Vec<String> = seen.lock().expect("lock").iter().map(|(n, _)| n.clone()).collect();
+        assert!(!contacted.contains(&"web-2".to_string()), "web-2 was never contacted");
     }
 
     #[tokio::test]
@@ -979,9 +851,10 @@ mod tests {
         });
         let seen: Arc<std::sync::Mutex<Vec<FleetStatus>>> = Arc::default();
         let sink = Arc::clone(&seen);
-        let exec = Arc::new(executor(&op, connect).with_status(Arc::new(move |status| {
-            sink.lock().expect("lock").push(status)
-        })));
+        let exec = Arc::new(
+            executor(&op, connect)
+                .with_status(Arc::new(move |status| sink.lock().expect("lock").push(status))),
+        );
 
         let running = tokio::spawn({
             let exec = Arc::clone(&exec);
@@ -992,21 +865,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         exec.cancel().await.expect("cancel");
 
-        let out = running
-            .await
-            .expect("join")
-            .expect("run returns after a cancel");
-        assert!(
-            out.stdout.contains("1 of 3 hosts answered"),
-            "{}",
-            out.stdout
-        );
+        let out = running.await.expect("join").expect("run returns after a cancel");
+        assert!(out.stdout.contains("1 of 3 hosts answered"), "{}", out.stdout);
         assert!(out.stdout.contains("1 ok, 2 cancelled"), "{}", out.stdout);
-        assert_eq!(
-            out.exit_code,
-            Some(0),
-            "a cancelled operation is not a failed one"
-        );
+        assert_eq!(out.exit_code, Some(0), "a cancelled operation is not a failed one");
         // The status bar's count stops running when the operation is
         // cancelled (#439), with the one host that answered.
         let last = *seen.lock().expect("lock").last().expect("a status");
@@ -1019,10 +881,7 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         let exec = executor(&fleet(&["web-1"]), connector(&[], &[], attempts, runs));
         exec.run("uptime").await.expect("run");
-        assert!(
-            exec.current.lock().expect("lock").is_none(),
-            "the finished run cleared itself"
-        );
+        assert!(exec.current.lock().expect("lock").is_none(), "the finished run cleared itself");
         exec.cancel().await.expect("cancel with no run in flight");
     }
 
@@ -1060,11 +919,7 @@ mod tests {
         assert_eq!(view.dropped[0].state, HostState::NoContact);
 
         // The model is quoted the short answers (#505), as data.
-        assert!(
-            out.stdout.contains("web-3 differs:\n  | 6.1.0-other\n"),
-            "{}",
-            out.stdout
-        );
+        assert!(out.stdout.contains("web-3 differs:\n  | 6.1.0-other\n"), "{}", out.stdout);
     }
 
     #[tokio::test]
@@ -1077,9 +932,7 @@ mod tests {
             &fleet(&["web-1", "web-2", "web-3"]),
             connector(&["web-3"], &[], attempts, runs),
         )
-        .with_status(Arc::new(move |status| {
-            sink.lock().expect("lock").push(status)
-        }));
+        .with_status(Arc::new(move |status| sink.lock().expect("lock").push(status)));
 
         exec.run("uptime").await.expect("fleet run");
         let seen = seen.lock().expect("lock");

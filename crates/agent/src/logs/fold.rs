@@ -52,10 +52,7 @@ pub fn normalize_message(message: &str) -> String {
             }
         }
         if chars[i].is_ascii_digit() {
-            while i < chars.len()
-                && (chars[i].is_ascii_digit()
-                    || (chars[i] == '.' && chars.get(i + 1).is_some_and(char::is_ascii_digit)))
-            {
+            while i < chars.len() && (chars[i].is_ascii_digit() || (chars[i] == '.' && chars.get(i + 1).is_some_and(char::is_ascii_digit))) {
                 i += 1;
             }
             out.push_str("<n>");
@@ -73,11 +70,7 @@ fn digits(chars: &[char], at: usize, n: usize) -> bool {
 
 /// `YYYY-MM-DD[T ]HH:MM:SS[.frac][Z|±HH[:]MM]`.
 fn timestamp_len(c: &[char]) -> Option<usize> {
-    let date = digits(c, 0, 4)
-        && c.get(4) == Some(&'-')
-        && digits(c, 5, 2)
-        && c.get(7) == Some(&'-')
-        && digits(c, 8, 2);
+    let date = digits(c, 0, 4) && c.get(4) == Some(&'-') && digits(c, 5, 2) && c.get(7) == Some(&'-') && digits(c, 8, 2);
     if !date {
         return None;
     }
@@ -133,15 +126,8 @@ fn uuid_len(c: &[char]) -> Option<usize> {
 /// `0x` and hex digits, or a run of 8+ hex digits with at least one digit
 /// and one letter, ending at a word boundary.
 fn hex_len(c: &[char]) -> Option<usize> {
-    let start = if c.first() == Some(&'0') && matches!(c.get(1), Some('x' | 'X')) {
-        2
-    } else {
-        0
-    };
-    let run = c[start..]
-        .iter()
-        .take_while(|ch| ch.is_ascii_hexdigit())
-        .count();
+    let start = if c.first() == Some(&'0') && matches!(c.get(1), Some('x' | 'X')) { 2 } else { 0 };
+    let run = c[start..].iter().take_while(|ch| ch.is_ascii_hexdigit()).count();
     let min = if start == 2 { 1 } else { 8 };
     if run < min || c.get(start + run).is_some_and(char::is_ascii_alphanumeric) {
         return None;
@@ -174,10 +160,7 @@ fn clock(time: Option<DateTime<Utc>>, multi_day: bool) -> String {
 }
 
 fn sample(text: &str) -> String {
-    let flat: String = text
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
+    let flat: String = text.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
     if flat.chars().count() <= SAMPLE_CHARS {
         return flat;
     }
@@ -206,9 +189,7 @@ pub fn fold_logs(name: &str, language: &str, query: &LogQuery, result: &LogResul
     }
     let cut_lines = result.lines.iter().filter(|l| l.truncated).count();
     if cut_lines > 0 {
-        out.push_str(&format!(
-            "{cut_lines} line(s) were longer than the per-line cap and are cut.\n"
-        ));
+        out.push_str(&format!("{cut_lines} line(s) were longer than the per-line cap and are cut.\n"));
     }
     if !result.series.is_empty() {
         out.push_str(&fold_series(&result.series, multi_day));
@@ -239,13 +220,8 @@ pub fn fold_logs(name: &str, language: &str, query: &LogQuery, result: &LogResul
         .iter()
         .enumerate()
         .map(|(i, n)| {
-            let at =
-                query.start + chrono::Duration::milliseconds(span * i as i64 / TIME_BUCKETS as i64);
-            let label = if multi_day {
-                at.format("%m-%d %H:%M")
-            } else {
-                at.format("%H:%M")
-            };
+            let at = query.start + chrono::Duration::milliseconds(span * i as i64 / TIME_BUCKETS as i64);
+            let label = if multi_day { at.format("%m-%d %H:%M") } else { at.format("%H:%M") };
             format!("{label} {n}")
         })
         .collect();
@@ -273,12 +249,7 @@ pub fn fold_logs(name: &str, language: &str, query: &LogQuery, result: &LogResul
             }
             None => {
                 index.insert(key, groups.len());
-                groups.push(Group {
-                    count: 1,
-                    first: line,
-                    last: line,
-                    order: groups.len(),
-                });
+                groups.push(Group { count: 1, first: line, last: line, order: groups.len() });
             }
         }
     }
@@ -286,19 +257,12 @@ pub fn fold_logs(name: &str, language: &str, query: &LogQuery, result: &LogResul
     groups.sort_by(|a, b| b.count.cmp(&a.count).then(a.order.cmp(&b.order)));
     out.push_str(&format!(
         "Groups: {distinct} distinct message(s) after normalising numbers, ids and times{}\n",
-        if distinct > MAX_FOLD_GROUPS {
-            format!(", top {MAX_FOLD_GROUPS} shown")
-        } else {
-            String::new()
-        }
+        if distinct > MAX_FOLD_GROUPS { format!(", top {MAX_FOLD_GROUPS} shown") } else { String::new() }
     ));
     for group in groups.iter().take(MAX_FOLD_GROUPS) {
         let first_time = clock(group.first.time, multi_day);
         if group.count == 1 {
-            out.push_str(&format!(
-                "[1×] {first_time}  {}\n",
-                sample(&group.first.message)
-            ));
+            out.push_str(&format!("[1×] {first_time}  {}\n", sample(&group.first.message)));
         } else {
             out.push_str(&format!(
                 "[{}×] {first_time} … {}  first: {}\n",
@@ -323,10 +287,7 @@ pub fn fold_logs(name: &str, language: &str, query: &LogQuery, result: &LogResul
     }
     if distinct > MAX_FOLD_GROUPS {
         let rest: usize = groups.iter().skip(MAX_FOLD_GROUPS).map(|g| g.count).sum();
-        out.push_str(&format!(
-            "… {} more group(s), {rest} line(s)\n",
-            distinct - MAX_FOLD_GROUPS
-        ));
+        out.push_str(&format!("… {} more group(s), {rest} line(s)\n", distinct - MAX_FOLD_GROUPS));
     }
     out
 }
@@ -352,18 +313,10 @@ pub fn fold_series(series: &[LogSeries], multi_day: bool) -> String {
     let mut out = format!(
         "Metric result: {} series{}\n",
         series.len(),
-        if series.len() > MAX_FOLD_SERIES {
-            format!(", top {MAX_FOLD_SERIES} by last value shown")
-        } else {
-            String::new()
-        }
+        if series.len() > MAX_FOLD_SERIES { format!(", top {MAX_FOLD_SERIES} by last value shown") } else { String::new() }
     );
     for s in ranked.iter().take(MAX_FOLD_SERIES) {
-        let labels: Vec<String> = s
-            .labels
-            .iter()
-            .map(|(k, v)| format!("{k}=\"{v}\""))
-            .collect();
+        let labels: Vec<String> = s.labels.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
         let values: Vec<f64> = s.points.iter().map(|p| p.1).collect();
         let min = values.iter().copied().fold(f64::INFINITY, f64::min);
         let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -374,13 +327,7 @@ pub fn fold_series(series: &[LogSeries], multi_day: bool) -> String {
         // Evenly over the whole series, first and newest point included.
         let k = values.len().min(SERIES_SAMPLES);
         let sampled: Vec<String> = (0..k)
-            .map(|i| {
-                if k == 1 {
-                    0
-                } else {
-                    i * (values.len() - 1) / (k - 1)
-                }
-            })
+            .map(|i| if k == 1 { 0 } else { i * (values.len() - 1) / (k - 1) })
             .map(|i| number(values[i]))
             .collect();
         out.push_str(&format!(
@@ -415,24 +362,10 @@ mod series_tests {
     #[test]
     fn samples_span_the_whole_series() {
         let points: Vec<(DateTime<Utc>, f64)> = (0..13)
-            .map(|i| {
-                (
-                    Utc.timestamp_opt(1_793_557_500 + i * 60, 0).unwrap(),
-                    i as f64,
-                )
-            })
+            .map(|i| (Utc.timestamp_opt(1_793_557_500 + i * 60, 0).unwrap(), i as f64))
             .collect();
-        let text = fold_series(
-            &[LogSeries {
-                labels: Default::default(),
-                points,
-            }],
-            false,
-        );
+        let text = fold_series(&[LogSeries { labels: Default::default(), points }], false);
         assert!(text.contains("values 0 "), "{text}");
-        assert!(
-            text.trim_end().ends_with(" 12"),
-            "the newest point is sampled: {text}"
-        );
+        assert!(text.trim_end().ends_with(" 12"), "the newest point is sampled: {text}");
     }
 }

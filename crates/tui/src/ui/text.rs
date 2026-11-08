@@ -44,10 +44,7 @@ struct LineCells {
 
 impl LineCells {
     fn new() -> Self {
-        Self {
-            cells: Vec::new(),
-            col: 0,
-        }
+        Self { cells: Vec::new(), col: 0 }
     }
 
     fn pad_to(&mut self, n: usize) {
@@ -282,8 +279,8 @@ pub(crate) fn strip_emoji(s: &str) -> String {
             || (0x2580..=0x259F).contains(&cp)  // Block elements
             || (0x25A0..=0x25FF).contains(&cp)  // Geometric shapes (▶ ◆ ● ■ ▸ ▾)
             || (0x2713..=0x2717).contains(&cp)  // Dingbats: ✓ ✗ (command status)
-            || (0x2800..=0x28FF).contains(&cp) // Braille patterns (spinner: ⠋⠙⠹…)
-                                               // Everything else (Misc symbols, Dingbats, Emojis, Flags) is stripped
+            || (0x2800..=0x28FF).contains(&cp)  // Braille patterns (spinner: ⠋⠙⠹…)
+            // Everything else (Misc symbols, Dingbats, Emojis, Flags) is stripped
         })
         .collect()
 }
@@ -359,7 +356,10 @@ pub fn render_markdown_line(
     if state.in_fence {
         if line.trim_start().starts_with("```") {
             state.in_fence = false;
-            return vec![Span::styled(format!("{} ```", glyphs.gutter), theme.dim())];
+            return vec![Span::styled(
+                format!("{} ```", glyphs.gutter),
+                theme.dim(),
+            )];
         }
         // Render line with gutter prefix, fg_dim style.
         return vec![Span::styled(
@@ -416,11 +416,7 @@ pub fn render_markdown_line(
                     spans.push(Span::styled(std::mem::take(&mut current), current_style));
                 }
                 in_code = false;
-                current_style = if in_bold {
-                    theme.bold_style()
-                } else {
-                    theme.fg_style()
-                };
+                current_style = if in_bold { theme.bold_style() } else { theme.fg_style() };
                 i += 1;
                 continue;
             } else {
@@ -447,11 +443,7 @@ pub fn render_markdown_line(
                     spans.push(Span::styled(std::mem::take(&mut current), current_style));
                 }
                 in_bold = false;
-                current_style = if in_code {
-                    theme.code_span_style()
-                } else {
-                    theme.fg_style()
-                };
+                current_style = if in_code { theme.code_span_style() } else { theme.fg_style() };
                 i += 2;
                 continue;
             } else {
@@ -463,11 +455,7 @@ pub fn render_markdown_line(
                         spans.push(Span::styled(std::mem::take(&mut current), current_style));
                     }
                     in_bold = true;
-                    current_style = if in_code {
-                        theme.code_span_style()
-                    } else {
-                        theme.bold_style()
-                    };
+                    current_style = if in_code { theme.code_span_style() } else { theme.bold_style() };
                     i += 2;
                     continue;
                 }
@@ -557,37 +545,17 @@ mod tests {
     fn md_code_span() {
         // `code` → should have separate spans: "", "code", ""
         let spans = md_spans("hello `world` end");
-        assert!(
-            spans.iter().any(|s| s == "world"),
-            "code span content should be a separate span: {:?}",
-            spans
-        );
-        assert!(
-            spans.iter().any(|s| s == "hello "),
-            "text before code should be a span: {:?}",
-            spans
-        );
-        assert!(
-            spans.iter().any(|s| s == " end"),
-            "text after code should be a span: {:?}",
-            spans
-        );
+        assert!(spans.iter().any(|s| s == "world"), "code span content should be a separate span: {:?}", spans);
+        assert!(spans.iter().any(|s| s == "hello "), "text before code should be a span: {:?}", spans);
+        assert!(spans.iter().any(|s| s == " end"), "text after code should be a span: {:?}", spans);
     }
 
     #[test]
     fn md_bold() {
         // **bold** → should have separate spans
         let spans = md_spans("this is **important** text");
-        assert!(
-            spans.iter().any(|s| s == "important"),
-            "bold content should be a separate span: {:?}",
-            spans
-        );
-        assert!(
-            spans.iter().any(|s| s == "this is "),
-            "text before bold: {:?}",
-            spans
-        );
+        assert!(spans.iter().any(|s| s == "important"), "bold content should be a separate span: {:?}", spans);
+        assert!(spans.iter().any(|s| s == "this is "), "text before bold: {:?}", spans);
     }
 
     #[test]
@@ -604,11 +572,7 @@ mod tests {
         let spans = md_spans("hello `world");
         // Should be a single span with the full text (unclosed backtick is literal)
         let combined: String = spans.join("");
-        assert_eq!(
-            combined, "hello `world",
-            "unclosed backtick should be literal: {:?}",
-            spans
-        );
+        assert_eq!(combined, "hello `world", "unclosed backtick should be literal: {:?}", spans);
     }
 
     #[test]
@@ -617,11 +581,7 @@ mod tests {
         let spans = md_spans("hello **world");
         let combined: String = spans.join("");
         // The ** is consumed by the parser but the content is still there
-        assert!(
-            combined.contains("world"),
-            "unclosed bold content should still appear: {:?}",
-            spans
-        );
+        assert!(combined.contains("world"), "unclosed bold content should still appear: {:?}", spans);
     }
 
     #[test]

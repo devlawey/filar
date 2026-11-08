@@ -10,10 +10,10 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use russh::client::{self, Handle};
+use russh::AgentAuthError;
 use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::*;
-use russh::AgentAuthError;
 use tracing::{debug, info};
 
 use filar_core::{CoreError, Result, SecretProvider, SshAuth, SshTarget};
@@ -129,9 +129,7 @@ fn agent_endpoint(auth_sock: Option<String>) -> AgentEndpoint {
 
 /// Error for an agent that cannot be reached; `detail` says why.
 fn agent_unavailable(detail: &str) -> CoreError {
-    CoreError::Other(format!(
-        "SSH agent unavailable: {detail}; {START_AGENT_HINT}"
-    ))
+    CoreError::Other(format!("SSH agent unavailable: {detail}; {START_AGENT_HINT}"))
 }
 
 /// Connect to the running SSH agent.
@@ -259,9 +257,7 @@ where
         .await
         .map_err(|e| agent_unavailable(&format!("cannot list agent keys: {e}")))?;
     if identities.is_empty() {
-        return Err(CoreError::Other(format!(
-            "SSH agent has no keys; {ADD_KEY_HINT}"
-        )));
+        return Err(CoreError::Other(format!("SSH agent has no keys; {ADD_KEY_HINT}")));
     }
     debug!(count = identities.len(), keys = ?describe(&identities), "agent identities");
     Ok(identities)
@@ -272,8 +268,9 @@ fn describe(identities: &[AgentIdentity]) -> Vec<Cow<'_, str>> {
     identities
         .iter()
         .map(|i| match i {
-            AgentIdentity::PublicKey { comment, .. }
-            | AgentIdentity::Certificate { comment, .. } => Cow::Borrowed(comment.as_str()),
+            AgentIdentity::PublicKey { comment, .. } | AgentIdentity::Certificate { comment, .. } => {
+                Cow::Borrowed(comment.as_str())
+            }
         })
         .collect()
 }
@@ -312,10 +309,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn no_auth_sock_is_an_agent_unavailable_error_with_a_hint() {
-        let err = connect_agent_at(AgentEndpoint::Unset)
-            .await
-            .err()
-            .expect("error");
+        let err = connect_agent_at(AgentEndpoint::Unset).await.err().expect("error");
         let msg = err.to_string();
         assert!(msg.contains("SSH agent unavailable"), "{msg}");
         assert!(msg.contains("SSH_AUTH_SOCK"), "{msg}");
@@ -357,9 +351,7 @@ mod tests {
             conn.read_exact(&mut body).await.expect("read body");
             assert_eq!(body, [11], "SSH_AGENTC_REQUEST_IDENTITIES");
             // SSH_AGENT_IDENTITIES_ANSWER (12) with a zero key count.
-            conn.write_all(&[0, 0, 0, 5, 12, 0, 0, 0, 0])
-                .await
-                .expect("write");
+            conn.write_all(&[0, 0, 0, 5, 12, 0, 0, 0, 0]).await.expect("write");
         });
 
         let mut agent = connect_agent_at(AgentEndpoint::Configured(sock.display().to_string()))

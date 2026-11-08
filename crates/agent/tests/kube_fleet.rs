@@ -16,14 +16,12 @@ use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Api, Client, Config};
 
 fn fixture(path: &Path) -> KubeCluster {
-    let context = std::env::var("FILAR_TEST_KUBE_CONTEXT")
-        .ok()
-        .unwrap_or_else(|| {
-            Kubeconfig::read_from(path)
-                .ok()
-                .and_then(|config| config.current_context)
-                .expect("test kubeconfig must have a current context")
-        });
+    let context = std::env::var("FILAR_TEST_KUBE_CONTEXT").ok().unwrap_or_else(|| {
+        Kubeconfig::read_from(path)
+            .ok()
+            .and_then(|config| config.current_context)
+            .expect("test kubeconfig must have a current context")
+    });
     KubeCluster {
         name: "filar-tests".into(),
         context,
@@ -89,10 +87,7 @@ async fn k8s_web_fleet_gets_and_folds_three_ready_pods() {
     let fleet = open_fleet("app=web", 3).await;
     let call = get_pod();
     let approval = fleet.approve(&call).expect("approve fleet get");
-    let report = fleet
-        .run(&call, approval)
-        .await
-        .expect("fleet get succeeds");
+    let report = fleet.run(&call, approval).await.expect("fleet get succeeds");
 
     assert_eq!(report.result().rows().len(), 3);
     assert_eq!(report.folded().hosts(), 3);
@@ -102,11 +97,7 @@ async fn k8s_web_fleet_gets_and_folds_three_ready_pods() {
         .rows()
         .iter()
         .all(|row| row.state() == HostState::Success));
-    assert!(report
-        .folded()
-        .groups()
-        .iter()
-        .all(|group| group.len() == 1));
+    assert!(report.folded().groups().iter().all(|group| group.len() == 1));
 }
 
 #[tokio::test]
@@ -125,17 +116,13 @@ async fn k8s_crashy_fleet_reads_previous_container_logs() {
 
     let mut last = String::new();
     for _ in 0..60 {
-        let approval = fleet
-            .approve(&call)
-            .expect("approve previous-log operation");
+        let approval = fleet.approve(&call).expect("approve previous-log operation");
         let report = fleet
             .run(&call, approval)
             .await
             .expect("previous-log operation completes");
         last = report.render();
-        if report.result().rows()[0].state() == HostState::Success
-            && last.contains("crashy: exiting")
-        {
+        if report.result().rows()[0].state() == HostState::Success && last.contains("crashy: exiting") {
             return;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -153,13 +140,8 @@ async fn k8s_pod_deleted_after_fleet_entry_is_reported_as_disappeared() {
         other => panic!("expected a pod member, got {}", other.name()),
     };
 
-    let kubeconfig = Kubeconfig::read_from(
-        target
-            .kubeconfig
-            .as_deref()
-            .expect("fixture kubeconfig path"),
-    )
-    .expect("read fixture kubeconfig");
+    let kubeconfig = Kubeconfig::read_from(target.kubeconfig.as_deref().expect("fixture kubeconfig path"))
+        .expect("read fixture kubeconfig");
     let options = KubeConfigOptions {
         context: Some(target.context.clone()),
         ..KubeConfigOptions::default()
@@ -175,22 +157,8 @@ async fn k8s_pod_deleted_after_fleet_entry_is_reported_as_disappeared() {
 
     let call = get_pod();
     let approval = fleet.approve(&call).expect("approve fleet get");
-    let report = fleet
-        .run(&call, approval)
-        .await
-        .expect("operation completes");
-    assert_eq!(
-        report.result().rows().len(),
-        3,
-        "replacement pods never join"
-    );
-    assert_eq!(
-        report.result().summary().count(HostState::PodDisappeared),
-        1
-    );
-    assert!(
-        report.render().contains("pod disappeared"),
-        "{}",
-        report.render()
-    );
+    let report = fleet.run(&call, approval).await.expect("operation completes");
+    assert_eq!(report.result().rows().len(), 3, "replacement pods never join");
+    assert_eq!(report.result().summary().count(HostState::PodDisappeared), 1);
+    assert!(report.render().contains("pod disappeared"), "{}", report.render());
 }

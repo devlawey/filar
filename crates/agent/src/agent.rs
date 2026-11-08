@@ -691,26 +691,20 @@ impl AgentBuilder {
 
     /// Build the agent.
     pub fn build(self) -> Result<Agent> {
-        let executor = self
-            .executor
-            .ok_or_else(|| CoreError::Other("executor not set".into()))?;
+        let executor = self.executor.ok_or_else(|| CoreError::Other("executor not set".into()))?;
         // Wrap the executor in SecretSubstitutingExecutor if a provider is set.
         // Never in a fleet (#436): a `$FILAR_SECRET_N` was typed for the host
         // of one tab, and substituting it here would send it to every host of
         // the group. The fleet prompt already says Ctrl+P secrets are not
         // available; this is what makes that true.
-        let secret_provider = if self.fleet {
-            None
-        } else {
-            self.secret_provider
-        };
+        let secret_provider = if self.fleet { None } else { self.secret_provider };
         let executor: Arc<dyn CommandExecutor> = match &secret_provider {
             Some(provider) => Arc::new(SecretSubstitutingExecutor::new(executor, provider.clone())),
             None => executor,
         };
-        let mut system_prompt = self
-            .system_prompt
-            .unwrap_or_else(|| build_system_prompt(false, None, cfg!(windows)));
+        let mut system_prompt = self.system_prompt.unwrap_or_else(||
+            build_system_prompt(false, None, cfg!(windows))
+        );
         // The prompt must match the tool set the model is given (AGENTS.md).
         if self.fleet {
             system_prompt.push('\n');
@@ -737,13 +731,9 @@ impl AgentBuilder {
             system_prompt.push_str(SAFE_MODE_PROMPT);
         }
         Ok(Agent {
-            llm: self
-                .llm
-                .ok_or_else(|| CoreError::Other("LLM client not set".into()))?,
+            llm: self.llm.ok_or_else(|| CoreError::Other("LLM client not set".into()))?,
             executor,
-            confirmer: self
-                .confirmer
-                .ok_or_else(|| CoreError::Other("confirmer not set".into()))?,
+            confirmer: self.confirmer.ok_or_else(|| CoreError::Other("confirmer not set".into()))?,
             confirm_mode: self.confirm_mode,
             max_iterations: self.max_iterations,
             max_output_chars: self.max_output_chars,
@@ -764,7 +754,9 @@ impl AgentBuilder {
             arbiter_model_name: self
                 .arbiter_model_name
                 .unwrap_or_else(|| "session profile".into()),
-            session_id: self.session_id.unwrap_or_else(|| "default".into()),
+            session_id: self
+                .session_id
+                .unwrap_or_else(|| "default".into()),
             is_local: self.is_local,
             fleet: self.fleet,
             risk_scorer: self.risk_scorer,
@@ -784,7 +776,10 @@ impl Default for AgentBuilder {
 ///
 /// If a cancellation token is set, wraps the future in `tokio::select!`
 /// with `token.cancelled()`. Returns `Err("cancelled")` if cancelled.
-async fn with_cancellation<F, T>(cancellation: Option<&CancellationToken>, future: F) -> Result<T>
+async fn with_cancellation<F, T>(
+    cancellation: Option<&CancellationToken>,
+    future: F,
+) -> Result<T>
 where
     F: std::future::Future<Output = Result<T>>,
 {
@@ -965,10 +960,7 @@ impl Agent {
         if let Some(sources) = &self.log_sources {
             tool_defs.push(sources.tool_definition(self.confirm_mode));
             if self.kube_pod.is_some() {
-                tool_defs.push(crate::logs::k8s::pod_logs_history_definition(
-                    self.confirm_mode,
-                    false,
-                ));
+                tool_defs.push(crate::logs::k8s::pod_logs_history_definition(self.confirm_mode, false));
             }
         }
 
@@ -1005,11 +997,7 @@ impl Agent {
                         sink(AgentEvent::TextDelta(delta));
                     }
                 };
-                with_cancellation(
-                    self.cancellation.as_ref(),
-                    self.llm.chat_stream(&request, &callback),
-                )
-                .await?
+                with_cancellation(self.cancellation.as_ref(), self.llm.chat_stream(&request, &callback)).await?
             } else {
                 with_cancellation(self.cancellation.as_ref(), self.llm.chat(&request)).await?
             };
@@ -1027,15 +1015,13 @@ impl Agent {
 
             if response.has_tool_calls() {
                 let tool_calls = response.tool_calls.clone();
-                info!(
-                    iteration,
-                    count = tool_calls.len(),
-                    "LLM requested tool calls"
-                );
+                info!(iteration, count = tool_calls.len(), "LLM requested tool calls");
 
                 // Add the assistant message with tool calls (and any preamble text) to history.
-                let assistant_msg =
-                    ChatMessage::assistant_with_tools(&response.text, tool_calls.clone());
+                let assistant_msg = ChatMessage::assistant_with_tools(
+                    &response.text,
+                    tool_calls.clone(),
+                );
                 messages.push(assistant_msg);
 
                 // In Explain mode, validate ALL explanations before executing any.
@@ -1058,10 +1044,7 @@ impl Agent {
                     if !errors.is_empty() {
                         missing_explanation_count += 1;
                         if missing_explanation_count > MAX_MISSING_EXPLANATION_RETRIES {
-                            warn!(
-                                count = missing_explanation_count,
-                                "explanation retries exhausted"
-                            );
+                            warn!(count = missing_explanation_count, "explanation retries exhausted");
                             return Err(CoreError::Other(
                                 "Agent repeatedly proposed commands without the required explanation. Stopping.".into()
                             ));
@@ -1120,10 +1103,7 @@ impl Agent {
         }
 
         // Exceeded max iterations.
-        warn!(
-            max_iterations = self.max_iterations,
-            "agent loop exceeded max iterations"
-        );
+        warn!(max_iterations = self.max_iterations, "agent loop exceeded max iterations");
         Err(CoreError::Other(format!(
             "agent loop exceeded maximum iterations ({})",
             self.max_iterations
@@ -1145,10 +1125,7 @@ impl Agent {
         // `query_logs`, the query written by filar for this pod.
         if tc.name == crate::logs::k8s::TOOL_POD_LOGS_HISTORY {
             let (Some(sources), Some(pod)) = (&self.log_sources, &self.kube_pod) else {
-                return Ok(ChatMessage::tool(
-                    &tc.id,
-                    "Error: pod_logs_history is available only in a pod tab with log sources.",
-                ));
+                return Ok(ChatMessage::tool(&tc.id, "Error: pod_logs_history is available only in a pod tab with log sources."));
             };
             let emit = |event: AgentEvent| self.emit(event);
             return sources
@@ -1222,16 +1199,17 @@ impl Agent {
         };
 
         // Check security / confirmation.
-        let mut decision =
-            security::tool_needs_confirmation(parsed.kind, &parsed.command, self.confirm_mode);
+        let mut decision = security::tool_needs_confirmation(
+            parsed.kind,
+            &parsed.command,
+            self.confirm_mode,
+        );
         // The fleet gate (#435). A read-only command is always put to the
         // user, whatever the mode would auto-approve: one approval covers
         // every host, so the radius must be seen before it is given. A write
         // would need an approval per host, and that path is closed — it is
         // refused below, before anyone is asked.
-        let fleet_gate = self
-            .fleet
-            .then(|| crate::fleet_gate::fleet_gate(&parsed.command));
+        let fleet_gate = self.fleet.then(|| crate::fleet_gate::fleet_gate(&parsed.command));
         if matches!(fleet_gate, Some(crate::fleet_gate::FleetGate::Ask(_)))
             && decision == ConfirmDecision::AutoApproved
         {
@@ -1315,16 +1293,11 @@ impl Agent {
                 )
                 .await;
 
-                let confirm_fut =
-                    self.confirmer
-                        .confirm(&display_command, &parsed.explanation, destructive);
+                let confirm_fut = self
+                    .confirmer
+                    .confirm(&display_command, &parsed.explanation, destructive);
                 let approved = if let Some(ct) = self.confirm_timeout {
-                    match tokio::time::timeout(
-                        ct,
-                        with_cancellation(self.cancellation.as_ref(), confirm_fut),
-                    )
-                    .await
-                    {
+                    match tokio::time::timeout(ct, with_cancellation(self.cancellation.as_ref(), confirm_fut)).await {
                         Ok(result) => result?,
                         Err(_) => {
                             info!(command = %display_command, "confirmation timed out");
@@ -1372,9 +1345,7 @@ impl Agent {
             }
         } else if let Some(ct) = self.command_timeout {
             let exec_fut = self.execute_parsed_tool(&parsed);
-            match tokio::time::timeout(ct, with_cancellation(self.cancellation.as_ref(), exec_fut))
-                .await
-            {
+            match tokio::time::timeout(ct, with_cancellation(self.cancellation.as_ref(), exec_fut)).await {
                 Ok(Ok(o)) => o,
                 Ok(Err(e)) if e.to_string() == "cancelled" => {
                     // Cancellation — kill the running command (foreground only).
@@ -1436,8 +1407,7 @@ impl Agent {
 
         // Truncate output if too long; enrich password/TTY failures for the LLM.
         let enriched = crate::password_prompt::enrich_password_prompt_message_for_command(
-            &parsed.command,
-            &output,
+            &parsed.command, &output,
         );
         let truncated = self.truncate_output(&enriched);
 
@@ -1466,8 +1436,7 @@ impl Agent {
         } else {
             format!("Error: {detail}")
         };
-        output =
-            crate::password_prompt::enrich_password_prompt_message_for_command(command, &output);
+        output = crate::password_prompt::enrich_password_prompt_message_for_command(command, &output);
         self.emit(AgentEvent::CommandFinished {
             command: display_command,
             output: output.clone(),
@@ -1693,12 +1662,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CommandConfirmer for MockConfirmer {
-        async fn confirm(
-            &self,
-            _command: &str,
-            _explanation: &str,
-            _destructive: bool,
-        ) -> Result<bool> {
+        async fn confirm(&self, _command: &str, _explanation: &str, _destructive: bool) -> Result<bool> {
             Ok(self.approve)
         }
     }
@@ -1727,17 +1691,14 @@ mod tests {
     #[tokio::test]
     async fn agent_tool_call_then_text() {
         // First response: tool call. Second response: text.
-        let tool_call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({
-                    "command": "echo hello",
-                    "explanation": "Print hello"
-                }),
-            }],
-        );
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "echo hello",
+                "explanation": "Print hello"
+            }),
+        }]);
 
         let llm = Arc::new(MockLlm::new(vec![
             tool_call,
@@ -1891,17 +1852,14 @@ mod tests {
 
     #[tokio::test]
     async fn agent_tool_call_denied() {
-        let tool_call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({
-                    "command": "rm -rf /tmp",
-                    "explanation": "Delete temp files"
-                }),
-            }],
-        );
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "rm -rf /tmp",
+                "explanation": "Delete temp files"
+            }),
+        }]);
 
         let llm = Arc::new(MockLlm::new(vec![
             tool_call,
@@ -1928,17 +1886,14 @@ mod tests {
     #[tokio::test]
     async fn agent_tool_call_auto_approved() {
         // In Allowlist mode, read-only commands are auto-approved (no confirmer call).
-        let tool_call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({
-                    "command": "ls -la",
-                    "explanation": "List files"
-                }),
-            }],
-        );
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "ls -la",
+                "explanation": "List files"
+            }),
+        }]);
 
         let llm = Arc::new(MockLlm::new(vec![
             tool_call,
@@ -1968,21 +1923,20 @@ mod tests {
         // #364 regression: a Ctrl+P secret registered AFTER the agent is
         // built must be substituted into tool commands (heredoc included),
         // and the real value must never reach the LLM-visible output.
-        let heredoc_cmd =
-            "printf '%s\n' \"$FILAR_SECRET_1\" | sudo -S tee /tmp/f <<'EOF'\n<x/>\nEOF";
-        let tool_call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({
-                    "command": heredoc_cmd,
-                    "explanation": "Write file with sudo"
-                }),
-            }],
-        );
+        let heredoc_cmd = "printf '%s\n' \"$FILAR_SECRET_1\" | sudo -S tee /tmp/f <<'EOF'\n<x/>\nEOF";
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": heredoc_cmd,
+                "explanation": "Write file with sudo"
+            }),
+        }]);
 
-        let llm = Arc::new(MockLlm::new(vec![tool_call, ChatResponse::text("Done.")]));
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call,
+            ChatResponse::text("Done."),
+        ]));
 
         let executor = Arc::new(MockExecutor {
             last_command: std::sync::Mutex::new(String::new()),
@@ -1990,8 +1944,7 @@ mod tests {
         let confirmer = Arc::new(MockConfirmer { approve: true });
         let provider = Arc::new(filar_core::StaticSecretProvider::new());
 
-        let finished: Arc<std::sync::Mutex<Vec<String>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let finished: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink_events = finished.clone();
         let sink: EventSink = Arc::new(move |event| {
             if let AgentEvent::CommandFinished { output, .. } = event {
@@ -2040,17 +1993,14 @@ mod tests {
     #[tokio::test]
     async fn agent_max_iterations() {
         // Always return a tool call — never produce text.
-        let tool_call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({
-                    "command": "echo loop",
-                    "explanation": "Looping"
-                }),
-            }],
-        );
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "echo loop",
+                "explanation": "Looping"
+            }),
+        }]);
 
         // Need enough responses for all iterations.
         let responses: Vec<ChatResponse> = (0..20).map(|_| tool_call.clone()).collect();
@@ -2197,19 +2147,19 @@ mod tests {
         // Started → CommandProposed → CommandFinished → Finished.
         use std::sync::Mutex;
 
-        let tool_call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({
-                    "command": "echo hello",
-                    "explanation": "Print hello"
-                }),
-            }],
-        );
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "echo hello",
+                "explanation": "Print hello"
+            }),
+        }]);
 
-        let llm = Arc::new(MockLlm::new(vec![tool_call, ChatResponse::text("Done!")]));
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call,
+            ChatResponse::text("Done!"),
+        ]));
 
         let executor = Arc::new(MockExecutor {
             last_command: Mutex::new(String::new()),
@@ -2239,26 +2189,13 @@ mod tests {
         assert_eq!(received.len(), 4, "expected 4 events, got {received:?}");
 
         // Verify the event sequence.
-        assert!(
-            matches!(&received[0], AgentEvent::Started),
-            "first event should be Started, got {:?}",
-            received[0]
-        );
-        assert!(
-            matches!(&received[1], AgentEvent::CommandProposed { command, .. } if command == "echo hello"),
-            "second event should be CommandProposed, got {:?}",
-            received[1]
-        );
-        assert!(
-            matches!(&received[2], AgentEvent::CommandFinished { command, denied, .. } if command == "echo hello" && !denied),
-            "third event should be CommandFinished (not denied), got {:?}",
-            received[2]
-        );
-        assert!(
-            matches!(&received[3], AgentEvent::Finished(text) if text == "Done!"),
-            "fourth event should be Finished, got {:?}",
-            received[3]
-        );
+        assert!(matches!(&received[0], AgentEvent::Started), "first event should be Started, got {:?}", received[0]);
+        assert!(matches!(&received[1], AgentEvent::CommandProposed { command, .. } if command == "echo hello"),
+            "second event should be CommandProposed, got {:?}", received[1]);
+        assert!(matches!(&received[2], AgentEvent::CommandFinished { command, denied, .. } if command == "echo hello" && !denied),
+            "third event should be CommandFinished (not denied), got {:?}", received[2]);
+        assert!(matches!(&received[3], AgentEvent::Finished(text) if text == "Done!"),
+            "fourth event should be Finished, got {:?}", received[3]);
     }
 
     #[tokio::test]
@@ -2266,17 +2203,14 @@ mod tests {
         // When a command is denied, sink should receive CommandFinished with denied=true.
         use std::sync::Mutex;
 
-        let tool_call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({
-                    "command": "rm -rf /tmp",
-                    "explanation": "Delete temp files"
-                }),
-            }],
-        );
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "rm -rf /tmp",
+                "explanation": "Delete temp files"
+            }),
+        }]);
 
         let llm = Arc::new(MockLlm::new(vec![
             tool_call,
@@ -2308,14 +2242,8 @@ mod tests {
         let received = events.lock().unwrap();
         // Started → CommandProposed → CommandFinished(denied=true) → Finished
         assert_eq!(received.len(), 4, "expected 4 events, got {received:?}");
-        assert!(
-            matches!(
-                &received[2],
-                AgentEvent::CommandFinished { denied: true, .. }
-            ),
-            "third event should be CommandFinished with denied=true, got {:?}",
-            received[2]
-        );
+        assert!(matches!(&received[2], AgentEvent::CommandFinished { denied: true, .. }),
+            "third event should be CommandFinished with denied=true, got {:?}", received[2]);
     }
 
     #[tokio::test]
@@ -2354,31 +2282,16 @@ mod tests {
         let received = events.lock().unwrap();
         // Expected: Started → TextDelta("Hello") → TextDelta(" world") → TextDelta("!") → Finished
         assert_eq!(received.len(), 5, "expected 5 events, got {received:?}");
-        assert!(
-            matches!(&received[0], AgentEvent::Started),
-            "first event should be Started, got {:?}",
-            received[0]
-        );
-        assert!(
-            matches!(&received[1], AgentEvent::TextDelta(s) if s == "Hello"),
-            "second event should be TextDelta, got {:?}",
-            received[1]
-        );
-        assert!(
-            matches!(&received[2], AgentEvent::TextDelta(s) if s == " world"),
-            "third event should be TextDelta, got {:?}",
-            received[2]
-        );
-        assert!(
-            matches!(&received[3], AgentEvent::TextDelta(s) if s == "!"),
-            "fourth event should be TextDelta, got {:?}",
-            received[3]
-        );
-        assert!(
-            matches!(&received[4], AgentEvent::Finished(text) if text == "Hello world!"),
-            "last event should be Finished, got {:?}",
-            received[4]
-        );
+        assert!(matches!(&received[0], AgentEvent::Started),
+            "first event should be Started, got {:?}", received[0]);
+        assert!(matches!(&received[1], AgentEvent::TextDelta(s) if s == "Hello"),
+            "second event should be TextDelta, got {:?}", received[1]);
+        assert!(matches!(&received[2], AgentEvent::TextDelta(s) if s == " world"),
+            "third event should be TextDelta, got {:?}", received[2]);
+        assert!(matches!(&received[3], AgentEvent::TextDelta(s) if s == "!"),
+            "fourth event should be TextDelta, got {:?}", received[3]);
+        assert!(matches!(&received[4], AgentEvent::Finished(text) if text == "Hello world!"),
+            "last event should be Finished, got {:?}", received[4]);
     }
 
     #[tokio::test]
@@ -2422,7 +2335,9 @@ mod tests {
             .unwrap();
 
         // Spawn the agent run in a task.
-        let handle = tokio::spawn(async move { agent.run("test", &[]).await });
+        let handle = tokio::spawn(async move {
+            agent.run("test", &[]).await
+        });
 
         // Give the agent a moment to start, then cancel.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2435,16 +2350,10 @@ mod tests {
         let received = events.lock().unwrap();
         // Expected: Started → Cancelled
         assert_eq!(received.len(), 2, "expected 2 events, got {received:?}");
-        assert!(
-            matches!(&received[0], AgentEvent::Started),
-            "first event should be Started, got {:?}",
-            received[0]
-        );
-        assert!(
-            matches!(&received[1], AgentEvent::Cancelled),
-            "second event should be Cancelled, got {:?}",
-            received[1]
-        );
+        assert!(matches!(&received[0], AgentEvent::Started),
+            "first event should be Started, got {:?}", received[0]);
+        assert!(matches!(&received[1], AgentEvent::Cancelled),
+            "second event should be Cancelled, got {:?}", received[1]);
     }
 
     #[tokio::test]
@@ -2463,19 +2372,19 @@ mod tests {
             }
         }
 
-        let tool_call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({
-                    "command": "echo hello",
-                    "explanation": "Print hello"
-                }),
-            }],
-        );
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "echo hello",
+                "explanation": "Print hello"
+            }),
+        }]);
 
-        let llm = Arc::new(MockLlm::new(vec![tool_call, ChatResponse::text("Done!")]));
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call,
+            ChatResponse::text("Done!"),
+        ]));
 
         let executor = Arc::new(MockExecutor {
             last_command: Mutex::new(String::new()),
@@ -2503,25 +2412,13 @@ mod tests {
 
         let received = events.lock().unwrap();
         // Expected: Started → CommandProposed → CommandFinished(denied=true, "timed out") → Finished
-        assert!(
-            received.len() >= 3,
-            "expected at least 3 events, got {received:?}"
-        );
-        assert!(
-            matches!(&received[0], AgentEvent::Started),
-            "first event should be Started, got {:?}",
-            received[0]
-        );
-        assert!(
-            matches!(&received[1], AgentEvent::CommandProposed { .. }),
-            "second event should be CommandProposed, got {:?}",
-            received[1]
-        );
-        assert!(
-            matches!(&received[2], AgentEvent::CommandFinished { denied: true, output, .. } if output.contains("timed out")),
-            "third event should be CommandFinished with denied=true and timeout message, got {:?}",
-            received[2]
-        );
+        assert!(received.len() >= 3, "expected at least 3 events, got {received:?}");
+        assert!(matches!(&received[0], AgentEvent::Started),
+            "first event should be Started, got {:?}", received[0]);
+        assert!(matches!(&received[1], AgentEvent::CommandProposed { .. }),
+            "second event should be CommandProposed, got {:?}", received[1]);
+        assert!(matches!(&received[2], AgentEvent::CommandFinished { denied: true, output, .. } if output.contains("timed out")),
+            "third event should be CommandFinished with denied=true and timeout message, got {:?}", received[2]);
     }
 
     #[tokio::test]
@@ -2548,21 +2445,21 @@ mod tests {
             }
         }
 
-        let tool_call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({
-                    // Must not be a long `sleep` — those are rejected by long_wait
-                    // policy (#323) before the executor runs.
-                    "command": "make all",
-                    "explanation": "Hang until agent timeout"
-                }),
-            }],
-        );
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                // Must not be a long `sleep` — those are rejected by long_wait
+                // policy (#323) before the executor runs.
+                "command": "make all",
+                "explanation": "Hang until agent timeout"
+            }),
+        }]);
 
-        let llm = Arc::new(MockLlm::new(vec![tool_call, ChatResponse::text("Done!")]));
+        let llm = Arc::new(MockLlm::new(vec![
+            tool_call,
+            ChatResponse::text("Done!"),
+        ]));
 
         let executor = Arc::new(HangingExecutor {
             cancel_count: Mutex::new(0),
@@ -2590,37 +2487,19 @@ mod tests {
 
         // executor.cancel() must have been called on timeout.
         let cancel_count = *executor.cancel_count.lock().unwrap();
-        assert_eq!(
-            cancel_count, 1,
-            "executor.cancel() should be called once on timeout"
-        );
+        assert_eq!(cancel_count, 1, "executor.cancel() should be called once on timeout");
 
         let received = events.lock().unwrap();
         // Expected: Started → CommandProposed → CommandFinished(output contains timed out) → Finished
-        assert!(
-            received.len() >= 3,
-            "expected at least 3 events, got {received:?}"
-        );
-        assert!(
-            matches!(&received[0], AgentEvent::Started),
-            "first event should be Started, got {:?}",
-            received[0]
-        );
-        assert!(
-            matches!(&received[1], AgentEvent::CommandProposed { .. }),
-            "second event should be CommandProposed, got {:?}",
-            received[1]
-        );
-        assert!(
-            matches!(&received[2], AgentEvent::CommandFinished { denied: false, output, .. } if output.contains("timed out")),
-            "third event should be CommandFinished with timeout message, got {:?}",
-            received[2]
-        );
-        assert!(
-            matches!(&received[2], AgentEvent::CommandFinished { output, .. } if output.contains("Ctrl+T")),
-            "timeout message should include long-wait guidance, got {:?}",
-            received[2]
-        );
+        assert!(received.len() >= 3, "expected at least 3 events, got {received:?}");
+        assert!(matches!(&received[0], AgentEvent::Started),
+            "first event should be Started, got {:?}", received[0]);
+        assert!(matches!(&received[1], AgentEvent::CommandProposed { .. }),
+            "second event should be CommandProposed, got {:?}", received[1]);
+        assert!(matches!(&received[2], AgentEvent::CommandFinished { denied: false, output, .. } if output.contains("timed out")),
+            "third event should be CommandFinished with timeout message, got {:?}", received[2]);
+        assert!(matches!(&received[2], AgentEvent::CommandFinished { output, .. } if output.contains("Ctrl+T")),
+            "timeout message should include long-wait guidance, got {:?}", received[2]);
     }
 
     #[tokio::test]
@@ -2649,17 +2528,14 @@ mod tests {
             }
         }
 
-        let tool_call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({
-                    "command": "sleep 120 && tail /tmp/x.log",
-                    "explanation": "Wait for pull"
-                }),
-            }],
-        );
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "sleep 120 && tail /tmp/x.log",
+                "explanation": "Wait for pull"
+            }),
+        }]);
 
         let llm = Arc::new(MockLlm::new(vec![
             tool_call,
@@ -2769,30 +2645,21 @@ mod tests {
     #[test]
     fn debug_container_prompt_points_at_the_target_process_root() {
         let plain = build_kube_pod_prompt(&eval_pod_target());
-        assert!(
-            !plain.contains("DEBUG container"),
-            "ordinary pods are unchanged"
-        );
+        assert!(!plain.contains("DEBUG container"), "ordinary pods are unchanged");
         let debug = build_kube_pod_prompt(&eval_pod_target().with_debug_target("main"));
         assert!(debug.contains("ephemeral DEBUG container"), "{debug}");
         assert!(debug.contains("/proc/1/root/"), "{debug}");
-        assert!(
-            debug.contains("cannot create or remove debug containers"),
-            "{debug}"
-        );
+        assert!(debug.contains("cannot create or remove debug containers"), "{debug}");
     }
 
     #[test]
     fn pod_prompt_states_known_limits_and_the_shared_memory_rule() {
         let prompt = build_kube_pod_prompt(&eval_pod_target());
-        assert!(
-            prompt.contains(
-                "Known settings of this container (from the pod spec): memory limit 256Mi; \
+        assert!(prompt.contains(
+            "Known settings of this container (from the pod spec): memory limit 256Mi; \
              memory request 128Mi; CPU request 100m; runs as non-root user 65534; \
              read-only root filesystem; dropped capabilities: ALL."
-            ),
-            "{prompt}"
-        );
+        ), "{prompt}");
         assert!(prompt.contains("share the memory and process limits with the application"));
         assert!(prompt.contains("OOM kill"));
         assert!(prompt.contains("`find /`"));
@@ -2802,14 +2669,8 @@ mod tests {
             prompt.contains("`start_background_job` needs a writable directory"),
             "the prompt states how background jobs behave on a read-only filesystem"
         );
-        assert!(
-            !prompt.contains("test -w"),
-            "no manual check: the code refuses itself (#599)"
-        );
-        assert!(
-            !prompt.contains("CPU limit"),
-            "unknown fields are not mentioned"
-        );
+        assert!(!prompt.contains("test -w"), "no manual check: the code refuses itself (#599)");
+        assert!(!prompt.contains("CPU limit"), "unknown fields are not mentioned");
     }
 
     #[test]
@@ -2901,13 +2762,8 @@ mod tests {
             inner: MockLlm::new(vec![query_logs_call(), ChatResponse::text("done")]),
             requests: std::sync::Mutex::new(Vec::new()),
         });
-        let executor = Arc::new(MockExecutor {
-            last_command: std::sync::Mutex::new(String::new()),
-        });
-        let sources = crate::logs::tests::stub_log_sources(vec![crate::logs::tests::stub_line(
-            1,
-            "disk full on /var",
-        )]);
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        let sources = crate::logs::tests::stub_log_sources(vec![crate::logs::tests::stub_line(1, "disk full on /var")]);
         let agent = Agent::builder()
             .llm(llm.clone())
             .executor(executor.clone())
@@ -2919,15 +2775,10 @@ mod tests {
         agent.run("why is the app failing?", &[]).await.unwrap();
         let requests = llm.requests.lock().unwrap();
         assert!(requests[0].tools.iter().any(|t| t.name == "query_logs"));
-        assert!(requests[0].messages[0]
-            .content
-            .contains("vlogs-prod — victorialogs, language LogsQL"));
+        assert!(requests[0].messages[0].content.contains("vlogs-prod — victorialogs, language LogsQL"));
         let answer = &requests[1].messages.last().unwrap().content;
         assert!(answer.contains("disk full on /var"), "{answer}");
-        assert!(
-            executor.last_command.lock().unwrap().is_empty(),
-            "nothing ran in the shell"
-        );
+        assert!(executor.last_command.lock().unwrap().is_empty(), "nothing ran in the shell");
     }
 
     #[tokio::test]
@@ -2936,9 +2787,7 @@ mod tests {
             inner: MockLlm::new(vec![ChatResponse::text("ok")]),
             requests: std::sync::Mutex::new(Vec::new()),
         });
-        let executor = Arc::new(MockExecutor {
-            last_command: std::sync::Mutex::new(String::new()),
-        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
         let agent = Agent::builder()
             .llm(llm.clone())
             .executor(executor)
@@ -2949,13 +2798,8 @@ mod tests {
             .unwrap();
         agent.run("x", &[]).await.unwrap();
         let requests = llm.requests.lock().unwrap();
-        assert!(requests[0]
-            .tools
-            .iter()
-            .any(|t| t.name == "pod_logs_history"));
-        assert!(requests[0].messages[0]
-            .content
-            .contains("k8s_logs is only the short tail"));
+        assert!(requests[0].tools.iter().any(|t| t.name == "pod_logs_history"));
+        assert!(requests[0].messages[0].content.contains("k8s_logs is only the short tail"));
     }
 
     #[tokio::test]
@@ -2964,9 +2808,7 @@ mod tests {
             inner: MockLlm::new(vec![ChatResponse::text("ok")]),
             requests: std::sync::Mutex::new(Vec::new()),
         });
-        let executor = Arc::new(MockExecutor {
-            last_command: std::sync::Mutex::new(String::new()),
-        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
         let agent = Agent::builder()
             .llm(llm.clone())
             .executor(executor)
@@ -2984,15 +2826,12 @@ mod tests {
     #[tokio::test]
     async fn explain_mode_wants_an_explanation_for_query_logs() {
         let mut call = query_logs_call();
-        call.tool_calls[0].arguments =
-            serde_json::json!({"source": "vlogs-prod", "query": "error", "since": "1h"});
+        call.tool_calls[0].arguments = serde_json::json!({"source": "vlogs-prod", "query": "error", "since": "1h"});
         let llm = Arc::new(RecordingLlm {
             inner: MockLlm::new(vec![call, ChatResponse::text("ok")]),
             requests: std::sync::Mutex::new(Vec::new()),
         });
-        let executor = Arc::new(MockExecutor {
-            last_command: std::sync::Mutex::new(String::new()),
-        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
         let agent = Agent::builder()
             .llm(llm.clone())
             .executor(executor)
@@ -3004,10 +2843,7 @@ mod tests {
         agent.run("x", &[]).await.unwrap();
         let requests = llm.requests.lock().unwrap();
         let reply = &requests[1].messages.last().unwrap().content;
-        assert!(
-            reply.contains("query_logs requires an `explanation`"),
-            "{reply}"
-        );
+        assert!(reply.contains("query_logs requires an `explanation`"), "{reply}");
     }
 
     // ── Fleet tool set (#434) ─────────────────────────────────────────
@@ -3043,68 +2879,32 @@ mod tests {
             inner: MockLlm::new(vec![ChatResponse::text("ok")]),
             requests: std::sync::Mutex::new(Vec::new()),
         });
-        let executor = Arc::new(MockExecutor {
-            last_command: std::sync::Mutex::new(String::new()),
-        });
-        fleet_agent(llm.clone(), executor, true)
-            .run("check the fleet", &[])
-            .await
-            .unwrap();
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        fleet_agent(llm.clone(), executor, true).run("check the fleet", &[]).await.unwrap();
         let requests = llm.requests.lock().unwrap();
         let names: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["run_command"], "only run_command in a fleet (#435)");
         // The prompt says so, matching the tool set.
         let prompt = &requests[0].messages[0].content;
         assert!(prompt.contains("Only run_command is available"), "{prompt}");
-        assert!(
-            prompt.contains("read_file, list_dir and background jobs"),
-            "{prompt}"
-        );
+        assert!(prompt.contains("read_file, list_dir and background jobs"), "{prompt}");
     }
 
     /// #514: the fleet prompt names the key that opens a host, the quoting
     /// the gate accepts, and how to speak about a failed host.
     #[test]
     fn the_fleet_prompt_matches_the_gate_and_the_ui() {
-        assert!(
-            FLEET_PROMPT.contains("own tab with Ctrl+O"),
-            "{FLEET_PROMPT}"
-        );
+        assert!(FLEET_PROMPT.contains("own tab with Ctrl+O"), "{FLEET_PROMPT}");
         assert!(!FLEET_PROMPT.contains("Ctrl+J →"), "{FLEET_PROMPT}");
-        assert!(
-            FLEET_PROMPT.contains("single quotes work for a whole word"),
-            "{FLEET_PROMPT}"
-        );
-        assert!(
-            FLEET_PROMPT.contains("the cause is not visible"),
-            "{FLEET_PROMPT}"
-        );
+        assert!(FLEET_PROMPT.contains("single quotes work for a whole word"), "{FLEET_PROMPT}");
+        assert!(FLEET_PROMPT.contains("the cause is not visible"), "{FLEET_PROMPT}");
         // The quoting examples it gives really pass the gate, and the
         // spellings it warns about really are refused.
-        for ok in [
-            "grep -E '^ID=|^NAME=' /etc/os-release",
-            "grep 'Time zone' /etc/timezone",
-        ] {
-            assert!(
-                filar_transport::readonly::check_read_only(ok).is_ok(),
-                "{ok}"
-            );
+        for ok in ["grep -E '^ID=|^NAME=' /etc/os-release", "grep 'Time zone' /etc/timezone"] {
+            assert!(filar_transport::readonly::check_read_only(ok).is_ok(), "{ok}");
         }
-        for bad in [
-            "grep \"x\" f",
-            "ls --a'b'",
-            "ls 'a\\b'",
-            "ls $HOME",
-            "ls *",
-            "ls ?",
-            "ls [a]",
-            "ls {a,b}",
-            "ls `x`",
-        ] {
-            assert!(
-                filar_transport::readonly::check_read_only(bad).is_err(),
-                "{bad}"
-            );
+        for bad in ["grep \"x\" f", "ls --a'b'", "ls 'a\\b'", "ls $HOME", "ls *", "ls ?", "ls [a]", "ls {a,b}", "ls `x`"] {
+            assert!(filar_transport::readonly::check_read_only(bad).is_err(), "{bad}");
         }
     }
 
@@ -3113,21 +2913,16 @@ mod tests {
         // #436: a `$FILAR_SECRET_N` was typed for one tab's host; in a fleet
         // it would go to every host of the group. Two layers keep it out.
         let command = "grep -c '$FILAR_SECRET_1' /etc/hostname";
-        let call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({ "command": command, "explanation": "why" }),
-            }],
-        );
+        let call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({ "command": command, "explanation": "why" }),
+        }]);
         let llm = Arc::new(RecordingLlm {
             inner: MockLlm::new(vec![call, ChatResponse::text("done")]),
             requests: std::sync::Mutex::new(Vec::new()),
         });
-        let executor = Arc::new(MockExecutor {
-            last_command: std::sync::Mutex::new(String::new()),
-        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
         let provider = Arc::new(filar_core::StaticSecretProvider::new());
         provider.insert("$FILAR_SECRET_1", "hunter2-of-one-host");
         let agent = Agent::builder()
@@ -3142,16 +2937,10 @@ mod tests {
 
         // The gate refuses the placeholder before any host is asked.
         agent.run("go", &[]).await.unwrap();
-        assert!(
-            executor.last_command.lock().unwrap().is_empty(),
-            "nothing reached the fleet"
-        );
+        assert!(executor.last_command.lock().unwrap().is_empty(), "nothing reached the fleet");
         for request in llm.requests.lock().unwrap().iter() {
             for message in &request.messages {
-                assert!(
-                    !message.content.contains("hunter2"),
-                    "secret reached the context"
-                );
+                assert!(!message.content.contains("hunter2"), "secret reached the context");
             }
         }
 
@@ -3159,10 +2948,7 @@ mod tests {
         // command got past the gate.
         agent.executor.run(command).await.unwrap();
         let executed = executor.last_command.lock().unwrap().clone();
-        assert_eq!(
-            executed, command,
-            "the placeholder is sent as is, never the secret"
-        );
+        assert_eq!(executed, command, "the placeholder is sent as is, never the secret");
     }
 
     // ── Fleet cancellation (#437) ─────────────────────────────────────
@@ -3181,8 +2967,7 @@ mod tests {
             self.started.notify_one();
             self.cancelled.notified().await;
             Ok(CommandResult {
-                stdout: "operation #1: 1 of 3 hosts answered, 0 did not answer — 1 ok, 2 cancelled"
-                    .into(),
+                stdout: "operation #1: 1 of 3 hosts answered, 0 did not answer — 1 ok, 2 cancelled".into(),
                 stderr: String::new(),
                 exit_code: Some(0),
                 duration: Duration::ZERO,
@@ -3190,8 +2975,7 @@ mod tests {
             })
         }
         async fn cancel(&self) -> Result<()> {
-            self.cancels
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.cancels.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.cancelled.notify_one();
             Ok(())
         }
@@ -3199,18 +2983,12 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_a_fleet_command_shows_the_partial_result_then_cancels() {
-        let call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({ "command": "uname -r", "explanation": "why" }),
-            }],
-        );
-        let llm = Arc::new(MockLlm::new(vec![
-            call,
-            ChatResponse::text("never reached"),
-        ]));
+        let call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({ "command": "uname -r", "explanation": "why" }),
+        }]);
+        let llm = Arc::new(MockLlm::new(vec![call, ChatResponse::text("never reached")]));
         let executor = Arc::new(CancellableFleet {
             started: tokio::sync::Notify::new(),
             cancelled: tokio::sync::Notify::new(),
@@ -3245,14 +3023,9 @@ mod tests {
         let events = events.lock().unwrap();
         let partial = events.iter().position(|e| matches!(e,
             AgentEvent::CommandFinished { output, denied: false, .. } if output.contains("2 cancelled")));
-        let cancelled = events
-            .iter()
-            .position(|e| matches!(e, AgentEvent::Cancelled));
+        let cancelled = events.iter().position(|e| matches!(e, AgentEvent::Cancelled));
         assert!(partial.is_some(), "the partial result is shown: {events:?}");
-        assert!(
-            partial < cancelled,
-            "shown before the cancellation is reported"
-        );
+        assert!(partial < cancelled, "shown before the cancellation is reported");
     }
 
     // ── Fleet gate (#435) ─────────────────────────────────────────────
@@ -3264,12 +3037,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CommandConfirmer for CountingConfirmer {
-        async fn confirm(
-            &self,
-            _command: &str,
-            _explanation: &str,
-            _destructive: bool,
-        ) -> Result<bool> {
+        async fn confirm(&self, _command: &str, _explanation: &str, _destructive: bool) -> Result<bool> {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(true)
         }
@@ -3278,24 +3046,17 @@ mod tests {
     /// Run a fleet agent in `mode` that proposes `command` once, approving
     /// everything; returns (times asked, command executed, tool result).
     async fn run_fleet_command(mode: CommandConfirmMode, command: &str) -> (usize, String, String) {
-        let call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({ "command": command, "explanation": "why" }),
-            }],
-        );
+        let call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({ "command": command, "explanation": "why" }),
+        }]);
         let llm = Arc::new(RecordingLlm {
             inner: MockLlm::new(vec![call, ChatResponse::text("done")]),
             requests: std::sync::Mutex::new(Vec::new()),
         });
-        let executor = Arc::new(MockExecutor {
-            last_command: std::sync::Mutex::new(String::new()),
-        });
-        let confirmer = Arc::new(CountingConfirmer {
-            asked: Default::default(),
-        });
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        let confirmer = Arc::new(CountingConfirmer { asked: Default::default() });
         Agent::builder()
             .llm(llm.clone())
             .executor(executor.clone())
@@ -3310,12 +3071,7 @@ mod tests {
         let asked = confirmer.asked.load(std::sync::atomic::Ordering::SeqCst);
         let executed = executor.last_command.lock().unwrap().clone();
         let requests = llm.requests.lock().unwrap();
-        let reply = requests[1]
-            .messages
-            .last()
-            .expect("tool result")
-            .content
-            .clone();
+        let reply = requests[1].messages.last().expect("tool result").content.clone();
         (asked, executed, reply)
     }
 
@@ -3344,53 +3100,32 @@ mod tests {
             CommandConfirmMode::Never,
             CommandConfirmMode::Explain,
         ] {
-            for cmd in [
-                "systemctl restart nginx",
-                "rm -rf /var/cache/x",
-                "uname -r; reboot",
-            ] {
+            for cmd in ["systemctl restart nginx", "rm -rf /var/cache/x", "uname -r; reboot"] {
                 let (asked, executed, reply) = run_fleet_command(mode, cmd).await;
                 assert_eq!(asked, 0, "{mode:?} {cmd}: refused before anyone is asked");
-                assert!(
-                    executed.is_empty(),
-                    "{mode:?} {cmd}: nothing reached the executor"
-                );
-                assert!(
-                    reply.starts_with("Error: the fleet is read-only"),
-                    "{reply}"
-                );
+                assert!(executed.is_empty(), "{mode:?} {cmd}: nothing reached the executor");
+                assert!(reply.starts_with("Error: the fleet is read-only"), "{reply}");
             }
         }
     }
 
     #[tokio::test]
     async fn a_background_job_in_a_fleet_runs_nothing() {
-        let call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "start_background_job".into(),
-                arguments: serde_json::json!({ "command": "sleep 100" }),
-            }],
-        );
+        let call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "start_background_job".into(),
+            arguments: serde_json::json!({ "command": "sleep 100" }),
+        }]);
         let llm = Arc::new(RecordingLlm {
             inner: MockLlm::new(vec![call, ChatResponse::text("ok")]),
             requests: std::sync::Mutex::new(Vec::new()),
         });
-        let executor = Arc::new(MockExecutor {
-            last_command: std::sync::Mutex::new(String::new()),
-        });
-        fleet_agent(llm.clone(), executor.clone(), true)
-            .run("go", &[])
-            .await
-            .unwrap();
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        fleet_agent(llm.clone(), executor.clone(), true).run("go", &[]).await.unwrap();
         assert!(executor.last_command.lock().unwrap().is_empty());
         let requests = llm.requests.lock().unwrap();
         let reply = &requests[1].messages.last().expect("tool result").content;
-        assert!(
-            reply.starts_with("Error: start_background_job is not available in a fleet"),
-            "{reply}"
-        );
+        assert!(reply.starts_with("Error: start_background_job is not available in a fleet"), "{reply}");
     }
 
     #[tokio::test]
@@ -3399,13 +3134,8 @@ mod tests {
             inner: MockLlm::new(vec![ChatResponse::text("ok")]),
             requests: std::sync::Mutex::new(Vec::new()),
         });
-        let executor = Arc::new(MockExecutor {
-            last_command: std::sync::Mutex::new(String::new()),
-        });
-        fleet_agent(llm.clone(), executor, false)
-            .run("hi", &[])
-            .await
-            .unwrap();
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        fleet_agent(llm.clone(), executor, false).run("hi", &[]).await.unwrap();
         let requests = llm.requests.lock().unwrap();
         let names: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"read_file") && names.contains(&"list_dir"));
@@ -3414,39 +3144,22 @@ mod tests {
 
     #[tokio::test]
     async fn a_single_host_tool_called_in_a_fleet_runs_nothing_and_says_why() {
-        let call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "read_file".into(),
-                arguments: serde_json::json!({ "path": "/etc/nginx/nginx.conf" }),
-            }],
-        );
+        let call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "/etc/nginx/nginx.conf" }),
+        }]);
         let llm = Arc::new(RecordingLlm {
             inner: MockLlm::new(vec![call, ChatResponse::text("understood")]),
             requests: std::sync::Mutex::new(Vec::new()),
         });
-        let executor = Arc::new(MockExecutor {
-            last_command: std::sync::Mutex::new(String::new()),
-        });
-        fleet_agent(llm.clone(), executor.clone(), true)
-            .run("read nginx.conf", &[])
-            .await
-            .unwrap();
-        assert!(
-            executor.last_command.lock().unwrap().is_empty(),
-            "nothing executed"
-        );
+        let executor = Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) });
+        fleet_agent(llm.clone(), executor.clone(), true).run("read nginx.conf", &[]).await.unwrap();
+        assert!(executor.last_command.lock().unwrap().is_empty(), "nothing executed");
         let requests = llm.requests.lock().unwrap();
         let reply = requests[1].messages.last().expect("tool result");
         assert_eq!(reply.tool_call_id.as_deref(), Some("call_1"));
-        assert!(
-            reply
-                .content
-                .starts_with("Error: read_file is not available in a fleet"),
-            "{}",
-            reply.content
-        );
+        assert!(reply.content.starts_with("Error: read_file is not available in a fleet"), "{}", reply.content);
     }
 
     #[test]
@@ -3477,14 +3190,11 @@ mod tests {
     #[tokio::test]
     async fn explain_mode_rejects_missing_explanation() {
         // Tool call without explanation — should be rejected, executor not called.
-        let tool_call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({"command": "ls"}),
-            }],
-        );
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        }]);
 
         let llm = Arc::new(MockLlm::new(vec![
             tool_call,
@@ -3515,14 +3225,11 @@ mod tests {
     #[tokio::test]
     async fn explain_mode_stops_after_retry_limit() {
         // Repeatedly send tool calls without explanation.
-        let tool_call = ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({"command": "ls"}),
-            }],
-        );
+        let tool_call = ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        }]);
 
         let llm = Arc::new(MockLlm::new(vec![
             tool_call.clone(),
@@ -3566,17 +3273,14 @@ mod tests {
     }
 
     fn tool_call_echo() -> ChatResponse {
-        ChatResponse::tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_1".into(),
-                name: "run_command".into(),
-                arguments: serde_json::json!({
-                    "command": "echo hello",
-                    "explanation": "Print hello"
-                }),
-            }],
-        )
+        ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({
+                "command": "echo hello",
+                "explanation": "Print hello"
+            }),
+        }])
     }
 
     #[tokio::test]
@@ -3624,17 +3328,15 @@ mod tests {
         assert!(
             received.iter().any(|e| matches!(
                 e,
-                AgentEvent::CommandAudited {
-                    unavailable: true,
-                    ..
-                }
+                AgentEvent::CommandAudited { unavailable: true, .. }
             )),
             "expected CommandAudited unavailable, got {received:?}"
         );
         assert!(
-            received
-                .iter()
-                .any(|e| matches!(e, AgentEvent::CommandFinished { denied: false, .. })),
+            received.iter().any(|e| matches!(
+                e,
+                AgentEvent::CommandFinished { denied: false, .. }
+            )),
             "command must not be auto-denied"
         );
     }
@@ -3738,14 +3440,11 @@ mod tests {
 
     fn one_command_llm(command: &str) -> Arc<MockLlm> {
         Arc::new(MockLlm::new(vec![
-            ChatResponse::tool_calls(
-                "",
-                vec![ToolCall {
-                    id: "call_1".into(),
-                    name: "run_command".into(),
-                    arguments: serde_json::json!({ "command": command, "explanation": "why" }),
-                }],
-            ),
+            ChatResponse::tool_calls("", vec![ToolCall {
+                id: "call_1".into(),
+                name: "run_command".into(),
+                arguments: serde_json::json!({ "command": command, "explanation": "why" }),
+            }]),
             ChatResponse::text("Done!"),
         ]))
     }
@@ -3761,9 +3460,7 @@ mod tests {
         let sink: EventSink = Arc::new(move |e| ev.lock().unwrap().push(e));
         let agent = Agent::builder()
             .llm(one_command_llm("echo hello"))
-            .executor(Arc::new(MockExecutor {
-                last_command: std::sync::Mutex::new(String::new()),
-            }))
+            .executor(Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) }))
             .confirmer(Arc::new(MockConfirmer { approve }))
             .confirm_mode(mode)
             .event_sink(sink)
@@ -3802,14 +3499,8 @@ mod tests {
                     if *proposal_id == id && model == "fake-decider"));
             assert!(scored.is_some(), "{mode:?}: no rating in {events:?}");
             // The rating lands before the terminal event.
-            let finished = events
-                .iter()
-                .position(|e| matches!(e, AgentEvent::Finished(_)))
-                .unwrap();
-            assert!(
-                scored.unwrap() < finished,
-                "{mode:?}: rating after Finished"
-            );
+            let finished = events.iter().position(|e| matches!(e, AgentEvent::Finished(_))).unwrap();
+            assert!(scored.unwrap() < finished, "{mode:?}: rating after Finished");
             assert_eq!(scorer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
             let input = scorer.inputs.lock().unwrap()[0].clone();
             assert_eq!(input.command, "echo hello");
@@ -3824,18 +3515,9 @@ mod tests {
         // and the rating still lands — after CommandFinished, before Finished.
         let scorer = FakeScorer::new(Ok(40), Duration::from_millis(300));
         let events = run_with_scorer(CommandConfirmMode::Never, scorer, true, false).await;
-        let finished_cmd = events
-            .iter()
-            .position(|e| matches!(e, AgentEvent::CommandFinished { .. }))
-            .unwrap();
-        let scored = events
-            .iter()
-            .position(|e| matches!(e, AgentEvent::CommandScored { .. }))
-            .unwrap();
-        let finished = events
-            .iter()
-            .position(|e| matches!(e, AgentEvent::Finished(_)))
-            .unwrap();
+        let finished_cmd = events.iter().position(|e| matches!(e, AgentEvent::CommandFinished { .. })).unwrap();
+        let scored = events.iter().position(|e| matches!(e, AgentEvent::CommandScored { .. })).unwrap();
+        let finished = events.iter().position(|e| matches!(e, AgentEvent::Finished(_))).unwrap();
         assert!(finished_cmd < scored && scored < finished, "{events:?}");
     }
 
@@ -3843,55 +3525,20 @@ mod tests {
     async fn a_failed_rating_is_unavailable_and_the_command_still_runs() {
         let scorer = FakeScorer::new(Err(()), Duration::ZERO);
         let events = run_with_scorer(CommandConfirmMode::Never, scorer, true, false).await;
-        assert!(
-            events.iter().any(|e| matches!(
-                e,
-                AgentEvent::CommandScored {
-                    safety_pct: None,
-                    unavailable: true,
-                    ..
-                }
-            )),
-            "{events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::CommandFinished { denied: false, .. })),
-            "{events:?}"
-        );
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::CommandScored { safety_pct: None, unavailable: true, .. })), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::CommandFinished { denied: false, .. })), "{events:?}");
     }
 
     #[tokio::test]
     async fn the_rating_does_not_touch_the_gate() {
         // A perfectly "safe" rating does not approve a command the user denies,
         // and a "dangerous" one does not stop a command the mode auto-approves.
-        let events = run_with_scorer(
-            CommandConfirmMode::Always,
-            FakeScorer::new(Ok(100), Duration::ZERO),
-            false,
-            false,
-        )
-        .await;
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::CommandFinished { denied: true, .. })),
-            "{events:?}"
-        );
-        let events = run_with_scorer(
-            CommandConfirmMode::Never,
-            FakeScorer::new(Ok(0), Duration::ZERO),
-            true,
-            false,
-        )
-        .await;
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::CommandFinished { denied: false, .. })),
-            "{events:?}"
-        );
+        let events = run_with_scorer(CommandConfirmMode::Always, FakeScorer::new(Ok(100), Duration::ZERO), false, false).await;
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::CommandFinished { denied: true, .. })), "{events:?}");
+        let events = run_with_scorer(CommandConfirmMode::Never, FakeScorer::new(Ok(0), Duration::ZERO), true, false).await;
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::CommandFinished { denied: false, .. })), "{events:?}");
     }
 
     #[tokio::test]
@@ -3899,9 +3546,7 @@ mod tests {
         let scorer = FakeScorer::new(Ok(50), Duration::ZERO);
         let events = run_with_scorer(CommandConfirmMode::Always, scorer.clone(), true, true).await;
         assert_eq!(scorer.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert!(!events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::CommandScored { .. })));
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandScored { .. })));
     }
 
     #[tokio::test]
@@ -3911,9 +3556,7 @@ mod tests {
             let ev = events.clone();
             let agent = Agent::builder()
                 .llm(one_command_llm("echo hi"))
-                .executor(Arc::new(MockExecutor {
-                    last_command: std::sync::Mutex::new(String::new()),
-                }))
+                .executor(Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) }))
                 .confirmer(Arc::new(MockConfirmer { approve: true }))
                 .confirm_mode(CommandConfirmMode::Never)
                 .event_sink(Arc::new(move |e| ev.lock().unwrap().push(e)))
@@ -3922,16 +3565,11 @@ mod tests {
             agent.run("go", &[]).await.unwrap();
         }
         let events = events.lock().unwrap();
-        assert!(!events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::CommandScored { .. })));
-        let ids: Vec<u64> = events
-            .iter()
-            .filter_map(|e| match e {
-                AgentEvent::CommandProposed { proposal_id, .. } => Some(*proposal_id),
-                _ => None,
-            })
-            .collect();
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandScored { .. })));
+        let ids: Vec<u64> = events.iter().filter_map(|e| match e {
+            AgentEvent::CommandProposed { proposal_id, .. } => Some(*proposal_id),
+            _ => None,
+        }).collect();
         assert_eq!(ids.len(), 2);
         assert_ne!(ids[0], ids[1], "ids are unique across agents");
     }
@@ -3954,9 +3592,7 @@ mod tests {
         }
         let agent = Agent::builder()
             .llm(one_command_llm("rm -rf /tmp/x"))
-            .executor(Arc::new(MockExecutor {
-                last_command: std::sync::Mutex::new(String::new()),
-            }))
+            .executor(Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) }))
             .confirmer(Arc::new(CancellingConfirmer(token.clone())))
             .confirm_mode(CommandConfirmMode::Always)
             .cancellation(token)
@@ -3966,19 +3602,11 @@ mod tests {
             .unwrap();
         let started = std::time::Instant::now();
         assert!(agent.run("go", &[]).await.is_err());
-        assert!(
-            started.elapsed() < Duration::from_secs(4),
-            "cancel waited for the scorer"
-        );
+        assert!(started.elapsed() < Duration::from_secs(4), "cancel waited for the scorer");
         tokio::time::sleep(Duration::from_millis(50)).await;
         let events = events.lock().unwrap();
-        assert!(
-            matches!(events.last(), Some(AgentEvent::Cancelled)),
-            "{events:?}"
-        );
-        assert!(!events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::CommandScored { .. })));
+        assert!(matches!(events.last(), Some(AgentEvent::Cancelled)), "{events:?}");
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandScored { .. })));
     }
 
     #[tokio::test]
@@ -3991,9 +3619,7 @@ mod tests {
         let token = CancellationToken::new();
         let agent = Agent::builder()
             .llm(one_command_llm("echo hi"))
-            .executor(Arc::new(MockExecutor {
-                last_command: std::sync::Mutex::new(String::new()),
-            }))
+            .executor(Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) }))
             .confirmer(Arc::new(MockConfirmer { approve: true }))
             .confirm_mode(CommandConfirmMode::Never)
             .cancellation(token.clone())
@@ -4008,18 +3634,10 @@ mod tests {
         let started = std::time::Instant::now();
         let _ = agent.run("go", &[]).await;
         canceller.await.unwrap();
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "the wait ignored the cancel"
-        );
+        assert!(started.elapsed() < Duration::from_secs(3), "the wait ignored the cancel");
         tokio::time::sleep(Duration::from_millis(50)).await;
         let events = events.lock().unwrap();
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::CommandScored { .. })),
-            "{events:?}"
-        );
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandScored { .. })), "{events:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -4032,9 +3650,7 @@ mod tests {
         let ev = events.clone();
         let agent = Agent::builder()
             .llm(one_command_llm("echo hi"))
-            .executor(Arc::new(MockExecutor {
-                last_command: std::sync::Mutex::new(String::new()),
-            }))
+            .executor(Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) }))
             .confirmer(Arc::new(MockConfirmer { approve: true }))
             .confirm_mode(CommandConfirmMode::Never)
             .event_sink(Arc::new(move |e| ev.lock().unwrap().push(e)))
@@ -4045,19 +3661,10 @@ mod tests {
             _ = agent.run("go", &[]) => panic!("the run waits for the rating"),
             _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
-        assert_eq!(
-            scorer.calls.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the rating was in flight"
-        );
+        assert_eq!(scorer.calls.load(std::sync::atomic::Ordering::SeqCst), 1, "the rating was in flight");
         tokio::time::sleep(Duration::from_secs(60)).await;
         let events = events.lock().unwrap();
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::CommandScored { .. })),
-            "{events:?}"
-        );
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::CommandScored { .. })), "{events:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -4080,16 +3687,11 @@ mod tests {
         let scorer = FakeScorer::new(Ok(70), Duration::from_millis(300));
         let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> = Arc::default();
         let ev = events.clone();
-        let call = |command: &str| {
-            ChatResponse::tool_calls(
-                "",
-                vec![ToolCall {
-                    id: "call_1".into(),
-                    name: "run_command".into(),
-                    arguments: serde_json::json!({ "command": command, "explanation": "why" }),
-                }],
-            )
-        };
+        let call = |command: &str| ChatResponse::tool_calls("", vec![ToolCall {
+            id: "call_1".into(),
+            name: "run_command".into(),
+            arguments: serde_json::json!({ "command": command, "explanation": "why" }),
+        }]);
         let agent = Agent::builder()
             // The first turn stops at its confirmation; the second runs
             // through: tool call, answer.
@@ -4098,9 +3700,7 @@ mod tests {
                 call("echo second"),
                 ChatResponse::text("Done!"),
             ])))
-            .executor(Arc::new(MockExecutor {
-                last_command: std::sync::Mutex::new(String::new()),
-            }))
+            .executor(Arc::new(MockExecutor { last_command: std::sync::Mutex::new(String::new()) }))
             .confirmer(Arc::new(HoldFirst))
             .confirm_mode(CommandConfirmMode::Always)
             .event_sink(Arc::new(move |e| ev.lock().unwrap().push(e)))
@@ -4118,21 +3718,15 @@ mod tests {
         let (_, second) = tokio::join!(first, agent.run("two", &[]));
         assert!(second.is_ok(), "{second:?}");
         tokio::time::sleep(Duration::from_secs(60)).await;
-        assert_eq!(
-            scorer.calls.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "both were rated at once"
-        );
+        assert_eq!(scorer.calls.load(std::sync::atomic::Ordering::SeqCst), 2, "both were rated at once");
         let events = events.lock().unwrap();
         let id_of = |command: &str| {
             events
                 .iter()
                 .find_map(|e| match e {
-                    AgentEvent::CommandProposed {
-                        proposal_id,
-                        command: c,
-                        ..
-                    } if c == command => Some(*proposal_id),
+                    AgentEvent::CommandProposed { proposal_id, command: c, .. } if c == command => {
+                        Some(*proposal_id)
+                    }
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("no proposal of {command}: {events:?}"))
@@ -4147,10 +3741,7 @@ mod tests {
             .iter()
             .position(|e| matches!(e, AgentEvent::Finished(_)))
             .expect("the second turn finished");
-        assert!(
-            scored(first_id).is_none(),
-            "the first turn's rating landed: {events:?}"
-        );
+        assert!(scored(first_id).is_none(), "the first turn's rating landed: {events:?}");
         let second_scored = scored(second_id).expect("the second turn keeps its rating");
         assert!(second_scored < finished, "{events:?}");
     }

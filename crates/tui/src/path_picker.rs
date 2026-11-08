@@ -219,11 +219,7 @@ pub fn list_local_dir(dir: &str) -> Result<(Vec<PathEntry>, bool)> {
 }
 
 /// Build display list with optional `..` parent row at the top.
-pub fn entries_with_parent(
-    dir: &str,
-    mut entries: Vec<PathEntry>,
-    is_remote: bool,
-) -> Vec<PathEntry> {
+pub fn entries_with_parent(dir: &str, mut entries: Vec<PathEntry>, is_remote: bool) -> Vec<PathEntry> {
     if parent_path(dir, is_remote).is_some() {
         entries.insert(
             0,

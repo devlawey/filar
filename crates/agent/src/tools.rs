@@ -157,12 +157,10 @@ pub fn tool_definitions(mode: CommandConfirmMode) -> Vec<ToolDef> {
     } else {
         serde_json::json!(["path"])
     };
-    let explanation_prop = || {
-        serde_json::json!({
-            "type": "string",
-            "description": "A brief explanation of what this command does and why."
-        })
-    };
+    let explanation_prop = || serde_json::json!({
+        "type": "string",
+        "description": "A brief explanation of what this command does and why."
+    });
 
     let required_job_id = if require_explanation {
         serde_json::json!(["job_id", "explanation"])
@@ -276,7 +274,8 @@ pub fn tool_definitions(mode: CommandConfirmMode) -> Vec<ToolDef> {
         },
         ToolDef {
             name: TOOL_CANCEL_BACKGROUND_JOB.into(),
-            description: "Cancel a background job by job_id. Stops the underlying process.".into(),
+            description: "Cancel a background job by job_id. Stops the underlying process."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -291,7 +290,8 @@ pub fn tool_definitions(mode: CommandConfirmMode) -> Vec<ToolDef> {
         },
         ToolDef {
             name: TOOL_LIST_BACKGROUND_JOBS.into(),
-            description: "List background jobs for the current session with their status.".into(),
+            description: "List background jobs for the current session with their status."
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -347,11 +347,7 @@ pub struct ParsedToolCall {
 /// Parse a tool call from the LLM into a `ParsedToolCall`.
 ///
 /// Returns an error if the tool name is unknown or the arguments are invalid.
-pub fn parse_tool_call(
-    id: &str,
-    name: &str,
-    arguments: &serde_json::Value,
-) -> Result<ParsedToolCall> {
+pub fn parse_tool_call(id: &str, name: &str, arguments: &serde_json::Value) -> Result<ParsedToolCall> {
     match name {
         TOOL_RUN_COMMAND => {
             let params: RunCommandParams = serde_json::from_value(arguments.clone())
@@ -399,9 +395,7 @@ pub fn parse_tool_call(
         }
         TOOL_START_BACKGROUND_JOB => {
             let params: StartBackgroundJobParams = serde_json::from_value(arguments.clone())
-                .map_err(|e| {
-                    CoreError::Other(format!("invalid start_background_job arguments: {e}"))
-                })?;
+                .map_err(|e| CoreError::Other(format!("invalid start_background_job arguments: {e}")))?;
             Ok(ParsedToolCall {
                 id: id.to_string(),
                 kind: ToolKind::StartBackgroundJob,
@@ -413,9 +407,7 @@ pub fn parse_tool_call(
         }
         TOOL_BACKGROUND_JOB_STATUS => {
             let params: BackgroundJobStatusParams = serde_json::from_value(arguments.clone())
-                .map_err(|e| {
-                    CoreError::Other(format!("invalid background_job_status arguments: {e}"))
-                })?;
+                .map_err(|e| CoreError::Other(format!("invalid background_job_status arguments: {e}")))?;
             Ok(ParsedToolCall {
                 id: id.to_string(),
                 kind: ToolKind::BackgroundJobStatus,
@@ -431,9 +423,7 @@ pub fn parse_tool_call(
         }
         TOOL_CANCEL_BACKGROUND_JOB => {
             let params: CancelBackgroundJobParams = serde_json::from_value(arguments.clone())
-                .map_err(|e| {
-                    CoreError::Other(format!("invalid cancel_background_job arguments: {e}"))
-                })?;
+                .map_err(|e| CoreError::Other(format!("invalid cancel_background_job arguments: {e}")))?;
             Ok(ParsedToolCall {
                 id: id.to_string(),
                 kind: ToolKind::CancelBackgroundJob,
@@ -449,9 +439,7 @@ pub fn parse_tool_call(
         }
         TOOL_LIST_BACKGROUND_JOBS => {
             let params: ListBackgroundJobsParams = serde_json::from_value(arguments.clone())
-                .map_err(|e| {
-                    CoreError::Other(format!("invalid list_background_jobs arguments: {e}"))
-                })?;
+                .map_err(|e| CoreError::Other(format!("invalid list_background_jobs arguments: {e}")))?;
             Ok(ParsedToolCall {
                 id: id.to_string(),
                 kind: ToolKind::ListBackgroundJobs,
@@ -508,8 +496,7 @@ pub fn check_explanation(name: &str, arguments: &serde_json::Value) -> Option<St
             }
         }
         TOOL_START_BACKGROUND_JOB => {
-            let params: StartBackgroundJobParams =
-                serde_json::from_value(arguments.clone()).ok()?;
+            let params: StartBackgroundJobParams = serde_json::from_value(arguments.clone()).ok()?;
             if params.explanation.trim().is_empty() {
                 return Some(
                     "Error: in safe mode, start_background_job requires an `explanation`. \
@@ -519,29 +506,29 @@ pub fn check_explanation(name: &str, arguments: &serde_json::Value) -> Option<St
             }
         }
         TOOL_BACKGROUND_JOB_STATUS => {
-            let params: BackgroundJobStatusParams =
-                serde_json::from_value(arguments.clone()).ok()?;
+            let params: BackgroundJobStatusParams = serde_json::from_value(arguments.clone()).ok()?;
             if params.explanation.trim().is_empty() {
                 return Some(
-                    "Error: in safe mode, background_job_status requires an `explanation`.".into(),
+                    "Error: in safe mode, background_job_status requires an `explanation`."
+                        .into(),
                 );
             }
         }
         TOOL_CANCEL_BACKGROUND_JOB => {
-            let params: CancelBackgroundJobParams =
-                serde_json::from_value(arguments.clone()).ok()?;
+            let params: CancelBackgroundJobParams = serde_json::from_value(arguments.clone()).ok()?;
             if params.explanation.trim().is_empty() {
                 return Some(
-                    "Error: in safe mode, cancel_background_job requires an `explanation`.".into(),
+                    "Error: in safe mode, cancel_background_job requires an `explanation`."
+                        .into(),
                 );
             }
         }
         TOOL_LIST_BACKGROUND_JOBS => {
-            let params: ListBackgroundJobsParams =
-                serde_json::from_value(arguments.clone()).ok()?;
+            let params: ListBackgroundJobsParams = serde_json::from_value(arguments.clone()).ok()?;
             if params.explanation.trim().is_empty() {
                 return Some(
-                    "Error: in safe mode, list_background_jobs requires an `explanation`.".into(),
+                    "Error: in safe mode, list_background_jobs requires an `explanation`."
+                        .into(),
                 );
             }
         }
@@ -596,10 +583,7 @@ pub async fn execute_tool_call(
 /// Simple shell quoting: wraps the value in single quotes if it contains
 /// any character that isn't alphanumeric, dash, underscore, dot, or slash.
 fn shell_quote(value: &str) -> String {
-    if value
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
-    {
+    if value.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/') {
         value.to_string()
     } else {
         // Replace any single quotes with '\'' to break out and re-enter quoting.
@@ -624,15 +608,10 @@ mod tests {
             CommandConfirmMode::Explain,
         ] {
             let all: Vec<String> = tool_definitions(mode).into_iter().map(|d| d.name).collect();
-            let fleet: Vec<String> = fleet_tool_definitions(mode)
-                .into_iter()
-                .map(|d| d.name)
-                .collect();
+            let fleet: Vec<String> =
+                fleet_tool_definitions(mode).into_iter().map(|d| d.name).collect();
             for single in SINGLE_HOST_TOOLS {
-                assert!(
-                    !fleet.iter().any(|n| n == single),
-                    "{single} offered: {fleet:?}"
-                );
+                assert!(!fleet.iter().any(|n| n == single), "{single} offered: {fleet:?}");
             }
             // Everything else is kept, in the same order.
             let expected: Vec<String> = all

@@ -351,10 +351,7 @@ mod tests {
             agent("a2"),
         ];
         let cut = compaction_boundary(&blocks, 1);
-        assert_eq!(
-            cut, 4,
-            "the tail starts at the last user block, not the notice"
-        );
+        assert_eq!(cut, 4, "the tail starts at the last user block, not the notice");
     }
 
     #[test]

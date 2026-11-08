@@ -78,22 +78,16 @@ fn pipe_stages(query: &str) -> Vec<&str> {
 }
 
 fn stage_word(stage: &str) -> String {
-    stage
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase()
+    stage.split_whitespace().next().unwrap_or("").to_ascii_lowercase()
 }
 
 /// Whether a LogsQL query already orders its results: a `sort`/`order`
 /// pipe, or `first`/`last`, which pick rows by an order of their own.
 pub fn sorts_itself(query: &str) -> bool {
-    pipe_stages(query).into_iter().skip(1).any(|pipe| {
-        matches!(
-            stage_word(pipe).as_str(),
-            "sort" | "order" | "first" | "last"
-        )
-    })
+    pipe_stages(query)
+        .into_iter()
+        .skip(1)
+        .any(|pipe| matches!(stage_word(pipe).as_str(), "sort" | "order" | "first" | "last"))
 }
 
 /// The query sent to the server: the model's, newest first unless it
@@ -124,12 +118,7 @@ pub fn server_query(query: &str) -> String {
 /// `max_line_bytes`. A line that is not a JSON object is kept as a message.
 /// `body_cut` = the body was cut at the byte cap: its last, partial line is
 /// dropped. Returns the lines and whether more existed.
-pub fn parse_json_lines(
-    body: &[u8],
-    limit: usize,
-    max_line_bytes: usize,
-    body_cut: bool,
-) -> (Vec<LogLine>, bool) {
+pub fn parse_json_lines(body: &[u8], limit: usize, max_line_bytes: usize, body_cut: bool) -> (Vec<LogLine>, bool) {
     let text = String::from_utf8_lossy(body);
     let mut raw: Vec<&str> = text.split('\n').collect();
     if body_cut {
@@ -170,9 +159,7 @@ fn parse_row(row: &str, max_line_bytes: usize) -> LogLine {
                 line.truncated = truncated;
             }
             "_time" => {
-                line.time = DateTime::parse_from_rfc3339(&text)
-                    .ok()
-                    .map(|t| t.with_timezone(&Utc));
+                line.time = DateTime::parse_from_rfc3339(&text).ok().map(|t| t.with_timezone(&Utc));
             }
             k if SKIPPED_FIELDS.contains(&k) => {}
             _ => {
@@ -204,18 +191,8 @@ impl LogSource for VictoriaLogsSource {
         let limits = self.http.limits;
         let form = [
             ("query", server_query(&query.query)),
-            (
-                "start",
-                query
-                    .start
-                    .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-            ),
-            (
-                "end",
-                query
-                    .end
-                    .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-            ),
+            ("start", query.start.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+            ("end", query.end.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
             ("limit", query.limit.to_string()),
             ("timeout", format!("{}s", self.cfg.timeout_secs)),
         ];
@@ -227,18 +204,10 @@ impl LogSource for VictoriaLogsSource {
             .form(&form);
         let response = self.http.send(request).await?;
         let body = read_limited(response, limits.max_response_bytes).await?;
-        let (lines, more) = parse_json_lines(
-            &body.bytes,
-            query.limit,
-            limits.max_line_bytes,
-            body.truncated,
-        );
+        let (lines, more) = parse_json_lines(&body.bytes, query.limit, limits.max_line_bytes, body.truncated);
         let truncated = more || lines.len() >= query.limit;
         let note = body.truncated.then(|| {
-            format!(
-                "the answer was cut at {} bytes (max_response_bytes)",
-                limits.max_response_bytes
-            )
+            format!("the answer was cut at {} bytes (max_response_bytes)", limits.max_response_bytes)
         });
         Ok(LogResult {
             lines,
@@ -258,39 +227,18 @@ mod tests {
     #[test]
     fn a_sort_is_added_only_when_the_query_has_none() {
         assert_eq!(server_query("error"), "error | sort by (_time) desc");
-        assert_eq!(
-            server_query("error | sort by (level)"),
-            "error | sort by (level)"
-        );
-        assert_eq!(
-            server_query("x | stats count() by (pod)"),
-            "x | stats count() by (pod) | sort by (_time) desc"
-        );
-        assert!(
-            !sorts_itself("message:\"sort by\""),
-            "a word in a filter is not a pipe"
-        );
-        assert!(
-            !sorts_itself(r#"_msg:~"error| sort by (x)""#),
-            "a | inside a regex is not a pipe"
-        );
-        assert!(
-            !sorts_itself(r#"_msg:"a \" | order" x"#),
-            "escaped quotes stay inside the string"
-        );
+        assert_eq!(server_query("error | sort by (level)"), "error | sort by (level)");
+        assert_eq!(server_query("x | stats count() by (pod)"), "x | stats count() by (pod) | sort by (_time) desc");
+        assert!(!sorts_itself("message:\"sort by\""), "a word in a filter is not a pipe");
+        assert!(!sorts_itself(r#"_msg:~"error| sort by (x)""#), "a | inside a regex is not a pipe");
+        assert!(!sorts_itself(r#"_msg:"a \" | order" x"#), "escaped quotes stay inside the string");
         assert!(sorts_itself(r#"_msg:~"a|b" | sort by (_time)"#));
-        assert_eq!(
-            server_query("error | limit 10"),
-            "error | sort by (_time) desc | limit 10"
-        );
+        assert_eq!(server_query("error | limit 10"), "error | sort by (_time) desc | limit 10");
         assert_eq!(
             server_query("error | fields _time, _msg | head 5 | fields _msg"),
             "error | fields _time, _msg | sort by (_time) desc | head 5 | fields _msg"
         );
-        assert_eq!(
-            server_query("error | first 5 by (_time desc)"),
-            "error | first 5 by (_time desc)"
-        );
+        assert_eq!(server_query("error | first 5 by (_time desc)"), "error | first 5 by (_time desc)");
         assert_eq!(
             server_query(r#"_msg:~"error|sort""#),
             r#"_msg:~"error|sort" | sort by (_time) desc"#
@@ -310,10 +258,7 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert!(more, "a fourth line existed");
         assert_eq!(lines[0].message, "boom");
-        assert_eq!(
-            lines[0].time.unwrap().to_rfc3339(),
-            "2026-11-01T10:00:01+00:00"
-        );
+        assert_eq!(lines[0].time.unwrap().to_rfc3339(), "2026-11-01T10:00:01+00:00");
         assert_eq!(lines[0].fields["kubernetes.pod_name"], "web-1");
         assert_eq!(lines[0].fields["code"], "500");
         assert_eq!(lines[0].fields["_stream"], "{app=\"web\"}");
@@ -333,10 +278,7 @@ mod tests {
     }
 
     /// Serve one request with `status` and `body`; return what was received.
-    async fn serve_once(
-        status: &'static str,
-        body: String,
-    ) -> (String, tokio::task::JoinHandle<Seen>) {
+    async fn serve_once(status: &'static str, body: String) -> (String, tokio::task::JoinHandle<Seen>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -350,17 +292,10 @@ mod tests {
                 if let Some(split) = text.find("\r\n\r\n") {
                     let len = text[..split]
                         .lines()
-                        .find_map(|l| {
-                            l.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|v| v.trim().parse::<usize>().unwrap())
-                        })
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
                         .unwrap_or(0);
                     if data.len() >= split + 4 + len || n == 0 {
-                        let reply = format!(
-                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
-                            body.len()
-                        );
+                        let reply = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}", body.len());
                         socket.write_all(reply.as_bytes()).await.unwrap();
                         return Seen {
                             head: text[..split].to_string(),
@@ -396,10 +331,7 @@ mod tests {
     }
 
     fn form_value(body: &str, key: &str) -> String {
-        let pair = body
-            .split('&')
-            .find(|p| p.starts_with(&format!("{key}=")))
-            .unwrap();
+        let pair = body.split('&').find(|p| p.starts_with(&format!("{key}="))).unwrap();
         let raw = &pair[key.len() + 1..];
         let raw = raw.replace('+', " ");
         let mut out = Vec::new();
@@ -424,19 +356,12 @@ mod tests {
         let source = VictoriaLogsSource::new(&cfg(url), "tok-123").unwrap();
         let result = source.query(&query()).await.unwrap();
         let seen = server.await.unwrap();
-        assert!(
-            seen.head.starts_with("POST /select/logsql/query HTTP/1.1"),
-            "{}",
-            seen.head
-        );
+        assert!(seen.head.starts_with("POST /select/logsql/query HTTP/1.1"), "{}", seen.head);
         let head = seen.head.to_ascii_lowercase();
         assert!(head.contains("accountid: 12"), "{head}");
         assert!(head.contains("projectid: 34"), "{head}");
         assert!(head.contains("authorization: bearer tok-123"), "{head}");
-        assert_eq!(
-            form_value(&seen.body, "query"),
-            "kubernetes.pod_namespace:shop error | sort by (_time) desc"
-        );
+        assert_eq!(form_value(&seen.body, "query"), "kubernetes.pod_namespace:shop error | sort by (_time) desc");
         assert_eq!(form_value(&seen.body, "start"), "2026-11-01T10:00:00Z");
         assert_eq!(form_value(&seen.body, "end"), "2026-11-01T11:00:00Z");
         assert_eq!(form_value(&seen.body, "limit"), "2");
@@ -451,11 +376,7 @@ mod tests {
         let (url, server) = serve_once("200 OK", String::new()).await;
         let mut q = query();
         q.end += chrono::Duration::milliseconds(500);
-        VictoriaLogsSource::new(&cfg(url), "tok-123")
-            .unwrap()
-            .query(&q)
-            .await
-            .unwrap();
+        VictoriaLogsSource::new(&cfg(url), "tok-123").unwrap().query(&q).await.unwrap();
         let seen = server.await.unwrap();
         assert_eq!(form_value(&seen.body, "end"), "2026-11-01T11:00:00.500Z");
         assert_eq!(form_value(&seen.body, "start"), "2026-11-01T10:00:00Z");
@@ -468,16 +389,9 @@ mod tests {
         c.tenant = None;
         c.auth = "none".into();
         c.key_env.clear();
-        let result = VictoriaLogsSource::new(&c, "")
-            .unwrap()
-            .query(&query())
-            .await
-            .unwrap();
+        let result = VictoriaLogsSource::new(&c, "").unwrap().query(&query()).await.unwrap();
         let head = server.await.unwrap().head.to_ascii_lowercase();
-        assert!(
-            head.contains("accountid: 0") && head.contains("projectid: 0"),
-            "{head}"
-        );
+        assert!(head.contains("accountid: 0") && head.contains("projectid: 0"), "{head}");
         assert!(!head.contains("authorization"), "{head}");
         assert!(result.lines.is_empty() && !result.truncated);
     }
@@ -485,14 +399,8 @@ mod tests {
     #[tokio::test]
     async fn server_errors_reach_the_model_without_the_key() {
         for (status, text) in [
-            (
-                "400 Bad Request",
-                "cannot parse query [error | bad]: unknown pipe \"bad\"",
-            ),
-            (
-                "422 Unprocessable Entity",
-                "the time range exceeds -search.maxQueryTimeRange=24h",
-            ),
+            ("400 Bad Request", "cannot parse query [error | bad]: unknown pipe \"bad\""),
+            ("422 Unprocessable Entity", "the time range exceeds -search.maxQueryTimeRange=24h"),
             ("502 Bad Gateway", "upstream rejected Bearer tok-123"),
         ] {
             let (url, server) = serve_once(status, text.to_string()).await;
@@ -506,10 +414,7 @@ mod tests {
             assert!(err.contains(&status[..3]), "{err}");
             assert!(!err.contains("tok-123"), "{err}");
             if !text.contains("tok-123") {
-                assert!(
-                    err.contains(text),
-                    "the server's reason must reach the model: {err}"
-                );
+                assert!(err.contains(text), "the server's reason must reach the model: {err}");
             }
         }
     }

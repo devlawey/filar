@@ -106,10 +106,7 @@ pub fn resolve_ssh_password(
 /// After a successful login with a typed password, offer to store it under
 /// [`password_entry`] — asked, never done silently.
 pub fn offer_to_save_password(target: &SshTarget, prompt: &mut dyn PasswordPrompt) {
-    let SshAuth::Password {
-        password: Some(password),
-    } = &target.auth
-    else {
+    let SshAuth::Password { password: Some(password) } = &target.auth else {
         return;
     };
     if prompt.offer_to_save(&target.name) {
@@ -161,12 +158,7 @@ mod tests {
 
     impl Scripted {
         fn new(typed: &[&'static str], save: bool) -> Self {
-            Self {
-                typed: typed.to_vec(),
-                asked: 0,
-                save,
-                saved: Vec::new(),
-            }
+            Self { typed: typed.to_vec(), asked: 0, save, saved: Vec::new() }
         }
     }
 
@@ -192,9 +184,7 @@ mod tests {
             host: "10.0.0.5".into(),
             port: 22,
             user: "deploy".into(),
-            auth: SshAuth::Password {
-                password: password.map(str::to_string),
-            },
+            auth: SshAuth::Password { password: password.map(str::to_string) },
             host_key_policy: Default::default(),
             tags: Vec::new(),
         }
@@ -259,10 +249,7 @@ mod tests {
         let (t, res) = resolve(&empty, &empty, &mut prompt);
         let msg = res.unwrap_err().to_string();
         assert_eq!(password_of(&t), None);
-        assert!(
-            msg.contains("Save password") && msg.contains("SSH_PASSWORD"),
-            "{msg}"
-        );
+        assert!(msg.contains("Save password") && msg.contains("SSH_PASSWORD"), "{msg}");
         assert!(msg.contains("prod-web"), "{msg}");
         assert!(!msg.contains("SshAuth"), "no internal names: {msg}");
     }
@@ -280,10 +267,7 @@ mod tests {
     fn other_targets_and_explicit_passwords_are_left_alone() {
         let empty = StaticSecretProvider::new();
         let mut prompt = Scripted::new(&[SECRET], true);
-        let sources = PasswordSources {
-            keyring: &empty,
-            env: &empty,
-        };
+        let sources = PasswordSources { keyring: &empty, env: &empty };
         let mut agent = password_target(None);
         agent.auth = SshAuth::Agent;
         assert_eq!(
@@ -306,10 +290,7 @@ mod tests {
         let mut t = password_target(Some(""));
         let res = resolve_ssh_password(
             &mut t,
-            &PasswordSources {
-                keyring: &empty,
-                env: &empty,
-            },
+            &PasswordSources { keyring: &empty, env: &empty },
             &mut prompt,
         );
         assert_eq!(res.unwrap(), PasswordOrigin::Typed);
@@ -321,10 +302,7 @@ mod tests {
         let target = password_target(Some(SECRET));
         let mut yes = Scripted::new(&[], true);
         offer_to_save_password(&target, &mut yes);
-        assert_eq!(
-            yes.saved,
-            [("ssh_target:prod-web".to_string(), SECRET.to_string())]
-        );
+        assert_eq!(yes.saved, [("ssh_target:prod-web".to_string(), SECRET.to_string())]);
         let mut no = Scripted::new(&[], false);
         offer_to_save_password(&target, &mut no);
         assert!(no.saved.is_empty());

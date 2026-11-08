@@ -218,11 +218,7 @@ fn apply_selection(
     }
     // Compute the column range for this specific line.
     let col_start = if line_idx == start_line { start_col } else { 0 };
-    let col_end = if line_idx == end_line {
-        end_col
-    } else {
-        usize::MAX
-    };
+    let col_end = if line_idx == end_line { end_col } else { usize::MAX };
 
     // Walk through the line's spans, splitting them at selection boundaries.
     let mut new_spans: Vec<Span<'static>> = Vec::new();
@@ -245,11 +241,13 @@ fn apply_selection(
                 new_spans.push(Span::styled(before, span.style));
             }
             // Selected portion
-            let selected: String = chars
-                [intersect_start - current_col..intersect_end - current_col]
+            let selected: String = chars[intersect_start - current_col..intersect_end - current_col]
                 .iter()
                 .collect();
-            new_spans.push(Span::styled(selected, span.style.patch(sel_style)));
+            new_spans.push(Span::styled(
+                selected,
+                span.style.patch(sel_style),
+            ));
             // After selection
             if intersect_end < span_end {
                 let after: String = chars[intersect_end - current_col..].iter().collect();
@@ -323,15 +321,14 @@ mod tests {
         // no leftover run of 'A' from the first frame on a short-line row.
         for y in 0..8 {
             let row = chat_row(buf, y, 40);
-            assert_eq!(
-                row.chars().count(),
-                40,
-                "row {y} must be fully painted: {row:?}"
-            );
+            assert_eq!(row.chars().count(), 40, "row {y} must be fully painted: {row:?}");
             // If the row is mostly spaces (padded short line), it must not
             // still contain a long AAAA tail from the previous frame.
             if row.trim().len() < 10 {
-                assert!(!row.contains("AAAA"), "stale glyphs on row {y}: {row:?}");
+                assert!(
+                    !row.contains("AAAA"),
+                    "stale glyphs on row {y}: {row:?}"
+                );
             }
         }
     }
@@ -394,10 +391,9 @@ mod tests {
             .map(|y| chat_row(terminal.backend().buffer(), y, 40))
             .collect();
         assert!(
-            before.iter().any(|r| r.contains('用')
-                || r.contains('代')
-                || r.contains("PID")
-                || r.contains("CMD")),
+            before
+                .iter()
+                .any(|r| r.contains('用') || r.contains('代') || r.contains("PID") || r.contains("CMD")),
             "first frame should show wide/columnar content: {before:?}"
         );
 
@@ -413,11 +409,7 @@ mod tests {
         let buf = terminal.backend().buffer();
         for y in 0..8 {
             let row = chat_row(buf, y, 40);
-            assert_eq!(
-                row.chars().count(),
-                40,
-                "row {y} must be fully painted: {row:?}"
-            );
+            assert_eq!(row.chars().count(), 40, "row {y} must be fully painted: {row:?}");
             assert!(!row.contains('\t'), "tab leaked on row {y}: {row:?}");
             if row.trim().chars().count() < 10 {
                 assert!(
@@ -431,3 +423,4 @@ mod tests {
         }
     }
 }
+

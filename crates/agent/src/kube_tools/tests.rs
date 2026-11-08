@@ -526,7 +526,8 @@ async fn log_character_limit_keeps_the_newest_lines() {
         }),
         ..MockCluster::default()
     });
-    let call = parse_kube_tool_call(TOOL_K8S_LOGS, &json!({"pod": "web-1"}), Some("shop")).unwrap();
+    let call = parse_kube_tool_call(TOOL_K8S_LOGS, &json!({"pod": "web-1"}), Some("shop"))
+        .unwrap();
     let result = executor.execute(&call).await.unwrap();
     assert!(!result.content.contains("oldest line"));
     assert!(result.content.contains("newest OOMKilled line"));
@@ -547,6 +548,7 @@ async fn metrics_unsupported_has_actionable_message() {
     assert!(error.to_string().contains("metrics-server не установлен"));
 }
 
+
 fn pod_with_port(name: &str) -> PodInfo {
     let mut info = pod(name);
     info.containers[0].ports = vec![filar_transport::ContainerPortInfo {
@@ -563,10 +565,7 @@ fn http_call(args: serde_json::Value) -> Result<KubeToolCall> {
 #[test]
 fn pod_http_get_refuses_other_methods_urls_and_binary_pprof() {
     let ok = http_call(json!({"pod": "web-1", "port": 9090, "path": "/metrics"})).unwrap();
-    assert_eq!(
-        ok.display_command(),
-        "pod_http_get GET web-1:9090/metrics -n shop"
-    );
+    assert_eq!(ok.display_command(), "pod_http_get GET web-1:9090/metrics -n shop");
     let post = http_call(json!({"pod": "web-1", "port": 9090, "path": "/x", "method": "POST"}));
     assert!(post.unwrap_err().to_string().contains("only sends GET"));
     let absolute = http_call(json!({"pod": "web-1", "port": 9090, "path": "http://evil/metrics"}));
@@ -582,11 +581,7 @@ async fn pod_http_get_needs_a_declared_or_allowed_port() {
         ..MockCluster::default()
     };
     let call = http_call(json!({"pod": "web-1", "port": 22, "path": "/"})).unwrap();
-    let err = executor(cluster)
-        .execute(&call)
-        .await
-        .unwrap_err()
-        .to_string();
+    let err = executor(cluster).execute(&call).await.unwrap_err().to_string();
     assert!(err.contains("diagnostic_ports"), "{err}");
 }
 
@@ -609,30 +604,12 @@ async fn pod_http_get_shows_requested_metrics_redacted_and_marks_truncation() {
     let call = http_call(json!({"pod": "web-1", "port": "metrics", "path": "/metrics", "metrics": ["db_up", "token_leak"]})).unwrap();
     let result = exec.execute(&call).await.unwrap();
     assert!(result.truncated);
-    assert!(
-        result
-            .content
-            .starts_with("HTTP 200 from shop/web-1:9090/metrics"),
-        "{}",
-        result.content
-    );
-    assert!(result
-        .content
-        .contains("[truncated: the answer was longer than 1 MiB]"));
-    assert!(
-        result.content.contains("password=\"***\""),
-        "{}",
-        result.content
-    );
+    assert!(result.content.starts_with("HTTP 200 from shop/web-1:9090/metrics"), "{}", result.content);
+    assert!(result.content.contains("[truncated: the answer was longer than 1 MiB]"));
+    assert!(result.content.contains("password=\"***\""), "{}", result.content);
     assert!(!result.content.contains("hunter2"));
-    assert!(
-        !result.content.contains("supersecret"),
-        "known secrets are masked"
-    );
-    assert!(
-        !result.content.contains("http_requests_total"),
-        "only the named metrics"
-    );
+    assert!(!result.content.contains("supersecret"), "known secrets are masked");
+    assert!(!result.content.contains("http_requests_total"), "only the named metrics");
     let sent = cluster.http_call.lock().unwrap().clone().unwrap();
     assert_eq!((sent.port, sent.path.as_str()), (9090, "/metrics"));
     assert_eq!(sent.max_bytes, crate::pod_http::MAX_POD_HTTP_BYTES);

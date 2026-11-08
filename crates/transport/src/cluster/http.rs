@@ -23,11 +23,7 @@ pub(crate) fn request_bytes(path: &str) -> Vec<u8> {
 
 /// Send `GET path` on `stream` and read the answer, keeping at most
 /// `max_bytes` of body.
-pub(crate) async fn get_over<S>(
-    stream: &mut S,
-    path: &str,
-    max_bytes: usize,
-) -> Result<PodHttpResponse>
+pub(crate) async fn get_over<S>(stream: &mut S, path: &str, max_bytes: usize) -> Result<PodHttpResponse>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -107,23 +103,22 @@ pub(crate) fn parse_response(raw: &[u8], max_bytes: usize) -> Result<PodHttpResp
             "the pod's HTTP answer was cut off after {got} bytes of body"
         ))
     };
-    let mut body =
-        if header_value(&lower, "transfer-encoding").is_some_and(|v| v.contains("chunked")) {
-            let (body, complete) = dechunk(rest);
-            if !complete && body.len() <= max_bytes {
-                return Err(cut_off(body.len()));
-            }
-            body
-        } else if let Some(len) =
-            header_value(&lower, "content-length").and_then(|v| v.parse::<usize>().ok())
-        {
-            if rest.len() < len && rest.len() <= max_bytes {
-                return Err(cut_off(rest.len()));
-            }
-            rest[..rest.len().min(len)].to_vec()
-        } else {
-            rest.to_vec()
-        };
+    let mut body = if header_value(&lower, "transfer-encoding").is_some_and(|v| v.contains("chunked")) {
+        let (body, complete) = dechunk(rest);
+        if !complete && body.len() <= max_bytes {
+            return Err(cut_off(body.len()));
+        }
+        body
+    } else if let Some(len) =
+        header_value(&lower, "content-length").and_then(|v| v.parse::<usize>().ok())
+    {
+        if rest.len() < len && rest.len() <= max_bytes {
+            return Err(cut_off(rest.len()));
+        }
+        rest[..rest.len().min(len)].to_vec()
+    } else {
+        rest.to_vec()
+    };
     let truncated = body.len() > max_bytes;
     body.truncate(max_bytes);
     Ok(PodHttpResponse {
@@ -231,8 +226,7 @@ mod tests {
 
     #[test]
     fn the_zero_chunk_needs_its_closing_empty_line() {
-        let head =
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n".to_vec();
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n".to_vec();
         assert!(!body_complete(&head), "0\\r\\n alone is not the end");
         let mut done = head.clone();
         done.extend_from_slice(b"\r\n");
