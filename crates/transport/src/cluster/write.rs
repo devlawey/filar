@@ -289,6 +289,9 @@ pub struct DeletionImpact {
     /// For a Namespace: objects in it by kind, `(kind, count, more)`;
     /// `more` = the count stopped at a page limit.
     pub contents: Vec<(String, usize, bool)>,
+    /// For a Namespace: some kinds could not be counted (discovery or a
+    /// list failed), so `contents` may miss objects.
+    pub contents_incomplete: bool,
     /// For a CustomResourceDefinition: its objects in all namespaces.
     pub custom_objects: Option<(usize, bool)>,
     /// For a PVC or PV: the volume's reclaim policy (`Delete`, `Retain`).
@@ -1288,8 +1291,14 @@ impl ClusterWriteApi for KubeClusterApi {
                     let pending = object
                         .as_ref()
                         .map(|o| o.metadata.deletion_timestamp.is_some());
-                    if let Some(object) = object {
-                        let mut value = to_value(&object)?;
+                    let object = match object {
+                        // A dry run answering a bare `Status`: read the
+                        // object, so the window can still tell what it is.
+                        None if dry_run => api.get_opt(&name).await.ok().flatten(),
+                        object => object,
+                    };
+                    if let Some(object) = &object {
+                        let mut value = to_value(object)?;
                         hide_secret_values(&mut value);
                         live = Some(value);
                     }
@@ -1365,10 +1374,13 @@ impl KubeClusterApi {
         Some((page.items.len(), more))
     }
 
-    async fn namespace_contents(&self, namespace: &str) -> Vec<(String, usize, bool)> {
+    /// Objects of a namespace by kind, and whether some kinds could not be
+    /// counted.
+    async fn namespace_contents(&self, namespace: &str) -> (Vec<(String, usize, bool)>, bool) {
         let Ok(discovery) = Discovery::new(self.client().clone()).run().await else {
-            return Vec::new();
+            return (Vec::new(), true);
         };
+        let mut incomplete = false;
         let mut contents = Vec::new();
         for group in discovery.groups() {
             for (resource, caps) in group.recommended_resources() {
@@ -1376,24 +1388,29 @@ impl KubeClusterApi {
                 if caps.scope != Scope::Namespaced || !listable || resource.kind == "Event" {
                     continue;
                 }
-                if let Some((count, more)) = self
+                match self
                     .count_objects(&resource, &caps, Some(namespace), &ListParams::default())
                     .await
                 {
-                    if count > 0 {
+                    Some((count, more)) if count > 0 => {
                         contents.push((resource.kind.clone(), count, more));
                     }
+                    Some(_) => {}
+                    None => incomplete = true,
                 }
             }
         }
         contents.sort();
-        contents
+        (contents, incomplete)
     }
 
     async fn reclaim_policy(&self, kind: &str, live: &Value) -> Option<String> {
         let client = self.client().clone();
         let field = |object: &Value, pointer: &str| {
-            object.pointer(pointer).and_then(Value::as_str).map(str::to_owned)
+            object
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
         };
         if kind == "PersistentVolume" {
             return field(live, "/spec/persistentVolumeReclaimPolicy");
@@ -1407,14 +1424,20 @@ impl KubeClusterApi {
                 .get(&volume)
                 .await
                 .ok()?;
-            return field(&to_value(&object).ok()?, "/spec/persistentVolumeReclaimPolicy");
+            return field(
+                &to_value(&object).ok()?,
+                "/spec/persistentVolumeReclaimPolicy",
+            );
         }
         let class = field(live, "/spec/storageClassName")?;
         let sc = ApiResource::from_gvk_with_plural(
             &GroupVersionKind::gvk("storage.k8s.io", "v1", "StorageClass"),
             "storageclasses",
         );
-        let object = Api::<DynamicObject>::all_with(client, &sc).get(&class).await.ok()?;
+        let object = Api::<DynamicObject>::all_with(client, &sc)
+            .get(&class)
+            .await
+            .ok()?;
         // A StorageClass without reclaimPolicy deletes.
         Some(field(&to_value(&object).ok()?, "/reclaimPolicy").unwrap_or_else(|| "Delete".into()))
     }
@@ -1442,7 +1465,10 @@ async fn impact_of(api: &KubeClusterApi, object: &DeletedObject) -> DeletionImpa
             )
         });
     match object.object.kind.as_str() {
-        "Namespace" => impact.contents = api.namespace_contents(&object.object.name).await,
+        "Namespace" => {
+            (impact.contents, impact.contents_incomplete) =
+                api.namespace_contents(&object.object.name).await;
+        }
         "CustomResourceDefinition" => {
             let group = live.pointer("/spec/group").and_then(Value::as_str);
             let plural = live.pointer("/spec/names/plural").and_then(Value::as_str);
@@ -1478,10 +1504,8 @@ async fn impact_of(api: &KubeClusterApi, object: &DeletedObject) -> DeletionImpa
             impact.reclaim_policy = api.reclaim_policy(&object.object.kind, live).await;
         }
         "Node" => {
-            let pods = ApiResource::from_gvk_with_plural(
-                &GroupVersionKind::gvk("", "v1", "Pod"),
-                "pods",
-            );
+            let pods =
+                ApiResource::from_gvk_with_plural(&GroupVersionKind::gvk("", "v1", "Pod"), "pods");
             let caps = ApiCapabilities {
                 scope: Scope::Cluster,
                 subresources: Vec::new(),

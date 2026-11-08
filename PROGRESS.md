@@ -12588,4 +12588,18 @@ it» и `⚠ propagationPolicy: Background`, `a` → DELETE с
 shop/web-1»; удаление Namespace shop — «EVERYTHING in this namespace is
 deleted: Deployment 1, Pod 2», `d` → только dry-run DELETE.
 
+**Ревью (CodeRabbit, первое и единственное).** Предупреждения в окне идут
+до списка объектов — окно не прокручивается; cluster-scoped удаление
+попадает в окно и к оценщику без namespace вкладки
+(`WritePreview::cluster_scoped`); `api_version` виден в команде
+(`--api-version=…`); аргументы неверного типа — ошибка до dry run, и
+namespace общий с другими инструментами записи; новые предупреждения:
+StatefulSet с `whenDeleted: Delete` (PVC и данные), `reclaimPolicy: Recycle`,
+непроверенные тома за первыми 10 объектами, неполный перечень Namespace
+(`DeletionImpact::contents_incomplete`), честная формулировка про поды Node;
+dry run, ответивший голым `Status`, дочитывает объект для проверки влияния.
+Документация уточняет, что имя — идентичность (пересозданный под тем же
+именем объект удаляется). В тесте `RecordingWriter` записывает вариант
+цели, и проверено, что реальное удаление идёт по `Names`.
+
 **Next.** #646 — метаданные Secret.

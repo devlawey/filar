@@ -1500,7 +1500,10 @@ fn a_yaml_error_names_the_position_not_the_text() {
 #[tokio::test]
 async fn the_impact_of_a_delete_is_read_from_the_cluster() {
     let api = fake().await;
-    api.put("/api/v1/namespaces/shop", json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "shop"}}));
+    api.put(
+        "/api/v1/namespaces/shop",
+        json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "shop"}}),
+    );
     for name in ["web-1", "web-2"] {
         let mut p = pod(name, "web");
         p["metadata"]["ownerReferences"] = json!([{"apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "web-7f9c", "uid": "u", "controller": true}]);
@@ -1512,9 +1515,18 @@ async fn the_impact_of_a_delete_is_read_from_the_cluster() {
     api.put("/api/v1/namespaces/shop/persistentvolumeclaims/data", json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": "data", "namespace": "shop"}, "spec": {"volumeName": "pv-1"}}));
     let writes = api.api();
     async fn dry(writes: &KubeClusterApi, kind: &str, name: &str) -> DeletedObject {
-        let kind = ObjectKind { api_version: Some("v1".into()), kind: kind.into() };
+        let kind = ObjectKind {
+            api_version: Some("v1".into()),
+            kind: kind.into(),
+        };
         writes
-            .delete(&kind, Some("shop"), &DeleteTarget::Name(name.into()), &DeleteOptions::default(), true)
+            .delete(
+                &kind,
+                Some("shop"),
+                &DeleteTarget::Name(name.into()),
+                &DeleteOptions::default(),
+                true,
+            )
             .await
             .unwrap()
             .remove(0)
@@ -1538,8 +1550,59 @@ async fn the_impact_of_a_delete_is_read_from_the_cluster() {
     );
 
     let claim = dry(&writes, "PersistentVolumeClaim", "data").await;
-    assert_eq!(writes.deletion_impact(&claim).await.reclaim_policy.as_deref(), Some("Delete"));
+    assert_eq!(
+        writes
+            .deletion_impact(&claim)
+            .await
+            .reclaim_policy
+            .as_deref(),
+        Some("Delete")
+    );
     let volume = dry(&writes, "PersistentVolume", "pv-1").await;
-    assert_eq!(writes.deletion_impact(&volume).await.reclaim_policy.as_deref(), Some("Delete"));
+    assert_eq!(
+        writes
+            .deletion_impact(&volume)
+            .await
+            .reclaim_policy
+            .as_deref(),
+        Some("Delete")
+    );
     assert!(api.get(&format!("{PODS}/web-1")).is_some(), "all dry runs");
+}
+
+#[tokio::test]
+async fn a_dry_run_answered_with_a_status_still_reads_the_object() {
+    let api = FakeApi::start(Arc::new(|request: &Request, state: &mut State| {
+        if request.method == "DELETE" {
+            return (
+                200,
+                json!({"kind": "Status", "apiVersion": "v1", "metadata": {},
+                       "status": "Success", "code": 200}),
+            );
+        }
+        cluster(request, state)
+    }))
+    .await;
+    api.put(&format!("{PODS}/web-1"), pod("web-1", "web"));
+    let kind = ObjectKind {
+        api_version: Some("v1".into()),
+        kind: "Pod".into(),
+    };
+    let listed = api
+        .api()
+        .delete(
+            &kind,
+            Some("shop"),
+            &DeleteTarget::Name("web-1".into()),
+            &DeleteOptions::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed[0].outcome, DeleteOutcome::WouldDelete);
+    assert_eq!(
+        listed[0].live.as_ref().unwrap()["metadata"]["name"],
+        "web-1",
+        "the impact check sees the object"
+    );
 }
