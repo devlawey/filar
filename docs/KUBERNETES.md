@@ -264,6 +264,8 @@ context or its credentials`. Проверьте плагин в том же те
 | `query_logs` | Поиск в хранилище логов ([7](#7-логи-приложений)) | только при `[[log_sources]]` |
 | `pod_logs_history` | История логов пода из хранилища | только при источнике с `clusters = ["…"]` |
 | `k8s_apply` | Создать или изменить объекты по YAML-манифесту, server-side apply ([4.7](#47-запись-k8s_apply)) | всегда подтверждение после dry run и diff; виды — сколько позволяет RBAC |
+| `k8s_scale` | Число реплик Deployment, StatefulSet, ReplicaSet ([4.8](#48-запись-k8s_scale-и-k8s_rollout)) | 0–1000; до 0 — деструктивно |
+| `k8s_rollout` | `restart` (Deployment, StatefulSet, DaemonSet) и `undo` (Deployment) ([4.8](#48-запись-k8s_scale-и-k8s_rollout)) | всегда подтверждение после dry run |
 
 В ленте запрос выглядит как сворачиваемый блок `⎈ k8s_get pod -n shop --limit 50`.
 В ASCII-наборе символов вместо `⎈` пишется `k8s:`.
@@ -432,6 +434,34 @@ custom resources, cluster-scoped объекты — всё, на что есть
 ли том и запустился ли под. Так же подключаются CephFS и GlusterFS (свой
 StorageClass) и S3 через CSI-драйвер (Mountpoint for S3, csi-s3): под с
 CSI-томом или PVC его StorageClass. Без `a` ничего не создаётся.
+
+### 4.8. Запись: `k8s_scale` и `k8s_rollout`
+
+- `k8s_scale` — `kind` (Deployment, StatefulSet, ReplicaSet), `name`,
+  `replicas` от 0 до 1000. Идёт через субресурс `scale`. В ленте —
+  `k8s_scale deployment/web -n shop 3→5`: «было» берётся из dry run.
+  Масштабирование до 0 останавливает сервис и показывается как деструктивное.
+- `k8s_rollout` с `action = restart` — Deployment, StatefulSet, DaemonSet:
+  шаблон пода получает аннотацию `kubectl.kubernetes.io/restartedAt`, и все
+  поды заменяются, как при `kubectl rollout restart`. В окне — diff с этой
+  аннотацией. Workload со стратегией `OnDelete` отклоняется ещё до окна:
+  там новый шаблон не заменяет ни одного пода, поды удаляют по одному.
+  `to_revision` у restart — ошибка, а не тихо отброшенный аргумент.
+- `namespace` можно не указывать: берётся namespace вкладки, а без него —
+  namespace по умолчанию из цели (тот, что назван в промпте).
+- `k8s_rollout` с `action = undo` — только Deployment: шаблон пода
+  возвращается из ReplicaSet нужной ревизии (`to_revision`) или предыдущей,
+  как `kubectl rollout undo`. В окне — diff текущего шаблона против целевого.
+  Перед откатом агент смотрит `k8s_rollout_history`.
+
+После выполнения filar сам следит за выкатом до двух минут: читает
+workload, пока готовых и обновлённых реплик не станет столько, сколько нужно,
+и отдаёт агенту итог («complete: 5/5 ready» или «not finished after 120 s:
+2/5 ready» — тогда агент смотрит события). Срок в две минуты действует и на
+сами запросы статуса. Если RBAC не даёт читать workloads, ожидание
+заканчивается сразу («not followed: status unreadable»), изменение при этом
+сделано. `Ctrl+C` прерывает ожидание, но не
+само изменение: оно уже сделано, и след о нём остаётся в ленте.
 
 ---
 

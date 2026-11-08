@@ -107,6 +107,35 @@ tools: &kube_tools
           explanation: { type: string }
         required: [manifest]
         additionalProperties: false
+  - type: function
+    function:
+      name: k8s_scale
+      description: "Set the replicas of a Deployment, StatefulSet or ReplicaSet through its scale subresource. Dry-run first and confirmed by the user, as every write; scaling to 0 stops the workload and is shown as destructive. After the scale filar waits a bounded time for the rollout and reports ready/desired; check events if it is not ready."
+      parameters:
+        type: object
+        properties:
+          kind: { type: string, enum: [Deployment, StatefulSet, ReplicaSet] }
+          name: { type: string }
+          namespace: { type: string, description: "Namespace; omit for the tab namespace." }
+          replicas: { type: integer, minimum: 0, maximum: 1000 }
+          explanation: { type: string }
+        required: [kind, name, replicas]
+        additionalProperties: false
+  - type: function
+    function:
+      name: k8s_rollout
+      description: "Restart a rollout (Deployment, StatefulSet, DaemonSet: every pod is replaced, as kubectl rollout restart) or undo a Deployment to an earlier revision (its pod template comes back, as kubectl rollout undo). Read k8s_rollout_history before an undo. Dry-run first and confirmed by the user, as every write. After it filar waits a bounded time for the rollout and reports ready/desired; check events if it is not ready."
+      parameters:
+        type: object
+        properties:
+          action: { type: string, enum: [restart, undo] }
+          kind: { type: string, enum: [Deployment, StatefulSet, DaemonSet], description: "undo works only for Deployment" }
+          name: { type: string }
+          namespace: { type: string, description: "Namespace; omit for the tab namespace." }
+          to_revision: { type: integer, minimum: 1, description: "undo only; omit for the revision before the current one" }
+          explanation: { type: string }
+        required: [action, kind, name]
+        additionalProperties: false
 
 providers:
   - id: openrouter:z-ai/glm-5.2
