@@ -6,6 +6,7 @@
 //! `cargo test -p filar-transport --test cluster_write -- --ignored`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use filar_core::KubeCluster;
@@ -135,10 +136,18 @@ async fn revision(api: &KubeClusterApi) -> i64 {
 #[tokio::test]
 #[ignore = "needs docker/k8s cluster"]
 async fn apply_scale_restart_undo_and_delete_against_fixture_cluster() {
-    let api = KubeClusterApi::connect(&admin_target()).await.unwrap();
+    let api = Arc::new(KubeClusterApi::connect(&admin_target()).await.unwrap());
     delete_workload(&api).await;
     wait_gone(&api).await;
+    // The scenario runs as its own task so a failed assertion still leaves
+    // a clean namespace behind.
+    if let Err(failure) = tokio::spawn(scenario(api.clone())).await {
+        delete_workload(&api).await;
+        std::panic::resume_unwind(failure.into_panic());
+    }
+}
 
+async fn scenario(api: Arc<KubeClusterApi>) {
     let dry = api.apply(WORKLOAD, Some("shop"), true).await.unwrap();
     assert!(dry
         .iter()

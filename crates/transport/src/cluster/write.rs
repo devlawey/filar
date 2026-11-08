@@ -346,8 +346,18 @@ pub trait ClusterWriteApi: Send + Sync {
 /// The documents come back as given: `Secret` values are **not** hidden
 /// (call [`hide_secret_values`] before showing a document to anyone).
 pub fn parse_manifest(manifest: &str) -> Result<Vec<Value>> {
-    let documents: Vec<Value> = serde_saphyr::from_multiple(manifest)
-        .map_err(|error| CoreError::Other(format!("the manifest is not valid YAML: {error}")))?;
+    // The parser's own message may quote the manifest (a Secret value next
+    // to the error), so only the position goes out.
+    let documents: Vec<Value> = serde_saphyr::from_multiple(manifest).map_err(|error| {
+        CoreError::Other(match error.location() {
+            Some(at) => format!(
+                "the manifest is not valid YAML (line {}, column {})",
+                at.line(),
+                at.column()
+            ),
+            None => "the manifest is not valid YAML".into(),
+        })
+    })?;
     let objects: Vec<Value> = documents.into_iter().filter(|doc| !doc.is_null()).collect();
     if objects.is_empty() {
         return Err(CoreError::Other("the manifest has no objects".into()));
@@ -405,6 +415,14 @@ fn submitted_secret_values(document: &Value) -> Vec<String> {
         };
         for value in map.values().filter_map(Value::as_str) {
             values.push(value.to_string());
+            if field == "stringData" {
+                // As `data` would carry it, should a webhook quote that.
+                if let Ok(Value::String(encoded)) =
+                    serde_json::to_value(k8s_openapi::ByteString(value.as_bytes().to_vec()))
+                {
+                    values.push(encoded);
+                }
+            }
             if field == "data" {
                 let decoded = serde_json::from_value::<k8s_openapi::ByteString>(Value::String(
                     value.to_string(),
@@ -599,28 +617,62 @@ fn paused_error(kind: &str, name: &str, verb: &str) -> CoreError {
     ))
 }
 
-/// Resources `kind` names — kind, plural, singular or `plural.group`,
-/// case-insensitive — one per kind and version.
+/// Resources `kind` names, one per kind and version: the kind, plural or
+/// `plural.group` exactly (case-insensitive), or — only when nothing
+/// matches exactly — a singular guessed as the plural minus `s`/`es`.
 fn matching_resources(
     resources: impl IntoIterator<Item = (ApiResource, ApiCapabilities)>,
     kind: &str,
 ) -> Vec<(ApiResource, ApiCapabilities)> {
     let wanted = kind.to_ascii_lowercase();
-    let mut found: Vec<(ApiResource, ApiCapabilities)> = Vec::new();
+    let mut exact: Vec<(ApiResource, ApiCapabilities)> = Vec::new();
+    let mut guessed: Vec<(ApiResource, ApiCapabilities)> = Vec::new();
     for (resource, caps) in resources {
-        let matches = resource.kind.to_ascii_lowercase() == wanted
+        let list = if resource.kind.to_ascii_lowercase() == wanted
             || resource.plural == wanted
-            || [format!("{wanted}s"), format!("{wanted}es")].contains(&resource.plural)
-            || resource_label(&resource) == wanted;
-        if matches
-            && !found
-                .iter()
-                .any(|(r, _)| r.api_version == resource.api_version && r.kind == resource.kind)
+            || resource_label(&resource) == wanted
         {
-            found.push((resource, caps));
+            &mut exact
+        } else if [format!("{wanted}s"), format!("{wanted}es")].contains(&resource.plural) {
+            &mut guessed
+        } else {
+            continue;
+        };
+        if !list
+            .iter()
+            .any(|(r, _)| r.api_version == resource.api_version && r.kind == resource.kind)
+        {
+            list.push((resource, caps));
         }
     }
-    found
+    if exact.is_empty() {
+        guessed
+    } else {
+        exact
+    }
+}
+
+/// The one resource of `found`, or why not: none, or several (a delete
+/// never picks one of several by order).
+fn single_resource(
+    mut found: Vec<(ApiResource, ApiCapabilities)>,
+    kind: &str,
+    context: &str,
+) -> Result<(ApiResource, ApiCapabilities)> {
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(CoreError::NotFound(format!(
+            "the cluster has no kind {kind} (context {context})"
+        ))),
+        _ => Err(CoreError::Other(format!(
+            "{kind} names several resources ({}); name the kind exactly",
+            found
+                .iter()
+                .map(|(resource, _)| format!("{} {}", resource.api_version, resource.kind))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
 }
 
 /// Resource name for messages: `deployments`, `deployments.apps`.
@@ -667,10 +719,10 @@ impl KubeClusterApi {
                         .get(&gvk.group)
                         .map(|group| group.versioned_resources(&gvk.version))
                         .unwrap_or_default();
-                    matching_resources(resources, &kind.kind)
-                        .into_iter()
-                        .next()
-                        .ok_or(CoreError::NotFound(message))
+                    match matching_resources(resources, &kind.kind) {
+                        found if found.is_empty() => Err(CoreError::NotFound(message)),
+                        found => single_resource(found, &kind.kind, &self.target().context),
+                    }
                 }
                 other => other,
             };
@@ -678,8 +730,8 @@ impl KubeClusterApi {
         let core = self
             .discover_matching(Discovery::new(self.client().clone()).filter(&[""]), kind)
             .await?;
-        if let Some(found) = core.into_iter().next() {
-            return Ok(found);
+        if !core.is_empty() {
+            return single_resource(core, &kind.kind, &self.target().context);
         }
         let mut found = self
             .discover_matching(Discovery::new(self.client().clone()).exclude(&[""]), kind)

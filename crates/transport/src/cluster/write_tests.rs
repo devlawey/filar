@@ -182,7 +182,9 @@ fn discovery(path: &str) -> Option<Value> {
         "/apis" => Some(
             json!({"kind": "APIGroupList", "apiVersion": "v1", "groups": [
             {"name": "apps", "versions": [{"groupVersion": "apps/v1", "version": "v1"}],
-             "preferredVersion": {"groupVersion": "apps/v1", "version": "v1"}}]}),
+             "preferredVersion": {"groupVersion": "apps/v1", "version": "v1"}},
+            {"name": "example.com", "versions": [{"groupVersion": "example.com/v1", "version": "v1"}],
+             "preferredVersion": {"groupVersion": "example.com/v1", "version": "v1"}}]}),
         ),
         "/api/v1" => Some(
             json!({"kind": "APIResourceList", "groupVersion": "v1", "resources": [
@@ -196,6 +198,15 @@ fn discovery(path: &str) -> Option<Value> {
             resource("statefulsets", "StatefulSet", true), scale("statefulsets"),
             resource("replicasets", "ReplicaSet", true), scale("replicasets"),
             resource("daemonsets", "DaemonSet", true)]}),
+        ),
+        // Custom resources: `widgetses` is listed before `widgets` (so a
+        // guessed singular could pick it), only `gadgets` has `/status`.
+        "/apis/example.com/v1" => Some(
+            json!({"kind": "APIResourceList", "apiVersion": "v1", "groupVersion": "example.com/v1", "resources": [
+            resource("widgetses", "Widgetse", true), resource("widgets", "Widget", true),
+            resource("gadgets", "Gadget", true),
+            {"name": "gadgets/status", "singularName": "", "namespaced": true, "kind": "Gadget",
+             "verbs": ["get", "patch", "update"]}]}),
         ),
         _ => None,
     }
@@ -335,6 +346,9 @@ fn is_collection(path: &str) -> bool {
         "statefulsets",
         "replicasets",
         "daemonsets",
+        "widgets",
+        "widgetses",
+        "gadgets",
     ]
     .contains(&last)
 }
@@ -1380,4 +1394,89 @@ fn a_singular_matches_its_plural_with_s_or_es() {
         assert_eq!(found.len(), 1, "{wanted}");
         assert_eq!(found[0].0.kind, kind, "{wanted}");
     }
+}
+
+#[tokio::test]
+async fn status_counts_for_a_custom_resource_without_a_status_subresource() {
+    let api = fake().await;
+    for (plural, kind) in [("widgets", "Widget"), ("gadgets", "Gadget")] {
+        api.put(
+            &format!("/apis/example.com/v1/namespaces/shop/{plural}/one"),
+            json!({"apiVersion": "example.com/v1", "kind": kind,
+                   "metadata": {"name": "one", "namespace": "shop"},
+                   "spec": {"size": 1}, "status": {"phase": "old"}}),
+        );
+    }
+    let action = |kind: &str| {
+        let manifest = format!(
+            "apiVersion: example.com/v1\nkind: {kind}\nmetadata: {{name: one}}\nspec: {{size: 1}}\nstatus: {{phase: new}}\n"
+        );
+        let api = api.api();
+        async move { api.apply(&manifest, Some("shop"), true).await.unwrap()[0].action }
+    };
+    assert_eq!(
+        action("Widget").await,
+        ApplyAction::Configured,
+        "status is the main endpoint's"
+    );
+    assert_eq!(
+        action("Gadget").await,
+        ApplyAction::Unchanged,
+        "status belongs to /status"
+    );
+}
+
+#[tokio::test]
+async fn an_exact_plural_wins_over_a_guessed_singular() {
+    let api = fake().await;
+    api.put(
+        "/apis/example.com/v1/namespaces/shop/widgets/one",
+        json!({"apiVersion": "example.com/v1", "kind": "Widget", "metadata": {"name": "one", "namespace": "shop"}}),
+    );
+    for api_version in [Some("example.com/v1".to_string()), None] {
+        let kind = ObjectKind {
+            api_version: api_version.clone(),
+            kind: "widgets".into(),
+        };
+        let listed = api
+            .api()
+            .delete(
+                &kind,
+                Some("shop"),
+                &DeleteTarget::Name("one".into()),
+                &DeleteOptions::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed[0].object.kind, "Widget", "{api_version:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_encoded_form_of_string_data_is_masked_too() {
+    // "c2VjcmV0LXRva2Vu" is base64 of "secret-token".
+    let api = refusing(
+        403,
+        "Forbidden",
+        "admission webhook denied the request: data.token=c2VjcmV0LXRva2Vu is reused",
+    )
+    .await;
+    let manifest =
+        "apiVersion: v1\nkind: Secret\nmetadata: {name: t}\nstringData: {token: secret-token}\n";
+    let error = api
+        .api()
+        .apply(manifest, Some("shop"), true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("c2VjcmV0LXRva2Vu"), "{error}");
+}
+
+#[test]
+fn a_yaml_error_names_the_position_not_the_text() {
+    let manifest = "apiVersion: v1\nkind: Secret\nmetadata: {name: x}\nstringData:\n  password: \"hunter22secret\n";
+    let error = parse_manifest(manifest).unwrap_err().to_string();
+    assert!(!error.contains("hunter22secret"), "{error}");
+    assert!(error.contains("not valid YAML"), "{error}");
 }
