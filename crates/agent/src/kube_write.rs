@@ -26,6 +26,13 @@ use crate::{security::ConfirmDecision, ToolDef};
 /// Longest diff shown in the confirmation window, in lines.
 pub const MAX_DIFF_LINES: usize = 80;
 
+/// Most objects one `k8s_apply` takes: the confirmation window does not
+/// scroll, and every object must be visible before approval (#640).
+pub const MAX_APPLY_OBJECTS: usize = 20;
+
+/// Most object names the feed's command line lists; the rest are counted.
+const MAX_DISPLAY_OBJECTS: usize = 5;
+
 /// Diff lines of all objects of one apply together in the window.
 const MAX_APPLY_DIFF_LINES: usize = 160;
 
@@ -129,8 +136,9 @@ impl KubeWriteCall {
                 // Kinds and names only: values may be Secret data.
                 let objects = filar_transport::parse_manifest(manifest)
                     .map(|objects| {
-                        objects
+                        let mut names = objects
                             .iter()
+                            .take(MAX_DISPLAY_OBJECTS)
                             .map(|object| {
                                 format!(
                                     "{}/{}",
@@ -139,7 +147,14 @@ impl KubeWriteCall {
                                 )
                             })
                             .collect::<Vec<_>>()
-                            .join(", ")
+                            .join(", ");
+                        if objects.len() > MAX_DISPLAY_OBJECTS {
+                            names.push_str(&format!(
+                                " and {} more",
+                                objects.len() - MAX_DISPLAY_OBJECTS
+                            ));
+                        }
+                        names
                     })
                     .unwrap_or_else(|_| "<manifest>".into());
                 match namespace {
@@ -277,7 +292,13 @@ pub fn parse_kube_write_call(
                 .and_then(Value::as_str)
                 .filter(|manifest| !manifest.trim().is_empty())
                 .ok_or_else(|| CoreError::Other("missing required argument manifest".into()))?;
-            filar_transport::parse_manifest(manifest)?;
+            let objects = filar_transport::parse_manifest(manifest)?;
+            if objects.len() > MAX_APPLY_OBJECTS {
+                return Err(CoreError::Other(format!(
+                    "the manifest has {} objects; one k8s_apply takes at most {MAX_APPLY_OBJECTS}, so the confirmation window can show every one — split it into several calls",
+                    objects.len()
+                )));
+            }
             Ok(KubeWriteCall::Apply {
                 manifest: manifest.to_string(),
                 namespace: default_namespace.map(str::to_owned),
@@ -589,11 +610,24 @@ fn key_state(state: SecretKeyState) -> &'static str {
 
 /// The objects of an apply, one line each, before their diffs: a long
 /// manifest is first seen as a list.
+/// One line per object, before any diff: even when diffs do not fit the
+/// window, every object and every Secret key change is seen before approval.
 fn applied_list(objects: &[AppliedObject]) -> String {
     let mut text = format!("apply {} object(s):\n", objects.len());
     for object in objects {
+        let keys = object
+            .secret_keys
+            .iter()
+            .filter(|key| key.state != SecretKeyState::Unchanged)
+            .map(|key| format!("{} {}", key.key, key_state(key.state)))
+            .collect::<Vec<_>>();
+        let keys = if keys.is_empty() {
+            String::new()
+        } else {
+            format!(" (keys: {})", keys.join(", "))
+        };
         text.push_str(&format!(
-            "  {} {}\n",
+            "  {} {}{keys}\n",
             object.action.as_str(),
             object_label(&object.object)
         ));
@@ -1009,6 +1043,66 @@ mod tests {
         assert!(error.to_string().contains("create a new pod"), "{error}");
         let other = explain_apply_error(CoreError::AccessDenied("forbidden".into()));
         assert_eq!(other.to_string(), "forbidden");
+    }
+
+    fn many_configmaps(count: usize) -> String {
+        (0..count)
+            .map(|i| format!("apiVersion: v1\nkind: ConfigMap\nmetadata: {{name: c{i}}}\n"))
+            .collect::<Vec<_>>()
+            .join("---\n")
+    }
+
+    #[test]
+    fn a_long_apply_is_counted_in_the_feed_and_capped_in_size() {
+        let call = KubeWriteCall::Apply {
+            manifest: many_configmaps(8),
+            namespace: Some("shop".into()),
+        };
+        assert_eq!(
+            call.display_command(),
+            "k8s_apply -n shop: ConfigMap/c0, ConfigMap/c1, ConfigMap/c2, ConfigMap/c3, ConfigMap/c4 and 3 more"
+        );
+        let args = |count| json!({"manifest": many_configmaps(count)});
+        assert!(
+            parse_kube_write_call(TOOL_K8S_APPLY, &args(MAX_APPLY_OBJECTS), Some("shop")).is_ok()
+        );
+        let error =
+            parse_kube_write_call(TOOL_K8S_APPLY, &args(MAX_APPLY_OBJECTS + 1), Some("shop"))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("split it"), "{error}");
+    }
+
+    #[test]
+    fn the_object_list_carries_secret_key_changes_before_any_diff() {
+        let secret = AppliedObject {
+            object: ObjectRef {
+                api_version: "v1".into(),
+                kind: "Secret".into(),
+                namespace: Some("shop".into()),
+                name: "db".into(),
+            },
+            action: filar_transport::ApplyAction::Configured,
+            live: None,
+            result: json!({}),
+            secret_keys: vec![
+                filar_transport::SecretKeyChange {
+                    key: "password".into(),
+                    state: SecretKeyState::Changed,
+                },
+                filar_transport::SecretKeyChange {
+                    key: "user".into(),
+                    state: SecretKeyState::Unchanged,
+                },
+            ],
+            status_is_content: false,
+        };
+        let list = applied_list(&[secret]);
+        assert!(
+            list.contains("configured Secret shop/db (keys: password value changed)"),
+            "{list}"
+        );
+        assert!(!list.contains("user"), "{list}");
     }
 }
 
