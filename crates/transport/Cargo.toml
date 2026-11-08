@@ -9,7 +9,7 @@ license.workspace = true
 # Enabled by default for TUI/desktop; disabled for bot/mobile (SSH-only).
 default = ["local", "kube"]
 local = ["dep:portable-pty"]
-kube = ["dep:kube", "dep:k8s-openapi", "dep:serde", "dep:serde_json", "dep:serde-saphyr"]
+kube = ["dep:kube", "dep:k8s-openapi", "dep:serde", "dep:serde_json", "dep:serde-saphyr", "dep:x509-cert"]
 
 [dependencies]
 filar-core = { workspace = true }
@@ -32,6 +32,9 @@ serde_json = { workspace = true, optional = true }
 # Multi-document YAML manifests for ClusterWriteApi::apply (#638); already in
 # the tree through kube-client.
 serde-saphyr = { version = "0.0.29", optional = true }
+# The public part of a TLS Secret's certificate (#646): subject, SAN, issuer,
+# validity. Its der/spki/const-oid are already in the tree.
+x509-cert = { version = "0.3", optional = true, default-features = false, features = ["pem"] }
 
 [dev-dependencies]
 # Integration tests in `tests/` do not inherit the regular dependencies, and

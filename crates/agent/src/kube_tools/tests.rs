@@ -27,6 +27,10 @@ pub(crate) struct MockCluster {
     pub(crate) workload_reads: Mutex<std::collections::VecDeque<Vec<WorkloadInfo>>>,
     /// When set, `list_workloads` is refused by RBAC.
     pub(crate) workloads_denied: bool,
+    /// Secret metadata (#646); `secrets_denied` answers like RBAC.
+    secrets: Vec<filar_transport::SecretInfo>,
+    secrets_denied: bool,
+    secret_refs: Vec<filar_transport::SecretRef>,
 }
 
 impl MockCluster {
@@ -140,6 +144,32 @@ impl ClusterApi for MockCluster {
     async fn namespaces(&self) -> Result<Vec<NamespaceInfo>> {
         Ok(vec![])
     }
+
+    async fn list_secrets(&self, _: Option<&str>) -> Result<Vec<filar_transport::SecretInfo>> {
+        if self.secrets_denied {
+            return Err(CoreError::AccessDenied(
+                "нет права list на secrets в namespace shop (контекст prod-eu-admin)".into(),
+            ));
+        }
+        Ok(self.secrets.clone())
+    }
+
+    async fn get_secret(&self, _: &str, name: &str) -> Result<filar_transport::SecretInfo> {
+        if self.secrets_denied {
+            return Err(CoreError::AccessDenied(
+                "нет права get на secrets в namespace shop (контекст prod-eu-admin)".into(),
+            ));
+        }
+        self.secrets
+            .iter()
+            .find(|s| s.name == name)
+            .cloned()
+            .ok_or_else(|| CoreError::NotFound(format!("secret {name} not found")))
+    }
+
+    async fn pod_secret_refs(&self, _: &str, _: &str) -> Result<Vec<filar_transport::SecretRef>> {
+        Ok(self.secret_refs.clone())
+    }
 }
 
 pub(crate) fn target() -> KubeCluster {
@@ -200,7 +230,7 @@ pub(crate) fn executor(cluster: MockCluster) -> KubeToolExecutor {
 }
 
 #[test]
-fn exposes_exactly_seven_read_only_tools_without_secret() {
+fn exposes_exactly_seven_read_only_tools_with_secret_metadata() {
     let defs = kube_tool_definitions(CommandConfirmMode::Always);
     assert_eq!(defs.len(), 7);
     assert_eq!(
@@ -217,7 +247,9 @@ fn exposes_exactly_seven_read_only_tools_without_secret() {
     );
     let schema =
         serde_json::to_string(&defs.iter().map(|def| &def.parameters).collect::<Vec<_>>()).unwrap();
-    assert!(!schema.contains("\"Secret\""));
+    // Secret is a kind, as metadata only (#646).
+    assert!(schema.contains("\"Secret\""));
+    assert!(schema.contains("never values"));
     assert!(!defs
         .iter()
         .any(|def| def.description.contains("kubectl describe")
@@ -323,10 +355,11 @@ fn pod_http_get_outside_diagnostic_paths_is_asked_in_every_mode() {
 }
 
 #[test]
-fn parsing_enforces_bounds_and_rejects_secret() {
+fn parsing_enforces_bounds_and_takes_secret_as_metadata() {
     let error =
-        parse_kube_tool_call(TOOL_K8S_GET, &json!({"kind": "Secret"}), Some("shop")).unwrap_err();
+        parse_kube_tool_call(TOOL_K8S_GET, &json!({"kind": "Gizmo"}), Some("shop")).unwrap_err();
     assert!(error.to_string().contains("unsupported Kubernetes kind"));
+    assert!(parse_kube_tool_call(TOOL_K8S_GET, &json!({"kind": "secrets"}), Some("shop")).is_ok());
     assert!(
         parse_kube_tool_call(TOOL_K8S_GET, &json!({"kind": "ingresses"}), Some("shop")).is_ok()
     );
@@ -372,7 +405,7 @@ fn prompt_matches_capabilities_and_eval_snapshot() {
         "previous=true",
         "OOMKilled",
         "cannot change",
-        "Secrets are unavailable",
+        "Secrets are visible only as metadata",
         "Environment variable values",
     ] {
         assert!(read_only.contains(expected), "missing {expected:?}: {read_only}");
@@ -649,3 +682,102 @@ fn pod_http_get_is_a_kube_tool_and_never_a_fleet_call() {
     });
     assert!(bind_fleet_call(&call, &member).is_err());
 }
+
+// ── Secret metadata (#646) ───────────────────────────────────────────────
+
+fn db_secret() -> filar_transport::SecretInfo {
+    filar_transport::SecretInfo {
+        namespace: "shop".into(),
+        name: "db-creds".into(),
+        type_: "Opaque".into(),
+        keys: vec![
+            filar_transport::SecretKeyInfo { name: "PASSWORD".into(), bytes: 24 },
+            filar_transport::SecretKeyInfo { name: "USER".into(), bytes: 5 },
+        ],
+        age_seconds: Some(3600),
+        created: Some("2026-11-01T10:00:00Z".into()),
+        last_modified: Some("2026-11-07T09:00:00Z".into()),
+        labels: BTreeMap::new(),
+        annotations: BTreeMap::new(),
+        owners: vec![],
+        immutable: false,
+        tls: None,
+    }
+}
+
+fn tls_secret() -> filar_transport::SecretInfo {
+    filar_transport::SecretInfo {
+        name: "shop-tls".into(),
+        type_: "kubernetes.io/tls".into(),
+        keys: vec![
+            filar_transport::SecretKeyInfo { name: "tls.crt".into(), bytes: 700 },
+            filar_transport::SecretKeyInfo { name: "tls.key".into(), bytes: 241 },
+        ],
+        owners: vec!["Certificate shop-tls".into()],
+        tls: Some(filar_transport::TlsCertificateInfo {
+            subject: "CN=shop.example.com".into(),
+            sans: vec!["DNS:shop.example.com".into()],
+            issuer: "CN=R11,O=Let's Encrypt".into(),
+            not_before: "2026-09-01T00:00:00Z".into(),
+            not_after: "2026-11-20T00:00:00Z".into(),
+            seconds_left: 12 * 24 * 3600,
+            seconds_to_start: -60 * 24 * 3600,
+        }),
+        ..db_secret()
+    }
+}
+
+#[tokio::test]
+async fn secrets_are_listed_and_described_as_metadata() {
+    let executor = executor(MockCluster {
+        secrets: vec![db_secret(), tls_secret()],
+        ..MockCluster::default()
+    });
+    let get = parse_kube_tool_call(TOOL_K8S_GET, &json!({"kind": "Secret"}), Some("shop")).unwrap();
+    let table = executor.execute(&get).await.unwrap().content;
+    assert!(table.contains("db-creds") && table.contains("PASSWORD (24 B), USER (5 B)"), "{table}");
+    assert!(table.contains("expires within 30 days, until 2026-11-20T00:00:00Z"), "{table}");
+    let describe = parse_kube_tool_call(TOOL_K8S_DESCRIBE, &json!({"kind": "Secret", "name": "shop-tls"}), Some("shop")).unwrap();
+    let object = executor.execute(&describe).await.unwrap().content;
+    for expected in ["CN=shop.example.com", "Let's Encrypt", "Certificate shop-tls", "tls.key", "never shown"] {
+        assert!(object.contains(expected), "{expected}: {object}");
+    }
+}
+
+#[tokio::test]
+async fn a_pod_describe_marks_a_missing_secret_key() {
+    let executor = executor(MockCluster {
+        pods: vec![pod("web-1")],
+        secrets: vec![db_secret()],
+        secret_refs: vec![
+            filar_transport::SecretRef { secret: "db-creds".into(), key: Some("password".into()), via: "env DB_PASSWORD (container main)".into(), optional: false },
+            filar_transport::SecretRef { secret: "db-creds".into(), key: Some("USER".into()), via: "env DB_USER (container main)".into(), optional: false },
+            filar_transport::SecretRef { secret: "registry".into(), key: None, via: "imagePullSecrets".into(), optional: false },
+        ],
+        ..MockCluster::default()
+    });
+    let describe = parse_kube_tool_call(TOOL_K8S_DESCRIBE, &json!({"kind": "Pod", "name": "web-1"}), Some("shop")).unwrap();
+    let object = executor.execute(&describe).await.unwrap().content;
+    assert!(object.contains("key not found (keys: PASSWORD, USER)"), "{object}");
+    assert!(object.contains("\"status\": \"ok\""), "{object}");
+    assert!(object.contains("secret not found"), "{object}");
+}
+
+#[tokio::test]
+async fn no_access_to_secrets_is_an_rbac_message_and_nothing_else_breaks() {
+    let executor = executor(MockCluster {
+        pods: vec![pod("web-1")],
+        secrets_denied: true,
+        secret_refs: vec![filar_transport::SecretRef { secret: "db-creds".into(), key: Some("PASSWORD".into()), via: "env DB_PASSWORD (container main)".into(), optional: false }],
+        ..MockCluster::default()
+    });
+    let get = parse_kube_tool_call(TOOL_K8S_GET, &json!({"kind": "Secret"}), Some("shop")).unwrap();
+    let error = executor.execute(&get).await.unwrap_err().to_string();
+    assert!(error.contains("нет права list на secrets в namespace shop"), "{error}");
+    let pods = parse_kube_tool_call(TOOL_K8S_GET, &json!({"kind": "Pod"}), Some("shop")).unwrap();
+    assert!(executor.execute(&pods).await.is_ok());
+    let describe = parse_kube_tool_call(TOOL_K8S_DESCRIBE, &json!({"kind": "Pod", "name": "web-1"}), Some("shop")).unwrap();
+    let object = executor.execute(&describe).await.unwrap().content;
+    assert!(object.contains("unknown: no access to secrets"), "{object}");
+}
+

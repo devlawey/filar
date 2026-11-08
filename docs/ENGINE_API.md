@@ -47,9 +47,13 @@ filar-transport = { git = "https://github.com/devlawey/filar", default-features 
 
 With the `kube` feature, `KubeClusterApi::connect(&KubeCluster)` implements
 `ClusterApi`. It reads pods, events, bounded logs, workloads, rollout history,
-nodes, metrics, Services, Endpoints, Ingresses, ConfigMaps and namespaces. The
-public result types do not expose `kube-rs`; `CommandExecutor` is unchanged.
-There are no write methods and no method can read a Kubernetes `Secret`.
+nodes, metrics, Services, Endpoints, Ingresses, ConfigMaps, namespaces and
+Secret metadata. The public result types do not expose `kube-rs`;
+`CommandExecutor` is unchanged. `list_secrets` / `get_secret` read a Secret
+from the API but return only `SecretInfo` — keys, sizes, type, metadata and,
+for a `kubernetes.io/tls` Secret, the certificate's public details: no type
+has a field for a value (#646). Writes are a separate trait,
+`ClusterWriteApi` (#638).
 
 The connection always uses the context named by the target, never the
 kubeconfig's `current-context`. Lists return at most 500 objects and do not
@@ -142,7 +146,7 @@ Log output first uses `filar_core::redact_secrets`, then masks bearer tokens and
 URL userinfo. `KubeCluster::reveal_configmaps` (`namespace/name`) and
 `KubeCluster::reveal_env` (`namespace/pod/VARIABLE`, Pod objects only) are
 narrow, explicit exceptions; revealed values carry the visible
-`«раскрыто настройкой»` marker. No exception enables Kubernetes Secret reads.
+`«раскрыто настройкой»` marker. No exception reveals Kubernetes Secret values.
 
 `From<ConfigMapInfo>` and `From<PodLogs>` adapt the corresponding `ClusterApi`
 results to this boundary. The transport remains independent of the agent's
@@ -155,7 +159,8 @@ objects or logs directly.
 `filar_agent::kube_tool_definitions(mode)` returns the six cluster-tab tools:
 `k8s_get`, `k8s_describe`, `k8s_logs`, `k8s_events`, `k8s_top` and
 `k8s_rollout_history`. They accept only the fixed resource list exposed by
-`KubeResourceKind`; there is no Secret kind and no mutation tool. Parse a model
+`KubeResourceKind`; its Secret kind shows metadata only, and mutation goes
+through the separate write tools (`kube_write_tool_definitions`). Parse a model
 call with `parse_kube_tool_call`, apply `kube_call_confirmation_decision`
 (call, mode, cluster, tag policies) and show
 `KubeToolCall::confirmation_context` when approval is required, then pass the
@@ -829,6 +834,7 @@ let _agent = builder.log_sources(sources);
 | `ClusterWriteApi` (apply, scale, rollout restart/undo, delete; every method with `dry_run`), `KubeClusterApi` implements it; `ObjectKind`, `ObjectRef`, `AppliedObject`/`ApplyAction`, `SecretKeyChange`/`SecretKeyState`, `ScaleKind`/`ScaleOutcome`, `RestartKind`, `WriteOutcome`, `UndoOutcome`, `DeleteTarget`/`DeleteOptions`/`Propagation`/`DeleteOutcome`/`DeletedObject`, `parse_manifest`, `hide_secret_values`, `SECRET_HIDDEN`, `FIELD_MANAGER` (#638) | Nothing — additive; `ClusterApi` is unchanged and stays read-only | Writes go through `ClusterWriteApi` behind your own confirmation gate; never hand it to fleets or read-only paths. Objects the write methods return never carry `Secret` values and submitted values in server errors are masked; `parse_manifest` returns your manifest as given, values included |
 | `AgentEvent::ClusterChanged`, `KubeAgent::cluster_writer`, `filar_agent::kube_write` (`KubeWriteCall`, `kube_write_confirmation_decision`, `preview`, `execute`, `diff`, `trace_line`), `build_kube_write_system_prompt`, `WritePreview::pin`, `AppliedObject::status_is_content` (#639) | `AgentEvent` is `#[non_exhaustive]`: nothing for matches with a wildcard. `AppliedObject` gains `status_is_content`: struct literals of it need the field | Pass `cluster_writer(Some(api))` to a cluster tab that may write; show `ClusterChanged` traces in your feed. Every write is dry-run and confirmed in every mode |
 | `DeletedObject::live`, `DeletionImpact` (with `contents_incomplete`), `ClusterWriteApi::deletion_impact` (default: nothing known), `WritePreview::cluster_scoped` (#642) | Struct literals of `DeletedObject` need `live`; of `WritePreview`, `cluster_scoped` | Add `live: None`; implement `deletion_impact` only if your API can read what a delete takes with it |
+| `SecretInfo`, `SecretKeyInfo`, `TlsCertificateInfo`, `SecretRef`, `parse_certificate`; `ClusterApi::list_secrets` / `get_secret` (default `Unsupported`) / `pod_secret_refs` (default empty); `KubeResourceKind::Secret` (#646) | Exhaustive `match` on `KubeResourceKind` needs the `Secret` arm; other `ClusterApi` implementations compile unchanged | Add the arm; implement the secret methods only if your API can read Secrets — and never return values |
 | `filar_core::LogSourceConfig`/`LogSourceKind`/`LogAuth`, new field `Config::log_sources`; `filar_agent::logs` (`LogSource`, `LogSources`, `build_log_sources`, tool `query_logs`), `AgentBuilder::log_sources`, `KubeAgent::log_sources` (#579) | `Config` literals without `..Default::default()` need `log_sources` | Add `log_sources: Vec::new()`; opt in with `build_log_sources` |
 | New `LogSourceConfig` fields `time_field`, `fields`, `ca_file`, `k8s_fields`; `K8sFieldPreset`/`K8sFields` and the OpenSearch/Elasticsearch adapter (#581) | `LogSourceConfig` literals without `..Default::default()` need the new fields | Use `..Default::default()` or populate the fields; private CAs are added to verification, never used to disable it |
 | `LogResult::series` and `LogSeries` for Loki metric queries (#582) | `LogResult` literals need `series`; `LogResult` no longer implements `Eq` because series contain `f64` | Add `series: Vec::new()` or `..Default::default()`; use approximate comparison for metric values |

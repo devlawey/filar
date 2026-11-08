@@ -639,6 +639,8 @@ pub(crate) mod tests {
         no_metrics: std::sync::atomic::AtomicBool,
         /// `list_events` answers 404, like an API without `events` (#645).
         no_events: std::sync::atomic::AtomicBool,
+        /// Secret metadata of this cluster (#646).
+        secrets: Mutex<Vec<filar_transport::SecretInfo>>,
     }
 
     struct Active<'a>(&'a AtomicUsize);
@@ -786,6 +788,13 @@ pub(crate) mod tests {
 
         async fn list_configmaps(&self, _: Option<&str>) -> Result<Vec<ConfigMapInfo>> {
             Ok(Vec::new())
+        }
+
+        async fn list_secrets(
+            &self,
+            _: Option<&str>,
+        ) -> Result<Vec<filar_transport::SecretInfo>> {
+            Ok(self.secrets.lock().unwrap_or_else(|p| p.into_inner()).clone())
         }
 
         async fn namespaces(&self) -> Result<Vec<NamespaceInfo>> {
@@ -1056,6 +1065,46 @@ pub(crate) mod tests {
             "{text}"
         );
         assert_eq!(report.folded().baseline().map(|group| group.len()), Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_fleet_compares_secret_metadata_and_sees_a_later_change() {
+        let secret = |modified: &str| filar_transport::SecretInfo {
+            namespace: "shop".into(),
+            name: "db-creds".into(),
+            type_: "Opaque".into(),
+            keys: vec![filar_transport::SecretKeyInfo {
+                name: "PASSWORD".into(),
+                bytes: 24,
+            }],
+            age_seconds: None,
+            created: Some("2026-11-01T10:00:00Z".into()),
+            last_modified: Some(modified.into()),
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            owners: vec![],
+            immutable: false,
+            tls: None,
+        };
+        let (eu, eu_mock) = cluster("prod-eu", vec![]);
+        let (us, us_mock) = cluster("prod-us", vec![]);
+        *eu_mock.secrets.lock().unwrap() = vec![secret("2026-11-01T10:00:00Z")];
+        *us_mock.secrets.lock().unwrap() = vec![secret("2026-11-07T09:00:00Z")];
+        let fleet = KubeFleet::open(&group(&["prod-eu", "prod-us"], None), vec![eu, us])
+            .await
+            .expect("fleet opens");
+        let get = KubeToolCall::Get {
+            kind: KubeResourceKind::Secret,
+            namespace: Some("shop".into()),
+            label_selector: None,
+            field_selector: None,
+            limit: 50,
+        };
+        let report = run_approved(&fleet, &get).await;
+        let text = report.render();
+        assert!(text.contains("differs"), "{text}");
+        assert!(text.contains("2026-11-01T10:00:00Z") && text.contains("2026-11-07T09:00:00Z"), "the later change is visible: {text}");
+        assert!(text.contains("PASSWORD (24 B)"), "keys, not values: {text}");
     }
 
     #[tokio::test]

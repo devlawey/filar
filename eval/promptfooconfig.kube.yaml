@@ -8,8 +8,8 @@ prompts:
 maxConcurrency: 1
 
 # Manual mirror of filar_agent::kube_tool_definitions(Always) plus
-# kube_write_tool_definitions(Always). No Secret kind is exposed to the
-# model for reading.
+# kube_write_tool_definitions(Always). Secret is readable as metadata only
+# (#646): keys, type, TLS dates, never values.
 tools: &kube_tools
   - type: function
     function:
@@ -18,7 +18,7 @@ tools: &kube_tools
       parameters:
         type: object
         properties:
-          kind: { type: string, enum: [Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob, Node, Service, Endpoints, Ingress, ConfigMap, Namespace] }
+          kind: { type: string, enum: [Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob, Node, Service, Endpoints, Ingress, ConfigMap, Namespace, Secret] }
           namespace: { type: string }
           label_selector: { type: string }
           field_selector: { type: string }
@@ -33,7 +33,7 @@ tools: &kube_tools
       parameters:
         type: object
         properties:
-          kind: { type: string, enum: [Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob, Node, Service, Endpoints, Ingress, ConfigMap, Namespace] }
+          kind: { type: string, enum: [Pod, Deployment, StatefulSet, DaemonSet, ReplicaSet, Job, CronJob, Node, Service, Endpoints, Ingress, ConfigMap, Namespace, Secret] }
           namespace: { type: string }
           name: { type: string }
           event_limit: { type: integer, minimum: 1, maximum: 100, default: 50 }

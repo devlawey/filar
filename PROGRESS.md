@@ -12603,3 +12603,54 @@ dry run, ответивший голым `Status`, дочитывает объе
 цели, и проверено, что реальное удаление идёт по `Names`.
 
 **Next.** #646 — метаданные Secret.
+
+## Issue #646: метаданные Kubernetes Secret без значений (веха 3.0.5)
+
+**Сделано.** Транспорт: модуль `cluster/secret.rs` — `SecretInfo` (тип,
+ключи с размером, возраст, создание, последнее изменение по `managedFields`,
+метки, аннотации без last-applied, владельцы, `immutable`, TLS) без единого
+поля для значения; `secret_info` отрезает значения сразу после ответа API.
+`parse_certificate` разбирает `tls.crt` (PEM или DER) через `x509-cert` 0.3:
+субъект, SAN (DNS, IP), издатель, `notBefore`/`notAfter`, секунды до конца;
+`tls.key` не трогается. `pod_secret_refs` — ссылки пода на секреты (env,
+envFrom, тома, projected, `imagePullSecrets`). `ClusterApi` получил
+`list_secrets`, `get_secret` (по умолчанию `Unsupported`) и
+`pod_secret_refs` (по умолчанию пусто) — существующие реализации не ломаются.
+
+Агент: `KubeResourceKind::Secret` для `k8s_get` и `k8s_describe`; таблица
+NAMESPACE / NAME / TYPE / KEYS / LAST CHANGE / TLS; describe секрета — объект
+метаданных с `"values": "never shown"`; describe пода — `secretRefs` со
+статусом `ok` / `secret not found` / `key not found (keys: …)` / `unknown: no
+access to secrets`. Промпты (вкладка, запись, флот) и описание `kind`: Secret
+— только метаданные, значения не спрашивать и не подбирать. Eval: `Secret`
+в перечне видов, снимок промпта обновлён.
+
+**Решения.**
+- Новые методы `ClusterApi` с реализациями по умолчанию, а не поле в
+  `PodInfo`: ни один встраивающий `ClusterApi` и ни один литерал `PodInfo` не
+  ломается. `KubeResourceKind` получил вариант — исчерпывающий `match`
+  встраивающего его заметит (см. `docs/ENGINE_API.md`).
+- Новая зависимость `x509-cert` (+ `der_derive`, `flagset`); `der`, `spki`,
+  `const-oid` уже были в дереве.
+- Фикстура `testdata/shop-tls.crt` — только сертификат; приватного ключа в
+  репозитории нет, тест подставляет заглушку.
+
+**Проверено.** Бинарник в tmux против фейкового API: под web-2 в
+`CreateContainerConfigError` с `secretKeyRef` на ключ `password`, в секрете
+`db-creds` ключи `PASSWORD` и `USER` → `k8s_describe` пода, в экспорте
+`Ctrl+S` — `"status": "key not found (keys: PASSWORD, USER)"`; ни одного
+значения секрета (ни base64, ни открытого) в экспорте нет.
+
+**Ревью (CodeRabbit, первое и единственное).** Сертификат разбирается
+только у Secret типа `kubernetes.io/tls`; из PEM-цепочки берётся первый
+(leaf); статус «not yet valid» по `notBefore` (`seconds_to_start`);
+ссылки ищутся и в эфемерных контейнерах, а projected-том даёт ссылку на
+каждый запрошенный ключ. В describe пода проверка ссылок на Secret идёт в
+общем бюджете 10 с (непроверенные — «unknown: not checked»), а сбой чтения
+ссылок виден как «Secret references not inspected»; во флоте сравнение
+describe пода получило колонку SECRETS, поэтому член флота с отсутствующим
+ключом не сворачивается в «одинаковые». ENGINE_API: обзор больше не
+говорит, что Secret не читаются. Отклонено как ложное срабатывание ai-review:
+`Time::to_unix_duration` в x509-cert 0.3 возвращает `Duration`.
+
+**Next.** Релиз 3.0.5 после мержа серии #638–#642, #646.

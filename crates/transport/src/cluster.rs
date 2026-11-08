@@ -2,8 +2,9 @@
 //! access [`ClusterWriteApi`] (#638).
 //!
 //! The public surface deliberately contains no Kubernetes client types.
-//! `ClusterApi` has no write operations and no method that can request a
-//! `Secret`; fleets and read-only paths get only it. Writes live behind
+//! `ClusterApi` has no write operations, and it reads a `Secret` only as
+//! metadata ([`SecretInfo`], #646) — no value leaves the transport; fleets
+//! and read-only paths get only it. Writes live behind
 //! `ClusterWriteApi`, which never returns `Secret` values. Enable the crate
 //! feature `kube` to use this module.
 
@@ -18,9 +19,11 @@ mod debug;
 mod exec;
 mod no_proxy;
 mod http;
+mod secret;
 mod write;
 
 pub use client::KubeClusterApi;
+pub use secret::{parse_certificate, SecretInfo, SecretKeyInfo, SecretRef, TlsCertificateInfo};
 pub use write::{
     hide_secret_values, parse_manifest, AppliedObject, ApplyAction, ClusterWriteApi,
     DeleteOptions, DeleteOutcome, DeleteTarget, DeletedObject, DeletionImpact, ObjectKind, ObjectRef,
@@ -348,7 +351,7 @@ pub struct IngressInfo {
 /// ConfigMap metadata and non-Secret payload.
 ///
 /// Callers displaying `data` must apply the project's ConfigMap redaction
-/// policy. `ClusterApi` never reads Kubernetes `Secret` objects.
+/// policy. Kubernetes `Secret` objects are read only as [`SecretInfo`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigMapInfo {
     /// ConfigMap namespace.
@@ -455,6 +458,30 @@ pub trait ClusterApi: Send + Sync {
 
     /// List ConfigMaps. Their data still requires output redaction.
     async fn list_configmaps(&self, namespace: Option<&str>) -> Result<Vec<ConfigMapInfo>>;
+
+    /// List Secrets as metadata only (#646): [`SecretInfo`] has no field
+    /// for a value. The default is `Unsupported`.
+    async fn list_secrets(&self, namespace: Option<&str>) -> Result<Vec<SecretInfo>> {
+        let _ = namespace;
+        Err(filar_core::CoreError::Unavailable(
+            "Secret metadata is not supported by this cluster API".into(),
+        ))
+    }
+
+    /// One Secret as metadata only (#646). The default is `Unsupported`.
+    async fn get_secret(&self, namespace: &str, name: &str) -> Result<SecretInfo> {
+        let _ = (namespace, name);
+        Err(filar_core::CoreError::Unavailable(
+            "Secret metadata is not supported by this cluster API".into(),
+        ))
+    }
+
+    /// The Secrets a pod's spec refers to — env, envFrom, volumes,
+    /// `imagePullSecrets` (#646). The default knows none.
+    async fn pod_secret_refs(&self, namespace: &str, pod: &str) -> Result<Vec<SecretRef>> {
+        let _ = (namespace, pod);
+        Ok(Vec::new())
+    }
 
     /// List namespaces, falling back to configured names under namespace RBAC.
     async fn namespaces(&self) -> Result<Vec<NamespaceInfo>>;

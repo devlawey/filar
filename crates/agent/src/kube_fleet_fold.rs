@@ -30,7 +30,7 @@ pub const GET_POD_COMMAND: &str = "k8s_get pod";
 /// The command a pod fleet's `k8s_top pods` folds under.
 pub const TOP_PODS_COMMAND: &str = "k8s_top pods";
 
-const DESCRIBE_COLUMNS: [&str; 10] = [
+const DESCRIBE_COLUMNS: [&str; 11] = [
     "CONTAINER",
     "IMAGE",
     "CPU REQUEST",
@@ -41,6 +41,7 @@ const DESCRIBE_COLUMNS: [&str; 10] = [
     "READY",
     "RESTARTS",
     "LAST REASON",
+    "SECRETS",
 ];
 const GET_COLUMNS: [&str; 8] = [
     "NAMESPACE",
@@ -192,6 +193,30 @@ impl OutputPreprocessor for DescribePod {
             field("/restarts"),
             field("/lastTermination/reason"),
         );
+        // Secret references that are not fine (#646): a missing key on one
+        // member must not fold into "identical".
+        let secrets = match pod.get("secretRefs").and_then(Value::as_array) {
+            None => "-".to_string(),
+            Some(refs) => {
+                let bad: Vec<String> = refs
+                    .iter()
+                    .filter(|r| r.get("status").and_then(Value::as_str) != Some("ok"))
+                    .map(|r| {
+                        let secret = r.get("secret").and_then(Value::as_str).unwrap_or("-");
+                        let status = r.get("status").and_then(Value::as_str).unwrap_or("-");
+                        match r.get("key").and_then(Value::as_str) {
+                            Some(key) => format!("{secret}/{key}: {status}"),
+                            None => format!("{secret}: {status}"),
+                        }
+                    })
+                    .collect();
+                if bad.is_empty() {
+                    "ok".to_string()
+                } else {
+                    bad.join("; ")
+                }
+            }
+        };
         let containers = pod
             .get("containers")
             .and_then(Value::as_array)
@@ -216,6 +241,7 @@ impl OutputPreprocessor for DescribePod {
                     ready.clone(),
                     restarts.clone(),
                     reason.clone(),
+                    secrets.clone(),
                 ]
             })
             .collect::<Vec<_>>();
@@ -279,6 +305,32 @@ mod tests {
         assert_eq!(
             error_reason(&CoreError::Other("admission webhook canceled the request".into())).as_deref(),
             Some("Kubernetes API request failed")
+        );
+    }
+
+    #[test]
+    fn a_secret_reference_problem_keeps_members_apart() {
+        let describe = |refs: &str| {
+            format!(
+                "Object (Pod):\n{{\"containers\":[{{\"name\":\"main\"}}],\"secretRefs\":{refs}}}\n\nEvents:\nTYPE"
+            )
+        };
+        let fine = DescribePod
+            .preprocess(
+                DESCRIBE_POD_COMMAND,
+                &describe(r#"[{"secret":"db","key":"password","status":"ok"}]"#),
+            )
+            .unwrap();
+        let broken = DescribePod
+            .preprocess(
+                DESCRIBE_POD_COMMAND,
+                &describe(r#"[{"secret":"db","key":"password","status":"key not found (keys: user)"}]"#),
+            )
+            .unwrap();
+        assert_ne!(format!("{fine:?}"), format!("{broken:?}"));
+        assert!(
+            format!("{broken:?}").contains("db/password: key not found"),
+            "{broken:?}"
         );
     }
 }
