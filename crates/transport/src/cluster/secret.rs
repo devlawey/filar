@@ -40,12 +40,16 @@ pub struct TlsCertificateInfo {
     pub not_after: String,
     /// Seconds until `notAfter`; negative when expired.
     pub seconds_left: i64,
+    /// Seconds until `notBefore`; positive while not yet valid.
+    pub seconds_to_start: i64,
 }
 
 impl TlsCertificateInfo {
-    /// Expired, or expiring within 30 days.
+    /// Not yet valid, expired, or expiring within 30 days.
     pub fn status(&self) -> &'static str {
-        if self.seconds_left < 0 {
+        if self.seconds_to_start > 0 {
+            "not yet valid"
+        } else if self.seconds_left < 0 {
             "expired"
         } else if self.seconds_left < 30 * 24 * 3600 {
             "expires within 30 days"
@@ -108,7 +112,9 @@ pub(super) fn secret_info(secret: Secret) -> SecretInfo {
     if let Some(data) = &secret.data {
         for (key, value) in data {
             keys.insert(key.clone(), value.0.len());
-            if key == "tls.crt" {
+            // Only a TLS Secret's certificate is metadata; an Opaque Secret
+            // keeps whatever it holds under `tls.crt` to itself.
+            if key == "tls.crt" && secret.type_.as_deref() == Some("kubernetes.io/tls") {
                 tls = parse_certificate(&value.0);
             }
         }
@@ -160,10 +166,16 @@ pub(super) fn secret_info(secret: Secret) -> SecretInfo {
     }
 }
 
-/// Parse the first certificate of a PEM (or DER) `tls.crt`.
+/// Parse the first certificate of a PEM (or DER) `tls.crt` — the leaf of a
+/// bundle with intermediates.
 pub fn parse_certificate(bytes: &[u8]) -> Option<TlsCertificateInfo> {
     let certificate = Certificate::from_pem(bytes)
         .ok()
+        .or_else(|| {
+            Certificate::load_pem_chain(bytes)
+                .ok()
+                .and_then(|chain| chain.into_iter().next())
+        })
         .or_else(|| Certificate::from_der(bytes).ok())?;
     let tbs = certificate.tbs_certificate();
     let validity = tbs.validity();
@@ -203,6 +215,7 @@ pub fn parse_certificate(bytes: &[u8]) -> Option<TlsCertificateInfo> {
         not_before: rfc3339(not_before),
         not_after: rfc3339(not_after),
         seconds_left: not_after - now,
+        seconds_to_start: not_before - now,
     })
 }
 
@@ -227,13 +240,22 @@ pub(super) fn pod_secret_refs(pod: &Pod) -> Vec<SecretRef> {
             optional: false,
         });
     }
+    // Ephemeral containers have the same env and envFrom (a debug container
+    // can depend on a Secret too).
     let containers = spec
         .init_containers
         .iter()
         .flatten()
-        .chain(spec.containers.iter());
-    for container in containers {
-        for env in container.env.iter().flatten() {
+        .chain(spec.containers.iter())
+        .map(|c| (&c.name, &c.env, &c.env_from))
+        .chain(
+            spec.ephemeral_containers
+                .iter()
+                .flatten()
+                .map(|c| (&c.name, &c.env, &c.env_from)),
+        );
+    for (container, env_vars, env_from) in containers {
+        for env in env_vars.iter().flatten() {
             if let Some(selector) = env
                 .value_from
                 .as_ref()
@@ -242,17 +264,17 @@ pub(super) fn pod_secret_refs(pod: &Pod) -> Vec<SecretRef> {
                 refs.push(SecretRef {
                     secret: selector.name.clone(),
                     key: Some(selector.key.clone()),
-                    via: format!("env {} (container {})", env.name, container.name),
+                    via: format!("env {} (container {container})", env.name),
                     optional: selector.optional.unwrap_or(false),
                 });
             }
         }
-        for from in container.env_from.iter().flatten() {
+        for from in env_from.iter().flatten() {
             if let Some(source) = from.secret_ref.as_ref() {
                 refs.push(SecretRef {
                     secret: source.name.clone(),
                     key: None,
-                    via: format!("envFrom (container {})", container.name),
+                    via: format!("envFrom (container {container})"),
                     optional: source.optional.unwrap_or(false),
                 });
             }
@@ -291,12 +313,32 @@ pub(super) fn pod_secret_refs(pod: &Pod) -> Vec<SecretRef> {
             .flat_map(|p| p.sources.iter().flatten())
         {
             if let Some(secret) = source.secret.as_ref() {
-                refs.push(SecretRef {
-                    secret: secret.name.clone(),
-                    key: None,
-                    via: format!("projected volume {}", volume.name),
-                    optional: secret.optional.unwrap_or(false),
-                });
+                // One reference per requested key, so a missing key shows.
+                let keys: Vec<String> = secret
+                    .items
+                    .iter()
+                    .flatten()
+                    .map(|item| item.key.clone())
+                    .collect();
+                let via = format!("projected volume {}", volume.name);
+                let optional = secret.optional.unwrap_or(false);
+                if keys.is_empty() {
+                    refs.push(SecretRef {
+                        secret: secret.name.clone(),
+                        key: None,
+                        via,
+                        optional,
+                    });
+                } else {
+                    for key in keys {
+                        refs.push(SecretRef {
+                            secret: secret.name.clone(),
+                            key: Some(key),
+                            via: via.clone(),
+                            optional,
+                        });
+                    }
+                }
             }
         }
     }
@@ -407,5 +449,59 @@ mod tests {
         assert_eq!(tls.status(), "expires within 30 days");
         tls.seconds_left = 90 * 24 * 3600;
         assert_eq!(tls.status(), "valid");
+    }
+
+    #[test]
+    fn only_a_tls_secret_shows_a_certificate() {
+        let opaque = secret_info(secret("Opaque", &[("tls.crt", CERT.as_bytes())]));
+        assert!(
+            opaque.tls.is_none(),
+            "an Opaque Secret keeps tls.crt to itself"
+        );
+        let tls = secret_info(secret("kubernetes.io/tls", &[("tls.crt", CERT.as_bytes())]));
+        assert!(tls.tls.is_some());
+    }
+
+    #[test]
+    fn the_leaf_of_a_pem_bundle_is_parsed() {
+        let bundle = format!("{CERT}\n{CERT}");
+        let info = parse_certificate(bundle.as_bytes()).expect("leaf of a bundle");
+        assert!(info.subject.contains("shop.example.com"), "{info:?}");
+    }
+
+    #[test]
+    fn a_certificate_not_yet_valid_says_so() {
+        let mut tls = parse_certificate(CERT.as_bytes()).unwrap();
+        tls.seconds_to_start = 3600;
+        tls.seconds_left = 90 * 24 * 3600;
+        assert_eq!(tls.status(), "not yet valid");
+    }
+
+    #[test]
+    fn projected_keys_and_ephemeral_containers_are_references() {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "web", "namespace": "shop"},
+            "spec": {
+                "containers": [{"name": "main", "image": "web:1"}],
+                "ephemeralContainers": [{"name": "debug", "image": "busybox",
+                    "env": [{"name": "TOKEN", "valueFrom": {"secretKeyRef": {"name": "api", "key": "token"}}}]}],
+                "volumes": [{"name": "creds", "projected": {"sources": [
+                    {"secret": {"name": "db", "items": [{"key": "password", "path": "pw"}]}}]}}]
+            }
+        }))
+        .unwrap();
+        let refs = pod_secret_refs(&pod);
+        assert!(
+            refs.iter().any(|r| r.secret == "api"
+                && r.key.as_deref() == Some("token")
+                && r.via.contains("container debug")),
+            "{refs:?}"
+        );
+        assert!(
+            refs.iter().any(|r| r.secret == "db"
+                && r.key.as_deref() == Some("password")
+                && r.via == "projected volume creds"),
+            "{refs:?}"
+        );
     }
 }

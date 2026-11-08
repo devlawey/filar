@@ -1438,20 +1438,36 @@ fn secret_object(o: SecretInfo) -> Value {
 
 /// How a pod's Secret references resolve (#646): `ok`, `secret not found`,
 /// `key not found`, or why it is unknown. Metadata only.
+/// Total time the Secret checks of one pod describe may take: the pod's own
+/// details are already read and must not be lost to slow Secret reads.
+const SECRET_REFS_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 async fn secret_ref_objects(api: &dyn ClusterApi, namespace: &str, pod: &str) -> Vec<Value> {
-    let Ok(refs) = api.pod_secret_refs(namespace, pod).await else {
-        return Vec::new();
+    let deadline = tokio::time::Instant::now() + SECRET_REFS_BUDGET;
+    let refs = match tokio::time::timeout_at(deadline, api.pod_secret_refs(namespace, pod)).await {
+        Ok(Ok(refs)) => refs,
+        // Say so: an empty list would read as "no Secret references".
+        Ok(Err(error)) => {
+            return vec![json!({"status": format!("unknown: Secret references not inspected ({error})")})]
+        }
+        Err(_) => {
+            return vec![json!({"status": "unknown: Secret references not inspected (timed out)"})]
+        }
     };
     let mut seen: std::collections::BTreeMap<String, std::result::Result<SecretInfo, String>> =
         std::collections::BTreeMap::new();
     let mut out = Vec::new();
     for reference in refs {
         if !seen.contains_key(&reference.secret) {
-            let found = match api.get_secret(namespace, &reference.secret).await {
-                Ok(info) => Ok(info),
-                Err(CoreError::NotFound(_)) => Err("secret not found".to_string()),
-                Err(CoreError::AccessDenied(_)) => Err("unknown: no access to secrets".to_string()),
-                Err(_) => Err("unknown: secret not readable".to_string()),
+            let read = tokio::time::timeout_at(deadline, api.get_secret(namespace, &reference.secret));
+            let found = match read.await {
+                Ok(Ok(info)) => Ok(info),
+                Ok(Err(CoreError::NotFound(_))) => Err("secret not found".to_string()),
+                Ok(Err(CoreError::AccessDenied(_))) => {
+                    Err("unknown: no access to secrets".to_string())
+                }
+                Ok(Err(_)) => Err("unknown: secret not readable".to_string()),
+                Err(_) => Err("unknown: not checked (time budget spent)".to_string()),
             };
             seen.insert(reference.secret.clone(), found);
         }

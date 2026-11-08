@@ -47,9 +47,13 @@ filar-transport = { git = "https://github.com/devlawey/filar", default-features 
 
 With the `kube` feature, `KubeClusterApi::connect(&KubeCluster)` implements
 `ClusterApi`. It reads pods, events, bounded logs, workloads, rollout history,
-nodes, metrics, Services, Endpoints, Ingresses, ConfigMaps and namespaces. The
-public result types do not expose `kube-rs`; `CommandExecutor` is unchanged.
-There are no write methods and no method can read a Kubernetes `Secret`.
+nodes, metrics, Services, Endpoints, Ingresses, ConfigMaps, namespaces and
+Secret metadata. The public result types do not expose `kube-rs`;
+`CommandExecutor` is unchanged. `list_secrets` / `get_secret` read a Secret
+from the API but return only `SecretInfo` — keys, sizes, type, metadata and,
+for a `kubernetes.io/tls` Secret, the certificate's public details: no type
+has a field for a value (#646). Writes are a separate trait,
+`ClusterWriteApi` (#638).
 
 The connection always uses the context named by the target, never the
 kubeconfig's `current-context`. Lists return at most 500 objects and do not
@@ -142,7 +146,7 @@ Log output first uses `filar_core::redact_secrets`, then masks bearer tokens and
 URL userinfo. `KubeCluster::reveal_configmaps` (`namespace/name`) and
 `KubeCluster::reveal_env` (`namespace/pod/VARIABLE`, Pod objects only) are
 narrow, explicit exceptions; revealed values carry the visible
-`«раскрыто настройкой»` marker. No exception enables Kubernetes Secret reads.
+`«раскрыто настройкой»` marker. No exception reveals Kubernetes Secret values.
 
 `From<ConfigMapInfo>` and `From<PodLogs>` adapt the corresponding `ClusterApi`
 results to this boundary. The transport remains independent of the agent's
@@ -155,7 +159,8 @@ objects or logs directly.
 `filar_agent::kube_tool_definitions(mode)` returns the six cluster-tab tools:
 `k8s_get`, `k8s_describe`, `k8s_logs`, `k8s_events`, `k8s_top` and
 `k8s_rollout_history`. They accept only the fixed resource list exposed by
-`KubeResourceKind`; there is no Secret kind and no mutation tool. Parse a model
+`KubeResourceKind`; its Secret kind shows metadata only, and mutation goes
+through the separate write tools (`kube_write_tool_definitions`). Parse a model
 call with `parse_kube_tool_call`, apply `kube_call_confirmation_decision`
 (call, mode, cluster, tag policies) and show
 `KubeToolCall::confirmation_context` when approval is required, then pass the

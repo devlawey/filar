@@ -721,6 +721,7 @@ fn tls_secret() -> filar_transport::SecretInfo {
             not_before: "2026-09-01T00:00:00Z".into(),
             not_after: "2026-11-20T00:00:00Z".into(),
             seconds_left: 12 * 24 * 3600,
+            seconds_to_start: -60 * 24 * 3600,
         }),
         ..db_secret()
     }
