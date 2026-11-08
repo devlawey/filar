@@ -862,7 +862,7 @@ impl KubeAgent {
                 proposal_id: crate::agent::next_proposal_id(),
                 command: display.clone(),
                 explanation: explanation.to_string(),
-                destructive: matches!(call, crate::KubeWriteCall::Delete { .. }),
+                destructive: call.is_destructive(),
                 tool,
             },
             call.namespace(),

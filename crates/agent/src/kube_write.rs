@@ -83,6 +83,15 @@ pub enum KubeWriteCall {
 }
 
 impl KubeWriteCall {
+    /// Destructive by the call alone: a delete, or scaling to 0. The dry
+    /// run can tell more (scaling an already-empty workload to 0 is not).
+    pub fn is_destructive(&self) -> bool {
+        matches!(
+            self,
+            Self::Delete { .. } | Self::Scale { replicas: 0, .. }
+        )
+    }
+
     /// The tool this call comes from.
     pub fn tool_name(&self) -> &'static str {
         match self {
@@ -820,5 +829,22 @@ mod tests {
             trace_line("configured Deployment shop/web", &target, "12:00:00"),
             "Изменение в кластере: configured Deployment shop/web (контекст prod-eu-admin, 12:00:00)"
         );
+    }
+}
+
+#[cfg(test)]
+mod destructive_tests {
+    use super::*;
+
+    #[test]
+    fn deletes_and_scaling_to_zero_are_destructive_by_the_call() {
+        let scale = |replicas| KubeWriteCall::Scale {
+            kind: ScaleKind::Deployment,
+            namespace: "shop".into(),
+            name: "web".into(),
+            replicas,
+        };
+        assert!(scale(0).is_destructive());
+        assert!(!scale(3).is_destructive());
     }
 }
