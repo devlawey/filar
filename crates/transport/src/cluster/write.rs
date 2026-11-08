@@ -384,8 +384,9 @@ pub fn hide_secret_values(object: &mut Value) {
     }
 }
 
-/// Shortest submitted `Secret` value [`mask_secret_values`] looks for: a
-/// shorter one would mask unrelated words of the message.
+/// Shortest submitted `Secret` value [`mask_secret_values`] masks in place;
+/// a message containing a shorter one is withheld whole, since masking
+/// `ab` would garble the text and leaving it would leak it.
 const MIN_MASKED_VALUE: usize = 4;
 
 /// The values a manifest document submits for a `Secret`: `stringData`
@@ -411,7 +412,7 @@ fn submitted_secret_values(document: &Value) -> Vec<String> {
             }
         }
     }
-    values.retain(|value| value.chars().count() >= MIN_MASKED_VALUE);
+    values.retain(|value| !value.is_empty());
     values.sort_by_key(|value| std::cmp::Reverse(value.len()));
     values.dedup();
     values
@@ -425,7 +426,15 @@ fn mask_secret_values(error: CoreError, values: &[String]) -> CoreError {
     }
     let mask = |mut message: String| {
         for value in values {
-            message = message.replace(value.as_str(), SECRET_HIDDEN);
+            if value.chars().count() < MIN_MASKED_VALUE {
+                if message.contains(value.as_str()) {
+                    return format!(
+                        "the Kubernetes API refused the Secret; its message is withheld because it may quote a submitted value ({SECRET_HIDDEN})"
+                    );
+                }
+            } else {
+                message = message.replace(value.as_str(), SECRET_HIDDEN);
+            }
         }
         message
     };

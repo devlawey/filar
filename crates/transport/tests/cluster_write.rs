@@ -156,7 +156,14 @@ async fn apply_scale_restart_undo_and_delete_against_fixture_cluster() {
         .unwrap();
     assert_eq!((scaled.from, scaled.to), (1, 2));
 
-    // A second revision: new image, then back with undo.
+    // A second revision: new image, then back with undo. The controller
+    // must have written revision 1 first, or the new image becomes it.
+    let mut waited = 0;
+    while revision(&api).await < 1 {
+        assert!(waited < 60, "revision 1 never appeared");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        waited += 1;
+    }
     let newer = WORKLOAD.replace("busybox:1.36", "busybox:1.37");
     api.apply(&newer, Some("shop"), false).await.unwrap();
     let restart = api

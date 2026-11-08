@@ -1329,3 +1329,22 @@ fn status_counts_as_content_only_without_a_status_subresource() {
         ApplyAction::Configured
     );
 }
+
+#[tokio::test]
+async fn a_message_quoting_a_short_secret_value_is_withheld_whole() {
+    let api = refusing(
+        403,
+        "Forbidden",
+        "admission webhook denied the request: pin 7x9 is too short",
+    )
+    .await;
+    let manifest = "apiVersion: v1\nkind: Secret\nmetadata: {name: pin}\nstringData: {pin: 7x9}\n";
+    let error = api
+        .api()
+        .apply(manifest, Some("shop"), true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("7x9"), "{error}");
+    assert!(error.contains("message is withheld"), "{error}");
+}
