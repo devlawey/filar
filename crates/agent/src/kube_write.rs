@@ -272,6 +272,31 @@ pub struct WritePreview {
     /// For a selector delete: the names the dry run listed. The real delete
     /// gets exactly these.
     pub names: Option<Vec<String>>,
+    /// For an undo: the revision the dry run rolled back to. The real undo
+    /// gets exactly this one, even if a rollout finished meanwhile.
+    pub undo_revision: Option<i64>,
+}
+
+impl WritePreview {
+    /// `call` bound to what this dry run showed: an undo without a revision
+    /// gets the previewed one.
+    pub fn pin(&self, call: &KubeWriteCall) -> KubeWriteCall {
+        match (call, self.undo_revision) {
+            (
+                KubeWriteCall::RolloutUndo {
+                    namespace,
+                    name,
+                    to_revision: None,
+                },
+                Some(revision),
+            ) => KubeWriteCall::RolloutUndo {
+                namespace: namespace.clone(),
+                name: name.clone(),
+                to_revision: Some(revision),
+            },
+            _ => call.clone(),
+        }
+    }
 }
 
 /// What an executed write left: a feed trace per object and the answer for
@@ -290,6 +315,7 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
     let mut text = String::new();
     let mut destructive = false;
     let mut names = None;
+    let mut undo_revision = None;
     match call {
         KubeWriteCall::Apply {
             manifest,
@@ -307,7 +333,9 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
             replicas,
         } => {
             let outcome = api.scale(*kind, namespace, name, *replicas, true).await?;
-            destructive = outcome.to == 0 && outcome.from > 0;
+            // Every scale to 0 is destructive, already-empty or not: the
+            // window and the proposal must agree.
+            destructive = *replicas == 0;
             text.push_str(&format!(
                 "scale {}: replicas {} → {}\n",
                 object_label(&outcome.object),
@@ -335,6 +363,7 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
             let outcome = api
                 .rollout_undo(namespace, name, *to_revision, true)
                 .await?;
+            undo_revision = Some(outcome.to_revision);
             text.push_str(&format!(
                 "undo {}: revision {} → template of revision {}\n",
                 object_label(&outcome.write.object),
@@ -368,6 +397,7 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
         text,
         destructive,
         names,
+        undo_revision,
     })
 }
 
@@ -517,7 +547,13 @@ fn applied_text(object: &AppliedObject) -> String {
             key_state(key.state)
         ));
     }
-    text.push_str(&diff(object.live.as_ref(), &object.result));
+    let mut shown = diff(object.live.as_ref(), &object.result);
+    if object.action == filar_transport::ApplyAction::Configured && shown.contains(NO_CHANGE) {
+        // The transport counted a status change: a resource without a
+        // `status` subresource takes status through the main endpoint.
+        shown = diff_with(object.live.as_ref(), &object.result, true);
+    }
+    text.push_str(&shown);
     text
 }
 
@@ -546,7 +582,7 @@ fn deleted_text(objects: &[DeletedObject], dry_run: bool) -> String {
 
 /// The object without what is noise in a diff: bookkeeping metadata, the
 /// last applied copy and status.
-fn without_noise(object: &Value) -> Value {
+fn without_noise(object: &Value, keep_status: bool) -> Value {
     let mut object = object.clone();
     if let Some(Value::Object(metadata)) = object.get_mut("metadata") {
         for field in [
@@ -567,8 +603,10 @@ fn without_noise(object: &Value) -> Value {
             }
         }
     }
-    if let Value::Object(map) = &mut object {
-        map.remove("status");
+    if !keep_status {
+        if let Value::Object(map) = &mut object {
+            map.remove("status");
+        }
     }
     object
 }
@@ -602,9 +640,16 @@ fn sort_keys(value: &Value) -> Value {
 /// one line of context, at most [`MAX_DIFF_LINES`]. A new object is shown
 /// whole, as `+` lines.
 pub fn diff(live: Option<&Value>, result: &Value) -> String {
-    let after = lines_of(&without_noise(result));
+    diff_with(live, result, false)
+}
+
+/// What [`diff`] says when nothing but noise changed.
+const NO_CHANGE: &str = "(no change to the object's content)";
+
+fn diff_with(live: Option<&Value>, result: &Value, keep_status: bool) -> String {
+    let after = lines_of(&without_noise(result, keep_status));
     let before = live
-        .map(|l| lines_of(&without_noise(l)))
+        .map(|l| lines_of(&without_noise(l, keep_status)))
         .unwrap_or_default();
     let mut out: Vec<String> = Vec::new();
     if live.is_none() {
@@ -630,7 +675,7 @@ pub fn diff(live: Option<&Value>, result: &Value) -> String {
             });
         }
         if out.is_empty() {
-            out.push("  (no change to the object's content)".into());
+            out.push(format!("  {NO_CHANGE}"));
         }
     }
     if out.len() > MAX_DIFF_LINES {
@@ -843,5 +888,48 @@ mod destructive_tests {
         };
         assert!(scale(0).is_destructive());
         assert!(!scale(3).is_destructive());
+    }
+    #[test]
+    fn an_undo_without_a_revision_is_pinned_to_the_previewed_one() {
+        let preview = WritePreview {
+            text: String::new(),
+            destructive: false,
+            names: None,
+            undo_revision: Some(2),
+        };
+        let undo = |to_revision| KubeWriteCall::RolloutUndo {
+            namespace: "shop".into(),
+            name: "web".into(),
+            to_revision,
+        };
+        assert_eq!(preview.pin(&undo(None)), undo(Some(2)));
+        assert_eq!(
+            preview.pin(&undo(Some(5))),
+            undo(Some(5)),
+            "an explicit revision stays"
+        );
+    }
+
+    #[test]
+    fn a_status_only_change_shows_status_in_the_window() {
+        let live = serde_json::json!({"kind": "Widget", "metadata": {"name": "w"},
+            "spec": {"a": 1}, "status": {"phase": "old"}});
+        let result = serde_json::json!({"kind": "Widget", "metadata": {"name": "w"},
+            "spec": {"a": 1}, "status": {"phase": "new"}});
+        let object = AppliedObject {
+            object: ObjectRef {
+                api_version: "example.com/v1".into(),
+                kind: "Widget".into(),
+                namespace: Some("shop".into()),
+                name: "w".into(),
+            },
+            action: filar_transport::ApplyAction::Configured,
+            live: Some(live),
+            result,
+            secret_keys: Vec::new(),
+        };
+        let text = applied_text(&object);
+        assert!(text.contains("\"new\""), "{text}");
+        assert!(!text.contains(NO_CHANGE), "{text}");
     }
 }

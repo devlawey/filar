@@ -320,9 +320,8 @@ impl KubeAgent {
         destructive: bool,
         conversation: &[ChatMessage],
     ) {
-        if self.confirm_mode == CommandConfirmMode::Never {
-            return;
-        }
+        // Called only when a window opens — a write, or a request a tag
+        // policy tightened — so `never` mode is no reason to skip it.
         let Some(audit_by) = &self.arbiter else {
             return;
         };
@@ -921,7 +920,7 @@ impl KubeAgent {
         let report = match self
             .cancellable(crate::kube_write::execute(
                 writer.as_ref(),
-                call,
+                &preview.pin(call),
                 preview.names.clone(),
             ))
             .await
@@ -2035,6 +2034,60 @@ mod tests {
             .await
             .unwrap();
         assert!(reply.content.contains("not available here"), "{}", reply.content);
+    }
+
+    #[tokio::test]
+    async fn a_write_is_audited_before_its_window_even_in_never_mode() {
+        let arbiter = ScriptedLlm::new(vec![ChatResponse::text(
+            r#"{"verdict":"MISMATCH","reason":"scales prod to zero"}"#,
+        )]);
+        let writer = Arc::new(RecordingWriter::default());
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let confirmer = Arc::new(WindowConfirmer {
+            approve: false,
+            writer: Arc::clone(&writer),
+            seen: Mutex::new(Vec::new()),
+        });
+        let agent = KubeAgent::new(
+            ScriptedLlm::new(vec![]),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::clone(&confirmer) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Never,
+            Vec::new(),
+        )
+        .event_sink(sink_into(&events))
+        .cluster_writer(Some(writer as Arc<dyn ClusterWriteApi>))
+        .arbiter(Some(arbiter as Arc<dyn LlmClient>), true, "judge");
+        let audited = AuditedConfirmer {
+            agent: &agent,
+            conversation: &[],
+        };
+        let tool = filar_core::ToolInvocation {
+            name: "k8s_scale".into(),
+            arguments: serde_json::json!({}),
+        };
+        agent
+            .process_write(
+                "call_1",
+                &scale_to_zero(),
+                "Stop web",
+                tool,
+                &audited,
+                &PendingScores::default(),
+            )
+            .await
+            .unwrap();
+        let events = events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::CommandAudited { verdict, .. } if verdict == "MISMATCH"
+            )),
+            "{events:?}"
+        );
+        assert_eq!(confirmer.seen.lock().unwrap().len(), 1, "then the window");
     }
 
     #[test]

@@ -12448,4 +12448,16 @@ TUI: `runner.rs` держит `kube_writers` рядом с `kube_apis` (один
 модуль `kube_write`, `build_kube_write_system_prompt`. `CommandExecutor`,
 `LlmClient` не менялись.
 
+**Ревью (раунд 1).** ai-review: scale до 0 стал деструктивным и в
+`CommandProposed` (`KubeWriteCall::is_destructive`). CodeRabbit: scale до 0
+деструктивен всегда, даже для уже пустого workload, — окно и заявка
+согласованы; undo без ревизии привязан к ревизии из dry run
+(`WritePreview::pin`); у ресурса без подресурса `status` изменение status
+видно в diff; арбитр больше не пропускает окна в режиме `never` (окно — это
+запись или запрос, ужесточённый политикой тега); KUBERNETES.md — таблица
+сравнения и правила режимов не противоречат гейту записи. Не сделано: UID
+как precondition удаления (имя — идентичность, как у `kubectl delete`; то же
+решение, что в #651), отдельная проверка уровня риска scale-до-0 в
+risk-eval (eval необязательный, порог попадания задан намеренно).
+
 **Next.** #640 — `k8s_apply`.
