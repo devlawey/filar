@@ -1412,7 +1412,19 @@ async fn status_counts_for_a_custom_resource_without_a_status_subresource() {
             "apiVersion: example.com/v1\nkind: {kind}\nmetadata: {{name: one}}\nspec: {{size: 1}}\nstatus: {{phase: new}}\n"
         );
         let api = api.api();
-        async move { api.apply(&manifest, Some("shop"), true).await.unwrap()[0].action }
+        async move {
+            api.apply(&manifest, Some("shop"), true)
+                .await
+                .unwrap()
+                .remove(0)
+        }
+    };
+    let widget = action("Widget").await;
+    assert!(widget.status_is_content);
+    assert!(!action("Gadget").await.status_is_content);
+    let action = |kind: &'static str| {
+        let action = &action;
+        async move { action(kind).await.action }
     };
     assert_eq!(
         action("Widget").await,

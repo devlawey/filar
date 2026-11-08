@@ -14,6 +14,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 ### Added
 
 - Engine: `ClusterWriteApi` in `filar-transport`, implemented by `KubeClusterApi` — server-side apply of YAML/JSON manifests, scale, rollout restart and undo, delete by name, selector or an exact list of names, every method with a server dry run; any kind the RBAC allows; objects the write methods return never carry Secret values, and submitted values quoted in a server error are masked (`parse_manifest` returns the caller's manifest as given); paused Deployments are refused for restart and undo. `ClusterApi` stays read-only and fleets get only it ([#638](https://github.com/devlawey/filar/issues/638)).
+- Gate for writes to a Kubernetes cluster tab: every write is run on the API server as a dry run first — a refused dry run (RBAC, admission, validation) goes to the feed and opens no window — then confirmed in every mode, `allowlist` and `never` included, with the action and a diff of the live object against the dry-run result per object (bookkeeping fields, status — unless the resource has no `status` subresource — and the last applied copy left out; Secret keys only, never values); deletes and every scale to 0 are destructive; an undo runs to the revision its dry run showed; the arbiter audits every window, in `never` mode too; a trace «Изменение в кластере: …» stays in the feed and the session export; the agent gets a short summary; fleets never get write tools ([#639](https://github.com/devlawey/filar/issues/639)).
 
 ### Changed
 

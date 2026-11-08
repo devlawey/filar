@@ -6253,6 +6253,11 @@ impl App {
                         raw,
                     });
                 }
+                filar_agent::AgentEvent::ClusterChanged { trace } => {
+                    // The trace of a cluster write (#639): in the feed and
+                    // the session export, like the debug-container trace.
+                    self.push_message(ChatBlock::System(trace));
+                }
                 filar_agent::AgentEvent::CommandFinished {
                     command,
                     output,

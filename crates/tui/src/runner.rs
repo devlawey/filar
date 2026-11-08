@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use filar_agent::{AgentBuilder, CommandConfirmer, LlmClient};
 use filar_core::{CommandConfirmMode, CoreError, Result, SecretProvider, StaticSecretProvider};
 use filar_transport::{
-    posix_cd_input, ClusterApi, CommandExecutor, InteractiveTerminal, KubeClusterApi,
+    posix_cd_input, ClusterApi, ClusterWriteApi, CommandExecutor, InteractiveTerminal, KubeClusterApi,
     LocalInteractive, SecretSubstitutingExecutor, SshExecutor, SshInteractive, SshTransportConfig,
     OSC7_PWD_PROBE,
 };
@@ -636,8 +636,13 @@ pub struct TuiConfig {
 struct KubeConnectionResult {
     session_id: SessionId,
     connection_id: u64,
-    result: std::result::Result<(Arc<dyn ClusterApi>, Vec<String>), String>,
+    /// The read API, the write API of the same connection (#639) and the
+    /// discovered namespaces.
+    result: std::result::Result<KubeConnected, String>,
 }
+
+/// A connected cluster: read and write access to the same API server.
+type KubeConnected = (Arc<dyn ClusterApi>, Arc<dyn ClusterWriteApi>, Vec<String>);
 
 /// Result of asynchronous Kubernetes fleet discovery or restored API binding.
 struct KubeFleetResult {
@@ -650,6 +655,8 @@ struct KubeFleetResult {
 enum KubeAgentTarget {
     Cluster {
         api: Arc<dyn ClusterApi>,
+        /// Write access (#639): every write is dry-run, shown and confirmed.
+        writer: Option<Arc<dyn ClusterWriteApi>>,
         target: filar_core::KubeCluster,
         namespace: Option<String>,
     },
@@ -909,11 +916,14 @@ fn start_pending_kube_connects(
             let connection_id = request.connection_id;
             let result = match KubeClusterApi::connect(&request.target).await {
                 Ok(api) => {
-                    let api: Arc<dyn ClusterApi> = Arc::new(api);
+                    let api = Arc::new(api);
+                    let writer: Arc<dyn ClusterWriteApi> = api.clone();
+                    let api: Arc<dyn ClusterApi> = api;
                     if request.discover {
                         match api.namespaces().await {
                             Ok(namespaces) => Ok((
                                 api,
+                                writer,
                                 namespaces
                                     .into_iter()
                                     .map(|namespace| namespace.name)
@@ -922,7 +932,7 @@ fn start_pending_kube_connects(
                             Err(error) => Err(error.to_string()),
                         }
                     } else {
-                        Ok((api, Vec::new()))
+                        Ok((api, writer, Vec::new()))
                     }
                 }
                 Err(error) => Err(error.to_string()),
@@ -1902,6 +1912,8 @@ async fn run_app(
     // Live typed Kubernetes APIs stay in the runner, never in persisted state.
     let (kube_tx, mut kube_rx) = mpsc::unbounded_channel::<KubeConnectionResult>();
     let mut kube_apis: HashMap<SessionId, Arc<dyn ClusterApi>> = HashMap::new();
+    // Write access of the same connections (#639), never handed to fleets.
+    let mut kube_writers: HashMap<SessionId, Arc<dyn ClusterWriteApi>> = HashMap::new();
     // Pod tabs (#565): pod lists, shell connections and shell events.
     let (pod_tx, mut pod_rx) = mpsc::unbounded_channel::<PodRunnerEvent>();
     let mut pod_shells: HashMap<SessionId, PodShell> = HashMap::new();
@@ -2456,6 +2468,7 @@ async fn run_app(
                                 session_llm,
                                 KubeAgentTarget::Cluster {
                                     api,
+                                    writer: kube_writers.get(&sid).cloned(),
                                     target: kube.target,
                                     namespace: kube.namespace,
                                 },
@@ -3065,6 +3078,7 @@ async fn run_app(
             // every host connection it held (#435).
             fleet_executors.remove(&sid);
             kube_apis.remove(&sid);
+            kube_writers.remove(&sid);
             kube_fleets.remove(&sid);
             if let Some(shell) = pod_shells.remove(&sid) {
                 shell.release().await;
@@ -3140,12 +3154,13 @@ async fn run_app(
             maybe_kube = kube_rx.recv() => {
                 if let Some(completed) = maybe_kube {
                     match completed.result {
-                        Ok((api, namespaces)) => {
+                        Ok((api, writer, namespaces)) => {
                             if app.kube_connection_is_current(
                                 completed.session_id,
                                 completed.connection_id,
                             ) {
                                 kube_apis.insert(completed.session_id, api);
+                                kube_writers.insert(completed.session_id, writer);
                                 app.complete_kube_connection(
                                     completed.session_id,
                                     completed.connection_id,
@@ -3280,6 +3295,7 @@ async fn run_app(
                     // Intercept TransportChanged to update per-session info.
                     if let TuiEvent::TransportChanged { session_id, is_local, ref ssh_info, ref alias, .. } = &event {
                         kube_apis.remove(session_id);
+                        kube_writers.remove(session_id);
                         if app.kube_namespace_select.as_ref().is_some_and(|select| {
                             select.session_id == *session_id
                         }) {
@@ -4577,6 +4593,7 @@ fn spawn_kube_agent(
                     api,
                     target,
                     namespace,
+                    ..
                 } => filar_agent::KubeAgent::new(
                     Arc::clone(&llm),
                     filar_agent::KubeToolExecutor::new(
@@ -4609,7 +4626,11 @@ fn spawn_kube_agent(
                 .cancellation(cancellation.clone())
                 .log_sources(log_sources.clone())
                 .arbiter(arbiter.0.clone(), arbiter_enabled, arbiter.1.clone())
-                .risk_scorer(risk_scorer.clone());
+                .risk_scorer(risk_scorer.clone())
+                .cluster_writer(match &target {
+                    KubeAgentTarget::Cluster { writer, .. } => writer.clone(),
+                    KubeAgentTarget::Fleet(_) => None,
+                });
 
             *held_error
                 .lock()

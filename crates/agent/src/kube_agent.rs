@@ -1,12 +1,15 @@
 //! Kubernetes agent loop for cluster tabs (#575).
 //!
-//! The loop executes only typed, read-only [`KubeToolCall`] values. It never
-//! adapts Kubernetes operations to shell commands or `CommandExecutor`.
+//! The loop executes only typed [`KubeToolCall`] reads and, in a cluster tab
+//! with a writer (#639), typed [`crate::KubeWriteCall`] writes behind their
+//! own gate: dry run, diff, confirmation in every mode. It never adapts
+//! Kubernetes operations to shell commands or `CommandExecutor`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use filar_core::{CommandConfirmMode, CoreError, KubeCluster, Result, TagPolicy};
+use filar_transport::ClusterWriteApi;
 use tokio_util::sync::CancellationToken;
 
 use crate::arbiter::{self, ArbiterContext, KubernetesArbiterTarget, ARBITER_TIMEOUT_SECS, HISTORY_TAIL_EXCHANGES};
@@ -85,6 +88,8 @@ pub struct KubeAgent {
     arbiter: Option<KubeArbiter>,
     /// Command safety scorer (#549, #631); cluster tabs only. Advisory.
     risk_scorer: Option<Arc<dyn RiskScorer>>,
+    /// Write access (#639); cluster tabs only. `None` = read-only tab.
+    writer: Option<Arc<dyn ClusterWriteApi>>,
 }
 
 /// The arbiter of a [`KubeAgent`] (#620).
@@ -120,6 +125,7 @@ impl KubeAgent {
             log_sources: None,
             arbiter: None,
             risk_scorer: None,
+            writer: None,
         }
     }
 
@@ -145,6 +151,7 @@ impl KubeAgent {
             log_sources: None,
             arbiter: None,
             risk_scorer: None,
+            writer: None,
         }
     }
 
@@ -261,6 +268,32 @@ impl KubeAgent {
         }
     }
 
+    /// Give a cluster tab write access (#639). Every write is dry-run on
+    /// the server, shown with its diff and confirmed, in every mode. A fleet
+    /// ignores it: write tools are never offered to fleets.
+    pub fn cluster_writer(mut self, writer: Option<Arc<dyn ClusterWriteApi>>) -> Self {
+        self.writer = writer;
+        self
+    }
+
+    /// The writer, when this is a cluster tab that has one.
+    fn cluster_writer_api(&self) -> Option<&Arc<dyn ClusterWriteApi>> {
+        match self.execution {
+            KubeExecution::Cluster { .. } => self.writer.as_ref(),
+            KubeExecution::Fleet { .. } => None,
+        }
+    }
+
+    /// The write tools offered in this tab: none in a fleet or without a
+    /// writer.
+    fn write_tools(&self) -> Vec<crate::ToolDef> {
+        if self.cluster_writer_api().is_some() {
+            crate::kube_write::kube_write_tool_definitions(self.confirm_mode)
+        } else {
+            Vec::new()
+        }
+    }
+
     /// What the arbiter and the safety scorer are told about the target.
     fn arbiter_target(&self) -> String {
         match &self.execution {
@@ -287,9 +320,8 @@ impl KubeAgent {
         destructive: bool,
         conversation: &[ChatMessage],
     ) {
-        if self.confirm_mode == CommandConfirmMode::Never {
-            return;
-        }
+        // Called only when a window opens — a write, or a request a tag
+        // policy tightened — so `never` mode is no reason to skip it.
         let Some(audit_by) = &self.arbiter else {
             return;
         };
@@ -408,7 +440,19 @@ impl KubeAgent {
         let prompt = match &self.execution {
             KubeExecution::Cluster {
                 target, namespace, ..
-            } => build_kube_system_prompt(target, namespace.as_deref()),
+            } => {
+                let writes: Vec<String> =
+                    self.write_tools().into_iter().map(|tool| tool.name).collect();
+                if writes.is_empty() {
+                    build_kube_system_prompt(target, namespace.as_deref())
+                } else {
+                    crate::kube_tools::build_kube_write_system_prompt(
+                        target,
+                        namespace.as_deref(),
+                        &writes,
+                    )
+                }
+            }
             KubeExecution::Fleet { fleet, .. } => build_kube_fleet_system_prompt(fleet.fleet()),
         };
         let mut prompt = prompt;
@@ -436,6 +480,7 @@ impl KubeAgent {
             let fleet = matches!(self.execution, KubeExecution::Fleet { .. });
             tools.push(crate::logs::k8s::pod_logs_history_definition(self.confirm_mode, fleet));
         }
+        tools.extend(self.write_tools());
         let mut missing_explanations = 0;
 
         for _ in 0..MAX_ITERATIONS {
@@ -577,6 +622,9 @@ impl KubeAgent {
                     crate::agent::next_proposal_id(),
                 )
                 .await;
+        }
+        if crate::kube_write::is_kube_write_tool(&call.name) {
+            return self.process_write_tool_call(call, &confirmer, scores).await;
         }
         let default_namespace = match &self.execution {
             KubeExecution::Cluster { namespace, .. } => namespace.as_deref(),
@@ -733,6 +781,175 @@ impl KubeAgent {
                 Ok(ChatMessage::tool(&call.id, output))
             }
         }
+    }
+}
+
+impl KubeAgent {
+    /// A write tool call (#639): refused in a fleet or without a writer,
+    /// otherwise parsed and put through [`Self::process_write`].
+    async fn process_write_tool_call(
+        &self,
+        call: &ToolCall,
+        confirmer: &AuditedConfirmer<'_>,
+        scores: &PendingScores,
+    ) -> Result<ChatMessage> {
+        if self.cluster_writer_api().is_none() {
+            return Ok(ChatMessage::tool(
+                &call.id,
+                "Error: writes to the cluster are not available here (read-only tab or fleet).",
+            ));
+        }
+        let default_namespace = match &self.execution {
+            KubeExecution::Cluster { namespace, .. } => namespace.as_deref(),
+            KubeExecution::Fleet { .. } => None,
+        };
+        let parsed = match crate::kube_write::parse_kube_write_call(
+            &call.name,
+            &call.arguments,
+            default_namespace,
+        ) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return Ok(ChatMessage::tool(
+                    &call.id,
+                    format!("Error: invalid Kubernetes write call: {error}"),
+                ));
+            }
+        };
+        let explanation = call
+            .arguments
+            .get("explanation")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Change in the Kubernetes cluster")
+            .to_string();
+        let tool = filar_core::ToolInvocation {
+            name: call.name.clone(),
+            arguments: crate::kube_write::redacted_arguments(&call.arguments),
+        };
+        self.process_write(&call.id, &parsed, &explanation, tool, confirmer, scores)
+            .await
+    }
+
+    /// The gate of one write (#639): dry run on the server first — a refusal
+    /// goes to the feed and no window opens; then the window with the diff,
+    /// confirmed in every mode; then the write itself, a trace per changed
+    /// object, and a summary for the model.
+    async fn process_write(
+        &self,
+        call_id: &str,
+        call: &crate::KubeWriteCall,
+        explanation: &str,
+        tool: filar_core::ToolInvocation,
+        confirmer: &(dyn CommandConfirmer + '_),
+        scores: &PendingScores,
+    ) -> Result<ChatMessage> {
+        let (Some(writer), KubeExecution::Cluster {
+            target,
+            namespace,
+            executor,
+        }) = (self.cluster_writer_api(), &self.execution)
+        else {
+            return Ok(ChatMessage::tool(
+                call_id,
+                "Error: writes to the cluster are not available here (read-only tab or fleet).",
+            ));
+        };
+        let display = call.display_command();
+        self.emit_and_rate(
+            scores,
+            AgentEvent::CommandProposed {
+                proposal_id: crate::agent::next_proposal_id(),
+                command: display.clone(),
+                explanation: explanation.to_string(),
+                destructive: call.is_destructive(),
+                tool,
+            },
+            call.namespace(),
+        );
+        let preview = match self
+            .cancellable(crate::kube_write::preview(writer.as_ref(), call))
+            .await
+        {
+            Ok(preview) => preview,
+            Err(error) if error.to_string() == "cancelled" => return Err(error),
+            Err(error) => {
+                let output = format!("Dry run refused, nothing was changed: {error}");
+                self.emit(AgentEvent::CommandFinished {
+                    command: display,
+                    output: output.clone(),
+                    denied: true,
+                });
+                return Ok(ChatMessage::tool(call_id, output));
+            }
+        };
+        let target_namespace = call.namespace().or(namespace.as_deref());
+        let window = format!(
+            "{explanation}\n\nTool: {}\nKubernetes context: {}\nNamespace: {}\nTarget: {} / {}\n\nDry run:\n{}",
+            call.tool_name(),
+            target.context,
+            target_namespace.unwrap_or("all / cluster-scoped"),
+            target.name,
+            target_namespace.unwrap_or("all / cluster-scoped"),
+            preview.text.trim_end(),
+        );
+        match crate::kube_write::kube_write_confirmation_decision(
+            self.confirm_mode,
+            target,
+            &self.tag_policies,
+        ) {
+            ConfirmDecision::Blocked(reason) => {
+                return Ok(ChatMessage::tool(call_id, format!("Error: {reason}")));
+            }
+            ConfirmDecision::NeedsConfirmation | ConfirmDecision::AutoApproved => {
+                let approved = self
+                    .cancellable(confirmer.confirm(&display, &window, preview.destructive))
+                    .await?;
+                if !approved {
+                    self.emit(AgentEvent::CommandFinished {
+                        command: display,
+                        output: String::new(),
+                        denied: true,
+                    });
+                    return Ok(ChatMessage::tool(
+                        call_id,
+                        "User denied this change to the cluster; nothing was changed. Do not retry the same change; ask the user or choose another approach.",
+                    ));
+                }
+            }
+        }
+        let report = match self
+            .cancellable(crate::kube_write::execute(
+                writer.as_ref(),
+                &preview.pin(call),
+                preview.names.clone(),
+            ))
+            .await
+        {
+            Ok(report) => report,
+            Err(error) if error.to_string() == "cancelled" => return Err(error),
+            Err(error) => {
+                let output = format!("Change failed: {error}");
+                self.emit(AgentEvent::CommandFinished {
+                    command: display,
+                    output: output.clone(),
+                    denied: false,
+                });
+                return Ok(ChatMessage::tool(call_id, output));
+            }
+        };
+        let at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        for change in &report.changes {
+            self.emit(AgentEvent::ClusterChanged {
+                trace: crate::kube_write::trace_line(change, target, &at),
+            });
+        }
+        let output = crate::kube_redact::redact_logs(&report.summary, executor.secrets().as_ref());
+        self.emit(AgentEvent::CommandFinished {
+            command: display,
+            output: output.clone(),
+            denied: false,
+        });
+        Ok(ChatMessage::tool(call_id, output))
     }
 }
 
@@ -1568,5 +1785,324 @@ mod tests {
     async fn pod_http_get_to_a_diagnostic_path_goes_without_a_question_in_never_mode() {
         let (confirmer, _) = run_http_get("/metrics", CommandConfirmMode::Never, false).await;
         assert!(confirmer.asked.lock().unwrap().is_empty(), "no window for /metrics");
+    }
+
+    // ── Write gate (#639) ──────────────────────────────────────────────
+
+    /// A writer that records each call and whether it was a dry run.
+    #[derive(Default)]
+    struct RecordingWriter {
+        calls: Mutex<Vec<(String, bool)>>,
+        refuse_dry_run: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ClusterWriteApi for RecordingWriter {
+        async fn apply(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: bool,
+        ) -> Result<Vec<filar_transport::AppliedObject>> {
+            Err(CoreError::Other("not in this mock".into()))
+        }
+
+        async fn scale(
+            &self,
+            kind: filar_transport::ScaleKind,
+            namespace: &str,
+            name: &str,
+            replicas: i32,
+            dry_run: bool,
+        ) -> Result<filar_transport::ScaleOutcome> {
+            self.calls.lock().unwrap().push((format!("scale {name}"), dry_run));
+            if dry_run && self.refuse_dry_run {
+                return Err(CoreError::AccessDenied(
+                    "нет права patch на deployments.apps/scale в namespace shop".into(),
+                ));
+            }
+            let _ = kind;
+            Ok(filar_transport::ScaleOutcome {
+                object: filar_transport::ObjectRef {
+                    api_version: "apps/v1".into(),
+                    kind: "Deployment".into(),
+                    namespace: Some(namespace.into()),
+                    name: name.into(),
+                },
+                from: 3,
+                to: replicas,
+            })
+        }
+
+        async fn rollout_restart(
+            &self,
+            _: filar_transport::RestartKind,
+            _: &str,
+            _: &str,
+            _: bool,
+        ) -> Result<filar_transport::WriteOutcome> {
+            Err(CoreError::Other("not in this mock".into()))
+        }
+
+        async fn rollout_undo(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<i64>,
+            _: bool,
+        ) -> Result<filar_transport::UndoOutcome> {
+            Err(CoreError::Other("not in this mock".into()))
+        }
+
+        async fn delete(
+            &self,
+            _: &filar_transport::ObjectKind,
+            _: Option<&str>,
+            _: &filar_transport::DeleteTarget,
+            _: &filar_transport::DeleteOptions,
+            _: bool,
+        ) -> Result<Vec<filar_transport::DeletedObject>> {
+            Err(CoreError::Other("not in this mock".into()))
+        }
+    }
+
+    /// One window: its text, whether destructive, the writer's calls so far.
+    type SeenWindow = (String, bool, Vec<(String, bool)>);
+
+    /// Answers as told and records the window and what the writer had seen.
+    struct WindowConfirmer {
+        approve: bool,
+        writer: Arc<RecordingWriter>,
+        seen: Mutex<Vec<SeenWindow>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandConfirmer for WindowConfirmer {
+        async fn confirm(&self, _: &str, explanation: &str, destructive: bool) -> Result<bool> {
+            let calls = self.writer.calls.lock().unwrap().clone();
+            self.seen
+                .lock()
+                .unwrap()
+                .push((explanation.into(), destructive, calls));
+            Ok(self.approve)
+        }
+    }
+
+    fn scale_to_zero() -> crate::KubeWriteCall {
+        crate::KubeWriteCall::Scale {
+            kind: filar_transport::ScaleKind::Deployment,
+            namespace: "shop".into(),
+            name: "web".into(),
+            replicas: 0,
+        }
+    }
+
+    async fn run_write(
+        writer: Arc<RecordingWriter>,
+        approve: bool,
+        mode: CommandConfirmMode,
+    ) -> (Arc<WindowConfirmer>, Vec<AgentEvent>, ChatMessage) {
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let confirmer = Arc::new(WindowConfirmer {
+            approve,
+            writer: Arc::clone(&writer),
+            seen: Mutex::new(Vec::new()),
+        });
+        let agent = KubeAgent::new(
+            ScriptedLlm::new(vec![]),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::clone(&confirmer) as Arc<dyn CommandConfirmer>,
+            mode,
+            Vec::new(),
+        )
+        .event_sink(sink_into(&events))
+        .cluster_writer(Some(writer as Arc<dyn ClusterWriteApi>));
+        let scores = PendingScores::default();
+        let tool = filar_core::ToolInvocation {
+            name: "k8s_scale".into(),
+            arguments: serde_json::json!({}),
+        };
+        let reply = agent
+            .process_write(
+                "call_1",
+                &scale_to_zero(),
+                "Stop web for maintenance",
+                tool,
+                confirmer.as_ref(),
+                &scores,
+            )
+            .await
+            .unwrap();
+        let events = events.lock().unwrap().clone();
+        (confirmer, events, reply)
+    }
+
+    #[tokio::test]
+    async fn a_write_is_dry_run_before_the_window_even_in_never_mode() {
+        let writer = Arc::new(RecordingWriter::default());
+        let (confirmer, events, reply) =
+            run_write(Arc::clone(&writer), true, CommandConfirmMode::Never).await;
+        let seen = confirmer.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "asked in never mode");
+        let (window, destructive, calls_before) = &seen[0];
+        assert_eq!(calls_before, &[("scale web".to_string(), true)], "dry run before the window");
+        assert!(window.contains("replicas 3 → 0"), "{window}");
+        assert!(window.contains("Target: prod-eu / shop"), "{window}");
+        assert!(*destructive, "scaling to 0 is destructive");
+        assert_eq!(
+            *writer.calls.lock().unwrap(),
+            [("scale web".to_string(), true), ("scale web".to_string(), false)]
+        );
+        let trace = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::ClusterChanged { trace } => Some(trace.clone()),
+                _ => None,
+            })
+            .expect("a trace");
+        assert!(
+            trace.starts_with("Изменение в кластере: scaled Deployment shop/web 3 → 0 (контекст prod-eu-admin, "),
+            "{trace}"
+        );
+        assert!(reply.content.contains("scaled Deployment shop/web 3 → 0"), "{}", reply.content);
+    }
+
+    #[tokio::test]
+    async fn a_denied_write_never_reaches_the_cluster() {
+        let writer = Arc::new(RecordingWriter::default());
+        let (_, events, reply) =
+            run_write(Arc::clone(&writer), false, CommandConfirmMode::Always).await;
+        assert_eq!(*writer.calls.lock().unwrap(), [("scale web".to_string(), true)]);
+        assert!(reply.content.contains("nothing was changed"), "{}", reply.content);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ClusterChanged { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_refused_dry_run_opens_no_window() {
+        let writer = Arc::new(RecordingWriter {
+            refuse_dry_run: true,
+            ..RecordingWriter::default()
+        });
+        let (confirmer, events, reply) =
+            run_write(Arc::clone(&writer), true, CommandConfirmMode::Always).await;
+        assert!(confirmer.seen.lock().unwrap().is_empty(), "no window");
+        assert_eq!(*writer.calls.lock().unwrap(), [("scale web".to_string(), true)]);
+        assert!(reply.content.contains("Dry run refused"), "{}", reply.content);
+        assert!(reply.content.contains("нет права patch"), "{}", reply.content);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::CommandFinished { denied: true, output, .. } if output.contains("Dry run refused")
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_fleet_never_gets_write_tools() {
+        let (cluster, _) = crate::kube_fleet::tests::cluster("prod-eu", vec![]);
+        let fleet = KubeFleet::open(
+            &crate::kube_fleet::tests::group(&["prod-eu"], None),
+            vec![cluster],
+        )
+        .await
+        .expect("fleet opens");
+        let agent = KubeAgent::new_fleet(
+            ScriptedLlm::new(vec![]),
+            Arc::new(fleet),
+            Arc::new(ReleasingConfirmer(None)) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Always,
+            Vec::new(),
+        )
+        .cluster_writer(Some(
+            Arc::new(RecordingWriter::default()) as Arc<dyn ClusterWriteApi>
+        ));
+        assert!(agent.cluster_writer_api().is_none(), "a fleet ignores the writer");
+        assert!(agent.write_tools().is_empty());
+        let call = ToolCall {
+            id: "1".into(),
+            name: "k8s_scale".into(),
+            arguments: serde_json::json!({}),
+        };
+        let confirmer = AuditedConfirmer {
+            agent: &agent,
+            conversation: &[],
+        };
+        let reply = agent
+            .process_write_tool_call(&call, &confirmer, &PendingScores::default())
+            .await
+            .unwrap();
+        assert!(reply.content.contains("not available here"), "{}", reply.content);
+    }
+
+    #[tokio::test]
+    async fn a_write_is_audited_before_its_window_even_in_never_mode() {
+        let arbiter = ScriptedLlm::new(vec![ChatResponse::text(
+            r#"{"verdict":"MISMATCH","reason":"scales prod to zero"}"#,
+        )]);
+        let writer = Arc::new(RecordingWriter::default());
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let confirmer = Arc::new(WindowConfirmer {
+            approve: false,
+            writer: Arc::clone(&writer),
+            seen: Mutex::new(Vec::new()),
+        });
+        let agent = KubeAgent::new(
+            ScriptedLlm::new(vec![]),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::clone(&confirmer) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Never,
+            Vec::new(),
+        )
+        .event_sink(sink_into(&events))
+        .cluster_writer(Some(writer as Arc<dyn ClusterWriteApi>))
+        .arbiter(Some(arbiter as Arc<dyn LlmClient>), true, "judge");
+        let audited = AuditedConfirmer {
+            agent: &agent,
+            conversation: &[],
+        };
+        let tool = filar_core::ToolInvocation {
+            name: "k8s_scale".into(),
+            arguments: serde_json::json!({}),
+        };
+        agent
+            .process_write(
+                "call_1",
+                &scale_to_zero(),
+                "Stop web",
+                tool,
+                &audited,
+                &PendingScores::default(),
+            )
+            .await
+            .unwrap();
+        let events = events.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::CommandAudited { verdict, .. } if verdict == "MISMATCH"
+            )),
+            "{events:?}"
+        );
+        assert_eq!(confirmer.seen.lock().unwrap().len(), 1, "then the window");
+    }
+
+    #[test]
+    fn the_write_prompt_tells_the_truth_about_writes() {
+        let prompt = crate::kube_tools::build_kube_write_system_prompt(
+            &target(),
+            Some("shop"),
+            &["k8s_apply".to_string()],
+        );
+        assert!(!prompt.contains("read-only API"));
+        assert!(!prompt.contains("cannot change"));
+        assert!(prompt.contains("only through the write tools (k8s_apply)"));
+        assert!(prompt.contains("dry run"));
+        assert!(prompt.contains("Secrets are never shown to you"));
+        let read_only = build_kube_system_prompt(&target(), Some("shop"));
+        assert!(read_only.contains("You cannot change"), "a tab without writes stays read-only");
     }
 }

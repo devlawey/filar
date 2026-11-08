@@ -131,6 +131,9 @@ pub struct AppliedObject {
     pub result: Value,
     /// For a `Secret`: its keys and whether each value changes.
     pub secret_keys: Vec<SecretKeyChange>,
+    /// The resource has no `status` subresource, so status is written with
+    /// the object and a status change is a change of content (#639).
+    pub status_is_content: bool,
 }
 
 /// Workload kinds with a `scale` subresource that filar scales.
@@ -853,7 +856,8 @@ impl KubeClusterApi {
             .map_err(|error| self.write_error(error, "apply", &label, namespace.as_deref()))?;
         let mut result = to_value(&result)?;
         let mut live = live;
-        let action = apply_action(live.as_ref(), &result, status_is_content(&caps));
+        let status_is_content = status_is_content(&caps);
+        let action = apply_action(live.as_ref(), &result, status_is_content);
         let secret_keys = if kind == "Secret" && resource.group.is_empty() {
             secret_key_changes(live.as_ref(), &result)
         } else {
@@ -874,6 +878,7 @@ impl KubeClusterApi {
             live,
             result,
             secret_keys,
+            status_is_content,
         })
     }
 
