@@ -86,10 +86,7 @@ impl KubeWriteCall {
     /// Destructive by the call alone: a delete, or scaling to 0. The dry
     /// run can tell more (scaling an already-empty workload to 0 is not).
     pub fn is_destructive(&self) -> bool {
-        matches!(
-            self,
-            Self::Delete { .. } | Self::Scale { replicas: 0, .. }
-        )
+        matches!(self, Self::Delete { .. } | Self::Scale { replicas: 0, .. })
     }
 
     /// The tool this call comes from.
