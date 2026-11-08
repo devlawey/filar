@@ -12319,3 +12319,83 @@ zero-install. Замысел Евгения: zero-install — про то, чт�
 `.filar-part`, где виден путь. Замечание CodeRabbit в #650.
 
 **Next.** #638 → #639.
+
+## Issue #638: ClusterWriteApi — запись в Kubernetes API за отдельным трейтом (веха 3.0.5)
+
+**Сделано.** Новый модуль `crates/transport/src/cluster/write.rs`: трейт
+`ClusterWriteApi` и его реализация для `KubeClusterApi`. Каждый метод принимает
+`dry_run` (`dryRun=All`):
+- `apply(manifest, default_namespace, dry_run)` — server-side apply YAML/JSON,
+  несколько документов по порядку, `fieldManager=filar`, без `force`,
+  `fieldValidation=Strict`. Вид разрешается через discovery (`pinned_kind`),
+  поэтому подходит любой вид, включая CRD и cluster-scoped. По каждому объекту
+  возвращаются `ObjectRef`, действие (created/configured/unchanged — по
+  сравнению живого объекта с результатом без служебных полей и `status`),
+  `live` и `result` для diff;
+- `scale` — субресурс `scale` (Deployment/StatefulSet/ReplicaSet), было/стало;
+- `rollout_restart` — merge-патч аннотации `kubectl.kubernetes.io/restartedAt`
+  (Deployment/StatefulSet/DaemonSet);
+- `rollout_undo` — шаблон ReplicaSet нужной ревизии (или предыдущей) без
+  `pod-template-hash`, `replace` Deployment с `resourceVersion`
+  (оптимистичная блокировка);
+- `delete(kind, namespace, target, options, dry_run)` — любой вид.
+  `DeleteTarget::Name`, `Selector` (список всех страниц, затем удаление по
+  именам; больше `MAX_DELETE_OBJECTS`=2000 — отказ) или `Names` (ровно то, что
+  показал dry-run; пропавший объект — `AlreadyGone`, а не ошибка).
+  `propagationPolicy` по умолчанию `Background`, force = `gracePeriodSeconds=0`.
+
+**Secret.** Значения `data`/`stringData` не покидают модуль: во всех
+возвращаемых объектах они заменены на `«скрыто»` (`SECRET_HIDDEN`),
+аннотация `last-applied-configuration` убрана. Для diff есть
+`secret_keys` — ключи и признак изменения (added/changed/unchanged/removed).
+Тела запросов не логируются.
+
+**Ошибки** (`write_error`): RBAC 403 — «нет права <verb> на <resource> …»
+(общий `api_error`); admission 403 и валидация 400/422 — текст сервера
+дословно; 409 у apply — «server-side apply conflict … filar does not force»
+с владельцем поля из ответа; неизвестный вид — «the cluster has no kind …».
+Ошибка в середине манифеста называет объект и сколько объектов уже применено.
+
+**Решения.**
+- `ClusterApi` не менялся и остаётся read-only. `KubeFleetCluster::new` и
+  `KubeToolExecutor::new` принимают только `Arc<dyn ClusterApi>`;
+  `compile_fail`-доктесты это проверяют, а их положительная пара (с
+  `ClusterApi`) проверена вручную.
+- YAML — через `serde-saphyr` 0.0.29: он уже был в дереве через `kube-client`,
+  теперь прямая зависимость фичи `kube`.
+- Тесты — встроенный фейковый API-сервер на `TcpListener`
+  (`cluster/write_tests.rs`): discovery, apply, merge-патч, PUT, DELETE,
+  список по селектору, dry-run. Live-тест `tests/cluster_write.rs`
+  (`#[ignore]`, `docker/k8s`) — ручной.
+- `CHANGELOG.md`: строка в `Added` про движок. В issue было «нет», но
+  AGENTS.md требует запись для изменения публичного контракта, а
+  `filar-transport` — крейт движка для встраивающих (замечание ai-review).
+- Ревью CodeRabbit, раунд 1: отправленные значения Secret (`stringData`,
+  `data` как base64 и раскодированные) маскируются в тексте ошибки
+  сервера — webhook может процитировать объект; если в тексте встречается
+  значение короче 4 символов, текст скрывается целиком (раунд 2); `parse_manifest`
+  возвращает манифест как есть, это задокументировано. Вид без `apiVersion`
+  ищется сначала в core-группе, поэтому сломанная сторонняя группа не мешает
+  удалить Pod; с `apiVersion` принимаются и `deployments`/`deployment`.
+  Нестроковый `metadata.namespace` — ошибка, а не подмена на namespace по
+  умолчанию. `Unavailable` сохраняется при добавлении контекста apply.
+  Приостановленный Deployment: restart и undo отказываются («resume it
+  first»), как kubectl. Undo читает все страницы ReplicaSet. Голый `Status`
+  в ответ на DELETE (агрегированные API) — повторный GET: объект ещё есть —
+  `Pending`. У CRD без подресурса `status` изменение status считается
+  `Configured`. Live-тест: securityContext под `restricted` PSA фикстуры,
+  предварительная очистка, ожидание ревизии 1 перед сменой образа и
+  ревизии 2 перед undo, проверка, что
+  dry-run restart не сохранился.
+- Ревью CodeRabbit, раунд 2: маскируется и base64-форма `stringData`;
+  ошибка разбора YAML называет только строку и колонку (текст парсера мог
+  процитировать значение Secret); точное совпадение kind/plural важнее
+  угаданного единственного числа, а несколько совпадений — ошибка, а не
+  первое по порядку discovery; live-тест убирает объекты и при падении.
+  Не сделано: singularName CRD (`person` у `people`) — `ApiResource` в
+  kube-rs его не хранит, kind и plural работают.
+
+**Контракты.** Новый публичный трейт `ClusterWriteApi` и типы (см.
+`docs/ENGINE_API.md`). `CommandExecutor`, `LlmClient`, `ClusterApi` не менялись.
+
+**Next.** #639 — гейт записи.

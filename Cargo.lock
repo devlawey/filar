@@ -1737,6 +1737,7 @@ dependencies = [
  "russh",
  "russh-sftp",
  "serde",
+ "serde-saphyr",
  "serde_json",
  "ssh-key",
  "tokio",

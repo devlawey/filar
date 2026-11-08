@@ -1,8 +1,11 @@
-//! Read-only Kubernetes cluster API.
+//! Kubernetes cluster API: read-only [`ClusterApi`] and, separately, write
+//! access [`ClusterWriteApi`] (#638).
 //!
-//! The public surface deliberately contains no Kubernetes client types and no
-//! write operations. In particular, there is no method that can request a
-//! `Secret`. Enable the crate feature `kube` to use this module.
+//! The public surface deliberately contains no Kubernetes client types.
+//! `ClusterApi` has no write operations and no method that can request a
+//! `Secret`; fleets and read-only paths get only it. Writes live behind
+//! `ClusterWriteApi`, which never returns `Secret` values. Enable the crate
+//! feature `kube` to use this module.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -15,8 +18,16 @@ mod debug;
 mod exec;
 mod no_proxy;
 mod http;
+mod write;
 
 pub use client::KubeClusterApi;
+pub use write::{
+    hide_secret_values, parse_manifest, AppliedObject, ApplyAction, ClusterWriteApi,
+    DeleteOptions, DeleteOutcome, DeleteTarget, DeletedObject, ObjectKind, ObjectRef,
+    Propagation, RestartKind, ScaleKind, ScaleOutcome, SecretKeyChange, SecretKeyState,
+    UndoOutcome, WriteOutcome, FIELD_MANAGER, MAX_DELETE_OBJECTS, RESTARTED_AT_ANNOTATION,
+    SECRET_HIDDEN,
+};
 pub use debug::{
     debug_container_name, DebugContainerSpec, DEBUG_CONTAINER_PREFIX,
 };

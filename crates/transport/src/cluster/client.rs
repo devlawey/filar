@@ -57,6 +57,12 @@ impl KubeClusterApi {
         })
     }
 
+    /// An API over an already built client (tests against a fake server).
+    #[cfg(test)]
+    pub(super) fn with_client(client: Client, target: KubeCluster) -> Self {
+        Self { client, target }
+    }
+
     /// The configured cluster entry this API is bound to.
     pub(super) fn target(&self) -> &KubeCluster {
         &self.target
