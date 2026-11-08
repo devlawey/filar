@@ -38,7 +38,7 @@ use tokio::sync::mpsc;
 #[cfg(feature = "kube")]
 pub use cluster::{
     debug_container_name, hide_secret_values, parse_manifest, AppliedObject, ApplyAction,
-    ClusterApi, ClusterWriteApi, DeleteOptions, DeleteOutcome, DeleteTarget, DeletedObject,
+    ClusterApi, ClusterWriteApi, DeleteOptions, DeleteOutcome, DeleteTarget, DeletedObject, DeletionImpact,
     ObjectKind, ObjectRef, Propagation, RestartKind, ScaleKind, ScaleOutcome, SecretKeyChange,
     SecretKeyState, UndoOutcome, WriteOutcome, FIELD_MANAGER, MAX_DELETE_OBJECTS,
     RESTARTED_AT_ANNOTATION, SECRET_HIDDEN, ConfigMapInfo, ContainerInfo, ContainerMetrics,

@@ -886,6 +886,13 @@ impl KubeAgent {
             Ok(preview) => preview.destructive,
             Err(_) => call.is_destructive(),
         };
+        // A cluster-scoped delete has no namespace, whatever the tab's.
+        let cluster_scoped = matches!(&preview, Ok(preview) if preview.cluster_scoped);
+        let call_namespace = if cluster_scoped {
+            None
+        } else {
+            call.namespace()
+        };
         self.emit_and_rate(
             scores,
             AgentEvent::CommandProposed {
@@ -895,7 +902,7 @@ impl KubeAgent {
                 destructive,
                 tool,
             },
-            call.namespace(),
+            call_namespace,
         );
         let preview = match preview {
             Ok(preview) => preview,
@@ -910,7 +917,11 @@ impl KubeAgent {
                 return Ok(ChatMessage::tool(call_id, output));
             }
         };
-        let target_namespace = call.namespace().or(namespace.as_deref());
+        let target_namespace = if cluster_scoped {
+            None
+        } else {
+            call.namespace().or(namespace.as_deref())
+        };
         let window = format!(
             "{explanation}\n\nTool: {}\nKubernetes context: {}\nNamespace: {}\nTarget: {} / {}\n\nDry run:\n{}",
             call.tool_name(),
@@ -1940,13 +1951,43 @@ mod tests {
 
         async fn delete(
             &self,
-            _: &filar_transport::ObjectKind,
-            _: Option<&str>,
-            _: &filar_transport::DeleteTarget,
-            _: &filar_transport::DeleteOptions,
-            _: bool,
+            kind: &filar_transport::ObjectKind,
+            namespace: Option<&str>,
+            target: &filar_transport::DeleteTarget,
+            options: &filar_transport::DeleteOptions,
+            dry_run: bool,
         ) -> Result<Vec<filar_transport::DeletedObject>> {
-            Err(CoreError::Other("not in this mock".into()))
+            let (variant, names) = match target {
+                filar_transport::DeleteTarget::Name(name) => ("name", vec![name.clone()]),
+                filar_transport::DeleteTarget::Names(names) => ("names", names.clone()),
+                filar_transport::DeleteTarget::Selector { .. } => {
+                    ("selector", vec!["web-1".into(), "web-2".into()])
+                }
+            };
+            self.calls.lock().unwrap().push((
+                format!("delete {variant} {} {:?}", names.join(","), options.propagation),
+                dry_run,
+            ));
+            Ok(names
+                .into_iter()
+                .map(|name| filar_transport::DeletedObject {
+                    object: filar_transport::ObjectRef {
+                        api_version: "v1".into(),
+                        kind: kind.kind.clone(),
+                        // Like the API: a cluster-scoped kind has none.
+                        namespace: (kind.kind != "ClusterRole")
+                            .then(|| namespace.map(str::to_owned))
+                            .flatten(),
+                        name,
+                    },
+                    outcome: if dry_run {
+                        filar_transport::DeleteOutcome::WouldDelete
+                    } else {
+                        filar_transport::DeleteOutcome::Deleted
+                    },
+                    live: None,
+                })
+                .collect())
         }
     }
 
@@ -2234,7 +2275,7 @@ mod tests {
             .collect();
         assert!(offered.contains(&"k8s_apply".to_string()), "{offered:?}");
         let system = &llm.requests.lock().unwrap()[0].messages[0].content;
-        assert!(system.contains("only through the write tools (k8s_apply, k8s_scale, k8s_rollout)"), "{system}");
+        assert!(system.contains("only through the write tools (k8s_apply, k8s_scale, k8s_rollout, k8s_delete)"), "{system}");
         assert_eq!(
             *writer.calls.lock().unwrap(),
             [("apply".to_string(), true), ("apply".to_string(), false)]
@@ -2362,5 +2403,107 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ClusterChanged { trace } if trace.contains("scaled Deployment shop/web 3 → 5"))));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::CommandFinished { output, .. } if output.contains("rollout wait cancelled"))));
         assert!(matches!(events.last(), Some(AgentEvent::Cancelled)), "{events:?}");
+    }
+
+    // ── k8s_delete (#642) ──────────────────────────────────────────────
+
+    async fn run_delete(approve: bool) -> (Arc<RecordingWriter>, Arc<WindowConfirmer>, Vec<AgentEvent>) {
+        run_delete_of(
+            approve,
+            serde_json::json!({"kind": "Pod", "label_selector": "app=web", "explanation": "stuck pods"}),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_cluster_scoped_delete_has_no_namespace_in_the_window_or_rating() {
+        let (_, confirmer, events) = run_delete_of(
+            true,
+            serde_json::json!({"kind": "ClusterRole", "name": "reader", "explanation": "unused"}),
+        )
+        .await;
+        let seen = confirmer.seen.lock().unwrap();
+        let (window, _, _) = &seen[0];
+        assert!(window.contains("Namespace: all / cluster-scoped"), "{window}");
+        assert!(!window.contains("Namespace: shop"), "{window}");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::CommandProposed { command, .. } if command == "k8s_delete clusterrole/reader"
+        )));
+    }
+
+    async fn run_delete_of(
+        approve: bool,
+        arguments: serde_json::Value,
+    ) -> (Arc<RecordingWriter>, Arc<WindowConfirmer>, Vec<AgentEvent>) {
+        let writer = Arc::new(RecordingWriter::default());
+        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let confirmer = Arc::new(WindowConfirmer {
+            approve,
+            writer: Arc::clone(&writer),
+            seen: Mutex::new(Vec::new()),
+        });
+        let call = ChatResponse::tool_calls(
+            "",
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "k8s_delete".into(),
+                arguments,
+            }],
+        );
+        KubeAgent::new(
+            ScriptedLlm::new(vec![call, ChatResponse::text("Done.")]),
+            executor(MockCluster::default()),
+            target(),
+            Some("shop".into()),
+            Arc::clone(&confirmer) as Arc<dyn CommandConfirmer>,
+            CommandConfirmMode::Never,
+            Vec::new(),
+        )
+        .event_sink(sink_into(&events))
+        .cluster_writer(Some(Arc::clone(&writer) as Arc<dyn ClusterWriteApi>))
+        .run("delete the stuck web pods", &[])
+        .await
+        .unwrap();
+        let events = events.lock().unwrap().clone();
+        (writer, confirmer, events)
+    }
+
+    #[tokio::test]
+    async fn k8s_delete_deletes_exactly_the_dry_run_list_after_a_destructive_window() {
+        let (writer, confirmer, events) = run_delete(true).await;
+        assert_eq!(
+            *writer.calls.lock().unwrap(),
+            [
+                ("delete selector web-1,web-2 Background".to_string(), true),
+                ("delete names web-1,web-2 Background".to_string(), false),
+            ],
+            "the real delete gets the dry run's names, propagation Background"
+        );
+        let seen = confirmer.seen.lock().unwrap();
+        let (window, destructive, _) = &seen[0];
+        assert!(*destructive, "a delete is always destructive");
+        assert!(window.contains("delete 2 object(s):"), "{window}");
+        assert!(window.contains("⚠ propagationPolicy: Background"), "{window}");
+        let traces: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ClusterChanged { trace } => Some(trace.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(traces.len(), 2);
+        assert!(traces[0].contains("deleted Pod shop/web-1"), "{traces:?}");
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::CommandProposed { command, destructive: true, .. } if command == "k8s_delete pod -l app=web -n shop")));
+    }
+
+    #[tokio::test]
+    async fn a_denied_delete_deletes_nothing() {
+        let (writer, _, events) = run_delete(false).await;
+        assert_eq!(
+            *writer.calls.lock().unwrap(),
+            [("delete selector web-1,web-2 Background".to_string(), true)]
+        );
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::ClusterChanged { .. })));
     }
 }

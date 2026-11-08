@@ -383,7 +383,7 @@ fn prompt_matches_capabilities_and_eval_snapshot() {
         .map(|tool| tool.name)
         .collect();
     let prompt = crate::kube_tools::build_kube_write_system_prompt(&target(), None, &writes);
-    for expected in ["only through the write tools (k8s_apply, k8s_scale, k8s_rollout)", "dry run", "previous=true", "OOMKilled"] {
+    for expected in ["only through the write tools (k8s_apply, k8s_scale, k8s_rollout, k8s_delete)", "dry run", "previous=true", "OOMKilled"] {
         assert!(prompt.contains(expected), "missing {expected:?}: {prompt}");
     }
     let path =

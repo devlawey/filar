@@ -136,6 +136,25 @@ tools: &kube_tools
           explanation: { type: string }
         required: [action, kind, name]
         additionalProperties: false
+  - type: function
+    function:
+      name: k8s_delete
+      description: "Delete Kubernetes objects of any kind the user's RBAC allows, cluster-scoped ones included (Namespace, Node, PersistentVolume, ClusterRole, CRD) and custom resources: by name or by a label/field selector. The most dangerous write: dry-run first, the user sees what goes with it (a namespace's contents, a CRD's objects, volume data under reclaimPolicy Delete, a node's pods) and confirms. A selector deletes exactly what the dry run listed. A pod managed by a controller is recreated by it. Prefer the smallest delete that solves the problem."
+      parameters:
+        type: object
+        properties:
+          kind: { type: string, description: "Kind (Pod), plural (pods) or plural.group (certificates.cert-manager.io)." }
+          api_version: { type: string, description: "apiVersion when the kind is ambiguous (cert-manager.io/v1)." }
+          name: { type: string, description: "Object name; or give a selector instead." }
+          label_selector: { type: string }
+          field_selector: { type: string }
+          namespace: { type: string, description: "Namespace; omit for the tab namespace." }
+          propagation: { type: string, enum: [Background, Foreground, Orphan], default: Background }
+          grace_period_seconds: { type: integer, minimum: 0 }
+          force: { type: boolean, default: false, description: "gracePeriodSeconds=0: no graceful shutdown." }
+          explanation: { type: string }
+        required: [kind]
+        additionalProperties: false
 
 providers:
   - id: openrouter:z-ai/glm-5.2

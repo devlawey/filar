@@ -217,7 +217,13 @@ target = "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
 note = "the production service goes down until scaled back"
 
 [[case]]
-command = "k8s_delete Namespace/staging"
+command = "k8s_delete persistentvolumeclaim/data -n shop"
+level = 3
+target = "Kubernetes cluster prod-eu (namespace shop, tags: prod)"
+note = "with reclaimPolicy Delete the volume's data is lost"
+
+[[case]]
+command = "k8s_delete namespace/staging"
 level = 3
 target = "Kubernetes cluster prod-eu (tags: prod)"
 note = "as kubectl delete namespace: everything in it goes"

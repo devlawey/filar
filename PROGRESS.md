@@ -12551,3 +12551,55 @@ restart — на кластере `dev` (scale→0 на prod должен оце
 чтение и так не считается завершением).
 
 **Next.** #642 — `k8s_delete`.
+
+## Issue #642: k8s_delete — удаление объектов во вкладке кластера (веха 3.0.5)
+
+**Сделано.** `kube_write.rs`: инструмент `k8s_delete` (`kind`,
+`api_version`, `name` или `label_selector`/`field_selector`, `namespace`,
+`propagation`, `grace_period_seconds`, `force`). Командная строка:
+`k8s_delete pod/web-7f9c -n shop`, `… -l app=web`, флаги
+`--cascade=foreground|orphan`, `--grace-period=N`, `--force`; у
+cluster-scoped вида (по ответу dry run) — без `-n`. Окно всегда
+деструктивное; `deletion_warnings` по первым 10 объектам (`MAX_IMPACT_READS`)
+пишет: контроллер пересоздаст под; каскад подов у workload и Job; всё
+содержимое Namespace по видам; все объекты CRD; `reclaimPolicy` тома; поды на
+ноде и совет про drain; риск потерять свой доступ при удалении RBAC;
+`⚠ propagationPolicy` и `⚠ force` / `⚠ gracePeriodSeconds`.
+
+Транспорт: `DeletedObject::live` — объект из ответа API на (dry-run) delete,
+значения Secret скрыты; `ClusterWriteApi::deletion_impact` (по умолчанию
+пусто) → `DeletionImpact` (controller, contents, custom_objects,
+reclaim_policy, node_pods). `KubeClusterApi` читает: discovery + одна
+страница (500) на вид в namespace, объекты CRD по её `spec`, PV или
+StorageClass для PVC (StorageClass без `reclaimPolicy` → `Delete`), поды с
+`spec.nodeName`. Непрочитанное остаётся пустым.
+
+**Решения.**
+- «Отдельной красной строкой» — строки с `⚠`: окно подтверждения не умеет
+  красить отдельные строки, оно целиком красное (деструктивное).
+- Права текущего пользователя для RBAC не вычисляются (нужен
+  SelfSubjectReview и разбор субъектов привязки): предупреждение даётся для
+  любого Role/ClusterRole/привязки.
+
+**Проверено.** Бинарник в tmux против фейкового API: удаление пода web-1 —
+красное окно с «managed by ReplicaSet web-7f9c: the controller will recreate
+it» и `⚠ propagationPolicy: Background`, `a` → DELETE с
+`propagationPolicy: Background`, след «Изменение в кластере: deleted Pod
+shop/web-1»; удаление Namespace shop — «EVERYTHING in this namespace is
+deleted: Deployment 1, Pod 2», `d` → только dry-run DELETE.
+
+**Ревью (CodeRabbit, первое и единственное).** Предупреждения в окне идут
+до списка объектов — окно не прокручивается; cluster-scoped удаление
+попадает в окно и к оценщику без namespace вкладки
+(`WritePreview::cluster_scoped`); `api_version` виден в команде
+(`--api-version=…`); аргументы неверного типа — ошибка до dry run, и
+namespace общий с другими инструментами записи; новые предупреждения:
+StatefulSet с `whenDeleted: Delete` (PVC и данные), `reclaimPolicy: Recycle`,
+непроверенные тома за первыми 10 объектами, неполный перечень Namespace
+(`DeletionImpact::contents_incomplete`), честная формулировка про поды Node;
+dry run, ответивший голым `Status`, дочитывает объект для проверки влияния.
+Документация уточняет, что имя — идентичность (пересозданный под тем же
+именем объект удаляется). В тесте `RecordingWriter` записывает вариант
+цели, и проверено, что реальное удаление идёт по `Names`.
+
+**Next.** #646 — метаданные Secret.

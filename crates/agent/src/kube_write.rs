@@ -198,11 +198,12 @@ impl KubeWriteCall {
                 target,
                 options,
             } => {
+                let kind_name = kind.kind.to_ascii_lowercase();
                 let what = match target {
-                    DeleteTarget::Name(name) => format!("{}/{name}", kind.kind),
-                    DeleteTarget::Names(names) => format!("{} {}", kind.kind, names.join(" ")),
+                    DeleteTarget::Name(name) => format!("{kind_name}/{name}"),
+                    DeleteTarget::Names(names) => format!("{kind_name} {}", names.join(" ")),
                     DeleteTarget::Selector { labels, fields } => {
-                        let mut out = kind.kind.clone();
+                        let mut out = kind_name.clone();
                         if let Some(labels) = labels {
                             out.push_str(&format!(" -l {labels}"));
                         }
@@ -212,8 +213,25 @@ impl KubeWriteCall {
                         out
                     }
                 };
-                let force = if options.force { " --force" } else { "" };
-                format!("k8s_delete {what}{}{force}", ns(namespace.as_deref()))
+                let mut flags = String::new();
+                // The apiVersion picks between same-named kinds of two
+                // groups: the window and the arbiter must see which.
+                if let Some(api_version) = &kind.api_version {
+                    flags.push_str(&format!(" --api-version={api_version}"));
+                }
+                match options.propagation {
+                    filar_transport::Propagation::Background => {}
+                    filar_transport::Propagation::Foreground => {
+                        flags.push_str(" --cascade=foreground")
+                    }
+                    filar_transport::Propagation::Orphan => flags.push_str(" --cascade=orphan"),
+                }
+                if options.force {
+                    flags.push_str(" --force");
+                } else if let Some(seconds) = options.grace_period_seconds {
+                    flags.push_str(&format!(" --grace-period={seconds}"));
+                }
+                format!("k8s_delete {what}{}{flags}", ns(namespace.as_deref()))
             }
         }
     }
@@ -243,6 +261,9 @@ pub const TOOL_K8S_SCALE: &str = "k8s_scale";
 
 /// Tool name of a rollout restart or undo (#641).
 pub const TOOL_K8S_ROLLOUT: &str = "k8s_rollout";
+
+/// Tool name of a delete (#642).
+pub const TOOL_K8S_DELETE: &str = "k8s_delete";
 
 /// Most replicas `k8s_scale` asks for; a bigger number is a typo more often
 /// than a plan.
@@ -303,6 +324,27 @@ pub fn kube_write_tool_definitions(mode: CommandConfirmMode) -> Vec<ToolDef> {
                 ("to_revision".to_string(), serde_json::json!({"type": "integer", "minimum": 1, "description": "undo only; omit for the revision before the current one"})),
             ]),
             vec!["action", "kind", "name"],
+            mode,
+        ),
+        crate::kube_tools::definition(
+            TOOL_K8S_DELETE,
+            "Delete Kubernetes objects of any kind the user's RBAC allows, cluster-scoped ones included \
+             (Namespace, Node, PersistentVolume, ClusterRole, CRD) and custom resources: by name or by a label/field selector. \
+             The most dangerous write: dry-run first, the user sees what goes with it (a namespace's contents, a CRD's objects, \
+             volume data under reclaimPolicy Delete, a node's pods) and confirms. A selector deletes exactly what the dry run listed. \
+             A pod managed by a controller is recreated by it. Prefer the smallest delete that solves the problem.",
+            Map::from_iter([
+                ("kind".to_string(), serde_json::json!({"type": "string", "description": "Kind (Pod), plural (pods) or plural.group (certificates.cert-manager.io)."})),
+                ("api_version".to_string(), serde_json::json!({"type": "string", "description": "apiVersion when the kind is ambiguous (cert-manager.io/v1)."})),
+                ("name".to_string(), serde_json::json!({"type": "string", "description": "Object name; or give a selector instead."})),
+                ("label_selector".to_string(), serde_json::json!({"type": "string"})),
+                ("field_selector".to_string(), serde_json::json!({"type": "string"})),
+                ("namespace".to_string(), namespace()),
+                ("propagation".to_string(), serde_json::json!({"type": "string", "enum": ["Background", "Foreground", "Orphan"], "default": "Background"})),
+                ("grace_period_seconds".to_string(), serde_json::json!({"type": "integer", "minimum": 0})),
+                ("force".to_string(), serde_json::json!({"type": "boolean", "default": false, "description": "gracePeriodSeconds=0: no graceful shutdown."})),
+            ]),
+            vec!["kind"],
             mode,
         ),
     ]
@@ -431,6 +473,98 @@ pub fn parse_kube_write_call(
                     "action must be restart or undo, not {other}"
                 ))),
             }
+        }
+        TOOL_K8S_DELETE => {
+            for key in [
+                "api_version",
+                "name",
+                "label_selector",
+                "field_selector",
+                "propagation",
+            ] {
+                if let Some(other) = args.get(key).filter(|v| !v.is_null() && !v.is_string()) {
+                    return Err(CoreError::Other(format!(
+                        "{key} must be a string, not {other}"
+                    )));
+                }
+            }
+            let kind = ObjectKind {
+                api_version: args
+                    .get("api_version")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned),
+                kind: required_str(args, "kind")?,
+            };
+            let text = |key: &str| {
+                args.get(key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned)
+            };
+            let target = match (text("name"), text("label_selector"), text("field_selector")) {
+                (Some(name), None, None) => DeleteTarget::Name(name),
+                (None, labels, fields) if labels.is_some() || fields.is_some() => {
+                    DeleteTarget::Selector { labels, fields }
+                }
+                (Some(_), _, _) => {
+                    return Err(CoreError::Other(
+                        "give either name or a selector, not both".into(),
+                    ))
+                }
+                _ => {
+                    return Err(CoreError::Other(
+                        "give the name or a label/field selector".into(),
+                    ))
+                }
+            };
+            let propagation = match text("propagation").as_deref() {
+                None | Some("Background") => filar_transport::Propagation::Background,
+                Some("Foreground") => filar_transport::Propagation::Foreground,
+                Some("Orphan") => filar_transport::Propagation::Orphan,
+                Some(other) => {
+                    return Err(CoreError::Other(format!(
+                        "propagation must be Background, Foreground or Orphan, not {other}"
+                    )))
+                }
+            };
+            let grace_period_seconds = match args.get("grace_period_seconds") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .and_then(|v| u32::try_from(v).ok())
+                        .ok_or_else(|| {
+                            CoreError::Other("grace_period_seconds must be 0 or more".into())
+                        })?,
+                ),
+            };
+            let force = match args.get("force") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(force)) => *force,
+                Some(_) => return Err(CoreError::Other("force must be true or false".into())),
+            };
+            // Optional for cluster-scoped kinds, but never a wrong type.
+            let namespace = namespace_of(args, default_namespace).ok();
+            if let Some(other) = args
+                .get("namespace")
+                .filter(|ns| !ns.is_null() && !ns.is_string())
+            {
+                return Err(CoreError::Other(format!(
+                    "namespace must be a string, not {other}"
+                )));
+            }
+            Ok(KubeWriteCall::Delete {
+                kind,
+                namespace,
+                target,
+                options: DeleteOptions {
+                    propagation,
+                    grace_period_seconds,
+                    force,
+                },
+            })
         }
         other => Err(CoreError::Other(format!(
             "unknown Kubernetes write tool {other}"
@@ -589,6 +723,9 @@ pub struct WritePreview {
     /// For an undo: the revision the dry run rolled back to. The real undo
     /// gets exactly this one, even if a rollout finished meanwhile.
     pub undo_revision: Option<i64>,
+    /// Every object the dry run touched is cluster-scoped: the window and
+    /// the risk scorer get no namespace, not the tab's (#642).
+    pub cluster_scoped: bool,
 }
 
 impl WritePreview {
@@ -630,6 +767,7 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
     let mut destructive = false;
     let mut names = None;
     let mut undo_revision = None;
+    let mut cluster_scoped = false;
     let mut display = None;
     match call {
         KubeWriteCall::Apply {
@@ -737,7 +875,20 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
                     "nothing matches: no object would be deleted".into(),
                 ));
             }
+            // Warnings first: a long list must not push them out of a window
+            // that does not scroll.
+            text.push_str(deletion_warnings(api, &listed, options).await.trim_start());
+            text.push('\n');
             text.push_str(&deleted_text(&listed, true));
+            // A cluster-scoped kind has no namespace: the dry run knows.
+            if listed.iter().all(|d| d.object.namespace.is_none()) {
+                cluster_scoped = true;
+                let mut cluster_scoped = call.clone();
+                if let KubeWriteCall::Delete { namespace, .. } = &mut cluster_scoped {
+                    *namespace = None;
+                }
+                display = Some(cluster_scoped.display_command());
+            }
             if matches!(target, DeleteTarget::Selector { .. }) {
                 names = Some(listed.iter().map(|d| d.object.name.clone()).collect());
             }
@@ -749,6 +900,7 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
         names,
         undo_revision,
         display,
+        cluster_scoped,
     })
 }
 
@@ -946,6 +1098,164 @@ fn applied_text(object: &AppliedObject) -> String {
         object.status_is_content,
     ));
     text
+}
+
+/// Most objects whose impact is read for the window: a long selector list
+/// is warned about by kind, not object by object.
+const MAX_IMPACT_READS: usize = 10;
+
+/// What a delete takes with it, for the window (#642): controllers that
+/// recreate, cascades, the contents of a Namespace, the objects of a CRD,
+/// volume data, a node's pods, RBAC access, and the options.
+async fn deletion_warnings(
+    api: &dyn ClusterWriteApi,
+    objects: &[DeletedObject],
+    options: &DeleteOptions,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for object in objects.iter().take(MAX_IMPACT_READS) {
+        let label = object_label(&object.object);
+        let impact = api.deletion_impact(object).await;
+        if let Some(controller) = &impact.controller {
+            lines.push(format!(
+                "{label} is managed by {controller}: the controller will recreate it"
+            ));
+        }
+        lines.extend(kind_warnings(object, &impact, options, &label));
+    }
+    if objects.len() > MAX_IMPACT_READS {
+        let rest = &objects[MAX_IMPACT_READS..];
+        lines.push(format!(
+            "{} more object(s) not inspected; the same kind warnings apply",
+            rest.len()
+        ));
+        if rest.iter().any(|d| {
+            matches!(
+                d.object.kind.as_str(),
+                "PersistentVolumeClaim" | "PersistentVolume" | "StatefulSet"
+            )
+        }) {
+            lines.push(
+                "⚠ volumes of the uninspected objects may have reclaimPolicy Delete: their DATA may be lost".into(),
+            );
+        }
+    }
+    let propagation = match options.propagation {
+        filar_transport::Propagation::Background => "Background",
+        filar_transport::Propagation::Foreground => "Foreground",
+        filar_transport::Propagation::Orphan => "Orphan (dependents stay)",
+    };
+    lines.push(format!("⚠ propagationPolicy: {propagation}"));
+    if options.force {
+        lines.push("⚠ force: gracePeriodSeconds=0 — no graceful shutdown".into());
+    } else if let Some(seconds) = options.grace_period_seconds {
+        lines.push(format!("⚠ gracePeriodSeconds={seconds}"));
+    }
+    let mut text = String::from("\n");
+    for line in lines {
+        text.push_str(&line);
+        text.push('\n');
+    }
+    text
+}
+
+/// Warnings by kind for one object of a delete.
+fn kind_warnings(
+    deleted: &DeletedObject,
+    impact: &filar_transport::DeletionImpact,
+    options: &DeleteOptions,
+    label: &str,
+) -> Vec<String> {
+    let orphan = options.propagation == filar_transport::Propagation::Orphan;
+    let count = |(count, more): (usize, bool)| {
+        if more {
+            format!("{count}+")
+        } else {
+            count.to_string()
+        }
+    };
+    let object = &deleted.object;
+    let mut lines = Vec::new();
+    match object.kind.as_str() {
+        "StatefulSet" if !orphan => {
+            lines.push(format!("{label}: its pods go with it"));
+            let retention = deleted.live.as_ref().map(|live| {
+                live.pointer("/spec/persistentVolumeClaimRetentionPolicy/whenDeleted")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Retain")
+                    .to_string()
+            });
+            match retention.as_deref() {
+                Some("Delete") => lines.push(format!(
+                    "{label}: PVC retention whenDeleted=Delete — its PVCs and their DATA are deleted too"
+                )),
+                Some(_) => {}
+                None => lines.push(format!(
+                    "{label}: if its PVC retention is whenDeleted=Delete, its PVCs and their data go too"
+                )),
+            }
+        }
+        "Deployment" | "DaemonSet" | "ReplicaSet" if !orphan => {
+            lines.push(format!("{label}: its pods go with it"));
+        }
+        "Job" | "CronJob" if !orphan => {
+            lines.push(format!("{label}: its jobs and pods go with it"));
+        }
+        "Namespace" => {
+            if impact.contents.is_empty() {
+                lines.push(format!(
+                    "{label}: EVERYTHING in this namespace is deleted (its contents could not be read or it is empty)"
+                ));
+            } else {
+                let contents: Vec<String> = impact
+                    .contents
+                    .iter()
+                    .map(|(kind, n, more)| format!("{kind} {}", count((*n, *more))))
+                    .collect();
+                let incomplete = if impact.contents_incomplete {
+                    " (some kinds could not be read: the list may be incomplete)"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "{label}: EVERYTHING in this namespace is deleted: {}{incomplete}",
+                    contents.join(", ")
+                ));
+            }
+        }
+        "CustomResourceDefinition" => match impact.custom_objects {
+            Some(objects) => lines.push(format!(
+                "{label}: all {} object(s) of this type in all namespaces are deleted",
+                count(objects)
+            )),
+            None => lines.push(format!(
+                "{label}: all objects of this type in all namespaces are deleted"
+            )),
+        },
+        "PersistentVolumeClaim" | "PersistentVolume" => match impact.reclaim_policy.as_deref() {
+            Some("Delete") => lines.push(format!(
+                "{label}: reclaimPolicy Delete — the volume's DATA WILL BE LOST"
+            )),
+            Some("Recycle") => lines.push(format!(
+                "{label}: reclaimPolicy Recycle — the volume is scrubbed: its DATA WILL BE LOST"
+            )),
+            Some(policy) => lines.push(format!(
+                "{label}: reclaimPolicy {policy} — the volume is kept"
+            )),
+            None => lines.push(format!(
+                "{label}: if the volume's reclaimPolicy is Delete, its data will be lost"
+            )),
+        },
+        "Node" => lines.push(format!(
+            "{label}: {} pod(s) on it are garbage-collected later (not at once); controller-managed ones may be recreated elsewhere if capacity allows, standalone ones are lost — drain the node first (kubectl drain)",
+            impact.node_pods.map(count).unwrap_or_else(|| "its".into())
+        )),
+        "Role" | "ClusterRole" | "RoleBinding" | "ClusterRoleBinding" => lines.push(format!(
+            "{label}: if this grants your own access, you may lose access to the cluster"
+        )),
+        _ => {}
+    }
+    lines
 }
 
 fn deleted_text(objects: &[DeletedObject], dry_run: bool) -> String {
@@ -1248,7 +1558,7 @@ mod tests {
         };
         assert_eq!(
             delete.display_command(),
-            "k8s_delete Pod -l app=web -n shop --force"
+            "k8s_delete pod -l app=web -n shop --force"
         );
     }
 
@@ -1451,7 +1761,15 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect();
-        assert_eq!(names, [TOOL_K8S_APPLY, TOOL_K8S_SCALE, TOOL_K8S_ROLLOUT]);
+        assert_eq!(
+            names,
+            [
+                TOOL_K8S_APPLY,
+                TOOL_K8S_SCALE,
+                TOOL_K8S_ROLLOUT,
+                TOOL_K8S_DELETE
+            ]
+        );
     }
 
     fn workload(ready: i32, updated: i32) -> filar_transport::WorkloadInfo {
@@ -1626,6 +1944,260 @@ mod tests {
             "{error}"
         );
     }
+
+    #[test]
+    fn k8s_delete_takes_any_kind_and_a_name_or_a_selector() {
+        let parse = |args: Value| parse_kube_write_call(TOOL_K8S_DELETE, &args, Some("shop"));
+        let pod = parse(json!({"kind": "Pod", "name": "web-7f9c"})).unwrap();
+        assert_eq!(pod.display_command(), "k8s_delete pod/web-7f9c -n shop");
+        let custom = parse(json!({"kind": "certificates.cert-manager.io", "api_version": "cert-manager.io/v1", "name": "tls"})).unwrap();
+        assert!(
+            matches!(&custom, KubeWriteCall::Delete { kind, .. } if kind.api_version.as_deref() == Some("cert-manager.io/v1"))
+        );
+        let selector = parse(json!({"kind": "Pod", "label_selector": "app=web", "propagation": "Foreground", "grace_period_seconds": 30})).unwrap();
+        assert_eq!(
+            selector.display_command(),
+            "k8s_delete pod -l app=web -n shop --cascade=foreground --grace-period=30"
+        );
+        let forced = parse(json!({"kind": "Pod", "name": "stuck", "force": true})).unwrap();
+        assert!(forced.display_command().ends_with("--force"));
+        let node = parse_kube_write_call(
+            TOOL_K8S_DELETE,
+            &json!({"kind": "Node", "name": "worker-3"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(node.display_command(), "k8s_delete node/worker-3");
+        for bad in [
+            json!({"kind": "Pod"}),
+            json!({"kind": "Pod", "name": "a", "label_selector": "app=web"}),
+            json!({"name": "a"}),
+            json!({"kind": "Pod", "name": "a", "propagation": "Later"}),
+            json!({"kind": "Pod", "name": "a", "grace_period_seconds": -1}),
+            json!({"kind": "Pod", "name": "a", "force": "yes"}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    /// A writer whose dry-run delete lists one object of the asked kind and
+    /// whose impact reading answers by kind.
+    struct ImpactWriter;
+
+    #[async_trait::async_trait]
+    impl ClusterWriteApi for ImpactWriter {
+        async fn apply(&self, _: &str, _: Option<&str>, _: bool) -> Result<Vec<AppliedObject>> {
+            unreachable!()
+        }
+        async fn scale(
+            &self,
+            _: ScaleKind,
+            _: &str,
+            _: &str,
+            _: i32,
+            _: bool,
+        ) -> Result<filar_transport::ScaleOutcome> {
+            unreachable!()
+        }
+        async fn rollout_restart(
+            &self,
+            _: RestartKind,
+            _: &str,
+            _: &str,
+            _: bool,
+        ) -> Result<filar_transport::WriteOutcome> {
+            unreachable!()
+        }
+        async fn rollout_undo(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<i64>,
+            _: bool,
+        ) -> Result<filar_transport::UndoOutcome> {
+            unreachable!()
+        }
+        async fn delete(
+            &self,
+            kind: &ObjectKind,
+            namespace: Option<&str>,
+            target: &DeleteTarget,
+            _: &DeleteOptions,
+            _: bool,
+        ) -> Result<Vec<DeletedObject>> {
+            let DeleteTarget::Name(name) = target else {
+                unreachable!()
+            };
+            Ok(vec![DeletedObject {
+                object: ObjectRef {
+                    api_version: "v1".into(),
+                    kind: kind.kind.clone(),
+                    namespace: namespace.map(str::to_owned),
+                    name: name.clone(),
+                },
+                outcome: DeleteOutcome::WouldDelete,
+                // A StatefulSet named `x` is read and deletes its PVCs; one
+                // named `unread` could not be read.
+                live: (kind.kind == "StatefulSet" && name == "x").then(|| {
+                    json!({"spec": {"persistentVolumeClaimRetentionPolicy": {"whenDeleted": "Delete"}}})
+                }),
+            }])
+        }
+        async fn deletion_impact(&self, object: &DeletedObject) -> filar_transport::DeletionImpact {
+            let mut impact = filar_transport::DeletionImpact::default();
+            if object.object.name == "partial" {
+                impact.contents = vec![("Pod".into(), 3, false)];
+                impact.contents_incomplete = true;
+                return impact;
+            }
+            if object.object.name == "recycled" {
+                impact.reclaim_policy = Some("Recycle".into());
+                return impact;
+            }
+            match object.object.kind.as_str() {
+                "Pod" => impact.controller = Some("ReplicaSet web-7f9c".into()),
+                "Namespace" => {
+                    impact.contents = vec![("Pod".into(), 12, false), ("Secret".into(), 500, true)]
+                }
+                "CustomResourceDefinition" => impact.custom_objects = Some((42, false)),
+                "PersistentVolumeClaim" => impact.reclaim_policy = Some("Delete".into()),
+                "PersistentVolume" => impact.reclaim_policy = Some("Retain".into()),
+                "Node" => impact.node_pods = Some((17, false)),
+                _ => {}
+            }
+            impact
+        }
+    }
+
+    async fn delete_window(kind: &str, force: bool) -> WritePreview {
+        delete_named(kind, "x", force).await
+    }
+
+    async fn delete_named(kind: &str, name: &str, force: bool) -> WritePreview {
+        let call = KubeWriteCall::Delete {
+            kind: ObjectKind {
+                api_version: None,
+                kind: kind.into(),
+            },
+            namespace: Some("shop".into()),
+            target: DeleteTarget::Name(name.into()),
+            options: DeleteOptions {
+                force,
+                ..DeleteOptions::default()
+            },
+        };
+        preview(&ImpactWriter, &call).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_delete_window_says_what_goes_with_it() {
+        let pod = delete_window("Pod", false).await;
+        assert!(pod.destructive);
+        assert!(
+            pod.text
+                .contains("managed by ReplicaSet web-7f9c: the controller will recreate it"),
+            "{}",
+            pod.text
+        );
+        assert!(
+            pod.text.contains("⚠ propagationPolicy: Background"),
+            "{}",
+            pod.text
+        );
+        let namespace = delete_window("Namespace", false).await;
+        assert_eq!(
+            namespace.display, None,
+            "the mock lists it with the tab namespace"
+        );
+        assert!(
+            namespace
+                .text
+                .contains("EVERYTHING in this namespace is deleted: Pod 12, Secret 500+"),
+            "{}",
+            namespace.text
+        );
+        let crd = delete_window("CustomResourceDefinition", false).await;
+        assert!(
+            crd.text
+                .contains("all 42 object(s) of this type in all namespaces"),
+            "{}",
+            crd.text
+        );
+        let pvc = delete_window("PersistentVolumeClaim", false).await;
+        assert!(
+            pvc.text
+                .contains("reclaimPolicy Delete — the volume's DATA WILL BE LOST"),
+            "{}",
+            pvc.text
+        );
+        let pv = delete_window("PersistentVolume", false).await;
+        assert!(
+            pv.text
+                .contains("reclaimPolicy Retain — the volume is kept"),
+            "{}",
+            pv.text
+        );
+        let node = delete_window("Node", false).await;
+        assert!(
+            node.text
+                .contains("17 pod(s) on it are garbage-collected later (not at once); controller-managed ones may be recreated elsewhere if capacity allows, standalone ones are lost"),
+            "{}",
+            node.text
+        );
+        let statefulset = delete_window("StatefulSet", false).await;
+        assert!(
+            statefulset.text.contains(
+                "PVC retention whenDeleted=Delete — its PVCs and their DATA are deleted too"
+            ),
+            "{}",
+            statefulset.text
+        );
+        let unread = delete_named("StatefulSet", "unread", false).await;
+        assert!(
+            unread
+                .text
+                .contains("if its PVC retention is whenDeleted=Delete"),
+            "{}",
+            unread.text
+        );
+        let recycled = delete_named("PersistentVolumeClaim", "recycled", false).await;
+        assert!(
+            recycled
+                .text
+                .contains("reclaimPolicy Recycle — the volume is scrubbed"),
+            "{}",
+            recycled.text
+        );
+        let partial = delete_named("Namespace", "partial", false).await;
+        assert!(
+            partial.text.contains("Pod 3 (some kinds could not be read"),
+            "{}",
+            partial.text
+        );
+        let first = |text: &str, needle: &str| text.find(needle).unwrap_or(usize::MAX);
+        assert!(
+            first(&pod.text, "managed by") < first(&pod.text, "delete 1 object(s)"),
+            "warnings come before the list: {}",
+            pod.text
+        );
+        let binding = delete_window("ClusterRoleBinding", true).await;
+        assert!(
+            binding.text.contains("you may lose access"),
+            "{}",
+            binding.text
+        );
+        assert!(
+            binding.text.contains("⚠ force: gracePeriodSeconds=0"),
+            "{}",
+            binding.text
+        );
+        let deployment = delete_window("Deployment", false).await;
+        assert!(
+            deployment.text.contains("its pods go with it"),
+            "{}",
+            deployment.text
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1651,6 +2223,7 @@ mod destructive_tests {
             names: None,
             display: None,
             undo_revision: Some(2),
+            cluster_scoped: false,
         };
         let undo = |to_revision| KubeWriteCall::RolloutUndo {
             namespace: "shop".into(),
@@ -1687,5 +2260,54 @@ mod destructive_tests {
         let text = applied_text(&object);
         assert!(text.contains("\"new\""), "status shown beside spec: {text}");
         assert!(text.contains("\"a\": 2"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod delete_review_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn delete_arguments_of_the_wrong_type_are_refused() {
+        let parse = |args: Value| parse_kube_write_call(TOOL_K8S_DELETE, &args, Some("shop"));
+        for (key, args) in [
+            (
+                "name",
+                json!({"kind": "Pod", "name": 7, "label_selector": "app=web"}),
+            ),
+            (
+                "propagation",
+                json!({"kind": "Pod", "name": "web", "propagation": true}),
+            ),
+            (
+                "api_version",
+                json!({"kind": "Widget", "name": "x", "api_version": 1}),
+            ),
+            (
+                "namespace",
+                json!({"kind": "Pod", "name": "web", "namespace": ["shop"]}),
+            ),
+        ] {
+            let error = parse(args).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("{key} must be a string")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_api_version_shows_in_the_delete_command() {
+        let call = parse_kube_write_call(
+            TOOL_K8S_DELETE,
+            &json!({"kind": "Widget", "name": "x", "api_version": "example.com/v1"}),
+            Some("shop"),
+        )
+        .unwrap();
+        assert_eq!(
+            call.display_command(),
+            "k8s_delete widget/x -n shop --api-version=example.com/v1"
+        );
     }
 }
