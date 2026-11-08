@@ -547,13 +547,13 @@ fn applied_text(object: &AppliedObject) -> String {
             key_state(key.state)
         ));
     }
-    let mut shown = diff(object.live.as_ref(), &object.result);
-    if object.action == filar_transport::ApplyAction::Configured && shown.contains(NO_CHANGE) {
-        // The transport counted a status change: a resource without a
-        // `status` subresource takes status through the main endpoint.
-        shown = diff_with(object.live.as_ref(), &object.result, true);
-    }
-    text.push_str(&shown);
+    // A resource without a `status` subresource takes status through the
+    // main endpoint: there status is content, not noise.
+    text.push_str(&diff_with(
+        object.live.as_ref(),
+        &object.result,
+        object.status_is_content,
+    ));
     text
 }
 
@@ -911,11 +911,11 @@ mod destructive_tests {
     }
 
     #[test]
-    fn a_status_only_change_shows_status_in_the_window() {
+    fn a_status_change_shows_in_the_window_without_a_status_subresource() {
         let live = serde_json::json!({"kind": "Widget", "metadata": {"name": "w"},
             "spec": {"a": 1}, "status": {"phase": "old"}});
         let result = serde_json::json!({"kind": "Widget", "metadata": {"name": "w"},
-            "spec": {"a": 1}, "status": {"phase": "new"}});
+            "spec": {"a": 2}, "status": {"phase": "new"}});
         let object = AppliedObject {
             object: ObjectRef {
                 api_version: "example.com/v1".into(),
@@ -927,9 +927,10 @@ mod destructive_tests {
             live: Some(live),
             result,
             secret_keys: Vec::new(),
+            status_is_content: true,
         };
         let text = applied_text(&object);
-        assert!(text.contains("\"new\""), "{text}");
-        assert!(!text.contains(NO_CHANGE), "{text}");
+        assert!(text.contains("\"new\""), "status shown beside spec: {text}");
+        assert!(text.contains("\"a\": 2"), "{text}");
     }
 }
