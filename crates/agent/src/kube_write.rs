@@ -385,6 +385,16 @@ pub fn parse_kube_write_call(
             let namespace = namespace_of(args, default_namespace)?;
             let name = required_str(args, "name")?;
             match required_str(args, "action")?.as_str() {
+                "restart"
+                    if args
+                        .get("to_revision")
+                        .is_some_and(|revision| !revision.is_null()) =>
+                {
+                    Err(CoreError::Other(
+                        "to_revision belongs to action undo; a restart keeps the current template"
+                            .into(),
+                    ))
+                }
                 "restart" => Ok(KubeWriteCall::RolloutRestart {
                     kind: match kind.as_str() {
                         "deployment" => RestartKind::Deployment,
@@ -438,9 +448,16 @@ fn required_str(args: &Value, key: &str) -> Result<String> {
 }
 
 fn namespace_of(args: &Value, default_namespace: Option<&str>) -> Result<String> {
-    args.get("namespace")
-        .and_then(Value::as_str)
-        .filter(|ns| !ns.is_empty())
+    let given = match args.get("namespace") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(ns)) => Some(ns.trim()).filter(|ns| !ns.is_empty()),
+        Some(other) => {
+            return Err(CoreError::Other(format!(
+                "namespace must be a string, not {other}"
+            )))
+        }
+    };
+    given
         .or(default_namespace)
         .map(str::to_owned)
         .ok_or_else(|| CoreError::Other("namespace is required (the tab has none)".into()))
@@ -496,14 +513,19 @@ pub async fn wait_rollout(
     poll: std::time::Duration,
 ) -> String {
     let started = tokio::time::Instant::now();
+    let deadline = started + wait;
     let mut reads = 0usize;
-    let mut last: String;
+    let mut last = String::from("status not read yet");
     loop {
         if reads > 0 {
-            tokio::time::sleep(poll).await;
+            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + poll)).await;
         }
         reads += 1;
-        match api.list_workloads(Some(namespace), kind).await {
+        let read = tokio::time::timeout_at(deadline, api.list_workloads(Some(namespace), kind));
+        let Ok(read) = read.await else {
+            return not_finished(name, wait, &last);
+        };
+        match read {
             Ok(workloads) => match workloads.into_iter().find(|w| w.name == name) {
                 Some(workload) => {
                     let desired = workload.desired.unwrap_or(0);
@@ -519,15 +541,25 @@ pub async fn wait_rollout(
                 }
                 None => last = format!("{name} not found while waiting"),
             },
+            // No permission to read workloads: retrying cannot help.
+            Err(error @ CoreError::AccessDenied(_)) => {
+                return format!(
+                    "rollout of {name} not followed: status unreadable ({error}); the change is applied"
+                );
+            }
             Err(error) => last = format!("status unreadable: {error}"),
         }
-        if started.elapsed() >= wait {
-            return format!(
-                "rollout of {name} not finished after {} s: {last}; check k8s_get, k8s_describe and events",
-                wait.as_secs()
-            );
+        if tokio::time::Instant::now() >= deadline {
+            return not_finished(name, wait, &last);
         }
     }
+}
+
+fn not_finished(name: &str, wait: std::time::Duration, last: &str) -> String {
+    format!(
+        "rollout of {name} not finished after {} s: {last}; check k8s_get, k8s_describe and events",
+        wait.as_secs()
+    )
 }
 
 /// The confirmation policy of a cluster write (#639): always asked, in every
@@ -656,6 +688,17 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
             name,
         } => {
             let outcome = api.rollout_restart(*kind, namespace, name, true).await?;
+            if outcome
+                .live
+                .pointer("/spec/updateStrategy/type")
+                .and_then(Value::as_str)
+                == Some("OnDelete")
+            {
+                return Err(CoreError::Other(format!(
+                    "{} uses updateStrategy OnDelete: a restart changes the template but replaces no pod; delete its pods one by one (k8s_delete) instead",
+                    object_label(&outcome.object)
+                )));
+            }
             text.push_str(&format!(
                 "restart {}: every pod is replaced\n",
                 object_label(&outcome.object)
@@ -1450,6 +1493,11 @@ mod tests {
             done.starts_with("rollout of web complete: 5/5 ready, 5 updated"),
             "{done}"
         );
+        assert_eq!(
+            cluster.workload_reads.lock().unwrap().len(),
+            1,
+            "the intermediate status was read"
+        );
 
         let stuck = MockCluster::default();
         *stuck.workload_reads.lock().unwrap() = [vec![workload(2, 5)]].into_iter().collect();
@@ -1467,6 +1515,116 @@ mod tests {
             "{late}"
         );
         assert!(late.contains("events"), "{late}");
+
+        let mut denied = MockCluster::default();
+        denied.workloads_denied = true;
+        let started = tokio::time::Instant::now();
+        let refused = wait_rollout(
+            &denied,
+            WorkloadKind::Deployment,
+            "shop",
+            "web",
+            ROLLOUT_WAIT,
+            ROLLOUT_POLL,
+        )
+        .await;
+        assert!(refused.contains("not followed"), "{refused}");
+        assert!(started.elapsed() < ROLLOUT_POLL, "no retries on RBAC");
+    }
+
+    #[test]
+    fn rollout_arguments_that_do_not_belong_are_refused() {
+        let parse = |args: Value| parse_kube_write_call(TOOL_K8S_ROLLOUT, &args, Some("shop"));
+        let error = parse(
+            json!({"action": "restart", "kind": "Deployment", "name": "web", "to_revision": 3}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("belongs to action undo"), "{error}");
+        let error = parse(
+            json!({"action": "restart", "kind": "Deployment", "name": "web", "namespace": 7}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("namespace must be a string"), "{error}");
+        assert!(parse(
+            json!({"action": "restart", "kind": "Deployment", "name": "web", "namespace": null})
+        )
+        .is_ok());
+    }
+
+    struct OnDeleteWriter;
+
+    #[async_trait::async_trait]
+    impl ClusterWriteApi for OnDeleteWriter {
+        async fn apply(&self, _: &str, _: Option<&str>, _: bool) -> Result<Vec<AppliedObject>> {
+            unreachable!()
+        }
+        async fn scale(
+            &self,
+            _: ScaleKind,
+            _: &str,
+            _: &str,
+            _: i32,
+            _: bool,
+        ) -> Result<filar_transport::ScaleOutcome> {
+            unreachable!()
+        }
+        async fn rollout_restart(
+            &self,
+            _: RestartKind,
+            namespace: &str,
+            name: &str,
+            _: bool,
+        ) -> Result<filar_transport::WriteOutcome> {
+            let live = json!({"spec": {"updateStrategy": {"type": "OnDelete"}}});
+            Ok(filar_transport::WriteOutcome {
+                object: ObjectRef {
+                    api_version: "apps/v1".into(),
+                    kind: "StatefulSet".into(),
+                    namespace: Some(namespace.into()),
+                    name: name.into(),
+                },
+                live: live.clone(),
+                result: live,
+            })
+        }
+        async fn rollout_undo(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<i64>,
+            _: bool,
+        ) -> Result<filar_transport::UndoOutcome> {
+            unreachable!()
+        }
+        async fn delete(
+            &self,
+            _: &filar_transport::ObjectKind,
+            _: Option<&str>,
+            _: &filar_transport::DeleteTarget,
+            _: &filar_transport::DeleteOptions,
+            _: bool,
+        ) -> Result<Vec<filar_transport::DeletedObject>> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_on_delete_restart_is_refused_before_the_window() {
+        let call = KubeWriteCall::RolloutRestart {
+            kind: RestartKind::StatefulSet,
+            namespace: "shop".into(),
+            name: "db".into(),
+        };
+        let error = preview(&OnDeleteWriter, &call)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("OnDelete") && error.contains("replaces no pod"),
+            "{error}"
+        );
     }
 }
 

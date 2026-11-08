@@ -810,8 +810,13 @@ impl KubeAgent {
                 "Error: writes to the cluster are not available here (read-only tab or fleet).",
             ));
         }
+        // The namespace the prompt advertises: the tab's, else the target's.
         let default_namespace = match &self.execution {
-            KubeExecution::Cluster { namespace, .. } => namespace.as_deref(),
+            KubeExecution::Cluster {
+                namespace, target, ..
+            } => namespace
+                .as_deref()
+                .or(target.default_namespace.as_deref()),
             KubeExecution::Fleet { .. } => None,
         };
         let parsed = match crate::kube_write::parse_kube_write_call(
@@ -989,9 +994,13 @@ impl KubeAgent {
                     summary.push('\n');
                 }
                 Err(error) => {
+                    let output = crate::kube_redact::redact_logs(
+                        &format!("{summary}rollout wait cancelled"),
+                        executor.secrets().as_ref(),
+                    );
                     self.emit(AgentEvent::CommandFinished {
                         command: display,
-                        output: format!("{summary}rollout wait cancelled"),
+                        output,
                         denied: false,
                     });
                     return Err(error);

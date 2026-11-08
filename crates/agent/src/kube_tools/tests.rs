@@ -25,6 +25,8 @@ pub(crate) struct MockCluster {
     /// Answers of successive `list_workloads` calls; the last one repeats
     /// (#641).
     pub(crate) workload_reads: Mutex<std::collections::VecDeque<Vec<WorkloadInfo>>>,
+    /// When set, `list_workloads` is refused by RBAC.
+    pub(crate) workloads_denied: bool,
 }
 
 impl MockCluster {
@@ -93,6 +95,9 @@ impl ClusterApi for MockCluster {
     }
 
     async fn list_workloads(&self, _: Option<&str>, _: WorkloadKind) -> Result<Vec<WorkloadInfo>> {
+        if self.workloads_denied {
+            return Err(CoreError::AccessDenied("cannot list deployments".into()));
+        }
         let mut reads = self.workload_reads.lock().unwrap();
         Ok(match reads.len() {
             0 => Vec::new(),
