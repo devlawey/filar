@@ -1247,7 +1247,7 @@ fn kind_warnings(
             )),
         },
         "Node" => lines.push(format!(
-            "{label}: {} pod(s) on it are evicted; controller-managed ones may be recreated elsewhere if capacity allows, standalone ones are gone — drain the node first (kubectl drain)",
+            "{label}: {} pod(s) on it are garbage-collected later (not at once); controller-managed ones may be recreated elsewhere if capacity allows, standalone ones are lost — drain the node first (kubectl drain)",
             impact.node_pods.map(count).unwrap_or_else(|| "its".into())
         )),
         "Role" | "ClusterRole" | "RoleBinding" | "ClusterRoleBinding" => lines.push(format!(
@@ -2140,7 +2140,7 @@ mod tests {
         let node = delete_window("Node", false).await;
         assert!(
             node.text
-                .contains("17 pod(s) on it are evicted; controller-managed ones may be recreated elsewhere if capacity allows, standalone ones are gone"),
+                .contains("17 pod(s) on it are garbage-collected later (not at once); controller-managed ones may be recreated elsewhere if capacity allows, standalone ones are lost"),
             "{}",
             node.text
         );

@@ -1294,7 +1294,15 @@ impl ClusterWriteApi for KubeClusterApi {
                     let object = match object {
                         // A dry run answering a bare `Status`: read the
                         // object, so the window can still tell what it is.
-                        None if dry_run => api.get_opt(&name).await.ok().flatten(),
+                        // Unreadable (no `get` right): the window then gives
+                        // the conditional warnings of an unknown object.
+                        None if dry_run => match api.get_opt(&name).await {
+                            Ok(object) => object,
+                            Err(error) => {
+                                tracing::debug!(%error, "dry-run delete of {name}: object unreadable");
+                                None
+                            }
+                        },
                         object => object,
                     };
                     if let Some(object) = &object {
