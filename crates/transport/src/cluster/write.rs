@@ -1299,7 +1299,7 @@ impl ClusterWriteApi for KubeClusterApi {
                         None if dry_run => match api.get_opt(&name).await {
                             Ok(object) => object,
                             Err(error) => {
-                                tracing::debug!(%error, "dry-run delete of {name}: object unreadable");
+                                tracing::warn!(%error, "dry-run delete of {name}: object unreadable, impact warnings are conditional");
                                 None
                             }
                         },
