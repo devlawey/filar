@@ -527,12 +527,16 @@ pub fn parse_kube_write_call(
                 Some(Value::Bool(force)) => *force,
                 Some(_) => return Err(CoreError::Other("force must be true or false".into())),
             };
-            let namespace = args
+            // Optional for cluster-scoped kinds, but never a wrong type.
+            let namespace = namespace_of(args, default_namespace).ok();
+            if let Some(other) = args
                 .get("namespace")
-                .and_then(Value::as_str)
-                .filter(|ns| !ns.is_empty())
-                .or(default_namespace)
-                .map(str::to_owned);
+                .filter(|ns| !ns.is_null() && !ns.is_string())
+            {
+                return Err(CoreError::Other(format!(
+                    "namespace must be a string, not {other}"
+                )));
+            }
             Ok(KubeWriteCall::Delete {
                 kind,
                 namespace,
