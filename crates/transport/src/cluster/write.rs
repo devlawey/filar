@@ -222,7 +222,10 @@ pub enum DeleteTarget {
         fields: Option<String>,
     },
     /// Exactly these names — what a dry run listed. A name gone since is
-    /// reported, not an error; nothing beyond these names is deleted.
+    /// reported, not an error; nothing beyond these names is deleted. Names
+    /// are identities here, as in `kubectl delete`: an object recreated under
+    /// the same name since the dry run (a StatefulSet pod `web-0`) is the one
+    /// deleted.
     Names(Vec<String>),
 }
 
@@ -413,7 +416,7 @@ fn submitted_secret_values(document: &Value) -> Vec<String> {
         }
     }
     values.retain(|value| !value.is_empty());
-    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values.sort_by_key(|value| std::cmp::Reverse(value.chars().count()));
     values.dedup();
     values
 }
@@ -607,7 +610,7 @@ fn matching_resources(
     for (resource, caps) in resources {
         let matches = resource.kind.to_ascii_lowercase() == wanted
             || resource.plural == wanted
-            || resource.plural.trim_end_matches('s') == wanted
+            || [format!("{wanted}s"), format!("{wanted}es")].contains(&resource.plural)
             || resource_label(&resource) == wanted;
         if matches
             && !found

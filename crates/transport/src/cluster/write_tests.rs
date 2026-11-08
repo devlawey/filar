@@ -1348,3 +1348,36 @@ async fn a_message_quoting_a_short_secret_value_is_withheld_whole() {
     assert!(!error.contains("7x9"), "{error}");
     assert!(error.contains("message is withheld"), "{error}");
 }
+
+#[test]
+fn a_singular_matches_its_plural_with_s_or_es() {
+    let resource = |plural: &str, kind: &str| {
+        (
+            ApiResource {
+                group: "networking.k8s.io".into(),
+                version: "v1".into(),
+                api_version: "networking.k8s.io/v1".into(),
+                kind: kind.into(),
+                plural: plural.into(),
+            },
+            ApiCapabilities {
+                scope: Scope::Cluster,
+                subresources: Vec::new(),
+                operations: Vec::new(),
+            },
+        )
+    };
+    let resources = vec![
+        resource("ingressclasses", "IngressClass"),
+        resource("ingresses", "Ingress"),
+    ];
+    for (wanted, kind) in [
+        ("ingressclass", "IngressClass"),
+        ("ingressclasses", "IngressClass"),
+        ("ingress", "Ingress"),
+    ] {
+        let found = matching_resources(resources.clone(), wanted);
+        assert_eq!(found.len(), 1, "{wanted}");
+        assert_eq!(found[0].0.kind, kind, "{wanted}");
+    }
+}
