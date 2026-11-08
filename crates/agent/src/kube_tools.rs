@@ -279,7 +279,9 @@ impl KubeToolCall {
                 port,
                 path,
                 metrics,
-            } => json!({"namespace": namespace, "pod": pod, "port": port.to_string(), "path": path, "metrics": metrics, "method": "GET"}),
+            } => {
+                json!({"namespace": namespace, "pod": pod, "port": port.to_string(), "path": path, "metrics": metrics, "method": "GET"})
+            }
         }
     }
 
@@ -885,7 +887,10 @@ pub fn parse_kube_tool_call(
         }),
         TOOL_POD_HTTP_GET => {
             if let Some(method) = args.get("method") {
-                if method.as_str().is_none_or(|m| !m.eq_ignore_ascii_case("GET")) {
+                if method
+                    .as_str()
+                    .is_none_or(|m| !m.eq_ignore_ascii_case("GET"))
+                {
                     return Err(CoreError::Other(
                         "pod_http_get only sends GET; other methods are refused".into(),
                     ));
@@ -1107,7 +1112,10 @@ impl KubeToolExecutor {
                 port,
                 path,
                 metrics,
-            } => self.execute_pod_http_get(namespace, pod, port, path, metrics).await,
+            } => {
+                self.execute_pod_http_get(namespace, pod, port, path, metrics)
+                    .await
+            }
             KubeToolCall::Get {
                 kind,
                 namespace,
@@ -1314,7 +1322,8 @@ impl KubeToolExecutor {
 
 /// filar's own error for a cluster without the metrics API; the fleet fold
 /// recognises it by this exact text (#619).
-pub(crate) const METRICS_UNAVAILABLE: &str = "metrics-server не установлен: metrics.k8s.io is unavailable";
+pub(crate) const METRICS_UNAVAILABLE: &str =
+    "metrics-server не установлен: metrics.k8s.io is unavailable";
 
 fn metrics_error(error: CoreError) -> CoreError {
     if error.to_string().starts_with("Unsupported:") {

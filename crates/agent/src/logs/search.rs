@@ -35,7 +35,10 @@ impl SearchSource {
         // `validate` already demands an index; never fall back to `/_search`
         // over every index if an unvalidated config gets here.
         if cfg.index.as_deref().is_none_or(|i| i.trim().is_empty()) {
-            return Err(CoreError::Config(format!("log source \"{}\": index is required", cfg.name)));
+            return Err(CoreError::Config(format!(
+                "log source \"{}\": index is required",
+                cfg.name
+            )));
         }
         Ok(Self {
             cfg: cfg.clone(),
@@ -45,7 +48,10 @@ impl SearchSource {
 
     /// The only path this adapter calls: `/{index}/_search`.
     pub fn search_path(&self) -> String {
-        format!("/{}/_search", self.cfg.index.as_deref().unwrap_or("").trim())
+        format!(
+            "/{}/_search",
+            self.cfg.index.as_deref().unwrap_or("").trim()
+        )
     }
 }
 
@@ -67,8 +73,16 @@ pub fn build_body(cfg: &LogSourceConfig, query: &LogQuery) -> Result<Value> {
                     _ => Value::Object(dsl),
                 }
             }
-            Ok(_) => return Err(CoreError::Other("a JSON query must be a query DSL object".into())),
-            Err(e) => return Err(CoreError::Other(format!("the query looks like JSON but does not parse: {e}"))),
+            Ok(_) => {
+                return Err(CoreError::Other(
+                    "a JSON query must be a query DSL object".into(),
+                ))
+            }
+            Err(e) => {
+                return Err(CoreError::Other(format!(
+                    "the query looks like JSON but does not parse: {e}"
+                )))
+            }
         }
     } else {
         json!({"query_string": {"query": text}})
@@ -100,7 +114,11 @@ fn flatten(prefix: &str, value: &Value, out: &mut BTreeMap<String, String>) {
     match value {
         Value::Object(map) => {
             for (k, v) in map {
-                let key = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                let key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
                 flatten(&key, v, out);
             }
         }
@@ -117,7 +135,12 @@ fn flatten(prefix: &str, value: &Value, out: &mut BTreeMap<String, String>) {
 /// Parse a `_search` answer: each hit's `_source` flattened to dotted
 /// fields, the message taken from the first of `message`, `log`, `msg`,
 /// `@message`, `_msg`, the time from the configured time field.
-pub fn parse_hits(body: &[u8], time_field: &str, limit: usize, max_line_bytes: usize) -> Result<LogResult> {
+pub fn parse_hits(
+    body: &[u8],
+    time_field: &str,
+    limit: usize,
+    max_line_bytes: usize,
+) -> Result<LogResult> {
     let answer: Value = serde_json::from_slice(body)
         .map_err(|e| CoreError::Other(format!("unexpected search answer: {e}")))?;
     let hits = answer
@@ -150,18 +173,34 @@ pub fn parse_hits(body: &[u8], time_field: &str, limit: usize, max_line_bytes: u
             .into_iter()
             .map(|(k, v)| (k, cap_line(&v, max_line_bytes).0))
             .collect();
-        lines.push(LogLine { time, message, fields, truncated });
+        lines.push(LogLine {
+            time,
+            message,
+            fields,
+            truncated,
+        });
     }
-    let total = answer.pointer("/hits/total/value").and_then(Value::as_u64)
+    let total = answer
+        .pointer("/hits/total/value")
+        .and_then(Value::as_u64)
         .or_else(|| answer.pointer("/hits/total").and_then(Value::as_u64));
-    let relation_gte = answer.pointer("/hits/total/relation").and_then(Value::as_str) == Some("gte");
-    let truncated = relation_gte || total.is_some_and(|t| t > lines.len() as u64) || hits.len() > limit;
+    let relation_gte = answer
+        .pointer("/hits/total/relation")
+        .and_then(Value::as_str)
+        == Some("gte");
+    let truncated =
+        relation_gte || total.is_some_and(|t| t > lines.len() as u64) || hits.len() > limit;
     let note = match (total, relation_gte) {
         (Some(t), true) => Some(format!("at least {t} documents match")),
         (Some(t), false) if t > lines.len() as u64 => Some(format!("{t} documents match")),
         _ => None,
     };
-    Ok(LogResult { lines, truncated, note, ..Default::default() })
+    Ok(LogResult {
+        lines,
+        truncated,
+        note,
+        ..Default::default()
+    })
 }
 
 /// `type: reason` of an OpenSearch / Elasticsearch error reply, root cause
@@ -216,7 +255,10 @@ impl LogSource for SearchSource {
             ));
         }
         if !self.cfg.fields.is_empty() {
-            out.push_str(&format!("\nOnly these fields are fetched: {}.", self.cfg.fields.join(", ")));
+            out.push_str(&format!(
+                "\nOnly these fields are fetched: {}.",
+                self.cfg.fields.join(", ")
+            ));
         }
         out
     }
@@ -240,8 +282,13 @@ impl LogSource for SearchSource {
                 ..Default::default()
             });
         }
-        parse_hits(&raw.bytes, self.cfg.time_field_name(), query.limit, limits.max_line_bytes)
-            .map_err(|e| self.http.error(&e.to_string()))
+        parse_hits(
+            &raw.bytes,
+            self.cfg.time_field_name(),
+            query.limit,
+            limits.max_line_bytes,
+        )
+        .map_err(|e| self.http.error(&e.to_string()))
     }
 }
 
@@ -278,7 +325,10 @@ mod tests {
         let range = &body["query"]["bool"]["filter"][0]["range"]["@timestamp"];
         assert_eq!(range["gte"], "2026-11-01T10:00:00.000Z");
         assert_eq!(range["lt"], "2026-11-01T11:00:00.000Z");
-        assert_eq!(body["query"]["bool"]["must"][0]["query_string"]["query"], "kubernetes.namespace_name:shop AND error");
+        assert_eq!(
+            body["query"]["bool"]["must"][0]["query_string"]["query"],
+            "kubernetes.namespace_name:shop AND error"
+        );
         assert!(body.get("_source").is_none());
     }
 
@@ -289,15 +339,34 @@ mod tests {
         c.fields = vec!["message".into(), "kubernetes.pod_name".into()];
         let dsl = r#"{"match": {"level": "error"}}"#;
         let body = build_body(&c, &query(dsl)).unwrap();
-        assert_eq!(body["query"]["bool"]["must"][0], json!({"match": {"level": "error"}}));
+        assert_eq!(
+            body["query"]["bool"]["must"][0],
+            json!({"match": {"level": "error"}})
+        );
         assert!(body["query"]["bool"]["filter"][0]["range"]["ts"].is_object());
         assert_eq!(body["sort"][0]["ts"]["order"], "desc");
-        assert_eq!(body["_source"], json!(["message", "kubernetes.pod_name", "ts"]));
+        assert_eq!(
+            body["_source"],
+            json!(["message", "kubernetes.pod_name", "ts"])
+        );
         // A whole request body pasted by habit contributes only its query.
-        let pasted = build_body(&c, &query(r#"{"query": {"term": {"pod": "web-1"}}, "size": 10}"#)).unwrap();
-        assert_eq!(pasted["query"]["bool"]["must"][0], json!({"term": {"pod": "web-1"}}));
-        assert!(build_body(&c, &query("{ not json")).unwrap_err().to_string().contains("does not parse"));
-        assert!(build_body(&c, &query("[1, 2]")).is_ok(), "not starting with {{ is query_string text");
+        let pasted = build_body(
+            &c,
+            &query(r#"{"query": {"term": {"pod": "web-1"}}, "size": 10}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            pasted["query"]["bool"]["must"][0],
+            json!({"term": {"pod": "web-1"}})
+        );
+        assert!(build_body(&c, &query("{ not json"))
+            .unwrap_err()
+            .to_string()
+            .contains("does not parse"));
+        assert!(
+            build_body(&c, &query("[1, 2]")).is_ok(),
+            "not starting with {{ is query_string text"
+        );
     }
 
     #[test]
@@ -326,18 +395,32 @@ mod tests {
         c.k8s_fields = Some("filebeat".into());
         let text = SearchSource::new(&c, "").unwrap().describe();
         assert!(text.contains("OpenSearch index logs-*"), "{text}");
-        assert!(text.contains("pod kubernetes.pod.name, namespace kubernetes.namespace"), "{text}");
+        assert!(
+            text.contains("pod kubernetes.pod.name, namespace kubernetes.namespace"),
+            "{text}"
+        );
         c.k8s_fields = None;
         let text = SearchSource::new(&c, "").unwrap().describe();
-        assert!(text.contains("(fluent-bit): pod kubernetes.pod_name, namespace kubernetes.namespace_name"), "{text}");
+        assert!(
+            text.contains(
+                "(fluent-bit): pod kubernetes.pod_name, namespace kubernetes.namespace_name"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
     fn error_replies_are_explained() {
         let parsing = r#"{"error":{"root_cause":[{"type":"parsing_exception","reason":"unknown query [mtch]","line":1,"col":51}],"type":"x_content_parse_exception","reason":"[1:51] [bool] failed to parse field [must]"},"status":400}"#;
-        assert_eq!(explain_error(parsing).unwrap(), "parsing_exception: unknown query [mtch]");
+        assert_eq!(
+            explain_error(parsing).unwrap(),
+            "parsing_exception: unknown query [mtch]"
+        );
         let missing = r#"{"error":{"root_cause":[{"type":"index_not_found_exception","reason":"no such index [nope]","index":"nope"}],"type":"index_not_found_exception","reason":"no such index [nope]","index":"nope"},"status":404}"#;
-        assert_eq!(explain_error(missing).unwrap(), "index_not_found_exception: no such index [nope] (index nope)");
+        assert_eq!(
+            explain_error(missing).unwrap(),
+            "index_not_found_exception: no such index [nope] (index nope)"
+        );
         assert!(explain_error("plain text").is_none());
     }
 }

@@ -6,6 +6,7 @@
 //! `cargo test -p filar-transport --test cluster_write -- --ignored`.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use filar_core::KubeCluster;
 use filar_transport::{
@@ -49,7 +50,12 @@ apiVersion: v1
 kind: Pod
 metadata: {name: filar-write-test, labels: {filar-test: write}}
 spec:
-  containers: [{name: main, image: "busybox:1.37", command: [sleep, "3600"]}]
+  securityContext: {runAsNonRoot: true, runAsUser: 65534, seccompProfile: {type: RuntimeDefault}}
+  containers:
+  - name: main
+    image: "busybox:1.37"
+    command: [sleep, "3600"]
+    securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -59,13 +65,79 @@ spec:
   selector: {matchLabels: {app: filar-write-test}}
   template:
     metadata: {labels: {app: filar-write-test}}
-    spec: {containers: [{name: main, image: "busybox:1.36", command: [sleep, "3600"]}]}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 65534, seccompProfile: {type: RuntimeDefault}}
+      containers:
+      - name: main
+        image: "busybox:1.36"
+        command: [sleep, "3600"]
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
 "#;
+
+const KINDS: [(&str, &str); 3] = [
+    ("Deployment", "apps/v1"),
+    ("Pod", "v1"),
+    ("PersistentVolumeClaim", "v1"),
+];
+
+/// Delete the test objects; missing ones are fine (a rerun after a failed
+/// run starts from a clean namespace).
+async fn delete_workload(api: &KubeClusterApi) -> Vec<DeleteOutcome> {
+    let mut outcomes = Vec::new();
+    for (kind, api_version) in KINDS {
+        let kind = ObjectKind {
+            api_version: Some(api_version.into()),
+            kind: kind.into(),
+        };
+        let deleted = api
+            .delete(
+                &kind,
+                Some("shop"),
+                &DeleteTarget::Names(vec!["filar-write-test".into()]),
+                &DeleteOptions::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        outcomes.extend(deleted.into_iter().map(|d| d.outcome));
+    }
+    outcomes
+}
+
+/// Wait until nothing named `filar-write-test` is left from an earlier run.
+async fn wait_gone(api: &KubeClusterApi) {
+    for _ in 0..60 {
+        let dry = api.apply(WORKLOAD, Some("shop"), true).await.unwrap();
+        if dry
+            .iter()
+            .all(|object| object.action == ApplyAction::Created)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    panic!("objects of an earlier run are still terminating");
+}
+
+async fn revision(api: &KubeClusterApi) -> i64 {
+    let dry = api.apply(WORKLOAD, Some("shop"), true).await.unwrap();
+    dry.iter()
+        .find(|object| object.object.kind == "Deployment")
+        .and_then(|object| {
+            object.live.as_ref()?["metadata"]["annotations"]["deployment.kubernetes.io/revision"]
+                .as_str()?
+                .parse()
+                .ok()
+        })
+        .unwrap_or(0)
+}
 
 #[tokio::test]
 #[ignore = "needs docker/k8s cluster"]
 async fn apply_scale_restart_undo_and_delete_against_fixture_cluster() {
     let api = KubeClusterApi::connect(&admin_target()).await.unwrap();
+    delete_workload(&api).await;
+    wait_gone(&api).await;
 
     let dry = api.apply(WORKLOAD, Some("shop"), true).await.unwrap();
     assert!(dry
@@ -87,37 +159,44 @@ async fn apply_scale_restart_undo_and_delete_against_fixture_cluster() {
     // A second revision: new image, then back with undo.
     let newer = WORKLOAD.replace("busybox:1.36", "busybox:1.37");
     api.apply(&newer, Some("shop"), false).await.unwrap();
-    api.rollout_restart(RestartKind::Deployment, "shop", "filar-write-test", true)
+    let restart = api
+        .rollout_restart(RestartKind::Deployment, "shop", "filar-write-test", true)
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(
+        restart.result["spec"]["template"]["metadata"]["annotations"]
+            ["kubectl.kubernetes.io/restartedAt"]
+            .is_string()
+    );
+    let after = api.apply(&newer, Some("shop"), true).await.unwrap();
+    let live_template = |objects: &[filar_transport::AppliedObject]| {
+        objects
+            .iter()
+            .find(|object| object.object.kind == "Deployment")
+            .and_then(|object| object.live.as_ref())
+            .map(|live| live["spec"]["template"].clone())
+    };
+    assert_eq!(
+        live_template(&after),
+        Some(restart.live["spec"]["template"].clone()),
+        "a dry-run restart is not stored"
+    );
+    // The controller writes revision 2 asynchronously; undo needs it.
+    let mut waited = 0;
+    while revision(&api).await < 2 {
+        assert!(waited < 60, "revision 2 never appeared");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        waited += 1;
+    }
     let undo = api
         .rollout_undo("shop", "filar-write-test", None, false)
         .await
         .unwrap();
     assert!(undo.to_revision < undo.from_revision);
 
-    for (kind, api_version) in [
-        ("Deployment", "apps/v1"),
-        ("Pod", "v1"),
-        ("PersistentVolumeClaim", "v1"),
-    ] {
-        let kind = ObjectKind {
-            api_version: Some(api_version.into()),
-            kind: kind.into(),
-        };
-        let deleted = api
-            .delete(
-                &kind,
-                Some("shop"),
-                &DeleteTarget::Name("filar-write-test".into()),
-                &DeleteOptions::default(),
-                false,
-            )
-            .await
-            .unwrap();
+    for outcome in delete_workload(&api).await {
         assert!(matches!(
-            deleted[0].outcome,
+            outcome,
             DeleteOutcome::Deleted | DeleteOutcome::Pending
         ));
     }

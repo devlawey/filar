@@ -68,12 +68,63 @@ use crate::{CommandExecutor, CommandResult, StreamEvent};
 /// are not here either: they are [`GUARDED_FORMS`], allowed only in the
 /// argument shapes spelled out there.
 pub const ALLOWED_COMMANDS: &[&str] = &[
-    "base64", "cat", "cksum", "cmp", "comm", "cut", "date", "df", "diff", "dig", "du", "echo",
-    "egrep", "fgrep", "file", "free", "getconf", "grep", "groups", "head", "host", "id", "ls",
-    "lsblk", "lscpu", "lsmod", "lspci", "lsusb", "md5sum", "netstat", "nl", "nproc", "nslookup",
-    "od", "ping", "ping6",
-    "printenv", "printf", "ps", "pwd", "sha1sum", "sha256sum", "sha512sum", "sort", "ss", "stat",
-    "strings", "tac", "tail", "tr", "uname", "uniq", "uptime", "wc", "which", "who", "whoami",
+    "base64",
+    "cat",
+    "cksum",
+    "cmp",
+    "comm",
+    "cut",
+    "date",
+    "df",
+    "diff",
+    "dig",
+    "du",
+    "echo",
+    "egrep",
+    "fgrep",
+    "file",
+    "free",
+    "getconf",
+    "grep",
+    "groups",
+    "head",
+    "host",
+    "id",
+    "ls",
+    "lsblk",
+    "lscpu",
+    "lsmod",
+    "lspci",
+    "lsusb",
+    "md5sum",
+    "netstat",
+    "nl",
+    "nproc",
+    "nslookup",
+    "od",
+    "ping",
+    "ping6",
+    "printenv",
+    "printf",
+    "ps",
+    "pwd",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "sort",
+    "ss",
+    "stat",
+    "strings",
+    "tac",
+    "tail",
+    "tr",
+    "uname",
+    "uniq",
+    "uptime",
+    "wc",
+    "which",
+    "who",
+    "whoami",
 ];
 
 /// Arguments that turn an otherwise read-only binary into a writer or an
@@ -263,7 +314,11 @@ fn check_redirections(cmd: &str) -> std::result::Result<(), String> {
 fn check_segment(segment: &str, quoted: &[String]) -> std::result::Result<(), String> {
     let skeleton: Vec<&str> = segment.split_whitespace().collect();
     let resolve = |token: &str| unquote(token, quoted);
-    let token = resolve(skeleton.first().ok_or_else(|| "empty command".to_string())?)?;
+    let token = resolve(
+        skeleton
+            .first()
+            .ok_or_else(|| "empty command".to_string())?,
+    )?;
     let base = strip_bin_prefix(&token);
     if let Some(form) = GUARDED_FORMS.iter().find(|f| f.bin == base) {
         let args = without_redirections(skeleton[1..].iter().copied())
@@ -271,9 +326,8 @@ fn check_segment(segment: &str, quoted: &[String]) -> std::result::Result<(), St
             .map(resolve)
             .collect::<std::result::Result<Vec<String>, String>>()?;
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        return check_form(form, &args).map_err(|why| {
-            format!("\"{base}\" is only allowed in its read-only forms: {why}")
-        });
+        return check_form(form, &args)
+            .map_err(|why| format!("\"{base}\" is only allowed in its read-only forms: {why}"));
     }
     if !ALLOWED_COMMANDS.contains(&base) {
         return Err(format!("\"{token}\" is not in the read-only allowlist"));
@@ -312,7 +366,9 @@ fn lift_single_quotes(cmd: &str) -> std::result::Result<(String, Vec<String>), S
     while let Some(open) = rest.find('\'') {
         skeleton.push_str(&rest[..open]);
         let after = &rest[open + 1..];
-        let close = after.find('\'').ok_or_else(|| "unclosed single quote".to_string())?;
+        let close = after
+            .find('\'')
+            .ok_or_else(|| "unclosed single quote".to_string())?;
         let content = &after[..close];
         if content.contains(['\\', '\n', '\r']) {
             return Err("a backslash or a line break inside quotes is not allowed".into());
@@ -422,13 +478,45 @@ const GUARDED_FORMS: &[GuardedForm] = &[
     GuardedForm {
         bin: "systemctl",
         flags: &[
-            "--failed", "--no-pager", "--all", "-a", "--full", "-l", "--no-legend", "--plain",
-            "--quiet", "-q", "--recursive", "-r", "--reverse", "--with-dependencies",
+            "--failed",
+            "--no-pager",
+            "--all",
+            "-a",
+            "--full",
+            "-l",
+            "--no-legend",
+            "--plain",
+            "--quiet",
+            "-q",
+            "--recursive",
+            "-r",
+            "--reverse",
+            "--with-dependencies",
         ],
-        valued: &["--type", "-t", "--state", "--property", "-p", "--lines", "-n", "--output", "-o"],
+        valued: &[
+            "--type",
+            "-t",
+            "--state",
+            "--property",
+            "-p",
+            "--lines",
+            "-n",
+            "--output",
+            "-o",
+        ],
         subcommands: &[
-            "status", "is-active", "is-enabled", "is-failed", "is-system-running", "list-units",
-            "list-unit-files", "list-timers", "list-sockets", "list-dependencies", "show", "cat",
+            "status",
+            "is-active",
+            "is-enabled",
+            "is-failed",
+            "is-system-running",
+            "list-units",
+            "list-unit-files",
+            "list-timers",
+            "list-sockets",
+            "list-dependencies",
+            "show",
+            "cat",
             "get-default",
         ],
         subcommand_required: false,
@@ -441,13 +529,47 @@ const GUARDED_FORMS: &[GuardedForm] = &[
     GuardedForm {
         bin: "journalctl",
         flags: &[
-            "--no-pager", "-b", "--boot", "-k", "--dmesg", "-x", "--catalog", "-e", "--pager-end",
-            "-r", "--reverse", "-a", "--all", "-q", "--quiet", "--utc", "--no-hostname",
-            "--system", "--list-boots", "--disk-usage", "--no-full",
+            "--no-pager",
+            "-b",
+            "--boot",
+            "-k",
+            "--dmesg",
+            "-x",
+            "--catalog",
+            "-e",
+            "--pager-end",
+            "-r",
+            "--reverse",
+            "-a",
+            "--all",
+            "-q",
+            "--quiet",
+            "--utc",
+            "--no-hostname",
+            "--system",
+            "--list-boots",
+            "--disk-usage",
+            "--no-full",
         ],
         valued: &[
-            "--unit", "-u", "--lines", "-n", "--priority", "-p", "--since", "-S", "--until", "-U",
-            "--output", "-o", "--grep", "-g", "--identifier", "-t", "--boot", "--facility",
+            "--unit",
+            "-u",
+            "--lines",
+            "-n",
+            "--priority",
+            "-p",
+            "--since",
+            "-S",
+            "--until",
+            "-U",
+            "--output",
+            "-o",
+            "--grep",
+            "-g",
+            "--identifier",
+            "-t",
+            "--boot",
+            "--facility",
         ],
         subcommands: &[],
         subcommand_required: false,
@@ -459,8 +581,24 @@ const GUARDED_FORMS: &[GuardedForm] = &[
     GuardedForm {
         bin: "dmesg",
         flags: &[
-            "-T", "--ctime", "-H", "--human", "-k", "--kernel", "-u", "--userspace", "-x",
-            "--decode", "-t", "--notime", "-e", "--reltime", "-r", "--raw", "--nopager", "-P",
+            "-T",
+            "--ctime",
+            "-H",
+            "--human",
+            "-k",
+            "--kernel",
+            "-u",
+            "--userspace",
+            "-x",
+            "--decode",
+            "-t",
+            "--notime",
+            "-e",
+            "--reltime",
+            "-r",
+            "--raw",
+            "--nopager",
+            "-P",
         ],
         valued: &["--level", "-l", "--facility", "-f", "--since", "--until"],
         subcommands: &[],
@@ -475,13 +613,43 @@ const GUARDED_FORMS: &[GuardedForm] = &[
     GuardedForm {
         bin: "ip",
         flags: &[
-            "-4", "-6", "-br", "-brief", "-s", "-stats", "-statistics", "-d", "-details", "-o",
-            "-oneline", "-j", "-json", "-p", "-pretty", "-h", "-human", "-c", "-color",
+            "-4",
+            "-6",
+            "-br",
+            "-brief",
+            "-s",
+            "-stats",
+            "-statistics",
+            "-d",
+            "-details",
+            "-o",
+            "-oneline",
+            "-j",
+            "-json",
+            "-p",
+            "-pretty",
+            "-h",
+            "-human",
+            "-c",
+            "-color",
         ],
         valued: &[],
         subcommands: &[
-            "a", "addr", "address", "l", "link", "r", "ro", "route", "n", "neigh", "neighbor",
-            "neighbour", "rule", "maddr", "maddress",
+            "a",
+            "addr",
+            "address",
+            "l",
+            "link",
+            "r",
+            "ro",
+            "route",
+            "n",
+            "neigh",
+            "neighbor",
+            "neighbour",
+            "rule",
+            "maddr",
+            "maddress",
         ],
         subcommand_required: true,
         words: Words::Any,
@@ -492,31 +660,77 @@ const GUARDED_FORMS: &[GuardedForm] = &[
     GuardedForm {
         bin: "dpkg",
         flags: &[
-            "-l", "--list", "-s", "--status", "-L", "--listfiles", "-S", "--search", "-p",
-            "--print-avail", "--get-selections", "--print-architecture", "--version", "--no-pager",
+            "-l",
+            "--list",
+            "-s",
+            "--status",
+            "-L",
+            "--listfiles",
+            "-S",
+            "--search",
+            "-p",
+            "--print-avail",
+            "--get-selections",
+            "--print-architecture",
+            "--version",
+            "--no-pager",
         ],
         valued: &[],
         subcommands: &[],
         subcommand_required: false,
         words: Words::Any,
         needs_one_of: &[
-            "-l", "--list", "-s", "--status", "-L", "--listfiles", "-S", "--search", "-p",
-            "--print-avail", "--get-selections", "--print-architecture", "--version",
+            "-l",
+            "--list",
+            "-s",
+            "--status",
+            "-L",
+            "--listfiles",
+            "-S",
+            "--search",
+            "-p",
+            "--print-avail",
+            "--get-selections",
+            "--print-architecture",
+            "--version",
         ],
     },
     GuardedForm {
         bin: "dpkg-query",
         flags: &[
-            "-l", "--list", "-W", "--show", "-s", "--status", "-L", "--listfiles", "-S",
-            "--search", "-p", "--print-avail", "--version", "--no-pager",
+            "-l",
+            "--list",
+            "-W",
+            "--show",
+            "-s",
+            "--status",
+            "-L",
+            "--listfiles",
+            "-S",
+            "--search",
+            "-p",
+            "--print-avail",
+            "--version",
+            "--no-pager",
         ],
         valued: &[],
         subcommands: &[],
         subcommand_required: false,
         words: Words::Any,
         needs_one_of: &[
-            "-l", "--list", "-W", "--show", "-s", "--status", "-L", "--listfiles", "-S",
-            "--search", "-p", "--print-avail", "--version",
+            "-l",
+            "--list",
+            "-W",
+            "--show",
+            "-s",
+            "--status",
+            "-L",
+            "--listfiles",
+            "-S",
+            "--search",
+            "-p",
+            "--print-avail",
+            "--version",
         ],
     },
     // `rpm` in query mode only; the mode letters are spelled out, so no
@@ -525,16 +739,45 @@ const GUARDED_FORMS: &[GuardedForm] = &[
     GuardedForm {
         bin: "rpm",
         flags: &[
-            "-q", "--query", "-qa", "-qi", "-ql", "-qf", "-qc", "-qd", "-qR", "-qal", "-qil",
-            "--all", "--info", "--list", "--file", "--requires", "--provides", "--whatprovides",
-            "--whatrequires", "--changelog", "--last", "--version",
+            "-q",
+            "--query",
+            "-qa",
+            "-qi",
+            "-ql",
+            "-qf",
+            "-qc",
+            "-qd",
+            "-qR",
+            "-qal",
+            "-qil",
+            "--all",
+            "--info",
+            "--list",
+            "--file",
+            "--requires",
+            "--provides",
+            "--whatprovides",
+            "--whatrequires",
+            "--changelog",
+            "--last",
+            "--version",
         ],
         valued: &[],
         subcommands: &[],
         subcommand_required: false,
         words: Words::Any,
         needs_one_of: &[
-            "-q", "--query", "-qa", "-qi", "-ql", "-qf", "-qc", "-qd", "-qR", "-qal", "-qil",
+            "-q",
+            "--query",
+            "-qa",
+            "-qi",
+            "-ql",
+            "-qf",
+            "-qc",
+            "-qd",
+            "-qR",
+            "-qal",
+            "-qil",
             "--version",
         ],
     },
@@ -628,7 +871,10 @@ fn check_form(form: &GuardedForm, args: &[&str]) -> std::result::Result<(), Stri
                 satisfied |= form.needs_one_of.contains(&arg);
                 // `journalctl -b -1`: the boot offset is an optional value
                 // of its own, and the only one that starts with a dash.
-                if form.bin == "journalctl" && arg == "-b" && args.get(i).is_some_and(|v| is_boot_offset(v)) {
+                if form.bin == "journalctl"
+                    && arg == "-b"
+                    && args.get(i).is_some_and(|v| is_boot_offset(v))
+                {
                     i += 1;
                 }
                 continue;
@@ -663,7 +909,9 @@ fn check_form(form: &GuardedForm, args: &[&str]) -> std::result::Result<(), Stri
             return Err(format!("`{arg}` is not accepted"));
         }
         if form.bin == "ip" && words_after == 0 && !IP_READ_COMMANDS.contains(&arg) {
-            return Err(format!("`{arg}` is not a read-only command (use show, list or get)"));
+            return Err(format!(
+                "`{arg}` is not a read-only command (use show, list or get)"
+            ));
         }
         words_after += 1;
     }
@@ -671,7 +919,10 @@ fn check_form(form: &GuardedForm, args: &[&str]) -> std::result::Result<(), Stri
         return Err("an object is required".into());
     }
     if !satisfied {
-        return Err(format!("one of {} is required", form.needs_one_of.join(", ")));
+        return Err(format!(
+            "one of {} is required",
+            form.needs_one_of.join(", ")
+        ));
     }
     Ok(())
 }
@@ -948,7 +1199,9 @@ mod tests {
             "zcat /var/log/syslog.2.gz | grep -i error | tail -n 5",
         ];
         for cmd in allowed {
-            exec.run(cmd).await.unwrap_or_else(|e| panic!("{cmd:?} must be allowed: {e}"));
+            exec.run(cmd)
+                .await
+                .unwrap_or_else(|e| panic!("{cmd:?} must be allowed: {e}"));
         }
         assert_eq!(inner.calls(), allowed.len());
     }
@@ -1102,8 +1355,14 @@ mod tests {
         ] {
             assert_refused(&exec, &inner, cmd).await;
         }
-        assert_eq!(without_redirections("-T 2>&1 >/dev/null -x".split_whitespace()), ["-T", "-x"]);
-        assert_eq!(without_redirections("a> /dev/null b 12>&1".split_whitespace()), ["a", "b"]);
+        assert_eq!(
+            without_redirections("-T 2>&1 >/dev/null -x".split_whitespace()),
+            ["-T", "-x"]
+        );
+        assert_eq!(
+            without_redirections("a> /dev/null b 12>&1".split_whitespace()),
+            ["a", "b"]
+        );
     }
 
     /// #504: a guarded binary never slips through behind an allowed one.
@@ -1113,7 +1372,9 @@ mod tests {
         assert_refused(&exec, &inner, "systemctl --failed; systemctl restart nginx").await;
         assert_refused(&exec, &inner, "ip a && ip link set eth0 down").await;
         assert_refused(&exec, &inner, "ls | dmesg -C").await;
-        exec.run("systemctl --failed --no-pager | grep -c failed").await.unwrap();
+        exec.run("systemctl --failed --no-pager | grep -c failed")
+            .await
+            .unwrap();
         assert_eq!(inner.calls(), 1);
     }
 
@@ -1133,7 +1394,11 @@ mod tests {
         for form in GUARDED_FORMS {
             assert!(!ALLOWED_COMMANDS.contains(&form.bin), "{}", form.bin);
             for needed in form.needs_one_of {
-                assert!(form.flags.contains(needed), "{}: {needed} is not a flag", form.bin);
+                assert!(
+                    form.flags.contains(needed),
+                    "{}: {needed} is not a flag",
+                    form.bin
+                );
             }
         }
     }
@@ -1155,7 +1420,9 @@ mod tests {
             "journalctl -u 'nginx' --no-pager",
         ];
         for cmd in allowed {
-            exec.run(cmd).await.unwrap_or_else(|e| panic!("{cmd:?} must be allowed: {e}"));
+            exec.run(cmd)
+                .await
+                .unwrap_or_else(|e| panic!("{cmd:?} must be allowed: {e}"));
         }
         assert_eq!(inner.calls(), allowed.len());
     }
@@ -1221,9 +1488,18 @@ mod tests {
     #[tokio::test]
     async fn system_facts_are_read_only() {
         let (exec, inner) = gated();
-        let allowed = ["nproc", "nproc --all", "lsmod", "lsmod | grep -c nf_", "getconf PAGESIZE", "getconf -a | head -n 5"];
+        let allowed = [
+            "nproc",
+            "nproc --all",
+            "lsmod",
+            "lsmod | grep -c nf_",
+            "getconf PAGESIZE",
+            "getconf -a | head -n 5",
+        ];
         for cmd in allowed {
-            exec.run(cmd).await.unwrap_or_else(|e| panic!("{cmd:?} must be allowed: {e}"));
+            exec.run(cmd)
+                .await
+                .unwrap_or_else(|e| panic!("{cmd:?} must be allowed: {e}"));
         }
         assert_eq!(inner.calls(), allowed.len());
         // Their neighbours that change the kernel stay out.
@@ -1407,8 +1683,15 @@ mod tests {
     #[tokio::test]
     async fn run_streaming_allowed_forwards_to_streaming_path() {
         let (exec, inner) = gated();
-        let mut rx = exec.run_streaming("tail -n 10 /var/log/syslog").await.unwrap();
-        assert_eq!(inner.streaming_calls(), 1, "must use the inner streaming path");
+        let mut rx = exec
+            .run_streaming("tail -n 10 /var/log/syslog")
+            .await
+            .unwrap();
+        assert_eq!(
+            inner.streaming_calls(),
+            1,
+            "must use the inner streaming path"
+        );
         match rx.recv().await {
             Some(StreamEvent::Stdout(chunk)) => assert_eq!(chunk, "tail -n 10 /var/log/syslog"),
             other => panic!("expected stdout chunk, got {other:?}"),
@@ -1430,15 +1713,17 @@ mod tests {
     #[cfg(feature = "local")]
     #[tokio::test]
     async fn real_local_executor_allows_reads_and_refuses_writes() {
-        let local: Arc<dyn CommandExecutor> =
-            Arc::new(crate::LocalExecutor::new().await.unwrap());
+        let local: Arc<dyn CommandExecutor> = Arc::new(crate::LocalExecutor::new().await.unwrap());
         let exec = ReadOnlyExecutor::new(local);
 
         let result = exec.run("echo filar-readonly-ok").await.unwrap();
         assert_eq!(result.exit_code, Some(0));
         assert!(result.stdout.contains("filar-readonly-ok"));
 
-        let err = exec.run("rm -rf /tmp/filar-readonly-never").await.unwrap_err();
+        let err = exec
+            .run("rm -rf /tmp/filar-readonly-never")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("read-only policy"));
     }
 }

@@ -15,12 +15,14 @@ fn admin() -> KubeCluster {
     let path = std::env::var_os("FILAR_TEST_KUBECONFIG")
         .map(PathBuf::from)
         .expect("FILAR_TEST_KUBECONFIG must point to docker/k8s admin kubeconfig");
-    let context = std::env::var("FILAR_TEST_KUBE_CONTEXT").ok().unwrap_or_else(|| {
-        Kubeconfig::read_from(&path)
-            .ok()
-            .and_then(|config| config.current_context)
-            .expect("test kubeconfig must have a current context")
-    });
+    let context = std::env::var("FILAR_TEST_KUBE_CONTEXT")
+        .ok()
+        .unwrap_or_else(|| {
+            Kubeconfig::read_from(&path)
+                .ok()
+                .and_then(|config| config.current_context)
+                .expect("test kubeconfig must have a current context")
+        });
     KubeCluster {
         name: "filar-tests".into(),
         context,
@@ -77,7 +79,11 @@ async fn background_job_runs_in_a_read_only_pod_with_tmp_volume() {
         ))
         .await
         .unwrap();
-    assert_eq!(left.stdout.trim(), "0", "log must be removed after completion");
+    assert_eq!(
+        left.stdout.trim(),
+        "0",
+        "log must be removed after completion"
+    );
 }
 
 /// `nowrite/main`: no writable directory — an honest refusal, no job.

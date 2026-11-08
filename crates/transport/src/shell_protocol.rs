@@ -51,7 +51,11 @@ impl EventSource for mpsc::UnboundedReceiver<ChannelEvent> {
 /// The marker tag of request `req_id`: unique per command, so output of an
 /// earlier command can never be taken for this one's marker.
 pub(crate) fn command_marker_tag(req_id: u64) -> String {
-    format!("{MARKER_PREFIX}req_{:08x}_{}", req_id, Uuid::new_v4().simple())
+    format!(
+        "{MARKER_PREFIX}req_{:08x}_{}",
+        req_id,
+        Uuid::new_v4().simple()
+    )
 }
 
 /// The bytes written for `command`: the command itself, then a `printf` of
@@ -148,7 +152,9 @@ pub(crate) async fn recv_until_marker<E: EventSource>(
     loop {
         let event = tokio::time::timeout_at(deadline, source.next_event())
             .await
-            .map_err(|_| CoreError::Other(format!("timeout waiting for command marker `{marker_tag}`")))?
+            .map_err(|_| {
+                CoreError::Other(format!("timeout waiting for command marker `{marker_tag}`"))
+            })?
             .ok_or_else(|| CoreError::Other("channel closed before marker received".into()))?;
 
         match event {
@@ -240,7 +246,9 @@ pub(crate) async fn recv_until_marker_simple<E: EventSource>(
                 // Ignore stderr during sync.
             }
             ChannelEvent::Closed => {
-                return Err(CoreError::Other("channel closed before marker received".into()));
+                return Err(CoreError::Other(
+                    "channel closed before marker received".into(),
+                ));
             }
         }
     }
@@ -257,7 +265,11 @@ mod tests {
         assert_eq!(marker_tag, "__FILAR_req_00000001");
         let tag = command_marker_tag(1);
         assert!(tag.starts_with("__FILAR_req_00000001_"), "{tag}");
-        assert_ne!(command_marker_tag(1), command_marker_tag(1), "tags are unique");
+        assert_ne!(
+            command_marker_tag(1),
+            command_marker_tag(1),
+            "tags are unique"
+        );
     }
 
     #[test]
@@ -324,18 +336,30 @@ mod tests {
             ChannelEvent::Data("v__\n".into()),
         ]);
         let (out, _, code, cwd) =
-            recv_until_marker(&mut rx, "__FILAR_req_1", Duration::from_secs(1)).await.unwrap();
-        assert_eq!((out.as_str(), code, cwd.as_deref()), ("hi", Some(0), Some("/srv")));
+            recv_until_marker(&mut rx, "__FILAR_req_1", Duration::from_secs(1))
+                .await
+                .unwrap();
+        assert_eq!(
+            (out.as_str(), code, cwd.as_deref()),
+            ("hi", Some(0), Some("/srv"))
+        );
     }
 
     #[test]
     fn the_shell_pid_is_read_from_its_marker_line() {
         let tag = "__FILAR_pid_abc";
-        assert_eq!(parse_shell_pid("noise\n__FILAR_pid_abc__4242__\n", tag), Some(4242));
+        assert_eq!(
+            parse_shell_pid("noise\n__FILAR_pid_abc__4242__\n", tag),
+            Some(4242)
+        );
         // An echo of the printf (a shell with echo on) is skipped.
         let echoed = "printf '\\n__FILAR_pid_abc__%s__\\n' \"$$\"\n__FILAR_pid_abc__77__\n";
         assert_eq!(parse_shell_pid(echoed, tag), Some(77));
-        assert_eq!(parse_shell_pid("__FILAR_pid_abc__", tag), None, "incomplete");
+        assert_eq!(
+            parse_shell_pid("__FILAR_pid_abc__", tag),
+            None,
+            "incomplete"
+        );
         assert_eq!(parse_shell_pid("__FILAR_pid_other__1__", tag), None);
     }
 
@@ -345,7 +369,10 @@ mod tests {
         assert!(cmd.contains("awk -v pp=4242"), "{cmd}");
         assert!(cmd.contains("kill -INT"), "{cmd}");
         // A failed `ps` or `kill` is reported, not swallowed.
-        assert!(cmd.contains("|| exit 1") && cmd.contains("|| rc=1") && cmd.ends_with("exit $rc"), "{cmd}");
+        assert!(
+            cmd.contains("|| exit 1") && cmd.contains("|| rc=1") && cmd.ends_with("exit $rc"),
+            "{cmd}"
+        );
         // Zero-install: the only redirection is stderr to /dev/null.
         assert_eq!(cmd.matches('>').count(), 1, "{cmd}");
         assert!(cmd.contains("2>/dev/null"), "{cmd}");
@@ -370,8 +397,9 @@ mod tests {
             ChannelEvent::Data("ne2\n__FILAR_req_1__3__/srv__\n".into()),
             ChannelEvent::Stderr("late\n".into()),
         ]);
-        let (out, err, code, cwd) =
-            recv_until_marker(&mut rx, tag, Duration::from_secs(1)).await.unwrap();
+        let (out, err, code, cwd) = recv_until_marker(&mut rx, tag, Duration::from_secs(1))
+            .await
+            .unwrap();
         assert_eq!(out, "line1\nline2");
         assert_eq!(err, "warn\nlate\n");
         assert_eq!(code, Some(3));
@@ -380,11 +408,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_closed_channel_before_the_marker_is_an_error() {
-        let mut rx = source(vec![ChannelEvent::Data("partial".into()), ChannelEvent::Closed]);
+        let mut rx = source(vec![
+            ChannelEvent::Data("partial".into()),
+            ChannelEvent::Closed,
+        ]);
         let err = recv_until_marker(&mut rx, "__FILAR_req_1", Duration::from_secs(1))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("closed before command marker"), "{err}");
+        assert!(
+            err.to_string().contains("closed before command marker"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -407,9 +441,11 @@ mod tests {
             .await
             .unwrap();
         let mut closed = source(vec![ChannelEvent::Closed]);
-        assert!(recv_until_marker_simple(&mut closed, "__FILAR_sync_x", Duration::from_secs(1))
-            .await
-            .is_err());
+        assert!(
+            recv_until_marker_simple(&mut closed, "__FILAR_sync_x", Duration::from_secs(1))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -419,8 +455,14 @@ mod tests {
             ChannelEvent::Data("\n__FILAR_pid_t__9".into()),
             ChannelEvent::Data("1__\n".into()),
         ]);
-        assert_eq!(read_shell_pid(&mut rx, "__FILAR_pid_t", Duration::from_secs(1)).await, Some(91));
+        assert_eq!(
+            read_shell_pid(&mut rx, "__FILAR_pid_t", Duration::from_secs(1)).await,
+            Some(91)
+        );
         let mut closed = source(vec![ChannelEvent::Closed]);
-        assert_eq!(read_shell_pid(&mut closed, "__FILAR_pid_t", Duration::from_secs(1)).await, None);
+        assert_eq!(
+            read_shell_pid(&mut closed, "__FILAR_pid_t", Duration::from_secs(1)).await,
+            None
+        );
     }
 }

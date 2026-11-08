@@ -99,7 +99,12 @@ pub async fn summarise_history(llm: &dyn LlmClient, transcript: &str) -> Summary
     let response = match llm.chat_stream(&request, &|_| {}).await {
         Ok(response) => response,
         // No response, so nothing was billed that we know of.
-        Err(e) => return SummaryOutcome { usage: None, summary: Err(e) },
+        Err(e) => {
+            return SummaryOutcome {
+                usage: None,
+                summary: Err(e),
+            }
+        }
     };
     let usage = response.usage.clone();
     let text = response.text.trim().to_string();
@@ -114,7 +119,10 @@ pub async fn summarise_history(llm: &dyn LlmClient, transcript: &str) -> Summary
             ))),
         };
     }
-    SummaryOutcome { usage, summary: Ok(text) }
+    SummaryOutcome {
+        usage,
+        summary: Ok(text),
+    }
 }
 
 #[cfg(test)]
@@ -206,7 +214,9 @@ mod tests {
         let real = "User asked for disk usage; agent ran df -h; root is 82% full.";
         let outcome = summarise_with_usage(real, Some(usage(9_000, 120))).await;
         assert_eq!(outcome.summary.unwrap(), real);
-        let u = outcome.usage.expect("usage must come back with the summary");
+        let u = outcome
+            .usage
+            .expect("usage must come back with the summary");
         assert_eq!(u.prompt_tokens, Some(9_000));
         assert_eq!(u.completion_tokens, Some(120));
     }

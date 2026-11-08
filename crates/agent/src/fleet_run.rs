@@ -292,10 +292,7 @@ impl FleetRunReport {
     }
 
     fn count(&self, predicate: impl Fn(&HostRun) -> bool) -> usize {
-        self.outcomes
-            .iter()
-            .filter(|o| predicate(&o.run))
-            .count()
+        self.outcomes.iter().filter(|o| predicate(&o.run)).count()
     }
 }
 
@@ -325,10 +322,7 @@ impl FleetRunReport {
 ///
 /// [`max_parallel`]: FleetOperation::max_parallel
 /// [`per_host_timeout`]: FleetOperation::per_host_timeout
-pub async fn run_on_fleet(
-    op: &mut FleetOperation,
-    tasks: Vec<HostTask>,
-) -> Result<FleetRunReport> {
+pub async fn run_on_fleet(op: &mut FleetOperation, tasks: Vec<HostTask>) -> Result<FleetRunReport> {
     run_on_fleet_until(op, tasks, &CancellationToken::new()).await
 }
 
@@ -479,8 +473,12 @@ async fn run_one(
 /// unusable for the next check. Cancellation is best-effort and bounded by
 /// the host's deadline: a host too wedged to accept a Ctrl-C must not
 /// become a second wedge here.
-async fn interrupt<F>(task: &HostTask, run_future: &mut std::pin::Pin<&mut F>, deadline: Duration, why: &str)
-where
+async fn interrupt<F>(
+    task: &HostTask,
+    run_future: &mut std::pin::Pin<&mut F>,
+    deadline: Duration,
+    why: &str,
+) where
     F: std::future::Future<Output = Result<CommandResult>>,
 {
     match tokio::time::timeout(deadline, task.executor.cancel()).await {
@@ -501,7 +499,10 @@ where
     // lands back as a stored permit — the same poisoning by a longer
     // route. Polling here consumes it. Bounded by the same deadline, and
     // its answer is discarded: whatever it says now, the cell is decided.
-    if tokio::time::timeout(deadline, run_future.as_mut()).await.is_err() {
+    if tokio::time::timeout(deadline, run_future.as_mut())
+        .await
+        .is_err()
+    {
         tracing::warn!(
             handle = ?task.handle,
             "fleet host did not finish even after being cancelled"
@@ -706,7 +707,11 @@ mod tests {
         let tasks = hosts
             .iter()
             .map(|(handle, host)| {
-                HostTask::new(*handle, host.clone() as Arc<dyn CommandExecutor>, "uname -r")
+                HostTask::new(
+                    *handle,
+                    host.clone() as Arc<dyn CommandExecutor>,
+                    "uname -r",
+                )
             })
             .collect();
 
@@ -716,19 +721,30 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
             trigger.cancel();
         });
-        let report = run_on_fleet_until(&mut op, tasks, &cancel).await.expect("valid tasks");
+        let report = run_on_fleet_until(&mut op, tasks, &cancel)
+            .await
+            .expect("valid tasks");
 
         // The answer that arrived before the cancellation is kept.
-        assert!(matches!(report.run_for(hosts[0].0), Some(HostRun::Answered(r)) if r.stdout == "5.15.0"));
+        assert!(
+            matches!(report.run_for(hosts[0].0), Some(HostRun::Answered(r)) if r.stdout == "5.15.0")
+        );
         // host-2 and host-3 were running: each got a Ctrl-C on the host.
         for (handle, host) in &hosts[1..3] {
             assert!(matches!(report.run_for(*handle), Some(HostRun::Cancelled)));
-            assert_eq!(host.cancels(), 1, "a running host is interrupted, not abandoned");
+            assert_eq!(
+                host.cancels(),
+                1,
+                "a running host is interrupted, not abandoned"
+            );
         }
         // host-4..6 were queued: never started, never contacted.
         for (handle, host) in &hosts[3..] {
             assert!(matches!(report.run_for(*handle), Some(HostRun::Cancelled)));
-            assert!(host.commands().is_empty(), "the queue does not start after a cancel");
+            assert!(
+                host.commands().is_empty(),
+                "the queue does not start after a cancel"
+            );
         }
         assert_eq!(report.answered(), 1);
         assert_eq!(report.cancelled(), 5);
@@ -744,7 +760,12 @@ mod tests {
         let mut op = FleetOperation::open(&group(3, 30), &targets);
         let hosts: Vec<_> = op
             .handles()
-            .map(|h| (h, FakeHost::new(Behaviour::Answers(Duration::ZERO, "x"), concurrency.clone())))
+            .map(|h| {
+                (
+                    h,
+                    FakeHost::new(Behaviour::Answers(Duration::ZERO, "x"), concurrency.clone()),
+                )
+            })
             .collect();
         let tasks = hosts
             .iter()
@@ -753,7 +774,9 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let report = run_on_fleet_until(&mut op, tasks, &cancel).await.expect("valid tasks");
+        let report = run_on_fleet_until(&mut op, tasks, &cancel)
+            .await
+            .expect("valid tasks");
         assert_eq!(report.cancelled(), 3);
         for (_, host) in &hosts {
             assert!(host.commands().is_empty());
@@ -782,7 +805,11 @@ mod tests {
         let tasks = hosts
             .iter()
             .map(|(handle, host)| {
-                HostTask::new(*handle, host.clone() as Arc<dyn CommandExecutor>, "uname -r")
+                HostTask::new(
+                    *handle,
+                    host.clone() as Arc<dyn CommandExecutor>,
+                    "uname -r",
+                )
             })
             .collect();
 
@@ -833,14 +860,29 @@ mod tests {
 
         let report = run_on_fleet(&mut op, tasks).await.expect("valid tasks");
 
-        assert_eq!(report.timed_out(), 1, "only the wedged host ran out of time");
+        assert_eq!(
+            report.timed_out(),
+            1,
+            "only the wedged host ran out of time"
+        );
         assert_eq!(report.answered(), 3, "the rest answered normally");
-        assert_eq!(op.count_at(HostProgress::Done), 4, "including the wedged one");
+        assert_eq!(
+            op.count_at(HostProgress::Done),
+            4,
+            "including the wedged one"
+        );
 
         let wedged_handle = op.handles().nth(1).expect("second member");
-        match report.run_for(wedged_handle).expect("a row for the wedged host") {
+        match report
+            .run_for(wedged_handle)
+            .expect("a row for the wedged host")
+        {
             HostRun::TimedOut(after) => {
-                assert_eq!(*after, Duration::from_secs(30), "its own deadline, per host")
+                assert_eq!(
+                    *after,
+                    Duration::from_secs(30),
+                    "its own deadline, per host"
+                )
             }
             other => panic!("expected a timeout, got {other:?}"),
         }
@@ -1021,21 +1063,29 @@ mod tests {
         let tasks = vec![
             HostTask::new(
                 handles[0],
-                FakeHost::new(Behaviour::Answers(Duration::ZERO, "ok"), concurrency.clone())
-                    as Arc<dyn CommandExecutor>,
+                FakeHost::new(
+                    Behaviour::Answers(Duration::ZERO, "ok"),
+                    concurrency.clone(),
+                ) as Arc<dyn CommandExecutor>,
                 "uptime",
             ),
             HostTask::new(
                 handles[2],
-                FakeHost::new(Behaviour::Answers(Duration::ZERO, "ok"), concurrency.clone())
-                    as Arc<dyn CommandExecutor>,
+                FakeHost::new(
+                    Behaviour::Answers(Duration::ZERO, "ok"),
+                    concurrency.clone(),
+                ) as Arc<dyn CommandExecutor>,
                 "uptime",
             ),
         ];
 
         let report = run_on_fleet(&mut op, tasks).await.expect("valid tasks");
 
-        assert_eq!(report.len(), 2, "the report has a row per task, not per member");
+        assert_eq!(
+            report.len(),
+            2,
+            "the report has a row per task, not per member"
+        );
         assert!(report.run_for(handles[1]).is_none());
         assert_eq!(op.count_at(HostProgress::Done), 2);
         assert_eq!(
@@ -1062,7 +1112,10 @@ mod tests {
         let mut mine = FleetOperation::open(&group(2, 30), &targets);
         let theirs = FleetOperation::open(&group(2, 30), &targets);
 
-        let host = FakeHost::new(Behaviour::Answers(Duration::ZERO, "ok"), concurrency.clone());
+        let host = FakeHost::new(
+            Behaviour::Answers(Duration::ZERO, "ok"),
+            concurrency.clone(),
+        );
         let foreign = vec![HostTask::new(
             theirs.handles().next().expect("member"),
             host.clone() as Arc<dyn CommandExecutor>,
@@ -1156,11 +1209,7 @@ mod tests {
 
         let report = run_on_fleet(&mut op, tasks).await.expect("valid tasks");
 
-        let order: Vec<HostHandle> = report
-            .outcomes()
-            .iter()
-            .map(HostOutcome::handle)
-            .collect();
+        let order: Vec<HostHandle> = report.outcomes().iter().map(HostOutcome::handle).collect();
         assert_eq!(order, handles);
     }
 }

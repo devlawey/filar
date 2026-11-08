@@ -677,9 +677,7 @@ enum PodRunnerEvent {
         error: String,
     },
     /// An approved debug container runs (#576).
-    DebugCreated {
-        proposal: crate::app::DebugProposal,
-    },
+    DebugCreated { proposal: crate::app::DebugProposal },
     /// An approved debug container could not be created (#576).
     DebugFailed {
         proposal: crate::app::DebugProposal,
@@ -788,9 +786,7 @@ async fn create_pending_local_executors(
                 if let Some(s) = app.sessions.iter_mut().find(|s| s.id == sid) {
                     s.ssh_info = None;
                 }
-                app.push_error(format!(
-                    "Failed to create local executor for new tab: {e}"
-                ));
+                app.push_error(format!("Failed to create local executor for new tab: {e}"));
                 app.pending_local_executors.push(sid);
             }
         }
@@ -799,10 +795,7 @@ async fn create_pending_local_executors(
 
 /// Create every debug container the user approved (#576): the only write to
 /// a cluster filar makes, and only from this explicit action.
-fn start_pending_kube_debug_creates(
-    app: &mut App,
-    pod_tx: &mpsc::UnboundedSender<PodRunnerEvent>,
-) {
+fn start_pending_kube_debug_creates(app: &mut App, pod_tx: &mpsc::UnboundedSender<PodRunnerEvent>) {
     for proposal in app.take_pending_kube_debug_creates() {
         let tx = pod_tx.clone();
         tokio::spawn(async move {
@@ -836,10 +829,7 @@ fn start_pending_kube_debug_creates(
 }
 
 /// Open every queued pod shell in the background, like an SSH connect (#565).
-fn start_pending_kube_pod_connects(
-    app: &mut App,
-    pod_tx: &mpsc::UnboundedSender<PodRunnerEvent>,
-) {
+fn start_pending_kube_pod_connects(app: &mut App, pod_tx: &mpsc::UnboundedSender<PodRunnerEvent>) {
     for request in app.take_pending_kube_pod_connects() {
         let tx = pod_tx.clone();
         tokio::spawn(async move {

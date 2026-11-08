@@ -12370,6 +12370,21 @@ zero-install. Замысел Евгения: zero-install — про то, чт�
 - `CHANGELOG.md`: строка в `Added` про движок. В issue было «нет», но
   AGENTS.md требует запись для изменения публичного контракта, а
   `filar-transport` — крейт движка для встраивающих (замечание ai-review).
+- Ревью CodeRabbit, раунд 1: отправленные значения Secret (`stringData`,
+  `data` как base64 и раскодированные, от 4 символов) маскируются в тексте
+  ошибки сервера — webhook может процитировать объект; `parse_manifest`
+  возвращает манифест как есть, это задокументировано. Вид без `apiVersion`
+  ищется сначала в core-группе, поэтому сломанная сторонняя группа не мешает
+  удалить Pod; с `apiVersion` принимаются и `deployments`/`deployment`.
+  Нестроковый `metadata.namespace` — ошибка, а не подмена на namespace по
+  умолчанию. `Unavailable` сохраняется при добавлении контекста apply.
+  Приостановленный Deployment: restart и undo отказываются («resume it
+  first»), как kubectl. Undo читает все страницы ReplicaSet. Голый `Status`
+  в ответ на DELETE (агрегированные API) — повторный GET: объект ещё есть —
+  `Pending`. У CRD без подресурса `status` изменение status считается
+  `Configured`. Live-тест: securityContext под `restricted` PSA фикстуры,
+  предварительная очистка, ожидание ревизии 2 перед undo, проверка, что
+  dry-run restart не сохранился.
 
 **Контракты.** Новый публичный трейт `ClusterWriteApi` и типы (см.
 `docs/ENGINE_API.md`). `CommandExecutor`, `LlmClient`, `ClusterApi` не менялись.

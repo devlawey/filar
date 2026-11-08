@@ -130,9 +130,13 @@ impl FleetView {
                     None => GroupRole::Split,
                 };
                 let sample = match group.value() {
-                    ComparedValue::Rows(rows) => {
-                        clamp(&rows.iter().map(|r| r.join("  ")).collect::<Vec<_>>().join("\n"))
-                    }
+                    ComparedValue::Rows(rows) => clamp(
+                        &rows
+                            .iter()
+                            .map(|r| r.join("  "))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
                     // A short answer is plain text by construction.
                     ComparedValue::Text(_) => group
                         .hosts()
@@ -156,14 +160,17 @@ impl FleetView {
             .dropped()
             .iter()
             .map(|d| {
-                let failed = report
-                    .run_for(d.handle())
-                    .and_then(|run| match run {
-                        HostRun::Answered(result) if d.state() == HostState::ExecutionError => Some(result),
-                        _ => None,
-                    });
+                let failed = report.run_for(d.handle()).and_then(|run| match run {
+                    HostRun::Answered(result) if d.state() == HostState::ExecutionError => {
+                        Some(result)
+                    }
+                    _ => None,
+                });
                 let first = |text: &str| {
-                    text.lines().map(str::trim).find(|l| !l.is_empty()).map(clamp)
+                    text.lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                        .map(clamp)
                 };
                 ViewDropped {
                     host: d.host().to_string(),
@@ -202,7 +209,10 @@ pub fn looks_binary(output: &str) -> bool {
             return true;
         }
         seen += 1;
-        let layout = matches!(c, '\n' | '\r' | '\t' | '\u{1b}' | '\u{8}' | '\u{c}' | '\u{7}');
+        let layout = matches!(
+            c,
+            '\n' | '\r' | '\t' | '\u{1b}' | '\u{8}' | '\u{c}' | '\u{7}'
+        );
         if c == '\u{fffd}' || (c.is_control() && !layout) {
             odd += 1;
         }
@@ -280,8 +290,14 @@ mod tests {
     #[test]
     fn a_binary_answer_is_replaced_by_one_line() {
         let sample = readable_sample(&gzip_like(), 0xe6f5_edc2_20c9_0ffa);
-        assert!(!sample.contains('\n') && !sample.contains('\u{fffd}'), "{sample}");
-        assert!(sample.starts_with("binary data, about 2 KB, digest 0xe6f5edc220c90ffa"), "{sample}");
+        assert!(
+            !sample.contains('\n') && !sample.contains('\u{fffd}'),
+            "{sample}"
+        );
+        assert!(
+            sample.starts_with("binary data, about 2 KB, digest 0xe6f5edc220c90ffa"),
+            "{sample}"
+        );
         assert_eq!(readable_sample("5.15.0-91\n", 1), "5.15.0-91\n");
     }
 
@@ -290,10 +306,18 @@ mod tests {
     #[test]
     fn progress_bars_and_page_breaks_are_text() {
         let bar: String = (0..=100)
-            .map(|p| format!("\r\u{1b}[K{p:3}% [{}>{}]", "=".repeat(p / 5), " ".repeat(20 - p / 5)))
+            .map(|p| {
+                format!(
+                    "\r\u{1b}[K{p:3}% [{}>{}]",
+                    "=".repeat(p / 5),
+                    " ".repeat(20 - p / 5)
+                )
+            })
             .collect();
         assert!(!looks_binary(&bar));
-        assert!(!looks_binary("Chapter 1\n\u{c}Chapter 2\n\u{c}Chapter 3\n\u{c}\u{c}\u{7}\n"));
+        assert!(!looks_binary(
+            "Chapter 1\n\u{c}Chapter 2\n\u{c}Chapter 3\n\u{c}\u{c}\u{7}\n"
+        ));
     }
 
     /// A long text answer is still bounded on its way to the panel.
@@ -302,7 +326,11 @@ mod tests {
         let long = "line of text\n".repeat(MAX_SAMPLE_CHARS);
         let sample = clamp(&readable_sample(&long, 7));
         assert!(sample.starts_with("line of text\n"));
-        assert_eq!(sample.chars().count(), MAX_SAMPLE_CHARS + 1, "clamped plus the ellipsis");
+        assert_eq!(
+            sample.chars().count(),
+            MAX_SAMPLE_CHARS + 1,
+            "clamped plus the ellipsis"
+        );
     }
 
     #[test]

@@ -87,7 +87,10 @@ impl LogSources {
 
     /// Source names, in config order.
     pub fn names(&self) -> Vec<String> {
-        self.sources.iter().map(|s| s.config().name.clone()).collect()
+        self.sources
+            .iter()
+            .map(|s| s.config().name.clone())
+            .collect()
     }
 
     fn get(&self, name: &str) -> Option<&Arc<dyn LogSource>> {
@@ -103,13 +106,22 @@ impl LogSources {
     /// Explain mode, as for every other tool.
     pub fn tool_definition(&self, mode: CommandConfirmMode) -> ToolDef {
         let mut properties = Map::new();
-        properties.insert("source".into(), json!({"type": "string", "enum": self.names(), "description": "Log source name."}));
+        properties.insert(
+            "source".into(),
+            json!({"type": "string", "enum": self.names(), "description": "Log source name."}),
+        );
         properties.insert("query".into(), json!({"type": "string", "description": "Query in the source's own language (see the LOG SOURCES section of the system prompt)."}));
         properties.insert("since".into(), json!({"type": "string", "description": "Window ending now, e.g. 15m, 1h, 2d. Use this or start/end."}));
         properties.insert("start".into(), json!({"type": "string", "description": "Window start, RFC 3339 (e.g. 2026-11-01T10:00:00Z)."}));
-        properties.insert("end".into(), json!({"type": "string", "description": "Window end, RFC 3339; defaults to now."}));
+        properties.insert(
+            "end".into(),
+            json!({"type": "string", "description": "Window end, RFC 3339; defaults to now."}),
+        );
         properties.insert("limit".into(), json!({"type": "integer", "minimum": 1, "description": "Most lines to return; capped by the source's max_lines."}));
-        properties.insert("explanation".into(), json!({"type": "string", "description": "Why this query is needed now."}));
+        properties.insert(
+            "explanation".into(),
+            json!({"type": "string", "description": "Why this query is needed now."}),
+        );
         let mut required = vec!["source", "query"];
         if mode == CommandConfirmMode::Explain {
             required.push("explanation");
@@ -167,19 +179,28 @@ impl LogSources {
                 Some(_) => Err(CoreError::Other(format!("{key} must be a string"))),
             }
         };
-        let name = text("source")?.ok_or_else(|| CoreError::Other("missing required argument source".into()))?;
+        let name = text("source")?
+            .ok_or_else(|| CoreError::Other("missing required argument source".into()))?;
         let source = self.get(&name).ok_or_else(|| {
-            CoreError::Other(format!("unknown log source \"{name}\"; available: {}", self.names().join(", ")))
+            CoreError::Other(format!(
+                "unknown log source \"{name}\"; available: {}",
+                self.names().join(", ")
+            ))
         })?;
         let cfg = source.config();
-        let query = text("query")?.ok_or_else(|| CoreError::Other("missing required argument query".into()))?;
+        let query = text("query")?
+            .ok_or_else(|| CoreError::Other("missing required argument query".into()))?;
         let since = text("since")?;
         let start = text("start")?;
         let end = text("end")?;
         let parse_time = |key: &str, value: &str| -> Result<DateTime<Utc>> {
             DateTime::parse_from_rfc3339(value)
                 .map(|t| t.with_timezone(&Utc))
-                .map_err(|_| CoreError::Other(format!("{key} must be an RFC 3339 time, e.g. 2026-11-01T10:00:00Z")))
+                .map_err(|_| {
+                    CoreError::Other(format!(
+                        "{key} must be an RFC 3339 time, e.g. 2026-11-01T10:00:00Z"
+                    ))
+                })
         };
         let (start, end) = match (since, start, end) {
             (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
@@ -209,7 +230,9 @@ impl LogSources {
             }
         };
         if end <= start {
-            return Err(CoreError::Other("the window is empty: end must be after start".into()));
+            return Err(CoreError::Other(
+                "the window is empty: end must be after start".into(),
+            ));
         }
         let max = Duration::hours(cfg.max_window_hours as i64);
         if end - start > max {
@@ -230,7 +253,12 @@ impl LogSources {
         let limit = requested.unwrap_or(DEFAULT_QUERY_LINES).min(cfg.max_lines);
         Ok(QueryLogsCall {
             source: name,
-            query: LogQuery { query, start, end, limit },
+            query: LogQuery {
+                query,
+                start,
+                end,
+                limit,
+            },
             limit_capped_from: requested.filter(|r| *r > cfg.max_lines),
             explanation: text("explanation")?.unwrap_or_default(),
         })
@@ -239,10 +267,17 @@ impl LogSources {
     /// The gate: confirmation in `always`/`explain`, none in
     /// `allowlist`/`never`; tag policies matching the source's tags tighten it.
     pub fn decision(&self, mode: CommandConfirmMode, call: &QueryLogsCall) -> ConfirmDecision {
-        let tags = self.get(&call.source).map(|s| s.config().tags.clone()).unwrap_or_default();
+        let tags = self
+            .get(&call.source)
+            .map(|s| s.config().tags.clone())
+            .unwrap_or_default();
         match tag_policy_floor(mode, &self.tag_policies, &tags).unwrap_or(mode) {
-            CommandConfirmMode::Always | CommandConfirmMode::Explain => ConfirmDecision::NeedsConfirmation,
-            CommandConfirmMode::Allowlist | CommandConfirmMode::Never => ConfirmDecision::AutoApproved,
+            CommandConfirmMode::Always | CommandConfirmMode::Explain => {
+                ConfirmDecision::NeedsConfirmation
+            }
+            CommandConfirmMode::Allowlist | CommandConfirmMode::Never => {
+                ConfirmDecision::AutoApproved
+            }
         }
     }
 
@@ -260,13 +295,19 @@ impl LogSources {
         let (name, language, max_lines) = match self.get(&call.source) {
             Some(source) => {
                 let cfg = source.config();
-                (cfg.name.clone(), cfg.source_kind().map(|k| k.language()).unwrap_or("?"), cfg.max_lines)
+                (
+                    cfg.name.clone(),
+                    cfg.source_kind().map(|k| k.language()).unwrap_or("?"),
+                    cfg.max_lines,
+                )
             }
             None => (call.source.clone(), "?", call.query.limit),
         };
         let mut text = fold_logs(&name, language, &call.query, result);
         if let Some(asked) = call.limit_capped_from {
-            text.push_str(&format!("(limit {asked} lowered to this source's max_lines {max_lines})\n"));
+            text.push_str(&format!(
+                "(limit {asked} lowered to this source's max_lines {max_lines})\n"
+            ));
         }
         text
     }
@@ -298,13 +339,26 @@ impl LogSources {
         let parsed = match self.parse_call(&call.arguments, Utc::now()) {
             Ok(parsed) => parsed,
             Err(error) => {
-                return Ok(ChatMessage::tool(&call.id, format!("Error: invalid query_logs call: {error}")));
+                return Ok(ChatMessage::tool(
+                    &call.id,
+                    format!("Error: invalid query_logs call: {error}"),
+                ));
             }
         };
         let display = parsed.display_command();
         let render = |call: &QueryLogsCall, result: &LogResult| self.fold(call, result);
-        self.run_framed(call, &parsed, display, &render, mode, confirmer, emit, cancellation, proposal_id)
-            .await
+        self.run_framed(
+            call,
+            &parsed,
+            display,
+            &render,
+            mode,
+            confirmer,
+            emit,
+            cancellation,
+            proposal_id,
+        )
+        .await
     }
 
     /// Gate, announce, run and render one framed query. `display` is what the
@@ -346,7 +400,10 @@ impl LogSources {
                     .get(&parsed.source)
                     .map(|s| {
                         let cfg = s.config();
-                        format!("{explanation}\n\nLog source: {} ({}, {})", cfg.name, cfg.kind, cfg.url)
+                        format!(
+                            "{explanation}\n\nLog source: {} ({}, {})",
+                            cfg.name, cfg.kind, cfg.url
+                        )
                     })
                     .unwrap_or(explanation.clone());
                 let confirm = confirmer.confirm(&display, &context, false);
@@ -393,7 +450,10 @@ impl LogSources {
                     .iter()
                     .take(UI_LINES)
                     .map(|line| {
-                        let time = line.time.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default();
+                        let time = line
+                            .time
+                            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                            .unwrap_or_default();
                         self.redact(format!("{time} {}", line.message.replace('\n', " ")).trim())
                     })
                     .collect();
@@ -450,10 +510,14 @@ pub fn build_log_sources(
     let mut seen = BTreeMap::new();
     for cfg in configs {
         if seen.insert(cfg.name.clone(), ()).is_some() {
-            notes.push(format!("log source \"{}\": duplicate name, skipped", cfg.name));
+            notes.push(format!(
+                "log source \"{}\": duplicate name, skipped",
+                cfg.name
+            ));
             continue;
         }
-        let built = resolve_log_key(cfg, secrets.as_ref()).and_then(|key| build_log_source(cfg, &key));
+        let built =
+            resolve_log_key(cfg, secrets.as_ref()).and_then(|key| build_log_source(cfg, &key));
         match built {
             Ok(source) => sources.push(source),
             Err(error) => {
@@ -462,6 +526,7 @@ pub fn build_log_sources(
             }
         }
     }
-    let set = (!sources.is_empty()).then(|| Arc::new(LogSources::new(sources, secrets, tag_policies)));
+    let set =
+        (!sources.is_empty()).then(|| Arc::new(LogSources::new(sources, secrets, tag_policies)));
     (set, notes)
 }

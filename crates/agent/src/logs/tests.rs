@@ -65,7 +65,9 @@ async fn a_huge_answer_is_read_only_up_to_the_cap() {
         // Megabyte-long lines, 256 MiB in total — far more than socket
         // buffers can absorb once the client stops reading.
         socket
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 268435456\r\n\r\n")
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 268435456\r\n\r\n",
+            )
             .await
             .unwrap();
         let line = vec![b'x'; 1024 * 1024];
@@ -86,7 +88,10 @@ async fn a_huge_answer_is_read_only_up_to_the_cap() {
     // The client stopped reading: the server could not push the whole body
     // through a closed connection.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert!(!sent_all.load(Ordering::SeqCst), "the whole body was downloaded");
+    assert!(
+        !sent_all.load(Ordering::SeqCst),
+        "the whole body was downloaded"
+    );
 }
 
 #[tokio::test]
@@ -113,7 +118,9 @@ async fn cancelling_a_query_closes_the_connection() {
     let http = LogHttp::new(&cfg, "").unwrap();
     let token = tokio_util::sync::CancellationToken::new();
     let run = async {
-        let response = http.send(http.request(reqwest::Method::POST, "/select/logsql/query")).await?;
+        let response = http
+            .send(http.request(reqwest::Method::POST, "/select/logsql/query"))
+            .await?;
         read_limited(response, 1 << 20).await
     };
     let canceller = token.clone();
@@ -151,7 +158,10 @@ async fn the_key_never_appears_in_an_error() {
                 .unwrap_or("")
                 .to_string();
             let body = format!("denied for {auth}");
-            let reply = format!("HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+            let reply = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
             socket.write_all(reply.as_bytes()).await.unwrap();
         }
     });
@@ -171,7 +181,10 @@ async fn the_key_never_appears_in_an_error() {
             .to_string();
         assert!(err.contains("401"), "{err}");
         assert!(!err.contains("s3cr3t-token-value"), "{err}");
-        assert!(!err.contains("cmVhZGVyOnMzY3IzdC10b2tlbi12YWx1ZQ"), "basic token leaked: {err}");
+        assert!(
+            !err.contains("cmVhZGVyOnMzY3IzdC10b2tlbi12YWx1ZQ"),
+            "basic token leaked: {err}"
+        );
     }
 }
 
@@ -182,12 +195,17 @@ fn a_missing_key_is_named_by_variable_only() {
         key_env: "FILAR_LOGS_NONE".into(),
         ..vlogs("v")
     };
-    let err = resolve_log_key(&cfg, &StaticSecretProvider::new()).unwrap_err().to_string();
+    let err = resolve_log_key(&cfg, &StaticSecretProvider::new())
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("FILAR_LOGS_NONE"), "{err}");
     let secrets = StaticSecretProvider::new();
     secrets.insert("FILAR_LOGS_NONE", "k-123");
     assert_eq!(resolve_log_key(&cfg, &secrets).unwrap(), "k-123");
-    assert_eq!(resolve_log_key(&vlogs("open"), &StaticSecretProvider::new()).unwrap(), "");
+    assert_eq!(
+        resolve_log_key(&vlogs("open"), &StaticSecretProvider::new()).unwrap(),
+        ""
+    );
 }
 
 #[test]
@@ -207,7 +225,11 @@ fn a_source_that_cannot_be_built_is_reported_not_offered() {
 
 #[test]
 fn victorialogs_sources_are_built() {
-    let (set, notes) = build_log_sources(&[vlogs("v")], Arc::new(StaticSecretProvider::new()), Vec::new());
+    let (set, notes) = build_log_sources(
+        &[vlogs("v")],
+        Arc::new(StaticSecretProvider::new()),
+        Vec::new(),
+    );
     assert!(notes.is_empty(), "{notes:?}");
     assert_eq!(set.unwrap().names(), vec!["v".to_string()]);
 }
@@ -222,9 +244,16 @@ fn normalisation_replaces_numbers_ids_and_times() {
         normalize("2026-11-01T10:00:00.123Z request 7f3c9a2e-1b4d-4c8e-9f00-123456789abc took 154ms from 10.0.0.12:8080"),
         "<time> request <uuid> took <n>ms from <n>:<n>"
     );
-    assert_eq!(normalize("trace=4bf92f3577b34da6a3ce929d0e0e4736 span 0x1f"), "trace=<hex> span <hex>");
+    assert_eq!(
+        normalize("trace=4bf92f3577b34da6a3ce929d0e0e4736 span 0x1f"),
+        "trace=<hex> span <hex>"
+    );
     assert_eq!(normalize("db-17 down"), "db-<n> down");
-    assert_eq!(normalize("deadbeef cafe"), "deadbeef cafe", "hex without digits is a word");
+    assert_eq!(
+        normalize("deadbeef cafe"),
+        "deadbeef cafe",
+        "hex without digits is a word"
+    );
 }
 
 fn normalize(s: &str) -> String {
@@ -251,7 +280,12 @@ fn hour_query(limit: usize) -> LogQuery {
 #[test]
 fn folding_groups_similar_messages_with_counts_and_bounds() {
     let mut lines: Vec<LogLine> = (0..30)
-        .map(|i| line(i, &format!("connection refused to db-{}:5432 after {}ms", i % 3, i * 10)))
+        .map(|i| {
+            line(
+                i,
+                &format!("connection refused to db-{}:5432 after {}ms", i % 3, i * 10),
+            )
+        })
         .collect();
     lines.push(line(45, "OOMKilled: worker 12"));
     let result = LogResult {
@@ -263,9 +297,20 @@ fn folding_groups_similar_messages_with_counts_and_bounds() {
     assert!(text.contains("31 line(s), limit 31"), "{text}");
     assert!(text.contains("TRUNCATED"), "{text}");
     assert!(text.contains("Groups: 2 distinct"), "{text}");
-    assert!(text.contains("[30×] 10:00:00 … 10:29:00  first: connection refused to db-0:5432 after 0ms"), "{text}");
-    assert!(text.contains("last: connection refused to db-2:5432 after 290ms"), "{text}");
-    assert!(text.contains("[1×] 10:45:00  OOMKilled: worker 12"), "{text}");
+    assert!(
+        text.contains(
+            "[30×] 10:00:00 … 10:29:00  first: connection refused to db-0:5432 after 0ms"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("last: connection refused to db-2:5432 after 290ms"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[1×] 10:45:00  OOMKilled: worker 12"),
+        "{text}"
+    );
     // 12 buckets of 5 minutes: the first six hold 5 lines each.
     assert!(text.contains("Distribution: 10:00 5 · 10:05 5"), "{text}");
     assert!(text.contains("10:45 1"), "{text}");
@@ -305,7 +350,11 @@ impl LogSource for MockSource {
     }
 }
 
-fn sources(lines: Vec<LogLine>, tags: Vec<String>, policies: Vec<TagPolicy>) -> (LogSources, Arc<MockSource>, StaticSecretProvider) {
+fn sources(
+    lines: Vec<LogLine>,
+    tags: Vec<String>,
+    policies: Vec<TagPolicy>,
+) -> (LogSources, Arc<MockSource>, StaticSecretProvider) {
     let mock = Arc::new(MockSource {
         cfg: LogSourceConfig {
             max_window_hours: 6,
@@ -318,7 +367,11 @@ fn sources(lines: Vec<LogLine>, tags: Vec<String>, policies: Vec<TagPolicy>) -> 
         seen: Mutex::new(Vec::new()),
     });
     let secrets = StaticSecretProvider::new();
-    let set = LogSources::new(vec![mock.clone() as Arc<dyn LogSource>], Arc::new(secrets.clone()), policies);
+    let set = LogSources::new(
+        vec![mock.clone() as Arc<dyn LogSource>],
+        Arc::new(secrets.clone()),
+        policies,
+    );
     (set, mock, secrets)
 }
 
@@ -331,22 +384,38 @@ fn the_frame_requires_a_window_within_the_cap_and_caps_the_limit() {
     let (set, _, _) = sources(Vec::new(), Vec::new(), Vec::new());
     let err = |args| set.parse_call(&args, now()).unwrap_err().to_string();
     assert!(err(json!({"source": "vlogs-prod", "query": "error"})).contains("window is required"));
-    assert!(err(json!({"source": "vlogs-prod", "query": "error", "since": "7h"})).contains("longer than this source allows (6 h)"));
-    assert!(err(json!({"source": "other", "query": "x", "since": "1h"})).contains("available: vlogs-prod"));
+    assert!(
+        err(json!({"source": "vlogs-prod", "query": "error", "since": "7h"}))
+            .contains("longer than this source allows (6 h)")
+    );
+    assert!(err(json!({"source": "other", "query": "x", "since": "1h"}))
+        .contains("available: vlogs-prod"));
     assert!(err(json!({"source": "vlogs-prod", "query": "x", "since": "1h", "start": "2026-11-01T10:00:00Z"})).contains("not both"));
-    assert!(err(json!({"source": "vlogs-prod", "query": "x", "start": "2026-11-01T13:00:00Z"})).contains("empty"));
+    assert!(
+        err(json!({"source": "vlogs-prod", "query": "x", "start": "2026-11-01T13:00:00Z"}))
+            .contains("empty")
+    );
 
     let call = set
-        .parse_call(&json!({"source": "vlogs-prod", "query": "error", "since": "30m", "limit": 5000}), now())
+        .parse_call(
+            &json!({"source": "vlogs-prod", "query": "error", "since": "30m", "limit": 5000}),
+            now(),
+        )
         .unwrap();
     assert_eq!(call.query.limit, 300);
     assert_eq!(call.limit_capped_from, Some(5000));
-    assert_eq!(call.query.end - call.query.start, chrono::Duration::minutes(30));
+    assert_eq!(
+        call.query.end - call.query.start,
+        chrono::Duration::minutes(30)
+    );
 
     let call = set
         .parse_call(&json!({"source": "vlogs-prod", "query": "error", "start": "2026-11-01T09:00:00+02:00"}), now())
         .unwrap();
-    assert_eq!(call.query.start, Utc.with_ymd_and_hms(2026, 11, 1, 7, 0, 0).unwrap());
+    assert_eq!(
+        call.query.start,
+        Utc.with_ymd_and_hms(2026, 11, 1, 7, 0, 0).unwrap()
+    );
     assert_eq!(call.query.end, now());
     assert_eq!(call.query.limit, 200, "default limit");
     assert_eq!(
@@ -359,7 +428,10 @@ fn the_frame_requires_a_window_within_the_cap_and_caps_the_limit() {
 fn a_huge_since_is_an_error_not_a_panic() {
     let (set, _, _) = sources(Vec::new(), Vec::new(), Vec::new());
     let err = set
-        .parse_call(&json!({"source": "vlogs-prod", "query": "x", "since": "9000000000000s"}), now())
+        .parse_call(
+            &json!({"source": "vlogs-prod", "query": "x", "since": "9000000000000s"}),
+            now(),
+        )
         .unwrap_err()
         .to_string();
     assert!(err.contains("too large") || err.contains("longer"), "{err}");
@@ -377,7 +449,9 @@ impl LogSource for FailingSource {
         String::new()
     }
     async fn query(&self, _: &LogQuery) -> filar_core::Result<LogResult> {
-        Err(filar_core::CoreError::Other("HTTP 502: upstream said token=other-secret-42".into()))
+        Err(filar_core::CoreError::Other(
+            "HTTP 502: upstream said token=other-secret-42".into(),
+        ))
     }
 }
 
@@ -397,7 +471,14 @@ async fn an_error_reply_is_redacted_before_the_model() {
     };
     let emit = |_: AgentEvent| {};
     let msg = set
-        .process(&call, CommandConfirmMode::Never, &Answer(true, Mutex::new(0)), &emit, None, 1)
+        .process(
+            &call,
+            CommandConfirmMode::Never,
+            &Answer(true, Mutex::new(0)),
+            &emit,
+            None,
+            1,
+        )
         .await
         .unwrap();
     assert!(msg.content.contains("502"), "{}", msg.content);
@@ -406,24 +487,51 @@ async fn an_error_reply_is_redacted_before_the_model() {
 
 #[test]
 fn the_gate_asks_in_always_and_explain_and_tags_tighten() {
-    let (set, _, _) = sources(Vec::new(), vec!["prod".into()], vec![TagPolicy {
-        tag: "prod".into(),
-        confirm_mode: CommandConfirmMode::Always,
-    }]);
-    let call = set.parse_call(&json!({"source": "vlogs-prod", "query": "x", "since": "1h"}), now()).unwrap();
-    assert_eq!(set.decision(CommandConfirmMode::Never, &call), ConfirmDecision::NeedsConfirmation);
+    let (set, _, _) = sources(
+        Vec::new(),
+        vec!["prod".into()],
+        vec![TagPolicy {
+            tag: "prod".into(),
+            confirm_mode: CommandConfirmMode::Always,
+        }],
+    );
+    let call = set
+        .parse_call(
+            &json!({"source": "vlogs-prod", "query": "x", "since": "1h"}),
+            now(),
+        )
+        .unwrap();
+    assert_eq!(
+        set.decision(CommandConfirmMode::Never, &call),
+        ConfirmDecision::NeedsConfirmation
+    );
     let (open, _, _) = sources(Vec::new(), Vec::new(), Vec::new());
-    assert_eq!(open.decision(CommandConfirmMode::Never, &call), ConfirmDecision::AutoApproved);
-    assert_eq!(open.decision(CommandConfirmMode::Allowlist, &call), ConfirmDecision::AutoApproved);
-    assert_eq!(open.decision(CommandConfirmMode::Always, &call), ConfirmDecision::NeedsConfirmation);
-    assert_eq!(open.decision(CommandConfirmMode::Explain, &call), ConfirmDecision::NeedsConfirmation);
+    assert_eq!(
+        open.decision(CommandConfirmMode::Never, &call),
+        ConfirmDecision::AutoApproved
+    );
+    assert_eq!(
+        open.decision(CommandConfirmMode::Allowlist, &call),
+        ConfirmDecision::AutoApproved
+    );
+    assert_eq!(
+        open.decision(CommandConfirmMode::Always, &call),
+        ConfirmDecision::NeedsConfirmation
+    );
+    assert_eq!(
+        open.decision(CommandConfirmMode::Explain, &call),
+        ConfirmDecision::NeedsConfirmation
+    );
 }
 
 #[tokio::test]
 async fn the_answer_is_redacted_before_the_model() {
     let (set, _, secrets) = sources(
         vec![
-            line(10, "auth header Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"),
+            line(
+                10,
+                "auth header Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig",
+            ),
             line(11, "connecting to postgres://app:hunter2@db:5432/shop"),
             line(12, "api key is k-live-123456"),
         ],
@@ -446,7 +554,10 @@ fn the_prompt_lists_sources_with_language_and_limits() {
     let prompt = set.prompt_section();
     assert!(prompt.contains(LOG_SOURCES_PROMPT_HEADER));
     assert!(prompt.contains("- vlogs-prod — victorialogs, language LogsQL; window ≤ 6 h, ≤ 300 lines; logs of clusters: prod-eu"), "{prompt}");
-    assert!(prompt.contains("| stats count() by"), "adapter hint: {prompt}");
+    assert!(
+        prompt.contains("| stats count() by"),
+        "adapter hint: {prompt}"
+    );
     assert!(prompt.contains("Always give a window"), "{prompt}");
 }
 
@@ -454,8 +565,14 @@ fn the_prompt_lists_sources_with_language_and_limits() {
 fn explanation_is_required_only_in_explain_mode() {
     let (set, _, _) = sources(Vec::new(), Vec::new(), Vec::new());
     let required = |mode| set.tool_definition(mode).parameters["required"].clone();
-    assert_eq!(required(CommandConfirmMode::Always), json!(["source", "query"]));
-    assert_eq!(required(CommandConfirmMode::Explain), json!(["source", "query", "explanation"]));
+    assert_eq!(
+        required(CommandConfirmMode::Always),
+        json!(["source", "query"])
+    );
+    assert_eq!(
+        required(CommandConfirmMode::Explain),
+        json!(["source", "query", "explanation"])
+    );
     assert!(tool::explanation_error(&json!({})).is_some());
     assert!(tool::explanation_error(&json!({"explanation": "why"})).is_none());
 }
@@ -482,23 +599,35 @@ async fn a_denied_query_is_never_sent_and_an_approved_one_runs_once() {
         arguments: json!({"source": "vlogs-prod", "query": "boom", "since": "1h"}),
     };
     let deny = Answer(false, Mutex::new(0));
-    let msg = set.process(&call, CommandConfirmMode::Always, &deny, &emit, None, 1).await.unwrap();
+    let msg = set
+        .process(&call, CommandConfirmMode::Always, &deny, &emit, None, 1)
+        .await
+        .unwrap();
     assert!(msg.content.contains("denied"), "{}", msg.content);
     assert!(mock.seen.lock().unwrap().is_empty());
 
     let allow = Answer(true, Mutex::new(0));
-    let msg = set.process(&call, CommandConfirmMode::Always, &allow, &emit, None, 2).await.unwrap();
+    let msg = set
+        .process(&call, CommandConfirmMode::Always, &allow, &emit, None, 2)
+        .await
+        .unwrap();
     assert!(msg.content.contains("[1×]"), "{}", msg.content);
     assert_eq!(mock.seen.lock().unwrap().len(), 1);
     assert_eq!(*allow.1.lock().unwrap(), 1);
 
     // Auto-approved in `never`: no question at all.
-    let msg = set.process(&call, CommandConfirmMode::Never, &deny, &emit, None, 3).await.unwrap();
+    let msg = set
+        .process(&call, CommandConfirmMode::Never, &deny, &emit, None, 3)
+        .await
+        .unwrap();
     assert!(msg.content.contains("boom"));
     assert_eq!(*deny.1.lock().unwrap(), 1, "never mode must not ask");
 
     let events = events.lock().unwrap();
-    let finished = events.iter().filter(|e| matches!(e, AgentEvent::CommandFinished { .. })).count();
+    let finished = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::CommandFinished { .. }))
+        .count();
     assert_eq!(finished, 3);
 }
 
@@ -560,12 +689,20 @@ async fn a_pod_history_query_is_written_by_filar_and_framed() {
     assert_eq!(seen[0].end - seen[0].start, chrono::Duration::hours(1));
     let events = events.lock().unwrap();
     let shown = events.iter().find_map(|e| match e {
-        AgentEvent::CommandProposed { command, tool, .. } => Some((command.clone(), tool.name.clone())),
+        AgentEvent::CommandProposed { command, tool, .. } => {
+            Some((command.clone(), tool.name.clone()))
+        }
         _ => None,
     });
     let (command, tool) = shown.unwrap();
-    assert!(command.starts_with("pod_logs_history vlogs-prod --start "), "{command}");
-    assert!(command.contains("\"kubernetes.pod_labels.app\":=\"web\""), "the query is visible: {command}");
+    assert!(
+        command.starts_with("pod_logs_history vlogs-prod --start "),
+        "{command}"
+    );
+    assert!(
+        command.contains("\"kubernetes.pod_labels.app\":=\"web\""),
+        "the query is visible: {command}"
+    );
     assert_eq!(tool, "pod_logs_history");
 }
 
@@ -587,8 +724,17 @@ async fn a_cluster_without_a_linked_source_gets_a_clear_answer() {
         )
         .await
         .unwrap();
-    assert!(msg.content.contains("Для кластера prod-us не настроен источник логов"), "{}", msg.content);
-    assert!(msg.content.contains("clusters = [\"prod-us\"]"), "{}", msg.content);
+    assert!(
+        msg.content
+            .contains("Для кластера prod-us не настроен источник логов"),
+        "{}",
+        msg.content
+    );
+    assert!(
+        msg.content.contains("clusters = [\"prod-us\"]"),
+        "{}",
+        msg.content
+    );
     assert!(mock.seen.lock().unwrap().is_empty());
 }
 
@@ -608,24 +754,46 @@ async fn a_fleet_asks_once_and_answers_per_pod() {
         namespace: "shop".into(),
         pod: Some(pod.into()),
     };
-    let members = [member("prod-eu", "web-1"), member("prod-eu", "web-2"), member("prod-eu", "web-3"), member("prod-us", "web-9")];
+    let members = [
+        member("prod-eu", "web-1"),
+        member("prod-eu", "web-2"),
+        member("prod-eu", "web-3"),
+        member("prod-us", "web-9"),
+    ];
     let asked = Answer(true, Mutex::new(0));
     let emit = |_: AgentEvent| {};
     let msg = set
-        .process_fleet_pod_logs(&history_call(json!({"since": "1h", "filter": "timeout"})), &members, &asked, &emit, None, 3)
+        .process_fleet_pod_logs(
+            &history_call(json!({"since": "1h", "filter": "timeout"})),
+            &members,
+            &asked,
+            &emit,
+            None,
+            3,
+        )
         .await
         .unwrap();
     // One request for the three linked pods, and the user was asked once,
     // although `never` would have auto-approved a single tab.
     let seen = mock.seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
-    assert!(seen[0].query.contains("\"web-1\"") && seen[0].query.contains("\"web-3\""), "{}", seen[0].query);
+    assert!(
+        seen[0].query.contains("\"web-1\"") && seen[0].query.contains("\"web-3\""),
+        "{}",
+        seen[0].query
+    );
     assert_eq!(*asked.1.lock().unwrap(), 1);
     let text = &msg.content;
-    assert!(text.contains("web-1 | 2 | 1 | [2×] timeout after 30s"), "{text}");
+    assert!(
+        text.contains("web-1 | 2 | 1 | [2×] timeout after 30s"),
+        "{text}"
+    );
     assert!(text.contains("web-2 | 1 | 1 | [1×] ok"), "{text}");
     assert!(text.contains("web-3 | 0 | 0 | —"), "{text}");
-    assert!(text.contains("No log source is linked to: prod-us"), "{text}");
+    assert!(
+        text.contains("No log source is linked to: prod-us"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -650,8 +818,22 @@ async fn a_fleet_keeps_the_real_reason_when_a_source_is_not_linked() {
         )
         .await
         .unwrap();
-    assert!(msg.content.contains("log source \"other\" is not linked to cluster prod-eu"), "{}", msg.content);
-    assert!(msg.content.contains("Для кластера prod-us не настроен источник логов"), "every reason: {}", msg.content);
-    assert!(!msg.content.contains("кластера prod-eu не настроен"), "prod-eu has a source: {}", msg.content);
+    assert!(
+        msg.content
+            .contains("log source \"other\" is not linked to cluster prod-eu"),
+        "{}",
+        msg.content
+    );
+    assert!(
+        msg.content
+            .contains("Для кластера prod-us не настроен источник логов"),
+        "every reason: {}",
+        msg.content
+    );
+    assert!(
+        !msg.content.contains("кластера prod-eu не настроен"),
+        "prod-eu has a source: {}",
+        msg.content
+    );
     assert!(mock.seen.lock().unwrap().is_empty());
 }

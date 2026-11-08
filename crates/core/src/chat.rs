@@ -72,7 +72,9 @@ impl ChatBlock {
             ChatBlock::Command { command, .. } => format!("$ {}", truncate(command, 60)),
             ChatBlock::Error(s) => format!("Error: {}", truncate(s, 60)),
             ChatBlock::System(s) => truncate(s, 60),
-            ChatBlock::Summary { replaced_blocks, .. } => {
+            ChatBlock::Summary {
+                replaced_blocks, ..
+            } => {
                 format!("Summary of {replaced_blocks} earlier blocks")
             }
         }
@@ -150,7 +152,9 @@ mod tests {
         };
         let json = serde_json::to_string(&block).unwrap();
         let decoded: ChatBlock = serde_json::from_str(&json).unwrap();
-        assert!(matches!(decoded, ChatBlock::Summary { replaced_blocks, .. } if replaced_blocks == 12));
+        assert!(
+            matches!(decoded, ChatBlock::Summary { replaced_blocks, .. } if replaced_blocks == 12)
+        );
         assert_eq!(block.preview(), "Summary of 12 earlier blocks");
     }
 

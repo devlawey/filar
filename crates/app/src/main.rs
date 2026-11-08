@@ -451,7 +451,9 @@ fn build_log_sources_for_launch(
     use filar_core::SecretProvider;
     for source in &config.log_sources {
         let key_env = source.key_env.trim();
-        let needs_key = source.auth_kind().is_some_and(filar_core::LogAuth::needs_key);
+        let needs_key = source
+            .auth_kind()
+            .is_some_and(filar_core::LogAuth::needs_key);
         if !needs_key || key_env.is_empty() {
             continue;
         }
@@ -1118,9 +1120,14 @@ mod tests {
         };
         let kept = super::config_with_launch_log_sources(config.clone(), None);
         assert_eq!(kept.log_sources, config.log_sources);
-        let replaced = super::config_with_launch_log_sources(config.clone(), Some(vec![source("from-launcher")]));
+        let replaced = super::config_with_launch_log_sources(
+            config.clone(),
+            Some(vec![source("from-launcher")]),
+        );
         assert_eq!(replaced.log_sources[0].name, "from-launcher");
-        assert!(super::config_with_launch_log_sources(config, Some(vec![])).log_sources.is_empty());
+        assert!(super::config_with_launch_log_sources(config, Some(vec![]))
+            .log_sources
+            .is_empty());
     }
 
     #[test]
@@ -1200,7 +1207,10 @@ mod tests {
             CliTarget::Kube(snapshot) => {
                 assert_eq!(snapshot.namespace.as_deref(), Some("shop"));
                 let pod = snapshot.pod.expect("a pod tab");
-                assert_eq!(pod.pod, filar_core::PodSelector::Name("web-7f9c4d5b8-x2k9p".into()));
+                assert_eq!(
+                    pod.pod,
+                    filar_core::PodSelector::Name("web-7f9c4d5b8-x2k9p".into())
+                );
                 assert!(pod.container.is_none());
             }
             _ => panic!("expected a Kubernetes target"),

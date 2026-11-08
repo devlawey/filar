@@ -73,7 +73,11 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
 
     // Header: the command and the headline, which always says how many
     // hosts did not answer (#428).
-    let prompt = if app.in_kube_fleet() { glyphs.kube } else { "$" };
+    let prompt = if app.in_kube_fleet() {
+        glyphs.kube
+    } else {
+        "$"
+    };
     let mut head: Vec<Line> = vec![Line::from(Span::styled(
         fit(&format!(" {prompt} {}", one_line(&view.command)), width),
         app.theme.command_style(),
@@ -81,7 +85,9 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
     for l in wrap_at_words(&view.headline, width.saturating_sub(1).max(1)) {
         head.push(Line::from(Span::styled(format!(" {l}"), app.theme.dim())));
     }
-    let sep = glyphs.separator.repeat(width / glyphs.separator.width().max(1));
+    let sep = glyphs
+        .separator
+        .repeat(width / glyphs.separator.width().max(1));
     head.push(Line::from(Span::styled(sep.clone(), app.theme.muted())));
 
     // Body: one block of lines per selectable row, remembering where each
@@ -89,7 +95,10 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
     let mut body: Vec<Line> = Vec::new();
     let mut starts: Vec<usize> = Vec::with_capacity(rows.len());
     if view.groups.is_empty() {
-        body.push(Line::from(Span::styled(" no host answered", app.theme.muted())));
+        body.push(Line::from(Span::styled(
+            " no host answered",
+            app.theme.muted(),
+        )));
     }
     for (i, row) in rows.iter().enumerate() {
         if let SummaryRow::Dropped(0) = row {
@@ -102,8 +111,16 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
                 let group = &view.groups[g];
                 let (mark, word, style) = match group.role {
                     GroupRole::Baseline => (glyphs.fleet_same, "same on", app.theme.success_fg()),
-                    GroupRole::Differs => (glyphs.fleet_differs, "differs on", Style::default().fg(app.theme.danger)),
-                    GroupRole::Split => (glyphs.fleet_split, "split, group of", app.theme.warning_fg()),
+                    GroupRole::Differs => (
+                        glyphs.fleet_differs,
+                        "differs on",
+                        Style::default().fg(app.theme.danger),
+                    ),
+                    GroupRole::Split => (
+                        glyphs.fleet_split,
+                        "split, group of",
+                        app.theme.warning_fg(),
+                    ),
                 };
                 let expanded = app.side_panel.expanded.contains(&g);
                 // Host output: control characters and escapes go, like in the
@@ -114,24 +131,29 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
                     .lines()
                     .map(str::to_string)
                     .collect();
-                let arrow = if expanded { glyphs.expand_arrow } else { glyphs.collapse_arrow };
-                let title = format!(
-                    " {} {} {}",
-                    word,
-                    group.hosts.len(),
-                    group.hosts.join(", ")
-                );
+                let arrow = if expanded {
+                    glyphs.expand_arrow
+                } else {
+                    glyphs.collapse_arrow
+                };
+                let title = format!(" {} {} {}", word, group.hosts.len(), group.hosts.join(", "));
                 let mut line = Line::from(vec![
                     Span::styled(format!("{mark} "), style),
                     Span::styled(arrow, app.theme.muted()),
-                    Span::raw(fit(&title, width.saturating_sub(mark.width() + 1 + arrow.width()))),
+                    Span::raw(fit(
+                        &title,
+                        width.saturating_sub(mark.width() + 1 + arrow.width()),
+                    )),
                 ]);
                 if highlight {
                     line = line.style(Style::default().add_modifier(Modifier::REVERSED));
                 }
                 body.push(line);
                 if lines.is_empty() {
-                    body.push(Line::from(Span::styled("   (empty output)", app.theme.muted())));
+                    body.push(Line::from(Span::styled(
+                        "   (empty output)",
+                        app.theme.muted(),
+                    )));
                 } else if expanded {
                     for l in lines.iter().take(MAX_EXPANDED_SAMPLE_LINES) {
                         for w in wrap_text(l, width.saturating_sub(3).max(1)) {
@@ -140,7 +162,10 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
                     }
                     if lines.len() > MAX_EXPANDED_SAMPLE_LINES {
                         body.push(Line::from(Span::styled(
-                            format!("   … {} more lines", lines.len() - MAX_EXPANDED_SAMPLE_LINES),
+                            format!(
+                                "   … {} more lines",
+                                lines.len() - MAX_EXPANDED_SAMPLE_LINES
+                            ),
                             app.theme.muted(),
                         )));
                     }
@@ -160,7 +185,12 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
                 let mut line = Line::from(vec![
                     Span::styled(format!(" {mark}"), style),
                     Span::raw(fit(
-                        &format!(" {} {} {}", host.host, glyphs.middle_dot, host.state.label()),
+                        &format!(
+                            " {} {} {}",
+                            host.host,
+                            glyphs.middle_dot,
+                            host.state.label()
+                        ),
                         width.saturating_sub(mark.width() + 1),
                     )),
                 ]);
@@ -183,7 +213,10 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
                     (None, None) => None,
                 };
                 if let Some(detail) = detail {
-                    body.push(Line::from(Span::styled(fit(&format!("   {detail}"), width), app.theme.dim())));
+                    body.push(Line::from(Span::styled(
+                        fit(&format!("   {detail}"), width),
+                        app.theme.dim(),
+                    )));
                 }
             }
         }
@@ -211,8 +244,8 @@ fn render_fleet_summary(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
     let body_h = (area.height as usize).saturating_sub(head.len() + hint.len());
     let anchor = starts.get(selected).copied().unwrap_or(0);
     let max_offset = body.len().saturating_sub(body_h);
-    let offset = (anchor.saturating_sub(body_h.saturating_sub(2)) + app.side_panel.scroll)
-        .min(max_offset);
+    let offset =
+        (anchor.saturating_sub(body_h.saturating_sub(2)) + app.side_panel.scroll).min(max_offset);
     let mut lines = head;
     lines.extend(body.into_iter().skip(offset).take(body_h));
     while lines.len() + hint.len() < area.height as usize {
@@ -270,7 +303,11 @@ fn pack_hint(parts: &[String], sep: &str, width: usize) -> Vec<String> {
 
 /// Mark for a host without a value: silence and errors stand out, a host
 /// nobody asked (or the user stopped) does not.
-fn dropped_mark(app: &App, state: filar_agent::fleet_result::HostState, glyphs: &Glyphs) -> (&'static str, Style) {
+fn dropped_mark(
+    app: &App,
+    state: filar_agent::fleet_result::HostState,
+    glyphs: &Glyphs,
+) -> (&'static str, Style) {
     use filar_agent::fleet_result::HostState;
     match state {
         HostState::NoContact
@@ -353,15 +390,24 @@ fn render_operations(f: &mut Frame, app: &App, area: Rect, glyphs: &Glyphs) {
         .collect();
     f.render_widget(Paragraph::new(tree_lines), chunks[0]);
 
-    let sep = glyphs.separator.repeat(width / glyphs.separator.width().max(1));
-    f.render_widget(Paragraph::new(Span::styled(sep, app.theme.muted())), chunks[1]);
+    let sep = glyphs
+        .separator
+        .repeat(width / glyphs.separator.width().max(1));
+    f.render_widget(
+        Paragraph::new(Span::styled(sep, app.theme.muted())),
+        chunks[1],
+    );
 
     let (op_idx, host_idx) = rows[selected].target();
     render_tail(f, app, chunks[2], &ops[op_idx], host_idx, glyphs);
 }
 
 /// Indent, glyph, state and text of a tree row.
-fn row_text(ops: &[Operation], row: TreeRow, glyphs: &Glyphs) -> (&'static str, &'static str, HostOpState, String) {
+fn row_text(
+    ops: &[Operation],
+    row: TreeRow,
+    glyphs: &Glyphs,
+) -> (&'static str, &'static str, HostOpState, String) {
     match row {
         TreeRow::Operation(i) => {
             let op = &ops[i];
@@ -379,7 +425,12 @@ fn row_text(ops: &[Operation], row: TreeRow, glyphs: &Glyphs) -> (&'static str, 
                 "  ",
                 state_glyph(host.state, glyphs),
                 host.state,
-                format!(" {} {} {}", host.name, glyphs.middle_dot, host_state_text(host)),
+                format!(
+                    " {} {} {}",
+                    host.name,
+                    glyphs.middle_dot,
+                    host_state_text(host)
+                ),
             )
         }
     }
@@ -399,7 +450,14 @@ fn host_state_text(host: &crate::ops::OpHost) -> String {
     s
 }
 
-fn render_tail(f: &mut Frame, app: &App, area: Rect, op: &Operation, host_idx: usize, glyphs: &Glyphs) {
+fn render_tail(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    op: &Operation,
+    host_idx: usize,
+    glyphs: &Glyphs,
+) {
     let Some(host) = op.hosts.get(host_idx) else {
         return;
     };
@@ -429,7 +487,10 @@ fn render_tail(f: &mut Frame, app: &App, area: Rect, op: &Operation, host_idx: u
     let all: Vec<&str> = clean.lines().collect();
     let mut lines = vec![header];
     if all.is_empty() {
-        lines.push(Line::from(Span::styled(" (no output yet)", app.theme.muted())));
+        lines.push(Line::from(Span::styled(
+            " (no output yet)",
+            app.theme.muted(),
+        )));
     } else {
         for l in &all[all.len().saturating_sub(body_h)..] {
             lines.push(Line::from(Span::raw(fit(&format!(" {l}"), width))));
@@ -481,7 +542,14 @@ mod tests {
     use ratatui::Terminal;
 
     fn host(name: &str, state: HostOpState, exit: Option<i32>, tail: &str) -> OpHost {
-        OpHost { name: name.into(), state, exit_code: exit, tail: tail.into(), stale: false, settled: true }
+        OpHost {
+            name: name.into(),
+            state,
+            exit_code: exit,
+            tail: tail.into(),
+            stale: false,
+            settled: true,
+        }
     }
 
     fn app_with_ops() -> App {
@@ -535,7 +603,10 @@ mod tests {
         let app = app_with_ops();
         let text = render(&app, 40, 20, &Glyphs::ASCII);
         for bad in ["▸", "✓", "✗", "■", "·", "─"] {
-            assert!(!text.contains(bad), "ASCII mode must not draw {bad:?}:\n{text}");
+            assert!(
+                !text.contains(bad),
+                "ASCII mode must not draw {bad:?}:\n{text}"
+            );
         }
         // Glyph + word per state — no colour needed.
         assert!(text.contains("> job-1"), "{text}");
@@ -618,9 +689,18 @@ mod tests {
         let text = render(&app, 100, 24, &Glyphs::UNICODE);
         assert!(text.contains("⎈ k8s_get pod -l app=web"), "{text}");
         assert!(text.contains("prod-eu/shop/web-a/main"), "{text}");
-        assert!(text.contains("prod-eu/shop/web-b/main · access denied"), "{text}");
-        assert!(text.contains("prod-eu/shop/web-c/main · pod disappeared"), "{text}");
-        assert!(text.contains("prod-eu/shop/web-d/main · no contact"), "{text}");
+        assert!(
+            text.contains("prod-eu/shop/web-b/main · access denied"),
+            "{text}"
+        );
+        assert!(
+            text.contains("prod-eu/shop/web-c/main · pod disappeared"),
+            "{text}"
+        );
+        assert!(
+            text.contains("prod-eu/shop/web-d/main · no contact"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -661,13 +741,22 @@ mod tests {
         assert!(text.contains("differs on 1 web-3"), "{text}");
         // The long answer is clamped to one line, and says there is more.
         assert!(text.contains("…"), "{text}");
-        assert!(!text.contains("VERSION_ID"), "collapsed: only the first line: {text}");
+        assert!(
+            !text.contains("VERSION_ID"),
+            "collapsed: only the first line: {text}"
+        );
         // Hosts without a value are listed apart, each with its reason.
         assert!(text.contains("not compared:"), "{text}");
-        assert!(text.contains("db-1") && text.contains("no contact"), "{text}");
+        assert!(
+            text.contains("db-1") && text.contains("no contact"),
+            "{text}"
+        );
         assert!(text.contains("win-1") && text.contains("n/a"), "{text}");
         for line in text.lines() {
-            assert!(line.chars().count() <= 72, "nothing spills past the panel: {line:?}");
+            assert!(
+                line.chars().count() <= 72,
+                "nothing spills past the panel: {line:?}"
+            );
         }
     }
 
@@ -685,7 +774,10 @@ mod tests {
         let app = crate::app::test_fleet_app(crate::app::test_fleet_view());
         let text = render(&app, 72, 24, &Glyphs::ASCII);
         for bad in ["≠", "≈", "▸", "▾", "·", "─", "✗", "↑", "↓"] {
-            assert!(!text.contains(bad), "ASCII mode must not draw {bad:?}:\n{text}");
+            assert!(
+                !text.contains(bad),
+                "ASCII mode must not draw {bad:?}:\n{text}"
+            );
         }
         // Marks keep their words, so nothing depends on a glyph or colour.
         assert!(text.contains("= +") && text.contains("same on"), "{text}");
@@ -706,13 +798,19 @@ mod tests {
     #[test]
     fn a_tall_expanded_answer_can_be_read_to_the_end() {
         let mut view = crate::app::test_fleet_view();
-        view.groups[1].sample = (1..=60).map(|i| format!("line-{i:02}")).collect::<Vec<_>>().join("\n");
+        view.groups[1].sample = (1..=60)
+            .map(|i| format!("line-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut app = crate::app::test_fleet_app(view);
         app.side_panel.open = true;
         app.side_panel.selected = 1;
         app.side_panel.expanded.insert(1);
         let text = render(&app, 72, 20, Glyphs::detect());
-        assert!(text.contains("line-01") && !text.contains("line-30"), "{text}");
+        assert!(
+            text.contains("line-01") && !text.contains("line-30"),
+            "{text}"
+        );
         // PgDn scrolls the body: the middle of the answer comes into view,
         // and past it the end, without moving to the next row.
         app.side_panel.scroll = 25;
@@ -721,7 +819,10 @@ mod tests {
         app.side_panel.scroll = 1000;
         let text = render(&app, 72, 20, Glyphs::detect());
         assert!(text.contains("line-60"), "{text}");
-        assert!(text.contains("PgUp/PgDn"), "the hint names the keys: {text}");
+        assert!(
+            text.contains("PgUp/PgDn"),
+            "the hint names the keys: {text}"
+        );
     }
 
     /// #503: at the docked panel's width (56 minus the border) and below,
@@ -757,7 +858,10 @@ mod tests {
 
     #[test]
     fn the_headline_breaks_between_words() {
-        assert_eq!(wrap_at_words("3 of 5 hosts answered", 12), ["3 of 5 hosts", "answered"]);
+        assert_eq!(
+            wrap_at_words("3 of 5 hosts answered", 12),
+            ["3 of 5 hosts", "answered"]
+        );
         assert_eq!(wrap_at_words("abcdefgh", 3), ["abc", "def", "gh"]);
         assert_eq!(wrap_at_words("", 5), [""]);
     }
@@ -766,13 +870,23 @@ mod tests {
     #[test]
     fn the_headline_is_wrapped_whole() {
         let app = crate::app::test_fleet_app(crate::app::test_fleet_view());
-        let text = render(&app, crate::side_panel::FLEET_PANEL_WIDTH - 2, 24, Glyphs::detect());
+        let text = render(
+            &app,
+            crate::side_panel::FLEET_PANEL_WIDTH - 2,
+            24,
+            Glyphs::detect(),
+        );
         let joined: String = text
             .lines()
             .map(|l| l.trim_start_matches(['│', '|']).trim())
             .collect::<Vec<_>>()
             .join(" ");
-        for piece in ["operation #9:", "3 of 5 hosts answered", "1 did not answer", "1 n/a"] {
+        for piece in [
+            "operation #9:",
+            "3 of 5 hosts answered",
+            "1 did not answer",
+            "1 n/a",
+        ] {
             assert!(joined.contains(piece), "{piece:?} is missing:\n{text}");
         }
     }
@@ -791,7 +905,10 @@ mod tests {
         let app = crate::app::test_fleet_app(view);
         let text = render(&app, 54, 30, Glyphs::detect());
         assert!(text.contains("sim1"), "{text}");
-        assert!(text.contains("exit 127: bash: ip: command not found"), "{text}");
+        assert!(
+            text.contains("exit 127: bash: ip: command not found"),
+            "{text}"
+        );
         assert!(!text.contains('\u{1b}'), "{text}");
     }
 }

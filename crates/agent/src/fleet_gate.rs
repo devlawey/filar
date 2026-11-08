@@ -123,7 +123,12 @@ mod tests {
 
     #[test]
     fn a_write_needs_an_approval_per_host_and_that_path_is_closed() {
-        for cmd in ["rm -rf /tmp/x", "systemctl restart nginx", "uname -r; reboot", "echo x > /etc/motd"] {
+        for cmd in [
+            "rm -rf /tmp/x",
+            "systemctl restart nginx",
+            "uname -r; reboot",
+            "echo x > /etc/motd",
+        ] {
             assert_eq!(approval_scope(cmd), ApprovalScope::PerHost, "{cmd}");
             match fleet_gate(cmd) {
                 FleetGate::Refuse(text) => {
@@ -148,12 +153,18 @@ mod tests {
 
     #[test]
     fn a_secret_placeholder_is_refused_even_in_single_quotes() {
-        for cmd in ["grep -c '$FILAR_SECRET_1' /etc/hostname", "echo '$FILAR_SECRET_12'"] {
+        for cmd in [
+            "grep -c '$FILAR_SECRET_1' /etc/hostname",
+            "echo '$FILAR_SECRET_12'",
+        ] {
             let FleetGate::Refuse(text) = fleet_gate(cmd) else {
                 panic!("{cmd} must be refused");
             };
             assert!(text.contains("Ctrl+P secrets"), "{text}");
         }
-        assert_eq!(fleet_gate("grep -c 'x' /etc/hostname"), FleetGate::Ask(ApprovalScope::Once));
+        assert_eq!(
+            fleet_gate("grep -c 'x' /etc/hostname"),
+            FleetGate::Ask(ApprovalScope::Once)
+        );
     }
 }

@@ -209,7 +209,8 @@ impl FleetTarget {
     }
 
     fn selected_by(&self, group: &HostGroup) -> bool {
-        self.as_ssh().is_some_and(|target| target_matches_group(group, target))
+        self.as_ssh()
+            .is_some_and(|target| target_matches_group(group, target))
     }
 
     fn same_identity(&self, saved: &Self) -> bool {
@@ -603,10 +604,7 @@ mod tests {
 
     #[test]
     fn reopen_keeps_the_frozen_composition_with_fresh_progress() {
-        let mut targets = vec![
-            target("web-1", &["prod"]),
-            target("web-2", &["prod"]),
-        ];
+        let mut targets = vec![target("web-1", &["prod"]), target("web-2", &["prod"])];
         let rule = group("prod", &["prod"]);
         let mut op = FleetOperation::open(&rule, &targets);
         let first = op.handles().next().expect("two members");
@@ -621,7 +619,10 @@ mod tests {
         assert_ne!(again.id(), op.id(), "a new question is a new operation");
         assert_eq!(again.count_at(HostProgress::Pending), 2);
         assert_eq!(again.group_name(), "prod");
-        assert!(again.member(first).is_none(), "old handles do not carry over");
+        assert!(
+            again.member(first).is_none(),
+            "old handles do not carry over"
+        );
     }
 
     #[test]
@@ -821,13 +822,25 @@ mod tests {
     #[test]
     fn a_restored_operation_keeps_the_saved_composition_not_the_tags() {
         // Since the save: web-2 lost its tag, web-9 gained it, web-3 is gone.
-        let targets = vec![target("web-1", &["web"]), target("web-2", &[]), target("web-9", &["web"])];
+        let targets = vec![
+            target("web-1", &["web"]),
+            target("web-2", &[]),
+            target("web-9", &["web"]),
+        ];
         let saved = saved_targets(&["web-1", "web-2", "web-3"]);
         let targets = fleet_targets(&targets);
 
         let (op, missing) = FleetOperation::restore(&group("web", &["web"]), &saved, &targets);
-        assert_eq!(names(&op), ["web-1", "web-2"], "membership comes from the session");
-        assert_eq!(missing, ["web-3"], "a vanished host is reported, not dropped silently");
+        assert_eq!(
+            names(&op),
+            ["web-1", "web-2"],
+            "membership comes from the session"
+        );
+        assert_eq!(
+            missing,
+            ["web-3"],
+            "a vanished host is reported, not dropped silently"
+        );
         assert_eq!(op.group_name(), "web");
         assert!(!op.contains("web-9"), "a newly tagged host does not join");
     }

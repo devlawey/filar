@@ -147,12 +147,7 @@ impl StaticSecretProvider {
     /// The removed value is zeroized internally — it is never returned to
     /// the caller in plaintext.
     pub fn remove(&self, name: &str) -> bool {
-        if let Some(mut value) = self
-            .secrets
-            .write()
-            .ok()
-            .and_then(|mut s| s.remove(name))
-        {
+        if let Some(mut value) = self.secrets.write().ok().and_then(|mut s| s.remove(name)) {
             value.zeroize();
             true
         } else {
@@ -442,7 +437,10 @@ impl SecretProvider for KeyringSecretProvider {
         // Failing to even build the entry (an invalid name, no backend) says
         // nothing about whether the secret is stored: not `Secret`.
         let entry = keyring::Entry::new("filar", name).map_err(|e| {
-            CoreError::Other(format!("OS credential store entry error for {}: {e}", redact(name)))
+            CoreError::Other(format!(
+                "OS credential store entry error for {}: {e}",
+                redact(name)
+            ))
         })?;
         entry.get_password().map_err(|e| match e {
             keyring::Error::NoEntry => {
@@ -674,7 +672,10 @@ mod tests {
             out.contains("$FILAR_SECRET_1"),
             "placeholder must stand in for the value: {out}"
         );
-        assert!(out.contains("Step 1:"), "the rest of the text survives: {out}");
+        assert!(
+            out.contains("Step 1:"),
+            "the rest of the text survives: {out}"
+        );
     }
 
     #[test]
@@ -684,8 +685,14 @@ mod tests {
         let provider = StaticSecretProvider::new();
         provider.insert("GLM_API_KEY", "sk-or-v1-abcdef");
         let out = redact_secrets("export GLM_API_KEY=sk-or-v1-abcdef", &provider);
-        assert!(!out.contains("sk-or-v1-abcdef"), "value must be gone: {out}");
-        assert!(!out.contains("GLM_API_KEY"), "the name must not leak: {out}");
+        assert!(
+            !out.contains("sk-or-v1-abcdef"),
+            "value must be gone: {out}"
+        );
+        assert!(
+            !out.contains("GLM_API_KEY"),
+            "the name must not leak: {out}"
+        );
         assert_eq!(out, "export <secret>=<secret>");
     }
 
@@ -707,7 +714,10 @@ mod tests {
         let provider = StaticSecretProvider::new();
         provider.insert("$FILAR_SECRET_1", "hunter2");
         provider.insert("SECRET", "zzz");
-        let out = redact_secrets("SECRET=zzz and ssh with hunter2, keep $FILAR_SECRET_1", &provider);
+        let out = redact_secrets(
+            "SECRET=zzz and ssh with hunter2, keep $FILAR_SECRET_1",
+            &provider,
+        );
         assert_eq!(
             out,
             "<secret>=<secret> and ssh with $FILAR_SECRET_1, keep $FILAR_SECRET_1"
@@ -778,17 +788,29 @@ mod tests {
 
     #[test]
     fn key_passphrase_entry_is_separate_from_the_password_entry() {
-        assert_eq!(ssh_key_passphrase_name("prod-web"), "ssh_key_passphrase:prod-web");
-        assert_ne!(ssh_key_passphrase_name("prod-web"), ssh_cred_name(0, "prod-web"));
+        assert_eq!(
+            ssh_key_passphrase_name("prod-web"),
+            "ssh_key_passphrase:prod-web"
+        );
+        assert_ne!(
+            ssh_key_passphrase_name("prod-web"),
+            ssh_cred_name(0, "prod-web")
+        );
     }
 
     #[test]
     fn the_default_llm_key_falls_back_to_its_legacy_name() {
         let provider = StaticSecretProvider::new();
         provider.insert("GLM_API_KEY", "legacy-key");
-        assert_eq!(llm_api_key(&provider, env_vars::LLM_API_KEY).unwrap(), "legacy-key");
+        assert_eq!(
+            llm_api_key(&provider, env_vars::LLM_API_KEY).unwrap(),
+            "legacy-key"
+        );
         provider.insert("FILAR_LLM_API_KEY", "new-key");
-        assert_eq!(llm_api_key(&provider, env_vars::LLM_API_KEY).unwrap(), "new-key");
+        assert_eq!(
+            llm_api_key(&provider, env_vars::LLM_API_KEY).unwrap(),
+            "new-key"
+        );
     }
 
     #[test]
@@ -796,6 +818,9 @@ mod tests {
         let provider = StaticSecretProvider::new();
         provider.insert("GLM_API_KEY", "legacy-key");
         assert!(llm_api_key(&provider, "OPENROUTER_API_KEY").is_err());
-        assert_eq!(llm_key_lookup_names("OPENROUTER_API_KEY"), vec!["OPENROUTER_API_KEY"]);
+        assert_eq!(
+            llm_key_lookup_names("OPENROUTER_API_KEY"),
+            vec!["OPENROUTER_API_KEY"]
+        );
     }
 }

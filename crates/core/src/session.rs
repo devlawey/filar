@@ -219,9 +219,7 @@ mod fleet_snapshot_targets {
         let targets: Vec<_> = targets
             .iter()
             .map(|target| match target {
-                FleetTarget::Ssh(target) => TargetRef::Ssh {
-                    name: &target.name,
-                },
+                FleetTarget::Ssh(target) => TargetRef::Ssh { name: &target.name },
                 FleetTarget::KubePod(target) => TargetRef::KubePod {
                     cluster: &target.cluster,
                     namespace: &target.namespace,
@@ -246,9 +244,7 @@ mod fleet_snapshot_targets {
             .into_iter()
             .map(|target| match target {
                 StoredTarget::Legacy(name) => FleetTarget::legacy_ssh(name),
-                StoredTarget::Current(TaggedTarget::Ssh { name }) => {
-                    FleetTarget::legacy_ssh(name)
-                }
+                StoredTarget::Current(TaggedTarget::Ssh { name }) => FleetTarget::legacy_ssh(name),
                 StoredTarget::Current(TaggedTarget::KubePod {
                     cluster,
                     namespace,

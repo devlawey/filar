@@ -73,6 +73,8 @@ mod tests {
             "timeout waiting for command marker `__FILAR_req_1`".into()
         )));
         assert!(!is_connection_lost(&CoreError::Config("bad config".into())));
-        assert!(!is_connection_lost(&CoreError::Secret("missing key".into())));
+        assert!(!is_connection_lost(&CoreError::Secret(
+            "missing key".into()
+        )));
     }
 }

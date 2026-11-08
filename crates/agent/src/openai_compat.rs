@@ -212,10 +212,7 @@ impl OpenAiCompatClient {
     }
 
     /// Attach bearer auth only when a key is present.
-    fn apply_auth(
-        &self,
-        builder: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder {
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if self.sends_authorization() {
             builder.bearer_auth(&self.api_key)
         } else {
@@ -247,7 +244,11 @@ impl LlmClient for OpenAiCompatClient {
         for attempt in 0..=self.max_retries {
             if attempt > 0 {
                 let delay = self.backoff_base * 2u32.pow(attempt - 1);
-                warn!(attempt, delay_ms = delay.as_millis(), "retrying after transient error");
+                warn!(
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    "retrying after transient error"
+                );
                 tokio::time::sleep(delay).await;
             }
 
@@ -304,7 +305,11 @@ impl LlmClient for OpenAiCompatClient {
         for attempt in 0..=self.max_retries {
             if attempt > 0 {
                 let delay = self.backoff_base * 2u32.pow(attempt - 1);
-                warn!(attempt, delay_ms = delay.as_millis(), "retrying after transient error");
+                warn!(
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    "retrying after transient error"
+                );
                 // Awaited inside this future so a cancellation token wrapping
                 // `chat_stream` aborts during the backoff, not after it.
                 tokio::time::sleep(delay).await;
@@ -427,9 +432,7 @@ impl OpenAiCompatClient {
                     if !state.done && state.is_empty() {
                         warn!("stream closed without any content or a [DONE] marker");
                         return StreamOutcome::Failed {
-                            error: ApiError::Network(
-                                "stream closed without any content".into(),
-                            ),
+                            error: ApiError::Network("stream closed without any content".into()),
                             emitted_any,
                         };
                     }
@@ -466,7 +469,10 @@ impl OpenAiCompatClient {
     }
 
     /// Send a single request to the API and return the raw response.
-    async fn send_request(&self, body: &serde_json::Value) -> std::result::Result<ApiResponse, ApiError> {
+    async fn send_request(
+        &self,
+        body: &serde_json::Value,
+    ) -> std::result::Result<ApiResponse, ApiError> {
         let response = self
             .apply_auth(self.http.post(self.endpoint()))
             .json(body)
@@ -501,16 +507,15 @@ impl OpenAiCompatClient {
                 }
             };
             debug!(status = %status, body_len = body_text.len(), "OpenAI-compatible API success response");
-            let api_response: ApiResponse = serde_json::from_str(&body_text)
-                .map_err(|e| {
-                    let preview = if body_text.len() > 500 {
-                        format!("{}...", &body_text[..500])
-                    } else {
-                        body_text.clone()
-                    };
-                    warn!(error = %e, body = %preview, "failed to parse API response");
-                    ApiError::Parse(format!("{e}. Response body: {preview}"))
-                })?;
+            let api_response: ApiResponse = serde_json::from_str(&body_text).map_err(|e| {
+                let preview = if body_text.len() > 500 {
+                    format!("{}...", &body_text[..500])
+                } else {
+                    body_text.clone()
+                };
+                warn!(error = %e, body = %preview, "failed to parse API response");
+                ApiError::Parse(format!("{e}. Response body: {preview}"))
+            })?;
             Ok(api_response)
         } else {
             let status_code = status.as_u16();
@@ -665,8 +670,7 @@ fn looks_like_context_overflow(body: &str) -> bool {
         || lower.contains("longer than")
         || lower.contains("reduce the length");
 
-    (names_the_context && complains_about_size)
-        || (names_the_request && complains_about_length)
+    (names_the_context && complains_about_size) || (names_the_request && complains_about_length)
 }
 
 /// Heuristic: provider body says the model/server cannot do tool calling.
@@ -715,16 +719,18 @@ impl ApiError {
     fn is_retryable(&self) -> bool {
         matches!(
             self,
-            ApiError::Connect(_) | ApiError::Network(_) | ApiError::Timeout(_) | ApiError::RateLimit(_) | ApiError::Server(_, _)
+            ApiError::Connect(_)
+                | ApiError::Network(_)
+                | ApiError::Timeout(_)
+                | ApiError::RateLimit(_)
+                | ApiError::Server(_, _)
         )
     }
 
     /// Convert to a [`CoreError`] for the final result.
     fn into_core_error(self) -> CoreError {
         match &self {
-            ApiError::Timeout(_) | ApiError::ToolsUnsupported => {
-                CoreError::Other(self.to_string())
-            }
+            ApiError::Timeout(_) | ApiError::ToolsUnsupported => CoreError::Other(self.to_string()),
             // Kept as its own variant all the way to the TUI: it is the signal
             // that compacting and retrying once is worth doing (#378).
             ApiError::ContextOverflow(msg) => CoreError::ContextOverflow(msg.clone()),
@@ -734,7 +740,9 @@ impl ApiError {
             ApiError::RateLimit(msg) => CoreError::Other(format!("rate limited: {msg}")),
             ApiError::Server(code, msg) => CoreError::Other(format!("server error {code}: {msg}")),
             ApiError::Client(code, msg) => CoreError::Other(format!("client error {code}: {msg}")),
-            ApiError::Parse(msg) => CoreError::Other(format!("failed to parse API response: {msg}")),
+            ApiError::Parse(msg) => {
+                CoreError::Other(format!("failed to parse API response: {msg}"))
+            }
         }
     }
 }
@@ -820,11 +828,7 @@ struct ApiMessage {
 
 impl From<&ChatMessage> for ApiMessage {
     fn from(msg: &ChatMessage) -> Self {
-        let tool_calls: Vec<ApiToolCall> = msg
-            .tool_calls
-            .iter()
-            .map(ApiToolCall::from)
-            .collect();
+        let tool_calls: Vec<ApiToolCall> = msg.tool_calls.iter().map(ApiToolCall::from).collect();
         Self {
             role: msg.role.as_str(),
             content: msg.content.clone(),
@@ -978,12 +982,14 @@ impl ApiResponse {
                         }
                     })
                     .collect();
-                let mut resp = ChatResponse::tool_calls(
-                    choice.message.content.unwrap_or_default(),
-                    parsed,
-                );
-                if let Some(u) = usage { resp = resp.with_usage(u); }
-                if let Some(m) = model { resp = resp.with_model(m); }
+                let mut resp =
+                    ChatResponse::tool_calls(choice.message.content.unwrap_or_default(), parsed);
+                if let Some(u) = usage {
+                    resp = resp.with_usage(u);
+                }
+                if let Some(m) = model {
+                    resp = resp.with_model(m);
+                }
                 return Ok(resp);
             }
         }
@@ -994,8 +1000,12 @@ impl ApiResponse {
             text.push_str(&note);
         }
         let mut resp = ChatResponse::text(text);
-        if let Some(u) = usage { resp = resp.with_usage(u); }
-        if let Some(m) = model { resp = resp.with_model(m); }
+        if let Some(u) = usage {
+            resp = resp.with_usage(u);
+        }
+        if let Some(m) = model {
+            resp = resp.with_model(m);
+        }
         Ok(resp)
     }
 }
@@ -1138,8 +1148,7 @@ impl SseState {
                         }
                         if let Some(tc_deltas) = choice.delta.tool_calls {
                             for tc in tc_deltas {
-                                let entry =
-                                    self.tool_calls.entry(tc.index).or_default();
+                                let entry = self.tool_calls.entry(tc.index).or_default();
                                 if let Some(id) = tc.id {
                                     entry.id = id;
                                 }
@@ -1373,14 +1382,16 @@ mod tests {
     #[cfg(feature = "smoke")]
     #[tokio::test]
     async fn smoke_text_response() {
-        let api_key = std::env::var("GLM_API_KEY").expect("GLM_API_KEY must be set for smoke tests");
+        let api_key =
+            std::env::var("GLM_API_KEY").expect("GLM_API_KEY must be set for smoke tests");
         let config = LlmConfig {
             model: "glm-4-flash".into(),
             api_base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
             max_tokens: 256,
             ..Default::default()
         };
-        let client = OpenAiCompatClient::new_with_key(&config, Duration::from_secs(60), &api_key).unwrap();
+        let client =
+            OpenAiCompatClient::new_with_key(&config, Duration::from_secs(60), &api_key).unwrap();
 
         let request = ChatRequest {
             messages: vec![
@@ -1391,25 +1402,35 @@ mod tests {
         };
 
         let response = client.chat(&request).await.expect("chat request failed");
-        assert!(!response.has_tool_calls(), "expected Text response, got ToolCalls");
-        assert!(!response.text.is_empty(), "response text should not be empty");
+        assert!(
+            !response.has_tool_calls(),
+            "expected Text response, got ToolCalls"
+        );
+        assert!(
+            !response.text.is_empty(),
+            "response text should not be empty"
+        );
     }
 
     #[cfg(feature = "smoke")]
     #[tokio::test]
     async fn smoke_tool_call() {
-        let api_key = std::env::var("GLM_API_KEY").expect("GLM_API_KEY must be set for smoke tests");
+        let api_key =
+            std::env::var("GLM_API_KEY").expect("GLM_API_KEY must be set for smoke tests");
         let config = LlmConfig {
             model: "glm-4-flash".into(),
             api_base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
             max_tokens: 256,
             ..Default::default()
         };
-        let client = OpenAiCompatClient::new_with_key(&config, Duration::from_secs(60), &api_key).unwrap();
+        let client =
+            OpenAiCompatClient::new_with_key(&config, Duration::from_secs(60), &api_key).unwrap();
 
         let request = ChatRequest {
             messages: vec![
-                ChatMessage::system("You are a system administrator assistant. Use tools when appropriate."),
+                ChatMessage::system(
+                    "You are a system administrator assistant. Use tools when appropriate.",
+                ),
                 ChatMessage::user("List the files in the current directory."),
             ],
             tools: vec![ToolDef {
@@ -1430,7 +1451,10 @@ mod tests {
 
         let response = client.chat(&request).await.expect("chat request failed");
         if response.has_tool_calls() {
-            assert!(!response.tool_calls.is_empty(), "expected at least one tool call");
+            assert!(
+                !response.tool_calls.is_empty(),
+                "expected at least one tool call"
+            );
         }
     }
 
@@ -1573,9 +1597,8 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         // Model sends text first, then tool calls.
         let mut state = SseState::new();
 
-        let d1 = state.process_chunk(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Let me check.\"}}]}\n\n",
-        );
+        let d1 = state
+            .process_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"Let me check.\"}}]}\n\n");
         assert_eq!(&d1, &["Let me check."]);
 
         state.process_chunk(
@@ -1648,14 +1671,11 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         // flush() should recover the final delta.
         let mut state = SseState::new();
         // First event complete.
-        let d1 = state.process_chunk(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
-        );
+        let d1 =
+            state.process_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n");
         assert_eq!(&d1, &["Hello".to_string()]);
         // Second event — no trailing newline.
-        let d2 = state.process_chunk(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"end\"}}]}",
-        );
+        let d2 = state.process_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"end\"}}]}");
         assert!(d2.is_empty(), "no complete line yet");
         // flush should process the remaining buffer.
         let d3 = state.flush();
@@ -1669,12 +1689,13 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
     fn sse_flush_done_without_newline() {
         // Stream ends with `data: [DONE]` but no trailing newline.
         let mut state = SseState::new();
-        state.process_chunk(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
-        );
+        state.process_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n");
         // [DONE] without newline.
         state.process_chunk("data: [DONE]");
-        assert!(!state.done, "done should not be set until line is processed");
+        assert!(
+            !state.done,
+            "done should not be set until line is processed"
+        );
         let deltas = state.flush();
         assert!(deltas.is_empty(), "[DONE] produces no text deltas");
         assert!(state.done, "flush should set done flag");
@@ -1893,7 +1914,8 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
             top_p: None,
             extra_body: None,
         };
-        let client = OpenAiCompatClient::new_with_key(&config, Duration::from_secs(30), "").unwrap();
+        let client =
+            OpenAiCompatClient::new_with_key(&config, Duration::from_secs(30), "").unwrap();
         assert!(!client.sends_authorization());
         let with_key =
             OpenAiCompatClient::new_with_key(&config, Duration::from_secs(30), "sk-test").unwrap();
@@ -1924,10 +1946,8 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
             "raw provider body must stay in logs, not the user message"
         );
         // 5xx with similar wording must stay retryable Server, not ToolsUnsupported.
-        let server = ApiError::from_http_status(
-            503,
-            "tools are not supported by this model".into(),
-        );
+        let server =
+            ApiError::from_http_status(503, "tools are not supported by this model".into());
         assert!(matches!(server, ApiError::Server(503, _)));
         assert!(server.is_retryable());
         let rate = ApiError::from_http_status(429, "tools not available, retry".into());
@@ -1939,7 +1959,10 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
     fn timeout_message_hints_local_llm_secs() {
         let err = ApiError::Timeout(Duration::from_secs(60));
         let msg = err.to_string();
-        assert!(msg.contains("llm_secs"), "timeout must hint llm_secs: {msg}");
+        assert!(
+            msg.contains("llm_secs"),
+            "timeout must hint llm_secs: {msg}"
+        );
     }
 
     #[test]
@@ -2182,7 +2205,11 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
             vec!["Hello".to_string(), " world".to_string()],
             "deltas must be delivered once, without replaying the first attempt"
         );
-        assert_eq!(served.load(Ordering::SeqCst), 2, "expected exactly one retry");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            2,
+            "expected exactly one retry"
+        );
     }
 
     /// When every attempt fails, the error names the attempt count, the elapsed
@@ -2269,7 +2296,11 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
             .expect("the retry must produce the answer");
 
         assert_eq!(response.text, "recovered");
-        assert_eq!(served.load(Ordering::SeqCst), 2, "the empty stream must be retried");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            2,
+            "the empty stream must be retried"
+        );
     }
 
     /// Missing `[DONE]` on its own is not a failure: OpenAI-compatible servers
@@ -2309,11 +2340,10 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         ];
         // 6 frames × 100 ms ≈ 600 ms total — twice the timeout, but no single
         // gap exceeds it.
-        let (url, served) =
-            spawn_provider(vec![
-                Step::finished(frames).with_gap(Duration::from_millis(100))
-            ])
-            .await;
+        let (url, served) = spawn_provider(vec![
+            Step::finished(frames).with_gap(Duration::from_millis(100))
+        ])
+        .await;
 
         let client = stream_test_client(&url, 0, timeout);
         let callback = |_: String| {};

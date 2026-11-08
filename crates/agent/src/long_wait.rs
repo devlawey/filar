@@ -175,10 +175,7 @@ mod tests {
 
     #[test]
     fn parses_powershell_start_sleep() {
-        assert_eq!(
-            longest_wait_secs("Start-Sleep -Seconds 180"),
-            Some(180)
-        );
+        assert_eq!(longest_wait_secs("Start-Sleep -Seconds 180"), Some(180));
         assert!(reject_long_wait("Start-Sleep -s 60").is_some());
     }
 

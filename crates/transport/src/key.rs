@@ -92,11 +92,16 @@ pub fn fill_key_passphrase(
         ("target", passphrase.take()),
         (
             "OS credential store",
-            store.get(&filar_core::ssh_key_passphrase_name(&target.name)).ok(),
+            store
+                .get(&filar_core::ssh_key_passphrase_name(&target.name))
+                .ok(),
         ),
         (
             "SSH_KEY_PASSPHRASE",
-            env.and_then(|e| e.get(filar_core::secrets::env_vars::SSH_KEY_PASSPHRASE).ok()),
+            env.and_then(|e| {
+                e.get(filar_core::secrets::env_vars::SSH_KEY_PASSPHRASE)
+                    .ok()
+            }),
         ),
     ];
     for (source, candidate) in candidates {
@@ -165,7 +170,10 @@ pub(crate) mod tests {
             Some(p) => key
                 .encrypt_with(
                     Cipher::Aes256Ctr,
-                    Kdf::Bcrypt { salt: [3u8; 16].to_vec(), rounds: 1 },
+                    Kdf::Bcrypt {
+                        salt: [3u8; 16].to_vec(),
+                        rounds: 1,
+                    },
                     0x1234_5678,
                     p,
                 )
@@ -181,7 +189,10 @@ pub(crate) mod tests {
     #[test]
     fn a_plain_key_needs_no_passphrase() {
         let path = write_test_key(None);
-        assert_eq!(key_protection(&path).expect("readable"), KeyProtection::Plain);
+        assert_eq!(
+            key_protection(&path).expect("readable"),
+            KeyProtection::Plain
+        );
         assert!(load_key(&path, None, "t").is_ok());
         let _ = std::fs::remove_file(path);
     }
@@ -189,7 +200,10 @@ pub(crate) mod tests {
     #[test]
     fn an_encrypted_key_is_reported_and_loads_with_its_passphrase() {
         let path = write_test_key(Some("correct horse"));
-        assert_eq!(key_protection(&path).expect("readable"), KeyProtection::Encrypted);
+        assert_eq!(
+            key_protection(&path).expect("readable"),
+            KeyProtection::Encrypted
+        );
         assert!(key_passphrase_matches(&path, "correct horse"));
         assert!(!key_passphrase_matches(&path, "wrong"));
         assert!(load_key(&path, Some("correct horse"), "t").is_ok());
@@ -199,7 +213,9 @@ pub(crate) mod tests {
     #[test]
     fn a_missing_passphrase_names_the_key_and_where_to_put_it() {
         let path = write_test_key(Some("correct horse"));
-        let msg = load_key(&path, None, "prod-web").expect_err("needs passphrase").to_string();
+        let msg = load_key(&path, None, "prod-web")
+            .expect_err("needs passphrase")
+            .to_string();
         assert!(msg.contains("is encrypted"), "{msg}");
         assert!(msg.contains("ssh_key_passphrase:prod-web"), "{msg}");
         assert!(msg.contains("SSH_KEY_PASSPHRASE"), "{msg}");
@@ -209,7 +225,9 @@ pub(crate) mod tests {
     #[test]
     fn a_wrong_passphrase_is_a_clear_error_that_does_not_echo_it() {
         let path = write_test_key(Some("correct horse"));
-        let msg = load_key(&path, Some("battery staple"), "t").expect_err("wrong").to_string();
+        let msg = load_key(&path, Some("battery staple"), "t")
+            .expect_err("wrong")
+            .to_string();
         assert!(msg.starts_with("wrong passphrase for SSH key"), "{msg}");
         assert!(!msg.contains("battery staple"), "{msg}");
         assert!(!msg.contains("correct horse"), "{msg}");
@@ -222,7 +240,10 @@ pub(crate) mod tests {
             host: "h".into(),
             port: 22,
             user: "u".into(),
-            auth: SshAuth::Key { path: Some(path.to_path_buf()), passphrase: None },
+            auth: SshAuth::Key {
+                path: Some(path.to_path_buf()),
+                passphrase: None,
+            },
             host_key_policy: Default::default(),
             tags: Vec::new(),
         }
@@ -244,7 +265,10 @@ pub(crate) mod tests {
         let env = StaticSecretProvider::new();
         env.insert("SSH_KEY_PASSPHRASE", "stale");
         let mut t = key_target(&path);
-        assert_eq!(fill_key_passphrase(&mut t, &store, Some(&env)).unwrap(), KeyPassphrase::Found);
+        assert_eq!(
+            fill_key_passphrase(&mut t, &store, Some(&env)).unwrap(),
+            KeyPassphrase::Found
+        );
         assert_eq!(passphrase_of(&t), Some("correct horse"));
         let _ = std::fs::remove_file(path);
     }
@@ -258,7 +282,10 @@ pub(crate) mod tests {
         let env = StaticSecretProvider::new();
         env.insert("SSH_KEY_PASSPHRASE", "correct horse");
         let mut t = key_target(&path);
-        assert_eq!(fill_key_passphrase(&mut t, &store, Some(&env)).unwrap(), KeyPassphrase::Found);
+        assert_eq!(
+            fill_key_passphrase(&mut t, &store, Some(&env)).unwrap(),
+            KeyPassphrase::Found
+        );
         assert_eq!(passphrase_of(&t), Some("correct horse"));
         let _ = std::fs::remove_file(path);
     }
@@ -282,9 +309,15 @@ pub(crate) mod tests {
         let path = write_test_key(None);
         let store = StaticSecretProvider::new();
         let mut t = key_target(&path);
-        assert_eq!(fill_key_passphrase(&mut t, &store, None).unwrap(), KeyPassphrase::NotNeeded);
+        assert_eq!(
+            fill_key_passphrase(&mut t, &store, None).unwrap(),
+            KeyPassphrase::NotNeeded
+        );
         t.auth = SshAuth::Agent;
-        assert_eq!(fill_key_passphrase(&mut t, &store, None).unwrap(), KeyPassphrase::NotNeeded);
+        assert_eq!(
+            fill_key_passphrase(&mut t, &store, None).unwrap(),
+            KeyPassphrase::NotNeeded
+        );
         let _ = std::fs::remove_file(path);
     }
 

@@ -23,9 +23,8 @@ use filar_core::{
 };
 
 use crate::shell_protocol::{
-    command_marker_tag, command_payload, interrupt_command, read_shell_pid,
-    recv_until_marker, recv_until_marker_simple, shell_pid_request, sync_request, ChannelEvent,
-    EventSource,
+    command_marker_tag, command_payload, interrupt_command, read_shell_pid, recv_until_marker,
+    recv_until_marker_simple, shell_pid_request, sync_request, ChannelEvent, EventSource,
 };
 use crate::CommandResult;
 
@@ -185,20 +184,22 @@ fn verify_host_key(
                 );
                 false
             }
-            HostKeyPolicy::Tofu => match append_known_hosts_entry(known_hosts, host_port, fingerprint) {
-                Ok(()) => {
-                    info!(host = %host_port, "host key added (TOFU)");
-                    true
+            HostKeyPolicy::Tofu => {
+                match append_known_hosts_entry(known_hosts, host_port, fingerprint) {
+                    Ok(()) => {
+                        info!(host = %host_port, "host key added (TOFU)");
+                        true
+                    }
+                    Err(e) => {
+                        warn!(
+                            host = %host_port,
+                            error = %e,
+                            "failed to write known_hosts entry, rejecting host key"
+                        );
+                        false
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        host = %host_port,
-                        error = %e,
-                        "failed to write known_hosts entry, rejecting host key"
-                    );
-                    false
-                }
-            },
+            }
             HostKeyPolicy::AcceptNew => {
                 info!(host = %host_port, "host key accepted (accept-new, not recorded)");
                 true
@@ -353,10 +354,7 @@ impl SshSession {
 
     /// Connect with an explicit transport config, resolving secrets through the
     /// default [`EnvSecretProvider`].
-    pub async fn connect_with_config(
-        target: &SshTarget,
-        cfg: &SshTransportConfig,
-    ) -> Result<Self> {
+    pub async fn connect_with_config(target: &SshTarget, cfg: &SshTransportConfig) -> Result<Self> {
         Self::connect_with_config_and_provider(target, cfg, &EnvSecretProvider::new()).await
     }
 
@@ -410,8 +408,12 @@ impl SshSession {
         let (pid_cmd, pid_tag) = shell_pid_request();
         let shell_pid = match channel.data(pid_cmd.as_bytes()).await {
             Ok(()) => {
-                read_shell_pid(&mut ShellChannel(&mut channel), &pid_tag, Duration::from_secs(10))
-                    .await
+                read_shell_pid(
+                    &mut ShellChannel(&mut channel),
+                    &pid_tag,
+                    Duration::from_secs(10),
+                )
+                .await
             }
             Err(_) => None,
         };
@@ -517,8 +519,9 @@ impl SshSession {
                     .cmd_tx
                     .send(ChannelCmd::Write(sync_cmd.into_bytes()))
                     .await;
-                let _ = recv_until_marker_simple(&mut *event_rx, &sync_marker, Duration::from_secs(10))
-                    .await;
+                let _ =
+                    recv_until_marker_simple(&mut *event_rx, &sync_marker, Duration::from_secs(10))
+                        .await;
                 Err(e)
             }
         }
@@ -563,7 +566,8 @@ impl SshSession {
                 Ok(Some(_)) => {}
                 Err(_) => {
                     return Err(CoreError::Other(
-                        "interrupt did not finish in time — the command may still be running".into(),
+                        "interrupt did not finish in time — the command may still be running"
+                            .into(),
                     ))
                 }
             }
@@ -623,10 +627,14 @@ impl EventSource for ShellChannel<'_> {
         loop {
             match self.0.wait().await? {
                 ChannelMsg::Data { ref data } => {
-                    return Some(ChannelEvent::Data(String::from_utf8_lossy(data).to_string()))
+                    return Some(ChannelEvent::Data(
+                        String::from_utf8_lossy(data).to_string(),
+                    ))
                 }
                 ChannelMsg::ExtendedData { ref data, ext: 1 } => {
-                    return Some(ChannelEvent::Stderr(String::from_utf8_lossy(data).to_string()))
+                    return Some(ChannelEvent::Stderr(
+                        String::from_utf8_lossy(data).to_string(),
+                    ))
                 }
                 ChannelMsg::Eof | ChannelMsg::Close => return Some(ChannelEvent::Closed),
                 _ => {}
@@ -874,10 +882,7 @@ impl crate::CommandExecutor for SshExecutor {
         }
 
         // Surfaced to the chat via the WARN→System log mirror (issue #57).
-        warn!(
-            "reconnected to {}:{}",
-            self.target.host, self.target.port
-        );
+        warn!("reconnected to {}:{}", self.target.host, self.target.port);
 
         // Single retry on the fresh session.
         let retry = self.session.read().await.run(&command).await;
@@ -893,8 +898,8 @@ impl crate::CommandExecutor for SshExecutor {
     }
 
     async fn set_cwd(&self, path: &str) -> Result<()> {
-        let _ = crate::posix_cd_command(path)
-            .ok_or_else(|| CoreError::Other("invalid cwd".into()))?;
+        let _ =
+            crate::posix_cd_command(path).ok_or_else(|| CoreError::Other("invalid cwd".into()))?;
         let path = path.trim().to_string();
         *lock_opt_string(&self.pending_cwd) = Some(path.clone());
         *lock_opt_string(&self.last_cwd) = Some(path);
@@ -902,7 +907,10 @@ impl crate::CommandExecutor for SshExecutor {
     }
 
     async fn current_cwd(&self) -> Option<String> {
-        self.last_cwd.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.last_cwd
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -998,16 +1006,19 @@ fn parse_known_hosts_contents(contents: &str) -> KnownHosts {
 
 /// `host:port` with a numeric port.
 fn is_host_port(field: &str) -> bool {
-    field
-        .rsplit_once(':')
-        .is_some_and(|(host, port)| !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+    field.rsplit_once(':').is_some_and(|(host, port)| {
+        !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 /// `SHA256:` followed by base64 and nothing else — a second `SHA256:` (or
 /// any `:`) means two fingerprints ran together.
 fn is_sha256_fingerprint(field: &str) -> bool {
     field.strip_prefix("SHA256:").is_some_and(|b64| {
-        !b64.is_empty() && b64.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        !b64.is_empty()
+            && b64
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
     })
 }
 
@@ -1038,17 +1049,28 @@ fn append_known_hosts_entry(
         std::fs::create_dir_all(parent)?;
     }
     let line = format!("{host_port} {fingerprint}\n");
-    match std::fs::OpenOptions::new().append(true).create_new(true).open(path) {
+    match std::fs::OpenOptions::new()
+        .append(true)
+        .create_new(true)
+        .open(path)
+    {
         Ok(mut file) => file.write_all(format!("{KNOWN_HOSTS_HEADER}\n{line}").as_bytes()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let mut file = std::fs::OpenOptions::new().read(true).append(true).open(path)?;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(path)?;
             let len = file.metadata()?.len();
             let mut last = *b"\n";
             if len > 0 {
                 file.seek(SeekFrom::Start(len - 1))?;
                 file.read_exact(&mut last)?;
             }
-            let payload = if last[0] == b'\n' { line } else { format!("\n{line}") };
+            let payload = if last[0] == b'\n' {
+                line
+            } else {
+                format!("\n{line}")
+            };
             file.write_all(payload.as_bytes())
         }
         Err(e) => Err(e),
@@ -1114,7 +1136,10 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
         session.cancel().await.unwrap();
         let interrupted = running.await.unwrap().unwrap();
-        assert!(started.elapsed() < Duration::from_secs(10), "the sleep was not interrupted");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the sleep was not interrupted"
+        );
         assert_ne!(interrupted.exit_code, Some(0));
 
         let next = session.run("echo still-here").await.unwrap();
@@ -1137,7 +1162,10 @@ mod tests {
             host: "127.0.0.1".into(),
             port: 2222,
             user: "testuser".into(),
-            auth: SshAuth::Key { path: Some(PathBuf::from(key)), passphrase: None },
+            auth: SshAuth::Key {
+                path: Some(PathBuf::from(key)),
+                passphrase: None,
+            },
             host_key_policy: HostKeyPolicy::Tofu,
             tags: Vec::new(),
         };
@@ -1252,8 +1280,11 @@ mod tests {
         // Count files in home after
         let after = session.run("find ~ -type f | wc -l").await.unwrap();
 
-        assert_eq!(before.stdout.trim(), after.stdout.trim(),
-            "zero-install violated: file count changed");
+        assert_eq!(
+            before.stdout.trim(),
+            after.stdout.trim(),
+            "zero-install violated: file count changed"
+        );
 
         session.close().await.unwrap();
     }
@@ -1279,7 +1310,9 @@ mod tests {
         // `ls` on a non-existent path writes to stderr and exits non-zero.
         let result = session.run("ls /nonexistent_path_xyz").await.unwrap();
 
-        let code = result.exit_code.expect("expected command to report an exit code");
+        let code = result
+            .exit_code
+            .expect("expected command to report an exit code");
         assert_ne!(code, 0, "expected non-zero exit code");
         assert!(
             !result.stderr.is_empty(),
@@ -1323,9 +1356,7 @@ mod tests {
 
         // Spawn the long-running command in a separate task.
         let session_clone = session.clone();
-        let run_task = tokio::spawn(async move {
-            session_clone.run("sleep 30").await
-        });
+        let run_task = tokio::spawn(async move { session_clone.run("sleep 30").await });
 
         // Give the command a moment to start, then cancel.
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1398,8 +1429,12 @@ mod tests {
             .map(|i| {
                 let path = path.clone();
                 std::thread::spawn(move || {
-                    append_known_hosts_entry(&path, &format!("10.0.0.{i}:22"), &format!("SHA256:key{i}AAAA"))
-                        .unwrap();
+                    append_known_hosts_entry(
+                        &path,
+                        &format!("10.0.0.{i}:22"),
+                        &format!("SHA256:key{i}AAAA"),
+                    )
+                    .unwrap();
                 })
             })
             .collect();
@@ -1410,7 +1445,11 @@ mod tests {
         let known = parse_known_hosts_contents(&contents);
         assert!(known.damaged.is_empty(), "{contents}");
         assert_eq!(known.entries.len(), 32, "{contents}");
-        assert_eq!(contents.matches(KNOWN_HOSTS_HEADER).count(), 1, "{contents}");
+        assert_eq!(
+            contents.matches(KNOWN_HOSTS_HEADER).count(),
+            1,
+            "{contents}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1423,11 +1462,20 @@ mod tests {
             .map(|i| {
                 let path = path.clone();
                 std::thread::spawn(move || {
-                    verify_host_key(&path, "10.0.0.1:22", &format!("SHA256:key{i}AAAA"), HostKeyPolicy::Tofu)
+                    verify_host_key(
+                        &path,
+                        "10.0.0.1:22",
+                        &format!("SHA256:key{i}AAAA"),
+                        HostKeyPolicy::Tofu,
+                    )
                 })
             })
             .collect();
-        let trusted = threads.into_iter().map(|t| t.join().unwrap()).filter(|ok| *ok).count();
+        let trusted = threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
         assert_eq!(trusted, 1);
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents.matches("10.0.0.1:22").count(), 1, "{contents}");
@@ -1451,12 +1499,33 @@ mod tests {
         assert_eq!(known.damaged, [3]);
         assert_eq!(known.entries.len(), 1);
 
-        assert!(!verify_host_key(&path, "127.0.0.1:2221", "SHA256:vdyoLFdo", HostKeyPolicy::Tofu));
-        assert!(!verify_host_key(&path, "other:22", "SHA256:xAAA", HostKeyPolicy::Tofu));
-        assert!(verify_host_key(&path, "web:22", "SHA256:goodAAAA", HostKeyPolicy::Tofu), "intact entries still match");
-        assert!(!verify_host_key(&path, "web:22", "SHA256:evilAAAA", HostKeyPolicy::Tofu));
+        assert!(!verify_host_key(
+            &path,
+            "127.0.0.1:2221",
+            "SHA256:vdyoLFdo",
+            HostKeyPolicy::Tofu
+        ));
+        assert!(!verify_host_key(
+            &path,
+            "other:22",
+            "SHA256:xAAA",
+            HostKeyPolicy::Tofu
+        ));
+        assert!(
+            verify_host_key(&path, "web:22", "SHA256:goodAAAA", HostKeyPolicy::Tofu),
+            "intact entries still match"
+        );
+        assert!(!verify_host_key(
+            &path,
+            "web:22",
+            "SHA256:evilAAAA",
+            HostKeyPolicy::Tofu
+        ));
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(!contents.contains("other:22"), "nothing was recorded: {contents}");
+        assert!(
+            !contents.contains("other:22"),
+            "nothing was recorded: {contents}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1484,24 +1553,15 @@ mod tests {
     #[test]
     fn known_hosts_append_and_read() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "filar_test_known_hosts_{}",
-            std::process::id()
-        ));
+        let path = dir.join(format!("filar_test_known_hosts_{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         append_known_hosts_entry(&path, "host1:22", "SHA256:aaa").unwrap();
         append_known_hosts_entry(&path, "host2:22", "SHA256:bbb").unwrap();
 
         let entries = parse_known_hosts(&path).unwrap().entries;
-        assert_eq!(
-            entries.get("host1:22"),
-            Some(&"SHA256:aaa".to_string())
-        );
-        assert_eq!(
-            entries.get("host2:22"),
-            Some(&"SHA256:bbb".to_string())
-        );
+        assert_eq!(entries.get("host1:22"), Some(&"SHA256:aaa".to_string()));
+        assert_eq!(entries.get("host2:22"), Some(&"SHA256:bbb".to_string()));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1587,9 +1647,18 @@ mod tests {
         let provider = filar_core::StaticSecretProvider::new();
         let err = resolve_ssh_password(&None, &provider).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("SshAuth::Password"), "should mention explicit password: {msg}");
-        assert!(msg.contains("SecretProvider"), "should mention the provider: {msg}");
-        assert!(msg.contains("SSH_PASSWORD"), "should mention the secret name: {msg}");
+        assert!(
+            msg.contains("SshAuth::Password"),
+            "should mention explicit password: {msg}"
+        );
+        assert!(
+            msg.contains("SecretProvider"),
+            "should mention the provider: {msg}"
+        );
+        assert!(
+            msg.contains("SSH_PASSWORD"),
+            "should mention the secret name: {msg}"
+        );
     }
 
     // ── reconnect integration tests (require Docker sshd) ────────────
@@ -1613,8 +1682,8 @@ mod tests {
 
     #[cfg(test)]
     fn docker(args: &[&str]) {
-        let container = std::env::var("FILAR_TEST_SSHD_CONTAINER")
-            .unwrap_or_else(|_| "filar-sshd".to_string());
+        let container =
+            std::env::var("FILAR_TEST_SSHD_CONTAINER").unwrap_or_else(|_| "filar-sshd".to_string());
         let mut full = Vec::with_capacity(args.len() + 1);
         full.extend_from_slice(args);
         full.push(container.as_str());

@@ -98,7 +98,9 @@ fn local_process_cwd(pid: i64) -> Option<String> {
             .output()
             .ok()?;
         let text = String::from_utf8(out.stdout).ok()?;
-        text.lines().find_map(|l| l.strip_prefix('n')).and_then(crate::usable_proc_cwd)
+        text.lines()
+            .find_map(|l| l.strip_prefix('n'))
+            .and_then(crate::usable_proc_cwd)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -181,11 +183,7 @@ impl LocalInteractive {
     ///
     /// If `shell` is `None`, uses [`resolve_default_local_shell`]: `$SHELL` on
     /// Unix/macOS (fallback `sh`), `cmd.exe` on Windows.
-    pub async fn with_shell_and_size(
-        shell: Option<&str>,
-        cols: u16,
-        rows: u16,
-    ) -> Result<Self> {
+    pub async fn with_shell_and_size(shell: Option<&str>, cols: u16, rows: u16) -> Result<Self> {
         Self::with_shell_size_and_cwd(shell, cols, rows, None).await
     }
 
@@ -219,7 +217,12 @@ impl LocalInteractive {
                 cmd.env("PROMPT", crate::cmd_osc7_prompt(existing.as_deref()));
             }
             crate::ShellFlavor::PowerShell => {
-                cmd.args(["-NoLogo", "-NoExit", "-Command", crate::POWERSHELL_OSC7_PROMPT]);
+                cmd.args([
+                    "-NoLogo",
+                    "-NoExit",
+                    "-Command",
+                    crate::POWERSHELL_OSC7_PROMPT,
+                ]);
             }
             crate::ShellFlavor::Posix => {}
         }
@@ -334,7 +337,12 @@ impl InteractiveTerminal for LocalInteractive {
     #[cfg(unix)]
     async fn foreground_cwd(&self) -> Option<crate::ForegroundCwd> {
         let shell = self.child.lock().ok()?.process_id().map(i64::from);
-        let foreground = self.master.lock().ok()?.process_group_leader().map(i64::from);
+        let foreground = self
+            .master
+            .lock()
+            .ok()?
+            .process_group_leader()
+            .map(i64::from);
         let at_prompt = foreground.is_none() || foreground == shell;
         tokio::task::spawn_blocking(move || {
             // A foreground program of another user (`sudo -i`) cannot be
@@ -459,7 +467,7 @@ impl SshInteractive {
                             break;
                         }
                     }
-                    Some(_) => {} // ignore other channel messages
+                    Some(_) => {}  // ignore other channel messages
                     None => break, // channel closed
                 }
             }
@@ -528,7 +536,10 @@ impl InteractiveTerminal for SshInteractive {
             let _ = channel.close().await;
             crate::parse_pty_cwd_reply(std::str::from_utf8(&out).ok()?)
         };
-        tokio::time::timeout(FOREGROUND_CWD_TIMEOUT, ask).await.ok().flatten()
+        tokio::time::timeout(FOREGROUND_CWD_TIMEOUT, ask)
+            .await
+            .ok()
+            .flatten()
     }
 }
 
@@ -564,13 +575,27 @@ mod tests {
             }
         };
         let path = dir.to_str().unwrap().to_string();
-        wait_for(crate::ForegroundCwd { path: "/".into(), at_prompt: true }).await;
+        wait_for(crate::ForegroundCwd {
+            path: "/".into(),
+            at_prompt: true,
+        })
+        .await;
 
-        term.write_input(format!("cd {path}\n").as_bytes()).await.unwrap();
-        wait_for(crate::ForegroundCwd { path: path.clone(), at_prompt: true }).await;
+        term.write_input(format!("cd {path}\n").as_bytes())
+            .await
+            .unwrap();
+        wait_for(crate::ForegroundCwd {
+            path: path.clone(),
+            at_prompt: true,
+        })
+        .await;
 
         term.write_input(b"sleep 30\n").await.unwrap();
-        wait_for(crate::ForegroundCwd { path, at_prompt: false }).await;
+        wait_for(crate::ForegroundCwd {
+            path,
+            at_prompt: false,
+        })
+        .await;
         term.close().await.unwrap();
     }
 
@@ -578,10 +603,7 @@ mod tests {
     #[test]
     fn unix_shell_prefers_valid_env_path() {
         // `/bin/sh` exists on essentially every Unix CI image.
-        assert_eq!(
-            resolve_unix_interactive_shell(Some("/bin/sh")),
-            "/bin/sh"
-        );
+        assert_eq!(resolve_unix_interactive_shell(Some("/bin/sh")), "/bin/sh");
     }
 
     #[cfg(all(unix, feature = "local"))]
@@ -676,6 +698,10 @@ mod tests {
         .unwrap_or(false);
         let _ = term.close().await;
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(seen, "OSC 7 missing: {:?}", String::from_utf8_lossy(&output));
+        assert!(
+            seen,
+            "OSC 7 missing: {:?}",
+            String::from_utf8_lossy(&output)
+        );
     }
 }

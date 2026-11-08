@@ -11,9 +11,12 @@
 //! `dry_run` (`dryRun=All` on the API server).
 //!
 //! `Secret` objects are written and deleted like any other, but their values
-//! never leave this module: in every returned object `data` and `stringData`
-//! values are replaced by [`SECRET_HIDDEN`], and a diff gets
-//! [`SecretKeyChange`]s — keys and whether a value changed — instead.
+//! never leave the write methods: in every object they return `data` and
+//! `stringData` values are replaced by [`SECRET_HIDDEN`], a diff gets
+//! [`SecretKeyChange`]s — keys and whether a value changed — instead, and a
+//! submitted value quoted in a server error is masked too. The one exception
+//! is [`parse_manifest`]: it parses the caller's own manifest and returns it
+//! as given, values included, because `apply` sends exactly that.
 
 use std::collections::BTreeMap;
 
@@ -33,7 +36,8 @@ use super::KubeClusterApi;
 /// The field manager of every filar write (server-side apply ownership).
 pub const FIELD_MANAGER: &str = "filar";
 
-/// What a `Secret` value is replaced with in everything this module returns.
+/// What a `Secret` value is replaced with in everything the write methods
+/// return (not in [`parse_manifest`], which returns the manifest as given).
 pub const SECRET_HIDDEN: &str = "«скрыто»";
 
 /// Most objects a selector delete may touch; a broader selector is refused
@@ -335,6 +339,9 @@ pub trait ClusterWriteApi: Send + Sync {
 /// Parse a manifest: YAML (one or more `---` documents) or JSON. Empty
 /// documents are skipped; each object needs `apiVersion`, `kind` and
 /// `metadata.name`. A `List` is not unpacked: send its items as documents.
+///
+/// The documents come back as given: `Secret` values are **not** hidden
+/// (call [`hide_secret_values`] before showing a document to anyone).
 pub fn parse_manifest(manifest: &str) -> Result<Vec<Value>> {
     let documents: Vec<Value> = serde_saphyr::from_multiple(manifest)
         .map_err(|error| CoreError::Other(format!("the manifest is not valid YAML: {error}")))?;
@@ -374,6 +381,64 @@ pub fn hide_secret_values(object: &mut Value) {
     // `kubectl apply` keeps the whole last applied object here, values too.
     if let Some(Value::Object(annotations)) = object.pointer_mut("/metadata/annotations") {
         annotations.remove("kubectl.kubernetes.io/last-applied-configuration");
+    }
+}
+
+/// Shortest submitted `Secret` value [`mask_secret_values`] looks for: a
+/// shorter one would mask unrelated words of the message.
+const MIN_MASKED_VALUE: usize = 4;
+
+/// The values a manifest document submits for a `Secret`: `stringData`
+/// values, `data` values as sent (base64) and decoded, longest first.
+fn submitted_secret_values(document: &Value) -> Vec<String> {
+    if document.get("kind").and_then(Value::as_str) != Some("Secret") {
+        return Vec::new();
+    }
+    let mut values = Vec::new();
+    for field in ["data", "stringData"] {
+        let Some(Value::Object(map)) = document.get(field) else {
+            continue;
+        };
+        for value in map.values().filter_map(Value::as_str) {
+            values.push(value.to_string());
+            if field == "data" {
+                let decoded = serde_json::from_value::<k8s_openapi::ByteString>(Value::String(
+                    value.to_string(),
+                ))
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes.0).ok());
+                values.extend(decoded);
+            }
+        }
+    }
+    values.retain(|value| value.chars().count() >= MIN_MASKED_VALUE);
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values.dedup();
+    values
+}
+
+/// Mask submitted `Secret` values in an error message: an admission webhook
+/// may quote the object it rejects.
+fn mask_secret_values(error: CoreError, values: &[String]) -> CoreError {
+    if values.is_empty() {
+        return error;
+    }
+    let mask = |mut message: String| {
+        for value in values {
+            message = message.replace(value.as_str(), SECRET_HIDDEN);
+        }
+        message
+    };
+    match error {
+        CoreError::Config(m) => CoreError::Config(mask(m)),
+        CoreError::Secret(m) => CoreError::Secret(mask(m)),
+        CoreError::ConnectionLost(m) => CoreError::ConnectionLost(mask(m)),
+        CoreError::ContextOverflow(m) => CoreError::ContextOverflow(mask(m)),
+        CoreError::AccessDenied(m) => CoreError::AccessDenied(mask(m)),
+        CoreError::NotFound(m) => CoreError::NotFound(mask(m)),
+        CoreError::Unavailable(m) => CoreError::Unavailable(mask(m)),
+        CoreError::Other(m) => CoreError::Other(mask(m)),
+        other => CoreError::Other(mask(other.to_string())),
     }
 }
 
@@ -418,9 +483,10 @@ fn secret_key_changes(live: Option<&Value>, result: &Value) -> Vec<SecretKeyChan
     changes
 }
 
-/// The object without what changes on every write: bookkeeping metadata and
-/// status. Two objects equal here differ in nothing a user changed.
-fn content(object: &Value) -> Value {
+/// The object without what changes on every write: bookkeeping metadata and,
+/// when a `status` subresource owns it, status. Two objects equal here
+/// differ in nothing a user changed.
+fn content(object: &Value, status_is_content: bool) -> Value {
     let mut object = object.clone();
     if let Some(Value::Object(metadata)) = object.get_mut("metadata") {
         for field in [
@@ -434,13 +500,25 @@ fn content(object: &Value) -> Value {
             metadata.remove(field);
         }
     }
-    if let Value::Object(map) = &mut object {
-        map.remove("status");
+    if !status_is_content {
+        if let Value::Object(map) = &mut object {
+            map.remove("status");
+        }
     }
     object
 }
 
-fn apply_action(live: Option<&Value>, result: &Value) -> ApplyAction {
+/// Without a `status` subresource (a CRD that does not declare one) status
+/// is written through the main endpoint, so an apply can change it.
+fn status_is_content(caps: &ApiCapabilities) -> bool {
+    !caps
+        .subresources
+        .iter()
+        .any(|(resource, _)| resource.plural == "status")
+}
+
+fn apply_action(live: Option<&Value>, result: &Value, status_is_content: bool) -> ApplyAction {
+    let content = |object| content(object, status_is_content);
     match live {
         None => ApplyAction::Created,
         Some(live) if content(live) == content(result) => ApplyAction::Unchanged,
@@ -502,6 +580,37 @@ pub(super) fn write_error(
     }
 }
 
+fn paused_error(kind: &str, name: &str, verb: &str) -> CoreError {
+    CoreError::Other(format!(
+        "{} {name} is paused: a {verb} would change nothing now and take effect on resume; resume it first (kubectl rollout resume)",
+        kind.to_ascii_lowercase()
+    ))
+}
+
+/// Resources `kind` names — kind, plural, singular or `plural.group`,
+/// case-insensitive — one per kind and version.
+fn matching_resources(
+    resources: impl IntoIterator<Item = (ApiResource, ApiCapabilities)>,
+    kind: &str,
+) -> Vec<(ApiResource, ApiCapabilities)> {
+    let wanted = kind.to_ascii_lowercase();
+    let mut found: Vec<(ApiResource, ApiCapabilities)> = Vec::new();
+    for (resource, caps) in resources {
+        let matches = resource.kind.to_ascii_lowercase() == wanted
+            || resource.plural == wanted
+            || resource.plural.trim_end_matches('s') == wanted
+            || resource_label(&resource) == wanted;
+        if matches
+            && !found
+                .iter()
+                .any(|(r, _)| r.api_version == resource.api_version && r.kind == resource.kind)
+        {
+            found.push((resource, caps));
+        }
+    }
+    found
+}
+
 /// Resource name for messages: `deployments`, `deployments.apps`.
 fn resource_label(resource: &ApiResource) -> String {
     if resource.group.is_empty() {
@@ -527,38 +636,42 @@ impl KubeClusterApi {
     }
 
     /// Resolve `kind` (and optional `apiVersion`) to a resource and scope.
+    /// With an `apiVersion` the kind may also be a plural or singular
+    /// (`deployments`); without one the core group is asked first, so an
+    /// unrelated broken API group cannot block `Pod` or `Secret`.
     async fn resolve_kind(&self, kind: &ObjectKind) -> Result<(ApiResource, ApiCapabilities)> {
-        let client = self.client().clone();
         if let Some(api_version) = kind.api_version.as_deref() {
-            return resolve_gvk(&client, self.target(), &gvk_of(api_version, &kind.kind)).await;
-        }
-        let discovery = Discovery::new(client)
-            .run()
-            .await
-            .map_err(|error| api_error(self.target(), error, "discover", "API resources", None))?;
-        let wanted = kind.kind.to_ascii_lowercase();
-        let mut found: Vec<(ApiResource, ApiCapabilities)> = Vec::new();
-        for group in discovery.groups() {
-            for (resource, caps) in group.recommended_resources() {
-                let matches = resource.kind.to_ascii_lowercase() == wanted
-                    || resource.plural == wanted
-                    || resource.plural.trim_end_matches('s') == wanted
-                    || resource_label(&resource) == wanted;
-                if matches
-                    && !found.iter().any(|(r, _)| {
-                        r.api_version == resource.api_version && r.kind == resource.kind
-                    })
-                {
-                    found.push((resource, caps));
+            let gvk = gvk_of(api_version, &kind.kind);
+            return match resolve_gvk(self.client(), self.target(), &gvk).await {
+                Err(CoreError::NotFound(message)) => {
+                    let discovery = Discovery::new(self.client().clone())
+                        .filter(&[gvk.group.as_str()])
+                        .run()
+                        .await
+                        .map_err(|error| {
+                            api_error(self.target(), error, "discover", api_version, None)
+                        })?;
+                    let resources = discovery
+                        .get(&gvk.group)
+                        .map(|group| group.versioned_resources(&gvk.version))
+                        .unwrap_or_default();
+                    matching_resources(resources, &kind.kind)
+                        .into_iter()
+                        .next()
+                        .ok_or(CoreError::NotFound(message))
                 }
-            }
+                other => other,
+            };
         }
-        if let Some(core) = found
-            .iter()
-            .position(|(resource, _)| resource.group.is_empty())
-        {
-            return Ok(found.swap_remove(core));
+        let core = self
+            .discover_matching(Discovery::new(self.client().clone()).filter(&[""]), kind)
+            .await?;
+        if let Some(found) = core.into_iter().next() {
+            return Ok(found);
         }
+        let mut found = self
+            .discover_matching(Discovery::new(self.client().clone()).exclude(&[""]), kind)
+            .await?;
         match found.len() {
             1 => Ok(found.remove(0)),
             0 => Err(CoreError::NotFound(format!(
@@ -576,6 +689,24 @@ impl KubeClusterApi {
                     .join(", ")
             ))),
         }
+    }
+
+    /// Resources of the groups `discovery` covers that `kind` names.
+    async fn discover_matching(
+        &self,
+        discovery: Discovery,
+        kind: &ObjectKind,
+    ) -> Result<Vec<(ApiResource, ApiCapabilities)>> {
+        let discovery = discovery
+            .run()
+            .await
+            .map_err(|error| api_error(self.target(), error, "discover", "API resources", None))?;
+        Ok(matching_resources(
+            discovery
+                .groups()
+                .flat_map(|group| group.recommended_resources()),
+            &kind.kind,
+        ))
     }
 
     fn dynamic_api(
@@ -609,6 +740,14 @@ impl KubeClusterApi {
         let (resource, caps) =
             resolve_gvk(self.client(), self.target(), &gvk_of(api_version, kind)).await?;
         let label = resource_label(&resource);
+        if let Some(value) = document
+            .pointer("/metadata/namespace")
+            .filter(|value| !value.is_null() && !value.is_string())
+        {
+            return Err(CoreError::Other(format!(
+                "{kind} {name}: metadata.namespace must be a string, not {value}"
+            )));
+        }
         let namespace = match caps.scope {
             Scope::Namespaced => Some(
                 document
@@ -650,7 +789,7 @@ impl KubeClusterApi {
             .map_err(|error| self.write_error(error, "apply", &label, namespace.as_deref()))?;
         let mut result = to_value(&result)?;
         let mut live = live;
-        let action = apply_action(live.as_ref(), &result);
+        let action = apply_action(live.as_ref(), &result, status_is_content(&caps));
         let secret_keys = if kind == "Secret" && resource.group.is_empty() {
             secret_key_changes(live.as_ref(), &result)
         } else {
@@ -752,6 +891,7 @@ impl ClusterWriteApi for KubeClusterApi {
             match self.apply_one(document, default_namespace, dry_run).await {
                 Ok(object) => applied.push(object),
                 Err(error) => {
+                    let error = mask_secret_values(error, &submitted_secret_values(document));
                     let name = format!(
                         "{} {}",
                         document["kind"].as_str().unwrap_or_default(),
@@ -768,6 +908,9 @@ impl ClusterWriteApi for KubeClusterApi {
                             CoreError::AccessDenied(format!("{name}: {m}{note}"))
                         }
                         CoreError::NotFound(m) => CoreError::NotFound(format!("{name}: {m}{note}")),
+                        CoreError::Unavailable(m) => {
+                            CoreError::Unavailable(format!("{name}: {m}{note}"))
+                        }
                         other => CoreError::Other(format!("{name}: {other}{note}")),
                     });
                 }
@@ -850,6 +993,9 @@ impl ClusterWriteApi for KubeClusterApi {
             .get(name)
             .await
             .map_err(|error| self.write_error(error, "get", &label, Some(namespace)))?;
+        if live.data.pointer("/spec/paused").and_then(Value::as_bool) == Some(true) {
+            return Err(paused_error(kind.kind(), name, "restart"));
+        }
         let params = PatchParams {
             dry_run,
             field_manager: Some(FIELD_MANAGER.into()),
@@ -892,14 +1038,26 @@ impl ClusterWriteApi for KubeClusterApi {
                 .and_then(|a| a.get(REVISION_ANNOTATION))
                 .and_then(|r| r.parse::<i64>().ok())
         };
+        if deployment.spec.as_ref().and_then(|spec| spec.paused) == Some(true) {
+            return Err(paused_error("Deployment", name, "roll back"));
+        }
         let current = revision_of(deployment.metadata.annotations.as_ref()).unwrap_or(0);
         let uid = deployment.metadata.uid.clone();
-        let replicasets = Api::<ReplicaSet>::namespaced(client, namespace)
-            .list(&ListParams::default().limit(super::DEFAULT_CLUSTER_LIST_LIMIT))
-            .await
-            .map_err(|error| self.write_error(error, "list", "replicasets", Some(namespace)))?;
+        let replicasets_api = Api::<ReplicaSet>::namespaced(client, namespace);
+        let mut replicasets = Vec::new();
+        let mut params = ListParams::default().limit(super::DEFAULT_CLUSTER_LIST_LIMIT);
+        loop {
+            let page = replicasets_api
+                .list(&params)
+                .await
+                .map_err(|error| self.write_error(error, "list", "replicasets", Some(namespace)))?;
+            replicasets.extend(page.items);
+            match page.metadata.continue_.filter(|token| !token.is_empty()) {
+                Some(token) => params = params.continue_token(&token),
+                None => break,
+            }
+        }
         let mut owned: Vec<(i64, ReplicaSet)> = replicasets
-            .items
             .into_iter()
             .filter(|rs| {
                 uid.is_some()
@@ -1031,7 +1189,17 @@ impl ClusterWriteApi for KubeClusterApi {
                     Some(object) if object.metadata.deletion_timestamp.is_some() => {
                         DeleteOutcome::Pending
                     }
-                    _ => DeleteOutcome::Deleted,
+                    Some(_) => DeleteOutcome::Deleted,
+                    // A bare `Status` (aggregated APIs, async deletes) says
+                    // the request was accepted, not that the object is gone.
+                    None => match api.get_opt(&name).await {
+                        Ok(Some(_)) => DeleteOutcome::Pending,
+                        Ok(None) => DeleteOutcome::Deleted,
+                        Err(error) => {
+                            tracing::debug!(%error, "post-delete check of {name} failed");
+                            DeleteOutcome::Pending
+                        }
+                    },
                 },
                 Err(kube::Error::Api(status)) if status.code == 404 && !missing_is_error => {
                     DeleteOutcome::AlreadyGone

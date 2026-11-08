@@ -13,7 +13,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
-- Engine: `ClusterWriteApi` in `filar-transport`, implemented by `KubeClusterApi` — server-side apply of YAML/JSON manifests, scale, rollout restart and undo, delete by name, selector or an exact list of names, every method with a server dry run; any kind the RBAC allows; returned objects never carry Secret values. `ClusterApi` stays read-only and fleets get only it ([#638](https://github.com/devlawey/filar/issues/638)).
+- Engine: `ClusterWriteApi` in `filar-transport`, implemented by `KubeClusterApi` — server-side apply of YAML/JSON manifests, scale, rollout restart and undo, delete by name, selector or an exact list of names, every method with a server dry run; any kind the RBAC allows; objects the write methods return never carry Secret values, and submitted values quoted in a server error are masked (`parse_manifest` returns the caller's manifest as given); paused Deployments are refused for restart and undo. `ClusterApi` stays read-only and fleets get only it ([#638](https://github.com/devlawey/filar/issues/638)).
 
 ### Changed
 

@@ -160,7 +160,8 @@ fn parse_compact_at_tokens(raw: &str) -> u64 {
     if text.is_empty() {
         return filar_core::DEFAULT_COMPACT_AT_TOKENS;
     }
-    text.parse().unwrap_or(filar_core::DEFAULT_COMPACT_AT_TOKENS)
+    text.parse()
+        .unwrap_or(filar_core::DEFAULT_COMPACT_AT_TOKENS)
 }
 
 /// Parse the reply-length cap typed in the launcher.
@@ -205,9 +206,13 @@ fn validate_profile_fields(p: &LlmProfileData) -> Result<(), String> {
     if !p.top_p.trim().is_empty()
         && !matches!(p.top_p.trim().parse::<f32>(), Ok(t) if t.is_finite() && t > 0.0 && t <= 1.0)
     {
-        return Err(format!("Invalid top_p: '{}'. Expected (0.0, 1.0].", p.top_p));
+        return Err(format!(
+            "Invalid top_p: '{}'. Expected (0.0, 1.0].",
+            p.top_p
+        ));
     }
-    if !p.compact_at_tokens.trim().is_empty() && p.compact_at_tokens.trim().parse::<u64>().is_err() {
+    if !p.compact_at_tokens.trim().is_empty() && p.compact_at_tokens.trim().parse::<u64>().is_err()
+    {
         return Err(format!(
             "Invalid compaction threshold: '{}'. Expected a whole number of tokens (0 = off).",
             p.compact_at_tokens
@@ -730,7 +735,10 @@ fn clean_tag(raw: &str) -> String {
 ///
 /// Empty items are dropped; order is preserved.
 fn parse_tags(raw: &str) -> Vec<String> {
-    raw.split(',').map(clean_tag).filter(|t| !t.is_empty()).collect()
+    raw.split(',')
+        .map(clean_tag)
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 /// The key file typed in a slot: `None` for a blank field (the default key).
@@ -766,9 +774,13 @@ fn build_ssh_targets_from_profiles(profiles: &[SshProfile]) -> Vec<filar_core::S
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut targets: Vec<filar_core::SshTarget> = Vec::new();
     for (i, profile) in profiles.iter().enumerate() {
-        if profile.host.is_empty() { continue; }
+        if profile.host.is_empty() {
+            continue;
+        }
         let name = filar_core::ssh_target_display_name(i, &profile.alias);
-        if seen.contains(&name) { continue; }
+        if seen.contains(&name) {
+            continue;
+        }
         seen.insert(name.clone());
         let port: u16 = profile.port.parse().unwrap_or_else(|_| {
             tracing::warn!(port = %profile.port, slot = i + 1, "invalid SSH port — using 22");
@@ -1125,7 +1137,11 @@ fn parse_import_csv(text: &str) -> Result<Vec<ImportRow>, String> {
         .position(|r| !is_blank(r))
         .ok_or("empty CSV file")?;
     let header = &all_rows[header_idx];
-    let column = |name: &str| header.iter().position(|h| h.trim().eq_ignore_ascii_case(name));
+    let column = |name: &str| {
+        header
+            .iter()
+            .position(|h| h.trim().eq_ignore_ascii_case(name))
+    };
     let name_col = column("name").ok_or("CSV header must include a \"name\" column")?;
     let host_col = column("host").ok_or("CSV header must include a \"host\" column")?;
     let port_col = column("port");
@@ -1140,7 +1156,9 @@ fn parse_import_csv(text: &str) -> Result<Vec<ImportRow>, String> {
         // 1-based: the number the user's editor shows.
         let line = idx + 1;
         let field = |col: Option<usize>| {
-            col.and_then(|c| row.get(c)).map(String::as_str).unwrap_or("")
+            col.and_then(|c| row.get(c))
+                .map(String::as_str)
+                .unwrap_or("")
         };
         let port = match field(port_col).trim() {
             "" => 22,
@@ -1265,7 +1283,10 @@ fn apply_import(
                     slot.password.clear();
                     slot.save_password = false;
                 }
-                if identity_changed || auth != SlotAuth::Key || key_path.trim() != slot.key_path.trim() {
+                if identity_changed
+                    || auth != SlotAuth::Key
+                    || key_path.trim() != slot.key_path.trim()
+                {
                     slot.passphrase.clear();
                     slot.save_passphrase = false;
                 }
@@ -1313,7 +1334,10 @@ fn import_status_line(outcome: &ImportOutcome) -> String {
         outcome.added, outcome.overwritten, outcome.renamed, outcome.skipped
     );
     if outcome.kube_skipped > 0 {
-        line.push_str(&format!("; {} Kubernetes cluster(s) skipped", outcome.kube_skipped));
+        line.push_str(&format!(
+            "; {} Kubernetes cluster(s) skipped",
+            outcome.kube_skipped
+        ));
     }
     line
 }
@@ -1654,10 +1678,7 @@ async fn check_kubernetes_target(target: &filar_core::KubeCluster) -> Result<Str
         .list_pods(Some(namespace), None, None)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(format!(
-        "Available: {} pod(s) in {namespace}",
-        pods.len()
-    ))
+    Ok(format!("Available: {} pod(s) in {namespace}", pods.len()))
 }
 
 struct SshSlot {
@@ -1940,10 +1961,17 @@ impl RiskScorerDraft {
                 .parse::<u8>()
                 .ok()
                 .filter(|v| *v <= 100)
-                .ok_or_else(|| format!("Command safety: {name} must be a whole number from 0 to 100"))
+                .ok_or_else(|| {
+                    format!("Command safety: {name} must be a whole number from 0 to 100")
+                })
         };
         let cfg = filar_core::RiskScorerConfig {
-            kind: if self.chat_logprobs { "chat-logprobs" } else { "decisions" }.to_string(),
+            kind: if self.chat_logprobs {
+                "chat-logprobs"
+            } else {
+                "decisions"
+            }
+            .to_string(),
             base_url: self.base_url.trim().to_string(),
             model: self.model.trim().to_string(),
             key_env: self.effective_key_env(),
@@ -1963,8 +1991,12 @@ impl RiskScorerDraft {
         if !self.keyless && cfg.key_env.is_empty() {
             return Err("Command safety: enter the key name, or tick \"no key\"".into());
         }
-        cfg.validate()
-            .map_err(|e| format!("Command safety: {}", e.to_string().trim_start_matches("config error: ")))?;
+        cfg.validate().map_err(|e| {
+            format!(
+                "Command safety: {}",
+                e.to_string().trim_start_matches("config error: ")
+            )
+        })?;
         Ok(Some(cfg))
     }
 
@@ -2142,13 +2174,30 @@ fn suggested_log_key_env(name: &str) -> String {
     let upper: String = name
         .trim()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
-    format!("FILAR_LOGS_{}", if upper.is_empty() { "SOURCE".into() } else { upper })
+    format!(
+        "FILAR_LOGS_{}",
+        if upper.is_empty() {
+            "SOURCE".into()
+        } else {
+            upper
+        }
+    )
 }
 
 fn split_list(text: &str) -> Vec<String> {
-    text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect()
+    text.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 impl LogSourceDraft {
@@ -2170,7 +2219,9 @@ impl LogSourceDraft {
         Self {
             id,
             name: cfg.name.clone(),
-            kind: cfg.source_kind().unwrap_or(filar_core::LogSourceKind::VictoriaLogs),
+            kind: cfg
+                .source_kind()
+                .unwrap_or(filar_core::LogSourceKind::VictoriaLogs),
             url: cfg.url.clone(),
             auth: cfg.auth_kind().unwrap_or(filar_core::LogAuth::None),
             key_env: cfg.key_env.clone(),
@@ -2199,24 +2250,25 @@ impl LogSourceDraft {
     /// numeric limits come pre-filled: only one changed from its starting
     /// value is input — a typo there must be reported, not dropped.
     fn is_blank(&self) -> bool {
-        let limits_untouched = self.max_window_hours.trim() == self.base.max_window_hours.to_string()
+        let limits_untouched = self.max_window_hours.trim()
+            == self.base.max_window_hours.to_string()
             && self.max_lines.trim() == self.base.max_lines.to_string()
             && self.timeout_secs.trim() == self.base.timeout_secs.to_string();
         limits_untouched
             && [
-            &self.name,
-            &self.url,
-            &self.key_env,
-            &self.key,
-            &self.user,
-            &self.tenant,
-            &self.index,
-            &self.k8s_fields,
-            &self.clusters,
-            &self.tags,
-        ]
-        .iter()
-        .all(|field| field.trim().is_empty())
+                &self.name,
+                &self.url,
+                &self.key_env,
+                &self.key,
+                &self.user,
+                &self.tenant,
+                &self.index,
+                &self.k8s_fields,
+                &self.clusters,
+                &self.tags,
+            ]
+            .iter()
+            .all(|field| field.trim().is_empty())
     }
 
     /// Whether a key is stored under the name as it reads now.
@@ -2234,21 +2286,36 @@ impl LogSourceDraft {
     /// The entry to write and launch with, or the first problem, worded for
     /// the launcher. Never contains a key.
     fn to_config(&self) -> Result<filar_core::LogSourceConfig, String> {
-        let label = if self.name.trim().is_empty() { "new source".to_string() } else { self.name.trim().to_string() };
+        let label = if self.name.trim().is_empty() {
+            "new source".to_string()
+        } else {
+            self.name.trim().to_string()
+        };
         let number = |raw: &str, field: &str| -> Result<u64, String> {
             raw.trim()
                 .parse::<u64>()
                 .map_err(|_| format!("Log source {label}: {field} must be a whole number"))
         };
         let opt = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
-        let search = matches!(self.kind, filar_core::LogSourceKind::OpenSearch | filar_core::LogSourceKind::Elasticsearch);
+        let search = matches!(
+            self.kind,
+            filar_core::LogSourceKind::OpenSearch | filar_core::LogSourceKind::Elasticsearch
+        );
         let cfg = filar_core::LogSourceConfig {
             name: self.name.trim().to_string(),
             kind: self.kind.as_str().to_string(),
             url: self.url.trim().to_string(),
             auth: self.auth.as_str().to_string(),
-            key_env: if self.auth.needs_key() { self.key_env.trim().to_string() } else { String::new() },
-            user: if self.auth == filar_core::LogAuth::Basic { opt(&self.user) } else { None },
+            key_env: if self.auth.needs_key() {
+                self.key_env.trim().to_string()
+            } else {
+                String::new()
+            },
+            user: if self.auth == filar_core::LogAuth::Basic {
+                opt(&self.user)
+            } else {
+                None
+            },
             tenant: if search { None } else { opt(&self.tenant) },
             index: if search { opt(&self.index) } else { None },
             k8s_fields: opt(&self.k8s_fields),
@@ -2257,12 +2324,26 @@ impl LogSourceDraft {
             timeout_secs: number(&self.timeout_secs, "timeout (s)")?,
             clusters: split_list(&self.clusters),
             tags: split_list(&self.tags),
-            time_field: if search { self.base.time_field.clone() } else { None },
-            fields: if search { self.base.fields.clone() } else { Vec::new() },
+            time_field: if search {
+                self.base.time_field.clone()
+            } else {
+                None
+            },
+            fields: if search {
+                self.base.fields.clone()
+            } else {
+                Vec::new()
+            },
             ..self.base.clone()
         };
-        cfg.validate()
-            .map_err(|e| format!("Log source {label}: {}", e.to_string().trim_start_matches("config error: ").trim_start_matches("log_sources: ")))?;
+        cfg.validate().map_err(|e| {
+            format!(
+                "Log source {label}: {}",
+                e.to_string()
+                    .trim_start_matches("config error: ")
+                    .trim_start_matches("log_sources: ")
+            )
+        })?;
         Ok(cfg)
     }
 
@@ -2296,7 +2377,10 @@ impl LogSourceDraft {
 fn log_check_query(cfg: &filar_core::LogSourceConfig) -> String {
     match cfg.source_kind() {
         Some(filar_core::LogSourceKind::Loki) => {
-            let label = cfg.k8s_preset().map(|p| p.fields().namespace).unwrap_or("namespace");
+            let label = cfg
+                .k8s_preset()
+                .map(|p| p.fields().namespace)
+                .unwrap_or("namespace");
             format!("{{{label}=~\".+\"}}")
         }
         _ => "*".to_string(),
@@ -2370,8 +2454,16 @@ impl HostGroupDraft {
             max_parallel: group.max_parallel.to_string(),
             per_host_timeout_secs: group.per_host_timeout_secs.to_string(),
             kube: group.kube.is_some(),
-            kube_clusters: group.kube.as_ref().map(|k| k.clusters.clone()).unwrap_or_default(),
-            kube_namespace: group.kube.as_ref().map(|k| k.namespace.clone()).unwrap_or_default(),
+            kube_clusters: group
+                .kube
+                .as_ref()
+                .map(|k| k.clusters.clone())
+                .unwrap_or_default(),
+            kube_namespace: group
+                .kube
+                .as_ref()
+                .map(|k| k.namespace.clone())
+                .unwrap_or_default(),
             kube_selector: group
                 .kube
                 .as_ref()
@@ -2391,7 +2483,9 @@ impl HostGroupDraft {
     /// A row with neither a name nor a rule is an in-UI scratch entry: it is
     /// not persisted, like a blank host row (#411/#418).
     fn is_blank(&self) -> bool {
-        self.name.trim().is_empty() && self.match_tags.trim().is_empty() && !self.has_kube_selection()
+        self.name.trim().is_empty()
+            && self.match_tags.trim().is_empty()
+            && !self.has_kube_selection()
     }
 
     /// The `kube` selection of a Kubernetes group, validated (#615), or
@@ -2422,7 +2516,11 @@ impl HostGroupDraft {
         }
         let selector = self.kube_selector.trim();
         Ok(Some(filar_core::KubeGroup {
-            clusters: self.kube_clusters.iter().map(|c| c.trim().to_string()).collect(),
+            clusters: self
+                .kube_clusters
+                .iter()
+                .map(|c| c.trim().to_string())
+                .collect(),
             namespace: namespace.to_string(),
             selector: (!selector.is_empty()).then(|| selector.to_string()),
         }))
@@ -2518,7 +2616,11 @@ fn kube_group_preview_line(draft: &HostGroupDraft) -> String {
         return "Effective now: no Kubernetes cluster picked yet.".to_string();
     }
     let namespace = draft.kube_namespace.trim();
-    let namespace = if namespace.is_empty() { "(not set)" } else { namespace };
+    let namespace = if namespace.is_empty() {
+        "(not set)"
+    } else {
+        namespace
+    };
     let selector = draft.kube_selector.trim();
     let pods = if selector.is_empty() {
         "every ready pod".to_string()
@@ -2664,7 +2766,10 @@ impl LlmProfileData {
             api_base_url: profile.api_base_url.clone(),
             key_env: profile.key_env.clone(),
             api_key,
-            temperature: profile.temperature.map(|t| t.to_string()).unwrap_or_default(),
+            temperature: profile
+                .temperature
+                .map(|t| t.to_string())
+                .unwrap_or_default(),
             max_tokens: profile.max_tokens.to_string(),
             top_p: profile.top_p.map(|t| t.to_string()).unwrap_or_default(),
             extra_body: profile
@@ -2901,10 +3006,7 @@ impl LauncherApp {
                 .show(ui, |ui| {
                     for (i, slot) in self.ssh_slots.iter().enumerate() {
                         ui.horizontal(|ui| {
-                            if ui
-                                .radio(kube_mode.is_none() && mode == i + 1, "")
-                                .clicked()
-                            {
+                            if ui.radio(kube_mode.is_none() && mode == i + 1, "").clicked() {
                                 mode = i + 1;
                                 kube_mode = None;
                             }
@@ -3031,22 +3133,13 @@ impl LauncherApp {
                 .spacing([10.0, 6.0])
                 .show(ui, |ui| {
                     ui.label("Host:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut slot.host)
-                            .hint_text("192.168.1.100"),
-                    );
+                    ui.add(egui::TextEdit::singleline(&mut slot.host).hint_text("192.168.1.100"));
                     ui.end_row();
                     ui.label("Port:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut slot.port)
-                            .hint_text("22"),
-                    );
+                    ui.add(egui::TextEdit::singleline(&mut slot.port).hint_text("22"));
                     ui.end_row();
                     ui.label("User:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut slot.user)
-                            .hint_text("root"),
-                    );
+                    ui.add(egui::TextEdit::singleline(&mut slot.user).hint_text("root"));
                     ui.end_row();
                     ui.label("Alias:");
                     ui.add(example_field(
@@ -3363,12 +3456,16 @@ impl LauncherApp {
             ui.label("No profiles defined. Click Add to create one.");
             if ui.button("Add Profile").clicked() {
                 self.profiles.push(LlmProfileData {
-                    name: "default".into(), model: String::new(),
+                    name: "default".into(),
+                    model: String::new(),
                     api_base_url: String::new(),
                     key_env: filar_core::secrets::env_vars::LLM_API_KEY.into(),
-                    api_key: String::new(), temperature: String::new(),
-                    max_tokens: String::new(), top_p: String::new(),
-                    extra_body: String::new(), compact_at_tokens: String::new(),
+                    api_key: String::new(),
+                    temperature: String::new(),
+                    max_tokens: String::new(),
+                    top_p: String::new(),
+                    extra_body: String::new(),
+                    compact_at_tokens: String::new(),
                 });
                 self.selected_profile = 0;
                 self.save_profiles();
@@ -3380,7 +3477,10 @@ impl LauncherApp {
                 .selected_text(&profile_names[self.selected_profile])
                 .show_ui(ui, |ui| {
                     for (i, name) in profile_names.iter().enumerate() {
-                        if ui.selectable_label(i == self.selected_profile, name).clicked() {
+                        if ui
+                            .selectable_label(i == self.selected_profile, name)
+                            .clicked()
+                        {
                             self.selected_profile = i;
                         }
                     }
@@ -3389,11 +3489,16 @@ impl LauncherApp {
                 let name = unique_profile_name(&self.profiles, "profile");
                 let key_env = format!("api_key_{name}");
                 self.profiles.push(LlmProfileData {
-                    name, key_env,
-                    model: String::new(), api_base_url: String::new(),
-                    api_key: String::new(), temperature: String::new(),
-                    max_tokens: String::new(), top_p: String::new(),
-                    extra_body: String::new(), compact_at_tokens: String::new(),
+                    name,
+                    key_env,
+                    model: String::new(),
+                    api_base_url: String::new(),
+                    api_key: String::new(),
+                    temperature: String::new(),
+                    max_tokens: String::new(),
+                    top_p: String::new(),
+                    extra_body: String::new(),
+                    compact_at_tokens: String::new(),
                 });
                 self.selected_profile = self.profiles.len() - 1;
                 self.save_profiles();
@@ -3424,8 +3529,14 @@ impl LauncherApp {
         let mut show_api_key = self.show_api_key;
         {
             let p = &mut self.profiles[self.selected_profile];
-            ui.horizontal(|ui| { ui.label("Name:"); ui.text_edit_singleline(&mut p.name); });
-            ui.horizontal(|ui| { ui.label("Model:"); ui.text_edit_singleline(&mut p.model); });
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.text_edit_singleline(&mut p.name);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Model:");
+                ui.text_edit_singleline(&mut p.model);
+            });
             ui.horizontal(|ui| {
                 ui.label("API URL:");
                 ui.add(example_field(
@@ -3458,9 +3569,7 @@ impl LauncherApp {
                 };
                 ui.colored_label(
                     egui::Color32::from_rgb(180, 180, 100),
-                    format!(
-                        "No API key — requests go only to {url} (local / air-gapped)."
-                    ),
+                    format!("No API key — requests go only to {url} (local / air-gapped)."),
                 );
             } else if p.api_key.trim().is_empty() {
                 ui.colored_label(
@@ -3468,7 +3577,10 @@ impl LauncherApp {
                     "API key empty: loaded from OS store / env on Launch, or clear Key env for local models.",
                 );
             }
-            ui.horizontal(|ui| { ui.label("Temp:"); ui.text_edit_singleline(&mut p.temperature); });
+            ui.horizontal(|ui| {
+                ui.label("Temp:");
+                ui.text_edit_singleline(&mut p.temperature);
+            });
             ui.horizontal(|ui| {
                 let explain = "Upper bound on the length of a single reply, in tokens. \
                      Raise it if long answers are being cut off. Empty = the \
@@ -3503,9 +3615,12 @@ impl LauncherApp {
                 .on_hover_text(explain);
             });
             ui.label("Extra body (JSON):");
-            ui.add(egui::TextEdit::multiline(&mut p.extra_body)
-                .hint_text("e.g. {\"thinking\":{\"type\":\"disabled\"}}")
-                .desired_rows(2).desired_width(f32::INFINITY));
+            ui.add(
+                egui::TextEdit::multiline(&mut p.extra_body)
+                    .hint_text("e.g. {\"thinking\":{\"type\":\"disabled\"}}")
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY),
+            );
         }
         self.show_api_key = show_api_key;
 
@@ -3520,7 +3635,10 @@ impl LauncherApp {
                 &arbiter_choice
             })
             .show_ui(ui, |ui| {
-                if ui.selectable_label(arbiter_choice.is_empty(), same_label).clicked() {
+                if ui
+                    .selectable_label(arbiter_choice.is_empty(), same_label)
+                    .clicked()
+                {
                     arbiter_choice.clear();
                 }
                 for name in &profile_names {
@@ -3628,7 +3746,11 @@ impl LauncherApp {
                     egui::TextEdit::singleline(&mut d.key)
                         .id(id)
                         .password(true)
-                        .hint_text(if saved { "saved — type to replace" } else { "not set" })
+                        .hint_text(if saved {
+                            "saved — type to replace"
+                        } else {
+                            "not set"
+                        })
                         .desired_width(180.0),
                 );
                 ui.label(
@@ -3676,7 +3798,11 @@ impl LauncherApp {
         for (i, d) in self.log_sources.iter_mut().enumerate() {
             let title = format!(
                 "{} ({})",
-                if d.name.trim().is_empty() { "new source" } else { d.name.trim() },
+                if d.name.trim().is_empty() {
+                    "new source"
+                } else {
+                    d.name.trim()
+                },
                 d.kind.as_str()
             );
             egui::CollapsingHeader::new(title)
@@ -3854,11 +3980,18 @@ impl LauncherApp {
         let id = d.id;
         let tx = self.log_check_tx.clone();
         std::thread::spawn(move || {
-            let result = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let result = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(runtime) => runtime.block_on(check_log_source(&cfg, &key)),
                 Err(e) => Err(format!("cannot start the check runtime: {e}")),
             };
-            let _ = tx.send(LogCheckResult { id, config: cfg, result });
+            let _ = tx.send(LogCheckResult {
+                id,
+                config: cfg,
+                result,
+            });
             // Wake the UI: nothing else would until the next input event.
             ctx.request_repaint();
         });
@@ -3897,7 +4030,10 @@ impl LauncherApp {
         for d in self.log_sources.iter().filter(|d| !d.is_blank()) {
             let cfg = d.to_config().map_err(|e| logs_tab_error(&e))?;
             if !seen.insert(cfg.name.clone()) {
-                return Err(logs_tab_error(&format!("Log source {}: the name is used twice", cfg.name)));
+                return Err(logs_tab_error(&format!(
+                    "Log source {}: the name is used twice",
+                    cfg.name
+                )));
             }
             if let Some(cluster) = cfg.clusters.iter().find(|c| !known.contains(*c)) {
                 return Err(logs_tab_error(&format!(
@@ -3986,7 +4122,11 @@ impl LauncherApp {
                 .filter(|s| !s.host.trim().is_empty())
                 .collect();
             if rows.is_empty() {
-                let kube_skipped = self.kube_slots.iter().filter(|slot| !slot.is_blank()).count();
+                let kube_skipped = self
+                    .kube_slots
+                    .iter()
+                    .filter(|slot| !slot.is_blank())
+                    .count();
                 if kube_skipped > 0 {
                     self.clear_error();
                     self.file_status = format!(
@@ -4109,14 +4249,22 @@ impl LauncherApp {
                     let ssh_free = !draft.has_kube_selection();
                     let kube_free = draft.match_tags.trim().is_empty();
                     if ui
-                        .add_enabled(ssh_free || !draft.kube, egui::RadioButton::new(!draft.kube, "SSH hosts by tags"))
-                        .on_disabled_hover_text("Clear the Kubernetes clusters, namespace and selector first")
+                        .add_enabled(
+                            ssh_free || !draft.kube,
+                            egui::RadioButton::new(!draft.kube, "SSH hosts by tags"),
+                        )
+                        .on_disabled_hover_text(
+                            "Clear the Kubernetes clusters, namespace and selector first",
+                        )
                         .clicked()
                     {
                         draft.kube = false;
                     }
                     if ui
-                        .add_enabled(kube_free || draft.kube, egui::RadioButton::new(draft.kube, "Kubernetes pods"))
+                        .add_enabled(
+                            kube_free || draft.kube,
+                            egui::RadioButton::new(draft.kube, "Kubernetes pods"),
+                        )
                         .on_disabled_hover_text("Clear Match tags first")
                         .clicked()
                     {
@@ -4201,10 +4349,8 @@ impl LauncherApp {
                             );
                         });
                     ui.label("Max parallel:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut draft.max_parallel).desired_width(40.0),
-                    )
-                    .on_hover_text("Upper bound on executors running at the same time");
+                    ui.add(egui::TextEdit::singleline(&mut draft.max_parallel).desired_width(40.0))
+                        .on_hover_text("Upper bound on executors running at the same time");
                     ui.label("Per-host timeout (s):");
                     ui.add(
                         egui::TextEdit::singleline(&mut draft.per_host_timeout_secs)
@@ -4392,7 +4538,11 @@ impl LauncherApp {
         settings.last_ssh = self.persisted_last_ssh();
         settings.temperature = p.map_or_else(String::new, |x| x.temperature.clone());
         settings.extra_body = p.map_or_else(String::new, |x| x.extra_body.clone());
-        settings.profiles = self.profiles.iter().map(LlmProfileData::to_profile).collect();
+        settings.profiles = self
+            .profiles
+            .iter()
+            .map(LlmProfileData::to_profile)
+            .collect();
         settings.selected_profile = self.selected_profile;
         settings.save_dir = self.save_dir.clone();
         settings.arbiter_profile = self.arbiter_profile.clone();
@@ -4513,7 +4663,11 @@ impl LauncherApp {
         if self.selected_kube.is_some() {
             return Ok(());
         }
-        let Some(slot) = self.target_mode.checked_sub(1).and_then(|i| self.ssh_slots.get(i)) else {
+        let Some(slot) = self
+            .target_mode
+            .checked_sub(1)
+            .and_then(|i| self.ssh_slots.get(i))
+        else {
             return Ok(());
         };
         if slot.auth != SlotAuth::Key {
@@ -4614,12 +4768,10 @@ impl LauncherApp {
             clusters.push(cluster);
         }
         if let Some(selected) = self.selected_kube {
-            if self
-                .kube_slots
-                .get(selected)
-                .is_none_or(KubeSlot::is_blank)
-            {
-                return Err("Name and context are required for the selected Kubernetes cluster.".into());
+            if self.kube_slots.get(selected).is_none_or(KubeSlot::is_blank) {
+                return Err(
+                    "Name and context are required for the selected Kubernetes cluster.".into(),
+                );
             }
         }
         Ok(clusters)
@@ -4859,7 +5011,9 @@ impl LauncherApp {
                 alias: slot.alias.clone(),
                 tags: parse_tags(&slot.tags),
             })
-        } else { None };
+        } else {
+            None
+        };
         let kube_clusters = match self.persistable_kube_clusters() {
             Ok(clusters) => clusters,
             Err(msg) => {
@@ -4882,14 +5036,20 @@ impl LauncherApp {
         }
 
         let settings = Settings {
-            model: p.model.clone(), api_base_url: p.api_base_url.clone(),
+            model: p.model.clone(),
+            api_base_url: p.api_base_url.clone(),
             ssh_profiles: self.persistable_ssh_profiles(),
             kube_profiles: kube_clusters.clone(),
             last_kube: self.selected_kube_name(),
             ssh_list_version: SSH_LIST_VERSION,
             last_ssh: self.persisted_last_ssh(),
-            temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
-            profiles: self.profiles.iter().map(LlmProfileData::to_profile).collect(),
+            temperature: p.temperature.clone(),
+            extra_body: p.extra_body.clone(),
+            profiles: self
+                .profiles
+                .iter()
+                .map(LlmProfileData::to_profile)
+                .collect(),
             selected_profile: self.selected_profile,
             save_dir: self.save_dir.clone(),
             arbiter_profile: self.arbiter_profile.clone(),
@@ -4955,12 +5115,20 @@ impl LauncherApp {
             ssh,
             kube,
             kube_clusters: Some(kube_clusters),
-            model: p.model.clone(), api_base_url: p.api_base_url.clone(),
-            api_key: sanitize_secret_clipboard(&p.api_key), session_id,
-            temperature: p.temperature.clone(), extra_body: p.extra_body.clone(),
-            selected_profile: Some(p.name.clone()), key_env: p.key_env.clone(),
+            model: p.model.clone(),
+            api_base_url: p.api_base_url.clone(),
+            api_key: sanitize_secret_clipboard(&p.api_key),
+            session_id,
+            temperature: p.temperature.clone(),
+            extra_body: p.extra_body.clone(),
+            selected_profile: Some(p.name.clone()),
+            key_env: p.key_env.clone(),
             save_dir: self.save_dir.clone(),
-            profiles: self.profiles.iter().map(LlmProfileData::to_profile).collect(),
+            profiles: self
+                .profiles
+                .iter()
+                .map(LlmProfileData::to_profile)
+                .collect(),
             ssh_targets,
             arbiter_profile: self.arbiter_profile.clone(),
             host_groups: Some(host_groups),
@@ -4989,21 +5157,18 @@ impl eframe::App for LauncherApp {
                     // launching now would drop the staged import silently
                     // (#416 review).
                     if ui
-                        .add_enabled(
-                            self.import_dialog.is_none(),
-                            egui::Button::new("Launch"),
-                        )
+                        .add_enabled(self.import_dialog.is_none(), egui::Button::new("Launch"))
                         .clicked()
                     {
                         self.do_launch();
                     }
-                if ui.button("Cancel").clicked() {
-                    std::process::exit(0);
+                    if ui.button("Cancel").clicked() {
+                        std::process::exit(0);
+                    }
+                });
+                if !self.validation_error.is_empty() {
+                    ui.colored_label(egui::Color32::RED, &self.validation_error);
                 }
-            });
-            if !self.validation_error.is_empty() {
-                ui.colored_label(egui::Color32::RED, &self.validation_error);
-            }
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -5083,9 +5248,10 @@ pub fn run_launcher(config: &Config) {
         .map(|(i, cluster)| KubeSlot::from_cluster(i as u64, cluster))
         .collect();
     let next_kube_slot_id = kube_slots.len() as u64;
-    let selected_kube = settings.last_kube.as_ref().and_then(|name| {
-        kube_slots.iter().position(|slot| slot.name == *name)
-    });
+    let selected_kube = settings
+        .last_kube
+        .as_ref()
+        .and_then(|name| kube_slots.iter().position(|slot| slot.name == *name));
     let (kube_check_tx, kube_check_rx) = std::sync::mpsc::channel();
     let (log_check_tx, log_check_rx) = std::sync::mpsc::channel();
     let log_sources: Vec<LogSourceDraft> = config
@@ -5116,8 +5282,16 @@ pub fn run_launcher(config: &Config) {
         let api_key = load_secret(api_key_cred_name());
         profiles.push(LlmProfileData {
             name: "default".into(),
-            model: if settings.model.is_empty() { config.llm.model.clone() } else { settings.model.clone() },
-            api_base_url: if settings.api_base_url.is_empty() { config.llm.api_base_url.clone() } else { settings.api_base_url.clone() },
+            model: if settings.model.is_empty() {
+                config.llm.model.clone()
+            } else {
+                settings.model.clone()
+            },
+            api_base_url: if settings.api_base_url.is_empty() {
+                config.llm.api_base_url.clone()
+            } else {
+                settings.api_base_url.clone()
+            },
             key_env: api_key_cred_name().to_string(),
             api_key,
             temperature: settings.temperature.clone(),
@@ -5153,14 +5327,19 @@ pub fn run_launcher(config: &Config) {
             temperature: settings.temperature.clone(),
             extra_body: settings.extra_body.clone(),
             profiles: profiles.iter().map(LlmProfileData::to_profile).collect(),
-            selected_profile: settings.selected_profile.min(profiles.len().saturating_sub(1)),
+            selected_profile: settings
+                .selected_profile
+                .min(profiles.len().saturating_sub(1)),
             save_dir: settings.save_dir.clone(),
             arbiter_profile: settings.arbiter_profile.clone(),
-        }.save();
+        }
+        .save();
         tracing::info!("persisted deduplicated profile config on startup");
     }
 
-    let selected_profile = settings.selected_profile.min(profiles.len().saturating_sub(1));
+    let selected_profile = settings
+        .selected_profile
+        .min(profiles.len().saturating_sub(1));
 
     let app = LauncherApp {
         sessions,
@@ -5201,7 +5380,11 @@ pub fn run_launcher(config: &Config) {
         log_check_rx,
         import_dialog: None,
         file_status: String::new(),
-        host_groups: config.host_groups.iter().map(HostGroupDraft::from_group).collect(),
+        host_groups: config
+            .host_groups
+            .iter()
+            .map(HostGroupDraft::from_group)
+            .collect(),
         active_tab: 0,
         key_probe: None,
     };
@@ -5215,11 +5398,7 @@ pub fn run_launcher(config: &Config) {
         ..Default::default()
     };
 
-    let _ = eframe::run_native(
-        "Filar",
-        options,
-        Box::new(|_cc| Ok(Box::new(app))),
-    );
+    let _ = eframe::run_native("Filar", options, Box::new(|_cc| Ok(Box::new(app))));
 }
 
 // ---------------------------------------------------------------------------
@@ -5485,7 +5664,10 @@ mod tests {
             log_sources: None,
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
-        assert!(!json.contains("\"password\":"), "must not emit password key when None, got: {json}");
+        assert!(
+            !json.contains("\"password\":"),
+            "must not emit password key when None, got: {json}"
+        );
         assert!(json.contains("10.0.0.1"), "ssh target must survive");
         // And the secret-detection heuristic in load_pending_launch must not trip.
         assert!(!json.contains("\"api_key\":"), "must not emit api_key");
@@ -5519,7 +5701,10 @@ mod tests {
         assert_eq!(stored.compact_at_tokens, 120_000);
 
         // …and back into the editor, unchanged.
-        assert_eq!(stored.compact_at_tokens.to_string(), edited.compact_at_tokens);
+        assert_eq!(
+            stored.compact_at_tokens.to_string(),
+            edited.compact_at_tokens
+        );
 
         // The value must also survive serialisation into settings.json /
         // pending_launch.json.
@@ -5538,7 +5723,11 @@ mod tests {
 
         assert_eq!(stored.max_tokens, 32_000, "max_tokens must not be reset");
         assert_eq!(stored.top_p, Some(0.85), "top_p must not be dropped");
-        assert_eq!(stored.temperature, Some(0.3), "temperature must survive too");
+        assert_eq!(
+            stored.temperature,
+            Some(0.3),
+            "temperature must survive too"
+        );
 
         // Through settings.json / pending_launch.json…
         let json = serde_json::to_string(&stored).unwrap();
@@ -5583,7 +5772,10 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let loaded: LaunchConfig = serde_json::from_str(&json).unwrap();
         let profile = &loaded.profiles[0];
-        assert_eq!(profile.max_tokens, 32_000, "must not arrive as the 4096 default");
+        assert_eq!(
+            profile.max_tokens, 32_000,
+            "must not arrive as the 4096 default"
+        );
         assert_eq!(profile.top_p, Some(0.85), "must not arrive as None");
     }
 
@@ -5639,22 +5831,38 @@ mod tests {
         vec![
             (
                 "temperature",
-                LlmProfileData { name: "other".into(), temperature: "5".into(), ..edited_profile() },
+                LlmProfileData {
+                    name: "other".into(),
+                    temperature: "5".into(),
+                    ..edited_profile()
+                },
                 "Invalid temperature",
             ),
             (
                 "max_tokens",
-                LlmProfileData { name: "other".into(), max_tokens: "abc".into(), ..edited_profile() },
+                LlmProfileData {
+                    name: "other".into(),
+                    max_tokens: "abc".into(),
+                    ..edited_profile()
+                },
                 "Invalid max tokens",
             ),
             (
                 "top_p",
-                LlmProfileData { name: "other".into(), top_p: "2.5".into(), ..edited_profile() },
+                LlmProfileData {
+                    name: "other".into(),
+                    top_p: "2.5".into(),
+                    ..edited_profile()
+                },
                 "Invalid top_p",
             ),
             (
                 "compact_at_tokens",
-                LlmProfileData { name: "other".into(), compact_at_tokens: "-1".into(), ..edited_profile() },
+                LlmProfileData {
+                    name: "other".into(),
+                    compact_at_tokens: "-1".into(),
+                    ..edited_profile()
+                },
                 "Invalid compaction threshold",
             ),
         ]
@@ -5666,7 +5874,10 @@ mod tests {
         // only, so a typo left in another one was rewritten as a default by the
         // next save — adding a profile with "+" was enough to trigger it.
         for (field, bad, expected) in invalid_field_cases() {
-            let selected = LlmProfileData { name: "selected".into(), ..edited_profile() };
+            let selected = LlmProfileData {
+                name: "selected".into(),
+                ..edited_profile()
+            };
             let mut app = app_with_profiles(vec![selected, bad]);
 
             app.save_profiles();
@@ -5694,7 +5905,10 @@ mod tests {
         // too, so it needs the same check. `validate_launch` is the part of
         // `do_launch` that can be called here — the rest exits the process.
         for (field, bad, expected) in invalid_field_cases() {
-            let selected = LlmProfileData { name: "selected".into(), ..edited_profile() };
+            let selected = LlmProfileData {
+                name: "selected".into(),
+                ..edited_profile()
+            };
             let mut app = app_with_profiles(vec![selected, bad]);
 
             assert!(!app.validate_launch(), "{field}: launch must be refused");
@@ -5714,8 +5928,15 @@ mod tests {
     #[test]
     fn launch_accepts_a_list_where_every_profile_is_valid() {
         let mut app = app_with_profiles(vec![
-            LlmProfileData { name: "one".into(), ..edited_profile() },
-            LlmProfileData { name: "two".into(), temperature: String::new(), ..edited_profile() },
+            LlmProfileData {
+                name: "one".into(),
+                ..edited_profile()
+            },
+            LlmProfileData {
+                name: "two".into(),
+                temperature: String::new(),
+                ..edited_profile()
+            },
         ]);
         assert!(app.validate_launch(), "got {:?}", app.validation_error);
     }
@@ -5779,7 +6000,10 @@ mod tests {
         // so the list has to be checked *without* the doomed profile before
         // anything is removed — otherwise settings.json keeps a profile whose
         // API key is already gone from the OS store (review of #389).
-        let doomed = LlmProfileData { name: "doomed".into(), ..edited_profile() };
+        let doomed = LlmProfileData {
+            name: "doomed".into(),
+            ..edited_profile()
+        };
         let broken = LlmProfileData {
             name: "broken".into(),
             max_tokens: "abc".into(),
@@ -5788,7 +6012,11 @@ mod tests {
         let profiles = vec![doomed, broken];
 
         // What the delete handler checks: everything except the selected entry.
-        let remaining = profiles.iter().enumerate().filter(|(i, _)| *i != 0).map(|(_, p)| p);
+        let remaining = profiles
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 0)
+            .map(|(_, p)| p);
         let verdict = validate_all_profile_fields(remaining);
 
         assert!(
@@ -5801,15 +6029,26 @@ mod tests {
     #[test]
     fn deleting_a_profile_is_allowed_when_the_rest_are_valid() {
         let profiles = vec![
-            LlmProfileData { name: "doomed".into(), ..edited_profile() },
-            LlmProfileData { name: "fine".into(), ..edited_profile() },
+            LlmProfileData {
+                name: "doomed".into(),
+                ..edited_profile()
+            },
+            LlmProfileData {
+                name: "fine".into(),
+                ..edited_profile()
+            },
         ];
-        let remaining = profiles.iter().enumerate().filter(|(i, _)| *i != 0).map(|(_, p)| p);
+        let remaining = profiles
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 0)
+            .map(|(_, p)| p);
         assert!(validate_all_profile_fields(remaining).is_ok());
     }
 
     #[test]
-    fn launch_config_round_trips_arbiter_profile() {        let cfg = LaunchConfig {
+    fn launch_config_round_trips_arbiter_profile() {
+        let cfg = LaunchConfig {
             target: "local".into(),
             ssh: None,
             kube: None,
@@ -5839,9 +6078,13 @@ mod tests {
     /// "not said" (a file from before #501) stay distinguishable.
     #[test]
     fn launch_config_carries_host_groups() {
-        let json = r#"{"target":"local","ssh":null,"model":"m","api_base_url":"u","session_id":null}"#;
+        let json =
+            r#"{"target":"local","ssh":null,"model":"m","api_base_url":"u","session_id":null}"#;
         let old: LaunchConfig = serde_json::from_str(json).unwrap();
-        assert!(old.host_groups.is_none(), "a pre-#501 file says nothing about groups");
+        assert!(
+            old.host_groups.is_none(),
+            "a pre-#501 file says nothing about groups"
+        );
 
         let group: filar_core::HostGroup =
             toml::from_str("name = \"sim-all\"\nmatch = [\"sim\"]").unwrap();
@@ -5866,9 +6109,14 @@ mod tests {
         // Replicate what Settings::save does: create_dir_all + write.
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         let s = Settings {
-            model: "test-model".into(), api_base_url: "https://example.com".into(),
-            ssh_profiles: vec![], kube_profiles: vec![], last_kube: None,
-            ssh_list_version: SSH_LIST_VERSION, last_ssh: 0, temperature: "0.5".into(),
+            model: "test-model".into(),
+            api_base_url: "https://example.com".into(),
+            ssh_profiles: vec![],
+            kube_profiles: vec![],
+            last_kube: None,
+            ssh_list_version: SSH_LIST_VERSION,
+            last_ssh: 0,
+            temperature: "0.5".into(),
             extra_body: String::new(),
             profiles: vec![],
             selected_profile: 0,
@@ -5877,7 +6125,8 @@ mod tests {
         };
         std::fs::write(&file, serde_json::to_string_pretty(&s).unwrap()).unwrap();
 
-        let loaded: Settings = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        let loaded: Settings =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(loaded.model, "test-model");
         assert_eq!(loaded.temperature, "0.5");
 
@@ -5920,7 +6169,10 @@ mod tests {
         std::fs::write(&file, corrupt).unwrap();
 
         let settings = Settings::load_from(Some(file.clone()));
-        assert!(settings.ssh_profiles.is_empty(), "fallback is in-memory only");
+        assert!(
+            settings.ssh_profiles.is_empty(),
+            "fallback is in-memory only"
+        );
         // The bytes — the only copy of the user's host list and profiles — must stay.
         assert_eq!(std::fs::read_to_string(&file).unwrap(), corrupt);
 
@@ -5947,7 +6199,10 @@ mod tests {
 
         let result = std::fs::read_to_string(&path).unwrap();
         assert!(result.contains("model = \"new\""), "model must be updated");
-        assert!(result.contains("[[ssh_targets]]"), "ssh_targets must survive");
+        assert!(
+            result.contains("[[ssh_targets]]"),
+            "ssh_targets must survive"
+        );
         assert!(result.contains("dev"), "ssh target name must survive");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -5956,8 +6211,26 @@ mod tests {
     #[test]
     fn config_save_writes_launcher_ssh_profiles() {
         let profiles = vec![
-            SshProfile { host: "10.0.0.1".into(), port: "2222".into(), user: "admin".into(), alias: String::new(), tags: "  ".into(), auth: Some(SlotAuth::Key), key_path: " /home/ops/.ssh/deploy ".into(), ..SshProfile::default() },
-            SshProfile { host: "10.0.0.2".into(), port: "22".into(), user: "root".into(), alias: "prod-web".into(), tags: "prod, web".into(), save_password: true, auth: Some(SlotAuth::Password), ..SshProfile::default() },
+            SshProfile {
+                host: "10.0.0.1".into(),
+                port: "2222".into(),
+                user: "admin".into(),
+                alias: String::new(),
+                tags: "  ".into(),
+                auth: Some(SlotAuth::Key),
+                key_path: " /home/ops/.ssh/deploy ".into(),
+                ..SshProfile::default()
+            },
+            SshProfile {
+                host: "10.0.0.2".into(),
+                port: "22".into(),
+                user: "root".into(),
+                alias: "prod-web".into(),
+                tags: "prod, web".into(),
+                save_password: true,
+                auth: Some(SlotAuth::Password),
+                ..SshProfile::default()
+            },
             SshProfile::default(), // empty slot — skipped
             SshProfile::default(),
             SshProfile::default(),
@@ -5973,12 +6246,18 @@ mod tests {
         // Auth follows the slot's login method, key path included (#489).
         match &result[0].auth {
             filar_core::SshAuth::Key { path, passphrase } => {
-                assert_eq!(path.as_deref(), Some(std::path::Path::new("/home/ops/.ssh/deploy")));
+                assert_eq!(
+                    path.as_deref(),
+                    Some(std::path::Path::new("/home/ops/.ssh/deploy"))
+                );
                 assert!(passphrase.is_none(), "no secret in the synced target");
             }
             other => panic!("expected Key auth, got {other:?}"),
         }
-        assert!(matches!(result[1].auth, filar_core::SshAuth::Password { password: None }));
+        assert!(matches!(
+            result[1].auth,
+            filar_core::SshAuth::Password { password: None }
+        ));
         // Tags pass through the launcher profile → SshTarget conversion; a
         // whitespace-only tag field is simply empty (#413).
         assert!(result[0].tags.is_empty(), "blank tag field → no tags");
@@ -5988,23 +6267,55 @@ mod tests {
     #[test]
     fn build_rewrites_all_targets_no_preservation() {
         let profiles = vec![
-            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: String::new(), tags: String::new(), save_password: false, ..SshProfile::default() },
-            SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
+            SshProfile {
+                host: "10.0.0.1".into(),
+                port: "22".into(),
+                user: "admin".into(),
+                alias: String::new(),
+                tags: String::new(),
+                save_password: false,
+                ..SshProfile::default()
+            },
+            SshProfile::default(),
+            SshProfile::default(),
+            SshProfile::default(),
+            SshProfile::default(),
         ];
         let result = build_ssh_targets_from_profiles(&profiles);
-        assert_eq!(result.len(), 1, "full rewrite only produces current profiles");
+        assert_eq!(
+            result.len(),
+            1,
+            "full rewrite only produces current profiles"
+        );
         assert_eq!(result[0].name, "SSH1");
     }
 
     #[test]
     fn build_removes_old_target_when_alias_changes() {
         let profiles = vec![
-            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: "prod-api".into(), tags: String::new(), save_password: false, ..SshProfile::default() },
-            SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
+            SshProfile {
+                host: "10.0.0.1".into(),
+                port: "22".into(),
+                user: "admin".into(),
+                alias: "prod-api".into(),
+                tags: String::new(),
+                save_password: false,
+                ..SshProfile::default()
+            },
+            SshProfile::default(),
+            SshProfile::default(),
+            SshProfile::default(),
+            SshProfile::default(),
         ];
         let result = build_ssh_targets_from_profiles(&profiles);
-        assert!(result.iter().any(|t| t.name == "prod-api"), "new alias target must be added");
-        assert!(result.iter().all(|t| t.name != "prod-web"), "old alias target with matching host must be removed");
+        assert!(
+            result.iter().any(|t| t.name == "prod-api"),
+            "new alias target must be added"
+        );
+        assert!(
+            result.iter().all(|t| t.name != "prod-web"),
+            "old alias target with matching host must be removed"
+        );
         assert_eq!(result.len(), 1);
     }
 
@@ -6013,11 +6324,26 @@ mod tests {
         // Profile with no alias — uses slot name SSH1. Old stale target
         // with same host/port/user but different name must be removed.
         let profiles = vec![
-            SshProfile { host: "10.0.0.1".into(), port: "22".into(), user: "admin".into(), alias: String::new(), tags: String::new(), save_password: false, ..SshProfile::default() },
-            SshProfile::default(), SshProfile::default(), SshProfile::default(), SshProfile::default(),
+            SshProfile {
+                host: "10.0.0.1".into(),
+                port: "22".into(),
+                user: "admin".into(),
+                alias: String::new(),
+                tags: String::new(),
+                save_password: false,
+                ..SshProfile::default()
+            },
+            SshProfile::default(),
+            SshProfile::default(),
+            SshProfile::default(),
+            SshProfile::default(),
         ];
         let result = build_ssh_targets_from_profiles(&profiles);
-        assert_eq!(result.len(), 1, "only SSH1 must remain, stale target removed");
+        assert_eq!(
+            result.len(),
+            1,
+            "only SSH1 must remain, stale target removed"
+        );
         assert_eq!(result[0].name, "SSH1");
     }
 
@@ -6026,7 +6352,10 @@ mod tests {
         // All profiles cleared (empty).
         let profiles = vec![SshProfile::default(); 5];
         let result = build_ssh_targets_from_profiles(&profiles);
-        assert!(result.is_empty(), "all launcher targets must be removed when slots are cleared");
+        assert!(
+            result.is_empty(),
+            "all launcher targets must be removed when slots are cleared"
+        );
     }
 
     #[test]
@@ -6039,7 +6368,10 @@ mod tests {
             ..SshProfile::default()
         };
         let auth_of = |p: SshProfile| build_ssh_targets_from_profiles(&[p]).remove(0).auth;
-        assert!(matches!(auth_of(profile(Some(SlotAuth::Agent), false)), filar_core::SshAuth::Agent));
+        assert!(matches!(
+            auth_of(profile(Some(SlotAuth::Agent), false)),
+            filar_core::SshAuth::Agent
+        ));
         assert!(matches!(
             auth_of(profile(Some(SlotAuth::Key), false)),
             filar_core::SshAuth::Key { path: None, .. }
@@ -6092,11 +6424,17 @@ mod tests {
     fn a_manual_host_never_shadows_a_launcher_target() {
         let merged = merge_manual_ssh_targets(
             build_ssh_targets_from_profiles(&[ssh_profile("10.0.0.11", "web-1")]),
-            &[config_target("web-1", "10.9.0.1"), config_target("fleet-01", "10.9.0.2")],
+            &[
+                config_target("web-1", "10.9.0.1"),
+                config_target("fleet-01", "10.9.0.2"),
+            ],
         );
         let web_1: Vec<_> = merged.iter().filter(|t| t.name == "web-1").collect();
         assert_eq!(web_1.len(), 1, "one entry per name");
-        assert_eq!(web_1[0].host, "10.0.0.11", "the launcher's host is the one that connects");
+        assert_eq!(
+            web_1[0].host, "10.0.0.11",
+            "the launcher's host is the one that connects"
+        );
         assert!(
             merged.iter().any(|t| t.name == "fleet-01"),
             "the non-colliding manual host stays"
@@ -6121,15 +6459,23 @@ mod tests {
             build_ssh_targets_from_profiles(&[ssh_profile("10.0.0.12", "web-2")]),
             &manual,
         );
-        assert!(after.iter().all(|t| t.name != "web-1"), "removed launcher host must be gone");
+        assert!(
+            after.iter().all(|t| t.name != "web-1"),
+            "removed launcher host must be gone"
+        );
         assert!(after.iter().any(|t| t.name == "web-2"));
-        assert!(after.iter().any(|t| t.name == "fleet-01"), "the manual host stays");
+        assert!(
+            after.iter().any(|t| t.name == "fleet-01"),
+            "the manual host stays"
+        );
     }
 
     #[test]
     fn a_manual_password_never_reaches_the_launch_payload() {
         let mut target = config_target("pw-host", "10.9.0.88");
-        target.auth = filar_core::SshAuth::Password { password: Some("hunter2".into()) };
+        target.auth = filar_core::SshAuth::Password {
+            password: Some("hunter2".into()),
+        };
         let merged = merge_manual_ssh_targets(Vec::new(), &strip_manual_ssh_passwords(&[target]));
 
         // `pending_launch.json` is plain text and `load_pending_launch`
@@ -6137,16 +6483,47 @@ mod tests {
         // gone while the auth variant survives (the keyring/prompt resolves
         // the credential).
         let json = serde_json::to_string(&merged).expect("launch payload must serialize");
-        assert!(!json.contains("\"password\":"), "no password key in the payload: {json}");
-        assert!(!json.contains("hunter2"), "no password value in the payload: {json}");
-        assert!(json.contains("\"type\":\"password\""), "password auth stays: {json}");
+        assert!(
+            !json.contains("\"password\":"),
+            "no password key in the payload: {json}"
+        );
+        assert!(
+            !json.contains("hunter2"),
+            "no password value in the payload: {json}"
+        );
+        assert!(
+            json.contains("\"type\":\"password\""),
+            "password auth stays: {json}"
+        );
     }
 
     #[test]
     fn unique_profile_name_fills_gaps() {
         let existing = vec![
-            LlmProfileData { name: "profile-1".into(), model: String::new(), api_base_url: String::new(), key_env: String::new(), api_key: String::new(), temperature: String::new(), max_tokens: String::new(), top_p: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
-            LlmProfileData { name: "profile-3".into(), model: String::new(), api_base_url: String::new(), key_env: String::new(), api_key: String::new(), temperature: String::new(), max_tokens: String::new(), top_p: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
+            LlmProfileData {
+                name: "profile-1".into(),
+                model: String::new(),
+                api_base_url: String::new(),
+                key_env: String::new(),
+                api_key: String::new(),
+                temperature: String::new(),
+                max_tokens: String::new(),
+                top_p: String::new(),
+                extra_body: String::new(),
+                compact_at_tokens: String::new(),
+            },
+            LlmProfileData {
+                name: "profile-3".into(),
+                model: String::new(),
+                api_base_url: String::new(),
+                key_env: String::new(),
+                api_key: String::new(),
+                temperature: String::new(),
+                max_tokens: String::new(),
+                top_p: String::new(),
+                extra_body: String::new(),
+                compact_at_tokens: String::new(),
+            },
         ];
         let name = unique_profile_name(&existing, "profile");
         assert_eq!(name, "profile-2", "must find first free number, not len+1");
@@ -6162,24 +6539,85 @@ mod tests {
     #[test]
     fn deduplicate_profiles_renames_collisions() {
         let mut profiles = vec![
-            LlmProfileData { name: "dup".into(), model: String::new(), api_base_url: String::new(), key_env: "k1".into(), api_key: String::new(), temperature: String::new(), max_tokens: String::new(), top_p: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
-            LlmProfileData { name: "dup".into(), model: String::new(), api_base_url: String::new(), key_env: "k2".into(), api_key: String::new(), temperature: String::new(), max_tokens: String::new(), top_p: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
+            LlmProfileData {
+                name: "dup".into(),
+                model: String::new(),
+                api_base_url: String::new(),
+                key_env: "k1".into(),
+                api_key: String::new(),
+                temperature: String::new(),
+                max_tokens: String::new(),
+                top_p: String::new(),
+                extra_body: String::new(),
+                compact_at_tokens: String::new(),
+            },
+            LlmProfileData {
+                name: "dup".into(),
+                model: String::new(),
+                api_base_url: String::new(),
+                key_env: "k2".into(),
+                api_key: String::new(),
+                temperature: String::new(),
+                max_tokens: String::new(),
+                top_p: String::new(),
+                extra_body: String::new(),
+                compact_at_tokens: String::new(),
+            },
         ];
         deduplicate_profiles(&mut profiles);
-        assert_ne!(profiles[0].name, profiles[1].name, "names must differ after dedup");
+        assert_ne!(
+            profiles[0].name, profiles[1].name,
+            "names must differ after dedup"
+        );
     }
 
     #[test]
     fn deduplicate_three_identical_names_completes() {
         let mut profiles = vec![
-            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k1".into(), api_key: String::new(), temperature: String::new(), max_tokens: String::new(), top_p: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
-            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k2".into(), api_key: String::new(), temperature: String::new(), max_tokens: String::new(), top_p: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
-            LlmProfileData { name: "x".into(), model: String::new(), api_base_url: String::new(), key_env: "k3".into(), api_key: String::new(), temperature: String::new(), max_tokens: String::new(), top_p: String::new(), extra_body: String::new(), compact_at_tokens: String::new() },
+            LlmProfileData {
+                name: "x".into(),
+                model: String::new(),
+                api_base_url: String::new(),
+                key_env: "k1".into(),
+                api_key: String::new(),
+                temperature: String::new(),
+                max_tokens: String::new(),
+                top_p: String::new(),
+                extra_body: String::new(),
+                compact_at_tokens: String::new(),
+            },
+            LlmProfileData {
+                name: "x".into(),
+                model: String::new(),
+                api_base_url: String::new(),
+                key_env: "k2".into(),
+                api_key: String::new(),
+                temperature: String::new(),
+                max_tokens: String::new(),
+                top_p: String::new(),
+                extra_body: String::new(),
+                compact_at_tokens: String::new(),
+            },
+            LlmProfileData {
+                name: "x".into(),
+                model: String::new(),
+                api_base_url: String::new(),
+                key_env: "k3".into(),
+                api_key: String::new(),
+                temperature: String::new(),
+                max_tokens: String::new(),
+                top_p: String::new(),
+                extra_body: String::new(),
+                compact_at_tokens: String::new(),
+            },
         ];
         deduplicate_profiles(&mut profiles);
         assert_ne!(profiles[0].name, profiles[1].name);
         assert_ne!(profiles[1].name, profiles[2].name);
-        assert_ne!(profiles[0].name, profiles[2].name, "all three must be unique after dedup");
+        assert_ne!(
+            profiles[0].name, profiles[2].name,
+            "all three must be unique after dedup"
+        );
     }
 
     #[test]
@@ -6200,7 +6638,12 @@ mod tests {
         assert_eq!(ssh_cred_name(1, "сервер"), "ssh_target:сервер");
     }
 
-    fn make_meta(ssh_info: Option<&str>, llm_profile: Option<&str>, model: Option<&str>, api_base_url: Option<&str>) -> SessionMeta {
+    fn make_meta(
+        ssh_info: Option<&str>,
+        llm_profile: Option<&str>,
+        model: Option<&str>,
+        api_base_url: Option<&str>,
+    ) -> SessionMeta {
         SessionMeta {
             id: "1".into(),
             timestamp: "2026-08-14 00:00:00".into(),
@@ -6333,8 +6776,14 @@ mod tests {
         app.profiles[0].model = "keep-me".into();
         app.profiles[0].api_base_url = "https://keep.example.com".into();
         app.on_session_selected(0);
-        assert_eq!(app.selected_profile, 0, "no matching profile → keep current");
-        assert_eq!(app.profiles[0].model, "keep-me", "unrelated profile must not be overwritten");
+        assert_eq!(
+            app.selected_profile, 0,
+            "no matching profile → keep current"
+        );
+        assert_eq!(
+            app.profiles[0].model, "keep-me",
+            "unrelated profile must not be overwritten"
+        );
         assert_eq!(app.profiles[0].api_base_url, "https://keep.example.com");
     }
 
@@ -6353,12 +6802,20 @@ mod tests {
         let mut app = make_app(meta);
         app.validation_error = "stale warning".into();
         app.on_session_selected(0);
-        assert!(app.validation_error.is_empty(), "Local selection must clear stale warning");
+        assert!(
+            app.validation_error.is_empty(),
+            "Local selection must clear stale warning"
+        );
     }
 
     #[test]
     fn session_click_flat_model_fills_current_profile() {
-        let meta = make_meta(None, None, Some("flat-model"), Some("https://flat.example.com"));
+        let meta = make_meta(
+            None,
+            None,
+            Some("flat-model"),
+            Some("https://flat.example.com"),
+        );
         let mut app = make_app(meta);
         app.on_session_selected(0);
         assert_eq!(app.selected_profile, 0);
@@ -6372,7 +6829,10 @@ mod tests {
         let mut app = make_app(meta);
         app.ssh_slots[0].port = "22abc".into();
         app.on_session_selected(0);
-        assert_eq!(app.target_mode, 0, "invalid non-empty port must not match 22");
+        assert_eq!(
+            app.target_mode, 0,
+            "invalid non-empty port must not match 22"
+        );
     }
 
     #[test]
@@ -6445,8 +6905,14 @@ mod tests {
         ];
         assert!(migrate_ssh_profiles(&mut profiles));
         assert_eq!(profiles[0].alias, "SSH1");
-        assert_eq!(profiles[1].alias, "SSH1_dup", "a duplicate hides a host from Ctrl+O");
-        assert!(!migrate_ssh_profiles(&mut profiles), "second run must change nothing");
+        assert_eq!(
+            profiles[1].alias, "SSH1_dup",
+            "a duplicate hides a host from Ctrl+O"
+        );
+        assert!(
+            !migrate_ssh_profiles(&mut profiles),
+            "second run must change nothing"
+        );
     }
 
     #[test]
@@ -6544,7 +7010,10 @@ mod tests {
         assert_eq!(app.ssh_slots.len(), 2);
         assert_eq!(app.target_mode, 2, "the new row becomes the edited target");
         assert!(app.ssh_slots[1].host.is_empty());
-        assert_eq!(app.ssh_slots[1].port, "22", "a fresh row defaults to port 22");
+        assert_eq!(
+            app.ssh_slots[1].port, "22",
+            "a fresh row defaults to port 22"
+        );
     }
 
     #[test]
@@ -6564,7 +7033,10 @@ mod tests {
         app.move_host_down(1);
         let aliases: Vec<&str> = app.ssh_slots.iter().map(|s| s.alias.as_str()).collect();
         assert_eq!(aliases, ["one", "three", "two"]);
-        assert_eq!(app.target_mode, 2, "the passed-over row moved one position up");
+        assert_eq!(
+            app.target_mode, 2,
+            "the passed-over row moved one position up"
+        );
     }
 
     #[test]
@@ -6661,7 +7133,11 @@ mod tests {
         let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
         app.add_host();
         let persisted = app.persistable_ssh_profiles();
-        assert_eq!(persisted.len(), 1, "the scratch row must not reach settings.json");
+        assert_eq!(
+            persisted.len(),
+            1,
+            "the scratch row must not reach settings.json"
+        );
         assert_eq!(persisted[0].alias, "web-1");
     }
 
@@ -6676,7 +7152,11 @@ mod tests {
         app.add_host(); // blank scratch row at index 1
 
         let ops = app.ssh_credential_ops();
-        assert_eq!(ops.len(), 1, "only the persisted host may touch the keyring");
+        assert_eq!(
+            ops.len(),
+            1,
+            "only the persisted host may touch the keyring"
+        );
         assert_eq!(ops[0].0, "ssh_target:SSH2");
         assert_eq!(ops[0].1.as_deref(), Some("s3cret"));
 
@@ -6695,7 +7175,10 @@ mod tests {
         app.ssh_slots[0].save_password = true;
         app.ssh_slots[0].password = "s3cret".into();
         app.ssh_slots[0].auth = SlotAuth::Key;
-        assert_eq!(app.ssh_credential_ops(), vec![("ssh_target:web-1".to_string(), None)]);
+        assert_eq!(
+            app.ssh_credential_ops(),
+            vec![("ssh_target:web-1".to_string(), None)]
+        );
     }
 
     #[test]
@@ -6708,14 +7191,23 @@ mod tests {
         slot.save_passphrase = true;
         assert_eq!(
             app.key_passphrase_ops(),
-            vec![("ssh_key_passphrase:web-1".to_string(), Some("correct horse".to_string()))]
+            vec![(
+                "ssh_key_passphrase:web-1".to_string(),
+                Some("correct horse".to_string())
+            )]
         );
         // Unchecked, or another login method: the entry is cleared.
         app.ssh_slots[0].save_passphrase = false;
-        assert_eq!(app.key_passphrase_ops(), vec![("ssh_key_passphrase:web-1".to_string(), None)]);
+        assert_eq!(
+            app.key_passphrase_ops(),
+            vec![("ssh_key_passphrase:web-1".to_string(), None)]
+        );
         app.ssh_slots[0].save_passphrase = true;
         app.ssh_slots[0].auth = SlotAuth::Agent;
-        assert_eq!(app.key_passphrase_ops(), vec![("ssh_key_passphrase:web-1".to_string(), None)]);
+        assert_eq!(
+            app.key_passphrase_ops(),
+            vec![("ssh_key_passphrase:web-1".to_string(), None)]
+        );
     }
 
     #[test]
@@ -6724,9 +7216,14 @@ mod tests {
         // target name of a launcher host is its alias (#489).
         assert_eq!(
             slot_passphrase_cred_name(3, "prod-web"),
-            filar_core::ssh_key_passphrase_name(&filar_core::ssh_target_display_name(3, "prod-web"))
+            filar_core::ssh_key_passphrase_name(&filar_core::ssh_target_display_name(
+                3, "prod-web"
+            ))
         );
-        assert_eq!(slot_passphrase_cred_name(3, "prod-web"), "ssh_key_passphrase:prod-web");
+        assert_eq!(
+            slot_passphrase_cred_name(3, "prod-web"),
+            "ssh_key_passphrase:prod-web"
+        );
     }
 
     #[test]
@@ -6735,7 +7232,10 @@ mod tests {
         slot.password = "s3cret".into();
         slot.passphrase = "correct horse".into();
         let debug = format!("{slot:?}");
-        assert!(!debug.contains("s3cret") && !debug.contains("correct horse"), "{debug}");
+        assert!(
+            !debug.contains("s3cret") && !debug.contains("correct horse"),
+            "{debug}"
+        );
     }
 
     #[test]
@@ -6767,7 +7267,11 @@ mod tests {
         let slot = SshSlot::from_profile(&profile, 0);
         assert_eq!(slot.auth, SlotAuth::Password);
         assert_eq!(slot.to_profile().auth, Some(SlotAuth::Password));
-        assert_eq!(SshSlot::blank().auth, SlotAuth::Agent, "new hosts use the agent");
+        assert_eq!(
+            SshSlot::blank().auth,
+            SlotAuth::Agent,
+            "new hosts use the agent"
+        );
     }
 
     const KEY_PASSPHRASE: &str = "correct horse";
@@ -6793,7 +7297,10 @@ mod tests {
         let key = if encrypted {
             key.encrypt_with(
                 Cipher::Aes256Ctr,
-                Kdf::Bcrypt { salt: [6u8; 16].to_vec(), rounds: 1 },
+                Kdf::Bcrypt {
+                    salt: [6u8; 16].to_vec(),
+                    rounds: 1,
+                },
                 11,
                 KEY_PASSPHRASE,
             )
@@ -6828,7 +7335,10 @@ mod tests {
         app.ssh_slots[0].passphrase = "battery staple".into();
         let err = app.validate_selected_key().unwrap_err();
         assert!(err.starts_with("Wrong passphrase for SSH key"), "{err}");
-        assert!(!err.contains("battery staple"), "the error must not echo it: {err}");
+        assert!(
+            !err.contains("battery staple"),
+            "the error must not echo it: {err}"
+        );
 
         app.ssh_slots[0].passphrase = KEY_PASSPHRASE.into();
         assert_eq!(app.validate_selected_key(), Ok(()));
@@ -6878,11 +7388,14 @@ mod tests {
         // raw slot index would preselect a different host after a restart.
         // The 1-based encoding keeps Local (0) apart from the first
         // persisted host (1).
-        let mut app =
-            app_with_hosts(&[("", ""), ("10.0.0.11", "web-1"), ("10.0.0.12", "web-2")]);
+        let mut app = app_with_hosts(&[("", ""), ("10.0.0.11", "web-1"), ("10.0.0.12", "web-2")]);
         assert_eq!(app.persisted_last_ssh(), 0, "Local remembers no host");
         app.target_mode = 1; // the blank scratch row itself
-        assert_eq!(app.persisted_last_ssh(), 0, "a blank row has no persisted counterpart");
+        assert_eq!(
+            app.persisted_last_ssh(),
+            0,
+            "a blank row has no persisted counterpart"
+        );
         app.target_mode = 2; // web-1: first persisted position
         assert_eq!(app.persisted_last_ssh(), 1);
         app.target_mode = 3; // web-2: second persisted position
@@ -6974,7 +7487,9 @@ mod tests {
         assert_eq!(rows[19].slot.alias, "fleet-20");
         assert_eq!(rows[19].slot.host, "192.0.2.20");
         // Secrets are never part of an import.
-        assert!(rows.iter().all(|r| r.slot.password.is_empty() && !r.slot.save_password));
+        assert!(rows
+            .iter()
+            .all(|r| r.slot.password.is_empty() && !r.slot.save_password));
         // No auth table in the file — the rows carry no auth verdict (#417).
         assert!(rows.iter().all(|r| r.auth.is_none()));
     }
@@ -7022,7 +7537,10 @@ host_key_policy = \"strict\"
             "[[ssh_targets]]\nname = \"web-1\"\nhost = \"192.0.2.1\"\nauth = { type = \"password\", password = \"hunter2\" }\n",
         )
         .unwrap();
-        assert_eq!(rows[0].auth.as_ref().map(|a| a.kind), Some(SlotAuth::Password));
+        assert_eq!(
+            rows[0].auth.as_ref().map(|a| a.kind),
+            Some(SlotAuth::Password)
+        );
         assert!(
             rows[0].slot.password.is_empty(),
             "an inline secret must not be read"
@@ -7048,7 +7566,10 @@ host_key_policy = \"strict\"
         .unwrap();
         assert_eq!(
             rows[0].auth,
-            Some(ImportAuth { kind: SlotAuth::Key, key_path: "/root/.ssh/id_rsa".into() })
+            Some(ImportAuth {
+                kind: SlotAuth::Key,
+                key_path: "/root/.ssh/id_rsa".into()
+            })
         );
         assert_eq!(rows[0].slot.auth, SlotAuth::Key);
         assert_eq!(rows[0].slot.key_path, "/root/.ssh/id_rsa");
@@ -7066,8 +7587,15 @@ host_key_policy = \"strict\"
         )
         .unwrap();
         assert_eq!(rows[0].slot.auth, SlotAuth::Agent);
-        assert!(rows[0].slot.key_path.is_empty(), "a path only belongs to key login");
-        assert_eq!(rows[1].slot.auth, SlotAuth::Agent, "new hosts default to the agent");
+        assert!(
+            rows[0].slot.key_path.is_empty(),
+            "a path only belongs to key login"
+        );
+        assert_eq!(
+            rows[1].slot.auth,
+            SlotAuth::Agent,
+            "new hosts default to the agent"
+        );
         assert!(rows[1].auth.is_none());
     }
 
@@ -7077,8 +7605,7 @@ host_key_policy = \"strict\"
             parse_import_toml("[[ssh_targets]]\nname = \"\"\nhost = \"192.0.2.1\"\n").unwrap_err();
         assert!(err.contains("name must not be empty"), "got {err}");
 
-        let err =
-            parse_import_toml("[[ssh_targets]]\nname = \"web\"\nhost = \"\"\n").unwrap_err();
+        let err = parse_import_toml("[[ssh_targets]]\nname = \"web\"\nhost = \"\"\n").unwrap_err();
         assert!(err.contains("host must not be empty"), "got {err}");
 
         let err = parse_import_toml("[[ssh_targets]]\nname = \"web\"\nhost = \"h\"\nport = 0\n")
@@ -7119,7 +7646,9 @@ host_key_policy = \"strict\"
         assert_eq!(rows[1].slot.port, "22", "an empty port defaults to 22");
         assert_eq!(rows[1].slot.tags, "");
         // CSV has no auth column: rows default to key auth (#417).
-        assert!(rows.iter().all(|r| r.auth.is_none() && !r.slot.save_password));
+        assert!(rows
+            .iter()
+            .all(|r| r.auth.is_none() && !r.slot.save_password));
     }
 
     #[test]
@@ -7152,8 +7681,7 @@ host_key_policy = \"strict\"
     fn import_with_no_collisions_appends_all_rows() {
         let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
         let rows =
-            parse_import_toml("[[ssh_targets]]\nname = \"db-1\"\nhost = \"10.0.0.12\"\n")
-                .unwrap();
+            parse_import_toml("[[ssh_targets]]\nname = \"db-1\"\nhost = \"10.0.0.12\"\n").unwrap();
         assert_eq!(
             find_import_collisions(&app.ssh_slots, &rows),
             Vec::<String>::new()
@@ -7168,15 +7696,23 @@ host_key_policy = \"strict\"
     fn import_skip_keeps_the_existing_host() {
         let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
         let rows =
-            parse_import_toml("[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.99\"\n")
-                .unwrap();
+            parse_import_toml("[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.99\"\n").unwrap();
         let outcome = apply_import(&mut app.ssh_slots, rows, CollisionPolicy::Skip);
         assert_eq!(
             outcome,
-            ImportOutcome { added: 0, overwritten: 0, renamed: 0, skipped: 1, kube_skipped: 0 }
+            ImportOutcome {
+                added: 0,
+                overwritten: 0,
+                renamed: 0,
+                skipped: 1,
+                kube_skipped: 0
+            }
         );
         assert_eq!(app.ssh_slots.len(), 1);
-        assert_eq!(app.ssh_slots[0].host, "10.0.0.11", "the existing host survives");
+        assert_eq!(
+            app.ssh_slots[0].host, "10.0.0.11",
+            "the existing host survives"
+        );
     }
 
     #[test]
@@ -7288,10 +7824,9 @@ host_key_policy = \"strict\"
     #[test]
     fn import_alias_strips_control_characters() {
         // The TOML escape decodes to a raw BEL (U+0007) inside the name.
-        let rows = parse_import_toml(
-            "[[ssh_targets]]\nname = \"web\\u0007-1\"\nhost = \"10.0.0.9\"\n",
-        )
-        .unwrap();
+        let rows =
+            parse_import_toml("[[ssh_targets]]\nname = \"web\\u0007-1\"\nhost = \"10.0.0.9\"\n")
+                .unwrap();
         assert_eq!(
             rows[0].slot.alias, "web-1",
             "a control character must not reach the TUI status bar"
@@ -7312,8 +7847,7 @@ host_key_policy = \"strict\"
     fn import_rename_uses_the_first_free_suffix() {
         let mut app = app_with_hosts(&[("10.0.0.11", "web-1"), ("10.0.0.12", "web-1-2")]);
         let rows =
-            parse_import_toml("[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.99\"\n")
-                .unwrap();
+            parse_import_toml("[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.99\"\n").unwrap();
         let outcome = apply_import(&mut app.ssh_slots, rows, CollisionPolicy::Rename);
         assert_eq!(outcome.renamed, 1);
         assert_eq!(app.ssh_slots.len(), 3);
@@ -7325,8 +7859,7 @@ host_key_policy = \"strict\"
     fn import_collision_check_ignores_blank_scratch_rows() {
         let mut app = app_with_hosts(&[("", "web-1")]);
         let rows =
-            parse_import_toml("[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.99\"\n")
-                .unwrap();
+            parse_import_toml("[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.99\"\n").unwrap();
         assert!(
             find_import_collisions(&app.ssh_slots, &rows).is_empty(),
             "blank rows are not saved hosts"
@@ -7345,7 +7878,11 @@ host_key_policy = \"strict\"
         let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
         let err = stage_import(&mut app.ssh_slots, &bad).unwrap_err();
         assert!(err.contains("not valid TOML"), "got {err}");
-        assert_eq!(app.ssh_slots.len(), 1, "a broken file must not touch the host list");
+        assert_eq!(
+            app.ssh_slots.len(),
+            1,
+            "a broken file must not touch the host list"
+        );
         assert_eq!(app.ssh_slots[0].alias, "web-1");
 
         // A file that cannot be read is an error, not a silent no-op.
@@ -7360,18 +7897,27 @@ host_key_policy = \"strict\"
         let dir = std::env::temp_dir().join(format!("filar_test_import2_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hosts.toml");
-        std::fs::write(&path, "[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.99\"\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.99\"\n",
+        )
+        .unwrap();
 
         let mut app = app_with_hosts(&[("10.0.0.11", "web-1")]);
         match stage_import(&mut app.ssh_slots, &path).unwrap() {
-            ImportStaged::NeedsDecision { rows, collisions, .. } => {
+            ImportStaged::NeedsDecision {
+                rows, collisions, ..
+            } => {
                 assert_eq!(collisions, vec!["web-1".to_string()]);
                 assert_eq!(rows.len(), 1);
             }
             ImportStaged::Applied(_) => panic!("a collision must not be applied silently"),
         }
-        assert_eq!(app.ssh_slots.len(), 1, "nothing is applied before the choice");
+        assert_eq!(
+            app.ssh_slots.len(),
+            1,
+            "nothing is applied before the choice"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7391,8 +7937,11 @@ host_key_policy = \"strict\"
         assert!(parse_import_file(&lying).is_err());
 
         let toml = dir.join("hosts.toml");
-        std::fs::write(&toml, "[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.11\"\n")
-            .unwrap();
+        std::fs::write(
+            &toml,
+            "[[ssh_targets]]\nname = \"web-1\"\nhost = \"10.0.0.11\"\n",
+        )
+        .unwrap();
         assert_eq!(parse_import_file(&toml).unwrap().rows.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -7422,9 +7971,7 @@ host_key_policy = \"strict\"
             kube_skipped: parsed.kube_skipped,
             ..ImportOutcome::default()
         };
-        assert!(
-            import_status_line(&outcome).contains("1 Kubernetes cluster(s) skipped")
-        );
+        assert!(import_status_line(&outcome).contains("1 Kubernetes cluster(s) skipped"));
         let line = export_status_line(2, 1, std::path::Path::new("hosts.toml"));
         assert!(line.contains("2 hosts"));
         assert!(line.contains("1 Kubernetes cluster(s) skipped"));
@@ -7465,7 +8012,10 @@ host_key_policy = \"strict\"
         app.ssh_slots[2].auth = SlotAuth::Agent;
         let refs: Vec<&SshSlot> = app.ssh_slots.iter().collect();
         let text = export_hosts_toml(&refs).unwrap();
-        assert!(!text.contains("s3cret") && !text.contains("correct horse"), "got {text}");
+        assert!(
+            !text.contains("s3cret") && !text.contains("correct horse"),
+            "got {text}"
+        );
 
         let rows = parse_import_toml(&text).expect("the export must parse as an import");
         assert_eq!(rows.len(), 3);
@@ -7475,11 +8025,22 @@ host_key_policy = \"strict\"
         assert_eq!(rows[0].slot.user, "admin");
         assert_eq!(rows[0].slot.tags, "prod, fleet");
         let kind = |i: usize| rows[i].auth.as_ref().map(|a| a.kind);
-        assert_eq!(kind(0), Some(SlotAuth::Password), "password auth survives the trip");
+        assert_eq!(
+            kind(0),
+            Some(SlotAuth::Password),
+            "password auth survives the trip"
+        );
         assert_eq!(rows[1].slot.alias, "db-1");
         assert_eq!(kind(1), Some(SlotAuth::Key), "key auth survives the trip");
-        assert_eq!(rows[1].slot.key_path, "/home/ops/.ssh/deploy", "and so does its path");
-        assert_eq!(kind(2), Some(SlotAuth::Agent), "agent auth survives the trip");
+        assert_eq!(
+            rows[1].slot.key_path, "/home/ops/.ssh/deploy",
+            "and so does its path"
+        );
+        assert_eq!(
+            kind(2),
+            Some(SlotAuth::Agent),
+            "agent auth survives the trip"
+        );
 
         // A clean machine gets the very same fleet back.
         let mut clean = app_with_hosts(&[]);
@@ -7555,7 +8116,10 @@ host_key_policy = \"strict\"
         for bad in ["0", "65536", "http", "-1"] {
             slot.diagnostic_ports = format!("8080, {bad}");
             let error = slot.to_cluster().unwrap_err();
-            assert!(error.contains("Diagnostic ports") && error.contains(bad), "{error}");
+            assert!(
+                error.contains("Diagnostic ports") && error.contains(bad),
+                "{error}"
+            );
         }
     }
 
@@ -7615,12 +8179,20 @@ host_key_policy = \"strict\"
             }),
             llm_profile: None,
         };
-        assert_eq!(HostGroupDraft::from_group(&group).to_group().unwrap(), group);
+        assert_eq!(
+            HostGroupDraft::from_group(&group).to_group().unwrap(),
+            group
+        );
     }
 
     // ── Kubernetes groups in the launcher (#615) ───────────────
 
-    fn kube_group_draft(name: &str, clusters: &[&str], namespace: &str, selector: &str) -> HostGroupDraft {
+    fn kube_group_draft(
+        name: &str,
+        clusters: &[&str],
+        namespace: &str,
+        selector: &str,
+    ) -> HostGroupDraft {
         HostGroupDraft {
             kube: true,
             kube_clusters: clusters.iter().map(|c| (*c).to_string()).collect(),
@@ -7642,7 +8214,12 @@ host_key_policy = \"strict\"
     #[test]
     fn a_kube_group_made_in_the_launcher_survives_launch() {
         let mut app = app_with_cluster("kind-filar-k8s", "k8s, kind");
-        app.host_groups = vec![kube_group_draft("k8s-pods", &[" kind-filar-k8s "], " filar-k8s ", "app=filar-k8s")];
+        app.host_groups = vec![kube_group_draft(
+            "k8s-pods",
+            &[" kind-filar-k8s "],
+            " filar-k8s ",
+            "app=filar-k8s",
+        )];
         assert_eq!(app.validate_host_groups(), Ok(()));
         let groups = app.persistable_host_groups().unwrap();
         assert_eq!(groups.len(), 1);
@@ -7665,7 +8242,12 @@ host_key_policy = \"strict\"
 
     #[test]
     fn a_kube_group_preview_shows_its_scope_not_zero_hosts() {
-        let draft = kube_group_draft("k8s-pods", &["kind-filar-k8s"], "filar-k8s", "app=filar-k8s");
+        let draft = kube_group_draft(
+            "k8s-pods",
+            &["kind-filar-k8s"],
+            "filar-k8s",
+            "app=filar-k8s",
+        );
         assert_eq!(
             kube_group_preview_line(&draft),
             "Effective now: 1 cluster(s) (kind-filar-k8s), namespace filar-k8s, selector app=filar-k8s"
@@ -7687,17 +8269,29 @@ host_key_policy = \"strict\"
         assert!(both.to_group().unwrap_err().contains("clear Match tags"));
         let mut ssh = group_draft("prod", "prod");
         ssh.kube_namespace = "shop".into();
-        assert!(ssh.to_group().unwrap_err().contains("clear the Kubernetes clusters, namespace and selector"));
+        assert!(ssh
+            .to_group()
+            .unwrap_err()
+            .contains("clear the Kubernetes clusters, namespace and selector"));
     }
 
     #[test]
     fn an_incomplete_or_unknown_kube_selection_is_refused() {
-        assert!(kube_group_draft("g", &[], "shop", "").to_group().unwrap_err().contains("Kubernetes clusters"));
-        assert!(kube_group_draft("g", &["c"], "  ", "").to_group().unwrap_err().contains("namespace"));
+        assert!(kube_group_draft("g", &[], "shop", "")
+            .to_group()
+            .unwrap_err()
+            .contains("Kubernetes clusters"));
+        assert!(kube_group_draft("g", &["c"], "  ", "")
+            .to_group()
+            .unwrap_err()
+            .contains("namespace"));
         let mut app = app_with_cluster("kind-filar-k8s", "");
         app.host_groups = vec![kube_group_draft("g", &["prod-eu"], "shop", "")];
         let error = app.validate_host_groups().unwrap_err();
-        assert!(error.contains("prod-eu is not in the cluster list"), "{error}");
+        assert!(
+            error.contains("prod-eu is not in the cluster list"),
+            "{error}"
+        );
         // A kube selection alone is not a blank scratch row.
         assert!(!kube_group_draft("", &["c"], "", "").is_blank());
     }
@@ -7737,7 +8331,10 @@ host_key_policy = \"strict\"
         }
         let mut draft = group_draft("prod", "prod");
         draft.name = "   ".into();
-        assert!(draft.to_group().is_err(), "a named group may not lose its name");
+        assert!(
+            draft.to_group().is_err(),
+            "a named group may not lose its name"
+        );
     }
 
     #[test]
@@ -7775,7 +8372,10 @@ host_key_policy = \"strict\"
         app.ssh_slots[0].tags = "work, prod".into();
         let targets = app.launch_ssh_targets();
         let line = group_preview_line("prod", &targets);
-        assert!(line.contains("1 host(s)") && line.contains("web-1"), "{line}");
+        assert!(
+            line.contains("1 host(s)") && line.contains("web-1"),
+            "{line}"
+        );
         // db-1 joins once it carries every tag of the rule...
         app.ssh_slots[1].tags = "work, prod".into();
         let targets = app.launch_ssh_targets();
@@ -7788,7 +8388,10 @@ host_key_policy = \"strict\"
         app.ssh_slots[0].tags = "work".into();
         let targets = app.launch_ssh_targets();
         let line = group_preview_line("work, prod", &targets);
-        assert!(line.contains("1 host(s)") && line.contains("db-1"), "{line}");
+        assert!(
+            line.contains("1 host(s)") && line.contains("db-1"),
+            "{line}"
+        );
     }
 
     #[test]
@@ -7796,7 +8399,10 @@ host_key_policy = \"strict\"
         let app = app_with_hosts(&[("10.0.0.1", "web-1")]);
         let targets = app.launch_ssh_targets();
         let line = group_preview_line("", &targets);
-        assert!(line.contains("0 hosts") && line.contains("no tags"), "{line}");
+        assert!(
+            line.contains("0 hosts") && line.contains("no tags"),
+            "{line}"
+        );
     }
 
     // ── Command safety scorer (#552) ─────────────────────────────────
@@ -7831,7 +8437,11 @@ host_key_policy = \"strict\"
         };
         let d = RiskScorerDraft::from_config(Some(&cfg));
         assert!(d.enabled && d.chat_logprobs && d.keyless);
-        assert_eq!(d.to_config(), Ok(Some(cfg)), "timeout carried over untouched");
+        assert_eq!(
+            d.to_config(),
+            Ok(Some(cfg)),
+            "timeout carried over untouched"
+        );
     }
 
     #[test]
@@ -7843,14 +8453,20 @@ host_key_policy = \"strict\"
         assert_eq!(cfg.key_env, "FILAR_RISK_API_KEY");
         assert_eq!(cfg.kind, "decisions");
         // The key is stored in the OS store under key_env, sanitised...
-        assert_eq!(d.key_to_save(), Some(("FILAR_RISK_API_KEY".into(), "sk-or-SECRET".into())));
+        assert_eq!(
+            d.key_to_save(),
+            Some(("FILAR_RISK_API_KEY".into(), "sk-or-SECRET".into()))
+        );
         // ...and appears in neither config.toml nor pending_launch.json.
         let toml_text = toml::to_string_pretty(&filar_core::Config {
             risk_scorer: Some(cfg),
             ..Default::default()
         })
         .unwrap();
-        assert!(toml_text.contains("[risk_scorer]") && !toml_text.contains("SECRET"), "{toml_text}");
+        assert!(
+            toml_text.contains("[risk_scorer]") && !toml_text.contains("SECRET"),
+            "{toml_text}"
+        );
         let launch = LaunchConfig {
             target: "local".into(),
             ssh: None,
@@ -7889,8 +8505,14 @@ host_key_policy = \"strict\"
         d.set_keyless(true);
         assert!(d.key.is_empty(), "ticking \"no key\" drops the typed key");
         d.set_keyless(false);
-        assert_eq!(d.key_checked_for, "FILAR_RISK_API_KEY", "status read on unticking");
-        assert_eq!(d.to_config().unwrap().unwrap().key_env, "FILAR_RISK_API_KEY");
+        assert_eq!(
+            d.key_checked_for, "FILAR_RISK_API_KEY",
+            "status read on unticking"
+        );
+        assert_eq!(
+            d.to_config().unwrap().unwrap().key_env,
+            "FILAR_RISK_API_KEY"
+        );
     }
 
     #[test]
@@ -7906,13 +8528,20 @@ host_key_policy = \"strict\"
         check(|d| d.base_url = "openrouter.ai".into(), "http");
         check(|d| d.warn_below = "abc".into(), "warn below");
         check(|d| d.danger_below = "101".into(), "danger below");
-        check(|d| { d.warn_below = "30".into(); d.danger_below = "50".into(); }, "danger_below");
+        check(
+            |d| {
+                d.warn_below = "30".into();
+                d.danger_below = "50".into();
+            },
+            "danger_below",
+        );
         check(|d| d.key_env = "  ".into(), "key name");
     }
 
     #[test]
     fn a_pending_launch_from_before_552_says_nothing_about_the_scorer() {
-        let json = r#"{"target":"local","ssh":null,"model":"m","api_base_url":"u","session_id":null}"#;
+        let json =
+            r#"{"target":"local","ssh":null,"model":"m","api_base_url":"u","session_id":null}"#;
         let cfg: LaunchConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.risk_scorer, None);
     }
@@ -7924,7 +8553,10 @@ host_key_policy = \"strict\"
         d.key_checked_for = d.key_env.clone();
         assert!(d.key_saved_now());
         d.key_env = "OTHER_KEY".into();
-        assert!(!d.key_saved_now(), "a renamed key is not shown as saved until checked");
+        assert!(
+            !d.key_saved_now(),
+            "a renamed key is not shown as saved until checked"
+        );
         d.refresh_key_saved(); // load_secret is a no-op in tests
         assert_eq!(d.key_checked_for, "OTHER_KEY");
         assert!(!d.key_saved_now());
@@ -7935,11 +8567,17 @@ host_key_policy = \"strict\"
         let mut d = enabled_draft();
         assert_eq!(d.base_url, RISK_DECISIONS_BASE_URL);
         d.set_chat_logprobs(true);
-        assert!(d.base_url.is_empty(), "the Decisions default does not follow into chat");
+        assert!(
+            d.base_url.is_empty(),
+            "the Decisions default does not follow into chat"
+        );
         d.base_url = "https://my-proxy.example/v1".into();
         d.set_chat_logprobs(false);
         d.set_chat_logprobs(true);
-        assert_eq!(d.base_url, "https://my-proxy.example/v1", "a typed address is kept");
+        assert_eq!(
+            d.base_url, "https://my-proxy.example/v1",
+            "a typed address is kept"
+        );
     }
 
     // ── Log sources (#584) ───────────────────────────────────────────
@@ -7959,7 +8597,10 @@ host_key_policy = \"strict\"
         let d = vlogs_draft();
         let cfg = d.to_config().unwrap();
         assert_eq!(cfg.key_env, "FILAR_LOGS_VLOGS_PROD");
-        assert_eq!(d.key_to_save(), Some(("FILAR_LOGS_VLOGS_PROD".into(), "SECRET-LOG-KEY".into())));
+        assert_eq!(
+            d.key_to_save(),
+            Some(("FILAR_LOGS_VLOGS_PROD".into(), "SECRET-LOG-KEY".into()))
+        );
         let back = LogSourceDraft::from_config(&cfg, 7);
         assert_eq!(back.to_config().unwrap(), cfg);
         assert!(back.key.is_empty());
@@ -7969,7 +8610,10 @@ host_key_policy = \"strict\"
             ..Default::default()
         };
         let toml_text = toml::to_string_pretty(&config).unwrap();
-        assert!(toml_text.contains("[[log_sources]]") && !toml_text.contains("SECRET-LOG-KEY"), "{toml_text}");
+        assert!(
+            toml_text.contains("[[log_sources]]") && !toml_text.contains("SECRET-LOG-KEY"),
+            "{toml_text}"
+        );
         let launch = LaunchConfig {
             target: "local".into(),
             ssh: None,
@@ -7992,7 +8636,10 @@ host_key_policy = \"strict\"
             log_sources: Some(vec![cfg]),
         };
         let json = serde_json::to_string(&launch).unwrap();
-        assert!(json.contains("vlogs-prod") && !json.contains("SECRET-LOG-KEY"), "{json}");
+        assert!(
+            json.contains("vlogs-prod") && !json.contains("SECRET-LOG-KEY"),
+            "{json}"
+        );
         let read: LaunchConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(read.log_sources, launch.log_sources);
     }
@@ -8010,10 +8657,17 @@ host_key_policy = \"strict\"
         assert!(d.to_config().unwrap_err().contains("needs index"));
         d.index = "logs-*".into();
         d.tenant = "0:0".into();
-        assert!(d.to_config().unwrap().tenant.is_none(), "a tenant field of another kind is dropped");
+        assert!(
+            d.to_config().unwrap().tenant.is_none(),
+            "a tenant field of another kind is dropped"
+        );
         let mut d = vlogs_draft();
         d.auth = filar_core::LogAuth::None;
-        assert_eq!(d.to_config().unwrap().key_env, "", "no key name without a keyed auth");
+        assert_eq!(
+            d.to_config().unwrap().key_env,
+            "",
+            "no key name without a keyed auth"
+        );
         assert_eq!(d.key_to_save(), None);
     }
 
@@ -8023,21 +8677,34 @@ host_key_policy = \"strict\"
         let mut d = vlogs_draft();
         d.clusters = "prod-eu".into();
         app.log_sources = vec![d.clone()];
-        assert!(app.validate_log_sources().unwrap_err().contains("cluster prod-eu is not in the cluster list"));
+        assert!(app
+            .validate_log_sources()
+            .unwrap_err()
+            .contains("cluster prod-eu is not in the cluster list"));
         d.clusters.clear();
         let mut twin = d.clone();
         twin.id = 2;
         app.log_sources = vec![d, twin];
-        assert!(app.validate_log_sources().unwrap_err().contains("used twice"));
+        assert!(app
+            .validate_log_sources()
+            .unwrap_err()
+            .contains("used twice"));
     }
 
     #[test]
     fn a_blank_log_source_row_neither_blocks_launch_nor_reaches_the_config() {
-        let mut app = app_with_profiles(vec![LlmProfileData { name: "one".into(), ..edited_profile() }]);
+        let mut app = app_with_profiles(vec![LlmProfileData {
+            name: "one".into(),
+            ..edited_profile()
+        }]);
         app.log_sources = vec![LogSourceDraft::blank(7)];
         assert!(app.log_sources[0].is_blank());
         assert!(app.validate_launch(), "got {:?}", app.validation_error);
-        assert_eq!(app.validate_log_sources().unwrap(), Vec::new(), "nothing to write to config.toml");
+        assert_eq!(
+            app.validate_log_sources().unwrap(),
+            Vec::new(),
+            "nothing to write to config.toml"
+        );
 
         // Next to a real source the blank row is skipped, the real one kept.
         app.log_sources.push(vlogs_draft());
@@ -8048,14 +8715,18 @@ host_key_policy = \"strict\"
 
     #[test]
     fn a_partly_filled_log_source_still_blocks_launch_and_names_the_logs_tab() {
-        let mut app = app_with_profiles(vec![LlmProfileData { name: "one".into(), ..edited_profile() }]);
+        let mut app = app_with_profiles(vec![LlmProfileData {
+            name: "one".into(),
+            ..edited_profile()
+        }]);
         let mut d = LogSourceDraft::blank(7);
         d.url = "http://vlogs:9428".into();
         assert!(!d.is_blank());
         app.log_sources = vec![d];
         assert!(!app.validate_launch());
         assert!(
-            app.validation_error.starts_with("Logs tab: log source new source:"),
+            app.validation_error
+                .starts_with("Logs tab: log source new source:"),
             "{:?}",
             app.validation_error
         );
@@ -8072,7 +8743,10 @@ host_key_policy = \"strict\"
         let mut d = LogSourceDraft::blank(1);
         d.kind = filar_core::LogSourceKind::Loki;
         d.auth = filar_core::LogAuth::Bearer;
-        assert!(d.is_blank(), "kind and auth picked from lists are not input");
+        assert!(
+            d.is_blank(),
+            "kind and auth picked from lists are not input"
+        );
         let default_lines = d.max_lines.clone();
         d.max_lines = "many".into();
         assert!(!d.is_blank(), "a changed limit is input");

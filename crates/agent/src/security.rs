@@ -89,7 +89,9 @@ fn writes_to_system_path(command: &str) -> bool {
     // Remove non-redirect patterns that contain > (=>, ->, >=).
     let cleaned = lower.replace("=>", "").replace("->", "").replace(">=", "");
 
-    let system_paths = ["/etc/", "/boot/", "/sys/", "/proc/", "/dev/", "/usr/", "/lib/"];
+    let system_paths = [
+        "/etc/", "/boot/", "/sys/", "/proc/", "/dev/", "/usr/", "/lib/",
+    ];
 
     // Split by shell operators to process each sub-command independently.
     for sub in cleaned.split([';', '|', '&']) {
@@ -149,41 +151,92 @@ fn writes_to_system_path(command: &str) -> bool {
 /// If ANY of these are present, the command requires confirmation.
 const WRITE_PATTERNS: &[&str] = &[
     // Delete / remove
-    "rm ", "rmdir ", "unlink ",
+    "rm ",
+    "rmdir ",
+    "unlink ",
     // Copy / move / rename
-    "cp ", "mv ", "install ",
+    "cp ",
+    "mv ",
+    "install ",
     // Create
-    "mkdir ", "touch ", "ln ",
+    "mkdir ",
+    "touch ",
+    "ln ",
     // Permissions
-    "chmod ", "chown ", "chgrp ", "setfacl ",
+    "chmod ",
+    "chown ",
+    "chgrp ",
+    "setfacl ",
     // Package management
-    "apt ", "apt-get ", "yum ", "dnf ", "pip ", "pip3 ", "npm ", "yarn ",
-    "cargo ", "go install", "gem ",
+    "apt ",
+    "apt-get ",
+    "yum ",
+    "dnf ",
+    "pip ",
+    "pip3 ",
+    "npm ",
+    "yarn ",
+    "cargo ",
+    "go install",
+    "gem ",
     // Service management — only write actions, not status/show/list
-    "systemctl start", "systemctl stop", "systemctl restart",
-    "systemctl reload", "systemctl enable", "systemctl disable",
-    "systemctl mask", "systemctl unmask", "systemctl daemon-reload",
+    "systemctl start",
+    "systemctl stop",
+    "systemctl restart",
+    "systemctl reload",
+    "systemctl enable",
+    "systemctl disable",
+    "systemctl mask",
+    "systemctl unmask",
+    "systemctl daemon-reload",
     // Disk / format
-    "dd ", "mkfs", "fdisk ", "parted ",
+    "dd ",
+    "mkfs",
+    "fdisk ",
+    "parted ",
     // Download to file
-    "curl -o", "curl -O", "wget ",
+    "curl -o",
+    "curl -O",
+    "wget ",
     // In-place edit
-    "sed -i", "perl -i",
+    "sed -i",
+    "perl -i",
     // Write to file
     "tee ",
     // Mount operations — only active mount, not listing
-    "mount -t", "mount -o", "mount /",
+    "mount -t",
+    "mount -o",
+    "mount /",
     "umount ",
     // User management
-    "useradd ", "userdel ", "usermod ", "passwd ", "groupadd ", "groupdel ",
+    "useradd ",
+    "userdel ",
+    "usermod ",
+    "passwd ",
+    "groupadd ",
+    "groupdel ",
     // Firewall
-    "iptables ", "ip6tables ", "ufw ", "firewall-cmd",
+    "iptables ",
+    "ip6tables ",
+    "ufw ",
+    "firewall-cmd",
     // Power
-    "shutdown", "reboot", "halt", "poweroff", "init 0", "init 6",
+    "shutdown",
+    "reboot",
+    "halt",
+    "poweroff",
+    "init 0",
+    "init 6",
     // Process kill
-    "kill ", "killall", "pkill",
+    "kill ",
+    "killall",
+    "pkill",
     // Network config — only changes, not reads
-    "ip link set", "ip addr add", "ip addr del", "ip route add", "ip route del",
+    "ip link set",
+    "ip addr add",
+    "ip addr del",
+    "ip route add",
+    "ip route del",
     "ip link set",
 ];
 
@@ -231,8 +284,7 @@ fn is_privilege_elevator(sub: &str) -> bool {
         "--split-string",
     ];
     // `timeout` flags that take a following argument.
-    const TIMEOUT_FLAGS_WITH_ARG: &[&str] =
-        &["-k", "--kill-after", "-s", "--signal"];
+    const TIMEOUT_FLAGS_WITH_ARG: &[&str] = &["-k", "--kill-after", "-s", "--signal"];
     // `stdbuf` / `nice` / `ionice` value-taking short options (best-effort).
     const STDBUF_FLAGS_WITH_ARG: &[&str] = &["-i", "-o", "-e"];
     const NICE_FLAGS_WITH_ARG: &[&str] = &["-n", "--adjustment"];
@@ -276,12 +328,7 @@ fn is_privilege_elevator(sub: &str) -> bool {
                 i += 1;
                 i = skip_wrapper_flags(&words, i, TIMEOUT_FLAGS_WITH_ARG);
                 // Duration before the command.
-                if i < words.len()
-                    && words[i]
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_digit())
-                {
+                if i < words.len() && words[i].chars().next().is_some_and(|c| c.is_ascii_digit()) {
                     i += 1;
                 }
             }
@@ -333,7 +380,10 @@ pub fn is_write_command(command: &str) -> bool {
         .replace("2>&1", "")
         .replace("1>&2", "");
     // Remove non-redirect patterns that contain > (=>, ->, >=).
-    let cleaned = redirect_cleaned.replace("=>", "").replace("->", "").replace(">=", "");
+    let cleaned = redirect_cleaned
+        .replace("=>", "")
+        .replace("->", "")
+        .replace(">=", "");
     if cleaned.contains('>') {
         return true;
     }
@@ -422,18 +472,20 @@ pub fn check_command(command: &str, mode: CommandConfirmMode) -> ConfirmDecision
 }
 
 /// Determine if a tool kind requires confirmation given the confirm mode.
-pub fn tool_needs_confirmation(kind: ToolKind, command: &str, mode: CommandConfirmMode) -> ConfirmDecision {
+pub fn tool_needs_confirmation(
+    kind: ToolKind,
+    command: &str,
+    mode: CommandConfirmMode,
+) -> ConfirmDecision {
     match kind {
         ToolKind::RunCommand | ToolKind::StartBackgroundJob => check_command(command, mode),
-        ToolKind::BackgroundJobStatus | ToolKind::ListBackgroundJobs => {
-            match mode {
-                CommandConfirmMode::Never => ConfirmDecision::AutoApproved,
-                CommandConfirmMode::Allowlist => ConfirmDecision::AutoApproved,
-                CommandConfirmMode::Always | CommandConfirmMode::Explain => {
-                    ConfirmDecision::NeedsConfirmation
-                }
+        ToolKind::BackgroundJobStatus | ToolKind::ListBackgroundJobs => match mode {
+            CommandConfirmMode::Never => ConfirmDecision::AutoApproved,
+            CommandConfirmMode::Allowlist => ConfirmDecision::AutoApproved,
+            CommandConfirmMode::Always | CommandConfirmMode::Explain => {
+                ConfirmDecision::NeedsConfirmation
             }
-        }
+        },
         ToolKind::CancelBackgroundJob => check_command("kill ", mode),
         // read_file and list_dir are wrappers around cat/ls — check the
         // generated command, but they're typically read-only.
@@ -498,8 +550,8 @@ impl CommandConfirmer for CliConfirmer {
             let mut input = String::new();
             stdin.lock().read_line(&mut input).ok();
 
-            let approved = input.trim().eq_ignore_ascii_case("y")
-                || input.trim().eq_ignore_ascii_case("yes");
+            let approved =
+                input.trim().eq_ignore_ascii_case("y") || input.trim().eq_ignore_ascii_case("yes");
 
             if approved {
                 writeln!(stdout, "  → Approved").ok();
@@ -577,7 +629,9 @@ mod tests {
         assert!(is_readonly("pwd"));
         assert!(is_readonly("echo hello"));
         assert!(is_readonly("hostname"));
-        assert!(is_readonly("ip -4 addr show | grep inet | awk '{print $2}'"));
+        assert!(is_readonly(
+            "ip -4 addr show | grep inet | awk '{print $2}'"
+        ));
         // Redirects to /dev/null are read-only
         assert!(is_readonly("cat /etc/os-release 2>/dev/null || cat /etc/redhat-release 2>/dev/null || echo unknown OS"));
         assert!(is_readonly("ls -la /tmp 2>/dev/null"));
@@ -724,7 +778,10 @@ mod tests {
         );
         // Write command → needs confirmation
         assert_eq!(
-            check_command("curl -o file http://example.com", CommandConfirmMode::Allowlist),
+            check_command(
+                "curl -o file http://example.com",
+                CommandConfirmMode::Allowlist
+            ),
             ConfirmDecision::NeedsConfirmation
         );
         // Destructive → needs confirmation

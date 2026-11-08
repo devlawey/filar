@@ -67,7 +67,14 @@ fn labels(value: Option<&serde_json::Value>) -> BTreeMap<String, String> {
         .and_then(serde_json::Value::as_object)
         .map(|map| {
             map.iter()
-                .map(|(k, v)| (k.clone(), v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())))
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        v.as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| v.to_string()),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -95,10 +102,23 @@ pub fn parse_answer(body: &[u8], limit: usize, max_line_bytes: usize) -> Result<
             let mut lines = Vec::new();
             for stream in &data.result {
                 let fields = labels(stream.get("stream"));
-                for value in stream.get("values").and_then(serde_json::Value::as_array).into_iter().flatten() {
-                    let Some(pair) = value.as_array() else { continue };
-                    let time = pair.first().and_then(serde_json::Value::as_str).and_then(nanos_to_time);
-                    let text = pair.get(1).and_then(serde_json::Value::as_str).unwrap_or("");
+                for value in stream
+                    .get("values")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let Some(pair) = value.as_array() else {
+                        continue;
+                    };
+                    let time = pair
+                        .first()
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(nanos_to_time);
+                    let text = pair
+                        .get(1)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
                     let (message, truncated) = cap_line(text, max_line_bytes);
                     lines.push(LogLine {
                         time,
@@ -116,7 +136,11 @@ pub fn parse_answer(body: &[u8], limit: usize, max_line_bytes: usize) -> Result<
         "matrix" | "vector" => {
             for item in &data.result {
                 let points_raw: Vec<&serde_json::Value> = match data.result_type.as_str() {
-                    "matrix" => item.get("values").and_then(serde_json::Value::as_array).map(|v| v.iter().collect()).unwrap_or_default(),
+                    "matrix" => item
+                        .get("values")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|v| v.iter().collect())
+                        .unwrap_or_default(),
                     _ => item.get("value").into_iter().collect(),
                 };
                 let points = points_raw
@@ -135,7 +159,9 @@ pub fn parse_answer(body: &[u8], limit: usize, max_line_bytes: usize) -> Result<
             }
         }
         other => {
-            return Err(CoreError::Other(format!("Loki result type \"{other}\" is not supported")));
+            return Err(CoreError::Other(format!(
+                "Loki result type \"{other}\" is not supported"
+            )));
         }
     }
     Ok(result)
@@ -171,8 +197,17 @@ impl LogSource for LokiSource {
             ("limit", query.limit.to_string()),
             ("direction", "backward".to_string()),
         ];
-        let mut request = self.http.request(reqwest::Method::GET, LOKI_QUERY_PATH).query(&params);
-        if let Some(tenant) = self.cfg.tenant.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        let mut request = self
+            .http
+            .request(reqwest::Method::GET, LOKI_QUERY_PATH)
+            .query(&params);
+        if let Some(tenant) = self
+            .cfg
+            .tenant
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
             request = request.header("X-Scope-OrgID", tenant);
         }
         let response = self.http.send(request).await?;
@@ -188,7 +223,8 @@ impl LogSource for LokiSource {
                 ..Default::default()
             });
         }
-        parse_answer(&body.bytes, query.limit, limits.max_line_bytes).map_err(|e| self.http.error(&e.to_string()))
+        parse_answer(&body.bytes, query.limit, limits.max_line_bytes)
+            .map_err(|e| self.http.error(&e.to_string()))
     }
 }
 
@@ -237,7 +273,10 @@ mod tests {
         assert_eq!(result.series.len(), 2);
         assert_eq!(result.series[0].labels["pod"], "web-1");
         assert_eq!(result.series[0].points[1].1, 5.0);
-        assert_eq!(result.series[1].points[0].0.timestamp_millis(), 1793557560500);
+        assert_eq!(
+            result.series[1].points[0].0.timestamp_millis(),
+            1793557560500
+        );
         let text = super::super::fold::fold_series(&result.series, false);
         assert!(text.contains("Metric result: 2 series"), "{text}");
         assert!(text.contains("{pod=\"web-1\"} 2 point(s)"), "{text}");
@@ -247,17 +286,24 @@ mod tests {
     #[test]
     fn long_lines_are_cut_and_bad_answers_are_errors() {
         let long = "y".repeat(9000);
-        let body = format!(r#"{{"status":"success","data":{{"resultType":"streams","result":[{{"stream":{{}},"values":[["1","{long}"]]}}]}}}}"#);
+        let body = format!(
+            r#"{{"status":"success","data":{{"resultType":"streams","result":[{{"stream":{{}},"values":[["1","{long}"]]}}]}}}}"#
+        );
         let result = parse_answer(body.as_bytes(), 10, 4096).unwrap();
         assert!(result.lines[0].truncated);
         assert!(parse_answer(b"not json", 10, 4096).is_err());
-        assert!(parse_answer(br#"{"status":"error","error":"boom"}"#, 10, 4096)
-            .unwrap_err()
-            .to_string()
-            .contains("boom"));
+        assert!(
+            parse_answer(br#"{"status":"error","error":"boom"}"#, 10, 4096)
+                .unwrap_err()
+                .to_string()
+                .contains("boom")
+        );
     }
 
-    async fn serve_once(status: &'static str, body: String) -> (String, tokio::task::JoinHandle<String>) {
+    async fn serve_once(
+        status: &'static str,
+        body: String,
+    ) -> (String, tokio::task::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -271,7 +317,10 @@ mod tests {
                 }
                 data.extend_from_slice(&buf[..n]);
             }
-            let reply = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
             socket.write_all(reply.as_bytes()).await.unwrap();
             String::from_utf8_lossy(&data).into_owned()
         });
@@ -303,43 +352,80 @@ mod tests {
     #[tokio::test]
     async fn the_request_carries_logql_nanosecond_window_tenant_and_auth() {
         let (url, server) = serve_once("200 OK", STREAMS.to_string()).await;
-        let result = LokiSource::new(&cfg(url), "pw-9").unwrap().query(&query()).await.unwrap();
+        let result = LokiSource::new(&cfg(url), "pw-9")
+            .unwrap()
+            .query(&query())
+            .await
+            .unwrap();
         let head = server.await.unwrap();
         let first = head.lines().next().unwrap();
-        assert!(first.starts_with("GET /loki/api/v1/query_range?"), "{first}");
-        assert!(first.contains("query=%7Bnamespace%3D%22shop%22%7D+%7C%3D+%22error%22"), "{first}");
+        assert!(
+            first.starts_with("GET /loki/api/v1/query_range?"),
+            "{first}"
+        );
+        assert!(
+            first.contains("query=%7Bnamespace%3D%22shop%22%7D+%7C%3D+%22error%22"),
+            "{first}"
+        );
         assert!(first.contains("start=1793527200000000000"), "{first}");
         assert!(first.contains("end=1793530800000000000"), "{first}");
-        assert!(first.contains("limit=100") && first.contains("direction=backward"), "{first}");
+        assert!(
+            first.contains("limit=100") && first.contains("direction=backward"),
+            "{first}"
+        );
         let lower = head.to_ascii_lowercase();
         assert!(lower.contains("x-scope-orgid: team-a"), "{head}");
         // reader:pw-9 in base64.
-        assert!(lower.contains("authorization: basic cmvhzgvyonb3ltk="), "{head}");
+        assert!(
+            lower.contains("authorization: basic cmvhzgvyonb3ltk="),
+            "{head}"
+        );
         assert_eq!(result.lines.len(), 3);
     }
 
     #[tokio::test]
     async fn loki_errors_reach_the_model_without_the_key() {
         for (status, text) in [
-            ("400 Bad Request", "parse error at line 1, col 23: syntax error: unexpected $end"),
+            (
+                "400 Bad Request",
+                "parse error at line 1, col 23: syntax error: unexpected $end",
+            ),
             ("429 Too Many Requests", "too many outstanding requests"),
-            ("500 Internal Server Error", "max entries limit per query exceeded, limit > max_entries_limit (5000 > 1000)"),
+            (
+                "500 Internal Server Error",
+                "max entries limit per query exceeded, limit > max_entries_limit (5000 > 1000)",
+            ),
         ] {
             let (url, server) = serve_once(status, text.to_string()).await;
-            let err = LokiSource::new(&cfg(url), "pw-9").unwrap().query(&query()).await.unwrap_err().to_string();
+            let err = LokiSource::new(&cfg(url), "pw-9")
+                .unwrap()
+                .query(&query())
+                .await
+                .unwrap_err()
+                .to_string();
             server.await.unwrap();
             assert!(err.contains(&status[..3]) && err.contains(text), "{err}");
-            assert!(!err.contains("pw-9") && !err.contains("cmVhZGVyOnB3LTk="), "{err}");
+            assert!(
+                !err.contains("pw-9") && !err.contains("cmVhZGVyOnB3LTk="),
+                "{err}"
+            );
         }
     }
 
     #[tokio::test]
     async fn an_answer_over_the_byte_cap_is_reported_not_parsed() {
-        let big = format!(r#"{{"status":"success","data":{{"resultType":"streams","result":[{{"stream":{{}},"values":[["1","{}"]]}}]}}}}"#, "z".repeat(200_000));
+        let big = format!(
+            r#"{{"status":"success","data":{{"resultType":"streams","result":[{{"stream":{{}},"values":[["1","{}"]]}}]}}}}"#,
+            "z".repeat(200_000)
+        );
         let (url, server) = serve_once("200 OK", big).await;
         let mut c = cfg(url);
         c.max_response_bytes = 64 * 1024;
-        let result = LokiSource::new(&c, "pw-9").unwrap().query(&query()).await.unwrap();
+        let result = LokiSource::new(&c, "pw-9")
+            .unwrap()
+            .query(&query())
+            .await
+            .unwrap();
         let _ = server.await;
         assert!(result.truncated && result.lines.is_empty());
         assert!(result.note.unwrap().contains("max_response_bytes"));

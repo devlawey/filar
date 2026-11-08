@@ -21,9 +21,9 @@
 
 pub mod fold;
 pub mod k8s;
-pub mod tool;
 pub mod loki;
 pub mod search;
+pub mod tool;
 pub mod victorialogs;
 
 use std::collections::BTreeMap;
@@ -158,7 +158,12 @@ pub async fn read_limited(response: reqwest::Response, max_bytes: usize) -> Resu
     let mut body = LimitedBody::default();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| CoreError::Other(format!("log source: reading the answer failed: {}", without_url(&e))))?;
+        let chunk = chunk.map_err(|e| {
+            CoreError::Other(format!(
+                "log source: reading the answer failed: {}",
+                without_url(&e)
+            ))
+        })?;
         let room = max_bytes - body.bytes.len();
         if chunk.len() > room {
             body.bytes.extend_from_slice(&chunk[..room]);
@@ -213,16 +218,24 @@ impl LogHttp {
         // An extra trusted CA (`ca_file`); verification stays on.
         if let Some(path) = &cfg.ca_file {
             let pem = std::fs::read(path).map_err(|e| {
-                CoreError::Config(format!("log source \"{}\": cannot read ca_file {}: {e}", cfg.name, path.display()))
+                CoreError::Config(format!(
+                    "log source \"{}\": cannot read ca_file {}: {e}",
+                    cfg.name,
+                    path.display()
+                ))
             })?;
             let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| {
-                CoreError::Config(format!("log source \"{}\": ca_file {} is not a PEM certificate: {e}", cfg.name, path.display()))
+                CoreError::Config(format!(
+                    "log source \"{}\": ca_file {} is not a PEM certificate: {e}",
+                    cfg.name,
+                    path.display()
+                ))
             })?;
             builder = builder.add_root_certificate(cert);
         }
-        let client = builder
-            .build()
-            .map_err(|e| CoreError::Other(format!("log source \"{}\": HTTP client: {e}", cfg.name)))?;
+        let client = builder.build().map_err(|e| {
+            CoreError::Other(format!("log source \"{}\": HTTP client: {e}", cfg.name))
+        })?;
         Ok(Self {
             client,
             auth: cfg.auth_kind().unwrap_or(LogAuth::None),
@@ -236,12 +249,19 @@ impl LogHttp {
 
     /// A request to `{base_url}{path}` with the source's auth applied.
     pub fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let builder = self.client.request(method, format!("{}{path}", self.base_url));
+        let builder = self
+            .client
+            .request(method, format!("{}{path}", self.base_url));
         match self.auth {
             LogAuth::None => builder,
-            LogAuth::Basic => builder.basic_auth(self.user.as_deref().unwrap_or(""), Some(&self.key)),
+            LogAuth::Basic => {
+                builder.basic_auth(self.user.as_deref().unwrap_or(""), Some(&self.key))
+            }
             LogAuth::Bearer => builder.bearer_auth(&self.key),
-            LogAuth::ApiKey => builder.header(reqwest::header::AUTHORIZATION, format!("ApiKey {}", self.key)),
+            LogAuth::ApiKey => builder.header(
+                reqwest::header::AUTHORIZATION,
+                format!("ApiKey {}", self.key),
+            ),
         }
     }
 
@@ -275,12 +295,20 @@ impl LogHttp {
             403 => "access denied (403) — the key lacks rights for this search".to_string(),
             _ => format!("HTTP {status}"),
         };
-        Err(self.error(&if text.is_empty() { what } else { format!("{what}: {text}") }))
+        Err(self.error(&if text.is_empty() {
+            what
+        } else {
+            format!("{what}: {text}")
+        }))
     }
 
     /// An error of this source with the key scrubbed from `message`.
     pub fn error(&self, message: &str) -> CoreError {
-        CoreError::Other(format!("log source \"{}\": {}", self.name, self.scrub(message)))
+        CoreError::Other(format!(
+            "log source \"{}\": {}",
+            self.name,
+            self.scrub(message)
+        ))
     }
 
     /// `text` with the key (and its basic-auth form) replaced by `***`.
@@ -306,12 +334,24 @@ mod base64_lite {
         let bytes = input.as_bytes();
         let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
         for chunk in bytes.chunks(3) {
-            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
             let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
             out.push(ALPHABET[(n >> 18) as usize & 63] as char);
             out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-            out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
-            out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+            out.push(if chunk.len() > 1 {
+                ALPHABET[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[n as usize & 63] as char
+            } else {
+                '='
+            });
         }
         out
     }
@@ -330,7 +370,9 @@ mod base64_lite {
 pub fn build_log_source(cfg: &LogSourceConfig, key: &str) -> Result<Arc<dyn LogSource>> {
     cfg.validate()?;
     match cfg.source_kind() {
-        Some(LogSourceKind::VictoriaLogs) => Ok(Arc::new(victorialogs::VictoriaLogsSource::new(cfg, key)?)),
+        Some(LogSourceKind::VictoriaLogs) => {
+            Ok(Arc::new(victorialogs::VictoriaLogsSource::new(cfg, key)?))
+        }
         Some(LogSourceKind::Loki) => Ok(Arc::new(loki::LokiSource::new(cfg, key)?)),
         Some(LogSourceKind::OpenSearch | LogSourceKind::Elasticsearch) => {
             Ok(Arc::new(search::SearchSource::new(cfg, key)?))
@@ -354,7 +396,12 @@ pub fn resolve_log_key(cfg: &LogSourceConfig, secrets: &dyn SecretProvider) -> R
         .get(key_env)
         .ok()
         .filter(|k| !k.is_empty())
-        .ok_or_else(|| CoreError::Secret(format!("log source \"{}\": key {key_env} is not set", cfg.name)))
+        .ok_or_else(|| {
+            CoreError::Secret(format!(
+                "log source \"{}\": key {key_env} is not set",
+                cfg.name
+            ))
+        })
 }
 
 #[cfg(test)]

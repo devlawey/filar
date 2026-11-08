@@ -394,9 +394,10 @@ pub fn parse_chat_logprob_response(body: &str, requested_model: &str) -> Result<
         .collect();
     let position = expected_position(&probabilities)
         .ok_or_else(|| CoreError::Other("risk scorer: empty distribution".into()))?;
-    let confidence = probabilities.values().cloned().fold(None, |m: Option<f32>, p| {
-        Some(m.map_or(p, |m| m.max(p)))
-    });
+    let confidence = probabilities
+        .values()
+        .cloned()
+        .fold(None, |m: Option<f32>, p| Some(m.map_or(p, |m| m.max(p))));
     Ok(RiskScore {
         safety_pct: safety_pct_from_position(position, RISK_LEVELS.len()),
         confidence,
@@ -467,17 +468,18 @@ async fn post_json(
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key);
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| CoreError::Other(format!("risk scorer request failed: {}", e.without_url())))?;
+    let resp = req.send().await.map_err(|e| {
+        CoreError::Other(format!("risk scorer request failed: {}", e.without_url()))
+    })?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| CoreError::Other(format!("risk scorer: body unreadable: {}", e.without_url())))?;
+    let text = resp.text().await.map_err(|e| {
+        CoreError::Other(format!("risk scorer: body unreadable: {}", e.without_url()))
+    })?;
     if !status.is_success() {
-        return Err(CoreError::Other(format!("risk scorer: HTTP {}", status.as_u16())));
+        return Err(CoreError::Other(format!(
+            "risk scorer: HTTP {}",
+            status.as_u16()
+        )));
     }
     Ok(text)
 }
@@ -552,8 +554,7 @@ pub(crate) struct PendingScores {
 
 impl Drop for PendingScores {
     fn drop(&mut self) {
-        self.closed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         // The ratings are aborted as they drop with the list.
     }
 }
@@ -792,19 +793,29 @@ mod tests {
     }
 
     /// One-shot HTTP server: answers `status` + `body` and records the request.
-    async fn serve_once(status: u16, body: &'static str, delay: Duration) -> (String, Arc<Mutex<String>>) {
+    async fn serve_once(
+        status: u16,
+        body: &'static str,
+        delay: Duration,
+    ) -> (String, Arc<Mutex<String>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = Arc::new(Mutex::new(String::new()));
         let seen2 = seen.clone();
         tokio::spawn(async move {
-            let Ok((mut socket, _)) = listener.accept().await else { return };
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
             let mut buf = Vec::new();
             let mut tmp = [0u8; 4096];
             // Read headers, then Content-Length bytes of body.
             loop {
-                let Ok(n) = socket.read(&mut tmp).await else { return };
-                if n == 0 { break; }
+                let Ok(n) = socket.read(&mut tmp).await else {
+                    return;
+                };
+                if n == 0 {
+                    break;
+                }
                 buf.extend_from_slice(&tmp[..n]);
                 let text = String::from_utf8_lossy(&buf).to_string();
                 if let Some(end) = text.find("\r\n\r\n") {
@@ -812,10 +823,13 @@ mod tests {
                         .lines()
                         .find_map(|l| {
                             let l = l.to_ascii_lowercase();
-                            l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            l.strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
                         })
                         .unwrap_or(0);
-                    if buf.len() >= end + 4 + len { break; }
+                    if buf.len() >= end + 4 + len {
+                        break;
+                    }
                 }
             }
             *seen2.lock().unwrap() = String::from_utf8_lossy(&buf).to_string();
@@ -835,19 +849,24 @@ mod tests {
     #[tokio::test]
     async fn scorer_posts_to_decisions_with_bearer() {
         let (base, seen) = serve_once(200, OK_BODY, Duration::ZERO).await;
-        let s = DecisionsApiScorer::new(&base, "typesafe/jev-1.14", SECRET, Duration::from_secs(5)).unwrap();
+        let s = DecisionsApiScorer::new(&base, "typesafe/jev-1.14", SECRET, Duration::from_secs(5))
+            .unwrap();
         let r = s.score(&input()).await.unwrap();
         assert_eq!(r.safety_pct, 25);
         let req = seen.lock().unwrap().clone();
         assert!(req.starts_with("POST /api/alpha/decisions "), "{req}");
-        assert!(req.to_ascii_lowercase().contains(&format!("authorization: bearer {}", SECRET.to_ascii_lowercase())));
+        assert!(req.to_ascii_lowercase().contains(&format!(
+            "authorization: bearer {}",
+            SECRET.to_ascii_lowercase()
+        )));
         assert!(req.contains("\"type\":\"score\""));
     }
 
     #[tokio::test]
     async fn keyless_scorer_sends_no_authorization() {
         let (base, seen) = serve_once(200, OK_BODY, Duration::ZERO).await;
-        let s = DecisionsApiScorer::new(&format!("{base}/"), "local", "", Duration::from_secs(5)).unwrap();
+        let s = DecisionsApiScorer::new(&format!("{base}/"), "local", "", Duration::from_secs(5))
+            .unwrap();
         s.score(&input()).await.unwrap();
         let req = seen.lock().unwrap().to_ascii_lowercase();
         assert!(req.starts_with("post /api/alpha/decisions "), "{req}");
@@ -857,7 +876,12 @@ mod tests {
     #[tokio::test]
     async fn http_errors_are_errors_without_the_key() {
         for status in [401u16, 429, 500, 503] {
-            let (base, _) = serve_once(status, r#"{"error":{"code":1,"message":"x"}}"#, Duration::ZERO).await;
+            let (base, _) = serve_once(
+                status,
+                r#"{"error":{"code":1,"message":"x"}}"#,
+                Duration::ZERO,
+            )
+            .await;
             let s = DecisionsApiScorer::new(&base, "m", SECRET, Duration::from_secs(5)).unwrap();
             let err = s.score(&input()).await.unwrap_err().to_string();
             assert!(err.contains(&status.to_string()), "{err}");
@@ -883,7 +907,13 @@ mod tests {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         drop(l);
-        let s = DecisionsApiScorer::new(&format!("http://{addr}"), "m", SECRET, Duration::from_secs(2)).unwrap();
+        let s = DecisionsApiScorer::new(
+            &format!("http://{addr}"),
+            "m",
+            SECRET,
+            Duration::from_secs(2),
+        )
+        .unwrap();
         let err = s.score(&input()).await.unwrap_err().to_string();
         assert!(!err.contains(SECRET), "{err}");
     }
@@ -907,10 +937,16 @@ mod tests {
         let s = build_risk_scorer(&cfg, &with_key).unwrap();
         assert_eq!(s.model_name(), "typesafe/jev-1.14");
 
-        let keyless = RiskScorerConfig { key_env: String::new(), ..cfg.clone() };
+        let keyless = RiskScorerConfig {
+            key_env: String::new(),
+            ..cfg.clone()
+        };
         assert!(build_risk_scorer(&keyless, &empty).is_ok());
 
-        let bad = RiskScorerConfig { kind: "magic".into(), ..cfg };
+        let bad = RiskScorerConfig {
+            kind: "magic".into(),
+            ..cfg
+        };
         assert!(build_risk_scorer(&bad, &with_key).is_err());
     }
 
@@ -929,7 +965,10 @@ mod tests {
             assert!(system.contains(&format!("{i}: {level}")), "{system}");
         }
         assert!(system.contains("exactly one digit"));
-        assert!(body["messages"][1]["content"].as_str().unwrap().contains("rm -rf /tmp/x"));
+        assert!(body["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("rm -rf /tmp/x"));
     }
 
     #[test]
@@ -940,7 +979,10 @@ mod tests {
             "top_logprobs":[{{"token":"3","logprob":{l3a}}},{{"token":" 3","logprob":{l3b}}},
             {{"token":"1","logprob":{l1}}},{{"token":"Sure","logprob":{lx}}}]}}]}}}}],
             "usage":{{"prompt_tokens":10,"completion_tokens":1}}}}"#,
-            l3a = (0.25f64).ln(), l3b = (0.25f64).ln(), l1 = (0.5f64).ln(), lx = (0.1f64).ln()
+            l3a = (0.25f64).ln(),
+            l3b = (0.25f64).ln(),
+            l1 = (0.5f64).ln(),
+            lx = (0.1f64).ln()
         );
         let s = parse_chat_logprob_response(&body, "m").unwrap();
         // Expected position: 0.5·3 + 0.5·1 = 2 → 50%.
@@ -953,7 +995,9 @@ mod tests {
     #[test]
     fn chat_without_logprobs_is_unavailable() {
         let body = r#"{"choices":[{"message":{"content":"2"}}]}"#;
-        let err = parse_chat_logprob_response(body, "m").unwrap_err().to_string();
+        let err = parse_chat_logprob_response(body, "m")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("does not return logprobs"), "{err}");
         let body = r#"{"choices":[{"logprobs":null}]}"#;
         assert!(parse_chat_logprob_response(body, "m").is_err());
@@ -982,7 +1026,10 @@ mod tests {
         let r = s.score(&input()).await.unwrap();
         assert_eq!(r.safety_pct, 0);
         let req = seen.lock().unwrap().to_ascii_lowercase();
-        assert!(req.starts_with("post /api/alpha/chat/completions "), "{req}");
+        assert!(
+            req.starts_with("post /api/alpha/chat/completions "),
+            "{req}"
+        );
         assert!(!req.contains("authorization:"), "keyless sends no key");
         assert!(req.contains("\"logprobs\":true"));
     }
@@ -993,7 +1040,11 @@ mod tests {
         let s = ChatLogprobScorer::new(&base, "m", SECRET, Duration::from_secs(5)).unwrap();
         let err = s.score(&input()).await.unwrap_err().to_string();
         assert!(err.contains("500") && !err.contains(SECRET), "{err}");
-        assert!(seen.lock().unwrap().to_ascii_lowercase().contains("authorization: bearer"));
+        assert!(seen
+            .lock()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("authorization: bearer"));
     }
 
     #[test]
@@ -1049,12 +1100,18 @@ mod tests {
         scores.spawn(Arc::new(InstantScorer), input(), 1, Some(sink));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !entered.load(std::sync::atomic::Ordering::SeqCst) {
-            assert!(std::time::Instant::now() < deadline, "the rating never reached the sink");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the rating never reached the sink"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         let dropped = std::time::Instant::now();
         drop(scores);
-        assert!(dropped.elapsed() < Duration::from_secs(1), "the drop waited for the sink");
+        assert!(
+            dropped.elapsed() < Duration::from_secs(1),
+            "the drop waited for the sink"
+        );
         drop(held);
     }
 

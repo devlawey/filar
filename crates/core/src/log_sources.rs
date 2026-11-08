@@ -84,7 +84,12 @@ impl LogSourceKind {
     /// Authentication schemes this kind supports.
     pub fn auths(self) -> &'static [LogAuth] {
         match self {
-            Self::Elasticsearch => &[LogAuth::None, LogAuth::Basic, LogAuth::Bearer, LogAuth::ApiKey],
+            Self::Elasticsearch => &[
+                LogAuth::None,
+                LogAuth::Basic,
+                LogAuth::Bearer,
+                LogAuth::ApiKey,
+            ],
             Self::VictoriaLogs | Self::OpenSearch | Self::Loki => {
                 &[LogAuth::None, LogAuth::Basic, LogAuth::Bearer]
             }
@@ -120,7 +125,12 @@ pub struct K8sFields {
 
 impl K8sFieldPreset {
     /// Every preset.
-    pub const ALL: [K8sFieldPreset; 4] = [Self::Vlagent, Self::FluentBit, Self::Filebeat, Self::Promtail];
+    pub const ALL: [K8sFieldPreset; 4] = [
+        Self::Vlagent,
+        Self::FluentBit,
+        Self::Filebeat,
+        Self::Promtail,
+    ];
 
     /// Parse the `k8s_fields` value.
     pub fn parse(s: &str) -> Option<Self> {
@@ -344,7 +354,11 @@ impl LogSourceConfig {
 
     /// The document time field (OpenSearch / Elasticsearch).
     pub fn time_field_name(&self) -> &str {
-        self.time_field.as_deref().map(str::trim).filter(|f| !f.is_empty()).unwrap_or("@timestamp")
+        self.time_field
+            .as_deref()
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .unwrap_or("@timestamp")
     }
 
     /// The Kubernetes field preset: `k8s_fields`, else the usual one for `kind`.
@@ -361,14 +375,24 @@ impl LogSourceConfig {
         let name = self.name.trim();
         let err = |msg: String| Err(CoreError::Config(format!("log_sources: \"{name}\": {msg}")));
         if name.is_empty() {
-            return Err(CoreError::Config("log_sources: name must not be empty".into()));
+            return Err(CoreError::Config(
+                "log_sources: name must not be empty".into(),
+            ));
         }
-        if self.name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        if self
+            .name
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+        {
             return err("name must not contain whitespace (leading or trailing included)".into());
         }
         let Some(kind) = self.source_kind() else {
             let all: Vec<&str> = LogSourceKind::ALL.iter().map(|k| k.as_str()).collect();
-            return err(format!("kind \"{}\" is not one of {}", self.kind, all.join(", ")));
+            return err(format!(
+                "kind \"{}\" is not one of {}",
+                self.kind,
+                all.join(", ")
+            ));
         };
         let url = self.url.trim();
         let rest = url
@@ -385,7 +409,10 @@ impl LogSourceConfig {
             return err("url must not carry credentials; use auth and key_env".into());
         }
         let Some(auth) = self.auth_kind() else {
-            return err(format!("auth \"{}\" is not one of none, basic, bearer, api-key", self.auth));
+            return err(format!(
+                "auth \"{}\" is not one of none, basic, bearer, api-key",
+                self.auth
+            ));
         };
         if !kind.auths().contains(&auth) {
             let allowed: Vec<&str> = kind.auths().iter().map(|a| a.as_str()).collect();
@@ -398,10 +425,15 @@ impl LogSourceConfig {
         }
         let key_env = self.key_env.trim();
         if auth.needs_key() && key_env.is_empty() {
-            return err(format!("auth = \"{}\" needs key_env (the name of the key, not the key)", auth.as_str()));
+            return err(format!(
+                "auth = \"{}\" needs key_env (the name of the key, not the key)",
+                auth.as_str()
+            ));
         }
         if !key_env.is_empty() && !is_key_name(key_env) {
-            return err("key_env must be a variable name (letters, digits, _), not a key value".into());
+            return err(
+                "key_env must be a variable name (letters, digits, _), not a key value".into(),
+            );
         }
         if auth == LogAuth::Basic && self.user.as_deref().is_none_or(|u| u.trim().is_empty()) {
             return err("auth = \"basic\" needs user".into());
@@ -410,16 +442,20 @@ impl LogSourceConfig {
             let tenant = tenant.trim();
             match kind {
                 LogSourceKind::VictoriaLogs => {
-                    let ok = tenant.split_once(':').is_some_and(|(a, p)| {
-                        a.parse::<u32>().is_ok() && p.parse::<u32>().is_ok()
-                    });
+                    let ok = tenant
+                        .split_once(':')
+                        .is_some_and(|(a, p)| a.parse::<u32>().is_ok() && p.parse::<u32>().is_ok());
                     if !ok {
                         return err("tenant must be AccountID:ProjectID, e.g. \"0:0\"".into());
                     }
                 }
                 LogSourceKind::Loki => {
-                    if tenant.is_empty() || tenant.chars().any(|c| c.is_whitespace() || c.is_control()) {
-                        return err("tenant must be a non-empty X-Scope-OrgID without spaces".into());
+                    if tenant.is_empty()
+                        || tenant.chars().any(|c| c.is_whitespace() || c.is_control())
+                    {
+                        return err(
+                            "tenant must be a non-empty X-Scope-OrgID without spaces".into()
+                        );
                     }
                 }
                 LogSourceKind::OpenSearch | LogSourceKind::Elasticsearch => {
@@ -433,8 +469,13 @@ impl LogSourceConfig {
                 if index.is_empty() {
                     return err(format!("{} needs index (e.g. \"logs-*\")", kind.as_str()));
                 }
-                if index.chars().any(|c| c.is_whitespace() || matches!(c, '/' | '?' | '#')) {
-                    return err("index must be an index name or pattern without spaces, /, ? or #".into());
+                if index
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '/' | '?' | '#'))
+                {
+                    return err(
+                        "index must be an index name or pattern without spaces, /, ? or #".into(),
+                    );
                 }
             }
             LogSourceKind::VictoriaLogs | LogSourceKind::Loki => {
@@ -444,13 +485,19 @@ impl LogSourceConfig {
             }
         }
         if !(1..=MAX_LOG_MAX_WINDOW_HOURS).contains(&self.max_window_hours) {
-            return err(format!("max_window_hours must be between 1 and {MAX_LOG_MAX_WINDOW_HOURS}"));
+            return err(format!(
+                "max_window_hours must be between 1 and {MAX_LOG_MAX_WINDOW_HOURS}"
+            ));
         }
         if !(1..=MAX_LOG_MAX_LINES).contains(&self.max_lines) {
-            return err(format!("max_lines must be between 1 and {MAX_LOG_MAX_LINES}"));
+            return err(format!(
+                "max_lines must be between 1 and {MAX_LOG_MAX_LINES}"
+            ));
         }
         if !(1..=MAX_LOG_TIMEOUT_SECS).contains(&self.timeout_secs) {
-            return err(format!("timeout_secs must be between 1 and {MAX_LOG_TIMEOUT_SECS}"));
+            return err(format!(
+                "timeout_secs must be between 1 and {MAX_LOG_TIMEOUT_SECS}"
+            ));
         }
         let (lo, hi) = LOG_MAX_LINE_BYTES_RANGE;
         if !(lo..=hi).contains(&self.max_line_bytes) {
@@ -460,11 +507,22 @@ impl LogSourceConfig {
         if !(lo..=hi).contains(&self.max_response_bytes) {
             return err(format!("max_response_bytes must be between {lo} and {hi}"));
         }
-        let search = matches!(kind, LogSourceKind::OpenSearch | LogSourceKind::Elasticsearch);
+        let search = matches!(
+            kind,
+            LogSourceKind::OpenSearch | LogSourceKind::Elasticsearch
+        );
         if !search && (self.time_field.is_some() || !self.fields.is_empty()) {
-            return err(format!("time_field and fields are not used by {}", kind.as_str()));
+            return err(format!(
+                "time_field and fields are not used by {}",
+                kind.as_str()
+            ));
         }
-        let field_ok = |f: &str| !f.trim().is_empty() && !f.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"');
+        let field_ok = |f: &str| {
+            !f.trim().is_empty()
+                && !f
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || c == '"')
+        };
         if self.time_field.as_deref().is_some_and(|f| !field_ok(f)) {
             return err("time_field must be a field name".into());
         }
@@ -474,10 +532,17 @@ impl LogSourceConfig {
         if let Some(preset) = self.k8s_fields.as_deref() {
             if K8sFieldPreset::parse(preset).is_none() {
                 let all: Vec<&str> = K8sFieldPreset::ALL.iter().map(|p| p.as_str()).collect();
-                return err(format!("k8s_fields \"{preset}\" is not one of {}", all.join(", ")));
+                return err(format!(
+                    "k8s_fields \"{preset}\" is not one of {}",
+                    all.join(", ")
+                ));
             }
         }
-        if self.ca_file.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
+        if self
+            .ca_file
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+        {
             return err("ca_file must be a path to a PEM file".into());
         }
         if self.clusters.iter().any(|c| c.trim().is_empty()) {
@@ -533,7 +598,13 @@ mod tests {
 
     #[test]
     fn the_url_must_be_http_with_a_host_and_no_credentials() {
-        for bad in ["vlogs.example.com", "ftp://x", "https://", "https:///x", "https://u:p@x"] {
+        for bad in [
+            "vlogs.example.com",
+            "ftp://x",
+            "https://",
+            "https:///x",
+            "https://u:p@x",
+        ] {
             let mut cfg = vlogs();
             cfg.url = bad.into();
             assert!(err(&cfg).contains("url"), "{bad}");
@@ -565,7 +636,10 @@ mod tests {
         cfg.key_env = "eyJhbGciOi.secret-value".into();
         let e = err(&cfg);
         assert!(e.contains("variable name"), "{e}");
-        assert!(!e.contains("secret-value"), "the value must not be echoed: {e}");
+        assert!(
+            !e.contains("secret-value"),
+            "the value must not be echoed: {e}"
+        );
         cfg.key_env = "FILAR_LOGS_VLOGS_PROD".into();
         cfg.validate().unwrap();
     }

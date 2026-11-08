@@ -425,7 +425,11 @@ fn kube_segment(kube: &crate::app::KubeTabState, tags: Option<&str>, glyphs: &Gl
             " {sep} {}",
             kube_component(&pod.display_pod(), 20, glyphs)
         ));
-        if let Some(container) = pod.container.as_deref().or(pod.pod_ref.container.as_deref()) {
+        if let Some(container) = pod
+            .container
+            .as_deref()
+            .or(pod.pod_ref.container.as_deref())
+        {
             out.push_str(&format!(" {sep} {}", kube_component(container, 16, glyphs)));
         }
         // A debug container (#576) is labelled as such.
@@ -1511,7 +1515,10 @@ mod tests {
         );
         let ascii = kube_segment(&kube, Some("[prod]"), &Glyphs::ASCII);
         assert!(ascii.is_ascii(), "{ascii}");
-        assert!(ascii.starts_with("k8s: prod-eu > shop > web-7f9c4d5b8-x2k9p > main [prod]"), "{ascii}");
+        assert!(
+            ascii.starts_with("k8s: prod-eu > shop > web-7f9c4d5b8-x2k9p > main [prod]"),
+            "{ascii}"
+        );
         let mut long = kube.clone();
         long.pod.as_mut().unwrap().pod = Some("checkout-api-7f9c4d5b8-x2k9p".into());
         assert!(

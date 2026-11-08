@@ -163,7 +163,10 @@ impl FleetIdentifiers {
                 .then(|| {
                     pairs.iter().find(|(id, _)| {
                         text[at..].starts_with(id)
-                            && !text[at + id.len()..].chars().next().is_some_and(is_name_char)
+                            && !text[at + id.len()..]
+                                .chars()
+                                .next()
+                                .is_some_and(is_name_char)
                     })
                 })
                 .flatten();
@@ -250,7 +253,11 @@ pub async fn generate_fleet_runbook(
     outcome
 }
 
-async fn generate_with(llm: &dyn LlmClient, system_prompt: &str, transcript: &str) -> RunbookOutcome {
+async fn generate_with(
+    llm: &dyn LlmClient,
+    system_prompt: &str,
+    transcript: &str,
+) -> RunbookOutcome {
     let request = ChatRequest {
         messages: vec![
             ChatMessage::new(MessageRole::System, system_prompt),
@@ -262,7 +269,12 @@ async fn generate_with(llm: &dyn LlmClient, system_prompt: &str, transcript: &st
     let response = match llm.chat_stream(&request, &|_| {}).await {
         Ok(response) => response,
         // No response, so nothing was billed that we know of.
-        Err(e) => return RunbookOutcome { usage: None, runbook: Err(e) },
+        Err(e) => {
+            return RunbookOutcome {
+                usage: None,
+                runbook: Err(e),
+            }
+        }
     };
     let usage = response.usage.clone();
     let text = response.text.trim().to_string();
@@ -275,7 +287,10 @@ async fn generate_with(llm: &dyn LlmClient, system_prompt: &str, transcript: &st
             ))),
         };
     }
-    RunbookOutcome { usage, runbook: Ok(text) }
+    RunbookOutcome {
+        usage,
+        runbook: Ok(text),
+    }
 }
 
 #[cfg(test)]
@@ -316,7 +331,12 @@ mod tests {
 
     fn fleet_ids() -> FleetIdentifiers {
         FleetIdentifiers {
-            hosts: vec!["web-1".into(), "10.0.0.11".into(), "web-10".into(), "web-10.prod.example".into()],
+            hosts: vec![
+                "web-1".into(),
+                "10.0.0.11".into(),
+                "web-10".into(),
+                "web-10.prod.example".into(),
+            ],
             users: vec!["admin".into()],
         }
     }
@@ -398,9 +418,15 @@ mod tests {
         let outcome = generate_fleet_runbook(&EchoLlm, transcript, &fleet_ids()).await;
         let text = outcome.runbook.expect("the echo is long enough");
         for leaked in ["web-1", "web-10", "10.0.0.11", "prod.example", "admin@"] {
-            assert!(!text.contains(leaked), "{leaked:?} reached the runbook:\n{text}");
+            assert!(
+                !text.contains(leaked),
+                "{leaked:?} reached the runbook:\n{text}"
+            );
         }
-        assert!(text.contains("for the group, not for one machine"), "the fleet block was sent");
+        assert!(
+            text.contains("for the group, not for one machine"),
+            "the fleet block was sent"
+        );
     }
 
     struct Named(&'static str);
@@ -418,12 +444,20 @@ mod tests {
                      Log in as admin if needed.";
         let outcome = generate_fleet_runbook(&Named(reply), "t", &fleet_ids()).await;
         let text = outcome.runbook.expect("long enough");
-        assert!(!text.contains("web-10") && !text.contains("10.0.0.11") && !text.contains("admin "), "{text}");
+        assert!(
+            !text.contains("web-10") && !text.contains("10.0.0.11") && !text.contains("admin "),
+            "{text}"
+        );
     }
 
     #[tokio::test]
     async fn a_fleet_runbook_keeps_the_single_host_rules() {
-        let outcome = generate_fleet_runbook(&FixedLlm("OK".into(), Some(usage(10, 1))), "t", &fleet_ids()).await;
+        let outcome = generate_fleet_runbook(
+            &FixedLlm("OK".into(), Some(usage(10, 1))),
+            "t",
+            &fleet_ids(),
+        )
+        .await;
         assert!(outcome.runbook.is_err(), "the length floor still applies");
         assert!(outcome.usage.is_some(), "usage is reported either way");
         let outcome = generate_fleet_runbook(&FailingLlm, "t", &fleet_ids()).await;
@@ -490,7 +524,9 @@ mod tests {
         let llm = FixedLlm(REAL_RUNBOOK.to_string(), Some(usage(9_000, 400)));
         let outcome = generate_runbook(&llm, "User: replica lag\n").await;
         assert_eq!(outcome.runbook.unwrap(), REAL_RUNBOOK);
-        let u = outcome.usage.expect("usage must come back with the runbook");
+        let u = outcome
+            .usage
+            .expect("usage must come back with the runbook");
         assert_eq!(u.prompt_tokens, Some(9_000));
         assert_eq!(u.completion_tokens, Some(400));
     }

@@ -203,7 +203,10 @@ mod tests {
     fn docked_on_wide_drawer_on_narrow() {
         let mut p = SidePanel::default();
         assert!(p.visible(160, true), "wide + content: permanent");
-        assert!(!p.visible(160, false), "wide + nothing to show: no space taken");
+        assert!(
+            !p.visible(160, false),
+            "wide + nothing to show: no space taken"
+        );
         assert!(!p.visible(80, true), "80 columns: the feed keeps its width");
         p.toggle();
         assert!(p.visible(80, true), "^J slides the drawer out");

@@ -981,10 +981,14 @@ pub(crate) mod tests {
         let mut p = pod(name);
         p.restarts = 2;
         p.containers[0].image = image.into();
-        p.containers[0].resource_requests =
-            BTreeMap::from([("cpu".into(), "100m".into()), ("memory".into(), "64Mi".into())]);
-        p.containers[0].resource_limits =
-            BTreeMap::from([("cpu".into(), "500m".into()), ("memory".into(), memory_limit.into())]);
+        p.containers[0].resource_requests = BTreeMap::from([
+            ("cpu".into(), "100m".into()),
+            ("memory".into(), "64Mi".into()),
+        ]);
+        p.containers[0].resource_limits = BTreeMap::from([
+            ("cpu".into(), "500m".into()),
+            ("memory".into(), memory_limit.into()),
+        ]);
         p
     }
 
@@ -1012,10 +1016,22 @@ pub(crate) mod tests {
             .expect("fleet opens");
         let report = run_approved(&fleet, &describe_pod()).await;
         let text = report.render();
-        assert!(text.contains("compared on: CONTAINER, IMAGE, CPU REQUEST"), "{text}");
-        assert!(!text.contains("digest"), "no digests for a pod describe: {text}");
-        assert!(text.contains("example/web:1") && text.contains("128Mi") && text.contains("100m"), "{text}");
-        assert!(text.contains("example/web:2") || text.contains("256Mi"), "the odd pod shows its values: {text}");
+        assert!(
+            text.contains("compared on: CONTAINER, IMAGE, CPU REQUEST"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("digest"),
+            "no digests for a pod describe: {text}"
+        );
+        assert!(
+            text.contains("example/web:1") && text.contains("128Mi") && text.contains("100m"),
+            "{text}"
+        );
+        assert!(
+            text.contains("example/web:2") || text.contains("256Mi"),
+            "the odd pod shows its values: {text}"
+        );
         assert_eq!(report.folded().baseline().map(|group| group.len()), Some(2));
     }
 
@@ -1073,14 +1089,22 @@ pub(crate) mod tests {
         };
         let report = run_approved(&fleet, &get).await;
         let text = report.render();
-        assert!(text.contains("compared on: PHASE, READY, RESTARTS, LAST REASON, NODE"), "{text}");
-        assert_eq!(report.folded().groups().len(), 1, "same state, one group: {text}");
+        assert!(
+            text.contains("compared on: PHASE, READY, RESTARTS, LAST REASON, NODE"),
+            "{text}"
+        );
+        assert_eq!(
+            report.folded().groups().len(),
+            1,
+            "same state, one group: {text}"
+        );
     }
 
     #[tokio::test]
     async fn a_missing_metrics_api_is_one_named_reason_for_every_member() {
         let (cluster, mock) = cluster("prod-eu", vec![pod("a"), pod("b"), pod("c"), pod("d")]);
-        mock.no_metrics.store(true, std::sync::atomic::Ordering::SeqCst);
+        mock.no_metrics
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let fleet = KubeFleet::open(&group(&["prod-eu"], Some("app=web")), vec![cluster])
             .await
             .expect("fleet opens");

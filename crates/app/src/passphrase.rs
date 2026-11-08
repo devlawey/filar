@@ -86,7 +86,10 @@ impl PassphrasePrompt for TerminalPrompt {
         if retry {
             eprintln!("Wrong passphrase, try again.");
         }
-        read_hidden(&format!("Passphrase for SSH key {} ({target}): ", key.display()))
+        read_hidden(&format!(
+            "Passphrase for SSH key {} ({target}): ",
+            key.display()
+        ))
     }
 
     fn offer_to_save(&mut self, _target: &str) -> bool {
@@ -166,7 +169,12 @@ mod tests {
 
     impl Scripted {
         fn new(typed: &[&'static str], save: bool) -> Self {
-            Self { typed: typed.to_vec(), asked: 0, save, saved: Vec::new() }
+            Self {
+                typed: typed.to_vec(),
+                asked: 0,
+                save,
+                saved: Vec::new(),
+            }
         }
     }
 
@@ -213,15 +221,17 @@ mod tests {
         let key = PrivateKey::from(Ed25519Keypair::from_seed(&[9u8; 32]))
             .encrypt_with(
                 Cipher::Aes256Ctr,
-                Kdf::Bcrypt { salt: [5u8; 16].to_vec(), rounds: 1 },
+                Kdf::Bcrypt {
+                    salt: [5u8; 16].to_vec(),
+                    rounds: 1,
+                },
                 7,
                 GOOD,
             )
             .expect("encrypt");
         let pem = key.to_openssh(LineEnding::LF).expect("encode");
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir()
-            .join(format!("filar-app-key-{}-{n}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("filar-app-key-{}-{n}", std::process::id()));
         std::fs::write(&path, pem.as_bytes()).expect("write");
         TempKey(path)
     }
@@ -232,7 +242,10 @@ mod tests {
             host: "h".into(),
             port: 22,
             user: "u".into(),
-            auth: SshAuth::Key { path: Some(path.to_path_buf()), passphrase: None },
+            auth: SshAuth::Key {
+                path: Some(path.to_path_buf()),
+                passphrase: None,
+            },
             host_key_policy: Default::default(),
             tags: Vec::new(),
         }
@@ -252,11 +265,7 @@ mod tests {
         prompt: &mut Scripted,
     ) -> (SshTarget, anyhow::Result<()>) {
         let mut t = key_target(path);
-        let res = resolve_key_passphrase(
-            &mut t,
-            &PassphraseSources { keyring, env },
-            prompt,
-        );
+        let res = resolve_key_passphrase(&mut t, &PassphraseSources { keyring, env }, prompt);
         (t, res)
     }
 
@@ -332,8 +341,15 @@ mod tests {
         t.auth = SshAuth::Agent;
         let empty = StaticSecretProvider::new();
         let mut prompt = Scripted::new(&[], false);
-        resolve_key_passphrase(&mut t, &PassphraseSources { keyring: &empty, env: &empty }, &mut prompt)
-            .expect("no-op");
+        resolve_key_passphrase(
+            &mut t,
+            &PassphraseSources {
+                keyring: &empty,
+                env: &empty,
+            },
+            &mut prompt,
+        )
+        .expect("no-op");
         assert_eq!(prompt.asked, 0);
     }
 }

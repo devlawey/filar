@@ -297,7 +297,10 @@ impl TerminalModel {
                     current_style = style;
                 } else if style != current_style {
                     if !current_text.is_empty() {
-                        spans.push(Span::styled(std::mem::take(&mut current_text), current_style));
+                        spans.push(Span::styled(
+                            std::mem::take(&mut current_text),
+                            current_style,
+                        ));
                     }
                     current_style = style;
                     style_start = col;
@@ -333,11 +336,7 @@ impl TerminalModel {
 }
 
 /// Whether `(row, col)` sits inside a normalised visible-grid selection.
-fn visible_cell_selected(
-    range: ((usize, usize), (usize, usize)),
-    row: usize,
-    col: usize,
-) -> bool {
+fn visible_cell_selected(range: ((usize, usize), (usize, usize)), row: usize, col: usize) -> bool {
     let ((sr, sc), (er, ec)) = range;
     if row < sr || row > er {
         return false;
@@ -630,12 +629,12 @@ fn ctrl_char_to_bytes(c: char) -> Vec<u8> {
     let lower = latin_key_for(c).unwrap_or(c).to_ascii_lowercase();
     let byte = match lower {
         'a'..='z' => (lower as u8) - b'a' + 1, // Ctrl+A = 0x01, ..., Ctrl+Z = 0x1A
-        '[' => 0x1b, // Ctrl+[ = ESC
-        '\\' => 0x1c, // Ctrl+\ = FS
-        ']' => 0x1d,  // Ctrl+] = GS
-        '^' => 0x1e,  // Ctrl+^ = RS
-        '_' => 0x1f,  // Ctrl+_ = US
-        ' ' => 0x00,  // Ctrl+Space = NUL
+        '[' => 0x1b,                           // Ctrl+[ = ESC
+        '\\' => 0x1c,                          // Ctrl+\ = FS
+        ']' => 0x1d,                           // Ctrl+] = GS
+        '^' => 0x1e,                           // Ctrl+^ = RS
+        '_' => 0x1f,                           // Ctrl+_ = US
+        ' ' => 0x00,                           // Ctrl+Space = NUL
         _ => return c.to_string().into_bytes(),
     };
     vec![byte]
@@ -851,7 +850,10 @@ mod tests {
             "\x1b]7;file://filar-raw/C:\\Users\\Иван\\My Dir\x1b\\C:\\Users\\Иван\\My Dir>"
                 .as_bytes(),
         );
-        assert_eq!(model.take_osc7_cwd().as_deref(), Some(r"C:\Users\Иван\My Dir"));
+        assert_eq!(
+            model.take_osc7_cwd().as_deref(),
+            Some(r"C:\Users\Иван\My Dir")
+        );
     }
 
     #[test]
@@ -863,7 +865,10 @@ mod tests {
 
     #[test]
     fn osc7_drive_root() {
-        assert_eq!(parse_osc7_payload(r"file://localhost/C:\"), Some(r"C:\".into()));
+        assert_eq!(
+            parse_osc7_payload(r"file://localhost/C:\"),
+            Some(r"C:\".into())
+        );
     }
 
     #[test]
@@ -877,7 +882,10 @@ mod tests {
             Some("/srv/100%25 done".into())
         );
         // A shell's own OSC 7 is still decoded.
-        assert_eq!(parse_osc7_payload("file://host/srv/my%20dir"), Some("/srv/my dir".into()));
+        assert_eq!(
+            parse_osc7_payload("file://host/srv/my%20dir"),
+            Some("/srv/my dir".into())
+        );
     }
 
     #[test]
@@ -949,7 +957,11 @@ mod tests {
         assert_eq!(ctrl('і'), b"\x13", "Ukrainian і is the S key");
 
         let plain = KeyEvent::new(KeyCode::Char('с'), KeyModifiers::NONE);
-        assert_eq!(key_to_bytes(plain), "с".as_bytes(), "typing Cyrillic is untouched");
+        assert_eq!(
+            key_to_bytes(plain),
+            "с".as_bytes(),
+            "typing Cyrillic is untouched"
+        );
         let alt = KeyEvent::new(KeyCode::Char('с'), KeyModifiers::ALT);
         assert_eq!(key_to_bytes(alt), "\x1bс".as_bytes(), "Alt is out of scope");
     }
@@ -1009,11 +1021,12 @@ mod tests {
 
     #[test]
     fn map_color_spec() {
-        let rgb = Rgb { r: 100, g: 150, b: 200 };
-        assert_eq!(
-            map_color(&VteColor::Spec(rgb)),
-            Color::Rgb(100, 150, 200)
-        );
+        let rgb = Rgb {
+            r: 100,
+            g: 150,
+            b: 200,
+        };
+        assert_eq!(map_color(&VteColor::Spec(rgb)), Color::Rgb(100, 150, 200));
     }
 
     #[test]
@@ -1047,8 +1060,14 @@ mod tests {
             .map_err(|e| format!("render scrollback view: {e:?}"))?;
         let scrolled = format!("{:?}", term.backend().buffer());
 
-        assert_ne!(bottom, scrolled, "scrollback view must differ from live view");
-        assert!(scrolled.contains("line3"), "scrollback should show earlier lines; got: {scrolled}");
+        assert_ne!(
+            bottom, scrolled,
+            "scrollback view must differ from live view"
+        );
+        assert!(
+            scrolled.contains("line3"),
+            "scrollback should show earlier lines; got: {scrolled}"
+        );
         Ok(())
     }
 }

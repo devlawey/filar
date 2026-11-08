@@ -163,9 +163,10 @@ async fn session_log_dir(executor: &dyn CommandExecutor, session_id: &str) -> Re
 
 /// Escape a string for embedding in a single-quoted POSIX `sh -c` argument.
 fn sh_single_quote(value: &str) -> String {
-    if value.chars().all(|c| {
-        c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/'
-    }) {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
+    {
         value.to_string()
     } else {
         let escaped = value.replace('\'', "'\\''");
@@ -479,12 +480,11 @@ async fn poll_remote_job(
     Ok((state, output))
 }
 
-async fn cancel_remote_job(
-    executor: &dyn CommandExecutor,
-    pid: u32,
-    log_path: &str,
-) -> Result<()> {
-    let cmd = format!("kill {pid} 2>/dev/null; rm -f {}", sh_single_quote(log_path));
+async fn cancel_remote_job(executor: &dyn CommandExecutor, pid: u32, log_path: &str) -> Result<()> {
+    let cmd = format!(
+        "kill {pid} 2>/dev/null; rm -f {}",
+        sh_single_quote(log_path)
+    );
     executor.run(&cmd).await?;
     Ok(())
 }
@@ -550,9 +550,7 @@ pub async fn start_job(
         Some(pid)
     };
 
-    let pid_line = pid
-        .map(|p| format!("\npid: {p}"))
-        .unwrap_or_default();
+    let pid_line = pid.map(|p| format!("\npid: {p}")).unwrap_or_default();
 
     info!(session_id, job_id = %job_id, "background job started");
     Ok(format!(
@@ -584,7 +582,9 @@ pub async fn job_status(
             ))
         })?;
         let (command, pid, state, output) = snapshot;
-        return Ok(format_status_response(job_id, &command, pid, &state, &output));
+        return Ok(format_status_response(
+            job_id, &command, pid, &state, &output,
+        ));
     }
 
     let (command, pid, state, log_path, cached_output) = with_session(session_id, |session| {
@@ -612,7 +612,9 @@ pub async fn job_status(
     }
 
     let Some(log) = log_path else {
-        return Err(CoreError::Other(format!("job {job_id} has no remote log path")));
+        return Err(CoreError::Other(format!(
+            "job {job_id} has no remote log path"
+        )));
     };
     let Some(pid) = pid else {
         return Err(CoreError::Other(format!("job {job_id} has no pid")));
@@ -685,11 +687,7 @@ pub async fn cancel_job(
             .jobs
             .get(job_id)
             .ok_or_else(|| CoreError::Other(format!("unknown job_id: {job_id}")))?;
-        Ok((
-            record.pid,
-            record.log_path.clone(),
-            record.state.clone(),
-        ))
+        Ok((record.pid, record.log_path.clone(), record.state.clone()))
     })?;
 
     if !matches!(state, JobState::Running) {
@@ -741,10 +739,7 @@ pub fn list_jobs(session_id: &str) -> Result<String> {
         }
         let mut lines = vec!["Background jobs:".to_string()];
         for (id, job) in &session.jobs {
-            let pid = job
-                .pid
-                .map(|p| format!(" pid={p}"))
-                .unwrap_or_default();
+            let pid = job.pid.map(|p| format!(" pid={p}")).unwrap_or_default();
             lines.push(format!("- {id}: {}{}", job.state.label(), pid));
         }
         Ok(lines.join("\n"))
@@ -958,9 +953,7 @@ mod tests {
             commands: StdMutex::new(vec![]),
         };
         let sid = test_session();
-        let err = cancel_job(&sid, "job-999", false, &exec)
-            .await
-            .unwrap_err();
+        let err = cancel_job(&sid, "job-999", false, &exec).await.unwrap_err();
         assert!(err.to_string().contains("unknown job_id"));
     }
 
@@ -1003,22 +996,16 @@ mod tests {
             commands: StdMutex::new(vec![]),
         };
 
-        let start_out = start_job(&sid, "sleep 10", false, &exec)
-            .await
-            .unwrap();
+        let start_out = start_job(&sid, "sleep 10", false, &exec).await.unwrap();
         assert!(start_out.contains("job_id: job-"));
         assert!(start_out.contains("pid: 12345"));
         assert!(start_out.contains("running"));
 
-        let status_running = job_status(&sid, "job-1", 20, false, &exec)
-            .await
-            .unwrap();
+        let status_running = job_status(&sid, "job-1", 20, false, &exec).await.unwrap();
         assert!(status_running.contains("status: running"));
         assert!(status_running.contains("line1"));
 
-        let status_done = job_status(&sid, "job-1", 20, false, &exec)
-            .await
-            .unwrap();
+        let status_done = job_status(&sid, "job-1", 20, false, &exec).await.unwrap();
         assert!(status_done.contains("status: done"));
         assert!(status_done.contains("done"));
 
@@ -1057,12 +1044,19 @@ mod tests {
         let sent_before = exec.commands.lock().unwrap().len();
 
         let snaps = snapshot(&sid, 10);
-        assert_eq!(exec.commands.lock().unwrap().len(), sent_before, "snapshot must not run commands");
+        assert_eq!(
+            exec.commands.lock().unwrap().len(),
+            sent_before,
+            "snapshot must not run commands"
+        );
         assert_eq!(snaps[0].job_id, "job-1");
         assert_eq!(snaps[0].command, "sleep 100");
         assert_eq!(snaps[0].state, JobState::Running);
         assert!(snaps[0].remote);
-        assert!(snaps[0].output_settled, "remote output is whatever was polled");
+        assert!(
+            snaps[0].output_settled,
+            "remote output is whatever was polled"
+        );
     }
 
     #[cfg(unix)]
@@ -1073,7 +1067,9 @@ mod tests {
             responses: StdMutex::new(vec![]),
             commands: StdMutex::new(vec![]),
         };
-        start_job(&sid, "printf 'one\\ntwo\\n'", true, &exec).await.unwrap();
+        start_job(&sid, "printf 'one\\ntwo\\n'", true, &exec)
+            .await
+            .unwrap();
         // Wait (bounded) for exit and EOF on both pipes.
         let mut snap = snapshot(&sid, 10).remove(0);
         for _ in 0..200 {
@@ -1085,7 +1081,10 @@ mod tests {
         }
         assert_eq!(snap.state, JobState::Done { exit_code: 0 });
         assert!(snap.output_settled);
-        assert_eq!(snap.output_tail, "one\ntwo", "final output is complete once settled");
+        assert_eq!(
+            snap.output_tail, "one\ntwo",
+            "final output is complete once settled"
+        );
     }
 
     #[tokio::test]
@@ -1151,11 +1150,18 @@ mod tests {
     #[tokio::test]
     async fn ssh_host_with_writable_tmp_keeps_the_tmp_log_path() {
         let sid = test_session();
-        let exec = mock(vec![ok("__FILAR_LOGDIR__=/tmp\n"), ok("__FILAR_PID__=77\n")]);
+        let exec = mock(vec![
+            ok("__FILAR_LOGDIR__=/tmp\n"),
+            ok("__FILAR_PID__=77\n"),
+        ]);
         start_job(&sid, "sleep 5", false, &exec).await.unwrap();
         let cmds = exec.commands.lock().unwrap().clone();
         assert_eq!(cmds.len(), 2);
-        assert!(cmds[0].contains("${TMPDIR:-}\" /tmp /dev/shm"), "{}", cmds[0]);
+        assert!(
+            cmds[0].contains("${TMPDIR:-}\" /tmp /dev/shm"),
+            "{}",
+            cmds[0]
+        );
         let log = format!("/tmp/filar-job-{sid}-job-1.log");
         assert!(cmds[1].contains(&format!("( : > {log} )")), "{}", cmds[1]);
         assert!(cmds[1].contains(&format!("> {log} 2>&1 &")), "{}", cmds[1]);
@@ -1165,7 +1171,10 @@ mod tests {
     fn probe_only_tests_and_never_writes() {
         assert!(LOG_DIR_PROBE.contains("[ -d \"$__filar_d\" ] && [ -w \"$__filar_d\" ]"));
         for writer in ["mkdir", "touch", ">", "rm "] {
-            assert!(!LOG_DIR_PROBE.contains(writer), "probe must be read-only: {writer}");
+            assert!(
+                !LOG_DIR_PROBE.contains(writer),
+                "probe must be read-only: {writer}"
+            );
         }
     }
 
@@ -1236,7 +1245,9 @@ mod tests {
         assert!(msg.contains("not writable"), "{msg}");
         let cmds = exec.commands.lock().unwrap().clone();
         assert_eq!(cmds.len(), 4, "{cmds:?}");
-        assert!(cmds.iter().all(|c| !c.contains("nohup") || c.starts_with("if ( : >")));
+        assert!(cmds
+            .iter()
+            .all(|c| !c.contains("nohup") || c.starts_with("if ( : >")));
         assert!(snapshot(&sid, 10).is_empty(), "no phantom job");
     }
 
@@ -1261,12 +1272,18 @@ mod tests {
     #[tokio::test]
     async fn cancel_removes_the_log_in_the_chosen_dir() {
         let sid = test_session();
-        let exec = mock(vec![ok("__FILAR_LOGDIR__=/dev/shm\n"), ok("__FILAR_PID__=5\n")]);
+        let exec = mock(vec![
+            ok("__FILAR_LOGDIR__=/dev/shm\n"),
+            ok("__FILAR_PID__=5\n"),
+        ]);
         start_job(&sid, "sleep 60", false, &exec).await.unwrap();
         cancel_job(&sid, "job-1", false, &exec).await.unwrap();
         let cmds = exec.commands.lock().unwrap().clone();
         let last = cmds.last().unwrap();
-        assert_eq!(last, &format!("kill 5 2>/dev/null; rm -f /dev/shm/filar-job-{sid}-job-1.log"));
+        assert_eq!(
+            last,
+            &format!("kill 5 2>/dev/null; rm -f /dev/shm/filar-job-{sid}-job-1.log")
+        );
     }
 
     /// Markers are spliced into shell commands unquoted.
@@ -1274,7 +1291,9 @@ mod tests {
     fn markers_are_plain_shell_words() {
         for marker in [LOG_DIR_MARKER, PID_MARKER, LOG_FAILED_MARKER] {
             assert!(
-                marker.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c == '='),
+                marker
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_' || c == '='),
                 "{marker} must need no shell quoting"
             );
         }
@@ -1283,6 +1302,9 @@ mod tests {
     #[test]
     fn unexpected_start_output_is_an_error() {
         assert!(parse_remote_start("sh: nohup: not found\n").is_err());
-        assert_eq!(parse_remote_start("noise\n__FILAR_PID__=12\n").unwrap(), RemoteStart::Started(12));
+        assert_eq!(
+            parse_remote_start("noise\n__FILAR_PID__=12\n").unwrap(),
+            RemoteStart::Started(12)
+        );
     }
 }

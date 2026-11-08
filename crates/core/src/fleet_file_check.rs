@@ -94,11 +94,11 @@ impl FileBaseline {
                 }
                 FileReference::Host(host.to_owned())
             }
-            FileReference::Sha256(digest) => FileReference::Sha256(
-                parse_sha256(digest.trim()).ok_or_else(|| {
+            FileReference::Sha256(digest) => {
+                FileReference::Sha256(parse_sha256(digest.trim()).ok_or_else(|| {
                     format!("reference sha256 must be {SHA256_HEX_LEN} hex digits")
-                })?,
-            ),
+                })?)
+            }
         };
         Ok(Self { path, reference })
     }
@@ -141,7 +141,10 @@ impl FileProbe {
     /// treats that as an error of the host, not as a value. Only the digest
     /// survives parsing; any other text a host printed is dropped here.
     pub fn parse(stdout: &str, exit_code: Option<i32>) -> Option<Self> {
-        let mut lines = stdout.lines().map(str::trim).filter(|line| !line.is_empty());
+        let mut lines = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
         let first = lines.next();
         let second = lines.next();
         let rest = lines.next();
@@ -189,12 +192,15 @@ fn validate_path(path: &str) -> Result<String, String> {
         return Err(format!("file '{path}' must be an absolute path"));
     }
     if path.len() > MAX_PATH_LEN {
-        return Err(format!("file path is {} bytes, the limit is {MAX_PATH_LEN}", path.len()));
+        return Err(format!(
+            "file path is {} bytes, the limit is {MAX_PATH_LEN}",
+            path.len()
+        ));
     }
-    if let Some(bad) = path
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '@' | ':' | ',' | '=')))
-    {
+    if let Some(bad) = path.chars().find(|c| {
+        !(c.is_ascii_alphanumeric()
+            || matches!(c, '/' | '.' | '_' | '-' | '+' | '@' | ':' | ',' | '='))
+    }) {
         return Err(format!(
             "file '{path}' contains '{}': only ASCII letters, digits and / . _ - + @ : , = \
              are allowed, so the path needs no quoting on the host",
@@ -226,7 +232,16 @@ mod tests {
 
     #[test]
     fn paths_that_need_quoting_or_are_relative_are_refused() {
-        for path in ["", "etc/hosts", "/etc/my file", "/etc/*.conf", "/etc/$HOME", "/etc/a;rm", "/etc/a'b", "/etc/\u{e9}"] {
+        for path in [
+            "",
+            "etc/hosts",
+            "/etc/my file",
+            "/etc/*.conf",
+            "/etc/$HOME",
+            "/etc/a;rm",
+            "/etc/a'b",
+            "/etc/\u{e9}",
+        ] {
             assert!(baseline(path).is_err(), "{path:?} must be refused");
         }
         assert!(baseline("/etc/nginx/conf.d/site-1_a+b@c:d,e=f.conf").is_ok());
@@ -244,7 +259,10 @@ mod tests {
     #[test]
     fn a_present_file_parses_to_its_digest_only() {
         let out = format!("present\n{HASH}  /etc/hosts\n");
-        assert_eq!(FileProbe::parse(&out, Some(0)), Some(FileProbe::Present(HASH.into())));
+        assert_eq!(
+            FileProbe::parse(&out, Some(0)),
+            Some(FileProbe::Present(HASH.into()))
+        );
     }
 
     #[test]
@@ -254,7 +272,10 @@ mod tests {
 
     #[test]
     fn an_existing_file_that_cannot_be_hashed_is_unreadable() {
-        assert_eq!(FileProbe::parse("present\n", Some(1)), Some(FileProbe::Unreadable));
+        assert_eq!(
+            FileProbe::parse("present\n", Some(1)),
+            Some(FileProbe::Unreadable)
+        );
     }
 
     #[test]

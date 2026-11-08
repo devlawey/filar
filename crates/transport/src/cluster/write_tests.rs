@@ -1019,3 +1019,313 @@ fn manifests_parse_as_yaml_documents_or_json() {
     assert_eq!(parse_manifest(json).unwrap()[0]["kind"], "ConfigMap");
     assert!(parse_manifest("kind: [unclosed").is_err());
 }
+
+// ── review round 1 (#651) ────────────────────────────────────────────────
+
+/// `cluster` with lists cut in two pages: the first item, then the rest
+/// behind a `continue` token.
+fn paged(request: &Request, state: &mut State) -> (u16, Value) {
+    let (code, mut answer) = cluster(request, state);
+    let Some(items) = answer["items"].as_array().cloned() else {
+        return (code, answer);
+    };
+    if items.len() < 2 {
+        return (code, answer);
+    }
+    if request.query.contains_key("continue") {
+        answer["items"] = Value::Array(items[1..].to_vec());
+    } else {
+        answer["items"] = Value::Array(items[..1].to_vec());
+        answer["metadata"]["continue"] = json!("page-2");
+    }
+    (code, answer)
+}
+
+#[tokio::test]
+async fn rollout_undo_reads_every_replicaset_page() {
+    let api = FakeApi::start(Arc::new(paged)).await;
+    api.put(&format!("{DEPLOY}/web"), deployment("web", 2));
+    for (revision, image) in [(1, "web:1"), (2, "web:2"), (3, "web:3")] {
+        api.put(
+            &format!("/apis/apps/v1/namespaces/shop/replicasets/web-{revision}"),
+            replicaset(revision, image),
+        );
+    }
+    let undo = api
+        .api()
+        .rollout_undo("shop", "web", None, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        (undo.from_revision, undo.to_revision),
+        (3, 2),
+        "revision 2 is on the second page"
+    );
+}
+
+#[tokio::test]
+async fn a_selector_delete_follows_continue_and_keeps_the_selector() {
+    let api = FakeApi::start(Arc::new(paged)).await;
+    for name in ["web-1", "web-2", "web-3"] {
+        api.put(&format!("{PODS}/{name}"), pod(name, "web"));
+    }
+    api.put(&format!("{PODS}/db-1"), pod("db-1", "db"));
+    let kind = ObjectKind {
+        api_version: Some("v1".into()),
+        kind: "Pod".into(),
+    };
+    let listed = api
+        .api()
+        .delete(
+            &kind,
+            Some("shop"),
+            &DeleteTarget::Selector {
+                labels: Some("app=web".into()),
+                fields: None,
+            },
+            &DeleteOptions::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let names: Vec<_> = listed.iter().map(|d| d.object.name.as_str()).collect();
+    assert_eq!(names, ["web-1", "web-2", "web-3"]);
+    let continued = api
+        .writes()
+        .into_iter()
+        .find(|r| r.method == "GET" && r.query.contains_key("continue"))
+        .expect("a second page was asked for");
+    assert_eq!(
+        continued.query.get("labelSelector").map(String::as_str),
+        Some("app=web")
+    );
+}
+
+#[tokio::test]
+async fn paused_deployments_are_neither_restarted_nor_rolled_back() {
+    let api = fake().await;
+    let mut paused = deployment("web", 2);
+    paused["spec"]["paused"] = json!(true);
+    api.put(&format!("{DEPLOY}/web"), paused);
+    api.put(
+        "/apis/apps/v1/namespaces/shop/replicasets/web-2",
+        replicaset(2, "web:2"),
+    );
+    let restart = api
+        .api()
+        .rollout_restart(RestartKind::Deployment, "shop", "web", true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        restart.contains("is paused") && restart.contains("resume"),
+        "{restart}"
+    );
+    let undo = api
+        .api()
+        .rollout_undo("shop", "web", None, true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(undo.contains("is paused"), "{undo}");
+    assert!(
+        api.writes().iter().all(|r| r.method == "GET"),
+        "nothing written"
+    );
+}
+
+#[tokio::test]
+async fn a_dry_run_restart_leaves_the_template_alone() {
+    let api = fake().await;
+    api.put(&format!("{DEPLOY}/web"), deployment("web", 2));
+    api.api()
+        .rollout_restart(RestartKind::Deployment, "shop", "web", true)
+        .await
+        .unwrap();
+    let patch = api
+        .writes()
+        .into_iter()
+        .find(|r| r.method == "PATCH")
+        .unwrap();
+    assert_eq!(patch.query.get("dryRun").map(String::as_str), Some("All"));
+    assert!(
+        api.get(&format!("{DEPLOY}/web")).unwrap()["spec"]["template"]["metadata"]["annotations"]
+            .is_null()
+    );
+}
+
+#[tokio::test]
+async fn a_kind_with_an_api_version_is_found_by_plural_or_singular_too() {
+    let api = fake().await;
+    api.put(&format!("{DEPLOY}/web"), deployment("web", 1));
+    for name in ["Deployment", "deployments", "deployment"] {
+        let kind = ObjectKind {
+            api_version: Some("apps/v1".into()),
+            kind: name.into(),
+        };
+        let listed = api
+            .api()
+            .delete(
+                &kind,
+                Some("shop"),
+                &DeleteTarget::Name("web".into()),
+                &DeleteOptions::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed[0].object.kind, "Deployment", "{name}");
+    }
+}
+
+#[tokio::test]
+async fn core_kinds_resolve_while_another_api_group_is_broken() {
+    let api = FakeApi::start(Arc::new(|request: &Request, state: &mut State| {
+        if request.path == "/apis/apps/v1" {
+            return status(503, "ServiceUnavailable", "apps discovery is down");
+        }
+        cluster(request, state)
+    }))
+    .await;
+    api.put(&format!("{PODS}/web-1"), pod("web-1", "web"));
+    let kind = ObjectKind {
+        api_version: None,
+        kind: "pod".into(),
+    };
+    let listed = api
+        .api()
+        .delete(
+            &kind,
+            Some("shop"),
+            &DeleteTarget::Name("web-1".into()),
+            &DeleteOptions::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed[0].object.kind, "Pod");
+}
+
+#[tokio::test]
+async fn a_non_string_namespace_is_refused_not_replaced() {
+    let api = fake().await;
+    let manifest = "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: c, namespace: 123}\n";
+    let error = api
+        .api()
+        .apply(manifest, Some("prod"), false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("metadata.namespace must be a string"),
+        "{error}"
+    );
+    assert!(api.writes().iter().all(|r| r.method != "PATCH"));
+}
+
+#[tokio::test]
+async fn an_accepted_delete_of_an_object_still_there_is_pending() {
+    // An aggregated API answers a bare Status and keeps the object for now.
+    let api = FakeApi::start(Arc::new(|request: &Request, state: &mut State| {
+        if request.method == "DELETE" && !is_dry_run(request) {
+            return (
+                200,
+                json!({"kind": "Status", "apiVersion": "v1", "metadata": {},
+                       "status": "Success", "code": 200}),
+            );
+        }
+        cluster(request, state)
+    }))
+    .await;
+    api.put(&format!("{PODS}/web-1"), pod("web-1", "web"));
+    let kind = ObjectKind {
+        api_version: Some("v1".into()),
+        kind: "Pod".into(),
+    };
+    let delete = |name: &'static str| {
+        let api = api.api();
+        let kind = kind.clone();
+        async move {
+            api.delete(
+                &kind,
+                Some("shop"),
+                &DeleteTarget::Name(name.into()),
+                &DeleteOptions::default(),
+                false,
+            )
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(delete("web-1").await[0].outcome, DeleteOutcome::Pending);
+    // Gone by the time it is checked: deleted.
+    let gone = FakeApi::start(Arc::new(|request: &Request, state: &mut State| {
+        if request.method == "DELETE" {
+            state.objects.remove(&request.path);
+            return (
+                200,
+                json!({"kind": "Status", "apiVersion": "v1", "metadata": {},
+                       "status": "Success", "code": 200}),
+            );
+        }
+        cluster(request, state)
+    }))
+    .await;
+    gone.put(&format!("{PODS}/web-3"), pod("web-3", "web"));
+    let deleted = gone
+        .api()
+        .delete(
+            &kind,
+            Some("shop"),
+            &DeleteTarget::Name("web-3".into()),
+            &DeleteOptions::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted[0].outcome, DeleteOutcome::Deleted);
+}
+
+#[tokio::test]
+async fn submitted_secret_values_are_masked_in_server_errors() {
+    // "aHVudGVyMjI=" is base64 of "hunter22".
+    let api = FakeApi::start(Arc::new(|request: &Request, state: &mut State| {
+        if request.method == "PATCH" {
+            return status(
+                403,
+                "Forbidden",
+                "admission webhook \"leaks.example.com\" denied the request: password s3cr3t-value, token aHVudGVyMjI= (hunter22) are weak",
+            );
+        }
+        cluster(request, state)
+    }))
+    .await;
+    let manifest = "apiVersion: v1\nkind: Secret\nmetadata: {name: db}\nstringData: {password: s3cr3t-value}\ndata: {token: aHVudGVyMjI=}\n";
+    let error = api
+        .api()
+        .apply(manifest, Some("shop"), true)
+        .await
+        .unwrap_err()
+        .to_string();
+    for leaked in ["s3cr3t-value", "aHVudGVyMjI=", "hunter22"] {
+        assert!(!error.contains(leaked), "{leaked} in {error}");
+    }
+    assert!(
+        error.contains("denied the request") && error.contains(SECRET_HIDDEN),
+        "{error}"
+    );
+}
+
+#[test]
+fn status_counts_as_content_only_without_a_status_subresource() {
+    let live = json!({"kind": "Widget", "metadata": {"name": "w"}, "spec": {"a": 1}, "status": {"phase": "old"}});
+    let result = json!({"kind": "Widget", "metadata": {"name": "w"}, "spec": {"a": 1}, "status": {"phase": "new"}});
+    assert_eq!(
+        apply_action(Some(&live), &result, false),
+        ApplyAction::Unchanged
+    );
+    assert_eq!(
+        apply_action(Some(&live), &result, true),
+        ApplyAction::Configured
+    );
+}

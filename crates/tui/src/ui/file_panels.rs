@@ -8,7 +8,9 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
-use crate::file_panels::{format_mtime, human_size, CopyPlan, Panel, PanelDialog, PanelStatus, Row, SecretPrompt, Side};
+use crate::file_panels::{
+    format_mtime, human_size, CopyPlan, Panel, PanelDialog, PanelStatus, Row, SecretPrompt, Side,
+};
 use filar_transport::EntryKind;
 
 const SIZE_COL: usize = 7;
@@ -53,7 +55,10 @@ pub(crate) fn render_file_panels(f: &mut Frame, app: &mut App, area: Rect) {
         (None, None) => (String::new(), theme.muted()),
     };
     f.render_widget(
-        Paragraph::new(Span::styled(truncate(&status, rows[1].width as usize), style)),
+        Paragraph::new(Span::styled(
+            truncate(&status, rows[1].width as usize),
+            style,
+        )),
         rows[1],
     );
 
@@ -220,7 +225,13 @@ fn render_panel(f: &mut Frame, theme: &crate::ui::Theme, p: &mut Panel, active: 
 }
 
 /// "Copy … → host:/dir?" — every copy is confirmed (#536).
-fn render_confirm(f: &mut Frame, theme: &crate::ui::Theme, plan: &CopyPlan, from: &str, area: Rect) {
+fn render_confirm(
+    f: &mut Frame,
+    theme: &crate::ui::Theme,
+    plan: &CopyPlan,
+    from: &str,
+    area: Rect,
+) {
     let width = 72.min(area.width.saturating_sub(4));
     let inner = width.saturating_sub(4) as usize;
     let rect = centered(area, width, 7);
@@ -232,11 +243,16 @@ fn render_confirm(f: &mut Frame, theme: &crate::ui::Theme, plan: &CopyPlan, from
         )),
         Line::from(Span::styled(
             truncate_left(&format!("to {}", plan.target()), inner),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
-            truncate("Enter copy   Esc cancel   (existing files: asked one by one)", inner),
+            truncate(
+                "Enter copy   Esc cancel   (existing files: asked one by one)",
+                inner,
+            ),
             theme.muted(),
         )),
     ];
@@ -267,11 +283,16 @@ pub(crate) fn render_overwrite(f: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(Span::styled(
             truncate_left(&dst, inner),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
-            truncate("o overwrite  s skip  a overwrite all  n skip all  Esc cancel copy", inner),
+            truncate(
+                "o overwrite  s skip  a overwrite all  n skip all  Esc cancel copy",
+                inner,
+            ),
             theme.muted(),
         )),
     ];
@@ -312,7 +333,9 @@ fn render_new_folder(
         )),
         Line::from(Span::styled(
             truncate_left(&format!("> {input}_"), inner),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         )),
         match error {
             Some(e) => Line::from(Span::styled(truncate(e, inner), theme.warning_fg())),

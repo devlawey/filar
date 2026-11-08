@@ -1,4 +1,4 @@
-﻿//! Event types for communication between the agent and the TUI.
+//! Event types for communication between the agent and the TUI.
 //!
 //! The agent runs in a separate tokio task and communicates with the UI
 //! via [`TuiEvent`] sent through an mpsc channel. Agent events are forwarded
@@ -54,15 +54,10 @@ pub enum TuiEvent {
     /// Ctrl+O connect failed. The runner stops folding the abandoned
     /// target's tag-policy floor and settles on the active transport
     /// (#414 review).
-    TransportSwapFailed {
-        session_id: SessionId,
-    },
+    TransportSwapFailed { session_id: SessionId },
 
     /// Working directory for a tab (OSC 7 / later sync). Status bar only.
-    CwdChanged {
-        session_id: SessionId,
-        cwd: String,
-    },
+    CwdChanged { session_id: SessionId, cwd: String },
 
     /// Ctrl+O encountered a password target with no cached password.
     /// The UI must switch to password entry mode.
@@ -121,10 +116,7 @@ pub enum TuiEvent {
     /// as final: it clears the cancellation token and marks the agent idle.
     /// Reporting mid-run progress through that variant would leave a request
     /// in flight that the user can no longer cancel (#378).
-    Notice {
-        session_id: SessionId,
-        text: String,
-    },
+    Notice { session_id: SessionId, text: String },
     /// The person-facing view of a fleet operation (#438), for the side
     /// panel. It carries host output, so it only ever reaches the panel —
     /// never the feed's command block, the transcript or the model.
@@ -171,7 +163,13 @@ mod tests {
             ssh_info: Some("root@10.0.0.5:22".into()),
             alias: None,
         };
-        if let TuiEvent::TransportChanged { session_id, is_local, ref ssh_info, .. } = event {
+        if let TuiEvent::TransportChanged {
+            session_id,
+            is_local,
+            ref ssh_info,
+            ..
+        } = event
+        {
             assert_eq!(session_id, SessionId(42));
             assert!(!is_local);
             assert_eq!(ssh_info.as_deref(), Some("root@10.0.0.5:22"));
@@ -182,7 +180,9 @@ mod tests {
 
     #[test]
     fn transport_swap_failed_carries_session_id() {
-        let event = TuiEvent::TransportSwapFailed { session_id: SessionId(7) };
+        let event = TuiEvent::TransportSwapFailed {
+            session_id: SessionId(7),
+        };
         if let TuiEvent::TransportSwapFailed { session_id } = event {
             assert_eq!(session_id, SessionId(7));
         } else {

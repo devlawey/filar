@@ -625,13 +625,7 @@ impl FleetCheckCatalog {
         }
     }
 
-    fn reject(
-        &mut self,
-        source: CheckSource,
-        index: usize,
-        name: Option<String>,
-        reason: String,
-    ) {
+    fn reject(&mut self, source: CheckSource, index: usize, name: Option<String>, reason: String) {
         self.rejected.push(RejectedCheck {
             source,
             index: Some(index),
@@ -675,7 +669,10 @@ impl FleetCheckCatalog {
                      user checks augment the built-ins, they do not replace them"
                 ),
                 CheckSource::User(path) => {
-                    format!("name '{name}' is already used by a check from {}", path.display())
+                    format!(
+                        "name '{name}' is already used by a check from {}",
+                        path.display()
+                    )
                 }
                 // Ad-hoc checks are never put into a catalog.
                 CheckSource::AdHoc => format!("name '{name}' is already used"),
@@ -696,15 +693,19 @@ impl FleetCheckCatalog {
             (None, None) => return Err("a check must set either command or file".into()),
             (Some(command), None) => {
                 if raw.reference_host.is_some() || raw.reference_sha256.is_some() {
-                    return Err("reference_host and reference_sha256 only apply to a file check".into());
+                    return Err(
+                        "reference_host and reference_sha256 only apply to a file check".into(),
+                    );
                 }
                 (validate_command(command)?, None)
             }
             (None, Some(path)) => {
                 if raw.preprocessor.is_some() || !raw.compare.is_empty() {
-                    return Err("a file check is compared by hash: preprocessor and compare \
+                    return Err(
+                        "a file check is compared by hash: preprocessor and compare \
                          must not be set"
-                        .into());
+                            .into(),
+                    );
                 }
                 let reference = match (&raw.reference_host, &raw.reference_sha256) {
                     (Some(host), None) => FileReference::Host(host.clone()),
@@ -931,7 +932,11 @@ mod tests {
         let catalog = FleetCheckCatalog::builtin();
         let mut names = HashSet::new();
         for check in catalog.checks() {
-            assert!(names.insert(check.name()), "duplicate name {}", check.name());
+            assert!(
+                names.insert(check.name()),
+                "duplicate name {}",
+                check.name()
+            );
             assert!(!check.description().is_empty());
             assert!(!check.commands().is_empty());
             assert!(check.commands().iter().all(|c| !c.is_empty()));
@@ -956,7 +961,10 @@ mod tests {
             "kernel-version",
             "os-release",
         ] {
-            assert!(catalog.get(name).is_some(), "missing built-in check '{name}'");
+            assert!(
+                catalog.get(name).is_some(),
+                "missing built-in check '{name}'"
+            );
         }
         let disk = catalog.get("disk-usage").unwrap();
         assert_eq!(disk.preprocessor(), Some("df"));
@@ -1141,7 +1149,10 @@ command = "whoami"
         // The rendered message must be usable as-is in the UI.
         let rendered = rejected.to_string();
         assert!(rendered.contains("check #2 ('no-command')"), "{rendered}");
-        assert!(rendered.contains(&file.path.display().to_string()), "{rendered}");
+        assert!(
+            rendered.contains(&file.path.display().to_string()),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1435,7 +1446,10 @@ command = { default = "df --output=source,size,used,avail,pcent,target", alpine 
         let catalog = FleetCheckCatalog::load(Some(&file.path));
         let check = catalog.get("with-default").unwrap();
 
-        assert_eq!(check.command_for(OsFamily::Alpine), CommandForOs::Runnable("df"));
+        assert_eq!(
+            check.command_for(OsFamily::Alpine),
+            CommandForOs::Runnable("df")
+        );
         for family in [OsFamily::Debian, OsFamily::Rhel, OsFamily::Unknown] {
             assert_eq!(
                 check.command_for(family),
@@ -1502,7 +1516,10 @@ command = { debian = "uptime", rhel = "  " }
         let catalog = FleetCheckCatalog::load(Some(&file.path));
         assert_eq!(catalog.rejected().len(), 1);
         let reason = catalog.rejected()[0].reason();
-        assert!(reason.contains("'rhel'"), "should name the variant: {reason}");
+        assert!(
+            reason.contains("'rhel'"),
+            "should name the variant: {reason}"
+        );
         assert!(reason.contains("must not be empty"), "{reason}");
     }
 
@@ -1519,7 +1536,9 @@ command = {}
         );
         let catalog = FleetCheckCatalog::load(Some(&file.path));
         assert_eq!(catalog.rejected().len(), 1);
-        assert!(catalog.rejected()[0].reason().contains("at least one variant"));
+        assert!(catalog.rejected()[0]
+            .reason()
+            .contains("at least one variant"));
     }
 
     /// A table holding only `default` means the same thing as a bare
@@ -1567,7 +1586,10 @@ command = { default = "a", debian = "b", alpine = "c" }
     fn the_builtin_disk_check_varies_only_on_alpine() {
         let catalog = FleetCheckCatalog::builtin();
         let disk = catalog.get("disk-usage").unwrap();
-        assert_eq!(disk.command_for(OsFamily::Alpine), CommandForOs::Runnable("df"));
+        assert_eq!(
+            disk.command_for(OsFamily::Alpine),
+            CommandForOs::Runnable("df")
+        );
         for family in [OsFamily::Debian, OsFamily::Rhel, OsFamily::Unknown] {
             assert_eq!(
                 disk.command_for(family),
@@ -1793,20 +1815,36 @@ reference_sha256 = "3b5d5c3712955042212316173ccf37be800a0e0fa8a1b5b1e1a5b8c4b0a1
         let check = FleetCheck::for_file(baseline.clone());
         assert_eq!(check.name(), FleetCheck::FILE_BASELINE_NAME);
         assert_eq!(check.file_baseline(), Some(&baseline));
-        assert_eq!(check.command_for(OsFamily::Unknown).command(), Some(baseline.command().as_str()));
+        assert_eq!(
+            check.command_for(OsFamily::Unknown).command(),
+            Some(baseline.command().as_str())
+        );
     }
 
     #[test]
     fn an_ad_hoc_command_folds_as_a_raw_check() {
         let check = FleetCheck::ad_hoc("  uname -r ").expect("a plain command is accepted");
         assert_eq!(check.name(), FleetCheck::AD_HOC_NAME);
-        assert_eq!(check.command_for(OsFamily::Debian).command(), Some("uname -r"));
-        assert_eq!(check.command_for(OsFamily::Unknown).command(), Some("uname -r"));
-        assert_eq!(check.preprocessor(), None, "compared by digest: no text reaches the model");
+        assert_eq!(
+            check.command_for(OsFamily::Debian).command(),
+            Some("uname -r")
+        );
+        assert_eq!(
+            check.command_for(OsFamily::Unknown).command(),
+            Some("uname -r")
+        );
+        assert_eq!(
+            check.preprocessor(),
+            None,
+            "compared by digest: no text reaches the model"
+        );
         assert!(check.compare().is_empty());
         assert_eq!(check.source(), &CheckSource::AdHoc);
 
         assert!(FleetCheck::ad_hoc("   ").is_err());
-        assert!(FleetCheck::ad_hoc("uname\nreboot").is_err(), "two lines are two commands");
+        assert!(
+            FleetCheck::ad_hoc("uname\nreboot").is_err(),
+            "two lines are two commands"
+        );
     }
 }

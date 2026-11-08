@@ -42,7 +42,10 @@ pub async fn summarise(llm: &dyn LlmClient, blocks: &[ChatBlock], boundary: usiz
 }
 
 /// "Log sources — `LogSource` and `query_logs`".
-pub fn log_sources(builder: filar_agent::AgentBuilder, config: &filar_core::Config) -> filar_agent::AgentBuilder {
+pub fn log_sources(
+    builder: filar_agent::AgentBuilder,
+    config: &filar_core::Config,
+) -> filar_agent::AgentBuilder {
     let secrets = std::sync::Arc::new(filar_core::StaticSecretProvider::new());
     secrets.insert("FILAR_LOGS_VLOGS_PROD", "token-from-your-store");
     let (sources, notes) =

@@ -41,7 +41,11 @@ impl KubeClusterApi {
             None => Kubeconfig::read(),
         }
         .map_err(|_| CoreError::Other("cannot read or parse the selected kubeconfig".into()))?;
-        Ok(config.contexts.into_iter().map(|context| context.name).collect())
+        Ok(config
+            .contexts
+            .into_iter()
+            .map(|context| context.name)
+            .collect())
     }
 
     /// Connect using the target's explicit context and configured timeout.
@@ -239,11 +243,16 @@ impl ClusterApi for KubeClusterApi {
                 .portforward(&request.pod, &[request.port])
                 .await
                 .map_err(|error| {
-                    self.api_error(error, "create", "pods/portforward", Some(&request.namespace))
+                    self.api_error(
+                        error,
+                        "create",
+                        "pods/portforward",
+                        Some(&request.namespace),
+                    )
                 })?;
-            let mut stream = forwarder.take_stream(request.port).ok_or_else(|| {
-                CoreError::Other("port-forward did not provide a stream".into())
-            })?;
+            let mut stream = forwarder
+                .take_stream(request.port)
+                .ok_or_else(|| CoreError::Other("port-forward did not provide a stream".into()))?;
             let result = super::http::get_over(&mut stream, &request.path, request.max_bytes).await;
             drop(stream);
             forwarder.abort();
@@ -535,7 +544,12 @@ impl ClusterApi for KubeClusterApi {
 /// stream (#563) is legitimately idle between commands, and a read timeout
 /// would tear the shell down. The connect timeout is always bounded.
 pub(super) async fn build_client(target: &KubeCluster, streaming: bool) -> Result<Client> {
-    let config = load_config(target, streaming, &super::no_proxy::ProxyEnv::from_process()).await?;
+    let config = load_config(
+        target,
+        streaming,
+        &super::no_proxy::ProxyEnv::from_process(),
+    )
+    .await?;
     Client::try_from(config)
         .map_err(|_| connect_error(target, "cannot initialize the Kubernetes client"))
 }
@@ -559,7 +573,12 @@ async fn load_config(
     };
     let mut config = Config::from_custom_kubeconfig(kubeconfig, &options)
         .await
-        .map_err(|_| connect_error(target, "cannot load the explicit context or its credentials"))?;
+        .map_err(|_| {
+            connect_error(
+                target,
+                "cannot load the explicit context or its credentials",
+            )
+        })?;
     super::no_proxy::choose_proxy(&mut config, explicit_proxy, proxy_env)
         .map_err(|_| connect_error(target, "the HTTPS_PROXY address cannot be parsed"))?;
     let timeout = Duration::from_secs(target.request_timeout_secs);
@@ -831,7 +850,8 @@ mod tests {
     // ── Proxy choice through the kubeconfig (#627) ─────────────────────
 
     async fn proxy_for(context: &str, env: &super::super::no_proxy::ProxyEnv) -> Option<String> {
-        let dir = std::env::temp_dir().join(format!("filar-no-proxy-{}-{context}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("filar-no-proxy-{}-{context}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config");
         std::fs::write(
@@ -876,7 +896,11 @@ users:
             https_proxy: Some("http://corp-proxy:3128".into()),
             no_proxy: Some("127.0.0.1,localhost".into()),
         };
-        assert_eq!(proxy_for("local", &env).await, None, "exempt server goes direct");
+        assert_eq!(
+            proxy_for("local", &env).await,
+            None,
+            "exempt server goes direct"
+        );
         assert_eq!(
             proxy_for("remote", &env).await.as_deref(),
             Some("http://corp-proxy:3128/"),
@@ -888,7 +912,11 @@ users:
             "a kubeconfig proxy-url wins over NO_PROXY"
         );
         let no_env = ProxyEnv::default();
-        assert_eq!(proxy_for("remote", &no_env).await, None, "no proxy configured, none used");
+        assert_eq!(
+            proxy_for("remote", &no_env).await,
+            None,
+            "no proxy configured, none used"
+        );
     }
     use super::*;
     use kube::core::response::Status;
@@ -917,7 +945,9 @@ users:
         let contexts = KubeClusterApi::context_names(Some(&path)).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(contexts, vec!["prod-eu", "staging"]);
-        assert!(!contexts.iter().any(|name| name.contains("must-not-be-returned")));
+        assert!(!contexts
+            .iter()
+            .any(|name| name.contains("must-not-be-returned")));
     }
 
     #[test]

@@ -26,7 +26,10 @@ use kube::Config;
 /// Whether `host` (as in a URL, IPv6 with or without brackets) on `port`
 /// is exempt from the proxy under `no_proxy`.
 pub fn bypasses_proxy(no_proxy: &str, host: &str, port: u16) -> bool {
-    let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
     let host_ip: Option<IpAddr> = host.parse().ok();
     no_proxy
         .split(',')
@@ -59,7 +62,9 @@ fn entry_matches(entry: &str, host: &str, host_ip: Option<IpAddr>, port: u16) ->
     if domain.is_empty() {
         return false;
     }
-    let subdomain = host.strip_suffix(domain).is_some_and(|rest| rest.ends_with('.'));
+    let subdomain = host
+        .strip_suffix(domain)
+        .is_some_and(|rest| rest.ends_with('.'));
     subdomain || (!subdomains_only && host == domain)
 }
 
@@ -216,7 +221,11 @@ pub(super) fn apply_no_proxy(config: &mut Config, explicit_proxy: bool, no_proxy
     };
     let port = url
         .port_u16()
-        .unwrap_or(if url.scheme_str() == Some("http") { 80 } else { 443 });
+        .unwrap_or(if url.scheme_str() == Some("http") {
+            80
+        } else {
+            443
+        });
     if bypasses_proxy(no_proxy, host, port) {
         config.proxy_url = None;
     }
@@ -232,8 +241,14 @@ mod tests {
             assert!(bypasses_proxy(no_proxy, "api.corp", 443), "{no_proxy}");
             assert!(!bypasses_proxy(no_proxy, "notcorp", 443), "{no_proxy}");
         }
-        assert!(bypasses_proxy("corp", "corp", 443), "a bare name matches itself");
-        assert!(!bypasses_proxy(".corp", "corp", 443), "a leading dot is subdomains only");
+        assert!(
+            bypasses_proxy("corp", "corp", 443),
+            "a bare name matches itself"
+        );
+        assert!(
+            !bypasses_proxy(".corp", "corp", 443),
+            "a leading dot is subdomains only"
+        );
         assert!(!bypasses_proxy("*.corp", "corp", 443), "so is *.");
         assert!(bypasses_proxy("k8s.example.com", "K8S.example.com", 6443));
         assert!(!bypasses_proxy("k8s.example.com", "api.example.com", 6443));
@@ -245,11 +260,17 @@ mod tests {
         assert!(!bypasses_proxy("127.0.0.1", "127.0.0.2", 443));
         assert!(bypasses_proxy("10.0.0.0/8", "10.20.30.40", 6443));
         assert!(!bypasses_proxy("10.0.0.0/8", "11.0.0.1", 6443));
-        assert!(!bypasses_proxy("10.0.0.0/8", "ten.corp", 6443), "a name is not in a block");
+        assert!(
+            !bypasses_proxy("10.0.0.0/8", "ten.corp", 6443),
+            "a name is not in a block"
+        );
         assert!(bypasses_proxy("0.0.0.0/0", "8.8.8.8", 443));
         assert!(bypasses_proxy("::1", "[::1]", 6443));
         assert!(bypasses_proxy("fd00::/8", "fd12::5", 6443));
-        assert!(!bypasses_proxy("10.0.0.0/33", "10.0.0.1", 443), "bad prefix matches nothing");
+        assert!(
+            !bypasses_proxy("10.0.0.0/33", "10.0.0.1", 443),
+            "bad prefix matches nothing"
+        );
     }
 
     #[test]
@@ -258,7 +279,10 @@ mod tests {
         assert!(!bypasses_proxy("api.corp:6443", "api.corp", 443));
         assert!(bypasses_proxy("[::1]:6443", "::1", 6443));
         assert!(!bypasses_proxy("[::1]:6443", "::1", 443));
-        assert!(!bypasses_proxy("[::1]:65536", "::1", 6443), "a bad port matches no port");
+        assert!(
+            !bypasses_proxy("[::1]:65536", "::1", 6443),
+            "a bad port matches no port"
+        );
         assert!(!bypasses_proxy("[::1]x", "::1", 6443));
         assert!(bypasses_proxy("[::1]", "::1", 6443));
         assert!(bypasses_proxy("127.0.0.1:18443", "127.0.0.1", 18443));
@@ -320,7 +344,10 @@ users:
   user: {}
 "#;
         let kubeconfig = Kubeconfig::from_yaml(yaml).unwrap();
-        assert_eq!(kubeconfig_proxy(&kubeconfig, "ctx-a").as_deref(), Some("http://p:3128"));
+        assert_eq!(
+            kubeconfig_proxy(&kubeconfig, "ctx-a").as_deref(),
+            Some("http://p:3128")
+        );
         assert_eq!(kubeconfig_proxy(&kubeconfig, "ctx-b"), None);
         assert_eq!(kubeconfig_proxy(&kubeconfig, "missing"), None);
     }

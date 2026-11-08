@@ -226,9 +226,7 @@ mod tests {
                     duration: Duration::from_millis(0),
                     cwd: None,
                 }),
-                Behaviour::Unreachable => {
-                    Err(CoreError::ConnectionLost("channel closed".into()))
-                }
+                Behaviour::Unreachable => Err(CoreError::ConnectionLost("channel closed".into())),
             }
         }
 
@@ -294,8 +292,14 @@ mod tests {
         let host = FakeHost::new(Behaviour::Fails);
         let probe = OsFamilyProbe::new();
 
-        assert_eq!(probe.detect(host.as_ref()).await.unwrap(), OsFamily::Unknown);
-        assert_eq!(probe.detect(host.as_ref()).await.unwrap(), OsFamily::Unknown);
+        assert_eq!(
+            probe.detect(host.as_ref()).await.unwrap(),
+            OsFamily::Unknown
+        );
+        assert_eq!(
+            probe.detect(host.as_ref()).await.unwrap(),
+            OsFamily::Unknown
+        );
         assert_eq!(host.calls(), 1, "a real answer is not re-asked");
         assert_eq!(probe.cached(), Some(OsFamily::Unknown));
     }
@@ -314,7 +318,11 @@ mod tests {
 
         host.set(Behaviour::Prints(ALPINE));
         assert_eq!(probe.detect(host.as_ref()).await.unwrap(), OsFamily::Alpine);
-        assert_eq!(host.calls(), 2, "the retry happened because nothing was cached");
+        assert_eq!(
+            host.calls(),
+            2,
+            "the retry happened because nothing was cached"
+        );
     }
 
     /// A command that never ran is not an answer: caching it would mark
@@ -331,7 +339,11 @@ mod tests {
         host.set(Behaviour::Prints(ALMA));
         assert_eq!(probe.detect(host.as_ref()).await.unwrap(), OsFamily::Rhel);
         assert_eq!(probe.cached(), Some(OsFamily::Rhel));
-        assert_eq!(host.calls(), 2, "the retry is the second call, and the last");
+        assert_eq!(
+            host.calls(),
+            2,
+            "the retry is the second call, and the last"
+        );
 
         assert_eq!(probe.detect(host.as_ref()).await.unwrap(), OsFamily::Rhel);
         assert_eq!(host.calls(), 2);

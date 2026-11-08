@@ -26,8 +26,8 @@ pub mod local;
 pub mod readonly;
 pub mod secret;
 pub mod sftp;
-pub mod ssh;
 mod shell_protocol;
+pub mod ssh;
 
 use std::time::Duration;
 
@@ -38,16 +38,15 @@ use tokio::sync::mpsc;
 #[cfg(feature = "kube")]
 pub use cluster::{
     debug_container_name, hide_secret_values, parse_manifest, AppliedObject, ApplyAction,
-    ClusterApi, ClusterWriteApi, DeleteOptions, DeleteOutcome, DeleteTarget, DeletedObject,
-    ObjectKind, ObjectRef, Propagation, RestartKind, ScaleKind, ScaleOutcome, SecretKeyChange,
-    SecretKeyState, UndoOutcome, WriteOutcome, FIELD_MANAGER, MAX_DELETE_OBJECTS,
-    RESTARTED_AT_ANNOTATION, SECRET_HIDDEN, ConfigMapInfo, ContainerInfo, ContainerMetrics,
-    ContainerPortInfo, DebugContainerSpec, EndpointInfo, EventInfo, IngressInfo, KubeClusterApi,
-    KubeExecConfig, KubeExecEvent, KubeExecutor, KubeInteractive, NamespaceInfo, NodeCondition,
-    NodeInfo, PodHttpRequest, PodHttpResponse, PodInfo, PodLogs, ResourceMetrics,
-    RolloutRevision, ServiceInfo, ServicePortInfo, TerminationInfo, WorkloadInfo, WorkloadKind,
-    DEBUG_CONTAINER_PREFIX, DEFAULT_CLUSTER_LIST_LIMIT, DEFAULT_POD_SHELL, MISSING_SHELL_MARK,
-    SHELL_RECREATED_MESSAGE,
+    ClusterApi, ClusterWriteApi, ConfigMapInfo, ContainerInfo, ContainerMetrics, ContainerPortInfo,
+    DebugContainerSpec, DeleteOptions, DeleteOutcome, DeleteTarget, DeletedObject, EndpointInfo,
+    EventInfo, IngressInfo, KubeClusterApi, KubeExecConfig, KubeExecEvent, KubeExecutor,
+    KubeInteractive, NamespaceInfo, NodeCondition, NodeInfo, ObjectKind, ObjectRef, PodHttpRequest,
+    PodHttpResponse, PodInfo, PodLogs, Propagation, ResourceMetrics, RestartKind, RolloutRevision,
+    ScaleKind, ScaleOutcome, SecretKeyChange, SecretKeyState, ServiceInfo, ServicePortInfo,
+    TerminationInfo, UndoOutcome, WorkloadInfo, WorkloadKind, WriteOutcome, DEBUG_CONTAINER_PREFIX,
+    DEFAULT_CLUSTER_LIST_LIMIT, DEFAULT_POD_SHELL, FIELD_MANAGER, MAX_DELETE_OBJECTS,
+    MISSING_SHELL_MARK, RESTARTED_AT_ANNOTATION, SECRET_HIDDEN, SHELL_RECREATED_MESSAGE,
 };
 pub use copy::{
     copy, CopyEvent, CopyObserver, CopyReport, CopySource, OverwriteDecision, PART_SUFFIX,

@@ -691,9 +691,7 @@ pub fn tag_policy_floor(
     policies: &[TagPolicy],
     tags: &[String],
 ) -> Option<CommandConfirmMode> {
-    let mut matching = policies
-        .iter()
-        .filter(|p| tags.iter().any(|t| t == &p.tag));
+    let mut matching = policies.iter().filter(|p| tags.iter().any(|t| t == &p.tag));
     let first = matching.next()?;
     Some(
         matching.fold(global.strictest(first.confirm_mode), |acc, p| {
@@ -759,7 +757,11 @@ impl KubeGroup {
                 "host_groups: \"{group_name}\": kube.namespace must not be empty"
             )));
         }
-        if self.selector.as_ref().is_some_and(|selector| selector.trim().is_empty()) {
+        if self
+            .selector
+            .as_ref()
+            .is_some_and(|selector| selector.trim().is_empty())
+        {
             return Err(CoreError::Config(format!(
                 "host_groups: \"{group_name}\": kube.selector must not be empty when present"
             )));
@@ -1011,7 +1013,8 @@ fn is_dns1123_subdomain(s: &str) -> bool {
 fn is_dns1123_label(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 63
-        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && s.starts_with(|c: char| c.is_ascii_alphanumeric())
         && s.ends_with(|c: char| c.is_ascii_alphanumeric())
 }
@@ -1066,7 +1069,8 @@ impl KubeCluster {
                 )));
             }
         }
-        if self.request_timeout_secs == 0 || self.request_timeout_secs > MAX_KUBE_REQUEST_TIMEOUT_SECS
+        if self.request_timeout_secs == 0
+            || self.request_timeout_secs > MAX_KUBE_REQUEST_TIMEOUT_SECS
         {
             return Err(CoreError::Config(format!(
                 "kube_clusters: \"{}\": request_timeout_secs must be between 1 and \
@@ -1077,9 +1081,7 @@ impl KubeCluster {
         for cm in &self.reveal_configmaps {
             let mut parts = cm.split('/');
             let valid = match (parts.next(), parts.next(), parts.next()) {
-                (Some(ns), Some(name), None) => {
-                    is_dns1123_label(ns) && is_dns1123_subdomain(name)
-                }
+                (Some(ns), Some(name), None) => is_dns1123_label(ns) && is_dns1123_subdomain(name),
                 _ => false,
             };
             if !valid {
@@ -1464,7 +1466,10 @@ api_base_url = "https://open.bigmodel.cn/api/paas/v4"
     // ── Tag policies (#414) ─────────────────────────────────────
 
     fn policy(tag: &str, mode: CommandConfirmMode) -> TagPolicy {
-        TagPolicy { tag: tag.into(), confirm_mode: mode }
+        TagPolicy {
+            tag: tag.into(),
+            confirm_mode: mode,
+        }
     }
 
     #[test]
@@ -1514,7 +1519,10 @@ api_base_url = "https://open.bigmodel.cn/api/paas/v4"
             tag_policy_floor(CommandConfirmMode::Allowlist, &policies, &tags),
             None
         );
-        assert_eq!(tag_policy_floor(CommandConfirmMode::Allowlist, &[], &tags), None);
+        assert_eq!(
+            tag_policy_floor(CommandConfirmMode::Allowlist, &[], &tags),
+            None
+        );
     }
 
     #[test]
@@ -1547,15 +1555,16 @@ confirm_mode = "explain"
         assert_eq!(cfg.tag_policies[0].tag, "prod");
         assert_eq!(cfg.tag_policies[0].confirm_mode, CommandConfirmMode::Always);
         assert_eq!(cfg.tag_policies[1].tag, "db");
-        assert_eq!(cfg.tag_policies[1].confirm_mode, CommandConfirmMode::Explain);
+        assert_eq!(
+            cfg.tag_policies[1].confirm_mode,
+            CommandConfirmMode::Explain
+        );
     }
 
     // ── Kubernetes clusters (#562) ────────────────────────────
 
     fn kube_toml(extra: &str) -> String {
-        format!(
-            "[[kube_clusters]]\nname = \"prod-eu\"\ncontext = \"prod-eu\"\n{extra}"
-        )
+        format!("[[kube_clusters]]\nname = \"prod-eu\"\ncontext = \"prod-eu\"\n{extra}")
     }
 
     fn kube_err(extra: &str) -> String {
@@ -1580,7 +1589,10 @@ confirm_mode = "explain"
             "[[log_sources]]\nname = \"vlogs\"\nkind = \"victorialogs\"\n\
              url = \"https://v\"\nclusters = [\"nope\"]\n",
         );
-        assert!(unknown.contains("\"nope\" is not a [[kube_clusters]] name"), "{unknown}");
+        assert!(
+            unknown.contains("\"nope\" is not a [[kube_clusters]] name"),
+            "{unknown}"
+        );
         let dup = kube_err_raw(
             "[[log_sources]]\nname = \"v\"\nkind = \"loki\"\nurl = \"http://l\"\n\
              [[log_sources]]\nname = \"v\"\nkind = \"loki\"\nurl = \"http://m\"\n",
@@ -1660,11 +1672,14 @@ reveal_env = ["shop/api/PUBLIC_MODE"]
         let cfg = load_str(&kube_toml(""));
         let c = cfg.kube_cluster("prod-eu").unwrap();
         assert_eq!(c.request_timeout_secs, DEFAULT_KUBE_REQUEST_TIMEOUT_SECS);
-        assert_eq!(*c, KubeCluster {
-            name: "prod-eu".into(),
-            context: "prod-eu".into(),
-            ..KubeCluster::default()
-        });
+        assert_eq!(
+            *c,
+            KubeCluster {
+                name: "prod-eu".into(),
+                context: "prod-eu".into(),
+                ..KubeCluster::default()
+            }
+        );
         // No namespaces configured: the description falls back to `default`.
         assert_eq!(
             c.describe(None),
@@ -1724,7 +1739,10 @@ reveal_env = ["shop/api/PUBLIC_MODE"]
         // No explicit list: any valid namespace is acceptable.
         let cfg = load_str(&kube_toml("default_namespace = \"web\"\n"));
         assert_eq!(
-            cfg.kube_cluster("prod-eu").unwrap().default_namespace.as_deref(),
+            cfg.kube_cluster("prod-eu")
+                .unwrap()
+                .default_namespace
+                .as_deref(),
             Some("web")
         );
     }
@@ -1734,15 +1752,22 @@ reveal_env = ["shop/api/PUBLIC_MODE"]
         assert!(kube_err("request_timeout_secs = 0\n").contains("request_timeout_secs"));
         assert!(kube_err("request_timeout_secs = 121\n").contains("request_timeout_secs"));
         let cfg = load_str(&kube_toml("request_timeout_secs = 120\n"));
-        assert_eq!(cfg.kube_cluster("prod-eu").unwrap().request_timeout_secs, 120);
+        assert_eq!(
+            cfg.kube_cluster("prod-eu").unwrap().request_timeout_secs,
+            120
+        );
     }
 
     #[test]
     fn kube_cluster_reveal_configmaps_must_be_namespaced() {
         assert!(kube_err("reveal_configmaps = [\"feature-flags\"]\n").contains("reveal_configmaps"));
-        assert!(kube_err("reveal_configmaps = [\"Shop/feature-flags\"]\n").contains("reveal_configmaps"));
+        assert!(kube_err("reveal_configmaps = [\"Shop/feature-flags\"]\n")
+            .contains("reveal_configmaps"));
         let cfg = load_str(&kube_toml("reveal_configmaps = [\"shop/feature-flags\"]\n"));
-        assert_eq!(cfg.kube_cluster("prod-eu").unwrap().reveal_configmaps.len(), 1);
+        assert_eq!(
+            cfg.kube_cluster("prod-eu").unwrap().reveal_configmaps.len(),
+            1
+        );
     }
 
     #[test]
@@ -1823,8 +1848,12 @@ context = "prod-eu"
         let cfg = load_str(&kube_toml(&format!(
             "reveal_configmaps = [\"shop/feature.flags\", \"shop/{long}\"]\n"
         )));
-        assert_eq!(cfg.kube_cluster("prod-eu").unwrap().reveal_configmaps.len(), 2);
-        assert!(kube_err("reveal_configmaps = [\"shop/feature_flags\"]\n").contains("reveal_configmaps"));
+        assert_eq!(
+            cfg.kube_cluster("prod-eu").unwrap().reveal_configmaps.len(),
+            2
+        );
+        assert!(kube_err("reveal_configmaps = [\"shop/feature_flags\"]\n")
+            .contains("reveal_configmaps"));
         assert!(kube_err("reveal_configmaps = [\"shop./flags\"]\n").contains("reveal_configmaps"));
     }
 
@@ -1897,7 +1926,10 @@ model = "typesafe/jev-1.14"
         assert_eq!(rs.kind, "decisions");
         assert_eq!(rs.key_env, crate::secrets::env_vars::RISK_API_KEY);
         assert_eq!(rs.timeout_secs, DEFAULT_RISK_SCORER_TIMEOUT_SECS);
-        assert_eq!(rs.thresholds(), (DEFAULT_RISK_WARN_BELOW, DEFAULT_RISK_DANGER_BELOW));
+        assert_eq!(
+            rs.thresholds(),
+            (DEFAULT_RISK_WARN_BELOW, DEFAULT_RISK_DANGER_BELOW)
+        );
         assert_eq!(rs.validate().unwrap(), RiskScorerKind::Decisions);
     }
 
@@ -1914,7 +1946,10 @@ key_env = ""
         );
         let rs = cfg.active_risk_scorer().expect("valid");
         assert_eq!(rs.validate().unwrap(), RiskScorerKind::ChatLogprobs);
-        assert_eq!(RiskScorerKind::parse(" decisions "), Some(RiskScorerKind::Decisions));
+        assert_eq!(
+            RiskScorerKind::parse(" decisions "),
+            Some(RiskScorerKind::Decisions)
+        );
         assert_eq!(RiskScorerKind::parse("chat"), None);
     }
 
@@ -2280,7 +2315,10 @@ thinking = { type = "disabled" }
         assert_eq!(cfg.llm.temperature, Some(0.5));
         assert_eq!(cfg.llm.top_p, Some(0.9));
         assert!(cfg.llm.extra_body.is_some());
-        assert_eq!(cfg.llm.extra_body.as_ref().unwrap()["thinking"]["type"], "disabled");
+        assert_eq!(
+            cfg.llm.extra_body.as_ref().unwrap()["thinking"]["type"],
+            "disabled"
+        );
     }
 
     #[test]
@@ -2488,12 +2526,18 @@ policy = "read-write"
         let outsider = target_with_tags("partial", &["work"]);
         let untagged = target_with_tags("adhoc", &[]);
         assert!(is_read_only_target(&groups, &member));
-        assert!(!is_read_only_target(&groups, &outsider), "all tags are required");
+        assert!(
+            !is_read_only_target(&groups, &outsider),
+            "all tags are required"
+        );
         assert!(
             !is_read_only_target(&groups, &untagged),
             "a tagless ad-hoc target matches nothing"
         );
-        assert!(!is_read_only_target(&[], &member), "no groups = no read-only policy");
+        assert!(
+            !is_read_only_target(&[], &member),
+            "no groups = no read-only policy"
+        );
         assert!(
             !is_read_only_target(&[group("draft", &[])], &member),
             "an empty rule must not silently cover everyone"
@@ -2561,15 +2605,24 @@ policy = "read-write"
         );
         let with_passphrase = format!(
             "{:?}",
-            SshAuth::Key { path: None, passphrase: Some("open sesame".into()) }
+            SshAuth::Key {
+                path: None,
+                passphrase: Some("open sesame".into())
+            }
         );
-        assert!(!with_passphrase.contains("open sesame"), "{with_passphrase}");
+        assert!(
+            !with_passphrase.contains("open sesame"),
+            "{with_passphrase}"
+        );
         assert!(with_passphrase.contains("<redacted>"), "{with_passphrase}");
     }
 
     #[test]
     fn a_key_passphrase_never_goes_to_or_comes_from_config_toml() {
-        let auth = SshAuth::Key { path: None, passphrase: Some("open sesame".into()) };
+        let auth = SshAuth::Key {
+            path: None,
+            passphrase: Some("open sesame".into()),
+        };
         let written = toml::to_string(&auth).expect("serialize");
         assert!(!written.contains("open sesame"), "{written}");
         assert!(!written.contains("passphrase"), "{written}");
@@ -2595,15 +2648,16 @@ policy = "read-write"
                 .iter()
                 .map(|t| t.name.as_str())
                 .collect();
-        assert_eq!(selected, ["both"], "only the host carrying every tag matches");
+        assert_eq!(
+            selected,
+            ["both"],
+            "only the host carrying every tag matches"
+        );
     }
 
     #[test]
     fn host_group_empty_match_selects_nothing() {
-        let targets = [
-            target_with_tags("a", &["prod"]),
-            target_with_tags("b", &[]),
-        ];
+        let targets = [target_with_tags("a", &["prod"]), target_with_tags("b", &[])];
         // Not "the whole fleet": an unfinished rule must not widen the list.
         assert!(select_hosts_for_group(&group("everything?", &[]), &targets).is_empty());
     }
@@ -2766,19 +2820,43 @@ max_parallel = 0
         let path = dir.join("config.toml");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&path, "[llm]\nmodel = \"env-model\"\napi_base_url = \"https://test.example.com\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "[llm]\nmodel = \"env-model\"\napi_base_url = \"https://test.example.com\"\n",
+        )
+        .unwrap();
 
         let _dir_guard = DirGuard(dir);
         let old_val = std::env::var("FILAR_CONFIG").ok();
         std::env::set_var("FILAR_CONFIG", path.as_os_str());
-        let _env_guard = EnvGuard { key: "FILAR_CONFIG", old: old_val };
+        let _env_guard = EnvGuard {
+            key: "FILAR_CONFIG",
+            old: old_val,
+        };
 
         let cfg = Config::load_default().unwrap();
-        assert_eq!(cfg.llm.model, "env-model", "FILAR_CONFIG must take priority");
+        assert_eq!(
+            cfg.llm.model, "env-model",
+            "FILAR_CONFIG must take priority"
+        );
     }
 
-    struct EnvGuard { key: &'static str, old: Option<String> }
-    impl Drop for EnvGuard { fn drop(&mut self) { match &self.old { Some(v) => std::env::set_var(self.key, v), None => std::env::remove_var(self.key), } } }
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
     struct DirGuard(std::path::PathBuf);
-    impl Drop for DirGuard { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 }

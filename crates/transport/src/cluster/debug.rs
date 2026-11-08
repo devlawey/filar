@@ -62,8 +62,12 @@ pub fn debug_container_name(id: &str) -> String {
 /// target, at worst narrower.
 pub fn debug_security_context(target: &Container, pod: Option<&PodSecurityContext>) -> Value {
     let own = target.security_context.as_ref();
-    let run_as_user = own.and_then(|c| c.run_as_user).or(pod.and_then(|p| p.run_as_user));
-    let run_as_group = own.and_then(|c| c.run_as_group).or(pod.and_then(|p| p.run_as_group));
+    let run_as_user = own
+        .and_then(|c| c.run_as_user)
+        .or(pod.and_then(|p| p.run_as_user));
+    let run_as_group = own
+        .and_then(|c| c.run_as_group)
+        .or(pod.and_then(|p| p.run_as_group));
     let run_as_non_root = own
         .and_then(|c| c.run_as_non_root)
         .or(pod.and_then(|p| p.run_as_non_root));
@@ -148,7 +152,10 @@ pub fn debug_state(pod: &Pod, name: &str) -> DebugState {
     if let Some(terminated) = state.terminated.as_ref() {
         return DebugState::Failed(format!(
             "debug container exited ({})",
-            terminated.reason.clone().unwrap_or_else(|| terminated.exit_code.to_string())
+            terminated
+                .reason
+                .clone()
+                .unwrap_or_else(|| terminated.exit_code.to_string())
         ));
     }
     if let Some(reason) = state.waiting.as_ref().and_then(|w| w.reason.clone()) {
@@ -165,7 +172,11 @@ pub fn debug_state(pod: &Pod, name: &str) -> DebugState {
                 .as_ref()
                 .and_then(|w| w.message.clone())
                 .unwrap_or_default();
-            return DebugState::Failed(format!("образ не скачался или не запустился: {reason} {message}").trim().to_string());
+            return DebugState::Failed(
+                format!("образ не скачался или не запустился: {reason} {message}")
+                    .trim()
+                    .to_string(),
+            );
         }
     }
     DebugState::Pending
@@ -190,21 +201,28 @@ impl KubeClusterApi {
     pub async fn add_debug_container(&self, spec: &DebugContainerSpec) -> Result<()> {
         let target: &KubeCluster = self.target();
         let pods: Api<Pod> = Api::namespaced(self.client().clone(), &spec.namespace);
-        let pod = pods.get(&spec.pod).await.map_err(|error| {
-            api_error(target, error, "get", "pods", Some(&spec.namespace))
-        })?;
+        let pod = pods
+            .get(&spec.pod)
+            .await
+            .map_err(|error| api_error(target, error, "get", "pods", Some(&spec.namespace)))?;
         let container = pod
             .spec
             .as_ref()
-            .and_then(|s| s.containers.iter().find(|c| c.name == spec.target_container))
+            .and_then(|s| {
+                s.containers
+                    .iter()
+                    .find(|c| c.name == spec.target_container)
+            })
             .ok_or_else(|| {
                 CoreError::NotFound(format!(
                     "pod {}/{} has no container {}",
                     spec.namespace, spec.pod, spec.target_container
                 ))
             })?;
-        let context =
-            debug_security_context(container, pod.spec.as_ref().and_then(|s| s.security_context.as_ref()));
+        let context = debug_security_context(
+            container,
+            pod.spec.as_ref().and_then(|s| s.security_context.as_ref()),
+        );
         pods.patch_ephemeral_containers(
             &spec.pod,
             &PatchParams::default(),
@@ -212,21 +230,32 @@ impl KubeClusterApi {
         )
         .await
         .map_err(|error| {
-            api_error(target, error, "patch", "pods/ephemeralcontainers", Some(&spec.namespace))
+            api_error(
+                target,
+                error,
+                "patch",
+                "pods/ephemeralcontainers",
+                Some(&spec.namespace),
+            )
         })?;
         Ok(())
     }
 
     /// Wait until the added debug container runs (#576). Errors here mean it
     /// is already in the pod spec but did not start.
-    pub async fn wait_debug_container(&self, spec: &DebugContainerSpec, wait: Duration) -> Result<()> {
+    pub async fn wait_debug_container(
+        &self,
+        spec: &DebugContainerSpec,
+        wait: Duration,
+    ) -> Result<()> {
         let target: &KubeCluster = self.target();
         let pods: Api<Pod> = Api::namespaced(self.client().clone(), &spec.namespace);
         let deadline = Instant::now() + wait;
         loop {
-            let pod = pods.get(&spec.pod).await.map_err(|error| {
-                api_error(target, error, "get", "pods", Some(&spec.namespace))
-            })?;
+            let pod = pods
+                .get(&spec.pod)
+                .await
+                .map_err(|error| api_error(target, error, "get", "pods", Some(&spec.namespace)))?;
             match debug_state(&pod, &spec.name) {
                 DebugState::Running => return Ok(()),
                 DebugState::Failed(why) => return Err(CoreError::Other(why)),
@@ -299,12 +328,22 @@ mod tests {
         };
         let ctx = debug_security_context(&target, Some(&pod));
         assert_eq!(ctx["runAsUser"], 65534);
-        assert_eq!(ctx["runAsGroup"], 65534, "the pod's group when the container sets none");
+        assert_eq!(
+            ctx["runAsGroup"], 65534,
+            "the pod's group when the container sets none"
+        );
         assert_eq!(ctx["runAsNonRoot"], true);
         assert_eq!(ctx["readOnlyRootFilesystem"], true);
-        assert_eq!(ctx["privileged"], false, "never privileged, whatever the target says");
+        assert_eq!(
+            ctx["privileged"], false,
+            "never privileged, whatever the target says"
+        );
         assert_eq!(ctx["allowPrivilegeEscalation"], false);
-        assert_eq!(ctx["capabilities"], json!({"drop": ["ALL"]}), "no added capabilities");
+        assert_eq!(
+            ctx["capabilities"],
+            json!({"drop": ["ALL"]}),
+            "no added capabilities"
+        );
     }
 
     #[test]
@@ -358,6 +397,8 @@ mod tests {
             }),
             ..Default::default()
         });
-        assert!(matches!(debug_state(&backoff, name), DebugState::Failed(m) if m.contains("образ не скачался")));
+        assert!(
+            matches!(debug_state(&backoff, name), DebugState::Failed(m) if m.contains("образ не скачался"))
+        );
     }
 }

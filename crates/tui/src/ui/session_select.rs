@@ -33,24 +33,24 @@ pub(crate) fn render_session_select(f: &mut Frame, app: &App, area: Rect) {
     let mut items: Vec<ListItem> = Vec::new();
 
     if app.session_select_metas.is_empty() {
-        items.push(ListItem::new(Line::from(vec![
-            Span::styled("  No saved sessions found.", app.theme.warning_fg()),
-        ])));
-        items.push(ListItem::new(Line::from(vec![
-            Span::styled(
-                "  Sessions are saved every 30s and on exit (Ctrl+Q).",
-                app.theme.muted(),
-            ),
-        ])));
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            "  No saved sessions found.",
+            app.theme.warning_fg(),
+        )])));
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            "  Sessions are saved every 30s and on exit (Ctrl+Q).",
+            app.theme.muted(),
+        )])));
     }
 
     let preview_budget = (width.saturating_sub(48)) as usize;
     for (i, meta) in app.session_select_metas.iter().enumerate() {
-        let cursor = if app.session_select_index == i { "\u{25b6}" } else { " " };
-        let host = meta
-            .ssh_info
-            .clone()
-            .unwrap_or_else(|| meta.target.clone());
+        let cursor = if app.session_select_index == i {
+            "\u{25b6}"
+        } else {
+            " "
+        };
+        let host = meta.ssh_info.clone().unwrap_or_else(|| meta.target.clone());
         let profile = meta.llm_profile.clone().unwrap_or_default();
 
         items.push(ListItem::new(Line::from(vec![

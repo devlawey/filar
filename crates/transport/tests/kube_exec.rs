@@ -18,12 +18,14 @@ use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Api, Client, Config};
 
 fn fixture(path: &Path) -> KubeCluster {
-    let context = std::env::var("FILAR_TEST_KUBE_CONTEXT").ok().unwrap_or_else(|| {
-        Kubeconfig::read_from(path)
-            .ok()
-            .and_then(|config| config.current_context)
-            .expect("test kubeconfig must have a current context")
-    });
+    let context = std::env::var("FILAR_TEST_KUBE_CONTEXT")
+        .ok()
+        .unwrap_or_else(|| {
+            Kubeconfig::read_from(path)
+                .ok()
+                .and_then(|config| config.current_context)
+                .expect("test kubeconfig must have a current context")
+        });
     KubeCluster {
         name: "filar-tests".into(),
         context,
@@ -75,7 +77,9 @@ async fn admin_client() -> Client {
 #[tokio::test]
 #[ignore = "needs docker/k8s cluster"]
 async fn shell_state_exit_codes_and_stderr() {
-    let exec = KubeExecutor::connect(&admin(), &web(Some("main"))).await.unwrap();
+    let exec = KubeExecutor::connect(&admin(), &web(Some("main")))
+        .await
+        .unwrap();
     assert!(exec.pod().starts_with("web-"), "{}", exec.pod());
     assert_eq!(exec.container(), "main");
 
@@ -97,7 +101,11 @@ async fn shell_state_exit_codes_and_stderr() {
 #[tokio::test]
 #[ignore = "needs docker/k8s cluster"]
 async fn cancel_interrupts_sleep_and_keeps_the_shell() {
-    let exec = Arc::new(KubeExecutor::connect(&admin(), &web(Some("main"))).await.unwrap());
+    let exec = Arc::new(
+        KubeExecutor::connect(&admin(), &web(Some("main")))
+            .await
+            .unwrap(),
+    );
     exec.run("cd /tmp").await.unwrap();
     let running = {
         let exec = exec.clone();
@@ -116,7 +124,9 @@ async fn cancel_interrupts_sleep_and_keeps_the_shell() {
 #[tokio::test]
 #[ignore = "needs docker/k8s cluster; deletes one web fixture pod"]
 async fn a_deleted_pod_is_replaced_by_the_selector() {
-    let exec = KubeExecutor::connect(&admin(), &web(Some("main"))).await.unwrap();
+    let exec = KubeExecutor::connect(&admin(), &web(Some("main")))
+        .await
+        .unwrap();
     let mut events = exec.subscribe();
     let old = exec.pod();
     Api::<Pod>::namespaced(admin_client().await, "shop")
@@ -148,7 +158,10 @@ async fn a_container_without_shell_points_to_debug_containers() {
         Ok(_) => panic!("distroless has no shell"),
         Err(error) => error.to_string(),
     };
-    assert!(error.contains("нет /bin/sh") && error.contains("debug-контейнер"), "{error}");
+    assert!(
+        error.contains("нет /bin/sh") && error.contains("debug-контейнер"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -160,13 +173,18 @@ async fn missing_pods_exec_right_is_an_rbac_message() {
     };
     assert!(matches!(error, CoreError::AccessDenied(_)), "{error:?}");
     let text = error.to_string();
-    assert!(text.contains("нет права create на pods/exec в namespace shop"), "{text}");
+    assert!(
+        text.contains("нет права create на pods/exec в namespace shop"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
 #[ignore = "needs docker/k8s cluster"]
 async fn pod_limits_match_the_fixture_spec() {
-    let exec = KubeExecutor::connect(&admin(), &web(Some("main"))).await.unwrap();
+    let exec = KubeExecutor::connect(&admin(), &web(Some("main")))
+        .await
+        .unwrap();
     assert_eq!(
         exec.pod_limits(),
         PodLimits {
@@ -209,20 +227,28 @@ async fn read_until(
 #[ignore = "needs docker/k8s cluster"]
 async fn pod_terminal_is_interactive_resizable_and_interruptible() {
     use filar_transport::InteractiveTerminal;
-    let exec = KubeExecutor::connect(&admin(), &web(Some("main"))).await.unwrap();
+    let exec = KubeExecutor::connect(&admin(), &web(Some("main")))
+        .await
+        .unwrap();
     let term = exec.open_terminal(100, 30).await.unwrap();
     assert_eq!(term.pod(), exec.pod());
 
     term.write_input(b"echo tty-$((40+2))\n").await.unwrap();
-    assert!(read_until(&term, "tty-42", Duration::from_secs(10)).await.contains("tty-42"));
+    assert!(read_until(&term, "tty-42", Duration::from_secs(10))
+        .await
+        .contains("tty-42"));
 
     term.resize(132, 43).await.unwrap();
     term.write_input(b"stty size\n").await.unwrap();
-    assert!(read_until(&term, "43 132", Duration::from_secs(10)).await.contains("43 132"));
+    assert!(read_until(&term, "43 132", Duration::from_secs(10))
+        .await
+        .contains("43 132"));
 
     let started = Instant::now();
     // `sl""ept` prints `slept` only if it runs; the TTY echo shows the quotes.
-    term.write_input(b"sleep 30; echo sl\"\"ept\n").await.unwrap();
+    term.write_input(b"sleep 30; echo sl\"\"ept\n")
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     term.write_input(b"\x03").await.unwrap();
     term.write_input(b"echo after-$((1+1))\n").await.unwrap();
@@ -233,7 +259,11 @@ async fn pod_terminal_is_interactive_resizable_and_interruptible() {
 
     term.close().await.unwrap();
     let result = exec.run("echo agent-$((2+3))").await.unwrap();
-    assert_eq!(result.stdout.trim(), "agent-5", "the agent's shell is independent");
+    assert_eq!(
+        result.stdout.trim(),
+        "agent-5",
+        "the agent's shell is independent"
+    );
 }
 
 fn reader() -> KubeCluster {
@@ -251,7 +281,9 @@ fn reader() -> KubeCluster {
 #[ignore = "needs docker/k8s cluster"]
 async fn debug_container_reads_the_target_root_and_rbac_refuses_without_the_right() {
     use filar_transport::{debug_container_name, DebugContainerSpec};
-    let admin_api = filar_transport::KubeClusterApi::connect(&admin()).await.unwrap();
+    let admin_api = filar_transport::KubeClusterApi::connect(&admin())
+        .await
+        .unwrap();
     let pod = filar_transport::ClusterApi::list_pods(
         &admin_api,
         Some("shop"),
@@ -262,7 +294,10 @@ async fn debug_container_reads_the_target_root_and_rbac_refuses_without_the_righ
     .unwrap()
     .remove(0)
     .name;
-    let id = format!("{:x}", Instant::now().elapsed().as_nanos() ^ u128::from(std::process::id()));
+    let id = format!(
+        "{:x}",
+        Instant::now().elapsed().as_nanos() ^ u128::from(std::process::id())
+    );
     let spec = DebugContainerSpec {
         namespace: "shop".into(),
         pod: pod.clone(),
@@ -280,11 +315,16 @@ async fn debug_container_reads_the_target_root_and_rbac_refuses_without_the_righ
     )
     .await
     .unwrap();
-    let result = exec.run("ls /proc/1/root/ | head -5; cat /proc/1/cmdline | tr '\\0' ' '").await.unwrap();
+    let result = exec
+        .run("ls /proc/1/root/ | head -5; cat /proc/1/cmdline | tr '\\0' ' '")
+        .await
+        .unwrap();
     assert!(result.stdout.contains("pause"), "{}", result.stdout);
     exec.close().await.unwrap();
 
-    let reader_api = filar_transport::KubeClusterApi::connect(&reader()).await.unwrap();
+    let reader_api = filar_transport::KubeClusterApi::connect(&reader())
+        .await
+        .unwrap();
     let mut denied = spec.clone();
     // A different name: `debug_container_name` keeps only 8 characters.
     denied.name = debug_container_name(&format!("{:08x}", std::process::id() ^ 0xdead_beef));

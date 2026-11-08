@@ -687,7 +687,10 @@ impl FilePanels {
         } else if p.path.is_empty() {
             Some("The panel is not ready".to_string())
         } else if p.read_only {
-            Some(format!("{} is read-only: no folder can be created there", p.label))
+            Some(format!(
+                "{} is read-only: no folder can be created there",
+                p.label
+            ))
         } else {
             None
         };
@@ -727,7 +730,8 @@ impl FilePanels {
                     Ok(()) => {
                         let dir = p.path.clone();
                         self.dialog = None;
-                        self.requests.push(PanelRequest::CreateDir { side, dir, name });
+                        self.requests
+                            .push(PanelRequest::CreateDir { side, dir, name });
                     }
                 }
             }
@@ -783,7 +787,10 @@ impl FilePanels {
             return Err("The target panel is not ready".into());
         }
         if dst.read_only {
-            return Err(format!("{} is read-only: nothing can be copied there", dst.label));
+            return Err(format!(
+                "{} is read-only: nothing can be copied there",
+                dst.label
+            ));
         }
         if dst.style == PathStyle::Windows && dst.path.is_empty() {
             return Err("Open a drive in the target panel first".into());
@@ -791,10 +798,17 @@ impl FilePanels {
         let picked: Vec<&DirEntry> = if src.marked.is_empty() {
             match src.current() {
                 Some(Row::Entry(e)) => vec![e],
-                _ => return Err("Nothing to copy: put the cursor on a file or mark some (Space)".into()),
+                _ => {
+                    return Err(
+                        "Nothing to copy: put the cursor on a file or mark some (Space)".into(),
+                    )
+                }
             }
         } else {
-            src.entries.iter().filter(|e| src.marked.contains(&e.name)).collect()
+            src.entries
+                .iter()
+                .filter(|e| src.marked.contains(&e.name))
+                .collect()
         };
         if picked.is_empty() {
             return Err("Nothing to copy".into());
@@ -816,7 +830,10 @@ impl FilePanels {
         };
         for e in picked {
             let path = src.style.join(&src.path, &e.name);
-            if same_fs && e.metadata.kind == EntryKind::Dir && is_within(src.style, &dst.path, &path) {
+            if same_fs
+                && e.metadata.kind == EntryKind::Dir
+                && is_within(src.style, &dst.path, &path)
+            {
                 return Err(format!("Cannot copy {} into itself", e.name));
             }
             if e.metadata.kind == EntryKind::Dir {
@@ -837,7 +854,8 @@ impl FilePanels {
     pub fn refresh_if_showing(&mut self, source: &PanelSource, dir: &str) {
         for side in [Side::Left, Side::Right] {
             let p = self.panel(side);
-            if p.source.as_ref() == Some(source) && p.path == dir && p.status == PanelStatus::Ready {
+            if p.source.as_ref() == Some(source) && p.path == dir && p.status == PanelStatus::Ready
+            {
                 let focus = match p.current() {
                     Some(Row::Entry(e)) => Some(e.name.clone()),
                     _ => None,
@@ -1134,7 +1152,10 @@ impl FileCopy {
     pub fn status_line(&self) -> String {
         match self.state {
             CopyState::Running => {
-                let pct = self.percent().map(|p| format!("{p}% · ")).unwrap_or_default();
+                let pct = self
+                    .percent()
+                    .map(|p| format!("{p}% · "))
+                    .unwrap_or_default();
                 let current = self
                     .current
                     .as_deref()
@@ -1649,7 +1670,10 @@ mod tests {
         // Any other key keeps the question open.
         assert_eq!(fp.handle_key(key(KeyCode::Down)), PanelsAction::None);
         assert!(fp.dialog.is_some());
-        assert_eq!(fp.handle_key(key(KeyCode::Enter)), PanelsAction::StartCopy(plan));
+        assert_eq!(
+            fp.handle_key(key(KeyCode::Enter)),
+            PanelsAction::StartCopy(plan)
+        );
         assert!(fp.left.marked.is_empty(), "marks are used up");
     }
 
@@ -1676,14 +1700,20 @@ mod tests {
         let mut fp = two_panels();
         fp.handle_key(key(KeyCode::F(5)));
         assert!(fp.dialog.is_none());
-        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("Nothing to copy")));
+        assert!(fp
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("Nothing to copy")));
 
         // Read-only target.
         let mut fp = two_panels();
         fp.right.read_only = true;
         fp.handle_key(key(KeyCode::Down));
         fp.handle_key(key(KeyCode::F(5)));
-        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("read-only")));
+        assert!(fp
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("read-only")));
 
         // Target panel not chosen yet.
         let mut fp = opened(Side::Left, "/src", vec![entry("a", EntryKind::File)]);
@@ -1699,14 +1729,23 @@ mod tests {
         fp.right.path = "/src".into();
         fp.handle_key(key(KeyCode::Down));
         fp.handle_key(key(KeyCode::F(5)));
-        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("same folder")));
+        assert!(fp
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("same folder")));
 
         let mut fp = two_panels();
         fp.right.source = Some(PanelSource::Local);
         fp.right.path = "/src/dir/deeper".into();
         fp.handle_key(key(KeyCode::Down)); // dir
         fp.handle_key(key(KeyCode::F(5)));
-        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("into itself")), "{:?}", fp.notice);
+        assert!(
+            fp.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("into itself")),
+            "{:?}",
+            fp.notice
+        );
     }
 
     #[test]
@@ -1753,17 +1792,29 @@ mod tests {
     #[test]
     fn a_copy_tracks_progress_and_sums_up_what_matters() {
         let mut c = FileCopy::new(1, SessionId(1), a_plan());
-        c.apply(CopyEvent::Planned { files: 2, bytes: 200 });
+        c.apply(CopyEvent::Planned {
+            files: 2,
+            bytes: 200,
+        });
         c.apply(CopyEvent::FileStarted {
             src: "/src/a.txt".into(),
             dst: "/dst/a.txt".into(),
             size: 100,
         });
-        c.apply(CopyEvent::Progress { done: 50, total: 200 });
+        c.apply(CopyEvent::Progress {
+            done: 50,
+            total: 200,
+        });
         assert_eq!(c.percent(), Some(25));
-        assert!(c.status_line().contains("Copying 0/2"), "{}", c.status_line());
+        assert!(
+            c.status_line().contains("Copying 0/2"),
+            "{}",
+            c.status_line()
+        );
         assert!(c.status_line().contains("/dst/a.txt"));
-        c.apply(CopyEvent::FileDone { dst: "/dst/a.txt".into() });
+        c.apply(CopyEvent::FileDone {
+            dst: "/dst/a.txt".into(),
+        });
         assert_eq!(c.files_done, 1);
         c.finish(CopyReport {
             copied: 1,
@@ -1775,7 +1826,10 @@ mod tests {
         let s = c.summary();
         assert!(s.contains("1 copied") && s.contains("1 failed"), "{s}");
         assert!(s.contains("permission denied"), "{s}");
-        assert!(s.contains("/dst/b.txt.filar-part"), "the leftover path must be shown: {s}");
+        assert!(
+            s.contains("/dst/b.txt.filar-part"),
+            "the leftover path must be shown: {s}"
+        );
         let op = c.operation();
         assert_eq!(op.id, "copy-1");
         assert_eq!(op.state(), crate::ops::HostOpState::Failed);
@@ -1806,7 +1860,9 @@ mod tests {
             assert!(check_folder_name(p, bad).is_err(), "{bad:?}");
         }
         assert!(check_folder_name(w, "Reports").is_ok());
-        for bad in ["a:b", "a\\b", "a/b", "what?", "x*", "q\"", "<a>", "a|b", "trail.", "trail "] {
+        for bad in [
+            "a:b", "a\\b", "a/b", "what?", "x*", "q\"", "<a>", "a|b", "trail.", "trail ",
+        ] {
             assert!(check_folder_name(w, bad).is_err(), "{bad:?}");
         }
     }
@@ -1816,7 +1872,13 @@ mod tests {
         let mut fp = two_panels();
         fp.handle_key(key(KeyCode::Tab)); // right: web1:/dst
         fp.handle_key(key(KeyCode::F(7)));
-        assert!(matches!(fp.dialog, Some(PanelDialog::NewFolder { side: Side::Right, .. })));
+        assert!(matches!(
+            fp.dialog,
+            Some(PanelDialog::NewFolder {
+                side: Side::Right,
+                ..
+            })
+        ));
         for c in "logs".chars() {
             fp.handle_key(key(KeyCode::Char(c)));
         }
@@ -1858,7 +1920,10 @@ mod tests {
         fp.handle_key(key(KeyCode::Tab));
         fp.handle_key(key(KeyCode::F(7)));
         assert!(fp.dialog.is_none());
-        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("read-only")));
+        assert!(fp
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("read-only")));
 
         let mut fp = two_panels();
         fp.left.style = PathStyle::Windows;
@@ -1892,7 +1957,10 @@ mod tests {
             side: Side::Right,
             generation: g,
             path: "/dst".into(),
-            result: Ok(vec![entry("a", EntryKind::Dir), entry("logs", EntryKind::Dir)]),
+            result: Ok(vec![
+                entry("a", EntryKind::Dir),
+                entry("logs", EntryKind::Dir),
+            ]),
         });
         assert!(matches!(fp.right.current(), Some(Row::Entry(e)) if e.name == "logs"));
 
@@ -1902,7 +1970,10 @@ mod tests {
             name: "logs".into(),
             result: Err("already exists".into()),
         });
-        assert!(fp.notice.as_deref().is_some_and(|n| n.contains("already exists")));
+        assert!(fp
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("already exists")));
         assert!(fp.requests.is_empty());
     }
 }

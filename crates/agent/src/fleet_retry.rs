@@ -196,7 +196,9 @@ pub async fn run_with_retries(
         // this cannot fail; it is checked rather than assumed because a
         // mismatch would file one host's answer under another's name.
         report.absorb(round).map_err(|error| {
-            CoreError::Other(format!("fleet retry: could not merge a retry round: {error}"))
+            CoreError::Other(format!(
+                "fleet retry: could not merge a retry round: {error}"
+            ))
         })?;
     }
 
@@ -297,9 +299,7 @@ mod tests {
             match behaviour {
                 Attempt::Answers => Ok(answer("5.15.0")),
                 Attempt::Fails => Err(CoreError::Other("df: command not found".into())),
-                Attempt::Unreachable => {
-                    Err(CoreError::ConnectionLost("host is rebooting".into()))
-                }
+                Attempt::Unreachable => Err(CoreError::ConnectionLost("host is rebooting".into())),
                 Attempt::Hangs => {
                     tokio::time::sleep(Duration::from_secs(3600)).await;
                     Ok(answer("too late"))
@@ -338,14 +338,9 @@ mod tests {
 
         let tasks = tasks_for(&op, &hosts);
 
-        let report = run_with_retries(
-            &mut op,
-
-            tasks,
-            RetryPolicy::new(3, Duration::from_secs(2)),
-        )
-        .await
-        .expect("valid tasks");
+        let report = run_with_retries(&mut op, tasks, RetryPolicy::new(3, Duration::from_secs(2)))
+            .await
+            .expect("valid tasks");
 
         assert_eq!(
             states(&op, &report),
@@ -353,7 +348,11 @@ mod tests {
             "the second-try answer replaces the first-try silence"
         );
         assert_eq!(steady.calls(), 1, "a host that answered is not asked again");
-        assert_eq!(flaky.calls(), 2, "the silent one is asked exactly once more");
+        assert_eq!(
+            flaky.calls(),
+            2,
+            "the silent one is asked exactly once more"
+        );
 
         let summary = OperationResult::build(&op, &report, &[])
             .expect("valid result")
@@ -371,13 +370,9 @@ mod tests {
         let dead = Flaky::new(&[Attempt::Unreachable]);
 
         let tasks = tasks_for(&op, std::slice::from_ref(&dead));
-        let report = run_with_retries(
-            &mut op,
-            tasks,
-            RetryPolicy::new(3, Duration::from_secs(2)),
-        )
-        .await
-        .expect("valid tasks");
+        let report = run_with_retries(&mut op, tasks, RetryPolicy::new(3, Duration::from_secs(2)))
+            .await
+            .expect("valid tasks");
 
         assert_eq!(
             dead.calls(),
@@ -388,7 +383,11 @@ mod tests {
         let summary = OperationResult::build(&op, &report, &[])
             .expect("valid result")
             .summary();
-        assert!(summary.is_failed(), "nobody answered: {}", summary.headline());
+        assert!(
+            summary.is_failed(),
+            "nobody answered: {}",
+            summary.headline()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -399,13 +398,9 @@ mod tests {
         let broken = Flaky::new(&[Attempt::Fails, Attempt::Answers]);
 
         let tasks = tasks_for(&op, std::slice::from_ref(&broken));
-        let report = run_with_retries(
-            &mut op,
-            tasks,
-            RetryPolicy::new(3, Duration::from_secs(2)),
-        )
-        .await
-        .expect("valid tasks");
+        let report = run_with_retries(&mut op, tasks, RetryPolicy::new(3, Duration::from_secs(2)))
+            .await
+            .expect("valid tasks");
 
         assert_eq!(
             broken.calls(),
@@ -425,13 +420,9 @@ mod tests {
         let wedged = Flaky::new(&[Attempt::Hangs, Attempt::Answers]);
 
         let tasks = tasks_for(&op, std::slice::from_ref(&wedged));
-        let report = run_with_retries(
-            &mut op,
-            tasks,
-            RetryPolicy::new(2, Duration::from_secs(2)),
-        )
-        .await
-        .expect("valid tasks");
+        let report = run_with_retries(&mut op, tasks, RetryPolicy::new(2, Duration::from_secs(2)))
+            .await
+            .expect("valid tasks");
 
         assert_eq!(wedged.calls(), 2);
         assert_eq!(states(&op, &report), vec![HostState::Success]);
@@ -445,13 +436,9 @@ mod tests {
 
         let tasks = tasks_for(&op, &hosts);
         let started = tokio::time::Instant::now();
-        let report = run_with_retries(
-            &mut op,
-            tasks,
-            RetryPolicy::new(5, Duration::from_secs(60)),
-        )
-        .await
-        .expect("valid tasks");
+        let report = run_with_retries(&mut op, tasks, RetryPolicy::new(5, Duration::from_secs(60)))
+            .await
+            .expect("valid tasks");
         let elapsed = started.elapsed();
 
         assert_eq!(report.answered(), 3);
@@ -484,7 +471,10 @@ mod tests {
         // A policy that asks nobody anything is not a retry policy; it is
         // a way to get an empty report out of a group full of hosts.
         assert_eq!(RetryPolicy::new(0, Duration::ZERO).attempts(), 1);
-        assert_eq!(RetryPolicy::default().attempts(), RetryPolicy::DEFAULT_ATTEMPTS);
+        assert_eq!(
+            RetryPolicy::default().attempts(),
+            RetryPolicy::DEFAULT_ATTEMPTS
+        );
         assert_eq!(RetryPolicy::default().pause(), RetryPolicy::DEFAULT_PAUSE);
     }
 
@@ -493,22 +483,17 @@ mod tests {
         let targets = targets(4);
         let mut op = FleetOperation::open(&group(4), &targets);
         let hosts = vec![
-            Flaky::new(&[Attempt::Answers]),                     // done
-            Flaky::new(&[Attempt::Fails]),                        // not retried
+            Flaky::new(&[Attempt::Answers]),                       // done
+            Flaky::new(&[Attempt::Fails]),                         // not retried
             Flaky::new(&[Attempt::Unreachable, Attempt::Answers]), // retried
-            Flaky::new(&[Attempt::Hangs, Attempt::Answers]),      // retried
+            Flaky::new(&[Attempt::Hangs, Attempt::Answers]),       // retried
         ];
 
         let tasks = tasks_for(&op, &hosts);
 
-        let report = run_with_retries(
-            &mut op,
-
-            tasks,
-            RetryPolicy::new(2, Duration::from_secs(1)),
-        )
-        .await
-        .expect("valid tasks");
+        let report = run_with_retries(&mut op, tasks, RetryPolicy::new(2, Duration::from_secs(1)))
+            .await
+            .expect("valid tasks");
 
         let calls: Vec<usize> = hosts.iter().map(|host| host.calls()).collect();
         assert_eq!(calls, vec![1, 1, 2, 2]);
@@ -538,14 +523,9 @@ mod tests {
 
         let tasks = tasks_for(&op, &hosts);
 
-        let report = run_with_retries(
-            &mut op,
-
-            tasks,
-            RetryPolicy::new(2, Duration::from_secs(1)),
-        )
-        .await
-        .expect("valid tasks");
+        let report = run_with_retries(&mut op, tasks, RetryPolicy::new(2, Duration::from_secs(1)))
+            .await
+            .expect("valid tasks");
 
         let order: Vec<HostHandle> = report.outcomes().iter().map(|o| o.handle()).collect();
         assert_eq!(order, handles, "retried rows stay where they were");
@@ -586,12 +566,8 @@ mod tests {
         .expect("valid tasks");
 
         assert_eq!(report.len(), 1, "a report row per task, retries included");
-        let result = OperationResult::build(
-            &op,
-            &report,
-            &[(handles[1], NotAsked::NotApplicable)],
-        )
-        .expect("valid result");
+        let result = OperationResult::build(&op, &report, &[(handles[1], NotAsked::NotApplicable)])
+            .expect("valid result");
         assert_eq!(
             result.state_for(handles[1]),
             Some(HostState::NotApplicable),

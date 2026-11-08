@@ -85,8 +85,13 @@ pub fn parse_selector(selector: &str) -> Result<Vec<LabelTerm>> {
                 "selector term \"{part}\" has an empty value; log stores cannot match empty labels reliably — name the pods instead"
             )));
         }
-        if key.is_empty() || key.contains(char::is_whitespace) || value.contains(char::is_whitespace) {
-            return Err(CoreError::Other(format!("selector term \"{part}\" is malformed")));
+        if key.is_empty()
+            || key.contains(char::is_whitespace)
+            || value.contains(char::is_whitespace)
+        {
+            return Err(CoreError::Other(format!(
+                "selector term \"{part}\" is malformed"
+            )));
         }
         terms.push(LabelTerm {
             key: key.to_string(),
@@ -134,7 +139,13 @@ fn lucene_field(name: &str) -> String {
 fn loki_label(name: &str) -> String {
     let mut out: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if out.starts_with(|c: char| c.is_ascii_digit()) {
         out.insert(0, '_');
@@ -156,7 +167,11 @@ fn regex_literal(text: &str) -> String {
 
 fn logsql_scope(f: &K8sFields, scope: &PodScope) -> String {
     let field = |name: &str| quote(name);
-    let mut parts = vec![format!("{}:={}", field(f.namespace), quote(&scope.namespace))];
+    let mut parts = vec![format!(
+        "{}:={}",
+        field(f.namespace),
+        quote(&scope.namespace)
+    )];
     match &scope.pick {
         PodPick::Names(names) if names.len() == 1 => {
             parts.push(format!("{}:={}", field(f.pod), quote(&names[0])));
@@ -167,7 +182,11 @@ fn logsql_scope(f: &K8sFields, scope: &PodScope) -> String {
         }
         PodPick::Labels(terms) => {
             for t in terms {
-                let term = format!("{}:={}", field(&format!("{}{}", f.labels_prefix, t.key)), quote(&t.value));
+                let term = format!(
+                    "{}:={}",
+                    field(&format!("{}{}", f.labels_prefix, t.key)),
+                    quote(&t.value)
+                );
                 parts.push(if t.equal { term } else { format!("-{term}") });
             }
         }
@@ -180,7 +199,11 @@ fn logsql_scope(f: &K8sFields, scope: &PodScope) -> String {
 }
 
 fn lucene_scope(f: &K8sFields, scope: &PodScope) -> String {
-    let mut parts = vec![format!("{}:{}", lucene_field(f.namespace), quote(&scope.namespace))];
+    let mut parts = vec![format!(
+        "{}:{}",
+        lucene_field(f.namespace),
+        quote(&scope.namespace)
+    )];
     match &scope.pick {
         PodPick::Names(names) => {
             let list: Vec<String> = names.iter().map(|n| quote(n)).collect();
@@ -188,7 +211,11 @@ fn lucene_scope(f: &K8sFields, scope: &PodScope) -> String {
         }
         PodPick::Labels(terms) => {
             for t in terms {
-                let term = format!("{}:{}", lucene_field(&format!("{}{}", f.labels_prefix, t.key)), quote(&t.value));
+                let term = format!(
+                    "{}:{}",
+                    lucene_field(&format!("{}{}", f.labels_prefix, t.key)),
+                    quote(&t.value)
+                );
                 parts.push(if t.equal { term } else { format!("NOT {term}") });
             }
         }
@@ -208,13 +235,20 @@ fn lucene_scope(f: &K8sFields, scope: &PodScope) -> String {
 /// exists in two of the namespaces would match in both — fleets name
 /// concrete pods, so this is rare), and label selectors are only allowed
 /// for a single scope.
-pub fn build_scope_query(cfg: &LogSourceConfig, scopes: &[PodScope], filter: Option<&str>) -> Result<String> {
-    let kind = cfg
-        .source_kind()
-        .ok_or_else(|| CoreError::Other(format!("log source \"{}\" has an unknown kind", cfg.name)))?;
-    let preset = cfg
-        .k8s_preset()
-        .ok_or_else(|| CoreError::Other(format!("log source \"{}\" has an unknown k8s_fields", cfg.name)))?;
+pub fn build_scope_query(
+    cfg: &LogSourceConfig,
+    scopes: &[PodScope],
+    filter: Option<&str>,
+) -> Result<String> {
+    let kind = cfg.source_kind().ok_or_else(|| {
+        CoreError::Other(format!("log source \"{}\" has an unknown kind", cfg.name))
+    })?;
+    let preset = cfg.k8s_preset().ok_or_else(|| {
+        CoreError::Other(format!(
+            "log source \"{}\" has an unknown k8s_fields",
+            cfg.name
+        ))
+    })?;
     let f = preset.fields();
     if scopes.is_empty() {
         return Err(CoreError::Other("no pods to query".into()));
@@ -225,7 +259,10 @@ pub fn build_scope_query(cfg: &LogSourceConfig, scopes: &[PodScope], filter: Opt
             let scope = if scopes.len() == 1 {
                 logsql_scope(&f, &scopes[0])
             } else {
-                let parts: Vec<String> = scopes.iter().map(|s| format!("({})", logsql_scope(&f, s))).collect();
+                let parts: Vec<String> = scopes
+                    .iter()
+                    .map(|s| format!("({})", logsql_scope(&f, s)))
+                    .collect();
                 format!("({})", parts.join(" OR "))
             };
             Ok(match filter {
@@ -237,7 +274,10 @@ pub fn build_scope_query(cfg: &LogSourceConfig, scopes: &[PodScope], filter: Opt
             let scope = if scopes.len() == 1 {
                 lucene_scope(&f, &scopes[0])
             } else {
-                let parts: Vec<String> = scopes.iter().map(|s| format!("({})", lucene_scope(&f, s))).collect();
+                let parts: Vec<String> = scopes
+                    .iter()
+                    .map(|s| format!("({})", lucene_scope(&f, s)))
+                    .collect();
                 format!("({})", parts.join(" OR "))
             };
             Ok(match filter {
@@ -247,13 +287,18 @@ pub fn build_scope_query(cfg: &LogSourceConfig, scopes: &[PodScope], filter: Opt
         }
         LogSourceKind::Loki => {
             if scopes.len() > 1 && scopes.iter().any(|s| matches!(s.pick, PodPick::Labels(_))) {
-                return Err(CoreError::Other("label selectors over several namespaces cannot be one LogQL query".into()));
+                return Err(CoreError::Other(
+                    "label selectors over several namespaces cannot be one LogQL query".into(),
+                ));
             }
             let namespaces: BTreeSet<&str> = scopes.iter().map(|s| s.namespace.as_str()).collect();
             let mut matchers = Vec::new();
             let ns_label = loki_label(f.namespace);
             if namespaces.len() == 1 {
-                matchers.push(format!("{ns_label}={}", quote(namespaces.iter().next().copied().unwrap_or(""))));
+                matchers.push(format!(
+                    "{ns_label}={}",
+                    quote(namespaces.iter().next().copied().unwrap_or(""))
+                ));
             } else {
                 let alt: Vec<String> = namespaces.iter().map(|n| regex_literal(n)).collect();
                 matchers.push(format!("{ns_label}=~{}", quote(&alt.join("|"))));
@@ -275,9 +320,9 @@ pub fn build_scope_query(cfg: &LogSourceConfig, scopes: &[PodScope], filter: Opt
                 .map(|s| s.namespace.as_str())
                 .collect();
             // Pods in a namespace that is wanted whole are already covered.
-            let uncovered = scopes
-                .iter()
-                .any(|s| matches!(s.pick, PodPick::Names(_)) && !whole.contains(s.namespace.as_str()));
+            let uncovered = scopes.iter().any(|s| {
+                matches!(s.pick, PodPick::Names(_)) && !whole.contains(s.namespace.as_str())
+            });
             if all && namespaces.len() > 1 && uncovered {
                 return Err(CoreError::Other(
                     "whole namespaces and single pods in other namespaces cannot be one LogQL query".into(),
@@ -286,21 +331,39 @@ pub fn build_scope_query(cfg: &LogSourceConfig, scopes: &[PodScope], filter: Opt
             if !pods.is_empty() && !all {
                 let pod_label = loki_label(f.pod);
                 if pods.len() == 1 {
-                    matchers.push(format!("{pod_label}={}", quote(pods.iter().next().copied().unwrap_or(""))));
+                    matchers.push(format!(
+                        "{pod_label}={}",
+                        quote(pods.iter().next().copied().unwrap_or(""))
+                    ));
                 } else {
                     let alt: Vec<String> = pods.iter().map(|p| regex_literal(p)).collect();
                     matchers.push(format!("{pod_label}=~{}", quote(&alt.join("|"))));
                 }
             }
-            if let [PodScope { pick: PodPick::Labels(terms), .. }] = scopes {
+            if let [PodScope {
+                pick: PodPick::Labels(terms),
+                ..
+            }] = scopes
+            {
                 for t in terms {
                     let op = if t.equal { "=" } else { "!=" };
-                    matchers.push(format!("{}{op}{}", loki_label(&format!("{}{}", f.labels_prefix, t.key)), quote(&t.value)));
+                    matchers.push(format!(
+                        "{}{op}{}",
+                        loki_label(&format!("{}{}", f.labels_prefix, t.key)),
+                        quote(&t.value)
+                    ));
                 }
             }
-            let containers: BTreeSet<&str> = scopes.iter().filter_map(|s| s.container.as_deref()).collect();
+            let containers: BTreeSet<&str> = scopes
+                .iter()
+                .filter_map(|s| s.container.as_deref())
+                .collect();
             if containers.len() == 1 && scopes.iter().all(|s| s.container.is_some()) {
-                matchers.push(format!("{}={}", loki_label(f.container), quote(containers.iter().next().copied().unwrap_or(""))));
+                matchers.push(format!(
+                    "{}={}",
+                    loki_label(f.container),
+                    quote(containers.iter().next().copied().unwrap_or(""))
+                ));
             }
             let selector = format!("{{{}}}", matchers.join(", "));
             Ok(match filter {
@@ -315,12 +378,20 @@ pub fn build_scope_query(cfg: &LogSourceConfig, scopes: &[PodScope], filter: Opt
 /// Loki keys lines by stream label, so a dotted preset field becomes the
 /// sanitised label (`kubernetes.pod_name` → `kubernetes_pod_name`).
 pub fn pod_field(cfg: &LogSourceConfig) -> String {
-    store_field(cfg, cfg.k8s_preset().map(|p| p.fields().pod).unwrap_or("pod"))
+    store_field(
+        cfg,
+        cfg.k8s_preset().map(|p| p.fields().pod).unwrap_or("pod"),
+    )
 }
 
 /// The namespace field of lines from a source with `cfg` (see [`pod_field`]).
 pub fn namespace_field(cfg: &LogSourceConfig) -> String {
-    store_field(cfg, cfg.k8s_preset().map(|p| p.fields().namespace).unwrap_or("namespace"))
+    store_field(
+        cfg,
+        cfg.k8s_preset()
+            .map(|p| p.fields().namespace)
+            .unwrap_or("namespace"),
+    )
 }
 
 fn store_field(cfg: &LogSourceConfig, field: &str) -> String {
@@ -344,7 +415,10 @@ pub fn fold_by_pod(
     pods: &[(String, String)],
 ) -> String {
     let key = |ns: &str, pod: &str| format!("{ns}/{pod}");
-    let mut per_pod: BTreeMap<String, Vec<&str>> = pods.iter().map(|(ns, p)| (key(ns, p), Vec::new())).collect();
+    let mut per_pod: BTreeMap<String, Vec<&str>> = pods
+        .iter()
+        .map(|(ns, p)| (key(ns, p), Vec::new()))
+        .collect();
     let mut other = 0usize;
     for line in &result.lines {
         let Some(pod) = line.fields.get(pod_field) else {
@@ -389,12 +463,22 @@ pub fn fold_by_pod(
         }
         let mut groups: BTreeMap<String, (usize, &str)> = BTreeMap::new();
         for message in lines {
-            let entry = groups.entry(normalize_message(message)).or_insert((0, message));
+            let entry = groups
+                .entry(normalize_message(message))
+                .or_insert((0, message));
             entry.0 += 1;
         }
-        let (count, sample) = groups.values().max_by_key(|(n, _)| *n).copied().unwrap_or((0, ""));
+        let (count, sample) = groups
+            .values()
+            .max_by_key(|(n, _)| *n)
+            .copied()
+            .unwrap_or((0, ""));
         let sample: String = sample.chars().take(200).collect();
-        out.push_str(&format!("{pod} | {} | {} | [{count}×] {sample}\n", lines.len(), groups.len()));
+        out.push_str(&format!(
+            "{pod} | {} | {} | [{count}×] {sample}\n",
+            lines.len(),
+            groups.len()
+        ));
     }
     if other > 0 {
         out.push_str(&format!(
@@ -420,18 +504,36 @@ pub fn query_logs_arguments(source: &str, query: &str, args: &Value) -> Value {
 
 /// The `pod_logs_history` tool definition; in a fleet, pods come from the
 /// fleet and `pod`/`selector` are not offered.
-pub fn pod_logs_history_definition(mode: filar_core::CommandConfirmMode, fleet: bool) -> crate::ToolDef {
+pub fn pod_logs_history_definition(
+    mode: filar_core::CommandConfirmMode,
+    fleet: bool,
+) -> crate::ToolDef {
     let mut p = Map::new();
     if !fleet {
         p.insert("pod".into(), json!({"type": "string", "description": "Pod name (deleted pods too). Use this or selector."}));
         p.insert("selector".into(), json!({"type": "string", "description": "Equality label selector, e.g. app=web,tier!=batch."}));
-        p.insert("namespace".into(), json!({"type": "string", "description": "Namespace; defaults to the tab's."}));
+        p.insert(
+            "namespace".into(),
+            json!({"type": "string", "description": "Namespace; defaults to the tab's."}),
+        );
     }
     p.insert("container".into(), json!({"type": "string"}));
-    p.insert("filter".into(), json!({"type": "string", "description": "Optional plain text the lines must contain."}));
-    p.insert("since".into(), json!({"type": "string", "description": "Window ending now, e.g. 15m, 1h."}));
-    p.insert("start".into(), json!({"type": "string", "description": "Window start, RFC 3339."}));
-    p.insert("end".into(), json!({"type": "string", "description": "Window end, RFC 3339; defaults to now."}));
+    p.insert(
+        "filter".into(),
+        json!({"type": "string", "description": "Optional plain text the lines must contain."}),
+    );
+    p.insert(
+        "since".into(),
+        json!({"type": "string", "description": "Window ending now, e.g. 15m, 1h."}),
+    );
+    p.insert(
+        "start".into(),
+        json!({"type": "string", "description": "Window start, RFC 3339."}),
+    );
+    p.insert(
+        "end".into(),
+        json!({"type": "string", "description": "Window end, RFC 3339; defaults to now."}),
+    );
     p.insert("limit".into(), json!({"type": "integer", "minimum": 1}));
     p.insert("source".into(), json!({"type": "string", "description": "Log source; needed only when several are linked to the cluster."}));
     p.insert("explanation".into(), json!({"type": "string"}));
@@ -453,13 +555,26 @@ pub fn pod_logs_history_definition(mode: filar_core::CommandConfirmMode, fleet: 
 
 /// The scope of a single-cluster call from its arguments and the tab's
 /// default namespace and pod.
-pub fn scope_from_arguments(args: &Value, default_namespace: Option<&str>, default_pod: Option<&str>) -> Result<PodScope> {
-    let text = |key: &str| args.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
-    let namespace = text("namespace")
-        .or(default_namespace)
-        .ok_or_else(|| CoreError::Other("namespace is required (the tab has no default namespace)".into()))?;
+pub fn scope_from_arguments(
+    args: &Value,
+    default_namespace: Option<&str>,
+    default_pod: Option<&str>,
+) -> Result<PodScope> {
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let namespace = text("namespace").or(default_namespace).ok_or_else(|| {
+        CoreError::Other("namespace is required (the tab has no default namespace)".into())
+    })?;
     let pick = match (text("pod"), text("selector")) {
-        (Some(_), Some(_)) => return Err(CoreError::Other("give either pod or selector, not both".into())),
+        (Some(_), Some(_)) => {
+            return Err(CoreError::Other(
+                "give either pod or selector, not both".into(),
+            ))
+        }
         (Some(pod), None) => PodPick::Names(vec![pod.to_string()]),
         (None, Some(selector)) => PodPick::Labels(parse_selector(selector)?),
         (None, None) => match default_pod {
@@ -506,13 +621,21 @@ impl super::LogSources {
             .collect()
     }
 
-    fn pick_linked(&self, cluster: &str, requested: Option<&str>) -> std::result::Result<String, String> {
+    fn pick_linked(
+        &self,
+        cluster: &str,
+        requested: Option<&str>,
+    ) -> std::result::Result<String, String> {
         let linked = self.linked(cluster);
         match requested.map(str::trim).filter(|s| !s.is_empty()) {
             Some(name) if linked.iter().any(|l| l == name) => Ok(name.to_string()),
             Some(name) => Err(format!(
                 "Error: log source \"{name}\" is not linked to cluster {cluster}; linked: {}",
-                if linked.is_empty() { "none".to_string() } else { linked.join(", ") }
+                if linked.is_empty() {
+                    "none".to_string()
+                } else {
+                    linked.join(", ")
+                }
             )),
             None => match linked.as_slice() {
                 [] => Err(no_linked_source(cluster)),
@@ -553,18 +676,37 @@ impl super::LogSources {
                 .ok_or_else(|| CoreError::Other(format!("unknown log source \"{source}\"")))?;
             let filter = args.get("filter").and_then(Value::as_str);
             let query = build_scope_query(cfg, &[scope], filter)?;
-            self.parse_call(&query_logs_arguments(&source, &query, args), chrono::Utc::now())
+            self.parse_call(
+                &query_logs_arguments(&source, &query, args),
+                chrono::Utc::now(),
+            )
         })();
         let parsed = match built {
             Ok(parsed) => parsed,
             Err(error) => {
-                return Ok(crate::ChatMessage::tool(&call.id, format!("Error: invalid pod_logs_history call: {error}")));
+                return Ok(crate::ChatMessage::tool(
+                    &call.id,
+                    format!("Error: invalid pod_logs_history call: {error}"),
+                ));
             }
         };
-        let display = format!("{TOOL_POD_LOGS_HISTORY} {}", parsed.display_command().trim_start_matches("query_logs "));
+        let display = format!(
+            "{TOOL_POD_LOGS_HISTORY} {}",
+            parsed.display_command().trim_start_matches("query_logs ")
+        );
         let render = |c: &super::QueryLogsCall, r: &LogResult| self.fold(c, r);
-        self.run_framed(call, &parsed, display, &render, mode, confirmer, emit, cancellation, proposal_id)
-            .await
+        self.run_framed(
+            call,
+            &parsed,
+            display,
+            &render,
+            mode,
+            confirmer,
+            emit,
+            cancellation,
+            proposal_id,
+        )
+        .await
     }
 
     /// `pod_logs_history` over a fleet: one query per linked source with all
@@ -592,7 +734,10 @@ impl super::LogSources {
                 Err(_) if self.linked(&member.cluster).is_empty() => {
                     unlinked.insert(member.cluster.as_str());
                 }
-                Err(message) => refused.entry(message).or_default().push(member.cluster.as_str()),
+                Err(message) => refused
+                    .entry(message)
+                    .or_default()
+                    .push(member.cluster.as_str()),
             }
         }
         if by_source.is_empty() {
@@ -604,7 +749,11 @@ impl super::LogSources {
             }
             return Ok(crate::ChatMessage::tool(&call.id, reasons.join("\n")));
         }
-        let container = args.get("container").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty());
+        let container = args
+            .get("container")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|c| !c.is_empty());
         let filter = args.get("filter").and_then(Value::as_str);
         let mut answers = Vec::new();
         for (source, members) in by_source {
@@ -612,7 +761,11 @@ impl super::LogSources {
                 .iter()
                 .map(|m| PodScope {
                     namespace: m.namespace.clone(),
-                    pick: m.pod.clone().map(|p| PodPick::Names(vec![p])).unwrap_or(PodPick::All),
+                    pick: m
+                        .pod
+                        .clone()
+                        .map(|p| PodPick::Names(vec![p]))
+                        .unwrap_or(PodPick::All),
                     container: container.map(str::to_owned),
                 })
                 .collect();
@@ -625,13 +778,18 @@ impl super::LogSources {
                     .source_config(&source)
                     .ok_or_else(|| CoreError::Other(format!("unknown log source \"{source}\"")))?;
                 let query = build_scope_query(cfg, &scopes, filter)?;
-                let parsed = self.parse_call(&query_logs_arguments(&source, &query, args), chrono::Utc::now())?;
+                let parsed = self.parse_call(
+                    &query_logs_arguments(&source, &query, args),
+                    chrono::Utc::now(),
+                )?;
                 Ok((parsed, pod_field(cfg), namespace_field(cfg)))
             })();
             let (parsed, field, ns_field) = match built {
                 Ok(built) => built,
                 Err(error) => {
-                    answers.push(format!("Error: invalid pod_logs_history call for {source}: {error}"));
+                    answers.push(format!(
+                        "Error: invalid pod_logs_history call for {source}: {error}"
+                    ));
                     continue;
                 }
             };
@@ -664,12 +822,18 @@ impl super::LogSources {
         }
         if !unlinked.is_empty() {
             let clusters: Vec<&str> = unlinked.into_iter().collect();
-            answers.push(format!("No log source is linked to: {}; their pods are not in this answer.", clusters.join(", ")));
+            answers.push(format!(
+                "No log source is linked to: {}; their pods are not in this answer.",
+                clusters.join(", ")
+            ));
         }
         for (message, clusters) in refused {
             let clusters: BTreeSet<&str> = clusters.into_iter().collect();
             let clusters: Vec<&str> = clusters.into_iter().collect();
-            answers.push(format!("Pods of {} are not in this answer: {message}", clusters.join(", ")));
+            answers.push(format!(
+                "Pods of {} are not in this answer: {message}",
+                clusters.join(", ")
+            ));
         }
         Ok(crate::ChatMessage::tool(&call.id, answers.join("\n")))
     }
@@ -707,7 +871,10 @@ mod tests {
         assert!(parse_selector("app in (web,api)").is_err());
         assert!(parse_selector("app").is_err());
         assert!(parse_selector(" ").is_err());
-        assert!(parse_selector("app=").is_err(), "an empty value would match nothing useful");
+        assert!(
+            parse_selector("app=").is_err(),
+            "an empty value would match nothing useful"
+        );
     }
 
     #[test]
@@ -725,18 +892,37 @@ mod tests {
     fn values_are_escaped_in_every_language() {
         let evil = PodScope {
             namespace: "shop".into(),
-            pick: PodPick::Labels(vec![LabelTerm { key: "app.kubernetes.io/name".into(), value: "we\"b\\x".into(), equal: true }]),
+            pick: PodPick::Labels(vec![LabelTerm {
+                key: "app.kubernetes.io/name".into(),
+                value: "we\"b\\x".into(),
+                equal: true,
+            }]),
             container: None,
         };
-        let vl = build_scope_query(&cfg("victorialogs", None), std::slice::from_ref(&evil), Some("say \"hi\"")).unwrap();
-        assert!(vl.contains(r#""kubernetes.pod_labels.app.kubernetes.io/name":="we\"b\\x""#), "{vl}");
+        let vl = build_scope_query(
+            &cfg("victorialogs", None),
+            std::slice::from_ref(&evil),
+            Some("say \"hi\""),
+        )
+        .unwrap();
+        assert!(
+            vl.contains(r#""kubernetes.pod_labels.app.kubernetes.io/name":="we\"b\\x""#),
+            "{vl}"
+        );
         assert!(vl.ends_with(r#""say \"hi\"""#), "{vl}");
 
-        let os = build_scope_query(&cfg("opensearch", None), std::slice::from_ref(&evil), None).unwrap();
-        assert_eq!(os, r#"kubernetes.namespace_name:"shop" AND kubernetes.labels.app.kubernetes.io\/name:"we\"b\\x""#);
+        let os =
+            build_scope_query(&cfg("opensearch", None), std::slice::from_ref(&evil), None).unwrap();
+        assert_eq!(
+            os,
+            r#"kubernetes.namespace_name:"shop" AND kubernetes.labels.app.kubernetes.io\/name:"we\"b\\x""#
+        );
 
         let loki = build_scope_query(&cfg("loki", None), &[evil], Some("x")).unwrap();
-        assert_eq!(loki, r#"{namespace="shop", app_kubernetes_io_name="we\"b\\x"} |= "x""#);
+        assert_eq!(
+            loki,
+            r#"{namespace="shop", app_kubernetes_io_name="we\"b\\x"} |= "x""#
+        );
     }
 
     #[test]
@@ -746,45 +932,119 @@ mod tests {
             pick: PodPick::Labels(parse_selector("app=web,tier!=batch").unwrap()),
             container: None,
         };
-        let fb = build_scope_query(&cfg("elasticsearch", Some("filebeat")), std::slice::from_ref(&scope), None).unwrap();
-        assert_eq!(fb, r#"kubernetes.namespace:"shop" AND kubernetes.labels.app:"web" AND NOT kubernetes.labels.tier:"batch""#);
-        let vl = build_scope_query(&cfg("victorialogs", None), std::slice::from_ref(&scope), None).unwrap();
-        assert!(vl.ends_with(r#"-"kubernetes.pod_labels.tier":="batch""#), "{vl}");
+        let fb = build_scope_query(
+            &cfg("elasticsearch", Some("filebeat")),
+            std::slice::from_ref(&scope),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fb,
+            r#"kubernetes.namespace:"shop" AND kubernetes.labels.app:"web" AND NOT kubernetes.labels.tier:"batch""#
+        );
+        let vl = build_scope_query(
+            &cfg("victorialogs", None),
+            std::slice::from_ref(&scope),
+            None,
+        )
+        .unwrap();
+        assert!(
+            vl.ends_with(r#"-"kubernetes.pod_labels.tier":="batch""#),
+            "{vl}"
+        );
         let loki = build_scope_query(&cfg("loki", None), &[scope], None).unwrap();
         assert_eq!(loki, r#"{namespace="shop", app="web", tier!="batch"}"#);
     }
 
     #[test]
     fn a_fleet_is_one_query_for_all_its_pods() {
-        let scopes = [pod("shop", "web-1"), pod("shop", "web-2"), pod("pay", "api.v2-1")];
+        let scopes = [
+            pod("shop", "web-1"),
+            pod("shop", "web-2"),
+            pod("pay", "api.v2-1"),
+        ];
         let vl = build_scope_query(&cfg("victorialogs", None), &scopes, Some("error")).unwrap();
         assert_eq!(vl.matches(" OR ").count(), 2, "{vl}");
         assert!(vl.ends_with(" \"error\""), "{vl}");
         let loki = build_scope_query(&cfg("loki", None), &scopes, None).unwrap();
-        assert_eq!(loki, r#"{namespace=~"pay|shop", pod=~"api\\.v2-1|web-1|web-2"}"#);
+        assert_eq!(
+            loki,
+            r#"{namespace=~"pay|shop", pod=~"api\\.v2-1|web-1|web-2"}"#
+        );
         let os = build_scope_query(&cfg("opensearch", None), &scopes, None).unwrap();
-        assert!(os.starts_with("((kubernetes.namespace_name:\"shop\" AND kubernetes.pod_name:(\"web-1\"))"), "{os}");
+        assert!(
+            os.starts_with(
+                "((kubernetes.namespace_name:\"shop\" AND kubernetes.pod_name:(\"web-1\"))"
+            ),
+            "{os}"
+        );
     }
 
     #[test]
     fn loki_never_widens_a_mix_of_namespaces_and_pods() {
-        let whole = PodScope { namespace: "pay".into(), pick: PodPick::All, container: None };
-        let err = build_scope_query(&cfg("loki", None), &[whole.clone(), pod("shop", "web-1")], None).unwrap_err();
-        assert!(err.to_string().contains("cannot be one LogQL query"), "{err}");
+        let whole = PodScope {
+            namespace: "pay".into(),
+            pick: PodPick::All,
+            container: None,
+        };
+        let err = build_scope_query(
+            &cfg("loki", None),
+            &[whole.clone(), pod("shop", "web-1")],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be one LogQL query"),
+            "{err}"
+        );
         // A pod of a namespace that is wanted whole is covered.
         let covered = build_scope_query(
             &cfg("loki", None),
-            &[whole.clone(), PodScope { namespace: "shop".into(), ..whole.clone() }, pod("shop", "web-1")],
+            &[
+                whole.clone(),
+                PodScope {
+                    namespace: "shop".into(),
+                    ..whole.clone()
+                },
+                pod("shop", "web-1"),
+            ],
             None,
         )
         .unwrap();
         assert_eq!(covered, r#"{namespace=~"pay|shop"}"#);
         // In one namespace, every pod of it is exactly what was asked.
-        let same = build_scope_query(&cfg("loki", None), &[PodScope { namespace: "shop".into(), ..whole }, pod("shop", "web-1")], None).unwrap();
+        let same = build_scope_query(
+            &cfg("loki", None),
+            &[
+                PodScope {
+                    namespace: "shop".into(),
+                    ..whole
+                },
+                pod("shop", "web-1"),
+            ],
+            None,
+        )
+        .unwrap();
         assert_eq!(same, r#"{namespace="shop"}"#);
         // Other languages keep each scope apart.
-        let vl = build_scope_query(&cfg("victorialogs", None), &[PodScope { namespace: "pay".into(), pick: PodPick::All, container: None }, pod("shop", "web-1")], None).unwrap();
-        assert!(vl.contains(r#"("kubernetes.pod_namespace":="pay")"#) && vl.contains(r#""kubernetes.pod_name":="web-1""#), "{vl}");
+        let vl = build_scope_query(
+            &cfg("victorialogs", None),
+            &[
+                PodScope {
+                    namespace: "pay".into(),
+                    pick: PodPick::All,
+                    container: None,
+                },
+                pod("shop", "web-1"),
+            ],
+            None,
+        )
+        .unwrap();
+        assert!(
+            vl.contains(r#"("kubernetes.pod_namespace":="pay")"#)
+                && vl.contains(r#""kubernetes.pod_name":="web-1""#),
+            "{vl}"
+        );
     }
 
     #[test]
@@ -804,7 +1064,11 @@ mod tests {
         assert_eq!(namespace_field(&loki), "kubernetes_namespace_name");
         assert_eq!(pod_field(&cfg("victorialogs", None)), "kubernetes.pod_name");
         let result = LogResult {
-            lines: vec![line("shop", "web-1", "a"), line("pay", "web-1", "b"), line("pay", "web-1", "b")],
+            lines: vec![
+                line("shop", "web-1", "a"),
+                line("pay", "web-1", "b"),
+                line("pay", "web-1", "b"),
+            ],
             ..Default::default()
         };
         let query = LogQuery {
@@ -813,8 +1077,18 @@ mod tests {
             end: chrono::Utc.with_ymd_and_hms(2026, 11, 1, 11, 0, 0).unwrap(),
             limit: 100,
         };
-        let pods = [("shop".to_string(), "web-1".to_string()), ("pay".to_string(), "web-1".to_string())];
-        let text = fold_by_pod("loki", &query, &result, &pod_field(&loki), &namespace_field(&loki), &pods);
+        let pods = [
+            ("shop".to_string(), "web-1".to_string()),
+            ("pay".to_string(), "web-1".to_string()),
+        ];
+        let text = fold_by_pod(
+            "loki",
+            &query,
+            &result,
+            &pod_field(&loki),
+            &namespace_field(&loki),
+            &pods,
+        );
         assert!(text.contains("shop/web-1 | 1 | 1 | [1×] a"), "{text}");
         assert!(text.contains("pay/web-1 | 2 | 1 | [2×] b"), "{text}");
     }
@@ -828,7 +1102,9 @@ mod tests {
         assert_eq!(s.pick, PodPick::Names(vec!["web-1".into()]));
         assert!(scope_from_arguments(&json!({}), Some("shop"), None).is_err());
         assert!(scope_from_arguments(&json!({"pod": "a"}), None, None).is_err());
-        assert!(scope_from_arguments(&json!({"pod": "a", "selector": "x=y"}), Some("n"), None).is_err());
+        assert!(
+            scope_from_arguments(&json!({"pod": "a", "selector": "x=y"}), Some("n"), None).is_err()
+        );
     }
 
     #[test]
@@ -854,10 +1130,26 @@ mod tests {
             end: chrono::Utc.with_ymd_and_hms(2026, 11, 1, 11, 0, 0).unwrap(),
             limit: 100,
         };
-        let pods = [("shop".to_string(), "web-1".to_string()), ("shop".to_string(), "web-2".to_string())];
-        let text = fold_by_pod("vlogs", &query, &result, "kubernetes.pod_name", "kubernetes.pod_namespace", &pods);
-        assert!(text.contains("shop/web-1 | 3 | 2 | [2×] timeout after 30s"), "{text}");
+        let pods = [
+            ("shop".to_string(), "web-1".to_string()),
+            ("shop".to_string(), "web-2".to_string()),
+        ];
+        let text = fold_by_pod(
+            "vlogs",
+            &query,
+            &result,
+            "kubernetes.pod_name",
+            "kubernetes.pod_namespace",
+            &pods,
+        );
+        assert!(
+            text.contains("shop/web-1 | 3 | 2 | [2×] timeout after 30s"),
+            "{text}"
+        );
         assert!(text.contains("shop/web-2 | 0 | 0 | —"), "{text}");
-        assert!(text.contains("1 line(s) came from pods outside the fleet"), "{text}");
+        assert!(
+            text.contains("1 line(s) came from pods outside the fleet"),
+            "{text}"
+        );
     }
 }

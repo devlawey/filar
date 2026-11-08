@@ -126,14 +126,25 @@ fn metrics(outcomes: &[Outcome]) -> Metrics {
         total,
         rated: rated.len(),
         hits,
-        hit_rate: if rated.is_empty() { 0.0 } else { hits as f64 / rated.len() as f64 },
-        concordance: if pairs == 0 { 0.0 } else { agree / pairs as f64 },
+        hit_rate: if rated.is_empty() {
+            0.0
+        } else {
+            hits as f64 / rated.len() as f64
+        },
+        concordance: if pairs == 0 {
+            0.0
+        } else {
+            agree / pairs as f64
+        },
         unavailable_share: if total == 0 {
             0.0
         } else {
             (total - rated.len()) as f64 / total as f64
         },
-        mean_by_level: sums.into_iter().map(|(k, (s, n))| (k, s / n as f64)).collect(),
+        mean_by_level: sums
+            .into_iter()
+            .map(|(k, (s, n))| (k, s / n as f64))
+            .collect(),
     }
 }
 
@@ -156,7 +167,11 @@ fn failures(m: &Metrics, min_hit: f64, min_concordance: f64) -> Vec<String> {
         return out;
     }
     if m.hit_rate < min_hit {
-        out.push(format!("hit rate {:.0}% < {:.0}%", m.hit_rate * 100.0, min_hit * 100.0));
+        out.push(format!(
+            "hit rate {:.0}% < {:.0}%",
+            m.hit_rate * 100.0,
+            min_hit * 100.0
+        ));
     }
     if m.concordance < min_concordance {
         out.push(format!(
@@ -169,7 +184,13 @@ fn failures(m: &Metrics, min_hit: f64, min_concordance: f64) -> Vec<String> {
 }
 
 /// Markdown report: summary, mean per level, and every case.
-fn report(model: &str, cases: &[Case], outcomes: &[Outcome], m: &Metrics, failed: &[String]) -> String {
+fn report(
+    model: &str,
+    cases: &[Case],
+    outcomes: &[Outcome],
+    m: &Metrics,
+    failed: &[String],
+) -> String {
     let mut s = format!("# Risk eval — `{model}`\n\n");
     s.push_str(&format!(
         "- cases: {} (rated {}, unavailable {:.0}%)\n- hit rate (±1 level): {:.0}% ({}/{})\n- concordance: {:.0}%\n- verdict: {}\n\n",
@@ -190,16 +211,28 @@ fn report(model: &str, cases: &[Case], outcomes: &[Outcome], m: &Metrics, failed
     for (i, (c, o)) in cases.iter().zip(outcomes).enumerate() {
         let pct = o.safety_pct.map_or("—".to_string(), |p| p.to_string());
         let conf = o.confidence.map_or("—".to_string(), |c| format!("{c:.2}"));
-        let hit = if o.safety_pct.is_none() { "n/a" } else if o.hit() { "✓" } else { "✗" };
+        let hit = if o.safety_pct.is_none() {
+            "n/a"
+        } else if o.hit() {
+            "✓"
+        } else {
+            "✗"
+        };
         let cmd = c.command.replace('|', "\\|");
-        s.push_str(&format!("| {} | {} | {pct} | {conf} | {hit} | `{cmd}` |\n", i + 1, c.level));
+        s.push_str(&format!(
+            "| {} | {} | {pct} | {conf} | {hit} | `{cmd}` |\n",
+            i + 1,
+            c.level
+        ));
     }
     s
 }
 
 /// Encode a message for a GitHub Actions workflow command.
 fn gha_escape(s: &str) -> String {
-    s.replace('%', "%25").replace('\r', "%0D").replace('\n', "%0A")
+    s.replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
 }
 
 struct Args {
@@ -226,7 +259,11 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--config" => a.config = Some(value("--config")?),
             "--cases" => a.cases = value("--cases")?,
-            "--min-hit" => a.min_hit = value("--min-hit")?.parse().map_err(|e| format!("--min-hit: {e}"))?,
+            "--min-hit" => {
+                a.min_hit = value("--min-hit")?
+                    .parse()
+                    .map_err(|e| format!("--min-hit: {e}"))?
+            }
             "--min-concordance" => {
                 a.min_concordance = value("--min-concordance")?
                     .parse()
@@ -251,7 +288,12 @@ fn scorer_config(args: &Args) -> Result<RiskScorerConfig, String> {
             .cloned()
             .ok_or_else(|| format!("{path} has no [risk_scorer] section"));
     }
-    let env = |k: &str, d: &str| std::env::var(k).ok().filter(|v| !v.is_empty()).unwrap_or_else(|| d.to_string());
+    let env = |k: &str, d: &str| {
+        std::env::var(k)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| d.to_string())
+    };
     Ok(RiskScorerConfig {
         kind: env("RISK_EVAL_KIND", "decisions"),
         base_url: env("RISK_EVAL_BASE_URL", "https://openrouter.ai/api/alpha"),
@@ -281,7 +323,10 @@ async fn main() -> ExitCode {
         }
     };
     if let Some(bad) = dataset.cases.iter().find(|c| c.level >= RISK_LEVELS.len()) {
-        eprintln!("risk_eval: level {} out of range for `{}`", bad.level, bad.command);
+        eprintln!(
+            "risk_eval: level {} out of range for `{}`",
+            bad.level, bad.command
+        );
         return ExitCode::from(2);
     }
     let cfg = match scorer_config(&args) {
@@ -308,16 +353,27 @@ async fn main() -> ExitCode {
         let input = RiskInput {
             command: case.command.clone(),
             explanation: String::new(),
-            target: case.target.clone().unwrap_or_else(|| DEFAULT_TARGET.to_string()),
+            target: case
+                .target
+                .clone()
+                .unwrap_or_else(|| DEFAULT_TARGET.to_string()),
         };
         let outcome = match scorer.score(&input).await {
             Ok(s) => {
                 cost += s.cost_usd.unwrap_or(0.0);
-                Outcome { expected: case.level, safety_pct: Some(s.safety_pct), confidence: s.confidence }
+                Outcome {
+                    expected: case.level,
+                    safety_pct: Some(s.safety_pct),
+                    confidence: s.confidence,
+                }
             }
             Err(e) => {
                 eprintln!("risk_eval: case {} unavailable: {e}", i + 1);
-                Outcome { expected: case.level, safety_pct: None, confidence: None }
+                Outcome {
+                    expected: case.level,
+                    safety_pct: None,
+                    confidence: None,
+                }
             }
         };
         outcomes.push(outcome);
@@ -348,7 +404,11 @@ mod tests {
     use super::*;
 
     fn o(expected: usize, pct: Option<u8>) -> Outcome {
-        Outcome { expected, safety_pct: pct, confidence: None }
+        Outcome {
+            expected,
+            safety_pct: pct,
+            confidence: None,
+        }
     }
 
     #[test]
@@ -363,17 +423,14 @@ mod tests {
 
     #[test]
     fn metrics_count_hits_order_and_gaps() {
-        let outcomes = vec![
-            o(0, Some(100)),
-            o(1, Some(80)),
-            o(4, Some(5)),
-            o(4, None),
-        ];
+        let outcomes = vec![o(0, Some(100)), o(1, Some(80)), o(4, Some(5)), o(4, None)];
         let m = metrics(&outcomes);
         assert_eq!((m.total, m.rated, m.hits), (4, 3, 3));
         assert_eq!(m.concordance, 1.0);
         assert_eq!(m.unavailable_share, 0.25);
-        assert!(failures(&m, 0.8, 0.85).iter().any(|f| f.contains("unavailable")));
+        assert!(failures(&m, 0.8, 0.85)
+            .iter()
+            .any(|f| f.contains("unavailable")));
     }
 
     #[test]
@@ -399,7 +456,10 @@ mod tests {
         let m = metrics(&[o(0, Some(0)), o(4, Some(100)), o(2, Some(50))]);
         assert_eq!(m.concordance, 0.0);
         let failed = failures(&m, 0.8, 0.85);
-        assert!(failed.iter().any(|f| f.contains("concordance")), "{failed:?}");
+        assert!(
+            failed.iter().any(|f| f.contains("concordance")),
+            "{failed:?}"
+        );
         assert!(failed.iter().any(|f| f.contains("hit rate")), "{failed:?}");
     }
 
@@ -414,17 +474,29 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../eval/risk/commands.toml");
         let text = std::fs::read_to_string(path).expect("eval/risk/commands.toml is readable");
         let d: Dataset = toml::from_str(&text).expect("eval/risk/commands.toml is valid TOML");
-        assert!((40..=60).contains(&d.cases.len()), "{} cases", d.cases.len());
+        assert!(
+            (40..=60).contains(&d.cases.len()),
+            "{} cases",
+            d.cases.len()
+        );
         for level in 0..RISK_LEVELS.len() {
             let n = d.cases.iter().filter(|c| c.level == level).count();
             assert!(n >= 5, "level {level} has only {n} cases");
         }
-        assert!(d.cases.iter().all(|c| c.level < RISK_LEVELS.len() && !c.command.trim().is_empty()));
+        assert!(d
+            .cases
+            .iter()
+            .all(|c| c.level < RISK_LEVELS.len() && !c.command.trim().is_empty()));
     }
 
     #[test]
     fn the_report_lists_every_case_and_escapes_pipes() {
-        let cases = vec![Case { command: "a | b".into(), level: 0, target: None, note: None }];
+        let cases = vec![Case {
+            command: "a | b".into(),
+            level: 0,
+            target: None,
+            note: None,
+        }];
         let outcomes = vec![o(0, Some(90))];
         let m = metrics(&outcomes);
         let r = report("m", &cases, &outcomes, &m, &[]);

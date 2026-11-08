@@ -70,7 +70,9 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     // shell commands, whatever they are called (#565 review).
     let in_cluster = app.kube.as_ref().is_some_and(|kube| kube.pod.is_none());
     let kubernetes = (in_cluster || kube_fleet)
-        && filar_agent::kube_tools::is_kube_tool_name(command.split_whitespace().next().unwrap_or(""));
+        && filar_agent::kube_tools::is_kube_tool_name(
+            command.split_whitespace().next().unwrap_or(""),
+        );
     let kube_target = app.kube.as_ref().map(|kube| {
         (
             kube.target.name.clone(),
@@ -90,7 +92,10 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         .and_then(|kube| crate::app::pod_tab::pod_confirm_target_line(kube, app.theme.glyphs()));
     let strict_pod = pod_target.is_some()
         && app.kube.as_ref().is_some_and(|kube| {
-            kube.target.tags.iter().any(|tag| tag.eq_ignore_ascii_case("prod"))
+            kube.target
+                .tags
+                .iter()
+                .any(|tag| tag.eq_ignore_ascii_case("prod"))
                 || filar_core::tag_policy_floor(
                     app.global_confirm_mode,
                     &app.tag_policies,
@@ -148,8 +153,8 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or(0);
     let command_rows = estimate_wrapped_rows(&command_text, inner_width);
     let empty_rows = 1; // separator line before buttons
-    // The header line above the command: the fleet radius, or in a pod tab
-    // its target. Never truncated away (see `build_modal_lines`).
+                        // The header line above the command: the fleet radius, or in a pod tab
+                        // its target. Never truncated away (see `build_modal_lines`).
     let header = radius_lines(
         &radius,
         radius_kind,
@@ -419,7 +424,12 @@ fn build_modal_lines(
         // short terminal never trades the command for the header.
         let room = max_rows.saturating_sub(2).min(HEADER_MAX_ROWS);
         for row in header_rows_within(&header, inner_width, room) {
-            let _ = push(&mut lines, &mut used, row, warning.add_modifier(Modifier::BOLD));
+            let _ = push(
+                &mut lines,
+                &mut used,
+                row,
+                warning.add_modifier(Modifier::BOLD),
+            );
         }
         if let Some(list) = list {
             // Leave room for the command line and the separator.
@@ -1167,8 +1177,14 @@ mod tests {
             )),
             "{screen}"
         );
-        let target_row = screen.lines().position(|l| l.contains("pod web-7f9c")).unwrap();
-        let command_row = screen.lines().position(|l| l.contains("$ cd /tmp && pwd")).unwrap();
+        let target_row = screen
+            .lines()
+            .position(|l| l.contains("pod web-7f9c"))
+            .unwrap();
+        let command_row = screen
+            .lines()
+            .position(|l| l.contains("$ cd /tmp && pwd"))
+            .unwrap();
         assert!(target_row < command_row, "{screen}");
         assert_eq!(confirm_border_color(&mut app), Some(app.theme.warning));
     }
@@ -1189,7 +1205,8 @@ mod tests {
         {
             let kube = app.kube.as_mut().unwrap();
             kube.target.context =
-                "arn:aws:eks:eu-central-1:123456789012:cluster/payments-production-eu-central".into();
+                "arn:aws:eks:eu-central-1:123456789012:cluster/payments-production-eu-central"
+                    .into();
             kube.namespace = Some("n".repeat(63));
             let pod = kube.pod.as_mut().unwrap();
             // The longest pod name Kubernetes accepts: 253 characters.
@@ -1251,7 +1268,10 @@ mod tests {
             tag: "pci".into(),
             confirm_mode: CommandConfirmMode::Always,
         }];
-        assert_eq!(confirm_border_color(&mut policed), Some(policed.theme.danger));
+        assert_eq!(
+            confirm_border_color(&mut policed),
+            Some(policed.theme.danger)
+        );
     }
 
     #[test]
