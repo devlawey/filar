@@ -12678,3 +12678,36 @@ describe пода получило колонку SECRETS, поэтому чле
 
 **Остаётся.** Ручной smoke Windows и macOS по `docs/SMOKE.md` (#298), включая
 живые сценарии записи в кластер, метаданных Secret, risk-scorer и log-source.
+
+## Issue #659: UID-precondition при удалении (веха 3.0.6)
+
+**Сделано.** Транспорт: `DeleteTarget::Names(Vec<PinnedName>)` —
+`PinnedName { name, uid: Option<String> }`; при заданном UID delete уходит с
+`Preconditions { uid }` (без `resourceVersion`: метки и аннотации меняют
+контроллеры), а 409 о precondition — исход `DeleteOutcome::Recreated`, не
+ошибка. `DeletedObject::uid()` берёт `metadata.uid` из ответа dry run. Агент:
+`WritePreview::names` закрепляет имена и UID для **любого** удаления, не
+только по селектору; `execute` отдаёт их реальному delete. Пересозданный объект
+не попадает в след «Изменение в кластере», а в итоге — «<объект>: recreated
+since preview (uid changed), not deleted» и совет повторить `k8s_delete`.
+Объект без UID в dry run — строка `⚠ identity not pinned` в окне, удаление по
+имени. `docs/KUBERNETES.md` §4.9 и раздел гейта обновлены.
+
+**Решения.** Пересмотрено решение #651/#639 «имя — идентичность»: у filar
+между показом и удалением есть окно, у `kubectl delete` — нет. Удаление по
+имени после dry run теперь идёт через `Names`, поэтому объект, исчезнувший за
+время окна, — «already gone», а не ошибка NotFound.
+
+**Контракты.** Ломающие для внешних потребителей движка: тип
+`DeleteTarget::Names` и новое значение `DeleteOutcome::Recreated` (исчерпывающие
+`match`). Добавлены `PinnedName`, `DeletedObject::uid`. `CommandExecutor`,
+`LlmClient`, `ClusterApi` не менялись. При релизе — строка в
+`docs/ENGINE_API.md` «Upgrading to engine-v3.0.6».
+
+**Проверено.** Юнит-тесты транспорта на фейковом API (совпадающий UID —
+удаление, другой — `Recreated`, без UID — по имени) и агента (под
+пересоздан при открытом окне; селектор из трёх, один пересоздан). Live-тест
+`a_pinned_delete_leaves_an_object_recreated_since_the_dry_run` в
+`crates/transport/tests/cluster_write.rs` — `#[ignore]`, ручной (kind).
+
+**Next.** #657 — чтение workload по имени и точное ожидание выката.

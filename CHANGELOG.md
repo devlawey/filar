@@ -11,6 +11,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Changed
+
+- `k8s_delete` deletes only the objects its window showed: each one — by name or by selector — is pinned to the UID the dry run saw (a `uid` precondition), so an object recreated under the same name while the window was open is left and reported as «recreated since preview (uid changed), not deleted»; an object whose dry run gave no UID is marked `⚠ identity not pinned` and deleted by name. Engine: `DeleteTarget::Names` now holds `PinnedName { name, uid }`, new `DeleteOutcome::Recreated` and `DeletedObject::uid()` ([#659](https://github.com/devlawey/filar/issues/659)).
+
 ## [3.0.5] - 2026-11-11
 
 ### Added

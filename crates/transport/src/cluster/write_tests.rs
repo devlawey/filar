@@ -322,6 +322,22 @@ fn cluster(request: &Request, state: &mut State) -> (u16, Value) {
             (200, request.body.clone())
         }
         "DELETE" => match state.objects.get(&path).cloned() {
+            // As the API server: a UID precondition must match (#659).
+            Some(object)
+                if request.body["preconditions"]["uid"]
+                    .as_str()
+                    .is_some_and(|uid| object["metadata"]["uid"].as_str() != Some(uid)) =>
+            {
+                status(
+                    409,
+                    "Conflict",
+                    &format!(
+                        "Operation cannot be fulfilled: Precondition failed: UID in precondition: {}, UID in object meta: {}",
+                        request.body["preconditions"]["uid"],
+                        object["metadata"]["uid"]
+                    ),
+                )
+            }
             Some(object) => {
                 if !dry_run {
                     state.objects.remove(&path);
@@ -897,7 +913,12 @@ async fn delete_by_selector_dry_run_lists_every_match_and_deletes_nothing() {
         .objects
         .remove(&format!("{PODS}/web-2"));
     api.put(&format!("{PODS}/web-3"), pod("web-3", "web"));
-    let names = DeleteTarget::Names(listed.iter().map(|d| d.object.name.clone()).collect());
+    let names = DeleteTarget::Names(
+        listed
+            .iter()
+            .map(|d| PinnedName::unpinned(d.object.name.clone()))
+            .collect(),
+    );
     let deleted = api
         .api()
         .delete(
@@ -924,6 +945,122 @@ async fn delete_by_selector_dry_run_lists_every_match_and_deletes_nothing() {
         api.get(&format!("{PODS}/web-3")).is_some(),
         "appeared after the dry run: kept"
     );
+}
+
+fn pod_with_uid(name: &str, uid: &str) -> Value {
+    let mut pod = pod(name, "web");
+    pod["metadata"]["uid"] = json!(uid);
+    pod
+}
+
+#[tokio::test]
+async fn a_pinned_delete_removes_only_the_object_the_dry_run_saw() {
+    let api = fake().await;
+    let kind = ObjectKind {
+        api_version: None,
+        kind: "pod".into(),
+    };
+    for (name, uid) in [("web-0", "uid-a"), ("web-1", "uid-b"), ("web-2", "uid-c")] {
+        api.put(&format!("{PODS}/{name}"), pod_with_uid(name, uid));
+    }
+    let listed = api
+        .api()
+        .delete(
+            &kind,
+            Some("shop"),
+            &DeleteTarget::Selector {
+                labels: Some("app=web".into()),
+                fields: None,
+            },
+            &DeleteOptions::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let pinned: Vec<_> = listed
+        .iter()
+        .map(|d| PinnedName {
+            name: d.object.name.clone(),
+            uid: d.uid().map(str::to_owned),
+        })
+        .collect();
+    assert_eq!(
+        pinned[0].uid.as_deref(),
+        Some("uid-a"),
+        "the dry run saw the UID"
+    );
+
+    // A controller recreates web-1 while the window is open.
+    api.put(&format!("{PODS}/web-1"), pod_with_uid("web-1", "uid-new"));
+    let deleted = api
+        .api()
+        .delete(
+            &kind,
+            Some("shop"),
+            &DeleteTarget::Names(pinned),
+            &DeleteOptions::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let outcomes: Vec<_> = deleted
+        .iter()
+        .map(|d| (d.object.name.as_str(), d.outcome))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            ("web-0", DeleteOutcome::Deleted),
+            ("web-1", DeleteOutcome::Recreated),
+            ("web-2", DeleteOutcome::Deleted)
+        ]
+    );
+    assert_eq!(
+        api.get(&format!("{PODS}/web-1")).unwrap()["metadata"]["uid"],
+        "uid-new",
+        "the successor is kept"
+    );
+    let real: Vec<_> = api
+        .writes()
+        .into_iter()
+        .filter(|r| r.method == "DELETE" && !is_dry_run(r))
+        .collect();
+    assert_eq!(real[0].body["preconditions"]["uid"], "uid-a");
+    assert!(
+        real[0].body["preconditions"]
+            .get("resourceVersion")
+            .is_none()
+            || real[0].body["preconditions"]["resourceVersion"].is_null(),
+        "only the UID is pinned: labels and annotations may change"
+    );
+}
+
+#[tokio::test]
+async fn an_unpinned_name_is_deleted_by_name_alone() {
+    let api = fake().await;
+    api.put(&format!("{PODS}/web-0"), pod_with_uid("web-0", "uid-new"));
+    let kind = ObjectKind {
+        api_version: None,
+        kind: "pod".into(),
+    };
+    let deleted = api
+        .api()
+        .delete(
+            &kind,
+            Some("shop"),
+            &DeleteTarget::Names(vec![PinnedName::unpinned("web-0")]),
+            &DeleteOptions::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted[0].outcome, DeleteOutcome::Deleted);
+    let delete = api
+        .writes()
+        .into_iter()
+        .find(|r| r.method == "DELETE")
+        .unwrap();
+    assert!(delete.body.get("preconditions").is_none() || delete.body["preconditions"].is_null());
 }
 
 #[tokio::test]
