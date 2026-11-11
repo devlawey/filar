@@ -306,8 +306,13 @@ pub struct DeletedObject {
 
 impl DeletedObject {
     /// `metadata.uid` of the object as the API server answered, if it did.
+    /// An empty UID is no identity and counts as none.
     pub fn uid(&self) -> Option<&str> {
-        self.live.as_ref()?.pointer("/metadata/uid")?.as_str()
+        self.live
+            .as_ref()?
+            .pointer("/metadata/uid")?
+            .as_str()
+            .filter(|uid| !uid.is_empty())
     }
 }
 
@@ -1579,7 +1584,10 @@ async fn impact_of(api: &KubeClusterApi, object: &DeletedObject) -> DeletionImpa
 mod tests;
 
 /// A 409 refusing a delete because its UID precondition no longer holds:
-/// the name now belongs to another object (#659).
+/// the name now belongs to another object (#659). Matched on the API
+/// server's own wording (`Precondition failed: UID in precondition: …`), so
+/// another 409 — an admission webhook, a resourceVersion conflict — stays an
+/// error.
 fn is_uid_conflict(status: &kube::core::Status) -> bool {
-    status.code == 409 && status.message.to_ascii_lowercase().contains("precondition")
+    status.code == 409 && status.message.contains("UID in precondition")
 }

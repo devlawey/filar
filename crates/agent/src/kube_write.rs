@@ -1011,13 +1011,28 @@ pub async fn execute(
                 .delete(kind, namespace.as_deref(), &target, options, false)
                 .await?;
             summary.push_str(&deleted_text(&deleted, false));
-            if deleted
+            // Named here too: the list above stops at MAX_LISTED_OBJECTS.
+            let recreated: Vec<_> = deleted
                 .iter()
-                .any(|d| d.outcome == DeleteOutcome::Recreated)
-            {
-                summary.push_str(
-                    "Objects recreated since the preview were not deleted; if the new ones must go too, call k8s_delete again (a new preview).\n",
-                );
+                .filter(|d| d.outcome == DeleteOutcome::Recreated)
+                .map(|d| d.object.name.as_str())
+                .collect();
+            if !recreated.is_empty() {
+                let mut names = recreated
+                    .iter()
+                    .take(MAX_LISTED_OBJECTS)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if recreated.len() > MAX_LISTED_OBJECTS {
+                    names.push_str(&format!(
+                        " and {} more",
+                        recreated.len() - MAX_LISTED_OBJECTS
+                    ));
+                }
+                summary.push_str(&format!(
+                    "Recreated since the preview, not deleted: {names}. If the new ones must go too, call k8s_delete again (a new preview).\n"
+                ));
             }
             changes.extend(
                 deleted
@@ -2515,7 +2530,9 @@ mod pinned_delete_tests {
             report.summary
         );
         assert!(
-            report.summary.contains("call k8s_delete again"),
+            report
+                .summary
+                .contains("Recreated since the preview, not deleted: web-0. If the new ones must go too, call k8s_delete again"),
             "{}",
             report.summary
         );
@@ -2551,6 +2568,37 @@ mod pinned_delete_tests {
         );
         let left: Vec<_> = api.pods.lock().unwrap().keys().cloned().collect();
         assert_eq!(left, ["web-1"]);
+    }
+
+    #[tokio::test]
+    async fn a_recreated_object_past_the_listed_ones_is_still_named() {
+        let pods: Vec<(String, String)> = (0..30)
+            .map(|i| (format!("web-{i:02}"), format!("uid-{i}")))
+            .collect();
+        let refs: Vec<(&str, Option<&str>)> = pods
+            .iter()
+            .map(|(name, uid)| (name.as_str(), Some(uid.as_str())))
+            .collect();
+        let api = UidWriter::new(&refs);
+        let call = delete_call(json!({"kind": "Pod", "label_selector": "app=web"}));
+        let preview = preview(&api, &call).await.unwrap();
+        api.recreate("web-28", "uid-new");
+        let report = execute(&api, &preview.pin(&call), preview.names.clone())
+            .await
+            .unwrap();
+        assert!(
+            !report.summary.contains("Pod shop/web-28:"),
+            "past the list limit: {}",
+            report.summary
+        );
+        assert!(
+            report
+                .summary
+                .contains("Recreated since the preview, not deleted: web-28."),
+            "{}",
+            report.summary
+        );
+        assert_eq!(report.changes.len(), 29);
     }
 
     #[tokio::test]

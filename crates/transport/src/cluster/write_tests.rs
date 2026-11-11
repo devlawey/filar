@@ -1025,14 +1025,69 @@ async fn a_pinned_delete_removes_only_the_object_the_dry_run_saw() {
         .into_iter()
         .filter(|r| r.method == "DELETE" && !is_dry_run(r))
         .collect();
-    assert_eq!(real[0].body["preconditions"]["uid"], "uid-a");
-    assert!(
-        real[0].body["preconditions"]
-            .get("resourceVersion")
-            .is_none()
-            || real[0].body["preconditions"]["resourceVersion"].is_null(),
-        "only the UID is pinned: labels and annotations may change"
+    let sent: Vec<_> = real
+        .iter()
+        .map(|r| r.body["preconditions"]["uid"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        sent,
+        ["uid-a", "uid-b", "uid-c"],
+        "every real delete is pinned"
     );
+    for request in &real {
+        assert!(
+            request.body["preconditions"]["resourceVersion"].is_null(),
+            "only the UID is pinned: labels and annotations may change"
+        );
+    }
+}
+
+#[tokio::test]
+async fn another_conflict_is_an_error_and_an_empty_uid_is_no_pin() {
+    let api = FakeApi::start(Arc::new(|request: &Request, state: &mut State| {
+        if request.method == "DELETE" && !is_dry_run(request) {
+            return status(
+                409,
+                "Conflict",
+                "admission webhook denied the request: precondition of policy p failed",
+            );
+        }
+        cluster(request, state)
+    }))
+    .await;
+    api.put(&format!("{PODS}/web-0"), pod_with_uid("web-0", "uid-a"));
+    let kind = ObjectKind {
+        api_version: None,
+        kind: "pod".into(),
+    };
+    let pinned = DeleteTarget::Names(vec![PinnedName {
+        name: "web-0".into(),
+        uid: Some("uid-a".into()),
+    }]);
+    let error = api
+        .api()
+        .delete(
+            &kind,
+            Some("shop"),
+            &pinned,
+            &DeleteOptions::default(),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("admission webhook denied"), "{error}");
+
+    let blank = DeletedObject {
+        object: ObjectRef {
+            api_version: "v1".into(),
+            kind: "Pod".into(),
+            namespace: None,
+            name: "x".into(),
+        },
+        outcome: DeleteOutcome::WouldDelete,
+        live: Some(json!({"metadata": {"uid": ""}})),
+    };
+    assert_eq!(blank.uid(), None);
 }
 
 #[tokio::test]

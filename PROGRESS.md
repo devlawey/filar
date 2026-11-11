@@ -12710,4 +12710,12 @@ since preview (uid changed), not deleted» и совет повторить `k8s
 `a_pinned_delete_leaves_an_object_recreated_since_the_dry_run` в
 `crates/transport/tests/cluster_write.rs` — `#[ignore]`, ручной (kind).
 
+**Ревью (CodeRabbit, раунд 1).** `Recreated` только по 409 с текстом
+API-сервера `UID in precondition` — 409 от admission webhook остаётся
+ошибкой; пустой `metadata.uid` — не закрепление (`⚠ identity not pinned`);
+имена пересозданных объектов перечислены отдельной строкой итога (до 25, далее
+«and N more») — список результатов обрезается на 25; в KUBERNETES.md гарантия
+по UID оговорена «если dry run вернул UID»; тест проверяет UID у каждого
+реального DELETE.
+
 **Next.** #657 — чтение workload по имени и точное ожидание выката.
