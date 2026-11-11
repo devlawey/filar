@@ -1075,7 +1075,10 @@ async fn another_conflict_is_an_error_and_an_empty_uid_is_no_pin() {
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("admission webhook denied"), "{error}");
+    assert!(
+        error.to_string().contains("admission webhook denied"),
+        "{error}"
+    );
 
     let blank = DeletedObject {
         object: ObjectRef {
@@ -1796,5 +1799,45 @@ async fn a_dry_run_answered_with_a_status_still_reads_the_object() {
         listed[0].live.as_ref().unwrap()["metadata"]["name"],
         "web-1",
         "the impact check sees the object"
+    );
+}
+
+// ── get_workload (#657) ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn one_workload_is_read_by_name_with_a_get() {
+    use crate::cluster::{ClusterApi, WorkloadKind};
+    let api = fake().await;
+    let mut web = deployment("web", 3);
+    web["metadata"]["generation"] = json!(2);
+    web["status"] =
+        json!({"observedGeneration": 2, "replicas": 3, "updatedReplicas": 3, "readyReplicas": 3});
+    api.put(&format!("{DEPLOY}/web"), web);
+    let found = api
+        .api()
+        .get_workload("shop", WorkloadKind::Deployment, "web")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (found.generation, found.observed_generation, found.replicas),
+        (Some(2), Some(2), Some(3))
+    );
+    let missing = api
+        .api()
+        .get_workload("shop", WorkloadKind::Deployment, "nope")
+        .await
+        .unwrap();
+    assert!(missing.is_none(), "404 is no workload, not an error");
+    let requests = api.requests.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.method == "GET" && r.path == format!("{DEPLOY}/web")),
+        "a GET by name"
+    );
+    assert!(
+        !requests.iter().any(|r| r.path == DEPLOY),
+        "no list: {requests:?}"
     );
 }

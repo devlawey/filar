@@ -207,6 +207,15 @@ pub struct WorkloadInfo {
     pub age_seconds: Option<u64>,
     /// Container images declared by the workload pod template.
     pub images: Vec<String>,
+    /// `metadata.generation`: bumped by every change of the spec (#657).
+    pub generation: Option<i64>,
+    /// `status.observedGeneration`: the generation the controller has acted
+    /// on. Below `generation`, the status still describes the old spec.
+    pub observed_generation: Option<i64>,
+    /// `status.replicas`: every pod of the workload, old revisions included
+    /// (Deployment, StatefulSet, ReplicaSet). Above `updated`, old pods are
+    /// still running.
+    pub replicas: Option<i32>,
 }
 
 /// One ReplicaSet revision in a Deployment rollout history.
@@ -420,6 +429,23 @@ pub trait ClusterApi: Send + Sync {
         namespace: Option<&str>,
         kind: WorkloadKind,
     ) -> Result<Vec<WorkloadInfo>>;
+
+    /// Read one workload by name (#657): `None` when it does not exist,
+    /// `AccessDenied` without the `get` right. Unlike a list it needs no
+    /// `list` right and no paging. The default reads the list, so fakes and
+    /// other implementations need nothing.
+    async fn get_workload(
+        &self,
+        namespace: &str,
+        kind: WorkloadKind,
+        name: &str,
+    ) -> Result<Option<WorkloadInfo>> {
+        Ok(self
+            .list_workloads(Some(namespace), kind)
+            .await?
+            .into_iter()
+            .find(|workload| workload.name == name))
+    }
 
     /// Read a Deployment's ReplicaSet-based rollout history.
     async fn rollout_history(

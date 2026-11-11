@@ -12719,3 +12719,36 @@ API-сервера `UID in precondition` — 409 от admission webhook оста
 реального DELETE.
 
 **Next.** #657 — чтение workload по имени и точное ожидание выката.
+
+## Issue #657: чтение workload по имени и точное ожидание выката (веха 3.0.6)
+
+**Сделано.** Транспорт: `ClusterApi::get_workload(namespace, kind, name) ->
+Result<Option<WorkloadInfo>>` — GET по имени (`get_opt`, 404 → `None`), с
+реализацией по умолчанию через `list_workloads`. `WorkloadInfo` получил
+`generation`, `observed_generation`, `replicas` (`status.replicas`, вместе со
+старыми подами); заполняются для Deployment, StatefulSet, ReplicaSet,
+`replicas` — не у DaemonSet (поля нет), у Job/CronJob — только `generation`.
+Агент: `wait_rollout` читает через `get_workload`; завершение —
+`observedGeneration ≥ generation`, `updated == ready == desired`,
+`replicas ≤ updated`; строка статуса говорит, чего ждём («waiting for the
+controller to observe generation N (seen M)», «K old replica(s) pending
+termination»). `docs/KUBERNETES.md` §4.8.
+
+**Решения.** С генерациями выкат может завершиться на первом чтении —
+правило «не на первом чтении» осталось только для workload без
+`observedGeneration`. `availableReplicas` и ревизии StatefulSet
+(`updateRevision`) в условие не вошли — не в скоупе issue.
+
+**Контракты.** Добавлены метод `ClusterApi::get_workload` (с реализацией по
+умолчанию — внешние реализации не ломаются) и три поля `WorkloadInfo`
+(ломает литералы структуры у внешних потребителей). `CommandExecutor`,
+`LlmClient` не менялись. При релизе — в «Upgrading to engine-v3.0.6».
+
+**Проверено.** Юнит-тесты `wait_rollout`: генерация не увидена при «всё
+ready», старые реплики, GET без LIST, удаление во время ожидания, отказ RBAC
+на GET; разбор полей из JSON; GET по имени и `None` на 404 против фейкового
+API. Бинарник в tmux против фейкового API (LIST deployments запрещён,
+контроллер отстаёт): `k8s_scale` 3→5 и restart — по пять GET, «complete»
+только после `observedGeneration` и ухода старых реплик (12 с).
+
+**Next.** #658 — прокручиваемое окно подтверждения.

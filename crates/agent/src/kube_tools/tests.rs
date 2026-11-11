@@ -25,8 +25,11 @@ pub(crate) struct MockCluster {
     /// Answers of successive `list_workloads` calls; the last one repeats
     /// (#641).
     pub(crate) workload_reads: Mutex<std::collections::VecDeque<Vec<WorkloadInfo>>>,
-    /// When set, `list_workloads` is refused by RBAC.
+    /// When set, `list_workloads` and `get_workload` are refused by RBAC.
     pub(crate) workloads_denied: bool,
+    /// When set, only `list_workloads` is refused: `get` allowed, `list`
+    /// not (#657).
+    pub(crate) workload_list_denied: bool,
     /// Secret metadata (#646); `secrets_denied` answers like RBAC.
     secrets: Vec<filar_transport::SecretInfo>,
     secrets_denied: bool,
@@ -34,6 +37,16 @@ pub(crate) struct MockCluster {
 }
 
 impl MockCluster {
+    /// The next of `workload_reads`; the last one repeats.
+    fn next_workload_read(&self) -> Vec<WorkloadInfo> {
+        let mut reads = self.workload_reads.lock().unwrap();
+        match reads.len() {
+            0 => Vec::new(),
+            1 => reads[0].clone(),
+            _ => reads.pop_front().unwrap_or_default(),
+        }
+    }
+
     /// The `pod_http_get` request this mock received, if any.
     pub(crate) fn last_http_request(&self) -> Option<filar_transport::PodHttpRequest> {
         self.http_call.lock().unwrap().clone()
@@ -99,15 +112,24 @@ impl ClusterApi for MockCluster {
     }
 
     async fn list_workloads(&self, _: Option<&str>, _: WorkloadKind) -> Result<Vec<WorkloadInfo>> {
-        if self.workloads_denied {
+        if self.workloads_denied || self.workload_list_denied {
             return Err(CoreError::AccessDenied("cannot list deployments".into()));
         }
-        let mut reads = self.workload_reads.lock().unwrap();
-        Ok(match reads.len() {
-            0 => Vec::new(),
-            1 => reads[0].clone(),
-            _ => reads.pop_front().unwrap_or_default(),
-        })
+        Ok(self.next_workload_read())
+    }
+    async fn get_workload(
+        &self,
+        _: &str,
+        _: WorkloadKind,
+        name: &str,
+    ) -> Result<Option<WorkloadInfo>> {
+        if self.workloads_denied {
+            return Err(CoreError::AccessDenied("cannot get deployments".into()));
+        }
+        Ok(self
+            .next_workload_read()
+            .into_iter()
+            .find(|workload| workload.name == name))
     }
     async fn rollout_history(&self, _: &str, _: &str) -> Result<Vec<RolloutRevision>> {
         Ok(vec![])
