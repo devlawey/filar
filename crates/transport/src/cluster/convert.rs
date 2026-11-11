@@ -169,6 +169,9 @@ fn base_workload(
         available,
         age_seconds: age_seconds(meta),
         images,
+        generation: meta.generation,
+        observed_generation: None,
+        replicas: None,
     }
 }
 
@@ -191,7 +194,7 @@ pub(super) fn deployment_info(workload: Deployment) -> WorkloadInfo {
         .as_ref()
         .map(|spec| pod_template_images(&spec.template))
         .unwrap_or_default();
-    base_workload(
+    let mut info = base_workload(
         &workload.metadata,
         WorkloadKind::Deployment,
         workload.spec.as_ref().and_then(|spec| spec.replicas),
@@ -208,7 +211,12 @@ pub(super) fn deployment_info(workload: Deployment) -> WorkloadInfo {
             .as_ref()
             .and_then(|status| status.available_replicas),
         images,
-    )
+    );
+    if let Some(status) = &workload.status {
+        info.observed_generation = status.observed_generation;
+        info.replicas = status.replicas;
+    }
+    info
 }
 
 pub(super) fn statefulset_info(workload: StatefulSet) -> WorkloadInfo {
@@ -217,7 +225,7 @@ pub(super) fn statefulset_info(workload: StatefulSet) -> WorkloadInfo {
         .as_ref()
         .map(|spec| pod_template_images(&spec.template))
         .unwrap_or_default();
-    base_workload(
+    let mut info = base_workload(
         &workload.metadata,
         WorkloadKind::StatefulSet,
         workload.spec.as_ref().and_then(|spec| spec.replicas),
@@ -234,7 +242,12 @@ pub(super) fn statefulset_info(workload: StatefulSet) -> WorkloadInfo {
             .as_ref()
             .and_then(|status| status.available_replicas),
         images,
-    )
+    );
+    if let Some(status) = &workload.status {
+        info.observed_generation = status.observed_generation;
+        info.replicas = Some(status.replicas);
+    }
+    info
 }
 
 pub(super) fn daemonset_info(workload: DaemonSet) -> WorkloadInfo {
@@ -243,7 +256,7 @@ pub(super) fn daemonset_info(workload: DaemonSet) -> WorkloadInfo {
         .as_ref()
         .map(|spec| pod_template_images(&spec.template))
         .unwrap_or_default();
-    base_workload(
+    let mut info = base_workload(
         &workload.metadata,
         WorkloadKind::DaemonSet,
         workload
@@ -260,7 +273,11 @@ pub(super) fn daemonset_info(workload: DaemonSet) -> WorkloadInfo {
             .as_ref()
             .and_then(|status| status.number_available),
         images,
-    )
+    );
+    if let Some(status) = &workload.status {
+        info.observed_generation = status.observed_generation;
+    }
+    info
 }
 
 pub(super) fn replicaset_info(workload: ReplicaSet) -> WorkloadInfo {
@@ -270,7 +287,7 @@ pub(super) fn replicaset_info(workload: ReplicaSet) -> WorkloadInfo {
         .and_then(|spec| spec.template.as_ref())
         .map(pod_template_images)
         .unwrap_or_default();
-    base_workload(
+    let mut info = base_workload(
         &workload.metadata,
         WorkloadKind::ReplicaSet,
         workload.spec.as_ref().and_then(|spec| spec.replicas),
@@ -284,7 +301,12 @@ pub(super) fn replicaset_info(workload: ReplicaSet) -> WorkloadInfo {
             .as_ref()
             .and_then(|status| status.available_replicas),
         images,
-    )
+    );
+    if let Some(status) = &workload.status {
+        info.observed_generation = status.observed_generation;
+        info.replicas = Some(status.replicas);
+    }
+    info
 }
 
 pub(super) fn job_info(workload: Job) -> WorkloadInfo {
@@ -526,6 +548,74 @@ pub(super) fn namespace_info(namespace: Namespace) -> NamespaceInfo {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn workload_status_carries_generations_and_the_total_of_pods() {
+        let template =
+            json!({"metadata": {}, "spec": {"containers": [{"name": "m", "image": "web:2"}]}});
+        let deployment: Deployment = serde_json::from_value(json!({
+            "metadata": {"name": "web", "namespace": "shop", "generation": 4},
+            "spec": {"replicas": 5, "selector": {}, "template": template},
+            "status": {"observedGeneration": 3, "replicas": 7, "updatedReplicas": 5,
+                       "readyReplicas": 6}
+        }))
+        .unwrap();
+        let info = deployment_info(deployment);
+        assert_eq!(
+            (
+                info.generation,
+                info.observed_generation,
+                info.replicas,
+                info.updated
+            ),
+            (Some(4), Some(3), Some(7), Some(5))
+        );
+
+        let statefulset: StatefulSet = serde_json::from_value(json!({
+            "metadata": {"name": "db", "generation": 2},
+            "spec": {"replicas": 3, "selector": {}, "serviceName": "db", "template": template},
+            "status": {"observedGeneration": 2, "replicas": 3, "updatedReplicas": 2}
+        }))
+        .unwrap();
+        let info = statefulset_info(statefulset);
+        assert_eq!(
+            (info.observed_generation, info.replicas),
+            (Some(2), Some(3))
+        );
+
+        let daemonset: DaemonSet = serde_json::from_value(json!({
+            "metadata": {"name": "agent", "generation": 9},
+            "spec": {"selector": {}, "template": template},
+            "status": {"observedGeneration": 8, "desiredNumberScheduled": 4,
+                       "currentNumberScheduled": 4, "numberMisscheduled": 0, "numberReady": 4}
+        }))
+        .unwrap();
+        let info = daemonset_info(daemonset);
+        assert_eq!(
+            (info.generation, info.observed_generation, info.replicas),
+            (Some(9), Some(8), None),
+            "a DaemonSet has no status.replicas"
+        );
+
+        let replicaset: ReplicaSet = serde_json::from_value(json!({
+            "metadata": {"name": "web-7f9c", "generation": 1},
+            "spec": {"replicas": 2, "selector": {}},
+            "status": {"observedGeneration": 1, "replicas": 3}
+        }))
+        .unwrap();
+        let info = replicaset_info(replicaset);
+        assert_eq!(
+            (info.observed_generation, info.replicas),
+            (Some(1), Some(3))
+        );
+
+        let job: Job = serde_json::from_value(json!({
+            "metadata": {"name": "once", "generation": 1},
+            "spec": {"template": template}
+        }))
+        .unwrap();
+        assert_eq!(job_info(job).observed_generation, None);
+    }
 
     #[test]
     fn pod_conversion_reports_restarts_and_latest_termination() {

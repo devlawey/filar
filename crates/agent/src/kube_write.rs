@@ -638,10 +638,16 @@ pub fn rollout_target(call: &KubeWriteCall) -> Option<(WorkloadKind, &str, &str)
     }
 }
 
-/// Wait for a rollout by reading the workload every `poll`, at most `wait`:
-/// done when ready and updated replicas reach the desired count, seen on
-/// the second read or later (the first may still show the old state). The
-/// caller makes it cancellable. Returns one line for the model.
+/// Wait for a rollout by reading the workload by name every `poll`, at most
+/// `wait` — complete in the sense of `kubectl rollout status` (#657):
+/// - the controller has seen the new spec (`observedGeneration ≥
+///   generation`); a workload without these fields is trusted from the
+///   second read on, as the first may still show the old state;
+/// - updated and ready replicas reach the desired count;
+/// - no pod of an old revision is left (`status.replicas ≤ updated`).
+///
+/// Reads with `get`, so a `list` right is not needed. The caller makes it
+/// cancellable. Returns one line for the model.
 pub async fn wait_rollout(
     api: &dyn ClusterApi,
     kind: WorkloadKind,
@@ -659,26 +665,22 @@ pub async fn wait_rollout(
             tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + poll)).await;
         }
         reads += 1;
-        let read = tokio::time::timeout_at(deadline, api.list_workloads(Some(namespace), kind));
+        let read = tokio::time::timeout_at(deadline, api.get_workload(namespace, kind, name));
         let Ok(read) = read.await else {
             return not_finished(name, wait, &last);
         };
         match read {
-            Ok(workloads) => match workloads.into_iter().find(|w| w.name == name) {
-                Some(workload) => {
-                    let desired = workload.desired.unwrap_or(0);
-                    let ready = workload.ready.unwrap_or(0);
-                    let updated = workload.updated.unwrap_or(desired);
-                    last = format!("{ready}/{desired} ready, {updated} updated");
-                    if reads >= 2 && ready == desired && updated == desired {
-                        return format!(
-                            "rollout of {name} complete: {last} (after {} s)",
-                            started.elapsed().as_secs()
-                        );
-                    }
+            Ok(Some(workload)) => {
+                let (done, status) = rollout_status(&workload, reads);
+                last = status;
+                if done {
+                    return format!(
+                        "rollout of {name} complete: {last} (after {} s)",
+                        started.elapsed().as_secs()
+                    );
                 }
-                None => last = format!("{name} not found while waiting"),
-            },
+            }
+            Ok(None) => last = format!("{name} not found while waiting"),
             // No permission to read workloads: retrying cannot help.
             Err(error @ CoreError::AccessDenied(_)) => {
                 return format!(
@@ -691,6 +693,43 @@ pub async fn wait_rollout(
             return not_finished(name, wait, &last);
         }
     }
+}
+
+/// Whether one read of the workload shows a finished rollout, and the
+/// status line saying what is still awaited. `read` counts from 1.
+fn rollout_status(workload: &filar_transport::WorkloadInfo, read: usize) -> (bool, String) {
+    let desired = workload.desired.unwrap_or(0);
+    let ready = workload.ready.unwrap_or(0);
+    // The API may omit a zero count: missing means none updated. Only a
+    // ReplicaSet has no updated count at all — its pods are all one revision.
+    let updated = match workload.kind {
+        WorkloadKind::ReplicaSet => workload.updated.unwrap_or(desired),
+        _ => workload.updated.unwrap_or(0),
+    };
+    let counts = format!("{ready}/{desired} ready, {updated} updated");
+    if let (Some(generation), Some(observed)) = (workload.generation, workload.observed_generation)
+    {
+        if observed < generation {
+            return (
+                false,
+                format!("{counts}; waiting for the controller to observe generation {generation} (seen {observed})"),
+            );
+        }
+    } else if read < 2 {
+        return (false, counts);
+    }
+    if let Some(total) = workload.replicas {
+        if total > updated {
+            return (
+                false,
+                format!(
+                    "{counts}; {} old replica(s) pending termination",
+                    total - updated
+                ),
+            );
+        }
+    }
+    (ready == desired && updated == desired, counts)
 }
 
 fn not_finished(name: &str, wait: std::time::Duration, last: &str) -> String {
@@ -1851,6 +1890,9 @@ mod tests {
             available: Some(ready),
             age_seconds: None,
             images: Vec::new(),
+            generation: None,
+            observed_generation: None,
+            replicas: None,
         }
     }
 
@@ -1916,6 +1958,140 @@ mod tests {
         .await;
         assert!(refused.contains("not followed"), "{refused}");
         assert!(started.elapsed() < ROLLOUT_POLL, "no retries on RBAC");
+    }
+
+    /// A workload whose status carries generations and the total of pods.
+    fn observed(
+        ready: i32,
+        updated: i32,
+        replicas: i32,
+        generation: i64,
+        observed: i64,
+    ) -> filar_transport::WorkloadInfo {
+        filar_transport::WorkloadInfo {
+            generation: Some(generation),
+            observed_generation: Some(observed),
+            replicas: Some(replicas),
+            ..workload(ready, updated)
+        }
+    }
+
+    async fn wait_on(cluster: &crate::kube_tools::tests::MockCluster) -> String {
+        wait_rollout(
+            cluster,
+            WorkloadKind::Deployment,
+            "shop",
+            "web",
+            ROLLOUT_WAIT,
+            ROLLOUT_POLL,
+        )
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_rollout_waits_for_the_controller_to_see_the_new_spec() {
+        use crate::kube_tools::tests::MockCluster;
+        // (а) All ready by the old spec: the controller has not seen gen 4.
+        let stale = MockCluster::default();
+        *stale.workload_reads.lock().unwrap() =
+            [vec![observed(5, 5, 5, 4, 3)]].into_iter().collect();
+        let late = wait_on(&stale).await;
+        assert!(
+            late.starts_with("rollout of web not finished after 120 s")
+                && late.contains("waiting for the controller to observe generation 4 (seen 3)"),
+            "{late}"
+        );
+        // Seen and done: complete on the first read, no second read needed.
+        let seen = MockCluster::default();
+        *seen.workload_reads.lock().unwrap() =
+            [vec![observed(5, 5, 5, 4, 4)]].into_iter().collect();
+        let started = tokio::time::Instant::now();
+        let done = wait_on(&seen).await;
+        assert!(
+            done.starts_with("rollout of web complete: 5/5 ready, 5 updated"),
+            "{done}"
+        );
+        assert!(
+            started.elapsed() < ROLLOUT_POLL,
+            "the generations make one read enough"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_rollout_waits_for_old_replicas_to_go() {
+        use crate::kube_tools::tests::MockCluster;
+        // (б) 5 updated and ready, 2 pods of the old ReplicaSet still there.
+        let cluster = MockCluster::default();
+        *cluster.workload_reads.lock().unwrap() =
+            [vec![observed(5, 5, 7, 2, 2)], vec![observed(5, 5, 5, 2, 2)]]
+                .into_iter()
+                .collect();
+        let done = wait_on(&cluster).await;
+        assert!(done.starts_with("rollout of web complete"), "{done}");
+        assert!(
+            cluster.workload_reads.lock().unwrap().len() == 1,
+            "the old pods were waited for"
+        );
+
+        let stuck = MockCluster::default();
+        *stuck.workload_reads.lock().unwrap() =
+            [vec![observed(5, 5, 7, 2, 2)]].into_iter().collect();
+        let late = wait_on(&stuck).await;
+        assert!(
+            late.contains("2 old replica(s) pending termination"),
+            "{late}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_updated_count_is_none_updated() {
+        use crate::kube_tools::tests::MockCluster;
+        // Right after a restart: new generation seen, the five old pods are
+        // ready, `updatedReplicas` (zero) omitted by the API.
+        let restarted = MockCluster::default();
+        *restarted.workload_reads.lock().unwrap() = [vec![filar_transport::WorkloadInfo {
+            updated: None,
+            ..observed(5, 0, 5, 3, 3)
+        }]]
+        .into_iter()
+        .collect();
+        let late = wait_on(&restarted).await;
+        assert!(
+            late.starts_with("rollout of web not finished")
+                && late.contains("5/5 ready, 0 updated"),
+            "{late}"
+        );
+        // A ReplicaSet has no updated count: its ready pods are the rollout.
+        let replicaset = MockCluster::default();
+        *replicaset.workload_reads.lock().unwrap() = [vec![filar_transport::WorkloadInfo {
+            kind: WorkloadKind::ReplicaSet,
+            updated: None,
+            ..observed(5, 0, 5, 1, 1)
+        }]]
+        .into_iter()
+        .collect();
+        let done = wait_on(&replicaset).await;
+        assert!(done.starts_with("rollout of web complete"), "{done}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_rollout_is_read_by_name_without_a_list_right() {
+        use crate::kube_tools::tests::MockCluster;
+        // (в) `get` allowed, `list` refused.
+        let mut cluster = MockCluster::default();
+        cluster.workload_list_denied = true;
+        *cluster.workload_reads.lock().unwrap() =
+            [vec![observed(5, 5, 5, 1, 1)]].into_iter().collect();
+        let done = wait_on(&cluster).await;
+        assert!(done.starts_with("rollout of web complete"), "{done}");
+
+        // (г) Deleted while waiting.
+        let gone = MockCluster::default();
+        *gone.workload_reads.lock().unwrap() = [vec![observed(3, 5, 5, 2, 2)], vec![]]
+            .into_iter()
+            .collect();
+        let late = wait_on(&gone).await;
+        assert!(late.contains("web not found while waiting"), "{late}");
     }
 
     #[test]

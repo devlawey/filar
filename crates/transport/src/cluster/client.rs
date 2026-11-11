@@ -75,6 +75,26 @@ impl KubeClusterApi {
         &self.client
     }
 
+    /// GET one namespaced object by name (#657): `None` on 404.
+    async fn get_namespaced<K, F, T>(
+        &self,
+        namespace: &str,
+        name: &str,
+        resource: &str,
+        convert: F,
+    ) -> Result<Option<T>>
+    where
+        K: Resource<Scope = NamespaceResourceScope> + Clone + DeserializeOwned + Debug,
+        <K as Resource>::DynamicType: Default,
+        F: Fn(K) -> T,
+    {
+        Api::<K>::namespaced(self.client.clone(), namespace)
+            .get_opt(name)
+            .await
+            .map(|object| object.map(convert))
+            .map_err(|error| self.api_error(error, "get", resource, Some(namespace)))
+    }
+
     async fn list_page<K, F, T>(
         &self,
         namespace: Option<&str>,
@@ -369,6 +389,40 @@ impl ClusterApi for KubeClusterApi {
             }
             WorkloadKind::CronJob => {
                 self.list_namespaced(namespace, "cronjobs", None, None, convert::cronjob_info)
+                    .await
+            }
+        }
+    }
+
+    async fn get_workload(
+        &self,
+        namespace: &str,
+        kind: WorkloadKind,
+        name: &str,
+    ) -> Result<Option<WorkloadInfo>> {
+        match kind {
+            WorkloadKind::Deployment => {
+                self.get_namespaced(namespace, name, "deployments", convert::deployment_info)
+                    .await
+            }
+            WorkloadKind::StatefulSet => {
+                self.get_namespaced(namespace, name, "statefulsets", convert::statefulset_info)
+                    .await
+            }
+            WorkloadKind::DaemonSet => {
+                self.get_namespaced(namespace, name, "daemonsets", convert::daemonset_info)
+                    .await
+            }
+            WorkloadKind::ReplicaSet => {
+                self.get_namespaced(namespace, name, "replicasets", convert::replicaset_info)
+                    .await
+            }
+            WorkloadKind::Job => {
+                self.get_namespaced(namespace, name, "jobs", convert::job_info)
+                    .await
+            }
+            WorkloadKind::CronJob => {
+                self.get_namespaced(namespace, name, "cronjobs", convert::cronjob_info)
                     .await
             }
         }
