@@ -755,11 +755,23 @@ pub(crate) fn render_help_bar(f: &mut Frame, app: &mut App, area: Rect) {
     app.helpbar_zones.clear();
 
     // The fleet layer does not advertise single-host keys it refuses (#434).
-    let items = if app.in_fleet() && app.mode == AppMode::Normal {
+    let mut items = if app.in_fleet() && app.mode == AppMode::Normal {
         fleet_help_items()
     } else {
         help_items(app.mode)
     };
+    // A confirmation taller than the screen scrolls (#658): say how.
+    if app.mode == AppMode::Confirming && app.pending_confirm.as_ref().is_some_and(|p| p.scrolls())
+    {
+        items.insert(
+            0,
+            HelpItem {
+                key: "↑↓/PgUp/PgDn",
+                desc: "scroll",
+                action: None,
+            },
+        );
+    }
     let mut spans: Vec<Span> = Vec::new();
     let mut col = area.x;
 

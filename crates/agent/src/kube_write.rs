@@ -919,8 +919,8 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
                     "nothing matches: no object would be deleted".into(),
                 ));
             }
-            // Warnings first: a long list must not push them out of a window
-            // that does not scroll.
+            // Warnings first: a long list must not push them below the first
+            // screen of the window.
             text.push_str(deletion_warnings(api, &listed, options).await.trim_start());
             text.push('\n');
             text.push_str(&deleted_text(&listed, true));

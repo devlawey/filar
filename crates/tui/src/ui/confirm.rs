@@ -181,7 +181,9 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     let modal_height = natural_height.min(area.height).max(MIN_MODAL_HEIGHT);
     let max_content_rows = modal_height.saturating_sub(3) as usize;
 
-    let (lines, used) = build_modal_lines(
+    let scroll = confirm.scroll;
+    let (lines, used, scrolled) = build_scrolled_lines(
+        scroll,
         header,
         &explanation,
         &command_text,
@@ -204,6 +206,13 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
     );
     // Rows, not logical lines (#608): every line below is one terminal row.
     debug_assert_eq!(lines.len(), used);
+    if let Some(p) = app.pending_confirm.as_mut() {
+        // Clamped here, so a resize never leaves the body scrolled past its end.
+        let (offset, max, page) = scrolled.unwrap_or((0, 0, 0));
+        p.scroll = offset;
+        p.scroll_max = max;
+        p.scroll_page = page;
+    }
     let content_height = max_content_rows.min(used).max(1) as u16;
 
     // Center within the area (height already ≤ area.height).
@@ -373,6 +382,173 @@ fn header_rows_within(text: &str, width: usize, max: usize) -> Vec<String> {
     rows
 }
 
+/// The least body rows worth scrolling: a window of one row plus the
+/// position line.
+const MIN_SCROLL_ROWS: usize = 2;
+
+/// [`build_modal_lines`], but a body that does not fit scrolls (#658)
+/// instead of being cut: the explanation — for a cluster write, the dry-run
+/// diff — becomes a window of rows starting at `scroll`, with a position
+/// line under it. The header above, and below the audit, the safety
+/// rating, the destructive warning and the command stay in place, so they
+/// are on screen whatever the scroll. A command cut to fit is repeated in
+/// full at the end of the body.
+///
+/// Returns the lines, the rows they take and, when scrolling, the clamped
+/// offset, the largest offset and the window height (one page). With too
+/// few rows for a window it falls back to cutting, as before.
+#[allow(clippy::too_many_arguments)]
+fn build_scrolled_lines(
+    scroll: usize,
+    radius: Option<(String, Option<String>)>,
+    explanation: &str,
+    command_text: &str,
+    destructive: bool,
+    audit_unavailable: bool,
+    audit_verdict: Option<&str>,
+    audit_reason: &str,
+    audit_model: Option<&str>,
+    same_as_session: bool,
+    session_name: &str,
+    safety: Option<(String, Style)>,
+    fg: Style,
+    danger: Style,
+    warning: Style,
+    muted: Style,
+    success: Style,
+    accent: ratatui::style::Color,
+    inner_width: usize,
+    max_rows: usize,
+) -> (Vec<Line<'static>>, usize, Option<(usize, usize, usize)>) {
+    let cut = |radius, explanation: &str| {
+        build_modal_lines(
+            radius,
+            explanation,
+            command_text,
+            destructive,
+            audit_unavailable,
+            audit_verdict,
+            audit_reason,
+            audit_model,
+            same_as_session,
+            session_name,
+            safety.clone(),
+            fg,
+            danger,
+            warning,
+            muted,
+            success,
+            accent,
+            inner_width,
+            max_rows,
+        )
+    };
+    let whole = || {
+        let (lines, used) = cut(radius.clone(), explanation);
+        (lines, used, None)
+    };
+    if explanation.is_empty() || max_rows == 0 {
+        return whole();
+    }
+    let mut head = Vec::new();
+    let mut head_rows = 0;
+    push_header(
+        &mut head,
+        &mut head_rows,
+        radius.clone(),
+        fg,
+        warning,
+        inner_width,
+        max_rows,
+    );
+    let remaining = max_rows.saturating_sub(head_rows);
+    // The fixed part below the body, by itself: on half the room at most,
+    // so a long command leaves the body a window (it is then repeated whole
+    // in the body).
+    let tail_room = |rows: usize| {
+        build_modal_lines(
+            None,
+            "",
+            command_text,
+            destructive,
+            audit_unavailable,
+            audit_verdict,
+            audit_reason,
+            audit_model,
+            same_as_session,
+            session_name,
+            safety.clone(),
+            fg,
+            danger,
+            warning,
+            muted,
+            success,
+            accent,
+            inner_width,
+            rows,
+        )
+    };
+    let (natural_tail, natural_used) = tail_room(remaining);
+    if wrapped_rows(explanation, inner_width).len() + natural_used <= remaining {
+        return whole();
+    }
+    let (tail, tail_used) = if natural_used * 2 > remaining {
+        tail_room((remaining / 2).max(1))
+    } else {
+        (natural_tail, natural_used)
+    };
+    let command_cut = tail
+        .iter()
+        .any(|line| line_text(line) == "… (command truncated)");
+    let body_room = remaining.saturating_sub(tail_used);
+    let mut body = wrapped_rows(explanation, inner_width);
+    let mut body_styles = vec![fg; body.len()];
+    if command_cut {
+        let command = wrapped_rows(command_text, inner_width);
+        body.push(String::new());
+        body.push("Full command:".to_string());
+        body_styles.extend([fg, muted]);
+        body_styles.extend(std::iter::repeat_n(warning, command.len()));
+        body.extend(command);
+    }
+    if body.len() <= body_room || body_room < MIN_SCROLL_ROWS {
+        // Fits as it is, or no room for a window: the cut layout decides.
+        return whole();
+    }
+    let window = body_room - 1;
+    let max = body.len() - window;
+    let offset = scroll.min(max);
+    let mut lines = head;
+    lines.extend(
+        body.iter()
+            .zip(&body_styles)
+            .skip(offset)
+            .take(window)
+            .map(|(row, style)| Line::from(Span::styled(row.clone(), *style))),
+    );
+    let last = offset + window;
+    let mut position = format!("rows {}–{last} of {}", offset + 1, body.len());
+    if last < body.len() {
+        position.push_str(&format!(" · ↓ {} more", body.len() - last));
+    }
+    position.push_str(" · ↑↓ PgUp PgDn Home End");
+    lines.push(Line::from(Span::styled(
+        truncate_to_rows(&position, inner_width, 1),
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    )));
+    lines.extend(tail);
+    let used = lines.len();
+    (lines, used, Some((offset, max, window)))
+}
+
+/// The text of a drawn row.
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
 /// Build modal body lines, truncating so wrapped height ≤ `max_rows`.
 ///
 /// Returns the lines and the rows they take: one line per row (#608).
@@ -412,22 +588,15 @@ fn build_modal_lines(
         push_line(lines, used, max_rows, inner_width, text, style)
     };
 
-    if let Some((header, list)) = radius {
-        // Wrapped here, by words, so the rows counted for the modal height
-        // are exactly the rows drawn.
-        // Leave room for the command line and the separator below it, so a
-        // short terminal never trades the command for the header.
-        let room = max_rows.saturating_sub(2).min(HEADER_MAX_ROWS);
-        for row in header_rows_within(&header, inner_width, room) {
-            let _ = push(&mut lines, &mut used, row, warning.add_modifier(Modifier::BOLD));
-        }
-        if let Some(list) = list {
-            // Leave room for the command line and the separator.
-            let budget = max_rows.saturating_sub(used).saturating_sub(2).max(1);
-            let shown = truncate_to_rows(&list, inner_width, budget);
-            let _ = push(&mut lines, &mut used, shown, fg);
-        }
-    }
+    push_header(
+        &mut lines,
+        &mut used,
+        radius,
+        fg,
+        warning,
+        inner_width,
+        max_rows,
+    );
 
     // Everything between the header and the command leaves the command at
     // least one row: approving a command that is not on screen is what the
@@ -515,6 +684,43 @@ fn build_modal_lines(
     }
 
     (lines, used)
+}
+
+/// The header above the command — the fleet radius or the pod target —
+/// as [`build_modal_lines`] draws it.
+fn push_header(
+    lines: &mut Vec<Line<'static>>,
+    used: &mut usize,
+    radius: Option<(String, Option<String>)>,
+    fg: Style,
+    warning: Style,
+    inner_width: usize,
+    max_rows: usize,
+) {
+    let Some((header, list)) = radius else {
+        return;
+    };
+    // Wrapped here, by words, so the rows counted for the modal height
+    // are exactly the rows drawn.
+    // Leave room for the command line and the separator below it, so a
+    // short terminal never trades the command for the header.
+    let room = max_rows.saturating_sub(2).min(HEADER_MAX_ROWS);
+    for row in header_rows_within(&header, inner_width, room) {
+        let _ = push_line(
+            lines,
+            used,
+            max_rows,
+            inner_width,
+            row,
+            warning.add_modifier(Modifier::BOLD),
+        );
+    }
+    if let Some(list) = list {
+        // Leave room for the command line and the separator.
+        let budget = max_rows.saturating_sub(*used).saturating_sub(2).max(1);
+        let shown = truncate_to_rows(&list, inner_width, budget);
+        let _ = push_line(lines, used, max_rows, inner_width, shown, fg);
+    }
 }
 
 fn append_audit_lines(
@@ -1505,6 +1711,170 @@ mod tests {
         assert!(
             no_spaces(&dialog_text(&screen)).contains(&no_spaces(&command)),
             "the whole command is drawn\n{screen}"
+        );
+    }
+
+    // ── scrolling the dialog (#658) ──────────────────────────────────────
+
+    fn key(app: &mut App, code: crossterm::event::KeyCode) {
+        app.handle_key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+
+    /// A cluster write whose dry-run diff is far longer than the screen.
+    fn long_diff() -> (PendingConfirm, oneshot::Receiver<bool>) {
+        let (tx, rx) = oneshot::channel();
+        let diff: Vec<String> = (1..=60)
+            .map(|i| format!("+  \"key-{i:02}\": {i}"))
+            .collect();
+        let explanation = format!(
+            "apply config\n\nTool: k8s_apply\n\nDry run:\napply 1 object(s):\n{}\nLAST DIFF LINE",
+            diff.join("\n")
+        );
+        (
+            PendingConfirm::new(
+                "k8s_apply -n shop: ConfigMap/web".into(),
+                explanation,
+                true,
+                tx,
+            ),
+            rx,
+        )
+    }
+
+    #[test]
+    fn a_long_diff_scrolls_to_its_end_with_the_buttons_in_place() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let (confirm, _rx) = long_diff();
+        app.pending_confirm = Some(confirm);
+        app.mode = AppMode::Confirming;
+        let screen = render_confirm(&mut app, 80, 24);
+        assert!(screen.contains("rows 1–"), "position line\n{screen}");
+        assert!(screen.contains("more · ↑↓ PgUp PgDn"), "{screen}");
+        assert!(!screen.contains("LAST DIFF LINE"), "{screen}");
+        assert!(
+            !screen.contains("explanation truncated"),
+            "scrolls, not cut\n{screen}"
+        );
+        assert!(
+            screen.contains("WARNING: This command may be destructive!"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("$ k8s_apply -n shop: ConfigMap/web"),
+            "{screen}"
+        );
+        assert!(screen.contains("[ Approve (a) ]"), "{screen}");
+
+        key(&mut app, crossterm::event::KeyCode::End);
+        let end = render_confirm(&mut app, 80, 24);
+        assert!(end.contains("LAST DIFF LINE"), "{end}");
+        assert!(!end.contains("more ·"), "nothing left below\n{end}");
+        assert!(
+            end.contains("[ Approve (a) ]") && end.contains("$ k8s_apply"),
+            "{end}"
+        );
+
+        // PgUp moves a page back; Home returns to the top.
+        let max = app.pending_confirm.as_ref().unwrap().scroll_max;
+        key(&mut app, crossterm::event::KeyCode::PageUp);
+        let page = app.pending_confirm.as_ref().unwrap().scroll_page;
+        assert_eq!(app.pending_confirm.as_ref().unwrap().scroll, max - page);
+        key(&mut app, crossterm::event::KeyCode::Down);
+        assert_eq!(app.pending_confirm.as_ref().unwrap().scroll, max - page + 1);
+        key(&mut app, crossterm::event::KeyCode::Home);
+        let top = render_confirm(&mut app, 80, 24);
+        assert!(
+            top.contains("apply config") && top.contains("rows 1–"),
+            "{top}"
+        );
+        assert_eq!(app.scroll, 0, "the chat behind did not move");
+    }
+
+    #[test]
+    fn a_short_dialog_has_no_position_line_and_pgup_moves_the_chat() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(pending("ls", false));
+        app.mode = AppMode::Confirming;
+        let screen = render_confirm(&mut app, 80, 24);
+        assert!(!screen.contains("rows 1–"), "{screen}");
+        assert!(!app.pending_confirm.as_ref().unwrap().scrolls());
+        // The chat needs something to scroll over.
+        for i in 0..80 {
+            app.push_error(format!("line {i}"));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        key(&mut app, crossterm::event::KeyCode::PageUp);
+        assert!(app.scroll > 0, "PgUp scrolled the chat");
+        key(&mut app, crossterm::event::KeyCode::End);
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn a_smaller_terminal_keeps_the_scroll_in_range_and_the_fleet_radius() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let (mut confirm, _rx) = long_diff();
+        confirm.radius = (1..=12).map(|i| format!("web-{i:02}")).collect();
+        app.pending_confirm = Some(confirm);
+        app.mode = AppMode::Confirming;
+        render_confirm(&mut app, 100, 40);
+        key(&mut app, crossterm::event::KeyCode::End);
+        let tall_max = app.pending_confirm.as_ref().unwrap().scroll_max;
+        let small = render_confirm(&mut app, 80, 20);
+        let p = app.pending_confirm.as_ref().unwrap();
+        assert!(
+            p.scroll_max > tall_max,
+            "a smaller window has more to scroll"
+        );
+        assert!(p.scroll <= p.scroll_max);
+        assert!(small.contains("Runs on 12 hosts"), "{small}");
+        assert!(small.contains("[ Approve (a) ]"), "{small}");
+        // Back to a big screen: the offset shrinks to the new end.
+        render_confirm(&mut app, 100, 40);
+        let p = app.pending_confirm.as_ref().unwrap();
+        assert_eq!(p.scroll, p.scroll_max);
+    }
+
+    #[test]
+    fn approving_after_scrolling_approves_the_same_command() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        let (confirm, mut rx) = long_diff();
+        app.pending_confirm = Some(confirm);
+        app.mode = AppMode::Confirming;
+        render_confirm(&mut app, 80, 24);
+        key(&mut app, crossterm::event::KeyCode::PageDown);
+        key(&mut app, crossterm::event::KeyCode::PageDown);
+        assert!(app.pending_confirm.as_ref().unwrap().scroll > 0);
+        key(&mut app, crossterm::event::KeyCode::Char('a'));
+        assert_eq!(rx.try_recv(), Ok(true));
+        assert!(app.pending_confirm.is_none());
+    }
+
+    #[test]
+    fn a_cut_command_is_repeated_whole_in_the_scrolled_body() {
+        let command = format!("query_logs vlogs --query '{}' END", "x".repeat(900));
+        let (tx, _rx) = oneshot::channel();
+        let explanation = (1..=40)
+            .map(|i| format!("row {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(PendingConfirm::new(command, explanation, false, tx));
+        app.mode = AppMode::Confirming;
+        let top = render_confirm(&mut app, 80, 24);
+        assert!(top.contains("… (command truncated)"), "{top}");
+        key(&mut app, crossterm::event::KeyCode::End);
+        let end = render_confirm(&mut app, 80, 24);
+        assert!(
+            end.contains("Full command:") || end.contains("' END"),
+            "{end}"
+        );
+        assert!(
+            end.contains("' END"),
+            "the end of the command is reachable\n{end}"
         );
     }
 }

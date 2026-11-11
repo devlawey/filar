@@ -181,6 +181,30 @@ pub struct PendingConfirm {
     pub(crate) radius_context: Option<String>,
     /// `proposal_id` of the command, to show its safety rating (#551).
     pub proposal_id: Option<u64>,
+    /// Scroll of the dialog body (#658): rows hidden above. A new dialog is
+    /// a new `PendingConfirm`, so it always starts at the top.
+    pub(crate) scroll: usize,
+    /// Set by each render: the largest useful `scroll` (0 = everything fits)
+    /// and the rows one page moves.
+    pub(crate) scroll_max: usize,
+    pub(crate) scroll_page: usize,
+}
+
+impl PendingConfirm {
+    /// The body has rows that do not fit: scrolling keys move the dialog.
+    pub(crate) fn scrolls(&self) -> bool {
+        self.scroll_max > 0
+    }
+
+    /// Move the body by `delta` rows, within what the last render allowed.
+    pub(crate) fn scroll_by(&mut self, delta: isize) {
+        let moved = if delta < 0 {
+            self.scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.scroll.saturating_add(delta.unsigned_abs())
+        };
+        self.scroll = moved.min(self.scroll_max);
+    }
 }
 
 /// Member noun used by fleet confirmation and status displays.
@@ -355,6 +379,9 @@ impl PendingConfirm {
             radius_kind: FleetRadiusKind::Hosts,
             radius_context: None,
             proposal_id: None,
+            scroll: 0,
+            scroll_max: 0,
+            scroll_page: 0,
         }
     }
 }
@@ -4899,6 +4926,35 @@ impl App {
                     {
                         p.radius_expanded = !p.radius_expanded;
                     }
+                }
+                // A dialog taller than the screen scrolls (#658); otherwise
+                // PgUp/PgDn/End move the chat behind it, as before.
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+                    if self.pending_confirm.as_ref().is_some_and(|p| p.scrolls()) =>
+                {
+                    if let Some(p) = self.pending_confirm.as_mut() {
+                        let page = p.scroll_page.max(1) as isize;
+                        match key.code {
+                            KeyCode::Up => p.scroll_by(-1),
+                            KeyCode::Down => p.scroll_by(1),
+                            KeyCode::PageUp => p.scroll_by(-page),
+                            KeyCode::PageDown => p.scroll_by(page),
+                            KeyCode::Home => p.scroll = 0,
+                            _ => p.scroll = p.scroll_max,
+                        }
+                    }
+                }
+                KeyCode::PageUp => {
+                    self.scroll = self.scroll.saturating_add(5);
+                    self.clamp_scroll();
+                }
+                KeyCode::PageDown => {
+                    self.scroll = self.scroll.saturating_sub(5);
                 }
                 KeyCode::End => {
                     self.scroll = 0;
