@@ -447,7 +447,7 @@ fn build_scrolled_lines(
         let (lines, used) = cut(radius.clone(), explanation);
         (lines, used, None)
     };
-    if explanation.is_empty() || max_rows == 0 {
+    if max_rows == 0 {
         return whole();
     }
     let mut head = Vec::new();
@@ -488,28 +488,65 @@ fn build_scrolled_lines(
             rows,
         )
     };
-    let (natural_tail, natural_used) = tail_room(remaining);
-    if wrapped_rows(explanation, inner_width).len() + natural_used <= remaining {
+    let explanation_rows = if explanation.is_empty() {
+        Vec::new()
+    } else {
+        wrapped_rows(explanation, inner_width)
+    };
+    // The fixed part with a one-row command: audit, rating, destructive
+    // warning, separator. These are never given up for the body.
+    let (_, fixed_used) = build_modal_lines(
+        None,
+        "",
+        "$",
+        destructive,
+        audit_unavailable,
+        audit_verdict,
+        audit_reason,
+        audit_model,
+        same_as_session,
+        session_name,
+        safety.clone(),
+        fg,
+        danger,
+        warning,
+        muted,
+        success,
+        accent,
+        inner_width,
+        remaining,
+    );
+    let command_rows = wrapped_rows(command_text, inner_width);
+    // What the fixed part takes with the whole command.
+    let natural_need = fixed_used.saturating_sub(1) + command_rows.len();
+    if explanation_rows.len() + natural_need <= remaining {
         return whole();
     }
-    let (tail, tail_used) = if natural_used * 2 > remaining {
-        tail_room((remaining / 2).max(1))
+    // A long command gets half the room at most (one row and the
+    // «truncated» note at least) and is repeated whole in the body.
+    let (tail, tail_used) = if natural_need * 2 > remaining {
+        tail_room((remaining / 2).max(fixed_used + 1).min(remaining))
     } else {
-        (natural_tail, natural_used)
+        tail_room(remaining)
     };
-    let command_cut = tail
-        .iter()
-        .any(|line| line_text(line) == "… (command truncated)");
+    // Cut or not, read off the rows drawn: the whole command is there only
+    // if its every row is.
+    let tail_texts: Vec<String> = tail.iter().map(line_text).collect();
+    let command_cut = !tail_texts
+        .windows(command_rows.len())
+        .any(|window| window == command_rows.as_slice());
     let body_room = remaining.saturating_sub(tail_used);
-    let mut body = wrapped_rows(explanation, inner_width);
+    let mut body = explanation_rows;
     let mut body_styles = vec![fg; body.len()];
     if command_cut {
-        let command = wrapped_rows(command_text, inner_width);
-        body.push(String::new());
+        if !body.is_empty() {
+            body.push(String::new());
+            body_styles.push(fg);
+        }
         body.push("Full command:".to_string());
-        body_styles.extend([fg, muted]);
-        body_styles.extend(std::iter::repeat_n(warning, command.len()));
-        body.extend(command);
+        body_styles.push(muted);
+        body_styles.extend(std::iter::repeat_n(warning, command_rows.len()));
+        body.extend(command_rows);
     }
     if body.len() <= body_room || body_room < MIN_SCROLL_ROWS {
         // Fits as it is, or no room for a window: the cut layout decides.
@@ -1876,5 +1913,68 @@ mod tests {
             end.contains("' END"),
             "the end of the command is reachable\n{end}"
         );
+    }
+
+    #[test]
+    fn an_open_side_panel_leaves_the_scroll_keys_to_a_long_dialog() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.side_panel.open = true;
+        let (confirm, _rx) = long_diff();
+        app.pending_confirm = Some(confirm);
+        app.mode = AppMode::Confirming;
+        render_confirm(&mut app, 80, 24);
+        let selected = app.side_panel.selected;
+        key(&mut app, crossterm::event::KeyCode::Down);
+        key(&mut app, crossterm::event::KeyCode::PageDown);
+        let p = app.pending_confirm.as_ref().unwrap();
+        assert_eq!(p.scroll, 1 + p.scroll_page, "the dialog scrolled");
+        assert_eq!(app.side_panel.selected, selected, "the panel did not move");
+        assert!(app.side_panel.open);
+    }
+
+    #[test]
+    fn a_long_command_never_pushes_out_the_destructive_warning() {
+        let command = format!("k8s_delete pod -l '{}'", "app=x,".repeat(300));
+        let (tx, _rx) = oneshot::channel();
+        let explanation = (1..=40)
+            .map(|i| format!("row {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut confirm = PendingConfirm::new(command, explanation, true, tx);
+        confirm.audit_verdict = Some("MISMATCH".into());
+        confirm.audit_reason = "deletes more than asked".into();
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(confirm);
+        app.mode = AppMode::Confirming;
+        for height in [16, 20, 24, 30] {
+            let screen = render_confirm(&mut app, 80, height);
+            if app.pending_confirm.as_ref().unwrap().scrolls() {
+                assert!(
+                    screen.contains("WARNING: This command may be destructive!")
+                        && screen.contains("Audit: MISMATCH")
+                        && screen.contains("[ Approve (a) ]"),
+                    "height {height}\n{screen}"
+                );
+            }
+        }
+        assert!(
+            app.pending_confirm.as_ref().unwrap().scrolls(),
+            "the last size scrolls"
+        );
+    }
+
+    #[test]
+    fn without_an_explanation_a_cut_command_is_still_readable_whole() {
+        let command = format!("query_logs vlogs --query '{}' END", "y".repeat(2500));
+        let (tx, _rx) = oneshot::channel();
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.pending_confirm = Some(PendingConfirm::new(command, String::new(), false, tx));
+        app.mode = AppMode::Confirming;
+        let top = render_confirm(&mut app, 80, 24);
+        assert!(top.contains("Full command:"), "{top}");
+        assert!(app.pending_confirm.as_ref().unwrap().scrolls());
+        key(&mut app, crossterm::event::KeyCode::End);
+        let end = render_confirm(&mut app, 80, 24);
+        assert!(end.contains("' END"), "{end}");
     }
 }

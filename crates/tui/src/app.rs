@@ -681,6 +681,10 @@ pub struct App {
     pub kube_pod_select: Option<pod_tab::KubePodSelect>,
     /// A debug container waiting for the user's explicit yes (#576).
     pub debug_proposal: Option<pod_tab::DebugProposal>,
+    /// Scroll of the debug-container confirmation text (#658) and, set by
+    /// its render, the largest useful scroll (0 = the text fits).
+    pub(crate) debug_scroll: usize,
+    pub(crate) debug_scroll_max: usize,
     /// Approved debug containers, created by the runner (#576).
     pub pending_kube_debug_creates: Vec<pod_tab::DebugProposal>,
     /// Kubernetes fleet discoveries and restored connections awaiting the runner.
@@ -1106,6 +1110,8 @@ impl App {
             pending_kube_pod_connects: Vec::new(),
             kube_pod_select: None,
             debug_proposal: None,
+            debug_scroll: 0,
+            debug_scroll_max: 0,
             pending_kube_debug_creates: Vec::new(),
             pending_kube_fleets: Vec::new(),
             kube_namespace_select: None,
@@ -7804,6 +7810,21 @@ impl App {
             return true;
         }
         if !self.side_panel.open {
+            return false;
+        }
+        // A confirmation taller than the screen owns the scroll keys (#658).
+        if self.mode == AppMode::Confirming
+            && self.pending_confirm.as_ref().is_some_and(|p| p.scrolls())
+            && matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+            )
+        {
             return false;
         }
         let rows = self.panel_rows();
