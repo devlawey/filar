@@ -12654,3 +12654,27 @@ describe пода получило колонку SECRETS, поэтому чле
 `Time::to_unix_duration` в x509-cert 0.3 возвращает `Duration`.
 
 **Next.** Релиз 3.0.5 после мержа серии #638–#642, #646.
+
+## Релиз 3.0.5: подготовка
+
+**Сделано.** Версия workspace поднята до 3.0.5; `CHANGELOG.md` закрывает
+`[3.0.5] - 2026-11-11`; `docs/ENGINE_API.md` переведён на `engine-v3.0.5` и
+получил раздел «Upgrading to engine-v3.0.5». В релиз входят #637–#646:
+политика zero-install для изменений цели, `ClusterWriteApi`, гейт записи в
+кластер с dry-run и diff, `k8s_apply`, `k8s_scale`/`k8s_rollout`, `k8s_delete`,
+обязательное подтверждение `pod_http_get` вне диагностических путей,
+привязка `PendingScores` к ходу, исправление `k8s_describe` при недоступных
+событиях и метаданные Kubernetes Secret без значений.
+
+**Контракты движка.** `CommandExecutor` и `LlmClient` не менялись. Добавлены
+`ClusterWriteApi` и методы `ClusterApi` с реализациями по умолчанию; новое
+значение `KubeResourceKind::Secret` ломает исчерпывающие `match` у внешних
+потребителей, что зафиксировано в `ENGINE_API.md`.
+
+**Проверено.** `cargo build --workspace` и `cargo test --workspace` зелёные,
+включая doc-tests; тесты `#[ignore]`, требующие внешней инфраструктуры,
+автоматически не запускались. После бампа `Cargo.lock` обновлён повторной
+сборкой workspace.
+
+**Остаётся.** Ручной smoke Windows и macOS по `docs/SMOKE.md` (#298), включая
+живые сценарии записи в кластер, метаданных Secret, risk-scorer и log-source.

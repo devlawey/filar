@@ -28,13 +28,13 @@ working example.
 Bots and mobile apps that only need SSH should disable default features:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.4", default-features = false }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.5", default-features = false }
 ```
 
 Desktop apps (TUI/GUI) should keep `local` enabled:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.4" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.5" }
 ```
 
 Consumers that need Kubernetes but not a local terminal can enable only `kube`:
@@ -201,9 +201,9 @@ application — and the arbiter/`RiskInput` target
 
 ```toml
 [dependencies]
-filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.4" }
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.4", default-features = false }
-filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.4" }
+filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.5" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.5", default-features = false }
+filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.5" }
 
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"
@@ -821,6 +821,18 @@ let _agent = builder.log_sources(sources);
   and any proxy in front of it (VictoriaLogs documents that it does). Kinds without an adapter in the
   build are reported by `build_log_sources` and not offered.
 
+## Upgrading to `engine-v3.0.5`
+
+| Change | Breaks | What to do |
+|--------|--------|------------|
+| `kube_call_confirmation_decision`, `KubeToolCall::may_change_application_state`, `pod_http::is_diagnostic_path` (#643) | Nothing — additive; `kube_confirmation_decision` is unchanged but does not see the call | If you offer `pod_http_get`, use `kube_call_confirmation_decision`: it asks for any path outside the diagnostic list in every mode |
+| `ClusterWriteApi` (apply, scale, rollout restart/undo, delete; every method with `dry_run`), `KubeClusterApi` implements it; `ObjectKind`, `ObjectRef`, `AppliedObject`/`ApplyAction`, `SecretKeyChange`/`SecretKeyState`, `ScaleKind`/`ScaleOutcome`, `RestartKind`, `WriteOutcome`, `UndoOutcome`, `DeleteTarget`/`DeleteOptions`/`Propagation`/`DeleteOutcome`/`DeletedObject`, `parse_manifest`, `hide_secret_values`, `SECRET_HIDDEN`, `FIELD_MANAGER` (#638) | Nothing — additive; `ClusterApi` is unchanged and stays read-only | Writes go through `ClusterWriteApi` behind your own confirmation gate; never hand it to fleets or read-only paths. Objects the write methods return never carry `Secret` values and submitted values in server errors are masked; `parse_manifest` returns your manifest as given, values included |
+| `AgentEvent::ClusterChanged`, `KubeAgent::cluster_writer`, `filar_agent::kube_write` (`KubeWriteCall`, `kube_write_confirmation_decision`, `preview`, `execute`, `diff`, `trace_line`), `build_kube_write_system_prompt`, `WritePreview::pin`, `AppliedObject::status_is_content` (#639) | `AgentEvent` is `#[non_exhaustive]`: nothing for matches with a wildcard. `AppliedObject` gains `status_is_content`: struct literals of it need the field | Pass `cluster_writer(Some(api))` to a cluster tab that may write; show `ClusterChanged` traces in your feed. Every write is dry-run and confirmed in every mode |
+| `DeletedObject::live`, `DeletionImpact` (with `contents_incomplete`), `ClusterWriteApi::deletion_impact` (default: nothing known), `WritePreview::cluster_scoped` (#642) | Struct literals of `DeletedObject` need `live`; of `WritePreview`, `cluster_scoped` | Add `live: None`; implement `deletion_impact` only if your API can read what a delete takes with it |
+| `SecretInfo`, `SecretKeyInfo`, `TlsCertificateInfo`, `SecretRef`, `parse_certificate`; `ClusterApi::list_secrets` / `get_secret` (default `Unsupported`) / `pod_secret_refs` (default empty); `KubeResourceKind::Secret` (#646) | Exhaustive `match` on `KubeResourceKind` needs the `Secret` arm; other `ClusterApi` implementations compile unchanged | Add the arm; implement the secret methods only if your API can read Secrets — and never return values |
+
+`CommandExecutor` and `LlmClient` are unchanged.
+
 ## Upgrading to `engine-v3.0.2`
 
 | Change | Breaks | What to do |
@@ -830,11 +842,6 @@ let _agent = builder.log_sources(sources);
 | `filar_core::KubePodSnapshot`, new field `KubeSessionSnapshot::pod` (#565) | Struct literals of `KubeSessionSnapshot` need `pod` (`None` for a cluster tab); saved sessions without it deserialize as cluster tabs | Add `pod: None`, or `Some(KubePodSnapshot { pod, container })` for a pod tab |
 | `KubeInteractive`, `KubeExecutor::open_terminal` under the `kube` feature (#577) | Nothing — additive; `InteractiveTerminal` is unchanged | Use `open_terminal(cols, rows)` for an interactive TTY shell in the executor's pod |
 | `ClusterApi::pod_http_get`, `PodHttpRequest`/`PodHttpResponse`, `ContainerPortInfo`, new fields `ContainerInfo::ports` and `KubeCluster::diagnostic_ports`, tool `pod_http_get` (#578) | Struct literals of `ContainerInfo` need `ports`; `KubeCluster` literals without `..Default::default()` need `diagnostic_ports`; other `ClusterApi` implementations get a default `Unavailable` | Add `ports: Vec::new()` / `diagnostic_ports: Vec::new()`; implement `pod_http_get` only if your API can port-forward |
-| `kube_call_confirmation_decision`, `KubeToolCall::may_change_application_state`, `pod_http::is_diagnostic_path` (#643) | Nothing — additive; `kube_confirmation_decision` is unchanged but does not see the call | If you offer `pod_http_get`, use `kube_call_confirmation_decision`: it asks for any path outside the diagnostic list in every mode |
-| `ClusterWriteApi` (apply, scale, rollout restart/undo, delete; every method with `dry_run`), `KubeClusterApi` implements it; `ObjectKind`, `ObjectRef`, `AppliedObject`/`ApplyAction`, `SecretKeyChange`/`SecretKeyState`, `ScaleKind`/`ScaleOutcome`, `RestartKind`, `WriteOutcome`, `UndoOutcome`, `DeleteTarget`/`DeleteOptions`/`Propagation`/`DeleteOutcome`/`DeletedObject`, `parse_manifest`, `hide_secret_values`, `SECRET_HIDDEN`, `FIELD_MANAGER` (#638) | Nothing — additive; `ClusterApi` is unchanged and stays read-only | Writes go through `ClusterWriteApi` behind your own confirmation gate; never hand it to fleets or read-only paths. Objects the write methods return never carry `Secret` values and submitted values in server errors are masked; `parse_manifest` returns your manifest as given, values included |
-| `AgentEvent::ClusterChanged`, `KubeAgent::cluster_writer`, `filar_agent::kube_write` (`KubeWriteCall`, `kube_write_confirmation_decision`, `preview`, `execute`, `diff`, `trace_line`), `build_kube_write_system_prompt`, `WritePreview::pin`, `AppliedObject::status_is_content` (#639) | `AgentEvent` is `#[non_exhaustive]`: nothing for matches with a wildcard. `AppliedObject` gains `status_is_content`: struct literals of it need the field | Pass `cluster_writer(Some(api))` to a cluster tab that may write; show `ClusterChanged` traces in your feed. Every write is dry-run and confirmed in every mode |
-| `DeletedObject::live`, `DeletionImpact` (with `contents_incomplete`), `ClusterWriteApi::deletion_impact` (default: nothing known), `WritePreview::cluster_scoped` (#642) | Struct literals of `DeletedObject` need `live`; of `WritePreview`, `cluster_scoped` | Add `live: None`; implement `deletion_impact` only if your API can read what a delete takes with it |
-| `SecretInfo`, `SecretKeyInfo`, `TlsCertificateInfo`, `SecretRef`, `parse_certificate`; `ClusterApi::list_secrets` / `get_secret` (default `Unsupported`) / `pod_secret_refs` (default empty); `KubeResourceKind::Secret` (#646) | Exhaustive `match` on `KubeResourceKind` needs the `Secret` arm; other `ClusterApi` implementations compile unchanged | Add the arm; implement the secret methods only if your API can read Secrets — and never return values |
 | `filar_core::LogSourceConfig`/`LogSourceKind`/`LogAuth`, new field `Config::log_sources`; `filar_agent::logs` (`LogSource`, `LogSources`, `build_log_sources`, tool `query_logs`), `AgentBuilder::log_sources`, `KubeAgent::log_sources` (#579) | `Config` literals without `..Default::default()` need `log_sources` | Add `log_sources: Vec::new()`; opt in with `build_log_sources` |
 | New `LogSourceConfig` fields `time_field`, `fields`, `ca_file`, `k8s_fields`; `K8sFieldPreset`/`K8sFields` and the OpenSearch/Elasticsearch adapter (#581) | `LogSourceConfig` literals without `..Default::default()` need the new fields | Use `..Default::default()` or populate the fields; private CAs are added to verification, never used to disable it |
 | `LogResult::series` and `LogSeries` for Loki metric queries (#582) | `LogResult` literals need `series`; `LogResult` no longer implements `Eq` because series contain `f64` | Add `series: Vec::new()` or `..Default::default()`; use approximate comparison for metric values |

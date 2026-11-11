@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [3.0.5] - 2026-11-11
+
 ### Added
 
 - Engine: `ClusterWriteApi` in `filar-transport`, implemented by `KubeClusterApi` — server-side apply of YAML/JSON manifests, scale, rollout restart and undo, delete by name, selector or an exact list of names, every method with a server dry run; any kind the RBAC allows; objects the write methods return never carry Secret values, and submitted values quoted in a server error are masked (`parse_manifest` returns the caller's manifest as given); paused Deployments are refused for restart and undo. `ClusterApi` stays read-only and fleets get only it ([#638](https://github.com/devlawey/filar/issues/638)).
@@ -1535,7 +1537,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v3.0.4...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v3.0.5...HEAD
+[3.0.5]: https://github.com/devlawey/filar/compare/v3.0.4...v3.0.5
 [3.0.4]: https://github.com/devlawey/filar/compare/v3.0.3...v3.0.4
 [3.0.3]: https://github.com/devlawey/filar/compare/v3.0.2...v3.0.3
 [3.0.2]: https://github.com/devlawey/filar/compare/v3.0.0...v3.0.2
