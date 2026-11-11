@@ -468,12 +468,16 @@ CSI-томом или PVC его StorageClass. Без `a` ничего не со
 `kubectl rollout status`: читает workload по имени (`get`; права `list` для
 этого не нужно) и считает выкат завершённым, когда одновременно контроллер
 увидел новую спецификацию (`observedGeneration ≥ generation`), готовых и
-обновлённых реплик столько, сколько нужно, и не осталось подов старой ревизии
-(`status.replicas ≤ updatedReplicas`). Агенту уходит итог («complete: 5/5
+обновлённых реплик столько, сколько нужно, и не осталось работающих подов
+старой ревизии (`status.replicas ≤ updatedReplicas`; уже завершающиеся
+старые поды API не считает — они могут ещё доживать свой grace period, как и
+у `kubectl rollout status`). Агенту уходит итог («complete: 5/5
 ready» или «not finished after 120 s: 5/5 ready, 5 updated; 2 old replica(s)
 pending termination» / «…; waiting for the controller to observe generation
 4» — тогда агент смотрит события). У workload без `observedGeneration`
-первое чтение завершением не считается. Срок в две минуты действует и на
+первое чтение завершением не считается. Отсутствующий в статусе счётчик
+обновлённых реплик (API опускает нули) читается как 0, а не как «все
+обновлены». Срок в две минуты действует и на
 сами запросы статуса. Если RBAC не даёт читать workload (`get`), ожидание
 заканчивается сразу («not followed: status unreadable»), изменение при этом
 сделано. `Ctrl+C` прерывает ожидание, но не

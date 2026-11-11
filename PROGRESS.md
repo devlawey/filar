@@ -12751,4 +12751,11 @@ API. Бинарник в tmux против фейкового API (LIST deployme
 контроллер отстаёт): `k8s_scale` 3→5 и restart — по пять GET, «complete»
 только после `observedGeneration` и ухода старых реплик (12 с).
 
+**Ревью (раунд 1).** CodeRabbit: отсутствующий `updatedReplicas` /
+`updatedNumberScheduled` (API опускает нули) — 0, а не «все обновлены»
+(кроме ReplicaSet, у которого счётчика нет); `status.replicas` — только
+незавершающиеся поды, это оговорено в доке, CHANGELOG и комментарии поля.
+CodeRabbit и ai-review: doc `get_workload` разводит GET у `KubeClusterApi` и
+LIST у реализации по умолчанию.
+
 **Next.** #658 — прокручиваемое окно подтверждения.

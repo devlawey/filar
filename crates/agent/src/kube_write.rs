@@ -700,7 +700,12 @@ pub async fn wait_rollout(
 fn rollout_status(workload: &filar_transport::WorkloadInfo, read: usize) -> (bool, String) {
     let desired = workload.desired.unwrap_or(0);
     let ready = workload.ready.unwrap_or(0);
-    let updated = workload.updated.unwrap_or(desired);
+    // The API may omit a zero count: missing means none updated. Only a
+    // ReplicaSet has no updated count at all — its pods are all one revision.
+    let updated = match workload.kind {
+        WorkloadKind::ReplicaSet => workload.updated.unwrap_or(desired),
+        _ => workload.updated.unwrap_or(0),
+    };
     let counts = format!("{ready}/{desired} ready, {updated} updated");
     if let (Some(generation), Some(observed)) = (workload.generation, workload.observed_generation)
     {
@@ -2036,6 +2041,37 @@ mod tests {
             late.contains("2 old replica(s) pending termination"),
             "{late}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_updated_count_is_none_updated() {
+        use crate::kube_tools::tests::MockCluster;
+        // Right after a restart: new generation seen, the five old pods are
+        // ready, `updatedReplicas` (zero) omitted by the API.
+        let restarted = MockCluster::default();
+        *restarted.workload_reads.lock().unwrap() = [vec![filar_transport::WorkloadInfo {
+            updated: None,
+            ..observed(5, 0, 5, 3, 3)
+        }]]
+        .into_iter()
+        .collect();
+        let late = wait_on(&restarted).await;
+        assert!(
+            late.starts_with("rollout of web not finished")
+                && late.contains("5/5 ready, 0 updated"),
+            "{late}"
+        );
+        // A ReplicaSet has no updated count: its ready pods are the rollout.
+        let replicaset = MockCluster::default();
+        *replicaset.workload_reads.lock().unwrap() = [vec![filar_transport::WorkloadInfo {
+            kind: WorkloadKind::ReplicaSet,
+            updated: None,
+            ..observed(5, 0, 5, 1, 1)
+        }]]
+        .into_iter()
+        .collect();
+        let done = wait_on(&replicaset).await;
+        assert!(done.starts_with("rollout of web complete"), "{done}");
     }
 
     #[tokio::test(start_paused = true)]
