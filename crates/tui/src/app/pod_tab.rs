@@ -432,6 +432,8 @@ impl App {
         image: String,
     ) {
         self.kube_pod_select = None;
+        self.debug_scroll = 0;
+        self.debug_scroll_max = 0;
         self.debug_proposal = Some(DebugProposal {
             origin: self.active_session().id,
             cluster,
@@ -462,6 +464,18 @@ impl App {
                     "Debug-контейнер не создан.".into(),
                 ));
             }
+            // Text taller than the window scrolls (#658); `y`/`n` stay on
+            // screen below it.
+            KeyCode::Up | KeyCode::PageUp => {
+                let step = if key.code == KeyCode::Up { 1 } else { 5 };
+                self.debug_scroll = self.debug_scroll.saturating_sub(step);
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                let step = if key.code == KeyCode::Down { 1 } else { 5 };
+                self.debug_scroll = (self.debug_scroll + step).min(self.debug_scroll_max);
+            }
+            KeyCode::Home => self.debug_scroll = 0,
+            KeyCode::End => self.debug_scroll = self.debug_scroll_max,
             _ => {}
         }
     }

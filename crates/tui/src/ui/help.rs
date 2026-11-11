@@ -233,6 +233,18 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
             section: "Agent",
             available: |m| m == AppMode::Confirming,
         },
+        HelpEntry {
+            key: "↑↓ PgUp PgDn",
+            desc: "Scroll a confirmation taller than the screen",
+            section: "Agent",
+            available: |m| m == AppMode::Confirming,
+        },
+        HelpEntry {
+            key: "Home / End",
+            desc: "Top / bottom of a long confirmation",
+            section: "Agent",
+            available: |m| m == AppMode::Confirming,
+        },
         // ── Scrolling ─────────────────────────────────────────────────
         HelpEntry {
             key: "PgUp",

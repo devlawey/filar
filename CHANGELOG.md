@@ -11,6 +11,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- The TUI confirmation dialog scrolls when its text does not fit — a long explanation or a cluster write's dry-run diff: ↑/↓ by row, PgUp/PgDn by page, Home/End; a `rows N–M of K · ↓ X more` line shows what is hidden, while the target header, audit verdict, safety rating, destructive warning, command and buttons stay in place and Approve/Deny work at any scroll; a command cut to fit is repeated whole at the end; an open side panel does not take these keys; the debug-container confirmation (Ctrl+B) scrolls the same way with its `y`/`n` line kept at the bottom; with nothing to scroll PgUp/PgDn move the chat as before ([#658](https://github.com/devlawey/filar/issues/658)).
+
 ### Changed
 
 - After `k8s_scale` and `k8s_rollout` the rollout is followed like `kubectl rollout status`: the workload is read by name (a `get` right is enough, no `list`, no paging), and the rollout counts as complete only once the controller has observed the new generation and no running (non-terminating) pod of an old revision is left — a missing updated count reads as zero; the status line says what is still awaited. Engine: `ClusterApi::get_workload` (with a default implementation) and `WorkloadInfo::{generation, observed_generation, replicas}` ([#657](https://github.com/devlawey/filar/issues/657)).
