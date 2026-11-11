@@ -766,7 +766,7 @@ pub(crate) fn render_help_bar(f: &mut Frame, app: &mut App, area: Rect) {
         items.insert(
             0,
             HelpItem {
-                key: "↑↓/PgUp/PgDn",
+                key: "↑↓/PgUp/PgDn/Home/End",
                 desc: "scroll",
                 action: None,
             },
