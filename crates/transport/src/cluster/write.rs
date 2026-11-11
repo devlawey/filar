@@ -1587,7 +1587,10 @@ mod tests;
 /// the name now belongs to another object (#659). Matched on the API
 /// server's own wording (`Precondition failed: UID in precondition: …`), so
 /// another 409 — an admission webhook, a resourceVersion conflict — stays an
-/// error.
+/// error. The API server gives no structured cause for it (`reason` is a
+/// plain `Conflict`, as for a webhook), so the text is the only signal; if a
+/// future server words it differently, the delete fails as an error — the
+/// object is still not deleted, only the message is less precise.
 fn is_uid_conflict(status: &kube::core::Status) -> bool {
     status.code == 409 && status.message.contains("UID in precondition")
 }
