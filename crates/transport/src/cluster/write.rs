@@ -24,7 +24,7 @@ use filar_core::{CoreError, KubeCluster, Result};
 use k8s_openapi::api::apps::v1::{Deployment, ReplicaSet};
 use kube::api::{
     ApiResource, DeleteParams, DynamicObject, GroupVersionKind, ListParams, Patch, PatchParams,
-    PostParams, PropagationPolicy, ValidationDirective,
+    PostParams, Preconditions, PropagationPolicy, ValidationDirective,
 };
 use kube::discovery::{ApiCapabilities, Discovery, Scope};
 use kube::{Api, Client};
@@ -224,12 +224,33 @@ pub enum DeleteTarget {
         /// Field selector.
         fields: Option<String>,
     },
-    /// Exactly these names — what a dry run listed. A name gone since is
-    /// reported, not an error; nothing beyond these names is deleted. Names
-    /// are identities here, as in `kubectl delete`: an object recreated under
-    /// the same name since the dry run (a StatefulSet pod `web-0`) is the one
-    /// deleted.
-    Names(Vec<String>),
+    /// Exactly these objects — what a dry run listed. A name gone since is
+    /// reported, not an error; nothing beyond these names is deleted. A name
+    /// with a UID is deleted only while it is that same object (`uid`
+    /// precondition, #659): one recreated under the same name since the dry
+    /// run (a StatefulSet pod `web-0`) is left and reported as
+    /// [`DeleteOutcome::Recreated`]. Without a UID the name is the identity,
+    /// as in `kubectl delete`.
+    Names(Vec<PinnedName>),
+}
+
+/// One object a dry run showed, by name and, when known, UID (#659).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedName {
+    /// Object name.
+    pub name: String,
+    /// `metadata.uid` the dry run saw; `None` = not pinned, the name decides.
+    pub uid: Option<String>,
+}
+
+impl PinnedName {
+    /// A name without a UID: deleted by name alone.
+    pub fn unpinned(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            uid: None,
+        }
+    }
 }
 
 /// Garbage-collection policy of a delete.
@@ -266,6 +287,9 @@ pub enum DeleteOutcome {
     Pending,
     /// Already gone when its turn came.
     AlreadyGone,
+    /// Not deleted: an object of that name exists, but it is not the one the
+    /// dry run showed (its UID changed, #659).
+    Recreated,
 }
 
 /// One object of a delete.
@@ -278,6 +302,18 @@ pub struct DeletedObject {
     /// The object as the API server answered the delete, when it did
     /// (owner, reclaim policy, …), Secret values hidden (#642).
     pub live: Option<Value>,
+}
+
+impl DeletedObject {
+    /// `metadata.uid` of the object as the API server answered, if it did.
+    /// An empty UID is no identity and counts as none.
+    pub fn uid(&self) -> Option<&str> {
+        self.live
+            .as_ref()?
+            .pointer("/metadata/uid")?
+            .as_str()
+            .filter(|uid| !uid.is_empty())
+    }
 }
 
 /// What else a delete takes with it or puts at risk (#642), as far as
@@ -1248,7 +1284,7 @@ impl ClusterWriteApi for KubeClusterApi {
         let label = resource_label(&resource);
         let api = self.dynamic_api(&resource, &caps, namespace)?;
         let (names, missing_is_error) = match target {
-            DeleteTarget::Name(name) => (vec![name.clone()], true),
+            DeleteTarget::Name(name) => (vec![PinnedName::unpinned(name.clone())], true),
             DeleteTarget::Names(names) => (names.clone(), false),
             DeleteTarget::Selector { labels, fields } => (
                 self.list_names(
@@ -1258,11 +1294,14 @@ impl ClusterWriteApi for KubeClusterApi {
                     &label,
                     namespace,
                 )
-                .await?,
+                .await?
+                .into_iter()
+                .map(PinnedName::unpinned)
+                .collect(),
                 false,
             ),
         };
-        let params = DeleteParams {
+        let base = DeleteParams {
             dry_run,
             grace_period_seconds: if options.force {
                 Some(0)
@@ -1277,7 +1316,16 @@ impl ClusterWriteApi for KubeClusterApi {
             preconditions: None,
         };
         let mut deleted = Vec::with_capacity(names.len());
-        for name in names {
+        for PinnedName { name, uid } in names {
+            // Only the object the window showed (#659): a UID precondition
+            // makes the API server refuse a same-named successor.
+            let params = DeleteParams {
+                preconditions: uid.clone().map(|uid| Preconditions {
+                    uid: Some(uid),
+                    resource_version: None,
+                }),
+                ..base.clone()
+            };
             let object = ObjectRef {
                 api_version: resource.api_version.clone(),
                 kind: resource.kind.clone(),
@@ -1329,6 +1377,9 @@ impl ClusterWriteApi for KubeClusterApi {
                 }
                 Err(kube::Error::Api(status)) if status.code == 404 && !missing_is_error => {
                     DeleteOutcome::AlreadyGone
+                }
+                Err(kube::Error::Api(status)) if uid.is_some() && is_uid_conflict(&status) => {
+                    DeleteOutcome::Recreated
                 }
                 Err(error) => {
                     let error = self.write_error(error, "delete", &label, namespace);
@@ -1531,3 +1582,15 @@ async fn impact_of(api: &KubeClusterApi, object: &DeletedObject) -> DeletionImpa
 #[cfg(test)]
 #[path = "write_tests.rs"]
 mod tests;
+
+/// A 409 refusing a delete because its UID precondition no longer holds:
+/// the name now belongs to another object (#659). Matched on the API
+/// server's own wording (`Precondition failed: UID in precondition: …`), so
+/// another 409 — an admission webhook, a resourceVersion conflict — stays an
+/// error. The API server gives no structured cause for it (`reason` is a
+/// plain `Conflict`, as for a webhook), so the text is the only signal; if a
+/// future server words it differently, the delete fails as an error — the
+/// object is still not deleted, only the message is less precise.
+fn is_uid_conflict(status: &kube::core::Status) -> bool {
+    status.code == 409 && status.message.contains("UID in precondition")
+}

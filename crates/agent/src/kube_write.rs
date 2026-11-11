@@ -17,7 +17,8 @@
 use filar_core::{CommandConfirmMode, CoreError, KubeCluster, Result, TagPolicy};
 use filar_transport::{
     AppliedObject, ClusterApi, ClusterWriteApi, DeleteOptions, DeleteOutcome, DeleteTarget,
-    DeletedObject, ObjectKind, ObjectRef, RestartKind, ScaleKind, SecretKeyState, WorkloadKind,
+    DeletedObject, ObjectKind, ObjectRef, PinnedName, RestartKind, ScaleKind, SecretKeyState,
+    WorkloadKind,
 };
 use serde_json::{Map, Value};
 
@@ -201,7 +202,10 @@ impl KubeWriteCall {
                 let kind_name = kind.kind.to_ascii_lowercase();
                 let what = match target {
                     DeleteTarget::Name(name) => format!("{kind_name}/{name}"),
-                    DeleteTarget::Names(names) => format!("{kind_name} {}", names.join(" ")),
+                    DeleteTarget::Names(names) => {
+                        let names: Vec<_> = names.iter().map(|n| n.name.as_str()).collect();
+                        format!("{kind_name} {}", names.join(" "))
+                    }
                     DeleteTarget::Selector { labels, fields } => {
                         let mut out = kind_name.clone();
                         if let Some(labels) = labels {
@@ -714,9 +718,10 @@ pub struct WritePreview {
     pub text: String,
     /// Deletes and scaling to 0 are destructive: the window says so.
     pub destructive: bool,
-    /// For a selector delete: the names the dry run listed. The real delete
-    /// gets exactly these.
-    pub names: Option<Vec<String>>,
+    /// For a delete: the objects the dry run listed, by name and UID
+    /// (#659). The real delete gets exactly these and leaves any of them
+    /// recreated since.
+    pub names: Option<Vec<PinnedName>>,
     /// A better command line than the call alone gives, once the dry run
     /// knows more (`k8s_scale deployment/web -n shop 3→5`).
     pub display: Option<String>,
@@ -889,9 +894,15 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
                 }
                 display = Some(cluster_scoped.display_command());
             }
-            if matches!(target, DeleteTarget::Selector { .. }) {
-                names = Some(listed.iter().map(|d| d.object.name.clone()).collect());
-            }
+            names = Some(
+                listed
+                    .iter()
+                    .map(|d| PinnedName {
+                        name: d.object.name.clone(),
+                        uid: d.uid().map(str::to_owned),
+                    })
+                    .collect(),
+            );
         }
     }
     Ok(WritePreview {
@@ -904,12 +915,13 @@ pub async fn preview(api: &dyn ClusterWriteApi, call: &KubeWriteCall) -> Result<
     })
 }
 
-/// Run `call` for real. A selector delete gets the names of its dry run,
-/// so nothing beyond what the window showed is deleted.
+/// Run `call` for real. A delete gets the objects of its dry run, pinned
+/// by UID (#659), so nothing beyond what the window showed is deleted —
+/// not even a same-named object recreated since.
 pub async fn execute(
     api: &dyn ClusterWriteApi,
     call: &KubeWriteCall,
-    previewed_names: Option<Vec<String>>,
+    previewed_names: Option<Vec<PinnedName>>,
 ) -> Result<WriteReport> {
     let mut changes = Vec::new();
     let mut summary = String::new();
@@ -999,10 +1011,38 @@ pub async fn execute(
                 .delete(kind, namespace.as_deref(), &target, options, false)
                 .await?;
             summary.push_str(&deleted_text(&deleted, false));
+            // Named here too: the list above stops at MAX_LISTED_OBJECTS.
+            let recreated: Vec<_> = deleted
+                .iter()
+                .filter(|d| d.outcome == DeleteOutcome::Recreated)
+                .map(|d| d.object.name.as_str())
+                .collect();
+            if !recreated.is_empty() {
+                let mut names = recreated
+                    .iter()
+                    .take(MAX_LISTED_OBJECTS)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if recreated.len() > MAX_LISTED_OBJECTS {
+                    names.push_str(&format!(
+                        " and {} more",
+                        recreated.len() - MAX_LISTED_OBJECTS
+                    ));
+                }
+                summary.push_str(&format!(
+                    "Recreated since the preview, not deleted: {names}. If the new ones must go too, call k8s_delete again (a new preview).\n"
+                ));
+            }
             changes.extend(
                 deleted
                     .iter()
-                    .filter(|d| d.outcome != DeleteOutcome::AlreadyGone)
+                    .filter(|d| {
+                        !matches!(
+                            d.outcome,
+                            DeleteOutcome::AlreadyGone | DeleteOutcome::Recreated
+                        )
+                    })
                     .map(|d| format!("deleted {}", object_label(&d.object))),
             );
         }
@@ -1151,6 +1191,27 @@ async fn deletion_warnings(
     } else if let Some(seconds) = options.grace_period_seconds {
         lines.push(format!("⚠ gracePeriodSeconds={seconds}"));
     }
+    // Unreadable in the dry run: the real delete goes by name alone (#659).
+    let unpinned: Vec<_> = objects
+        .iter()
+        .filter(|d| d.uid().is_none())
+        .map(|d| d.object.name.as_str())
+        .collect();
+    if !unpinned.is_empty() {
+        let more = unpinned.len().saturating_sub(MAX_IMPACT_READS);
+        let mut shown = unpinned
+            .iter()
+            .take(MAX_IMPACT_READS)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if more > 0 {
+            shown.push_str(&format!(" and {more} more"));
+        }
+        lines.push(format!(
+            "⚠ identity not pinned (no UID in the dry run): {shown} — deleted by name, even if recreated meanwhile"
+        ));
+    }
     let mut text = String::from("\n");
     for line in lines {
         text.push_str(&line);
@@ -1269,6 +1330,13 @@ fn deleted_text(objects: &[DeletedObject], dry_run: bool) -> String {
             DeleteOutcome::Deleted => "deleted",
             DeleteOutcome::Pending => "deleting (finalizers or grace period)",
             DeleteOutcome::AlreadyGone => "already gone",
+            DeleteOutcome::Recreated => {
+                text.push_str(&format!(
+                    "  {}: recreated since preview (uid changed), not deleted\n",
+                    object_label(&object.object)
+                ));
+                continue;
+            }
         };
         text.push_str(&format!("  {what} {}\n", object_label(&object.object)));
     }
@@ -2309,5 +2377,245 @@ mod delete_review_tests {
             call.display_command(),
             "k8s_delete widget/x -n shop --api-version=example.com/v1"
         );
+    }
+}
+
+#[cfg(test)]
+mod pinned_delete_tests {
+    //! The real delete removes only what the window showed (#659).
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// Pods by name → UID; a delete with a UID precondition refuses a
+    /// same-named successor, as the API server does.
+    struct UidWriter {
+        pods: Mutex<BTreeMap<String, Option<String>>>,
+    }
+
+    impl UidWriter {
+        fn new(pods: &[(&str, Option<&str>)]) -> Self {
+            Self {
+                pods: Mutex::new(
+                    pods.iter()
+                        .map(|(name, uid)| (name.to_string(), uid.map(str::to_owned)))
+                        .collect(),
+                ),
+            }
+        }
+
+        fn recreate(&self, name: &str, uid: &str) {
+            self.pods
+                .lock()
+                .unwrap()
+                .insert(name.into(), Some(uid.into()));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ClusterWriteApi for UidWriter {
+        async fn apply(&self, _: &str, _: Option<&str>, _: bool) -> Result<Vec<AppliedObject>> {
+            unreachable!()
+        }
+        async fn scale(
+            &self,
+            _: ScaleKind,
+            _: &str,
+            _: &str,
+            _: i32,
+            _: bool,
+        ) -> Result<filar_transport::ScaleOutcome> {
+            unreachable!()
+        }
+        async fn rollout_restart(
+            &self,
+            _: RestartKind,
+            _: &str,
+            _: &str,
+            _: bool,
+        ) -> Result<filar_transport::WriteOutcome> {
+            unreachable!()
+        }
+        async fn rollout_undo(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<i64>,
+            _: bool,
+        ) -> Result<filar_transport::UndoOutcome> {
+            unreachable!()
+        }
+        async fn delete(
+            &self,
+            kind: &ObjectKind,
+            namespace: Option<&str>,
+            target: &DeleteTarget,
+            _: &DeleteOptions,
+            dry_run: bool,
+        ) -> Result<Vec<DeletedObject>> {
+            let mut pods = self.pods.lock().unwrap();
+            let wanted: Vec<PinnedName> = match target {
+                DeleteTarget::Name(name) => vec![PinnedName::unpinned(name.clone())],
+                DeleteTarget::Names(names) => names.clone(),
+                DeleteTarget::Selector { .. } => {
+                    pods.keys().cloned().map(PinnedName::unpinned).collect()
+                }
+            };
+            let mut out = Vec::new();
+            for PinnedName { name, uid } in wanted {
+                let live = pods.get(&name).cloned();
+                let outcome = match (&live, &uid) {
+                    (None, _) => DeleteOutcome::AlreadyGone,
+                    (Some(have), Some(want)) if have.as_deref() != Some(want.as_str()) => {
+                        DeleteOutcome::Recreated
+                    }
+                    _ if dry_run => DeleteOutcome::WouldDelete,
+                    _ => {
+                        pods.remove(&name);
+                        DeleteOutcome::Deleted
+                    }
+                };
+                out.push(DeletedObject {
+                    object: ObjectRef {
+                        api_version: "v1".into(),
+                        kind: kind.kind.clone(),
+                        namespace: namespace.map(str::to_owned),
+                        name: name.clone(),
+                    },
+                    outcome,
+                    live: live.map(|uid| match uid {
+                        Some(uid) => json!({"metadata": {"name": name, "uid": uid}}),
+                        None => json!({"metadata": {"name": name}}),
+                    }),
+                });
+            }
+            Ok(out)
+        }
+    }
+
+    fn delete_call(args: Value) -> KubeWriteCall {
+        parse_kube_write_call(TOOL_K8S_DELETE, &args, Some("shop")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_pod_recreated_while_the_window_is_open_is_not_deleted() {
+        let api = UidWriter::new(&[("web-0", Some("uid-a"))]);
+        let call = delete_call(json!({"kind": "Pod", "name": "web-0"}));
+        let preview = preview(&api, &call).await.unwrap();
+        assert_eq!(
+            preview.names,
+            Some(vec![PinnedName {
+                name: "web-0".into(),
+                uid: Some("uid-a".into())
+            }]),
+            "a delete by name is pinned too"
+        );
+        assert!(
+            !preview.text.contains("identity not pinned"),
+            "{}",
+            preview.text
+        );
+
+        api.recreate("web-0", "uid-b");
+        let report = execute(&api, &preview.pin(&call), preview.names.clone())
+            .await
+            .unwrap();
+        assert!(report.changes.is_empty(), "{:?}", report.changes);
+        assert!(
+            report
+                .summary
+                .contains("Pod shop/web-0: recreated since preview (uid changed), not deleted"),
+            "{}",
+            report.summary
+        );
+        assert!(
+            report
+                .summary
+                .contains("Recreated since the preview, not deleted: web-0. If the new ones must go too, call k8s_delete again"),
+            "{}",
+            report.summary
+        );
+        assert!(
+            api.pods.lock().unwrap().contains_key("web-0"),
+            "the successor is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_selector_delete_skips_only_the_recreated_object() {
+        let api = UidWriter::new(&[
+            ("web-0", Some("uid-a")),
+            ("web-1", Some("uid-b")),
+            ("web-2", Some("uid-c")),
+        ]);
+        let call = delete_call(json!({"kind": "Pod", "label_selector": "app=web"}));
+        let preview = preview(&api, &call).await.unwrap();
+        api.recreate("web-1", "uid-new");
+        let report = execute(&api, &preview.pin(&call), preview.names.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            report.changes,
+            ["deleted Pod shop/web-0", "deleted Pod shop/web-2"]
+        );
+        assert!(
+            report
+                .summary
+                .contains("Pod shop/web-1: recreated since preview (uid changed), not deleted"),
+            "{}",
+            report.summary
+        );
+        let left: Vec<_> = api.pods.lock().unwrap().keys().cloned().collect();
+        assert_eq!(left, ["web-1"]);
+    }
+
+    #[tokio::test]
+    async fn a_recreated_object_past_the_listed_ones_is_still_named() {
+        let pods: Vec<(String, String)> = (0..30)
+            .map(|i| (format!("web-{i:02}"), format!("uid-{i}")))
+            .collect();
+        let refs: Vec<(&str, Option<&str>)> = pods
+            .iter()
+            .map(|(name, uid)| (name.as_str(), Some(uid.as_str())))
+            .collect();
+        let api = UidWriter::new(&refs);
+        let call = delete_call(json!({"kind": "Pod", "label_selector": "app=web"}));
+        let preview = preview(&api, &call).await.unwrap();
+        api.recreate("web-28", "uid-new");
+        let report = execute(&api, &preview.pin(&call), preview.names.clone())
+            .await
+            .unwrap();
+        assert!(
+            !report.summary.contains("Pod shop/web-28:"),
+            "past the list limit: {}",
+            report.summary
+        );
+        assert!(
+            report
+                .summary
+                .contains("Recreated since the preview, not deleted: web-28."),
+            "{}",
+            report.summary
+        );
+        assert_eq!(report.changes.len(), 29);
+    }
+
+    #[tokio::test]
+    async fn an_object_without_a_uid_is_flagged_and_deleted_by_name() {
+        let api = UidWriter::new(&[("odd", None)]);
+        let call = delete_call(json!({"kind": "Pod", "name": "odd"}));
+        let preview = preview(&api, &call).await.unwrap();
+        assert!(
+            preview
+                .text
+                .contains("⚠ identity not pinned (no UID in the dry run): odd"),
+            "{}",
+            preview.text
+        );
+        let report = execute(&api, &preview.pin(&call), preview.names.clone())
+            .await
+            .unwrap();
+        assert_eq!(report.changes, ["deleted Pod shop/odd"]);
     }
 }

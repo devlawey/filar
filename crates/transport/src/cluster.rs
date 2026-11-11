@@ -26,7 +26,7 @@ pub use client::KubeClusterApi;
 pub use secret::{parse_certificate, SecretInfo, SecretKeyInfo, SecretRef, TlsCertificateInfo};
 pub use write::{
     hide_secret_values, parse_manifest, AppliedObject, ApplyAction, ClusterWriteApi,
-    DeleteOptions, DeleteOutcome, DeleteTarget, DeletedObject, DeletionImpact, ObjectKind, ObjectRef,
+    DeleteOptions, DeleteOutcome, DeleteTarget, DeletedObject, DeletionImpact, ObjectKind, ObjectRef, PinnedName,
     Propagation, RestartKind, ScaleKind, ScaleOutcome, SecretKeyChange, SecretKeyState,
     UndoOutcome, WriteOutcome, FIELD_MANAGER, MAX_DELETE_OBJECTS, RESTARTED_AT_ANNOTATION,
     SECRET_HIDDEN,

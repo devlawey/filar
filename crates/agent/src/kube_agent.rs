@@ -1959,7 +1959,9 @@ mod tests {
         ) -> Result<Vec<filar_transport::DeletedObject>> {
             let (variant, names) = match target {
                 filar_transport::DeleteTarget::Name(name) => ("name", vec![name.clone()]),
-                filar_transport::DeleteTarget::Names(names) => ("names", names.clone()),
+                filar_transport::DeleteTarget::Names(names) => {
+                    ("names", names.iter().map(|n| n.name.clone()).collect())
+                }
                 filar_transport::DeleteTarget::Selector { .. } => {
                     ("selector", vec!["web-1".into(), "web-2".into()])
                 }
@@ -1971,6 +1973,8 @@ mod tests {
             Ok(names
                 .into_iter()
                 .map(|name| filar_transport::DeletedObject {
+                    // The API answers the object, UID included (#659).
+                    live: Some(serde_json::json!({"metadata": {"name": name, "uid": format!("uid-{name}")}})),
                     object: filar_transport::ObjectRef {
                         api_version: "v1".into(),
                         kind: kind.kind.clone(),
@@ -1985,7 +1989,6 @@ mod tests {
                     } else {
                         filar_transport::DeleteOutcome::Deleted
                     },
-                    live: None,
                 })
                 .collect())
         }

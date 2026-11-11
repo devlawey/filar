@@ -12,7 +12,7 @@ use std::time::Duration;
 use filar_core::KubeCluster;
 use filar_transport::{
     ApplyAction, ClusterWriteApi, DeleteOptions, DeleteOutcome, DeleteTarget, KubeClusterApi,
-    ObjectKind, RestartKind, ScaleKind,
+    ObjectKind, PinnedName, RestartKind, ScaleKind,
 };
 use kube::config::Kubeconfig;
 
@@ -94,7 +94,7 @@ async fn delete_workload(api: &KubeClusterApi) -> Vec<DeleteOutcome> {
             .delete(
                 &kind,
                 Some("shop"),
-                &DeleteTarget::Names(vec!["filar-write-test".into()]),
+                &DeleteTarget::Names(vec![PinnedName::unpinned("filar-write-test")]),
                 &DeleteOptions::default(),
                 false,
             )
@@ -216,4 +216,59 @@ async fn scenario(api: Arc<KubeClusterApi>) {
             DeleteOutcome::Deleted | DeleteOutcome::Pending
         ));
     }
+}
+
+const PINNED: &str = r#"
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: filar-pinned-test}
+data: {k: v}
+"#;
+
+#[tokio::test]
+#[ignore = "needs docker/k8s cluster"]
+async fn a_pinned_delete_leaves_an_object_recreated_since_the_dry_run() {
+    let api = KubeClusterApi::connect(&admin_target()).await.unwrap();
+    let kind = ObjectKind {
+        api_version: Some("v1".into()),
+        kind: "ConfigMap".into(),
+    };
+    let name = DeleteTarget::Names(vec![PinnedName::unpinned("filar-pinned-test")]);
+    api.delete(&kind, Some("shop"), &name, &DeleteOptions::default(), false)
+        .await
+        .unwrap();
+    api.apply(PINNED, Some("shop"), false).await.unwrap();
+    let dry = api
+        .delete(&kind, Some("shop"), &name, &DeleteOptions::default(), true)
+        .await
+        .unwrap();
+    let pinned = DeleteTarget::Names(vec![PinnedName {
+        name: "filar-pinned-test".into(),
+        uid: dry[0].uid().map(str::to_owned),
+    }]);
+    assert!(
+        dry[0].uid().is_some(),
+        "a dry-run delete answers the object"
+    );
+    // Recreated under the same name: a new UID.
+    api.delete(&kind, Some("shop"), &name, &DeleteOptions::default(), false)
+        .await
+        .unwrap();
+    api.apply(PINNED, Some("shop"), false).await.unwrap();
+    let deleted = api
+        .delete(
+            &kind,
+            Some("shop"),
+            &pinned,
+            &DeleteOptions::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted[0].outcome, DeleteOutcome::Recreated);
+    let cleanup = api
+        .delete(&kind, Some("shop"), &name, &DeleteOptions::default(), false)
+        .await
+        .unwrap();
+    assert_eq!(cleanup[0].outcome, DeleteOutcome::Deleted);
 }
