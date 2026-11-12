@@ -311,6 +311,7 @@ mod tests {
     /// Arm a runbook job; its fields carry no meaning for rendering.
     fn arm_runbook(app: &mut App) {
         app.runbook_armed = Some(RunbookArmed {
+            safety: Default::default(),
             session_id: SessionId(0),
             target_dir: std::path::PathBuf::from("/tmp"),
             messages: Vec::new(),

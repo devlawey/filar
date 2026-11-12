@@ -38,6 +38,10 @@ those placeholders.
 Never include passwords, tokens or keys in any form — write <secret> where a value would
 be needed, and refer to credentials as something the operator obtains separately.
 Do not speculate or add steps that are not in the transcript.
+Some commands in the transcript are followed by a safety rating from a separate scorer, such
+as `· safety 34% ⛔ danger` (100% means completely safe). Keep that rating next to the same
+command in its step, exactly as written. Never add a rating to a command that has none in
+the transcript, and never change one.
 Write in the language the session is conducted in.";
 
 /// Appended to [`RUNBOOK_SYSTEM_PROMPT`] when the session was a fleet

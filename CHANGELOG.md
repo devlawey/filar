@@ -13,6 +13,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Added
 
+- The `Ctrl+S` export, the Explain-mode transcript and the runbook carry each rated command's safety rating after it — `**$ rm -rf /tmp/x** · safety 12% ⛔ danger *(denied)*`, `~62%` when the scorer is unsure, `⚠ warn` / `⛔ danger` by the configured thresholds, `· safety: unavailable` / `· safety: not rated yet` — and the export header names the scorer and its thresholds; commands folded by history compaction keep their ratings, unrated commands read as before ([#663](https://github.com/devlawey/filar/issues/663)).
 - The TUI confirmation dialog scrolls when its text does not fit — a long explanation or a cluster write's dry-run diff: ↑/↓ by row, PgUp/PgDn by page, Home/End; a `rows N–M of K · ↓ X more` line shows what is hidden, while the target header, audit verdict, safety rating, destructive warning, command and buttons stay in place and Approve/Deny work at any scroll; a command cut to fit is repeated whole at the end; an open side panel does not take these keys; the debug-container confirmation (Ctrl+B) scrolls the same way with its `y`/`n` line kept at the bottom; with nothing to scroll PgUp/PgDn move the chat as before ([#658](https://github.com/devlawey/filar/issues/658)).
 
 ### Changed

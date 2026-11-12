@@ -330,6 +330,32 @@ impl SafetyScore {
         }
     }
 
+    /// The rating as written after a command in the session export and the
+    /// runbook transcript (#663): `· safety 88%`, `· safety 34% ⛔ danger`,
+    /// `· safety: unavailable`, `· safety: not rated yet`.
+    pub fn export_note(&self, thresholds: (u8, u8)) -> String {
+        match self {
+            SafetyScore::Pending => "· safety: not rated yet".to_string(),
+            SafetyScore::Unavailable { .. } => "· safety: unavailable".to_string(),
+            SafetyScore::Ready { .. } => {
+                let marker = match self.level(thresholds) {
+                    SafetyLevel::Danger => " ⛔ danger",
+                    SafetyLevel::Warn => " ⚠ warn",
+                    SafetyLevel::Safe | SafetyLevel::Muted => "",
+                };
+                format!("· safety {}{marker}", self.label())
+            }
+        }
+    }
+
+    /// The scorer's model, when the rating came back (ready or unavailable).
+    fn model(&self) -> Option<&str> {
+        match self {
+            SafetyScore::Ready { model, .. } | SafetyScore::Unavailable { model } => Some(model),
+            SafetyScore::Pending => None,
+        }
+    }
+
     /// Level for colouring, given `(warn_below, danger_below)`.
     pub fn level(&self, thresholds: (u8, u8)) -> SafetyLevel {
         match self {
@@ -345,6 +371,41 @@ impl SafetyScore {
             }
             _ => SafetyLevel::Muted,
         }
+    }
+}
+
+/// Safety ratings of the blocks of an exported history (#663), for
+/// [`messages_to_markdown_rated`].
+///
+/// `by_block` is keyed by the index into the exported list — `folded_history`
+/// followed by `messages`, as [`App::full_history`] returns it. Empty (the
+/// default) means the export reads exactly as it did before ratings existed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExportSafety {
+    /// Rating of each rated command block, by index into the exported history.
+    pub by_block: HashMap<usize, SafetyScore>,
+    /// `(warn_below, danger_below)` the levels are read against.
+    pub thresholds: (u8, u8),
+}
+
+impl ExportSafety {
+    /// Header line naming the scorer and its thresholds, so a percentage can
+    /// be read without the config; `None` when no rating came back.
+    fn header(&self) -> Option<String> {
+        let models: std::collections::BTreeSet<&str> = self
+            .by_block
+            .values()
+            .filter_map(SafetyScore::model)
+            .collect();
+        if models.is_empty() {
+            return None;
+        }
+        let models: Vec<&str> = models.into_iter().collect();
+        let (warn_below, danger_below) = self.thresholds;
+        Some(format!(
+            "Safety scorer: {}, warn below {warn_below}%, danger below {danger_below}%",
+            models.join(", ")
+        ))
     }
 }
 
@@ -1038,6 +1099,10 @@ pub struct Session {
     /// command). The command is checked at render time, so a stale index
     /// after the history is replaced shows nothing rather than a wrong badge.
     pub block_proposals: HashMap<usize, (u64, String)>,
+    /// The same links for blocks compaction folded away (#663): index into
+    /// `folded_history` → (`proposal_id`, command). The feed no longer shows
+    /// these blocks, but the export still does, with their ratings.
+    pub folded_block_proposals: HashMap<usize, (u64, String)>,
     /// Safety ratings received in this session (for F1).
     pub risk_ratings: u64,
     /// Log queries per source in this session (#584, for F1).
@@ -1463,6 +1528,7 @@ impl Session {
             pending_proposal_id: None,
             safety_scores: HashMap::new(),
             block_proposals: HashMap::new(),
+            folded_block_proposals: HashMap::new(),
             risk_ratings: 0,
             risk_cost_usd: None,
             log_queries: std::collections::BTreeMap::new(),
@@ -1674,6 +1740,9 @@ pub struct RunbookArmed {
     pub target_dir: std::path::PathBuf,
     /// The same session snapshot the `.md` was written from.
     pub messages: Vec<ChatBlock>,
+    /// Safety ratings of `messages`' command blocks (#663): the transcript
+    /// the model is sent carries them, as the `.md` does.
+    pub safety: ExportSafety,
     /// Session / SSH labels for the transcript header.
     pub session_name: String,
     pub ssh_info: Option<String>,
@@ -2077,14 +2146,29 @@ async fn generate_save_filename(
     name
 }
 
-/// Convert a list of [`ChatBlock`] messages into a Markdown string.
-///
-/// `pub(crate)` because the runbook task (#401) hands the LLM the exact
-/// transcript conversion the `.md` export is written from.
+/// Convert a list of [`ChatBlock`] messages into a Markdown string, without
+/// safety ratings: the shape the tests of the export's layout read.
+#[cfg(test)]
 pub(crate) fn messages_to_markdown(
     messages: &[ChatBlock],
     session_name: &str,
     ssh_info: &Option<String>,
+) -> String {
+    messages_to_markdown_rated(messages, session_name, ssh_info, &ExportSafety::default())
+}
+
+/// Convert a list of [`ChatBlock`] messages into a Markdown string, with each
+/// rated command's safety rating written after it (#663) and the scorer named
+/// in the header. A command without a rating reads exactly as in an unrated
+/// export.
+///
+/// `pub(crate)` because the runbook task (#401) hands the LLM the exact
+/// transcript conversion the `.md` export is written from.
+pub(crate) fn messages_to_markdown_rated(
+    messages: &[ChatBlock],
+    session_name: &str,
+    ssh_info: &Option<String>,
+    safety: &ExportSafety,
 ) -> String {
     let mut md = String::new();
     md.push_str(&format!("# Session: {session_name}\n\n"));
@@ -2095,9 +2179,13 @@ pub(crate) fn messages_to_markdown(
     if let Some(ref info) = ssh_info {
         md.push_str(&format!("Target: {info}\n"));
     }
+    if let Some(line) = safety.header() {
+        md.push_str(&line);
+        md.push('\n');
+    }
     md.push_str("\n---\n\n");
 
-    for block in messages {
+    for (idx, block) in messages.iter().enumerate() {
         match block {
             ChatBlock::User(s) => {
                 md.push_str(&format!("**You:** {s}\n\n"));
@@ -2116,6 +2204,10 @@ pub(crate) fn messages_to_markdown(
                     md.push_str(&format!("> {explanation}\n\n"));
                 }
                 md.push_str(&format!("**$ {command}**"));
+                if let Some(score) = safety.by_block.get(&idx) {
+                    md.push(' ');
+                    md.push_str(&score.export_note(safety.thresholds));
+                }
                 if !*approved {
                     md.push_str(" *(denied)*");
                 }
@@ -2419,18 +2511,27 @@ impl App {
         // context the model carries never costs the user the record of what
         // happened (#379).
         let folded: Vec<_> = self.active_session().messages[..boundary].to_vec();
+        let folded_offset = self.active_session().folded_history.len();
         self.active_session_mut().folded_history.extend(folded);
         self.active_session_mut().messages = compacted;
         self.active_session_mut().pending_compaction = None;
         // Safety badges follow their blocks (#551): the kept tail moves up by
         // the folded head, less the summary that replaces it.
         let shift = before - after;
+        // The folded head keeps its ratings for the export (#663): its blocks
+        // now sit in `folded_history` after the ones folded before.
         let links = std::mem::take(&mut self.active_session_mut().block_proposals);
-        self.active_session_mut().block_proposals = links
+        let (kept, folded_links): (HashMap<_, _>, HashMap<_, _>) =
+            links.into_iter().partition(|(idx, _)| *idx >= boundary);
+        self.active_session_mut().block_proposals = kept
             .into_iter()
-            .filter(|(idx, _)| *idx >= boundary)
             .map(|(idx, link)| (idx - shift, link))
             .collect();
+        self.active_session_mut().folded_block_proposals.extend(
+            folded_links
+                .into_iter()
+                .map(|(idx, link)| (folded_offset + idx, link)),
+        );
         // Log query details likewise (#584): folded blocks lose theirs.
         let details = std::mem::take(&mut self.active_session_mut().log_details);
         self.active_session_mut().log_details = details
@@ -3530,6 +3631,7 @@ impl App {
         // their F1 count: ratings are not saved with a session, so a
         // restored one starts from zero rather than showing the old tab's.
         self.block_proposals.clear();
+        self.folded_block_proposals.clear();
         self.safety_scores.clear();
         self.pending_proposal_id = None;
         self.risk_ratings = 0;
@@ -3947,6 +4049,8 @@ impl App {
         // with a hole in it (#379). Both save paths go through this one
         // accessor so they cannot drift apart.
         let messages = self.full_history();
+        // Ratings travel with the snapshot they index (#663).
+        let safety = self.export_safety();
         let tx = tx.clone();
         // Resolve the export directory: configured `save_dir`, else CWD.
         let base_dir = self.save_dir.clone().unwrap_or_else(|| {
@@ -3991,6 +4095,7 @@ impl App {
                     session_id: self.sessions[self.active].id,
                     target_dir: target_dir.clone(),
                     messages: messages.clone(),
+                    safety: safety.clone(),
                     session_name: session_name.clone(),
                     ssh_info: ssh_info.clone(),
                     profile,
@@ -4024,7 +4129,8 @@ impl App {
 
             let filename =
                 generate_save_filename(&session_name, &ssh_info, &messages, &target_dir).await;
-            let mut md_content = messages_to_markdown(&messages, &session_name, &ssh_info);
+            let mut md_content =
+                messages_to_markdown_rated(&messages, &session_name, &ssh_info, &safety);
             if let Some(section) = &fleet_section {
                 md_content.push_str(section);
             }
@@ -4193,6 +4299,7 @@ impl App {
         // with a hole where the head used to be is worth little, and the
         // transcript must not depend on whether compaction happened (#379).
         let messages = self.full_history();
+        let safety = self.export_safety();
         let session_name = self.sessions[self.active].target_name.clone();
         let ssh_info = self.sessions[self.active].ssh_info.clone();
 
@@ -4237,7 +4344,7 @@ impl App {
                     return;
                 }
             }
-            let md = messages_to_markdown(&messages, &session_name, &ssh_info);
+            let md = messages_to_markdown_rated(&messages, &session_name, &ssh_info, &safety);
             let result = tokio::fs::write(&path, &md).await;
             match result {
                 Ok(()) => {
@@ -6053,6 +6160,34 @@ impl App {
                 self.safety_scores.get(pid)
             }
             _ => None,
+        }
+    }
+
+    /// Safety ratings of the active session's command blocks for an export
+    /// of [`App::full_history`] (#663): folded blocks first, then the feed,
+    /// each checked against its command like [`App::block_safety`], so a stale
+    /// link writes nothing rather than a rating on someone else's command.
+    pub fn export_safety(&self) -> ExportSafety {
+        let s = self.active_session();
+        let offset = s.folded_history.len();
+        let rated =
+            |blocks: &[ChatBlock], idx: usize, (pid, cmd): &(u64, String)| match blocks.get(idx) {
+                Some(ChatBlock::Command { command, .. }) if command == cmd => {
+                    s.safety_scores.get(pid).cloned()
+                }
+                _ => None,
+            };
+        let folded = s
+            .folded_block_proposals
+            .iter()
+            .filter_map(|(idx, link)| Some((*idx, rated(&s.folded_history, *idx, link)?)));
+        let feed = s
+            .block_proposals
+            .iter()
+            .filter_map(|(idx, link)| Some((offset + idx, rated(&s.messages, *idx, link)?)));
+        ExportSafety {
+            by_block: folded.chain(feed).collect(),
+            thresholds: self.risk_thresholds,
         }
     }
 
@@ -16645,6 +16780,7 @@ mod tests {
             .messages
             .push(command_block("rm -rf /", false));
         app.runbook_armed = Some(RunbookArmed {
+            safety: Default::default(),
             session_id: app.sessions[0].id,
             target_dir: std::path::PathBuf::from("exports/local"),
             messages: app.sessions[0].messages.clone(),
@@ -16682,6 +16818,7 @@ mod tests {
             .messages
             .push(command_block("systemctl restart nginx", true));
         app.runbook_armed = Some(RunbookArmed {
+            safety: Default::default(),
             session_id: app.sessions[0].id,
             target_dir: std::path::PathBuf::from("exports/prod-web"),
             messages: app.sessions[0].messages.clone(),
@@ -17970,6 +18107,199 @@ mod tests {
         let badges = app.safety_badges();
         assert_eq!(badges.len(), 1, "{badges:?}");
         assert_eq!(badges.get(&2).map(|b| b.0.as_str()), Some("90%"));
+    }
+
+    // ── Safety ratings in the export (#663) ──────────────────────────
+
+    fn export_command(command: &str, approved: bool) -> ChatBlock {
+        ChatBlock::Command {
+            command: command.into(),
+            explanation: String::new(),
+            output: None,
+            approved,
+            tool: None,
+        }
+    }
+
+    fn ready(pct: u8, confidence: Option<f32>) -> SafetyScore {
+        SafetyScore::Ready {
+            pct,
+            confidence,
+            model: "jev".into(),
+        }
+    }
+
+    fn rated_export(blocks: &[ChatBlock], by_block: Vec<(usize, SafetyScore)>) -> String {
+        let safety = ExportSafety {
+            by_block: by_block.into_iter().collect(),
+            thresholds: (70, 40),
+        };
+        messages_to_markdown_rated(blocks, "test", &None, &safety)
+    }
+
+    #[test]
+    fn the_export_writes_each_rating_after_its_command() {
+        let blocks = vec![
+            export_command("ls", true),
+            export_command("chmod 600 key", true),
+            export_command("rm -rf /tmp/x", false),
+            export_command("uptime", true),
+            export_command("df -h", true),
+            export_command("free -m", true),
+        ];
+        let md = rated_export(
+            &blocks,
+            vec![
+                (0, ready(88, Some(0.9))),
+                (1, ready(55, Some(0.9))),
+                (2, ready(12, Some(0.9))),
+                (3, ready(62, Some(0.3))),
+                (
+                    4,
+                    SafetyScore::Unavailable {
+                        model: "jev".into(),
+                    },
+                ),
+                (5, SafetyScore::Pending),
+            ],
+        );
+        assert!(md.contains("**$ ls** · safety 88%\n"), "{md}");
+        assert!(
+            md.contains("**$ chmod 600 key** · safety 55% ⚠ warn\n"),
+            "{md}"
+        );
+        assert!(
+            md.contains("**$ rm -rf /tmp/x** · safety 12% ⛔ danger *(denied)*\n"),
+            "the rating and the denial stand together: {md}"
+        );
+        assert!(md.contains("**$ uptime** · safety ~62% ⚠ warn\n"), "{md}");
+        assert!(md.contains("**$ df -h** · safety: unavailable\n"), "{md}");
+        assert!(
+            md.contains("**$ free -m** · safety: not rated yet\n"),
+            "{md}"
+        );
+        assert!(
+            md.contains("Safety scorer: jev, warn below 70%, danger below 40%\n"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn an_unrated_command_reads_as_before() {
+        let blocks = vec![
+            ChatBlock::User("check".into()),
+            export_command("ls", true),
+            export_command("rm x", false),
+        ];
+        let rated = rated_export(&blocks, Vec::new());
+        let plain = messages_to_markdown(&blocks, "test", &None);
+        // The date line is the clock's, not the export's.
+        let body = |md: &str| {
+            md.lines()
+                .filter(|l| !l.starts_with("Date: "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(body(&rated), body(&plain));
+        assert!(!rated.contains("Safety scorer"), "no ratings, no header");
+        assert!(!rated.contains("safety"));
+    }
+
+    #[test]
+    fn only_pending_ratings_name_no_scorer() {
+        let md = rated_export(
+            &[export_command("ls", true)],
+            vec![(0, SafetyScore::Pending)],
+        );
+        assert!(!md.contains("Safety scorer"), "{md}");
+        assert!(md.contains("· safety: not rated yet"), "{md}");
+    }
+
+    #[test]
+    fn export_ratings_stay_on_their_commands_through_compaction() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Never);
+        app.risk_scorer_on = true;
+        app.messages.clear();
+        app.messages.push(ChatBlock::User("old".into()));
+        propose(&mut app, 701, "rm -rf /tmp/old", "run_command");
+        finished(&mut app, "rm -rf /tmp/old"); // index 1 — folded away
+        app.messages.push(ChatBlock::User("new".into()));
+        propose(&mut app, 702, "ls", "run_command");
+        finished(&mut app, "ls"); // index 3 — kept
+        scored(&mut app, 701, Some(10));
+        scored(&mut app, 702, Some(90));
+        app.active_session_mut().pending_compaction = Some(2);
+        app.apply_compaction(2, "summary".into());
+        // A second fold puts the folded links after the first ones.
+        app.messages.push(ChatBlock::User("newer".into()));
+        propose(&mut app, 703, "uptime", "run_command");
+        finished(&mut app, "uptime");
+        scored(&mut app, 703, Some(95));
+        let ls_idx = app
+            .messages
+            .iter()
+            .position(|b| matches!(b, ChatBlock::Command { command, .. } if command == "ls"))
+            .unwrap();
+        app.active_session_mut().pending_compaction = Some(ls_idx + 1);
+        app.apply_compaction(ls_idx + 1, "summary 2".into());
+
+        let history = app.full_history();
+        let safety = app.export_safety();
+        assert_eq!(safety.by_block.len(), 3, "{safety:?}");
+        let md = messages_to_markdown_rated(&history, "test", &None, &safety);
+        assert!(
+            md.contains("**$ rm -rf /tmp/old** · safety 10% ⛔ danger"),
+            "{md}"
+        );
+        assert!(md.contains("**$ ls** · safety 90%\n"), "{md}");
+        assert!(md.contains("**$ uptime** · safety 95%\n"), "{md}");
+        // Every rating sits on the command it was given for, nowhere else.
+        for (idx, score) in &safety.by_block {
+            let ChatBlock::Command { command, .. } = &history[*idx] else {
+                panic!("rating on a non-command block {idx}");
+            };
+            let expected = match command.as_str() {
+                "rm -rf /tmp/old" => 10,
+                "ls" => 90,
+                "uptime" => 95,
+                other => panic!("unexpected {other}"),
+            };
+            assert!(matches!(score, SafetyScore::Ready { pct, .. } if *pct == expected));
+        }
+    }
+
+    #[test]
+    fn a_stale_link_writes_no_rating_in_the_export() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Never);
+        app.risk_scorer_on = true;
+        propose(&mut app, 711, "ls", "run_command");
+        finished(&mut app, "ls");
+        scored(&mut app, 711, Some(90));
+        let idx = app.messages.len() - 1;
+        app.messages[idx] = export_command("something else", true);
+        assert!(app.export_safety().by_block.is_empty());
+    }
+
+    #[test]
+    fn a_restored_session_exports_without_folded_ratings() {
+        let mut app = App::new("local".into(), CommandConfirmMode::Never);
+        app.risk_scorer_on = true;
+        app.messages.clear();
+        app.messages.push(ChatBlock::User("old".into()));
+        propose(&mut app, 721, "ls", "run_command");
+        finished(&mut app, "ls");
+        scored(&mut app, 721, Some(90));
+        app.messages.push(ChatBlock::User("new".into()));
+        app.active_session_mut().pending_compaction = Some(2);
+        app.apply_compaction(2, "summary".into());
+        assert_eq!(app.folded_block_proposals.len(), 1);
+        // The saved file holds the same folded `ls`: only a cleared link
+        // keeps the old rating off it.
+        let saved = crate::runner::session_snapshot(&app, "test", "1", "t");
+        app.apply_loaded_session(saved);
+        assert!(!app.active_session().folded_history.is_empty());
+        assert!(app.folded_block_proposals.is_empty());
+        assert!(app.export_safety().by_block.is_empty());
     }
 
     #[test]

@@ -31,7 +31,7 @@ use filar_transport::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::app::{messages_to_markdown, App, AppMode, RunbookState, SaveProgress, SessionId};
+use crate::app::{messages_to_markdown_rated, App, AppMode, RunbookState, SaveProgress, SessionId};
 use crate::confirmer::TuiConfirmer;
 use crate::event::TuiEvent;
 use crate::path_picker::{self, PathEntry};
@@ -4152,7 +4152,12 @@ fn spawn_runbook_generation(
     };
 
     let (path, display) = runbook_path(&armed.target_dir, markdown_name);
-    let transcript = messages_to_markdown(&armed.messages, &armed.session_name, &armed.ssh_info);
+    let transcript = messages_to_markdown_rated(
+        &armed.messages,
+        &armed.session_name,
+        &armed.ssh_info,
+        &armed.safety,
+    );
     let token = CancellationToken::new();
     app.runbook_cancel = Some(token.clone());
     app.runbook_state = Some(RunbookState::Generating);
@@ -6400,6 +6405,7 @@ mod tests {
             tool: None,
         });
         app.runbook_armed = Some(crate::app::RunbookArmed {
+            safety: Default::default(),
             session_id: app.sessions[0].id,
             target_dir: dir.clone(),
             messages: app.sessions[0].messages.clone(),
@@ -6453,6 +6459,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_runbook_model_is_sent_the_commands_with_their_ratings() {
+        // #663: the transcript the runbook is made from is the rated export.
+        let dir = runbook_temp_dir("rated");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let provider = Arc::new(filar_core::StaticSecretProvider::new());
+        let scripted = Arc::new(ScriptedLlm::answering(&long_runbook("")));
+        let llm: Arc<dyn LlmClient> = Arc::clone(&scripted) as Arc<dyn LlmClient>;
+        let config = test_tui_config(llm, Arc::clone(&provider));
+        let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
+        app.profiles = config.profiles.clone();
+        app.push_message(ChatBlock::Command {
+            command: "rm -rf /var/cache/nginx".into(),
+            explanation: "clear the cache".into(),
+            output: Some("".into()),
+            approved: true,
+            tool: None,
+        });
+        app.push_message(ChatBlock::Command {
+            command: "systemctl status nginx".into(),
+            explanation: "check the service".into(),
+            output: Some("active (running)".into()),
+            approved: true,
+            tool: None,
+        });
+        // Only the first command was rated.
+        let rm_idx = app.sessions[0]
+            .messages
+            .iter()
+            .position(
+                |b| matches!(b, ChatBlock::Command { command, .. } if command.starts_with("rm")),
+            )
+            .expect("the command block");
+        app.sessions[0].safety_scores.insert(
+            41,
+            crate::app::SafetyScore::Ready {
+                pct: 34,
+                confidence: Some(0.9),
+                model: "jev".into(),
+            },
+        );
+        app.sessions[0]
+            .block_proposals
+            .insert(rm_idx, (41, "rm -rf /var/cache/nginx".into()));
+        app.runbook_armed = Some(crate::app::RunbookArmed {
+            safety: app.export_safety(),
+            session_id: app.sessions[0].id,
+            target_dir: dir.clone(),
+            messages: app.full_history(),
+            session_name: "prod-web".into(),
+            ssh_info: None,
+            profile: "glm".into(),
+            fleet: None,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        apply_save_progress(
+            &mut app,
+            SaveProgress::Done("prod-web/db-1.md".into()),
+            &config.llm_factory,
+            &config.secret_provider,
+            &tx,
+        );
+        let report = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the runbook must report back")
+            .expect("channel is open");
+        assert!(
+            matches!(report, SaveProgress::RunbookDone { .. }),
+            "{report:?}"
+        );
+
+        let sent = scripted.captured_prompt();
+        assert!(
+            sent.contains("**$ rm -rf /var/cache/nginx** · safety 34% ⛔ danger"),
+            "the rated command carries its rating: {sent}"
+        );
+        assert!(
+            sent.contains("**$ systemctl status nginx**\n"),
+            "an unrated command carries none: {sent}"
+        );
+        assert!(sent.contains("Safety scorer: jev"), "{sent}");
+        assert!(
+            sent.contains("Keep that rating next to the same"),
+            "the model is told to keep the ratings"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
     async fn an_unanswered_question_holds_the_runbook_until_y() {
         let dir = runbook_temp_dir("asked");
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -6471,6 +6568,7 @@ mod tests {
             tool: None,
         });
         app.runbook_offer = Some(crate::app::RunbookArmed {
+            safety: Default::default(),
             session_id: app.sessions[0].id,
             target_dir: dir.clone(),
             messages: app.sessions[0].messages.clone(),
@@ -6521,6 +6619,7 @@ mod tests {
     async fn a_failed_export_drops_the_armed_runbook() {
         let mut app = App::new("prod-web".into(), CommandConfirmMode::Always);
         app.runbook_armed = Some(crate::app::RunbookArmed {
+            safety: Default::default(),
             session_id: app.sessions[0].id,
             target_dir: std::path::PathBuf::from("exports/prod-web"),
             messages: app.sessions[0].messages.clone(),
@@ -6580,6 +6679,7 @@ mod tests {
             tool: None,
         });
         app.runbook_armed = Some(crate::app::RunbookArmed {
+            safety: Default::default(),
             session_id: app.sessions[0].id,
             target_dir: dir.clone(),
             messages: app.sessions[0].messages.clone(),
@@ -6668,6 +6768,7 @@ mod tests {
             tool: None,
         });
         app.runbook_armed = Some(crate::app::RunbookArmed {
+            safety: Default::default(),
             session_id: app.sessions[0].id,
             target_dir: dir.clone(),
             messages: app.sessions[0].messages.clone(),
