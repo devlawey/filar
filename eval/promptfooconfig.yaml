@@ -120,11 +120,23 @@ tools: &filar_tools
             description: "A brief explanation of what this command does and why."
         required: []
 
-# Providers — ten models via OpenRouter. The key is read automatically from
+# Providers — the free smoke router plus ten models via OpenRouter. The key is read automatically from
 # the OPENROUTER_API_KEY environment variable (methodology §6: no secrets in
 # the repo). To change/add models, edit the `id:` lines below — the model id
 # is the OpenRouter slug (see https://openrouter.ai/models).
 providers:
+  # Smoke baseline (CI eval-smoke): OpenRouter's Free Models Router. It picks a
+  # free model at random per request, among those that support what the
+  # request needs (tool calling here) — no cost, but the model can differ from
+  # run to run. max_tokens is generous because a reasoning model may be picked
+  # and must not spend its whole budget before the answer (#665).
+  - id: openrouter:openrouter/free
+    label: Free router (OpenRouter)
+    config:
+      temperature: 0
+      max_tokens: 4096
+      timeoutMs: 300000
+      tools: *filar_tools
   - id: openrouter:z-ai/glm-5.2
     label: GLM-5.2 (OpenRouter)
     config:

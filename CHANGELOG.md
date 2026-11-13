@@ -18,6 +18,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Changed
 
+- The eval-smoke CI baseline is now OpenRouter's Free Models Router (`openrouter/free`) instead of GLM-5.2, at no cost; it picks a tool-calling free model per request, so the model behind a run can vary. GLM-5.2 stays in the comparison set.
 - The eval `llm-rubric` judge is now Jev (`typesafe/jev-1.14`) over the OpenRouter Decisions API (`eval/providers/jev-grader.js`) instead of `mistralai/mistral-large`, whose reasoning tokens began exhausting its 512-token limit and failing correct answers with `No output` / `Could not extract JSON` ([#665](https://github.com/devlawey/filar/issues/665)).
 - After `k8s_scale` and `k8s_rollout` the rollout is followed like `kubectl rollout status`: the workload is read by name (a `get` right is enough, no `list`, no paging), and the rollout counts as complete only once the controller has observed the new generation and no running (non-terminating) pod of an old revision is left — a missing updated count reads as zero; the status line says what is still awaited. Engine: `ClusterApi::get_workload` (with a default implementation) and `WorkloadInfo::{generation, observed_generation, replicas}` ([#657](https://github.com/devlawey/filar/issues/657)).
 
