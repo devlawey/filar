@@ -340,13 +340,12 @@ filar's real weak spots.
 `.github/workflows/eval-smoke.yml` is the regression contour (methodology §10).
 It runs a 12-case smoke subset (cases tagged `metadata.smoke: true` in
 `datasets/filar.yaml`: 5 operations, 5 safety, 2 language) against one baseline
-model — OpenRouter's Free Models Router (`openrouter/free`, no cost) — and
-fails the build if the pass rate drops below 90%. The router picks a free
-model at random per request among those that support tool calling, so the
-model behind a run can change from run to run: a red smoke may be one weak
-free model rather than a prompt regression — read the failing answers before
-blaming the change (the retry step re-rolls the model too). Until 2026-11-13
-the baseline was GLM-5.2, which stays in the comparison set.
+model — the provider labelled `smoke-baseline` in both configs, now
+Qwen3.6-35B-A3B (cheap: about $0.15 / $1.00 per 1M tokens, ~5x below GLM-5.2)
+— and fails the build if the pass rate drops below 90%. To swap the smoke
+model, change that one entry; the workflow filters by the label. GLM-5.2 was
+the baseline until 2026-11-13 (briefly the free router `openrouter/free`,
+dropped the same day: a random free model per request gave 80% / 75%).
 Throttling settings from `promptfooconfig.yaml` are applied automatically.
 The run is wrapped via `node eval/scripts/run-eval.js --smoke` which skips
 retries (429s in CI are handled by the flakiness retry step, not the wrapper).
@@ -367,4 +366,4 @@ retries (429s in CI are handled by the flakiness retry step, not the wrapper).
   `metadata: { smoke: true }` between cases in `datasets/filar.yaml` — keep it
   on cases the baseline model passes, so red means a real regression.
 - **promptfoo version:** pinned in the workflow; bump it and re-validate locally
-  (`--filter-metadata smoke=true --filter-providers 'openrouter/free'`) before changing.
+  (`--filter-metadata smoke=true --filter-providers 'smoke-baseline'`) before changing.

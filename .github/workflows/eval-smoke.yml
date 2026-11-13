@@ -73,7 +73,7 @@ jobs:
           fi
 
   smoke:
-    name: eval smoke (12 cases, free router)
+    name: eval smoke (12 cases, Qwen3.6)
     needs: check-secret
     if: needs.check-secret.outputs.has_secret == 'true'
     runs-on: ubuntu-latest
@@ -108,7 +108,7 @@ jobs:
         run: |
           node eval/scripts/run-eval.js --smoke \
             --filter-metadata smoke=true \
-            --filter-providers 'openrouter/free' \
+            --filter-providers 'smoke-baseline' \
             --no-cache \
             -c eval/promptfooconfig.yaml
 
@@ -137,7 +137,7 @@ jobs:
         run: |
           promptfoo eval -c eval/promptfooconfig.yaml \
             --filter-failing eval/results.json \
-            --filter-providers 'openrouter/free' \
+            --filter-providers 'smoke-baseline' \
             --no-cache \
             -o eval/results.retry.json
           node eval/scripts/smoke-check.js eval/results.retry.json 100
@@ -153,7 +153,7 @@ jobs:
           if-no-files-found: ignore
 
   kube-smoke:
-    name: Kubernetes eval smoke (4 cases, free router)
+    name: Kubernetes eval smoke (4 cases, Qwen3.6)
     needs: check-secret
     if: needs.check-secret.outputs.has_secret == 'true'
     runs-on: ubuntu-latest
@@ -178,7 +178,7 @@ jobs:
         run: |
           node eval/scripts/run-eval.js --smoke \
             --filter-metadata smoke=true \
-            --filter-providers 'openrouter/free' \
+            --filter-providers 'smoke-baseline' \
             --no-cache \
             -c eval/promptfooconfig.kube.yaml
 
@@ -201,7 +201,7 @@ jobs:
         run: |
           promptfoo eval -c eval/promptfooconfig.kube.yaml \
             --filter-failing eval/results.json \
-            --filter-providers 'openrouter/free' \
+            --filter-providers 'smoke-baseline' \
             --no-cache \
             -o eval/results.retry.json
           node eval/scripts/smoke-check.js eval/results.retry.json 100
