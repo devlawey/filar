@@ -533,6 +533,12 @@ writing it, through `filar_core::redact_secrets(text, &provider)` — a
 the call carries no tool definitions: the model writing a procedure must not
 be able to run anything, the same rule as the summary writer.
 
+A command line in the transcript may carry a safety rating after it, as the
+TUI export writes it (`**$ rm -rf /tmp/x** · safety 12% ⛔ danger`, #663).
+The runbook prompt keeps such a rating next to the same command in its step
+and never adds one to a command that has none; a transcript without ratings
+reads as before.
+
 ### `Session::folded_history` — where the folded turns live
 
 ```rust

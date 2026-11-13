@@ -227,6 +227,7 @@
 - [ ] F1 → Usage → строка `Risk scorer: N ratings $…`
 - [ ] Неверный ключ или адрес → `unavailable`, команды выполняются; нет ключа → при старте `Safety rating off: …`
 - [ ] Без секции `[risk_scorer]` — ни строки в окне, ни бейджей
+- [ ] Одобрить безопасную команду и команду в зоне warn, отклонить команду в зоне danger → `Ctrl+S` → `y`: в `.md` под `Target:` строка `Safety scorer: …`, у команд `· safety N%`, `⚠ warn`, `⛔ danger *(denied)*`; в `*.runbook.md` шаги несут те же проценты; без `[risk_scorer]` в экспорте нет ни строки `Safety scorer`, ни `· safety`
 - [ ] Лаунчер: **Command safety score** → Decisions API, модель `typesafe/jev-1.14`, ключ → Launch → в TUI у команд агента есть оценки; в `config.toml` секция `[risk_scorer]` без ключа; повторный запуск лаунчера — настройки на месте, у ключа «saved»
 - [ ] Лаунчер: снять галочку → Launch → оценок нет, секции `[risk_scorer]` в `config.toml` нет; **No key** → `key_env = ""`; пустая модель или адрес без `http` → ошибка, окно не закрывается
 
