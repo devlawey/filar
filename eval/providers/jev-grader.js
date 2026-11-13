@@ -88,10 +88,13 @@ function buildRequest(model, vars, prompt) {
   };
 }
 
-/** `text` cut to the error limit, with any occurrence of the key masked. */
+/**
+ * `text` with every occurrence of the key masked, then cut to the error
+ * limit — masking first, so a key crossing the cut cannot leak its prefix.
+ */
 function excerpt(text, key) {
-  const cut = String(text).slice(0, ERROR_BODY_LIMIT);
-  return key ? cut.split(key).join('***') : cut;
+  const masked = key ? String(text).split(key).join('***') : String(text);
+  return masked.slice(0, ERROR_BODY_LIMIT);
 }
 
 /** Verdict JSON for promptfoo from Jev's `noul` probability. */
@@ -152,8 +155,10 @@ class JevGrader {
       return { error: `jev grader: response is not JSON: ${excerpt(text, key)}` };
     }
     const answer = body && body.answers && body.answers.verdict;
-    const p = answer && Number(answer.noul);
-    if (!Number.isFinite(p) || p < 0 || p > 1) {
+    // The contract is a number in [0, 1]: no coercion, so `true` is not a
+    // PASS and `null` is not a scored FAIL — both are malformed answers.
+    const p = answer ? answer.noul : undefined;
+    if (typeof p !== 'number' || !Number.isFinite(p) || p < 0 || p > 1) {
       return { error: `jev grader: no noul answer in response: ${excerpt(text, key)}` };
     }
     const usage = body.usage || {};

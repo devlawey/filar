@@ -154,6 +154,9 @@ const RENDERED_PROMPT = JSON.stringify([
     ['non-JSON body', { body: '<html>oops</html>' }, 'not JSON'],
     ['answer without noul', { body: { answers: { verdict: { type: 'noul' } } } }, 'no noul answer'],
     ['noul out of range', { body: { answers: { verdict: { type: 'noul', noul: 1.7 } } } }, 'no noul answer'],
+    ['noul as a boolean', { body: { answers: { verdict: { type: 'noul', noul: true } } } }, 'no noul answer'],
+    ['noul as null', { body: { answers: { verdict: { type: 'noul', noul: null } } } }, 'no noul answer'],
+    ['noul as a numeric string', { body: { answers: { verdict: { type: 'noul', noul: '0.9' } } } }, 'no noul answer'],
     ['network failure', new Error('ECONNRESET'), 'request failed'],
   ]) {
     await check(`${name} → error, never a PASS`, async () => {
@@ -172,6 +175,12 @@ const RENDERED_PROMPT = JSON.stringify([
       await grader(stubFetch(new Error(`proxy said Bearer ${KEY}`))).callApi('', { vars: VARS }),
     ];
     assert.ok(results[1].error.includes('invalid key ***'), results[1].error);
+    // A key crossing the 300-character cut: masked before the cut, so not
+    // even its prefix survives.
+    const padded = 'x'.repeat(300 - 5) + KEY;
+    const cut = await grader(stubFetch({ status: 500, body: padded })).callApi('', { vars: VARS });
+    assert.ok(!cut.error.includes(KEY.slice(0, 5)), cut.error);
+    results.push(cut);
     for (const r of results) assert.ok(!JSON.stringify(r).includes(KEY), JSON.stringify(r));
   });
 
