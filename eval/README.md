@@ -20,6 +20,9 @@ eval/
 │   └── agent-chat.json    # chat prompt: system (file:// agent-system.txt) + user {{question}}
 ├── asserts.js             # filar-specific assert helpers
 ├── asserts.test.js        # plain-Node unit tests for asserts.js
+├── providers/
+│   ├── jev-grader.js      # llm-rubric judge: Jev over the OpenRouter Decisions API
+│   └── jev-grader.test.js # plain-Node unit tests for the judge (stub fetch)
 ├── scripts/
 │   ├── run-eval.js        # retry wrapper around `promptfoo eval`
 │   ├── run-eval.test.js   # wrapper contract tests (stub binary, no network)
@@ -114,10 +117,10 @@ Use `--smoke` to skip retries (CI mode — fails immediately on low pass rate).
 
 OpenRouter pricing varies widely. A full 10-model × 100-case run costs roughly
 **$0.20–$4.00** depending on model mix (free models cost $0; frontier models
-like GPT-5.6-SOL are the most expensive). The judge (`mistralai/mistral-large`)
-adds roughly $0.05–$0.15 per run (it scales with the rubric buckets). Budget
-~$4 for a complete rerun, ~$6 if you also pay for a frontier model judge call
-on every B/C case.
+like GPT-5.6-SOL are the most expensive). The judge (Jev) is billed by input
+tokens only — a few hundred per rubric — so it adds cents per run. Budget ~$4
+for a complete rerun, ~$6 if you also pay for a frontier model judge call on
+every B/C case.
 
 ## Models (changing them)
 
@@ -161,6 +164,30 @@ providers:
 model — `defaultTest.options.provider` in `promptfooconfig.yaml`, a different
 family from the compared models (methodology §7.3).
 
+### The judge: Jev (`eval/providers/jev-grader.js`)
+
+The judge is **Jev** (`typesafe/jev-1.14`), a decision model, reached over the
+OpenRouter Decisions API (`POST https://openrouter.ai/api/alpha/decisions`)
+with the same `OPENROUTER_API_KEY` — the API filar's risk scorer already uses.
+For each rubric the provider asks Jev one `noul` (yes/no) question: *does the
+answer satisfy this rubric?* The state is the user's request plus the agent's
+answer (prose and tool calls as JSON); the instructions are the rubric. Jev
+returns a probability `p`; the verdict is `pass = p >= 0.5`, `score = p`, and
+the reason reads `jev typesafe/jev-1.14: p(pass)=0.93`. Jev does not explain
+itself, so a failing rubric shows a probability, not a sentence.
+
+Why not a chat judge: on 2026-11-12 `mistralai/mistral-large` (the previous
+judge) started emitting reasoning tokens on OpenRouter and spent its whole
+512-token budget on them, so three of the four smoke failures were the judge
+answering `No output` / `Could not extract JSON` on correct answers (#665).
+A decision model has no reasoning to run out of.
+
+- Model: `JEV_GRADER_MODEL` (env) overrides the default `typesafe/jev-1.14`.
+- A failed call (no key, HTTP error, timeout, no `noul` in the answer) is an
+  error — the rubric fails with that reason; it never passes silently. The key
+  never appears in a verdict or an error (masked if a server echoes it).
+
+
 The helpers tolerate a plain string (text-only) and the common
 OpenAI-compatible response shapes. If your provider exposes tool calls in a
 different shape, extend `extractToolCalls` in `asserts.js`.
@@ -170,6 +197,7 @@ Verify the assert logic without a provider (Node 18+):
 ```bash
 node eval/asserts.test.js
 node eval/scripts/run-eval.test.js
+node eval/providers/jev-grader.test.js
 ```
 
 The first checks the DoD directly: a command in prose => FAIL, a correct tool
@@ -177,7 +205,9 @@ call => PASS, and the safety-inversion behaviour. The second pins the contract
 between the wrapper and the promptfoo CLI — it runs the wrapper against a stub
 binary and asserts the `eval` subcommand is passed, which is exactly what
 regressed in #369 and silently disabled the smoke gate for six weeks. Both run
-in CI (`eval smoke` → `eval script unit tests`) without a provider key.
+in CI (`eval smoke` → `eval script unit tests`) without a provider key, as
+does the third: the judge's request, verdict and error handling against a stub
+`fetch`.
 
 ## System prompt sync
 
@@ -201,6 +231,9 @@ user turn `{{question}}` from each test case.
   promptfoo report includes cost (unlike the earlier no-gateway note).
 - **Tool call, not text.** Asserts inspect tool-call structure (filar
   adaptation called out in the issue).
+- **A decision model as the judge.** §7.3 shows a chat model; filar's judge is
+  Jev over the Decisions API (a custom promptfoo provider), still from outside
+  the compared families (#665).
 - **Tools live in `config.tools`.** promptfoo's OpenRouter provider does not
   forward the top-level `tools` key, so the schema is attached to each
   provider's `config.tools` via the `&filar_tools` YAML anchor.

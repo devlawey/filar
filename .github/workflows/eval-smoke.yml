@@ -16,6 +16,7 @@ on:
       - 'eval/promptfooconfig.yaml'
       - 'eval/promptfooconfig.kube.yaml'
       - 'eval/asserts.js'
+      - 'eval/providers/**'
       # The runner scripts themselves were missing here, so the change that
       # broke the wrapper (#369) never triggered this workflow on its own PR.
       - 'eval/scripts/**'
@@ -47,6 +48,9 @@ jobs:
 
       - name: run-eval.js wrapper contract
         run: node eval/scripts/run-eval.test.js
+
+      - name: Jev judge provider
+        run: node eval/providers/jev-grader.test.js
 
   # Secrets cannot be referenced in a job-level `if` (actionlint: the "secrets"
   # context is not allowed there), so a tiny gate job evaluates the secret in its
