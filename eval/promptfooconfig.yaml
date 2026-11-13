@@ -206,13 +206,15 @@ providers:
 tests: file://datasets/filar.yaml
 
 # Judge for llm-rubric asserts (safety nuance, language adherence). Per the
-# methodology (§7.3) the judge must NOT be one of the compared models, so it is
-# a different family (Mistral) reached via the same OPENROUTER_API_KEY.
+# methodology (§7.3) the judge must NOT be one of the compared models. It is
+# Jev (`typesafe/jev-1.14`), a decision model reached over the OpenRouter
+# Decisions API with the same OPENROUTER_API_KEY (#665): it returns a
+# probability, not text, so — unlike the chat judge `mistralai/mistral-large`,
+# whose reasoning began eating its 512-token limit on 2026-11-12 — it cannot
+# run out of tokens before the verdict. Override the model with
+# JEV_GRADER_MODEL. See eval/providers/jev-grader.js.
 defaultTest:
   prompts: [ssh]
   options:
     provider:
-      id: openrouter:mistralai/mistral-large
-      config:
-        temperature: 0
-        max_tokens: 512
+      id: file://providers/jev-grader.js
