@@ -176,6 +176,9 @@ pub struct ReplayRun {
     pub target: String,
     /// The tab's confirmation mode when it started.
     pub mode: CommandConfirmMode,
+    /// The host the replay runs on (`None`: local); a step is sent only
+    /// while the tab is still on it (review).
+    pub host: Option<String>,
 }
 
 /// The operator's answer in the step window.
@@ -465,6 +468,7 @@ impl App {
                 window_open: false,
                 target,
                 mode,
+                host: self.ssh_info.clone(),
             },
         );
         self.begin_replay_step();
@@ -545,8 +549,43 @@ impl App {
         self.push_message(ChatBlock::System(note));
     }
 
+    /// Why the next step cannot go out on this tab now, if it cannot: the
+    /// tab is connecting, or it is on another host than the replay began on.
+    /// The bool says whether the replay has to stop.
+    fn replay_target_problem(&self) -> Option<(bool, String)> {
+        let run = self.active_replay()?;
+        let sid = self.sessions[self.active].id;
+        if run.host != self.ssh_info {
+            let now = self.ssh_info.as_deref().unwrap_or("local");
+            return Some((
+                true,
+                format!(
+                    "The tab is on {now} now, not on {} where the replay began — the replay stops. Start it again from the picker to run it here.",
+                    run.host.as_deref().unwrap_or("local")
+                ),
+            ));
+        }
+        if self.ctrl_o_pending_session_id == Some(sid) || self.pending_ssh.is_some() {
+            return Some((
+                false,
+                "The tab is connecting — continue once it is connected.".into(),
+            ));
+        }
+        None
+    }
+
     /// The operator's decision in the step window.
     pub fn replay_decide(&mut self, decision: ReplayDecision) {
+        let advances = !matches!(decision, ReplayDecision::Hide | ReplayDecision::Stop);
+        if advances {
+            if let Some((stop, note)) = self.replay_target_problem() {
+                self.push_message(ChatBlock::System(note));
+                if stop {
+                    self.finish_replay(true);
+                }
+                return;
+            }
+        }
         let sid = self.sessions[self.active].id;
         let Some(run) = self.replay_runs.get_mut(&sid) else {
             return;
@@ -620,9 +659,13 @@ impl App {
     }
 
     /// Whether the step window takes the keys now.
+    /// Only in Normal mode: in the terminal (Ctrl+T) or a dialog the keys
+    /// belong elsewhere, so the window is not drawn either (review).
     pub(crate) fn replay_window_active(&self) -> bool {
-        self.active_replay()
-            .is_some_and(|r| r.window_open && r.phase != ReplayPhase::Running)
+        self.mode == crate::app::AppMode::Normal
+            && self
+                .active_replay()
+                .is_some_and(|r| r.window_open && r.phase != ReplayPhase::Running)
     }
 
     /// Enter on an empty input while a replay waits: show the window again.
@@ -645,15 +688,12 @@ impl App {
             .active_replay()
             .filter(|r| r.phase == ReplayPhase::Running)?;
         let step = run.plan.steps.get(run.current)?;
-        let mut line = format!(
-            "Runbook step {}/{}: {}",
-            step.index,
-            run.plan.steps.len(),
-            step.title
-        );
+        // The rating before the title: a long title cut to fit never hides it.
+        let mut line = format!("Runbook step {}/{}", step.index, run.plan.steps.len());
         if let Some(rating) = &step.original_safety {
             line.push_str(&format!(" · in runbook: {rating}"));
         }
+        line.push_str(&format!(": {}", step.title));
         let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
         let runbook = step
             .command
@@ -1151,7 +1191,10 @@ mod tests {
         let (line, runbook) = app
             .replay_confirm_header("systemctl restart nginx")
             .expect("header during a step");
-        assert!(line.contains("Runbook step 3/3: step 3"), "{line}");
+        assert!(
+            line.starts_with("Runbook step 3/3 · in runbook: safety 34% ⛔ danger: step 3"),
+            "{line}"
+        );
         assert!(line.contains("in runbook: safety 34% ⛔ danger"), "{line}");
         assert_eq!(
             runbook.as_deref(),
@@ -1216,5 +1259,64 @@ mod tests {
                 .and_then(|p| p.notice.as_deref()),
             Some("The plan has no steps.")
         );
+    }
+
+    #[test]
+    fn a_changed_host_stops_the_replay_instead_of_sending_the_next_step() {
+        let mut app = started(CommandConfirmMode::Always);
+        finish_turn(&mut app, "STEP RESULT: passed - ok");
+        app.active_session_mut().ssh_info = Some("root@10.0.0.9:22".into());
+        app.pending_input = None;
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.active_replay().is_none(), "the replay stopped");
+        assert!(app.pending_input.is_none(), "nothing went to the new host");
+        let text: Vec<String> = app
+            .messages
+            .iter()
+            .filter_map(|b| match b {
+                ChatBlock::System(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text.iter()
+                .any(|t| t.contains("root@10.0.0.9:22") && t.contains("replay stops")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn a_connecting_tab_holds_the_next_step() {
+        let mut app = started(CommandConfirmMode::Always);
+        finish_turn(&mut app, "STEP RESULT: passed - ok");
+        app.pending_ssh = Some(("root".into(), "h".into(), 22));
+        app.pending_input = None;
+        app.handle_key(key(KeyCode::Enter));
+        let run = run_of(&app);
+        assert_eq!(run.current, 0, "the step was not decided");
+        assert!(app.pending_input.is_none());
+    }
+
+    #[test]
+    fn ctrl_s_in_the_step_window_is_not_skip() {
+        let mut app = started(CommandConfirmMode::Always);
+        finish_turn(&mut app, "STEP RESULT: passed - ok");
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let run = run_of(&app);
+        assert_eq!(run.current, 0);
+        assert_eq!(
+            run.statuses[0],
+            StepStatus::Running,
+            "the step is still undecided"
+        );
+    }
+
+    #[test]
+    fn the_window_belongs_to_normal_mode_only() {
+        let mut app = started(CommandConfirmMode::Always);
+        finish_turn(&mut app, "STEP RESULT: passed - ok");
+        assert!(app.replay_window_active());
+        app.mode = crate::app::AppMode::Interactive;
+        assert!(!app.replay_window_active(), "the terminal gets its keys");
     }
 }

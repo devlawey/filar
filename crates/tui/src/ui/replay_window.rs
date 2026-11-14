@@ -22,7 +22,9 @@ pub(crate) fn render_replay_window(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let width = MAX_WIDTH.min(area.width.saturating_sub(4)).max(24);
-    let lines = window_lines(app, run);
+    // Inside the frame, with a row to spare above and below it.
+    let room = area.height.saturating_sub(4).max(3) as usize;
+    let lines = window_lines(app, run, room);
     let inner_w = width.saturating_sub(2) as usize;
     let rows: usize = lines
         .iter()
@@ -55,18 +57,37 @@ pub(crate) fn render_replay_window(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// The checklist, the current step's state and the keys.
-pub(crate) fn window_lines(app: &App, run: &ReplayRun) -> Vec<Line<'static>> {
+/// The checklist, the current step's state and the keys, in at most `room`
+/// rows: the current step and the keys always fit, and a checklist longer
+/// than the rest of the room shows the steps around the current one (review).
+pub(crate) fn window_lines(app: &App, run: &ReplayRun, room: usize) -> Vec<Line<'static>> {
     let muted = app.theme.muted();
     let bold = Style::default()
         .fg(app.theme.fg)
         .add_modifier(Modifier::BOLD);
+    let mut tail = tail_lines(app, run);
     let mut out = vec![Line::from(vec![
         Span::styled(run.name.clone(), bold),
         Span::styled(format!("  · {}", run.target), muted),
     ])];
-    for (i, step) in run.plan.steps.iter().enumerate() {
-        let status = run.statuses[i];
+    let total = run.plan.steps.len();
+    let avail = room.saturating_sub(1 + tail.len()).max(1);
+    let (from, to) = if total <= avail {
+        (0, total)
+    } else {
+        // Two rows go to the "… earlier" / "… more" marks.
+        let shown = avail.saturating_sub(2).max(1);
+        let from = run.current.saturating_sub(shown / 2).min(total - shown);
+        (from, from + shown)
+    };
+    if from > 0 {
+        out.push(Line::from(Span::styled(
+            format!("  … {from} earlier"),
+            muted,
+        )));
+    }
+    for (i, step) in run.plan.steps.iter().enumerate().take(to).skip(from) {
+        let status = run.statuses.get(i).copied().unwrap_or(StepStatus::Pending);
         let style = match status {
             StepStatus::Passed | StepStatus::Manual => app.theme.success_fg(),
             StepStatus::Failed => app.theme.danger_fg(),
@@ -80,7 +101,23 @@ pub(crate) fn window_lines(app: &App, run: &ReplayRun) -> Vec<Line<'static>> {
             style,
         )));
     }
-    out.push(Line::raw(""));
+    if to < total {
+        out.push(Line::from(Span::styled(
+            format!("  … {} more", total - to),
+            muted,
+        )));
+    }
+    out.append(&mut tail);
+    out
+}
+
+/// The current step's state and the keys.
+fn tail_lines(app: &App, run: &ReplayRun) -> Vec<Line<'static>> {
+    let muted = app.theme.muted();
+    let bold = Style::default()
+        .fg(app.theme.fg)
+        .add_modifier(Modifier::BOLD);
+    let mut out = vec![Line::raw("")];
     let Some(step) = run
         .plan
         .steps
@@ -104,7 +141,6 @@ pub(crate) fn window_lines(app: &App, run: &ReplayRun) -> Vec<Line<'static>> {
                     app.theme.command_style(),
                 )));
             }
-            out.push(Line::raw(""));
             out.push(Line::from(Span::styled(
                 "Enter/m done by hand · s skip · q stop · Esc hide",
                 muted,
@@ -133,7 +169,6 @@ pub(crate) fn window_lines(app: &App, run: &ReplayRun) -> Vec<Line<'static>> {
                     muted,
                 )));
             }
-            out.push(Line::raw(""));
             out.push(Line::from(Span::styled(
                 "Enter accept · p passed · f failed · r retry · s skip · m done by hand · q stop · Esc talk",
                 muted,
@@ -184,6 +219,7 @@ mod tests {
             window_open: true,
             target: "local".into(),
             mode: CommandConfirmMode::Always,
+            host: None,
         }
     }
 
@@ -231,5 +267,41 @@ mod tests {
         assert!(s.contains("needs a <secret>"), "{s}");
         assert!(s.contains("Enter/m done by hand"), "{s}");
         assert!(!s.contains("r retry"), "{s}");
+    }
+
+    #[test]
+    fn a_long_checklist_keeps_the_current_step_and_the_keys_on_a_short_screen() {
+        let mut r = run(ReplayPhase::Operator);
+        let template = r.plan.steps[0].clone();
+        r.plan.steps = (1..=30)
+            .map(|i| ReplayStep {
+                index: i,
+                title: format!("step {i}"),
+                needs_secret: i == 17,
+                ..template.clone()
+            })
+            .collect();
+        r.statuses = vec![StepStatus::Pending; 30];
+        r.notes = vec![String::new(); 30];
+        r.current = 16;
+        let app = app_with(r);
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| render_replay_window(f, &app, f.area())).unwrap();
+        let buf = t.backend().buffer().clone();
+        let s = (0..24)
+            .map(|y| {
+                (0..80)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(s.contains("> · 17. step 17"), "{s}");
+        assert!(s.contains("earlier") && s.contains("more"), "{s}");
+        assert!(s.contains("Enter/m done by hand"), "{s}");
+        assert!(
+            s.contains("$ df -h"),
+            "the operator's command stays readable: {s}"
+        );
     }
 }

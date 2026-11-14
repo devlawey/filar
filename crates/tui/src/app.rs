@@ -4418,7 +4418,12 @@ impl App {
 
         // The step window of a runbook replay (#669) takes the keys while it
         // is shown; Esc hides it to talk to the agent.
-        if self.mode == AppMode::Normal && self.replay_window_active() {
+        // Ctrl/Alt chords pass through (Ctrl+S still saves, Ctrl+Q quits).
+        if self.replay_window_active()
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
             self.handle_replay_window_key(key);
             return;
         }

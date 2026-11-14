@@ -54,8 +54,19 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Snapshot fields we need so we can drop the borrow before mutating `app`
     // further (button areas). Styles still need `app.theme` later.
-    let explanation = confirm.explanation.clone();
+    let mut explanation = confirm.explanation.clone();
     let command = confirm.command.clone();
+    // A runbook replay step (#669): the step and its rating head the dialog;
+    // the runbook's command, when it differs, opens the scrollable body so a
+    // long one is never cut off (review).
+    let replay = app.replay_confirm_header(&command);
+    if let Some((_, Some(runbook))) = &replay {
+        explanation = if explanation.is_empty() {
+            runbook.clone()
+        } else {
+            format!("{runbook}\n\n{explanation}")
+        };
+    }
     let destructive = confirm.destructive;
     let audit_verdict = confirm.audit_verdict.clone();
     let audit_reason = confirm.audit_reason.clone();
@@ -157,9 +168,8 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         radius_expanded,
     )
     .or_else(|| pod_target.clone().map(|line| (line, None)))
-    // A runbook replay step (#669): which step, its rating in the runbook,
-    // and the runbook's command when the proposed one differs.
-    .or_else(|| app.replay_confirm_header(&command));
+    // A runbook replay step (#669): which step and its rating in the runbook.
+    .or_else(|| replay.clone().map(|(line, _)| (line, None)));
     let radius_rows = match header.clone() {
         None => 0,
         // The pod target may wrap (long contexts such as EKS ARNs), within
