@@ -1926,6 +1926,10 @@ async fn run_app(
     // `Done` reports back through this same channel (#401).
     app.save_tx = Some(save_tx.clone());
 
+    // Replay plans extracted from runbooks (#668).
+    let (replay_plan_tx, mut replay_plan_rx) =
+        mpsc::unbounded_channel::<crate::app::runbook_replay::ReplayPlanResult>();
+
     // Channel for in-TUI path picker directory listings (#351).
     let (path_picker_tx, mut path_picker_rx) =
         tokio::sync::mpsc::unbounded_channel::<(u64, PathPickerLoadResult)>();
@@ -2089,6 +2093,11 @@ async fn run_app(
                 needs_redraw = true;
             }
 
+            Some(result) = replay_plan_rx.recv() => {
+                app.finish_replay_plan(result);
+                needs_redraw = true;
+            }
+
             Some((token, result)) = path_picker_rx.recv() => {
                 path_picker_load_in_flight = None;
                 if app.path_picker_visible && app.path_picker_load_token == token {
@@ -2216,6 +2225,18 @@ async fn run_app(
                 // In-TUI path picker (#351): open overlay instead of native dialog.
                 if let Some(kind) = app.take_pending_path_picker() {
                     app.open_path_picker(kind);
+                    needs_redraw = true;
+                }
+
+                // A runbook chosen in the picker: extract its plan (#668).
+                if let Some(request) = app.take_pending_replay_plan() {
+                    spawn_replay_plan(
+                        &mut app,
+                        request,
+                        &config.llm_factory,
+                        &config.secret_provider,
+                        &replay_plan_tx,
+                    );
                     needs_redraw = true;
                 }
 
@@ -4202,6 +4223,71 @@ fn spawn_runbook_generation(
             },
         };
         let _ = tx.send(report);
+    });
+}
+
+/// Extract the replay plan of a runbook chosen in the picker (#668).
+///
+/// Runs on the LLM profile the request names — the tab's — with the same
+/// factory as the runbook writer. Secrets known to the session are redacted
+/// from the text first, as for the runbook transcript. The task reports
+/// through `tx` whatever happens: a plan, an error, a panic as an error, or
+/// a cancellation (outcome `None`).
+fn spawn_replay_plan(
+    app: &mut App,
+    request: crate::app::runbook_replay::ReplayPlanRequest,
+    llm_factory: &RunbookLlmFactory,
+    secret_provider: &Arc<StaticSecretProvider>,
+    tx: &mpsc::UnboundedSender<crate::app::runbook_replay::ReplayPlanResult>,
+) {
+    use crate::app::runbook_replay::ReplayPlanResult;
+    let reply = |outcome| ReplayPlanResult {
+        session_id: request.session_id,
+        request_id: request.request_id,
+        name: request.name.clone(),
+        outcome,
+        usage: None,
+        profile: request.profile.clone(),
+    };
+    let llm = match app.profiles.iter().find(|p| p.name == request.profile) {
+        Some(profile) => match (llm_factory)(profile, secret_provider) {
+            Ok(client) => client,
+            Err(e) => {
+                app.finish_replay_plan(reply(Some(Err(e.to_string()))));
+                return;
+            }
+        },
+        None => {
+            let reason = format!("profile '{}' not found", request.profile);
+            app.finish_replay_plan(reply(Some(Err(reason))));
+            return;
+        }
+    };
+    let token = CancellationToken::new();
+    app.replay_plan_started(token.clone());
+    let text = filar_core::redact_secrets(&request.text, secret_provider.as_ref());
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let outcome = std::panic::AssertUnwindSafe(filar_agent::extract_replay_plan(
+            llm.as_ref(),
+            &text,
+            &token,
+        ))
+        .catch_unwind()
+        .await;
+        let (outcome, usage) = match outcome {
+            Ok(Some(done)) => (Some(done.plan.map_err(|e| e.to_string())), done.usage),
+            Ok(None) => (None, None),
+            Err(_) => (Some(Err("the plan task panicked — see the log".to_string())), None),
+        };
+        let _ = tx.send(ReplayPlanResult {
+            session_id: request.session_id,
+            request_id: request.request_id,
+            name: request.name,
+            outcome,
+            usage,
+            profile: request.profile,
+        });
     });
 }
 
