@@ -8,7 +8,7 @@ description: "filar agent eval — tool-calling on filar tasks"
 # A second prompt (#564) is the pod variant (build_kube_pod_prompt for a fixed
 # example container), synced by the `pod_prompt_matches_eval_snapshot` test.
 # Every case runs against the SSH prompt (`defaultTest.prompts: [ssh]`) unless
-# it names `prompts: [pod]` (or `[replay]`) itself.
+# it names `prompts: [pod]` (or `[replay]`, `[replay-step]`) itself.
 prompts:
   - id: file://prompts/agent-chat.json
     label: ssh
@@ -18,6 +18,10 @@ prompts:
   # crates/agent/src/runbook_replay.rs by `prompt_matches_eval_snapshot`.
   - id: file://prompts/replay-plan-chat.json
     label: replay
+  # A step of a runbook replay (#669): the SSH prompt plus the replay block,
+  # synced by `replay_step_prompt_matches_eval_snapshot`.
+  - id: file://prompts/replay-step-chat.json
+    label: replay-step
 
 # Global throttling — limits parallelism to avoid 429 Too Many Requests from
 # OpenRouter. A full run is ~1000+ requests (100 cases × 10 models + judge

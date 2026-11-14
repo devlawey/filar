@@ -104,8 +104,7 @@ pub(crate) fn render_replay_preview(f: &mut Frame, app: &App, area: Rect) {
     );
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" [ Start ] ", app.theme.muted()),
-            Span::styled("not available yet (#669)   ", app.theme.muted()),
+            Span::styled(" [ Start ] Enter   ", Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD)),
             Span::styled(
                 "[ Cancel ] Esc",
                 Style::default()
@@ -366,7 +365,7 @@ mod tests {
             "(no command — done by hand)",
             "Exit criteria:",
             "[ Cancel ] Esc",
-            "not available yet",
+            "[ Start ] Enter",
         ] {
             assert!(s.contains(want), "{want:?} missing:\n{s}");
         }
@@ -422,9 +421,9 @@ mod tests {
     fn a_start_notice_replaces_the_rows_line() {
         let mut app = app_with_preview(CommandConfirmMode::Always);
         if let Some(p) = app.replay_preview.as_mut() {
-            p.notice = Some(crate::app::runbook_replay::START_UNAVAILABLE.into());
+            p.notice = Some("A replay is already running in this tab.".into());
         }
         let s = screen(&app, 110, 40);
-        assert!(s.contains("Start is not available yet"), "{s}");
+        assert!(s.contains("A replay is already running"), "{s}");
     }
 }

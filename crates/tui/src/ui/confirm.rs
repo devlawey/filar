@@ -156,7 +156,10 @@ pub(crate) fn render_confirm_modal(f: &mut Frame, app: &mut App, area: Rect) {
         radius_context.as_deref(),
         radius_expanded,
     )
-    .or_else(|| pod_target.clone().map(|line| (line, None)));
+    .or_else(|| pod_target.clone().map(|line| (line, None)))
+    // A runbook replay step (#669): which step, its rating in the runbook,
+    // and the runbook's command when the proposed one differs.
+    .or_else(|| app.replay_confirm_header(&command));
     let radius_rows = match header.clone() {
         None => 0,
         // The pod target may wrap (long contexts such as EKS ARNs), within

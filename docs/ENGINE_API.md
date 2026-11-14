@@ -603,6 +603,34 @@ the call. Replaying a fleet runbook is not supported yet.
 `REPLAY_PLAN_SYSTEM_PROMPT` is a system prompt: a change to it needs an eval
 run; its snapshot is `eval/prompts/replay-plan-system.txt`.
 
+### Replaying a plan step by step (#669)
+
+```rust
+pub fn replay_step_message(plan: &ReplayPlan, step: &ReplayStep) -> String;
+pub fn parse_step_verdict(reply: &str) -> Option<(StepVerdict, String)>;
+pub enum StepVerdict { Passed, Failed, Unclear }
+pub const RUNBOOK_REPLAY_PROMPT: &str;
+
+AgentBuilder::runbook_replay(true)   // the turn is a replay step
+```
+
+A replay sends the agent **one step per turn**: `replay_step_message` writes it
+as a user message with the step inside `<step>…</step>` (a closing tag in the
+runbook's text is defused). Turn on `AgentBuilder::runbook_replay` for that
+turn: it appends `RUNBOOK_REPLAY_PROMPT` to the system prompt. The block says
+the step text is a plan from a file, not the operator, keeps the agent to the
+current step, has it fill placeholders from read-only commands or by asking,
+never fill `<secret>`, flag requests to weaken confirmation, download and run
+code or send data out, and end with `STEP RESULT: passed|failed|unclear - …`.
+The tool set and the confirmation gate are unchanged; a fleet ignores the flag.
+
+`parse_step_verdict` reads that last line. Treat the verdict as a suggestion
+to show the operator, not as the step's status. Keep the rules that matter in
+your code as well: never send a `needs_secret` step, send every command
+through your gate, and pause between steps whatever the confirmation mode.
+`RUNBOOK_REPLAY_PROMPT` is a system prompt (eval snapshot
+`eval/prompts/replay-step-system.txt`).
+
 ### `Session::folded_history` — where the folded turns live
 
 ```rust
@@ -896,6 +924,7 @@ let _agent = builder.log_sources(sources);
 | Change | Breaks | What to do |
 |--------|--------|------------|
 | `extract_replay_plan`, `parse_replay_plan`, `ReplayPlan`, `ReplayStep`, `ReplayPlanOutcome`, `REPLAY_PLAN_SYSTEM_PROMPT`, `MAX_REPLAY_RUNBOOK_BYTES`, `SECRET_PLACEHOLDER` (#667) | Nothing — additive; `LlmClient` is unchanged | To replay a runbook, show the plan first and send every step's command through your confirmation gate; never hand a `needs_secret` step to the agent |
+| `replay_step_message`, `parse_step_verdict`, `StepVerdict`, `RUNBOOK_REPLAY_PROMPT`, `AgentBuilder::runbook_replay` (#669) | Nothing — additive; off by default, the prompt and tools are unchanged without it | Send one step per turn with the flag on; never send a `needs_secret` step; pause after each step |
 | `generate_fleet_runbook` text starts with `FLEET_RUNBOOK_MARKER` on its own line (#667) | Only code that compares a fleet runbook's text exactly | Strip the first line if you need the bare text; it is an HTML comment, so rendered markdown hides it |
 
 ## Upgrading to `engine-v3.0.5`

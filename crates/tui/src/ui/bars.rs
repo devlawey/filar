@@ -555,7 +555,17 @@ pub(crate) fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
     // gap of the context indicator it makes the two-column separation
     // before `confirm_mode`; when the indicator is dropped, the space stays
     // and keeps `confirm_mode` apart from the preceding text.
-    let confirm_text = format!(" {:?}", app.confirm_mode);
+    // A runbook replay (#669) shows its progress next to the mode.
+    let confirm_text = match app.active_replay() {
+        Some(run) => format!(
+            " runbook {}/{} {} {:?}",
+            (run.current + 1).min(run.plan.steps.len()),
+            run.plan.steps.len(),
+            glyphs.middle_dot,
+            app.confirm_mode
+        ),
+        None => format!(" {:?}", app.confirm_mode),
+    };
     let confirm_style = if app.confirm_mode == filar_core::CommandConfirmMode::Explain {
         app.theme.muted().fg(app.theme.accent)
     } else {
