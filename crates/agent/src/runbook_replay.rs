@@ -420,16 +420,24 @@ fn runbook_commands(runbook: &str) -> Vec<(usize, String)> {
             push(&mut out, i, t);
             continue;
         }
+        // Inline code first; bold is looked for only outside it, so a `**$ …**`
+        // quoted inside backticks is not a command of its own (review).
+        let mut outside = String::with_capacity(line.len());
         let mut rest = line;
         while let Some(open) = rest.find('`') {
+            outside.push_str(&rest[..open]);
             let after = &rest[open + 1..];
             let Some(close) = after.find('`') else {
+                outside.push_str(&rest[open..]);
+                rest = "";
                 break;
             };
             push(&mut out, i, &after[..close]);
+            outside.push(' ');
             rest = &after[close + 1..];
         }
-        let mut rest = line;
+        outside.push_str(rest);
+        let mut rest = outside.as_str();
         while let Some(open) = rest.find("**") {
             let after = &rest[open + 2..];
             let Some(close) = after.find("**") else {
@@ -646,6 +654,25 @@ Root has more than 10% free.
         let plan = parse_replay_plan(RUNBOOK, &reply(steps)).expect("plan");
         assert_eq!(plan.steps[0].command.as_deref(), Some("df -h"));
         assert_eq!(plan.steps[0].original_safety.as_deref(), Some("safety 98%"));
+    }
+
+    #[test]
+    fn a_middle_dot_inside_a_command_is_kept() {
+        // Only `· safety …` is a rating; any other `·` is part of the command.
+        let runbook = "1. Print: `echo \"a · b\"` · safety 99%\n";
+        let steps = r#"{"title":"a","command":"echo \"a · b\"","expect":""}"#;
+        let plan = parse_replay_plan(runbook, &reply(steps)).expect("plan");
+        assert_eq!(plan.steps[0].command.as_deref(), Some("echo \"a · b\""));
+        assert_eq!(plan.steps[0].original_safety.as_deref(), Some("safety 99%"));
+    }
+
+    #[test]
+    fn bold_quoted_inside_inline_code_is_not_a_command() {
+        let runbook = "1. Never type `**$ rm -rf /**` here; run `df -h` instead.\n";
+        let steps = r#"{"title":"a","command":"rm -rf /","expect":""}"#;
+        assert!(parse_replay_plan(runbook, &reply(steps)).is_err());
+        let steps = r#"{"title":"a","command":"df -h","expect":""}"#;
+        assert!(parse_replay_plan(runbook, &reply(steps)).is_ok());
     }
 
     #[test]

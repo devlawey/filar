@@ -404,7 +404,7 @@ function runbookCommands(runbook, norm) {
   const add = (raw) => {
     let c = raw.trim();
     if (c.startsWith('$ ')) c = c.slice(2);
-    c = norm(c.split(' · safety')[0].split('·')[0]);
+    c = norm(c.split(/\s*·\s*safety/)[0]);
     if (c) out.add(c);
   };
   let fence = false;
@@ -413,7 +413,9 @@ function runbookCommands(runbook, norm) {
     if (t.startsWith('```')) { fence = !fence; continue; }
     if (fence) { add(t); continue; }
     for (const m of line.matchAll(/`([^`]+)`/g)) add(m[1]);
-    for (const m of line.matchAll(/\*\*(\$ .+?)\*\*/g)) add(m[1]);
+    // Bold only outside inline code, as in the Rust parser.
+    const outside = line.replace(/`[^`]+`/g, ' ');
+    for (const m of outside.matchAll(/\*\*(\$ .+?)\*\*/g)) add(m[1]);
     if (t.startsWith('$ ')) add(t);
   }
   return out;

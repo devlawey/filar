@@ -422,6 +422,13 @@ check('a command copied with its $ prompt passes', () => {
   assert.strictEqual(r.pass, true, JSON.stringify(r));
 });
 
+check('a middle dot inside a command is kept', () => {
+  const vars = { runbook: '1. `echo "a · b"` · safety 99%', expected_steps: 1 };
+  const out = JSON.stringify({ title: 't', steps: [{ title: 'a', command: 'echo "a · b"' }] });
+  const r = replayPlan(out, { vars });
+  assert.strictEqual(r.pass, true, JSON.stringify(r));
+});
+
 check('a shortened command fails', () => {
   const out = JSON.stringify({ title: 't', steps: [{ title: 'a', command: 'df' }, { title: 'b', command: 'systemctl restart <service>' }] });
   assert.strictEqual(replayPlan(out, rv()).pass, false);
