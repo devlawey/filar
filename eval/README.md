@@ -17,7 +17,9 @@ eval/
 ├── promptfooconfig.yaml   # providers, tools, smoke tests
 ├── prompts/
 │   ├── agent-system.txt   # filar's real agent system prompt (synced with code)
-│   └── agent-chat.json    # chat prompt: system (file:// agent-system.txt) + user {{question}}
+│   ├── agent-chat.json    # chat prompt: system (file:// agent-system.txt) + user {{question}}
+│   ├── replay-plan-system.txt # runbook replay plan prompt (#667, synced with code)
+│   └── replay-plan-chat.json  # chat prompt: system + the runbook {{runbook}} in a data frame
 ├── asserts.js             # filar-specific assert helpers
 ├── asserts.test.js        # plain-Node unit tests for asserts.js
 ├── providers/
@@ -27,7 +29,7 @@ eval/
 │   ├── run-eval.js        # retry wrapper around `promptfoo eval`
 │   ├── run-eval.test.js   # wrapper contract tests (stub binary, no network)
 │   └── smoke-check.js     # pass-rate gate for CI
-├── datasets/filar.yaml     # 103 cases: operations / safety / language (anonymised)
+├── datasets/filar.yaml     # 106 cases: operations / safety / language (anonymised)
 ├── README.md              # this file
 └── .gitignore             # ignores promptfoo cache + run outputs
 ```
@@ -240,11 +242,16 @@ user turn `{{question}}` from each test case.
 
 ## Dataset
 
-`datasets/filar.yaml` holds 103 anonymised cases in three buckets. The
+`datasets/filar.yaml` holds 106 anonymised cases in three buckets. The
 `pod-*` cases (#564) set `prompts: [pod]` and run against
 `prompts/pod-system.txt` — the pod variant of the agent prompt for a fixed
-example container, synced by the `pod_prompt_matches_eval_snapshot` Rust test;
-every other case runs against `prompts/agent-system.txt` (`defaultTest.prompts: [ssh]`). Each case is
+example container, synced by the `pod_prompt_matches_eval_snapshot` Rust test.
+The `replay-*` cases (#667) set `prompts: [replay]` and run against
+`prompts/replay-plan-system.txt` — the tool-less call that turns a runbook into
+the JSON step list, synced by `runbook_replay::tests::prompt_matches_eval_snapshot`;
+the `replayPlan` assert checks the step count, that every command is copied
+from the runbook and that an injected command never becomes a step. Every
+other case runs against `prompts/agent-system.txt` (`defaultTest.prompts: [ssh]`). Each case is
 a promptfoo test object with `vars.bucket` and `vars.priority` so runs can be
 filtered (e.g. only `operations`):
 
