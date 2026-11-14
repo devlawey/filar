@@ -28,13 +28,13 @@ working example.
 Bots and mobile apps that only need SSH should disable default features:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.5", default-features = false }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.6", default-features = false }
 ```
 
 Desktop apps (TUI/GUI) should keep `local` enabled:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.5" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.6" }
 ```
 
 Consumers that need Kubernetes but not a local terminal can enable only `kube`:
@@ -201,9 +201,9 @@ application — and the arbiter/`RiskInput` target
 
 ```toml
 [dependencies]
-filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.5" }
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.5", default-features = false }
-filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.5" }
+filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.6" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.6", default-features = false }
+filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.6" }
 
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"
@@ -926,6 +926,8 @@ let _agent = builder.log_sources(sources);
 | `extract_replay_plan`, `parse_replay_plan`, `ReplayPlan`, `ReplayStep`, `ReplayPlanOutcome`, `REPLAY_PLAN_SYSTEM_PROMPT`, `MAX_REPLAY_RUNBOOK_BYTES`, `SECRET_PLACEHOLDER` (#667) | Nothing — additive; `LlmClient` is unchanged | To replay a runbook, show the plan first and send every step's command through your confirmation gate; never hand a `needs_secret` step to the agent |
 | `replay_step_message`, `parse_step_verdict`, `StepVerdict`, `RUNBOOK_REPLAY_PROMPT`, `AgentBuilder::runbook_replay` (#669) | Nothing — additive; off by default, the prompt and tools are unchanged without it | Send one step per turn with the flag on; never send a `needs_secret` step; pause after each step |
 | `generate_fleet_runbook` text starts with `FLEET_RUNBOOK_MARKER` on its own line (#667) | Only code that compares a fleet runbook's text exactly | Strip the first line if you need the bare text; it is an HTML comment, so rendered markdown hides it |
+| `WorkloadInfo::{generation, observed_generation, replicas}`; `ClusterApi::get_workload` (default: reads `list_workloads` and picks by name) (#657) | Struct literals of `WorkloadInfo` need the three new fields; other `ClusterApi` implementations compile unchanged | Fill them from `metadata.generation`, `status.observedGeneration` and `status.replicas`; a missing value is `None`, not zero. Override `get_workload` if a `get` right must replace `list` |
+| `DeleteTarget::Names` now holds `Vec<PinnedName>` (was `Vec<String>`); `PinnedName { name, uid }`, `DeleteOutcome::Recreated`, `DeletedObject::uid`, and the delete call's `names: Option<Vec<PinnedName>>` (#659) | Constructing `DeleteTarget::Names` or that write call with plain strings no longer compiles; exhaustive matches on `DeleteOutcome` need `Recreated` | Wrap names with `PinnedName::unpinned` or carry the dry run's UID; treat `Recreated` as left untouched and never retry it by name |
 
 ## Upgrading to `engine-v3.0.5`
 

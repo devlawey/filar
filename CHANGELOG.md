@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [3.0.6] - 2026-11-14
+
 ### Added
 
 - `Start` in the replay preview walks the runbook on the tab as a checklist: each agent turn carries only the current step, framed as data (earlier steps stay in the conversation), the replay stops if the tab moves to another host, with a `RUNBOOK REPLAY` system-prompt block, and fills placeholders from read-only commands or by asking; every command goes through the tab's confirmation gate, audit and safety rating as usual, and the dialog adds `Runbook step N/M: … · in runbook: safety …` and the runbook's command when the proposed one differs; after every step — in every mode, `never` included — a step window shows the checklist and the agent's `STEP RESULT` verdict (`Enter` accept, `p`/`f`, `r` retry, `s` skip, `m` done by hand, `q` stop, `Esc` to talk); `<secret>` steps never reach the agent; the status bar shows `runbook N/M`; the end writes a `Runbook replay: <name>` summary to the feed and the `Ctrl+S` export. Engine: `replay_step_message`, `parse_step_verdict`, `StepVerdict`, `RUNBOOK_REPLAY_PROMPT`, `AgentBuilder::runbook_replay` ([#669](https://github.com/devlawey/filar/issues/669)).
@@ -1554,7 +1556,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v3.0.5...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v3.0.6...HEAD
+[3.0.6]: https://github.com/devlawey/filar/compare/v3.0.5...v3.0.6
 [3.0.5]: https://github.com/devlawey/filar/compare/v3.0.4...v3.0.5
 [3.0.4]: https://github.com/devlawey/filar/compare/v3.0.3...v3.0.4
 [3.0.3]: https://github.com/devlawey/filar/compare/v3.0.2...v3.0.3
