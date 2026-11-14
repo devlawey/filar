@@ -1297,6 +1297,8 @@ impl App {
         }
         let closed = self.active;
         self.sessions.remove(closed);
+        // A replay on the closed tab ends with it (#669 review).
+        self.replay_runs.remove(&sid);
         // Land on the neighbouring ordinary tab, never on the fleet session.
         let tabs = self.tab_indices();
         self.active = tabs

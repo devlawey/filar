@@ -423,6 +423,14 @@ impl App {
             Some("The agent is busy — start the replay when its turn has ended.")
         } else if self.active_replay().is_some() {
             Some("A replay is already running in this tab.")
+        } else if self
+            .replay_preview
+            .as_ref()
+            .is_some_and(|p| p.plan.steps.is_empty())
+        {
+            // `parse_replay_plan` never returns one, but a panic here would
+            // take the whole TUI down (review).
+            Some("The plan has no steps.")
         } else {
             None
         };
@@ -469,7 +477,9 @@ impl App {
         let Some(run) = self.replay_runs.get_mut(&sid) else {
             return;
         };
-        let step = run.plan.steps[run.current].clone();
+        let Some(step) = run.plan.steps.get(run.current).cloned() else {
+            return;
+        };
         let total = run.plan.steps.len();
         run.verdict = None;
         if step.needs_secret || step.command.is_none() {
@@ -509,7 +519,9 @@ impl App {
             return;
         }
         let verdict = reply.and_then(filar_agent::parse_step_verdict);
-        let step = &run.plan.steps[run.current];
+        let Some(step) = run.plan.steps.get(run.current) else {
+            return;
+        };
         let note = match &verdict {
             Some((v, reason)) => format!(
                 "Step {}/{} «{}»: the agent says {}{}{}",
@@ -632,7 +644,7 @@ impl App {
         let run = self
             .active_replay()
             .filter(|r| r.phase == ReplayPhase::Running)?;
-        let step = &run.plan.steps[run.current];
+        let step = run.plan.steps.get(run.current)?;
         let mut line = format!(
             "Runbook step {}/{}: {}",
             step.index,
@@ -1172,6 +1184,37 @@ mod tests {
         assert!(
             note.contains("agent is busy") || note.contains("already running"),
             "{note}"
+        );
+    }
+
+    #[test]
+    fn closing_the_tab_ends_its_replay() {
+        let mut app = started(CommandConfirmMode::Always);
+        let sid = app.sessions[app.active].id;
+        app.new_tab();
+        app.active = 0;
+        app.close_tab();
+        assert!(!app.replay_runs.contains_key(&sid));
+    }
+
+    #[test]
+    fn an_empty_plan_is_refused_not_a_panic() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let mut plan = replay_plan();
+        plan.steps.clear();
+        app.replay_preview = Some(ReplayPreview {
+            name: "x".into(),
+            plan,
+            scroll: 0,
+            notice: None,
+        });
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.active_replay().is_none());
+        assert_eq!(
+            app.replay_preview
+                .as_ref()
+                .and_then(|p| p.notice.as_deref()),
+            Some("The plan has no steps.")
         );
     }
 }

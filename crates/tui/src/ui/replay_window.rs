@@ -81,7 +81,13 @@ pub(crate) fn window_lines(app: &App, run: &ReplayRun) -> Vec<Line<'static>> {
         )));
     }
     out.push(Line::raw(""));
-    let step = &run.plan.steps[run.current.min(run.plan.steps.len() - 1)];
+    let Some(step) = run
+        .plan
+        .steps
+        .get(run.current.min(run.plan.steps.len().saturating_sub(1)))
+    else {
+        return out;
+    };
     match run.phase {
         ReplayPhase::Operator => {
             out.push(Line::from(Span::styled(
