@@ -499,6 +499,7 @@ impl HostSelectRow {
 }
 
 pub mod pod_tab;
+pub mod runbook_replay;
 pub use pod_tab::{DebugProposal, KubePodConnectRequest, KubePodListRequest, KubePodSelect, PodChoice};
 
 /// Flat Ctrl+O selection index of [`HostSelectRow::EnterPod`]: outside the
@@ -857,6 +858,18 @@ pub struct App {
     pub path_picker_remote: bool,
     /// Bumped to request (re)load of `path_picker_dir` in the runner.
     pub path_picker_load_token: u64,
+    /// What the picker lists: the target's files or the runbooks (#668).
+    pub path_picker_source: runbook_replay::PickerSource,
+    /// The runbooks source of the picker (#668).
+    pub runbook_picker: runbook_replay::RunbookPickerState,
+    /// A replay plan for the runner to extract (#668).
+    pub pending_replay_plan: Option<runbook_replay::ReplayPlanRequest>,
+    /// Stops the plan extraction in flight.
+    pub replay_plan_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// The current plan request; older results are not shown.
+    pub replay_plan_request_id: u64,
+    /// The plan preview window, while open (#668).
+    pub replay_preview: Option<runbook_replay::ReplayPreview>,
     /// Operations shown in the side panel, across all tabs (#431).
     /// Refreshed from the agent's background-job registry.
     pub operations: Vec<crate::ops::Operation>,
@@ -1228,6 +1241,12 @@ impl App {
             path_picker_truncated: false,
             path_picker_remote: false,
             path_picker_load_token: 0,
+            path_picker_source: runbook_replay::PickerSource::Files,
+            runbook_picker: runbook_replay::RunbookPickerState::default(),
+            pending_replay_plan: None,
+            replay_plan_cancel: None,
+            replay_plan_request_id: 0,
+            replay_preview: None,
             operations: Vec::new(),
             side_panel: crate::side_panel::SidePanel::default(),
         }
@@ -1322,11 +1341,9 @@ impl App {
             // Entering Explain mode — create transcript path if not yet set.
             let messages = self.messages.clone();
             let dir_name = self.session_export_dir(self.active);
+            let base_dir = self.export_base_dir();
             let session = &mut self.sessions[self.active];
             if session.transcript_path.is_none() {
-                let base_dir = self.save_dir.clone().unwrap_or_else(|| {
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-                });
                 let filename =
                     transcript_filename(&session.target_name, &session.ssh_info, &messages);
                 // Inside the per-target folder (#400) — the group's folder in
@@ -4053,9 +4070,7 @@ impl App {
         let safety = self.export_safety();
         let tx = tx.clone();
         // Resolve the export directory: configured `save_dir`, else CWD.
-        let base_dir = self.save_dir.clone().unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-        });
+        let base_dir = self.export_base_dir();
         // One folder per target (#400), decided from the host the tab is on
         // *now*: the sanitized display name, or `local` for local tabs. The
         // fleet layer saves under its group's name (#441), with every host's
@@ -4314,11 +4329,10 @@ impl App {
                 path
             } else {
                 let desired = transcript_filename(&session_name, &ssh_info, &messages);
-                let base = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| {
-                    self.save_dir.clone().unwrap_or_else(|| {
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-                    })
-                });
+                let base = path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| self.export_base_dir());
                 let new_path = base.join(&desired);
                 self.sessions[self.active].transcript_path = Some(new_path.clone());
                 new_path
@@ -4388,6 +4402,12 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        // The replay-plan preview (#668) is modal: it takes every key.
+        if self.replay_preview.is_some() {
+            self.handle_replay_preview_key(key);
             return;
         }
 
@@ -4646,9 +4666,15 @@ impl App {
 
         // In-TUI path picker (#351): navigate directories on the active target.
         if self.path_picker_visible {
+            if self.path_picker_source == runbook_replay::PickerSource::Runbooks {
+                self.handle_runbook_picker_key(key);
+                return;
+            }
             let list_size = self.path_picker_entries.len();
             match key.code {
                 KeyCode::Esc => self.close_path_picker(),
+                // Tab lists the runbooks instead (#668).
+                KeyCode::Tab => self.toggle_picker_source(),
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.path_picker_index = self.path_picker_index.saturating_sub(1);
                 }
@@ -6908,9 +6934,17 @@ impl App {
         self.path_picker_truncated = false;
         self.path_picker_visible = true;
         self.path_picker_load_token = self.path_picker_load_token.wrapping_add(1);
+        // Every opening starts on the target's files; Tab switches (#668).
+        self.path_picker_source = runbook_replay::PickerSource::Files;
+        self.runbook_picker.error = None;
     }
 
     pub fn close_path_picker(&mut self) {
+        // Closing the picker abandons a plan it was waiting for (#668).
+        if self.runbook_picker.extracting.is_some() {
+            self.cancel_replay_plan();
+        }
+        self.path_picker_source = runbook_replay::PickerSource::Files;
         self.path_picker_visible = false;
         self.path_picker_loading = false;
         self.path_picker_error = None;

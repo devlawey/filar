@@ -16,6 +16,8 @@ pub mod file_panels;
 pub mod log_layer;
 pub mod ops;
 pub mod path_picker;
+/// Runbooks for replay, listed from the local export folder (#668).
+pub mod runbook_picker;
 pub mod runner;
 pub mod side_panel;
 pub mod terminal;

@@ -343,6 +343,12 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
             available: |m| m == AppMode::Normal,
         },
         HelpEntry {
+            key: "/ then Tab",
+            desc: "Path picker: list the runbooks of the export folder; Enter shows a runbook's replay plan for this tab (local and SSH tabs)",
+            section: "Input",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
             key: "^Shift+F",
             desc: "Open file picker (active target)",
             section: "Input",

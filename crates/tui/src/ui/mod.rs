@@ -39,6 +39,7 @@ mod namespace_select;
 mod debug_confirm;
 mod pod_select;
 mod path_picker_overlay;
+mod replay_preview;
 mod save_overlay;
 mod session_select;
 mod side_panel;
@@ -180,6 +181,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
         path_picker_overlay::render_path_picker(f, app, full);
     }
 
+    // The replay-plan preview (#668).
+    if app.replay_preview.is_some() {
+        replay_preview::render_replay_preview(f, app, f.area());
+    }
+
     // Render session-save progress overlay on top of everything if active.
     if app.save_overlay_visible {
         let full = f.area();
@@ -318,6 +324,11 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
     if app.path_picker_visible {
         let full = f.area();
         path_picker_overlay::render_path_picker(f, app, full);
+    }
+
+    // The replay-plan preview (#668).
+    if app.replay_preview.is_some() {
+        replay_preview::render_replay_preview(f, app, f.area());
     }
 
     // Render session-save progress overlay on top of everything if active.
