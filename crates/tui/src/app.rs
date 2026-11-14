@@ -4658,6 +4658,17 @@ impl App {
                     }
                 }
                 KeyCode::Enter => self.path_picker_activate(),
+                // A second `/` types a literal one (#670): `//var/log` reads
+                // `/var/log`. The overlay closes and the input under it is
+                // as it was, so the slash lands where the picker opened.
+                KeyCode::Char('/')
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.close_path_picker();
+                    self.insert_char('/');
+                }
                 // `a` picks a folder (#483), also on the Russian layout.
                 KeyCode::Char('a' | 'A' | 'ф' | 'Ф') => self.path_picker_pick_folder(),
                 _ => {}
@@ -4915,10 +4926,14 @@ impl App {
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     // Any char input cancels history browsing.
                     self.history_pos = None;
+                    // `/` with the picker queued but not yet open (both keys
+                    // in one batch) is the same `//` as in the overlay (#670).
+                    if c == '/' && self.pending_path_picker.take().is_some() {
+                        self.insert_char('/');
                     // In the fleet `/` is just a character: the picker
                     // browses one host (#432).
                     // Nor in a pod tab: the picker reads the local disk (#565).
-                    if c == '/'
+                    } else if c == '/'
                         && !self.in_fleet()
                         && !self.in_pod_tab()
                         && crate::path_picker::path_token_starts_at_cursor(
@@ -12734,6 +12749,110 @@ mod tests {
         ));
         assert_eq!(app.input, "foo/");
         assert!(app.pending_path_picker.is_none());
+    }
+
+    fn press_and_open(app: &mut App, c: char) {
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(c),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        // What the runner does after every key: open a queued picker.
+        if let Some(kind) = app.take_pending_path_picker() {
+            app.open_path_picker(kind);
+        }
+    }
+
+    #[test]
+    fn double_slash_types_a_literal_slash() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        press_and_open(&mut app, '/');
+        assert!(app.path_picker_visible, "first `/` opens the picker");
+        press_and_open(&mut app, '/');
+        assert_eq!(app.input, "/");
+        assert_eq!(app.cursor_pos, 1);
+        assert!(!app.path_picker_visible, "second `/` closes the picker");
+        assert!(app.pending_path_picker.is_none());
+    }
+
+    #[test]
+    fn double_slash_after_a_space_lands_at_the_cursor() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        for c in "ls ".chars() {
+            press_and_open(&mut app, c);
+        }
+        press_and_open(&mut app, '/');
+        press_and_open(&mut app, '/');
+        assert_eq!(app.input, "ls /");
+        assert_eq!(app.cursor_pos, 4);
+        assert!(!app.path_picker_visible);
+    }
+
+    #[test]
+    fn double_slash_then_a_path_reads_as_typed() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        for c in "//var/log".chars() {
+            press_and_open(&mut app, c);
+        }
+        assert_eq!(app.input, "/var/log");
+        assert!(!app.path_picker_visible);
+    }
+
+    #[test]
+    fn slash_in_a_hotkey_opened_picker_is_literal() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('F'),
+            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::SHIFT,
+        ));
+        let kind = app
+            .take_pending_path_picker()
+            .expect("Ctrl+Shift+F queues the picker");
+        app.open_path_picker(kind);
+        press_and_open(&mut app, '/');
+        assert_eq!(app.input, "/");
+        assert!(!app.path_picker_visible);
+    }
+
+    #[test]
+    fn slash_while_the_picker_is_loading_is_literal() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        press_and_open(&mut app, '/');
+        assert!(app.path_picker_loading, "a fresh picker is still loading");
+        press_and_open(&mut app, '/');
+        assert_eq!(app.input, "/");
+        assert!(!app.path_picker_visible);
+        assert!(!app.path_picker_loading);
+        // The runner applies a listing only to a visible picker, so a late
+        // result cannot bring the overlay back.
+        assert!(app.take_pending_path_picker().is_none());
+    }
+
+    #[test]
+    fn slash_with_the_picker_queued_but_not_open_is_literal() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        let slash = || {
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('/'),
+                crossterm::event::KeyModifiers::NONE,
+            )
+        };
+        app.handle_key(slash());
+        app.handle_key(slash());
+        assert_eq!(app.input, "/");
+        assert!(app.pending_path_picker.is_none());
+        assert!(!app.path_picker_visible);
+    }
+
+    #[test]
+    fn esc_still_closes_the_picker_without_a_slash() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        press_and_open(&mut app, '/');
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.input, "");
+        assert!(!app.path_picker_visible);
     }
 
     #[test]

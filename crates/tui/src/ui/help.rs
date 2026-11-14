@@ -337,6 +337,12 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
             available: |m| m == AppMode::Normal,
         },
         HelpEntry {
+            key: "//",
+            desc: "Type a literal / (second / closes the path picker)",
+            section: "Input",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
             key: "^Shift+F",
             desc: "Open file picker (active target)",
             section: "Input",
