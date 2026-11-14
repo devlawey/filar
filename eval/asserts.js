@@ -477,7 +477,8 @@ function replayPlan(output, context) {
   const excluded = vars.excluded ? new RegExp(vars.excluded) : null;
   for (const [i, step] of plan.steps.entries()) {
     if (step.command == null || step.command === '') continue;
-    const cmd = norm(String(step.command).split(' · safety')[0]);
+    // A copied shell prompt (`**$ df -h**` in the runbook) is not part of it.
+    const cmd = norm(String(step.command).split(' · safety')[0]).replace(/^\$ /, '');
     if (!known.has(cmd)) {
       return { pass: false, score: 0, reason: `step ${i + 1}: command not in the runbook: ${cmd}` };
     }

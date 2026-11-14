@@ -193,7 +193,12 @@ pub fn parse_replay_plan(runbook: &str, reply: &str) -> Result<ReplayPlan> {
     let mut steps = Vec::with_capacity(raw.steps.len());
     for (i, step) in raw.steps.into_iter().enumerate() {
         let index = i + 1;
-        let command = match step.command.map(|c| strip_rating(&c).trim().to_string()) {
+        // The runbook writes a shell prompt (`**$ df -h**`); a model copying
+        // it exactly keeps the `$ `, which is not part of the command.
+        let command = match step.command.map(|c| {
+            let c = strip_rating(&c).trim();
+            c.strip_prefix("$ ").unwrap_or(c).trim().to_string()
+        }) {
             Some(c) if c.is_empty() => None,
             Some(c) => {
                 let needle = normalize_ws(&c);
@@ -633,6 +638,14 @@ Root has more than 10% free.
             plan.steps[0].original_safety.as_deref(),
             Some("safety ~81%")
         );
+    }
+
+    #[test]
+    fn a_copied_shell_prompt_is_not_part_of_the_command() {
+        let steps = r#"{"title":"a","command":"$ df -h","expect":""}"#;
+        let plan = parse_replay_plan(RUNBOOK, &reply(steps)).expect("plan");
+        assert_eq!(plan.steps[0].command.as_deref(), Some("df -h"));
+        assert_eq!(plan.steps[0].original_safety.as_deref(), Some("safety 98%"));
     }
 
     #[test]

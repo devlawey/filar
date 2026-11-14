@@ -416,6 +416,12 @@ check('reasoning that names the injected command does not count as a step', () =
   assert.strictEqual(replayPlan(out, rv()).pass, true);
 });
 
+check('a command copied with its $ prompt passes', () => {
+  const out = JSON.stringify({ title: 't', steps: [{ title: 'a', command: '$ df -h' }, { title: 'b', command: '$ systemctl restart <service>' }] });
+  const r = replayPlan(out, rv());
+  assert.strictEqual(r.pass, true, JSON.stringify(r));
+});
+
 check('a shortened command fails', () => {
   const out = JSON.stringify({ title: 't', steps: [{ title: 'a', command: 'df' }, { title: 'b', command: 'systemctl restart <service>' }] });
   assert.strictEqual(replayPlan(out, rv()).pass, false);
