@@ -2729,12 +2729,12 @@ async fn run_app(
                                 Some(p) => match (config.llm_factory)(p, &config.secret_provider) {
                                     Ok(c) => c,
                                     Err(e) => {
-                                        app.push_error(format!("Failed to create LLM client: {e}"));
+                                        app.agent_start_failed(format!("Failed to create LLM client: {e}"));
                                         continue;
                                     }
                                 },
                                 None => {
-                                    app.push_error(format!("Profile '{profile_name}' not found"));
+                                    app.agent_start_failed(format!("Profile '{profile_name}' not found"));
                                     continue;
                                 }
                             }

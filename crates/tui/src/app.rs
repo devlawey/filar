@@ -3647,6 +3647,9 @@ impl App {
         self.hovered_button = None;
         self.collapsed_overrides.clear();
         self.selection = None;
+        // A replay belongs to the conversation being replaced (#669 review).
+        let sid = self.sessions[self.active].id;
+        self.replay_runs.remove(&sid);
 
         self.messages = session.messages;
         // Ratings belong to the replaced history's blocks (#551), and so does
@@ -3842,6 +3845,17 @@ impl App {
     /// the layout cache invalidates correctly.
     pub fn push_error(&mut self, text: String) {
         self.push_message(ChatBlock::Error(text));
+    }
+
+    /// The agent's turn could not even start (no LLM client, unknown
+    /// profile): show why and settle the turn like a failed one, so the tab
+    /// leaves Thinking and a runbook replay step pauses (#669 review).
+    pub fn agent_start_failed(&mut self, text: String) {
+        self.push_error(text);
+        self.mode = AppMode::Normal;
+        self.agent_running = false;
+        self.cancellation = None;
+        self.replay_turn_ended(None);
     }
 
     /// Handle a terminal keyboard event.
@@ -6692,6 +6706,9 @@ impl App {
                     self.replay_turn_ended(None);
                 }
                 filar_agent::AgentEvent::Cancelled => {
+                    // Ctrl+Z on a replay step (#669 review): the step pauses
+                    // without a verdict; a later Finished/Error is a no-op.
+                    self.replay_turn_ended(None);
                     // A cancelled turn drops its ratings still in flight
                     // (#631): no `CommandScored` follows, so a badge left at
                     // "rating…" would never resolve.

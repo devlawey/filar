@@ -1097,11 +1097,12 @@ mod tests {
     #[test]
     fn a_denied_or_cancelled_step_does_not_move_the_checklist() {
         let mut app = started(CommandConfirmMode::Always);
-        // The agent's turn ends with an error (a cancelled run, say).
+        // Ctrl+Z on the step: the agent reports Cancelled.
         app.handle_agent_event(crate::event::TuiEvent::Agent {
             session_id: app.sessions[app.active].id,
-            event: filar_agent::AgentEvent::Error("cancelled".into()),
+            event: filar_agent::AgentEvent::Cancelled,
         });
+        app.mode = crate::app::AppMode::Normal;
         let run = run_of(&app);
         assert_eq!(run.current, 0);
         assert_eq!(run.phase, ReplayPhase::Paused);
@@ -1318,5 +1319,38 @@ mod tests {
         assert!(app.replay_window_active());
         app.mode = crate::app::AppMode::Interactive;
         assert!(!app.replay_window_active(), "the terminal gets its keys");
+    }
+
+    #[test]
+    fn an_agent_that_cannot_start_pauses_the_step() {
+        let mut app = started(CommandConfirmMode::Always);
+        app.agent_start_failed("Profile 'x' not found".into());
+        assert_eq!(app.mode, crate::app::AppMode::Normal);
+        assert!(!app.agent_running);
+        let run = run_of(&app);
+        assert_eq!(run.phase, ReplayPhase::Paused);
+        assert!(app.replay_window_active(), "retry and stop are reachable");
+    }
+
+    #[test]
+    fn an_error_turn_also_pauses_the_step() {
+        let mut app = started(CommandConfirmMode::Always);
+        app.handle_agent_event(crate::event::TuiEvent::Agent {
+            session_id: app.sessions[app.active].id,
+            event: filar_agent::AgentEvent::Error("network".into()),
+        });
+        assert_eq!(run_of(&app).phase, ReplayPhase::Paused);
+    }
+
+    #[test]
+    fn restoring_a_session_into_the_tab_ends_its_replay() {
+        let mut app = started(CommandConfirmMode::Always);
+        finish_turn(&mut app, "STEP RESULT: passed - ok");
+        let saved = crate::runner::session_snapshot(&app, "test", "1", "t");
+        app.apply_loaded_session(saved);
+        assert!(
+            app.active_replay().is_none(),
+            "the old checklist does not follow F3"
+        );
     }
 }
