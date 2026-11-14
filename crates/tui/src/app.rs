@@ -4667,6 +4667,9 @@ impl App {
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.close_path_picker();
+                    // An edit, like any typed character: Down must not bring
+                    // the recalled line back over it (review).
+                    self.history_pos = None;
                     self.insert_char('/');
                 }
                 // `a` picks a folder (#483), also on the Russian layout.
@@ -12841,6 +12844,32 @@ mod tests {
         assert_eq!(app.input, "/");
         assert!(app.pending_path_picker.is_none());
         assert!(!app.path_picker_visible);
+    }
+
+    #[test]
+    fn a_literal_slash_ends_history_browsing() {
+        let mut app = App::new("test".into(), CommandConfirmMode::Always);
+        app.input_history.push("ls".into());
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.input, "ls");
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('F'),
+            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::SHIFT,
+        ));
+        let kind = app
+            .take_pending_path_picker()
+            .expect("Ctrl+Shift+F queues the picker");
+        app.open_path_picker(kind);
+        press_and_open(&mut app, '/');
+        assert_eq!(app.input, "ls/");
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.input, "ls/", "Down must not restore the line over the edit");
     }
 
     #[test]

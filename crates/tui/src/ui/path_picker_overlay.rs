@@ -122,6 +122,7 @@ pub(crate) fn render_path_picker(f: &mut Frame, app: &App, area: Rect) {
 fn footer_hint(kind: PathPickerKind, width: u16) -> Cow<'static, str> {
     let variants: &[&'static str] = match kind {
         PathPickerKind::File => &[
+            " \u{2191}\u{2193} Enter open/pick file  a pick folder (.. = here)  // literal /  Esc ",
             " Enter open/pick file  a pick folder (.. = here)  // literal /  Esc ",
             " Enter open/pick file  a pick folder  // literal /  Esc ",
             " Enter open/file  a folder  // literal /  Esc ",
@@ -173,6 +174,13 @@ mod tests {
             }
         }
         assert!(footer_hint(PathPickerKind::File, OVERLAY_MAX_WIDTH).contains("pick file"));
+        // Both pickers name the arrow keys at full width, and the hint leaves
+        // the right corner of the frame alone (review of #670).
+        for kind in [PathPickerKind::File, PathPickerKind::Folder] {
+            let full = footer_hint(kind, OVERLAY_MAX_WIDTH);
+            assert!(full.contains('\u{2191}'), "{full}");
+            assert!(full.chars().count() < OVERLAY_MAX_WIDTH as usize, "{full}");
+        }
         // The literal-slash key is named whenever there is room for it (#670).
         for kind in [PathPickerKind::File, PathPickerKind::Folder] {
             assert!(footer_hint(kind, OVERLAY_MAX_WIDTH).contains("// literal /"));
