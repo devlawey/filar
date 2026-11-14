@@ -2729,12 +2729,12 @@ async fn run_app(
                                 Some(p) => match (config.llm_factory)(p, &config.secret_provider) {
                                     Ok(c) => c,
                                     Err(e) => {
-                                        app.push_error(format!("Failed to create LLM client: {e}"));
+                                        app.agent_start_failed(format!("Failed to create LLM client: {e}"));
                                         continue;
                                     }
                                 },
                                 None => {
-                                    app.push_error(format!("Profile '{profile_name}' not found"));
+                                    app.agent_start_failed(format!("Profile '{profile_name}' not found"));
                                     continue;
                                 }
                             }
@@ -2770,6 +2770,9 @@ async fn run_app(
                             in_fleet,
                             app.pod_agent_target(),
                             config.log_sources.clone(),
+                            app.replay_runs.get(&sid).is_some_and(|r| {
+                                r.phase == crate::app::runbook_replay::ReplayPhase::Running
+                            }),
                         );
                         // Consumed by this run: the summary comes back as an
                         // event, and a leftover flag would fold the history a
@@ -4401,6 +4404,9 @@ fn spawn_agent(
     pod_target: Option<filar_agent::KubePodTarget>,
     // `query_logs` (#579); the builder drops it for a fleet.
     log_sources: Option<Arc<filar_agent::LogSources>>,
+    // The turn is a step of a runbook replay (#669): the prompt gets the
+    // replay block.
+    runbook_replay: bool,
 ) {
     let tx = event_tx.clone();
     let confirmer = Arc::new(TuiConfirmer::new(event_tx.clone(), sid)) as Arc<dyn CommandConfirmer>;
@@ -4476,7 +4482,10 @@ fn spawn_agent(
                     .ssh_mode(ssh_info.as_deref())
                     .arbiter_ssh_context(ssh_info.clone());
             }
-            builder = builder.session_id(sid.0.to_string()).fleet(fleet);
+            builder = builder
+                .session_id(sid.0.to_string())
+                .fleet(fleet)
+                .runbook_replay(runbook_replay);
 
             let agent = match builder.build() {
                 Ok(a) => a,

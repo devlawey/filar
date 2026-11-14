@@ -435,6 +435,7 @@ pub struct AgentBuilder {
     risk_scorer: Option<Arc<dyn RiskScorer>>,
     log_sources: Option<Arc<crate::logs::LogSources>>,
     kube_pod: Option<KubePodTarget>,
+    runbook_replay: bool,
 }
 
 impl AgentBuilder {
@@ -464,6 +465,7 @@ impl AgentBuilder {
             risk_scorer: None,
             log_sources: None,
             kube_pod: None,
+            runbook_replay: false,
         }
     }
 
@@ -606,6 +608,14 @@ impl AgentBuilder {
         self
     }
 
+    /// The turn is a step of a runbook replay (#669): the system prompt gets
+    /// [`crate::RUNBOOK_REPLAY_PROMPT`]. Not for a fleet, where it is ignored.
+    /// The tool set and the confirmation gate are unchanged.
+    pub fn runbook_replay(mut self, replay: bool) -> Self {
+        self.runbook_replay = replay;
+        self
+    }
+
     /// Set the command safety scorer (#549). Every command the agent proposes
     /// is rated asynchronously, in every confirmation mode; the rating
     /// arrives as [`AgentEvent::CommandScored`] and never affects the gate.
@@ -724,6 +734,11 @@ impl AgentBuilder {
                 system_prompt.push_str(crate::logs::k8s::POD_LOGS_HISTORY_PROMPT);
                 system_prompt.push('\n');
             }
+        }
+        // A runbook replay step (#669): one host only.
+        if self.runbook_replay && !self.fleet {
+            system_prompt.push('\n');
+            system_prompt.push_str(crate::runbook_replay::RUNBOOK_REPLAY_PROMPT);
         }
         // Append SAFE MODE block in Explain mode.
         if self.confirm_mode == CommandConfirmMode::Explain {
@@ -2577,6 +2592,47 @@ mod tests {
             )),
             "expected CommandFinished with long-wait refusal, got {received:?}"
         );
+    }
+
+    #[test]
+    fn replay_step_prompt_matches_eval_snapshot() {
+        // eval/prompts/replay-step-system.txt is the SSH prompt with the
+        // replay block, as the builder appends it (#669).
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../eval/prompts/replay-step-system.txt");
+        let snapshot = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        let expected = format!(
+            "{}\n{}",
+            build_system_prompt(false, None, false),
+            crate::runbook_replay::RUNBOOK_REPLAY_PROMPT
+        );
+        assert_eq!(
+            snapshot.trim_end(),
+            expected.trim_end(),
+            "eval/prompts/replay-step-system.txt is out of sync with the replay system prompt"
+        );
+    }
+
+    #[test]
+    fn the_replay_block_is_added_only_for_a_replay_step() {
+        use crate::runbook_replay::RUNBOOK_REPLAY_PROMPT;
+        let build = |replay: bool, fleet: bool| {
+            Agent::builder()
+                .llm(Arc::new(MockLlm::new(vec![])))
+                .executor(Arc::new(MockExecutor {
+                    last_command: std::sync::Mutex::new(String::new()),
+                }))
+                .confirmer(Arc::new(MockConfirmer { approve: true }))
+                .ssh_mode(Some("root@h:22"))
+                .runbook_replay(replay)
+                .fleet(fleet)
+                .build()
+                .expect("agent")
+        };
+        assert!(build(true, false).system_prompt.contains(RUNBOOK_REPLAY_PROMPT));
+        assert!(!build(false, false).system_prompt.contains("RUNBOOK REPLAY"));
+        assert!(!build(true, true).system_prompt.contains("RUNBOOK REPLAY"), "never for a fleet");
     }
 
     #[test]

@@ -870,6 +870,8 @@ pub struct App {
     pub replay_plan_request_id: u64,
     /// The plan preview window, while open (#668).
     pub replay_preview: Option<runbook_replay::ReplayPreview>,
+    /// Runbook replays in progress, by tab (#669).
+    pub replay_runs: HashMap<SessionId, runbook_replay::ReplayRun>,
     /// Operations shown in the side panel, across all tabs (#431).
     /// Refreshed from the agent's background-job registry.
     pub operations: Vec<crate::ops::Operation>,
@@ -1247,6 +1249,7 @@ impl App {
             replay_plan_cancel: None,
             replay_plan_request_id: 0,
             replay_preview: None,
+            replay_runs: HashMap::new(),
             operations: Vec::new(),
             side_panel: crate::side_panel::SidePanel::default(),
         }
@@ -1294,6 +1297,8 @@ impl App {
         }
         let closed = self.active;
         self.sessions.remove(closed);
+        // A replay on the closed tab ends with it (#669 review).
+        self.replay_runs.remove(&sid);
         // Land on the neighbouring ordinary tab, never on the fleet session.
         let tabs = self.tab_indices();
         self.active = tabs
@@ -3642,6 +3647,9 @@ impl App {
         self.hovered_button = None;
         self.collapsed_overrides.clear();
         self.selection = None;
+        // A replay belongs to the conversation being replaced (#669 review).
+        let sid = self.sessions[self.active].id;
+        self.replay_runs.remove(&sid);
 
         self.messages = session.messages;
         // Ratings belong to the replaced history's blocks (#551), and so does
@@ -3837,6 +3845,17 @@ impl App {
     /// the layout cache invalidates correctly.
     pub fn push_error(&mut self, text: String) {
         self.push_message(ChatBlock::Error(text));
+    }
+
+    /// The agent's turn could not even start (no LLM client, unknown
+    /// profile): show why and settle the turn like a failed one, so the tab
+    /// leaves Thinking and a runbook replay step pauses (#669 review).
+    pub fn agent_start_failed(&mut self, text: String) {
+        self.push_error(text);
+        self.mode = AppMode::Normal;
+        self.agent_running = false;
+        self.cancellation = None;
+        self.replay_turn_ended(None);
     }
 
     /// Handle a terminal keyboard event.
@@ -4411,6 +4430,18 @@ impl App {
             return;
         }
 
+        // The step window of a runbook replay (#669) takes the keys while it
+        // is shown; Esc hides it to talk to the agent.
+        // Ctrl/Alt chords pass through (Ctrl+S still saves, Ctrl+Q quits).
+        if self.replay_window_active()
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.handle_replay_window_key(key);
+            return;
+        }
+
         // Namespace selection is modal: discovery must not leak late results
         // after Esc, and global overlays must not steal its navigation (#575).
         if self.kube_namespace_select.is_some() {
@@ -4915,6 +4946,9 @@ impl App {
                             self.cursor_pos = 0;
                             self.begin_agent_request(text);
                         }
+                    } else {
+                        // An empty Enter brings back a hidden replay window (#669).
+                        self.reopen_replay_window();
                     }
                 }
                 _ if ctrl_key('t', 'е') => {
@@ -6584,6 +6618,7 @@ impl App {
                     self.save_transcript_silent();
                 }
                 filar_agent::AgentEvent::Finished(text) => {
+                    let finished_text = text.clone();
                     if self.streaming {
                         if !text.is_empty() {
                             if let Some(ChatBlock::Agent(ref mut existing)) =
@@ -6604,6 +6639,12 @@ impl App {
                     self.agent_running = false;
                     self.cancellation = None;
                     self.active_session_mut().background_activity = false;
+                    // A replay step's turn ended (#669): its reply has the verdict.
+                    let reply = match self.messages.last() {
+                        Some(ChatBlock::Agent(t)) if !t.is_empty() => t.clone(),
+                        _ => finished_text,
+                    };
+                    self.replay_turn_ended(Some(&reply));
                 }
                 filar_agent::AgentEvent::TokenUsage {
                     tokens_in,
@@ -6662,8 +6703,12 @@ impl App {
                     self.agent_running = false;
                     self.cancellation = None;
                     self.active_session_mut().background_activity = false;
+                    self.replay_turn_ended(None);
                 }
                 filar_agent::AgentEvent::Cancelled => {
+                    // Ctrl+Z on a replay step (#669 review): the step pauses
+                    // without a verdict; a later Finished/Error is a no-op.
+                    self.replay_turn_ended(None);
                     // A cancelled turn drops its ratings still in flight
                     // (#631): no `CommandScored` follows, so a badge left at
                     // "rating…" would never resolve.

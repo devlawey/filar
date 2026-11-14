@@ -98,7 +98,8 @@ pub use runbook::{
     FLEET_RUNBOOK_PROMPT, RUNBOOK_SYSTEM_PROMPT,
 };
 pub use runbook_replay::{
-    extract_replay_plan, parse_replay_plan, ReplayPlan, ReplayPlanOutcome, ReplayStep,
+    extract_replay_plan, parse_replay_plan, parse_step_verdict, replay_step_message, ReplayPlan,
+    ReplayPlanOutcome, ReplayStep, StepVerdict, RUNBOOK_REPLAY_PROMPT,
     FLEET_RUNBOOK_MARKER, MAX_REPLAY_RUNBOOK_BYTES, REPLAY_PLAN_SYSTEM_PROMPT, SECRET_PLACEHOLDER,
 };
 pub use security::{CliConfirmer, CommandConfirmer, ConfirmDecision};

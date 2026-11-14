@@ -40,6 +40,8 @@ mod debug_confirm;
 mod pod_select;
 mod path_picker_overlay;
 mod replay_preview;
+mod replay_window;
+pub(crate) use replay_preview::mode_name as confirm_mode_name;
 mod save_overlay;
 mod session_select;
 mod side_panel;
@@ -186,6 +188,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
         replay_preview::render_replay_preview(f, app, f.area());
     }
 
+    // The step window of a runbook replay (#669).
+    if app.replay_window_active() {
+        replay_window::render_replay_window(f, app, f.area());
+    }
+
     // Render session-save progress overlay on top of everything if active.
     if app.save_overlay_visible {
         let full = f.area();
@@ -329,6 +336,11 @@ fn render_interactive(f: &mut Frame, app: &mut App) {
     // The replay-plan preview (#668).
     if app.replay_preview.is_some() {
         replay_preview::render_replay_preview(f, app, f.area());
+    }
+
+    // The step window of a runbook replay (#669).
+    if app.replay_window_active() {
+        replay_window::render_replay_window(f, app, f.area());
     }
 
     // Render session-save progress overlay on top of everything if active.

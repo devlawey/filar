@@ -349,6 +349,12 @@ pub(crate) fn help_registry() -> Vec<HelpEntry> {
             available: |m| m == AppMode::Normal,
         },
         HelpEntry {
+            key: "replay",
+            desc: "Runbook replay step window: Enter accept the agent's verdict, p/f passed/failed, r retry, s skip, m done by hand, q stop, Esc talk to the agent (empty Enter brings the window back)",
+            section: "Input",
+            available: |m| m == AppMode::Normal,
+        },
+        HelpEntry {
             key: "^Shift+F",
             desc: "Open file picker (active target)",
             section: "Input",
