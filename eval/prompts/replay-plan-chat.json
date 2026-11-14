@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "file://prompts/replay-plan-system.txt"
+  },
+  {
+    "role": "user",
+    "content": "Convert this runbook into the JSON step list.\n\n<runbook>\n{{runbook}}\n</runbook>"
+  }
+]

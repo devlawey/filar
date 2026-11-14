@@ -58,6 +58,7 @@ pub mod pod_http;
 pub mod preprocess;
 pub mod risk;
 pub mod runbook;
+pub mod runbook_replay;
 pub mod security;
 pub mod tools;
 
@@ -95,6 +96,10 @@ pub use risk::{build_risk_scorer, DecisionsApiScorer, RiskInput, RiskScore, Risk
 pub use runbook::{
     generate_fleet_runbook, generate_runbook, FleetIdentifiers, RunbookOutcome,
     FLEET_RUNBOOK_PROMPT, RUNBOOK_SYSTEM_PROMPT,
+};
+pub use runbook_replay::{
+    extract_replay_plan, parse_replay_plan, ReplayPlan, ReplayPlanOutcome, ReplayStep,
+    FLEET_RUNBOOK_MARKER, MAX_REPLAY_RUNBOOK_BYTES, REPLAY_PLAN_SYSTEM_PROMPT, SECRET_PLACEHOLDER,
 };
 pub use security::{CliConfirmer, CommandConfirmer, ConfirmDecision};
 pub use tools::{tool_definitions, ToolKind};

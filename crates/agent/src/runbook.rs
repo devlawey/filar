@@ -242,7 +242,8 @@ pub async fn generate_runbook(llm: &dyn LlmClient, transcript: &str) -> RunbookO
 /// before the call and from the reply after it.
 ///
 /// The same rules as the single-host runbook hold — no tools, the length
-/// floor, usage reported either way.
+/// floor, usage reported either way. The text starts with
+/// [`crate::FLEET_RUNBOOK_MARKER`] on its own line (#667).
 pub async fn generate_fleet_runbook(
     llm: &dyn LlmClient,
     transcript: &str,
@@ -250,7 +251,15 @@ pub async fn generate_fleet_runbook(
 ) -> RunbookOutcome {
     let prompt = format!("{RUNBOOK_SYSTEM_PROMPT}\n\n{FLEET_RUNBOOK_PROMPT}");
     let mut outcome = generate_with(llm, &prompt, &ids.scrub(transcript)).await;
-    outcome.runbook = outcome.runbook.map(|text| ids.scrub(&text));
+    // The marker lets a replay refuse a fleet runbook without asking the
+    // model (#667); it is an HTML comment, so a rendered runbook hides it.
+    outcome.runbook = outcome.runbook.map(|text| {
+        format!(
+            "{}\n{}",
+            crate::runbook_replay::FLEET_RUNBOOK_MARKER,
+            ids.scrub(&text)
+        )
+    });
     outcome
 }
 
@@ -405,6 +414,23 @@ mod tests {
             assert!(!text.contains(leaked), "{leaked:?} reached the runbook:\n{text}");
         }
         assert!(text.contains("for the group, not for one machine"), "the fleet block was sent");
+    }
+
+    #[tokio::test]
+    async fn a_fleet_runbook_carries_the_replay_marker() {
+        // A replay refuses fleet runbooks by this first line (#667).
+        let outcome =
+            generate_fleet_runbook(&EchoLlm, "## Fleet: web\n`uptime`", &fleet_ids()).await;
+        let text = outcome.runbook.expect("the echo is long enough");
+        assert!(text.starts_with(crate::FLEET_RUNBOOK_MARKER), "{text}");
+        let single = generate_runbook(&EchoLlm, "`uptime` on one host")
+            .await
+            .runbook
+            .expect("long enough");
+        assert!(
+            !single.contains(crate::FLEET_RUNBOOK_MARKER),
+            "single-host runbooks are unmarked"
+        );
     }
 
     struct Named(&'static str);

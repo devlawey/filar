@@ -539,6 +539,70 @@ The runbook prompt keeps such a rating next to the same command in its step
 and never adds one to a command that has none; a transcript without ratings
 reads as before.
 
+### `extract_replay_plan` — a runbook back into steps (#667)
+
+```rust
+pub async fn extract_replay_plan(
+    llm: &dyn LlmClient,
+    runbook: &str,
+    cancel: &CancellationToken,
+) -> Option<ReplayPlanOutcome>;        // None: cancelled, nothing to report
+
+pub fn parse_replay_plan(runbook: &str, reply: &str) -> Result<ReplayPlan>;
+
+pub struct ReplayPlanOutcome { pub usage: Option<TokenUsage>, pub plan: Result<ReplayPlan> }
+
+pub struct ReplayPlan {
+    pub title: String,
+    pub symptom: Option<String>,
+    pub preconditions: Vec<String>,
+    pub steps: Vec<ReplayStep>,        // never empty
+    pub exit_criteria: Vec<String>,
+    pub next_actions: Vec<String>,
+}
+
+pub struct ReplayStep {
+    pub index: usize,                  // from 1
+    pub title: String,
+    pub command: Option<String>,       // None: the operator does it by hand
+    pub expect: String,                // what to look at in the output
+    pub original_safety: Option<String>, // "safety 34% ⛔ danger", from the runbook text
+    pub placeholders: Vec<String>,     // "<service>", "<secret>", …
+    pub needs_secret: bool,            // has "<secret>": the operator performs it
+}
+```
+
+The plan a replay (the checklist in the TUI) holds while it walks a runbook
+on another host. One streaming call with **no tools**, like the runbook
+writer; the runbook goes to the model inside a `<runbook>` frame as data, and
+a closing tag in the text is defused so it cannot end the frame. `usage` comes
+back with an `Err` too — the call was paid for.
+
+What the model decides is only where steps begin and end. Everything else is
+checked in code after it:
+
+- a step's `command` must equal, as a whole (whitespace aside), a command
+  the runbook writes — inline code, `**$ …**`, a `$ ` line or a line of a
+  code block — or the whole plan is an error. The model cannot add a command
+  the runbook does not have, nor shorten one (`rm -rf /` out of
+  `rm -rf /tmp/x`). A command that *is* written in the text (inside an
+  injected sentence, say) passes; showing the plan before a replay and the
+  confirm gate on every command are what stop that, not this check;
+- a rating the model copied after the command is dropped; `original_safety`
+  is read from that command's line — for a command used twice, the
+  occurrence after the previous step's (#663 format);
+- `placeholders` and `needs_secret` come from scanning the step's text. Never
+  hand a `needs_secret` step to the agent — `<secret>` is for the operator.
+
+Refused before any call: a runbook over `MAX_REPLAY_RUNBOOK_BYTES` (256 KiB),
+an empty one, and a fleet runbook — `generate_fleet_runbook` now writes
+`FLEET_RUNBOOK_MARKER` (`<!-- filar:fleet-runbook -->`) on its first line, and
+an older fleet runbook the model reports as `scope: fleet` is refused after
+the call. Replaying a fleet runbook is not supported yet.
+
+`REPLAY_PLAN_SYSTEM_PROMPT` is a system prompt: a change to it needs an eval
+run; its snapshot is `eval/prompts/replay-plan-system.txt`.
+
 ### `Session::folded_history` — where the folded turns live
 
 ```rust
@@ -614,7 +678,7 @@ existing traits rather than by widening them:
 | `fleet_fold::fold`, `fleet_file_fold::fold_file` | `filar-agent` | The only text about an operation the model gets: groups of agreeing hosts by typed rows or digests (#430); for a file check, verdicts against the reference (#440) |
 | `fleet_creds::FleetCredentials` | `filar-agent` | One host's own credentials each; a host without them drops out (#436) |
 | `fleet_view::FleetView` | `filar-agent` | The person-facing aggregate with sample answers — for a UI, never the model (#438) |
-| `FleetIdentifiers`, `generate_fleet_runbook` | `filar-agent` | A fleet session's runbook: a procedure for the group, with host names, addresses and accounts scrubbed in code (#443) |
+| `FleetIdentifiers`, `generate_fleet_runbook` | `filar-agent` | A fleet session's runbook: a procedure for the group, with host names, addresses and accounts scrubbed in code (#443) ; starts with `FLEET_RUNBOOK_MARKER` (#667) |
 
 ### Containment is the design
 
@@ -826,6 +890,13 @@ let _agent = builder.log_sources(sources);
   connection. Whether the store then stops the query depends on the backend
   and any proxy in front of it (VictoriaLogs documents that it does). Kinds without an adapter in the
   build are reported by `build_log_sources` and not offered.
+
+## Upgrading to `engine-v3.0.6`
+
+| Change | Breaks | What to do |
+|--------|--------|------------|
+| `extract_replay_plan`, `parse_replay_plan`, `ReplayPlan`, `ReplayStep`, `ReplayPlanOutcome`, `REPLAY_PLAN_SYSTEM_PROMPT`, `MAX_REPLAY_RUNBOOK_BYTES`, `SECRET_PLACEHOLDER` (#667) | Nothing — additive; `LlmClient` is unchanged | To replay a runbook, show the plan first and send every step's command through your confirmation gate; never hand a `needs_secret` step to the agent |
+| `generate_fleet_runbook` text starts with `FLEET_RUNBOOK_MARKER` on its own line (#667) | Only code that compares a fleet runbook's text exactly | Strip the first line if you need the bare text; it is an HTML comment, so rendered markdown hides it |
 
 ## Upgrading to `engine-v3.0.5`
 
