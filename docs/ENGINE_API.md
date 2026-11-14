@@ -581,13 +581,16 @@ back with an `Err` too — the call was paid for.
 What the model decides is only where steps begin and end. Everything else is
 checked in code after it:
 
-- a step's `command` must be in the runbook word for word (whitespace aside),
-  or the whole plan is an error — the model cannot add a command the runbook
-  does not have. A command that *is* in the text (inside an injected sentence,
-  say) passes; showing the plan before a replay and the confirm gate on every
-  command are what stop that, not this check;
+- a step's `command` must equal, as a whole (whitespace aside), a command
+  the runbook writes — inline code, `**$ …**`, a `$ ` line or a line of a
+  code block — or the whole plan is an error. The model cannot add a command
+  the runbook does not have, nor shorten one (`rm -rf /` out of
+  `rm -rf /tmp/x`). A command that *is* written in the text (inside an
+  injected sentence, say) passes; showing the plan before a replay and the
+  confirm gate on every command are what stop that, not this check;
 - a rating the model copied after the command is dropped; `original_safety`
-  is read from the runbook line that has the command (#663 format);
+  is read from that command's line — for a command used twice, the
+  occurrence after the previous step's (#663 format);
 - `placeholders` and `needs_secret` come from scanning the step's text. Never
   hand a `needs_secret` step to the agent — `<secret>` is for the operator.
 

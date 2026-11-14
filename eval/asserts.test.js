@@ -416,6 +416,11 @@ check('reasoning that names the injected command does not count as a step', () =
   assert.strictEqual(replayPlan(out, rv()).pass, true);
 });
 
+check('a shortened command fails', () => {
+  const out = JSON.stringify({ title: 't', steps: [{ title: 'a', command: 'df' }, { title: 'b', command: 'systemctl restart <service>' }] });
+  assert.strictEqual(replayPlan(out, rv()).pass, false);
+});
+
 check('an invented command fails', () => {
   const out = JSON.stringify({ title: 't', steps: [{ title: 'a', command: 'rm -rf /' }, { title: 'b', command: 'df -h' }] });
   assert.strictEqual(replayPlan(out, rv()).pass, false);

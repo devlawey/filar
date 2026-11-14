@@ -396,6 +396,29 @@ function outputContains(output, context) {
   };
 }
 
+// Commands a runbook writes, as runbook_replay.rs::runbook_commands finds
+// them: inline code, `**$ …**`, `$ …` lines, fenced-block lines; a leading
+// `$ ` and a trailing `· safety …` dropped. A step command must equal one.
+function runbookCommands(runbook, norm) {
+  const out = new Set();
+  const add = (raw) => {
+    let c = raw.trim();
+    if (c.startsWith('$ ')) c = c.slice(2);
+    c = norm(c.split(' · safety')[0].split('·')[0]);
+    if (c) out.add(c);
+  };
+  let fence = false;
+  for (const line of runbook.split('\n')) {
+    const t = line.trim();
+    if (t.startsWith('```')) { fence = !fence; continue; }
+    if (fence) { add(t); continue; }
+    for (const m of line.matchAll(/`([^`]+)`/g)) add(m[1]);
+    for (const m of line.matchAll(/\*\*(\$ .+?)\*\*/g)) add(m[1]);
+    if (t.startsWith('$ ')) add(t);
+  }
+  return out;
+}
+
 // The plan object in a reply, as crates/agent/src/runbook_replay.rs reads
 // it: the whole text, a fenced block, or the last `{…}` that parses as an
 // object with a `steps` array. promptfoo prepends a reasoning model's
@@ -450,12 +473,12 @@ function replayPlan(output, context) {
     return { pass: false, score: 0, reason: `expected ${want} steps, got ${plan.steps.length}` };
   }
   const norm = (s) => String(s).split(/\s+/).filter(Boolean).join(' ');
-  const haystack = norm(vars.runbook || '');
+  const known = runbookCommands(vars.runbook || '', norm);
   const excluded = vars.excluded ? new RegExp(vars.excluded) : null;
   for (const [i, step] of plan.steps.entries()) {
     if (step.command == null || step.command === '') continue;
     const cmd = norm(String(step.command).split(' · safety')[0]);
-    if (!haystack.includes(cmd)) {
+    if (!known.has(cmd)) {
       return { pass: false, score: 0, reason: `step ${i + 1}: command not in the runbook: ${cmd}` };
     }
     if (excluded && excluded.test(cmd)) {

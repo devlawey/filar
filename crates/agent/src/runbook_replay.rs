@@ -185,7 +185,7 @@ pub fn parse_replay_plan(runbook: &str, reply: &str) -> Result<ReplayPlan> {
     if raw.steps.is_empty() {
         return Err(CoreError::Other("no steps found in the runbook".into()));
     }
-    let haystack = normalize_ws(runbook);
+    let commands = runbook_commands(runbook);
     let lines: Vec<&str> = runbook.lines().collect();
     // Where the previous step's command was found: a command that appears in
     // two steps takes its rating from its own occurrence, not the first one.
@@ -196,7 +196,8 @@ pub fn parse_replay_plan(runbook: &str, reply: &str) -> Result<ReplayPlan> {
         let command = match step.command.map(|c| strip_rating(&c).trim().to_string()) {
             Some(c) if c.is_empty() => None,
             Some(c) => {
-                if !haystack.contains(&normalize_ws(&c)) {
+                let needle = normalize_ws(&c);
+                if !commands.iter().any(|(_, known)| *known == needle) {
                     return Err(CoreError::Other(format!(
                         "step {index} of the replay plan has a command that is not in the runbook: {c}"
                     )));
@@ -206,7 +207,7 @@ pub fn parse_replay_plan(runbook: &str, reply: &str) -> Result<ReplayPlan> {
             None => None,
         };
         let original_safety = match command.as_deref() {
-            Some(c) => match find_command_line(&lines, c, cursor) {
+            Some(c) => match find_command_line(&commands, c, cursor) {
                 Some(at) => {
                     cursor = at + 1;
                     rating_on_line(lines[at], c)
@@ -336,9 +337,10 @@ fn read_raw_plan(reply: &str) -> Result<RawPlan> {
     };
     let mut end = text.len();
     while let Some(start) = text[..end].rfind('{') {
-        let tail = text[start..].trim_end();
-        let tail = tail.strip_suffix("```").unwrap_or(tail);
-        if let Ok(plan) = serde_json::from_str::<RawPlan>(tail) {
+        // The first JSON value from here; whatever follows it (a closing
+        // fence, a sentence) is not read.
+        let mut values = serde_json::Deserializer::from_str(&text[start..]).into_iter::<RawPlan>();
+        if let Some(Ok(plan)) = values.next() {
             return Ok(plan);
         }
         end = start;
@@ -385,15 +387,73 @@ fn strip_rating(command: &str) -> &str {
     }
 }
 
-/// The first line at or after `from` that has `command` (whitespace aside),
-/// else the first such line anywhere — steps the model put out of order
+/// Every command the runbook writes, with its line, whitespace collapsed:
+/// inline code (`` `…` ``), a bold command (`**$ …**`), a line starting with
+/// `$ `, and each line of a fenced code block — a leading `$ ` and a
+/// trailing safety rating dropped.
+///
+/// A step's command must equal one of these as a whole. A substring is not
+/// enough: `rm -rf /` is a substring of `rm -rf /tmp/x` (review of #667).
+fn runbook_commands(runbook: &str) -> Vec<(usize, String)> {
+    fn push(out: &mut Vec<(usize, String)>, line: usize, raw: &str) {
+        let c = raw.trim();
+        let c = c.strip_prefix("$ ").unwrap_or(c);
+        let c = normalize_ws(strip_rating(c));
+        if !c.is_empty() {
+            out.push((line, c));
+        }
+    }
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for (i, line) in runbook.lines().enumerate() {
+        let t = line.trim();
+        if t.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            push(&mut out, i, t);
+            continue;
+        }
+        let mut rest = line;
+        while let Some(open) = rest.find('`') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('`') else {
+                break;
+            };
+            push(&mut out, i, &after[..close]);
+            rest = &after[close + 1..];
+        }
+        let mut rest = line;
+        while let Some(open) = rest.find("**") {
+            let after = &rest[open + 2..];
+            let Some(close) = after.find("**") else {
+                break;
+            };
+            let inner = &after[..close];
+            if inner.trim_start().starts_with("$ ") {
+                push(&mut out, i, inner);
+            }
+            rest = &after[close + 2..];
+        }
+        if let Some(cmd) = t.strip_prefix("$ ") {
+            push(&mut out, i, cmd);
+        }
+    }
+    out
+}
+
+/// The line of the first runbook command equal to `command` at or after
+/// line `from`, else the first anywhere — steps the model put out of order
 /// still find their line.
-fn find_command_line(lines: &[&str], command: &str, from: usize) -> Option<usize> {
+fn find_command_line(commands: &[(usize, String)], command: &str, from: usize) -> Option<usize> {
     let needle = normalize_ws(command);
-    let has = |i: &usize| normalize_ws(lines[*i]).contains(&needle);
-    (from..lines.len())
-        .find(has)
-        .or_else(|| (0..from.min(lines.len())).find(has))
+    let at = |(line, known): &(usize, String)| (*known == needle).then_some(*line);
+    commands
+        .iter()
+        .filter(|(line, _)| *line >= from)
+        .find_map(at)
+        .or_else(|| commands.iter().find_map(at))
 }
 
 /// The rating written after `command` on `line`, without the leading `·`
@@ -405,7 +465,20 @@ fn find_command_line(lines: &[&str], command: &str, from: usize) -> Option<usize
 fn rating_on_line(line: &str, command: &str) -> Option<String> {
     let needle = normalize_ws(command);
     let norm = normalize_ws(line);
-    let at = norm.find(&needle)?;
+    // The occurrence that ends where a command ends — at a closing `` ` ``
+    // or `**`, before the rating, or at the end of the line — not the
+    // inside of a longer command on the same line.
+    let ends_command = |at: usize| {
+        let after = norm[at + needle.len()..].trim_start();
+        after.is_empty()
+            || after.starts_with('`')
+            || after.starts_with('*')
+            || after.starts_with('·')
+    };
+    let at = norm
+        .match_indices(needle.as_str())
+        .map(|(at, _)| at)
+        .find(|at| ends_command(*at))?;
     let tail = &norm[at + needle.len()..];
     let start = rating_start(tail)?;
     Some(clean_rating(tail[start + '·'.len_utf8()..].trim_start()))
@@ -519,6 +592,50 @@ Root has more than 10% free.
     }
 
     #[test]
+    fn a_shortened_command_is_not_a_runbook_command() {
+        // A prefix of a runbook command can mean something else entirely.
+        let runbook = "1. Clean: `rm -rf /tmp/x`\n2. Greet: **$ echo hello** · safety 99%\n";
+        for cmd in ["rm -rf /", "echo", "hello", "rm -rf /tmp"] {
+            let steps = format!(r#"{{"title":"a","command":"{cmd}","expect":""}}"#);
+            let err = parse_replay_plan(runbook, &reply(&steps))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not in the runbook"), "{cmd}: {err}");
+        }
+        let steps = r#"{"title":"a","command":"rm -rf /tmp/x","expect":""},{"title":"b","command":"echo hello","expect":""}"#;
+        let plan = parse_replay_plan(runbook, &reply(steps)).expect("whole commands pass");
+        assert_eq!(plan.steps[1].original_safety.as_deref(), Some("safety 99%"));
+    }
+
+    #[test]
+    fn commands_in_code_blocks_and_dollar_lines_are_runbook_commands() {
+        let runbook = "## Steps\n1. Check\n```bash\n$ journalctl -u nginx --since -1h\ntail -n 50 /var/log/nginx/error.log\n```\n2. Reload\n$ sudo systemctl reload nginx · safety 70% ⚠ warn\n";
+        let steps = r#"
+            {"title":"a","command":"journalctl -u nginx --since -1h","expect":""},
+            {"title":"b","command":"tail -n 50 /var/log/nginx/error.log","expect":""},
+            {"title":"c","command":"sudo systemctl reload nginx","expect":""}"#;
+        let plan = parse_replay_plan(runbook, &reply(steps)).expect("plan");
+        assert_eq!(
+            plan.steps[2].original_safety.as_deref(),
+            Some("safety 70% ⚠ warn")
+        );
+    }
+
+    #[test]
+    fn a_bold_command_with_a_glob_is_found_whole() {
+        // From eval case replay-01: `*` inside `**$ …**` is not its end.
+        let runbook =
+            "2. Найти логи: **$ sudo du -sh /var/log/* | sort -h | tail -5** · safety ~81%\n";
+        let steps =
+            r#"{"title":"a","command":"sudo du -sh /var/log/* | sort -h | tail -5","expect":""}"#;
+        let plan = parse_replay_plan(runbook, &reply(steps)).expect("plan");
+        assert_eq!(
+            plan.steps[0].original_safety.as_deref(),
+            Some("safety ~81%")
+        );
+    }
+
+    #[test]
     fn whitespace_differences_do_not_fail_the_match() {
         let steps = r#"{"title":"Logs","command":"du -sh  /var/log/*  |  sort -h","expect":""}"#;
         assert!(parse_replay_plan(RUNBOOK, &reply(steps)).is_ok());
@@ -610,6 +727,12 @@ Root has more than 10% free.
         );
         let plan = parse_replay_plan(RUNBOOK, &reply).expect("plan");
         assert_eq!(plan.steps.len(), 5);
+        // Text after the object does not hide it either.
+        let trailing = format!(
+            "Thinking: ok.\n{} — that is the plan.",
+            super::tests::reply(GOOD_STEPS)
+        );
+        assert!(parse_replay_plan(RUNBOOK, &trailing).is_ok());
     }
 
     #[test]
