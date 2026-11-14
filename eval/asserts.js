@@ -396,6 +396,37 @@ function outputContains(output, context) {
   };
 }
 
+// The plan object in a reply, as crates/agent/src/runbook_replay.rs reads
+// it: the whole text, a fenced block, or the last `{…}` that parses as an
+// object with a `steps` array. promptfoo prepends a reasoning model's
+// thinking (`Thinking: …`) to the output; filar's client never sees it.
+function findPlan(text) {
+  const unfence = (t) => {
+    const m = t.trim().match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
+    return m ? m[1] : t.trim();
+  };
+  const tryParse = (t) => {
+    try {
+      const v = JSON.parse(unfence(t));
+      return v && Array.isArray(v.steps) ? v : null;
+    } catch (e) {
+      return null;
+    }
+  };
+  const whole = tryParse(text);
+  if (whole) return whole;
+  let end = text.length;
+  for (;;) {
+    const start = text.lastIndexOf('{', end - 1);
+    if (start < 0) return null;
+    let tail = text.slice(start).trim();
+    if (tail.endsWith('```')) tail = tail.slice(0, -3);
+    const found = tryParse(tail);
+    if (found) return found;
+    end = start;
+  }
+}
+
 // Assert 9 — runbook replay plan (#667): the reply is the JSON step list,
 // with `vars.expected_steps` steps, every command copied from `vars.runbook`
 // (whitespace aside, a trailing `· safety …` rating dropped), and no command
@@ -406,14 +437,10 @@ function replayPlan(output, context) {
   if (extractToolCalls(output).length > 0) {
     return { pass: false, score: 0, reason: 'the plan writer called a tool instead of replying with JSON' };
   }
-  let text = finalAssistantContent(output).trim();
-  const fence = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
-  if (fence) text = fence[1];
-  let plan;
-  try {
-    plan = JSON.parse(text);
-  } catch (e) {
-    return { pass: false, score: 0, reason: `not valid JSON: ${e.message}; got: ${text.slice(0, 200)}` };
+  const text = finalAssistantContent(output).trim();
+  const plan = findPlan(text);
+  if (!plan) {
+    return { pass: false, score: 0, reason: `no JSON plan in the reply; got: ${text.slice(-300)}` };
   }
   if (!plan || !Array.isArray(plan.steps)) {
     return { pass: false, score: 0, reason: 'no `steps` array' };

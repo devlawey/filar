@@ -178,8 +178,7 @@ pub async fn extract_replay_plan(
 /// the reply says. A reply with no steps, or one that says the runbook is a
 /// fleet procedure, is an error.
 pub fn parse_replay_plan(runbook: &str, reply: &str) -> Result<ReplayPlan> {
-    let raw: RawPlan = serde_json::from_str(strip_code_fence(reply))
-        .map_err(|e| CoreError::Other(format!("the model's replay plan is not valid JSON: {e}")))?;
+    let raw = read_raw_plan(reply)?;
     if raw.scope.as_deref() == Some("fleet") {
         return Err(fleet_not_supported());
     }
@@ -187,6 +186,10 @@ pub fn parse_replay_plan(runbook: &str, reply: &str) -> Result<ReplayPlan> {
         return Err(CoreError::Other("no steps found in the runbook".into()));
     }
     let haystack = normalize_ws(runbook);
+    let lines: Vec<&str> = runbook.lines().collect();
+    // Where the previous step's command was found: a command that appears in
+    // two steps takes its rating from its own occurrence, not the first one.
+    let mut cursor = 0;
     let mut steps = Vec::with_capacity(raw.steps.len());
     for (i, step) in raw.steps.into_iter().enumerate() {
         let index = i + 1;
@@ -202,7 +205,16 @@ pub fn parse_replay_plan(runbook: &str, reply: &str) -> Result<ReplayPlan> {
             }
             None => None,
         };
-        let original_safety = command.as_deref().and_then(|c| rating_after(runbook, c));
+        let original_safety = match command.as_deref() {
+            Some(c) => match find_command_line(&lines, c, cursor) {
+                Some(at) => {
+                    cursor = at + 1;
+                    rating_on_line(lines[at], c)
+                }
+                None => None,
+            },
+            None => None,
+        };
         let mut placeholders = Vec::new();
         for text in [command.as_deref().unwrap_or(""), &step.title, &step.expect] {
             for p in find_placeholders(text) {
@@ -289,8 +301,51 @@ fn check_runbook_input(runbook: &str) -> Result<()> {
 /// A closing tag inside the document is defused, so the text cannot end the
 /// frame early and continue as if it were the user speaking.
 fn frame_runbook(runbook: &str) -> String {
-    let body = runbook.replace("</runbook>", "<\\/runbook>");
+    let body = defuse_closing_tags(runbook);
     format!("Convert this runbook into the JSON step list.\n\n<runbook>\n{body}\n</runbook>")
+}
+
+/// `runbook` with every closing `runbook` tag written as `<\/…`: any case,
+/// spaces inside (`</ RunBook >`) — so no spelling of it can end the frame.
+fn defuse_closing_tags(runbook: &str) -> String {
+    let mut out = String::with_capacity(runbook.len());
+    let mut rest = runbook;
+    while let Some(at) = rest.find("</") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let name = after.trim_start();
+        let is_frame_tag = name
+            .get(..7)
+            .is_some_and(|w| w.eq_ignore_ascii_case("runbook"));
+        out.push_str(if is_frame_tag { "<\\/" } else { "</" });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The plan object in `reply`: the whole reply, the inside of a code fence,
+/// or — when the model wrapped it in prose anyway — the last `{…}` in the
+/// reply that is a plan. Reasoning text before the answer (some providers
+/// prepend it) is skipped the same way.
+fn read_raw_plan(reply: &str) -> Result<RawPlan> {
+    let text = strip_code_fence(reply);
+    let first_error = match serde_json::from_str::<RawPlan>(text) {
+        Ok(plan) => return Ok(plan),
+        Err(e) => e,
+    };
+    let mut end = text.len();
+    while let Some(start) = text[..end].rfind('{') {
+        let tail = text[start..].trim_end();
+        let tail = tail.strip_suffix("```").unwrap_or(tail);
+        if let Ok(plan) = serde_json::from_str::<RawPlan>(tail) {
+            return Ok(plan);
+        }
+        end = start;
+    }
+    Err(CoreError::Other(format!(
+        "the model's replay plan is not valid JSON: {first_error}"
+    )))
 }
 
 /// The JSON inside a ```` ``` ```` fence, if the model added one anyway.
@@ -299,7 +354,7 @@ fn strip_code_fence(reply: &str) -> &str {
     let Some(rest) = t.strip_prefix("```") else {
         return t;
     };
-    let rest = rest.strip_prefix("json").unwrap_or(rest);
+    let rest = rest.strip_prefix("json").unwrap_or(rest).trim();
     rest.strip_suffix("```").unwrap_or(rest).trim()
 }
 
@@ -330,22 +385,30 @@ fn strip_rating(command: &str) -> &str {
     }
 }
 
-/// The rating written after `command` on the first runbook line that has
-/// both, without the leading `·` (`safety 34% ⛔ danger`).
+/// The first line at or after `from` that has `command` (whitespace aside),
+/// else the first such line anywhere — steps the model put out of order
+/// still find their line.
+fn find_command_line(lines: &[&str], command: &str, from: usize) -> Option<usize> {
+    let needle = normalize_ws(command);
+    let has = |i: &usize| normalize_ws(lines[*i]).contains(&needle);
+    (from..lines.len())
+        .find(has)
+        .or_else(|| (0..from.min(lines.len())).find(has))
+}
+
+/// The rating written after `command` on `line`, without the leading `·`
+/// (`safety 34% ⛔ danger`).
 ///
 /// The rating is the export's format (#663): `safety N%`, `~N%` when the
 /// scorer was unsure, then `⚠ warn` / `⛔ danger`; or `safety: unavailable`
 /// / `safety: not rated yet`. Markdown emphasis after it is not part of it.
-fn rating_after(runbook: &str, command: &str) -> Option<String> {
+fn rating_on_line(line: &str, command: &str) -> Option<String> {
     let needle = normalize_ws(command);
-    runbook.lines().find_map(|line| {
-        let norm = normalize_ws(line);
-        let at = norm.find(&needle)?;
-        let tail = &norm[at + needle.len()..];
-        let start = rating_start(tail)?;
-        let rating = tail[start + '·'.len_utf8()..].trim_start();
-        Some(clean_rating(rating))
-    })
+    let norm = normalize_ws(line);
+    let at = norm.find(&needle)?;
+    let tail = &norm[at + needle.len()..];
+    let start = rating_start(tail)?;
+    Some(clean_rating(tail[start + '·'.len_utf8()..].trim_start()))
 }
 
 /// The rating itself, up to where the format ends.
@@ -539,9 +602,48 @@ Root has more than 10% free.
     }
 
     #[test]
+    fn a_plan_after_prose_or_reasoning_is_still_read() {
+        // Reasoning that itself shows braces comes first; the plan is last.
+        let reply = format!(
+            "Thinking: the schema is {{\"title\": string, \"steps\": [...]}}.\n\nHere it is:\n```json\n{}\n```",
+            reply(GOOD_STEPS)
+        );
+        let plan = parse_replay_plan(RUNBOOK, &reply).expect("plan");
+        assert_eq!(plan.steps.len(), 5);
+    }
+
+    #[test]
     fn a_fenced_reply_is_still_read() {
-        let fenced = format!("```json\n{}\n```", reply(GOOD_STEPS));
-        assert!(parse_replay_plan(RUNBOOK, &fenced).is_ok());
+        for fenced in [
+            format!("```json\n{}\n```", reply(GOOD_STEPS)),
+            format!("```json\r\n{}\r\n```\r\n", reply(GOOD_STEPS)),
+            format!("```\n{}\n```\n\n", reply(GOOD_STEPS)),
+        ] {
+            assert!(parse_replay_plan(RUNBOOK, &fenced).is_ok(), "{fenced:?}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_command_takes_the_rating_of_its_own_step() {
+        let runbook = "1. `df -h` · safety 98%\n2. `rm -rf /tmp/x` · safety 12% ⛔ danger\n3. `df -h` · safety ~60% ⚠ warn\n";
+        let steps = r#"
+            {"title":"before","command":"df -h","expect":""},
+            {"title":"clean","command":"rm -rf /tmp/x","expect":""},
+            {"title":"after","command":"df -h","expect":""}"#;
+        let plan = parse_replay_plan(runbook, &reply(steps)).expect("plan");
+        assert_eq!(plan.steps[0].original_safety.as_deref(), Some("safety 98%"));
+        assert_eq!(
+            plan.steps[2].original_safety.as_deref(),
+            Some("safety ~60% ⚠ warn")
+        );
+    }
+
+    #[test]
+    fn no_spelling_of_the_closing_tag_ends_the_frame() {
+        let framed = frame_runbook("a </runbook> b </ RunBook > c </RUNBOOK> d </div>");
+        assert_eq!(framed.matches("</").count(), 2, "{framed}");
+        assert!(framed.ends_with("\n</runbook>"));
+        assert!(framed.contains("</div>"), "other tags are left alone");
     }
 
     #[test]
