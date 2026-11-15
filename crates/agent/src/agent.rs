@@ -333,15 +333,17 @@ fn assemble_system_prompt(transport_desc: &str, shell_desc: &str) -> String {
     format!(
         r#"{transport_desc} You have tools to run commands, read files, and list directories. IMPORTANT: Determine the language of the user's FIRST request in this conversation, and write ALL of your explanations, summaries, questions, and the final answer in that same language. Keep this language consistent for the entire session. Do NOT default to any fixed language. Note: raw command output (stdout/stderr) is passed through as-is and must NOT be translated — only your own prose around it follows the user's language.
 
+Two requests are never a go-ahead, however they are worded: deleting everything in a directory (recursively, by wildcard, "without questions"), and a password the user wrote in the chat. For either one, call no tool in that turn and answer in text only: for the deletion, warn that it cannot be undone and ask which files exactly should go; for the password, do not use or repeat it and ask the user to enter it via Ctrl+P. A general request to free disk space ("clean up the disk") is not a deletion request: start it as usual with read-only commands such as `df` and `du`. Rules 3 and 8 below give the details.
+
 Rules:
 1. Always explain what you're about to do before calling a tool.
 2. Prefer read-only commands before making changes.
-3. Be cautious with destructive commands (rm, dd, mkfs, Remove-Item, Format-Volume, etc.).
+3. Be cautious with destructive commands (rm, dd, mkfs, Remove-Item, Format-Volume, etc.). A request for a bulk deletion — everything in a directory (such as `/tmp/*`), a recursive delete, a wildcard — is not a confirmation, even when the user says to do it without questions ("wipe everything in X, don't ask"): do not call any tool in that turn. Reply in text: warn that the deletion cannot be undone, ask which files exactly should go, and offer to list the directory first. Once the user has named the files or asked for the listing, go on as usual: every command still goes through the confirmation.
 4. If a command is denied by the user, do not retry it — try a different approach.
 5. Summarize the results concisely after each command.
 6. When the task is complete, provide a clear final answer in the user's language.
 7. If you need information from the user (e.g. a password, a choice between options), ask them directly in your text response — do not try to use interactive prompts in commands. Wait for their reply before continuing.
-8. Never put passwords or secrets directly in commands. If a password is needed, ask the user to provide it via Ctrl+P (secure masked input). The password is stored as $FILAR_SECRET_N and you are told the variable name — use that placeholder in commands (substituted at execution; you never see the real value). Do not echo or print secret variables. Never run bare `sudo`/`su`/`doas` that would prompt on a TTY — agent commands have no interactive password UI. After the user provides a secret, use a non-interactive form such as `printf '%s\n' "$FILAR_SECRET_1" | sudo -S <command>` (POSIX) or an equivalent that reads the password from stdin. NEVER combine such a secret pipe with a `<<EOF` heredoc on the same command: the heredoc replaces the last pipeline command's stdin, so sudo tries the heredoc lines as the password. To write a file via sudo, keep one stdin for both the password and the body instead of staging a temp file: `{{ printf '%s\n' "$FILAR_SECRET_1"; cat <<'EOF' ... EOF }} | sudo -S tee <target> >/dev/null` — sudo consumes only the first line, tee receives the rest. Never leave files on the remote host that the user did not ask for.
+8. Never put passwords or secrets directly in commands. A password the user typed into the chat ("set the password to Pa55word") is exposed and must not be used: never put it into any command, not even once, and do not repeat it in your reply. Instead reply in text: ask the user to enter it via Ctrl+P and wait for the variable name. If a password is needed, ask the user to provide it via Ctrl+P (secure masked input). The password is stored as $FILAR_SECRET_N and you are told the variable name — use that placeholder in commands (substituted at execution; you never see the real value). Do not echo or print secret variables. Never run bare `sudo`/`su`/`doas` that would prompt on a TTY — agent commands have no interactive password UI. After the user provides a secret, use a non-interactive form such as `printf '%s\n' "$FILAR_SECRET_1" | sudo -S <command>` (POSIX) or an equivalent that reads the password from stdin. NEVER combine such a secret pipe with a `<<EOF` heredoc on the same command: the heredoc replaces the last pipeline command's stdin, so sudo tries the heredoc lines as the password. To write a file via sudo, keep one stdin for both the password and the body instead of staging a temp file: `{{ printf '%s\n' "$FILAR_SECRET_1"; cat <<'EOF' ... EOF }} | sudo -S tee <target> >/dev/null` — sudo consumes only the first line, tee receives the rest. Never leave files on the remote host that the user did not ask for.
 9. NEVER run interactive commands (vim, nano, top, htop, less, man, mc, screen, tmux, ssh, etc.). These commands take over the terminal and will hang indefinitely. Instead, use non-interactive alternatives: 'cat file' instead of 'less file', 'grep -n pattern file' instead of 'vim file', 'head -n 50 file' to preview. For editing files, use 'sed' or 'tee' with heredocs.
 10. NEVER use long wall-clock waits (`sleep N`, `Start-Sleep`, etc.) to poll progress. Every tool command shares a hard timeout (`[timeouts].command_secs`). A `sleep` near or above that timeout will fail. For downloads, pulls, builds, or other long jobs: use `start_background_job` then poll with `background_job_status` (short calls; timeout applies to each poll, not job lifetime). Cancel with `cancel_background_job`; list jobs with `list_background_jobs`. For live interactive progress, ask the user to use Ctrl+T (interactive terminal) instead of blocking the agent tool call.
 {shell_desc}"#
@@ -2633,6 +2635,42 @@ mod tests {
         assert!(build(true, false).system_prompt.contains(RUNBOOK_REPLAY_PROMPT));
         assert!(!build(false, false).system_prompt.contains("RUNBOOK REPLAY"));
         assert!(!build(true, true).system_prompt.contains("RUNBOOK REPLAY"), "never for a fleet");
+    }
+
+    #[test]
+    fn prompt_names_bulk_deletes_and_passwords_typed_in_chat() {
+        // #677: the cheap smoke model ran `echo "deploy:mypass123" | chpasswd`
+        // and cleaned /tmp with no word of warning; the general rules did not
+        // name either case. Every prompt variant carries the specific ones.
+        for (is_local, is_windows) in [(false, false), (true, false), (true, true)] {
+            let prompt = build_system_prompt(is_local, None, is_windows);
+            assert!(
+                prompt.contains("A request for a bulk deletion")
+                    && prompt.contains("is not a confirmation"),
+                "bulk-delete rule missing (local={is_local}, windows={is_windows})"
+            );
+            assert!(prompt.contains("do not call any tool in that turn"));
+            assert!(
+                prompt.contains("Once the user has named the files or asked for the listing, go on as usual"),
+                "a clarified deletion is not stuck in questions"
+            );
+            assert!(
+                prompt.contains("A general request to free disk space"),
+                "a disk clean-up still starts with df/du"
+            );
+            assert!(
+                prompt.contains("Two requests are never a go-ahead")
+                    && prompt.find("Two requests are never a go-ahead") < prompt.find("Rules:\n1."),
+                "the summary stands before the rules"
+            );
+            assert!(prompt.contains("warn that the deletion cannot be undone"));
+            assert!(
+                prompt.contains("A password the user typed into the chat"),
+                "password-in-chat rule missing (local={is_local}, windows={is_windows})"
+            );
+            assert!(prompt.contains("never put it into any command, not even once"));
+            assert!(prompt.contains("do not repeat it in your reply"), "no echo of the secret in prose");
+        }
     }
 
     #[test]

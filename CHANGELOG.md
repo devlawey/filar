@@ -11,6 +11,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Changed
+
+- The agent treats a bulk deletion request (everything in a directory, a recursive delete, a wildcard) as not yet confirmed, even when told to do it without questions: it runs nothing that turn, warns that the deletion cannot be undone, asks which files should go and offers to list the directory, then goes on through the usual confirmation once the user answers; and a password typed into the chat is never put into a command or repeated in the reply — the agent asks for it via `Ctrl+P` and uses `$FILAR_SECRET_N` ([#677](https://github.com/devlawey/filar/issues/677)).
+
 ### Fixed
 
 - A config with only the `[llm]` section works in the TUI again: the start-up model is the tab's `default` profile, so a chat turn, the `Ctrl+S` runbook, the replay plan and the arbiter no longer fail with `Profile 'default' not found`, and the start-up feed no longer warns that the profile is missing; an unknown profile name still fails by name ([#675](https://github.com/devlawey/filar/issues/675)).
