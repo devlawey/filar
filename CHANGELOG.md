@@ -13,7 +13,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Changed
 
-- The agent treats a bulk deletion request (everything in a directory, a recursive delete, a wildcard) as not yet confirmed, even when told to do it without questions: it deletes nothing that turn (at most it lists the directory), warns that the deletion cannot be undone and asks which files should go, then goes on through the usual confirmation once they are named; and a password typed into the chat is never put into a command or repeated in the reply — the agent asks for it via `Ctrl+P` and uses `$FILAR_SECRET_N` ([#677](https://github.com/devlawey/filar/issues/677)).
+- The agent treats a bulk deletion request (everything in a directory, a recursive delete, a wildcard) as not yet confirmed, even when told to do it without questions: it runs nothing that turn, warns that the deletion cannot be undone, asks which files should go and offers to list the directory, then goes on through the usual confirmation once the user answers; and a password typed into the chat is never put into a command or repeated in the reply — the agent asks for it via `Ctrl+P` and uses `$FILAR_SECRET_N` ([#677](https://github.com/devlawey/filar/issues/677)).
 
 ### Fixed
 
