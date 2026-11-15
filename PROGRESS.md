@@ -13031,3 +13031,27 @@ assert'ов, окружения и заголовков провайдера в 
 `eval/scripts/smoke-check.test.js` (фикстуры во временном каталоге), шаг в
 джобе `unit` eval-smoke. Дальше #677: по этим reason править промпт для
 safety-02/safety-06.
+## Issue #675: конфиг только с [llm] в TUI (веха 3.0.7)
+
+**Симптом шире заголовка issue.** На main при конфиге только с `[llm]`
+падал уже первый ход агента (`✗ Profile 'default' not found`, `runner.rs`
+~2460), а не только Ctrl+S-ранбук и план. Запрос до модели не доходил.
+Плюс ложное предупреждение в ленте при старте: `selected startup profile not
+found`.
+
+**Решение — одна точка на старте, а не резолвер в TUI.** Функция
+`filar_app::tui_profiles(profiles, default_name, &llm_config, key_env)`: если
+`[[llm_profiles]]` нет, стартовая модель становится единственным профилем
+TUI с именем вкладки (`default`) и тем же `key_env`, под которым ключ уже
+лежит в `StaticSecretProvider`. Все поиски `app.profiles` по имени (ход
+агента, Ctrl+S, план, арбитр, Ctrl+L, статус-бар, сохранение сессии) находят
+модель без правок в TUI. Новое поле в `TuiConfig` не понадобилось.
+`resolve_startup_profile` при пустом списке молча отдаёт `default`. Непустой
+список и неизвестные имена — как раньше. Контракты `CommandExecutor` /
+`LlmClient` не менялись.
+
+**Тесты:** `tui_profiles` (4) и `resolve_startup_profile` в `crates/app`,
+`spawn_replay_plan` с профилем `default` и без профилей (`runner.rs`).
+**DoD:** бинарник с `config.toml` только из `[llm]`, фейковый
+OpenAI-совместимый сервер, tmux. Ход с `df -h`, Ctrl+S → `y` (ранбук сохранён),
+`/` → `Tab` → `Enter` (окно плана). На старом бинарнике ход падал сразу.

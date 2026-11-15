@@ -105,7 +105,8 @@ fn parse_args() -> Args {
 ///
 /// Priority: CLI `--llm` flag > GUI launcher selection > first profile in config.
 /// If the resolved profile doesn't exist in `profiles` (deleted/renamed), falls
-/// back to the first available profile with a warning.
+/// back to the first available profile with a warning. With no profiles at
+/// all (the `[llm]` section only) the answer is `default`, without one.
 ///
 /// This is a free function so it can be unit-tested independently of `main`.
 pub fn resolve_startup_profile(
@@ -117,6 +118,11 @@ pub fn resolve_startup_profile(
         .first()
         .map(|p| p.name.clone())
         .unwrap_or_else(|| "default".into());
+    if profiles.is_empty() {
+        // Only the `[llm]` section: its tab is `default`, not a missing
+        // profile — no fallback warning in the feed (#675).
+        return first_in_config;
+    }
     let cli_profile = cli_llm.filter(|n| *n != "default");
     let candidate = cli_profile.or(gui_selected).unwrap_or(&first_in_config);
     if profiles.iter().any(|p| p.name == candidate) {
@@ -143,6 +149,40 @@ pub fn cli_llm_selection(
         None if profiles.is_empty() => None,
         None => Some(resolve_startup_profile(profiles, None, None)),
     }
+}
+
+/// The LLM profiles the TUI resolves its tabs against (#675).
+///
+/// Configured `[[llm_profiles]]` are passed as is. With none — a config that
+/// has only the `[llm]` section — the start-up model itself becomes the one
+/// profile, under the name the tabs already run on (`default_name`, see
+/// [`resolve_startup_profile`]) and with the key variable the start-up client
+/// was built with. Everything that builds its own client by profile name
+/// (the Ctrl+S runbook, the replay plan, the arbiter, Ctrl+L) then finds the
+/// tab's model instead of failing with `profile 'default' not found`.
+///
+/// Only the profile *name* `default_name` is added: a tab restored with
+/// another, unknown profile still fails by name, as before.
+pub fn tui_profiles(
+    profiles: Vec<filar_core::LlmProfile>,
+    default_name: &str,
+    startup: &filar_core::LlmConfig,
+    key_env: &str,
+) -> Vec<filar_core::LlmProfile> {
+    if !profiles.is_empty() {
+        return profiles;
+    }
+    vec![filar_core::LlmProfile {
+        name: default_name.to_string(),
+        model: startup.model.clone(),
+        api_base_url: startup.api_base_url.clone(),
+        max_tokens: startup.max_tokens,
+        key_env: key_env.to_string(),
+        temperature: startup.temperature,
+        top_p: startup.top_p,
+        extra_body: startup.extra_body.clone(),
+        compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
+    }]
 }
 
 /// Build an [`SshTarget`](filar_core::SshTarget) from a GUI [`SshConnection`](filar_gui::SshConnection).
@@ -1003,6 +1043,12 @@ async fn run() -> anyhow::Result<()> {
         cli_llm_name.as_deref(),
         gui_selected_profile.as_deref(),
     );
+    let launch_profiles = tui_profiles(
+        launch_profiles,
+        &default_profile_name,
+        &llm_config,
+        &key_env_name,
+    );
     let tui_config = TuiConfig {
         target_name: target_name.clone(),
         confirm_mode: loaded.confirm_mode.unwrap_or(config.confirm_mode),
@@ -1626,6 +1672,8 @@ mod tests {
         let profiles: Vec<LlmProfile> = vec![];
         let result = resolve_startup_profile(&profiles, None, None);
         assert_eq!(result, "default");
+        // A stale launcher pick or `--llm` cannot leave `[llm]`'s tab nameless (#675).
+        assert_eq!(resolve_startup_profile(&profiles, Some("glm"), Some("x")), "default");
     }
 
     // ── CLI profile selection (#490) ───────────────────────────────────
@@ -1705,6 +1753,73 @@ mod tests {
             .expect_err("unknown profile")
             .to_string();
         assert!(msg.contains("'deepseek' not found"), "{msg}");
+    }
+
+    // ── TUI profiles with only the [llm] section (#675) ────────────────
+
+    use super::tui_profiles;
+
+    fn llm_section() -> filar_core::LlmConfig {
+        filar_core::LlmConfig {
+            model: "qwen".into(),
+            api_base_url: "http://127.0.0.1:9/v1".into(),
+            max_tokens: 2048,
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            extra_body: Some(serde_json::json!({ "reasoning": { "enabled": false } })),
+        }
+    }
+
+    #[test]
+    fn llm_section_only_becomes_the_default_profile() {
+        let config = filar_core::Config {
+            llm: llm_section(),
+            ..Default::default()
+        };
+        let default_name = resolve_startup_profile(&config.llm_profiles, None, None);
+        let (startup, key_env) = config
+            .select_llm(cli_llm_selection(&config.llm_profiles, None).as_deref())
+            .expect("[llm] section");
+        let profiles = tui_profiles(config.llm_profiles.clone(), &default_name, &startup, &key_env);
+
+        assert_eq!(profiles.len(), 1);
+        let p = &profiles[0];
+        assert_eq!(p.name, "default");
+        assert_eq!(p.name, default_name, "the tab's profile name resolves");
+        assert_eq!(p.model, "qwen");
+        assert_eq!(p.api_base_url, "http://127.0.0.1:9/v1");
+        assert_eq!(p.max_tokens, 2048);
+        assert_eq!(p.temperature, Some(0.2));
+        assert_eq!(p.top_p, Some(0.9));
+        assert_eq!(p.extra_body, startup.extra_body);
+        assert_eq!(p.key_env, filar_core::config::default_llm_key_env());
+        assert_eq!(p.compact_at_tokens, filar_core::DEFAULT_COMPACT_AT_TOKENS);
+        let back: filar_core::LlmConfig = p.into();
+        assert_eq!(back.model, startup.model, "a client built from it is the start-up one");
+    }
+
+    #[test]
+    fn a_keyless_llm_section_stays_keyless() {
+        let profiles = tui_profiles(Vec::new(), "default", &llm_section(), "");
+        assert!(!profiles[0].requires_api_key());
+    }
+
+    #[test]
+    fn configured_profiles_are_passed_unchanged() {
+        let configured = vec![make_profile("glm"), make_profile("local")];
+        let profiles = tui_profiles(configured.clone(), "glm", &llm_section(), "OTHER_KEY");
+        let names: Vec<_> = profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["glm", "local"]);
+        assert_eq!(profiles[0].model, configured[0].model, "not replaced by [llm]");
+    }
+
+    #[test]
+    fn llm_section_only_still_has_no_other_profile_name() {
+        let profiles = tui_profiles(Vec::new(), "default", &llm_section(), "K");
+        assert!(
+            !profiles.iter().any(|p| p.name == "deepseek"),
+            "an unknown profile is still unknown"
+        );
     }
 
     use super::config_with_launch_risk_scorer;

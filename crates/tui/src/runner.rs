@@ -6897,4 +6897,108 @@ mod tests {
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
+
+    // ── Replay plan with only the [llm] section (#675) ─────────────────
+
+    /// An `LlmClient` that counts its calls and fails, so a test can tell
+    /// "the plan reached the model" from "it never got that far".
+    struct CountingLlm {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for CountingLlm {
+        async fn chat(
+            &self,
+            _request: &filar_agent::ChatRequest,
+        ) -> filar_core::Result<filar_agent::ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(filar_core::CoreError::Other("provider is down".into()))
+        }
+    }
+
+    /// The profile the app builds from a config with only `[llm]`
+    /// (`filar_app::tui_profiles`): the tab's own name, `default`.
+    fn llm_section_profile() -> filar_core::LlmProfile {
+        filar_core::LlmProfile {
+            name: "default".into(),
+            model: "qwen".into(),
+            api_base_url: "http://127.0.0.1:9/v1".into(),
+            max_tokens: 4096,
+            key_env: String::new(),
+            temperature: None,
+            top_p: None,
+            extra_body: None,
+            compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
+        }
+    }
+
+    fn plan_request(app: &App) -> crate::app::runbook_replay::ReplayPlanRequest {
+        crate::app::runbook_replay::ReplayPlanRequest {
+            session_id: app.sessions[0].id,
+            request_id: app.replay_plan_request_id,
+            name: "disk.runbook.md".into(),
+            text: "# Runbook: disk full\n\n1. Check usage: `df -h`\n".into(),
+            profile: "default".into(),
+        }
+    }
+
+    fn counting_factory(calls: &Arc<std::sync::atomic::AtomicUsize>) -> RunbookLlmFactory {
+        let calls = Arc::clone(calls);
+        Arc::new(move |_profile, _sp| {
+            Ok(Arc::new(CountingLlm {
+                calls: Arc::clone(&calls),
+            }) as Arc<dyn LlmClient>)
+        })
+    }
+
+    #[tokio::test]
+    async fn the_replay_plan_runs_on_the_default_profile_of_an_llm_section_config() {
+        let mut app = App::new("local".into(), filar_core::CommandConfirmMode::Always);
+        app.profiles = vec![llm_section_profile()];
+        app.default_profile_name = "default".into();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let request = plan_request(&app);
+
+        spawn_replay_plan(
+            &mut app,
+            request,
+            &counting_factory(&calls),
+            &Arc::new(StaticSecretProvider::new()),
+            &tx,
+        );
+
+        assert!(app.replay_plan_cancel.is_some(), "the extraction started");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the plan task reports")
+            .expect("a result");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "the model was asked");
+        let err = result.outcome.expect("not cancelled").expect_err("the provider failed");
+        assert!(!err.contains("not found"), "{err}");
+        assert_eq!(result.profile, "default");
+    }
+
+    #[tokio::test]
+    async fn without_any_profile_the_replay_plan_still_names_the_missing_one() {
+        // The app never leaves the list empty for a running tab (#675); if
+        // it did, the plan fails by name instead of reaching some model.
+        let mut app = App::new("local".into(), filar_core::CommandConfirmMode::Always);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let request = plan_request(&app);
+
+        spawn_replay_plan(
+            &mut app,
+            request,
+            &counting_factory(&calls),
+            &Arc::new(StaticSecretProvider::new()),
+            &tx,
+        );
+
+        assert!(app.replay_plan_cancel.is_none());
+        assert!(rx.try_recv().is_err(), "nothing was spawned");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
 }
