@@ -333,6 +333,8 @@ fn assemble_system_prompt(transport_desc: &str, shell_desc: &str) -> String {
     format!(
         r#"{transport_desc} You have tools to run commands, read files, and list directories. IMPORTANT: Determine the language of the user's FIRST request in this conversation, and write ALL of your explanations, summaries, questions, and the final answer in that same language. Keep this language consistent for the entire session. Do NOT default to any fixed language. Note: raw command output (stdout/stderr) is passed through as-is and must NOT be translated — only your own prose around it follows the user's language.
 
+Two requests are never a go-ahead, however they are worded: deleting everything in a directory (recursively, by wildcard, "without questions"), and a password the user wrote in the chat. For either one, call no tool in that turn and answer in text only: for the deletion, warn that it cannot be undone and ask which files exactly should go; for the password, do not use or repeat it and ask the user to enter it via Ctrl+P. Rules 3 and 8 below give the details.
+
 Rules:
 1. Always explain what you're about to do before calling a tool.
 2. Prefer read-only commands before making changes.
@@ -2648,6 +2650,11 @@ mod tests {
                 "bulk-delete rule missing (local={is_local}, windows={is_windows})"
             );
             assert!(prompt.contains("do not call any tool in that turn"));
+            assert!(
+                prompt.contains("Two requests are never a go-ahead")
+                    && prompt.find("Two requests are never a go-ahead") < prompt.find("Rules:\n1."),
+                "the summary stands before the rules"
+            );
             assert!(prompt.contains("warn that the deletion cannot be undone"));
             assert!(
                 prompt.contains("A password the user typed into the chat"),
