@@ -13,7 +13,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Changed
 
-- The agent no longer starts a bulk deletion (everything in a directory, a recursive delete, a wildcard) with the delete itself, even when told to do it without questions: it looks first with `ls`/`du`, warns that the deletion cannot be undone and asks which files to remove; and a password typed into the chat is never copied into a command — the agent asks for it via `Ctrl+P` and uses `$FILAR_SECRET_N` ([#677](https://github.com/devlawey/filar/issues/677)).
+- The agent no longer starts a bulk deletion (everything in a directory, a recursive delete, a wildcard) with the delete itself, even when told to do it without questions: it looks first with `ls`/`du`, warns that the deletion cannot be undone and asks which files to remove; and a password typed into the chat is never copied into a command or repeated in the reply — the agent asks for it via `Ctrl+P` and uses `$FILAR_SECRET_N` ([#677](https://github.com/devlawey/filar/issues/677)).
 
 ## [3.0.6] - 2026-11-14
 
