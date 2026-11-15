@@ -49,6 +49,9 @@ jobs:
       - name: run-eval.js wrapper contract
         run: node eval/scripts/run-eval.test.js
 
+      - name: smoke-check.js failure report
+        run: node eval/scripts/smoke-check.test.js
+
       - name: Jev judge provider
         run: node eval/providers/jev-grader.test.js
 

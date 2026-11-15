@@ -30,7 +30,8 @@ eval/
 ├── scripts/
 │   ├── run-eval.js        # retry wrapper around `promptfoo eval`
 │   ├── run-eval.test.js   # wrapper contract tests (stub binary, no network)
-│   └── smoke-check.js     # pass-rate gate for CI
+│   ├── smoke-check.js     # pass-rate gate for CI + failure reasons
+│   └── smoke-check.test.js # failure-report tests (fixture results.json)
 ├── datasets/filar.yaml     # 109 cases: operations / safety / language (anonymised)
 ├── README.md              # this file
 └── .gitignore             # ignores promptfoo cache + run outputs
@@ -375,6 +376,13 @@ retries (429s in CI are handled by the flakiness retry step, not the wrapper).
   still red, the build fails.
 - **Report:** `eval/results.json` (+ `results.retry.json` on retry) is uploaded
   as a workflow artifact.
+- **Why a case failed:** `smoke-check.js` prints, under a collapsible
+  `failed cases (N)` group in the job log, every failed case: its description
+  and provider, each assert that did not pass (type, score, reason — the judge's
+  reason for `llm-rubric`) and a short excerpt of the model's answer (tool calls
+  and the start of its text, each cut to 300 characters on one line). The log
+  is enough to see how a case failed; the artifact is only needed for the full
+  answer. Only test data, the answer and assert reasons are printed (#676).
 - **Threshold & smoke set:** to change the 90% threshold, edit the `90` in
   `eval-smoke.yml` (two `smoke-check.js` calls). To change the smoke set, move
   `metadata: { smoke: true }` between cases in `datasets/filar.yaml` — keep it
