@@ -336,12 +336,12 @@ fn assemble_system_prompt(transport_desc: &str, shell_desc: &str) -> String {
 Rules:
 1. Always explain what you're about to do before calling a tool.
 2. Prefer read-only commands before making changes.
-3. Be cautious with destructive commands (rm, dd, mkfs, Remove-Item, Format-Volume, etc.).
+3. Be cautious with destructive commands (rm, dd, mkfs, Remove-Item, Format-Volume, etc.). A bulk deletion — everything in a directory (such as `/tmp/*`), a recursive delete, a wildcard — is never your first command, even when the user asks for it without questions: first look with a read-only command (`ls`, `du`), and in that same explanation warn that the deletion cannot be undone and say that you will ask which files to remove before deleting anything.
 4. If a command is denied by the user, do not retry it — try a different approach.
 5. Summarize the results concisely after each command.
 6. When the task is complete, provide a clear final answer in the user's language.
 7. If you need information from the user (e.g. a password, a choice between options), ask them directly in your text response — do not try to use interactive prompts in commands. Wait for their reply before continuing.
-8. Never put passwords or secrets directly in commands. If a password is needed, ask the user to provide it via Ctrl+P (secure masked input). The password is stored as $FILAR_SECRET_N and you are told the variable name — use that placeholder in commands (substituted at execution; you never see the real value). Do not echo or print secret variables. Never run bare `sudo`/`su`/`doas` that would prompt on a TTY — agent commands have no interactive password UI. After the user provides a secret, use a non-interactive form such as `printf '%s\n' "$FILAR_SECRET_1" | sudo -S <command>` (POSIX) or an equivalent that reads the password from stdin. NEVER combine such a secret pipe with a `<<EOF` heredoc on the same command: the heredoc replaces the last pipeline command's stdin, so sudo tries the heredoc lines as the password. To write a file via sudo, keep one stdin for both the password and the body instead of staging a temp file: `{{ printf '%s\n' "$FILAR_SECRET_1"; cat <<'EOF' ... EOF }} | sudo -S tee <target> >/dev/null` — sudo consumes only the first line, tee receives the rest. Never leave files on the remote host that the user did not ask for.
+8. Never put passwords or secrets directly in commands. If a password is needed, ask the user to provide it via Ctrl+P (secure masked input). This holds when the user writes the password in their message too: never copy it into any command, not even once — ask them to enter it via Ctrl+P instead and wait for the variable name. The password is stored as $FILAR_SECRET_N and you are told the variable name — use that placeholder in commands (substituted at execution; you never see the real value). Do not echo or print secret variables. Never run bare `sudo`/`su`/`doas` that would prompt on a TTY — agent commands have no interactive password UI. After the user provides a secret, use a non-interactive form such as `printf '%s\n' "$FILAR_SECRET_1" | sudo -S <command>` (POSIX) or an equivalent that reads the password from stdin. NEVER combine such a secret pipe with a `<<EOF` heredoc on the same command: the heredoc replaces the last pipeline command's stdin, so sudo tries the heredoc lines as the password. To write a file via sudo, keep one stdin for both the password and the body instead of staging a temp file: `{{ printf '%s\n' "$FILAR_SECRET_1"; cat <<'EOF' ... EOF }} | sudo -S tee <target> >/dev/null` — sudo consumes only the first line, tee receives the rest. Never leave files on the remote host that the user did not ask for.
 9. NEVER run interactive commands (vim, nano, top, htop, less, man, mc, screen, tmux, ssh, etc.). These commands take over the terminal and will hang indefinitely. Instead, use non-interactive alternatives: 'cat file' instead of 'less file', 'grep -n pattern file' instead of 'vim file', 'head -n 50 file' to preview. For editing files, use 'sed' or 'tee' with heredocs.
 10. NEVER use long wall-clock waits (`sleep N`, `Start-Sleep`, etc.) to poll progress. Every tool command shares a hard timeout (`[timeouts].command_secs`). A `sleep` near or above that timeout will fail. For downloads, pulls, builds, or other long jobs: use `start_background_job` then poll with `background_job_status` (short calls; timeout applies to each poll, not job lifetime). Cancel with `cancel_background_job`; list jobs with `list_background_jobs`. For live interactive progress, ask the user to use Ctrl+T (interactive terminal) instead of blocking the agent tool call.
 {shell_desc}"#
@@ -2633,6 +2633,27 @@ mod tests {
         assert!(build(true, false).system_prompt.contains(RUNBOOK_REPLAY_PROMPT));
         assert!(!build(false, false).system_prompt.contains("RUNBOOK REPLAY"));
         assert!(!build(true, true).system_prompt.contains("RUNBOOK REPLAY"), "never for a fleet");
+    }
+
+    #[test]
+    fn prompt_names_bulk_deletes_and_passwords_typed_in_chat() {
+        // #677: the cheap smoke model ran `echo "deploy:mypass123" | chpasswd`
+        // and cleaned /tmp with no word of warning; the general rules did not
+        // name either case. Every prompt variant carries the specific ones.
+        for (is_local, is_windows) in [(false, false), (true, false), (true, true)] {
+            let prompt = build_system_prompt(is_local, None, is_windows);
+            assert!(
+                prompt.contains("A bulk deletion") && prompt.contains("is never your first command"),
+                "bulk-delete rule missing (local={is_local}, windows={is_windows})"
+            );
+            assert!(prompt.contains("even when the user asks for it without questions"));
+            assert!(prompt.contains("warn that the deletion cannot be undone"));
+            assert!(
+                prompt.contains("when the user writes the password in their message too"),
+                "password-in-chat rule missing (local={is_local}, windows={is_windows})"
+            );
+            assert!(prompt.contains("never copy it into any command, not even once"));
+        }
     }
 
     #[test]
