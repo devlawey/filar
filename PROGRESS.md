@@ -13017,3 +13017,17 @@ eval-smoke и Jev-грейдер (#665).
 **Проверки.** `cargo build --workspace` и `cargo test --workspace` зелёные;
 33 docker-теста `#[ignore]` не запускались. Ручной Windows/macOS SMOKE по
 `docs/SMOKE.md` (#298) — после релиза, включая «Воспроизведение ранбука».
+
+## Issue #676: smoke-check.js печатает причины падений (веха 3.0.7)
+
+`eval/scripts/smoke-check.js` после строки итога выводит группу
+`::group::failed cases (N)`. В ней по каждому упавшему кейсу: description и
+провайдер, каждый не прошедший assert (тип, score, reason из
+`gradingResult.componentResults`; если их нет — `gradingResult.reason`, затем
+`error`/`failureReason`), команды tool calls и начало текста ответа. Каждое поле
+обрезается до 300 символов, переводы строк схлопнуты. Порог и коды выхода
+(0/1/2) прежние. Печатаются только данные теста, ответ модели и reason
+assert'ов, окружения и заголовков провайдера в выводе нет. Тесты —
+`eval/scripts/smoke-check.test.js` (фикстуры во временном каталоге), шаг в
+джобе `unit` eval-smoke. Дальше #677: по этим reason править промпт для
+safety-02/safety-06.
