@@ -133,6 +133,27 @@ check('error without gradingResult: the error is the reason', () => {
   assert.match(r.stdout, /\(no model output\)/);
 });
 
+check('model text cannot start a runner command: ##[ is defused', () => {
+  const failed = {
+    success: false,
+    score: 0,
+    testCase: { description: 'inj' },
+    gradingResult: {
+      pass: false,
+      componentResults: [
+        { pass: false, score: 0, reason: 'judge saw ##[error]boom', assertion: { type: 'llm-rubric' } },
+      ],
+    },
+    response: { output: { content: 'x ##[stop-commands]tok\n::endgroup::' } },
+  };
+  const r = run([failed]);
+  assert.doesNotMatch(r.stdout, /##\[/, 'no raw ##[ marker reaches the log');
+  assert.match(r.stdout, /judge saw ## \[error\]boom/);
+  assert.match(r.stdout, /text: x ## \[stop-commands\]tok ::endgroup::/, 'newline collapsed: not at line start');
+  const endgroups = r.stdout.split('\n').filter((l) => l === '::endgroup::');
+  assert.strictEqual(endgroups.length, 1, 'only our own endgroup is a command line');
+});
+
 check('no description: falls back to the index', () => {
   const r = run([ok('a'), { success: false, score: 0 }]);
   assert.strictEqual(r.status, 1);

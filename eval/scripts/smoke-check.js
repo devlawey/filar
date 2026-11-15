@@ -19,11 +19,21 @@ const { extractToolCalls } = require(path.join(__dirname, '..', 'asserts.js'));
 /** Longest excerpt of one field, in characters, before it is cut with `…`. */
 const MAX_FIELD = 300;
 
-/** Collapse whitespace (newlines included) and cut to `max` characters. */
+/**
+ * Collapse whitespace (newlines included), defuse runner commands and cut to
+ * `max` characters.
+ *
+ * The excerpts carry model text and judge reasons. The Actions runner reads
+ * `##[…]` anywhere in a line as a legacy workflow command, so a reply holding
+ * `##[error]` or `##[stop-commands]` could annotate the job or swallow the
+ * `::endgroup::` below; `## [` is inert. A `::command::` needs line start,
+ * which an excerpt never has: every printed line begins with our own prefix.
+ */
 function clip(value, max = MAX_FIELD) {
   if (value == null) return '';
   const text = (typeof value === 'string' ? value : JSON.stringify(value))
     .replace(/\s+/g, ' ')
+    .replace(/##\[/g, '## [')
     .trim();
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
