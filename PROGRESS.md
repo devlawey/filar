@@ -361,10 +361,10 @@ cargo test --workspace
 1. **Windows Explorer icon cache** — после пересборки .exe может показывать
    старую иконку. Решение: копирование .exe в новый файл, или перезагрузка,
    или `ie4uinit.exe -show`, или очистка `%LOCALAPPDATA%\IconCache.db`
-2. **parse_minimal_config test** — pre-existing failure, unrelated
-3. **Interactive terminal** — Ctrl+T режим работает, но требует доработки
-   OSC-маркеров для блоков команд
-4. **SSH agent auth** — TODO (возвращает ошибку), работает только password/key
+
+(пункты про `parse_minimal_config`, OSC-маркеры интерактивного терминала
+и SSH agent auth сняты: всё реализовано, тесты зелёные — см. `config.rs`,
+`transport/src/interactive.rs`, `transport/src/auth.rs`)
 
 ---
 
