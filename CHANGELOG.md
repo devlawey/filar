@@ -17,6 +17,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- A long command in a command block's header now wraps to continuation rows aligned under the command instead of running past the right edge with a clipped tail, and stray fragments of ANSI escape sequences (a split or emoji-stripped sequence left its body visible, e.g. in the agent's text) are gone: `strip_emoji` and the output sanitizer drop a CSI/OSC/charset sequence whole, including one cut by the end of a chunk ([#682](https://github.com/devlawey/filar/issues/682)).
 - A config with only the `[llm]` section works in the TUI again: the start-up model is the tab's `default` profile, so a chat turn, the `Ctrl+S` runbook, the replay plan and the arbiter no longer fail with `Profile 'default' not found`, and the start-up feed no longer warns that the profile is missing; an unknown profile name still fails by name ([#675](https://github.com/devlawey/filar/issues/675)).
 
 ## [3.0.6] - 2026-11-14

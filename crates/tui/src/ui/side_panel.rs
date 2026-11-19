@@ -637,7 +637,10 @@ mod tests {
         app.side_panel.selected = 1;
         let text = render(&app, 40, 20, &Glyphs::UNICODE);
         assert!(!text.contains('\x1b'), "{text:?}");
-        assert!(text.contains("ok[2Jboom"), "{text}");
+        // The sequence is removed whole: its body (`[2J`) must not leak into
+        // the panel as visible text either (#682).
+        assert!(text.contains("okboom"), "{text}");
+        assert!(!text.contains("[2J"), "{text}");
     }
 
     #[test]

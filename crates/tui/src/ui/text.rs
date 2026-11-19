@@ -185,7 +185,14 @@ fn sanitize_line(src: &str) -> String {
             continue;
         }
 
-        if esc_next == Some(']') || cp == 0x9D {
+        // OSC and the other ST-terminated string sequences (DCS, SOS, PM,
+        // APC), in 7-bit and 8-bit form, are skipped to their terminator —
+        // their body is never text (#682 review).
+        if esc_next == Some(']')
+            || cp == 0x9D
+            || matches!(esc_next, Some('P' | 'X' | '^' | '_'))
+            || matches!(cp, 0x90 | 0x98 | 0x9E | 0x9F)
+        {
             let mut j = i + if c == '\u{1b}' { 2 } else { 1 };
             while j < chars.len() {
                 if chars[j] == '\u{7}' || chars[j] == '\u{9c}' {
@@ -203,7 +210,18 @@ fn sanitize_line(src: &str) -> String {
         }
 
         if c == '\u{1b}' {
-            i += 2; // two-character escape (ESC(B, ESC=, …)
+            // ECMA-48: ESC, any number of intermediate bytes (0x20..=0x2F —
+            // charset selects ESC(B, S7C1T ESC SP F, …), then one final byte.
+            // Skipping just ESC+one would leave the final byte of a
+            // three-byte form visible as a stray char (#682).
+            let mut j = i + 1;
+            while j < chars.len() && (0x20..=0x2F).contains(&(chars[j] as u32)) {
+                j += 1;
+            }
+            if j < chars.len() {
+                j += 1;
+            }
+            i = j;
             continue;
         }
 
@@ -257,14 +275,15 @@ pub(crate) fn sanitize_output(s: &str) -> String {
 /// Windows terminal (conhost) can't display most emojis, so they show as '?'.
 /// Conservative whitelist: ASCII, Cyrillic, Latin, punctuation, arrows, math, box drawing.
 ///
-/// Control characters are **not** whitelisted: `ESC`/`CR`/`BS` reaching the
-/// terminal desynchronise ratatui's buffer from the physical screen (#366).
+/// Escape sequences are removed **whole**, not character by character:
+/// dropping only the control introducer (`ESC` / C1) would leave the
+/// sequence body (`[31m`, `]8;;https://…`) visible as stray text (#682).
 /// `\t` and `\n` are kept — wrapping and [`expand_tabs`] depend on them.
 pub(crate) fn strip_emoji(s: &str) -> String {
-    s.chars()
-        .filter(|&c| {
-            let cp = c as u32;
-            c == '\n' || c == '\t'
+    /// Whitelist of renderable characters (see the doc above).
+    fn is_renderable(c: char) -> bool {
+        let cp = c as u32;
+        c == '\n' || c == '\t'
             || ((0x20..=0x024F).contains(&cp)   // ASCII + Latin + Latin Extended
                 && cp != 0x7F                   // minus DEL
                 && !(0x80..=0x9F).contains(&cp))// minus C1 controls
@@ -281,8 +300,97 @@ pub(crate) fn strip_emoji(s: &str) -> String {
             || (0x2713..=0x2717).contains(&cp)  // Dingbats: ✓ ✗ (command status)
             || (0x2800..=0x28FF).contains(&cp)  // Braille patterns (spinner: ⠋⠙⠹…)
             // Everything else (Misc symbols, Dingbats, Emojis, Flags) is stripped
-        })
-        .collect()
+    }
+
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let cp = c as u32;
+        if c == '\u{1b}' || (0x80..=0x9F).contains(&cp) {
+            i += escape_sequence_len(&chars, i);
+            continue;
+        }
+        if is_renderable(c) {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Length in chars of the escape sequence starting at `chars[start]`
+/// (an `ESC` or a C1 introducer), so the whole sequence can be skipped at
+/// once. Covers CSI (up to and including the final byte `0x40..=0x7E`), the
+/// ST-terminated string sequences OSC, DCS, SOS, PM and APC (up to and
+/// including `BEL`, 8-bit `ST` or `ESC \`) and the two/three-byte `ESC`
+/// forms (`ESC=`, charset select `ESC ( B`, …). An unterminated sequence
+/// runs to the end of the input: a sequence cut by the end of a chunk
+/// leaves no visible tail (#682).
+fn escape_sequence_len(chars: &[char], start: usize) -> usize {
+    let c = chars[start];
+    let rest = chars.len() - start;
+    if c == '\u{9b}' {
+        // 8-bit CSI.
+        return 1 + csi_body_len(&chars[start + 1..]);
+    }
+    if matches!(c, '\u{9d}' | '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}') {
+        // 8-bit OSC / DCS / SOS / PM / APC: a string body ended by ST.
+        return 1 + string_body_len(&chars[start + 1..]);
+    }
+    if c != '\u{1b}' {
+        // Any other C1 control stands alone.
+        return 1;
+    }
+    if rest < 2 {
+        return 1; // lone trailing ESC
+    }
+    match chars[start + 1] {
+        '[' => 2 + csi_body_len(&chars[start + 2..]),
+        ']' | 'P' | 'X' | '^' | '_' => 2 + string_body_len(&chars[start + 2..]),
+        // ECMA-48: ESC, any number of intermediate bytes (0x20..=0x2F —
+        // charset selects ESC(B, DEC special ESC#8, S7C1T ESC SP F, …),
+        // then one final byte.
+        _ => {
+            let mut j = start + 1;
+            while j < chars.len() && (0x20..=0x2F).contains(&(chars[j] as u32)) {
+                j += 1;
+            }
+            if j < chars.len() {
+                j += 1;
+            }
+            j - start
+        }
+    }
+}
+
+/// Chars of a CSI body (after the introducer) up to and including the final
+/// byte; the whole rest when the sequence is unterminated.
+fn csi_body_len(body: &[char]) -> usize {
+    for (i, &c) in body.iter().enumerate() {
+        if (0x40..=0x7E).contains(&(c as u32)) {
+            return i + 1;
+        }
+    }
+    body.len()
+}
+
+/// Chars of a string body (OSC/DCS/SOS/PM/APC, after the introducer) up to
+/// and including the terminator (`BEL`, 8-bit `ST` or `ESC \`); the whole
+/// rest when the sequence is unterminated.
+fn string_body_len(body: &[char]) -> usize {
+    let mut i = 0;
+    while i < body.len() {
+        if body[i] == '\u{7}' || body[i] == '\u{9c}' {
+            return i + 1;
+        }
+        if body[i] == '\u{1b}' && body.get(i + 1) == Some(&'\\') {
+            return i + 2;
+        }
+        i += 1;
+    }
+    body.len()
 }
 
 /// Wrap a single line of text to fit within `width` **display columns**
@@ -785,14 +893,90 @@ mod tests {
     #[test]
     fn strip_emoji_removes_control_characters() {
         // #366: ESC/CR/BS used to pass the `cp <= 0x024F` whitelist.
-        assert_eq!(strip_emoji("a\u{1b}b"), "ab");
+        // ESC + one char is a complete two-byte escape per ECMA-48 (Fs range
+        // 0x60..=0x7E): the pair is consumed whole, the char is not text (#682).
+        assert_eq!(strip_emoji("a\u{1b}b"), "a");
         assert_eq!(strip_emoji("a\rb"), "ab");
         assert_eq!(strip_emoji("a\u{8}b"), "ab");
         assert_eq!(strip_emoji("a\u{7f}b"), "ab");
-        assert_eq!(strip_emoji("a\u{9b}b"), "ab");
+        // An 8-bit CSI consumes its final byte, as a real terminal would:
+        // `\u{9b}b` is a complete sequence (final byte `b`), not a control
+        // followed by text (#682).
+        assert_eq!(strip_emoji("a\u{9b}b"), "a");
         // Newlines and tabs are still needed by wrapping and expand_tabs.
         assert_eq!(strip_emoji("a\nb\tc"), "a\nb\tc");
         // Regression guard: normal text is unaffected.
         assert_eq!(strip_emoji("Привет — ok ✓"), "Привет — ok ✓");
+    }
+
+    // ── #682: escape sequences are removed whole, not per character ─────
+
+    #[test]
+    fn strip_emoji_removes_whole_escape_sequences() {
+        // Dropping only the ESC introducer would leave the sequence body
+        // (`[31m`, `]8;;https://…`) as visible stray text.
+        assert_eq!(strip_emoji("a\u{1b}[1;31mb"), "ab");
+        assert_eq!(strip_emoji("a\u{1b}[?25lb"), "ab");
+        assert_eq!(
+            strip_emoji("a\u{1b}]8;;https://example.com\u{7}link\u{1b}]8;;\u{7}b"),
+            "alinkb"
+        );
+        assert_eq!(strip_emoji("a\u{1b}]0;title\u{1b}\\b"), "ab");
+        // Three-byte forms: charset select, DEC alignment, charset switch,
+        // S7C1T (ESC SP F) and other intermediate-byte forms.
+        assert_eq!(strip_emoji("a\u{1b}(Bb"), "ab");
+        assert_eq!(strip_emoji("a\u{1b}%Gb"), "ab");
+        assert_eq!(strip_emoji("a\u{1b}#8b"), "ab");
+        assert_eq!(strip_emoji("a\u{1b} Fb"), "ab");
+        // 8-bit forms.
+        assert_eq!(strip_emoji("a\u{9b}31mb"), "ab");
+        assert_eq!(strip_emoji("a\u{9d}0;title\u{9c}b"), "ab");
+        // DCS/SOS/PM/APC string bodies (7-bit and 8-bit) go with their
+        // introducer too.
+        assert_eq!(strip_emoji("a\u{1b}Pq1;2;3\u{1b}\\b"), "ab");
+        assert_eq!(strip_emoji("a\u{90}dcs-body\u{9c}b"), "ab");
+        assert_eq!(strip_emoji("a\u{1b}_apc payload\u{9c}b"), "ab");
+        // Unterminated sequence: the tail is dropped, nothing shows.
+        assert_eq!(strip_emoji("ab\u{1b}[31"), "ab");
+        assert_eq!(strip_emoji("ab\u{1b}]8;;https://exam"), "ab");
+    }
+
+    #[test]
+    fn sanitize_line_drops_three_byte_escapes_wholesale() {
+        assert_eq!(sanitize_output("a\u{1b}(Bb"), "ab");
+        assert_eq!(sanitize_output("a\u{1b}%Gb"), "ab");
+        assert_eq!(sanitize_output("a\u{1b}#8b"), "ab");
+        assert_eq!(sanitize_output("a\u{1b}=b"), "ab");
+        assert_eq!(sanitize_output("a\u{1b} Fb"), "ab");
+        // DCS & co: the string body is not text either.
+        assert_eq!(sanitize_output("a\u{1b}Pq1;2;3\u{1b}\\b"), "ab");
+        assert_eq!(sanitize_output("a\u{90}dcs-body\u{9c}b"), "ab");
+    }
+
+    #[test]
+    fn escape_sequences_split_across_chunks_leave_no_stray_fragments() {
+        // The streaming path accumulates deltas into the block's text and the
+        // sanitisers run on the whole accumulated string; this test pins the
+        // invariant behind the issue's DoD: however ANSI-coloured text is
+        // split into chunks — including mid-sequence — the joined text
+        // renders without stray fragments.
+        let styled =
+            "\u{1b}[1m\u{1b}]8;;https://example.com\u{7}Создаём\u{1b}]8;;\u{7} конфигурацию \u{1b}[0m\u{1b}(B";
+        let want = "Создаём конфигурацию ";
+        // `sanitize_line` replays a line as cells and trims the tail.
+        let want_sanitized = "Создаём конфигурацию";
+        for split in 0..=styled.len() {
+            if !styled.is_char_boundary(split) {
+                continue;
+            }
+            // Two streaming chunks, accumulated as the frontend does.
+            let joined = format!("{}{}", &styled[..split], &styled[split..]);
+            assert_eq!(strip_emoji(&joined), want, "strip_emoji, split at byte {split}");
+            assert_eq!(
+                sanitize_output(&joined),
+                want_sanitized,
+                "sanitize_output, split at byte {split}"
+            );
+        }
     }
 }

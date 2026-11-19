@@ -191,8 +191,7 @@ impl ChatLayoutCache {
                         Span::raw("  "),
                         Span::styled(format!("{} ", arrow), theme.warning_fg()),
                     ];
-                    // Safety badge (#551) before the command: the header is
-                    // not wrapped, so after a long command it would be cut.
+                    // Safety badge (#551) before the command.
                     if let Some((label, level)) = self.safety_badges.get(&idx) {
                         let style = match level {
                             SafetyLevel::Safe => theme.success_fg(),
@@ -213,12 +212,47 @@ impl ChatLayoutCache {
                     } else {
                         "$ ".to_string()
                     };
-                    header.extend([
-                        Span::styled(marker, theme.warning_fg()),
-                        Span::styled(command.clone(), theme.command_style()),
-                        status,
-                    ]);
-                    self.push_header(idx, header);
+                    header.push(Span::styled(marker, theme.warning_fg()));
+
+                    // The header wraps at word boundaries (#682): a long
+                    // command used to run past the right edge and lose its
+                    // tail. Continuation rows align under the command text;
+                    // the status glyph closes the last row, so its width is
+                    // reserved on every row. A terminal too narrow for the
+                    // decorations and a column of command keeps the command
+                    // and drops the prefix and the indent — the words are
+                    // the point (same rule as push_marked, #685 review).
+                    let prefix_width: usize = header
+                        .iter()
+                        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                        .sum();
+                    let status_width = UnicodeWidthStr::width(status.content.as_ref());
+                    // A terminal too narrow for the decorations and a column
+                    // of command keeps the command and drops the prefix and
+                    // the indent — the words are the point (same rule as
+                    // push_marked, #685 review); the status glyph is still
+                    // reserved while it fits.
+                    let compact = inner <= prefix_width + status_width;
+                    let indent = if compact { 0 } else { prefix_width };
+                    let with_status = inner > indent + status_width;
+                    let reserve = indent + if with_status { status_width } else { 0 };
+                    let avail = inner.saturating_sub(reserve).max(1);
+                    let rows = wrap_words(command, avail);
+                    let last = rows.len() - 1;
+                    for (row_idx, row) in rows.into_iter().enumerate() {
+                        let mut line = if row_idx == 0 && !compact {
+                            std::mem::take(&mut header)
+                        } else if indent > 0 {
+                            vec![Span::raw(" ".repeat(indent))]
+                        } else {
+                            Vec::new()
+                        };
+                        line.push(Span::styled(row, theme.command_style()));
+                        if row_idx == last && with_status {
+                            line.push(status.clone());
+                        }
+                        self.push_header(idx, line);
+                    }
 
                     if !explanation.is_empty() {
                         for wrapped in wrap_text(&strip_emoji(explanation), output_width) {
@@ -758,16 +792,27 @@ mod tests {
             approved: true,
             tool: None,
         }];
+        // The header wraps a long command over several rows (#682), so the
+        // badge is looked up in the joined text of all header rows with
+        // whitespace collapsed: the continuation-row indent differs with and
+        // without the badge.
+        let header_text = |cache: &ChatLayoutCache| -> String {
+            cache
+                .lines
+                .iter()
+                .filter(|l| l.region == LineRegion::Header)
+                .flat_map(|l| l.line.spans.iter())
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         cache
             .safety_badges
             .insert(0, ("~62%".into(), SafetyLevel::Warn));
         cache.rebuild(&msgs, 80, &theme, &HashSet::new(), 1);
-        let header: String = cache.lines[0]
-            .line
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
+        let header = header_text(&cache);
         let badge = header.find("[~62%]").expect("badge in the header");
         assert!(badge < header.find("$ echo").unwrap(), "{header}");
         let with_badge = cache.lines[0].line.spans.len();
@@ -777,14 +822,119 @@ mod tests {
         // draws the status as `[ok]` (#551).
         cache.safety_badges.clear();
         cache.rebuild(&msgs, 80, &theme, &HashSet::new(), 2);
-        let plain: String = cache.lines[0]
+        let plain = header_text(&cache);
+        assert_eq!(cache.lines[0].line.spans.len(), with_badge - 1);
+        // The wrap cuts the long word at different columns with and without
+        // the badge, so compare with all whitespace removed.
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        assert_eq!(squash(&header.replacen("[~62%]", "", 1)), squash(&plain));
+    }
+
+    #[test]
+    fn a_long_command_wraps_in_the_header_and_stays_whole() {
+        let theme = Theme::default_dark();
+        let mut cache = ChatLayoutCache::new();
+        let command = "grep -q 'net.ipv6' /etc/sysctl.conf && cat >> /etc/sysctl.conf << 'EOF' && sysctl --system --load --apply --verbose"
+            .to_string();
+        let msgs = vec![ChatBlock::Command {
+            command: command.clone(),
+            explanation: String::new(),
+            output: None,
+            approved: true,
+            tool: None,
+        }];
+        let width: usize = 60;
+        cache.rebuild(&msgs, width as u16, &theme, &HashSet::new(), 1);
+
+        let header_rows: Vec<&RenderedLine> = cache
+            .lines
+            .iter()
+            .filter(|l| l.region == LineRegion::Header)
+            .collect();
+        assert!(
+            header_rows.len() > 1,
+            "the long command must wrap, got {} row(s)",
+            header_rows.len()
+        );
+
+        // No row runs past the right edge, and the whole command survives.
+        let mut joined = String::new();
+        for row in &header_rows {
+            let text: String = row.line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                UnicodeWidthStr::width(text.as_str()) <= width,
+                "header row wider than the terminal: {text:?}"
+            );
+            joined.push_str(&text);
+        }
+        let squashed: String = joined.split_whitespace().collect();
+        let want: String = command.split_whitespace().collect();
+        assert!(squashed.contains(&want), "the command must stay whole: {joined}");
+
+        // Continuation rows align under the command text.
+        let first_prefix_width: usize = header_rows[0]
             .line
             .spans
             .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert_eq!(cache.lines[0].line.spans.len(), with_badge - 1);
-        assert_eq!(header.replacen("[~62%] ", "", 1), plain);
+            .take_while(|s| !s.content.ends_with("$ "))
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum::<usize>()
+            + 2; // the "$ " marker itself
+        let indent = &header_rows[1].line.spans[0];
+        assert_eq!(
+            UnicodeWidthStr::width(indent.content.as_ref()),
+            first_prefix_width,
+            "continuation indent must align under the command: {indent:?}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_terminal_drops_decorations_instead_of_overflowing() {
+        // With no room left after the prefix, the header goes compact: the
+        // command rows fit the width instead of overflowing it (#685 review).
+        let theme = Theme::default_dark();
+        let mut cache = ChatLayoutCache::new();
+        let msgs = vec![ChatBlock::Command {
+            command: "systemctl restart networking.service".into(),
+            explanation: String::new(),
+            output: None,
+            approved: true,
+            tool: None,
+        }];
+        for (badge, width) in [(false, 6u16), (true, 6u16), (false, 4u16)] {
+            cache.safety_badges.clear();
+            if badge {
+                cache.safety_badges.insert(0, ("!".into(), SafetyLevel::Danger));
+            }
+            cache.rebuild(&msgs, width, &theme, &HashSet::new(), 1);
+            let header_rows: Vec<&RenderedLine> = cache
+                .lines
+                .iter()
+                .filter(|l| l.region == LineRegion::Header)
+                .collect();
+            assert!(header_rows.len() > 1, "width {width}: the command must wrap");
+            for row in &header_rows {
+                let text: String = row.line.spans.iter().map(|s| s.content.as_ref()).collect();
+                assert!(
+                    UnicodeWidthStr::width(text.as_str()) <= width as usize,
+                    "width {width}, badge {badge}: header row overflows: {text:?}"
+                );
+            }
+            // …and the whole command must survive the wrap, not merely fit.
+            let joined: String = header_rows
+                .iter()
+                .flat_map(|r| r.line.spans.iter())
+                .map(|s| s.content.as_ref())
+                .collect();
+            let squashed: String = joined.split_whitespace().collect();
+            let want: String = "systemctl restart networking.service"
+                .split_whitespace()
+                .collect();
+            assert!(
+                squashed.contains(&want),
+                "width {width}, badge {badge}: the command must stay whole: {joined}"
+            );
+        }
     }
 
     #[test]
