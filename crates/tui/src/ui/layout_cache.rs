@@ -913,13 +913,27 @@ mod tests {
                 .filter(|l| l.region == LineRegion::Header)
                 .collect();
             assert!(header_rows.len() > 1, "width {width}: the command must wrap");
-            for row in header_rows {
+            for row in &header_rows {
                 let text: String = row.line.spans.iter().map(|s| s.content.as_ref()).collect();
                 assert!(
                     UnicodeWidthStr::width(text.as_str()) <= width as usize,
                     "width {width}, badge {badge}: header row overflows: {text:?}"
                 );
             }
+            // …and the whole command must survive the wrap, not merely fit.
+            let joined: String = header_rows
+                .iter()
+                .flat_map(|r| r.line.spans.iter())
+                .map(|s| s.content.as_ref())
+                .collect();
+            let squashed: String = joined.split_whitespace().collect();
+            let want: String = "systemctl restart networking.service"
+                .split_whitespace()
+                .collect();
+            assert!(
+                squashed.contains(&want),
+                "width {width}, badge {badge}: the command must stay whole: {joined}"
+            );
         }
     }
 
