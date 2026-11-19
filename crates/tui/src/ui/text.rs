@@ -185,7 +185,14 @@ fn sanitize_line(src: &str) -> String {
             continue;
         }
 
-        if esc_next == Some(']') || cp == 0x9D {
+        // OSC and the other ST-terminated string sequences (DCS, SOS, PM,
+        // APC), in 7-bit and 8-bit form, are skipped to their terminator —
+        // their body is never text (#682 review).
+        if esc_next == Some(']')
+            || cp == 0x9D
+            || matches!(esc_next, Some('P' | 'X' | '^' | '_'))
+            || matches!(cp, 0x90 | 0x98 | 0x9E | 0x9F)
+        {
             let mut j = i + if c == '\u{1b}' { 2 } else { 1 };
             while j < chars.len() {
                 if chars[j] == '\u{7}' || chars[j] == '\u{9c}' {
@@ -203,14 +210,18 @@ fn sanitize_line(src: &str) -> String {
         }
 
         if c == '\u{1b}' {
-            // Two-character escape (ESC=, ESC>) or three-byte form (charset
-            // select ESC(B, DEC alignment ESC#8, …): skip the sequence whole,
-            // otherwise its final byte stays visible as a stray char (#682).
-            let len = match chars.get(i + 1) {
-                Some('(' | ')' | '*' | '+' | '#' | '%') => 3,
-                _ => 2,
-            };
-            i += len;
+            // ECMA-48: ESC, any number of intermediate bytes (0x20..=0x2F —
+            // charset selects ESC(B, S7C1T ESC SP F, …), then one final byte.
+            // Skipping just ESC+one would leave the final byte of a
+            // three-byte form visible as a stray char (#682).
+            let mut j = i + 1;
+            while j < chars.len() && (0x20..=0x2F).contains(&(chars[j] as u32)) {
+                j += 1;
+            }
+            if j < chars.len() {
+                j += 1;
+            }
+            i = j;
             continue;
         }
 
@@ -311,11 +322,12 @@ pub(crate) fn strip_emoji(s: &str) -> String {
 
 /// Length in chars of the escape sequence starting at `chars[start]`
 /// (an `ESC` or a C1 introducer), so the whole sequence can be skipped at
-/// once. Covers CSI (up to and including the final byte `0x40..=0x7E`), OSC
-/// (up to and including `BEL`, 8-bit `ST` or `ESC \`) and the two/three-byte
-/// `ESC` forms (`ESC=`, charset select `ESC ( B`, …). An unterminated
-/// sequence runs to the end of the input: a sequence cut by the end of a
-/// chunk leaves no visible tail (#682).
+/// once. Covers CSI (up to and including the final byte `0x40..=0x7E`), the
+/// ST-terminated string sequences OSC, DCS, SOS, PM and APC (up to and
+/// including `BEL`, 8-bit `ST` or `ESC \`) and the two/three-byte `ESC`
+/// forms (`ESC=`, charset select `ESC ( B`, …). An unterminated sequence
+/// runs to the end of the input: a sequence cut by the end of a chunk
+/// leaves no visible tail (#682).
 fn escape_sequence_len(chars: &[char], start: usize) -> usize {
     let c = chars[start];
     let rest = chars.len() - start;
@@ -323,9 +335,9 @@ fn escape_sequence_len(chars: &[char], start: usize) -> usize {
         // 8-bit CSI.
         return 1 + csi_body_len(&chars[start + 1..]);
     }
-    if c == '\u{9d}' {
-        // 8-bit OSC.
-        return 1 + osc_body_len(&chars[start + 1..]);
+    if matches!(c, '\u{9d}' | '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}') {
+        // 8-bit OSC / DCS / SOS / PM / APC: a string body ended by ST.
+        return 1 + string_body_len(&chars[start + 1..]);
     }
     if c != '\u{1b}' {
         // Any other C1 control stands alone.
@@ -336,11 +348,20 @@ fn escape_sequence_len(chars: &[char], start: usize) -> usize {
     }
     match chars[start + 1] {
         '[' => 2 + csi_body_len(&chars[start + 2..]),
-        ']' => 2 + osc_body_len(&chars[start + 2..]),
-        // Charset selects (ESC(B) and friends, DEC special (ESC#8),
-        // charset switch (ESC%G) carry a third byte.
-        '(' | ')' | '*' | '+' | '#' | '%' => rest.min(3),
-        _ => 2, // ESC=, ESC>, ESCM, …
+        ']' | 'P' | 'X' | '^' | '_' => 2 + string_body_len(&chars[start + 2..]),
+        // ECMA-48: ESC, any number of intermediate bytes (0x20..=0x2F —
+        // charset selects ESC(B, DEC special ESC#8, S7C1T ESC SP F, …),
+        // then one final byte.
+        _ => {
+            let mut j = start + 1;
+            while j < chars.len() && (0x20..=0x2F).contains(&(chars[j] as u32)) {
+                j += 1;
+            }
+            if j < chars.len() {
+                j += 1;
+            }
+            j - start
+        }
     }
 }
 
@@ -355,10 +376,10 @@ fn csi_body_len(body: &[char]) -> usize {
     body.len()
 }
 
-/// Chars of an OSC body (after the introducer) up to and including the
-/// terminator (`BEL`, 8-bit `ST` or `ESC \`); the whole rest when the
-/// sequence is unterminated.
-fn osc_body_len(body: &[char]) -> usize {
+/// Chars of a string body (OSC/DCS/SOS/PM/APC, after the introducer) up to
+/// and including the terminator (`BEL`, 8-bit `ST` or `ESC \`); the whole
+/// rest when the sequence is unterminated.
+fn string_body_len(body: &[char]) -> usize {
     let mut i = 0;
     while i < body.len() {
         if body[i] == '\u{7}' || body[i] == '\u{9c}' {
@@ -901,13 +922,20 @@ mod tests {
             "alinkb"
         );
         assert_eq!(strip_emoji("a\u{1b}]0;title\u{1b}\\b"), "ab");
-        // Three-byte forms: charset select, DEC alignment, charset switch.
+        // Three-byte forms: charset select, DEC alignment, charset switch,
+        // S7C1T (ESC SP F) and other intermediate-byte forms.
         assert_eq!(strip_emoji("a\u{1b}(Bb"), "ab");
         assert_eq!(strip_emoji("a\u{1b}%Gb"), "ab");
         assert_eq!(strip_emoji("a\u{1b}#8b"), "ab");
+        assert_eq!(strip_emoji("a\u{1b} Fb"), "ab");
         // 8-bit forms.
         assert_eq!(strip_emoji("a\u{9b}31mb"), "ab");
         assert_eq!(strip_emoji("a\u{9d}0;title\u{9c}b"), "ab");
+        // DCS/SOS/PM/APC string bodies (7-bit and 8-bit) go with their
+        // introducer too.
+        assert_eq!(strip_emoji("a\u{1b}Pq1;2;3\u{1b}\\b"), "ab");
+        assert_eq!(strip_emoji("a\u{90}dcs-body\u{9c}b"), "ab");
+        assert_eq!(strip_emoji("a\u{1b}_apc payload\u{9c}b"), "ab");
         // Unterminated sequence: the tail is dropped, nothing shows.
         assert_eq!(strip_emoji("ab\u{1b}[31"), "ab");
         assert_eq!(strip_emoji("ab\u{1b}]8;;https://exam"), "ab");
@@ -919,6 +947,10 @@ mod tests {
         assert_eq!(sanitize_output("a\u{1b}%Gb"), "ab");
         assert_eq!(sanitize_output("a\u{1b}#8b"), "ab");
         assert_eq!(sanitize_output("a\u{1b}=b"), "ab");
+        assert_eq!(sanitize_output("a\u{1b} Fb"), "ab");
+        // DCS & co: the string body is not text either.
+        assert_eq!(sanitize_output("a\u{1b}Pq1;2;3\u{1b}\\b"), "ab");
+        assert_eq!(sanitize_output("a\u{90}dcs-body\u{9c}b"), "ab");
     }
 
     #[test]

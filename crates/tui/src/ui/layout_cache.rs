@@ -218,23 +218,37 @@ impl ChatLayoutCache {
                     // command used to run past the right edge and lose its
                     // tail. Continuation rows align under the command text;
                     // the status glyph closes the last row, so its width is
-                    // reserved on every row.
+                    // reserved on every row. A terminal too narrow for the
+                    // decorations and a column of command keeps the command
+                    // and drops the prefix and the indent — the words are
+                    // the point (same rule as push_marked, #685 review).
                     let prefix_width: usize = header
                         .iter()
                         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
                         .sum();
                     let status_width = UnicodeWidthStr::width(status.content.as_ref());
-                    let avail = inner.saturating_sub(prefix_width + status_width).max(1);
+                    // A terminal too narrow for the decorations and a column
+                    // of command keeps the command and drops the prefix and
+                    // the indent — the words are the point (same rule as
+                    // push_marked, #685 review); the status glyph is still
+                    // reserved while it fits.
+                    let compact = inner <= prefix_width + status_width;
+                    let indent = if compact { 0 } else { prefix_width };
+                    let with_status = inner > indent + status_width;
+                    let reserve = indent + if with_status { status_width } else { 0 };
+                    let avail = inner.saturating_sub(reserve).max(1);
                     let rows = wrap_words(command, avail);
                     let last = rows.len() - 1;
                     for (row_idx, row) in rows.into_iter().enumerate() {
-                        let mut line = if row_idx == 0 {
+                        let mut line = if row_idx == 0 && !compact {
                             std::mem::take(&mut header)
+                        } else if indent > 0 {
+                            vec![Span::raw(" ".repeat(indent))]
                         } else {
-                            vec![Span::raw(" ".repeat(prefix_width))]
+                            Vec::new()
                         };
                         line.push(Span::styled(row, theme.command_style()));
-                        if row_idx == last {
+                        if row_idx == last && with_status {
                             line.push(status.clone());
                         }
                         self.push_header(idx, line);
@@ -872,6 +886,41 @@ mod tests {
             first_prefix_width,
             "continuation indent must align under the command: {indent:?}"
         );
+    }
+
+    #[test]
+    fn a_narrow_terminal_drops_decorations_instead_of_overflowing() {
+        // With no room left after the prefix, the header goes compact: the
+        // command rows fit the width instead of overflowing it (#685 review).
+        let theme = Theme::default_dark();
+        let mut cache = ChatLayoutCache::new();
+        let msgs = vec![ChatBlock::Command {
+            command: "systemctl restart networking.service".into(),
+            explanation: String::new(),
+            output: None,
+            approved: true,
+            tool: None,
+        }];
+        for (badge, width) in [(false, 6u16), (true, 6u16), (false, 4u16)] {
+            cache.safety_badges.clear();
+            if badge {
+                cache.safety_badges.insert(0, ("!".into(), SafetyLevel::Danger));
+            }
+            cache.rebuild(&msgs, width, &theme, &HashSet::new(), 1);
+            let header_rows: Vec<&RenderedLine> = cache
+                .lines
+                .iter()
+                .filter(|l| l.region == LineRegion::Header)
+                .collect();
+            assert!(header_rows.len() > 1, "width {width}: the command must wrap");
+            for row in header_rows {
+                let text: String = row.line.spans.iter().map(|s| s.content.as_ref()).collect();
+                assert!(
+                    UnicodeWidthStr::width(text.as_str()) <= width as usize,
+                    "width {width}, badge {badge}: header row overflows: {text:?}"
+                );
+            }
+        }
     }
 
     #[test]
