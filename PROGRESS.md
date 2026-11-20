@@ -13308,5 +13308,31 @@ login-каталоге при врущем `current_cwd()`. Теперь это 
 `current_cwd()` == None, после `docker restart` следующая команда честно
 reconnect'ится в login-каталог. Остаточное теоретическое окно
 (store_cwd_from после отпускания read-гвардии, ~нс, без await-точек)
-самоисцеляется маркером следующей команды и не может перенаправить
-команду: префикс `cd` строится только из pending_cwd.
+самоисцеляется маркером следующей команды — закрыто окончательно в
+раунде 5.
+
+**Ревью (PR #687, раунд 5, CodeRabbit — прогон продолжен по указанию
+пользователя сверх базового лимита):** все четыре находки приняты.
+(1) Двойное применение относительного pending-cwd: `set_cwd("..")` →
+`restore_cwd_on` делал `cd ..` на свежем шелле, а ретрай гнал
+`full_command` с тем же префиксом — `..` применялся дважды. Оба ретрая
+(ConnectionLost и read-only после forced) теперь идут БЕЗ префикса:
+restore уже применил цель (и перепроверка в swap_in_verified держит её
+актуальной), для абсолютных путей повтор был безвреден, но единообразно
+пропускается. (2) Forget стирал свежий set_cwd из backoff-окна: теперь
+compare-and-clear — `forget_cwd_if_unchanged(pending, last, failed_pair)`
+сравнивает и очищает оба поля в одной критической секции (порядок локов
+pending → last, как в set_cwd); `set_cwd` обновляет пару атомарно под
+той же защитой и берёт read-гвардию сессии (ждёт только сам swap, ~мс).
+(3) Тест `ssh_forced_reconnect_with_unrestorable_cwd_forgets_it` не
+доходил до реконнекта (один sleep → resync проходит → серия 1): теперь
+два timed-out sleep, как в `ssh_marker_timeout_streak_forces_reconnect`.
+(4) `store_cwd_from` перенесён ВНУТРЬ read-гвардии во всех трёх точках
+`run()` — store упорядочен до re-check в swap_in_verified (write-гвардия
+ждёт летящие команды), интервала «guard отпущен, cwd не сохранён»
+больше не существует структурно. Детерминированное покрытие: юнит-тест
+`a_proven_dead_cwd_is_forgotten_only_while_it_is_still_the_stored_state`
+(unchanged → cleared; свежий set_cwd → preserved; одиночный
+marker-store → preserved; mixed-failure dial-после-restore → пара не
+трогается dial-веткой и compare-and-clear срабатывает) плюс docker-тесты
+раунда 4.
