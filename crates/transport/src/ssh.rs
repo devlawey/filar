@@ -967,6 +967,9 @@ impl SshExecutor {
             // target: clear exactly the selection it applied, or the next
             // command would re-apply a relative `cd` (#687 review). A
             // `set_cwd` that landed mid-reconnect is newer and survives.
+            // NOTE: the equality is the exact `Option<String>` value —
+            // any change of `pending_cwd`'s type must revisit this
+            // comparison (#687 review).
             let mut pending = lock_state(&self.pending_cwd);
             if *pending == attempted_pending {
                 *pending = None;
@@ -993,16 +996,17 @@ impl SshExecutor {
     /// this adds on top of a clean slate). If the post-timeout resync
     /// died too, the freshly installed session is dead weight — force one
     /// more reconnect so the next command does not hit the same wall.
+    ///
+    /// MUST be called without holding a session guard: the eager
+    /// reconnect takes the write guard. Each retry's outcome is recorded
+    /// exactly once — recording the same retry twice would double-count.
     async fn record_retry_outcome(&self, retry: &Result<CommandResult>) {
+        self.consecutive_timeouts
+            .fetch_add(retry_streak_delta(retry), Ordering::Relaxed);
         let Err(e) = retry else {
             return;
         };
-        if !is_marker_timeout(e) {
-            return;
-        }
-        self.consecutive_timeouts
-            .fetch_add(retry_streak_delta(retry), Ordering::Relaxed);
-        if is_session_unusable(e) {
+        if is_marker_timeout(e) && is_session_unusable(e) {
             warn!("ssh: the replacement session's resync failed — forcing another reconnect");
             // On success the swap resets the streak; on failure the
             // counted timeout stays, so the next timeout triggers the
@@ -1102,6 +1106,8 @@ impl crate::CommandExecutor for SshExecutor {
                         self.store_cwd_from(&result);
                         result
                     };
+                    // The retry's read guard was dropped with its block
+                    // above — this may take the write guard (#687 review).
                     self.record_retry_outcome(&retry).await;
                     retry
                 }
@@ -1154,6 +1160,9 @@ impl crate::CommandExecutor for SshExecutor {
                                     self.store_cwd_from(&result);
                                     result
                                 };
+                                // The retry's read guard was dropped with
+                                // its block above — this may take the
+                                // write guard (#687 review).
                                 self.record_retry_outcome(&retry).await;
                                 return retry;
                             }
