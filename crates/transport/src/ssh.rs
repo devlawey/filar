@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,7 @@ use filar_core::{
 };
 
 use crate::shell_protocol::{
-    command_marker_tag, command_payload, interrupt_command, read_shell_pid,
+    command_marker_tag, command_payload, interrupt_command, is_marker_timeout, read_shell_pid,
     recv_until_marker, recv_until_marker_simple, shell_pid_request, sync_request, ChannelEvent,
     EventSource,
 };
@@ -59,8 +59,10 @@ pub struct SshTransportConfig {
     /// Number of unanswered keepalives after which the connection is closed.
     pub keepalive_max: usize,
     /// When `true`, a command that fails because the connection was lost
-    /// *before dispatch* triggers one silent reconnect and a single retry.
-    /// A command that may already have executed is never auto-retried.
+    /// *before dispatch* triggers one silent reconnect and a single retry,
+    /// and a streak of command-marker timeouts (or a failed post-timeout
+    /// resync) forces a reconnect of the dead channel (#684). A command
+    /// that may already have executed is only retried when it is read-only.
     pub auto_reconnect: bool,
     /// How long to wait for a command's end-of-output marker before sending
     /// Ctrl-C and failing with `timeout waiting for command marker`.
@@ -511,15 +513,27 @@ impl SshSession {
                 if let Err(e) = self.cancel().await {
                     warn!(error = %e, "could not interrupt the timed-out command");
                 }
-                // Drain any remaining output and resync.
+                // Drain any remaining output and resync. A failed resync
+                // means the channel is dead weight: say so on the error so
+                // the executor can force a reconnect instead of letting the
+                // next command hit the same wall (#684).
                 let (sync_cmd, sync_marker) = sync_request();
-                let _ = self
-                    .cmd_tx
-                    .send(ChannelCmd::Write(sync_cmd.into_bytes()))
-                    .await;
-                let _ = recv_until_marker_simple(&mut *event_rx, &sync_marker, Duration::from_secs(10))
-                    .await;
-                Err(e)
+                let resync_ok = match self.cmd_tx.send(ChannelCmd::Write(sync_cmd.into_bytes())).await
+                {
+                    Ok(()) => {
+                        recv_until_marker_simple(&mut *event_rx, &sync_marker, Duration::from_secs(10))
+                            .await
+                            .is_ok()
+                    }
+                    Err(_) => false,
+                };
+                if resync_ok {
+                    Err(e)
+                } else {
+                    Err(CoreError::Other(format!(
+                        "{e} ({RESYNC_FAILED_NOTE})"
+                    )))
+                }
             }
         }
     }
@@ -736,6 +750,8 @@ pub struct SshExecutor {
     last_cwd: StdMutex<Option<String>>,
     /// Applied once as `cd … &&` on the next [`run`] (user-approved command).
     pending_cwd: StdMutex<Option<String>>,
+    /// Marker timeouts in a row, reset by any successful command (#684).
+    consecutive_timeouts: AtomicU32,
 }
 
 impl SshExecutor {
@@ -777,6 +793,7 @@ impl SshExecutor {
             secrets,
             last_cwd: StdMutex::new(None),
             pending_cwd: StdMutex::new(None),
+            consecutive_timeouts: AtomicU32::new(0),
         })
     }
 
@@ -818,39 +835,17 @@ impl SshExecutor {
     fn clear_pending_cwd(&self) {
         *lock_opt_string(&self.pending_cwd) = None;
     }
-}
 
-fn lock_opt_string(m: &StdMutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<String>> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-#[async_trait::async_trait]
-impl crate::CommandExecutor for SshExecutor {
-    async fn run(&self, command: &str) -> Result<CommandResult> {
-        let command = self.prefixed_command(command);
-        // First attempt on the current session.
-        let first = { self.session.read().await.run(&command).await };
-
-        // Reconnect only when the connection was lost *before* the command was
-        // dispatched (the `ConnectionLost` variant). A command that may have
-        // started executing surfaces as a different error and is never retried
-        // automatically — this preserves the "no silent re-execution" invariant.
-        let should_reconnect =
-            self.config.auto_reconnect && matches!(first, Err(CoreError::ConnectionLost(_)));
-        if !should_reconnect {
-            if !matches!(first, Err(CoreError::ConnectionLost(_))) {
-                self.clear_pending_cwd();
+    /// Re-dial and swap in a fresh session, with a growing pause between
+    /// attempts (#684). The dial and the pause run without the session
+    /// guard — only the swap takes it — so a `cancel()` in flight is never
+    /// stuck behind a reconnect.
+    async fn reconnect_with_backoff(&self, attempts: u32) -> Result<()> {
+        let mut last_err = None;
+        for attempt in 1..=attempts.max(1) {
+            if attempt > 1 {
+                tokio::time::sleep(Duration::from_secs(u64::from(attempt - 1))).await;
             }
-            self.store_cwd_from(&first);
-            return first;
-        }
-
-        info!("ssh connection lost before dispatch — attempting one silent reconnect");
-
-        // Install a fresh session under the write guard, then drop the guard
-        // before retrying so `cancel()` can still proceed during the retry.
-        {
-            let mut guard = self.session.write().await;
             match SshSession::connect_with_config_and_provider(
                 &self.target,
                 &self.config,
@@ -859,33 +854,149 @@ impl crate::CommandExecutor for SshExecutor {
             .await
             {
                 Ok(fresh) => {
+                    let mut guard = self.session.write().await;
                     let old = std::mem::replace(&mut *guard, fresh);
                     // The old session is already dead here; mark it so its
                     // reader task (if any lingers) treats closure as expected.
                     old.mark_shutdown();
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(attempt, error = %e, "ssh reconnect attempt failed");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| CoreError::Other("reconnect attempts exhausted".into())))
+    }
+}
+
+fn lock_opt_string(m: &StdMutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<String>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Note appended to a marker-timeout error when the post-timeout resync
+/// failed too — the session is dead weight and only a reconnect helps
+/// (#684).
+const RESYNC_FAILED_NOTE: &str = "channel resync failed — session unusable";
+
+/// Whether the error carries [`RESYNC_FAILED_NOTE`].
+fn is_session_unusable(err: &CoreError) -> bool {
+    matches!(err, CoreError::Other(msg) if msg.contains(RESYNC_FAILED_NOTE))
+}
+
+/// Whether a marker-timeout failure justifies a forced reconnect (#684):
+/// the resync after it proved the channel dead, or timeouts repeat — one
+/// slow command must not trigger a reconnect on its own.
+fn needs_forced_reconnect(consecutive_timeouts: u32, session_unusable: bool, auto_reconnect: bool) -> bool {
+    auto_reconnect && (session_unusable || consecutive_timeouts >= 2)
+}
+
+/// Forced-reconnect attempts after repeated marker timeouts (#684), with a
+/// growing pause between them (1s, 2s, …) — a flapping network gets a
+/// chance to settle, a dead one fails within seconds.
+const FORCED_RECONNECT_ATTEMPTS: u32 = 3;
+
+#[async_trait::async_trait]
+impl crate::CommandExecutor for SshExecutor {
+    async fn run(&self, command: &str) -> Result<CommandResult> {
+        let full_command = self.prefixed_command(command);
+        // First attempt on the current session.
+        let first = { self.session.read().await.run(&full_command).await };
+
+        // Reconnect only when the connection was lost *before* the command was
+        // dispatched (the `ConnectionLost` variant). A command that may have
+        // started executing surfaces as a different error and is never retried
+        // automatically — this preserves the "no silent re-execution" invariant.
+        let should_reconnect =
+            self.config.auto_reconnect && matches!(first, Err(CoreError::ConnectionLost(_)));
+        if should_reconnect {
+            info!("ssh connection lost before dispatch — attempting one silent reconnect");
+            let reconnect = self.reconnect_with_backoff(1).await;
+            return match reconnect {
+                Ok(()) => {
+                    // Surfaced to the chat via the WARN→System log mirror (issue #57).
+                    warn!("reconnected to {}:{}", self.target.host, self.target.port);
+
+                    // Single retry on the fresh session.
+                    let retry = self.session.read().await.run(&full_command).await;
+                    if !matches!(retry, Err(CoreError::ConnectionLost(_))) {
+                        self.clear_pending_cwd();
+                    }
+                    if retry.is_ok() {
+                        self.consecutive_timeouts.store(0, Ordering::Relaxed);
+                    }
+                    self.store_cwd_from(&retry);
+                    retry
                 }
                 Err(reconnect_err) => {
                     warn!(error = %reconnect_err, "ssh reconnect failed");
                     // Return the original connection-lost error, not the
                     // reconnect failure — the user's command never ran.
-                    return first;
+                    first
                 }
+            };
+        }
+
+        // A marker timeout means the command was dispatched but its answer
+        // never came (#684). One slow command is fine; a *streak* of timeouts
+        // (or a resync that failed right away) means the channel is dead —
+        // force a reconnect instead of letting every next command hit the
+        // same wall.
+        if let Err(e) = &first {
+            if is_marker_timeout(e) {
+                let n = self.consecutive_timeouts.fetch_add(1, Ordering::Relaxed) + 1;
+                if needs_forced_reconnect(n, is_session_unusable(e), self.config.auto_reconnect) {
+                    match self.reconnect_with_backoff(FORCED_RECONNECT_ATTEMPTS).await {
+                        Ok(()) => {
+                            self.consecutive_timeouts.store(0, Ordering::Relaxed);
+                            // One clear line, surfaced via the WARN→System mirror.
+                            warn!(
+                                "ssh: reconnected to {}:{} after {n} consecutive command timeout(s)",
+                                self.target.host, self.target.port
+                            );
+                            // The command may or may not have run remotely
+                            // before the timeout, so only a read-only command
+                            // is safe to retry automatically.
+                            if crate::readonly::check_read_only(command).is_ok() {
+                                info!("retrying the read-only command on the fresh session");
+                                let retry = self.session.read().await.run(&full_command).await;
+                                if !matches!(retry, Err(CoreError::ConnectionLost(_))) {
+                                    self.clear_pending_cwd();
+                                }
+                                self.store_cwd_from(&retry);
+                                return retry;
+                            }
+                            self.clear_pending_cwd();
+                            return Err(CoreError::Other(format!(
+                                "ssh connection to {}:{} was re-established after {n} \
+                                 consecutive command timeout(s); the command was not re-run \
+                                 automatically because it is not read-only (it may or may not \
+                                 have run remotely before the timeout) — check the remote state \
+                                 and re-run it if needed",
+                                self.target.host, self.target.port
+                            )));
+                        }
+                        Err(reconnect_err) => {
+                            warn!(error = %reconnect_err, "ssh reconnect after timeouts failed");
+                            self.clear_pending_cwd();
+                            return first;
+                        }
+                    }
+                }
+                // Below the reconnect threshold: report the timeout as is.
+                self.clear_pending_cwd();
+                return first;
             }
+            // Any other failure breaks the timeout streak.
+            self.consecutive_timeouts.store(0, Ordering::Relaxed);
+        } else {
+            self.consecutive_timeouts.store(0, Ordering::Relaxed);
         }
 
-        // Surfaced to the chat via the WARN→System log mirror (issue #57).
-        warn!(
-            "reconnected to {}:{}",
-            self.target.host, self.target.port
-        );
-
-        // Single retry on the fresh session.
-        let retry = self.session.read().await.run(&command).await;
-        if !matches!(retry, Err(CoreError::ConnectionLost(_))) {
-            self.clear_pending_cwd();
-        }
-        self.store_cwd_from(&retry);
-        retry
+        self.clear_pending_cwd();
+        self.store_cwd_from(&first);
+        first
     }
 
     async fn cancel(&self) -> Result<()> {
@@ -1592,6 +1703,46 @@ mod tests {
         assert!(msg.contains("SSH_PASSWORD"), "should mention the secret name: {msg}");
     }
 
+    // ── forced reconnect after marker timeouts (#684) ────────────────
+
+    #[test]
+    fn marker_timeout_is_detected_by_its_message() {
+        let timeout = CoreError::Other("timeout waiting for command marker `__FILAR_req_1`".into());
+        assert!(is_marker_timeout(&timeout));
+        // The resync-failed variant is still a marker timeout at heart.
+        let unusable = CoreError::Other(format!(
+            "timeout waiting for command marker `__FILAR_req_2` ({RESYNC_FAILED_NOTE})"
+        ));
+        assert!(is_marker_timeout(&unusable));
+        assert!(is_session_unusable(&unusable));
+        assert!(!is_session_unusable(&timeout));
+        // Other failures are not marker timeouts.
+        assert!(!is_marker_timeout(&CoreError::ConnectionLost("x".into())));
+        assert!(!is_marker_timeout(&CoreError::Other("channel closed".into())));
+    }
+
+    #[test]
+    fn forced_reconnect_needs_a_streak_or_a_dead_channel() {
+        // One slow command is not a reason.
+        assert!(!needs_forced_reconnect(1, false, true));
+        // The second consecutive timeout is.
+        assert!(needs_forced_reconnect(2, false, true));
+        assert!(needs_forced_reconnect(5, false, true));
+        // A failed resync proves the channel dead on its own.
+        assert!(needs_forced_reconnect(1, true, true));
+        // auto_reconnect off — never.
+        assert!(!needs_forced_reconnect(3, true, false));
+    }
+
+    #[test]
+    fn retry_after_forced_reconnect_is_read_only_only() {
+        // The decision uses the read-only allowlist: reads may be retried,
+        // anything else must come back to the user instead.
+        assert!(crate::readonly::check_read_only("ls -la /var/log").is_ok());
+        assert!(crate::readonly::check_read_only("systemctl restart nginx").is_err());
+        assert!(crate::readonly::check_read_only("touch /tmp/x").is_err());
+    }
+
     // ── reconnect integration tests (require Docker sshd) ────────────
     //
     // These drive `SshExecutor` against a real container and toggle it with
@@ -1690,6 +1841,46 @@ mod tests {
             result.is_err() || result.as_ref().unwrap().exit_code != Some(0),
             "dispatched command should not have completed successfully after reconnect: {result:?}"
         );
+
+        exec.close().await.unwrap();
+    }
+
+    /// Two marker timeouts in a row force a reconnect (#684): each command
+    /// outlives its timeout on a healthy shell, the streak swaps in a fresh
+    /// session — observable as a new remote shell PID — and the session
+    /// works right away instead of cascading the same marker error.
+    #[tokio::test]
+    #[ignore = "requires Docker sshd container on port 2222"]
+    async fn ssh_marker_timeout_streak_forces_reconnect() {
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
+
+        use crate::CommandExecutor;
+        let cfg = SshTransportConfig::default().with_command_timeout(Duration::from_secs(2));
+        let exec = SshExecutor::connect_with_config(&test_target(), cfg)
+            .await
+            .unwrap();
+
+        let pid_before = exec.session.read().await.shell_pid;
+        assert!(pid_before.is_some(), "the docker shell reports its PID");
+
+        // Two commands that outlive the 2s timeout → a streak of two marker
+        // timeouts → forced reconnect.
+        let first = exec.run("sleep 10").await;
+        assert!(first.is_err(), "the sleep must outlive the 2s timeout");
+        let second = exec.run("sleep 10").await;
+        assert!(second.is_err(), "the second sleep must outlive the 2s timeout");
+
+        let pid_after = exec.session.read().await.shell_pid;
+        assert!(pid_after.is_some(), "the fresh session reports its shell PID");
+        assert_ne!(
+            pid_before, pid_after,
+            "the timeout streak must have swapped in a fresh session"
+        );
+
+        // No cascade: the next command just works.
+        let r = exec.run("echo ok").await.unwrap();
+        assert_eq!(r.stdout.trim(), "ok");
 
         exec.close().await.unwrap();
     }
