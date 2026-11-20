@@ -1076,6 +1076,10 @@ struct StreamToolCall {
 /// then call [`into_response`](Self::into_response) to get the final [`ChatResponse`].
 struct SseState {
     buffer: String,
+    /// `data:` lines of the event currently being read. SSE allows one
+    /// event to span several data lines; the payload is them joined with
+    /// '\n' (#683).
+    pending_data: Vec<String>,
     full_text: String,
     tool_calls: BTreeMap<usize, StreamToolCall>,
     done: bool,
@@ -1089,6 +1093,7 @@ impl SseState {
     fn new() -> Self {
         Self {
             buffer: String::new(),
+            pending_data: Vec::new(),
             full_text: String::new(),
             tool_calls: BTreeMap::new(),
             done: false,
@@ -1105,62 +1110,103 @@ impl SseState {
         while let Some(pos) = self.buffer.find('\n') {
             let line = self.buffer[..pos].trim_end_matches('\r').to_string();
             self.buffer = self.buffer[pos + 1..].to_string();
+            self.process_line(&line, &mut new_deltas);
+        }
+        new_deltas
+    }
 
-            if line.is_empty() {
-                continue;
+    /// Handle one complete SSE line.
+    fn process_line(&mut self, line: &str, new_deltas: &mut Vec<String>) {
+        if line.is_empty() {
+            // Blank line = event boundary. Anything still waiting for its
+            // continuation will never parse — log and drop it.
+            self.dispatch_pending_data(new_deltas, true);
+            return;
+        }
+        // The field name ends at the colon; a single leading space of the
+        // value is optional. `data:{...}` is as valid as `data: {...}` —
+        // treating it as noise lost the delta silently (#683).
+        let Some(value) = line
+            .strip_prefix("data:")
+            .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
+        else {
+            // Comment lines and the event:/id:/retry: fields carry no payload.
+            return;
+        };
+
+        if value.trim() == "[DONE]" {
+            self.dispatch_pending_data(new_deltas, true);
+            self.done = true;
+            return;
+        }
+
+        self.pending_data.push(value.to_string());
+        // Well-formed servers put a whole event on one data line: dispatch
+        // as soon as the accumulated payload parses, without waiting for
+        // the blank line. A payload split across several data lines only
+        // parses once its last fragment arrives.
+        self.dispatch_pending_data(new_deltas, false);
+    }
+
+    /// Try to parse the accumulated `data:` lines as one event and apply it.
+    /// On success the accumulator is cleared; on failure the lines stay
+    /// buffered (more may follow) unless `final_attempt` marks an event
+    /// boundary — then the unparsable payload is logged and dropped.
+    fn dispatch_pending_data(&mut self, new_deltas: &mut Vec<String>, final_attempt: bool) {
+        if self.pending_data.is_empty() {
+            return;
+        }
+        let payload = self.pending_data.join("\n");
+        match serde_json::from_str::<SseEvent>(&payload) {
+            Ok(event) => {
+                self.pending_data.clear();
+                self.apply_event(event, new_deltas);
             }
-            let Some(data) = line.strip_prefix("data: ") else {
-                continue;
-            };
-
-            if data.trim() == "[DONE]" {
-                self.done = true;
-                continue;
-            }
-
-            match serde_json::from_str::<SseEvent>(data) {
-                Ok(event) => {
-                    if let Some(u) = event.usage {
-                        self.streamed_usage = Some(u);
-                    }
-                    if let Some(m) = event.model {
-                        self.streamed_model = Some(m);
-                    }
-                    if let Some(choice) = event.choices.into_iter().next() {
-                        if let Some(reason) = choice.finish_reason {
-                            self.finish_reason = Some(reason);
-                        }
-                        if let Some(content) = choice.delta.content {
-                            if !content.is_empty() {
-                                new_deltas.push(content.clone());
-                                self.full_text.push_str(&content);
-                            }
-                        }
-                        if let Some(tc_deltas) = choice.delta.tool_calls {
-                            for tc in tc_deltas {
-                                let entry =
-                                    self.tool_calls.entry(tc.index).or_default();
-                                if let Some(id) = tc.id {
-                                    entry.id = id;
-                                }
-                                if let Some(func) = tc.function {
-                                    if let Some(name) = func.name {
-                                        entry.name = name;
-                                    }
-                                    if let Some(args) = func.arguments {
-                                        entry.arguments.push_str(&args);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, line = %data, "failed to parse SSE event, skipping");
+            Err(e) => {
+                if final_attempt {
+                    warn!(error = %e, payload = %payload, "failed to parse SSE event, skipping");
+                    self.pending_data.clear();
                 }
             }
         }
-        new_deltas
+    }
+
+    /// Apply one parsed event: record metadata, accumulate text and tool
+    /// calls, and queue new text deltas for the callback.
+    fn apply_event(&mut self, event: SseEvent, new_deltas: &mut Vec<String>) {
+        if let Some(u) = event.usage {
+            self.streamed_usage = Some(u);
+        }
+        if let Some(m) = event.model {
+            self.streamed_model = Some(m);
+        }
+        if let Some(choice) = event.choices.into_iter().next() {
+            if let Some(reason) = choice.finish_reason {
+                self.finish_reason = Some(reason);
+            }
+            if let Some(content) = choice.delta.content {
+                if !content.is_empty() {
+                    new_deltas.push(content.clone());
+                    self.full_text.push_str(&content);
+                }
+            }
+            if let Some(tc_deltas) = choice.delta.tool_calls {
+                for tc in tc_deltas {
+                    let entry = self.tool_calls.entry(tc.index).or_default();
+                    if let Some(id) = tc.id {
+                        entry.id = id;
+                    }
+                    if let Some(func) = tc.function {
+                        if let Some(name) = func.name {
+                            entry.name = name;
+                        }
+                        if let Some(args) = func.arguments {
+                            entry.arguments.push_str(&args);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Flush any remaining buffered data as a final SSE line.
@@ -1169,11 +1215,15 @@ impl SseState {
     /// contains a partial `data:` line, it is processed as if a newline were
     /// appended.  Returns any text deltas produced.
     fn flush(&mut self) -> Vec<String> {
-        if self.buffer.is_empty() {
-            return Vec::new();
+        let mut new_deltas = Vec::new();
+        if !self.buffer.is_empty() {
+            // Append a newline so `process_chunk` can handle the trailing line.
+            new_deltas.extend(self.process_chunk("\n"));
         }
-        // Append a newline so `process_chunk` can handle the trailing line.
-        self.process_chunk("\n")
+        // The stream is over: data lines still waiting for a continuation
+        // will never get one — log and drop them.
+        self.dispatch_pending_data(&mut new_deltas, true);
+        new_deltas
     }
 
     /// Build the final [`ChatResponse`] from accumulated state.
@@ -1730,6 +1780,50 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         let response = state.into_response().unwrap();
         assert!(!response.has_tool_calls(), "expected Text response");
         assert_eq!(response.text, "end");
+    }
+
+    /// `data:` without a space is valid SSE framing: the field name ends at
+    /// the colon and only ONE leading space of the value is stripped.
+    /// Treating such lines as noise lost the delta silently, cutting the
+    /// visible answer mid-word (#683).
+    #[test]
+    fn sse_data_field_without_space_parses() {
+        let mut state = SseState::new();
+        let d = state.process_chunk("data:{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
+        assert_eq!(&d, &["hi".to_string()]);
+        state.process_chunk("data:[DONE]\n\n");
+        assert!(state.done);
+        let response = state.into_response().unwrap();
+        assert_eq!(response.text, "hi");
+    }
+
+    /// One event may span several `data:` lines — the payload is the lines
+    /// joined with '\n'. A proxy re-framing a long event this way must not
+    /// cost the delta (#683).
+    #[test]
+    fn sse_event_split_across_data_lines_parses() {
+        let mut state = SseState::new();
+        let d1 = state.process_chunk("data: {\"choices\":[{\"delta\":\n");
+        assert!(d1.is_empty(), "the payload is not complete JSON yet");
+        let d2 = state.process_chunk("data: {\"content\":\"hi\"}}]}\n\n");
+        assert_eq!(&d2, &["hi".to_string()]);
+        let response = state.into_response().unwrap();
+        assert_eq!(response.text, "hi");
+    }
+
+    /// A stream ending mid-event drops the unparseable tail instead of
+    /// inventing text; the complete events before it still land (#683).
+    #[test]
+    fn sse_stream_end_drops_unparseable_tail() {
+        let mut state = SseState::new();
+        let d1 = state.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"trun\n",
+        );
+        assert_eq!(&d1, &["ok".to_string()]);
+        let d2 = state.flush();
+        assert!(d2.is_empty(), "the truncated tail never becomes text");
+        let response = state.into_response().unwrap();
+        assert_eq!(response.text, "ok");
     }
 
     // ── LLM parameter tests ────────────────────────────────────────────
@@ -2289,6 +2383,38 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
             .expect("a complete body without [DONE] is still a valid answer");
 
         assert_eq!(response.text, "Hi");
+        assert_eq!(served.load(Ordering::SeqCst), 1, "no retry expected");
+    }
+
+    /// Spec-valid but unusual SSE framing must not cost deltas (#683):
+    /// `data:` without a space and one event split across several `data:`
+    /// lines both have to reach the callback whole.
+    #[tokio::test]
+    async fn stream_tolerates_compact_and_multiline_data_framing() {
+        let (url, served) = spawn_provider(vec![Step::finished(vec![
+            "data:{\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n".to_string(),
+            "data:{\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n".to_string(),
+            "data: {\"choices\":[{\"delta\":\ndata: {\"content\":\"lo\"}}]}\n\n".to_string(),
+            done_frame(),
+        ])])
+        .await;
+
+        let client = stream_test_client(&url, 1, Duration::from_secs(5));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let callback = move |d: String| sink.lock().unwrap().push(d);
+
+        let response = client
+            .chat_stream(&simple_request(), &callback)
+            .await
+            .expect("spec-valid framing must parse");
+
+        assert_eq!(response.text, "Hello");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["Hel".to_string(), "lo".to_string()],
+            "every delta reaches the callback exactly once"
+        );
         assert_eq!(served.load(Ordering::SeqCst), 1, "no retry expected");
     }
 

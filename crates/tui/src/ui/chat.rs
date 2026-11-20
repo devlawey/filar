@@ -422,5 +422,81 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn streamed_agent_text_is_shown_whole_at_every_delta() {
+        // #683: a long streamed answer used to lose the tail of the phrase
+        // mid-word until the stream finished. After every delta the visible
+        // text must equal everything streamed so far.
+        use crate::app::AppMode;
+        use crate::event::TuiEvent;
+
+        let mut app = App::new("local".into(), CommandConfirmMode::Always);
+        app.messages.clear();
+        app.mode = AppMode::Thinking;
+
+        // Word-by-word deltas; one word is split across two deltas
+        // mid-word ("диа" + "гностику"), as a real token stream does.
+        let words: Vec<String> = {
+            let phrase = "Теперь закрепляем отключение IPv6 в sysctl.conf и делаем чистую финальную ";
+            let mut v: Vec<String> = phrase
+                .split_inclusive(' ')
+                .map(str::to_string)
+                .collect();
+            v.push("диа".to_string());
+            v.push("гностику ".to_string());
+            v.push("и перепроверяем результат.".to_string());
+            v
+        };
+        let full: String = words.concat();
+
+        let (w, h) = (60u16, 14u16);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut accumulated = String::new();
+        for delta in &words {
+            app.handle_agent_event(TuiEvent::Agent {
+                session_id: app.sessions[0].id,
+                event: filar_agent::AgentEvent::TextDelta(delta.clone()),
+            });
+            accumulated.push_str(delta);
+            terminal
+                .draw(|f| {
+                    render_chat_history(f, &mut app, Rect::new(0, 0, w, h));
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let screen: String = (0..h)
+                .map(|y| chat_row(buf, y, w))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .split_whitespace()
+                .collect();
+            let want: String = accumulated.split_whitespace().collect();
+            assert!(
+                screen.contains(&want),
+                "after {delta:?} the screen lost the tail\nwant: {want}\nscreen: {screen}"
+            );
+        }
+
+        // And after the stream ends the complete text is still there.
+        app.handle_agent_event(TuiEvent::Agent {
+            session_id: app.sessions[0].id,
+            event: filar_agent::AgentEvent::Finished(full.clone()),
+        });
+        terminal
+            .draw(|f| {
+                render_chat_history(f, &mut app, Rect::new(0, 0, w, h));
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let screen: String = (0..h)
+            .map(|y| chat_row(buf, y, w))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split_whitespace()
+            .collect();
+        let want: String = full.split_whitespace().collect();
+        assert!(screen.contains(&want), "final frame lost text: {screen}");
+    }
 }
 
