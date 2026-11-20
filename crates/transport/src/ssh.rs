@@ -837,18 +837,14 @@ impl SshExecutor {
         *lock_state(&self.pending_cwd) = None;
     }
 
-    /// The directory a fresh session must be put back into: the pending,
-    /// user-approved cwd wins over the last reported one — it is newer.
-    /// `None` — there is nothing to restore.
-    fn cwd_restore_target(&self) -> Option<String> {
-        let pending = lock_state(&self.pending_cwd).clone();
-        pending.or_else(|| lock_state(&self.last_cwd).clone())
-    }
-
     /// Run `cd <cwd>` on a *specific* session — called before the session
     /// is installed, so no concurrent command can ever observe a shell
     /// that still sits in the login directory (#687 review).
-    async fn restore_cwd_on(&self, session: &SshSession, target: &Option<String>) -> Result<()> {
+    async fn restore_cwd_on(
+        &self,
+        session: &SshSession,
+        target: &Option<String>,
+    ) -> std::result::Result<(), RestoreFailure> {
         let Some(cwd) = target else {
             return Ok(());
         };
@@ -859,17 +855,19 @@ impl SshExecutor {
             // `current_cwd()` keeps reporting the old path (#687
             // review). Fail instead: the session is discarded and the
             // stale path forgotten.
-            return Err(CoreError::Other(format!(
+            return Err(RestoreFailure::Rejected(CoreError::Other(format!(
                 "reconnected, but the stored working directory `{cwd}` cannot be \
                  restored (rejected by the cwd safety checks)"
-            )));
+            ))));
         };
-        let result = session.run(&cd).await?;
+        // A failure to RUN the `cd` is a transport problem — it says the
+        // link died mid-`cd`, nothing about the directory (#687 review).
+        let result = session.run(&cd).await.map_err(RestoreFailure::Transport)?;
         match result.exit_code {
             Some(0) => Ok(()),
-            other => Err(CoreError::Other(format!(
+            other => Err(RestoreFailure::Rejected(CoreError::Other(format!(
                 "reconnected, but restoring the working directory `{cwd}` failed (exit {other:?})"
-            ))),
+            )))),
         }
     }
 
@@ -902,36 +900,57 @@ impl SshExecutor {
             if attempt > 1 {
                 tokio::time::sleep(Duration::from_secs(u64::from(attempt - 1))).await;
             }
-            let fresh = match SshSession::connect_with_config_and_provider(
-                &self.target,
-                &self.config,
-                &*self.secrets,
+            // Every dial is bounded (#687 review): an endpoint that
+            // accepts TCP but never speaks SSH would otherwise hang this
+            // loop — and every command waiting on it — forever.
+            let dialed = tokio::time::timeout(
+                RECONNECT_DIAL_TIMEOUT,
+                SshSession::connect_with_config_and_provider(
+                    &self.target,
+                    &self.config,
+                    &*self.secrets,
+                ),
             )
-            .await
-            {
-                Ok(fresh) => fresh,
-                Err(e) => {
+            .await;
+            let fresh = match dialed {
+                Ok(Ok(fresh)) => fresh,
+                Ok(Err(e)) => {
                     warn!(attempt, error = %e, "ssh reconnect attempt failed");
                     last_err = Some(e);
+                    continue;
+                }
+                Err(_) => {
+                    warn!(attempt, "ssh reconnect attempt timed out");
+                    last_err = Some(CoreError::Other(format!(
+                        "ssh reconnect attempt timed out after {}s",
+                        RECONNECT_DIAL_TIMEOUT.as_secs()
+                    )));
                     continue;
                 }
             };
             // Restore the working directory BEFORE the swap (#687
             // review): a concurrent command can never run on a shell
-            // that still sits in the login directory.
-            let target = self.cwd_restore_target();
-            if let Err(e) = self.restore_cwd_on(&fresh, &target).await {
-                warn!(attempt, error = %e, "ssh reconnect: cwd restore failed, session discarded");
-                // Only an explicit rejection (the `cd` ran and failed, or
-                // the path is unquotable) proves the directory dead. A
-                // transport error says the LINK died, not the directory —
-                // the cwd is kept then, so the next reconnect after the
-                // link recovers still restores it (#687 review).
-                if !matches!(e, CoreError::ConnectionLost(_)) && !is_marker_timeout(&e) {
+            // that still sits in the login directory. The pending
+            // selection is captured together with the target, so the
+            // clear after the swap removes exactly what the restore
+            // applied.
+            let attempted_pending = lock_state(&self.pending_cwd).clone();
+            let target = attempted_pending
+                .clone()
+                .or_else(|| lock_state(&self.last_cwd).clone());
+            match self.restore_cwd_on(&fresh, &target).await {
+                Ok(()) => {}
+                Err(RestoreFailure::Rejected(e)) => {
+                    warn!(attempt, error = %e, "ssh reconnect: cwd restore failed, session discarded");
                     cwd_restore_failed = true;
+                    last_err = Some(e);
+                    continue;
                 }
-                last_err = Some(e);
-                continue;
+                Err(RestoreFailure::Transport(e)) => {
+                    warn!(attempt, error = %e, "ssh reconnect: cwd restore hit a transport error, session discarded");
+                    last_err = Some(e);
+                    continue;
+                }
             }
             // Install the fresh session and drop the old one.
             {
@@ -940,11 +959,19 @@ impl SshExecutor {
                 // The old session is already dead here; mark it so its
                 // reader task (if any lingers) treats closure as expected.
                 old.mark_shutdown();
+                // The replacement starts with a clean timeout streak
+                // (#687 review): nothing from the old session survives.
+                self.consecutive_timeouts.store(0, Ordering::Relaxed);
             }
             // The restore physically moved the fresh shell to the pending
-            // target, so the pending value is applied: clear it, or the
-            // next command would re-apply a relative `cd` (#687 review).
-            self.clear_pending_cwd();
+            // target: clear exactly the selection it applied, or the next
+            // command would re-apply a relative `cd` (#687 review). A
+            // `set_cwd` that landed mid-reconnect is newer and survives.
+            let mut pending = lock_state(&self.pending_cwd);
+            if *pending == attempted_pending {
+                *pending = None;
+            }
+            drop(pending);
             return Ok(());
         }
         if cwd_restore_failed {
@@ -960,10 +987,43 @@ impl SshExecutor {
         }
         Err(last_err.unwrap_or_else(|| CoreError::Other("reconnect attempts exhausted".into())))
     }
+
+    /// Record a post-reconnect retry's outcome (#687 review): a marker
+    /// timeout counts towards the streak (the swap already reset it, so
+    /// this adds on top of a clean slate). If the post-timeout resync
+    /// died too, the freshly installed session is dead weight — force one
+    /// more reconnect so the next command does not hit the same wall.
+    async fn record_retry_outcome(&self, retry: &Result<CommandResult>) {
+        let Err(e) = retry else {
+            return;
+        };
+        if !is_marker_timeout(e) {
+            return;
+        }
+        self.consecutive_timeouts
+            .fetch_add(retry_streak_delta(retry), Ordering::Relaxed);
+        if is_session_unusable(e) {
+            warn!("ssh: the replacement session's resync failed — forcing another reconnect");
+            // On success the swap resets the streak; on failure the
+            // counted timeout stays, so the next timeout triggers the
+            // forced reconnect it needs.
+            let _ = self.reconnect_with_backoff(FORCED_RECONNECT_ATTEMPTS).await;
+        }
+    }
 }
 
 fn lock_state<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Why a cwd restore failed (#687 review): only an explicit rejection
+/// (the `cd` ran and failed, or the path is unquotable) proves the
+/// directory dead; a transport error means the link died mid-`cd`, so
+/// the cwd must be kept.
+#[derive(Debug)]
+enum RestoreFailure {
+    Rejected(CoreError),
+    Transport(CoreError),
 }
 
 /// Note appended to a marker-timeout error when the post-timeout resync
@@ -988,11 +1048,16 @@ fn needs_forced_reconnect(consecutive_timeouts: u32, session_unusable: bool, aut
 /// chance to settle, a dead one fails within seconds.
 const FORCED_RECONNECT_ATTEMPTS: u32 = 3;
 
-/// The timeout streak after a pre-dispatch reconnect + retry (#687
-/// review): the replacement session is installed with a clean slate, and
-/// only a retry *timeout* counts one — so an earlier, unrelated timeout
-/// can never team up with a later one into a forced reconnect.
-fn streak_after_retry_on_replacement(retry: &Result<CommandResult>) -> u32 {
+/// Upper bound for one reconnect dial (#687 review): an endpoint that
+/// accepts TCP but never sends its SSH identification would otherwise
+/// hang the reconnect loop — and every command waiting on it — forever.
+const RECONNECT_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What a post-reconnect retry's outcome adds to the timeout streak
+/// (#687 review): a marker timeout adds one, anything else adds nothing
+/// (the swap of the replacement session has already reset the streak, so
+/// an earlier, unrelated timeout can never team up with a later one).
+fn retry_streak_delta(retry: &Result<CommandResult>) -> u32 {
     match retry {
         Err(e) if is_marker_timeout(e) => 1,
         _ => 0,
@@ -1037,12 +1102,7 @@ impl crate::CommandExecutor for SshExecutor {
                         self.store_cwd_from(&result);
                         result
                     };
-                    // The replacement session starts with a clean streak;
-                    // only a retry TIMEOUT counts towards it (#687
-                    // review) — a non-timeout retry failure must not keep
-                    // an unrelated earlier timeout alive.
-                    self.consecutive_timeouts
-                        .store(streak_after_retry_on_replacement(&retry), Ordering::Relaxed);
+                    self.record_retry_outcome(&retry).await;
                     retry
                 }
                 Err(reconnect_err) => {
@@ -1072,7 +1132,7 @@ impl crate::CommandExecutor for SshExecutor {
                 if needs_forced_reconnect(n, is_session_unusable(e), self.config.auto_reconnect) {
                     match self.reconnect_with_backoff(FORCED_RECONNECT_ATTEMPTS).await {
                         Ok(()) => {
-                            self.consecutive_timeouts.store(0, Ordering::Relaxed);
+                            // The swap already reset the timeout streak.
                             // One clear line, surfaced via the WARN→System mirror.
                             warn!(
                                 "ssh: reconnected to {}:{} after {n} consecutive command timeout(s)",
@@ -1094,14 +1154,7 @@ impl crate::CommandExecutor for SshExecutor {
                                     self.store_cwd_from(&result);
                                     result
                                 };
-                                // A timed-out retry keeps the streak alive so
-                                // the next timeout triggers the reconnect it
-                                // needs (#687 review); anything else resets.
-                                if let Err(e) = &retry {
-                                    if is_marker_timeout(e) {
-                                        self.consecutive_timeouts.store(1, Ordering::Relaxed);
-                                    }
-                                }
+                                self.record_retry_outcome(&retry).await;
                                 return retry;
                             }
                             return Err(CoreError::Other(format!(
@@ -1885,10 +1938,11 @@ mod tests {
     fn a_replacement_session_resets_the_streak_and_only_a_retry_timeout_counts() {
         // Regression (#687 review): an earlier timeout must not survive
         // the pre-dispatch reconnect — otherwise a later, unrelated
-        // timeout would reach the forced-reconnect threshold.
+        // timeout would reach the forced-reconnect threshold. The swap
+        // resets the streak; the retry only ADDS this delta.
         let timeout: Result<CommandResult> =
             Err(CoreError::Other("timeout waiting for command marker `x`".into()));
-        assert_eq!(streak_after_retry_on_replacement(&timeout), 1);
+        assert_eq!(retry_streak_delta(&timeout), 1);
 
         let ok: Result<CommandResult> = Ok(CommandResult {
             stdout: String::new(),
@@ -1897,12 +1951,12 @@ mod tests {
             duration: Duration::from_millis(1),
             cwd: None,
         });
-        assert_eq!(streak_after_retry_on_replacement(&ok), 0);
+        assert_eq!(retry_streak_delta(&ok), 0);
 
         // A non-timeout retry error: the streak is clean, so the next
         // timeout counts as ONE and does not force a reconnect.
         let lost: Result<CommandResult> = Err(CoreError::ConnectionLost("gone".into()));
-        assert_eq!(streak_after_retry_on_replacement(&lost), 0);
+        assert_eq!(retry_streak_delta(&lost), 0);
         assert!(!needs_forced_reconnect(1, false, true));
     }
 
