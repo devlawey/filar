@@ -988,6 +988,17 @@ fn needs_forced_reconnect(consecutive_timeouts: u32, session_unusable: bool, aut
 /// chance to settle, a dead one fails within seconds.
 const FORCED_RECONNECT_ATTEMPTS: u32 = 3;
 
+/// The timeout streak after a pre-dispatch reconnect + retry (#687
+/// review): the replacement session is installed with a clean slate, and
+/// only a retry *timeout* counts one — so an earlier, unrelated timeout
+/// can never team up with a later one into a forced reconnect.
+fn streak_after_retry_on_replacement(retry: &Result<CommandResult>) -> u32 {
+    match retry {
+        Err(e) if is_marker_timeout(e) => 1,
+        _ => 0,
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::CommandExecutor for SshExecutor {
     async fn run(&self, command: &str) -> Result<CommandResult> {
@@ -1026,16 +1037,12 @@ impl crate::CommandExecutor for SshExecutor {
                         self.store_cwd_from(&result);
                         result
                     };
-                    match &retry {
-                        Ok(_) => self.consecutive_timeouts.store(0, Ordering::Relaxed),
-                        // A timed-out retry counts towards the streak, so
-                        // the next timeout triggers the forced reconnect
-                        // it needs (#687 review).
-                        Err(e) if is_marker_timeout(e) => {
-                            self.consecutive_timeouts.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(_) => {}
-                    }
+                    // The replacement session starts with a clean streak;
+                    // only a retry TIMEOUT counts towards it (#687
+                    // review) — a non-timeout retry failure must not keep
+                    // an unrelated earlier timeout alive.
+                    self.consecutive_timeouts
+                        .store(streak_after_retry_on_replacement(&retry), Ordering::Relaxed);
                     retry
                 }
                 Err(reconnect_err) => {
@@ -1133,7 +1140,13 @@ impl crate::CommandExecutor for SshExecutor {
             .ok_or_else(|| CoreError::Other("invalid cwd".into()))?;
         let path = path.trim().to_string();
         *lock_state(&self.pending_cwd) = Some(path.clone());
-        *lock_state(&self.last_cwd) = Some(path);
+        // Only an ABSOLUTE selection updates the reported cwd: a relative
+        // one ("..") would otherwise sit in `last_cwd` until the next
+        // marker and a reconnect could restore it from the wrong base —
+        // the fresh shell's login directory (#687 review).
+        if path.starts_with('/') {
+            *lock_state(&self.last_cwd) = Some(path);
+        }
         Ok(())
     }
 
@@ -1868,6 +1881,31 @@ mod tests {
         assert!(crate::readonly::check_read_only("touch /tmp/x").is_err());
     }
 
+    #[test]
+    fn a_replacement_session_resets_the_streak_and_only_a_retry_timeout_counts() {
+        // Regression (#687 review): an earlier timeout must not survive
+        // the pre-dispatch reconnect — otherwise a later, unrelated
+        // timeout would reach the forced-reconnect threshold.
+        let timeout: Result<CommandResult> =
+            Err(CoreError::Other("timeout waiting for command marker `x`".into()));
+        assert_eq!(streak_after_retry_on_replacement(&timeout), 1);
+
+        let ok: Result<CommandResult> = Ok(CommandResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: Duration::from_millis(1),
+            cwd: None,
+        });
+        assert_eq!(streak_after_retry_on_replacement(&ok), 0);
+
+        // A non-timeout retry error: the streak is clean, so the next
+        // timeout counts as ONE and does not force a reconnect.
+        let lost: Result<CommandResult> = Err(CoreError::ConnectionLost("gone".into()));
+        assert_eq!(streak_after_retry_on_replacement(&lost), 0);
+        assert!(!needs_forced_reconnect(1, false, true));
+    }
+
     // ── reconnect integration tests (require Docker sshd) ────────────
     //
     // These drive `SshExecutor` against a real container and toggle it with
@@ -2074,6 +2112,39 @@ mod tests {
             Some(r.stdout.trim()),
             "after recovery the reported cwd matches the shell's real cwd"
         );
+
+        exec.close().await.unwrap();
+    }
+
+    /// A relative `set_cwd` must not land in `last_cwd` (#687 review):
+    /// the reported cwd stays the last confirmed directory until the
+    /// marker of the command that applies the selection reports the
+    /// real one — a reconnect can never restore `..` from the login
+    /// directory.
+    #[tokio::test]
+    #[ignore = "requires Docker sshd container on port 2222"]
+    async fn ssh_relative_set_cwd_is_not_reported_as_the_cwd() {
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
+
+        use crate::CommandExecutor;
+        let exec = SshExecutor::connect(&test_target()).await.unwrap();
+
+        exec.run("mkdir -p /tmp/filar-rel-cwd && cd /tmp/filar-rel-cwd")
+            .await
+            .unwrap();
+        exec.set_cwd("..").await.unwrap();
+        assert_eq!(
+            exec.current_cwd().await.as_deref(),
+            Some("/tmp/filar-rel-cwd"),
+            "a relative selection must not replace the confirmed cwd"
+        );
+
+        // The selection still applies — once, on the next command — and
+        // the marker then reports the real directory.
+        let r = exec.run("pwd").await.unwrap();
+        assert_eq!(r.stdout.trim(), "/tmp");
+        assert_eq!(exec.current_cwd().await.as_deref(), Some("/tmp"));
 
         exec.close().await.unwrap();
     }
