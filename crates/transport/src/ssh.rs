@@ -822,46 +822,44 @@ impl SshExecutor {
         }
     }
 
-    /// Prefix `cd … &&` if a tab cwd is pending. Does not consume the pending
-    /// value until the command has been dispatched (see [`clear_pending_cwd`]).
-    fn prefixed_command(&self, command: &str) -> String {
-        let pending = lock_opt_string(&self.pending_cwd).clone();
+    /// Prefix `cd … &&` for the given pending snapshot.
+    fn prefixed_command(pending: &Option<String>, command: &str) -> String {
         match pending.as_deref().and_then(crate::posix_cd_command) {
             Some(cd) => format!("{cd} && {command}"),
             None => command.to_string(),
         }
     }
 
-    fn clear_pending_cwd(&self) {
-        *lock_opt_string(&self.pending_cwd) = None;
+
+    /// The raw `(pending, last)` state pair, captured in ONE critical
+    /// section (lock order pending → last, the same `set_cwd` uses) so
+    /// the pair can never mix a newer pending with an older last
+    /// (#687 review).
+    fn cwd_state_pair(&self) -> (Option<String>, Option<String>) {
+        let pending = lock_opt_string(&self.pending_cwd);
+        let last = lock_opt_string(&self.last_cwd);
+        (pending.clone(), last.clone())
     }
 
     /// The directory a fresh session must be put back into: the pending,
     /// user-approved cwd wins over the last reported one — it is newer.
     /// `None` — there is nothing to restore.
     fn cwd_restore_target(&self) -> Option<String> {
-        lock_opt_string(&self.pending_cwd)
-            .clone()
-            .or_else(|| lock_opt_string(&self.last_cwd).clone())
-    }
-
-    /// The raw `(pending, last)` state pair — the snapshot a failed
-    /// restore is compared against before it is forgotten (#687 review).
-    fn cwd_state_pair(&self) -> (Option<String>, Option<String>) {
-        (
-            lock_opt_string(&self.pending_cwd).clone(),
-            lock_opt_string(&self.last_cwd).clone(),
-        )
+        let (pending, last) = self.cwd_state_pair();
+        pending.or(last)
     }
 
     /// Run `cd <cwd>` on a *specific* session — called before the session
     /// is installed, so no concurrent command can ever observe a shell
-    /// that still sits in the login directory (#687 review).
-    async fn restore_cwd_on(&self, session: &SshSession) -> Result<()> {
-        let Some(cwd) = self.cwd_restore_target() else {
+    /// that still sits in the login directory (#687 review). The target
+    /// is the caller's captured snapshot, NOT a fresh read of the state:
+    /// the restore is bound to exactly what the attempt decided to
+    /// restore, so a concurrent `set_cwd` cannot be applied twice.
+    async fn restore_cwd_on(&self, session: &SshSession, target: &Option<String>) -> Result<()> {
+        let Some(cwd) = target else {
             return Ok(());
         };
-        let Some(cd) = crate::posix_cd_command(&cwd) else {
+        let Some(cd) = crate::posix_cd_command(cwd) else {
             // Every writer filters through `is_safe_cwd`, so this is
             // practically unreachable — but treating an unquotable path
             // as "restored" would install a login-directory shell while
@@ -895,12 +893,7 @@ impl SshExecutor {
     /// stale cwd state is then forgotten, so the next reconnect starts
     /// clean instead of failing on the same dead path forever.
     async fn reconnect_with_backoff(&self, attempts: u32) -> Result<()> {
-        let mut last_err = None;
-        let mut cwd_restore_failed = false;
-        // The (pending, last) pair as it was when the restore last failed
-        // — the forget step must not erase a *newer* state that landed
-        // during the backoff (#687 review).
-        let mut failed_pair = None;
+        let mut state = ReconnectState::default();
         for attempt in 1..=attempts.max(1) {
             if attempt > 1 {
                 tokio::time::sleep(Duration::from_secs(u64::from(attempt - 1))).await;
@@ -915,60 +908,74 @@ impl SshExecutor {
                 Ok(fresh) => fresh,
                 Err(e) => {
                     warn!(attempt, error = %e, "ssh reconnect attempt failed");
-                    last_err = Some(e);
-                    // `cwd_restore_failed`/`failed_pair` stay as is: a cwd
+                    // A dial failure says nothing about the cwd: a pair
                     // that proved unrestorable on an earlier attempt is
-                    // not resurrected by a later dial failure (#687 review).
+                    // kept, but no new pair is recorded (#687 review).
+                    state.dial_failed(e);
                     continue;
                 }
             };
-            let restored_target = self.cwd_restore_target();
-            if let Err(e) = self.restore_cwd_on(&fresh).await {
+            // Capture the pair BEFORE the attempt: the restore and —
+            // on failure — the forget are both bound to exactly this
+            // state, never to whatever a concurrent `set_cwd` or marker
+            // store lands while the `cd` is in flight (#687 review).
+            let attempted_pair = self.cwd_state_pair();
+            let restored_target = attempted_pair.0.clone().or_else(|| attempted_pair.1.clone());
+            if let Err(e) = self.restore_cwd_on(&fresh, &restored_target).await {
                 warn!(attempt, error = %e, "ssh reconnect: cwd restore failed, session discarded");
-                last_err = Some(e);
-                cwd_restore_failed = true;
-                failed_pair = Some(self.cwd_state_pair());
+                state.restore_failed(e, attempted_pair);
                 continue;
             }
-            if let Err(e) = self.swap_in_verified(fresh, &restored_target).await {
+            if let Err((e, attempted)) = self.swap_in_verified(fresh, &restored_target).await {
                 warn!(attempt, error = %e, "ssh reconnect: cwd restore failed, session discarded");
-                last_err = Some(e);
-                cwd_restore_failed = true;
-                failed_pair = Some(self.cwd_state_pair());
+                state.restore_failed(e, attempted);
                 continue;
             }
             return Ok(());
         }
-        if cwd_restore_failed {
+        if let Some(pair) = state.dead_pair() {
             // The stored cwd proved unrestorable (e.g. the directory is
             // gone): forget it so the next reconnect is not poisoned by
             // the same dead path, and `current_cwd()` stops reporting a
             // directory no shell is in — but only if the state is still
             // the pair that failed; a `set_cwd` or a marker store that
             // landed during the backoff survives (#687 review).
-            if let Some(pair) = &failed_pair {
-                forget_cwd_if_unchanged(&self.pending_cwd, &self.last_cwd, pair);
+            let pair = pair.clone();
+            if forget_cwd_if_unchanged(&self.pending_cwd, &self.last_cwd, &pair) {
+                // The retained session still sits in the abandoned
+                // directory; left alive, a later command on it would
+                // succeed and its marker would put the dead path right
+                // back into `last_cwd` (#687 review). Close it: the next
+                // command reconnects into an honest shell instead.
+                let retained = self.session.read().await;
+                retained.mark_shutdown();
+                let _ = retained.close().await;
             }
         }
-        Err(last_err.unwrap_or_else(|| CoreError::Other("reconnect attempts exhausted".into())))
+        Err(state.into_error())
     }
 
     /// Install a restored `fresh` session, closing the last race (#687
     /// review): a command still in flight on the old session may have
     /// moved the stored cwd while the reconnect dialled and restored.
     /// The write guard waits for in-flight readers and blocks new ones,
-    /// so the target re-read here cannot change until the swap — if it
-    /// no longer matches the restored snapshot, the fresh session is
-    /// re-restored first. An unrestorable new target is an error and
-    /// nothing is swapped.
+    /// so the state re-read here cannot change until the swap — if the
+    /// target no longer matches the restored snapshot, the fresh session
+    /// is re-restored to the CURRENT target first. On failure the error
+    /// carries the exact state pair that was attempted, so the caller's
+    /// forget logic is bound to it — and nothing is swapped.
     async fn swap_in_verified(
         &self,
         fresh: SshSession,
         restored_target: &Option<String>,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), (CoreError, (Option<String>, Option<String>))> {
         let mut guard = self.session.write().await;
-        if self.cwd_restore_target() != *restored_target {
-            self.restore_cwd_on(&fresh).await?;
+        let current = self.cwd_state_pair();
+        let current_target = current.0.clone().or_else(|| current.1.clone());
+        if current_target != *restored_target {
+            if let Err(e) = self.restore_cwd_on(&fresh, &current_target).await {
+                return Err((e, current));
+            }
         }
         let old = std::mem::replace(&mut *guard, fresh);
         // The old session is already dead here; mark it so its
@@ -978,8 +985,58 @@ impl SshExecutor {
     }
 }
 
+/// Bookkeeping of a `reconnect_with_backoff` loop (#687 review): the
+/// last error, and the `(pending, last)` pair whose restore proved
+/// unrestorable. Pure state — unit-tested directly; the async loop
+/// only records outcomes into it. A later dial failure never erases an
+/// already recorded pair: a proven-dead cwd stays dead, while pure
+/// dial failures never poison the cwd at all.
+#[derive(Default)]
+struct ReconnectState {
+    last_err: Option<CoreError>,
+    failed_pair: Option<(Option<String>, Option<String>)>,
+}
+
+impl ReconnectState {
+    fn dial_failed(&mut self, err: CoreError) {
+        self.last_err = Some(err);
+    }
+
+    fn restore_failed(&mut self, err: CoreError, attempted: (Option<String>, Option<String>)) {
+        self.last_err = Some(err);
+        self.failed_pair = Some(attempted);
+    }
+
+    /// The pair to compare-and-clear after the attempts run out —
+    /// `Some` only if a restore failure ever proved the cwd dead.
+    fn dead_pair(&self) -> Option<&(Option<String>, Option<String>)> {
+        self.failed_pair.as_ref()
+    }
+
+    fn into_error(self) -> CoreError {
+        self.last_err
+            .unwrap_or_else(|| CoreError::Other("reconnect attempts exhausted".into()))
+    }
+}
+
 fn lock_opt_string(m: &StdMutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<String>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Consume the pending cwd, but only if it is still the exact value the
+/// command was dispatched with (#687 review): a `set_cwd` that landed
+/// mid-flight is newer and must survive. Returns whether it cleared.
+fn consume_pending_if_unchanged(
+    pending: &StdMutex<Option<String>>,
+    consumed: &Option<String>,
+) -> bool {
+    let mut p = lock_opt_string(pending);
+    if *p == *consumed {
+        *p = None;
+        true
+    } else {
+        false
+    }
 }
 
 /// Forget the stored cwd, but only if it is still the exact pair that
@@ -1028,7 +1085,10 @@ const FORCED_RECONNECT_ATTEMPTS: u32 = 3;
 #[async_trait::async_trait]
 impl crate::CommandExecutor for SshExecutor {
     async fn run(&self, command: &str) -> Result<CommandResult> {
-        let full_command = self.prefixed_command(command);
+        // The pending value this command is dispatched with; cleared
+        // afterwards only if it is still exactly this one (#687 review).
+        let pending_snapshot = lock_opt_string(&self.pending_cwd).clone();
+        let full_command = Self::prefixed_command(&pending_snapshot, command);
         // First attempt on the current session. The marker's cwd is
         // stored while the read guard is still held, so a reconnect
         // swap (which waits for this guard before re-reading the
@@ -1054,6 +1114,11 @@ impl crate::CommandExecutor for SshExecutor {
                     // Surfaced to the chat via the WARN→System log mirror (issue #57).
                     warn!("reconnected to {}:{}", self.target.host, self.target.port);
 
+                    // The restore has physically moved the fresh shell to
+                    // the pending target — consume it (if it is still
+                    // ours) so no later command re-applies it (#687 review).
+                    consume_pending_if_unchanged(&self.pending_cwd, &pending_snapshot);
+
                     // Single retry on the fresh session. Its working
                     // directory was already restored before the swap —
                     // including a pending cwd — so the retry goes WITHOUT
@@ -1065,9 +1130,6 @@ impl crate::CommandExecutor for SshExecutor {
                         self.store_cwd_from(&result);
                         result
                     };
-                    if !matches!(retry, Err(CoreError::ConnectionLost(_))) {
-                        self.clear_pending_cwd();
-                    }
                     if retry.is_ok() {
                         self.consecutive_timeouts.store(0, Ordering::Relaxed);
                     }
@@ -1099,6 +1161,11 @@ impl crate::CommandExecutor for SshExecutor {
                                 "ssh: reconnected to {}:{} after {n} consecutive command timeout(s)",
                                 self.target.host, self.target.port
                             );
+                            // The restore has physically moved the fresh
+                            // shell to the pending target — consume it (if
+                            // it is still ours) so no later command
+                            // re-applies it (#687 review).
+                            consume_pending_if_unchanged(&self.pending_cwd, &pending_snapshot);
                             // The command may or may not have run remotely
                             // before the timeout, so only a read-only command
                             // is safe to retry automatically. The fresh shell
@@ -1115,9 +1182,6 @@ impl crate::CommandExecutor for SshExecutor {
                                     self.store_cwd_from(&result);
                                     result
                                 };
-                                if !matches!(retry, Err(CoreError::ConnectionLost(_))) {
-                                    self.clear_pending_cwd();
-                                }
                                 // A timed-out retry keeps the streak alive so
                                 // the next timeout triggers the reconnect it
                                 // needs (#687 review); anything else resets.
@@ -1128,7 +1192,6 @@ impl crate::CommandExecutor for SshExecutor {
                                 }
                                 return retry;
                             }
-                            self.clear_pending_cwd();
                             return Err(CoreError::Other(format!(
                                 "ssh connection to {}:{} was re-established after {n} \
                                  consecutive command timeout(s); the command was not re-run \
@@ -1140,13 +1203,16 @@ impl crate::CommandExecutor for SshExecutor {
                         }
                         Err(reconnect_err) => {
                             warn!(error = %reconnect_err, "ssh reconnect after timeouts failed");
-                            self.clear_pending_cwd();
+                            // The pending value is NOT cleared here: the
+                            // reconnect failed, so nothing consumed it —
+                            // and a newer selection made during the
+                            // backoff must survive anyway (#687 review).
                             return first;
                         }
                     }
                 }
                 // Below the reconnect threshold: report the timeout as is.
-                self.clear_pending_cwd();
+                consume_pending_if_unchanged(&self.pending_cwd, &pending_snapshot);
                 return first;
             }
             // Any other failure breaks the timeout streak.
@@ -1155,7 +1221,7 @@ impl crate::CommandExecutor for SshExecutor {
             self.consecutive_timeouts.store(0, Ordering::Relaxed);
         }
 
-        self.clear_pending_cwd();
+        consume_pending_if_unchanged(&self.pending_cwd, &pending_snapshot);
         first
     }
 
@@ -1946,6 +2012,47 @@ mod tests {
         assert!(forget_cwd_if_unchanged(&pending, &last, &failed));
     }
 
+    #[test]
+    fn reconnect_state_binds_the_dead_pair_to_the_restore_attempt() {
+        let err = || CoreError::Other("boom".into());
+        let dead = (Some("/dead".to_string()), Some("/dead".to_string()));
+
+        // The mixed sequence: a restore failure proves the pair dead; a
+        // later dial failure updates the error but NEVER erases the pair.
+        let mut s = ReconnectState::default();
+        s.restore_failed(err(), dead.clone());
+        s.dial_failed(err());
+        s.dial_failed(err());
+        assert_eq!(s.dead_pair(), Some(&dead));
+        assert!(matches!(s.into_error(), CoreError::Other(_)));
+
+        // Pure dial failures say nothing about the cwd: nothing to forget.
+        let mut s = ReconnectState::default();
+        s.dial_failed(err());
+        assert_eq!(s.dead_pair(), None);
+    }
+
+    #[test]
+    fn a_pending_cwd_is_consumed_only_if_it_is_still_the_dispatched_one() {
+        // Same value — consumed.
+        let pending = StdMutex::new(Some("/tab".to_string()));
+        assert!(consume_pending_if_unchanged(&pending, &Some("/tab".to_string())));
+        assert_eq!(*pending.lock().unwrap(), None);
+
+        // A `set_cwd` that landed mid-flight survives.
+        let pending = StdMutex::new(Some("/newer".to_string()));
+        assert!(!consume_pending_if_unchanged(&pending, &Some("/tab".to_string())));
+        assert_eq!(*pending.lock().unwrap(), Some("/newer".to_string()));
+
+        // Nothing pending, nothing consumed — and a raced `set_cwd`
+        // is still not erased.
+        let pending = StdMutex::new(None);
+        assert!(consume_pending_if_unchanged(&pending, &None));
+        let pending = StdMutex::new(Some("/raced".to_string()));
+        assert!(!consume_pending_if_unchanged(&pending, &None));
+        assert_eq!(*pending.lock().unwrap(), Some("/raced".to_string()));
+    }
+
     // ── reconnect integration tests (require Docker sshd) ────────────
     //
     // These drive `SshExecutor` against a real container and toggle it with
@@ -2187,7 +2294,7 @@ mod tests {
         .unwrap();
         let restored = exec.cwd_restore_target();
         assert_eq!(restored.as_deref(), Some("/tmp/filar-moved-a"));
-        exec.restore_cwd_on(&fresh).await.unwrap();
+        exec.restore_cwd_on(&fresh, &restored).await.unwrap();
 
         // …then a command still in flight on the old session finishes
         // and moves the stored cwd before the swap.
@@ -2212,6 +2319,41 @@ mod tests {
             Some(r.stdout.trim()),
             "reported cwd and real shell cwd must agree after the swap"
         );
+
+        exec.close().await.unwrap();
+    }
+
+    /// The restore is bound to the caller's captured target, not to a
+    /// fresh read of the state (#687 review): a concurrent `set_cwd`
+    /// between the snapshot and the restore must not be applied twice.
+    #[tokio::test]
+    #[ignore = "requires Docker sshd container on port 2222"]
+    async fn ssh_restore_applies_the_captured_target_not_the_state() {
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
+
+        use crate::CommandExecutor;
+        let exec = SshExecutor::connect(&test_target()).await.unwrap();
+
+        exec.run("mkdir -p /tmp/filar-snap-a /tmp/filar-snap-b && cd /tmp/filar-snap-a")
+            .await
+            .unwrap();
+
+        let fresh = SshSession::connect_with_config_and_provider(
+            &exec.target,
+            &exec.config,
+            &*exec.secrets,
+        )
+        .await
+        .unwrap();
+
+        // The stored state says /a — but this attempt captured /b: the
+        // fresh shell must go to /b, exactly once.
+        exec.restore_cwd_on(&fresh, &Some("/tmp/filar-snap-b".to_string()))
+            .await
+            .unwrap();
+        let r = fresh.run("pwd").await.unwrap();
+        assert_eq!(r.stdout.trim(), "/tmp/filar-snap-b");
 
         exec.close().await.unwrap();
     }

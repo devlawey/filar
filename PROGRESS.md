@@ -13336,3 +13336,27 @@ pending → last, как в set_cwd); `set_cwd` обновляет пару ат
 marker-store → preserved; mixed-failure dial-после-restore → пара не
 трогается dial-веткой и compare-and-clear срабатывает) плюс docker-тесты
 раунда 4.
+
+**Ревью (PR #687, раунд 6, CodeRabbit + ai-review):** все находки
+приняты, корень один — привязка попытки к снапшоту состояния.
+(1) `restore_cwd_on` больше не перечитывает состояние: цель передаётся
+параметром из атомарного снапшота `cwd_state_pair()` (оба мьютекса в
+одной критической секции, порядок pending → last) — гонка
+«снапшот /a, restore перечитал /b, swap сверил с /a» (включая ABA
+/a→/b→/a) исчезла; swap при mismatch до-восстанавливает на ТЕКУЩУЮ
+цель, ошибка несёт точную пару попытки. (2) `failed_pair` фиксируется
+ДО попытки, а не после — set_cwd во время `cd` не попадает в снапшот;
+учёт цикла сведён в чистый `ReconnectState` (dial_failed не трогает
+пару — mixed-failure покрыт юнит-тестом детерминированно). (3) Forget
+больше не добивается безусловным `clear_pending_cwd` в плече провала
+forced-реконнекта — оно убрано; все очистки pending заменены на
+`consume_pending_if_unchanged` (compare-and-clear по снапшоту, снятому
+в начале `run`): чужой свежий `set_cwd` не стирается даже гонкой
+«команда завершилась во время swap». После успешного реконнекта pending
+потребляется сразу — restore физически перевёл шелл (находка ai-review
+про неочищенный pending). (4) При сработавшем forget удерживаемая
+старая сессия закрывается (mark_shutdown + close) — её маркер не вернёт
+мёртвый путь в `last_cwd`; следующая команда честно reconnect'ится.
+Новые тесты: юнит `reconnect_state_binds_the_dead_pair_to_the_restore_attempt`,
+юнит `a_pending_cwd_is_consumed_only_if_it_is_still_the_dispatched_one`,
+docker `ssh_restore_applies_the_captured_target_not_the_state`.
