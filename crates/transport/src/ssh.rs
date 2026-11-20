@@ -836,6 +836,27 @@ impl SshExecutor {
         *lock_opt_string(&self.pending_cwd) = None;
     }
 
+    /// A fresh shell starts in the login directory: put it back where the
+    /// user was (#687 review). A pending cwd wins over the last reported
+    /// one — it is the newer, user-approved target. Without either there
+    /// is nothing to restore.
+    async fn restore_cwd_after_reconnect(&self) -> Result<()> {
+        let cwd = lock_opt_string(&self.pending_cwd)
+            .clone()
+            .or_else(|| lock_opt_string(&self.last_cwd).clone());
+        let Some(cwd) = cwd else { return Ok(()) };
+        let Some(cd) = crate::posix_cd_command(&cwd) else {
+            return Ok(());
+        };
+        let result = self.session.read().await.run(&cd).await?;
+        match result.exit_code {
+            Some(0) => Ok(()),
+            other => Err(CoreError::Other(format!(
+                "reconnected, but restoring the working directory `{cwd}` failed (exit {other:?})"
+            ))),
+        }
+    }
+
     /// Re-dial and swap in a fresh session, with a growing pause between
     /// attempts (#684). The dial and the pause run without the session
     /// guard — only the swap takes it — so a `cancel()` in flight is never
@@ -918,6 +939,14 @@ impl crate::CommandExecutor for SshExecutor {
                     // Surfaced to the chat via the WARN→System log mirror (issue #57).
                     warn!("reconnected to {}:{}", self.target.host, self.target.port);
 
+                    // The fresh shell starts in the login directory — a
+                    // retry from the wrong cwd is worse than no retry.
+                    if let Err(e) = self.restore_cwd_after_reconnect().await {
+                        warn!(error = %e, "ssh reconnect: cwd restore failed");
+                        self.clear_pending_cwd();
+                        return Err(e);
+                    }
+
                     // Single retry on the fresh session.
                     let retry = self.session.read().await.run(&full_command).await;
                     if !matches!(retry, Err(CoreError::ConnectionLost(_))) {
@@ -957,12 +986,28 @@ impl crate::CommandExecutor for SshExecutor {
                             );
                             // The command may or may not have run remotely
                             // before the timeout, so only a read-only command
-                            // is safe to retry automatically.
+                            // is safe to retry automatically. Either way the
+                            // fresh shell first goes back to the user's cwd —
+                            // a retry from the login directory is worse than
+                            // no retry (#687 review).
+                            if let Err(e) = self.restore_cwd_after_reconnect().await {
+                                warn!(error = %e, "ssh reconnect: cwd restore failed");
+                                self.clear_pending_cwd();
+                                return Err(e);
+                            }
                             if crate::readonly::check_read_only(command).is_ok() {
                                 info!("retrying the read-only command on the fresh session");
                                 let retry = self.session.read().await.run(&full_command).await;
                                 if !matches!(retry, Err(CoreError::ConnectionLost(_))) {
                                     self.clear_pending_cwd();
+                                }
+                                // A timed-out retry keeps the streak alive so
+                                // the next timeout triggers the reconnect it
+                                // needs (#687 review); anything else resets.
+                                if let Err(e) = &retry {
+                                    if is_marker_timeout(e) {
+                                        self.consecutive_timeouts.store(1, Ordering::Relaxed);
+                                    }
                                 }
                                 self.store_cwd_from(&retry);
                                 return retry;
@@ -1864,6 +1909,11 @@ mod tests {
         let pid_before = exec.session.read().await.shell_pid;
         assert!(pid_before.is_some(), "the docker shell reports its PID");
 
+        // Set a non-default working directory: after the forced reconnect
+        // the fresh shell must be put back into it (#687 review).
+        let r = exec.run("cd /tmp && pwd").await.unwrap();
+        assert_eq!(r.stdout.trim(), "/tmp");
+
         // Two commands that outlive the 2s timeout → a streak of two marker
         // timeouts → forced reconnect.
         let first = exec.run("sleep 10").await;
@@ -1878,9 +1928,12 @@ mod tests {
             "the timeout streak must have swapped in a fresh session"
         );
 
-        // No cascade: the next command just works.
+        // No cascade: the next command just works — and it works from the
+        // restored working directory, not the login one.
         let r = exec.run("echo ok").await.unwrap();
         assert_eq!(r.stdout.trim(), "ok");
+        let r = exec.run("pwd").await.unwrap();
+        assert_eq!(r.stdout.trim(), "/tmp", "the fresh session must restore the cwd");
 
         exec.close().await.unwrap();
     }
