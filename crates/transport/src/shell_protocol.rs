@@ -182,6 +182,16 @@ pub(crate) async fn recv_until_marker<E: EventSource>(
     }
 }
 
+/// Whether the error is a command-marker timeout from [`recv_until_marker`]
+/// (#684). The timeout text is produced above; matching it here keeps the
+/// producer and the detector side by side.
+pub(crate) fn is_marker_timeout(err: &CoreError) -> bool {
+    matches!(
+        err,
+        CoreError::Other(msg) if msg.starts_with("timeout waiting for command marker")
+    )
+}
+
 /// Parse `<marker_tag>__<exit>__` or `<marker_tag>__<exit>__<pwd>__`.
 /// Returns the exit code, the `$PWD` (if present and safe) and the byte
 /// offset where the marker line starts.
