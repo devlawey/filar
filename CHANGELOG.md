@@ -11,6 +11,8 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+## [3.0.7] - 2026-11-21
+
 ### Changed
 
 - The agent treats a bulk deletion request (everything in a directory, a recursive delete, a wildcard) as not yet confirmed, even when told to do it without questions: it runs nothing that turn, warns that the deletion cannot be undone, asks which files should go and offers to list the directory, then goes on through the usual confirmation once the user answers; and a password typed into the chat is never put into a command or repeated in the reply — the agent asks for it via `Ctrl+P` and uses `$FILAR_SECRET_N` ([#677](https://github.com/devlawey/filar/issues/677)).
@@ -1567,7 +1569,8 @@ TUI modernization: the mouse becomes a first-class input alongside the keyboard.
 - Layout stability: no flicker or artifacts on mode change, and graceful
   degradation when mouse capture is unavailable (#23).
 
-[Unreleased]: https://github.com/devlawey/filar/compare/v3.0.6...HEAD
+[Unreleased]: https://github.com/devlawey/filar/compare/v3.0.7...HEAD
+[3.0.7]: https://github.com/devlawey/filar/compare/v3.0.6...v3.0.7
 [3.0.6]: https://github.com/devlawey/filar/compare/v3.0.5...v3.0.6
 [3.0.5]: https://github.com/devlawey/filar/compare/v3.0.4...v3.0.5
 [3.0.4]: https://github.com/devlawey/filar/compare/v3.0.3...v3.0.4

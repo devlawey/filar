@@ -28,13 +28,13 @@ working example.
 Bots and mobile apps that only need SSH should disable default features:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.6", default-features = false }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.7", default-features = false }
 ```
 
 Desktop apps (TUI/GUI) should keep `local` enabled:
 
 ```toml
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.6" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.7" }
 ```
 
 Consumers that need Kubernetes but not a local terminal can enable only `kube`:
@@ -201,9 +201,9 @@ application — and the arbiter/`RiskInput` target
 
 ```toml
 [dependencies]
-filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.6" }
-filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.6", default-features = false }
-filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.6" }
+filar-core      = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.7" }
+filar-transport = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.7", default-features = false }
+filar-agent     = { git = "https://github.com/devlawey/filar", tag = "engine-v3.0.7" }
 
 tokio       = { version = "1", features = ["full"] }
 async-trait = "0.1"
@@ -919,7 +919,7 @@ let _agent = builder.log_sources(sources);
   and any proxy in front of it (VictoriaLogs documents that it does). Kinds without an adapter in the
   build are reported by `build_log_sources` and not offered.
 
-## Upgrading to `engine-v3.0.6`
+## Upgrading to `engine-v3.0.7`
 
 | Change | Breaks | What to do |
 |--------|--------|------------|
