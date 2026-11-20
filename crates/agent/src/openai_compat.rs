@@ -1070,6 +1070,11 @@ struct StreamToolCall {
     arguments: String,
 }
 
+/// Upper bound for one pending SSE event (#686 review): a stream whose
+/// payload never parses and never sees a blank line must not grow the
+/// accumulator without limit.
+const MAX_PENDING_EVENT_BYTES: usize = 1024 * 1024;
+
 /// Stateful SSE parser — accumulates text and tool_calls across chunked data.
 ///
 /// Designed for unit-testing: feed it chunked SSE data via [`process_chunk`](Self::process_chunk),
@@ -1146,12 +1151,42 @@ impl SseState {
         // the blank line. A payload split across several data lines only
         // parses once its last fragment arrives.
         self.dispatch_pending_data(new_deltas, false);
+        if self.pending_data.is_empty() {
+            return;
+        }
+        // The joined payload does not parse. If the newest line is a
+        // complete event on its own, the lines before it were a malformed
+        // event, not this one's fragment — dropping them keeps a bad line
+        // from suppressing every complete event after it (#686 review).
+        if self.pending_data.len() > 1 {
+            let last = self.pending_data.last().expect("just pushed").clone();
+            if let Ok(event) = serde_json::from_str::<SseEvent>(&last) {
+                let dropped_len: usize = self.pending_data[..self.pending_data.len() - 1]
+                    .iter()
+                    .map(|l| l.len() + 1)
+                    .sum();
+                warn!(dropped_len, "dropping an unparseable SSE payload before a complete event");
+                self.pending_data.clear();
+                self.apply_event(event, new_deltas);
+                return;
+            }
+        }
+        // Cap one pending event: a stream that never terminates its JSON
+        // and never sends a blank line would otherwise grow the accumulator
+        // (and the reparse cost of each new line) without bound (#686 review).
+        let pending_bytes: usize = self.pending_data.iter().map(|l| l.len() + 1).sum();
+        if pending_bytes > MAX_PENDING_EVENT_BYTES {
+            warn!(pending_bytes, "dropping an oversized unparseable SSE event");
+            self.pending_data.clear();
+        }
     }
 
     /// Try to parse the accumulated `data:` lines as one event and apply it.
     /// On success the accumulator is cleared; on failure the lines stay
     /// buffered (more may follow) unless `final_attempt` marks an event
-    /// boundary — then the unparsable payload is logged and dropped.
+    /// boundary — then the unparseable payload is logged and dropped. The
+    /// log carries the error and the length, never the payload itself: a
+    /// model's answer may contain secrets (#686 review).
     fn dispatch_pending_data(&mut self, new_deltas: &mut Vec<String>, final_attempt: bool) {
         if self.pending_data.is_empty() {
             return;
@@ -1164,7 +1199,7 @@ impl SseState {
             }
             Err(e) => {
                 if final_attempt {
-                    warn!(error = %e, payload = %payload, "failed to parse SSE event, skipping");
+                    warn!(error = %e, payload_len = payload.len(), "failed to parse SSE event, skipping");
                     self.pending_data.clear();
                 }
             }
@@ -1824,6 +1859,42 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         assert!(d2.is_empty(), "the truncated tail never becomes text");
         let response = state.into_response().unwrap();
         assert_eq!(response.text, "ok");
+    }
+
+    /// A malformed data line must not suppress the complete event after it
+    /// when the server sends events back-to-back without blank lines
+    /// (#686 review).
+    #[test]
+    fn sse_malformed_line_does_not_suppress_next_event() {
+        let mut state = SseState::new();
+        let d = state.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\ndata: not-json\ndata: {\"choices\":[{\"delta\":{\"content\":\"tail\"}}]}\ndata: [DONE]\n",
+        );
+        assert_eq!(&d, &["ok".to_string(), "tail".to_string()]);
+        assert!(state.done);
+        let response = state.into_response().unwrap();
+        assert_eq!(response.text, "oktail");
+    }
+
+    /// A pending event that never parses is capped instead of growing the
+    /// accumulator — and the reparse cost of every new line — without
+    /// bound (#686 review). A later well-formed event still parses.
+    #[test]
+    fn sse_pending_event_is_capped() {
+        let mut state = SseState::new();
+        let big = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\n",
+            "a".repeat(MAX_PENDING_EVENT_BYTES + 16)
+        );
+        let d1 = state.process_chunk(&big);
+        assert!(d1.is_empty());
+        assert!(
+            state.pending_data.is_empty(),
+            "an oversized unparseable event is dropped"
+        );
+        let d2 =
+            state.process_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n");
+        assert_eq!(&d2, &["ok".to_string()]);
     }
 
     // ── LLM parameter tests ────────────────────────────────────────────
