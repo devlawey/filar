@@ -836,16 +836,22 @@ impl SshExecutor {
         *lock_opt_string(&self.pending_cwd) = None;
     }
 
+    /// The directory a fresh session must be put back into: the pending,
+    /// user-approved cwd wins over the last reported one — it is newer.
+    /// `None` — there is nothing to restore.
+    fn cwd_restore_target(&self) -> Option<String> {
+        lock_opt_string(&self.pending_cwd)
+            .clone()
+            .or_else(|| lock_opt_string(&self.last_cwd).clone())
+    }
+
     /// Run `cd <cwd>` on a *specific* session — called before the session
     /// is installed, so no concurrent command can ever observe a shell
-    /// that still sits in the login directory (#687 review). A pending
-    /// cwd wins over the last reported one — it is the newer,
-    /// user-approved target. Without either there is nothing to restore.
+    /// that still sits in the login directory (#687 review).
     async fn restore_cwd_on(&self, session: &SshSession) -> Result<()> {
-        let cwd = lock_opt_string(&self.pending_cwd)
-            .clone()
-            .or_else(|| lock_opt_string(&self.last_cwd).clone());
-        let Some(cwd) = cwd else { return Ok(()) };
+        let Some(cwd) = self.cwd_restore_target() else {
+            return Ok(());
+        };
         let Some(cd) = crate::posix_cd_command(&cwd) else {
             // Every writer filters through `is_safe_cwd`, so this is
             // practically unreachable — but treating an unquotable path
@@ -903,17 +909,19 @@ impl SshExecutor {
                     continue;
                 }
             };
+            let restored_target = self.cwd_restore_target();
             if let Err(e) = self.restore_cwd_on(&fresh).await {
                 warn!(attempt, error = %e, "ssh reconnect: cwd restore failed, session discarded");
                 last_err = Some(e);
                 cwd_restore_failed = true;
                 continue;
             }
-            let mut guard = self.session.write().await;
-            let old = std::mem::replace(&mut *guard, fresh);
-            // The old session is already dead here; mark it so its
-            // reader task (if any lingers) treats closure as expected.
-            old.mark_shutdown();
+            if let Err(e) = self.swap_in_verified(fresh, &restored_target).await {
+                warn!(attempt, error = %e, "ssh reconnect: cwd restore failed, session discarded");
+                last_err = Some(e);
+                cwd_restore_failed = true;
+                continue;
+            }
             return Ok(());
         }
         if cwd_restore_failed {
@@ -925,6 +933,30 @@ impl SshExecutor {
             *lock_opt_string(&self.last_cwd) = None;
         }
         Err(last_err.unwrap_or_else(|| CoreError::Other("reconnect attempts exhausted".into())))
+    }
+
+    /// Install a restored `fresh` session, closing the last race (#687
+    /// review): a command still in flight on the old session may have
+    /// moved the stored cwd while the reconnect dialled and restored.
+    /// The write guard waits for in-flight readers and blocks new ones,
+    /// so the target re-read here cannot change until the swap — if it
+    /// no longer matches the restored snapshot, the fresh session is
+    /// re-restored first. An unrestorable new target is an error and
+    /// nothing is swapped.
+    async fn swap_in_verified(
+        &self,
+        fresh: SshSession,
+        restored_target: &Option<String>,
+    ) -> Result<()> {
+        let mut guard = self.session.write().await;
+        if self.cwd_restore_target() != *restored_target {
+            self.restore_cwd_on(&fresh).await?;
+        }
+        let old = std::mem::replace(&mut *guard, fresh);
+        // The old session is already dead here; mark it so its
+        // reader task (if any lingers) treats closure as expected.
+        old.mark_shutdown();
+        Ok(())
     }
 }
 
@@ -2019,6 +2051,112 @@ mod tests {
             Some(r.stdout.trim()),
             "after recovery the reported cwd matches the shell's real cwd"
         );
+
+        exec.close().await.unwrap();
+    }
+
+    /// A command that finishes on the old session while a reconnect is
+    /// dialling can move the stored cwd after the fresh shell was already
+    /// restored (#687 review): the swap must re-verify the target under
+    /// the write guard and re-restore, so the installed session never
+    /// lags behind the state `current_cwd()` reports.
+    #[tokio::test]
+    #[ignore = "requires Docker sshd container on port 2222"]
+    async fn ssh_swap_rerestores_cwd_that_moved_during_reconnect() {
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
+
+        use crate::CommandExecutor;
+        let exec = SshExecutor::connect(&test_target()).await.unwrap();
+
+        let r = exec
+            .run("mkdir -p /tmp/filar-moved-a /tmp/filar-moved-b && cd /tmp/filar-moved-a && pwd")
+            .await
+            .unwrap();
+        assert_eq!(r.stdout.trim(), "/tmp/filar-moved-a");
+
+        // Dial and restore a fresh session exactly the way
+        // `reconnect_with_backoff` does…
+        let fresh = SshSession::connect_with_config_and_provider(
+            &exec.target,
+            &exec.config,
+            &*exec.secrets,
+        )
+        .await
+        .unwrap();
+        let restored = exec.cwd_restore_target();
+        assert_eq!(restored.as_deref(), Some("/tmp/filar-moved-a"));
+        exec.restore_cwd_on(&fresh).await.unwrap();
+
+        // …then a command still in flight on the old session finishes
+        // and moves the stored cwd before the swap.
+        let r = exec.run("cd /tmp/filar-moved-b && pwd").await.unwrap();
+        assert_eq!(r.stdout.trim(), "/tmp/filar-moved-b");
+        assert_eq!(
+            exec.current_cwd().await.as_deref(),
+            Some("/tmp/filar-moved-b")
+        );
+
+        // The swap re-verifies: the snapshot moved /a → /b, so the fresh
+        // session must be re-restored to /b before being installed.
+        exec.swap_in_verified(fresh, &restored).await.unwrap();
+        let r = exec.run("pwd").await.unwrap();
+        assert_eq!(
+            r.stdout.trim(),
+            "/tmp/filar-moved-b",
+            "the installed session must match the moved cwd, not the stale snapshot"
+        );
+        assert_eq!(
+            exec.current_cwd().await.as_deref(),
+            Some(r.stdout.trim()),
+            "reported cwd and real shell cwd must agree after the swap"
+        );
+
+        exec.close().await.unwrap();
+    }
+
+    /// Forced-reconnect attempts whose cwd restore keeps failing must
+    /// still forget the stale path once the attempts run out (#687
+    /// review): the dead directory must not poison every later
+    /// reconnect, and the executor recovers into an honest state.
+    #[tokio::test]
+    #[ignore = "requires Docker sshd container on port 2222"]
+    async fn ssh_forced_reconnect_with_unrestorable_cwd_forgets_it() {
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
+
+        use crate::CommandExecutor;
+        let cfg = SshTransportConfig::default().with_command_timeout(Duration::from_secs(2));
+        let exec = SshExecutor::connect_with_config(&test_target(), cfg)
+            .await
+            .unwrap();
+
+        // Stored cwd points at a directory the next fresh shell cannot
+        // enter.
+        exec.run("mkdir -p /tmp/filar-stuck-cwd && cd /tmp/filar-stuck-cwd")
+            .await
+            .unwrap();
+        exec.run("rmdir /tmp/filar-stuck-cwd").await.unwrap();
+
+        // A command outliving the timeout makes the post-timeout resync
+        // fail, which forces the reconnect — whose every attempt dies on
+        // the cwd restore.
+        let timed_out = exec.run("sleep 10").await;
+        assert!(timed_out.is_err(), "the sleep must outlive the 2s timeout");
+        assert_eq!(
+            exec.current_cwd().await,
+            None,
+            "after the attempts run out the unrestorable cwd must be forgotten"
+        );
+
+        // The executor recovers: with the old shell gone, the next
+        // command reconnects into an honest login-directory shell
+        // instead of failing on the dead path again.
+        docker(&["restart"]);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let r = exec.run("pwd").await.unwrap();
+        assert_ne!(r.stdout.trim(), "/tmp/filar-stuck-cwd");
+        assert_eq!(exec.current_cwd().await.as_deref(), Some(r.stdout.trim()));
 
         exec.close().await.unwrap();
     }
