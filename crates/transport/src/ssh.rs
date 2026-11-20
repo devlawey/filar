@@ -922,7 +922,14 @@ impl SshExecutor {
             let target = self.cwd_restore_target();
             if let Err(e) = self.restore_cwd_on(&fresh, &target).await {
                 warn!(attempt, error = %e, "ssh reconnect: cwd restore failed, session discarded");
-                cwd_restore_failed = true;
+                // Only an explicit rejection (the `cd` ran and failed, or
+                // the path is unquotable) proves the directory dead. A
+                // transport error says the LINK died, not the directory —
+                // the cwd is kept then, so the next reconnect after the
+                // link recovers still restores it (#687 review).
+                if !matches!(e, CoreError::ConnectionLost(_)) && !is_marker_timeout(&e) {
+                    cwd_restore_failed = true;
+                }
                 last_err = Some(e);
                 continue;
             }
