@@ -748,8 +748,10 @@ pub struct SshExecutor {
     secrets: Arc<dyn SecretProvider>,
     /// Last `$PWD` reported by the command marker (or [`set_cwd`]).
     last_cwd: StdMutex<Option<String>>,
-    /// Applied once as `cd … &&` on the next [`run`] (user-approved command).
-    pending_cwd: StdMutex<Option<String>>,
+    /// Applied once as `cd … &&` on the next [`run`] (user-approved
+    /// command). The epoch distinguishes a *newer* `set_cwd` from an
+    /// older one with the same path (#687 review).
+    pending_cwd: StdMutex<PendingCwd>,
     /// Marker timeouts in a row, reset by any successful command (#684).
     consecutive_timeouts: AtomicU32,
 }
@@ -792,7 +794,7 @@ impl SshExecutor {
             config,
             secrets,
             last_cwd: StdMutex::new(None),
-            pending_cwd: StdMutex::new(None),
+            pending_cwd: StdMutex::new((0, None)),
             consecutive_timeouts: AtomicU32::new(0),
         })
     }
@@ -817,7 +819,7 @@ impl SshExecutor {
     fn store_cwd_from(&self, result: &Result<CommandResult>) {
         if let Ok(r) = result {
             if let Some(cwd) = r.cwd.as_deref().filter(|p| crate::is_safe_cwd(p)) {
-                *lock_opt_string(&self.last_cwd) = Some(cwd.to_string());
+                *lock_state(&self.last_cwd) = Some(cwd.to_string());
             }
         }
     }
@@ -835,18 +837,19 @@ impl SshExecutor {
     /// section (lock order pending → last, the same `set_cwd` uses) so
     /// the pair can never mix a newer pending with an older last
     /// (#687 review).
-    fn cwd_state_pair(&self) -> (Option<String>, Option<String>) {
-        let pending = lock_opt_string(&self.pending_cwd);
-        let last = lock_opt_string(&self.last_cwd);
+    fn cwd_state_pair(&self) -> CwdPair {
+        let pending = lock_state(&self.pending_cwd);
+        let last = lock_state(&self.last_cwd);
         (pending.clone(), last.clone())
     }
 
     /// The directory a fresh session must be put back into: the pending,
     /// user-approved cwd wins over the last reported one — it is newer.
-    /// `None` — there is nothing to restore.
+    /// `None` — there is nothing to restore. Test-only: the reconnect
+    /// loop captures the whole pair and derives the target itself.
+    #[cfg(test)]
     fn cwd_restore_target(&self) -> Option<String> {
-        let (pending, last) = self.cwd_state_pair();
-        pending.or(last)
+        pair_restore_target(&self.cwd_state_pair())
     }
 
     /// Run `cd <cwd>` on a *specific* session — called before the session
@@ -920,7 +923,7 @@ impl SshExecutor {
             // state, never to whatever a concurrent `set_cwd` or marker
             // store lands while the `cd` is in flight (#687 review).
             let attempted_pair = self.cwd_state_pair();
-            let restored_target = attempted_pair.0.clone().or_else(|| attempted_pair.1.clone());
+            let restored_target = pair_restore_target(&attempted_pair);
             if let Err(e) = self.restore_cwd_on(&fresh, &restored_target).await {
                 warn!(attempt, error = %e, "ssh reconnect: cwd restore failed, session discarded");
                 state.restore_failed(e, attempted_pair);
@@ -941,13 +944,18 @@ impl SshExecutor {
             // the pair that failed; a `set_cwd` or a marker store that
             // landed during the backoff survives (#687 review).
             let pair = pair.clone();
+            // The forget and the session retirement run under the WRITE
+            // guard (#687 review): it waits for every command in flight —
+            // whose marker store happens inside its read guard — and blocks
+            // new ones, so no store can slip a dead path back into
+            // `last_cwd` between the forget and the close.
+            let retained = self.session.write().await;
             if forget_cwd_if_unchanged(&self.pending_cwd, &self.last_cwd, &pair) {
                 // The retained session still sits in the abandoned
                 // directory; left alive, a later command on it would
                 // succeed and its marker would put the dead path right
                 // back into `last_cwd` (#687 review). Close it: the next
                 // command reconnects into an honest shell instead.
-                let retained = self.session.read().await;
                 retained.mark_shutdown();
                 let _ = retained.close().await;
             }
@@ -964,14 +972,20 @@ impl SshExecutor {
     /// is re-restored to the CURRENT target first. On failure the error
     /// carries the exact state pair that was attempted, so the caller's
     /// forget logic is bound to it — and nothing is swapped.
+    ///
+    /// On success the swap itself consumes the pending cwd it applied and
+    /// reconciles `last_cwd` with the installed target — atomically, under
+    /// the same write guard (#687 review): no caller-side consume can race
+    /// a newer `set_cwd`, and `current_cwd()` never reports a directory
+    /// the installed shell is not in.
     async fn swap_in_verified(
         &self,
         fresh: SshSession,
         restored_target: &Option<String>,
-    ) -> std::result::Result<(), (CoreError, (Option<String>, Option<String>))> {
+    ) -> std::result::Result<(), (CoreError, CwdPair)> {
         let mut guard = self.session.write().await;
         let current = self.cwd_state_pair();
-        let current_target = current.0.clone().or_else(|| current.1.clone());
+        let current_target = pair_restore_target(&current);
         if current_target != *restored_target {
             if let Err(e) = self.restore_cwd_on(&fresh, &current_target).await {
                 return Err((e, current));
@@ -981,6 +995,23 @@ impl SshExecutor {
         // The old session is already dead here; mark it so its
         // reader task (if any lingers) treats closure as expected.
         old.mark_shutdown();
+        // The installed shell now physically sits in `current_target`, so
+        // the state is reconciled with it — still under the write guard,
+        // where neither a command store nor a `set_cwd` can interleave
+        // (#687 review):
+        // - a pending cwd has been APPLIED by the restore (exactly once:
+        //   the retries after a reconnect run unprefixed), so it is
+        //   consumed here — not by the caller, which could race a newer
+        //   selection;
+        // - `last_cwd` is set to the same target, so `current_cwd()`
+        //   reports the directory the shell is actually in instead of a
+        //   pre-reconnect value until the next marker lands.
+        if current.0 .1.is_some() {
+            lock_state(&self.pending_cwd).1 = None;
+        }
+        if current_target.is_some() {
+            *lock_state(&self.last_cwd) = current_target;
+        }
         Ok(())
     }
 }
@@ -994,7 +1025,7 @@ impl SshExecutor {
 #[derive(Default)]
 struct ReconnectState {
     last_err: Option<CoreError>,
-    failed_pair: Option<(Option<String>, Option<String>)>,
+    failed_pair: Option<CwdPair>,
 }
 
 impl ReconnectState {
@@ -1002,14 +1033,14 @@ impl ReconnectState {
         self.last_err = Some(err);
     }
 
-    fn restore_failed(&mut self, err: CoreError, attempted: (Option<String>, Option<String>)) {
+    fn restore_failed(&mut self, err: CoreError, attempted: CwdPair) {
         self.last_err = Some(err);
         self.failed_pair = Some(attempted);
     }
 
     /// The pair to compare-and-clear after the attempts run out —
     /// `Some` only if a restore failure ever proved the cwd dead.
-    fn dead_pair(&self) -> Option<&(Option<String>, Option<String>)> {
+    fn dead_pair(&self) -> Option<&CwdPair> {
         self.failed_pair.as_ref()
     }
 
@@ -1019,20 +1050,34 @@ impl ReconnectState {
     }
 }
 
-fn lock_opt_string(m: &StdMutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<String>> {
+fn lock_state<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A pending cwd with its selection epoch: the epoch distinguishes a
+/// newer `set_cwd` from an older one carrying the same path (#687
+/// review), so a stale consumer never erases a fresh selection.
+type PendingCwd = (u64, Option<String>);
+
+/// The `(pending, last)` cwd state pair.
+type CwdPair = (PendingCwd, Option<String>);
+
+/// The restore target of a state pair: the pending, user-approved cwd
+/// wins over the last reported one.
+fn pair_restore_target(pair: &CwdPair) -> Option<String> {
+    pair.0 .1.clone().or_else(|| pair.1.clone())
 }
 
 /// Consume the pending cwd, but only if it is still the exact value the
 /// command was dispatched with (#687 review): a `set_cwd` that landed
 /// mid-flight is newer and must survive. Returns whether it cleared.
 fn consume_pending_if_unchanged(
-    pending: &StdMutex<Option<String>>,
-    consumed: &Option<String>,
+    pending: &StdMutex<PendingCwd>,
+    consumed: &PendingCwd,
 ) -> bool {
-    let mut p = lock_opt_string(pending);
+    let mut p = lock_state(pending);
     if *p == *consumed {
-        *p = None;
+        p.1 = None;
         true
     } else {
         false
@@ -1045,14 +1090,14 @@ fn consume_pending_if_unchanged(
 /// compared and cleared in one critical section; lock order pending →
 /// last, the same order `set_cwd` uses. Returns whether it forgot.
 fn forget_cwd_if_unchanged(
-    pending: &StdMutex<Option<String>>,
+    pending: &StdMutex<PendingCwd>,
     last: &StdMutex<Option<String>>,
-    failed: &(Option<String>, Option<String>),
+    failed: &CwdPair,
 ) -> bool {
-    let mut p = lock_opt_string(pending);
-    let mut l = lock_opt_string(last);
+    let mut p = lock_state(pending);
+    let mut l = lock_state(last);
     if *p == failed.0 && *l == failed.1 {
-        *p = None;
+        p.1 = None;
         *l = None;
         true
     } else {
@@ -1087,8 +1132,8 @@ impl crate::CommandExecutor for SshExecutor {
     async fn run(&self, command: &str) -> Result<CommandResult> {
         // The pending value this command is dispatched with; cleared
         // afterwards only if it is still exactly this one (#687 review).
-        let pending_snapshot = lock_opt_string(&self.pending_cwd).clone();
-        let full_command = Self::prefixed_command(&pending_snapshot, command);
+        let pending_snapshot = lock_state(&self.pending_cwd).clone();
+        let full_command = Self::prefixed_command(&pending_snapshot.1, command);
         // First attempt on the current session. The marker's cwd is
         // stored while the read guard is still held, so a reconnect
         // swap (which waits for this guard before re-reading the
@@ -1114,10 +1159,9 @@ impl crate::CommandExecutor for SshExecutor {
                     // Surfaced to the chat via the WARN→System log mirror (issue #57).
                     warn!("reconnected to {}:{}", self.target.host, self.target.port);
 
-                    // The restore has physically moved the fresh shell to
-                    // the pending target — consume it (if it is still
-                    // ours) so no later command re-applies it (#687 review).
-                    consume_pending_if_unchanged(&self.pending_cwd, &pending_snapshot);
+                    // The pending cwd was already consumed by the swap
+                    // itself — the restore applied it physically, exactly
+                    // once (#687 review).
 
                     // Single retry on the fresh session. Its working
                     // directory was already restored before the swap —
@@ -1161,11 +1205,9 @@ impl crate::CommandExecutor for SshExecutor {
                                 "ssh: reconnected to {}:{} after {n} consecutive command timeout(s)",
                                 self.target.host, self.target.port
                             );
-                            // The restore has physically moved the fresh
-                            // shell to the pending target — consume it (if
-                            // it is still ours) so no later command
-                            // re-applies it (#687 review).
-                            consume_pending_if_unchanged(&self.pending_cwd, &pending_snapshot);
+                            // The pending cwd was already consumed by the
+                            // swap itself — the restore applied it
+                            // physically, exactly once (#687 review).
                             // The command may or may not have run remotely
                             // before the timeout, so only a read-only command
                             // is safe to retry automatically. The fresh shell
@@ -1240,9 +1282,13 @@ impl crate::CommandExecutor for SshExecutor {
         // fields change in one critical section, pending → last — the
         // same order `forget_cwd_if_unchanged` uses.
         let _guard = self.session.read().await;
-        let mut pending = lock_opt_string(&self.pending_cwd);
-        let mut last = lock_opt_string(&self.last_cwd);
-        *pending = Some(path.clone());
+        let mut pending = lock_state(&self.pending_cwd);
+        let mut last = lock_state(&self.last_cwd);
+        // A new selection bumps the epoch even when the path is unchanged,
+        // so a stale compare-and-clear (a reconnect that captured the OLD
+        // selection) can never erase this newer one (#687 review).
+        pending.0 += 1;
+        pending.1 = Some(path.clone());
         *last = Some(path);
         Ok(())
     }
@@ -1981,41 +2027,50 @@ mod tests {
     #[test]
     fn a_proven_dead_cwd_is_forgotten_only_while_it_is_still_the_stored_state() {
         // The failed pair is still there — forgotten (#687 review).
-        let pending = StdMutex::new(Some("/dead".to_string()));
+        let pending = StdMutex::new((1, Some("/dead".to_string())));
         let last = StdMutex::new(Some("/dead".to_string()));
-        let failed = (Some("/dead".to_string()), Some("/dead".to_string()));
+        let failed = ((1, Some("/dead".to_string())), Some("/dead".to_string()));
         assert!(forget_cwd_if_unchanged(&pending, &last, &failed));
-        assert_eq!(*pending.lock().unwrap(), None);
+        assert_eq!(*pending.lock().unwrap(), (1, None));
         assert_eq!(*last.lock().unwrap(), None);
 
         // A `set_cwd` that landed during the backoff survives…
-        let pending = StdMutex::new(Some("/new".to_string()));
+        let pending = StdMutex::new((2, Some("/new".to_string())));
         let last = StdMutex::new(Some("/new".to_string()));
         assert!(!forget_cwd_if_unchanged(&pending, &last, &failed));
-        assert_eq!(*pending.lock().unwrap(), Some("/new".to_string()));
+        assert_eq!(*pending.lock().unwrap(), (2, Some("/new".to_string())));
         assert_eq!(*last.lock().unwrap(), Some("/new".to_string()));
 
-        // …and so does a lone marker store (pending unchanged, last moved).
-        let pending = StdMutex::new(None);
-        let last = StdMutex::new(Some("/reported".to_string()));
-        let failed = (None, Some("/dead".to_string()));
+        // …even when it re-selected the SAME path: the newer epoch makes
+        // it a different selection the stale failure must not erase
+        // (#687 review).
+        let pending = StdMutex::new((2, Some("/dead".to_string())));
+        let last = StdMutex::new(Some("/dead".to_string()));
         assert!(!forget_cwd_if_unchanged(&pending, &last, &failed));
-        assert_eq!(*pending.lock().unwrap(), None);
+        assert_eq!(*pending.lock().unwrap(), (2, Some("/dead".to_string())));
+        assert_eq!(*last.lock().unwrap(), Some("/dead".to_string()));
+
+        // …and so does a lone marker store (pending unchanged, last moved).
+        let pending = StdMutex::new((1, None));
+        let last = StdMutex::new(Some("/reported".to_string()));
+        let failed = ((1, None), Some("/dead".to_string()));
+        assert!(!forget_cwd_if_unchanged(&pending, &last, &failed));
+        assert_eq!(*pending.lock().unwrap(), (1, None));
         assert_eq!(*last.lock().unwrap(), Some("/reported".to_string()));
 
         // The mixed-failure sequence ends here too: a dial failure after
         // a restore failure leaves the failed pair untouched (the dial
         // arm never reassigns it), so the compare-and-clear still fires.
-        let pending = StdMutex::new(Some("/dead".to_string()));
+        let pending = StdMutex::new((1, Some("/dead".to_string())));
         let last = StdMutex::new(Some("/dead".to_string()));
-        let failed = (Some("/dead".to_string()), Some("/dead".to_string()));
+        let failed = ((1, Some("/dead".to_string())), Some("/dead".to_string()));
         assert!(forget_cwd_if_unchanged(&pending, &last, &failed));
     }
 
     #[test]
     fn reconnect_state_binds_the_dead_pair_to_the_restore_attempt() {
         let err = || CoreError::Other("boom".into());
-        let dead = (Some("/dead".to_string()), Some("/dead".to_string()));
+        let dead: CwdPair = ((1, Some("/dead".to_string())), Some("/dead".to_string()));
 
         // The mixed sequence: a restore failure proves the pair dead; a
         // later dial failure updates the error but NEVER erases the pair.
@@ -2034,23 +2089,38 @@ mod tests {
 
     #[test]
     fn a_pending_cwd_is_consumed_only_if_it_is_still_the_dispatched_one() {
-        // Same value — consumed.
-        let pending = StdMutex::new(Some("/tab".to_string()));
-        assert!(consume_pending_if_unchanged(&pending, &Some("/tab".to_string())));
-        assert_eq!(*pending.lock().unwrap(), None);
+        // Same value, same epoch — consumed.
+        let pending = StdMutex::new((1, Some("/tab".to_string())));
+        assert!(consume_pending_if_unchanged(
+            &pending,
+            &(1, Some("/tab".to_string()))
+        ));
+        assert_eq!(*pending.lock().unwrap(), (1, None));
 
         // A `set_cwd` that landed mid-flight survives.
-        let pending = StdMutex::new(Some("/newer".to_string()));
-        assert!(!consume_pending_if_unchanged(&pending, &Some("/tab".to_string())));
-        assert_eq!(*pending.lock().unwrap(), Some("/newer".to_string()));
+        let pending = StdMutex::new((2, Some("/newer".to_string())));
+        assert!(!consume_pending_if_unchanged(
+            &pending,
+            &(1, Some("/tab".to_string()))
+        ));
+        assert_eq!(*pending.lock().unwrap(), (2, Some("/newer".to_string())));
+
+        // …even when it re-selected the SAME path: the newer epoch makes
+        // it a different selection (#687 review).
+        let pending = StdMutex::new((2, Some("/tab".to_string())));
+        assert!(!consume_pending_if_unchanged(
+            &pending,
+            &(1, Some("/tab".to_string()))
+        ));
+        assert_eq!(*pending.lock().unwrap(), (2, Some("/tab".to_string())));
 
         // Nothing pending, nothing consumed — and a raced `set_cwd`
         // is still not erased.
-        let pending = StdMutex::new(None);
-        assert!(consume_pending_if_unchanged(&pending, &None));
-        let pending = StdMutex::new(Some("/raced".to_string()));
-        assert!(!consume_pending_if_unchanged(&pending, &None));
-        assert_eq!(*pending.lock().unwrap(), Some("/raced".to_string()));
+        let pending = StdMutex::new((1, None));
+        assert!(consume_pending_if_unchanged(&pending, &(1, None)));
+        let pending = StdMutex::new((2, Some("/raced".to_string())));
+        assert!(!consume_pending_if_unchanged(&pending, &(1, None)));
+        assert_eq!(*pending.lock().unwrap(), (2, Some("/raced".to_string())));
     }
 
     // ── reconnect integration tests (require Docker sshd) ────────────
@@ -2317,6 +2387,70 @@ mod tests {
         assert_eq!(
             exec.current_cwd().await.as_deref(),
             Some(r.stdout.trim()),
+            "reported cwd and real shell cwd must agree after the swap"
+        );
+
+        exec.close().await.unwrap();
+    }
+
+    /// A `set_cwd` that lands while a reconnect is dialling is restored
+    /// by the swap itself — and consumed there, exactly once (#687
+    /// review): the next command must run WITHOUT the `cd` prefix, or a
+    /// relative pending path (`cd ..`) would be applied a second time.
+    #[tokio::test]
+    #[ignore = "requires Docker sshd container on port 2222"]
+    async fn ssh_swap_consumes_pending_set_during_reconnect_exactly_once() {
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
+
+        use crate::CommandExecutor;
+        let exec = SshExecutor::connect(&test_target()).await.unwrap();
+
+        let r = exec
+            .run("mkdir -p /tmp/filar-pending-sub && cd /tmp/filar-pending-sub && pwd")
+            .await
+            .unwrap();
+        assert_eq!(r.stdout.trim(), "/tmp/filar-pending-sub");
+
+        // Dial and restore a fresh session exactly the way
+        // `reconnect_with_backoff` does…
+        let fresh = SshSession::connect_with_config_and_provider(
+            &exec.target,
+            &exec.config,
+            &*exec.secrets,
+        )
+        .await
+        .unwrap();
+        let restored = exec.cwd_restore_target();
+        assert_eq!(restored.as_deref(), Some("/tmp/filar-pending-sub"));
+        exec.restore_cwd_on(&fresh, &restored).await.unwrap();
+
+        // …then a relative `set_cwd` lands before the swap.
+        exec.set_cwd("..").await.unwrap();
+
+        // The swap re-verifies: the target moved to the pending "..", so
+        // the fresh session is re-restored — `cd ..` applied ONCE, from
+        // /tmp/filar-pending-sub to /tmp — and installed.
+        exec.swap_in_verified(fresh, &restored).await.unwrap();
+
+        // The applied pending selection is consumed by the swap…
+        assert_eq!(
+            lock_state(&exec.pending_cwd).1,
+            None,
+            "the swap must consume the pending cwd it applied"
+        );
+
+        // …so the next command runs unprefixed and lands in /tmp — not in
+        // `/`, which is where a SECOND `cd ..` would have put it.
+        let r = exec.run("pwd").await.unwrap();
+        assert_eq!(
+            r.stdout.trim(),
+            "/tmp",
+            "the relative pending cwd must be applied exactly once"
+        );
+        assert_eq!(
+            exec.current_cwd().await.as_deref(),
+            Some("/tmp"),
             "reported cwd and real shell cwd must agree after the swap"
         );
 

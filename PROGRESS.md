@@ -13360,3 +13360,26 @@ forced-реконнекта — оно убрано; все очистки pendi
 Новые тесты: юнит `reconnect_state_binds_the_dead_pair_to_the_restore_attempt`,
 юнит `a_pending_cwd_is_consumed_only_if_it_is_still_the_dispatched_one`,
 docker `ssh_restore_applies_the_captured_target_not_the_state`.
+
+**Ревью (PR #687, раунд 7, CodeRabbit):** все три находки приняты, корень
+общий — потребление и зачистка cwd-состояния происходили вне write-гвардии
+swap'а. (1) Forget + закрытие удерживаемой сессии ушли под write-гвардию:
+она ждёт все команды в полёте (их запись маркера — внутри read-гвардий) и
+блокирует новые, поэтому мёртвый путь не может проскочить обратно в
+`last_cwd` между зачисткой и закрытием. (2)+(3) `swap_in_verified` сам
+потребляет восстановленный pending и мирит `last_cwd` с установленной
+целью — атомарно, под той же write-гвардией: вызывающая сторона больше
+не потребляет (два вызова `consume_pending_if_unchanged` после успешных
+реконнектов убраны из `run`), гонки «потребили чужой свежий set_cwd» и
+«потребление не привязано к фактически восстановленному pending» исчезают
+конструктивно. У pending появилась эпоха (счётчик выбора): повторный
+`set_cwd` на ТОТ ЖЕ путь отличим от старого снапшота — compare-and-clear
+сравнивает пару (эпоха, путь), поэтому протухшая зачистка не сотрёт свежий
+выбор даже при совпадении пути. `consume_pending_if_unchanged` и
+`forget_cwd_if_unchanged` переведены на типы `PendingCwd`/`CwdPair`;
+`ReconnectState.failed_pair` хранит полную пару с эпохой. Тесты: юнит-кейсы
+«та же строка, новая эпоха — не стирается» в обоих compare-and-clear
+тестах, docker `ssh_swap_consumes_pending_set_during_reconnect_exactly_once`
+(restore в подкаталог → set_cwd("..") во время реконнекта → swap применяет
+«..» ровно один раз, pending потреблён, следующая команда без префикса
+остаётся в /tmp, `current_cwd()` согласован с реальным pwd).
