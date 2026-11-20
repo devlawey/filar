@@ -836,11 +836,12 @@ impl SshExecutor {
         *lock_opt_string(&self.pending_cwd) = None;
     }
 
-    /// A fresh shell starts in the login directory: put it back where the
-    /// user was (#687 review). A pending cwd wins over the last reported
-    /// one — it is the newer, user-approved target. Without either there
-    /// is nothing to restore.
-    async fn restore_cwd_after_reconnect(&self) -> Result<()> {
+    /// Run `cd <cwd>` on a *specific* session — called before the session
+    /// is installed, so no concurrent command can ever observe a shell
+    /// that still sits in the login directory (#687 review). A pending
+    /// cwd wins over the last reported one — it is the newer,
+    /// user-approved target. Without either there is nothing to restore.
+    async fn restore_cwd_on(&self, session: &SshSession) -> Result<()> {
         let cwd = lock_opt_string(&self.pending_cwd)
             .clone()
             .or_else(|| lock_opt_string(&self.last_cwd).clone());
@@ -848,7 +849,7 @@ impl SshExecutor {
         let Some(cd) = crate::posix_cd_command(&cwd) else {
             return Ok(());
         };
-        let result = self.session.read().await.run(&cd).await?;
+        let result = session.run(&cd).await?;
         match result.exit_code {
             Some(0) => Ok(()),
             other => Err(CoreError::Other(format!(
@@ -861,32 +862,56 @@ impl SshExecutor {
     /// attempts (#684). The dial and the pause run without the session
     /// guard — only the swap takes it — so a `cancel()` in flight is never
     /// stuck behind a reconnect.
+    ///
+    /// The working directory is restored on the fresh session *before*
+    /// the swap (#687 review): a concurrent command can never run on a
+    /// shell that still sits in the login directory. A session whose cwd
+    /// could not be restored is dropped without being installed, so a
+    /// later command cannot silently run from the wrong directory; the
+    /// stale cwd state is then forgotten, so the next reconnect starts
+    /// clean instead of failing on the same dead path forever.
     async fn reconnect_with_backoff(&self, attempts: u32) -> Result<()> {
         let mut last_err = None;
+        let mut cwd_restore_failed = false;
         for attempt in 1..=attempts.max(1) {
             if attempt > 1 {
                 tokio::time::sleep(Duration::from_secs(u64::from(attempt - 1))).await;
             }
-            match SshSession::connect_with_config_and_provider(
+            let fresh = match SshSession::connect_with_config_and_provider(
                 &self.target,
                 &self.config,
                 &*self.secrets,
             )
             .await
             {
-                Ok(fresh) => {
-                    let mut guard = self.session.write().await;
-                    let old = std::mem::replace(&mut *guard, fresh);
-                    // The old session is already dead here; mark it so its
-                    // reader task (if any lingers) treats closure as expected.
-                    old.mark_shutdown();
-                    return Ok(());
-                }
+                Ok(fresh) => fresh,
                 Err(e) => {
                     warn!(attempt, error = %e, "ssh reconnect attempt failed");
                     last_err = Some(e);
+                    cwd_restore_failed = false;
+                    continue;
                 }
+            };
+            if let Err(e) = self.restore_cwd_on(&fresh).await {
+                warn!(attempt, error = %e, "ssh reconnect: cwd restore failed, session discarded");
+                last_err = Some(e);
+                cwd_restore_failed = true;
+                continue;
             }
+            let mut guard = self.session.write().await;
+            let old = std::mem::replace(&mut *guard, fresh);
+            // The old session is already dead here; mark it so its
+            // reader task (if any lingers) treats closure as expected.
+            old.mark_shutdown();
+            return Ok(());
+        }
+        if cwd_restore_failed {
+            // The stored cwd proved unrestorable (e.g. the directory is
+            // gone): forget it so the next reconnect is not poisoned by
+            // the same dead path, and `current_cwd()` stops reporting a
+            // directory no shell is in.
+            self.clear_pending_cwd();
+            *lock_opt_string(&self.last_cwd) = None;
         }
         Err(last_err.unwrap_or_else(|| CoreError::Other("reconnect attempts exhausted".into())))
     }
@@ -939,15 +964,9 @@ impl crate::CommandExecutor for SshExecutor {
                     // Surfaced to the chat via the WARN→System log mirror (issue #57).
                     warn!("reconnected to {}:{}", self.target.host, self.target.port);
 
-                    // The fresh shell starts in the login directory — a
-                    // retry from the wrong cwd is worse than no retry.
-                    if let Err(e) = self.restore_cwd_after_reconnect().await {
-                        warn!(error = %e, "ssh reconnect: cwd restore failed");
-                        self.clear_pending_cwd();
-                        return Err(e);
-                    }
-
-                    // Single retry on the fresh session.
+                    // Single retry on the fresh session — its working
+                    // directory was already restored before the swap, so
+                    // the retry cannot start from the login directory.
                     let retry = self.session.read().await.run(&full_command).await;
                     if !matches!(retry, Err(CoreError::ConnectionLost(_))) {
                         self.clear_pending_cwd();
@@ -986,15 +1005,10 @@ impl crate::CommandExecutor for SshExecutor {
                             );
                             // The command may or may not have run remotely
                             // before the timeout, so only a read-only command
-                            // is safe to retry automatically. Either way the
-                            // fresh shell first goes back to the user's cwd —
-                            // a retry from the login directory is worse than
-                            // no retry (#687 review).
-                            if let Err(e) = self.restore_cwd_after_reconnect().await {
-                                warn!(error = %e, "ssh reconnect: cwd restore failed");
-                                self.clear_pending_cwd();
-                                return Err(e);
-                            }
+                            // is safe to retry automatically. The fresh shell
+                            // was already put back into the user's cwd before
+                            // the swap — a retry from the login directory is
+                            // worse than no retry (#687 review).
                             if crate::readonly::check_read_only(command).is_ok() {
                                 info!("retrying the read-only command on the fresh session");
                                 let retry = self.session.read().await.run(&full_command).await;
@@ -1934,6 +1948,66 @@ mod tests {
         assert_eq!(r.stdout.trim(), "ok");
         let r = exec.run("pwd").await.unwrap();
         assert_eq!(r.stdout.trim(), "/tmp", "the fresh session must restore the cwd");
+
+        exec.close().await.unwrap();
+    }
+
+    /// If the stored working directory is gone, the reconnect must not
+    /// install a shell that still sits in the login directory (#687
+    /// review): the reconnect fails, the unrestored session is discarded
+    /// before it ever becomes visible, the stale cwd is forgotten so the
+    /// next reconnect is not poisoned by the same dead path, and the
+    /// executor then recovers into an honest login-directory shell.
+    #[tokio::test]
+    #[ignore = "requires Docker sshd container on port 2222"]
+    async fn ssh_failed_cwd_restore_does_not_install_unrestored_session() {
+        std::env::var("SSH_PASSWORD")
+            .expect("set SSH_PASSWORD to run ignored SSH integration tests");
+
+        use crate::CommandExecutor;
+        let exec = SshExecutor::connect(&test_target()).await.unwrap();
+
+        // Work from a directory we then delete: the client-side cwd state
+        // points at a path the next fresh shell cannot enter.
+        let r = exec
+            .run("mkdir -p /tmp/filar-deleted-cwd && cd /tmp/filar-deleted-cwd && pwd")
+            .await
+            .unwrap();
+        assert_eq!(r.stdout.trim(), "/tmp/filar-deleted-cwd");
+        exec.run("rmdir /tmp/filar-deleted-cwd").await.unwrap();
+        let pid_before = exec.session.read().await.shell_pid;
+
+        // Kill the connection so the next command triggers the silent
+        // reconnect — which must fail at the cwd-restore step.
+        docker(&["restart"]);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let failed = exec.run("echo after-restart").await;
+        assert!(
+            failed.is_err(),
+            "a reconnect that cannot restore the cwd must fail, not run from the login directory"
+        );
+
+        // The unrestored fresh session was never installed…
+        let pid_after = exec.session.read().await.shell_pid;
+        assert_eq!(
+            pid_before, pid_after,
+            "a session whose cwd could not be restored must not be installed"
+        );
+        // …and the stale cwd is forgotten instead of poisoning every next
+        // reconnect or making `current_cwd()` report a directory no shell
+        // is in.
+        assert_eq!(exec.current_cwd().await, None);
+
+        // The next command reconnects into an honest login-directory
+        // shell — no stale path, no silent wrong-directory retry.
+        let r = exec.run("pwd").await.unwrap();
+        assert_ne!(r.stdout.trim(), "/tmp/filar-deleted-cwd");
+        assert_eq!(
+            exec.current_cwd().await.as_deref(),
+            Some(r.stdout.trim()),
+            "after recovery the reported cwd matches the shell's real cwd"
+        );
 
         exec.close().await.unwrap();
     }
