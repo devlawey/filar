@@ -847,7 +847,16 @@ impl SshExecutor {
             .or_else(|| lock_opt_string(&self.last_cwd).clone());
         let Some(cwd) = cwd else { return Ok(()) };
         let Some(cd) = crate::posix_cd_command(&cwd) else {
-            return Ok(());
+            // Every writer filters through `is_safe_cwd`, so this is
+            // practically unreachable — but treating an unquotable path
+            // as "restored" would install a login-directory shell while
+            // `current_cwd()` keeps reporting the old path (#687
+            // review). Fail instead: the session is discarded and the
+            // stale path forgotten.
+            return Err(CoreError::Other(format!(
+                "reconnected, but the stored working directory `{cwd}` cannot be \
+                 restored (rejected by the cwd safety checks)"
+            )));
         };
         let result = session.run(&cd).await?;
         match result.exit_code {
@@ -888,7 +897,9 @@ impl SshExecutor {
                 Err(e) => {
                     warn!(attempt, error = %e, "ssh reconnect attempt failed");
                     last_err = Some(e);
-                    cwd_restore_failed = false;
+                    // `cwd_restore_failed` stays as is: a cwd that proved
+                    // unrestorable on an earlier attempt is not resurrected
+                    // by a later dial failure (#687 review).
                     continue;
                 }
             };
