@@ -418,12 +418,13 @@ impl OpenAiCompatClient {
                     // A body that ends without `[DONE]` is not an error by
                     // itself: plenty of OpenAI-compatible servers (local ones
                     // in particular) just close the connection after the last
-                    // chunk. But a body that ends carrying *nothing at all* —
-                    // no text, no tool calls, no completion marker — is
-                    // indistinguishable from a truncated response, and
-                    // returning it as success would hand the user an empty
-                    // answer. Retry instead; `emitted_any` is false here by
-                    // construction, so nothing can be replayed.
+                    // chunk, and they still send a `finish_reason`. A body
+                    // that ends carrying *nothing at all* — no text, no tool
+                    // calls, no completion marker — is indistinguishable from
+                    // a truncated response, and returning it as success would
+                    // hand the user an empty answer. Retry instead;
+                    // `emitted_any` is false here by construction, so nothing
+                    // can be replayed.
                     if !state.done && state.is_empty() {
                         warn!("stream closed without any content or a [DONE] marker");
                         return StreamOutcome::Failed {
@@ -435,6 +436,13 @@ impl OpenAiCompatClient {
                     }
 
                     if let Some(note) = state.take_cut_off_notice() {
+                        on_delta(note);
+                    }
+                    // Partial content, but neither `[DONE]` nor a
+                    // `finish_reason`: the body just closed. Say so in the
+                    // feed instead of presenting the fragment as a finished
+                    // answer (#688).
+                    if let Some(note) = state.take_incomplete_stream_notice() {
                         on_delta(note);
                     }
                     return StreamOutcome::Complete(state.into_response());
@@ -1041,6 +1049,46 @@ fn cut_off_notice(finish_reason: Option<&str>, has_tool_calls: bool) -> Option<S
     }
 }
 
+/// A stream body that closed with some content but neither `[DONE]` nor a
+/// `finish_reason` (#688).
+///
+/// A normal stop still carries one of those markers; without either, the
+/// fragment was being returned as a finished answer. `None` when the stream
+/// completed, named a finish reason, or carried nothing (the empty case is a
+/// retry, not a note).
+fn incomplete_stream_notice(
+    done: bool,
+    finish_reason: Option<&str>,
+    has_content: bool,
+) -> Option<String> {
+    if done || finish_reason.is_some() || !has_content {
+        return None;
+    }
+    info!("LLM stream closed without a completion marker");
+    Some(
+        "\n\n[filar: the stream ended without a completion marker — the answer may be incomplete]"
+            .to_string(),
+    )
+}
+
+/// Field name of an SSE line (`event: …` → `event`), when the left side of
+/// the colon looks like a field and not a payload. Only for the skip log
+/// (#688): the value after the colon is never logged.
+fn sse_field_name(line: &str) -> Option<&str> {
+    let name = line.split_once(':')?.0;
+    let bytes = name.as_bytes();
+    if (1..=32).contains(&name.len())
+        && bytes[0].is_ascii_alphabetic()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+    {
+        Some(name)
+    } else {
+        None
+    }
+}
+
 #[derive(Deserialize)]
 struct SseDelta {
     #[serde(default)]
@@ -1135,7 +1183,17 @@ impl SseState {
             .strip_prefix("data:")
             .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
         else {
-            // Comment lines and the event:/id:/retry: fields carry no payload.
+            // A leading `:` is an SSE comment (a keepalive). Every other line
+            // that is not a `data:` field used to be dropped with no trace,
+            // so a stream that never delivered the text still looked clean
+            // (#688). Log the length and the field name, never the value.
+            if !line.starts_with(':') {
+                warn!(
+                    line_len = line.len(),
+                    field = sse_field_name(line).unwrap_or("-"),
+                    "skipping an SSE line that is not a data field or a comment"
+                );
+            }
             return;
         };
 
@@ -1278,6 +1336,16 @@ impl SseState {
         Some(note)
     }
 
+    /// Append the incomplete-stream note (and return it so the caller can
+    /// stream it too) when the body closed on partial content with no
+    /// `[DONE]` and no `finish_reason` (#688).
+    fn take_incomplete_stream_notice(&mut self) -> Option<String> {
+        let note =
+            incomplete_stream_notice(self.done, self.finish_reason.as_deref(), !self.is_empty())?;
+        self.full_text.push_str(&note);
+        Some(note)
+    }
+
     fn into_response(self) -> Result<ChatResponse> {
         let mut resp = if !self.tool_calls.is_empty() {
             let calls: Vec<ToolCall> = self.tool_calls.values().map(|tc| {
@@ -1314,6 +1382,37 @@ impl SseState {
 mod tests {
     use super::*;
     use crate::{ChatMessage, MessageRole, ToolDef};
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    /// Warn lines emitted while `body` runs. The process-wide subscriber is
+    /// left alone: this one is installed only for the closure.
+    fn captured_warns(body: impl FnOnce()) -> String {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || LogBuf(writer.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let bytes = buf.lock().expect("log buf").clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogBuf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buf").extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn serialize_simple_request() {
@@ -1632,6 +1731,87 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{\\\"comm\"}}]},\"finish_reason\":\"length\"}]}\n\n",
         );
         assert!(state.take_cut_off_notice().is_none());
+    }
+
+    /// A body that closed on partial text with neither `[DONE]` nor a
+    /// `finish_reason` is marked incomplete instead of looking finished (#688).
+    #[test]
+    fn sse_closed_body_without_marker_gets_a_notice() {
+        let mut state = SseState::new();
+        state.process_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"переза\"}}]}\n\n");
+        assert!(!state.done);
+        assert!(state.finish_reason.is_none());
+        let note = state
+            .take_incomplete_stream_notice()
+            .expect("a body that just closed is flagged");
+        assert!(note.contains("without a completion marker"), "{note}");
+        let response = state.into_response().unwrap();
+        assert!(response.text.starts_with("переза"));
+        assert!(response.text.ends_with(&note));
+    }
+
+    /// `[DONE]`, a `finish_reason`, or an empty body do not get that note.
+    /// The empty body is a retry in `read_stream`, not a remark.
+    #[test]
+    fn sse_completed_or_empty_stream_gets_no_incomplete_notice() {
+        let mut done = SseState::new();
+        done.process_chunk("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n");
+        done.process_chunk("data: [DONE]\n\n");
+        assert!(done.take_incomplete_stream_notice().is_none());
+
+        let mut stopped = SseState::new();
+        stopped.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        assert!(!stopped.done, "the server closed without [DONE]");
+        assert!(stopped.take_incomplete_stream_notice().is_none());
+
+        let mut empty = SseState::new();
+        assert!(empty.take_incomplete_stream_notice().is_none());
+    }
+
+    /// Tool calls alone are content: a body that died on them is incomplete too.
+    #[test]
+    fn sse_closed_body_with_only_a_tool_call_gets_a_notice() {
+        let mut state = SseState::new();
+        state.process_chunk(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"run_command\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        );
+        let note = state
+            .take_incomplete_stream_notice()
+            .expect("a tool-call fragment is flagged");
+        let response = state.into_response().unwrap();
+        assert!(response.has_tool_calls());
+        assert!(response.text.ends_with(&note));
+    }
+
+    /// Lines that are neither `data:` nor an SSE comment are skipped and
+    /// logged, without the line's value and without losing the next event (#688).
+    #[test]
+    fn sse_non_data_line_is_skipped_and_logged_without_its_value() {
+        let logs = captured_warns(|| {
+            let mut state = SseState::new();
+            let deltas = state.process_chunk(
+                ": OPENROUTER PROCESSING\n\
+                 event: secret-must-not-be-logged\n\
+                 not-a-data-line\n\
+                 data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            );
+            assert_eq!(&deltas, &["hi".to_string()]);
+            assert_eq!(state.into_response().unwrap().text, "hi");
+        });
+        let skips = logs.matches("skipping an SSE line").count();
+        assert_eq!(
+            skips, 2,
+            "comment stays quiet, the other two lines warn: {logs}"
+        );
+        assert!(
+            logs.contains("field=event") || logs.contains("field=\"event\""),
+            "{logs}"
+        );
+        assert!(!logs.contains("secret-must-not-be-logged"), "{logs}");
+        assert!(!logs.contains("OPENROUTER"), "{logs}");
+        assert!(!logs.contains("not-a-data-line"), "{logs}");
     }
 
     /// The non-streaming path flags a cut-off answer the same way.
@@ -2149,7 +2329,6 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
     // client made.
 
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// One scripted connection of the fake provider.
@@ -2437,13 +2616,46 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         assert_eq!(served.load(Ordering::SeqCst), 2, "the empty stream must be retried");
     }
 
-    /// Missing `[DONE]` on its own is not a failure: OpenAI-compatible servers
-    /// (local ones especially) often just close the connection after the last
-    /// chunk. As long as content arrived, the answer stands.
+    /// Missing `[DONE]` on its own is not a failure and is not retried: the
+    /// content already reached the caller. With no `finish_reason` either, the
+    /// feed says the answer may be incomplete (#688). A server that names a
+    /// finish reason and then just closes — local ones often skip `[DONE]` —
+    /// stays a normal stop.
     #[tokio::test]
     async fn stream_without_done_marker_but_with_content_succeeds() {
         let (url, served) =
             spawn_provider(vec![Step::finished(vec![role_frame(), text_frame("Hi")])]).await;
+
+        let client = stream_test_client(&url, 1, Duration::from_secs(5));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let callback = move |d: String| sink.lock().unwrap().push(d);
+
+        let response = client
+            .chat_stream(&simple_request(), &callback)
+            .await
+            .expect("a body with content is still a success, not a retry");
+
+        let note = "\n\n[filar: the stream ended without a completion marker — the answer may be incomplete]";
+        assert_eq!(response.text, format!("Hi{note}"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["Hi".to_string(), note.to_string()],
+            "the note is streamed into the feed, not only stored"
+        );
+        assert_eq!(served.load(Ordering::SeqCst), 1, "no retry expected");
+    }
+
+    /// `finish_reason` without `[DONE]` is how many local servers end a stream.
+    /// That is a normal stop, not an unmarked close (#688).
+    #[tokio::test]
+    async fn stream_closed_after_finish_reason_is_a_normal_stop() {
+        let (url, served) = spawn_provider(vec![Step::finished(vec![
+            role_frame(),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n"
+                .to_string(),
+        ])])
+        .await;
 
         let client = stream_test_client(&url, 1, Duration::from_secs(5));
         let callback = |_: String| {};
@@ -2451,7 +2663,7 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}
         let response = client
             .chat_stream(&simple_request(), &callback)
             .await
-            .expect("a complete body without [DONE] is still a valid answer");
+            .expect("a finish_reason is a complete answer");
 
         assert_eq!(response.text, "Hi");
         assert_eq!(served.load(Ordering::SeqCst), 1, "no retry expected");
