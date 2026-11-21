@@ -33,6 +33,8 @@ toml = { workspace = true }
 # Live docker/k8s fleet tests manage their explicit pod-deletion fixture (#568).
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
+# Captures the SSE skip warning in unit tests (#688).
+tracing-subscriber = { workspace = true }
 
 # Command safety rating eval (#553). `test = true` so its unit tests run
 # with `cargo test`; the eval itself only runs when invoked.

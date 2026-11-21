@@ -11,6 +11,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Fixed
+
+- A streamed answer whose body closes with some text but neither `[DONE]` nor a `finish_reason` now says the stream ended without a completion marker, instead of reading as a finished reply; an SSE line that is neither a `data:` field nor a comment is logged (length and field name only) instead of being dropped in silence ([#688](https://github.com/devlawey/filar/issues/688)).
+
 ## [3.0.7] - 2026-11-21
 
 ### Changed
