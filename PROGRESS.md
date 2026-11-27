@@ -13681,3 +13681,52 @@ bare-CR тест); исправлено имя пакета в PLATFORM_NOTES (�
 Fedora/Arch CLI входит в пакет `keepassxc`).
 
 **Next:** #694 (подключение chain в app/runner).
+
+## #694 — подключение ChainSecretProvider в app/runner
+
+**Сделано.** Chain из `[secret_provider]` строится один раз на старте
+(`main.rs`) и подключён во все точки разрешения: ключ LLM-профиля (GUI/CLI/
+Ctrl+L/фабрика), ключи risk_scorer и log_sources (арбитр берёт ключ через
+фабрику профилей), пароль SSH-цели, passphrase ключа (`passphrase.rs`,
+`password.rs` — поле `chain` в Sources), пароли хостов флота
+(`app.credential_store`), SFTP файловых панелей. Невалидная секция — ошибка
+конфига с именем поля; неразрешённый секрет — заметка на старте или понятная
+ошибка с именем провайдера и логическим именем, никогда со значением.
+
+**Решения.**
+- Секция present → chain полностью заменяет keyring → env (без тихого
+  fallback); секции нет → прежний порядок байт-в-байт.
+- Синхронные вызовы chain — только на старте или в `spawn_blocking`,
+  никогда в цикле событий TUI. Для синхронных контекстов (enter_fleet,
+  llm_factory/key_checker в Ctrl+L) — prefetch на старте в память:
+  `prefetch_profile_keys` (main) и `prefetch_host_secrets` (runner,
+  `ssh_target:<name>` + passphrase для всех целей). В цикле lookup читает
+  только `StaticSecretProvider`; промах prefetch в цикле не ретраится —
+  сообщение указывает на стартовую заметку.
+- `fill_saved_secret` (пароль/passphrase при Ctrl+O и панелях): оба
+  режима теперь в `spawn_blocking` (legacy keyring тоже убран с async-потока).
+- SFTP-панели в chain-режиме получают пустой StaticSecretProvider вместо
+  EnvSecretProvider — секреты уже подставлены chain'ом, env-fallback исключён.
+- Заметки chain'а (`secret_provider_notes`) показываются System-блоками
+  на старте после log_source_notes.
+
+**Контракты.** `TuiConfig` += `secret_chain: Option<Arc<dyn SecretProvider>>`,
+`secret_provider_notes: Vec<String>`; `PassphraseSources`/`PasswordSources`
++= `chain: Option<&dyn SecretProvider>`; `build_llm_client_from_profile`/
+`check_profile_api_key`/`lookup_profile_api_key` += `chain_mode: bool`;
+`build_risk_scorer_for_launch`/`build_log_sources_for_launch` +=
+`chain: Option<&dyn SecretProvider>`. `CommandExecutor`/`LlmClient` без
+изменений.
+
+**Тесты.** 13 новых (main 6: legacy env без секции, chain-only lookup,
+prefetch профилей, падающий провайдер = заметка не краш, GUI-пароль из
+chain, risk_scorer из chain + заметка без значения; passphrase/password
+по 2: chain заменяет keyring/env, пустой chain не читает env; runner 3:
+fill_saved_secret из chain, пустой chain без env, prefetch флота).
+App 62, tui 925, workspace зелёные; `cargo build --release` зелёный.
+Прогон бинарника: chain order=["env"], пароль SSH-цели из env-звена —
+ошибка соединения (не пароля) на недостижимом порту; негативный прогон —
+сообщение «chain did not resolve ssh_target:…». Реальный менеджерский CLI +
+живой sshd — ручная проверка (нет docker/op/bw/keepassxc в окружении).
+
+**Next:** #695 (GUI-лаунчер: карточка Secret provider).

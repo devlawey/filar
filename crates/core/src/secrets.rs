@@ -538,12 +538,11 @@ impl ChainSecretProvider {
 
     /// Build the chain described by `[secret_provider]` (#690).
     ///
-    /// `keyring`, `env`, `onepassword` and `bitwarden` map to
+    /// `keyring`, `env`, `onepassword`, `bitwarden` and `keepassxc` map to
     /// [`KeyringSecretProvider`], [`EnvSecretProvider`],
-    /// [`OnePasswordProvider`] and [`BitwardenProvider`]; the remaining
-    /// password-manager kind is recognised by validation but its provider
-    /// lands with the follow-up issues of milestone 3.1.0 — until then
-    /// naming one fails with a clear error instead of silently skipping it.
+    /// [`OnePasswordProvider`], [`BitwardenProvider`] and
+    /// [`KeePassXcProvider`]; an unknown kind fails with a clear error
+    /// instead of silently skipping it.
     pub fn from_config(cfg: &crate::config::SecretProviderConfig) -> Result<Self> {
         cfg.validate()?;
         let mut providers: Vec<Arc<dyn SecretProvider>> = Vec::new();

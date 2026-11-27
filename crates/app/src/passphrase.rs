@@ -25,6 +25,9 @@ pub struct PassphraseSources<'a> {
     pub keyring: &'a dyn SecretProvider,
     /// The process environment (`SSH_KEY_PASSPHRASE`).
     pub env: &'a dyn SecretProvider,
+    /// The `[secret_provider]` chain (#694). When set, it replaces the
+    /// keyring → env order entirely — no silent fallback to either.
+    pub chain: Option<&'a dyn SecretProvider>,
 }
 
 /// Talks to the user. `ask` returns `None` when no prompt is possible (no
@@ -47,7 +50,11 @@ pub fn resolve_key_passphrase(
     sources: &PassphraseSources<'_>,
     prompt: &mut dyn PassphrasePrompt,
 ) -> anyhow::Result<()> {
-    let key_path = match fill_key_passphrase(target, sources.keyring, Some(sources.env))? {
+    let filled = match sources.chain {
+        Some(chain) => fill_key_passphrase(target, chain, None)?,
+        None => fill_key_passphrase(target, sources.keyring, Some(sources.env))?,
+    };
+    let key_path = match filled {
         KeyPassphrase::NotNeeded | KeyPassphrase::Found => return Ok(()),
         KeyPassphrase::Missing(path) => path,
     };
@@ -66,6 +73,14 @@ pub fn resolve_key_passphrase(
             *passphrase = Some(typed);
         }
         return Ok(());
+    }
+    if sources.chain.is_some() {
+        anyhow::bail!(
+            "SSH key {} is encrypted and no working passphrase was given; the [secret_provider] \
+             chain did not resolve {entry} — store the passphrase in the configured secret \
+             source, or load the key into ssh-agent and use type = \"agent\"",
+            key_path.display()
+        )
     }
     anyhow::bail!(
         "SSH key {} is encrypted and no working passphrase was given; save it in the OS \
@@ -254,7 +269,7 @@ mod tests {
         let mut t = key_target(path);
         let res = resolve_key_passphrase(
             &mut t,
-            &PassphraseSources { keyring, env },
+            &PassphraseSources { keyring, env, chain: None },
             prompt,
         );
         (t, res)
@@ -332,8 +347,52 @@ mod tests {
         t.auth = SshAuth::Agent;
         let empty = StaticSecretProvider::new();
         let mut prompt = Scripted::new(&[], false);
-        resolve_key_passphrase(&mut t, &PassphraseSources { keyring: &empty, env: &empty }, &mut prompt)
+        resolve_key_passphrase(&mut t, &PassphraseSources { keyring: &empty, env: &empty, chain: None }, &mut prompt)
             .expect("no-op");
         assert_eq!(prompt.asked, 0);
+    }
+
+    /// #694: with a chain configured, it is the only saved source — the
+    /// keyring and env entries are not consulted at all.
+    #[test]
+    fn the_chain_replaces_the_keyring_and_env() {
+        let path = encrypted_key();
+        let chain = StaticSecretProvider::new();
+        chain.insert("ssh_key_passphrase:prod-web", GOOD);
+        let keyring = StaticSecretProvider::new();
+        keyring.insert("ssh_key_passphrase:prod-web", "stale-keyring");
+        let env = StaticSecretProvider::new();
+        env.insert("SSH_KEY_PASSPHRASE", "stale-env");
+        let mut t = key_target(&path);
+        let mut prompt = Scripted::new(&[], false);
+        resolve_key_passphrase(
+            &mut t,
+            &PassphraseSources { keyring: &keyring, env: &env, chain: Some(&chain) },
+            &mut prompt,
+        )
+        .expect("resolved from the chain");
+        assert_eq!(passphrase_of(&t), Some(GOOD));
+        assert_eq!(prompt.asked, 0);
+    }
+
+    /// #694: an empty chain is a miss, not a fallback to env; the error
+    /// names the chain and the logical entry, never a value.
+    #[test]
+    fn an_empty_chain_does_not_fall_back_to_env() {
+        let path = encrypted_key();
+        let chain = StaticSecretProvider::new();
+        let env = StaticSecretProvider::new();
+        env.insert("SSH_KEY_PASSPHRASE", GOOD);
+        let mut t = key_target(&path);
+        let mut prompt = Scripted::new(&[], false);
+        let res = resolve_key_passphrase(
+            &mut t,
+            &PassphraseSources { keyring: &chain, env: &env, chain: Some(&chain) },
+            &mut prompt,
+        );
+        let msg = res.expect_err("no fallback").to_string();
+        assert!(msg.contains("[secret_provider]"), "{msg}");
+        assert!(msg.contains("ssh_key_passphrase:prod-web"), "{msg}");
+        assert!(!msg.contains(GOOD), "{msg}");
     }
 }

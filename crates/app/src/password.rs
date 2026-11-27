@@ -24,6 +24,9 @@ pub struct PasswordSources<'a> {
     pub keyring: &'a dyn SecretProvider,
     /// The process environment (`SSH_PASSWORD`).
     pub env: &'a dyn SecretProvider,
+    /// The `[secret_provider]` chain (#694). When set, it replaces the
+    /// keyring → env order entirely — no silent fallback to either.
+    pub chain: Option<&'a dyn SecretProvider>,
 }
 
 /// Talks to the user. `ask` returns `None` when no prompt is possible (no
@@ -72,13 +75,19 @@ pub fn resolve_ssh_password(
     if !missing {
         return Ok(PasswordOrigin::NotNeeded);
     }
-    let stored = [
-        sources.keyring.get(&password_entry(&target.name)).ok(),
-        sources.env.get("SSH_PASSWORD").ok(),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|p| !p.is_empty());
+    let stored = match sources.chain {
+        Some(chain) => chain
+            .get(&password_entry(&target.name))
+            .ok()
+            .filter(|p| !p.is_empty()),
+        None => [
+            sources.keyring.get(&password_entry(&target.name)).ok(),
+            sources.env.get("SSH_PASSWORD").ok(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|p| !p.is_empty()),
+    };
     if let Some(password) = stored {
         set_password(target, password);
         return Ok(PasswordOrigin::Stored);
@@ -92,6 +101,17 @@ pub fn resolve_ssh_password(
             Some(_) => continue,
             None => break,
         }
+    }
+    if sources.chain.is_some() {
+        anyhow::bail!(
+            "no SSH password for {} ({}@{}): the [secret_provider] chain did not resolve {} — \
+             store the password in the configured secret source, or start filar in a terminal \
+             and type the password when asked",
+            target.name,
+            target.user,
+            target.host,
+            password_entry(&target.name)
+        )
     }
     anyhow::bail!(
         "no SSH password for {} ({}@{}): tick \"Save password\" for this host in the launcher, \
@@ -203,7 +223,7 @@ mod tests {
         prompt: &mut Scripted,
     ) -> (SshTarget, anyhow::Result<PasswordOrigin>) {
         let mut t = password_target(None);
-        let res = resolve_ssh_password(&mut t, &PasswordSources { keyring, env }, prompt);
+        let res = resolve_ssh_password(&mut t, &PasswordSources { keyring, env, chain: None }, prompt);
         (t, res)
     }
 
@@ -267,7 +287,7 @@ mod tests {
     fn other_targets_and_explicit_passwords_are_left_alone() {
         let empty = StaticSecretProvider::new();
         let mut prompt = Scripted::new(&[SECRET], true);
-        let sources = PasswordSources { keyring: &empty, env: &empty };
+        let sources = PasswordSources { keyring: &empty, env: &empty, chain: None };
         let mut agent = password_target(None);
         agent.auth = SshAuth::Agent;
         assert_eq!(
@@ -290,7 +310,7 @@ mod tests {
         let mut t = password_target(Some(""));
         let res = resolve_ssh_password(
             &mut t,
-            &PasswordSources { keyring: &empty, env: &empty },
+            &PasswordSources { keyring: &empty, env: &empty, chain: None },
             &mut prompt,
         );
         assert_eq!(res.unwrap(), PasswordOrigin::Typed);
@@ -314,5 +334,48 @@ mod tests {
         let debug = format!("{target:?}");
         assert!(!debug.contains(SECRET), "{debug}");
         assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    /// #694: with a chain configured, it is the only saved source — the
+    /// keyring and env entries are not consulted at all.
+    #[test]
+    fn the_chain_replaces_the_keyring_and_env() {
+        let chain = StaticSecretProvider::new();
+        chain.insert("ssh_target:prod-web", SECRET);
+        let keyring = StaticSecretProvider::new();
+        keyring.insert("ssh_target:prod-web", "stale-keyring");
+        let env = StaticSecretProvider::new();
+        env.insert("SSH_PASSWORD", "stale-env");
+        let mut t = password_target(None);
+        let mut prompt = Scripted::new(&["typed"], true);
+        let res = resolve_ssh_password(
+            &mut t,
+            &PasswordSources { keyring: &keyring, env: &env, chain: Some(&chain) },
+            &mut prompt,
+        );
+        assert_eq!(res.unwrap(), PasswordOrigin::Stored);
+        assert_eq!(password_of(&t), Some(SECRET));
+        assert_eq!(prompt.asked, 0);
+    }
+
+    /// #694: an empty chain is a miss, not a fallback to env; the error
+    /// names the chain and the logical entry, never a value.
+    #[test]
+    fn an_empty_chain_does_not_fall_back_to_env() {
+        let chain = StaticSecretProvider::new();
+        let env = StaticSecretProvider::new();
+        env.insert("SSH_PASSWORD", SECRET);
+        let mut t = password_target(None);
+        let mut prompt = Scripted::new(&[], true);
+        let res = resolve_ssh_password(
+            &mut t,
+            &PasswordSources { keyring: &chain, env: &env, chain: Some(&chain) },
+            &mut prompt,
+        );
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("[secret_provider]"), "{msg}");
+        assert!(msg.contains("ssh_target:prod-web"), "{msg}");
+        assert!(!msg.contains(SECRET), "{msg}");
+        assert_eq!(password_of(&t), None);
     }
 }
