@@ -28,11 +28,13 @@ pub use compaction::{
 };
 pub use config::{
     is_read_only_target, select_hosts_for_group, tag_policy_floor, target_matches_group,
-    CommandConfirmMode, Config, HostGroup, HostGroupPolicy, HostKeyPolicy, KubeCluster, KubeGroup, LlmConfig,
-    LlmProfile, RiskScorerConfig, RiskScorerKind, SshAuth, SshTarget, TagPolicy, TimeoutConfig,
-    DEFAULT_COMMAND_TIMEOUT_SECS, DEFAULT_COMPACT_AT_TOKENS, DEFAULT_KUBE_REQUEST_TIMEOUT_SECS,
-    DEFAULT_MAX_TOKENS, DEFAULT_RISK_DANGER_BELOW, DEFAULT_RISK_SCORER_TIMEOUT_SECS,
-    DEFAULT_RISK_WARN_BELOW, MAX_KUBE_REQUEST_TIMEOUT_SECS, MAX_RISK_SCORER_TIMEOUT_SECS,
+    CommandConfirmMode, Config, HostGroup, HostGroupPolicy, HostKeyPolicy, KeePassXcProviderConfig,
+    KubeCluster, KubeGroup, LlmConfig, LlmProfile, ProviderItemsConfig, RiskScorerConfig,
+    RiskScorerKind, SecretProviderConfig, SecretProviderKind, SshAuth, SshTarget, TagPolicy,
+    TimeoutConfig, DEFAULT_COMMAND_TIMEOUT_SECS, DEFAULT_COMPACT_AT_TOKENS,
+    DEFAULT_KUBE_REQUEST_TIMEOUT_SECS, DEFAULT_MAX_TOKENS, DEFAULT_RISK_DANGER_BELOW,
+    DEFAULT_RISK_SCORER_TIMEOUT_SECS, DEFAULT_RISK_WARN_BELOW, DEFAULT_SECRET_CACHE_TTL_SECS,
+    MAX_KUBE_REQUEST_TIMEOUT_SECS, MAX_RISK_SCORER_TIMEOUT_SECS,
 };
 pub use error::{CoreError, Result};
 pub use fleet_checks::{
@@ -49,7 +51,8 @@ pub use log_sources::{K8sFieldPreset, K8sFields, LogAuth, LogSourceConfig, LogSo
 pub use os_family::{OsFamily, OS_RELEASE_COMMAND};
 pub use secrets::{
     redact, redact_secrets, ssh_cred_name, ssh_key_passphrase_name, ssh_target_display_name,
-    EnvSecretProvider, KeyringSecretProvider, SecretProvider, StaticSecretProvider,
+    ChainSecretProvider, EnvSecretProvider, KeyringSecretProvider, SecretProvider,
+    StaticSecretProvider,
 };
 pub use session::{
     default_base_dir, FleetSnapshot, KubePodSnapshot, KubeSessionSnapshot, ProfileUsage, Session, SessionMeta,

@@ -9,7 +9,8 @@
 //! codebase needs to know variable names or storage details.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use zeroize::Zeroize;
 
@@ -488,6 +489,169 @@ pub fn delete_secret_from_keyring(username: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// ChainSecretProvider
+// ---------------------------------------------------------------------------
+
+/// A cached secret value together with the moment it expires.
+struct CachedSecret {
+    value: String,
+    expires_at: Instant,
+}
+
+/// [`SecretProvider`] that consults an ordered chain of providers (#690).
+///
+/// The first provider returning a non-empty value wins; an empty answer is
+/// treated as a miss and the next provider is tried. Resolved values are
+/// cached for a configurable TTL so a slow provider (a password-manager CLI)
+/// is not spawned on every lookup; cached values are zeroized when evicted,
+/// replaced or dropped. A zero TTL disables caching.
+///
+/// `secret_names()` is the union of every provider's names —
+/// `SecretSubstitutingExecutor` needs it to mask command output. Neither
+/// errors nor the hand-written [`Debug`] ever carry a secret value.
+///
+/// Build one from `[secret_provider]` with [`ChainSecretProvider::from_config`],
+/// or wrap an explicit list with [`ChainSecretProvider::new`].
+pub struct ChainSecretProvider {
+    providers: Vec<Arc<dyn SecretProvider>>,
+    ttl: Duration,
+    cache: Mutex<HashMap<String, CachedSecret>>,
+}
+
+impl ChainSecretProvider {
+    /// Wrap `providers` into a chain with the given cache TTL. An empty
+    /// chain is rejected: there must be no silent fallback to env.
+    pub fn new(providers: Vec<Arc<dyn SecretProvider>>, ttl: Duration) -> Result<Self> {
+        if providers.is_empty() {
+            return Err(CoreError::Config(
+                "secret provider chain must contain at least one provider".into(),
+            ));
+        }
+        Ok(Self {
+            providers,
+            ttl,
+            cache: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Build the chain described by `[secret_provider]` (#690).
+    ///
+    /// `keyring` and `env` map to [`KeyringSecretProvider`] and
+    /// [`EnvSecretProvider`]; the password-manager kinds are recognised by
+    /// validation but their providers land with the follow-up issues of
+    /// milestone 3.1.0 — until then naming one fails with a clear error
+    /// instead of silently skipping it.
+    pub fn from_config(cfg: &crate::config::SecretProviderConfig) -> Result<Self> {
+        cfg.validate()?;
+        let mut providers: Vec<Arc<dyn SecretProvider>> = Vec::new();
+        for kind in &cfg.order {
+            let parsed = crate::config::SecretProviderKind::parse(kind).ok_or_else(|| {
+                CoreError::Config(format!("secret_provider.order: unknown kind '{kind}'"))
+            })?;
+            let provider: Arc<dyn SecretProvider> = match parsed {
+                crate::config::SecretProviderKind::Keyring => Arc::new(KeyringSecretProvider::new()),
+                crate::config::SecretProviderKind::Env => Arc::new(EnvSecretProvider::new()),
+                other => {
+                    return Err(CoreError::Config(format!(
+                        "secret_provider.order: provider '{}' is not available yet",
+                        other.as_str()
+                    )));
+                }
+            };
+            providers.push(provider);
+        }
+        Self::new(providers, Duration::from_secs(cfg.cache_ttl_secs))
+    }
+
+    /// Lock the cache, recovering from a poisoned lock: the cache holds
+    /// only copies of secrets, so a panic elsewhere must not wedge lookups.
+    fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<String, CachedSecret>> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl SecretProvider for ChainSecretProvider {
+    fn get(&self, name: &str) -> Result<String> {
+        if !self.ttl.is_zero() {
+            let mut cache = self.cache();
+            if let Some(entry) = cache.get(name) {
+                if entry.expires_at > Instant::now() {
+                    return Ok(entry.value.clone());
+                }
+            }
+            // Expired (or about to be replaced): zeroize before dropping.
+            if let Some(mut old) = cache.remove(name) {
+                old.value.zeroize();
+            }
+        }
+
+        // Resolve without holding the lock: a slow provider must not block
+        // other lookups, and a provider may itself consult the chain.
+        for provider in &self.providers {
+            if let Ok(value) = provider.get(name) {
+                if !value.is_empty() {
+                    if !self.ttl.is_zero() {
+                        let mut cache = self.cache();
+                        if let Some(mut old) = cache.insert(
+                            name.to_string(),
+                            CachedSecret {
+                                value: value.clone(),
+                                expires_at: Instant::now() + self.ttl,
+                            },
+                        ) {
+                            old.value.zeroize();
+                        }
+                    }
+                    return Ok(value);
+                }
+            }
+        }
+        Err(CoreError::Secret(format!(
+            "{} not resolved by any of the {} secret providers",
+            redact(name),
+            self.providers.len()
+        )))
+    }
+
+    fn secret_names(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        for provider in &self.providers {
+            for name in provider.secret_names() {
+                if seen.insert(name.clone()) {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    }
+}
+
+/// Hand-written like [`SshAuth`](crate::config::SshAuth): counts only, so a
+/// `{chain:?}` in a log line can never print a cached value.
+impl std::fmt::Debug for ChainSecretProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainSecretProvider")
+            .field("providers", &self.providers.len())
+            .field("cache_ttl_secs", &self.ttl.as_secs())
+            .field("cached", &self.cache().len())
+            .finish()
+    }
+}
+
+/// Zeroize every cached value when the chain is dropped.
+impl Drop for ChainSecretProvider {
+    fn drop(&mut self) {
+        if let Ok(cache) = self.cache.get_mut() {
+            for entry in cache.values_mut() {
+                entry.value.zeroize();
+            }
+            cache.clear();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -797,5 +961,199 @@ mod tests {
         provider.insert("GLM_API_KEY", "legacy-key");
         assert!(llm_api_key(&provider, "OPENROUTER_API_KEY").is_err());
         assert_eq!(llm_key_lookup_names("OPENROUTER_API_KEY"), vec!["OPENROUTER_API_KEY"]);
+    }
+
+    // ── ChainSecretProvider (#690) ────────────────────────────────────
+
+    /// A provider that counts `get` calls, to observe the cache.
+    struct CountingProvider {
+        inner: StaticSecretProvider,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingProvider {
+        fn new() -> Self {
+            Self {
+                inner: StaticSecretProvider::new(),
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl SecretProvider for CountingProvider {
+        fn get(&self, name: &str) -> Result<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get(name)
+        }
+
+        fn secret_names(&self) -> Vec<String> {
+            self.inner.secret_names()
+        }
+    }
+
+    /// A provider that answers `Ok("")` — an empty answer must be a miss.
+    struct EmptyOkProvider;
+
+    impl SecretProvider for EmptyOkProvider {
+        fn get(&self, _name: &str) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn secret_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    fn chain(providers: Vec<Arc<dyn SecretProvider>>, ttl_secs: u64) -> ChainSecretProvider {
+        ChainSecretProvider::new(providers, Duration::from_secs(ttl_secs)).unwrap()
+    }
+
+    #[test]
+    fn chain_first_non_empty_answer_wins() {
+        let first = StaticSecretProvider::new();
+        first.insert("KEY", "from-first");
+        let second = StaticSecretProvider::new();
+        second.insert("KEY", "from-second");
+        let c = chain(vec![Arc::new(first), Arc::new(second)], 0);
+        assert_eq!(c.get("KEY").unwrap(), "from-first");
+    }
+
+    #[test]
+    fn chain_falls_through_to_the_next_provider() {
+        let first = StaticSecretProvider::new();
+        let second = StaticSecretProvider::new();
+        second.insert("KEY", "from-second");
+        let c = chain(vec![Arc::new(first), Arc::new(second)], 0);
+        assert_eq!(c.get("KEY").unwrap(), "from-second");
+    }
+
+    #[test]
+    fn chain_treats_an_empty_answer_as_a_miss() {
+        let second = StaticSecretProvider::new();
+        second.insert("KEY", "real");
+        let c = chain(vec![Arc::new(EmptyOkProvider), Arc::new(second)], 0);
+        assert_eq!(c.get("KEY").unwrap(), "real");
+    }
+
+    #[test]
+    fn chain_empty_providers_rejected() {
+        assert!(ChainSecretProvider::new(Vec::new(), Duration::from_secs(60)).is_err());
+    }
+
+    #[test]
+    fn chain_caches_within_ttl() {
+        let counting = Arc::new(CountingProvider::new());
+        counting.inner.insert("KEY", "cached-value");
+        let calls = counting.calls.clone();
+        let c = chain(vec![counting], 3600);
+        assert_eq!(c.get("KEY").unwrap(), "cached-value");
+        assert_eq!(c.get("KEY").unwrap(), "cached-value");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn chain_zero_ttl_disables_caching() {
+        let counting = Arc::new(CountingProvider::new());
+        counting.inner.insert("KEY", "v");
+        let calls = counting.calls.clone();
+        let c = chain(vec![counting], 0);
+        let _ = c.get("KEY");
+        let _ = c.get("KEY");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn chain_expired_entry_is_resolved_again() {
+        let counting = Arc::new(CountingProvider::new());
+        counting.inner.insert("KEY", "old");
+        let calls = counting.calls.clone();
+        let c = ChainSecretProvider::new(vec![counting.clone()], Duration::from_millis(20)).unwrap();
+        assert_eq!(c.get("KEY").unwrap(), "old");
+        std::thread::sleep(Duration::from_millis(60));
+        counting.inner.insert("KEY", "new");
+        assert_eq!(c.get("KEY").unwrap(), "new");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn chain_secret_names_is_the_deduplicated_union() {
+        let first = StaticSecretProvider::new();
+        first.insert("$FILAR_SECRET_1", "a");
+        first.insert("SHARED", "b");
+        let second = StaticSecretProvider::new();
+        second.insert("SHARED", "c");
+        second.insert("$FILAR_SECRET_2", "d");
+        let c = chain(vec![Arc::new(first), Arc::new(second)], 0);
+        let mut names = c.secret_names();
+        names.sort();
+        assert_eq!(names, vec!["$FILAR_SECRET_1", "$FILAR_SECRET_2", "SHARED"]);
+    }
+
+    #[test]
+    fn chain_miss_error_carries_no_value() {
+        let provider = StaticSecretProvider::new();
+        provider.insert("OTHER", "sk-or-v1-super-secret-value");
+        let c = chain(vec![Arc::new(provider)], 0);
+        let err = c.get("sk-or-v1-super-secret-value").unwrap_err();
+        let msg = format!("{err}");
+        assert!(!msg.contains("sk-or-v1-super-secret-value"), "leak: {msg}");
+        assert!(msg.contains("sk-o"), "redacted prefix expected: {msg}");
+    }
+
+    #[test]
+    fn chain_debug_carries_no_values() {
+        let provider = StaticSecretProvider::new();
+        provider.insert("KEY", "sk-or-v1-debug-leak-check");
+        let c = chain(vec![Arc::new(provider)], 3600);
+        let _ = c.get("KEY"); // populate the cache
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("sk-or-v1-debug-leak-check"), "leak: {dbg}");
+        assert!(dbg.contains("ChainSecretProvider"));
+    }
+
+    #[test]
+    fn chain_from_config_builds_keyring_and_env() {
+        let cfg = crate::config::SecretProviderConfig {
+            order: vec!["keyring".into(), "env".into()],
+            ..Default::default()
+        };
+        let c = ChainSecretProvider::from_config(&cfg).unwrap();
+        // env is the second link: a unique env var resolves through it.
+        std::env::set_var("FILAR_TEST_CHAIN_690", "chain-env-value");
+        assert_eq!(c.get("FILAR_TEST_CHAIN_690").unwrap(), "chain-env-value");
+        std::env::remove_var("FILAR_TEST_CHAIN_690");
+    }
+
+    #[test]
+    fn chain_from_config_rejects_empty_order() {
+        let cfg = crate::config::SecretProviderConfig::default();
+        let err = ChainSecretProvider::from_config(&cfg).unwrap_err();
+        assert!(format!("{err}").contains("secret_provider.order"));
+    }
+
+    #[test]
+    fn chain_from_config_rejects_unknown_kind() {
+        let cfg = crate::config::SecretProviderConfig {
+            order: vec!["lastpass".into()],
+            ..Default::default()
+        };
+        let err = ChainSecretProvider::from_config(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("secret_provider.order"), "{msg}");
+        assert!(msg.contains("lastpass"), "{msg}");
+    }
+
+    #[test]
+    fn chain_from_config_manager_kind_not_available_yet() {
+        // The manager providers land with the follow-up issues of 3.1.0;
+        // until then the error names the kind instead of skipping it.
+        let cfg = crate::config::SecretProviderConfig {
+            order: vec!["onepassword".into()],
+            ..Default::default()
+        };
+        let err = ChainSecretProvider::from_config(&cfg).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("onepassword"), "{msg}");
+        assert!(msg.contains("not available yet"), "{msg}");
     }
 }

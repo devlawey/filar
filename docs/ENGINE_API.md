@@ -391,6 +391,29 @@ one with `wrong passphrase for SSH key …` — neither error carries the passph
 each checked by decrypting), `key_protection` and `key_passphrase_matches` let you
 resolve or verify a passphrase locally before connecting; they are blocking.
 
+### Secret provider chain (`[secret_provider]`, #690)
+
+`filar_core::ChainSecretProvider` wraps an ordered `Vec<Arc<dyn SecretProvider>>`:
+the first non-empty answer wins, an empty answer falls through to the next
+link. Resolved values are cached for a TTL (`Duration::ZERO` disables caching)
+and zeroized on eviction, replacement and drop. `secret_names()` is the
+deduplicated union of every link's names, so `SecretSubstitutingExecutor`
+keeps masking output from all sources. Errors and the hand-written `Debug`
+never carry a value. An empty chain is rejected at construction.
+
+The chain is described by `[secret_provider]` in `config.toml`
+(`SecretProviderConfig`): `order` lists the kinds `keyring`, `env`,
+`onepassword`, `bitwarden`, `keepassxc`; `cache_ttl_secs` defaults to
+`DEFAULT_SECRET_CACHE_TTL_SECS` (300). An unknown kind or an empty order fails
+the config load naming the field — there is no silent fallback to env.
+Provider parameters (`onepassword.items`, `bitwarden.items`,
+`keepassxc.database` / `attribute` / `entries`) are references only; a secret
+value never enters the config. `ChainSecretProvider::from_config` builds the
+chain from the section; the password-manager kinds pass validation but their
+providers land with the rest of milestone 3.1.0 — until then `from_config`
+refuses them by name. Without the section, secret resolution keeps its
+legacy order (static → keyring → env).
+
 `SshTransportConfig::command_timeout` (default 300s,
 `filar_core::DEFAULT_COMMAND_TIMEOUT_SECS`) is how long `SshSession::run` waits
 for the command marker. Override with

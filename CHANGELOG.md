@@ -11,6 +11,10 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ## [Unreleased]
 
+### Added
+
+- Secret resolution can chain several providers: a new `[secret_provider]` config section (`order` of `keyring`/`env`/`onepassword`/`bitwarden`/`keepassxc`, `cache_ttl_secs`, per-manager reference tables) and `ChainSecretProvider` — the first non-empty answer wins, resolved values are cached with a TTL and zeroized on eviction, `secret_names()` unions every link for output masking; an unknown kind or an empty order fails the config load by field name with no silent fallback to env, and secret values never enter the config; the password-manager providers themselves follow in the rest of milestone 3.1.0 ([#690](https://github.com/devlawey/filar/issues/690)).
+
 ### Fixed
 
 - A streamed answer whose body closes with some text but neither `[DONE]` nor a `finish_reason` now says the stream ended without a completion marker, instead of reading as a finished reply; an SSE line that is neither a `data:` field nor a comment is logged (length and field name only) instead of being dropped in silence ([#688](https://github.com/devlawey/filar/issues/688)).
