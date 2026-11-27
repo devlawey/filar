@@ -694,6 +694,7 @@ struct PipeBuffer {
     data: Vec<u8>,
     done: bool,
     overflow: bool,
+    error: bool,
 }
 
 impl PipeBuffer {
@@ -702,6 +703,7 @@ impl PipeBuffer {
             data: Vec::with_capacity(MAX_SECRET_CLI_OUTPUT_BYTES),
             done: false,
             overflow: false,
+            error: false,
         }
     }
 }
@@ -735,39 +737,49 @@ fn abort_pipe_readers(
 /// flag under the buffer lock after every chunk. While blocked in `read()`
 /// the thread holds no secret data: the previous chunk was wiped right
 /// after being copied. The thread may linger until EOF, but never with a
-/// secret in its own memory.
+/// secret in its own memory. `Interrupted` reads are retried; any other
+/// read error is recorded so a truncated value is never returned as the
+/// secret. Thread creation is fallible: the caller must not leave an
+/// already-spawned child unmanaged on failure.
 fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
     pipe: Option<R>,
     buf: Arc<Mutex<PipeBuffer>>,
     aborted: Arc<std::sync::atomic::AtomicBool>,
-) {
-    std::thread::spawn(move || {
-        if let Some(mut pipe) = pipe {
-            let mut chunk = [0u8; 8192];
-            loop {
-                let n = match pipe.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
-                if aborted.load(std::sync::atomic::Ordering::SeqCst) {
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("filar-secret-cli-reader".to_string())
+        .spawn(move || {
+            if let Some(mut pipe) = pipe {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let n = match pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => {
+                            buf.lock().unwrap_or_else(|e| e.into_inner()).error = true;
+                            break;
+                        }
+                    };
+                    let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+                    if aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                        chunk[..n].zeroize();
+                        break;
+                    }
+                    if b.data.len() + n > MAX_SECRET_CLI_OUTPUT_BYTES {
+                        b.overflow = true;
+                        chunk[..n].zeroize();
+                        break;
+                    }
+                    // Within the capacity reserved in PipeBuffer::new():
+                    // no reallocation, no freed unwiped copy of the secret.
+                    b.data.extend_from_slice(&chunk[..n]);
                     chunk[..n].zeroize();
-                    break;
                 }
-                if b.data.len() + n > MAX_SECRET_CLI_OUTPUT_BYTES {
-                    b.overflow = true;
-                    chunk[..n].zeroize();
-                    break;
-                }
-                // Within the capacity reserved in PipeBuffer::new():
-                // no reallocation, no freed unwiped copy of the secret.
-                b.data.extend_from_slice(&chunk[..n]);
-                chunk[..n].zeroize();
             }
-        }
-        buf.lock().unwrap_or_else(|e| e.into_inner()).done = true;
-    });
+            buf.lock().unwrap_or_else(|e| e.into_inner()).done = true;
+        })?;
+    Ok(())
 }
 
 /// Run a password-manager CLI and return its stdout verbatim (the caller
@@ -820,8 +832,20 @@ fn run_secret_cli(
     let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let out_buf: Arc<Mutex<PipeBuffer>> = Arc::new(Mutex::new(PipeBuffer::new()));
     let err_buf: Arc<Mutex<PipeBuffer>> = Arc::new(Mutex::new(PipeBuffer::new()));
-    spawn_pipe_reader(child.stdout.take(), Arc::clone(&out_buf), Arc::clone(&aborted));
-    spawn_pipe_reader(child.stderr.take(), Arc::clone(&err_buf), Arc::clone(&aborted));
+    spawn_pipe_reader(child.stdout.take(), Arc::clone(&out_buf), Arc::clone(&aborted))
+        .and_then(|_| {
+            spawn_pipe_reader(child.stderr.take(), Arc::clone(&err_buf), Arc::clone(&aborted))
+        })
+        .map_err(|e| {
+            // A reader thread could not start: stop whatever did start,
+            // terminate and reap the child, never leave it unmanaged.
+            abort_pipe_readers(&aborted, &[&out_buf, &err_buf]);
+            let _ = child.kill();
+            let _ = child.wait();
+            CoreError::Other(format!(
+                "{provider}: failed to start output reader for CLI '{cli}': {e}"
+            ))
+        })?;
 
     let status = loop {
         match child.try_wait() {
@@ -873,6 +897,15 @@ fn run_secret_cli(
         abort_pipe_readers(&aborted, &[&out_buf, &err_buf]);
         return Err(CoreError::Secret(format!(
             "{provider}: CLI output exceeds the {MAX_SECRET_CLI_OUTPUT_BYTES}-byte limit reading {reference}"
+        )));
+    }
+    // A failed read must never pass a truncated value off as the secret.
+    let read_error = out_buf.lock().unwrap_or_else(|e| e.into_inner()).error
+        || err_buf.lock().unwrap_or_else(|e| e.into_inner()).error;
+    if read_error {
+        abort_pipe_readers(&aborted, &[&out_buf, &err_buf]);
+        return Err(CoreError::Other(format!(
+            "{provider}: failed to read CLI output reading {reference}"
         )));
     }
     let mut stdout_bytes = std::mem::take(&mut out_buf.lock().unwrap_or_else(|e| e.into_inner()).data);
@@ -1787,6 +1820,7 @@ mod tests {
             data: b"partial-secret".to_vec(),
             done: false,
             overflow: false,
+            error: false,
         });
         abort_pipe_readers(&aborted, &[&buf]);
         assert!(aborted.load(std::sync::atomic::Ordering::SeqCst));
@@ -1808,7 +1842,8 @@ mod tests {
             Some(std::io::repeat(b'x')),
             Arc::clone(&buf),
             Arc::clone(&aborted),
-        );
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if buf.lock().unwrap().done {
@@ -1821,6 +1856,50 @@ mod tests {
         assert!(b.overflow, "overflow flag not set");
         assert_eq!(b.data.len(), MAX_SECRET_CLI_OUTPUT_BYTES);
         assert_eq!(b.data.capacity(), MAX_SECRET_CLI_OUTPUT_BYTES, "buffer reallocated");
+    }
+
+    #[test]
+    fn pipe_reader_retries_interrupted_and_records_fatal_errors() {
+        // A read error must not pass for EOF: Interrupted is retried, any
+        // other error is recorded so run_secret_cli rejects the invocation
+        // instead of returning a truncated secret (#733 review).
+        struct FlakyReader {
+            calls: usize,
+        }
+        impl std::io::Read for FlakyReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "retry me")),
+                    2 => {
+                        buf[..4].copy_from_slice(b"tail");
+                        Ok(4)
+                    }
+                    3 => Err(std::io::Error::new(std::io::ErrorKind::Other, "pipe broke")),
+                    _ => Ok(0),
+                }
+            }
+        }
+        let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let buf = Arc::new(Mutex::new(PipeBuffer::new()));
+        spawn_pipe_reader(
+            Some(FlakyReader { calls: 0 }),
+            Arc::clone(&buf),
+            Arc::clone(&aborted),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if buf.lock().unwrap().done {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reader did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let b = buf.lock().unwrap();
+        assert!(b.error, "fatal read error not recorded");
+        // The Interrupted read was retried: the tail chunk was collected.
+        assert_eq!(&b.data[..], b"tail");
     }
 
     #[test]
