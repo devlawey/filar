@@ -13612,4 +13612,14 @@ unauthenticated, not found, таймаут, передача BW_SESSION из env
 CLI, Debug/secret_names/промах, chain из конфига; интеграция с реальным `bw`
 — `#[ignore]`, ручная.
 
+**Ревью (раунд 1).** Принято от ai-review: RAII-guard очистки `BW_SESSION`
+в env-тесте (убирает переменную и при панике); явная проверка, что
+`bw status` вернул JSON-объект, с точным сообщением ошибки;
+`tracing::debug!` о недоступности keyring (без значений). Отклонено:
+`serial_test`/`with_session` против «гонки» — BW_SESSION трогает только
+этот тест; «env не zeroize-ится» — `get()` затирает session независимо от
+источника; «\r без \n» — bw добавляет `\n`, а trim_end_matches съел бы
+хвостовые переводы строки самого пароля. CodeRabbit в этом раунде
+упёрся в лимит ревью.
+
 **Next:** #693 (провайдер KeePassXC).

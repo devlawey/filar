@@ -1120,6 +1120,7 @@ impl BitwardenProvider {
         )?;
         let state = serde_json::from_str::<serde_json::Value>(&status_out)
             .ok()
+            .filter(|v| v.is_object())
             .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string));
         status_out.zeroize();
         match state.as_deref() {
@@ -1136,7 +1137,7 @@ impl BitwardenProvider {
             }
             _ => {
                 return Err(CoreError::Other(format!(
-                    "bitwarden: unexpected 'bw status' output (item {reference})"
+                    "bitwarden: unexpected 'bw status' output — expected a JSON object with a 'status' field (item {reference})"
                 )));
             }
         }
@@ -1195,18 +1196,33 @@ impl std::fmt::Debug for BitwardenProvider {
 
 /// Resolve `BW_SESSION` from the environment or the OS credential store —
 /// never from the config (#692). A keyring failure means "no session", not
-/// an error: `bw status` reports the vault state either way.
+/// an error: `bw status` reports the vault state either way. The caller
+/// zeroizes the returned value; the OS environment block itself cannot be
+/// wiped, which is inherent to env-based secrets.
 fn resolve_bw_session() -> Option<String> {
     if let Ok(v) = std::env::var("BW_SESSION") {
         if !v.is_empty() {
             return Some(v);
         }
     }
-    keyring::Entry::new("filar", "BW_SESSION")
-        .ok()?
-        .get_password()
-        .ok()
-        .filter(|v| !v.is_empty())
+    let entry = match keyring::Entry::new("filar", "BW_SESSION") {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!("bitwarden: OS credential store unavailable for BW_SESSION: {e}");
+            return None;
+        }
+    };
+    match entry.get_password() {
+        Ok(v) if !v.is_empty() => Some(v),
+        Ok(_) => None,
+        Err(keyring::Error::NoEntry) => None,
+        Err(e) => {
+            tracing::debug!(
+                "bitwarden: could not read BW_SESSION from the OS credential store: {e}"
+            );
+            None
+        }
+    }
 }
 
 /// Classify `bw` stderr into a short hint; the raw text never reaches the
@@ -2331,7 +2347,15 @@ mod tests {
     #[test]
     fn bw_provider_passes_session_from_env_to_the_cli() {
         // The stub echoes BW_SESSION back: the value must reach the child
-        // from the environment, not from any config field.
+        // from the environment, not from any config field. This is the only
+        // test that writes or removes BW_SESSION, so no other test can race
+        // on its value; the guard removes it even if an assert panics.
+        struct EnvVarGuard(&'static str);
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                std::env::remove_var(self.0);
+            }
+        }
         let dir = op_stub_dir("bw-session");
         #[cfg(windows)]
         let body = concat!(
@@ -2355,10 +2379,10 @@ mod tests {
         );
         let stub = write_stub(&dir, "bw-session", body);
         std::env::set_var("BW_SESSION", "test-bw-session-42");
+        let _guard = EnvVarGuard("BW_SESSION");
         let p = BitwardenProvider::new(bw_items("api-key-item"))
             .with_cli_path(stub.to_str().unwrap());
         let value = p.get("FILAR_LLM_API_KEY").unwrap();
-        std::env::remove_var("BW_SESSION");
         assert_eq!(value, "test-bw-session-42");
         let _ = std::fs::remove_dir_all(&dir);
     }
