@@ -53,4 +53,20 @@ pub fn log_sources(builder: filar_agent::AgentBuilder, config: &filar_core::Conf
     builder.log_sources(sources)
 }
 
+/// "Audit journal — `AuditRecord` / `AuditWriter` (#696)".
+pub fn audit(
+    writer: &mut filar_core::AuditWriter,
+    secrets: Option<&filar_core::StaticSecretProvider>,
+) -> filar_core::Result<()> {
+    let record = filar_core::AuditRecord::new(
+        "session-123",
+        filar_core::AuditTarget { kind: "ssh".into(), name: "web-1".into(), host: None, tags: vec![] },
+        "systemctl restart nginx",
+        filar_core::AuditDecision::Approved,
+        filar_core::AuditDecisionSource::User,
+    );
+    writer.append(&record, secrets)?;
+    Ok(())
+}
+
 fn main() {}

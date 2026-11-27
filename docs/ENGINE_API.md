@@ -1242,3 +1242,66 @@ temperature = 0.3
 ```
 
 Select it at launch with `--llm ollama` (or `Config::select_llm(Some("ollama"))`).
+
+## Audit journal — `AuditRecord` / `AuditWriter` (#696)
+
+`filar_core::audit` records command decisions as a local append-only JSONL
+journal. Nothing leaves the machine: the writer only touches the file system.
+
+- `AuditRecord` — one decision: `ts` (UTC RFC 3339), `session_id`, `target`
+  (`AuditTarget`: kind, name, host, tags), `command`, `explanation`,
+  `destructive`, `decision` (`AuditDecision`: approved / denied / auto /
+  cancelled), `decision_source` (`AuditDecisionSource`: user / allowlist /
+  never / policy), `risk_score`, `arbiter_verdict`, `arbiter_reason`,
+  `arbiter_model`, `exit_code`, `duration_ms`, `proposal_id`. Optional fields
+  are `None` when the information was not available.
+- `AuditWriter` — append-only writer. Files live in
+  `dirs::data_local_dir()/filar/audit/` (`audit::default_dir()`), named
+  `audit-<YYYY-MM-DD>.jsonl` from the record timestamp; when a file would
+  exceed the size limit (`DEFAULT_AUDIT_MAX_BYTES`, 10 MiB) the writer rolls
+  over to `audit-<YYYY-MM-DD>.<n>.jsonl`. Existing files are never rewritten.
+  Sizes are checked against the file system (another writer's appends are
+  seen), and a file whose last line is incomplete (a torn write) is
+  preserved as-is and skipped in favour of a new indexed file.
+- Secret values are masked before the line is written: pass the session's
+  secret snapshot to `append` and known values become their slot names
+  (`$FILAR_SECRET_*`) or `<secret>` — a value never reaches the disk.
+  **Masking contract:** `append` takes an `Option<&StaticSecretProvider>` —
+  an enumeration-complete snapshot of every secret resolved in this session;
+  its keys are the masking scope. Build one with
+  `audit::secret_snapshot(provider)` from a provider that enumerates the
+  session's resolved secrets; it is fail-closed: if a listed name cannot be
+  read (a vault locked after the value was resolved) it returns `Err` before
+  anything is written. Completeness is the caller's responsibility: a
+  non-enumerable store (e.g. `KeyringSecretProvider`) yields an empty
+  snapshot that masks nothing — for such stores the caller must supply the
+  names it resolved in this session explicitly
+  (`StaticSecretProvider::with_secrets`).
+- A write failure is returned as `Err`; the caller logs a warning and keeps
+  going. Auditing never blocks or fails a command.
+- `append` performs synchronous file I/O (the core crate is runtime-agnostic);
+  async callers should offload it via `tokio::task::spawn_blocking` — the TUI/agent
+  integration wires this up in #698.
+- `audit::read_records(path)` reads a file back in order; a malformed line
+  is an error naming its number.
+
+```rust
+use filar_core::{AuditDecision, AuditDecisionSource, AuditRecord, AuditTarget, AuditWriter};
+
+let mut writer = AuditWriter::open_default()?;
+let record = AuditRecord::new(
+    "session-123",
+    AuditTarget { kind: "ssh".into(), name: "web-1".into(), host: None, tags: vec![] },
+    "systemctl restart nginx",
+    AuditDecision::Approved,
+    AuditDecisionSource::User,
+);
+// `secrets` is the session's secret snapshot (None = no known secrets);
+// build it from the session provider with `filar_core::secret_snapshot`.
+let secrets: Option<filar_core::StaticSecretProvider> = None;
+writer.append(&record, secrets.as_ref())?;
+# Ok::<(), filar_core::CoreError>(())
+```
+
+The hash chain (`prev_hash` / `hash`) and integrity verification arrive with
+#697; readers must tolerate records without those fields.
