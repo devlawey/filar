@@ -22,6 +22,7 @@ dependency point for embedders (see `docs/ENGINE_API.md`).
 
 ### Fixed
 
+- The Secrets tab's provider-order buttons in the GUI launcher are labelled `Up`/`Down` instead of `↑`/`↓`, which egui's default fonts rendered as empty boxes ([#738](https://github.com/devlawey/filar/issues/738)).
 - A streamed answer whose body closes with some text but neither `[DONE]` nor a `finish_reason` now says the stream ended without a completion marker, instead of reading as a finished reply; an SSE line that is neither a `data:` field nor a comment is logged (length and field name only) instead of being dropped in silence ([#688](https://github.com/devlawey/filar/issues/688)).
 
 ## [3.0.7] - 2026-11-21
