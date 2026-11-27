@@ -13562,4 +13562,13 @@ abort-флаг проверяется под тем же локом, поэто�
 (Windows `start /b`, Unix `&`), читатель до abort (Unix). Расхождение
 описано в `docs/PLATFORM_NOTES.md`.
 
+**Ревью (раунд 3).** Принят blocker ai-review и follow-up CodeRabbit:
+читатель, заблокированный в `read()` на pipe, который держит внук, не
+должен хранить часть секрета до EOF. Читатели теперь копируют вывод
+chunk-за-chunk-ом в общий буфер под мьютексом и затирают chunk сразу;
+abort-путь затирает общий буфер немедленно, без ожидания EOF. Поток может
+жить до EOF, но секретных байтов вне общего буфера не держит (оговорено в
+PLATFORM_NOTES). Тесты: `abort_pipe_readers_wipes_partial_data_without_eof`,
+`op_provider_timeout_with_partial_output_and_held_pipe`.
+
 **Next:** #692 (провайдер Bitwarden CLI).

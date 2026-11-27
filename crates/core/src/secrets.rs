@@ -678,19 +678,60 @@ impl Drop for ChainSecretProvider {
 /// Default timeout for a password-manager CLI invocation, seconds (#691).
 pub const DEFAULT_SECRET_CLI_TIMEOUT_SECS: u64 = 30;
 
-/// Set the abort flag and wipe whatever the pipe readers already stored.
-/// A reader that finishes later sees the flag under the same slot lock and
-/// wipes its own buffer, so no partial output is dropped unzeroized.
+/// Partial pipe output shared with a reader thread. The abort path wipes
+/// `data` under the same lock the reader copies each chunk into, so a
+/// partial secret is zeroized immediately on timeout — even while the
+/// reader stays blocked in `read()` on a pipe an orphaned grandchild keeps
+/// open. The reader keeps no secret bytes of its own between reads.
+#[derive(Default)]
+struct PipeBuffer {
+    data: Vec<u8>,
+    done: bool,
+}
+
+/// Set the abort flag and wipe whatever the pipe readers already copied.
+/// A reader that returns from `read()` later sees the flag under the same
+/// lock and wipes its chunk, so no partial output survives unzeroized.
 fn abort_pipe_readers(
     aborted: &std::sync::atomic::AtomicBool,
-    slots: &[&Mutex<Option<Vec<u8>>>],
+    buffers: &[&Mutex<PipeBuffer>],
 ) {
     aborted.store(true, std::sync::atomic::Ordering::SeqCst);
-    for slot in slots {
-        if let Some(mut buf) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            buf.zeroize();
-        }
+    for buf in buffers {
+        buf.lock().unwrap_or_else(|e| e.into_inner()).data.zeroize();
     }
+}
+
+/// Read a pipe chunk by chunk into the shared buffer, checking the abort
+/// flag under the buffer lock after every chunk. While blocked in `read()`
+/// the thread holds no secret data: the previous chunk was wiped right
+/// after being copied. The thread may linger until EOF, but never with a
+/// secret in its own memory.
+fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+    buf: Arc<Mutex<PipeBuffer>>,
+    aborted: Arc<std::sync::atomic::AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        if let Some(mut pipe) = pipe {
+            let mut chunk = [0u8; 8192];
+            loop {
+                let n = match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+                if aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                    chunk[..n].zeroize();
+                    break;
+                }
+                b.data.extend_from_slice(&chunk[..n]);
+                chunk[..n].zeroize();
+            }
+        }
+        buf.lock().unwrap_or_else(|e| e.into_inner()).done = true;
+    });
 }
 
 /// Run a password-manager CLI and return its stdout verbatim (the caller
@@ -710,7 +751,6 @@ fn run_secret_cli(
     reference: &str,
     classify: impl Fn(&str) -> Option<&'static str>,
 ) -> Result<String> {
-    use std::io::Read;
     use std::process::{Command, Stdio};
 
     // An unrepresentable deadline must fail before the child starts:
@@ -737,54 +777,22 @@ fn run_secret_cli(
 
     // Drain both pipes concurrently: a child writing more than the pipe
     // capacity would block forever with nobody reading (#733 review).
-    // Readers hand their buffers over through slots; on abort the flag is
-    // set and the slots wiped under the same lock the readers check, so a
-    // buffer is zeroized exactly once regardless of who wins the race —
-    // including a reader that finished before the timeout was reached.
+    // Readers copy chunks into shared buffers; on abort the flag is set
+    // and the buffers wiped under the same lock, so partial output is
+    // zeroized immediately — no EOF wait, no secret left in a blocked
+    // reader's own memory.
     let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let out_slot: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-    let err_slot: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    {
-        let slot = Arc::clone(&out_slot);
-        let aborted = Arc::clone(&aborted);
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = stdout_pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-            if aborted.load(std::sync::atomic::Ordering::SeqCst) {
-                buf.zeroize();
-            } else {
-                *slot = Some(buf);
-            }
-        });
-    }
-    {
-        let slot = Arc::clone(&err_slot);
-        let aborted = Arc::clone(&aborted);
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = stderr_pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-            if aborted.load(std::sync::atomic::Ordering::SeqCst) {
-                buf.zeroize();
-            } else {
-                *slot = Some(buf);
-            }
-        });
-    }
+    let out_buf: Arc<Mutex<PipeBuffer>> = Arc::new(Mutex::new(PipeBuffer::default()));
+    let err_buf: Arc<Mutex<PipeBuffer>> = Arc::new(Mutex::new(PipeBuffer::default()));
+    spawn_pipe_reader(child.stdout.take(), Arc::clone(&out_buf), Arc::clone(&aborted));
+    spawn_pipe_reader(child.stderr.take(), Arc::clone(&err_buf), Arc::clone(&aborted));
 
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    abort_pipe_readers(&aborted, &[&out_slot, &err_slot]);
+                    abort_pipe_readers(&aborted, &[&out_buf, &err_buf]);
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(CoreError::Secret(format!(
@@ -795,7 +803,7 @@ fn run_secret_cli(
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(e) => {
-                abort_pipe_readers(&aborted, &[&out_slot, &err_slot]);
+                abort_pipe_readers(&aborted, &[&out_buf, &err_buf]);
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(CoreError::Other(format!(
@@ -809,13 +817,13 @@ fn run_secret_cli(
     // open (Windows .cmd stubs): wait for the readers no longer than the
     // same deadline, never an unbounded join.
     loop {
-        let out_done = out_slot.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-        let err_done = err_slot.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let out_done = out_buf.lock().unwrap_or_else(|e| e.into_inner()).done;
+        let err_done = err_buf.lock().unwrap_or_else(|e| e.into_inner()).done;
         if out_done && err_done {
             break;
         }
         if Instant::now() >= deadline {
-            abort_pipe_readers(&aborted, &[&out_slot, &err_slot]);
+            abort_pipe_readers(&aborted, &[&out_buf, &err_buf]);
             return Err(CoreError::Secret(format!(
                 "{provider}: timed out after {}s reading {reference}",
                 timeout.as_secs()
@@ -823,16 +831,8 @@ fn run_secret_cli(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    let mut stdout_bytes = out_slot
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .unwrap_or_default();
-    let mut stderr_bytes = err_slot
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .unwrap_or_default();
+    let mut stdout_bytes = std::mem::take(&mut out_buf.lock().unwrap_or_else(|e| e.into_inner()).data);
+    let mut stderr_bytes = std::mem::take(&mut err_buf.lock().unwrap_or_else(|e| e.into_inner()).data);
     let mut stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
     let mut stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
     stdout_bytes.zeroize();
@@ -1719,6 +1719,46 @@ mod tests {
         let dir = op_stub_dir("preabort");
         let body = "#!/bin/sh\nprintf 'partial-secret'\nexec 1>&-\nsleep 30\n";
         let stub = write_stub(&dir, "op-preabort", body);
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "timeout not enforced");
+        let msg = format!("{err}");
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(!msg.contains("partial-secret"), "value leak: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abort_pipe_readers_wipes_partial_data_without_eof() {
+        // The reader is still blocked in read() (done = false): the abort
+        // path must wipe the shared partial data right away, without
+        // waiting for the pipe to close (#733 review, ai-review blocker).
+        let aborted = std::sync::atomic::AtomicBool::new(false);
+        let buf = Mutex::new(PipeBuffer {
+            data: b"partial-secret".to_vec(),
+            done: false,
+        });
+        abort_pipe_readers(&aborted, &[&buf]);
+        assert!(aborted.load(std::sync::atomic::Ordering::SeqCst));
+        let b = buf.lock().unwrap();
+        // zeroize wipes the bytes and truncates the Vec.
+        assert!(b.data.is_empty(), "partial data not zeroized");
+    }
+
+    #[test]
+    fn op_provider_timeout_with_partial_output_and_held_pipe() {
+        // The CLI writes part of the value, then keeps the pipe open past
+        // the deadline: the call must return promptly and the error must
+        // not carry the partial value.
+        let dir = op_stub_dir("partial");
+        #[cfg(windows)]
+        let body = "@echo off\r\necho partial-secret\r\nping -n 30 127.0.0.1 >nul\r\nexit /b 0\r\n";
+        #[cfg(not(windows))]
+        let body = "#!/bin/sh\nprintf 'partial-secret'\nsleep 30\n";
+        let stub = write_stub(&dir, "op-partial", body);
         let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
             .with_cli_path(stub.to_str().unwrap())
             .with_timeout(Duration::from_millis(300));

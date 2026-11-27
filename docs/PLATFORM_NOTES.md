@@ -629,14 +629,19 @@ Windows (`KEY_EVENT` с `uChar = 0x07`); ни Windows Terminal, ни conhost,
 унаследованный handle stderr-pipe. Потомок может держать pipe и после
 штатного выхода самого CLI (`start /b` на Windows, `cmd &` на Unix).
 Поэтому `run_secret_cli` (`crates/core/src/secrets.rs`) никогда не делает
-безусловный `join` читателей pipe: они передают буферы через слоты под
-мьютексом, ожидание читателей ограничено тем же дедлайном, а по таймауту
-abort-флаг + очистка слотов под тем же локом гарантируют `zeroize` буфера
-независимо от того, кто выиграл гонку — включая читателя, завершившегося
-до таймаута. На Unix одиночный `sh`-процесс закрывает pipe сразу при kill;
-поведение тем не менее унифицировано. Проверено тестами
+безусловный `join` читателей pipe: они копируют вывод chunk-за-chunk-ом в
+общие буферы под мьютексом и сразу затирают свой chunk; ожидание
+читателей после штатного выхода CLI ограничено тем же дедлайном. По
+таймауту (и при ошибке ожидания) abort-путь затирает общие буферы под тем
+же локом немедленно — частичный секрет не остаётся в памяти даже если
+читатель ещё заблокирован в `read()` на удерживаемом внуком pipe; сам
+поток может жить до EOF, но секретных байтов вне общего буфера не держит.
+На Unix одиночный `sh`-процесс закрывает pipe сразу при kill; поведение
+тем не менее унифицировано. Проверено тестами
 `op_provider_timeout_kills_the_cli`,
-`op_provider_grandchild_holding_pipe_is_bounded_by_deadline` (Windows
-локально, macOS в CI) и `op_provider_timeout_wipes_output_stored_before_abort`
+`op_provider_grandchild_holding_pipe_is_bounded_by_deadline`,
+`op_provider_timeout_with_partial_output_and_held_pipe`,
+`abort_pipe_readers_wipes_partial_data_without_eof` (Windows локально,
+macOS в CI) и `op_provider_timeout_wipes_output_stored_before_abort`
 (Unix).
 
