@@ -110,9 +110,11 @@ pub struct Config {
     /// (static → keyring → env). Only provider parameters live here —
     /// never a secret value.
     ///
-    /// The section is validated and stored, but production key resolution
-    /// (`lookup_profile_api_key` and the CLI path in `crates/app`) still
-    /// uses the legacy sources until the chain is wired in #694.
+    /// Wired into every resolution point by #694: the app builds the
+    /// chain once at start-up (`ChainSecretProvider::from_config`) and
+    /// resolves LLM keys, SSH passwords, key passphrases and fleet host
+    /// credentials through it; synchronous chain calls happen only at
+    /// start-up or in `spawn_blocking`, never in the TUI event loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_provider: Option<SecretProviderConfig>,
 }

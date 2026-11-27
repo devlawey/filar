@@ -411,11 +411,14 @@ Provider parameters (`onepassword.items`, `bitwarden.items`,
 value never enters the config. `ChainSecretProvider::from_config` builds the
 chain from the section; `onepassword` maps to `OnePasswordProvider` (#691),
 `bitwarden` maps to `BitwardenProvider` (#692), `keepassxc` maps to
-`KeePassXcProvider` (#693) — all five kinds build. Without the section,
-secret resolution keeps its
-legacy order (static → keyring → env). The section does not yet govern
-production key resolution in the app — the chain is wired into the startup
-paths in #694.
+`KeePassXcProvider` (#693) — all five kinds build. The app wires the chain
+into every resolution point (#694): with the section present it replaces the
+keyring → env order for the LLM profile key, risk-scorer and log-source keys,
+SSH password, key passphrase and fleet host passwords; synchronous provider
+calls happen only at start-up or in `spawn_blocking` (profile and fleet
+secrets are prefetched into memory once), never in the TUI event loop.
+Without the section, secret resolution keeps its
+legacy order (static → keyring → env).
 
 `filar_core::OnePasswordProvider` (#691) reads secrets through the local
 1Password CLI: `op read op://<vault>/<item>/<field> --no-newline`, with a

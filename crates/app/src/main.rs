@@ -191,7 +191,8 @@ pub fn tui_profiles(
 ///
 /// - **Password** — when the password is empty (normal after
 ///   `pending_launch.json` deserialize — it is `#[serde(skip)]`), it is read
-///   from the OS keyring under [`filar_core::ssh_cred_name`], the same key
+///   from the `[secret_provider]` chain when configured (#694), else from
+///   the OS keyring under [`filar_core::ssh_cred_name`], the same key
 ///   the launcher writes.
 /// - **Key** — the key file only; the passphrase of an encrypted key is
 ///   filled afterwards by the `--target` passphrase step (keyring
@@ -206,17 +207,23 @@ pub fn tui_profiles(
 /// `KeyringSecretProvider::get` is synchronous. Callers must invoke this
 /// **once during startup**, before the TUI event loop is running (same
 /// pattern as the GUI API-key lookup a few lines below). Do not call it from
-/// a hot async path without `spawn_blocking`.
-fn resolve_gui_ssh_target(s: &filar_gui::SshConnection) -> filar_core::SshTarget {
+/// a hot async path without `spawn_blocking`. The same holds for the
+/// `[secret_provider]` chain (#694): a password-manager CLI may be spawned.
+fn resolve_gui_ssh_target(
+    s: &filar_gui::SshConnection,
+    chain: Option<&dyn SecretProvider>,
+) -> filar_core::SshTarget {
     let name = filar_core::ssh_target_display_name(s.slot, &s.alias);
     let auth = match s.auth {
         filar_gui::SlotAuth::Password => {
             let password = if s.password.is_empty() {
-                let cred = filar_core::KeyringSecretProvider::new();
                 let key = filar_core::ssh_cred_name(s.slot, &s.alias);
-                cred.get(&key)
+                let keyring = filar_core::KeyringSecretProvider::new();
+                let provider: &dyn SecretProvider = chain.unwrap_or(&keyring);
+                provider
+                    .get(&key)
                     .inspect_err(
-                        |e| tracing::debug!(error = %e, %key, "no saved SSH password in keyring"),
+                        |e| tracing::debug!(error = %e, %key, "no saved SSH password in the secret sources"),
                     )
                     .ok()
             } else {
@@ -340,6 +347,11 @@ fn session_kube_clusters(
 /// (keyring) → environment variable. On first keyring hit, the key is cached in
 /// `sp` to avoid repeated OS credential store calls.
 ///
+/// With `chain_mode` (#694) the key must already be in `sp`: the
+/// `[secret_provider]` chain is consulted once at start-up
+/// ([`prefetch_profile_keys`]), and the TUI event loop never calls the
+/// chain, the keyring or env — a miss is reported, not retried synchronously.
+///
 /// An **empty** [`LlmProfile::key_env`] means the profile is keyless (local /
 /// air-gapped OpenAI-compatible server): key resolution is skipped and the
 /// client is created without an API key (no `Authorization` header).
@@ -350,11 +362,12 @@ pub fn build_llm_client_from_profile(
     profile: &filar_core::LlmProfile,
     sp: &filar_core::StaticSecretProvider,
     llm_timeout_secs: u64,
+    chain_mode: bool,
 ) -> std::result::Result<Arc<dyn LlmClient>, CoreError> {
     let key = if !profile.requires_api_key() {
         String::new()
     } else {
-        lookup_profile_api_key(profile, sp).ok_or_else(|| {
+        lookup_profile_api_key(profile, sp, chain_mode).ok_or_else(|| {
             filar_core::CoreError::Secret(format!("no API key found for profile {}", profile.name))
         })?
     };
@@ -373,9 +386,16 @@ pub fn build_llm_client_from_profile(
 fn check_profile_api_key(
     profile: &filar_core::LlmProfile,
     sp: &filar_core::StaticSecretProvider,
+    chain_mode: bool,
 ) -> Option<String> {
-    if !profile.requires_api_key() || lookup_profile_api_key(profile, sp).is_some() {
+    if !profile.requires_api_key() || lookup_profile_api_key(profile, sp, chain_mode).is_some() {
         return None;
+    }
+    if chain_mode {
+        return Some(format!(
+            "no API key found (the [secret_provider] chain did not resolve '{}' at start-up)",
+            profile.key_env
+        ));
     }
     Some(format!(
         "no API key found (checked memory, OS store, env '{}')",
@@ -422,14 +442,16 @@ type LaunchRiskScorer = (
 /// The command safety scorer of `config` (#549/#551), with the note to show
 /// at start-up when a configured scorer cannot be used.
 ///
-/// The key is looked up like a profile's: in-memory `sp` → OS credential
+/// The key is looked up like a profile's: in-memory `sp` → the
+/// `[secret_provider]` chain when configured (#694), else OS credential
 /// store → environment, under the section's own `key_env`, and cached in
 /// `sp` (so command output that echoes it is masked). Called once during
-/// start-up, before the TUI loop runs (the keyring is synchronous). Neither the result nor
-/// the note ever carries the key.
+/// start-up, before the TUI loop runs (the keyring and the chain are
+/// synchronous). Neither the result nor the note ever carries the key.
 fn build_risk_scorer_for_launch(
     config: &filar_core::Config,
     sp: &filar_core::StaticSecretProvider,
+    chain: Option<&dyn SecretProvider>,
 ) -> LaunchRiskScorer {
     let default_thresholds = (
         filar_core::DEFAULT_RISK_WARN_BELOW,
@@ -448,17 +470,24 @@ fn build_risk_scorer_for_launch(
     let key_env = rs.key_env.trim();
     if !key_env.is_empty() {
         let non_empty = |k: filar_core::Result<String>| k.ok().filter(|k| !k.is_empty());
-        let found = non_empty(sp.get(key_env))
-            .or_else(|| non_empty(filar_core::KeyringSecretProvider::new().get(key_env)))
-            .or_else(|| non_empty(filar_core::EnvSecretProvider::new().get(key_env)));
+        let found = non_empty(sp.get(key_env)).or_else(|| match chain {
+            Some(chain) => non_empty(chain.get(key_env)),
+            None => non_empty(filar_core::KeyringSecretProvider::new().get(key_env))
+                .or_else(|| non_empty(filar_core::EnvSecretProvider::new().get(key_env))),
+        });
         match found {
             Some(key) => sp.insert(key_env, &key),
             None => {
+                let checked = if chain.is_some() {
+                    format!("the [secret_provider] chain did not resolve '{key_env}'")
+                } else {
+                    format!("checked memory, OS store, env '{key_env}'")
+                };
                 return (
                     None,
                     rs.thresholds(),
                     Some(format!(
-                        "Safety rating off: no key found for the risk scorer (checked memory, OS store, env '{key_env}')."
+                        "Safety rating off: no key found for the risk scorer ({checked})."
                     )),
                 )
             }
@@ -480,13 +509,15 @@ fn build_risk_scorer_for_launch(
 /// The log sources of `config` (#579), with one start-up note per source
 /// that cannot be used.
 ///
-/// Each key is looked up like the risk scorer's: in-memory `sp` → OS
-/// credential store → environment, under the source's own `key_env`, and
-/// cached in `sp` so that output echoing it is masked. Neither the sources'
+/// Each key is looked up like the risk scorer's: in-memory `sp` → the
+/// `[secret_provider]` chain when configured (#694), else OS credential
+/// store → environment, under the source's own `key_env`, and cached in
+/// `sp` so that output echoing it is masked. Neither the sources'
 /// errors nor the notes ever carry a key.
 fn build_log_sources_for_launch(
     config: &filar_core::Config,
     sp: &filar_core::StaticSecretProvider,
+    chain: Option<&dyn SecretProvider>,
 ) -> (Option<std::sync::Arc<filar_agent::LogSources>>, Vec<String>) {
     use filar_core::SecretProvider;
     for source in &config.log_sources {
@@ -496,9 +527,11 @@ fn build_log_sources_for_launch(
             continue;
         }
         let non_empty = |k: filar_core::Result<String>| k.ok().filter(|k| !k.is_empty());
-        let found = non_empty(sp.get(key_env))
-            .or_else(|| non_empty(filar_core::KeyringSecretProvider::new().get(key_env)))
-            .or_else(|| non_empty(filar_core::EnvSecretProvider::new().get(key_env)));
+        let found = non_empty(sp.get(key_env)).or_else(|| match chain {
+            Some(chain) => non_empty(chain.get(key_env)),
+            None => non_empty(filar_core::KeyringSecretProvider::new().get(key_env))
+                .or_else(|| non_empty(filar_core::EnvSecretProvider::new().get(key_env))),
+        });
         if let Some(key) = found {
             sp.insert(key_env, &key);
         }
@@ -518,13 +551,22 @@ fn build_log_sources_for_launch(
 /// environment, each under [`secrets::llm_key_lookup_names`] of its
 /// `key_env` (the default name falls back to its legacy one, #490). A key
 /// found in the OS store is cached in `sp`.
+///
+/// With `chain_mode` (#694) only `sp` is consulted: the chain's keys were
+/// prefetched at start-up ([`prefetch_profile_keys`]), and this function
+/// runs inside the TUI event loop, where a synchronous provider call (a
+/// password-manager CLI) is forbidden.
 fn lookup_profile_api_key(
     profile: &filar_core::LlmProfile,
     sp: &filar_core::StaticSecretProvider,
+    chain_mode: bool,
 ) -> Option<String> {
     let non_empty = |k: filar_core::Result<String>| k.ok().filter(|k| !k.is_empty());
     if let Some(key) = non_empty(secrets::llm_api_key(sp, &profile.key_env)) {
         return Some(key);
+    }
+    if chain_mode {
+        return None;
     }
     let keyring = filar_core::KeyringSecretProvider::new();
     if let Some(key) = non_empty(secrets::llm_api_key(&keyring, &profile.key_env)) {
@@ -535,6 +577,43 @@ fn lookup_profile_api_key(
         &filar_core::EnvSecretProvider::new(),
         &profile.key_env,
     ))
+}
+
+/// Resolve every profile's API key through the `[secret_provider]` chain
+/// into `sp`, once at start-up (#694). Runs inside `spawn_blocking`: a
+/// password-manager CLI may be spawned per lookup.
+///
+/// Returns one note per profile whose key could not be resolved — the
+/// profile name and the provider error, never a value. Keys already in
+/// `sp` (the start-up profile's own) are left alone. A failed resolution
+/// does not stop start-up: the note is shown in the chat and `Ctrl+L`
+/// reports the missing key later.
+fn prefetch_profile_keys(
+    chain: &dyn SecretProvider,
+    sp: &filar_core::StaticSecretProvider,
+    profiles: &[filar_core::LlmProfile],
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    for profile in profiles {
+        if !profile.requires_api_key() {
+            continue;
+        }
+        if secrets::llm_api_key(sp, &profile.key_env).is_ok_and(|k| !k.is_empty()) {
+            continue;
+        }
+        match secrets::llm_api_key(chain, &profile.key_env) {
+            Ok(key) if !key.is_empty() => sp.insert(&profile.key_env, &key),
+            Ok(_) => notes.push(format!(
+                "LLM key for profile '{}' is empty in the [secret_provider] chain.",
+                profile.name
+            )),
+            Err(e) => notes.push(format!(
+                "LLM key for profile '{}' not resolved: {e}",
+                profile.name
+            )),
+        }
+    }
+    notes
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +755,20 @@ async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // ── Secret provider chain (#694) ─────────────────────────────────
+    // Built once from `[secret_provider]` and passed to every resolution
+    // point below. `None` (no section) keeps the legacy order
+    // static → keyring → env. An invalid section is a configuration error
+    // and stops start-up with a clear message; a provider that fails to
+    // *resolve* a value only produces a note, never a crash.
+    let secret_chain: Option<Arc<dyn SecretProvider>> = match &config.secret_provider {
+        Some(cfg) => Some(Arc::new(
+            filar_core::ChainSecretProvider::from_config(cfg)
+                .map_err(|e| anyhow::anyhow!("[secret_provider]: {e}"))?,
+        )),
+        None => None,
+    };
+
     // The launcher's command-safety choice (#552); `None` = not said (CLI
     // launch, or a pending_launch.json from before #552) → config.toml.
     let mut launch_risk_scorer: Option<filar_gui::RiskScorerLaunch> = None;
@@ -759,7 +852,9 @@ async fn run() -> anyhow::Result<()> {
                 // Read password from OS credential store if not passed in
                 // (since the struct now excludes secrets from serialization).
                 // Keyring key MUST match GUI/`ssh_cred_name` (#290), not legacy `ssh{slot}`.
-                let ssh_target = launch.ssh.map(|s| resolve_gui_ssh_target(&s));
+                let ssh_target = launch
+                    .ssh
+                    .map(|s| resolve_gui_ssh_target(&s, secret_chain.as_deref()));
                 let launch_kube = launch.kube;
                 let launch_kube_clusters = launch.kube_clusters;
                 // Session label: the alias (or SSH{n}) for SSH, the cluster
@@ -771,9 +866,11 @@ async fn run() -> anyhow::Result<()> {
                 let api_key = if key_env_name.trim().is_empty() {
                     String::new()
                 } else if launch.api_key.is_empty() {
-                    let cred = filar_core::KeyringSecretProvider::new();
-                    secrets::llm_api_key(&cred, &key_env_name)
-                        .inspect_err(|e| tracing::warn!(error = %e, key_name = %key_env_name, "failed to read API key from OS credential store"))
+                    let keyring = filar_core::KeyringSecretProvider::new();
+                    let provider: &dyn SecretProvider =
+                        secret_chain.as_deref().unwrap_or(&keyring);
+                    secrets::llm_api_key(provider, &key_env_name)
+                        .inspect_err(|e| tracing::warn!(error = %e, key_name = %key_env_name, "failed to read API key from the secret sources"))
                         .unwrap_or_default()
                 } else {
                     launch.api_key
@@ -815,10 +912,18 @@ async fn run() -> anyhow::Result<()> {
         let key = if key_env.trim().is_empty() {
             String::new()
         } else {
-            secrets::llm_api_key(&filar_core::EnvSecretProvider::new(), &key_env).map_err(|e| {
-                anyhow::anyhow!(
-                    "{e}. Set the {key_env} environment variable or use the GUI launcher."
-                )
+            let env = filar_core::EnvSecretProvider::new();
+            let provider: &dyn SecretProvider = secret_chain.as_deref().unwrap_or(&env);
+            secrets::llm_api_key(provider, &key_env).map_err(|e| {
+                if secret_chain.is_some() {
+                    anyhow::anyhow!(
+                        "{e}. Check the [secret_provider] configuration and the password-manager CLI, or use the GUI launcher."
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "{e}. Set the {key_env} environment variable or use the GUI launcher."
+                    )
+                }
             })?
         };
 
@@ -852,6 +957,9 @@ async fn run() -> anyhow::Result<()> {
     // Validate API key unless the profile is explicitly keyless (empty key_env).
     let requires_key = !key_env_name.trim().is_empty();
     if api_key.is_empty() && requires_key {
+        if secret_chain.is_some() {
+            anyhow::bail!("API key is required. The [secret_provider] chain did not resolve '{key_env_name}'. Check the password-manager CLI and its configuration, or enter the key in the GUI launcher. For local models, clear Key env on the profile.");
+        }
         anyhow::bail!("API key is required. Enter it in the GUI launcher or set the {key_env_name} environment variable. For local models, clear Key env on the profile.");
     }
 
@@ -887,6 +995,7 @@ async fn run() -> anyhow::Result<()> {
     // off the runtime they go.
     let mut password_origin = password::PasswordOrigin::NotNeeded;
     if let Some(mut target) = ssh_target.take() {
+        let chain = secret_chain.clone();
         let (target, resolved) = tokio::task::spawn_blocking(move || {
             let keyring = filar_core::KeyringSecretProvider::new();
             let env = filar_core::EnvSecretProvider::new();
@@ -895,6 +1004,7 @@ async fn run() -> anyhow::Result<()> {
                 &passphrase::PassphraseSources {
                     keyring: &keyring,
                     env: &env,
+                    chain: chain.as_deref(),
                 },
                 &mut passphrase::TerminalPrompt,
             )
@@ -904,6 +1014,7 @@ async fn run() -> anyhow::Result<()> {
                     &password::PasswordSources {
                         keyring: &keyring,
                         env: &env,
+                        chain: chain.as_deref(),
                     },
                     &mut password::TerminalPrompt,
                 )
@@ -1031,11 +1142,12 @@ async fn run() -> anyhow::Result<()> {
     // ── Command safety scorer (#549/#551) ──────────────────────────────
     let config = config_with_launch_risk_scorer(config, launch_risk_scorer);
     let (risk_scorer, risk_thresholds, risk_scorer_note) =
-        build_risk_scorer_for_launch(&config, &secret_provider);
+        build_risk_scorer_for_launch(&config, &secret_provider, secret_chain.as_deref());
 
     // ── Log sources (#579, #584) ───────────────────────────────────────
     let config = config_with_launch_log_sources(config, launch_log_sources);
-    let (log_sources, log_source_notes) = build_log_sources_for_launch(&config, &secret_provider);
+    let (log_sources, log_source_notes) =
+        build_log_sources_for_launch(&config, &secret_provider, secret_chain.as_deref());
 
     // ── Launch TUI ─────────────────────────────────────────────────────
     let default_profile_name = resolve_startup_profile(
@@ -1049,6 +1161,21 @@ async fn run() -> anyhow::Result<()> {
         &llm_config,
         &key_env_name,
     );
+    // ── Prefetch profile keys through the chain (#694) ───────────────
+    // The TUI loop builds clients from `sp` only; the chain (which may
+    // spawn a password-manager CLI) is consulted here, once, off the
+    // runtime. A failed resolution becomes a chat note, not a crash.
+    let mut secret_provider_notes: Vec<String> = Vec::new();
+    if let Some(chain) = &secret_chain {
+        let chain = chain.clone();
+        let sp = secret_provider.clone();
+        let profiles = launch_profiles.clone();
+        let notes =
+            tokio::task::spawn_blocking(move || prefetch_profile_keys(&*chain, &sp, &profiles))
+                .await
+                .map_err(|e| anyhow::anyhow!("secret prefetch task failed: {e}"))?;
+        secret_provider_notes.extend(notes);
+    }
     let tui_config = TuiConfig {
         target_name: target_name.clone(),
         confirm_mode: loaded.confirm_mode.unwrap_or(config.confirm_mode),
@@ -1076,21 +1203,25 @@ async fn run() -> anyhow::Result<()> {
         is_local: ssh_target.is_none(),
         initial_ssh_info: loaded.ssh_info,
         secret_provider: secret_provider.clone(),
+        secret_chain: secret_chain.clone(),
+        secret_provider_notes,
         log_rx,
         profiles: launch_profiles,
         default_profile_name,
         llm_factory: {
             let llm_timeout_secs = config.timeouts.llm_secs;
+            let chain_mode = secret_chain.is_some();
             Arc::new(
                 move |profile: &filar_core::LlmProfile, sp: &filar_core::StaticSecretProvider| {
-                    build_llm_client_from_profile(profile, sp, llm_timeout_secs)
+                    build_llm_client_from_profile(profile, sp, llm_timeout_secs, chain_mode)
                 },
             )
         },
         key_checker: {
             let key_checker_provider = secret_provider.clone();
+            let chain_mode = secret_chain.is_some();
             Arc::new(move |profile: &filar_core::LlmProfile| {
-                check_profile_api_key(profile, &key_checker_provider)
+                check_profile_api_key(profile, &key_checker_provider, chain_mode)
             })
         },
         ssh_targets: launch_ssh_targets,
@@ -1139,9 +1270,9 @@ mod tests {
     use filar_core::{LlmProfile, SecretProvider, StaticSecretProvider};
 
     use super::{
-        build_llm_client_from_profile, check_profile_api_key, gui_launch_target_name,
-        resolve_cli_target, resolve_gui_ssh_target, session_host_groups, session_kube_clusters,
-        CliTarget,
+        build_llm_client_from_profile, build_risk_scorer_for_launch, check_profile_api_key,
+        gui_launch_target_name, lookup_profile_api_key, prefetch_profile_keys, resolve_cli_target,
+        resolve_gui_ssh_target, session_host_groups, session_kube_clusters, CliTarget,
     };
 
     fn group(name: &str, tag: &str) -> filar_core::HostGroup {
@@ -1291,7 +1422,7 @@ mod tests {
             alias: String::new(),
             tags: Vec::new(),
         };
-        let target = resolve_gui_ssh_target(&conn);
+        let target = resolve_gui_ssh_target(&conn, None);
         assert_eq!(target.name, "SSH1", "empty alias → SSH{{slot+1}}");
         assert_eq!(
             filar_core::ssh_cred_name(conn.slot, &conn.alias),
@@ -1318,7 +1449,7 @@ mod tests {
             alias: "prod-web".into(),
             tags: vec!["prod".into(), "web".into()],
         };
-        let target = resolve_gui_ssh_target(&conn);
+        let target = resolve_gui_ssh_target(&conn, None);
         assert_eq!(target.name, "prod-web");
         assert_eq!(target.host, "example.com");
         assert_eq!(target.port, 2222);
@@ -1354,7 +1485,7 @@ mod tests {
             alias: "prod-web".into(),
             tags: Vec::new(),
         };
-        match resolve_gui_ssh_target(&conn).auth {
+        match resolve_gui_ssh_target(&conn, None).auth {
             filar_core::SshAuth::Key { path, passphrase } => {
                 assert_eq!(
                     path.as_deref(),
@@ -1366,12 +1497,12 @@ mod tests {
         }
         conn.key_path = None;
         assert!(matches!(
-            resolve_gui_ssh_target(&conn).auth,
+            resolve_gui_ssh_target(&conn, None).auth,
             filar_core::SshAuth::Key { path: None, .. }
         ));
         conn.auth = filar_gui::SlotAuth::Agent;
         assert!(matches!(
-            resolve_gui_ssh_target(&conn).auth,
+            resolve_gui_ssh_target(&conn, None).auth,
             filar_core::SshAuth::Agent
         ));
     }
@@ -1489,7 +1620,7 @@ mod tests {
             extra_body: None,
             compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         };
-        let result = build_llm_client_from_profile(&profile, &sp, 60);
+        let result = build_llm_client_from_profile(&profile, &sp, 60, false);
         assert!(result.is_ok(), "factory must succeed with a valid key");
     }
 
@@ -1507,7 +1638,7 @@ mod tests {
             extra_body: None,
             compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         };
-        let result = build_llm_client_from_profile(&profile, &sp, 60);
+        let result = build_llm_client_from_profile(&profile, &sp, 60, false);
         assert!(
             result.is_err(),
             "factory must fail when no key is available"
@@ -1528,7 +1659,7 @@ mod tests {
             extra_body: None,
             compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         };
-        let result = build_llm_client_from_profile(&profile, &sp, 60);
+        let result = build_llm_client_from_profile(&profile, &sp, 60, false);
         assert!(
             result.is_ok(),
             "empty key_env must create a keyless client without error"
@@ -1550,7 +1681,7 @@ mod tests {
             compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         };
         assert!(
-            check_profile_api_key(&profile, &sp).is_none(),
+            check_profile_api_key(&profile, &sp, false).is_none(),
             "key_checker must accept keyless profiles"
         );
     }
@@ -1569,7 +1700,7 @@ mod tests {
             extra_body: None,
             compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         };
-        let msg = check_profile_api_key(&profile, &sp);
+        let msg = check_profile_api_key(&profile, &sp, false);
         assert!(
             msg.is_some(),
             "key_checker must fail when required key is missing"
@@ -1596,7 +1727,7 @@ mod tests {
             compact_at_tokens: filar_core::DEFAULT_COMPACT_AT_TOKENS,
         };
         // Test 1: key is absent → error must NOT contain the test value.
-        let result = build_llm_client_from_profile(&profile, &sp, 60);
+        let result = build_llm_client_from_profile(&profile, &sp, 60, false);
         if let Err(ref e) = result {
             let msg = format!("{e}");
             assert!(
@@ -1610,7 +1741,7 @@ mod tests {
         }
         // Test 2: insert the key → factory must succeed (no error to check).
         sp.insert("LEAK_TEST_KEY", key_value);
-        let result2 = build_llm_client_from_profile(&profile, &sp, 60);
+        let result2 = build_llm_client_from_profile(&profile, &sp, 60, false);
         assert!(result2.is_ok(), "factory must succeed after inserting key");
     }
 
@@ -1868,5 +1999,156 @@ mod tests {
         );
         assert!(bad.active_risk_scorer().is_none());
         assert!(bad.risk_scorer_error.is_some());
+    }
+
+    // ── Secret provider chain wiring (#694) ────────────────────────────
+
+    /// A one-provider chain over an in-memory store, standing in for the
+    /// `[secret_provider]` chain in tests.
+    fn chain_of(pairs: &[(&str, &str)]) -> filar_core::ChainSecretProvider {
+        let store = StaticSecretProvider::new();
+        for (name, value) in pairs {
+            store.insert(*name, *value);
+        }
+        filar_core::ChainSecretProvider::new(
+            vec![std::sync::Arc::new(store)],
+            std::time::Duration::ZERO,
+        )
+        .expect("non-empty chain")
+    }
+
+    /// A provider that always fails, like a password-manager CLI that is
+    /// not installed.
+    struct FailingProvider;
+
+    impl SecretProvider for FailingProvider {
+        fn get(&self, _name: &str) -> filar_core::Result<String> {
+            Err(filar_core::CoreError::Other("op CLI not found".into()))
+        }
+        fn secret_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    fn keyed_profile(name: &str, key_env: &str) -> LlmProfile {
+        LlmProfile { key_env: key_env.into(), ..make_profile(name) }
+    }
+
+    /// Without a section the legacy order is unchanged: the real lookup
+    /// still falls back to the environment.
+    #[test]
+    fn without_a_section_the_legacy_lookup_still_reads_env() {
+        std::env::set_var("FILAR_TEST_694_LEGACY", "legacy-env-key");
+        let sp = StaticSecretProvider::new();
+        let profile = keyed_profile("legacy", "FILAR_TEST_694_LEGACY");
+        assert_eq!(
+            lookup_profile_api_key(&profile, &sp, false).as_deref(),
+            Some("legacy-env-key")
+        );
+        std::env::remove_var("FILAR_TEST_694_LEGACY");
+    }
+
+    /// In chain mode the loop reads memory only: an env var with the same
+    /// name is NOT consulted, a prefetched key is.
+    #[test]
+    fn chain_mode_reads_only_the_prefetched_memory() {
+        std::env::set_var("FILAR_TEST_694_CHAIN", "env-must-not-win");
+        let sp = StaticSecretProvider::new();
+        let profile = keyed_profile("cloud", "FILAR_TEST_694_CHAIN");
+        assert!(lookup_profile_api_key(&profile, &sp, true).is_none());
+        let msg = check_profile_api_key(&profile, &sp, true).expect("missing");
+        assert!(msg.contains("[secret_provider]"), "{msg}");
+        sp.insert("FILAR_TEST_694_CHAIN", "chain-key");
+        assert_eq!(
+            lookup_profile_api_key(&profile, &sp, true).as_deref(),
+            Some("chain-key")
+        );
+        assert!(check_profile_api_key(&profile, &sp, true).is_none());
+        std::env::remove_var("FILAR_TEST_694_CHAIN");
+    }
+
+    /// The start-up prefetch brings every profile's key into memory and
+    /// leaves keyless profiles and already-resolved keys alone.
+    #[test]
+    fn prefetch_brings_profile_keys_into_memory() {
+        let chain = chain_of(&[("PREFETCH_694_A", "a-key")]);
+        let sp = StaticSecretProvider::new();
+        sp.insert("PREFETCH_694_B", "already-there");
+        let profiles = vec![
+            keyed_profile("a", "PREFETCH_694_A"),
+            keyed_profile("b", "PREFETCH_694_B"),
+            make_profile("keyless"),
+        ];
+        let notes = prefetch_profile_keys(&chain, &sp, &profiles);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(sp.get("PREFETCH_694_A").unwrap(), "a-key");
+        assert_eq!(sp.get("PREFETCH_694_B").unwrap(), "already-there");
+    }
+
+    /// A provider error is a start-up note naming the profile, not a crash
+    /// and not a leaked value.
+    #[test]
+    fn a_failing_provider_is_a_note_not_a_crash() {
+        let chain = filar_core::ChainSecretProvider::new(
+            vec![std::sync::Arc::new(FailingProvider)],
+            std::time::Duration::ZERO,
+        )
+        .expect("non-empty chain");
+        let sp = StaticSecretProvider::new();
+        let profiles = vec![keyed_profile("broken", "MISSING_694_KEY")];
+        let notes = prefetch_profile_keys(&chain, &sp, &profiles);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("broken"), "{}", notes[0]);
+        assert!(notes[0].contains("not resolved"), "{}", notes[0]);
+        assert!(sp.get("MISSING_694_KEY").is_err());
+    }
+
+    /// The GUI SSH password comes from the chain when one is configured.
+    #[test]
+    fn gui_ssh_password_comes_from_the_chain() {
+        let chain = chain_of(&[("ssh_target:SSH1", "chain-pass")]);
+        let conn = filar_gui::SshConnection {
+            host: "10.0.0.1".into(),
+            port: 22,
+            user: "root".into(),
+            password: String::new(),
+            auth: filar_gui::SlotAuth::Password,
+            key_path: None,
+            slot: 0,
+            alias: String::new(),
+            tags: Vec::new(),
+        };
+        let target = resolve_gui_ssh_target(&conn, Some(&chain));
+        match target.auth {
+            filar_core::SshAuth::Password { password } => {
+                assert_eq!(password.as_deref(), Some("chain-pass"));
+            }
+            other => panic!("expected Password auth, got {other:?}"),
+        }
+    }
+
+    /// The risk scorer's key comes from the chain and is cached in `sp`
+    /// for output masking; a miss is a note, not a crash.
+    #[test]
+    fn risk_scorer_key_comes_from_the_chain() {
+        let chain = chain_of(&[("RS_694_KEY", "rs-chain-key")]);
+        let mut rs = risk_section("scorer-model");
+        rs.key_env = "RS_694_KEY".into();
+        let config = filar_core::Config { risk_scorer: Some(rs), ..Default::default() };
+        let sp = StaticSecretProvider::new();
+        let (scorer, _, note) = build_risk_scorer_for_launch(&config, &sp, Some(&chain));
+        assert!(scorer.is_some(), "note: {note:?}");
+        assert!(note.is_none());
+        assert_eq!(sp.get("RS_694_KEY").unwrap(), "rs-chain-key");
+
+        // A chain that cannot resolve the key: scorer off, clear note.
+        let empty = chain_of(&[]);
+        let sp2 = StaticSecretProvider::new();
+        let (scorer2, _, note2) = build_risk_scorer_for_launch(&config, &sp2, Some(&empty));
+        assert!(scorer2.is_none());
+        let note2 = note2.expect("a note");
+        assert!(note2.contains("[secret_provider]"), "{note2}");
+        assert!(note2.contains("RS_694_KEY"), "{note2}");
+        assert!(!note2.contains("rs-chain-key"), "{note2}");
     }
 }

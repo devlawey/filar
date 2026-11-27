@@ -578,6 +578,14 @@ pub struct TuiConfig {
     /// Shared between the TUI (for dynamic `$FILAR_SECRET_N` insertion via
     /// Ctrl+P) and the agent (via `SecretSubstitutingExecutor`).
     pub secret_provider: Arc<StaticSecretProvider>,
+    /// The `[secret_provider]` chain (#694), built once at start-up.
+    /// `Some` replaces the legacy keyring → env order at every resolution
+    /// point; `None` (no section) keeps it. Synchronous chain calls happen
+    /// only at start-up or in `spawn_blocking`, never in the event loop.
+    pub secret_chain: Option<Arc<dyn SecretProvider>>,
+    /// Shown once at start-up, one per profile whose key the chain could
+    /// not resolve (#694). Never contains a secret.
+    pub secret_provider_notes: Vec<String>,
     /// All configured LLM profiles loaded from config.
     pub profiles: Vec<filar_core::LlmProfile>,
     /// Name of the default (startup) profile.
@@ -1131,6 +1139,8 @@ struct PanelCtx {
     tx: tokio::sync::mpsc::UnboundedSender<PanelMsg>,
     command_timeout: Duration,
     host_groups: Vec<filar_core::HostGroup>,
+    /// The `[secret_provider]` chain (#694); `None` = legacy sources.
+    secret_chain: Option<Arc<dyn SecretProvider>>,
 }
 
 /// How a source is reached.
@@ -1430,8 +1440,9 @@ fn spawn_panel_open(
     let tx = ctx.tx.clone();
     let cfg = ssh_transport_config(ctx.command_timeout);
     let host_groups = ctx.host_groups.clone();
+    let chain = ctx.secret_chain.clone();
     tokio::spawn(async move {
-        let opened = open_panel_source(open, &cfg, &host_groups).await;
+        let opened = open_panel_source(open, &cfg, &host_groups, chain.as_ref()).await;
         let (conn, label, read_only) = match opened {
             PanelOpened::Ready {
                 conn,
@@ -1518,6 +1529,7 @@ async fn open_panel_source(
     open: PanelOpen,
     cfg: &SshTransportConfig,
     host_groups: &[filar_core::HostGroup],
+    chain: Option<&Arc<dyn SecretProvider>>,
 ) -> PanelOpened {
     let target = match open {
         PanelOpen::Local => {
@@ -1543,7 +1555,7 @@ async fn open_panel_source(
                 }
                 // Known host, but not its executor (e.g. a restored tab):
                 // a connection of the panel's own.
-                (None, Some(t)) => match fill_saved_secret(t).await {
+                (None, Some(t)) => match fill_saved_secret(t, chain).await {
                     Ok(SavedSecret::Ready(t)) => t,
                     Ok(SavedSecret::Missing(t)) => {
                         return PanelOpened::NeedSecret {
@@ -1556,7 +1568,7 @@ async fn open_panel_source(
                 _ => return PanelOpened::Failed("this tab is not on an SSH host".into()),
             }
         }
-        PanelOpen::Target(t) => match fill_saved_secret(t).await {
+        PanelOpen::Target(t) => match fill_saved_secret(t, chain).await {
             Ok(SavedSecret::Ready(t)) => t,
             Ok(SavedSecret::Missing(t)) => {
                 return PanelOpened::NeedSecret {
@@ -1582,13 +1594,13 @@ async fn open_panel_source(
             t
         }
     };
-    match filar_transport::SftpFileTransfer::connect(
-        &target,
-        cfg,
-        &filar_core::EnvSecretProvider::new(),
-    )
-    .await
-    {
+    // With a chain configured the secret was already filled through it
+    // above; an empty provider keeps the legacy env fallback from sneaking
+    // in (#694). Without a chain, env stays the fallback as before.
+    let no_fallback = filar_core::StaticSecretProvider::new();
+    let env = filar_core::EnvSecretProvider::new();
+    let secrets: &dyn SecretProvider = if chain.is_some() { &no_fallback } else { &env };
+    match filar_transport::SftpFileTransfer::connect(&target, cfg, secrets).await {
         Ok(sftp) => ready_sftp(sftp, &target, host_groups),
         Err(e) => PanelOpened::Failed(e.to_string()),
     }
@@ -1621,22 +1633,44 @@ enum SavedSecret {
 }
 
 /// Fill `target`'s secret the way Ctrl+O does — and the file panels (#535),
-/// which must connect exactly like it: a password from config, the OS
-/// credential store (`ssh_target:<name>`) or `SSH_PASSWORD`; an encrypted
-/// key's passphrase from the credential store or `SSH_KEY_PASSPHRASE` (#480).
-async fn fill_saved_secret(mut target: filar_core::SshTarget) -> Result<SavedSecret> {
+/// which must connect exactly like it: a password from config, the
+/// `[secret_provider]` chain when configured (#694), else the OS credential
+/// store (`ssh_target:<name>`) or `SSH_PASSWORD`; an encrypted key's
+/// passphrase from the same sources (#480). Provider calls run in
+/// `spawn_blocking`: a password-manager CLI may be spawned.
+async fn fill_saved_secret(
+    mut target: filar_core::SshTarget,
+    chain: Option<&Arc<dyn SecretProvider>>,
+) -> Result<SavedSecret> {
     if let filar_core::SshAuth::Password { ref password } = target.auth {
         let keyring_name = format!("ssh_target:{}", target.name);
-        let resolved = password
-            .clone()
-            .or_else(|| {
-                let kr = filar_core::KeyringSecretProvider::new();
-                kr.get(&keyring_name).ok().filter(|v| !v.is_empty())
-            })
-            .or_else(|| std::env::var("SSH_PASSWORD").ok().filter(|v| !v.is_empty()));
+        // An empty explicit password (`password = ""`) counts as missing,
+        // exactly like `resolve_ssh_password` at start-up.
+        let explicit = password.clone().filter(|p| !p.is_empty());
+        let had_explicit = explicit.is_some();
+        let resolved = match explicit {
+            Some(pw) => Some(pw),
+            None => {
+                let chain = chain.cloned();
+                tokio::task::spawn_blocking(move || match chain {
+                    Some(chain) => chain.get(&keyring_name).ok().filter(|v| !v.is_empty()),
+                    None => {
+                        let kr = filar_core::KeyringSecretProvider::new();
+                        kr.get(&keyring_name)
+                            .ok()
+                            .filter(|v| !v.is_empty())
+                            .or_else(|| {
+                                std::env::var("SSH_PASSWORD").ok().filter(|v| !v.is_empty())
+                            })
+                    }
+                })
+                .await
+                .map_err(|e| CoreError::Other(format!("secret lookup task failed: {e}")))?
+            }
+        };
         match resolved {
             Some(pw) => {
-                if password.is_some() {
+                if had_explicit {
                     warn!(target = %target.name, "password in config.toml for SSH target — consider moving to OS credential store");
                 }
                 target.auth = filar_core::SshAuth::Password { password: Some(pw) };
@@ -1646,11 +1680,19 @@ async fn fill_saved_secret(mut target: filar_core::SshTarget) -> Result<SavedSec
     }
     // An encrypted key: decrypting is blocking.
     if matches!(target.auth, filar_core::SshAuth::Key { .. }) {
+        let chain = chain.cloned();
         let (t, found) = tokio::task::spawn_blocking(move || {
-            let store = filar_core::KeyringSecretProvider::new();
-            let env = filar_core::EnvSecretProvider::new();
-            filar_transport::fill_key_passphrase(&mut target, &store, Some(&env))
-                .map(|found| (target, found))
+            let filled = match &chain {
+                Some(chain) => {
+                    filar_transport::fill_key_passphrase(&mut target, chain.as_ref(), None)
+                }
+                None => {
+                    let store = filar_core::KeyringSecretProvider::new();
+                    let env = filar_core::EnvSecretProvider::new();
+                    filar_transport::fill_key_passphrase(&mut target, &store, Some(&env))
+                }
+            };
+            filled.map(|found| (target, found))
         })
         .await
         .map_err(|e| CoreError::Other(format!("key check task failed: {e}")))??;
@@ -1660,6 +1702,32 @@ async fn fill_saved_secret(mut target: filar_core::SshTarget) -> Result<SavedSec
         target = t;
     }
     Ok(SavedSecret::Ready(target))
+}
+
+/// Prefetch every configured host's password and key passphrase through
+/// the `[secret_provider]` chain into an in-memory store (#694). Fleet
+/// entry (`App::enter_fleet`) resolves credentials synchronously inside
+/// the event loop, so the chain — which may spawn a password-manager CLI —
+/// is consulted here, once at start-up, off the runtime. A miss is left
+/// out: the fleet intro reports it per host.
+fn prefetch_host_secrets(
+    chain: &dyn SecretProvider,
+    targets: &[filar_core::SshTarget],
+) -> Arc<StaticSecretProvider> {
+    let store = StaticSecretProvider::new();
+    for target in targets {
+        for name in [
+            format!("ssh_target:{}", target.name),
+            filar_core::ssh_key_passphrase_name(&target.name),
+        ] {
+            match chain.get(&name) {
+                Ok(value) if !value.is_empty() => store.insert(&name, &value),
+                Ok(_) => {}
+                Err(e) => debug!(error = %e, name = %name, "no host secret in the chain"),
+            }
+        }
+    }
+    Arc::new(store)
 }
 
 /// Whether the passphrase typed for `target`'s encrypted key decrypts it
@@ -1831,6 +1899,8 @@ async fn run_app(
     // Read-only wrap decisions need the groups for every session swap (#419),
     // captured before the config is partially consumed below.
     let host_groups = config.host_groups.clone();
+    // The [secret_provider] chain (#694), captured before the partial moves.
+    let secret_chain = config.secret_chain.clone();
     let profiles_for_restore = std::mem::take(&mut config.profiles);
     let default_for_restore = std::mem::take(&mut config.default_profile_name);
     let has_history = !config.initial_messages.is_empty()
@@ -1888,7 +1958,20 @@ async fn run_app(
     // command substitution and output sanitisation.
     app.secrets = config.secret_provider.clone();
     // Fleet hosts' own passwords come from the OS credential store (#436).
-    app.credential_store = Arc::new(filar_core::KeyringSecretProvider::new());
+    // With a [secret_provider] chain (#694) they come from a one-time
+    // start-up prefetch of it instead: enter_fleet resolves credentials
+    // synchronously inside the event loop, where a chain call (a
+    // password-manager CLI) is forbidden.
+    app.credential_store = match &secret_chain {
+        Some(chain) => {
+            let chain = chain.clone();
+            let targets = config.ssh_targets.clone();
+            tokio::task::spawn_blocking(move || prefetch_host_secrets(&*chain, &targets))
+                .await
+                .map_err(|e| CoreError::Other(format!("secret prefetch task failed: {e}")))?
+        }
+        None => Arc::new(filar_core::KeyringSecretProvider::new()),
+    };
     app.runbook_enabled = config.save_runbook;
     app.risk_scorer_on = config.risk_scorer.is_some();
     app.risk_thresholds = config.risk_thresholds;
@@ -1896,6 +1979,9 @@ async fn run_app(
         app.push_message(ChatBlock::System(note));
     }
     for note in std::mem::take(&mut config.log_source_notes) {
+        app.push_message(ChatBlock::System(note));
+    }
+    for note in std::mem::take(&mut config.secret_provider_notes) {
         app.push_message(ChatBlock::System(note));
     }
     // Host groups are fleet entry points in Ctrl+O; `--group` opens the fleet
@@ -1946,6 +2032,7 @@ async fn run_app(
         tx: panel_tx.clone(),
         command_timeout,
         host_groups: host_groups.clone(),
+        secret_chain: secret_chain.clone(),
     };
 
     // Receiver for WARN/ERROR log lines mirrored into the chat.
@@ -3000,6 +3087,7 @@ async fn run_app(
                 continue;
             }
             let tx = agent_tx.clone();
+            let chain_for_swap = secret_chain.clone();
             let handle = tokio::spawn(async move {
                 tokio::select! {
                     _ = token.cancelled() => return,
@@ -3033,9 +3121,10 @@ async fn run_app(
                         return;
                     }
                     if let Some(t) = targets.get(idx - 1) {
-                        // Saved secrets first: config, OS credential store,
-                        // env (#480); ask only when none has it.
-                        let target = match fill_saved_secret(t.clone()).await {
+                        // Saved secrets first: config, the [secret_provider]
+                        // chain or the legacy store/env (#480, #694); ask
+                        // only when none has it.
+                        let target = match fill_saved_secret(t.clone(), chain_for_swap.as_ref()).await {
                             Ok(SavedSecret::Ready(target)) => target,
                             Ok(SavedSecret::Missing(target)) => {
                                 let _ = tx.send(TuiEvent::PasswordNeeded { session_id: sid, target });
@@ -6418,6 +6507,108 @@ mod tests {
         );
     }
 
+    /// #694: with a chain configured, the reconnect password comes from
+    /// it — the keyring and `SSH_PASSWORD` are not consulted.
+    #[tokio::test]
+    async fn fill_saved_secret_reads_the_chain() {
+        let store = StaticSecretProvider::new();
+        store.insert("ssh_target:web-694", "chain-pass");
+        let chain: Arc<dyn SecretProvider> = Arc::new(
+            filar_core::ChainSecretProvider::new(vec![Arc::new(store)], Duration::ZERO)
+                .expect("non-empty chain"),
+        );
+        let target = filar_core::SshTarget {
+            name: "web-694".into(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: filar_core::SshAuth::Password { password: None },
+            host_key_policy: Default::default(),
+            tags: Vec::new(),
+        };
+        let filled = fill_saved_secret(target, Some(&chain)).await.expect("lookup");
+        match filled {
+            SavedSecret::Ready(t) => match t.auth {
+                filar_core::SshAuth::Password { password } => {
+                    assert_eq!(password.as_deref(), Some("chain-pass"));
+                }
+                other => panic!("expected password auth, got {other:?}"),
+            },
+            SavedSecret::Missing(_) => panic!("the chain had the password"),
+        }
+    }
+
+    /// #694 review: an empty explicit password (`password = ""`) is missing,
+    /// not an override — the chain is consulted, like at start-up.
+    #[tokio::test]
+    async fn fill_saved_secret_treats_an_empty_explicit_password_as_missing() {
+        let store = StaticSecretProvider::new();
+        store.insert("ssh_target:web-694-empty", "chain-pass");
+        let chain: Arc<dyn SecretProvider> = Arc::new(store);
+        let target = filar_core::SshTarget {
+            name: "web-694-empty".into(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: filar_core::SshAuth::Password { password: Some(String::new()) },
+            host_key_policy: Default::default(),
+            tags: Vec::new(),
+        };
+        let filled = fill_saved_secret(target, Some(&chain)).await.expect("lookup");
+        match filled {
+            SavedSecret::Ready(t) => match t.auth {
+                filar_core::SshAuth::Password { password } => {
+                    assert_eq!(password.as_deref(), Some("chain-pass"));
+                }
+                other => panic!("expected password auth, got {other:?}"),
+            },
+            SavedSecret::Missing(_) => panic!("the chain had the password"),
+        }
+    }
+
+    /// #694: an empty chain is a miss, not a fallback to `SSH_PASSWORD`
+    /// (whether or not the variable happens to be set in the environment).
+    #[tokio::test]
+    async fn fill_saved_secret_with_an_empty_chain_does_not_read_env() {
+        let chain: Arc<dyn SecretProvider> = Arc::new(StaticSecretProvider::new());
+        let target = filar_core::SshTarget {
+            name: "web-694-none".into(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: filar_core::SshAuth::Password { password: None },
+            host_key_policy: Default::default(),
+            tags: Vec::new(),
+        };
+        let filled = fill_saved_secret(target, Some(&chain)).await.expect("lookup");
+        assert!(matches!(filled, SavedSecret::Missing(_)));
+    }
+
+    /// #694: the fleet store is prefetched through the chain at start-up;
+    /// a host the chain does not know stays out (the fleet intro reports it).
+    #[test]
+    fn prefetch_host_secrets_fills_the_fleet_store() {
+        let store = StaticSecretProvider::new();
+        store.insert("ssh_target:web-1", "pw-1");
+        store.insert("ssh_key_passphrase:web-2", "pp-2");
+        let chain = filar_core::ChainSecretProvider::new(vec![Arc::new(store)], Duration::ZERO)
+            .expect("non-empty chain");
+        let target = |name: &str| filar_core::SshTarget {
+            name: name.into(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: filar_core::SshAuth::Password { password: None },
+            host_key_policy: Default::default(),
+            tags: Vec::new(),
+        };
+        let targets = vec![target("web-1"), target("web-2"), target("web-3")];
+        let prefetched = prefetch_host_secrets(&chain, &targets);
+        assert_eq!(prefetched.get("ssh_target:web-1").unwrap(), "pw-1");
+        assert_eq!(prefetched.get("ssh_key_passphrase:web-2").unwrap(), "pp-2");
+        assert!(prefetched.get("ssh_target:web-3").is_err());
+    }
+
     /// A `TuiConfig` with one `glm` profile served by `llm`, for tests that
     /// exercise the runner's own wiring (never `run_app` itself).
     fn test_tui_config(
@@ -6447,6 +6638,8 @@ mod tests {
             initial_ssh_info: None,
             is_local: true,
             secret_provider,
+            secret_chain: None,
+            secret_provider_notes: Vec::new(),
             profiles: vec![filar_core::LlmProfile {
                 name: "glm".into(),
                 model: "glm-5.1".into(),

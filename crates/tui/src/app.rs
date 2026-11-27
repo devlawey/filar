@@ -683,7 +683,9 @@ pub struct App {
     /// Shared secret provider: $FILAR_SECRET_N → actual value.
     pub secrets: Arc<StaticSecretProvider>,
     /// Where fleet hosts' passwords are looked up on entry (#436): the OS
-    /// credential store in the app, an in-memory store in tests.
+    /// credential store in the app, an in-memory store in tests. With a
+    /// `[secret_provider]` chain (#694) the runner prefetches the chain
+    /// into an in-memory store at start-up, so entry stays synchronous.
     pub credential_store: Arc<dyn filar_core::SecretProvider>,
     /// Pending SSH connection: (user, host, port) parsed from `!ssh user@host`.
     pub pending_ssh: Option<(String, String, u16)>,
