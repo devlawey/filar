@@ -4229,10 +4229,12 @@ impl LauncherApp {
             ui.horizontal(|ui| {
                 ui.label(format!("{}.", i + 1));
                 ui.label(kind.as_str());
-                if ui.add_enabled(i > 0, egui::Button::new("↑")).clicked() {
+                // ASCII captions: egui's default fonts lack U+2191/U+2193,
+                // so arrows rendered as tofu boxes (#738).
+                if ui.add_enabled(i > 0, egui::Button::new("Up")).clicked() {
                     move_up = Some(i);
                 }
-                if ui.add_enabled(i + 1 < d.order.len(), egui::Button::new("↓")).clicked() {
+                if ui.add_enabled(i + 1 < d.order.len(), egui::Button::new("Down")).clicked() {
                     move_down = Some(i);
                 }
                 if ui.button("Remove").clicked() {
