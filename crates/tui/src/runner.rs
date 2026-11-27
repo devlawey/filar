@@ -1644,7 +1644,11 @@ async fn fill_saved_secret(
 ) -> Result<SavedSecret> {
     if let filar_core::SshAuth::Password { ref password } = target.auth {
         let keyring_name = format!("ssh_target:{}", target.name);
-        let resolved = match password.clone() {
+        // An empty explicit password (`password = ""`) counts as missing,
+        // exactly like `resolve_ssh_password` at start-up.
+        let explicit = password.clone().filter(|p| !p.is_empty());
+        let had_explicit = explicit.is_some();
+        let resolved = match explicit {
             Some(pw) => Some(pw),
             None => {
                 let chain = chain.cloned();
@@ -1666,7 +1670,7 @@ async fn fill_saved_secret(
         };
         match resolved {
             Some(pw) => {
-                if password.is_some() {
+                if had_explicit {
                     warn!(target = %target.name, "password in config.toml for SSH target — consider moving to OS credential store");
                 }
                 target.auth = filar_core::SshAuth::Password { password: Some(pw) };
@@ -6519,6 +6523,34 @@ mod tests {
             port: 22,
             user: "u".into(),
             auth: filar_core::SshAuth::Password { password: None },
+            host_key_policy: Default::default(),
+            tags: Vec::new(),
+        };
+        let filled = fill_saved_secret(target, Some(&chain)).await.expect("lookup");
+        match filled {
+            SavedSecret::Ready(t) => match t.auth {
+                filar_core::SshAuth::Password { password } => {
+                    assert_eq!(password.as_deref(), Some("chain-pass"));
+                }
+                other => panic!("expected password auth, got {other:?}"),
+            },
+            SavedSecret::Missing(_) => panic!("the chain had the password"),
+        }
+    }
+
+    /// #694 review: an empty explicit password (`password = ""`) is missing,
+    /// not an override — the chain is consulted, like at start-up.
+    #[tokio::test]
+    async fn fill_saved_secret_treats_an_empty_explicit_password_as_missing() {
+        let store = StaticSecretProvider::new();
+        store.insert("ssh_target:web-694-empty", "chain-pass");
+        let chain: Arc<dyn SecretProvider> = Arc::new(store);
+        let target = filar_core::SshTarget {
+            name: "web-694-empty".into(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: filar_core::SshAuth::Password { password: Some(String::new()) },
             host_key_policy: Default::default(),
             tags: Vec::new(),
         };

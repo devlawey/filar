@@ -13729,4 +13729,12 @@ App 62, tui 925, workspace зелёные; `cargo build --release` зелёны�
 сообщение «chain did not resolve ssh_target:…». Реальный менеджерский CLI +
 живой sshd — ручная проверка (нет docker/op/bw/keepassxc в окружении).
 
+**Ревью (раунд 1).** Принято от CodeRabbit: пустой явный `password = ""`
+в `fill_saved_secret` теперь считается отсутствующим (как в
+`resolve_ssh_password`) и не пропускает chain; итоговая ошибка
+`ChainSecretProvider::get` сохраняет санитизированные причины отказа
+провайдеров (без значений), пустой ответ по-прежнему miss. По тесту на
+каждую правку; core 299, tui 926. ai-review первого прогона отменён по
+таймауту без комментариев — перезапущен push'ем.
+
 **Next:** #695 (GUI-лаунчер: карточка Secret provider).

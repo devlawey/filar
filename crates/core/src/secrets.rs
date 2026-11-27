@@ -613,9 +613,12 @@ impl SecretProvider for ChainSecretProvider {
 
         // Resolve without holding the lock: a slow provider must not block
         // other lookups, and a provider may itself consult the chain.
+        // Provider errors are already sanitized (no value, no raw stderr);
+        // keep them so a total failure can name what went wrong (#694).
+        let mut failures: Vec<String> = Vec::new();
         for provider in &self.providers {
-            if let Ok(value) = provider.get(name) {
-                if !value.is_empty() {
+            match provider.get(name) {
+                Ok(value) if !value.is_empty() => {
                     if !self.ttl.is_zero() {
                         // An unrepresentable deadline (e.g. `Duration::MAX`)
                         // must not panic under the lock: skip caching and
@@ -635,12 +638,23 @@ impl SecretProvider for ChainSecretProvider {
                     }
                     return Ok(value);
                 }
+                // An empty answer is a miss: fall through to the next link.
+                Ok(_) => {}
+                Err(e) => failures.push(e.to_string()),
             }
         }
+        if failures.is_empty() {
+            return Err(CoreError::Secret(format!(
+                "{} not resolved by any of the {} secret providers",
+                redact(name),
+                self.providers.len()
+            )));
+        }
         Err(CoreError::Secret(format!(
-            "{} not resolved by any of the {} secret providers",
+            "{} not resolved by any of the {} secret providers: {}",
             redact(name),
-            self.providers.len()
+            self.providers.len(),
+            failures.join("; ")
         )))
     }
 
@@ -1974,6 +1988,23 @@ mod tests {
         let msg = format!("{err}");
         assert!(!msg.contains("sk-or-v1-super-secret-value"), "leak: {msg}");
         assert!(msg.contains("sk-o"), "redacted prefix expected: {msg}");
+    }
+
+    /// #736 review: a total failure keeps the sanitized provider causes,
+    /// so start-up callers can report what went wrong; a later link still
+    /// wins over an earlier failure.
+    #[test]
+    fn chain_total_failure_keeps_provider_causes() {
+        let c = chain(vec![Arc::new(EnvSecretProvider::new())], 0);
+        let err = c.get("FILAR_TEST_CHAIN_694_ABSENT").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not set or empty"), "provider cause lost: {msg}");
+        assert!(msg.contains("not resolved by any"), "{msg}");
+
+        let second = StaticSecretProvider::new();
+        second.insert("FILAR_TEST_CHAIN_694_ABSENT", "from-second");
+        let c = chain(vec![Arc::new(EnvSecretProvider::new()), Arc::new(second)], 0);
+        assert_eq!(c.get("FILAR_TEST_CHAIN_694_ABSENT").unwrap(), "from-second");
     }
 
     #[test]
