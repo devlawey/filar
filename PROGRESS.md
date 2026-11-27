@@ -13590,3 +13590,51 @@ stdbuf/python3); буферы CLI-вывода получили фиксиров
 дедлайном ожидание обоих читателей уже есть перед проверкой overflow.
 
 **Next:** #692 (провайдер Bitwarden CLI).
+
+## #692 — провайдер Bitwarden CLI (bw get)
+
+**Сделано.** `BitwardenProvider` (`secrets.rs`): `bw status` проверяет
+состояние vault (locked → «vault locked: выполните bw unlock»,
+unauthenticated → подсказка 'bw login', без интерактивного ввода), затем
+`bw get password <id>` с таймаутом (дефолт 30с). Маппинг имён через
+`[secret_provider.bitwarden.items]`; немапленное имя — промах. `BW_SESSION`
+берётся из env или OS credential store (service `filar`, name `BW_SESSION`),
+не из config; передаётся только дочернему процессу и zeroize-ится после
+вызова. `run_secret_cli` получил env-вариант (`run_secret_cli_with_env`),
+сигнатура прежнего не изменилась. Piped `bw get password` не добавляет
+свой перевод строки — stdout возвращается verbatim, хвостовой newline
+самого пароля сохраняется.
+`from_config` собирает звено `bitwarden`; `keepassxc` — «not available yet»
+(#693). Ошибки — имя провайдера и item id, без значения и сырого stderr;
+буферы zeroize, кэш в Chain, Debug — только counts.
+
+**Тесты.** Заглушки CLI: успешное чтение, stored-newline, locked,
+unauthenticated, not found, таймаут, передача BW_SESSION дочернему процессу,
+отсутствие CLI, Debug/secret_names/промах, chain из конфига; интеграция с
+реальным `bw` — `#[ignore]`, ручная.
+
+**Ревью (раунд 1).** Принято от ai-review: RAII-guard очистки `BW_SESSION`
+в env-тесте (убирает переменную и при панике); явная проверка, что
+`bw status` вернул JSON-объект, с точным сообщением ошибки;
+`tracing::debug!` о недоступности keyring (без значений). Отклонено:
+`serial_test`/`with_session` против «гонки» — BW_SESSION трогает только
+этот тест; «env не zeroize-ится» — `get()` затирает session независимо от
+источника; «\r без \n» — bw добавляет `\n`, а trim_end_matches съел бы
+хвостовые переводы строки самого пароля. CodeRabbit в этом раунде
+упёрся в лимит ревью.
+
+**Ревью (раунд 2).** Принято замечание об UB конкурентного доступа к env:
+env-тест переписан без мутации окружения процесса — сессия инжектится через
+тестовый `with_session` (`#[cfg(test)] session_override`), RAII-guard и
+`set_var` удалены; замечание о порядке guard/`set_var` закрыто тем же
+переписыванием. Отклонено: «нет строки CHANGELOG» в сводке ai-review —
+строка #692 присутствует в PR. Core 284, workspace зелёные.
+
+**Ревью (раунд 3).** Принято замечание CodeRabbit: piped `bw get password`
+не добавляет свой newline (`writeLn(out, true)` в base-program.ts /
+utils.ts cli-v2026.9.1 — на non-TTY финальная строка пишется без `\n`),
+поэтому strip убран — значение возвращается verbatim; заглушки и тесты
+поправлены (newline-item — это хвост самого пароля). Верифицировано по
+исходникам bw. Ai-review этого раунда завершился по таймауту (cancelled).
+
+**Next:** #693 (провайдер KeePassXC).

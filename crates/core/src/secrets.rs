@@ -538,12 +538,12 @@ impl ChainSecretProvider {
 
     /// Build the chain described by `[secret_provider]` (#690).
     ///
-    /// `keyring`, `env` and `onepassword` map to [`KeyringSecretProvider`],
-    /// [`EnvSecretProvider`] and [`OnePasswordProvider`]; the remaining
-    /// password-manager kinds are recognised by validation but their
-    /// providers land with the follow-up issues of milestone 3.1.0 — until
-    /// then naming one fails with a clear error instead of silently
-    /// skipping it.
+    /// `keyring`, `env`, `onepassword` and `bitwarden` map to
+    /// [`KeyringSecretProvider`], [`EnvSecretProvider`],
+    /// [`OnePasswordProvider`] and [`BitwardenProvider`]; the remaining
+    /// password-manager kind is recognised by validation but its provider
+    /// lands with the follow-up issues of milestone 3.1.0 — until then
+    /// naming one fails with a clear error instead of silently skipping it.
     pub fn from_config(cfg: &crate::config::SecretProviderConfig) -> Result<Self> {
         cfg.validate()?;
         let mut providers: Vec<Arc<dyn SecretProvider>> = Vec::new();
@@ -556,6 +556,9 @@ impl ChainSecretProvider {
                 crate::config::SecretProviderKind::Env => Arc::new(EnvSecretProvider::new()),
                 crate::config::SecretProviderKind::OnePassword => {
                     Arc::new(OnePasswordProvider::new(cfg.onepassword.items.clone()))
+                }
+                crate::config::SecretProviderKind::Bitwarden => {
+                    Arc::new(BitwardenProvider::new(cfg.bitwarden.items.clone()))
                 }
                 other => {
                     return Err(CoreError::Config(format!(
@@ -799,6 +802,22 @@ fn run_secret_cli(
     reference: &str,
     classify: impl Fn(&str) -> Option<&'static str>,
 ) -> Result<String> {
+    run_secret_cli_with_env(cli, args, timeout, provider, reference, classify, &[])
+}
+
+/// [`run_secret_cli`] with extra environment for the child only (e.g. the
+/// Bitwarden session key `BW_SESSION`, #692). The values come from env or
+/// the OS credential store at the call site; they never enter the config,
+/// the logs or the error messages.
+fn run_secret_cli_with_env(
+    cli: &str,
+    args: &[&str],
+    timeout: Duration,
+    provider: &str,
+    reference: &str,
+    classify: impl Fn(&str) -> Option<&'static str>,
+    env: &[(&str, &str)],
+) -> Result<String> {
     use std::process::{Command, Stdio};
 
     // An unrepresentable deadline must fail before the child starts:
@@ -809,6 +828,7 @@ fn run_secret_cli(
 
     let mut child = Command::new(cli)
         .args(args)
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1029,6 +1049,204 @@ impl std::fmt::Debug for OnePasswordProvider {
             .field("items", &self.items.len())
             .field("timeout_secs", &self.timeout.as_secs())
             .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BitwardenProvider
+// ---------------------------------------------------------------------------
+
+/// [`SecretProvider`] backed by the local Bitwarden CLI (`bw`, #692).
+///
+/// Logical names map to Bitwarden item ids via
+/// `[secret_provider.bitwarden.items]`; a value is read with
+/// `bw get password <id>`. The vault state is checked with `bw status`
+/// first: a locked vault fails with «vault locked: выполните bw unlock»,
+/// an unauthenticated one with a 'bw login' hint — never an interactive
+/// prompt inside the TUI loop.
+///
+/// The session key `BW_SESSION` is taken from the process environment or
+/// the OS credential store (service `filar`, name `BW_SESSION`) — never
+/// from `config.toml` — and passed to the child process only.
+///
+/// `bw get password` writes the value verbatim when stdout is piped (the
+/// CLI's `writeLn` skips its own newline for a final line on a non-TTY),
+/// so the captured stdout is returned unchanged — a stored password that
+/// ends with a line break keeps it.
+///
+/// Errors name the provider and the item id, never a value and never the
+/// raw stderr. Value buffers are zeroized; caching lives in
+/// [`ChainSecretProvider`]. The trait is synchronous: async callers must
+/// use `tokio::task::spawn_blocking`.
+pub struct BitwardenProvider {
+    items: HashMap<String, String>,
+    cli: String,
+    timeout: Duration,
+    #[cfg(test)]
+    session_override: Option<String>,
+}
+
+impl BitwardenProvider {
+    /// Create a provider from the logical-name → item-id mapping. Uses the
+    /// `bw` binary from `PATH` and [`DEFAULT_SECRET_CLI_TIMEOUT_SECS`].
+    pub fn new(items: HashMap<String, String>) -> Self {
+        Self {
+            items,
+            cli: "bw".to_string(),
+            timeout: Duration::from_secs(DEFAULT_SECRET_CLI_TIMEOUT_SECS),
+            #[cfg(test)]
+            session_override: None,
+        }
+    }
+
+    /// Override the CLI path (tests use a stub script).
+    pub fn with_cli_path(mut self, path: impl Into<String>) -> Self {
+        self.cli = path.into();
+        self
+    }
+
+    /// Override the per-invocation timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Test-only: inject the session key directly so a test can verify the
+    /// session reaches the child without mutating the process environment
+    /// (parallel tests share it, and concurrent env access is unsound).
+    #[cfg(test)]
+    fn with_session(mut self, session: impl Into<String>) -> Self {
+        self.session_override = Some(session.into());
+        self
+    }
+
+    /// Check the vault state, then read the item. Split out of `get` so the
+    /// session key is zeroized on every exit path.
+    fn read_with_status(&self, reference: &str, env: &[(&str, &str)]) -> Result<String> {
+        let mut status_out = run_secret_cli_with_env(
+            &self.cli,
+            &["status"],
+            self.timeout,
+            "bitwarden",
+            reference,
+            classify_bw_stderr,
+            env,
+        )?;
+        let state = serde_json::from_str::<serde_json::Value>(&status_out)
+            .ok()
+            .filter(|v| v.is_object())
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string));
+        status_out.zeroize();
+        match state.as_deref() {
+            Some("unlocked") => {}
+            Some("locked") => {
+                return Err(CoreError::Secret(format!(
+                    "bitwarden: vault locked: выполните bw unlock (item {reference})"
+                )));
+            }
+            Some("unauthenticated") => {
+                return Err(CoreError::Secret(format!(
+                    "bitwarden: not logged in — run 'bw login' (item {reference})"
+                )));
+            }
+            _ => {
+                return Err(CoreError::Other(format!(
+                    "bitwarden: unexpected 'bw status' output — expected a JSON object with a 'status' field (item {reference})"
+                )));
+            }
+        }
+        let value = run_secret_cli_with_env(
+            &self.cli,
+            &["get", "password", reference],
+            self.timeout,
+            "bitwarden",
+            reference,
+            classify_bw_stderr,
+            env,
+        )?;
+        // Piped `bw get password` adds no newline of its own: return the
+        // value verbatim, including any stored terminal line break.
+        Ok(value)
+    }
+}
+
+impl SecretProvider for BitwardenProvider {
+    fn get(&self, name: &str) -> Result<String> {
+        let reference = self.items.get(name).ok_or_else(|| {
+            CoreError::Secret(format!("bitwarden: no bw item mapping for {}", redact(name)))
+        })?;
+        #[cfg(test)]
+        let mut session = self.session_override.clone().or_else(resolve_bw_session);
+        #[cfg(not(test))]
+        let mut session = resolve_bw_session();
+        let env: Vec<(&str, &str)> = session
+            .as_deref()
+            .map(|s| vec![("BW_SESSION", s)])
+            .unwrap_or_default();
+        let result = self.read_with_status(reference, &env);
+        if let Some(s) = session.as_mut() {
+            s.zeroize();
+        }
+        result
+    }
+
+    fn secret_names(&self) -> Vec<String> {
+        self.items.keys().cloned().collect()
+    }
+}
+
+/// Counts only — the provider holds no values, but keep the log line lean.
+impl std::fmt::Debug for BitwardenProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BitwardenProvider")
+            .field("items", &self.items.len())
+            .field("timeout_secs", &self.timeout.as_secs())
+            .finish()
+    }
+}
+
+/// Resolve `BW_SESSION` from the environment or the OS credential store —
+/// never from the config (#692). A keyring failure means "no session", not
+/// an error: `bw status` reports the vault state either way. The caller
+/// zeroizes the returned value; the OS environment block itself cannot be
+/// wiped, which is inherent to env-based secrets.
+fn resolve_bw_session() -> Option<String> {
+    if let Ok(v) = std::env::var("BW_SESSION") {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    let entry = match keyring::Entry::new("filar", "BW_SESSION") {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!("bitwarden: OS credential store unavailable for BW_SESSION: {e}");
+            return None;
+        }
+    };
+    match entry.get_password() {
+        Ok(v) if !v.is_empty() => Some(v),
+        Ok(_) => None,
+        Err(keyring::Error::NoEntry) => None,
+        Err(e) => {
+            tracing::debug!(
+                "bitwarden: could not read BW_SESSION from the OS credential store: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// Classify `bw` stderr into a short hint; the raw text never reaches the
+/// error message. Matches the lowercased stderr.
+fn classify_bw_stderr(stderr: &str) -> Option<&'static str> {
+    if stderr.contains("locked") {
+        Some("vault locked: выполните bw unlock")
+    } else if stderr.contains("not logged in") || stderr.contains("unauthenticated") {
+        Some("not logged in — run 'bw login'")
+    } else if stderr.contains("not found") {
+        Some("item not found")
+    } else {
+        None
     }
 }
 
@@ -1526,15 +1744,15 @@ mod tests {
 
     #[test]
     fn chain_from_config_manager_kind_not_available_yet() {
-        // The remaining manager providers land with the follow-up issues of
+        // The remaining manager provider lands with the follow-up issues of
         // 3.1.0; until then the error names the kind instead of skipping it.
         let cfg = crate::config::SecretProviderConfig {
-            order: vec!["bitwarden".into()],
+            order: vec!["keepassxc".into()],
             ..Default::default()
         };
         let err = ChainSecretProvider::from_config(&cfg).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("bitwarden"), "{msg}");
+        assert!(msg.contains("keepassxc"), "{msg}");
         assert!(msg.contains("not available yet"), "{msg}");
     }
 
@@ -1982,6 +2200,249 @@ mod tests {
         let reference = std::env::var("FILAR_TEST_OP_REFERENCE")
             .expect("set FILAR_TEST_OP_REFERENCE to an op:// reference");
         let p = OnePasswordProvider::new(op_items(&reference));
+        let value = p.get("FILAR_LLM_API_KEY").unwrap();
+        assert!(!value.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // BitwardenProvider (#692)
+    // -----------------------------------------------------------------------
+
+    fn bw_items(id: &str) -> HashMap<String, String> {
+        let mut items = HashMap::new();
+        items.insert("FILAR_LLM_API_KEY".to_string(), id.to_string());
+        items
+    }
+
+    /// Stub `bw`: `status` reports an unlocked vault; `get password <id>`
+    /// prints the value verbatim, like the real CLI on a pipe. The id
+    /// "missing-item" selects the not-found branch, "newline-item" a stored
+    /// value that itself ends with a line break.
+    fn bw_stub(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        let body = concat!(
+            "@echo off\r\n",
+            "if \"%1\"==\"status\" (\r\n",
+            "  <nul set /p={\"status\":\"unlocked\"}\r\n",
+            "  exit /b 0\r\n",
+            ")\r\n",
+            "if \"%3\"==\"missing-item\" (\r\n",
+            "  echo Not found. 1>&2\r\n",
+            "  exit /b 1\r\n",
+            ")\r\n",
+            "<nul set /p=bw-secret-value\r\n",
+            "if \"%3\"==\"newline-item\" echo.\r\n",
+            "exit /b 0\r\n",
+        );
+        #[cfg(not(windows))]
+        let body = concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"status\" ]; then\n",
+            "  printf '{\"status\":\"unlocked\"}'\n",
+            "  exit 0\n",
+            "fi\n",
+            "if [ \"$3\" = \"missing-item\" ]; then\n",
+            "  echo \"Not found.\" >&2\n",
+            "  exit 1\n",
+            "fi\n",
+            "printf 'bw-secret-value'\n",
+            "if [ \"$3\" = \"newline-item\" ]; then printf '\\n'; fi\n",
+        );
+        write_stub(dir, "bw", body)
+    }
+
+    /// Stub `bw` with a vault in the given state ("locked" or
+    /// "unauthenticated"); `get` fails on stderr like the real CLI.
+    fn bw_state_stub(dir: &std::path::Path, state: &str) -> std::path::PathBuf {
+        #[cfg(windows)]
+        let body = format!(
+            "@echo off\r\nif \"%1\"==\"status\" (\r\n  <nul set /p={{\"status\":\"{state}\"}}\r\n  exit /b 0\r\n)\r\necho Vault is locked. marker-stderr-xyz 1>&2\r\nexit /b 1\r\n"
+        );
+        #[cfg(not(windows))]
+        let body = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"status\" ]; then\n  printf '{{\"status\":\"{state}\"}}'\n  exit 0\nfi\necho \"Vault is locked. marker-stderr-xyz\" >&2\nexit 1\n"
+        );
+        write_stub(dir, "bw-state", &body)
+    }
+
+    #[test]
+    fn bw_provider_reads_value_via_cli_stub() {
+        let dir = op_stub_dir("bw-read");
+        let stub = bw_stub(&dir);
+        let p = BitwardenProvider::new(bw_items("api-key-item"))
+            .with_cli_path(stub.to_str().unwrap());
+        // Piped bw adds no newline: stdout is returned verbatim.
+        assert_eq!(p.get("FILAR_LLM_API_KEY").unwrap(), "bw-secret-value");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bw_provider_preserves_a_stored_terminal_newline() {
+        let dir = op_stub_dir("bw-newline");
+        let stub = bw_stub(&dir);
+        let p = BitwardenProvider::new(bw_items("newline-item"))
+            .with_cli_path(stub.to_str().unwrap());
+        // The stored terminal line break is part of the value and survives.
+        #[cfg(windows)]
+        let expected = "bw-secret-value\r\n";
+        #[cfg(not(windows))]
+        let expected = "bw-secret-value\n";
+        assert_eq!(p.get("FILAR_LLM_API_KEY").unwrap(), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bw_provider_locked_vault_error_names_provider_and_item() {
+        let dir = op_stub_dir("bw-locked");
+        let stub = bw_state_stub(&dir, "locked");
+        let p = BitwardenProvider::new(bw_items("api-key-item"))
+            .with_cli_path(stub.to_str().unwrap());
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("bitwarden"), "{msg}");
+        assert!(msg.contains("api-key-item"), "{msg}");
+        assert!(msg.contains("vault locked"), "{msg}");
+        assert!(msg.contains("bw unlock"), "{msg}");
+        // The raw stderr never reaches the error.
+        assert!(!msg.contains("marker-stderr-xyz"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bw_provider_unauthenticated_error_points_to_bw_login() {
+        let dir = op_stub_dir("bw-unauth");
+        let stub = bw_state_stub(&dir, "unauthenticated");
+        let p = BitwardenProvider::new(bw_items("api-key-item"))
+            .with_cli_path(stub.to_str().unwrap());
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("bitwarden"), "{msg}");
+        assert!(msg.contains("bw login"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bw_provider_missing_item_error() {
+        let dir = op_stub_dir("bw-missing");
+        let stub = bw_stub(&dir);
+        let p = BitwardenProvider::new(bw_items("missing-item"))
+            .with_cli_path(stub.to_str().unwrap());
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("bitwarden"), "{msg}");
+        assert!(msg.contains("missing-item"), "{msg}");
+        assert!(msg.contains("not found"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bw_provider_timeout_kills_the_cli() {
+        let dir = op_stub_dir("bw-slow");
+        #[cfg(windows)]
+        let body = "@echo off\r\nping -n 30 127.0.0.1 >nul\r\nexit /b 0\r\n";
+        #[cfg(not(windows))]
+        let body = "#!/bin/sh\nsleep 30\n";
+        let stub = write_stub(&dir, "bw-slow", body);
+        let p = BitwardenProvider::new(bw_items("api-key-item"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "timeout not enforced");
+        let msg = format!("{err}");
+        assert!(msg.contains("timed out"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bw_provider_passes_session_to_the_cli_child() {
+        // The stub echoes BW_SESSION back: the session must reach the child
+        // through its environment, not from any config field. The key is
+        // injected test-only — the process environment is never mutated,
+        // so parallel tests cannot race on it (#734 review).
+        let dir = op_stub_dir("bw-session");
+        #[cfg(windows)]
+        let body = concat!(
+            "@echo off\r\n",
+            "if \"%1\"==\"status\" (\r\n",
+            "  <nul set /p={\"status\":\"unlocked\"}\r\n",
+            "  exit /b 0\r\n",
+            ")\r\n",
+            "<nul set /p=%BW_SESSION%\r\n",
+            "exit /b 0\r\n",
+        );
+        #[cfg(not(windows))]
+        let body = concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"status\" ]; then\n",
+            "  printf '{\"status\":\"unlocked\"}'\n",
+            "  exit 0\n",
+            "fi\n",
+            "printf '%s' \"$BW_SESSION\"\n",
+        );
+        let stub = write_stub(&dir, "bw-session", body);
+        let p = BitwardenProvider::new(bw_items("api-key-item"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_session("test-bw-session-42");
+        let value = p.get("FILAR_LLM_API_KEY").unwrap();
+        assert_eq!(value, "test-bw-session-42");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bw_provider_unmapped_name_is_a_miss() {
+        let p = BitwardenProvider::new(bw_items("api-key-item"));
+        let err = p.get("ssh_target:other").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("bitwarden"), "{msg}");
+        assert!(msg.contains("no bw item mapping"), "{msg}");
+    }
+
+    #[test]
+    fn bw_provider_missing_cli_is_a_clear_error() {
+        let p = BitwardenProvider::new(bw_items("api-key-item"))
+            .with_cli_path("filar-nonexistent-bw-cli-992");
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("bitwarden"), "{msg}");
+        assert!(msg.contains("not found"), "{msg}");
+    }
+
+    #[test]
+    fn bw_provider_debug_carries_no_values_or_references() {
+        let p = BitwardenProvider::new(bw_items("api-key-item"));
+        let dbg = format!("{p:?}");
+        assert!(dbg.contains("BitwardenProvider"), "{dbg}");
+        assert!(dbg.contains("items: 1"), "{dbg}");
+        assert!(!dbg.contains("api-key-item"), "{dbg}");
+    }
+
+    #[test]
+    fn bw_provider_secret_names_lists_the_mapping() {
+        let p = BitwardenProvider::new(bw_items("api-key-item"));
+        assert_eq!(p.secret_names(), vec!["FILAR_LLM_API_KEY".to_string()]);
+    }
+
+    #[test]
+    fn chain_from_config_builds_bitwarden() {
+        let mut cfg = crate::config::SecretProviderConfig {
+            order: vec!["bitwarden".into()],
+            ..Default::default()
+        };
+        cfg.bitwarden.items = bw_items("api-key-item");
+        // Building the chain must not spawn the CLI.
+        let c = ChainSecretProvider::from_config(&cfg).unwrap();
+        let dbg = format!("{c:?}");
+        assert!(dbg.contains("providers: 1"), "{dbg}");
+        assert!(c.secret_names().contains(&"FILAR_LLM_API_KEY".to_string()));
+    }
+
+    #[test]
+    #[ignore = "needs Bitwarden CLI (bw) with an unlocked vault; set FILAR_TEST_BW_ITEM"]
+    fn bw_provider_real_cli_integration() {
+        let id = std::env::var("FILAR_TEST_BW_ITEM")
+            .expect("set FILAR_TEST_BW_ITEM to a Bitwarden item id");
+        let p = BitwardenProvider::new(bw_items(&id));
         let value = p.get("FILAR_LLM_API_KEY").unwrap();
         assert!(!value.is_empty());
     }

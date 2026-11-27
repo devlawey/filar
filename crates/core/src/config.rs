@@ -311,7 +311,7 @@ pub enum SecretProviderKind {
     Env,
     /// 1Password CLI (`op read`, [`crate::secrets::OnePasswordProvider`]).
     OnePassword,
-    /// Bitwarden CLI (`bw get`).
+    /// Bitwarden CLI (`bw get`, [`crate::secrets::BitwardenProvider`]).
     Bitwarden,
     /// KeePassXC CLI (`keepassxc-cli show`).
     KeePassXc,
