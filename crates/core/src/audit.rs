@@ -11,7 +11,7 @@
 //! files are only ever appended to, never rewritten.
 
 use crate::error::{CoreError, Result};
-use crate::secrets::{redact_secrets, SecretProvider};
+use crate::secrets::{redact_secrets, SecretProvider, StaticSecretProvider};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -226,6 +226,14 @@ impl AuditWriter {
     /// When `secrets` is given, known secret values are masked in the
     /// command, explanation and arbiter reason before serialization —
     /// a value never reaches the disk.
+    ///
+    /// Masking contract: the provider must enumerate **every** secret
+    /// resolved in this session (`secret_names()` is the masking scope).
+    /// A provider that cannot list its entries (e.g. `KeyringSecretProvider`)
+    /// must be wrapped into an enumeration-complete snapshot such as
+    /// `StaticSecretProvider` before being passed here. Masking is
+    /// fail-closed: if a listed name cannot be resolved, `append` returns
+    /// an error and nothing is written.
     pub fn append(
         &mut self,
         record: &AuditRecord,
@@ -233,10 +241,11 @@ impl AuditWriter {
     ) -> Result<PathBuf> {
         let mut clean = record.clone();
         if let Some(provider) = secrets {
-            clean.command = redact_secrets(&clean.command, provider);
-            clean.explanation = redact_secrets(&clean.explanation, provider);
+            let snapshot = secret_snapshot(provider)?;
+            clean.command = redact_secrets(&clean.command, &snapshot);
+            clean.explanation = redact_secrets(&clean.explanation, &snapshot);
             if let Some(reason) = &clean.arbiter_reason {
-                clean.arbiter_reason = Some(redact_secrets(reason, provider));
+                clean.arbiter_reason = Some(redact_secrets(reason, &snapshot));
             }
         }
         let mut line = serde_json::to_string(&clean)
@@ -252,10 +261,16 @@ impl AuditWriter {
 
     /// Choose the file for `date`: the cached one while it fits, otherwise
     /// the first `audit-<date>[.<n>].jsonl` with room for `extra` bytes.
+    /// Sizes come from the file system, not the instance-local counter —
+    /// another writer may have appended to the same file meanwhile.
     fn pick_file(&mut self, date: &str, extra: u64) -> Result<PathBuf> {
-        if let Some((path, _, size)) = &self.current {
-            if file_date(path) == date && size.saturating_add(extra) <= self.max_bytes {
-                return Ok(path.clone());
+        if let Some((path, _, _)) = &self.current {
+            if file_date(path) == date && tail_is_complete(path) {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    if meta.len().saturating_add(extra) <= self.max_bytes {
+                        return Ok(path.clone());
+                    }
+                }
             }
         }
         let base = self.dir.join(format!("audit-{date}.jsonl"));
@@ -264,8 +279,13 @@ impl AuditWriter {
         loop {
             let size = std::fs::metadata(&candidate).map(|m| m.len()).unwrap_or(0);
             // A brand-new file accepts any single line, even an oversized
-            // one — a record must never be dropped for being long.
-            if size == 0 || size.saturating_add(extra) <= self.max_bytes {
+            // one — a record must never be dropped for being long. A file
+            // whose last line is incomplete (a torn write) is preserved
+            // as-is and skipped: appending after a partial line would
+            // corrupt both records.
+            if (size == 0 || size.saturating_add(extra) <= self.max_bytes)
+                && tail_is_complete(&candidate)
+            {
                 return Ok(candidate);
             }
             index += 1;
@@ -296,10 +316,62 @@ impl AuditWriter {
     }
 }
 
+/// Resolve every listed secret into an in-memory snapshot before masking.
+///
+/// Fail-closed: `redact_secrets` silently skips a name whose `get()` fails
+/// (a vault locked after the value was resolved) — for the audit journal
+/// that would mean writing the credential in plaintext. Any listed name
+/// that cannot be read aborts the append instead. The snapshot also pins
+/// the values so all fields are masked against the same set, and
+/// `StaticSecretProvider` zeroizes them on drop.
+fn secret_snapshot(provider: &dyn SecretProvider) -> Result<StaticSecretProvider> {
+    let mut map = std::collections::HashMap::new();
+    for name in provider.secret_names() {
+        // The provider error already redacts the name; never add the value.
+        let value = provider.get(&name).map_err(|e| {
+            CoreError::Other(format!(
+                "audit record not written: a listed secret could not be resolved for masking: {e}"
+            ))
+        })?;
+        map.insert(name, value);
+    }
+    Ok(StaticSecretProvider::with_secrets(map))
+}
+
+/// Whether the file ends on a complete line (`\n`), so appending cannot
+/// glue a new record onto a torn write. Missing/empty files count as
+/// complete; an unreadable tail counts as incomplete (skip the file).
+fn tail_is_complete(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        // Does not exist yet — a fresh file has no torn tail.
+        return true;
+    };
+    let Ok(meta) = file.metadata() else { return false };
+    if meta.len() == 0 {
+        return true;
+    }
+    if file.seek(SeekFrom::End(-1)).is_err() {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    match file.read_exact(&mut byte) {
+        Ok(()) => byte[0] == b'\n',
+        Err(_) => false,
+    }
+}
+
 /// `YYYY-MM-DD` prefix of an RFC 3339 timestamp; falls back to today for
 /// a malformed value so a record is never lost over a bad clock string.
 fn date_of_ts(ts: &str) -> String {
-    if ts.len() >= 10 && ts.as_bytes()[4] == b'-' && ts.as_bytes()[7] == b'-' {
+    let bytes = ts.as_bytes();
+    // Validate the ASCII shape before slicing: a multibyte character at
+    // byte 10 would make `ts[..10]` panic (not a UTF-8 boundary).
+    let shaped = bytes.len() >= 10
+        && bytes[..10].iter().enumerate().all(|(i, &c)| {
+            if i == 4 || i == 7 { c == b'-' } else { c.is_ascii_digit() }
+        });
+    if shaped {
         ts[..10].to_string()
     } else {
         now_rfc3339()[..10].to_string()
@@ -439,6 +511,75 @@ mod tests {
         let result = w.append(&record("2026-01-02T03:04:05Z", "uptime"), None);
         assert!(result.is_err(), "an unwritable journal is an error, not a panic");
         let _ = std::fs::remove_file(&dir);
+    }
+
+    /// A provider that lists a name but cannot resolve it (a vault locked
+    /// after the value was used) — masking must fail closed.
+    struct LockedListedProvider;
+    impl SecretProvider for LockedListedProvider {
+        fn get(&self, _name: &str) -> Result<String> {
+            Err(CoreError::Other("vault is locked".into()))
+        }
+        fn secret_names(&self) -> Vec<String> {
+            vec!["$FILAR_SECRET_TOKEN".into()]
+        }
+    }
+
+    #[test]
+    fn unresolvable_listed_secret_aborts_write() {
+        let dir = tmp_dir("failclosed");
+        let mut w = AuditWriter::new(&dir);
+        let r = record("2026-01-02T03:04:05Z", "curl -H 'Bearer hunter2' https://api.example.com");
+        let result = w.append(&r, Some(&LockedListedProvider));
+        assert!(result.is_err(), "a listed secret that cannot be read must abort the append");
+        assert!(!dir.exists(), "nothing may be written when masking cannot complete");
+    }
+
+    #[test]
+    fn incomplete_tail_is_preserved_and_skipped() {
+        let dir = tmp_dir("torntail");
+        std::fs::create_dir_all(&dir).unwrap();
+        let torn = dir.join("audit-2026-01-02.jsonl");
+        // A partial write: the last line has no trailing newline.
+        let partial = "{\"ts\":\"2026-01-02T03:04:05Z\",\"comm";
+        std::fs::write(&torn, partial).unwrap();
+
+        let mut w = AuditWriter::new(&dir);
+        let path = w.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap();
+        assert_ne!(path, torn, "a torn file must not be appended to");
+        assert!(path.to_string_lossy().contains("audit-2026-01-02.1.jsonl"));
+        assert_eq!(std::fs::read_to_string(&torn).unwrap(), partial, "torn file stays byte-identical");
+        assert_eq!(read_records(&path).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn second_writer_appends_are_seen_by_size_check() {
+        let dir = tmp_dir("twowriters");
+        let r = record("2026-01-02T03:04:05Z", "uptime");
+        let line_len = (serde_json::to_string(&r).unwrap().len() + 1) as u64;
+        // Room for two records, not three.
+        let max = line_len * 2 + line_len / 2;
+        let mut w1 = AuditWriter::with_max_bytes(&dir, max);
+        let mut w2 = AuditWriter::with_max_bytes(&dir, max);
+        let p1 = w1.append(&r, None).unwrap();
+        let p2 = w2.append(&r, None).unwrap();
+        assert_eq!(p1, p2, "both writers share the base file while it fits");
+        // w1's cached size is stale; the file-system size must trigger rollover.
+        let p3 = w1.append(&r, None).unwrap();
+        assert_ne!(p3, p1, "the third record must roll over, not exceed the limit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_ts_falls_back_to_today_without_panic() {
+        let dir = tmp_dir("badts");
+        // Byte 10 lands inside a multibyte character: slicing would panic.
+        let mut w = AuditWriter::new(&dir);
+        let path = w.append(&record("2026-01-0\u{0413}c", "uptime"), None).unwrap();
+        let today = &now_rfc3339()[..10];
+        assert!(path.to_string_lossy().contains(&format!("audit-{today}")), "bad ts falls back to today: {}", path.display());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

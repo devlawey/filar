@@ -1260,9 +1260,19 @@ journal. Nothing leaves the machine: the writer only touches the file system.
   `audit-<YYYY-MM-DD>.jsonl` from the record timestamp; when a file would
   exceed the size limit (`DEFAULT_AUDIT_MAX_BYTES`, 10 MiB) the writer rolls
   over to `audit-<YYYY-MM-DD>.<n>.jsonl`. Existing files are never rewritten.
+  Sizes are checked against the file system (another writer's appends are
+  seen), and a file whose last line is incomplete (a torn write) is
+  preserved as-is and skipped in favour of a new indexed file.
 - Secret values are masked before the line is written: pass the session's
   `SecretProvider` to `append` and known values become their slot names
   (`$FILAR_SECRET_*`) or `<secret>` — a value never reaches the disk.
+  **Masking contract:** the provider must enumerate every secret resolved
+  in this session — `secret_names()` is the masking scope. A provider that
+  cannot list its entries (e.g. `KeyringSecretProvider`) must be wrapped
+  into an enumeration-complete snapshot (`StaticSecretProvider`) first.
+  Masking is fail-closed: `append` resolves all listed names into a snapshot
+  before writing, and if any of them cannot be read it returns `Err` and
+  writes nothing.
 - A write failure is returned as `Err`; the caller logs a warning and keeps
   going. Auditing never blocks or fails a command.
 - `audit::read_records(path)` reads a file back in order; a malformed line
