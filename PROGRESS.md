@@ -13894,3 +13894,20 @@ world-readable даже кратко), ошибка `set_permissions` фатал
 вынесено за скоуп: требует windows-sys + unsafe FFI
 (GetNamedSecurityInfo/SetNamedSecurityInfo) — отдельная задача-hardening,
 предложена в сводке.
+
+## 2026-11-28 — #696: AuditRecord и append-only writer журнала (core)
+
+Новый модуль `filar_core::audit`: `AuditRecord` (JSONL, все поля из issue,
+опциональные — `None`), `AuditDecision`/`AuditDecisionSource` (lowercase),
+`AuditTarget`, `AuditWriter` (append-only, файлы `audit-<date>.jsonl` в
+`data_local_dir()/filar/audit/`, ротация по дате записи и по размеру
+10 MiB → `audit-<date>.<n>.jsonl`, существующее не перезаписывается).
+Маскирование секретов через `redact_secrets` до записи (command,
+explanation, arbiter_reason); ошибка записи — `Err`, вызывающий логирует
+WARN и не блокирует команду (интеграция — #698). `read_records` читает
+файл построчно, битая строка — ошибка с номером. RFC3339 без chrono:
+`session::unix_to_ymdhms` стал `pub(crate)`. Поля хеш-цепочки — #697,
+читатели обязаны терпеть их отсутствие. Публичный API описан в
+`docs/ENGINE_API.md`. +7 core-тестов (roundtrip, дозапись, ротация
+размер/дата, маскирование, ошибка записи, битая строка). Контракты
+трейтов не менялись.

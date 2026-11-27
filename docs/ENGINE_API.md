@@ -1242,3 +1242,48 @@ temperature = 0.3
 ```
 
 Select it at launch with `--llm ollama` (or `Config::select_llm(Some("ollama"))`).
+
+## Audit journal — `AuditRecord` / `AuditWriter` (#696)
+
+`filar_core::audit` records command decisions as a local append-only JSONL
+journal. Nothing leaves the machine: the writer only touches the file system.
+
+- `AuditRecord` — one decision: `ts` (UTC RFC 3339), `session_id`, `target`
+  (`AuditTarget`: kind, name, host, tags), `command`, `explanation`,
+  `destructive`, `decision` (`AuditDecision`: approved / denied / auto /
+  cancelled), `decision_source` (`AuditDecisionSource`: user / allowlist /
+  never / policy), `risk_score`, `arbiter_verdict`, `arbiter_reason`,
+  `arbiter_model`, `exit_code`, `duration_ms`, `proposal_id`. Optional fields
+  are `None` when the information was not available.
+- `AuditWriter` — append-only writer. Files live in
+  `dirs::data_local_dir()/filar/audit/` (`audit::default_dir()`), named
+  `audit-<YYYY-MM-DD>.jsonl` from the record timestamp; when a file would
+  exceed the size limit (`DEFAULT_AUDIT_MAX_BYTES`, 10 MiB) the writer rolls
+  over to `audit-<YYYY-MM-DD>.<n>.jsonl`. Existing files are never rewritten.
+- Secret values are masked before the line is written: pass the session's
+  `SecretProvider` to `append` and known values become their slot names
+  (`$FILAR_SECRET_*`) or `<secret>` — a value never reaches the disk.
+- A write failure is returned as `Err`; the caller logs a warning and keeps
+  going. Auditing never blocks or fails a command.
+- `audit::read_records(path)` reads a file back in order; a malformed line
+  is an error naming its number.
+
+```rust
+use filar_core::{AuditDecision, AuditDecisionSource, AuditRecord, AuditTarget, AuditWriter};
+
+let mut writer = AuditWriter::open_default()?;
+let record = AuditRecord::new(
+    "session-123",
+    AuditTarget { kind: "ssh".into(), name: "web-1".into(), host: None, tags: vec![] },
+    "systemctl restart nginx",
+    AuditDecision::Approved,
+    AuditDecisionSource::User,
+);
+// `secrets` is the session's SecretProvider (None = no known secrets).
+let secrets: Option<std::sync::Arc<dyn filar_core::SecretProvider>> = None;
+writer.append(&record, secrets.as_deref())?;
+# Ok::<(), filar_core::CoreError>(())
+```
+
+The hash chain (`prev_hash` / `hash`) and integrity verification arrive with
+#697; readers must tolerate records without those fields.

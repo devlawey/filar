@@ -557,7 +557,7 @@ pub fn now_session_id() -> (String, String) {
 /// Convert a Unix timestamp (seconds) to broken-down UTC time.
 ///
 /// This is a minimal implementation that avoids pulling in `chrono`.
-fn unix_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+pub(crate) fn unix_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let hour = (rem / 3600) as u32;

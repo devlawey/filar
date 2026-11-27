@@ -4,10 +4,12 @@
 //! - [`error`]: Error types and a unified `Result` alias.
 //! - [`config`]: Configuration loading from TOML files and environment variables.
 //! - [`secrets`]: Secure reading of API keys and other secrets from the environment.
+//! - [`audit`]: Local append-only audit journal (#696).
 //! - [`fleet_checks`]: The declarative catalog of fleet checks (built-in + user).
 //! - [`fleet_op`]: Fleet operations — one question, a frozen set of hosts.
 //! - [`os_family`]: Which family of OS a host belongs to, for command variants.
 
+pub mod audit;
 pub mod chat;
 pub mod compaction;
 pub mod config;
@@ -21,6 +23,10 @@ pub mod os_family;
 pub mod secrets;
 pub mod session;
 
+pub use audit::{
+    AuditDecision, AuditDecisionSource, AuditRecord, AuditTarget, AuditWriter,
+    DEFAULT_AUDIT_MAX_BYTES,
+};
 pub use chat::{ChatBlock, ToolInvocation, SHELL_ESCAPE_EXPLANATION};
 pub use compaction::{
     compact_history, compaction_boundary, should_compact, transcript_for_summary,
