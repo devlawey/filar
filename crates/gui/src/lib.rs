@@ -1521,8 +1521,36 @@ fn save_config_toml_to(
     }
     match toml::to_string_pretty(&config) {
         Ok(data) => {
-            if let Err(e) = std::fs::write(path, &data) {
-                tracing::warn!(path = %path.display(), error = %e, "failed to save config.toml");
+            // Atomic replace (#740 review): a partial in-place write (full
+            // disk, I/O error) would leave a truncated config the next save
+            // cannot parse — and the destination may now be the user's only
+            // copy (FILAR_CONFIG / local ./config.toml). Write beside it,
+            // then rename over it. Canonicalize the directory so a symlinked
+            // destination keeps receiving updates instead of being replaced
+            // by a regular file.
+            let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+            let target = match dir {
+                Some(d) => {
+                    let cd = std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf());
+                    path.file_name().map(|n| cd.join(n)).unwrap_or_else(|| path.to_path_buf())
+                }
+                None => path.to_path_buf(),
+            };
+            let file_name = path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "config.toml".to_string());
+            let tmp = target.with_file_name(format!("{file_name}.filar-tmp"));
+            if let Err(e) = std::fs::write(&tmp, &data) {
+                let _ = std::fs::remove_file(&tmp);
+                tracing::warn!(path = %tmp.display(), error = %e, "failed to write config.toml temp file");
+                return Err(format!("failed to save config.toml: {e}"));
+            }
+            if let Err(e) = std::fs::rename(&tmp, &target) {
+                // On Windows the rename fails while another process holds
+                // the destination open (an editor). The original file is
+                // untouched; the caller keeps the draft for retry.
+                let _ = std::fs::remove_file(&tmp);
+                tracing::warn!(path = %target.display(), error = %e, "failed to replace config.toml");
                 return Err(format!("failed to save config.toml: {e}"));
             }
         }
@@ -1532,6 +1560,23 @@ fn save_config_toml_to(
         }
     }
     Ok(())
+}
+
+/// Refuse the save when the resolved write destination moved since the
+/// launcher started (#740 review): the drafts were loaded from the startup
+/// file, and writing them into a different file would clobber that file's
+/// launcher-owned sections while the panel still shows the old path.
+fn ensure_config_destination(expected: &std::path::Path) -> Result<(), String> {
+    let now = config_write_path()?;
+    if now == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "config destination changed since the launcher started: {} -> {} — restart the launcher to reload",
+            expected.display(),
+            now.display()
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2946,6 +2991,10 @@ struct LauncherApp {
     /// Absolute path of the `config.toml` Launch will write (#740), shown
     /// in the bottom panel. Empty in tests.
     config_target: String,
+    /// The resolved write destination as resolved at start-up (#740
+    /// review): Launch refuses to save if the resolution moved since.
+    /// `None` in tests and when no path could be resolved.
+    config_path: Option<std::path::PathBuf>,
 }
 
 /// Whether a key file needs a passphrase, cached per path so the launcher
@@ -5598,6 +5647,15 @@ impl LauncherApp {
             }
         }
         settings.save();
+        // The destination must still be the file the panel shows (#740
+        // review): a higher-priority config appearing mid-session would
+        // otherwise receive drafts loaded from a different file.
+        if let Some(expected) = &self.config_path {
+            if let Err(msg) = ensure_config_destination(expected) {
+                self.set_other_error(msg);
+                return;
+            }
+        }
         if let Err(msg) = save_config_toml(&settings, &host_groups, risk_section.as_ref(), &log_sources, secret_section.as_ref()) {
             // A failed write would silently restore the old chain on the next
             // launch: keep the draft open for retry (#695 review).
@@ -5871,17 +5929,19 @@ pub fn run_launcher(config: &Config) {
     // direct TUI/CLI run uses. Shown in the bottom panel so a write into a
     // foreign local config is a conscious choice. Relative paths (local
     // ./config.toml, relative FILAR_CONFIG) are absolutized for display.
-    let config_target = match config_write_path() {
+    let config_path = config_write_path();
+    let config_target = match &config_path {
         Ok(p) => {
             let abs = if p.is_relative() {
-                std::env::current_dir().map(|cwd| cwd.join(&p)).unwrap_or(p)
+                std::env::current_dir().map(|cwd| cwd.join(p)).unwrap_or_else(|_| p.clone())
             } else {
-                p
+                p.clone()
             };
             abs.display().to_string()
         }
         Err(e) => format!("unavailable: {e}"),
     };
+    let config_path = config_path.ok();
 
     let app = LauncherApp {
         sessions,
@@ -5940,6 +6000,7 @@ pub fn run_launcher(config: &Config) {
         active_tab: 0,
         key_probe: None,
         config_target,
+        config_path,
     };
 
     let options = eframe::NativeOptions {
@@ -6813,6 +6874,29 @@ mod tests {
         assert!(!result.contains("passphrase ="), "no passphrase value in config.toml");
         // Launcher SSH slots go through pending_launch.json, not config.toml.
         assert!(!result.contains("10.0.0.9"), "launcher slots must not leak into config.toml");
+        // The atomic replace must not leave its temp file behind.
+        assert!(!path.with_file_name("config.toml.filar-tmp").exists(), "temp file must be renamed away");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_config_destination_detects_move() {
+        let _lock = CONFIG_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("filar_test_dest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.toml");
+        let b = dir.join("b.toml");
+
+        let old = std::env::var("FILAR_CONFIG").ok();
+        std::env::set_var("FILAR_CONFIG", a.as_os_str());
+        let _env = CfgEnvGuard { key: "FILAR_CONFIG", old };
+
+        assert!(ensure_config_destination(&a).is_ok(), "unchanged destination passes");
+        let err = ensure_config_destination(&b).unwrap_err();
+        assert!(err.contains(&a.display().to_string()), "error names the startup path: {err}");
+        assert!(err.contains(&b.display().to_string()), "error names the current path: {err}");
+        drop(_env);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7132,6 +7216,7 @@ mod tests {
             active_tab: 0,
             key_probe: None,
             config_target: String::new(),
+            config_path: None,
         }
     }
 
