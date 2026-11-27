@@ -424,7 +424,9 @@ per-invocation timeout (`DEFAULT_SECRET_CLI_TIMEOUT_SECS`, 30s;
 `[secret_provider.onepassword.items]`; an unmapped name is a miss so the
 chain falls through. A locked vault or missing session yields an error
 naming the provider and the item reference — never a value, never the raw
-stderr. Value buffers are zeroized; caching lives in the chain. The trait
+stderr. Value buffers are zeroized; caching lives in the chain. CLI output
+is capped at 1 MiB per stream (fixed pre-reserved buffers, no reallocation);
+larger output is an error, not a truncated secret. The trait
 is synchronous: async callers must use `tokio::task::spawn_blocking`.
 
 `SshTransportConfig::command_timeout` (default 300s,

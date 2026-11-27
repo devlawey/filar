@@ -13571,4 +13571,15 @@ abort-путь затирает общий буфер немедленно, бе
 PLATFORM_NOTES). Тесты: `abort_pipe_readers_wipes_partial_data_without_eof`,
 `op_provider_timeout_with_partial_output_and_held_pipe`.
 
+**Ревью (раунд 4).** Принято: `Drop` для `PipeBuffer` (затирание при любом
+освобождении); `done = true` в abort-пути; Unix-заглушки partial-тестов
+переведены на `printf … | cat` (гарантированный сброс в pipe, без
+stdbuf/python3); буферы CLI-вывода получили фиксированную вместимость
+1 МиБ на поток (`MAX_SECRET_CLI_OUTPUT_BYTES`) — realloc исключён, старая
+незатёртая копия секрета не появляется, переполнение — ошибка. Отклонено:
+прерывание заблокированного `read()` читателя — требует unsafe
+платформенных API или новых зависимостей; после abort читатель секретных
+байтов не держит, поток завершается по EOF/выходу потомка (кандидат на
+отдельную issue). Тест `pipe_reader_caps_output_without_realloc`.
+
 **Next:** #692 (провайдер Bitwarden CLI).

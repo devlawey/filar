@@ -678,27 +678,56 @@ impl Drop for ChainSecretProvider {
 /// Default timeout for a password-manager CLI invocation, seconds (#691).
 pub const DEFAULT_SECRET_CLI_TIMEOUT_SECS: u64 = 30;
 
+/// Upper bound on password-manager CLI output, per stream. Secret values
+/// are small; the fixed pre-reserved capacity guarantees the buffer never
+/// reallocates, so no freed copy of a secret is left unwiped (#733 review).
+/// Output beyond the limit is an error, never a truncated secret.
+const MAX_SECRET_CLI_OUTPUT_BYTES: usize = 1024 * 1024;
+
 /// Partial pipe output shared with a reader thread. The abort path wipes
 /// `data` under the same lock the reader copies each chunk into, so a
 /// partial secret is zeroized immediately on timeout — even while the
 /// reader stays blocked in `read()` on a pipe an orphaned grandchild keeps
 /// open. The reader keeps no secret bytes of its own between reads.
-#[derive(Default)]
+/// The capacity is reserved once in `new()` and never grows.
 struct PipeBuffer {
     data: Vec<u8>,
     done: bool,
+    overflow: bool,
+}
+
+impl PipeBuffer {
+    fn new() -> Self {
+        Self {
+            data: Vec::with_capacity(MAX_SECRET_CLI_OUTPUT_BYTES),
+            done: false,
+            overflow: false,
+        }
+    }
+}
+
+/// Wipe the secret bytes even if the buffer is dropped without an explicit
+/// zeroize (panic, future refactor).
+impl Drop for PipeBuffer {
+    fn drop(&mut self) {
+        self.data.zeroize();
+    }
 }
 
 /// Set the abort flag and wipe whatever the pipe readers already copied.
 /// A reader that returns from `read()` later sees the flag under the same
 /// lock and wipes its chunk, so no partial output survives unzeroized.
+/// `done` is set too: an aborted buffer must never be awaited or read as
+/// a valid result.
 fn abort_pipe_readers(
     aborted: &std::sync::atomic::AtomicBool,
     buffers: &[&Mutex<PipeBuffer>],
 ) {
     aborted.store(true, std::sync::atomic::Ordering::SeqCst);
     for buf in buffers {
-        buf.lock().unwrap_or_else(|e| e.into_inner()).data.zeroize();
+        let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+        b.data.zeroize();
+        b.done = true;
     }
 }
 
@@ -726,6 +755,13 @@ fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
                     chunk[..n].zeroize();
                     break;
                 }
+                if b.data.len() + n > MAX_SECRET_CLI_OUTPUT_BYTES {
+                    b.overflow = true;
+                    chunk[..n].zeroize();
+                    break;
+                }
+                // Within the capacity reserved in PipeBuffer::new():
+                // no reallocation, no freed unwiped copy of the secret.
                 b.data.extend_from_slice(&chunk[..n]);
                 chunk[..n].zeroize();
             }
@@ -782,8 +818,8 @@ fn run_secret_cli(
     // zeroized immediately — no EOF wait, no secret left in a blocked
     // reader's own memory.
     let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let out_buf: Arc<Mutex<PipeBuffer>> = Arc::new(Mutex::new(PipeBuffer::default()));
-    let err_buf: Arc<Mutex<PipeBuffer>> = Arc::new(Mutex::new(PipeBuffer::default()));
+    let out_buf: Arc<Mutex<PipeBuffer>> = Arc::new(Mutex::new(PipeBuffer::new()));
+    let err_buf: Arc<Mutex<PipeBuffer>> = Arc::new(Mutex::new(PipeBuffer::new()));
     spawn_pipe_reader(child.stdout.take(), Arc::clone(&out_buf), Arc::clone(&aborted));
     spawn_pipe_reader(child.stderr.take(), Arc::clone(&err_buf), Arc::clone(&aborted));
 
@@ -830,6 +866,14 @@ fn run_secret_cli(
             )));
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+    let overflow = out_buf.lock().unwrap_or_else(|e| e.into_inner()).overflow
+        || err_buf.lock().unwrap_or_else(|e| e.into_inner()).overflow;
+    if overflow {
+        abort_pipe_readers(&aborted, &[&out_buf, &err_buf]);
+        return Err(CoreError::Secret(format!(
+            "{provider}: CLI output exceeds the {MAX_SECRET_CLI_OUTPUT_BYTES}-byte limit reading {reference}"
+        )));
     }
     let mut stdout_bytes = std::mem::take(&mut out_buf.lock().unwrap_or_else(|e| e.into_inner()).data);
     let mut stderr_bytes = std::mem::take(&mut err_buf.lock().unwrap_or_else(|e| e.into_inner()).data);
@@ -1717,7 +1761,9 @@ mod tests {
         // CLI keeps running: at timeout the already-stored buffer must be
         // wiped by the abort path, not dropped unzeroized (#733 review).
         let dir = op_stub_dir("preabort");
-        let body = "#!/bin/sh\nprintf 'partial-secret'\nexec 1>&-\nsleep 30\n";
+        // cat in a pipeline guarantees the partial value reaches the pipe
+        // before stdout is closed (a bare printf could stay buffered).
+        let body = "#!/bin/sh\nprintf 'partial-secret' | cat\nexec 1>&-\nsleep 30\n";
         let stub = write_stub(&dir, "op-preabort", body);
         let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
             .with_cli_path(stub.to_str().unwrap())
@@ -1740,12 +1786,41 @@ mod tests {
         let buf = Mutex::new(PipeBuffer {
             data: b"partial-secret".to_vec(),
             done: false,
+            overflow: false,
         });
         abort_pipe_readers(&aborted, &[&buf]);
         assert!(aborted.load(std::sync::atomic::Ordering::SeqCst));
         let b = buf.lock().unwrap();
         // zeroize wipes the bytes and truncates the Vec.
         assert!(b.data.is_empty(), "partial data not zeroized");
+        // An aborted buffer is marked done: it must never be awaited.
+        assert!(b.done);
+    }
+
+    #[test]
+    fn pipe_reader_caps_output_without_realloc() {
+        // The capacity is reserved once: filling past the limit sets the
+        // overflow flag instead of growing (and freeing) the allocation,
+        // so no unwiped copy of the secret is left behind (#733 review).
+        let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let buf = Arc::new(Mutex::new(PipeBuffer::new()));
+        spawn_pipe_reader(
+            Some(std::io::repeat(b'x')),
+            Arc::clone(&buf),
+            Arc::clone(&aborted),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if buf.lock().unwrap().done {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reader did not stop at the cap");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let b = buf.lock().unwrap();
+        assert!(b.overflow, "overflow flag not set");
+        assert_eq!(b.data.len(), MAX_SECRET_CLI_OUTPUT_BYTES);
+        assert_eq!(b.data.capacity(), MAX_SECRET_CLI_OUTPUT_BYTES, "buffer reallocated");
     }
 
     #[test]
@@ -1757,7 +1832,10 @@ mod tests {
         #[cfg(windows)]
         let body = "@echo off\r\necho partial-secret\r\nping -n 30 127.0.0.1 >nul\r\nexit /b 0\r\n";
         #[cfg(not(windows))]
-        let body = "#!/bin/sh\nprintf 'partial-secret'\nsleep 30\n";
+        // The pipeline subshell flushes on exit and cat writes to the pipe
+        // immediately: a bare builtin printf could stay buffered and the
+        // reader would never see the partial value (#733 review).
+        let body = "#!/bin/sh\nprintf 'partial-secret' | cat\nsleep 30\n";
         let stub = write_stub(&dir, "op-partial", body);
         let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
             .with_cli_path(stub.to_str().unwrap())
