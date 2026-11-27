@@ -13664,11 +13664,20 @@ stderr. `from_config` теперь собирает все пять звенье
 `run_secret_cli`/`run_secret_cli_with_env` не изменились.
 `CommandExecutor`/`LlmClient` без изменений.
 
-**Тесты.** 13 новых: чтение, stored-newline, неверный пароль (без пароля и
+**Тесты.** 14 новых: чтение, stored-newline, stored-CR, неверный пароль (без пароля и
 marker-stderr в ошибке), missing entry, таймаут, отсутствие CLI, доставка
 пароля через stdin, промах, нет источника пароля, недоступный пароль,
 Debug/secret_names, chain из конфига, keepassxc без database; интеграция с
-реальным `keepassxc-cli` — `#[ignore]`, ручная. Core 297, workspace зелёные.
+реальным `keepassxc-cli` — `#[ignore]`, ручная. Core 298, workspace зелёные.
 PLATFORM_NOTES: наличие CLI по ОС, newline-поведение, prompt в stderr.
+
+**Ревью (раунд 1).** Отклонено замечание ai-review о detached writer-потоке:
+паника в spawned-потоке не роняет процесс (дефолтный unwind), Zeroizing-
+копия затирается и при панике, а безусловный join мог бы зависнуть сверх
+дедлайна на осиротевшем внуке с pipe (Windows-питфолл #733). Принято от
+CodeRabbit: strip разделителя стал платформенно-условным — на Unix
+снимается только `\n`, хвостовой `\r` самого значения сохраняется (добавлен
+bare-CR тест); исправлено имя пакета в PLATFORM_NOTES (на Debian/Ubuntu/
+Fedora/Arch CLI входит в пакет `keepassxc`).
 
 **Next:** #694 (подключение chain в app/runner).

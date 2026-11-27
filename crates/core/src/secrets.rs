@@ -1362,8 +1362,9 @@ fn classify_bw_stderr(stderr: &str) -> Option<&'static str> {
 /// zeroized after the call.
 ///
 /// `show -a` appends exactly one newline of its own (`Qt::endl`); precisely
-/// that trailing line break (`\n` or `\r\n`) is stripped, a newline stored
-/// in the value itself survives.
+/// that trailing line break is stripped — `\r\n` on Windows (CRT text-mode
+/// stdout), a bare `\n` on Unix — a newline or carriage return stored in
+/// the value itself survives.
 ///
 /// Errors name the provider and the entry path, never a password value and
 /// never the raw stderr. Value buffers are zeroized; caching lives in
@@ -1462,10 +1463,13 @@ impl KeePassXcProvider {
             classify_keepassxc_stderr,
             password,
         )?;
-        // Strip exactly the one line break `show -a` appends (Qt::endl);
-        // a newline that is part of the stored value itself survives.
+        // Strip exactly the one line break `show -a` appends (Qt::endl).
+        // On Windows the CRT text-mode stdout turns it into `\r\n`; on
+        // Unix it is a bare `\n` — a stored trailing `\r` must survive
+        // there (#735 review).
         if value.ends_with('\n') {
             value.pop();
+            #[cfg(windows)]
             if value.ends_with('\r') {
                 value.pop();
             }
@@ -2740,11 +2744,13 @@ mod tests {
     /// Stub `keepassxc-cli`: reads the password line from stdin like the
     /// real CLI; `show -a <attr> <db> <entry>` selects the branch by the
     /// entry (5th argument). The value is printed with the CLI's own
-    /// trailing newline, "newline-entry" adds a stored one on top.
+    /// trailing newline, "newline-entry" adds a stored LF on top,
+    /// "cr-entry" a stored bare CR.
     fn kx_stub(dir: &std::path::Path) -> std::path::PathBuf {
         #[cfg(windows)]
         let body = concat!(
             "@echo off\r\n",
+            "setlocal EnableDelayedExpansion\r\n",
             "set /p PW=\r\n",
             "if \"%5\"==\"missing-entry\" (\r\n",
             "  echo Could not find entry with path %5. 1>&2\r\n",
@@ -2753,6 +2759,12 @@ mod tests {
             "if \"%5\"==\"wrong-pass\" (\r\n",
             "  echo Invalid credentials were provided, please try again. marker-stderr-xyz 1>&2\r\n",
             "  exit /b 1\r\n",
+            ")\r\n",
+            "if \"%5\"==\"cr-entry\" (\r\n",
+            "  for /f %%a in ('copy /Z \"%~dpf0\" nul') do set \"CR=%%a\"\r\n",
+            "  <nul set /p=kx-secret-value!CR!\r\n",
+            "  echo.\r\n",
+            "  exit /b 0\r\n",
             ")\r\n",
             "echo kx-secret-value\r\n",
             "if \"%5\"==\"newline-entry\" echo.\r\n",
@@ -2765,6 +2777,7 @@ mod tests {
             "case \"$5\" in\n",
             "*missing-entry*) printf '%s\\n' \"Could not find entry with path $5.\" >&2; exit 1 ;;\n",
             "*wrong-pass*) printf '%s\\n' \"Invalid credentials were provided, please try again. marker-stderr-xyz\" >&2; exit 1 ;;\n",
+            "*cr-entry*) printf 'kx-secret-value\\r\\n' ;;\n",
             "*newline-entry*) printf 'kx-secret-value\\n\\n' ;;\n",
             "*) printf 'kx-secret-value\\n' ;;\n",
             "esac\n",
@@ -2797,6 +2810,19 @@ mod tests {
         #[cfg(not(windows))]
         let expected = "kx-secret-value\n";
         assert_eq!(p.get("FILAR_LLM_API_KEY").unwrap(), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kx_provider_preserves_a_stored_terminal_cr() {
+        let dir = op_stub_dir("kx-cr");
+        let stub = kx_stub(&dir);
+        let p = KeePassXcProvider::new("test.kdbx", kx_items("cr-entry"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_password_provider(kx_password_source(), "KX_DB_PASS");
+        // The CLI delimiter is CRLF on Windows and a bare LF on Unix; a
+        // stored trailing CR is part of the value on both (#735 review).
+        assert_eq!(p.get("FILAR_LLM_API_KEY").unwrap(), "kx-secret-value\r");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
