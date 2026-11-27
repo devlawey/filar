@@ -560,11 +560,29 @@ impl ChainSecretProvider {
                 crate::config::SecretProviderKind::Bitwarden => {
                     Arc::new(BitwardenProvider::new(cfg.bitwarden.items.clone()))
                 }
-                other => {
-                    return Err(CoreError::Config(format!(
-                        "secret_provider.order: provider '{}' is not available yet",
-                        other.as_str()
-                    )));
+                crate::config::SecretProviderKind::KeePassXc => {
+                    let database = cfg.keepassxc.database.clone().ok_or_else(|| {
+                        CoreError::Config(
+                            "secret_provider.keepassxc.database must be set when 'keepassxc' is in secret_provider.order"
+                                .into(),
+                        )
+                    })?;
+                    // The database password is itself a secret: resolve it
+                    // through keyring → env under a fixed logical name, with
+                    // no caching (TTL zero). A masked startup prompt can be
+                    // injected instead via `with_password_provider` (#694).
+                    let password_source = Arc::new(ChainSecretProvider::new(
+                        vec![
+                            Arc::new(KeyringSecretProvider::new()),
+                            Arc::new(EnvSecretProvider::new()),
+                        ],
+                        Duration::ZERO,
+                    )?);
+                    Arc::new(
+                        KeePassXcProvider::new(database, cfg.keepassxc.entries.clone())
+                            .with_attribute(cfg.keepassxc.attribute.clone())
+                            .with_password_provider(password_source, "FILAR_KEEPASSXC_DB_PASSWORD"),
+                    )
                 }
             };
             providers.push(provider);
@@ -818,6 +836,47 @@ fn run_secret_cli_with_env(
     classify: impl Fn(&str) -> Option<&'static str>,
     env: &[(&str, &str)],
 ) -> Result<String> {
+    run_secret_cli_inner(cli, args, timeout, provider, reference, classify, env, None)
+}
+
+/// [`run_secret_cli`] that feeds one secret line to the child's stdin and
+/// closes the pipe (KeePassXC reads the database password this way, #693).
+/// No temporary file is created; the writer's copy of the secret is
+/// zeroized on every path.
+fn run_secret_cli_with_stdin(
+    cli: &str,
+    args: &[&str],
+    timeout: Duration,
+    provider: &str,
+    reference: &str,
+    classify: impl Fn(&str) -> Option<&'static str>,
+    stdin_secret: &str,
+) -> Result<String> {
+    run_secret_cli_inner(
+        cli,
+        args,
+        timeout,
+        provider,
+        reference,
+        classify,
+        &[],
+        Some(stdin_secret),
+    )
+}
+
+/// Shared body of the CLI runners: spawn, drain both output pipes, enforce
+/// the deadline, optionally feed one secret line to stdin. `classify` turns
+/// lowercased stderr into a short hint; raw stderr never reaches the error.
+fn run_secret_cli_inner(
+    cli: &str,
+    args: &[&str],
+    timeout: Duration,
+    provider: &str,
+    reference: &str,
+    classify: impl Fn(&str) -> Option<&'static str>,
+    env: &[(&str, &str)],
+    stdin_secret: Option<&str>,
+) -> Result<String> {
     use std::process::{Command, Stdio};
 
     // An unrepresentable deadline must fail before the child starts:
@@ -829,7 +888,11 @@ fn run_secret_cli_with_env(
     let mut child = Command::new(cli)
         .args(args)
         .envs(env.iter().copied())
-        .stdin(Stdio::null())
+        .stdin(if stdin_secret.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -866,6 +929,37 @@ fn run_secret_cli_with_env(
                 "{provider}: failed to start output reader for CLI '{cli}': {e}"
             ))
         })?;
+
+    // Feed the secret line on a dedicated thread: a password larger than
+    // the pipe capacity must not block the deadline loop. Closing the pipe
+    // afterwards gives the CLI EOF. The thread owns a `Zeroizing` copy, so
+    // the secret is wiped on every path — including a failed spawn, where
+    // the closure (and its payload) is dropped without running.
+    if let Some(secret) = stdin_secret {
+        let mut stdin = child.stdin.take();
+        let mut payload = zeroize::Zeroizing::new(Vec::with_capacity(secret.len() + 1));
+        payload.extend_from_slice(secret.as_bytes());
+        payload.push(b'\n');
+        let writer = std::thread::Builder::new()
+            .name("filar-secret-cli-writer".to_string())
+            .spawn(move || {
+                if let Some(pipe) = stdin.as_mut() {
+                    use std::io::Write;
+                    // A broken pipe only means the child exited early; its
+                    // exit status and stderr govern the outcome.
+                    let _ = pipe.write_all(&payload);
+                    let _ = pipe.flush();
+                }
+            });
+        if let Err(e) = writer {
+            abort_pipe_readers(&aborted, &[&out_buf, &err_buf]);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CoreError::Other(format!(
+                "{provider}: failed to start stdin writer for CLI '{cli}': {e}"
+            )));
+        }
+    }
 
     let status = loop {
         match child.try_wait() {
@@ -1245,6 +1339,190 @@ fn classify_bw_stderr(stderr: &str) -> Option<&'static str> {
         Some("not logged in — run 'bw login'")
     } else if stderr.contains("not found") {
         Some("item not found")
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KeePassXcProvider
+// ---------------------------------------------------------------------------
+
+/// [`SecretProvider`] backed by the local KeePassXC CLI
+/// (`keepassxc-cli show -a <attribute> <db> <entry>`, #693).
+///
+/// The database path and the attribute come from
+/// `[secret_provider.keepassxc]`; logical names map to entry paths through
+/// `entries`. The database password is a secret and never enters the
+/// config: it is resolved through an injected [`SecretProvider`] —
+/// `from_config` wires keyring → env under the logical name
+/// `FILAR_KEEPASSXC_DB_PASSWORD`; a masked startup prompt can be injected
+/// as a [`StaticSecretProvider`] instead. The password is fed to the CLI's
+/// stdin (its prompt goes to stderr) — no temporary file is created — and
+/// zeroized after the call.
+///
+/// `show -a` appends exactly one newline of its own (`Qt::endl`); precisely
+/// that trailing line break is stripped — `\r\n` on Windows (CRT text-mode
+/// stdout), a bare `\n` on Unix — a newline or carriage return stored in
+/// the value itself survives.
+///
+/// Errors name the provider and the entry path, never a password value and
+/// never the raw stderr. Value buffers are zeroized; caching lives in
+/// [`ChainSecretProvider`]. The trait is synchronous: async callers must
+/// use `tokio::task::spawn_blocking`.
+pub struct KeePassXcProvider {
+    database: std::path::PathBuf,
+    attribute: String,
+    entries: HashMap<String, String>,
+    cli: String,
+    timeout: Duration,
+    password_provider: Option<Arc<dyn SecretProvider>>,
+    password_name: String,
+}
+
+impl KeePassXcProvider {
+    /// Create a provider for a database and a logical-name → entry-path
+    /// mapping. Reads the `password` attribute via `keepassxc-cli` from
+    /// `PATH` with [`DEFAULT_SECRET_CLI_TIMEOUT_SECS`]; no password source
+    /// is configured yet — add one with [`Self::with_password_provider`].
+    pub fn new(database: impl Into<std::path::PathBuf>, entries: HashMap<String, String>) -> Self {
+        Self {
+            database: database.into(),
+            attribute: "password".to_string(),
+            entries,
+            cli: "keepassxc-cli".to_string(),
+            timeout: Duration::from_secs(DEFAULT_SECRET_CLI_TIMEOUT_SECS),
+            password_provider: None,
+            password_name: "FILAR_KEEPASSXC_DB_PASSWORD".to_string(),
+        }
+    }
+
+    /// Override the entry attribute to read (`show -a`).
+    pub fn with_attribute(mut self, attribute: impl Into<String>) -> Self {
+        self.attribute = attribute.into();
+        self
+    }
+
+    /// Override the CLI path (tests use a stub script).
+    pub fn with_cli_path(mut self, path: impl Into<String>) -> Self {
+        self.cli = path.into();
+        self
+    }
+
+    /// Override the per-invocation timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Set where the database password comes from: a [`SecretProvider`]
+    /// (keyring/env, or a [`StaticSecretProvider`] holding a masked startup
+    /// input) queried under `name`. The password never enters the config.
+    pub fn with_password_provider(
+        mut self,
+        provider: Arc<dyn SecretProvider>,
+        name: impl Into<String>,
+    ) -> Self {
+        self.password_provider = Some(provider);
+        self.password_name = name.into();
+        self
+    }
+
+    /// Resolve the database password through the configured source. The
+    /// error names the logical name only — never a value; the underlying
+    /// provider error goes to the debug log (provider errors carry names,
+    /// not values, by contract).
+    fn resolve_db_password(&self) -> Result<String> {
+        let provider = self.password_provider.as_ref().ok_or_else(|| {
+            CoreError::Secret(
+                "keepassxc: no database password source configured — store the password in the OS credential store/env or enter it at startup"
+                    .into(),
+            )
+        })?;
+        provider.get(&self.password_name).map_err(|e| {
+            tracing::debug!(
+                "keepassxc: database password '{}' unavailable: {e}",
+                self.password_name
+            );
+            CoreError::Secret(format!(
+                "keepassxc: database password '{}' is not available — store it in the OS credential store/env or enter it at startup",
+                self.password_name
+            ))
+        })
+    }
+
+    /// Run `show -a` for one entry. Split out of `get` so the password is
+    /// zeroized on every exit path.
+    fn read_entry(&self, db: &str, entry: &str, password: &str) -> Result<String> {
+        let mut value = run_secret_cli_with_stdin(
+            &self.cli,
+            &["show", "-a", &self.attribute, db, entry],
+            self.timeout,
+            "keepassxc",
+            entry,
+            classify_keepassxc_stderr,
+            password,
+        )?;
+        // Strip exactly the one line break `show -a` appends (Qt::endl).
+        // On Windows the CRT text-mode stdout turns it into `\r\n`; on
+        // Unix it is a bare `\n` — a stored trailing `\r` must survive
+        // there (#735 review).
+        if value.ends_with('\n') {
+            value.pop();
+            #[cfg(windows)]
+            if value.ends_with('\r') {
+                value.pop();
+            }
+        }
+        Ok(value)
+    }
+}
+
+impl SecretProvider for KeePassXcProvider {
+    fn get(&self, name: &str) -> Result<String> {
+        let entry = self.entries.get(name).ok_or_else(|| {
+            CoreError::Secret(format!("keepassxc: no entry mapping for {}", redact(name)))
+        })?;
+        let db = self.database.to_str().ok_or_else(|| {
+            CoreError::Config("keepassxc: database path is not valid UTF-8".into())
+        })?;
+        let mut password = self.resolve_db_password()?;
+        let result = self.read_entry(db, entry, &password);
+        password.zeroize();
+        result
+    }
+
+    fn secret_names(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
+    }
+}
+
+/// Counts and non-secret parameters only — never the password, never a
+/// value; the database path is not secret but keeps the log line lean.
+impl std::fmt::Debug for KeePassXcProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeePassXcProvider")
+            .field("entries", &self.entries.len())
+            .field("attribute", &self.attribute)
+            .field("timeout_secs", &self.timeout.as_secs())
+            .field("password_source", &self.password_provider.is_some())
+            .finish()
+    }
+}
+
+/// Classify `keepassxc-cli` stderr into a short hint; the raw text never
+/// reaches the error message. Matches the lowercased stderr.
+fn classify_keepassxc_stderr(stderr: &str) -> Option<&'static str> {
+    if stderr.contains("invalid credentials") {
+        Some("wrong database password")
+    } else if stderr.contains("could not find entry") {
+        Some("entry not found")
+    } else if stderr.contains("unknown attribute") {
+        Some("unknown attribute")
+    } else if stderr.contains("is ambiguous") {
+        Some("attribute name is ambiguous")
+    } else if stderr.contains("not readable") {
+        Some("database file not readable")
     } else {
         None
     }
@@ -1743,17 +2021,16 @@ mod tests {
     }
 
     #[test]
-    fn chain_from_config_manager_kind_not_available_yet() {
-        // The remaining manager provider lands with the follow-up issues of
-        // 3.1.0; until then the error names the kind instead of skipping it.
+    fn chain_from_config_keepassxc_requires_database() {
+        // All five kinds now build; keepassxc without a database path is a
+        // config error naming the field, not a silent skip.
         let cfg = crate::config::SecretProviderConfig {
             order: vec!["keepassxc".into()],
             ..Default::default()
         };
         let err = ChainSecretProvider::from_config(&cfg).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("keepassxc"), "{msg}");
-        assert!(msg.contains("not available yet"), "{msg}");
+        assert!(msg.contains("keepassxc.database"), "{msg}");
     }
 
     #[test]
@@ -2443,6 +2720,265 @@ mod tests {
         let id = std::env::var("FILAR_TEST_BW_ITEM")
             .expect("set FILAR_TEST_BW_ITEM to a Bitwarden item id");
         let p = BitwardenProvider::new(bw_items(&id));
+        let value = p.get("FILAR_LLM_API_KEY").unwrap();
+        assert!(!value.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // KeePassXcProvider (#693)
+    // ------------------------------------------------------------------
+
+    fn kx_items(entry: &str) -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("FILAR_LLM_API_KEY".to_string(), entry.to_string());
+        m
+    }
+
+    /// A static password source holding the test database password.
+    fn kx_password_source() -> Arc<dyn SecretProvider> {
+        let s = StaticSecretProvider::new();
+        s.insert("KX_DB_PASS", "kx-db-pass-42");
+        Arc::new(s)
+    }
+
+    /// Stub `keepassxc-cli`: reads the password line from stdin like the
+    /// real CLI; `show -a <attr> <db> <entry>` selects the branch by the
+    /// entry (5th argument). The value is printed with the CLI's own
+    /// trailing newline, "newline-entry" adds a stored LF on top,
+    /// "cr-entry" a stored bare CR.
+    fn kx_stub(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        let body = concat!(
+            "@echo off\r\n",
+            "setlocal EnableDelayedExpansion\r\n",
+            "set /p PW=\r\n",
+            "if \"%5\"==\"missing-entry\" (\r\n",
+            "  echo Could not find entry with path %5. 1>&2\r\n",
+            "  exit /b 1\r\n",
+            ")\r\n",
+            "if \"%5\"==\"wrong-pass\" (\r\n",
+            "  echo Invalid credentials were provided, please try again. marker-stderr-xyz 1>&2\r\n",
+            "  exit /b 1\r\n",
+            ")\r\n",
+            "if \"%5\"==\"cr-entry\" (\r\n",
+            "  for /f %%a in ('copy /Z \"%~dpf0\" nul') do set \"CR=%%a\"\r\n",
+            "  <nul set /p=kx-secret-value!CR!\r\n",
+            "  echo.\r\n",
+            "  exit /b 0\r\n",
+            ")\r\n",
+            "echo kx-secret-value\r\n",
+            "if \"%5\"==\"newline-entry\" echo.\r\n",
+            "exit /b 0\r\n",
+        );
+        #[cfg(not(windows))]
+        let body = concat!(
+            "#!/bin/sh\n",
+            "read PW\n",
+            "case \"$5\" in\n",
+            "*missing-entry*) printf '%s\\n' \"Could not find entry with path $5.\" >&2; exit 1 ;;\n",
+            "*wrong-pass*) printf '%s\\n' \"Invalid credentials were provided, please try again. marker-stderr-xyz\" >&2; exit 1 ;;\n",
+            "*cr-entry*) printf 'kx-secret-value\\r\\n' ;;\n",
+            "*newline-entry*) printf 'kx-secret-value\\n\\n' ;;\n",
+            "*) printf 'kx-secret-value\\n' ;;\n",
+            "esac\n",
+        );
+        write_stub(dir, "kx", body)
+    }
+
+    #[test]
+    fn kx_provider_reads_value_via_cli_stub() {
+        let dir = op_stub_dir("kx-read");
+        let stub = kx_stub(&dir);
+        let p = KeePassXcProvider::new("test.kdbx", kx_items("api-key-entry"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_password_provider(kx_password_source(), "KX_DB_PASS");
+        // The CLI's own trailing newline is stripped, the value is intact.
+        assert_eq!(p.get("FILAR_LLM_API_KEY").unwrap(), "kx-secret-value");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kx_provider_preserves_a_stored_terminal_newline() {
+        let dir = op_stub_dir("kx-newline");
+        let stub = kx_stub(&dir);
+        let p = KeePassXcProvider::new("test.kdbx", kx_items("newline-entry"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_password_provider(kx_password_source(), "KX_DB_PASS");
+        // Exactly one CLI-added line break is stripped; the stored one stays.
+        #[cfg(windows)]
+        let expected = "kx-secret-value\r\n";
+        #[cfg(not(windows))]
+        let expected = "kx-secret-value\n";
+        assert_eq!(p.get("FILAR_LLM_API_KEY").unwrap(), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kx_provider_preserves_a_stored_terminal_cr() {
+        let dir = op_stub_dir("kx-cr");
+        let stub = kx_stub(&dir);
+        let p = KeePassXcProvider::new("test.kdbx", kx_items("cr-entry"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_password_provider(kx_password_source(), "KX_DB_PASS");
+        // The CLI delimiter is CRLF on Windows and a bare LF on Unix; a
+        // stored trailing CR is part of the value on both (#735 review).
+        assert_eq!(p.get("FILAR_LLM_API_KEY").unwrap(), "kx-secret-value\r");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kx_provider_wrong_password_error_hides_password_and_stderr() {
+        let dir = op_stub_dir("kx-wrongpass");
+        let stub = kx_stub(&dir);
+        let p = KeePassXcProvider::new("test.kdbx", kx_items("wrong-pass"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_password_provider(kx_password_source(), "KX_DB_PASS");
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("keepassxc"), "{msg}");
+        assert!(msg.contains("wrong database password"), "{msg}");
+        assert!(!msg.contains("kx-db-pass-42"), "{msg}");
+        assert!(!msg.contains("marker-stderr-xyz"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kx_provider_missing_entry_error() {
+        let dir = op_stub_dir("kx-missing");
+        let stub = kx_stub(&dir);
+        let p = KeePassXcProvider::new("test.kdbx", kx_items("missing-entry"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_password_provider(kx_password_source(), "KX_DB_PASS");
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("keepassxc"), "{msg}");
+        assert!(msg.contains("entry not found"), "{msg}");
+        assert!(!msg.contains("kx-db-pass-42"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kx_provider_timeout_kills_the_cli() {
+        let dir = op_stub_dir("kx-slow");
+        #[cfg(windows)]
+        let body = "@echo off\r\nping -n 30 127.0.0.1 >nul\r\nexit /b 0\r\n";
+        #[cfg(not(windows))]
+        let body = "#!/bin/sh\nsleep 30\n";
+        let stub = write_stub(&dir, "kx-slow", body);
+        let p = KeePassXcProvider::new("test.kdbx", kx_items("api-key-entry"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_timeout(Duration::from_millis(300))
+            .with_password_provider(kx_password_source(), "KX_DB_PASS");
+        let started = Instant::now();
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "timeout not enforced");
+        let msg = format!("{err}");
+        assert!(msg.contains("timed out"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kx_provider_missing_cli_is_a_clear_error() {
+        let p = KeePassXcProvider::new("test.kdbx", kx_items("api-key-entry"))
+            .with_cli_path("filar-nonexistent-kx-cli-993")
+            .with_password_provider(kx_password_source(), "KX_DB_PASS");
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("keepassxc"), "{msg}");
+        assert!(msg.contains("not found"), "{msg}");
+    }
+
+    #[test]
+    fn kx_provider_passes_password_via_stdin() {
+        // The stub echoes the stdin line back: the database password must
+        // reach the child through its stdin, not through args or a file.
+        let dir = op_stub_dir("kx-stdin");
+        #[cfg(windows)]
+        let body = "@echo off\r\nset /p PW=\r\necho %PW%\r\nexit /b 0\r\n";
+        #[cfg(not(windows))]
+        let body = "#!/bin/sh\nread PW\nprintf '%s\\n' \"$PW\"\n";
+        let stub = write_stub(&dir, "kx-stdin", body);
+        let p = KeePassXcProvider::new("test.kdbx", kx_items("api-key-entry"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_password_provider(kx_password_source(), "KX_DB_PASS");
+        assert_eq!(p.get("FILAR_LLM_API_KEY").unwrap(), "kx-db-pass-42");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kx_provider_unmapped_name_is_a_miss() {
+        let p = KeePassXcProvider::new("test.kdbx", kx_items("api-key-entry"));
+        let err = p.get("ssh_target:other").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("keepassxc"), "{msg}");
+        assert!(msg.contains("no entry mapping"), "{msg}");
+    }
+
+    #[test]
+    fn kx_provider_no_password_source_is_a_clear_error() {
+        let p = KeePassXcProvider::new("test.kdbx", kx_items("api-key-entry"));
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("keepassxc"), "{msg}");
+        assert!(msg.contains("no database password source"), "{msg}");
+    }
+
+    #[test]
+    fn kx_provider_unavailable_password_names_the_logical_name_only() {
+        let empty = StaticSecretProvider::new();
+        let p = KeePassXcProvider::new("test.kdbx", kx_items("api-key-entry"))
+            .with_password_provider(Arc::new(empty), "KX_DB_PASS");
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("keepassxc"), "{msg}");
+        assert!(msg.contains("KX_DB_PASS"), "{msg}");
+        assert!(msg.contains("not available"), "{msg}");
+    }
+
+    #[test]
+    fn kx_provider_debug_carries_no_values_or_entries() {
+        let p = KeePassXcProvider::new("test.kdbx", kx_items("secret-entry-path"))
+            .with_password_provider(kx_password_source(), "KX_DB_PASS");
+        let dbg = format!("{p:?}");
+        assert!(!dbg.contains("kx-db-pass-42"), "{dbg}");
+        assert!(!dbg.contains("secret-entry-path"), "{dbg}");
+        assert!(dbg.contains("entries: 1"), "{dbg}");
+        assert!(dbg.contains("password_source: true"), "{dbg}");
+    }
+
+    #[test]
+    fn kx_provider_secret_names_lists_the_mapping() {
+        let p = KeePassXcProvider::new("test.kdbx", kx_items("api-key-entry"));
+        assert_eq!(p.secret_names(), vec!["FILAR_LLM_API_KEY".to_string()]);
+    }
+
+    #[test]
+    fn chain_from_config_builds_keepassxc() {
+        let mut cfg = crate::config::SecretProviderConfig {
+            order: vec!["keepassxc".into()],
+            ..Default::default()
+        };
+        cfg.keepassxc.database = Some("test.kdbx".into());
+        cfg.keepassxc.entries = kx_items("api-key-entry");
+        // Building the chain must not spawn the CLI or touch the keyring.
+        let c = ChainSecretProvider::from_config(&cfg).unwrap();
+        let dbg = format!("{c:?}");
+        assert!(dbg.contains("providers: 1"), "{dbg}");
+        assert!(c.secret_names().contains(&"FILAR_LLM_API_KEY".to_string()));
+    }
+
+    #[test]
+    #[ignore = "needs keepassxc-cli and a test database; set FILAR_TEST_KX_DB, FILAR_TEST_KX_ENTRY, FILAR_TEST_KX_PASSWORD"]
+    fn kx_provider_real_cli_integration() {
+        let db = std::env::var("FILAR_TEST_KX_DB").expect("set FILAR_TEST_KX_DB to a .kdbx path");
+        let entry =
+            std::env::var("FILAR_TEST_KX_ENTRY").expect("set FILAR_TEST_KX_ENTRY to an entry path");
+        let password =
+            std::env::var("FILAR_TEST_KX_PASSWORD").expect("set FILAR_TEST_KX_PASSWORD");
+        let source = StaticSecretProvider::new();
+        source.insert("KX_DB_PASS", password);
+        let p = KeePassXcProvider::new(db, kx_items(&entry))
+            .with_password_provider(Arc::new(source), "KX_DB_PASS");
         let value = p.get("FILAR_LLM_API_KEY").unwrap();
         assert!(!value.is_empty());
     }

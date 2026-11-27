@@ -645,3 +645,27 @@ Windows (`KEY_EVENT` с `uChar = 0x07`); ни Windows Terminal, ни conhost,
 macOS в CI) и `op_provider_timeout_wipes_output_stored_before_abort`
 (Unix).
 
+## KeePassXC CLI: наличие и поведение по ОС (#693)
+
+`keepassxc-cli` не всегда лежит в `PATH`: на Windows он ставится вместе с
+KeePassXC (обычно `C:\Program Files\KeePassXC\keepassxc-cli.exe`) и в `PATH`
+по умолчанию не добавляется; на macOS бинарник находится внутри бандла
+(`/Applications/KeePassXC.app/Contents/MacOS/keepassxc-cli`); на Linux
+бинарник `/usr/bin/keepassxc-cli` входит в пакет `keepassxc` (Debian/
+Ubuntu, Fedora, Arch) — отдельного пакета `keepassxc-cli` в этих
+дистрибутивах нет. Отсутствие CLI — понятная ошибка с именем провайдера и
+подсказкой установить его или убрать звено из `secret_provider.order`.
+
+Поведение `show -a <attribute>`: значение печатается в stdout с ровно одним
+завершающим переводом строки (`Qt::endl` пишет `\n`), провайдер снимает
+именно его. На Windows текстовый режим stdout (CRT) превращает добавленный
+`\n` в `\r\n` — снимается пара; на Unix разделитель — одиночный `\n`, и
+хвостовой `\r` самого хранимого значения сохраняется (снятие `\r` после
+`\n` на Unix съедало бы часть секрета). Хвостовой newline самого значения
+сохраняется на обеих платформах. Приглашение пароля
+(«Enter password to unlock …») идёт в stderr, пароль читается из stdin
+одной строкой — поэтому пароль передаётся через pipe stdin, без временных
+файлов, и stdout остаётся чистым значением. Неверный пароль — stderr
+«Invalid credentials were provided…», отсутствующая entry — «Could not find
+entry with path …»: это разные классифицированные ошибки провайдера.
+

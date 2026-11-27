@@ -410,9 +410,8 @@ Provider parameters (`onepassword.items`, `bitwarden.items`,
 `keepassxc.database` / `attribute` / `entries`) are references only; a secret
 value never enters the config. `ChainSecretProvider::from_config` builds the
 chain from the section; `onepassword` maps to `OnePasswordProvider` (#691),
-`bitwarden` maps to `BitwardenProvider` (#692), the remaining password-manager
-kind passes validation but its provider lands with the rest of milestone
-3.1.0 — until then `from_config` refuses it by name. Without the section,
+`bitwarden` maps to `BitwardenProvider` (#692), `keepassxc` maps to
+`KeePassXcProvider` (#693) — all five kinds build. Without the section,
 secret resolution keeps its
 legacy order (static → keyring → env). The section does not yet govern
 production key resolution in the app — the chain is wired into the startup
@@ -443,6 +442,23 @@ from the environment or the OS credential store (service `filar`, name
 `BW_SESSION`), never from the config, and passed to the child process only.
 Errors name the provider and the item id, never a value or the raw stderr;
 value buffers are zeroized; caching lives in the chain. The trait is
+synchronous: async callers must use `tokio::task::spawn_blocking`.
+
+`filar_core::KeePassXcProvider` (#693) reads secrets through the local
+KeePassXC CLI: `keepassxc-cli show -a <attribute> <db> <entry>` with a
+per-invocation timeout (30s default, `with_timeout` overrides). The database
+path and attribute come from `[secret_provider.keepassxc]`; logical names
+map to entry paths via `entries`, an unmapped name is a miss. The database
+password never enters the config: `from_config` resolves it through
+keyring → env under the logical name `FILAR_KEEPASSXC_DB_PASSWORD` (no
+caching); `with_password_provider` accepts any `SecretProvider`, e.g. a
+`StaticSecretProvider` holding a masked startup input. The password is fed
+to the CLI's stdin — no temporary file is created — and zeroized after the
+call. `show -a` appends exactly one newline of its own; precisely that line
+break is stripped, a stored terminal newline survives. A wrong database
+password, a missing entry and a missing CLI are distinct errors naming the
+provider and the entry — never a password value, never the raw stderr.
+`Debug` carries counts and non-secret parameters only. The trait is
 synchronous: async callers must use `tokio::task::spawn_blocking`.
 
 `SshTransportConfig::command_timeout` (default 300s,

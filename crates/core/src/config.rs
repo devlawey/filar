@@ -313,7 +313,7 @@ pub enum SecretProviderKind {
     OnePassword,
     /// Bitwarden CLI (`bw get`, [`crate::secrets::BitwardenProvider`]).
     Bitwarden,
-    /// KeePassXC CLI (`keepassxc-cli show`).
+    /// KeePassXC CLI (`keepassxc-cli show`, [`crate::secrets::KeePassXcProvider`]).
     KeePassXc,
 }
 
@@ -428,8 +428,9 @@ pub struct ProviderItemsConfig {
 
 /// `[secret_provider.keepassxc]` — where the local KeePassXC database lives
 /// and how logical names map to its entries. The database password is a
-/// secret and is never stored here: it comes from the keyring, env or a
-/// masked prompt (#693).
+/// secret and is never stored here: `from_config` resolves it through
+/// keyring → env under the logical name `FILAR_KEEPASSXC_DB_PASSWORD`, or
+/// it comes from a masked startup prompt (#693).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeePassXcProviderConfig {
     /// Path to the `.kdbx` database file.
