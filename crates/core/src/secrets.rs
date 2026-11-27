@@ -678,8 +678,11 @@ impl Drop for ChainSecretProvider {
 /// Default timeout for a password-manager CLI invocation, seconds (#691).
 pub const DEFAULT_SECRET_CLI_TIMEOUT_SECS: u64 = 30;
 
-/// Run a password-manager CLI and return its stdout with trailing newlines
-/// stripped. The child is killed when `timeout` elapses.
+/// Run a password-manager CLI and return its stdout verbatim (the caller
+/// passes flags like `--no-newline` so nothing is added; a stored secret
+/// may itself end with a newline). The child is killed when `timeout`
+/// elapses; both output pipes are drained while it runs, so a value larger
+/// than the pipe capacity cannot deadlock the child into a false timeout.
 ///
 /// Errors name the provider and the (non-secret) reference, never a value
 /// and never the raw stderr: the stderr is only classified into a short
@@ -692,7 +695,14 @@ fn run_secret_cli(
     reference: &str,
     classify: impl Fn(&str) -> Option<&'static str>,
 ) -> Result<String> {
+    use std::io::Read;
     use std::process::{Command, Stdio};
+
+    // An unrepresentable deadline must fail before the child starts:
+    // dropping a `Child` does not terminate the subprocess.
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        CoreError::Config(format!("{provider}: timeout is too large to represent"))
+    })?;
 
     let mut child = Command::new(cli)
         .args(args)
@@ -710,12 +720,43 @@ fn run_secret_cli(
             }
         })?;
 
-    let deadline = Instant::now() + timeout;
+    // Drain both pipes concurrently: a child writing more than the pipe
+    // capacity would block forever with nobody reading (#733 review).
+    // On abort the readers are not joined — an orphaned grandchild may keep
+    // a pipe open long after the kill (Windows cmd.exe stubs) — they wipe
+    // their buffers themselves once the pipes finally close.
+    let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let out_aborted = Arc::clone(&aborted);
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        if out_aborted.load(std::sync::atomic::Ordering::Relaxed) {
+            buf.zeroize();
+        }
+        buf
+    });
+    let err_aborted = Arc::clone(&aborted);
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        if err_aborted.load(std::sync::atomic::Ordering::Relaxed) {
+            buf.zeroize();
+        }
+        buf
+    });
+
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    aborted.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(CoreError::Secret(format!(
@@ -726,6 +767,7 @@ fn run_secret_cli(
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(e) => {
+                aborted.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(CoreError::Other(format!(
@@ -735,25 +777,26 @@ fn run_secret_cli(
         }
     };
 
-    // The child has exited; drain the pipes. A value larger than the pipe
-    // buffer would have blocked the child until the timeout killed it.
-    let mut output = child
-        .wait_with_output()
-        .map_err(|e| CoreError::Other(format!("{provider}: failed to read CLI output: {e}")))?;
-    let mut stdout_bytes = std::mem::take(&mut output.stdout);
-    let mut stderr_bytes = std::mem::take(&mut output.stderr);
+    let mut stdout_bytes = out_reader
+        .join()
+        .map_err(|_| CoreError::Other(format!("{provider}: stdout reader panicked")))?;
+    let mut stderr_bytes = err_reader
+        .join()
+        .map_err(|_| CoreError::Other(format!("{provider}: stderr reader panicked")))?;
     let mut stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
     let mut stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
     stdout_bytes.zeroize();
     stderr_bytes.zeroize();
 
-    let result = if status.success() {
-        // `op read` appends a newline unless --no-newline; strip only the
-        // line ending, never meaningful whitespace inside the value.
-        let value = stdout.trim_end_matches(['\r', '\n']).to_string();
-        Ok(value)
+    if status.success() {
+        stderr.zeroize();
+        Ok(stdout)
     } else {
-        let hint = classify(&stderr.to_lowercase()).unwrap_or("CLI read failed");
+        let mut normalized = stderr.to_lowercase();
+        let hint = classify(&normalized).unwrap_or("CLI read failed");
+        normalized.zeroize();
+        stderr.zeroize();
+        stdout.zeroize();
         let code = status
             .code()
             .map(|c| c.to_string())
@@ -761,10 +804,7 @@ fn run_secret_cli(
         Err(CoreError::Secret(format!(
             "{provider}: {hint} (item {reference}, exit {code})"
         )))
-    };
-    stdout.zeroize();
-    stderr.zeroize();
-    result
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,8 +1462,9 @@ mod tests {
     }
 
     /// Stub `op`: the reference (second argument) selects the behaviour —
-    /// "locked" → sign-in error, "missing" → not-found error, anything else
-    /// → a value with a trailing newline (which the provider must strip).
+    /// "locked" → sign-in error, "missing" → not-found error, "newline" → a
+    /// value whose stored form ends with a line break, anything else → a
+    /// value printed verbatim (the stub honours `--no-newline`).
     fn op_stub(dir: &std::path::Path) -> std::path::PathBuf {
         #[cfg(windows)]
         let body = concat!(
@@ -1438,7 +1479,12 @@ mod tests {
             "  echo [ERROR] item isn't an item in the vault 1>&2\r\n",
             "  exit /b 1\r\n",
             ")\r\n",
-            "echo op-secret-value\r\n",
+            "echo %2 | find \"newline\" >nul\r\n",
+            "if not errorlevel 1 (\r\n",
+            "  echo op-secret-value\r\n",
+            "  exit /b 0\r\n",
+            ")\r\n",
+            "<nul set /p=op-secret-value\r\n",
             "exit /b 0\r\n",
         );
         #[cfg(not(windows))]
@@ -1447,10 +1493,27 @@ mod tests {
             "case \"$2\" in\n",
             "*locked*) printf '%s\\n' \"[ERROR] You are not signed in. Your session has expired.\" >&2; exit 1 ;;\n",
             "*missing*) printf '%s\\n' \"[ERROR] item isn't an item in the vault\" >&2; exit 1 ;;\n",
-            "*) printf 'op-secret-value\\n' ;;\n",
+            "*newline*) printf 'op-secret-value\\n' ;;\n",
+            "*) printf 'op-secret-value' ;;\n",
             "esac\n",
         );
         write_stub(dir, "op-stub", body)
+    }
+
+    /// Stub `op` writing more than the pipe capacity (≈200 KB) before it
+    /// exits — the provider must drain the pipes, not deadlock (#733 review).
+    fn op_big_stub(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        let body = concat!(
+            "@echo off\r\n",
+            "setlocal enabledelayedexpansion\r\n",
+            "set LINE=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n",
+            "for /L %%i in (1,1,2000) do echo !LINE!\r\n",
+            "exit /b 0\r\n",
+        );
+        #[cfg(not(windows))]
+        let body = "#!/bin/sh\nawk 'BEGIN{for(i=0;i<200000;i++)printf \"a\"}'\n";
+        write_stub(dir, "op-big", body)
     }
 
     fn op_slow_stub(dir: &std::path::Path) -> std::path::PathBuf {
@@ -1473,9 +1536,51 @@ mod tests {
         let stub = op_stub(&dir);
         let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
             .with_cli_path(stub.to_str().unwrap());
-        // The trailing newline of the stub output must be stripped.
+        // The stub honours --no-newline; stdout is returned verbatim.
         assert_eq!(p.get("FILAR_LLM_API_KEY").unwrap(), "op-secret-value");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_preserves_a_terminal_newline_of_the_stored_secret() {
+        // A stored password may itself end with a line break; --no-newline
+        // only suppresses the newline the CLI would add (#733 review).
+        let dir = op_stub_dir("newline");
+        let stub = op_stub(&dir);
+        let p = OnePasswordProvider::new(op_items("op://vault/newline-item/credential"))
+            .with_cli_path(stub.to_str().unwrap());
+        #[cfg(windows)]
+        let expected = "op-secret-value\r\n";
+        #[cfg(not(windows))]
+        let expected = "op-secret-value\n";
+        assert_eq!(p.get("FILAR_LLM_API_KEY").unwrap(), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_large_output_does_not_deadline() {
+        // More than the pipe capacity: the pipes must be drained while the
+        // CLI runs, or the child blocks and gets a false timeout.
+        let dir = op_stub_dir("big");
+        let stub = op_big_stub(&dir);
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_timeout(Duration::from_secs(20));
+        let value = p.get("FILAR_LLM_API_KEY").unwrap();
+        assert!(value.len() > 100_000, "expected >100KB, got {}", value.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_unrepresentable_timeout_fails_before_spawning() {
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path("filar-nonexistent-op-cli-991")
+            .with_timeout(Duration::MAX);
+        // The deadline check runs before spawn: the error is about the
+        // timeout, not about the missing CLI.
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("too large"), "{msg}");
     }
 
     #[test]

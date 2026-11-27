@@ -13546,4 +13546,12 @@ zeroize; кэш — в Chain. `from_config` собирает звено `onepass
 `DEFAULT_SECRET_CLI_TIMEOUT_SECS` (описаны в `docs/ENGINE_API.md`).
 `CommandExecutor`/`LlmClient` без изменений.
 
+**Ревью (раунд 1).** Приняты все четыре замечания CodeRabbit: дедлайн
+через `checked_add` до спавна (непредставимый таймаут — ошибка, child не
+остаётся); оба pipe вычитываются параллельными потоками — вывод больше
+ёмкости pipe не даёт ложный таймаут (тест ≈200 KB); stdout возвращается
+как есть — секрет с собственным trailing newline не портится
+(`--no-newline` уже ничего не добавляет); lowercase-копия stderr тоже
+zeroize.
+
 **Next:** #692 (провайдер Bitwarden CLI).
