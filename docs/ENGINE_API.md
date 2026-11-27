@@ -1279,6 +1279,9 @@ journal. Nothing leaves the machine: the writer only touches the file system.
   (`StaticSecretProvider::with_secrets`).
 - A write failure is returned as `Err`; the caller logs a warning and keeps
   going. Auditing never blocks or fails a command.
+- `append` performs synchronous file I/O (the core crate is runtime-agnostic);
+  async callers should offload it via `tokio::task::spawn_blocking` — the TUI/agent
+  integration wires this up in #698.
 - `audit::read_records(path)` reads a file back in order; a malformed line
   is an error naming its number.
 

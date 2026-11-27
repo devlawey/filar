@@ -235,6 +235,11 @@ impl AuditWriter {
     /// resolved in this session explicitly (`StaticSecretProvider::with_secrets`)
     /// — a snapshot built from a non-enumerable source is empty and masks
     /// nothing.
+    ///
+    /// This call performs synchronous file I/O; the core crate is
+    /// runtime-agnostic. Callers on an async executor (agent loop, TUI)
+    /// should offload it, e.g. via `tokio::task::spawn_blocking`, so the
+    /// write cannot stall the runtime (#698 wires this up).
     pub fn append(
         &mut self,
         record: &AuditRecord,

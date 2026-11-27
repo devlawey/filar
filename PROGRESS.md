@@ -13955,3 +13955,11 @@ Err) — нечитаемый каталог больше не даёт вечн
 FFI (std File::lock стабилен с 1.89, MSRV репо — 1.85), гонка требует
 короткой записи на малом append; предложена отдельная hardening-issue
 в сводке. +1 core-тест — 12 audit-тестов.
+
+Ревью-раунд 5 (PR #744, финальный): doc-заметка о синхронном I/O в
+`append` (core не зависит от рантайма; async-вызывающий выносит запись
+в `spawn_blocking`, интеграция — #698) в доке метода и ENGINE_API.
+Отклонено как ложные срабатывания ai-review: «StaticSecretProvider не
+реэкспортирован из корня» — реэкспорт есть в lib.rs (`pub use
+secrets::{… StaticSecretProvider …}`), пример компилируется
+(`cargo build -p filar-agent --example engine_api_snippets`).
