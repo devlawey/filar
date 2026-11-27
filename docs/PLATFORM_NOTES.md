@@ -620,3 +620,28 @@ Windows (`KEY_EVENT` с `uChar = 0x07`); ни Windows Terminal, ни conhost,
 не появляются, даже если навести курсор на кнопку Check. Это ограничение
 стенда, а не лаунчера. Наличие таких подсказок проверяется по коду и тестом
 текстов, а их показ — вживую на Windows и macOS.
+
+## Таймаут CLI менеджеров паролей: kill не убивает дерево процессов (#691)
+
+`Child::kill()` на Windows завершает только сам процесс. Если CLI запущен
+через `.cmd`/`.bat` (так работают тестовые заглушки `op`), убивается
+`cmd.exe`, а его потомок (например `ping`) продолжает жить и держит
+унаследованный handle stderr-pipe. Потомок может держать pipe и после
+штатного выхода самого CLI (`start /b` на Windows, `cmd &` на Unix).
+Поэтому `run_secret_cli` (`crates/core/src/secrets.rs`) никогда не делает
+безусловный `join` читателей pipe: они копируют вывод chunk-за-chunk-ом в
+общие буферы под мьютексом и сразу затирают свой chunk; ожидание
+читателей после штатного выхода CLI ограничено тем же дедлайном. По
+таймауту (и при ошибке ожидания) abort-путь затирает общие буферы под тем
+же локом немедленно — частичный секрет не остаётся в памяти даже если
+читатель ещё заблокирован в `read()` на удерживаемом внуком pipe; сам
+поток может жить до EOF, но секретных байтов вне общего буфера не держит.
+На Unix одиночный `sh`-процесс закрывает pipe сразу при kill; поведение
+тем не менее унифицировано. Проверено тестами
+`op_provider_timeout_kills_the_cli`,
+`op_provider_grandchild_holding_pipe_is_bounded_by_deadline`,
+`op_provider_timeout_with_partial_output_and_held_pipe`,
+`abort_pipe_readers_wipes_partial_data_without_eof` (Windows локально,
+macOS в CI) и `op_provider_timeout_wipes_output_stored_before_abort`
+(Unix).
+

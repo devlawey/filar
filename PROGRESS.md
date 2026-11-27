@@ -13522,3 +13522,71 @@ config.rs и ENGINE_API.md явно говорят, что секция пока
 `docs/ENGINE_API.md`). `CommandExecutor`/`LlmClient` без изменений.
 
 **Next:** #691 (провайдер 1Password CLI).
+
+## #691 — провайдер 1Password CLI (op read)
+
+**Сделано.** `OnePasswordProvider` (`secrets.rs`): чтение через
+`op read op://<vault>/<item>/<field> --no-newline` subprocess с таймаутом
+(дефолт 30с, `DEFAULT_SECRET_CLI_TIMEOUT_SECS`, `with_timeout`); маппинг
+логических имён через `[secret_provider.onepassword.items]`; немапленное
+имя — промах (chain идёт дальше). Заблокированный vault / нет сессии —
+ошибка с именем провайдера и item-ссылки, без значения и без сырого stderr
+(stderr только классифицируется в короткий hint). Буферы значений
+zeroize; кэш — в Chain. `from_config` собирает звено `onepassword`;
+`bitwarden`/`keepassxc` по-прежнему «not available yet» (#692–#693).
+Общий helper `run_secret_cli` (spawn + try_wait + kill по таймауту)
+переиспользуется следующими провайдерами.
+
+**Решения.** Трейт синхронный — async-вызовы только через `spawn_blocking`
+(задокументировано). CLI-путь подменяем (`with_cli_path`) — юнит-тесты
+гоняют stub-скрипт (.cmd на Windows, sh на Unix), реальный `op` —
+`#[ignore]`-тест с `FILAR_TEST_OP_REFERENCE` (ручной).
+
+**Контракты.** Новые публичные элементы: `OnePasswordProvider`,
+`DEFAULT_SECRET_CLI_TIMEOUT_SECS` (описаны в `docs/ENGINE_API.md`).
+`CommandExecutor`/`LlmClient` без изменений.
+
+**Ревью (раунд 1).** Приняты все четыре замечания CodeRabbit: дедлайн
+через `checked_add` до спавна (непредставимый таймаут — ошибка, child не
+остаётся); оба pipe вычитываются параллельными потоками — вывод больше
+ёмкости pipe не даёт ложный таймаут (тест ≈200 KB); stdout возвращается
+как есть — секрет с собственным trailing newline не портится
+(`--no-newline` уже ничего не добавляет); lowercase-копия stderr тоже
+zeroize.
+
+**Ревью (раунд 2).** Принято follow-up замечание CodeRabbit: ожидание
+читателей pipe после выхода CLI ограничено тем же дедлайном (внук может
+держать pipe открытым), буферы передаются через слоты под мьютексом —
+abort-флаг проверяется под тем же локом, поэтому zeroize гарантирован и
+для читателя, завершившегося до таймаута. Тесты: внук с открытым pipe
+(Windows `start /b`, Unix `&`), читатель до abort (Unix). Расхождение
+описано в `docs/PLATFORM_NOTES.md`.
+
+**Ревью (раунд 3).** Принят blocker ai-review и follow-up CodeRabbit:
+читатель, заблокированный в `read()` на pipe, который держит внук, не
+должен хранить часть секрета до EOF. Читатели теперь копируют вывод
+chunk-за-chunk-ом в общий буфер под мьютексом и затирают chunk сразу;
+abort-путь затирает общий буфер немедленно, без ожидания EOF. Поток может
+жить до EOF, но секретных байтов вне общего буфера не держит (оговорено в
+PLATFORM_NOTES). Тесты: `abort_pipe_readers_wipes_partial_data_without_eof`,
+`op_provider_timeout_with_partial_output_and_held_pipe`.
+
+**Ревью (раунд 4).** Принято: `Drop` для `PipeBuffer` (затирание при любом
+освобождении); `done = true` в abort-пути; Unix-заглушки partial-тестов
+переведены на `printf … | cat` (гарантированный сброс в pipe, без
+stdbuf/python3); буферы CLI-вывода получили фиксированную вместимость
+1 МиБ на поток (`MAX_SECRET_CLI_OUTPUT_BYTES`) — realloc исключён, старая
+незатёртая копия секрета не появляется, переполнение — ошибка. Отклонено:
+прерывание заблокированного `read()` читателя — требует unsafe
+платформенных API или новых зависимостей; после abort читатель секретных
+байтов не держит, поток завершается по EOF/выходу потомка (кандидат на
+отдельную issue). Тест `pipe_reader_caps_output_without_realloc`.
+Дополнительно в том же раунде: создание читателей — через fallible
+`Builder::spawn` (при отказе — abort/kill/wait ребёнка, без паники);
+ошибка чтения больше не выдаётся за EOF (`Interrupted` ретраится,
+фатальная — флаг `error` и отказ вызова, чтобы обрезанный секрет не
+попал в кэш). Тест `pipe_reader_retries_interrupted_and_records_fatal_errors`.
+«blocker» ai-review про отсутствие ожидания `done` отклонён: ограниченное
+дедлайном ожидание обоих читателей уже есть перед проверкой overflow.
+
+**Next:** #692 (провайдер Bitwarden CLI).

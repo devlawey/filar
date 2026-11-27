@@ -409,12 +409,25 @@ the config load naming the field — there is no silent fallback to env.
 Provider parameters (`onepassword.items`, `bitwarden.items`,
 `keepassxc.database` / `attribute` / `entries`) are references only; a secret
 value never enters the config. `ChainSecretProvider::from_config` builds the
-chain from the section; the password-manager kinds pass validation but their
-providers land with the rest of milestone 3.1.0 — until then `from_config`
-refuses them by name. Without the section, secret resolution keeps its
+chain from the section; `onepassword` maps to `OnePasswordProvider` (#691),
+the remaining password-manager kinds pass validation but their providers
+land with the rest of milestone 3.1.0 — until then `from_config` refuses them
+by name. Without the section, secret resolution keeps its
 legacy order (static → keyring → env). The section does not yet govern
 production key resolution in the app — the chain is wired into the startup
 paths in #694.
+
+`filar_core::OnePasswordProvider` (#691) reads secrets through the local
+1Password CLI: `op read op://<vault>/<item>/<field> --no-newline`, with a
+per-invocation timeout (`DEFAULT_SECRET_CLI_TIMEOUT_SECS`, 30s;
+`with_timeout` overrides). Logical names map to `op://` references via
+`[secret_provider.onepassword.items]`; an unmapped name is a miss so the
+chain falls through. A locked vault or missing session yields an error
+naming the provider and the item reference — never a value, never the raw
+stderr. Value buffers are zeroized; caching lives in the chain. CLI output
+is capped at 1 MiB per stream (fixed pre-reserved buffers, no reallocation);
+larger output is an error, not a truncated secret. The trait
+is synchronous: async callers must use `tokio::task::spawn_blocking`.
 
 `SshTransportConfig::command_timeout` (default 300s,
 `filar_core::DEFAULT_COMMAND_TIMEOUT_SECS`) is how long `SshSession::run` waits

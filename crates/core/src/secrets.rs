@@ -538,11 +538,12 @@ impl ChainSecretProvider {
 
     /// Build the chain described by `[secret_provider]` (#690).
     ///
-    /// `keyring` and `env` map to [`KeyringSecretProvider`] and
-    /// [`EnvSecretProvider`]; the password-manager kinds are recognised by
-    /// validation but their providers land with the follow-up issues of
-    /// milestone 3.1.0 — until then naming one fails with a clear error
-    /// instead of silently skipping it.
+    /// `keyring`, `env` and `onepassword` map to [`KeyringSecretProvider`],
+    /// [`EnvSecretProvider`] and [`OnePasswordProvider`]; the remaining
+    /// password-manager kinds are recognised by validation but their
+    /// providers land with the follow-up issues of milestone 3.1.0 — until
+    /// then naming one fails with a clear error instead of silently
+    /// skipping it.
     pub fn from_config(cfg: &crate::config::SecretProviderConfig) -> Result<Self> {
         cfg.validate()?;
         let mut providers: Vec<Arc<dyn SecretProvider>> = Vec::new();
@@ -553,6 +554,9 @@ impl ChainSecretProvider {
             let provider: Arc<dyn SecretProvider> = match parsed {
                 crate::config::SecretProviderKind::Keyring => Arc::new(KeyringSecretProvider::new()),
                 crate::config::SecretProviderKind::Env => Arc::new(EnvSecretProvider::new()),
+                crate::config::SecretProviderKind::OnePassword => {
+                    Arc::new(OnePasswordProvider::new(cfg.onepassword.items.clone()))
+                }
                 other => {
                     return Err(CoreError::Config(format!(
                         "secret_provider.order: provider '{}' is not available yet",
@@ -664,6 +668,367 @@ impl Drop for ChainSecretProvider {
             }
             cache.clear();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Password-manager CLI helpers
+// ---------------------------------------------------------------------------
+
+/// Default timeout for a password-manager CLI invocation, seconds (#691).
+pub const DEFAULT_SECRET_CLI_TIMEOUT_SECS: u64 = 30;
+
+/// Upper bound on password-manager CLI output, per stream. Secret values
+/// are small; the fixed pre-reserved capacity guarantees the buffer never
+/// reallocates, so no freed copy of a secret is left unwiped (#733 review).
+/// Output beyond the limit is an error, never a truncated secret.
+const MAX_SECRET_CLI_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// Partial pipe output shared with a reader thread. The abort path wipes
+/// `data` under the same lock the reader copies each chunk into, so a
+/// partial secret is zeroized immediately on timeout — even while the
+/// reader stays blocked in `read()` on a pipe an orphaned grandchild keeps
+/// open. The reader keeps no secret bytes of its own between reads.
+/// The capacity is reserved once in `new()` and never grows.
+struct PipeBuffer {
+    data: Vec<u8>,
+    done: bool,
+    overflow: bool,
+    error: bool,
+}
+
+impl PipeBuffer {
+    fn new() -> Self {
+        Self {
+            data: Vec::with_capacity(MAX_SECRET_CLI_OUTPUT_BYTES),
+            done: false,
+            overflow: false,
+            error: false,
+        }
+    }
+}
+
+/// Wipe the secret bytes even if the buffer is dropped without an explicit
+/// zeroize (panic, future refactor).
+impl Drop for PipeBuffer {
+    fn drop(&mut self) {
+        self.data.zeroize();
+    }
+}
+
+/// Set the abort flag and wipe whatever the pipe readers already copied.
+/// A reader that returns from `read()` later sees the flag under the same
+/// lock and wipes its chunk, so no partial output survives unzeroized.
+/// `done` is set too: an aborted buffer must never be awaited or read as
+/// a valid result.
+fn abort_pipe_readers(
+    aborted: &std::sync::atomic::AtomicBool,
+    buffers: &[&Mutex<PipeBuffer>],
+) {
+    aborted.store(true, std::sync::atomic::Ordering::SeqCst);
+    for buf in buffers {
+        let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+        b.data.zeroize();
+        b.done = true;
+    }
+}
+
+/// Read a pipe chunk by chunk into the shared buffer, checking the abort
+/// flag under the buffer lock after every chunk. While blocked in `read()`
+/// the thread holds no secret data: the previous chunk was wiped right
+/// after being copied. The thread may linger until EOF, but never with a
+/// secret in its own memory. `Interrupted` reads are retried; any other
+/// read error is recorded so a truncated value is never returned as the
+/// secret. Thread creation is fallible: the caller must not leave an
+/// already-spawned child unmanaged on failure.
+fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+    buf: Arc<Mutex<PipeBuffer>>,
+    aborted: Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("filar-secret-cli-reader".to_string())
+        .spawn(move || {
+            if let Some(mut pipe) = pipe {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let n = match pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => {
+                            buf.lock().unwrap_or_else(|e| e.into_inner()).error = true;
+                            break;
+                        }
+                    };
+                    let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+                    if aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                        chunk[..n].zeroize();
+                        break;
+                    }
+                    if b.data.len() + n > MAX_SECRET_CLI_OUTPUT_BYTES {
+                        b.overflow = true;
+                        chunk[..n].zeroize();
+                        break;
+                    }
+                    // Within the capacity reserved in PipeBuffer::new():
+                    // no reallocation, no freed unwiped copy of the secret.
+                    b.data.extend_from_slice(&chunk[..n]);
+                    chunk[..n].zeroize();
+                }
+            }
+            buf.lock().unwrap_or_else(|e| e.into_inner()).done = true;
+        })?;
+    Ok(())
+}
+
+/// Run a password-manager CLI and return its stdout verbatim (the caller
+/// passes flags like `--no-newline` so nothing is added; a stored secret
+/// may itself end with a newline). The child is killed when `timeout`
+/// elapses; both output pipes are drained while it runs, so a value larger
+/// than the pipe capacity cannot deadlock the child into a false timeout.
+///
+/// Errors name the provider and the (non-secret) reference, never a value
+/// and never the raw stderr: the stderr is only classified into a short
+/// hint by `classify`. All intermediate buffers are zeroized.
+fn run_secret_cli(
+    cli: &str,
+    args: &[&str],
+    timeout: Duration,
+    provider: &str,
+    reference: &str,
+    classify: impl Fn(&str) -> Option<&'static str>,
+) -> Result<String> {
+    use std::process::{Command, Stdio};
+
+    // An unrepresentable deadline must fail before the child starts:
+    // dropping a `Child` does not terminate the subprocess.
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        CoreError::Config(format!("{provider}: timeout is too large to represent"))
+    })?;
+
+    let mut child = Command::new(cli)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CoreError::Secret(format!(
+                    "{provider}: CLI '{cli}' not found — install it or remove the provider from secret_provider.order"
+                ))
+            } else {
+                CoreError::Other(format!("{provider}: failed to start CLI '{cli}': {e}"))
+            }
+        })?;
+
+    // Drain both pipes concurrently: a child writing more than the pipe
+    // capacity would block forever with nobody reading (#733 review).
+    // Readers copy chunks into shared buffers; on abort the flag is set
+    // and the buffers wiped under the same lock, so partial output is
+    // zeroized immediately — no EOF wait, no secret left in a blocked
+    // reader's own memory.
+    let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let out_buf: Arc<Mutex<PipeBuffer>> = Arc::new(Mutex::new(PipeBuffer::new()));
+    let err_buf: Arc<Mutex<PipeBuffer>> = Arc::new(Mutex::new(PipeBuffer::new()));
+    spawn_pipe_reader(child.stdout.take(), Arc::clone(&out_buf), Arc::clone(&aborted))
+        .and_then(|_| {
+            spawn_pipe_reader(child.stderr.take(), Arc::clone(&err_buf), Arc::clone(&aborted))
+        })
+        .map_err(|e| {
+            // A reader thread could not start: stop whatever did start,
+            // terminate and reap the child, never leave it unmanaged.
+            abort_pipe_readers(&aborted, &[&out_buf, &err_buf]);
+            let _ = child.kill();
+            let _ = child.wait();
+            CoreError::Other(format!(
+                "{provider}: failed to start output reader for CLI '{cli}': {e}"
+            ))
+        })?;
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    abort_pipe_readers(&aborted, &[&out_buf, &err_buf]);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(CoreError::Secret(format!(
+                        "{provider}: timed out after {}s reading {reference}",
+                        timeout.as_secs()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                abort_pipe_readers(&aborted, &[&out_buf, &err_buf]);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CoreError::Other(format!(
+                    "{provider}: failed to wait for CLI '{cli}': {e}"
+                )));
+            }
+        }
+    };
+
+    // The child exited, but an orphaned grandchild may still hold a pipe
+    // open (Windows .cmd stubs): wait for the readers no longer than the
+    // same deadline, never an unbounded join.
+    loop {
+        let out_done = out_buf.lock().unwrap_or_else(|e| e.into_inner()).done;
+        let err_done = err_buf.lock().unwrap_or_else(|e| e.into_inner()).done;
+        if out_done && err_done {
+            break;
+        }
+        if Instant::now() >= deadline {
+            abort_pipe_readers(&aborted, &[&out_buf, &err_buf]);
+            return Err(CoreError::Secret(format!(
+                "{provider}: timed out after {}s reading {reference}",
+                timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let overflow = out_buf.lock().unwrap_or_else(|e| e.into_inner()).overflow
+        || err_buf.lock().unwrap_or_else(|e| e.into_inner()).overflow;
+    if overflow {
+        abort_pipe_readers(&aborted, &[&out_buf, &err_buf]);
+        return Err(CoreError::Secret(format!(
+            "{provider}: CLI output exceeds the {MAX_SECRET_CLI_OUTPUT_BYTES}-byte limit reading {reference}"
+        )));
+    }
+    // A failed read must never pass a truncated value off as the secret.
+    let read_error = out_buf.lock().unwrap_or_else(|e| e.into_inner()).error
+        || err_buf.lock().unwrap_or_else(|e| e.into_inner()).error;
+    if read_error {
+        abort_pipe_readers(&aborted, &[&out_buf, &err_buf]);
+        return Err(CoreError::Other(format!(
+            "{provider}: failed to read CLI output reading {reference}"
+        )));
+    }
+    let mut stdout_bytes = std::mem::take(&mut out_buf.lock().unwrap_or_else(|e| e.into_inner()).data);
+    let mut stderr_bytes = std::mem::take(&mut err_buf.lock().unwrap_or_else(|e| e.into_inner()).data);
+    let mut stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let mut stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    stdout_bytes.zeroize();
+    stderr_bytes.zeroize();
+
+    if status.success() {
+        stderr.zeroize();
+        Ok(stdout)
+    } else {
+        let mut normalized = stderr.to_lowercase();
+        let hint = classify(&normalized).unwrap_or("CLI read failed");
+        normalized.zeroize();
+        stderr.zeroize();
+        stdout.zeroize();
+        let code = status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        Err(CoreError::Secret(format!(
+            "{provider}: {hint} (item {reference}, exit {code})"
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OnePasswordProvider
+// ---------------------------------------------------------------------------
+
+/// [`SecretProvider`] backed by the 1Password CLI (`op read`, #691).
+///
+/// Logical names (`FILAR_LLM_API_KEY`, `ssh_target:<name>`,
+/// `ssh_key_passphrase:<name>`) map to `op://<vault>/<item>/<field>`
+/// references through `[secret_provider.onepassword.items]`. The CLI runs
+/// on the user's machine, so zero-install on the remote (invariant 1) is
+/// not affected. The trait is synchronous: async callers must wrap `get()`
+/// in `tokio::task::spawn_blocking`, never call it on a runtime worker.
+///
+/// A locked vault or a missing session (`OP_SESSION`, service account) is
+/// reported as a clear error naming the provider and the item reference —
+/// never a value and never the raw stderr. Value buffers are zeroized;
+/// caching lives in [`ChainSecretProvider`], not here.
+pub struct OnePasswordProvider {
+    items: HashMap<String, String>,
+    cli: String,
+    timeout: Duration,
+}
+
+impl OnePasswordProvider {
+    /// Create a provider from the logical-name → `op://` mapping. Uses the
+    /// `op` binary from `PATH` and [`DEFAULT_SECRET_CLI_TIMEOUT_SECS`].
+    pub fn new(items: HashMap<String, String>) -> Self {
+        Self {
+            items,
+            cli: "op".to_string(),
+            timeout: Duration::from_secs(DEFAULT_SECRET_CLI_TIMEOUT_SECS),
+        }
+    }
+
+    /// Override the CLI path (tests use a stub script).
+    pub fn with_cli_path(mut self, path: impl Into<String>) -> Self {
+        self.cli = path.into();
+        self
+    }
+
+    /// Override the per-invocation timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+impl SecretProvider for OnePasswordProvider {
+    fn get(&self, name: &str) -> Result<String> {
+        let reference = self.items.get(name).ok_or_else(|| {
+            CoreError::Secret(format!("onepassword: no op:// mapping for {}", redact(name)))
+        })?;
+        run_secret_cli(
+            &self.cli,
+            &["read", reference, "--no-newline"],
+            self.timeout,
+            "onepassword",
+            reference,
+            |stderr| {
+                if stderr.contains("not signed in")
+                    || stderr.contains("session expired")
+                    || stderr.contains("session has expired")
+                    || stderr.contains("sign in")
+                    || stderr.contains("authentication")
+                    || stderr.contains("locked")
+                {
+                    Some(
+                        "vault is locked or there is no active session — sign in with 'op signin' or provide OP_SESSION / a service account token",
+                    )
+                } else if stderr.contains("isn't an item")
+                    || stderr.contains("not found")
+                    || stderr.contains("could not be found")
+                    || stderr.contains("no item")
+                    || stderr.contains("no vault")
+                {
+                    Some("item or vault not found")
+                } else {
+                    None
+                }
+            },
+        )
+    }
+
+    fn secret_names(&self) -> Vec<String> {
+        self.items.keys().cloned().collect()
+    }
+}
+
+/// Counts only — the provider holds no values, but keep the log line lean.
+impl std::fmt::Debug for OnePasswordProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnePasswordProvider")
+            .field("items", &self.items.len())
+            .field("timeout_secs", &self.timeout.as_secs())
+            .finish()
     }
 }
 
@@ -1161,15 +1526,15 @@ mod tests {
 
     #[test]
     fn chain_from_config_manager_kind_not_available_yet() {
-        // The manager providers land with the follow-up issues of 3.1.0;
-        // until then the error names the kind instead of skipping it.
+        // The remaining manager providers land with the follow-up issues of
+        // 3.1.0; until then the error names the kind instead of skipping it.
         let cfg = crate::config::SecretProviderConfig {
-            order: vec!["onepassword".into()],
+            order: vec!["bitwarden".into()],
             ..Default::default()
         };
         let err = ChainSecretProvider::from_config(&cfg).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("onepassword"), "{msg}");
+        assert!(msg.contains("bitwarden"), "{msg}");
         assert!(msg.contains("not available yet"), "{msg}");
     }
 
@@ -1197,5 +1562,427 @@ mod tests {
         let out = redact_secrets("ssh with hunter2", &c);
         assert!(!out.contains("hunter2"), "cached value must be masked: {out}");
         assert!(out.contains("$FILAR_SECRET_1"), "{out}");
+    }
+
+    // -----------------------------------------------------------------------
+    // OnePasswordProvider (#691) — CLI stub tests
+    // -----------------------------------------------------------------------
+
+    fn op_stub_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("filar-op-stub-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_stub(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        #[cfg(windows)]
+        let path = dir.join(format!("{name}.cmd"));
+        #[cfg(not(windows))]
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// Stub `op`: the reference (second argument) selects the behaviour —
+    /// "locked" → sign-in error, "missing" → not-found error, "newline" → a
+    /// value whose stored form ends with a line break, anything else → a
+    /// value printed verbatim (the stub honours `--no-newline`).
+    fn op_stub(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        let body = concat!(
+            "@echo off\r\n",
+            "echo %2 | find \"locked\" >nul\r\n",
+            "if not errorlevel 1 (\r\n",
+            "  echo [ERROR] You are not signed in. Your session has expired. 1>&2\r\n",
+            "  exit /b 1\r\n",
+            ")\r\n",
+            "echo %2 | find \"missing\" >nul\r\n",
+            "if not errorlevel 1 (\r\n",
+            "  echo [ERROR] item isn't an item in the vault 1>&2\r\n",
+            "  exit /b 1\r\n",
+            ")\r\n",
+            "echo %2 | find \"newline\" >nul\r\n",
+            "if not errorlevel 1 (\r\n",
+            "  echo op-secret-value\r\n",
+            "  exit /b 0\r\n",
+            ")\r\n",
+            "<nul set /p=op-secret-value\r\n",
+            "exit /b 0\r\n",
+        );
+        #[cfg(not(windows))]
+        let body = concat!(
+            "#!/bin/sh\n",
+            "case \"$2\" in\n",
+            "*locked*) printf '%s\\n' \"[ERROR] You are not signed in. Your session has expired.\" >&2; exit 1 ;;\n",
+            "*missing*) printf '%s\\n' \"[ERROR] item isn't an item in the vault\" >&2; exit 1 ;;\n",
+            "*newline*) printf 'op-secret-value\\n' ;;\n",
+            "*) printf 'op-secret-value' ;;\n",
+            "esac\n",
+        );
+        write_stub(dir, "op-stub", body)
+    }
+
+    /// Stub `op` writing more than the pipe capacity (≈200 KB) before it
+    /// exits — the provider must drain the pipes, not deadlock (#733 review).
+    fn op_big_stub(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        let body = concat!(
+            "@echo off\r\n",
+            "setlocal enabledelayedexpansion\r\n",
+            "set LINE=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n",
+            "for /L %%i in (1,1,2000) do echo !LINE!\r\n",
+            "exit /b 0\r\n",
+        );
+        #[cfg(not(windows))]
+        let body = "#!/bin/sh\nawk 'BEGIN{for(i=0;i<200000;i++)printf \"a\"}'\n";
+        write_stub(dir, "op-big", body)
+    }
+
+    fn op_slow_stub(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        let body = "@echo off\r\nping -n 30 127.0.0.1 >nul\r\nexit /b 0\r\n";
+        #[cfg(not(windows))]
+        let body = "#!/bin/sh\nsleep 30\n";
+        write_stub(dir, "op-slow", body)
+    }
+
+    fn op_items(reference: &str) -> HashMap<String, String> {
+        let mut items = HashMap::new();
+        items.insert("FILAR_LLM_API_KEY".to_string(), reference.to_string());
+        items
+    }
+
+    #[test]
+    fn op_provider_reads_value_via_cli_stub() {
+        let dir = op_stub_dir("read");
+        let stub = op_stub(&dir);
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path(stub.to_str().unwrap());
+        // The stub honours --no-newline; stdout is returned verbatim.
+        assert_eq!(p.get("FILAR_LLM_API_KEY").unwrap(), "op-secret-value");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_preserves_a_terminal_newline_of_the_stored_secret() {
+        // A stored password may itself end with a line break; --no-newline
+        // only suppresses the newline the CLI would add (#733 review).
+        let dir = op_stub_dir("newline");
+        let stub = op_stub(&dir);
+        let p = OnePasswordProvider::new(op_items("op://vault/newline-item/credential"))
+            .with_cli_path(stub.to_str().unwrap());
+        #[cfg(windows)]
+        let expected = "op-secret-value\r\n";
+        #[cfg(not(windows))]
+        let expected = "op-secret-value\n";
+        assert_eq!(p.get("FILAR_LLM_API_KEY").unwrap(), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_large_output_does_not_deadline() {
+        // More than the pipe capacity: the pipes must be drained while the
+        // CLI runs, or the child blocks and gets a false timeout.
+        let dir = op_stub_dir("big");
+        let stub = op_big_stub(&dir);
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_timeout(Duration::from_secs(20));
+        let value = p.get("FILAR_LLM_API_KEY").unwrap();
+        assert!(value.len() > 100_000, "expected >100KB, got {}", value.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_unrepresentable_timeout_fails_before_spawning() {
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path("filar-nonexistent-op-cli-991")
+            .with_timeout(Duration::MAX);
+        // The deadline check runs before spawn: the error is about the
+        // timeout, not about the missing CLI.
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("too large"), "{msg}");
+    }
+
+    #[test]
+    fn op_provider_unmapped_name_is_a_miss() {
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"));
+        let err = p.get("ssh_target:other").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("onepassword"), "{msg}");
+        assert!(msg.contains("no op:// mapping"), "{msg}");
+    }
+
+    #[test]
+    fn op_provider_locked_vault_error_names_provider_and_item() {
+        let dir = op_stub_dir("locked");
+        let stub = op_stub(&dir);
+        let p = OnePasswordProvider::new(op_items("op://vault/locked-item/credential"))
+            .with_cli_path(stub.to_str().unwrap());
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("onepassword"), "{msg}");
+        assert!(msg.contains("op://vault/locked-item/credential"), "{msg}");
+        assert!(msg.contains("session"), "{msg}");
+        // Neither the raw stderr nor a value may leak into the error.
+        assert!(!msg.contains("[ERROR]"), "raw stderr leak: {msg}");
+        assert!(!msg.contains("op-secret-value"), "value leak: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_missing_item_error() {
+        let dir = op_stub_dir("missing");
+        let stub = op_stub(&dir);
+        let p = OnePasswordProvider::new(op_items("op://vault/missing-item/credential"))
+            .with_cli_path(stub.to_str().unwrap());
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not found"), "{msg}");
+        assert!(msg.contains("op://vault/missing-item/credential"), "{msg}");
+        assert!(!msg.contains("[ERROR]"), "raw stderr leak: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_timeout_kills_the_cli() {
+        let dir = op_stub_dir("slow");
+        let stub = op_slow_stub(&dir);
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "timeout not enforced");
+        let msg = format!("{err}");
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(msg.contains("onepassword"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_grandchild_holding_pipe_is_bounded_by_deadline() {
+        // The direct child exits at once, but a background grandchild keeps
+        // the stderr pipe open: the post-exit wait for the readers must
+        // obey the deadline instead of blocking on an unbounded join.
+        let dir = op_stub_dir("grandchild");
+        #[cfg(windows)]
+        let body = "@echo off\r\nstart /b ping -n 30 127.0.0.1 >nul\r\nexit /b 0\r\n";
+        #[cfg(not(windows))]
+        let body = "#!/bin/sh\nsleep 30 &\nexit 0\n";
+        let stub = write_stub(&dir, "op-grandchild", body);
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_timeout(Duration::from_millis(500));
+        let started = Instant::now();
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "post-exit wait not bounded");
+        assert!(format!("{err}").contains("timed out"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn op_provider_timeout_wipes_output_stored_before_abort() {
+        // The stdout reader finishes (the stub closes its stdout) while the
+        // CLI keeps running: at timeout the already-stored buffer must be
+        // wiped by the abort path, not dropped unzeroized (#733 review).
+        let dir = op_stub_dir("preabort");
+        // cat in a pipeline guarantees the partial value reaches the pipe
+        // before stdout is closed (a bare printf could stay buffered).
+        let body = "#!/bin/sh\nprintf 'partial-secret' | cat\nexec 1>&-\nsleep 30\n";
+        let stub = write_stub(&dir, "op-preabort", body);
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "timeout not enforced");
+        let msg = format!("{err}");
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(!msg.contains("partial-secret"), "value leak: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abort_pipe_readers_wipes_partial_data_without_eof() {
+        // The reader is still blocked in read() (done = false): the abort
+        // path must wipe the shared partial data right away, without
+        // waiting for the pipe to close (#733 review, ai-review blocker).
+        let aborted = std::sync::atomic::AtomicBool::new(false);
+        let buf = Mutex::new(PipeBuffer {
+            data: b"partial-secret".to_vec(),
+            done: false,
+            overflow: false,
+            error: false,
+        });
+        abort_pipe_readers(&aborted, &[&buf]);
+        assert!(aborted.load(std::sync::atomic::Ordering::SeqCst));
+        let b = buf.lock().unwrap();
+        // zeroize wipes the bytes and truncates the Vec.
+        assert!(b.data.is_empty(), "partial data not zeroized");
+        // An aborted buffer is marked done: it must never be awaited.
+        assert!(b.done);
+    }
+
+    #[test]
+    fn pipe_reader_caps_output_without_realloc() {
+        // The capacity is reserved once: filling past the limit sets the
+        // overflow flag instead of growing (and freeing) the allocation,
+        // so no unwiped copy of the secret is left behind (#733 review).
+        let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let buf = Arc::new(Mutex::new(PipeBuffer::new()));
+        spawn_pipe_reader(
+            Some(std::io::repeat(b'x')),
+            Arc::clone(&buf),
+            Arc::clone(&aborted),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if buf.lock().unwrap().done {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reader did not stop at the cap");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let b = buf.lock().unwrap();
+        assert!(b.overflow, "overflow flag not set");
+        assert_eq!(b.data.len(), MAX_SECRET_CLI_OUTPUT_BYTES);
+        assert_eq!(b.data.capacity(), MAX_SECRET_CLI_OUTPUT_BYTES, "buffer reallocated");
+    }
+
+    #[test]
+    fn pipe_reader_retries_interrupted_and_records_fatal_errors() {
+        // A read error must not pass for EOF: Interrupted is retried, any
+        // other error is recorded so run_secret_cli rejects the invocation
+        // instead of returning a truncated secret (#733 review).
+        struct FlakyReader {
+            calls: usize,
+        }
+        impl std::io::Read for FlakyReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "retry me")),
+                    2 => {
+                        buf[..4].copy_from_slice(b"tail");
+                        Ok(4)
+                    }
+                    3 => Err(std::io::Error::new(std::io::ErrorKind::Other, "pipe broke")),
+                    _ => Ok(0),
+                }
+            }
+        }
+        let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let buf = Arc::new(Mutex::new(PipeBuffer::new()));
+        spawn_pipe_reader(
+            Some(FlakyReader { calls: 0 }),
+            Arc::clone(&buf),
+            Arc::clone(&aborted),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if buf.lock().unwrap().done {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reader did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let b = buf.lock().unwrap();
+        assert!(b.error, "fatal read error not recorded");
+        // The Interrupted read was retried: the tail chunk was collected.
+        assert_eq!(&b.data[..], b"tail");
+    }
+
+    #[test]
+    fn op_provider_timeout_with_partial_output_and_held_pipe() {
+        // The CLI writes part of the value, then keeps the pipe open past
+        // the deadline: the call must return promptly and the error must
+        // not carry the partial value.
+        let dir = op_stub_dir("partial");
+        #[cfg(windows)]
+        let body = "@echo off\r\necho partial-secret\r\nping -n 30 127.0.0.1 >nul\r\nexit /b 0\r\n";
+        #[cfg(not(windows))]
+        // The pipeline subshell flushes on exit and cat writes to the pipe
+        // immediately: a bare builtin printf could stay buffered and the
+        // reader would never see the partial value (#733 review).
+        let body = "#!/bin/sh\nprintf 'partial-secret' | cat\nsleep 30\n";
+        let stub = write_stub(&dir, "op-partial", body);
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "timeout not enforced");
+        let msg = format!("{err}");
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(!msg.contains("partial-secret"), "value leak: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_missing_cli_is_a_clear_error() {
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path("filar-nonexistent-op-cli-991");
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("onepassword"), "{msg}");
+        assert!(msg.contains("not found"), "{msg}");
+    }
+
+    #[test]
+    fn op_provider_debug_carries_no_values_or_references() {
+        let dir = op_stub_dir("debug");
+        let stub = op_stub(&dir);
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path(stub.to_str().unwrap());
+        let _ = p.get("FILAR_LLM_API_KEY").unwrap();
+        let dbg = format!("{p:?}");
+        assert!(dbg.contains("OnePasswordProvider"), "{dbg}");
+        assert!(!dbg.contains("op-secret-value"), "value leak: {dbg}");
+        assert!(!dbg.contains("credential"), "reference leak: {dbg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_secret_names_are_the_mapping_keys() {
+        let mut items = op_items("op://vault/api-key/credential");
+        items.insert("ssh_target:prod".into(), "op://vault/prod/password".into());
+        let p = OnePasswordProvider::new(items);
+        let mut names = p.secret_names();
+        names.sort();
+        assert_eq!(names, vec!["FILAR_LLM_API_KEY", "ssh_target:prod"]);
+    }
+
+    #[test]
+    fn chain_from_config_builds_onepassword() {
+        let mut cfg = crate::config::SecretProviderConfig {
+            order: vec!["onepassword".into()],
+            ..Default::default()
+        };
+        cfg.onepassword.items = op_items("op://vault/api-key/credential");
+        // Building the chain must not spawn the CLI.
+        let c = ChainSecretProvider::from_config(&cfg).unwrap();
+        let dbg = format!("{c:?}");
+        assert!(dbg.contains("providers: 1"), "{dbg}");
+        assert!(c.secret_names().contains(&"FILAR_LLM_API_KEY".to_string()));
+    }
+
+    #[test]
+    #[ignore = "needs 1Password CLI (op) with an active session; set FILAR_TEST_OP_REFERENCE"]
+    fn op_provider_real_cli_integration() {
+        let reference = std::env::var("FILAR_TEST_OP_REFERENCE")
+            .expect("set FILAR_TEST_OP_REFERENCE to an op:// reference");
+        let p = OnePasswordProvider::new(op_items(&reference));
+        let value = p.get("FILAR_LLM_API_KEY").unwrap();
+        assert!(!value.is_empty());
     }
 }
