@@ -1550,8 +1550,8 @@ fn save_config_toml_to(
             let tmp = target.with_file_name(format!("{file_name}.filar-tmp-{}", std::process::id()));
             // create_new refuses a pre-existing name — a planted symlink
             // must not be followed. On Unix the temp starts owner-only:
-            // the config may carry manually written credentials and must
-            // never be world-readable, even briefly (#740 review).
+            // the user-owned config is treated as sensitive regardless of
+            // its contents (#740 review).
             let mut opts = std::fs::OpenOptions::new();
             opts.write(true).create_new(true);
             #[cfg(unix)]
@@ -1573,14 +1573,15 @@ fn save_config_toml_to(
                 return Err(format!("failed to save config.toml: {e}"));
             }
             drop(file);
-            // Keep the destination's permissions. Failure is fatal: the
-            // temp's restrictive mode must not silently widen or narrow
-            // the replaced file (#740 review).
+            // Keep the destination's permissions when the FS allows it.
+            // Best effort: the temp is created owner-only on Unix, so a
+            // failed chmod can only leave group/other access equal or
+            // more restrictive — never wider. FAT/exFAT and foreign-owned
+            // files reject chmod; failing the save there would be a
+            // regression (#740 review).
             if let Ok(meta) = std::fs::metadata(&target) {
                 if let Err(e) = std::fs::set_permissions(&tmp, meta.permissions()) {
-                    let _ = std::fs::remove_file(&tmp);
-                    tracing::warn!(path = %tmp.display(), error = %e, "failed to set config.toml temp permissions");
-                    return Err(format!("failed to save config.toml: {e}"));
+                    tracing::warn!(path = %tmp.display(), error = %e, "failed to copy config.toml permissions to temp");
                 }
             }
             if let Err(e) = std::fs::rename(&tmp, &target) {
@@ -7043,6 +7044,41 @@ mod tests {
             "a pre-existing temp name must abort the save");
         assert_eq!(std::fs::read_to_string(&planted).unwrap(), "sentinel", "planted file must be untouched");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "destination must be untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_save_to_writes_checked_path_after_resolution_change() {
+        // do_launch passes the checked path straight into the save: even
+        // if a higher-priority destination appears after the guard passed,
+        // the write lands in the startup file and the new one is untouched
+        // (#740 review).
+        let _lock = CONFIG_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("filar_test_cfglate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.toml");
+        let b = dir.join("b.toml");
+        std::fs::write(&a, "[llm]\nmodel = \"old\"\napi_base_url = \"https://old.example.com\"\n").unwrap();
+        let foreign = "[llm]\nmodel = \"foreign\"\n";
+        std::fs::write(&b, foreign).unwrap();
+
+        let old = std::env::var("FILAR_CONFIG").ok();
+        std::env::set_var("FILAR_CONFIG", a.as_os_str());
+        let _env = CfgEnvGuard { key: "FILAR_CONFIG", old };
+
+        assert!(ensure_config_destination(&a).is_ok(), "startup destination passes the guard");
+        // The resolution moves after the check — the save must still use
+        // the checked path, exactly as do_launch does.
+        std::env::set_var("FILAR_CONFIG", b.as_os_str());
+        let settings = Settings { model: "late-new".into(), ..Settings::default() };
+        save_config_toml_to(&a, &settings, &[], None, &[], None).unwrap();
+
+        assert!(std::fs::read_to_string(&a).unwrap().contains("model = \"late-new\""),
+            "the write must land in the checked startup file");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), foreign,
+            "the newly resolved file must stay untouched");
+        drop(_env);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
