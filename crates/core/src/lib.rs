@@ -24,7 +24,7 @@ pub mod secrets;
 pub mod session;
 
 pub use audit::{
-    AuditDecision, AuditDecisionSource, AuditRecord, AuditTarget, AuditWriter,
+    secret_snapshot, AuditDecision, AuditDecisionSource, AuditRecord, AuditTarget, AuditWriter,
     DEFAULT_AUDIT_MAX_BYTES,
 };
 pub use chat::{ChatBlock, ToolInvocation, SHELL_ESCAPE_EXPLANATION};

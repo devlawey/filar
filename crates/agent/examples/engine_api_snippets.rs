@@ -56,7 +56,7 @@ pub fn log_sources(builder: filar_agent::AgentBuilder, config: &filar_core::Conf
 /// "Audit journal — `AuditRecord` / `AuditWriter` (#696)".
 pub fn audit(
     writer: &mut filar_core::AuditWriter,
-    secrets: Option<&dyn filar_core::SecretProvider>,
+    secrets: Option<&filar_core::StaticSecretProvider>,
 ) -> filar_core::Result<()> {
     let record = filar_core::AuditRecord::new(
         "session-123",

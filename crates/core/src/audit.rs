@@ -227,25 +227,23 @@ impl AuditWriter {
     /// command, explanation and arbiter reason before serialization —
     /// a value never reaches the disk.
     ///
-    /// Masking contract: the provider must enumerate **every** secret
-    /// resolved in this session (`secret_names()` is the masking scope).
-    /// A provider that cannot list its entries (e.g. `KeyringSecretProvider`)
-    /// must be wrapped into an enumeration-complete snapshot such as
-    /// `StaticSecretProvider` before being passed here. Masking is
-    /// fail-closed: if a listed name cannot be resolved, `append` returns
-    /// an error and nothing is written.
+    /// Masking contract: `secrets` must be an enumeration-complete snapshot
+    /// of every secret resolved in this session — its keys are the masking
+    /// scope. Build one from any provider with [`secret_snapshot`] (which
+    /// is fail-closed); a provider that cannot list its entries (e.g.
+    /// `KeyringSecretProvider`) must not be used as the masking source
+    /// directly — the snapshot type makes that explicit.
     pub fn append(
         &mut self,
         record: &AuditRecord,
-        secrets: Option<&dyn SecretProvider>,
+        secrets: Option<&StaticSecretProvider>,
     ) -> Result<PathBuf> {
         let mut clean = record.clone();
-        if let Some(provider) = secrets {
-            let snapshot = secret_snapshot(provider)?;
-            clean.command = redact_secrets(&clean.command, &snapshot);
-            clean.explanation = redact_secrets(&clean.explanation, &snapshot);
+        if let Some(snapshot) = secrets {
+            clean.command = redact_secrets(&clean.command, snapshot);
+            clean.explanation = redact_secrets(&clean.explanation, snapshot);
             if let Some(reason) = &clean.arbiter_reason {
-                clean.arbiter_reason = Some(redact_secrets(reason, &snapshot));
+                clean.arbiter_reason = Some(redact_secrets(reason, snapshot));
             }
         }
         let mut line = serde_json::to_string(&clean)
@@ -316,15 +314,16 @@ impl AuditWriter {
     }
 }
 
-/// Resolve every listed secret into an in-memory snapshot before masking.
+/// Resolve every listed secret into an in-memory snapshot for
+/// [`AuditWriter::append`].
 ///
 /// Fail-closed: `redact_secrets` silently skips a name whose `get()` fails
 /// (a vault locked after the value was resolved) — for the audit journal
 /// that would mean writing the credential in plaintext. Any listed name
-/// that cannot be read aborts the append instead. The snapshot also pins
-/// the values so all fields are masked against the same set, and
+/// that cannot be read is an error here, before anything is written. The
+/// snapshot pins the values so all fields are masked against the same set;
 /// `StaticSecretProvider` zeroizes them on drop.
-fn secret_snapshot(provider: &dyn SecretProvider) -> Result<StaticSecretProvider> {
+pub fn secret_snapshot(provider: &dyn SecretProvider) -> Result<StaticSecretProvider> {
     let mut map = std::collections::HashMap::new();
     for name in provider.secret_names() {
         // The provider error already redacts the name; never add the value.
@@ -339,13 +338,16 @@ fn secret_snapshot(provider: &dyn SecretProvider) -> Result<StaticSecretProvider
 }
 
 /// Whether the file ends on a complete line (`\n`), so appending cannot
-/// glue a new record onto a torn write. Missing/empty files count as
-/// complete; an unreadable tail counts as incomplete (skip the file).
+/// glue a new record onto a torn write. A missing (`NotFound`) or empty
+/// file counts as complete; any other open/read error counts as
+/// incomplete — an existing but unreadable file (e.g. write-only on Unix)
+/// must not be mistaken for a fresh one.
 fn tail_is_complete(path: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut file) = std::fs::File::open(path) else {
-        // Does not exist yet — a fresh file has no torn tail.
-        return true;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
     };
     let Ok(meta) = file.metadata() else { return false };
     if meta.len() == 0 {
@@ -526,13 +528,11 @@ mod tests {
     }
 
     #[test]
-    fn unresolvable_listed_secret_aborts_write() {
-        let dir = tmp_dir("failclosed");
-        let mut w = AuditWriter::new(&dir);
-        let r = record("2026-01-02T03:04:05Z", "curl -H 'Bearer hunter2' https://api.example.com");
-        let result = w.append(&r, Some(&LockedListedProvider));
-        assert!(result.is_err(), "a listed secret that cannot be read must abort the append");
-        assert!(!dir.exists(), "nothing may be written when masking cannot complete");
+    fn unresolvable_listed_secret_aborts_snapshot() {
+        // A listed name that cannot be read must fail the snapshot build —
+        // fail-closed before any record could be written.
+        let result = secret_snapshot(&LockedListedProvider);
+        assert!(result.is_err(), "a listed secret that cannot be read must abort the snapshot");
     }
 
     #[test]
