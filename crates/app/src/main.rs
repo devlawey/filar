@@ -431,6 +431,40 @@ fn config_with_launch_log_sources(
     config
 }
 
+/// `config` with the launcher's `[secret_provider]` choice applied (#695):
+/// `On` replaces the section, `Off` removes it (the legacy order returns),
+/// `None` keeps what `config.toml` holds. Applied before the chain is built:
+/// the launcher's edit of `config.toml` is invisible to the config loaded
+/// before the GUI subprocess ran.
+fn config_with_launch_secret_provider(
+    mut config: filar_core::Config,
+    launch: Option<filar_gui::SecretProviderLaunch>,
+) -> filar_core::Config {
+    match launch {
+        None => {}
+        Some(filar_gui::SecretProviderLaunch::Off) => config.secret_provider = None,
+        Some(filar_gui::SecretProviderLaunch::On { config: sp }) => config.secret_provider = Some(sp),
+    }
+    config
+}
+
+/// Build the secret resolution chain from `[secret_provider]` (#694).
+/// `None` (no section) keeps the legacy order static → keyring → env. An
+/// invalid section is a configuration error and stops start-up with a clear
+/// message; a provider that fails to *resolve* a value only produces a note,
+/// never a crash.
+fn build_secret_chain(
+    cfg: Option<&filar_core::SecretProviderConfig>,
+) -> anyhow::Result<Option<Arc<dyn SecretProvider>>> {
+    match cfg {
+        Some(cfg) => Ok(Some(Arc::new(
+            filar_core::ChainSecretProvider::from_config(cfg)
+                .map_err(|e| anyhow::anyhow!("[secret_provider]: {e}"))?,
+        ))),
+        None => Ok(None),
+    }
+}
+
 /// The scorer, the display thresholds `(warn_below, danger_below)` and the
 /// start-up note (if the scorer cannot be used).
 type LaunchRiskScorer = (
@@ -707,7 +741,7 @@ async fn run() -> anyhow::Result<()> {
 
     // ── Config ─────────────────────────────────────────────────────────
     // FILAR_CONFIG env var → appdata → CWD → exe dir → built-in defaults.
-    let config = Config::load_default().map_err(|e| anyhow::anyhow!(e))?;
+    let mut config = Config::load_default().map_err(|e| anyhow::anyhow!(e))?;
 
     info!(
         model = %config.llm.model,
@@ -757,16 +791,14 @@ async fn run() -> anyhow::Result<()> {
 
     // ── Secret provider chain (#694) ─────────────────────────────────
     // Built once from `[secret_provider]` and passed to every resolution
-    // point below. `None` (no section) keeps the legacy order
-    // static → keyring → env. An invalid section is a configuration error
-    // and stops start-up with a clear message; a provider that fails to
-    // *resolve* a value only produces a note, never a crash.
-    let secret_chain: Option<Arc<dyn SecretProvider>> = match &config.secret_provider {
-        Some(cfg) => Some(Arc::new(
-            filar_core::ChainSecretProvider::from_config(cfg)
-                .map_err(|e| anyhow::anyhow!("[secret_provider]: {e}"))?,
-        )),
-        None => None,
+    // point below. In GUI mode the build is deferred until the launcher's
+    // choice (#695) is applied: an invalid section in the file must not stop
+    // the launcher that could repair it (#695 review). CLI mode reports it
+    // here, before any session starts.
+    let mut secret_chain = if args.is_empty() {
+        None
+    } else {
+        build_secret_chain(config.secret_provider.as_ref())?
     };
 
     // The launcher's command-safety choice (#552); `None` = not said (CLI
@@ -815,6 +847,17 @@ async fn run() -> anyhow::Result<()> {
 
         match launch {
             Some(launch) => {
+                // The launcher's [secret_provider] choice (#695) must be
+                // applied before the chain's first use below: config.toml
+                // was loaded before the GUI subprocess ran, so its edit is
+                // invisible here. `None` (an older handoff) keeps the file.
+                if launch.secret_provider.is_some() {
+                    config = config_with_launch_secret_provider(config, launch.secret_provider.clone());
+                }
+                // An older handoff without the field keeps the file's section;
+                // an invalid one is reported here, after the launcher had its
+                // chance to replace it (#695 review).
+                secret_chain = build_secret_chain(config.secret_provider.as_ref())?;
                 let temperature = if launch.temperature.trim().is_empty() {
                     None
                 } else {
@@ -1270,9 +1313,10 @@ mod tests {
     use filar_core::{LlmProfile, SecretProvider, StaticSecretProvider};
 
     use super::{
-        build_llm_client_from_profile, build_risk_scorer_for_launch, check_profile_api_key,
-        gui_launch_target_name, lookup_profile_api_key, prefetch_profile_keys, resolve_cli_target,
-        resolve_gui_ssh_target, session_host_groups, session_kube_clusters, CliTarget,
+        build_llm_client_from_profile, build_risk_scorer_for_launch, build_secret_chain,
+        check_profile_api_key, config_with_launch_secret_provider, gui_launch_target_name,
+        lookup_profile_api_key, prefetch_profile_keys, resolve_cli_target, resolve_gui_ssh_target,
+        session_host_groups, session_kube_clusters, CliTarget,
     };
 
     fn group(name: &str, tag: &str) -> filar_core::HostGroup {
@@ -2150,5 +2194,58 @@ mod tests {
         assert!(note2.contains("[secret_provider]"), "{note2}");
         assert!(note2.contains("RS_694_KEY"), "{note2}");
         assert!(!note2.contains("rs-chain-key"), "{note2}");
+    }
+
+    // ── Launcher secret provider choice (#695) ───────────────────────
+
+    /// `Off` removes the section, `On` replaces it, `None` keeps the file.
+    #[test]
+    fn launch_secret_provider_choice_overrides_the_config_section() {
+        let file_cfg = filar_core::SecretProviderConfig {
+            order: vec!["env".into()],
+            ..Default::default()
+        };
+        let config = filar_core::Config {
+            secret_provider: Some(file_cfg.clone()),
+            ..Default::default()
+        };
+        // None: an older handoff keeps config.toml's section.
+        let kept = config_with_launch_secret_provider(config.clone(), None);
+        assert_eq!(kept.secret_provider, Some(file_cfg));
+        // Off: the legacy order returns.
+        let off = config_with_launch_secret_provider(
+            config.clone(),
+            Some(filar_gui::SecretProviderLaunch::Off),
+        );
+        assert!(off.secret_provider.is_none());
+        // On: the launcher's section wins.
+        let launcher_cfg = filar_core::SecretProviderConfig {
+            order: vec!["keyring".into(), "onepassword".into()],
+            ..Default::default()
+        };
+        let on = config_with_launch_secret_provider(
+            config,
+            Some(filar_gui::SecretProviderLaunch::On { config: launcher_cfg.clone() }),
+        );
+        assert_eq!(on.secret_provider, Some(launcher_cfg));
+    }
+
+    /// The chain is rebuilt from the launcher's section; an invalid one is
+    /// a start-up error naming the section, never a secret value.
+    #[test]
+    fn build_secret_chain_follows_the_section() {
+        assert!(build_secret_chain(None).unwrap().is_none());
+        let cfg = filar_core::SecretProviderConfig {
+            order: vec!["env".into()],
+            ..Default::default()
+        };
+        assert!(build_secret_chain(Some(&cfg)).unwrap().is_some());
+        let bad = filar_core::SecretProviderConfig {
+            order: vec!["vault".into()],
+            ..Default::default()
+        };
+        let err = build_secret_chain(Some(&bad)).err().expect("invalid section").to_string();
+        assert!(err.contains("[secret_provider]"), "{err}");
+        assert!(err.contains("vault"), "{err}");
     }
 }

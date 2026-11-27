@@ -13738,3 +13738,76 @@ App 62, tui 925, workspace зелёные; `cargo build --release` зелёны�
 таймауту без комментариев — перезапущен push'ем.
 
 **Next:** #695 (GUI-лаунчер: карточка Secret provider).
+
+## #695 — GUI-лаунчер: вкладка Secrets и документация
+
+**Сделано.** В лаунчере новая вкладка **Secrets** (`active_tab == 3`) по
+образцу Logs: чекбокс включения цепочки, порядок провайдеров (добавление
+кнопками, ↑/↓, Remove), cache TTL, поля 1Password/Bitwarden items и
+KeePassXC database/attribute/entries (multiline `имя = ссылка`, комментарии
+`#` и пустые строки пропускаются), маскированный пароль базы KeePassXC.
+**Check** разрешает одно логическое имя через цепочку в фоне (обычный
+`std::thread` — провайдеры синхронные) и показывает только итог, значение
+дропается в рабочем потоке (`map(|_| ())`). При **Launch** секция пишется в
+`config.toml` целиком (выключено = секции нет), пароль базы уходит в
+хранилище ОС под `FILAR_KEEPASSXC_DB_PASSWORD`, выбор передаётся через
+`pending_launch.json` (`SecretProviderLaunch` Off/On, serde tag `state`).
+USER_GUIDE.md += §3.5 «Менеджеры паролей»: что где лежит, миграция с
+keyring, заблокированный vault.
+
+**Решения.**
+- Выбор лаунчера применяется в `main.rs` внутри GUI-ветки ДО первого
+  использования chain: `config.toml` перечитан не будет (загружен до
+  GUI-subprocess), поэтому `config_with_launch_secret_provider` +
+  перестройка `build_secret_chain` (helper выделен из inline-блока #694).
+  `None` в handoff (файл до #695) — секция из файла.
+- Check с несохранённым паролем базы: новый core-helper
+  `ChainSecretProvider::from_config_with_keepassxc_password` (пароль
+  инъектируется StaticSecretProvider'ом; `from_config` делегирует с None).
+- Свежий draft без секции предзаполнен порядком `["keyring", "env"]` —
+  включение чекбокса сразу даёт рабочую цепочку; выключенный draft ничего
+  не пишет и не сохраняет.
+- Валидация в `validate_launch` (ошибки с префиксом «Secret provider:»);
+  keepassxc в порядке без database — ошибка до Launch.
+
+**Контракты.** `LaunchConfig` += `secret_provider: Option<SecretProviderLaunch>`
+(serde default); новый публичный `filar_gui::SecretProviderLaunch`;
+`ChainSecretProvider::from_config_with_keepassxc_password` (core);
+`save_config_toml` += параметр `secret_provider`. `CommandExecutor`/
+`LlmClient` без изменений.
+
+**Тесты.** 12 новых: core 3 (инъекция пароля, default keyring→env, chain с
+инъекцией без значения в Debug), gui 7 (round-trip без пароля в toml/json,
+pending_launch без секретов + старый файл, валидация draft'а, свежий draft,
+launch-refuse, Check-строка без значения, format/parse item lines), app 2
+(Off/On/None поверх секции, build_secret_chain). Core 302, gui 158, app 64,
+tui 926, workspace зелёные. Прогон лаунчера выполнен агентом (Win32-клики
+по окну лаунчера): вкладка Secrets, цепочка order=["env"], Check
+FILAR_LLM_API_KEY → «Check OK: … resolved (value not shown).», значение на
+экране не появляется; Launch с target Local → TUI «Connected to: local» и
+заметка risk scorer про FILAR_RISK_API_KEY без значения. Конфиг прогона —
+отдельный FILAR_CONFIG, реальный appdata восстановлен из бэкапа (следов
+прогона не осталось). Реальных op/bw/keepassxc в окружении нет — их звенья
+покрыты юнит-тестами и #[ignore]-интеграцией (ручная проверка).
+
+**Ревью (раунд 1, PR #737).** CodeRabbit: 14 инлайн-комментариев, 12 приняты,
+2 вне скоупа. Принято и исправлено: построение chain в GUI-режиме отложено
+до применения выбора лаунчера (битая секция в файле не блокирует лаунчер,
+который может её починить); имена с `=`/кавычками/слэшами экранируются в
+item-lines и переживают round-trip; Check предзаполняется key_env выбранного
+профиля; kind с пробелами нормализуется как в core; TTL > i64::MAX отклоняется
+до записи; скрытые поля удалённых провайдеров не блокируют Launch; смена
+Check-имени/пароля базы сбрасывает статус и отбрасывает результат устаревшего
+Check (check_rev); поток Check через thread::Builder с обработкой ошибки
+старта; save_config_toml возвращает Result и ошибка записи останавливает
+Launch; имя FILAR_KEEPASSXC_DB_PASSWORD зарезервировано (валидация против
+совпадения с другими credential); пароль базы сохраняется до записи конфига,
+ошибка keyring оставляет лаунчер открытым; USER_GUIDE §3.5 — исход locked
+vault по типам секрета. Вне скоупа: per-manager Check мимо chain (новая фича)
+и запись Secrets в активный FILAR_CONFIG (существующее поведение лаунчера для
+всех вкладок). +6 gui-тестов (164), app 64, workspace зелёные. Раунд 2:
+CodeRabbit подтвердил правки и снял замечание про per-manager Check; новых
+замечаний нет. ai-review отменён по таймауту без комментариев на обоих
+прогонах (инфраструктура, как в #694).
+
+**Next:** финал прогона 690–695 (сборка workspace, сводка).

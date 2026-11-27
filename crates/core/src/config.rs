@@ -350,9 +350,8 @@ impl SecretProviderKind {
 /// parameters are stored here (vault/item references, entry names, a database
 /// path) — a secret value never reaches `config.toml` (invariant 3).
 ///
-/// Not yet enforced in production key resolution: the chain is wired into
-/// the app's startup paths in #694; until then this section is only parsed
-/// and validated.
+/// Wired into every resolution point by #694; the GUI launcher edits the
+/// section on its Secrets tab (#695).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SecretProviderConfig {
     /// Provider kinds in resolution order, e.g.

@@ -544,6 +544,18 @@ impl ChainSecretProvider {
     /// [`KeePassXcProvider`]; an unknown kind fails with a clear error
     /// instead of silently skipping it.
     pub fn from_config(cfg: &crate::config::SecretProviderConfig) -> Result<Self> {
+        Self::from_config_with_keepassxc_password(cfg, None)
+    }
+
+    /// Like [`Self::from_config`], but a KeePassXC database password typed
+    /// in the launcher (#695) can be injected directly instead of being
+    /// resolved through keyring → env. `None` (or an empty string) keeps
+    /// the default keyring → env source under `FILAR_KEEPASSXC_DB_PASSWORD`.
+    /// The password never enters the config or the chain's cache.
+    pub fn from_config_with_keepassxc_password(
+        cfg: &crate::config::SecretProviderConfig,
+        db_password: Option<String>,
+    ) -> Result<Self> {
         cfg.validate()?;
         let mut providers: Vec<Arc<dyn SecretProvider>> = Vec::new();
         for kind in &cfg.order {
@@ -566,17 +578,11 @@ impl ChainSecretProvider {
                                 .into(),
                         )
                     })?;
-                    // The database password is itself a secret: resolve it
-                    // through keyring → env under a fixed logical name, with
-                    // no caching (TTL zero). A masked startup prompt can be
-                    // injected instead via `with_password_provider` (#694).
-                    let password_source = Arc::new(ChainSecretProvider::new(
-                        vec![
-                            Arc::new(KeyringSecretProvider::new()),
-                            Arc::new(EnvSecretProvider::new()),
-                        ],
-                        Duration::ZERO,
-                    )?);
+                    // The database password is itself a secret: a typed one
+                    // (launcher Check, #695) is injected, otherwise it is
+                    // resolved through keyring → env under a fixed logical
+                    // name, with no caching (TTL zero).
+                    let password_source = keepassxc_password_source(db_password.clone())?;
                     Arc::new(
                         KeePassXcProvider::new(database, cfg.keepassxc.entries.clone())
                             .with_attribute(cfg.keepassxc.attribute.clone())
@@ -593,6 +599,29 @@ impl ChainSecretProvider {
     /// only copies of secrets, so a panic elsewhere must not wedge lookups.
     fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<String, CachedSecret>> {
         self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Where a KeePassXC database password comes from (#695): a typed one is
+/// held in a [`StaticSecretProvider`], otherwise keyring → env is consulted
+/// under `FILAR_KEEPASSXC_DB_PASSWORD` with no caching (TTL zero).
+fn keepassxc_password_source(db_password: Option<String>) -> Result<Arc<ChainSecretProvider>> {
+    match db_password.filter(|p| !p.is_empty()) {
+        Some(password) => {
+            let source = StaticSecretProvider::new();
+            source.insert("FILAR_KEEPASSXC_DB_PASSWORD", &password);
+            Ok(Arc::new(ChainSecretProvider::new(
+                vec![Arc::new(source)],
+                Duration::ZERO,
+            )?))
+        }
+        None => Ok(Arc::new(ChainSecretProvider::new(
+            vec![
+                Arc::new(KeyringSecretProvider::new()),
+                Arc::new(EnvSecretProvider::new()),
+            ],
+            Duration::ZERO,
+        )?)),
     }
 }
 
@@ -2994,6 +3023,50 @@ mod tests {
         let c = ChainSecretProvider::from_config(&cfg).unwrap();
         let dbg = format!("{c:?}");
         assert!(dbg.contains("providers: 1"), "{dbg}");
+        assert!(c.secret_names().contains(&"FILAR_LLM_API_KEY".to_string()));
+    }
+
+    #[test]
+    fn keepassxc_password_source_injected_holds_the_typed_password() {
+        let source = keepassxc_password_source(Some("typed-db-pass-695".into())).unwrap();
+        assert_eq!(
+            source.get("FILAR_KEEPASSXC_DB_PASSWORD").unwrap(),
+            "typed-db-pass-695"
+        );
+        let dbg = format!("{source:?}");
+        assert!(dbg.contains("providers: 1"), "{dbg}");
+        assert!(!dbg.contains("typed-db-pass-695"), "{dbg}");
+    }
+
+    #[test]
+    fn keepassxc_password_source_default_is_keyring_then_env() {
+        // An empty typed password counts as "not typed" (#695).
+        for typed in [None, Some(String::new())] {
+            let source = keepassxc_password_source(typed).unwrap();
+            let dbg = format!("{source:?}");
+            assert!(dbg.contains("providers: 2"), "{dbg}");
+            assert!(dbg.contains("cache_ttl_secs: 0"), "{dbg}");
+        }
+    }
+
+    #[test]
+    fn chain_from_config_with_typed_db_password_builds() {
+        let mut cfg = crate::config::SecretProviderConfig {
+            order: vec!["keepassxc".into()],
+            ..Default::default()
+        };
+        cfg.keepassxc.database = Some("test.kdbx".into());
+        cfg.keepassxc.entries = kx_items("api-key-entry");
+        // Building must not spawn the CLI; the typed password stays out of
+        // the chain's own names and Debug (#695).
+        let c = ChainSecretProvider::from_config_with_keepassxc_password(
+            &cfg,
+            Some("typed-db-pass-695".into()),
+        )
+        .unwrap();
+        let dbg = format!("{c:?}");
+        assert!(dbg.contains("providers: 1"), "{dbg}");
+        assert!(!dbg.contains("typed-db-pass-695"), "{dbg}");
         assert!(c.secret_names().contains(&"FILAR_LLM_API_KEY".to_string()));
     }
 
