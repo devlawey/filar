@@ -439,6 +439,12 @@ pub struct LaunchConfig {
     /// a key — only `key_env`, the name it is stored under.
     #[serde(default)]
     pub log_sources: Option<Vec<filar_core::LogSourceConfig>>,
+    /// The secret provider chain as the launcher left it (#695): `On` with
+    /// its settings, or `Off`. `None` (a file written before #695) means
+    /// "not said" and the session keeps `config.toml`'s `[secret_provider]`.
+    /// Never carries a secret — only references and entry names.
+    #[serde(default)]
+    pub secret_provider: Option<SecretProviderLaunch>,
 }
 
 /// The launcher's choice for the command safety scorer (#552).
@@ -451,6 +457,19 @@ pub enum RiskScorerLaunch {
     On {
         /// The `[risk_scorer]` settings (no secret in them).
         config: filar_core::RiskScorerConfig,
+    },
+}
+
+/// The launcher's choice for the secret provider chain (#695).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum SecretProviderLaunch {
+    /// No chain for this session: the legacy order (OS store → env).
+    Off,
+    /// Resolve secrets through this chain.
+    On {
+        /// The `[secret_provider]` settings (no secret in them).
+        config: filar_core::SecretProviderConfig,
     },
 }
 
@@ -1398,6 +1417,7 @@ fn save_config_toml(
     host_groups: &[filar_core::HostGroup],
     risk_scorer: Option<&filar_core::RiskScorerConfig>,
     log_sources: &[filar_core::LogSourceConfig],
+    secret_provider: Option<&filar_core::SecretProviderConfig>,
 ) {
     let base = match filar_core::default_base_dir() {
         Ok(b) => b,
@@ -1452,6 +1472,9 @@ fn save_config_toml(
     // `[[log_sources]]` likewise (#584): the Logs tab owns them; keys are
     // only named (`key_env`), never written.
     config.log_sources = log_sources.to_vec();
+    // `[secret_provider]` likewise (#695): the Secrets tab owns it, switched
+    // off = no section. Only references and entry names — never a secret.
+    config.secret_provider = secret_provider.cloned();
 
     if let Err(e) = std::fs::create_dir_all(&app_dir) {
         tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");
@@ -2328,6 +2351,212 @@ struct LogCheckResult {
 }
 
 // ---------------------------------------------------------------------------
+// Secret provider chain (#695)
+// ---------------------------------------------------------------------------
+
+/// The logical name the KeePassXC database password is stored under — the
+/// same one `ChainSecretProvider::from_config` resolves at start-up.
+const KEEPASSXC_DB_PASSWORD_NAME: &str = "FILAR_KEEPASSXC_DB_PASSWORD";
+
+/// Launcher working copy of `[secret_provider]` (#695). Numbers and maps
+/// are kept as typed text, like the other launcher fields. No `Debug`: it
+/// holds a typed database password.
+#[derive(Clone, PartialEq)]
+struct SecretProviderDraft {
+    enabled: bool,
+    /// Provider kinds in resolution order.
+    order: Vec<String>,
+    cache_ttl_secs: String,
+    /// One `logical name = op://vault/item/field` per line.
+    onepassword_items: String,
+    /// One `logical name = item id` per line.
+    bitwarden_items: String,
+    keepassxc_database: String,
+    keepassxc_attribute: String,
+    /// One `logical name = entry path` per line.
+    keepassxc_entries: String,
+    /// A newly typed database password — saved to the OS store at launch
+    /// under [`KEEPASSXC_DB_PASSWORD_NAME`], never to a file.
+    db_password: String,
+    /// A password is already stored (checked at start-up, not per frame).
+    db_password_saved: bool,
+    /// Logical name the Check button resolves through the chain.
+    check_name: String,
+    /// Result of the last Check.
+    check_status: String,
+    check_in_flight: bool,
+}
+
+/// Render a logical-name → reference map as the multiline field text:
+/// one `name = reference` per line, sorted by name so the text is stable.
+fn format_item_lines(items: &std::collections::HashMap<String, String>) -> String {
+    let mut names: Vec<&String> = items.keys().collect();
+    names.sort();
+    names
+        .iter()
+        .map(|name| format!("{name} = {}", items[*name]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse a `name = reference` map from a multiline field (#695). Blank
+/// lines and `#` comments are skipped; a line without `=`, without both
+/// sides, or repeating a name is an error worded for the launcher.
+fn parse_item_lines(
+    text: &str,
+    field: &str,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut map = std::collections::HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, reference)) = line.split_once('=') else {
+            return Err(format!(
+                "Secret provider: {field}: line '{line}' must be 'name = reference'"
+            ));
+        };
+        let name = name.trim();
+        let reference = reference.trim();
+        if name.is_empty() || reference.is_empty() {
+            return Err(format!(
+                "Secret provider: {field}: line '{line}' needs a name and a reference"
+            ));
+        }
+        if map.insert(name.to_string(), reference.to_string()).is_some() {
+            return Err(format!(
+                "Secret provider: {field}: name '{name}' is listed twice"
+            ));
+        }
+    }
+    Ok(map)
+}
+
+impl SecretProviderDraft {
+    /// From `config.toml`'s section; `db_password_saved` is filled in by the
+    /// caller. With no section the draft starts disabled but pre-seeded with
+    /// the legacy order, so ticking the checkbox gives a working chain.
+    fn from_config(cfg: Option<&filar_core::SecretProviderConfig>) -> Self {
+        let d = filar_core::SecretProviderConfig::default();
+        let c = cfg.unwrap_or(&d);
+        Self {
+            enabled: cfg.is_some(),
+            order: if cfg.is_some() {
+                c.order.clone()
+            } else {
+                vec!["keyring".into(), "env".into()]
+            },
+            cache_ttl_secs: c.cache_ttl_secs.to_string(),
+            onepassword_items: format_item_lines(&c.onepassword.items),
+            bitwarden_items: format_item_lines(&c.bitwarden.items),
+            keepassxc_database: c
+                .keepassxc
+                .database
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            keepassxc_attribute: c.keepassxc.attribute.clone(),
+            keepassxc_entries: format_item_lines(&c.keepassxc.entries),
+            db_password: String::new(),
+            db_password_saved: false,
+            check_name: filar_core::config::default_llm_key_env(),
+            check_status: String::new(),
+            check_in_flight: false,
+        }
+    }
+
+    /// Whether a provider kind is in the order right now.
+    fn has_kind(&self, kind: &str) -> bool {
+        self.order.iter().any(|k| k == kind)
+    }
+
+    /// Look the database password up in the OS store once (no-op in unit
+    /// tests).
+    fn refresh_db_password_saved(&mut self) {
+        self.db_password_saved = !load_secret(KEEPASSXC_DB_PASSWORD_NAME).is_empty();
+    }
+
+    /// The section to write and launch with — `None` when switched off —
+    /// or the first problem, worded for the launcher. Never contains a
+    /// secret: the typed database password is not part of the section.
+    fn to_config(&self) -> Result<Option<filar_core::SecretProviderConfig>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let cache_ttl_secs = if self.cache_ttl_secs.trim().is_empty() {
+            filar_core::DEFAULT_SECRET_CACHE_TTL_SECS
+        } else {
+            self.cache_ttl_secs.trim().parse::<u64>().map_err(|_| {
+                "Secret provider: cache TTL must be a whole number of seconds".to_string()
+            })?
+        };
+        let attribute = self.keepassxc_attribute.trim();
+        let cfg = filar_core::SecretProviderConfig {
+            order: self.order.clone(),
+            cache_ttl_secs,
+            onepassword: filar_core::ProviderItemsConfig {
+                items: parse_item_lines(&self.onepassword_items, "1Password items")?,
+            },
+            bitwarden: filar_core::ProviderItemsConfig {
+                items: parse_item_lines(&self.bitwarden_items, "Bitwarden items")?,
+            },
+            keepassxc: filar_core::KeePassXcProviderConfig {
+                database: (!self.keepassxc_database.trim().is_empty())
+                    .then(|| std::path::PathBuf::from(self.keepassxc_database.trim())),
+                attribute: if attribute.is_empty() { "password".into() } else { attribute.to_string() },
+                entries: parse_item_lines(&self.keepassxc_entries, "KeePassXC entries")?,
+            },
+        };
+        cfg.validate().map_err(|e| {
+            format!(
+                "Secret provider: {}",
+                e.to_string()
+                    .trim_start_matches("config error: ")
+                    .trim_start_matches("secret_provider.")
+            )
+        })?;
+        if self.has_kind("keepassxc") && cfg.keepassxc.database.is_none() {
+            return Err("Secret provider: enter the KeePassXC database path".into());
+        }
+        Ok(Some(cfg))
+    }
+
+    /// What pending_launch carries for this draft (it is validated first).
+    fn to_launch(&self) -> Result<SecretProviderLaunch, String> {
+        Ok(match self.to_config()? {
+            Some(config) => SecretProviderLaunch::On { config },
+            None => SecretProviderLaunch::Off,
+        })
+    }
+
+    /// A database password to store at launch: only when the chain uses
+    /// KeePassXC and one was typed.
+    fn db_password_to_save(&self) -> Option<String> {
+        let pw = sanitize_secret_clipboard(&self.db_password);
+        (self.enabled && self.has_kind("keepassxc") && !pw.is_empty()).then_some(pw)
+    }
+}
+
+struct SecretCheckResult {
+    config: filar_core::SecretProviderConfig,
+    /// The logical name that was checked.
+    name: String,
+    /// Ok = a value was resolved. The value itself is dropped in the worker
+    /// thread and never reaches the UI (#695).
+    result: Result<(), String>,
+}
+
+/// The Check line shown under the button. Never contains the value — the
+/// worker thread already dropped it; only the outcome travels here.
+fn secret_check_status(name: &str, result: &Result<(), String>) -> String {
+    match result {
+        Ok(()) => format!("Check OK: {name} resolved (value not shown)."),
+        Err(message) => format!("Check failed: {message}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Host groups (#418)
 // ---------------------------------------------------------------------------
 
@@ -2587,6 +2816,10 @@ struct LauncherApp {
     next_log_source_id: u64,
     log_check_tx: std::sync::mpsc::Sender<LogCheckResult>,
     log_check_rx: std::sync::mpsc::Receiver<LogCheckResult>,
+    /// Secret provider chain settings (#695).
+    secret_provider: SecretProviderDraft,
+    sp_check_tx: std::sync::mpsc::Sender<SecretCheckResult>,
+    sp_check_rx: std::sync::mpsc::Receiver<SecretCheckResult>,
     /// Staged import waiting for the collision policy choice (#416).
     import_dialog: Option<ImportDialog>,
     /// Result of the last host-file operation — import or export (#416/#417),
@@ -2595,7 +2828,7 @@ struct LauncherApp {
     /// Working copies of the `[[host_groups]]` definitions (#418).
     host_groups: Vec<HostGroupDraft>,
     /// Active central tab: 0 = session & hosts, 1 = groups (#418), 2 = log
-    /// sources (#584).
+    /// sources (#584), 3 = secret provider (#695).
     active_tab: usize,
     /// Last "is this key encrypted?" answer for the key login fields (#489).
     key_probe: Option<KeyProbe>,
@@ -3881,6 +4114,240 @@ impl LauncherApp {
         }
     }
 
+    /// The Secrets tab (#695): the `[secret_provider]` chain — password
+    /// managers consulted for API keys, SSH passwords and key passphrases.
+    fn render_secret_provider(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Secret provider").strong());
+        ui.label(
+            egui::RichText::new(
+                "Password managers consulted for API keys, SSH passwords and key passphrases, \
+                 in order — the first non-empty answer wins. Only references are written to \
+                 config.toml, never a secret value.",
+            )
+            .small()
+            .weak(),
+        );
+        let mut check = false;
+        let d = &mut self.secret_provider;
+        ui.checkbox(&mut d.enabled, "Use a secret provider chain");
+        if !d.enabled {
+            ui.label(
+                egui::RichText::new(
+                    "Off: secrets come from the OS credential store, then the environment.",
+                )
+                .small()
+                .weak(),
+            );
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Cache TTL (s):");
+            ui.add(egui::TextEdit::singleline(&mut d.cache_ttl_secs).desired_width(60.0))
+                .on_hover_text("How long a resolved value is cached. 0 disables caching.");
+        });
+        ui.label(egui::RichText::new("Order (first non-empty answer wins):").small());
+        let mut remove = None;
+        let mut move_up = None;
+        let mut move_down = None;
+        for (i, kind) in d.order.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("{}.", i + 1));
+                ui.label(kind.as_str());
+                if ui.add_enabled(i > 0, egui::Button::new("↑")).clicked() {
+                    move_up = Some(i);
+                }
+                if ui.add_enabled(i + 1 < d.order.len(), egui::Button::new("↓")).clicked() {
+                    move_down = Some(i);
+                }
+                if ui.button("Remove").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = move_up {
+            d.order.swap(i, i - 1);
+        }
+        if let Some(i) = move_down {
+            d.order.swap(i, i + 1);
+        }
+        if let Some(i) = remove {
+            d.order.remove(i);
+        }
+        ui.horizontal(|ui| {
+            ui.label("Add:");
+            for kind in ["keyring", "env", "onepassword", "bitwarden", "keepassxc"] {
+                if !d.has_kind(kind) && ui.button(kind).clicked() {
+                    d.order.push(kind.to_string());
+                }
+            }
+        });
+        if d.has_kind("onepassword") {
+            ui.label(egui::RichText::new("1Password items").strong());
+            ui.label(
+                egui::RichText::new(
+                    "One per line: logical name = op://vault/item/field. \
+                     Needs the 1Password CLI (`op`), signed in.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add(
+                egui::TextEdit::multiline(&mut d.onepassword_items)
+                    .hint_text("FILAR_LLM_API_KEY = op://Private/OpenRouter/credential")
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
+            );
+        }
+        if d.has_kind("bitwarden") {
+            ui.label(egui::RichText::new("Bitwarden items").strong());
+            ui.label(
+                egui::RichText::new(
+                    "One per line: logical name = item id. \
+                     Needs the Bitwarden CLI (`bw`), unlocked (BW_SESSION).",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add(
+                egui::TextEdit::multiline(&mut d.bitwarden_items)
+                    .hint_text("FILAR_LLM_API_KEY = 4c8f9a2e-1b3d-4e5f-8a9b-0c1d2e3f4a5b")
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
+            );
+        }
+        if d.has_kind("keepassxc") {
+            ui.label(egui::RichText::new("KeePassXC").strong());
+            ui.horizontal(|ui| {
+                ui.label("Database:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut d.keepassxc_database)
+                        .hint_text("C:\\Users\\me\\secrets.kdbx")
+                        .desired_width(f32::INFINITY),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Attribute:");
+                ui.add(egui::TextEdit::singleline(&mut d.keepassxc_attribute).desired_width(100.0))
+                    .on_hover_text("Entry attribute to read (keepassxc-cli show -a). Empty = password.");
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Entries, one per line: logical name = entry path. \
+                     Needs the KeePassXC CLI (`keepassxc-cli`).",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add(
+                egui::TextEdit::multiline(&mut d.keepassxc_entries)
+                    .hint_text("FILAR_LLM_API_KEY = Servers/OpenRouter")
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
+            );
+            let saved = d.db_password_saved;
+            ui.horizontal(|ui| {
+                ui.label("Database password:");
+                let id = ui.make_persistent_id("keepassxc_db_password");
+                apply_focused_secret_paste(ui, id, &mut d.db_password);
+                ui.add(
+                    egui::TextEdit::singleline(&mut d.db_password)
+                        .id(id)
+                        .password(true)
+                        .hint_text(if saved { "saved — type to replace" } else { "not set" })
+                        .desired_width(200.0),
+                );
+                ui.label(egui::RichText::new(if saved { "saved" } else { "not set" }).small().weak());
+            });
+            ui.label(
+                egui::RichText::new(format!(
+                    "Saved to the OS credential store at Launch under {KEEPASSXC_DB_PASSWORD_NAME} — never to a file.",
+                ))
+                .small()
+                .weak(),
+            );
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Check name:");
+            ui.add(egui::TextEdit::singleline(&mut d.check_name).desired_width(200.0))
+                .on_hover_text("Logical name to resolve, e.g. FILAR_LLM_API_KEY or ssh_target:<name>.");
+            if ui
+                .add_enabled(!d.check_in_flight, egui::Button::new("Check"))
+                .on_hover_text("Resolves one name through the chain. The value is never shown.")
+                .clicked()
+            {
+                check = true;
+            }
+        });
+        if d.check_in_flight {
+            ui.label(egui::RichText::new("checking…").small().weak());
+        } else if !d.check_status.is_empty() {
+            ui.label(egui::RichText::new(&d.check_status).small());
+        }
+        if check {
+            self.start_secret_check(ui.ctx().clone());
+        }
+    }
+
+    fn start_secret_check(&mut self, ctx: egui::Context) {
+        let d = &mut self.secret_provider;
+        let cfg = match d.to_config() {
+            Ok(Some(cfg)) => cfg,
+            Ok(None) => {
+                d.check_status = "Secret provider is switched off.".to_string();
+                return;
+            }
+            Err(msg) => {
+                d.check_status = msg;
+                return;
+            }
+        };
+        let name = d.check_name.trim().to_string();
+        if name.is_empty() {
+            d.check_status = "Enter the logical name to check.".to_string();
+            return;
+        }
+        // A typed database password is used for the Check before it is saved.
+        let db_password = {
+            let typed = sanitize_secret_clipboard(&d.db_password);
+            (!typed.is_empty()).then_some(typed)
+        };
+        d.check_in_flight = true;
+        d.check_status.clear();
+        let tx = self.sp_check_tx.clone();
+        std::thread::spawn(move || {
+            // Providers are synchronous (CLI calls with their own timeout):
+            // a plain thread is enough, no async runtime.
+            let result = filar_core::ChainSecretProvider::from_config_with_keepassxc_password(
+                &cfg,
+                db_password,
+            )
+            .map_err(|e| e.to_string())
+            .and_then(|chain| {
+                // Drop the value right here: only "resolved" reaches the UI.
+                filar_core::SecretProvider::get(&chain, &name)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            });
+            let _ = tx.send(SecretCheckResult { config: cfg, name, result });
+            // Wake the UI: nothing else would until the next input event.
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_secret_checks(&mut self, ctx: &egui::Context) {
+        while let Ok(done) = self.sp_check_rx.try_recv() {
+            let d = &mut self.secret_provider;
+            d.check_in_flight = false;
+            d.check_status = if d.to_config().ok().flatten().as_ref() == Some(&done.config) {
+                secret_check_status(&done.name, &done.result)
+            } else {
+                "Check result discarded: the provider fields changed.".to_string()
+            };
+            ctx.request_repaint();
+        }
+    }
+
     /// Every log source must be complete, uniquely named, and linked only to
     /// clusters the launcher knows (#584).
     fn validate_log_sources(&self) -> Result<Vec<filar_core::LogSourceConfig>, String> {
@@ -4463,6 +4930,10 @@ impl LauncherApp {
             self.set_other_error(msg);
             return false;
         }
+        if let Err(msg) = self.secret_provider.to_config() {
+            self.set_other_error(msg);
+            return false;
+        }
         if let Err(msg) = self.validate_log_sources() {
             self.set_other_error(msg);
             return false;
@@ -4923,10 +5394,25 @@ impl LauncherApp {
                 return;
             }
         };
+        let secret_provider = match self.secret_provider.to_launch() {
+            Ok(choice) => choice,
+            // validate_launch already refused it; never launch half-set.
+            Err(msg) => {
+                self.set_other_error(msg);
+                return;
+            }
+        };
+        let secret_section = match &secret_provider {
+            SecretProviderLaunch::On { config } => Some(config.clone()),
+            SecretProviderLaunch::Off => None,
+        };
         settings.save();
-        save_config_toml(&settings, &host_groups, risk_section.as_ref(), &log_sources);
+        save_config_toml(&settings, &host_groups, risk_section.as_ref(), &log_sources, secret_section.as_ref());
         if let Some((key_env, key)) = self.risk_scorer.key_to_save() {
             save_secret(&key_env, &key);
+        }
+        if let Some(pw) = self.secret_provider.db_password_to_save() {
+            save_secret(KEEPASSXC_DB_PASSWORD_NAME, &pw);
         }
         for d in self.log_sources.iter().filter(|d| !d.is_blank()) {
             if let Some((key_env, key)) = d.key_to_save() {
@@ -4966,6 +5452,7 @@ impl LauncherApp {
             host_groups: Some(host_groups),
             risk_scorer: Some(risk_scorer),
             log_sources: Some(log_sources),
+            secret_provider: Some(secret_provider),
         };
         save_pending_launch(&cfg);
         std::process::exit(0);
@@ -4978,6 +5465,7 @@ impl eframe::App for LauncherApp {
         configure_theme(ctx);
         self.poll_kube_checks(ctx);
         self.poll_log_checks(ctx);
+        self.poll_secret_checks(ctx);
 
         // Fixed bottom panel: Launch/Cancel always visible, regardless of
         // window height. The rest of the content scrolls above it.
@@ -5020,6 +5508,7 @@ impl eframe::App for LauncherApp {
                     ui.selectable_value(&mut self.active_tab, 0, "Hosts");
                     ui.selectable_value(&mut self.active_tab, 1, "Groups");
                     ui.selectable_value(&mut self.active_tab, 2, "Logs");
+                    ui.selectable_value(&mut self.active_tab, 3, "Secrets");
                 });
                 ui.separator();
 
@@ -5027,6 +5516,8 @@ impl eframe::App for LauncherApp {
                     self.render_groups(ui);
                 } else if self.active_tab == 2 {
                     self.render_log_sources(ui);
+                } else if self.active_tab == 3 {
+                    self.render_secret_provider(ui);
                 } else {
                     self.render_session_list(ui);
                     ui.separator();
@@ -5088,6 +5579,7 @@ pub fn run_launcher(config: &Config) {
     });
     let (kube_check_tx, kube_check_rx) = std::sync::mpsc::channel();
     let (log_check_tx, log_check_rx) = std::sync::mpsc::channel();
+    let (sp_check_tx, sp_check_rx) = std::sync::mpsc::channel();
     let log_sources: Vec<LogSourceDraft> = config
         .log_sources
         .iter()
@@ -5199,6 +5691,17 @@ pub fn run_launcher(config: &Config) {
         next_log_source_id,
         log_check_tx,
         log_check_rx,
+        secret_provider: {
+            let mut d = SecretProviderDraft::from_config(config.secret_provider.as_ref());
+            // One OS-store read at start-up, not one per frame — and none
+            // when the chain does not use KeePassXC.
+            if d.has_kind("keepassxc") {
+                d.refresh_db_password_saved();
+            }
+            d
+        },
+        sp_check_tx,
+        sp_check_rx,
         import_dialog: None,
         file_status: String::new(),
         host_groups: config.host_groups.iter().map(HostGroupDraft::from_group).collect(),
@@ -5298,6 +5801,7 @@ mod tests {
             host_groups: None,
             risk_scorer: None,
             log_sources: None,
+            secret_provider: None,
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(!json.contains("supersecret"));
@@ -5359,6 +5863,7 @@ mod tests {
             host_groups: None,
             risk_scorer: None,
             log_sources: None,
+            secret_provider: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let loaded: LaunchConfig = serde_json::from_str(&json).unwrap();
@@ -5483,6 +5988,7 @@ mod tests {
             host_groups: None,
             risk_scorer: None,
             log_sources: None,
+            secret_provider: None,
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(!json.contains("\"password\":"), "must not emit password key when None, got: {json}");
@@ -5578,6 +6084,7 @@ mod tests {
             host_groups: None,
             risk_scorer: None,
             log_sources: None,
+            secret_provider: None,
         };
 
         let json = serde_json::to_string(&cfg).unwrap();
@@ -5829,6 +6336,7 @@ mod tests {
             host_groups: None,
             risk_scorer: None,
             log_sources: None,
+            secret_provider: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let loaded: LaunchConfig = serde_json::from_str(&json).unwrap();
@@ -6217,6 +6725,7 @@ mod tests {
     fn make_app(meta: SessionMeta) -> LauncherApp {
         let (kube_check_tx, kube_check_rx) = std::sync::mpsc::channel();
         let (log_check_tx, log_check_rx) = std::sync::mpsc::channel();
+        let (sp_check_tx, sp_check_rx) = std::sync::mpsc::channel();
         LauncherApp {
             sessions: vec![meta],
             selected_session: None,
@@ -6259,6 +6768,9 @@ mod tests {
             next_log_source_id: 0,
             log_check_tx,
             log_check_rx,
+            secret_provider: SecretProviderDraft::from_config(None),
+            sp_check_tx,
+            sp_check_rx,
             import_dialog: None,
             file_status: String::new(),
             host_groups: Vec::new(),
@@ -7871,6 +8383,7 @@ host_key_policy = \"strict\"
             host_groups: None,
             risk_scorer: Some(d.to_launch().unwrap()),
             log_sources: None,
+            secret_provider: None,
         };
         let json = serde_json::to_string(&launch).unwrap();
         assert!(!json.contains("SECRET"), "{json}");
@@ -7990,6 +8503,7 @@ host_key_policy = \"strict\"
             host_groups: None,
             risk_scorer: None,
             log_sources: Some(vec![cfg]),
+            secret_provider: None,
         };
         let json = serde_json::to_string(&launch).unwrap();
         assert!(json.contains("vlogs-prod") && !json.contains("SECRET-LOG-KEY"), "{json}");
@@ -8217,5 +8731,173 @@ host_key_policy = \"strict\"
             assert!(text.contains(says), "{text:?}");
         }
         assert!(DEBUG_IMAGES_HINT.contains("Empty = the action is unavailable"));
+    }
+
+    // ── Secret provider chain (#695) ───────────────────────────────
+
+    /// A draft with all three password managers configured and a typed
+    /// database password that must never reach a file.
+    fn secret_draft() -> SecretProviderDraft {
+        let mut d = SecretProviderDraft::from_config(None);
+        d.enabled = true;
+        d.order = vec!["onepassword".into(), "bitwarden".into(), "keepassxc".into(), "env".into()];
+        d.onepassword_items =
+            "# comment\n\nFILAR_LLM_API_KEY = op://Private/OpenRouter/credential\nssh_target:prod = op://Private/prod/password".into();
+        d.bitwarden_items = "FILAR_LLM_API_KEY = 4c8f9a2e".into();
+        d.keepassxc_database = "C:/ops/secrets.kdbx".into();
+        d.keepassxc_entries = "FILAR_LLM_API_KEY = Servers/OpenRouter".into();
+        d.db_password = "SECRET-DB-PASS-695".into();
+        d
+    }
+
+    #[test]
+    fn a_secret_provider_draft_round_trips_without_the_database_password() {
+        let d = secret_draft();
+        let cfg = d.to_config().unwrap().unwrap();
+        assert_eq!(cfg.onepassword.items.len(), 2, "comments and blank lines are skipped");
+        assert_eq!(cfg.onepassword.items["FILAR_LLM_API_KEY"], "op://Private/OpenRouter/credential");
+        assert_eq!(cfg.bitwarden.items["FILAR_LLM_API_KEY"], "4c8f9a2e");
+        assert_eq!(cfg.keepassxc.entries["FILAR_LLM_API_KEY"], "Servers/OpenRouter");
+        assert_eq!(cfg.keepassxc.attribute, "password");
+        assert_eq!(d.db_password_to_save(), Some("SECRET-DB-PASS-695".to_string()));
+        let back = SecretProviderDraft::from_config(Some(&cfg));
+        assert_eq!(back.to_config().unwrap(), Some(cfg.clone()));
+        assert!(back.db_password.is_empty());
+
+        // config.toml: references yes, the typed password never.
+        let config = filar_core::Config {
+            secret_provider: Some(cfg.clone()),
+            ..Default::default()
+        };
+        let toml_text = toml::to_string_pretty(&config).unwrap();
+        assert!(toml_text.contains("[secret_provider]"), "{toml_text}");
+        assert!(!toml_text.contains("SECRET-DB-PASS-695"), "{toml_text}");
+
+        // pending_launch: the choice travels, the password does not.
+        let launch = d.to_launch().unwrap();
+        let json = serde_json::to_string(&launch).unwrap();
+        assert!(json.contains("\"state\":\"on\""), "{json}");
+        assert!(json.contains("op://Private/OpenRouter/credential"), "{json}");
+        assert!(!json.contains("SECRET-DB-PASS-695"), "{json}");
+        let read: SecretProviderLaunch = serde_json::from_str(&json).unwrap();
+        assert_eq!(read, launch);
+        let off = serde_json::to_string(&SecretProviderLaunch::Off).unwrap();
+        assert_eq!(off, "{\"state\":\"off\"}");
+    }
+
+    #[test]
+    fn pending_launch_carries_the_secret_provider_choice_without_secrets() {
+        let choice = secret_draft().to_launch().unwrap();
+        let launch = LaunchConfig {
+            target: "local".into(),
+            ssh: None,
+            kube: None,
+            kube_clusters: None,
+            model: "m".into(),
+            api_base_url: String::new(),
+            api_key: String::new(),
+            session_id: None,
+            temperature: String::new(),
+            extra_body: String::new(),
+            selected_profile: None,
+            key_env: String::new(),
+            save_dir: None,
+            profiles: vec![],
+            ssh_targets: vec![],
+            arbiter_profile: None,
+            host_groups: None,
+            risk_scorer: None,
+            log_sources: None,
+            secret_provider: Some(choice),
+        };
+        let json = serde_json::to_string(&launch).unwrap();
+        assert!(json.contains("keepassxc") && !json.contains("SECRET-DB-PASS-695"), "{json}");
+        // The handoff must not trip the plaintext-secret heuristic.
+        assert!(!json.contains("\"password\":"), "{json}");
+        let read: LaunchConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(read.secret_provider, launch.secret_provider);
+        // A file written before #695 means "not said".
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("secret_provider");
+        let old: LaunchConfig = serde_json::from_value(value).unwrap();
+        assert!(old.secret_provider.is_none());
+    }
+
+    #[test]
+    fn secret_provider_drafts_are_validated_like_the_config() {
+        let mut d = secret_draft();
+        d.enabled = false;
+        assert_eq!(d.to_config().unwrap(), None);
+        assert_eq!(d.to_launch().unwrap(), SecretProviderLaunch::Off);
+        assert_eq!(d.db_password_to_save(), None, "a disabled chain saves nothing");
+        let mut d = secret_draft();
+        d.order.clear();
+        assert!(d.to_config().unwrap_err().contains("at least one provider"));
+        let mut d = secret_draft();
+        d.order = vec!["vault".into()];
+        assert!(d.to_config().unwrap_err().contains("unknown kind"));
+        let mut d = secret_draft();
+        d.onepassword_items = "no-equals-sign".into();
+        assert!(d.to_config().unwrap_err().contains("must be 'name = reference'"));
+        let mut d = secret_draft();
+        d.bitwarden_items = "A = 1\nA = 2".into();
+        assert!(d.to_config().unwrap_err().contains("listed twice"));
+        let mut d = secret_draft();
+        d.keepassxc_database.clear();
+        assert!(d.to_config().unwrap_err().contains("database path"));
+        let mut d = secret_draft();
+        d.cache_ttl_secs = "soon".into();
+        assert!(d.to_config().unwrap_err().contains("whole number"));
+        let mut d = secret_draft();
+        d.cache_ttl_secs = " ".into();
+        assert_eq!(d.to_config().unwrap().unwrap().cache_ttl_secs, filar_core::DEFAULT_SECRET_CACHE_TTL_SECS);
+        // A typed password without KeePassXC in the order is not saved.
+        let mut d = secret_draft();
+        d.order = vec!["env".into()];
+        assert_eq!(d.db_password_to_save(), None);
+    }
+
+    #[test]
+    fn a_fresh_secret_provider_draft_starts_disabled_with_the_legacy_order() {
+        let d = SecretProviderDraft::from_config(None);
+        assert!(!d.enabled);
+        assert_eq!(d.order, vec!["keyring".to_string(), "env".to_string()]);
+        assert_eq!(d.to_config().unwrap(), None);
+        assert_eq!(d.check_name, filar_core::config::default_llm_key_env());
+    }
+
+    #[test]
+    fn launch_refuses_a_half_set_secret_provider() {
+        let mut app = app_with_profiles(vec![LlmProfileData { name: "one".into(), ..edited_profile() }]);
+        let mut d = secret_draft();
+        d.keepassxc_database.clear();
+        app.secret_provider = d;
+        assert!(!app.validate_launch());
+        assert!(app.validation_error.starts_with("Secret provider:"), "{:?}", app.validation_error);
+        app.secret_provider = secret_draft();
+        assert!(app.validate_launch(), "got {:?}", app.validation_error);
+    }
+
+    #[test]
+    fn the_secret_check_line_never_shows_a_value() {
+        // The worker thread drops the value before sending: only the
+        // outcome reaches this formatter, so no value can leak through it.
+        let ok = secret_check_status("FILAR_LLM_API_KEY", &Ok(()));
+        assert!(ok.contains("FILAR_LLM_API_KEY") && ok.contains("not shown"), "{ok}");
+        let err = secret_check_status("FILAR_LLM_API_KEY", &Err("op CLI not found".into()));
+        assert_eq!(err, "Check failed: op CLI not found");
+    }
+
+    #[test]
+    fn item_lines_format_sorted_and_parse_back() {
+        let mut items = std::collections::HashMap::new();
+        items.insert("b".to_string(), "ref-b".to_string());
+        items.insert("a".to_string(), "op://v/i/f".to_string());
+        let text = format_item_lines(&items);
+        assert_eq!(text, "a = op://v/i/f\nb = ref-b");
+        assert_eq!(parse_item_lines(&text, "items").unwrap(), items);
+        assert!(parse_item_lines("  \n# only a comment", "items").unwrap().is_empty());
+        assert!(parse_item_lines("= ref", "items").unwrap_err().contains("needs a name"));
+        assert!(parse_item_lines("name =", "items").unwrap_err().contains("needs a name"));
     }
 }
