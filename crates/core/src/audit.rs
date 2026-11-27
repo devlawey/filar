@@ -229,10 +229,12 @@ impl AuditWriter {
     ///
     /// Masking contract: `secrets` must be an enumeration-complete snapshot
     /// of every secret resolved in this session — its keys are the masking
-    /// scope. Build one from any provider with [`secret_snapshot`] (which
-    /// is fail-closed); a provider that cannot list its entries (e.g.
-    /// `KeyringSecretProvider`) must not be used as the masking source
-    /// directly — the snapshot type makes that explicit.
+    /// scope. Build one with [`secret_snapshot`] from a provider that
+    /// enumerates the session's resolved secrets; for a non-enumerable
+    /// store (e.g. `KeyringSecretProvider`) supply the names and values
+    /// resolved in this session explicitly (`StaticSecretProvider::with_secrets`)
+    /// — a snapshot built from a non-enumerable source is empty and masks
+    /// nothing.
     pub fn append(
         &mut self,
         record: &AuditRecord,
@@ -279,24 +281,27 @@ impl AuditWriter {
         const MAX_SCAN: u32 = 1000;
         loop {
             let size = match std::fs::metadata(&candidate) {
-                Ok(m) => m.len(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-                // Any other probe error: the candidate is unusable, skip
-                // it — the scan cap turns a fully unreadable dir into Err.
-                Err(_) => u64::MAX,
+                Ok(m) => Some(m.len()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+                // Any other probe error: the size is unknown, the candidate
+                // is unusable — skip it regardless of max_bytes. The scan
+                // cap turns a fully unreadable dir into Err.
+                Err(_) => None,
             };
             // A brand-new file accepts any single line, even an oversized
             // one — a record must never be dropped for being long. A file
             // whose last line is incomplete (a torn write) is preserved
             // as-is and skipped: appending after a partial line would
             // corrupt both records.
-            if (size == 0 || size.saturating_add(extra) <= self.max_bytes)
-                && tail_is_complete(&candidate)
-            {
-                return Ok(candidate);
+            if let Some(size) = size {
+                if (size == 0 || size.saturating_add(extra) <= self.max_bytes)
+                    && tail_is_complete(&candidate)
+                {
+                    return Ok(candidate);
+                }
             }
             index += 1;
-            if index > MAX_SCAN {
+            if index >= MAX_SCAN {
                 return Err(CoreError::Other(format!(
                     "no usable audit journal file for {date} within {MAX_SCAN} candidates in {} (unreadable directory or too many files)",
                     self.dir.display()
@@ -599,6 +604,23 @@ mod tests {
         let path = w.append(&record("2026-01-0\u{0413}c", "uptime"), None).unwrap();
         let today = &now_rfc3339()[..10];
         assert!(path.to_string_lossy().contains(&format!("audit-{today}")), "bad ts falls back to today: {}", path.display());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_cap_returns_error_not_loops() {
+        // Exactly MAX_SCAN (1000) candidates, all over the size limit:
+        // the bounded scan must end with an error, not probe file 1001.
+        let dir = tmp_dir("scancap");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("audit-2026-01-02.jsonl"), "x\n").unwrap();
+        for i in 1..1000 {
+            std::fs::write(dir.join(format!("audit-2026-01-02.{i}.jsonl")), "x\n").unwrap();
+        }
+        let mut w = AuditWriter::with_max_bytes(&dir, 1);
+        let err = w.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap_err().to_string();
+        assert!(err.contains("1000 candidates"), "error names the scan cap: {err}");
+        assert!(!dir.join("audit-2026-01-02.1000.jsonl").exists(), "no candidate past the cap may be created");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
