@@ -13601,8 +13601,9 @@ unauthenticated → подсказка 'bw login', без интерактивн
 берётся из env или OS credential store (service `filar`, name `BW_SESSION`),
 не из config; передаётся только дочернему процессу и zeroize-ится после
 вызова. `run_secret_cli` получил env-вариант (`run_secret_cli_with_env`),
-сигнатура прежнего не изменилась. CLI добавляет один перевод строки —
-снимается ровно он, хвостовой newline самого пароля сохраняется.
+сигнатура прежнего не изменилась. Piped `bw get password` не добавляет
+свой перевод строки — stdout возвращается verbatim, хвостовой newline
+самого пароля сохраняется.
 `from_config` собирает звено `bitwarden`; `keepassxc` — «not available yet»
 (#693). Ошибки — имя провайдера и item id, без значения и сырого stderr;
 буферы zeroize, кэш в Chain, Debug — только counts.
@@ -13628,5 +13629,12 @@ env-тест переписан без мутации окружения про�
 `set_var` удалены; замечание о порядке guard/`set_var` закрыто тем же
 переписыванием. Отклонено: «нет строки CHANGELOG» в сводке ai-review —
 строка #692 присутствует в PR. Core 284, workspace зелёные.
+
+**Ревью (раунд 3).** Принято замечание CodeRabbit: piped `bw get password`
+не добавляет свой newline (`writeLn(out, true)` в base-program.ts /
+utils.ts cli-v2026.9.1 — на non-TTY финальная строка пишется без `\n`),
+поэтому strip убран — значение возвращается verbatim; заглушки и тесты
+поправлены (newline-item — это хвост самого пароля). Верифицировано по
+исходникам bw. Ai-review этого раунда завершился по таймауту (cancelled).
 
 **Next:** #693 (провайдер KeePassXC).

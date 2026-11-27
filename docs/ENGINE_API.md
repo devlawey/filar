@@ -432,8 +432,9 @@ is synchronous: async callers must use `tokio::task::spawn_blocking`.
 
 `filar_core::BitwardenProvider` (#692) reads secrets through the local
 Bitwarden CLI: `bw status` checks the vault state first, then
-`bw get password <id>` reads the value (the one trailing line break the CLI
-appends is stripped; a newline stored in the password itself survives).
+`bw get password <id>` reads the value (piped `bw` adds no newline of its
+own, so stdout is returned verbatim — a newline stored in the password
+itself survives).
 Logical names map to item ids via `[secret_provider.bitwarden.items]`; an
 unmapped name is a miss so the chain falls through. A locked vault yields
 «vault locked: выполните bw unlock», an unauthenticated one a 'bw login'

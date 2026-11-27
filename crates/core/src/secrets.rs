@@ -1069,9 +1069,10 @@ impl std::fmt::Debug for OnePasswordProvider {
 /// the OS credential store (service `filar`, name `BW_SESSION`) — never
 /// from `config.toml` — and passed to the child process only.
 ///
-/// `bw get password` appends one newline of its own; exactly that trailing
-/// line break (`\n` or `\r\n`) is stripped, the rest of the value is
-/// returned verbatim.
+/// `bw get password` writes the value verbatim when stdout is piped (the
+/// CLI's `writeLn` skips its own newline for a final line on a non-TTY),
+/// so the captured stdout is returned unchanged — a stored password that
+/// ends with a line break keeps it.
 ///
 /// Errors name the provider and the item id, never a value and never the
 /// raw stderr. Value buffers are zeroized; caching lives in
@@ -1154,7 +1155,7 @@ impl BitwardenProvider {
                 )));
             }
         }
-        let mut value = run_secret_cli_with_env(
+        let value = run_secret_cli_with_env(
             &self.cli,
             &["get", "password", reference],
             self.timeout,
@@ -1163,14 +1164,8 @@ impl BitwardenProvider {
             classify_bw_stderr,
             env,
         )?;
-        // Strip exactly the one line break the CLI appends; a newline that
-        // is part of the stored password itself survives.
-        if value.ends_with('\n') {
-            value.pop();
-            if value.ends_with('\r') {
-                value.pop();
-            }
-        }
+        // Piped `bw get password` adds no newline of its own: return the
+        // value verbatim, including any stored terminal line break.
         Ok(value)
     }
 }
@@ -2220,7 +2215,7 @@ mod tests {
     }
 
     /// Stub `bw`: `status` reports an unlocked vault; `get password <id>`
-    /// prints a value with the CLI's own trailing newline. The id
+    /// prints the value verbatim, like the real CLI on a pipe. The id
     /// "missing-item" selects the not-found branch, "newline-item" a stored
     /// value that itself ends with a line break.
     fn bw_stub(dir: &std::path::Path) -> std::path::PathBuf {
@@ -2236,7 +2231,6 @@ mod tests {
             "  exit /b 1\r\n",
             ")\r\n",
             "<nul set /p=bw-secret-value\r\n",
-            "echo.\r\n",
             "if \"%3\"==\"newline-item\" echo.\r\n",
             "exit /b 0\r\n",
         );
@@ -2251,7 +2245,7 @@ mod tests {
             "  echo \"Not found.\" >&2\n",
             "  exit 1\n",
             "fi\n",
-            "printf 'bw-secret-value\\n'\n",
+            "printf 'bw-secret-value'\n",
             "if [ \"$3\" = \"newline-item\" ]; then printf '\\n'; fi\n",
         );
         write_stub(dir, "bw", body)
@@ -2277,7 +2271,7 @@ mod tests {
         let stub = bw_stub(&dir);
         let p = BitwardenProvider::new(bw_items("api-key-item"))
             .with_cli_path(stub.to_str().unwrap());
-        // The CLI's own trailing newline is stripped, the value is intact.
+        // Piped bw adds no newline: stdout is returned verbatim.
         assert_eq!(p.get("FILAR_LLM_API_KEY").unwrap(), "bw-secret-value");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2288,7 +2282,7 @@ mod tests {
         let stub = bw_stub(&dir);
         let p = BitwardenProvider::new(bw_items("newline-item"))
             .with_cli_path(stub.to_str().unwrap());
-        // Exactly one CLI-added line break is stripped; the stored one stays.
+        // The stored terminal line break is part of the value and survives.
         #[cfg(windows)]
         let expected = "bw-secret-value\r\n";
         #[cfg(not(windows))]
@@ -2375,7 +2369,6 @@ mod tests {
             "  exit /b 0\r\n",
             ")\r\n",
             "<nul set /p=%BW_SESSION%\r\n",
-            "echo.\r\n",
             "exit /b 0\r\n",
         );
         #[cfg(not(windows))]
@@ -2385,7 +2378,7 @@ mod tests {
             "  printf '{\"status\":\"unlocked\"}'\n",
             "  exit 0\n",
             "fi\n",
-            "printf '%s\\n' \"$BW_SESSION\"\n",
+            "printf '%s' \"$BW_SESSION\"\n",
         );
         let stub = write_stub(&dir, "bw-session", body);
         let p = BitwardenProvider::new(bw_items("api-key-item"))
