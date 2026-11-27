@@ -410,9 +410,10 @@ Provider parameters (`onepassword.items`, `bitwarden.items`,
 `keepassxc.database` / `attribute` / `entries`) are references only; a secret
 value never enters the config. `ChainSecretProvider::from_config` builds the
 chain from the section; `onepassword` maps to `OnePasswordProvider` (#691),
-the remaining password-manager kinds pass validation but their providers
-land with the rest of milestone 3.1.0 — until then `from_config` refuses them
-by name. Without the section, secret resolution keeps its
+`bitwarden` maps to `BitwardenProvider` (#692), the remaining password-manager
+kind passes validation but its provider lands with the rest of milestone
+3.1.0 — until then `from_config` refuses it by name. Without the section,
+secret resolution keeps its
 legacy order (static → keyring → env). The section does not yet govern
 production key resolution in the app — the chain is wired into the startup
 paths in #694.
@@ -428,6 +429,20 @@ stderr. Value buffers are zeroized; caching lives in the chain. CLI output
 is capped at 1 MiB per stream (fixed pre-reserved buffers, no reallocation);
 larger output is an error, not a truncated secret. The trait
 is synchronous: async callers must use `tokio::task::spawn_blocking`.
+
+`filar_core::BitwardenProvider` (#692) reads secrets through the local
+Bitwarden CLI: `bw status` checks the vault state first, then
+`bw get password <id>` reads the value (the one trailing line break the CLI
+appends is stripped; a newline stored in the password itself survives).
+Logical names map to item ids via `[secret_provider.bitwarden.items]`; an
+unmapped name is a miss so the chain falls through. A locked vault yields
+«vault locked: выполните bw unlock», an unauthenticated one a 'bw login'
+hint — never an interactive prompt. The session key `BW_SESSION` is taken
+from the environment or the OS credential store (service `filar`, name
+`BW_SESSION`), never from the config, and passed to the child process only.
+Errors name the provider and the item id, never a value or the raw stderr;
+value buffers are zeroized; caching lives in the chain. The trait is
+synchronous: async callers must use `tokio::task::spawn_blocking`.
 
 `SshTransportConfig::command_timeout` (default 300s,
 `filar_core::DEFAULT_COMMAND_TIMEOUT_SECS`) is how long `SshSession::run` waits

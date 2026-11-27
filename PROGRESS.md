@@ -13590,3 +13590,26 @@ stdbuf/python3); буферы CLI-вывода получили фиксиров
 дедлайном ожидание обоих читателей уже есть перед проверкой overflow.
 
 **Next:** #692 (провайдер Bitwarden CLI).
+
+## #692 — провайдер Bitwarden CLI (bw get)
+
+**Сделано.** `BitwardenProvider` (`secrets.rs`): `bw status` проверяет
+состояние vault (locked → «vault locked: выполните bw unlock»,
+unauthenticated → подсказка 'bw login', без интерактивного ввода), затем
+`bw get password <id>` с таймаутом (дефолт 30с). Маппинг имён через
+`[secret_provider.bitwarden.items]`; немапленное имя — промах. `BW_SESSION`
+берётся из env или OS credential store (service `filar`, name `BW_SESSION`),
+не из config; передаётся только дочернему процессу и zeroize-ится после
+вызова. `run_secret_cli` получил env-вариант (`run_secret_cli_with_env`),
+сигнатура прежнего не изменилась. CLI добавляет один перевод строки —
+снимается ровно он, хвостовой newline самого пароля сохраняется.
+`from_config` собирает звено `bitwarden`; `keepassxc` — «not available yet»
+(#693). Ошибки — имя провайдера и item id, без значения и сырого stderr;
+буферы zeroize, кэш в Chain, Debug — только counts.
+
+**Тесты.** Заглушки CLI: успешное чтение, stored-newline, locked,
+unauthenticated, not found, таймаут, передача BW_SESSION из env, отсутствие
+CLI, Debug/secret_names/промах, chain из конфига; интеграция с реальным `bw`
+— `#[ignore]`, ручная.
+
+**Next:** #693 (провайдер KeePassXC).
