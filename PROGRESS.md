@@ -13522,3 +13522,28 @@ config.rs и ENGINE_API.md явно говорят, что секция пока
 `docs/ENGINE_API.md`). `CommandExecutor`/`LlmClient` без изменений.
 
 **Next:** #691 (провайдер 1Password CLI).
+
+## #691 — провайдер 1Password CLI (op read)
+
+**Сделано.** `OnePasswordProvider` (`secrets.rs`): чтение через
+`op read op://<vault>/<item>/<field> --no-newline` subprocess с таймаутом
+(дефолт 30с, `DEFAULT_SECRET_CLI_TIMEOUT_SECS`, `with_timeout`); маппинг
+логических имён через `[secret_provider.onepassword.items]`; немапленное
+имя — промах (chain идёт дальше). Заблокированный vault / нет сессии —
+ошибка с именем провайдера и item-ссылки, без значения и без сырого stderr
+(stderr только классифицируется в короткий hint). Буферы значений
+zeroize; кэш — в Chain. `from_config` собирает звено `onepassword`;
+`bitwarden`/`keepassxc` по-прежнему «not available yet» (#692–#693).
+Общий helper `run_secret_cli` (spawn + try_wait + kill по таймауту)
+переиспользуется следующими провайдерами.
+
+**Решения.** Трейт синхронный — async-вызовы только через `spawn_blocking`
+(задокументировано). CLI-путь подменяем (`with_cli_path`) — юнит-тесты
+гоняют stub-скрипт (.cmd на Windows, sh на Unix), реальный `op` —
+`#[ignore]`-тест с `FILAR_TEST_OP_REFERENCE` (ручной).
+
+**Контракты.** Новые публичные элементы: `OnePasswordProvider`,
+`DEFAULT_SECRET_CLI_TIMEOUT_SECS` (описаны в `docs/ENGINE_API.md`).
+`CommandExecutor`/`LlmClient` без изменений.
+
+**Next:** #692 (провайдер Bitwarden CLI).

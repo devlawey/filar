@@ -538,11 +538,12 @@ impl ChainSecretProvider {
 
     /// Build the chain described by `[secret_provider]` (#690).
     ///
-    /// `keyring` and `env` map to [`KeyringSecretProvider`] and
-    /// [`EnvSecretProvider`]; the password-manager kinds are recognised by
-    /// validation but their providers land with the follow-up issues of
-    /// milestone 3.1.0 — until then naming one fails with a clear error
-    /// instead of silently skipping it.
+    /// `keyring`, `env` and `onepassword` map to [`KeyringSecretProvider`],
+    /// [`EnvSecretProvider`] and [`OnePasswordProvider`]; the remaining
+    /// password-manager kinds are recognised by validation but their
+    /// providers land with the follow-up issues of milestone 3.1.0 — until
+    /// then naming one fails with a clear error instead of silently
+    /// skipping it.
     pub fn from_config(cfg: &crate::config::SecretProviderConfig) -> Result<Self> {
         cfg.validate()?;
         let mut providers: Vec<Arc<dyn SecretProvider>> = Vec::new();
@@ -553,6 +554,9 @@ impl ChainSecretProvider {
             let provider: Arc<dyn SecretProvider> = match parsed {
                 crate::config::SecretProviderKind::Keyring => Arc::new(KeyringSecretProvider::new()),
                 crate::config::SecretProviderKind::Env => Arc::new(EnvSecretProvider::new()),
+                crate::config::SecretProviderKind::OnePassword => {
+                    Arc::new(OnePasswordProvider::new(cfg.onepassword.items.clone()))
+                }
                 other => {
                     return Err(CoreError::Config(format!(
                         "secret_provider.order: provider '{}' is not available yet",
@@ -664,6 +668,200 @@ impl Drop for ChainSecretProvider {
             }
             cache.clear();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Password-manager CLI helpers
+// ---------------------------------------------------------------------------
+
+/// Default timeout for a password-manager CLI invocation, seconds (#691).
+pub const DEFAULT_SECRET_CLI_TIMEOUT_SECS: u64 = 30;
+
+/// Run a password-manager CLI and return its stdout with trailing newlines
+/// stripped. The child is killed when `timeout` elapses.
+///
+/// Errors name the provider and the (non-secret) reference, never a value
+/// and never the raw stderr: the stderr is only classified into a short
+/// hint by `classify`. All intermediate buffers are zeroized.
+fn run_secret_cli(
+    cli: &str,
+    args: &[&str],
+    timeout: Duration,
+    provider: &str,
+    reference: &str,
+    classify: impl Fn(&str) -> Option<&'static str>,
+) -> Result<String> {
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(cli)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CoreError::Secret(format!(
+                    "{provider}: CLI '{cli}' not found — install it or remove the provider from secret_provider.order"
+                ))
+            } else {
+                CoreError::Other(format!("{provider}: failed to start CLI '{cli}': {e}"))
+            }
+        })?;
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(CoreError::Secret(format!(
+                        "{provider}: timed out after {}s reading {reference}",
+                        timeout.as_secs()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CoreError::Other(format!(
+                    "{provider}: failed to wait for CLI '{cli}': {e}"
+                )));
+            }
+        }
+    };
+
+    // The child has exited; drain the pipes. A value larger than the pipe
+    // buffer would have blocked the child until the timeout killed it.
+    let mut output = child
+        .wait_with_output()
+        .map_err(|e| CoreError::Other(format!("{provider}: failed to read CLI output: {e}")))?;
+    let mut stdout_bytes = std::mem::take(&mut output.stdout);
+    let mut stderr_bytes = std::mem::take(&mut output.stderr);
+    let mut stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+    let mut stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    stdout_bytes.zeroize();
+    stderr_bytes.zeroize();
+
+    let result = if status.success() {
+        // `op read` appends a newline unless --no-newline; strip only the
+        // line ending, never meaningful whitespace inside the value.
+        let value = stdout.trim_end_matches(['\r', '\n']).to_string();
+        Ok(value)
+    } else {
+        let hint = classify(&stderr.to_lowercase()).unwrap_or("CLI read failed");
+        let code = status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        Err(CoreError::Secret(format!(
+            "{provider}: {hint} (item {reference}, exit {code})"
+        )))
+    };
+    stdout.zeroize();
+    stderr.zeroize();
+    result
+}
+
+// ---------------------------------------------------------------------------
+// OnePasswordProvider
+// ---------------------------------------------------------------------------
+
+/// [`SecretProvider`] backed by the 1Password CLI (`op read`, #691).
+///
+/// Logical names (`FILAR_LLM_API_KEY`, `ssh_target:<name>`,
+/// `ssh_key_passphrase:<name>`) map to `op://<vault>/<item>/<field>`
+/// references through `[secret_provider.onepassword.items]`. The CLI runs
+/// on the user's machine, so zero-install on the remote (invariant 1) is
+/// not affected. The trait is synchronous: async callers must wrap `get()`
+/// in `tokio::task::spawn_blocking`, never call it on a runtime worker.
+///
+/// A locked vault or a missing session (`OP_SESSION`, service account) is
+/// reported as a clear error naming the provider and the item reference —
+/// never a value and never the raw stderr. Value buffers are zeroized;
+/// caching lives in [`ChainSecretProvider`], not here.
+pub struct OnePasswordProvider {
+    items: HashMap<String, String>,
+    cli: String,
+    timeout: Duration,
+}
+
+impl OnePasswordProvider {
+    /// Create a provider from the logical-name → `op://` mapping. Uses the
+    /// `op` binary from `PATH` and [`DEFAULT_SECRET_CLI_TIMEOUT_SECS`].
+    pub fn new(items: HashMap<String, String>) -> Self {
+        Self {
+            items,
+            cli: "op".to_string(),
+            timeout: Duration::from_secs(DEFAULT_SECRET_CLI_TIMEOUT_SECS),
+        }
+    }
+
+    /// Override the CLI path (tests use a stub script).
+    pub fn with_cli_path(mut self, path: impl Into<String>) -> Self {
+        self.cli = path.into();
+        self
+    }
+
+    /// Override the per-invocation timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+impl SecretProvider for OnePasswordProvider {
+    fn get(&self, name: &str) -> Result<String> {
+        let reference = self.items.get(name).ok_or_else(|| {
+            CoreError::Secret(format!("onepassword: no op:// mapping for {}", redact(name)))
+        })?;
+        run_secret_cli(
+            &self.cli,
+            &["read", reference, "--no-newline"],
+            self.timeout,
+            "onepassword",
+            reference,
+            |stderr| {
+                if stderr.contains("not signed in")
+                    || stderr.contains("session expired")
+                    || stderr.contains("session has expired")
+                    || stderr.contains("sign in")
+                    || stderr.contains("authentication")
+                    || stderr.contains("locked")
+                {
+                    Some(
+                        "vault is locked or there is no active session — sign in with 'op signin' or provide OP_SESSION / a service account token",
+                    )
+                } else if stderr.contains("isn't an item")
+                    || stderr.contains("not found")
+                    || stderr.contains("could not be found")
+                    || stderr.contains("no item")
+                    || stderr.contains("no vault")
+                {
+                    Some("item or vault not found")
+                } else {
+                    None
+                }
+            },
+        )
+    }
+
+    fn secret_names(&self) -> Vec<String> {
+        self.items.keys().cloned().collect()
+    }
+}
+
+/// Counts only — the provider holds no values, but keep the log line lean.
+impl std::fmt::Debug for OnePasswordProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnePasswordProvider")
+            .field("items", &self.items.len())
+            .field("timeout_secs", &self.timeout.as_secs())
+            .finish()
     }
 }
 
@@ -1161,15 +1359,15 @@ mod tests {
 
     #[test]
     fn chain_from_config_manager_kind_not_available_yet() {
-        // The manager providers land with the follow-up issues of 3.1.0;
-        // until then the error names the kind instead of skipping it.
+        // The remaining manager providers land with the follow-up issues of
+        // 3.1.0; until then the error names the kind instead of skipping it.
         let cfg = crate::config::SecretProviderConfig {
-            order: vec!["onepassword".into()],
+            order: vec!["bitwarden".into()],
             ..Default::default()
         };
         let err = ChainSecretProvider::from_config(&cfg).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("onepassword"), "{msg}");
+        assert!(msg.contains("bitwarden"), "{msg}");
         assert!(msg.contains("not available yet"), "{msg}");
     }
 
@@ -1197,5 +1395,200 @@ mod tests {
         let out = redact_secrets("ssh with hunter2", &c);
         assert!(!out.contains("hunter2"), "cached value must be masked: {out}");
         assert!(out.contains("$FILAR_SECRET_1"), "{out}");
+    }
+
+    // -----------------------------------------------------------------------
+    // OnePasswordProvider (#691) — CLI stub tests
+    // -----------------------------------------------------------------------
+
+    fn op_stub_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("filar-op-stub-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_stub(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        #[cfg(windows)]
+        let path = dir.join(format!("{name}.cmd"));
+        #[cfg(not(windows))]
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// Stub `op`: the reference (second argument) selects the behaviour —
+    /// "locked" → sign-in error, "missing" → not-found error, anything else
+    /// → a value with a trailing newline (which the provider must strip).
+    fn op_stub(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        let body = concat!(
+            "@echo off\r\n",
+            "echo %2 | find \"locked\" >nul\r\n",
+            "if not errorlevel 1 (\r\n",
+            "  echo [ERROR] You are not signed in. Your session has expired. 1>&2\r\n",
+            "  exit /b 1\r\n",
+            ")\r\n",
+            "echo %2 | find \"missing\" >nul\r\n",
+            "if not errorlevel 1 (\r\n",
+            "  echo [ERROR] item isn't an item in the vault 1>&2\r\n",
+            "  exit /b 1\r\n",
+            ")\r\n",
+            "echo op-secret-value\r\n",
+            "exit /b 0\r\n",
+        );
+        #[cfg(not(windows))]
+        let body = concat!(
+            "#!/bin/sh\n",
+            "case \"$2\" in\n",
+            "*locked*) printf '%s\\n' \"[ERROR] You are not signed in. Your session has expired.\" >&2; exit 1 ;;\n",
+            "*missing*) printf '%s\\n' \"[ERROR] item isn't an item in the vault\" >&2; exit 1 ;;\n",
+            "*) printf 'op-secret-value\\n' ;;\n",
+            "esac\n",
+        );
+        write_stub(dir, "op-stub", body)
+    }
+
+    fn op_slow_stub(dir: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(windows)]
+        let body = "@echo off\r\nping -n 30 127.0.0.1 >nul\r\nexit /b 0\r\n";
+        #[cfg(not(windows))]
+        let body = "#!/bin/sh\nsleep 30\n";
+        write_stub(dir, "op-slow", body)
+    }
+
+    fn op_items(reference: &str) -> HashMap<String, String> {
+        let mut items = HashMap::new();
+        items.insert("FILAR_LLM_API_KEY".to_string(), reference.to_string());
+        items
+    }
+
+    #[test]
+    fn op_provider_reads_value_via_cli_stub() {
+        let dir = op_stub_dir("read");
+        let stub = op_stub(&dir);
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path(stub.to_str().unwrap());
+        // The trailing newline of the stub output must be stripped.
+        assert_eq!(p.get("FILAR_LLM_API_KEY").unwrap(), "op-secret-value");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_unmapped_name_is_a_miss() {
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"));
+        let err = p.get("ssh_target:other").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("onepassword"), "{msg}");
+        assert!(msg.contains("no op:// mapping"), "{msg}");
+    }
+
+    #[test]
+    fn op_provider_locked_vault_error_names_provider_and_item() {
+        let dir = op_stub_dir("locked");
+        let stub = op_stub(&dir);
+        let p = OnePasswordProvider::new(op_items("op://vault/locked-item/credential"))
+            .with_cli_path(stub.to_str().unwrap());
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("onepassword"), "{msg}");
+        assert!(msg.contains("op://vault/locked-item/credential"), "{msg}");
+        assert!(msg.contains("session"), "{msg}");
+        // Neither the raw stderr nor a value may leak into the error.
+        assert!(!msg.contains("[ERROR]"), "raw stderr leak: {msg}");
+        assert!(!msg.contains("op-secret-value"), "value leak: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_missing_item_error() {
+        let dir = op_stub_dir("missing");
+        let stub = op_stub(&dir);
+        let p = OnePasswordProvider::new(op_items("op://vault/missing-item/credential"))
+            .with_cli_path(stub.to_str().unwrap());
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not found"), "{msg}");
+        assert!(msg.contains("op://vault/missing-item/credential"), "{msg}");
+        assert!(!msg.contains("[ERROR]"), "raw stderr leak: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_timeout_kills_the_cli() {
+        let dir = op_stub_dir("slow");
+        let stub = op_slow_stub(&dir);
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "timeout not enforced");
+        let msg = format!("{err}");
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(msg.contains("onepassword"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_missing_cli_is_a_clear_error() {
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path("filar-nonexistent-op-cli-991");
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("onepassword"), "{msg}");
+        assert!(msg.contains("not found"), "{msg}");
+    }
+
+    #[test]
+    fn op_provider_debug_carries_no_values_or_references() {
+        let dir = op_stub_dir("debug");
+        let stub = op_stub(&dir);
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path(stub.to_str().unwrap());
+        let _ = p.get("FILAR_LLM_API_KEY").unwrap();
+        let dbg = format!("{p:?}");
+        assert!(dbg.contains("OnePasswordProvider"), "{dbg}");
+        assert!(!dbg.contains("op-secret-value"), "value leak: {dbg}");
+        assert!(!dbg.contains("credential"), "reference leak: {dbg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_secret_names_are_the_mapping_keys() {
+        let mut items = op_items("op://vault/api-key/credential");
+        items.insert("ssh_target:prod".into(), "op://vault/prod/password".into());
+        let p = OnePasswordProvider::new(items);
+        let mut names = p.secret_names();
+        names.sort();
+        assert_eq!(names, vec!["FILAR_LLM_API_KEY", "ssh_target:prod"]);
+    }
+
+    #[test]
+    fn chain_from_config_builds_onepassword() {
+        let mut cfg = crate::config::SecretProviderConfig {
+            order: vec!["onepassword".into()],
+            ..Default::default()
+        };
+        cfg.onepassword.items = op_items("op://vault/api-key/credential");
+        // Building the chain must not spawn the CLI.
+        let c = ChainSecretProvider::from_config(&cfg).unwrap();
+        let dbg = format!("{c:?}");
+        assert!(dbg.contains("providers: 1"), "{dbg}");
+        assert!(c.secret_names().contains(&"FILAR_LLM_API_KEY".to_string()));
+    }
+
+    #[test]
+    #[ignore = "needs 1Password CLI (op) with an active session; set FILAR_TEST_OP_REFERENCE"]
+    fn op_provider_real_cli_integration() {
+        let reference = std::env::var("FILAR_TEST_OP_REFERENCE")
+            .expect("set FILAR_TEST_OP_REFERENCE to an op:// reference");
+        let p = OnePasswordProvider::new(op_items(&reference));
+        let value = p.get("FILAR_LLM_API_KEY").unwrap();
+        assert!(!value.is_empty());
     }
 }

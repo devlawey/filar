@@ -309,7 +309,7 @@ pub enum SecretProviderKind {
     Keyring,
     /// Process environment ([`crate::secrets::EnvSecretProvider`]).
     Env,
-    /// 1Password CLI (`op read`).
+    /// 1Password CLI (`op read`, [`crate::secrets::OnePasswordProvider`]).
     OnePassword,
     /// Bitwarden CLI (`bw get`).
     Bitwarden,
