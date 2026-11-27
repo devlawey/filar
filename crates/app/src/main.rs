@@ -791,9 +791,15 @@ async fn run() -> anyhow::Result<()> {
 
     // ── Secret provider chain (#694) ─────────────────────────────────
     // Built once from `[secret_provider]` and passed to every resolution
-    // point below. The launcher's choice (#695) may replace it before its
-    // first use in the GUI arm.
-    let mut secret_chain = build_secret_chain(config.secret_provider.as_ref())?;
+    // point below. In GUI mode the build is deferred until the launcher's
+    // choice (#695) is applied: an invalid section in the file must not stop
+    // the launcher that could repair it (#695 review). CLI mode reports it
+    // here, before any session starts.
+    let mut secret_chain = if args.is_empty() {
+        None
+    } else {
+        build_secret_chain(config.secret_provider.as_ref())?
+    };
 
     // The launcher's command-safety choice (#552); `None` = not said (CLI
     // launch, or a pending_launch.json from before #552) → config.toml.
@@ -847,8 +853,11 @@ async fn run() -> anyhow::Result<()> {
                 // invisible here. `None` (an older handoff) keeps the file.
                 if launch.secret_provider.is_some() {
                     config = config_with_launch_secret_provider(config, launch.secret_provider.clone());
-                    secret_chain = build_secret_chain(config.secret_provider.as_ref())?;
                 }
+                // An older handoff without the field keeps the file's section;
+                // an invalid one is reported here, after the launcher had its
+                // chance to replace it (#695 review).
+                secret_chain = build_secret_chain(config.secret_provider.as_ref())?;
                 let temperature = if launch.temperature.trim().is_empty() {
                     None
                 } else {

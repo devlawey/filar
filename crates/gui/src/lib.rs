@@ -99,22 +99,26 @@ fn secret_text_edit(
 /// list tests use ordinary aliases, and must never touch the developer's
 /// real credential store.
 fn save_secret(username: &str, secret: &str) {
+    if let Err(e) = try_save_secret(username, secret) {
+        tracing::warn!(error = %e, "failed to save secret to credential store");
+    }
+}
+
+/// Like [`save_secret`] but reports a store failure to the caller, for
+/// credentials whose absence would break the session (#695 review). The
+/// error never carries the secret value.
+fn try_save_secret(username: &str, secret: &str) -> Result<(), String> {
     if cfg!(test) {
-        return;
+        return Ok(());
     }
     let secret = sanitize_secret_clipboard(secret);
     if secret.is_empty() {
         delete_secret(username);
-        return;
+        return Ok(());
     }
-    match keyring::Entry::new(CRED_SERVICE, username) {
-        Ok(entry) => {
-            if let Err(e) = entry.set_password(&secret) {
-                tracing::warn!(error = %e, "failed to save secret to credential store");
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "failed to create credential entry"),
-    }
+    let entry = keyring::Entry::new(CRED_SERVICE, username)
+        .map_err(|e| format!("credential entry: {e}"))?;
+    entry.set_password(&secret).map_err(|e| e.to_string())
 }
 
 /// Load a secret from the OS credential store. Returns empty string if not found.
@@ -1418,10 +1422,10 @@ fn save_config_toml(
     risk_scorer: Option<&filar_core::RiskScorerConfig>,
     log_sources: &[filar_core::LogSourceConfig],
     secret_provider: Option<&filar_core::SecretProviderConfig>,
-) {
+) -> Result<(), String> {
     let base = match filar_core::default_base_dir() {
         Ok(b) => b,
-        Err(_) => return,
+        Err(e) => return Err(format!("config directory unavailable: {e}")),
     };
     let app_dir = base.join("filar");
     let path = app_dir.join("config.toml");
@@ -1432,7 +1436,7 @@ fn save_config_toml(
             Ok(cfg) => cfg,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "config.toml exists but is invalid, not overwriting");
-                return;
+                return Err(format!("config.toml exists but is invalid, not overwriting: {e}"));
             }
         }
     } else {
@@ -1478,18 +1482,21 @@ fn save_config_toml(
 
     if let Err(e) = std::fs::create_dir_all(&app_dir) {
         tracing::warn!(path = %app_dir.display(), error = %e, "failed to create config directory");
-        return;
+        return Err(format!("failed to create config directory: {e}"));
     }
     match toml::to_string_pretty(&config) {
         Ok(data) => {
             if let Err(e) = std::fs::write(&path, &data) {
                 tracing::warn!(path = %path.display(), error = %e, "failed to save config.toml");
+                return Err(format!("failed to save config.toml: {e}"));
             }
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to serialize config.toml");
+            return Err(format!("failed to serialize config.toml: {e}"));
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2385,23 +2392,40 @@ struct SecretProviderDraft {
     /// Result of the last Check.
     check_status: String,
     check_in_flight: bool,
+    /// Bumped whenever a Check input (name, typed database password) changes,
+    /// so a finished Check for older inputs is never shown (#695 review).
+    check_rev: u64,
 }
 
 /// Render a logical-name → reference map as the multiline field text:
 /// one `name = reference` per line, sorted by name so the text is stable.
+/// Names containing `=` (or quotes, backslashes, edge spaces) are quoted so
+/// the round trip through `parse_item_lines` keeps them whole (#695 review).
 fn format_item_lines(items: &std::collections::HashMap<String, String>) -> String {
     let mut names: Vec<&String> = items.keys().collect();
     names.sort();
     names
         .iter()
-        .map(|name| format!("{name} = {}", items[*name]))
+        .map(|name| {
+            let needs_quotes = name.contains('=')
+                || name.contains('"')
+                || name.contains('\\')
+                || name.trim() != name.as_str();
+            let shown = if needs_quotes {
+                format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+            } else {
+                name.to_string()
+            };
+            format!("{shown} = {}", items[*name])
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 /// Parse a `name = reference` map from a multiline field (#695). Blank
 /// lines and `#` comments are skipped; a line without `=`, without both
-/// sides, or repeating a name is an error worded for the launcher.
+/// sides, or repeating a name is an error worded for the launcher. A name
+/// in double quotes is unescaped verbatim, so names containing `=` survive.
 fn parse_item_lines(
     text: &str,
     field: &str,
@@ -2412,19 +2436,44 @@ fn parse_item_lines(
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((name, reference)) = line.split_once('=') else {
-            return Err(format!(
-                "Secret provider: {field}: line '{line}' must be 'name = reference'"
-            ));
+        let (name, reference) = if let Some(rest) = line.strip_prefix('"') {
+            let mut name = String::new();
+            let mut chars = rest.chars();
+            let mut closed = false;
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => match chars.next() {
+                        Some(escaped) => name.push(escaped),
+                        None => break,
+                    },
+                    '"' => {
+                        closed = true;
+                        break;
+                    }
+                    _ => name.push(c),
+                }
+            }
+            let tail = chars.as_str().trim_start();
+            if !closed || !tail.starts_with('=') {
+                return Err(format!(
+                    "Secret provider: {field}: line '{line}' must be 'name = reference'"
+                ));
+            }
+            (name, tail[1..].trim().to_string())
+        } else {
+            let Some((name, reference)) = line.split_once('=') else {
+                return Err(format!(
+                    "Secret provider: {field}: line '{line}' must be 'name = reference'"
+                ));
+            };
+            (name.trim().to_string(), reference.trim().to_string())
         };
-        let name = name.trim();
-        let reference = reference.trim();
         if name.is_empty() || reference.is_empty() {
             return Err(format!(
                 "Secret provider: {field}: line '{line}' needs a name and a reference"
             ));
         }
-        if map.insert(name.to_string(), reference.to_string()).is_some() {
+        if map.insert(name.clone(), reference).is_some() {
             return Err(format!(
                 "Secret provider: {field}: name '{name}' is listed twice"
             ));
@@ -2443,7 +2492,9 @@ impl SecretProviderDraft {
         Self {
             enabled: cfg.is_some(),
             order: if cfg.is_some() {
-                c.order.clone()
+                // Core trims kinds; keep the draft canonical so padded config
+                // entries still show their fields (#695 review).
+                c.order.iter().map(|k| k.trim().to_string()).collect()
             } else {
                 vec!["keyring".into(), "env".into()]
             },
@@ -2463,12 +2514,13 @@ impl SecretProviderDraft {
             check_name: filar_core::config::default_llm_key_env(),
             check_status: String::new(),
             check_in_flight: false,
+            check_rev: 0,
         }
     }
 
     /// Whether a provider kind is in the order right now.
     fn has_kind(&self, kind: &str) -> bool {
-        self.order.iter().any(|k| k == kind)
+        self.order.iter().any(|k| k.trim() == kind)
     }
 
     /// Look the database password up in the OS store once (no-op in unit
@@ -2487,25 +2539,47 @@ impl SecretProviderDraft {
         let cache_ttl_secs = if self.cache_ttl_secs.trim().is_empty() {
             filar_core::DEFAULT_SECRET_CACHE_TTL_SECS
         } else {
-            self.cache_ttl_secs.trim().parse::<u64>().map_err(|_| {
+            let ttl = self.cache_ttl_secs.trim().parse::<u64>().map_err(|_| {
                 "Secret provider: cache TTL must be a whole number of seconds".to_string()
-            })?
+            })?;
+            // The TOML serializer only holds i64; a larger value would make
+            // the config write fail after Launch (#695 review).
+            if ttl > i64::MAX as u64 {
+                return Err("Secret provider: cache TTL is too large to save".into());
+            }
+            ttl
         };
         let attribute = self.keepassxc_attribute.trim();
+        // Hidden editors of removed providers must not block Launch: their
+        // text stays in the draft but is only parsed while selected (#695 review).
+        let empty = std::collections::HashMap::new();
         let cfg = filar_core::SecretProviderConfig {
             order: self.order.clone(),
             cache_ttl_secs,
             onepassword: filar_core::ProviderItemsConfig {
-                items: parse_item_lines(&self.onepassword_items, "1Password items")?,
+                items: if self.has_kind("onepassword") {
+                    parse_item_lines(&self.onepassword_items, "1Password items")?
+                } else {
+                    empty.clone()
+                },
             },
             bitwarden: filar_core::ProviderItemsConfig {
-                items: parse_item_lines(&self.bitwarden_items, "Bitwarden items")?,
+                items: if self.has_kind("bitwarden") {
+                    parse_item_lines(&self.bitwarden_items, "Bitwarden items")?
+                } else {
+                    empty.clone()
+                },
             },
             keepassxc: filar_core::KeePassXcProviderConfig {
-                database: (!self.keepassxc_database.trim().is_empty())
+                database: (self.has_kind("keepassxc")
+                    && !self.keepassxc_database.trim().is_empty())
                     .then(|| std::path::PathBuf::from(self.keepassxc_database.trim())),
                 attribute: if attribute.is_empty() { "password".into() } else { attribute.to_string() },
-                entries: parse_item_lines(&self.keepassxc_entries, "KeePassXC entries")?,
+                entries: if self.has_kind("keepassxc") {
+                    parse_item_lines(&self.keepassxc_entries, "KeePassXC entries")?
+                } else {
+                    empty
+                },
             },
         };
         cfg.validate().map_err(|e| {
@@ -2542,6 +2616,8 @@ struct SecretCheckResult {
     config: filar_core::SecretProviderConfig,
     /// The logical name that was checked.
     name: String,
+    /// The draft's Check-input revision when the worker started.
+    rev: u64,
     /// Ok = a value was resolved. The value itself is dropped in the worker
     /// thread and never reaches the UI (#695).
     result: Result<(), String>,
@@ -4245,6 +4321,7 @@ impl LauncherApp {
                     .desired_width(f32::INFINITY),
             );
             let saved = d.db_password_saved;
+            let password_before = d.db_password.clone();
             ui.horizontal(|ui| {
                 ui.label("Database password:");
                 let id = ui.make_persistent_id("keepassxc_db_password");
@@ -4258,6 +4335,11 @@ impl LauncherApp {
                 );
                 ui.label(egui::RichText::new(if saved { "saved" } else { "not set" }).small().weak());
             });
+            // A replaced password was never tested: drop the old Check line.
+            if d.db_password != password_before {
+                d.check_status.clear();
+                d.check_rev += 1;
+            }
             ui.label(
                 egui::RichText::new(format!(
                     "Saved to the OS credential store at Launch under {KEEPASSXC_DB_PASSWORD_NAME} — never to a file.",
@@ -4269,8 +4351,13 @@ impl LauncherApp {
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Check name:");
-            ui.add(egui::TextEdit::singleline(&mut d.check_name).desired_width(200.0))
-                .on_hover_text("Logical name to resolve, e.g. FILAR_LLM_API_KEY or ssh_target:<name>.");
+            let name_response =
+                ui.add(egui::TextEdit::singleline(&mut d.check_name).desired_width(200.0))
+                    .on_hover_text("Logical name to resolve, e.g. FILAR_LLM_API_KEY or ssh_target:<name>.");
+            if name_response.changed() {
+                d.check_status.clear();
+                d.check_rev += 1;
+            }
             if ui
                 .add_enabled(!d.check_in_flight, egui::Button::new("Check"))
                 .on_hover_text("Resolves one name through the chain. The value is never shown.")
@@ -4314,32 +4401,43 @@ impl LauncherApp {
         };
         d.check_in_flight = true;
         d.check_status.clear();
+        let rev = d.check_rev;
         let tx = self.sp_check_tx.clone();
-        std::thread::spawn(move || {
-            // Providers are synchronous (CLI calls with their own timeout):
-            // a plain thread is enough, no async runtime.
-            let result = filar_core::ChainSecretProvider::from_config_with_keepassxc_password(
-                &cfg,
-                db_password,
-            )
-            .map_err(|e| e.to_string())
-            .and_then(|chain| {
-                // Drop the value right here: only "resolved" reaches the UI.
-                filar_core::SecretProvider::get(&chain, &name)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
+        let worker = std::thread::Builder::new()
+            .name("secret-check".into())
+            .spawn(move || {
+                // Providers are synchronous (CLI calls with their own timeout):
+                // a plain thread is enough, no async runtime.
+                let result = filar_core::ChainSecretProvider::from_config_with_keepassxc_password(
+                    &cfg,
+                    db_password,
+                )
+                .map_err(|e| e.to_string())
+                .and_then(|chain| {
+                    // Drop the value right here: only "resolved" reaches the UI.
+                    filar_core::SecretProvider::get(&chain, &name)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                });
+                let _ = tx.send(SecretCheckResult { config: cfg, name, rev, result });
+                // Wake the UI: nothing else would until the next input event.
+                ctx.request_repaint();
             });
-            let _ = tx.send(SecretCheckResult { config: cfg, name, result });
-            // Wake the UI: nothing else would until the next input event.
-            ctx.request_repaint();
-        });
+        if let Err(e) = worker {
+            // The OS refused a thread: report it and let the user retry
+            // instead of panicking in the UI callback (#695 review).
+            d.check_in_flight = false;
+            d.check_status = format!("Check failed: could not start the worker thread: {e}");
+        }
     }
 
     fn poll_secret_checks(&mut self, ctx: &egui::Context) {
         while let Ok(done) = self.sp_check_rx.try_recv() {
             let d = &mut self.secret_provider;
             d.check_in_flight = false;
-            d.check_status = if d.to_config().ok().flatten().as_ref() == Some(&done.config) {
+            d.check_status = if d.check_rev == done.rev
+                && d.to_config().ok().flatten().as_ref() == Some(&done.config)
+            {
                 secret_check_status(&done.name, &done.result)
             } else {
                 "Check result discarded: the provider fields changed.".to_string()
@@ -4866,6 +4964,44 @@ impl LauncherApp {
         settings.save();
     }
 
+    /// Refuse a launch where another typed credential would write the OS
+    /// store name owned by the KeePassXC database password (#695 review):
+    /// the later write would silently replace it with the wrong secret.
+    fn validate_credential_names(&self) -> Result<(), String> {
+        if self.secret_provider.db_password_to_save().is_none() {
+            return Ok(());
+        }
+        let mut names: Vec<String> = Vec::new();
+        if let Some((key_env, _)) = self.risk_scorer.key_to_save() {
+            names.push(key_env);
+        }
+        for d in self.log_sources.iter().filter(|d| !d.is_blank()) {
+            if let Some((key_env, _)) = d.key_to_save() {
+                names.push(key_env);
+            }
+        }
+        for prof in &self.profiles {
+            if !prof.key_env.trim().is_empty() && !prof.api_key.is_empty() {
+                names.push(prof.key_env.clone());
+            }
+        }
+        for (key, password) in self
+            .ssh_credential_ops()
+            .into_iter()
+            .chain(self.key_passphrase_ops())
+        {
+            if password.is_some() {
+                names.push(key);
+            }
+        }
+        if names.iter().any(|n| n == KEEPASSXC_DB_PASSWORD_NAME) {
+            return Err(format!(
+                "Secret provider: {KEEPASSXC_DB_PASSWORD_NAME} is reserved for the KeePassXC database password; rename the other credential's key env."
+            ));
+        }
+        Ok(())
+    }
+
     /// Check everything that must hold before a launch, reporting the first
     /// problem through `validation_error`.
     ///
@@ -4931,6 +5067,10 @@ impl LauncherApp {
             return false;
         }
         if let Err(msg) = self.secret_provider.to_config() {
+            self.set_other_error(msg);
+            return false;
+        }
+        if let Err(msg) = self.validate_credential_names() {
             self.set_other_error(msg);
             return false;
         }
@@ -5406,13 +5546,26 @@ impl LauncherApp {
             SecretProviderLaunch::On { config } => Some(config.clone()),
             SecretProviderLaunch::Off => None,
         };
+        // The database password owns its credential name and must survive the
+        // launch: store it before any config/handoff write, and refuse Launch
+        // if the OS store rejects it (#695 review). Blank = keep what is there.
+        if let Some(pw) = self.secret_provider.db_password_to_save() {
+            if let Err(e) = try_save_secret(KEEPASSXC_DB_PASSWORD_NAME, &pw) {
+                self.set_other_error(format!(
+                    "Could not save the KeePassXC database password to the OS credential store: {e}"
+                ));
+                return;
+            }
+        }
         settings.save();
-        save_config_toml(&settings, &host_groups, risk_section.as_ref(), &log_sources, secret_section.as_ref());
+        if let Err(msg) = save_config_toml(&settings, &host_groups, risk_section.as_ref(), &log_sources, secret_section.as_ref()) {
+            // A failed write would silently restore the old chain on the next
+            // launch: keep the draft open for retry (#695 review).
+            self.set_other_error(msg);
+            return;
+        }
         if let Some((key_env, key)) = self.risk_scorer.key_to_save() {
             save_secret(&key_env, &key);
-        }
-        if let Some(pw) = self.secret_provider.db_password_to_save() {
-            save_secret(KEEPASSXC_DB_PASSWORD_NAME, &pw);
         }
         for d in self.log_sources.iter().filter(|d| !d.is_blank()) {
             if let Some((key_env, key)) = d.key_to_save() {
@@ -5654,6 +5807,14 @@ pub fn run_launcher(config: &Config) {
 
     let selected_profile = settings.selected_profile.min(profiles.len().saturating_sub(1));
 
+    // Check defaults to the name Launch will actually resolve for the selected
+    // profile — a different canonical name could pass Check and fail Launch
+    // (#695 review). Keyless profiles keep the generic default.
+    let default_check_name = profiles
+        .get(selected_profile)
+        .map(|p| p.key_env.clone())
+        .filter(|k| !k.trim().is_empty());
+
     let app = LauncherApp {
         sessions,
         selected_session: None,
@@ -5693,6 +5854,9 @@ pub fn run_launcher(config: &Config) {
         log_check_rx,
         secret_provider: {
             let mut d = SecretProviderDraft::from_config(config.secret_provider.as_ref());
+            if let Some(name) = default_check_name {
+                d.check_name = name;
+            }
             // One OS-store read at start-up, not one per frame — and none
             // when the chain does not use KeePassXC.
             if d.has_kind("keepassxc") {
@@ -8899,5 +9063,80 @@ host_key_policy = \"strict\"
         assert!(parse_item_lines("  \n# only a comment", "items").unwrap().is_empty());
         assert!(parse_item_lines("= ref", "items").unwrap_err().contains("needs a name"));
         assert!(parse_item_lines("name =", "items").unwrap_err().contains("needs a name"));
+    }
+
+    #[test]
+    fn item_lines_round_trip_keeps_names_with_equals() {
+        let mut items = std::collections::HashMap::new();
+        items.insert("ssh_target:db=blue".to_string(), "op://v/i/f".to_string());
+        items.insert("plain".to_string(), "ref".to_string());
+        items.insert("weird \"name\" \\ x".to_string(), "ref2".to_string());
+        let text = format_item_lines(&items);
+        assert_eq!(parse_item_lines(&text, "items").unwrap(), items);
+    }
+
+    #[test]
+    fn cache_ttl_above_i64_max_is_refused_before_launch() {
+        let mut d = secret_draft();
+        d.cache_ttl_secs = (i64::MAX as u64 + 1).to_string();
+        assert!(d.to_config().unwrap_err().contains("too large"));
+    }
+
+    #[test]
+    fn removed_provider_hidden_text_does_not_block_launch() {
+        let mut d = secret_draft();
+        d.order = vec!["env".into()];
+        d.bitwarden_items = "broken line without equals".into();
+        d.keepassxc_entries = "also broken".into();
+        let cfg = d.to_config().unwrap().unwrap();
+        assert!(cfg.bitwarden.items.is_empty());
+        assert!(cfg.keepassxc.entries.is_empty());
+        assert!(cfg.keepassxc.database.is_none());
+    }
+
+    #[test]
+    fn padded_provider_kind_is_recognized() {
+        let cfg = filar_core::SecretProviderConfig {
+            order: vec![" keepassxc ".into()],
+            keepassxc: filar_core::KeePassXcProviderConfig {
+                database: Some("C:/vault.kdbx".into()),
+                attribute: "password".into(),
+                entries: std::collections::HashMap::new(),
+            },
+            ..Default::default()
+        };
+        let d = SecretProviderDraft::from_config(Some(&cfg));
+        assert!(d.has_kind("keepassxc"));
+        assert_eq!(d.order, vec!["keepassxc".to_string()]);
+        assert!(d.to_config().is_ok());
+    }
+
+    #[test]
+    fn check_result_for_older_inputs_is_discarded() {
+        let mut app = make_app(make_meta(None, None, None, None));
+        app.secret_provider = secret_draft();
+        let cfg = app.secret_provider.to_config().unwrap().unwrap();
+        app.secret_provider.check_rev = 7;
+        let ctx = egui::Context::default();
+        app.sp_check_tx
+            .send(SecretCheckResult { config: cfg.clone(), name: "X".into(), rev: 6, result: Ok(()) })
+            .unwrap();
+        app.poll_secret_checks(&ctx);
+        assert!(app.secret_provider.check_status.contains("discarded"));
+        app.sp_check_tx
+            .send(SecretCheckResult { config: cfg, name: "X".into(), rev: 7, result: Ok(()) })
+            .unwrap();
+        app.poll_secret_checks(&ctx);
+        assert!(app.secret_provider.check_status.starts_with("Check OK: X"));
+    }
+
+    #[test]
+    fn reserved_credential_name_refuses_launch() {
+        let mut app = make_app(make_meta(None, None, None, None));
+        app.secret_provider = secret_draft();
+        app.profiles[0].key_env = KEEPASSXC_DB_PASSWORD_NAME.into();
+        app.profiles[0].api_key = "typed".into();
+        assert!(!app.validate_launch());
+        assert!(app.validation_error.contains("reserved"));
     }
 }
