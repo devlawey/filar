@@ -109,6 +109,10 @@ pub struct Config {
     /// value is cached. `None` keeps the legacy resolution order
     /// (static → keyring → env). Only provider parameters live here —
     /// never a secret value.
+    ///
+    /// The section is validated and stored, but production key resolution
+    /// (`lookup_profile_api_key` and the CLI path in `crates/app`) still
+    /// uses the legacy sources until the chain is wired in #694.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_provider: Option<SecretProviderConfig>,
 }
@@ -343,6 +347,10 @@ impl SecretProviderKind {
 /// The first provider that returns a non-empty value wins. Only provider
 /// parameters are stored here (vault/item references, entry names, a database
 /// path) — a secret value never reaches `config.toml` (invariant 3).
+///
+/// Not yet enforced in production key resolution: the chain is wired into
+/// the app's startup paths in #694; until then this section is only parsed
+/// and validated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SecretProviderConfig {
     /// Provider kinds in resolution order, e.g.

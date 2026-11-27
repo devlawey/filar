@@ -412,7 +412,9 @@ value never enters the config. `ChainSecretProvider::from_config` builds the
 chain from the section; the password-manager kinds pass validation but their
 providers land with the rest of milestone 3.1.0 — until then `from_config`
 refuses them by name. Without the section, secret resolution keeps its
-legacy order (static → keyring → env).
+legacy order (static → keyring → env). The section does not yet govern
+production key resolution in the app — the chain is wired into the startup
+paths in #694.
 
 `SshTransportConfig::command_timeout` (default 300s,
 `filar_core::DEFAULT_COMMAND_TIMEOUT_SECS`) is how long `SshSession::run` waits

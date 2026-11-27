@@ -506,9 +506,11 @@ struct CachedSecret {
 /// is not spawned on every lookup; cached values are zeroized when evicted,
 /// replaced or dropped. A zero TTL disables caching.
 ///
-/// `secret_names()` is the union of every provider's names —
-/// `SecretSubstitutingExecutor` needs it to mask command output. Neither
-/// errors nor the hand-written [`Debug`] ever carry a secret value.
+/// `secret_names()` is the union of every provider's names plus the names
+/// of unexpired cached values — `SecretSubstitutingExecutor` needs it to
+/// mask command output even after a source stops reporting a name it once
+/// resolved. Neither errors nor the hand-written [`Debug`] ever carry a
+/// secret value.
 ///
 /// Build one from `[secret_provider]` with [`ChainSecretProvider::from_config`],
 /// or wrap an explicit list with [`ChainSecretProvider::new`].
@@ -591,15 +593,20 @@ impl SecretProvider for ChainSecretProvider {
             if let Ok(value) = provider.get(name) {
                 if !value.is_empty() {
                     if !self.ttl.is_zero() {
-                        let mut cache = self.cache();
-                        if let Some(mut old) = cache.insert(
-                            name.to_string(),
-                            CachedSecret {
-                                value: value.clone(),
-                                expires_at: Instant::now() + self.ttl,
-                            },
-                        ) {
-                            old.value.zeroize();
+                        // An unrepresentable deadline (e.g. `Duration::MAX`)
+                        // must not panic under the lock: skip caching and
+                        // still return the provider's result.
+                        if let Some(expires_at) = Instant::now().checked_add(self.ttl) {
+                            let mut cache = self.cache();
+                            if let Some(mut old) = cache.insert(
+                                name.to_string(),
+                                CachedSecret {
+                                    value: value.clone(),
+                                    expires_at,
+                                },
+                            ) {
+                                old.value.zeroize();
+                            }
                         }
                     }
                     return Ok(value);
@@ -621,6 +628,15 @@ impl SecretProvider for ChainSecretProvider {
                 if seen.insert(name.clone()) {
                     names.push(name);
                 }
+            }
+        }
+        // Cached values stay returnable until they expire, so their names
+        // must stay visible to output masking even when the source no
+        // longer reports them.
+        let now = Instant::now();
+        for (name, entry) in self.cache().iter() {
+            if entry.expires_at > now && seen.insert(name.clone()) {
+                names.push(name.clone());
             }
         }
         names
@@ -1155,5 +1171,31 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("onepassword"), "{msg}");
         assert!(msg.contains("not available yet"), "{msg}");
+    }
+
+    #[test]
+    fn chain_max_ttl_does_not_panic_on_an_unrepresentable_deadline() {
+        let provider = StaticSecretProvider::new();
+        provider.insert("KEY", "v");
+        let c = ChainSecretProvider::new(vec![Arc::new(provider)], Duration::MAX).unwrap();
+        // Instant + Duration::MAX overflows: the value is returned uncached.
+        assert_eq!(c.get("KEY").unwrap(), "v");
+        assert_eq!(c.get("KEY").unwrap(), "v");
+    }
+
+    #[test]
+    fn chain_secret_names_keeps_unexpired_cached_names() {
+        // A cached value stays returnable after its source removes the
+        // name; output masking must still see it (#732 review).
+        let provider = StaticSecretProvider::new();
+        provider.insert("$FILAR_SECRET_1", "hunter2");
+        let c = chain(vec![Arc::new(provider.clone())], 3600);
+        assert_eq!(c.get("$FILAR_SECRET_1").unwrap(), "hunter2");
+        assert!(provider.remove("$FILAR_SECRET_1"));
+        assert!(c.secret_names().contains(&"$FILAR_SECRET_1".to_string()));
+        assert_eq!(c.get("$FILAR_SECRET_1").unwrap(), "hunter2");
+        let out = redact_secrets("ssh with hunter2", &c);
+        assert!(!out.contains("hunter2"), "cached value must be masked: {out}");
+        assert!(out.contains("$FILAR_SECRET_1"), "{out}");
     }
 }
