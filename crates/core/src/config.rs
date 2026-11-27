@@ -103,6 +103,18 @@ pub struct Config {
     /// (`key_env`) only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub log_sources: Vec<crate::log_sources::LogSourceConfig>,
+
+    /// Secret resolution chain from `[secret_provider]` (#690): which
+    /// providers are consulted, in which order, and how long a resolved
+    /// value is cached. `None` keeps the legacy resolution order
+    /// (static → keyring → env). Only provider parameters live here —
+    /// never a secret value.
+    ///
+    /// The section is validated and stored, but production key resolution
+    /// (`lookup_profile_api_key` and the CLI path in `crates/app`) still
+    /// uses the legacy sources until the chain is wired in #694.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_provider: Option<SecretProviderConfig>,
 }
 
 impl Default for Config {
@@ -123,6 +135,7 @@ impl Default for Config {
             risk_scorer_error: None,
             kube_clusters: Vec::new(),
             log_sources: Vec::new(),
+            secret_provider: None,
         }
     }
 }
@@ -279,6 +292,171 @@ impl RiskScorerConfig {
     pub fn thresholds(&self) -> (u8, u8) {
         (self.warn_below, self.danger_below)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Secret provider chain
+// ---------------------------------------------------------------------------
+
+/// Default lifetime of a cached secret in the chain, seconds (#690).
+pub const DEFAULT_SECRET_CACHE_TTL_SECS: u64 = 300;
+
+/// A secret source named in `[secret_provider].order` (#690).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SecretProviderKind {
+    /// OS credential store ([`crate::secrets::KeyringSecretProvider`]).
+    Keyring,
+    /// Process environment ([`crate::secrets::EnvSecretProvider`]).
+    Env,
+    /// 1Password CLI (`op read`).
+    OnePassword,
+    /// Bitwarden CLI (`bw get`).
+    Bitwarden,
+    /// KeePassXC CLI (`keepassxc-cli show`).
+    KeePassXc,
+}
+
+impl SecretProviderKind {
+    /// Parse a `kind` value from the config.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "keyring" => Some(Self::Keyring),
+            "env" => Some(Self::Env),
+            "onepassword" => Some(Self::OnePassword),
+            "bitwarden" => Some(Self::Bitwarden),
+            "keepassxc" => Some(Self::KeePassXc),
+            _ => None,
+        }
+    }
+
+    /// The config spelling of this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Keyring => "keyring",
+            Self::Env => "env",
+            Self::OnePassword => "onepassword",
+            Self::Bitwarden => "bitwarden",
+            Self::KeePassXc => "keepassxc",
+        }
+    }
+}
+
+/// `[secret_provider]` — the ordered chain of secret sources (#690).
+///
+/// The first provider that returns a non-empty value wins. Only provider
+/// parameters are stored here (vault/item references, entry names, a database
+/// path) — a secret value never reaches `config.toml` (invariant 3).
+///
+/// Not yet enforced in production key resolution: the chain is wired into
+/// the app's startup paths in #694; until then this section is only parsed
+/// and validated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecretProviderConfig {
+    /// Provider kinds in resolution order, e.g.
+    /// `["keyring", "onepassword", "env"]`. Must not be empty — there is no
+    /// silent fallback to env.
+    #[serde(default)]
+    pub order: Vec<String>,
+
+    /// How long a resolved value is cached, seconds. `0` disables caching.
+    #[serde(default = "default_secret_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+
+    /// Parameters of the 1Password provider (`[secret_provider.onepassword]`).
+    #[serde(default)]
+    pub onepassword: ProviderItemsConfig,
+
+    /// Parameters of the Bitwarden provider (`[secret_provider.bitwarden]`).
+    #[serde(default)]
+    pub bitwarden: ProviderItemsConfig,
+
+    /// Parameters of the KeePassXC provider (`[secret_provider.keepassxc]`).
+    #[serde(default)]
+    pub keepassxc: KeePassXcProviderConfig,
+}
+
+impl Default for SecretProviderConfig {
+    fn default() -> Self {
+        Self {
+            order: Vec::new(),
+            cache_ttl_secs: DEFAULT_SECRET_CACHE_TTL_SECS,
+            onepassword: ProviderItemsConfig::default(),
+            bitwarden: ProviderItemsConfig::default(),
+            keepassxc: KeePassXcProviderConfig::default(),
+        }
+    }
+}
+
+fn default_secret_cache_ttl_secs() -> u64 {
+    DEFAULT_SECRET_CACHE_TTL_SECS
+}
+
+impl SecretProviderConfig {
+    /// Check the section. Errors name the offending field; an unknown kind
+    /// or an empty order is rejected — never silently replaced by env.
+    pub fn validate(&self) -> Result<()> {
+        if self.order.is_empty() {
+            return Err(CoreError::Config(
+                "secret_provider.order must list at least one provider \
+                 (keyring, env, onepassword, bitwarden, keepassxc)"
+                    .into(),
+            ));
+        }
+        for kind in &self.order {
+            if SecretProviderKind::parse(kind).is_none() {
+                return Err(CoreError::Config(format!(
+                    "secret_provider.order: unknown kind '{kind}' \
+                     (expected keyring, env, onepassword, bitwarden or keepassxc)"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Logical-name → provider-reference table shared by the 1Password and
+/// Bitwarden providers: `op://vault/item/field` references and Bitwarden
+/// item ids respectively. References are not secrets.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ProviderItemsConfig {
+    /// Maps a logical name (`FILAR_LLM_API_KEY`, `ssh_target:<name>`,
+    /// `ssh_key_passphrase:<name>`) to the provider's own reference.
+    #[serde(default)]
+    pub items: std::collections::HashMap<String, String>,
+}
+
+/// `[secret_provider.keepassxc]` — where the local KeePassXC database lives
+/// and how logical names map to its entries. The database password is a
+/// secret and is never stored here: it comes from the keyring, env or a
+/// masked prompt (#693).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeePassXcProviderConfig {
+    /// Path to the `.kdbx` database file.
+    #[serde(default)]
+    pub database: Option<PathBuf>,
+
+    /// Entry attribute to read (`keepassxc-cli show -a`), default `password`.
+    #[serde(default = "default_keepassxc_attribute")]
+    pub attribute: String,
+
+    /// Maps a logical name to an entry path inside the database.
+    #[serde(default)]
+    pub entries: std::collections::HashMap<String, String>,
+}
+
+impl Default for KeePassXcProviderConfig {
+    fn default() -> Self {
+        Self {
+            database: None,
+            attribute: default_keepassxc_attribute(),
+            entries: std::collections::HashMap::new(),
+        }
+    }
+}
+
+fn default_keepassxc_attribute() -> String {
+    "password".to_string()
 }
 
 /// Runbook generation alongside the Ctrl+S export is on by default: the
@@ -1200,6 +1378,9 @@ impl Config {
         }
         cfg.validate_target_names()?;
         cfg.validate_log_sources()?;
+        if let Some(sp) = &cfg.secret_provider {
+            sp.validate()?;
+        }
         cfg.check_risk_scorer();
         Ok(cfg)
     }
@@ -1583,7 +1764,11 @@ confirm_mode = "explain"
         assert!(unknown.contains("\"nope\" is not a [[kube_clusters]] name"), "{unknown}");
         let dup = kube_err_raw(
             "[[log_sources]]\nname = \"v\"\nkind = \"loki\"\nurl = \"http://l\"\n\
-             [[log_sources]]\nname = \"v\"\nkind = \"loki\"\nurl = \"http://m\"\n",
+             [[log_sources]]
+name = \"v\"
+kind = \"loki\"
+url = \"http://m\"
+",
         );
         assert!(dup.contains("duplicate name \"v\""), "{dup}");
         let bad = kube_err_raw("[[log_sources]]\nname = \"v\"\nkind = \"loki\"\nurl = \"l\"\n");
@@ -2781,4 +2966,110 @@ max_parallel = 0
     impl Drop for EnvGuard { fn drop(&mut self) { match &self.old { Some(v) => std::env::set_var(self.key, v), None => std::env::remove_var(self.key), } } }
     struct DirGuard(std::path::PathBuf);
     impl Drop for DirGuard { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+
+    // ── [secret_provider] (#690) ────────────────────────────────────────
+
+    #[test]
+    fn secret_provider_section_parses_with_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+[secret_provider]
+order = ["keyring", "onepassword", "env"]
+
+[secret_provider.onepassword.items]
+FILAR_LLM_API_KEY = "op://Private/openrouter/credential"
+
+[secret_provider.keepassxc]
+database = "C:/vaults/admin.kdbx"
+
+[secret_provider.keepassxc.entries]
+"ssh_target:prod-web" = "Servers/prod-web"
+"#,
+        )
+        .unwrap();
+        let sp = cfg.secret_provider.expect("section present");
+        sp.validate().unwrap();
+        assert_eq!(sp.order, vec!["keyring", "onepassword", "env"]);
+        assert_eq!(sp.cache_ttl_secs, DEFAULT_SECRET_CACHE_TTL_SECS);
+        assert_eq!(
+            sp.onepassword.items.get("FILAR_LLM_API_KEY").map(String::as_str),
+            Some("op://Private/openrouter/credential")
+        );
+        assert_eq!(sp.keepassxc.attribute, "password");
+        assert_eq!(
+            sp.keepassxc.entries.get("ssh_target:prod-web").map(String::as_str),
+            Some("Servers/prod-web")
+        );
+    }
+
+    #[test]
+    fn secret_provider_absent_section_is_none() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.secret_provider.is_none());
+    }
+
+    #[test]
+    fn secret_provider_empty_order_is_rejected() {
+        let cfg: Config = toml::from_str("[secret_provider]\n").unwrap();
+        let err = cfg.secret_provider.unwrap().validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("secret_provider.order"), "{msg}");
+    }
+
+    #[test]
+    fn secret_provider_unknown_kind_is_rejected_by_name() {
+        let cfg: Config = toml::from_str(
+            "[secret_provider]\norder = [\"keyring\", \"lastpass\"]\n",
+        )
+        .unwrap();
+        let err = cfg.secret_provider.unwrap().validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("secret_provider.order"), "{msg}");
+        assert!(msg.contains("lastpass"), "{msg}");
+    }
+
+    #[test]
+    fn secret_provider_load_rejects_unknown_kind() {
+        let file = TempConfig::new(
+            "sp_bad_kind",
+            "[secret_provider]\norder = [\"nope\"]\n",
+        );
+        let err = Config::load(file.path()).unwrap_err();
+        assert!(format!("{err}").contains("secret_provider.order"));
+    }
+
+    #[test]
+    fn secret_provider_load_rejects_empty_order() {
+        let file = TempConfig::new("sp_empty_order", "[secret_provider]\ncache_ttl_secs = 10\n");
+        assert!(Config::load(file.path()).is_err());
+    }
+
+    #[test]
+    fn secret_provider_kind_parse_roundtrip() {
+        for kind in [
+            SecretProviderKind::Keyring,
+            SecretProviderKind::Env,
+            SecretProviderKind::OnePassword,
+            SecretProviderKind::Bitwarden,
+            SecretProviderKind::KeePassXc,
+        ] {
+            assert_eq!(SecretProviderKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(SecretProviderKind::parse(""), None);
+        assert_eq!(SecretProviderKind::parse(" env "), Some(SecretProviderKind::Env));
+    }
+
+    #[test]
+    fn secret_provider_section_survives_serialisation_without_values() {
+        // The section holds references only; a save must round-trip it
+        // unchanged and never invent a value field.
+        let cfg: Config = toml::from_str(
+            "[secret_provider]\norder = [\"env\"]\ncache_ttl_secs = 0\n",
+        )
+        .unwrap();
+        let out = toml::to_string(&cfg).unwrap();
+        assert!(out.contains("[secret_provider]"));
+        let back: Config = toml::from_str(&out).unwrap();
+        assert_eq!(back.secret_provider, cfg.secret_provider);
+    }
 }

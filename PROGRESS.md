@@ -13489,3 +13489,36 @@ swap'а ограничена своим блоком внутри `reconnect_wit
    `finish_reason` без `[DONE]` (локальные серверы) пометку не получает.
 
 **Контракты.** `CommandExecutor`/`LlmClient` без изменений.
+
+## #690 — секция [secret_provider] и ChainSecretProvider
+
+**Сделано.** Точка расширения для менеджеров паролей (майлстоун 3.1.0):
+- `Config.secret_provider: Option<SecretProviderConfig>` — `order` (kind:
+  `keyring`, `env`, `onepassword`, `bitwarden`, `keepassxc`),
+  `cache_ttl_secs` (дефолт 300, 0 = без кэша), таблицы параметров
+  (`onepassword.items`, `bitwarden.items`, `keepassxc.database/attribute/entries`).
+  Валидация при загрузке: пустой order или неизвестный kind — ошибка с именем
+  поля, молчаливого fallback на env нет. Значения секретов в секцию не попадают.
+- `ChainSecretProvider` (`secrets.rs`): обёртка над `Vec<Arc<dyn SecretProvider>>`,
+  первый непустой ответ выигрывает; кэш с TTL, `zeroize` при вытеснении,
+  замене и drop; `secret_names()` — дедуплицированное объединение звеньев;
+  ручной `Debug` (только счётчики) и ошибки без значений. `from_config` собирает
+  chain из секции; kind'ы менеджеров распознаются валидацией, но их провайдеры
+  появятся в #691–#693 — до тех пор `from_config` отказывает по имени.
+
+**Решения.** Порядок разрешения пока не подключён к точкам чтения ключей —
+это #694; конфиг без секции работает как раньше. Пустой chain запрещён.
+
+**Ревью (раунд 1).** Приняты все три замечания CodeRabbit: doc-комментарии
+config.rs и ENGINE_API.md явно говорят, что секция пока не управляет
+разрешением ключей до #694; TTL-дедлайн считается через `checked_add`
+(непредставимый дедлайн — кэш пропускается, без паники); `secret_names()`
+включает имена из ещё не истёкшего кэша (маскирование не теряется, если
+провайдер перестал возвращать имя). Добавлены два регрессионных теста.
+
+**Контракты.** Новые публичные типы: `ChainSecretProvider`,
+`SecretProviderConfig`, `SecretProviderKind`, `ProviderItemsConfig`,
+`KeePassXcProviderConfig`, `DEFAULT_SECRET_CACHE_TTL_SECS` (описаны в
+`docs/ENGINE_API.md`). `CommandExecutor`/`LlmClient` без изменений.
+
+**Next:** #691 (провайдер 1Password CLI).
