@@ -1525,30 +1525,44 @@ fn save_config_toml_to(
             // disk, I/O error) would leave a truncated config the next save
             // cannot parse — and the destination may now be the user's only
             // copy (FILAR_CONFIG / local ./config.toml). Write beside it,
-            // then rename over it. Canonicalize the directory so a symlinked
-            // destination keeps receiving updates instead of being replaced
-            // by a regular file.
+            // then rename over it.
             let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
-            let target = match dir {
-                Some(d) => {
-                    let cd = std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf());
-                    path.file_name().map(|n| cd.join(n)).unwrap_or_else(|| path.to_path_buf())
+            // Resolve the file itself when it exists: a symlinked
+            // config.toml must keep pointing at its target — renaming over
+            // the link would replace it with a regular file (#740 review).
+            // A fresh path keeps the directory canonicalized so a symlinked
+            // parent still lands in the right place.
+            let target = if path.exists() {
+                std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+            } else {
+                match dir {
+                    Some(d) => {
+                        let cd = std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf());
+                        path.file_name().map(|n| cd.join(n)).unwrap_or_else(|| path.to_path_buf())
+                    }
+                    None => path.to_path_buf(),
                 }
-                None => path.to_path_buf(),
             };
             let file_name = path.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "config.toml".to_string());
-            let tmp = target.with_file_name(format!("{file_name}.filar-tmp"));
+            // Pid suffix: two concurrent launchers must not share one temp.
+            let tmp = target.with_file_name(format!("{file_name}.filar-tmp-{}", std::process::id()));
             if let Err(e) = std::fs::write(&tmp, &data) {
                 let _ = std::fs::remove_file(&tmp);
                 tracing::warn!(path = %tmp.display(), error = %e, "failed to write config.toml temp file");
                 return Err(format!("failed to save config.toml: {e}"));
             }
+            // Keep the destination's permissions — the umask may otherwise
+            // widen them on Unix. Best effort, not fatal.
+            if let Ok(meta) = std::fs::metadata(&target) {
+                let _ = std::fs::set_permissions(&tmp, meta.permissions());
+            }
             if let Err(e) = std::fs::rename(&tmp, &target) {
                 // On Windows the rename fails while another process holds
                 // the destination open (an editor). The original file is
-                // untouched; the caller keeps the draft for retry.
+                // untouched; the launcher state is preserved so the user
+                // can retry.
                 let _ = std::fs::remove_file(&tmp);
                 tracing::warn!(path = %target.display(), error = %e, "failed to replace config.toml");
                 return Err(format!("failed to save config.toml: {e}"));
@@ -1568,7 +1582,7 @@ fn save_config_toml_to(
 /// launcher-owned sections while the panel still shows the old path.
 fn ensure_config_destination(expected: &std::path::Path) -> Result<(), String> {
     let now = config_write_path()?;
-    if now == expected {
+    if same_config_path(&now, expected) {
         Ok(())
     } else {
         Err(format!(
@@ -1576,6 +1590,16 @@ fn ensure_config_destination(expected: &std::path::Path) -> Result<(), String> {
             expected.display(),
             now.display()
         ))
+    }
+}
+
+/// Path equality that survives Windows case differences (`C:\…` vs `c:\…`):
+/// canonicalize both when they exist, fall back to literal equality for
+/// fresh paths that cannot be resolved yet (#740 review).
+fn same_config_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
     }
 }
 
@@ -5649,14 +5673,20 @@ impl LauncherApp {
         settings.save();
         // The destination must still be the file the panel shows (#740
         // review): a higher-priority config appearing mid-session would
-        // otherwise receive drafts loaded from a different file.
-        if let Some(expected) = &self.config_path {
-            if let Err(msg) = ensure_config_destination(expected) {
-                self.set_other_error(msg);
-                return;
+        // otherwise receive drafts loaded from a different file. The
+        // checked path is passed straight into the write so no re-resolution
+        // can slip in between the check and the save.
+        let save_result = match &self.config_path {
+            Some(expected) => {
+                if let Err(msg) = ensure_config_destination(expected) {
+                    self.set_other_error(msg);
+                    return;
+                }
+                save_config_toml_to(expected, &settings, &host_groups, risk_section.as_ref(), &log_sources, secret_section.as_ref())
             }
-        }
-        if let Err(msg) = save_config_toml(&settings, &host_groups, risk_section.as_ref(), &log_sources, secret_section.as_ref()) {
+            None => save_config_toml(&settings, &host_groups, risk_section.as_ref(), &log_sources, secret_section.as_ref()),
+        };
+        if let Err(msg) = save_result {
             // A failed write would silently restore the old chain on the next
             // launch: keep the draft open for retry (#695 review).
             self.set_other_error(msg);
@@ -6874,8 +6904,83 @@ mod tests {
         assert!(!result.contains("passphrase ="), "no passphrase value in config.toml");
         // Launcher SSH slots go through pending_launch.json, not config.toml.
         assert!(!result.contains("10.0.0.9"), "launcher slots must not leak into config.toml");
-        // The atomic replace must not leave its temp file behind.
-        assert!(!path.with_file_name("config.toml.filar-tmp").exists(), "temp file must be renamed away");
+        // The atomic replace must not leave its temp file behind (the name
+        // carries a pid suffix, so scan the directory).
+        let leftover = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".filar-tmp-"));
+        assert!(!leftover, "temp file must be renamed away");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_save_to_preserves_symlink() {
+        let dir = std::env::temp_dir().join(format!("filar_test_cfglink_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.toml");
+        let link = dir.join("config.toml");
+        std::fs::write(&real, "[llm]\nmodel = \"old\"\napi_base_url = \"https://old.example.com\"\n").unwrap();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&real, &link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&real, &link);
+        if made.is_err() {
+            // Symlink creation needs privileges on Windows (developer mode);
+            // skip rather than fail there.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let settings = Settings { model: "link-new".into(), ..Settings::default() };
+        save_config_toml_to(&link, &settings, &[], None, &[], None).unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the symlink itself must survive the atomic replace");
+        let result = std::fs::read_to_string(&real).unwrap();
+        assert!(result.contains("model = \"link-new\""), "edits must land in the symlink target");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_save_to_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("filar_test_cfgperm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[llm]\nmodel = \"old\"\napi_base_url = \"https://old.example.com\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let settings = Settings { model: "perm-new".into(), ..Settings::default() };
+        save_config_toml_to(&path, &settings, &[], None, &[], None).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the atomic replace must keep the destination's permissions");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ensure_config_destination_accepts_case_difference() {
+        let _lock = CONFIG_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("filar_test_destcase_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[llm]\nmodel = \"old\"\n").unwrap();
+        // Same file, different letter case — Windows paths are
+        // case-insensitive, the guard must not fire.
+        let upper = std::path::PathBuf::from(path.to_string_lossy().to_uppercase());
+
+        let old = std::env::var("FILAR_CONFIG").ok();
+        std::env::set_var("FILAR_CONFIG", upper.as_os_str());
+        let _env = CfgEnvGuard { key: "FILAR_CONFIG", old };
+
+        assert!(ensure_config_destination(&path).is_ok(),
+            "case-only difference on Windows is the same destination");
+        drop(_env);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
