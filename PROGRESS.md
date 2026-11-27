@@ -13608,9 +13608,9 @@ unauthenticated → подсказка 'bw login', без интерактивн
 буферы zeroize, кэш в Chain, Debug — только counts.
 
 **Тесты.** Заглушки CLI: успешное чтение, stored-newline, locked,
-unauthenticated, not found, таймаут, передача BW_SESSION из env, отсутствие
-CLI, Debug/secret_names/промах, chain из конфига; интеграция с реальным `bw`
-— `#[ignore]`, ручная.
+unauthenticated, not found, таймаут, передача BW_SESSION дочернему процессу,
+отсутствие CLI, Debug/secret_names/промах, chain из конфига; интеграция с
+реальным `bw` — `#[ignore]`, ручная.
 
 **Ревью (раунд 1).** Принято от ai-review: RAII-guard очистки `BW_SESSION`
 в env-тесте (убирает переменную и при панике); явная проверка, что
@@ -13621,5 +13621,12 @@ CLI, Debug/secret_names/промах, chain из конфига; интегра�
 источника; «\r без \n» — bw добавляет `\n`, а trim_end_matches съел бы
 хвостовые переводы строки самого пароля. CodeRabbit в этом раунде
 упёрся в лимит ревью.
+
+**Ревью (раунд 2).** Принято замечание об UB конкурентного доступа к env:
+env-тест переписан без мутации окружения процесса — сессия инжектится через
+тестовый `with_session` (`#[cfg(test)] session_override`), RAII-guard и
+`set_var` удалены; замечание о порядке guard/`set_var` закрыто тем же
+переписыванием. Отклонено: «нет строки CHANGELOG» в сводке ai-review —
+строка #692 присутствует в PR. Core 284, workspace зелёные.
 
 **Next:** #693 (провайдер KeePassXC).

@@ -1081,6 +1081,8 @@ pub struct BitwardenProvider {
     items: HashMap<String, String>,
     cli: String,
     timeout: Duration,
+    #[cfg(test)]
+    session_override: Option<String>,
 }
 
 impl BitwardenProvider {
@@ -1091,6 +1093,8 @@ impl BitwardenProvider {
             items,
             cli: "bw".to_string(),
             timeout: Duration::from_secs(DEFAULT_SECRET_CLI_TIMEOUT_SECS),
+            #[cfg(test)]
+            session_override: None,
         }
     }
 
@@ -1103,6 +1107,15 @@ impl BitwardenProvider {
     /// Override the per-invocation timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Test-only: inject the session key directly so a test can verify the
+    /// session reaches the child without mutating the process environment
+    /// (parallel tests share it, and concurrent env access is unsound).
+    #[cfg(test)]
+    fn with_session(mut self, session: impl Into<String>) -> Self {
+        self.session_override = Some(session.into());
         self
     }
 
@@ -1167,6 +1180,9 @@ impl SecretProvider for BitwardenProvider {
         let reference = self.items.get(name).ok_or_else(|| {
             CoreError::Secret(format!("bitwarden: no bw item mapping for {}", redact(name)))
         })?;
+        #[cfg(test)]
+        let mut session = self.session_override.clone().or_else(resolve_bw_session);
+        #[cfg(not(test))]
         let mut session = resolve_bw_session();
         let env: Vec<(&str, &str)> = session
             .as_deref()
@@ -2345,17 +2361,11 @@ mod tests {
     }
 
     #[test]
-    fn bw_provider_passes_session_from_env_to_the_cli() {
-        // The stub echoes BW_SESSION back: the value must reach the child
-        // from the environment, not from any config field. This is the only
-        // test that writes or removes BW_SESSION, so no other test can race
-        // on its value; the guard removes it even if an assert panics.
-        struct EnvVarGuard(&'static str);
-        impl Drop for EnvVarGuard {
-            fn drop(&mut self) {
-                std::env::remove_var(self.0);
-            }
-        }
+    fn bw_provider_passes_session_to_the_cli_child() {
+        // The stub echoes BW_SESSION back: the session must reach the child
+        // through its environment, not from any config field. The key is
+        // injected test-only — the process environment is never mutated,
+        // so parallel tests cannot race on it (#734 review).
         let dir = op_stub_dir("bw-session");
         #[cfg(windows)]
         let body = concat!(
@@ -2378,10 +2388,9 @@ mod tests {
             "printf '%s\\n' \"$BW_SESSION\"\n",
         );
         let stub = write_stub(&dir, "bw-session", body);
-        std::env::set_var("BW_SESSION", "test-bw-session-42");
-        let _guard = EnvVarGuard("BW_SESSION");
         let p = BitwardenProvider::new(bw_items("api-key-item"))
-            .with_cli_path(stub.to_str().unwrap());
+            .with_cli_path(stub.to_str().unwrap())
+            .with_session("test-bw-session-42");
         let value = p.get("FILAR_LLM_API_KEY").unwrap();
         assert_eq!(value, "test-bw-session-42");
         let _ = std::fs::remove_dir_all(&dir);
