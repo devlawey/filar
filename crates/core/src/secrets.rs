@@ -678,6 +678,21 @@ impl Drop for ChainSecretProvider {
 /// Default timeout for a password-manager CLI invocation, seconds (#691).
 pub const DEFAULT_SECRET_CLI_TIMEOUT_SECS: u64 = 30;
 
+/// Set the abort flag and wipe whatever the pipe readers already stored.
+/// A reader that finishes later sees the flag under the same slot lock and
+/// wipes its own buffer, so no partial output is dropped unzeroized.
+fn abort_pipe_readers(
+    aborted: &std::sync::atomic::AtomicBool,
+    slots: &[&Mutex<Option<Vec<u8>>>],
+) {
+    aborted.store(true, std::sync::atomic::Ordering::SeqCst);
+    for slot in slots {
+        if let Some(mut buf) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            buf.zeroize();
+        }
+    }
+}
+
 /// Run a password-manager CLI and return its stdout verbatim (the caller
 /// passes flags like `--no-newline` so nothing is added; a stored secret
 /// may itself end with a newline). The child is killed when `timeout`
@@ -722,41 +737,54 @@ fn run_secret_cli(
 
     // Drain both pipes concurrently: a child writing more than the pipe
     // capacity would block forever with nobody reading (#733 review).
-    // On abort the readers are not joined — an orphaned grandchild may keep
-    // a pipe open long after the kill (Windows cmd.exe stubs) — they wipe
-    // their buffers themselves once the pipes finally close.
+    // Readers hand their buffers over through slots; on abort the flag is
+    // set and the slots wiped under the same lock the readers check, so a
+    // buffer is zeroized exactly once regardless of who wins the race —
+    // including a reader that finished before the timeout was reached.
     let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let out_slot: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let err_slot: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let out_aborted = Arc::clone(&aborted);
-    let out_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stdout_pipe {
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        if out_aborted.load(std::sync::atomic::Ordering::Relaxed) {
-            buf.zeroize();
-        }
-        buf
-    });
-    let err_aborted = Arc::clone(&aborted);
-    let err_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stderr_pipe {
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        if err_aborted.load(std::sync::atomic::Ordering::Relaxed) {
-            buf.zeroize();
-        }
-        buf
-    });
+    {
+        let slot = Arc::clone(&out_slot);
+        let aborted = Arc::clone(&aborted);
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stdout_pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                buf.zeroize();
+            } else {
+                *slot = Some(buf);
+            }
+        });
+    }
+    {
+        let slot = Arc::clone(&err_slot);
+        let aborted = Arc::clone(&aborted);
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stderr_pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                buf.zeroize();
+            } else {
+                *slot = Some(buf);
+            }
+        });
+    }
 
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                    abort_pipe_readers(&aborted, &[&out_slot, &err_slot]);
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(CoreError::Secret(format!(
@@ -767,7 +795,7 @@ fn run_secret_cli(
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(e) => {
-                aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                abort_pipe_readers(&aborted, &[&out_slot, &err_slot]);
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(CoreError::Other(format!(
@@ -777,12 +805,34 @@ fn run_secret_cli(
         }
     };
 
-    let mut stdout_bytes = out_reader
-        .join()
-        .map_err(|_| CoreError::Other(format!("{provider}: stdout reader panicked")))?;
-    let mut stderr_bytes = err_reader
-        .join()
-        .map_err(|_| CoreError::Other(format!("{provider}: stderr reader panicked")))?;
+    // The child exited, but an orphaned grandchild may still hold a pipe
+    // open (Windows .cmd stubs): wait for the readers no longer than the
+    // same deadline, never an unbounded join.
+    loop {
+        let out_done = out_slot.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let err_done = err_slot.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        if out_done && err_done {
+            break;
+        }
+        if Instant::now() >= deadline {
+            abort_pipe_readers(&aborted, &[&out_slot, &err_slot]);
+            return Err(CoreError::Secret(format!(
+                "{provider}: timed out after {}s reading {reference}",
+                timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut stdout_bytes = out_slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default();
+    let mut stderr_bytes = err_slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default();
     let mut stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
     let mut stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
     stdout_bytes.zeroize();
@@ -1636,6 +1686,48 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("timed out"), "{msg}");
         assert!(msg.contains("onepassword"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_provider_grandchild_holding_pipe_is_bounded_by_deadline() {
+        // The direct child exits at once, but a background grandchild keeps
+        // the stderr pipe open: the post-exit wait for the readers must
+        // obey the deadline instead of blocking on an unbounded join.
+        let dir = op_stub_dir("grandchild");
+        #[cfg(windows)]
+        let body = "@echo off\r\nstart /b ping -n 30 127.0.0.1 >nul\r\nexit /b 0\r\n";
+        #[cfg(not(windows))]
+        let body = "#!/bin/sh\nsleep 30 &\nexit 0\n";
+        let stub = write_stub(&dir, "op-grandchild", body);
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_timeout(Duration::from_millis(500));
+        let started = Instant::now();
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "post-exit wait not bounded");
+        assert!(format!("{err}").contains("timed out"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn op_provider_timeout_wipes_output_stored_before_abort() {
+        // The stdout reader finishes (the stub closes its stdout) while the
+        // CLI keeps running: at timeout the already-stored buffer must be
+        // wiped by the abort path, not dropped unzeroized (#733 review).
+        let dir = op_stub_dir("preabort");
+        let body = "#!/bin/sh\nprintf 'partial-secret'\nexec 1>&-\nsleep 30\n";
+        let stub = write_stub(&dir, "op-preabort", body);
+        let p = OnePasswordProvider::new(op_items("op://vault/api-key/credential"))
+            .with_cli_path(stub.to_str().unwrap())
+            .with_timeout(Duration::from_millis(300));
+        let started = Instant::now();
+        let err = p.get("FILAR_LLM_API_KEY").unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "timeout not enforced");
+        let msg = format!("{err}");
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(!msg.contains("partial-secret"), "value leak: {msg}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -626,12 +626,17 @@ Windows (`KEY_EVENT` с `uChar = 0x07`); ни Windows Terminal, ни conhost,
 `Child::kill()` на Windows завершает только сам процесс. Если CLI запущен
 через `.cmd`/`.bat` (так работают тестовые заглушки `op`), убивается
 `cmd.exe`, а его потомок (например `ping`) продолжает жить и держит
-унаследованный handle stderr-pipe. Поэтому `run_secret_cli`
-(`crates/core/src/secrets.rs`) по таймауту не ждёт читателей pipe
-(`join` заблокировался бы до выхода осиротевшего потомка): выставляет
-abort-флаг, убивает child и возвращается сразу; потоки-читатели сами
-затирают буферы (`zeroize`), когда pipe наконец закроется. На Unix
-заглушка — один `sh`-процесс, и kill закрывает pipe сразу; поведение
-тем не менее унифицировано. Проверено тестом
-`op_provider_timeout_kills_the_cli` (Windows локально, macOS в CI).
+унаследованный handle stderr-pipe. Потомок может держать pipe и после
+штатного выхода самого CLI (`start /b` на Windows, `cmd &` на Unix).
+Поэтому `run_secret_cli` (`crates/core/src/secrets.rs`) никогда не делает
+безусловный `join` читателей pipe: они передают буферы через слоты под
+мьютексом, ожидание читателей ограничено тем же дедлайном, а по таймауту
+abort-флаг + очистка слотов под тем же локом гарантируют `zeroize` буфера
+независимо от того, кто выиграл гонку — включая читателя, завершившегося
+до таймаута. На Unix одиночный `sh`-процесс закрывает pipe сразу при kill;
+поведение тем не менее унифицировано. Проверено тестами
+`op_provider_timeout_kills_the_cli`,
+`op_provider_grandchild_holding_pipe_is_bounded_by_deadline` (Windows
+локально, macOS в CI) и `op_provider_timeout_wipes_output_stored_before_abort`
+(Unix).
 
