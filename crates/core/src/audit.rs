@@ -274,8 +274,17 @@ impl AuditWriter {
         let base = self.dir.join(format!("audit-{date}.jsonl"));
         let mut candidate = base.clone();
         let mut index = 0u32;
+        // Bounded scan: in an unreadable directory every probe fails, and
+        // without a cap the loop would spin forever instead of erroring.
+        const MAX_SCAN: u32 = 1000;
         loop {
-            let size = std::fs::metadata(&candidate).map(|m| m.len()).unwrap_or(0);
+            let size = match std::fs::metadata(&candidate) {
+                Ok(m) => m.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                // Any other probe error: the candidate is unusable, skip
+                // it — the scan cap turns a fully unreadable dir into Err.
+                Err(_) => u64::MAX,
+            };
             // A brand-new file accepts any single line, even an oversized
             // one — a record must never be dropped for being long. A file
             // whose last line is incomplete (a torn write) is preserved
@@ -287,6 +296,12 @@ impl AuditWriter {
                 return Ok(candidate);
             }
             index += 1;
+            if index > MAX_SCAN {
+                return Err(CoreError::Other(format!(
+                    "no usable audit journal file for {date} within {MAX_SCAN} candidates in {} (unreadable directory or too many files)",
+                    self.dir.display()
+                )));
+            }
             candidate = self.dir.join(format!("audit-{date}.{index}.jsonl"));
         }
     }
@@ -323,6 +338,11 @@ impl AuditWriter {
 /// that cannot be read is an error here, before anything is written. The
 /// snapshot pins the values so all fields are masked against the same set;
 /// `StaticSecretProvider` zeroizes them on drop.
+///
+/// Completeness is the caller's responsibility: a provider that cannot
+/// enumerate (e.g. `KeyringSecretProvider`) yields an empty snapshot that
+/// masks nothing — for such stores the caller must supply the names it
+/// resolved in this session explicitly (`StaticSecretProvider::with_secrets`).
 pub fn secret_snapshot(provider: &dyn SecretProvider) -> Result<StaticSecretProvider> {
     let mut map = std::collections::HashMap::new();
     for name in provider.secret_names() {

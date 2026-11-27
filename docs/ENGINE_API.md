@@ -1268,12 +1268,15 @@ journal. Nothing leaves the machine: the writer only touches the file system.
   (`$FILAR_SECRET_*`) or `<secret>` — a value never reaches the disk.
   **Masking contract:** `append` takes an `Option<&StaticSecretProvider>` —
   an enumeration-complete snapshot of every secret resolved in this session;
-  its keys are the masking scope. Build one from any provider with
-  `audit::secret_snapshot(provider)`, which is fail-closed: if a listed name
-  cannot be read (a vault locked after the value was resolved) it returns
-  `Err` before anything is written. A provider that cannot list its entries
-  (e.g. `KeyringSecretProvider`) must not be used as the masking source
-  directly — the snapshot parameter type makes that explicit.
+  its keys are the masking scope. Build one with
+  `audit::secret_snapshot(provider)` from a provider that enumerates the
+  session's resolved secrets; it is fail-closed: if a listed name cannot be
+  read (a vault locked after the value was resolved) it returns `Err` before
+  anything is written. Completeness is the caller's responsibility: a
+  non-enumerable store (e.g. `KeyringSecretProvider`) yields an empty
+  snapshot that masks nothing — for such stores the caller must supply the
+  names it resolved in this session explicitly
+  (`StaticSecretProvider::with_secrets`).
 - A write failure is returned as `Err`; the caller logs a warning and keeps
   going. Auditing never blocks or fails a command.
 - `audit::read_records(path)` reads a file back in order; a malformed line
