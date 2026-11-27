@@ -1548,15 +1548,40 @@ fn save_config_toml_to(
                 .unwrap_or_else(|| "config.toml".to_string());
             // Pid suffix: two concurrent launchers must not share one temp.
             let tmp = target.with_file_name(format!("{file_name}.filar-tmp-{}", std::process::id()));
-            if let Err(e) = std::fs::write(&tmp, &data) {
+            // create_new refuses a pre-existing name — a planted symlink
+            // must not be followed. On Unix the temp starts owner-only:
+            // the config may carry manually written credentials and must
+            // never be world-readable, even briefly (#740 review).
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = match opts.open(&tmp) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!(path = %tmp.display(), error = %e, "failed to create config.toml temp file");
+                    return Err(format!("failed to save config.toml: {e}"));
+                }
+            };
+            if let Err(e) = std::io::Write::write_all(&mut file, data.as_bytes()) {
+                drop(file);
                 let _ = std::fs::remove_file(&tmp);
                 tracing::warn!(path = %tmp.display(), error = %e, "failed to write config.toml temp file");
                 return Err(format!("failed to save config.toml: {e}"));
             }
-            // Keep the destination's permissions — the umask may otherwise
-            // widen them on Unix. Best effort, not fatal.
+            drop(file);
+            // Keep the destination's permissions. Failure is fatal: the
+            // temp's restrictive mode must not silently widen or narrow
+            // the replaced file (#740 review).
             if let Ok(meta) = std::fs::metadata(&target) {
-                let _ = std::fs::set_permissions(&tmp, meta.permissions());
+                if let Err(e) = std::fs::set_permissions(&tmp, meta.permissions()) {
+                    let _ = std::fs::remove_file(&tmp);
+                    tracing::warn!(path = %tmp.display(), error = %e, "failed to set config.toml temp permissions");
+                    return Err(format!("failed to save config.toml: {e}"));
+                }
             }
             if let Err(e) = std::fs::rename(&tmp, &target) {
                 // On Windows the rename fails while another process holds
@@ -6985,6 +7010,43 @@ mod tests {
     }
 
     #[test]
+    fn config_save_to_creates_missing_parent() {
+        // FILAR_CONFIG may point at a fresh path whose directory does not
+        // exist yet — the save must create it, not fail (#740 review).
+        let dir = std::env::temp_dir().join(format!("filar_test_cfgfresh_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("custom.toml");
+
+        let settings = Settings { model: "fresh".into(), ..Settings::default() };
+        save_config_toml_to(&path, &settings, &[], None, &[], None).unwrap();
+
+        let result = std::fs::read_to_string(&path).unwrap();
+        assert!(result.contains("model = \"fresh\""), "save must create the missing parent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_save_to_refuses_preexisting_temp() {
+        // A pre-planted file (or symlink) at the temp name must not be
+        // overwritten or followed — create_new refuses it (#740 review).
+        let dir = std::env::temp_dir().join(format!("filar_test_cfgplant_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let original = "[llm]\nmodel = \"old\"\napi_base_url = \"https://old.example.com\"\n";
+        std::fs::write(&path, original).unwrap();
+        let planted = dir.join(format!("config.toml.filar-tmp-{}", std::process::id()));
+        std::fs::write(&planted, "sentinel").unwrap();
+
+        let settings = Settings { model: "new".into(), ..Settings::default() };
+        assert!(save_config_toml_to(&path, &settings, &[], None, &[], None).is_err(),
+            "a pre-existing temp name must abort the save");
+        assert_eq!(std::fs::read_to_string(&planted).unwrap(), "sentinel", "planted file must be untouched");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "destination must be untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ensure_config_destination_detects_move() {
         let _lock = CONFIG_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("filar_test_dest_{}", std::process::id()));
@@ -6992,6 +7054,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a.toml");
         let b = dir.join("b.toml");
+        std::fs::write(&b, "[llm]\nmodel = \"foreign\"\n").unwrap();
 
         let old = std::env::var("FILAR_CONFIG").ok();
         std::env::set_var("FILAR_CONFIG", a.as_os_str());
@@ -7001,6 +7064,10 @@ mod tests {
         let err = ensure_config_destination(&b).unwrap_err();
         assert!(err.contains(&a.display().to_string()), "error names the startup path: {err}");
         assert!(err.contains(&b.display().to_string()), "error names the current path: {err}");
+        // The guard itself must never touch the newly resolved file —
+        // do_launch aborts before any write (#740 review).
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "[llm]\nmodel = \"foreign\"\n",
+            "the guard must leave the new destination untouched");
         drop(_env);
         let _ = std::fs::remove_dir_all(&dir);
     }
