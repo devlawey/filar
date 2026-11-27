@@ -13638,3 +13638,37 @@ utils.ts cli-v2026.9.1 — на non-TTY финальная строка пише
 исходникам bw. Ai-review этого раунда завершился по таймауту (cancelled).
 
 **Next:** #693 (провайдер KeePassXC).
+
+## #693 — провайдер KeePassXC (keepassxc-cli)
+
+**Сделано.** `KeePassXcProvider` (`secrets.rs`): `keepassxc-cli show -a
+<attribute> <db> <entry>` с таймаутом (дефолт 30с); путь к базе и атрибут —
+из `[secret_provider.keepassxc]`, маппинг имён на entry — `entries`.
+Пароль базы — через инжектированный `SecretProvider`: `from_config`
+подключает keyring → env под логическим именем `FILAR_KEEPASSXC_DB_PASSWORD`
+(без кэша, TTL 0); маскированный ввод на старте можно передать через
+`with_password_provider` (`StaticSecretProvider`) — это уровень app (#694).
+Пароль подаётся в stdin CLI отдельным writer-потоком (`Zeroizing`-копия,
+затирается на всех путях), временных файлов нет; после вызова пароль
+затирается в `get()`. `show -a` добавляет ровно один newline (`Qt::endl`,
+верифицировано по Show.cpp) — снимается именно он, хвостовой newline
+самого значения сохраняется. Ошибки раздельные: неверный пароль («wrong
+database password»), нет entry («entry not found»), нет CLI, неизвестный/
+неоднозначный атрибут, нечитаемая база — без значения пароля и без сырого
+stderr. `from_config` теперь собирает все пять звеньев; keepassxc без
+`database` — ошибка конфига с именем поля.
+
+**Контракты.** Новый публичный `KeePassXcProvider` (реэкспорт в `lib.rs`,
+описан в `docs/ENGINE_API.md`); внутренний helper получил stdin-вариант
+(`run_secret_cli_with_stdin`, общий `run_secret_cli_inner`), сигнатуры
+`run_secret_cli`/`run_secret_cli_with_env` не изменились.
+`CommandExecutor`/`LlmClient` без изменений.
+
+**Тесты.** 13 новых: чтение, stored-newline, неверный пароль (без пароля и
+marker-stderr в ошибке), missing entry, таймаут, отсутствие CLI, доставка
+пароля через stdin, промах, нет источника пароля, недоступный пароль,
+Debug/secret_names, chain из конфига, keepassxc без database; интеграция с
+реальным `keepassxc-cli` — `#[ignore]`, ручная. Core 297, workspace зелёные.
+PLATFORM_NOTES: наличие CLI по ОС, newline-поведение, prompt в stderr.
+
+**Next:** #694 (подключение chain в app/runner).
