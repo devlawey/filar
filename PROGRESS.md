@@ -14142,3 +14142,20 @@ RiskScorerDraft), секция едет в config.toml и pending_launch.json �
 Roaming). +7 core-тестов конфига, +5 core-тестов retention/probe, +4
 gui-теста. ENGINE_API: секция конфигурации, миграционная строка, сняты
 заглушки «arrives with #699».
+
+Ревью #699 (PR #747, раунд 1): приняты все 9 замечаний. Главное — writer
+больше не смешивает режимы хеш-цепочки в одном файле: `pick_file`
+пропускает файл, записанный в другом режиме (`chain_mode_matches`), и
+переключение `hash_chain` между запусками роллит в новый индексный файл
+того же дня — записи не теряются и verify_chain не ломается (раньше
+включение цепочки на сегодняшнем файле без хешей давало ошибку на каждую
+запись, выключение — смесь hashed/unchained). Probe-файл
+`ensure_writable_dir` удаляется и при ошибке write/flush; retention
+считает невозможные календарные даты (2025-02-31) невалидным именем и не
+удаляет их (days_in_month с високосными годами), ошибки чтения элементов
+каталога — warn; ensure_writable_dir и apply_retention в раннере вынесены
+в spawn_blocking; GUI: подсказка retention при 0 говорит «disabled», а не
+«older than 0 days», default_dir для подсказки считается один раз в
+AuditDraft::from_config. Тесты: 2 прежних «error»-теста цепочки стали
+rollover-тестами, +2 новых (disabling chain rollover, impossible dates),
++1 gui-тест подсказки. ENGINE_API и CHANGELOG обновлены под rollover.

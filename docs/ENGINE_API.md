@@ -1312,9 +1312,11 @@ The hash chain (#697) is opt-in: `AuditWriter::new(dir).with_hash_chain(true)`
 carries its own chain: `prev_hash` of the first record is `GENESIS_HASH`
 (64 hex zeros), every next record links to the previous record's `hash` —
 SHA-256 (hex) of the record's canonical JSON without the `hash` field
-(`prev_hash` included; masking happens before hashing). Enabling the chain
-on a file that already holds unchained records is an error — existing lines
-are never rewritten. `filar_core::verify_chain(&records)` returns a
+(`prev_hash` included; masking happens before hashing). A file written in
+the other chain mode is never extended (#699 review): the writer rolls over
+to a new indexed file for the same date, so toggling the chain between runs
+neither drops records nor mixes hashed and unhashed lines in one file —
+existing lines are never rewritten. `filar_core::verify_chain(&records)` returns a
 `ChainVerifyReport { records_checked, outcome }` with `ChainOutcome::Disabled`
 (no hash fields at all), `Intact`, or `Broken { record, reason }` — the first
 modified/deleted/reordered/inserted record (1-based record number; blank
@@ -1362,13 +1364,15 @@ The journal is opt-in. `Config::audit` (`filar_core::AuditConfig`,
   `docs/PLATFORM_NOTES.md`). An empty string is rejected by name.
 - `retention_days: u32` — default 30; at start-up `audit::apply_retention`
   deletes `audit-*.jsonl` files whose file-name date is strictly older than
-  `today - retention_days`. Today's file is never deleted, unparseable
-  names are never touched, `0` disables pruning, and a per-file delete
-  error only warns.
+  `today - retention_days`. Today's file is never deleted, malformed names
+  (including impossible calendar dates like `2025-02-31`) are never
+  touched, `0` disables pruning, and a per-file delete error only warns.
 - `max_file_mb: u32` — default 10; the writer's rollover size
   (`AuditWriter::with_max_bytes`). `0` is rejected by name at config load.
 - `hash_chain: bool` — default `false`; enables the per-file SHA-256 chain
-  (`AuditWriter::with_hash_chain`).
+  (`AuditWriter::with_hash_chain`). Switching the flag between runs rolls
+  over to a new indexed journal file for the same date — chained and
+  unchained records never share a file.
 
 `AuditConfig::validate()` runs inside `Config::load` and names the
 offending field (`audit: max_file_mb …`, `audit: path …`).

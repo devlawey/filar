@@ -1972,10 +1972,23 @@ async fn run_app(
     // silent disable.
     let (audit_handle, audit_task) = if config.audit.enabled {
         let dir = config.audit.resolve_dir()?;
-        filar_core::audit::ensure_writable_dir(&dir)?;
+        // Both start-up sweeps do synchronous file I/O — offload them like
+        // the collector's appends so a cold file-system cache or a big
+        // journal directory cannot stall the runtime (#699 review).
+        let probe_dir = dir.clone();
+        tokio::task::spawn_blocking(move || filar_core::audit::ensure_writable_dir(&probe_dir))
+            .await
+            .map_err(|e| CoreError::Other(format!("audit directory check task failed: {e}")))??;
         // Retention is best-effort: a file that cannot be removed warns,
         // it must not block start-up (#699).
-        match filar_core::audit::apply_retention(&dir, config.audit.retention_days) {
+        let retention_dir = dir.clone();
+        let retention_days = config.audit.retention_days;
+        let retention = tokio::task::spawn_blocking(move || {
+            filar_core::audit::apply_retention(&retention_dir, retention_days)
+        })
+        .await
+        .map_err(|e| CoreError::Other(format!("audit retention task failed: {e}")))?;
+        match retention {
             Ok(n) if n > 0 => {
                 tracing::info!(removed = n, "audit retention pruned old journal files")
             }

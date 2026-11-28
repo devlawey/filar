@@ -2175,6 +2175,9 @@ struct AuditDraft {
     max_file_mb: u32,
     /// Not edited in the launcher; carried over from `config.toml`.
     hash_chain: bool,
+    /// OS default directory for the hint, resolved once at construction
+    /// (#699 review) — not on every rendered frame.
+    default_hint: String,
 }
 
 impl AuditDraft {
@@ -2190,6 +2193,9 @@ impl AuditDraft {
             retention_days: cfg.retention_days,
             max_file_mb: cfg.max_file_mb,
             hash_chain: cfg.hash_chain,
+            default_hint: filar_core::audit::default_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "the OS local data directory".to_string()),
         }
     }
 
@@ -2215,6 +2221,19 @@ impl AuditDraft {
             )
         })?;
         Ok(cfg)
+    }
+}
+
+/// Retention sentence of the launcher hint (#699 review): zero disables
+/// pruning — it does not mean "older than 0 days are removed".
+fn audit_retention_hint(days: u32) -> String {
+    if days == 0 {
+        "Retention is disabled; journal files are kept.".to_string()
+    } else {
+        format!(
+            "Files older than {days} days are removed at start-up; \
+             today's file is never deleted."
+        )
     }
 }
 
@@ -4093,14 +4112,11 @@ impl LauncherApp {
                     .desired_width(f32::INFINITY),
             );
         });
-        let default_hint = filar_core::audit::default_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "the OS local data directory".to_string());
         ui.label(
             egui::RichText::new(format!(
-                "Empty = {default_hint}. Files older than {} days are removed at start-up; \
-                 today's file is never deleted.",
-                d.retention_days
+                "Empty = {}. {}",
+                d.default_hint,
+                audit_retention_hint(d.retention_days)
             ))
             .small()
             .weak(),
@@ -9768,6 +9784,7 @@ host_key_policy = \"strict\"
         let d = AuditDraft::from_config(&filar_core::AuditConfig::default());
         assert!(!d.enabled);
         assert!(d.path.is_empty());
+        assert!(!d.default_hint.is_empty(), "the OS default hint is resolved once, up front");
         assert_eq!(d.to_config().unwrap(), filar_core::AuditConfig::default());
         let mut d = d;
         d.enabled = true;
@@ -9794,6 +9811,18 @@ host_key_policy = \"strict\"
         let msg = d.to_config().unwrap_err();
         assert!(msg.contains("Audit journal"), "{msg}");
         assert!(msg.contains("max_file_mb"), "{msg}");
+    }
+
+    #[test]
+    fn audit_retention_hint_zero_means_disabled() {
+        // #699 review: zero disables pruning — the hint must not claim
+        // that files "older than 0 days" are removed.
+        let zero = audit_retention_hint(0);
+        assert!(zero.contains("disabled"), "{zero}");
+        assert!(!zero.contains("older than"), "{zero}");
+        let month = audit_retention_hint(30);
+        assert!(month.contains("30 days"), "{month}");
+        assert!(month.contains("never deleted"), "{month}");
     }
 
     #[test]
