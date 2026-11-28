@@ -1030,6 +1030,7 @@ let _agent = builder.log_sources(sources);
 | `AgentEvent::LogQueryFinished` (UI-only details of a log query: source, language, query, window, line count, truncated, raw lines) emitted before the matching `CommandFinished` (#584) | Nothing — `AgentEvent` is `#[non_exhaustive]` | Show it or ignore it; it never reaches the model |
 | `KubeClusterApi::create_debug_container`, `DebugContainerSpec`, `debug_container_name`; new fields `KubeCluster::debug_images` and `KubePodTarget::debug_target` (#576) | `KubeCluster` literals without `..Default::default()` need `debug_images`; `KubePodTarget` built by `new` is unchanged | Add `debug_images: Vec::new()`; use `with_debug_target` for a debug container |
 | `filar_agent::background::reset_log_dir(session_id)` (#599) | Nothing — additive | Call it after replacing a session's target so the next background job probes the new target's writable log directory |
+| `AgentEvent::CommandFinished` and `AgentEvent::Cancelled` carry `proposal_id: Option<u64>`; `Cancelled` is now a struct variant; `fleet_view::ViewGroup` gained `exits: Vec<Option<i32>>` (#698) | `Cancelled` patterns/literals and `CommandFinished`/`ViewGroup` literals without `..` need the new fields | Match `Cancelled { .. }`; add `proposal_id` (the originating proposal, `None` for a user shell escape) and `exits` (per-host exit codes, `None` for a host that did not answer) |
 
 `CommandExecutor` and `LlmClient` are unchanged.
 
@@ -1350,22 +1351,36 @@ match report.outcome {
 The TUI fills the journal from the events it already sees: one collector
 task per process (`filar_tui::audit`) assembles records with a pure state
 machine and appends them via `spawn_blocking` in arrival order, so the
-event loop never blocks on file I/O and a write failure only warns.
-Recorded: the proposed command (explanation, destructiveness), the arbiter
-verdict and the risk rating (matched by `proposal_id`), the user's decision
-and its source (including the auto-deny on Esc/F2/quit), cancellations
-(`cancelled`), policy refusals (`denied`), the execution result (exit code,
-duration), one record per fleet host with that host's result, and one
-record per cluster change with the dry-run window text as its explanation.
+event loop never blocks on file I/O and a write failure only warns. The
+queue is bounded (1024 observations, `try_send` — a full queue drops the
+observation with a warning), and shutdown drops the senders and drains the
+task, so held records and a quit mid-confirm reach the disk.
+Recorded: the proposed command (explanation, destructiveness, the confirm
+mode in force at proposal time), the arbiter verdict and the risk rating
+(matched by `proposal_id`), the user's decision and its source (Esc and
+quit read `denied`/`user`; an F2 mode switch aborts the confirm and reads
+`cancelled`/`user`), cancellations (`cancelled`, matched to the proposal
+the turn was working on), policy refusals (`denied`/`policy` — a refusal
+string only counts when the command carries no execution metadata), the
+execution result (exit code, duration), one record per fleet host with
+that host's exit code and the arbiter verdict, dropped hosts noted with
+their state and reason, and one record per cluster change with the dry-run
+window text as its explanation. An outcome consumes only its own proposal
+(`proposal_id` identity): a late finish of an older proposal never eats a
+newer pending one. With a risk scorer configured, records wait for their
+rating; the turn's end (`Finished`/`Error`) releases anything still held
+and journals a proposal left without an outcome as a policy denial.
 The user's own `!cmd` shell escape is journaled too: no proposal precedes
-it, so the record carries the tab's target and reads `approved`/`user`.
+it, so the record carries the tab's target and reads `approved`/`user`
+(a failed escape keeps the error text as its explanation).
 Secret values are masked per record from a fresh snapshot (fail-closed);
-the runner builds the masking set as the union of the in-memory
+the runner builds the masking set as a `MaskingUnion` of the in-memory
 substitution provider, the `[secret_provider]` chain and the env
-`FILAR_SECRET_*` names, and resolves it inside `spawn_blocking` so a
-password-manager CLI link never stalls the reactor. The journal is written
-unconditionally with the chain off; the `[audit]` config gate arrives with
-#699.
+`FILAR_SECRET_*` names — every link's value for a name is masked, even
+when two links answer it differently — and resolves it inside
+`spawn_blocking` so a password-manager CLI link never stalls the reactor.
+The journal is written unconditionally with the chain off; the `[audit]`
+config gate arrives with #699.
 
 `AgentEvent::CommandFinished` gained `exit_code: Option<i32>` and
 `duration_ms: Option<u64>` (#698) — the execution result the journal
@@ -1373,3 +1388,9 @@ records. Patterns without `..` and hand-built events need the two fields;
 both are `None` when the command did not run or the executor reported no
 value. `filar_agent::tools::execute_tool_call_with_meta` returns them
 alongside the output string (`execute_tool_call` delegates to it).
+`CommandFinished` and `Cancelled` also carry `proposal_id: Option<u64>`
+(#698 review) — the originating proposal's id, `None` for the user's own
+shell escape or a turn that had not proposed; `Cancelled` became a struct
+variant. `fleet_view::ViewGroup` gained `exits: Vec<Option<i32>>`, the
+per-host exit codes aligned with the group's members (`None` for a host
+that did not answer).

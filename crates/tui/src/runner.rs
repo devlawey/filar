@@ -1961,33 +1961,33 @@ async fn run_app(
     // its own task so the event loop never blocks on file I/O. The [audit]
     // config section and the hash chain arrive with #699; until then the
     // journal is written unconditionally, chain off.
-    let audit_handle = match filar_core::audit::default_dir() {
+    let (audit_handle, audit_task) = match filar_core::audit::default_dir() {
         Ok(dir) => {
             // The masking set is the union of everything that can resolve a
             // secret in this process: the in-memory substitution provider
             // (Ctrl+P, prefetched keys), the [secret_provider] chain when
-            // configured, and the env FILAR_SECRET_* names. No outer cache:
-            // the chain link keeps its own TTL cache.
+            // configured, and the env FILAR_SECRET_* names. MaskingUnion
+            // (#698 review) masks every link's value even when two links
+            // answer the same name differently — a first-wins chain would
+            // leave the other value in the journal.
             let mut links: Vec<Arc<dyn SecretProvider>> = vec![config.secret_provider.clone()];
             if let Some(chain) = &config.secret_chain {
                 links.push(chain.clone());
             }
             links.push(Arc::new(filar_core::EnvSecretProvider::new()));
             let masking: Arc<dyn SecretProvider> =
-                match filar_core::ChainSecretProvider::new(links, Duration::ZERO) {
-                    Ok(union) => Arc::new(union),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "audit masking falls back to the substitution provider");
-                        config.secret_provider.clone()
-                    }
-                };
-            let handle = crate::audit::spawn(dir, masking);
+                Arc::new(crate::audit::MaskingUnion::new(links));
+            // With a risk scorer configured the collector holds records until
+            // the rating lands (#698 review); the JoinHandle lets shutdown
+            // drain them instead of losing the tail of the journal.
+            let (handle, task) =
+                crate::audit::spawn(dir, masking, config.risk_scorer.is_some());
             app.audit = Some(handle.clone());
-            Some(handle)
+            (Some(handle), Some(task))
         }
         Err(e) => {
             tracing::warn!(error = %e, "audit journal disabled: no local data directory");
-            None
+            (None, None)
         }
     };
     // Fleet hosts' own passwords come from the OS credential store (#436).
@@ -2715,6 +2715,16 @@ async fn run_app(
                             let provider = config.secret_provider.clone();
                             let sid = app.sessions[app.active].id;
                             let tx = agent_tx.clone();
+                            // The audit journal needs the tab's target even
+                            // when the escape fails before any event reaches
+                            // the forward loop (#698 review).
+                            let audit = app.audit.clone();
+                            let audit_target = crate::audit::session_target(
+                                &app.sessions[app.active],
+                                &app.ssh_targets,
+                            );
+                            let confirm_mode = app.sessions[app.active].confirm_mode;
+                            let fleet_tab = app.sessions[app.active].fleet.is_some();
                             tokio::spawn(async move {
                                 let wrapped = SecretSubstitutingExecutor::new(
                                     exec,
@@ -2735,6 +2745,7 @@ async fn run_app(
                                         let _ = tx.send(TuiEvent::Agent {
                                             session_id: sid,
                                             event: filar_agent::AgentEvent::CommandFinished {
+                                                proposal_id: None,
                                                 command: cmd.clone(),
                                                 output,
                                                 denied: false,
@@ -2745,11 +2756,28 @@ async fn run_app(
                                         true
                                     }
                                     Err(e) => {
+                                        let text = format!("Shell command failed: {e}");
+                                        // A failed escape never produced a
+                                        // CommandFinished, so journal it here
+                                        // (#698 review): the error text is the
+                                        // record's explanation.
+                                        if let Some(audit) = &audit {
+                                            audit.send(crate::audit::AuditInput::Finished {
+                                                session_id: sid.0.to_string(),
+                                                proposal_id: None,
+                                                target: audit_target,
+                                                command: cmd,
+                                                output: crate::audit::bound_output(&text),
+                                                denied: false,
+                                                exit_code: None,
+                                                duration_ms: None,
+                                                confirm_mode,
+                                                fleet: fleet_tab,
+                                            });
+                                        }
                                         let _ = tx.send(TuiEvent::Agent {
                                             session_id: sid,
-                                            event: filar_agent::AgentEvent::Error(
-                                                format!("Shell command failed: {e}")
-                                            )
+                                            event: filar_agent::AgentEvent::Error(text)
                                         });
                                         false
                                     }
@@ -3739,6 +3767,18 @@ async fn run_app(
             if app.toast_text().is_none() {
                 app.toast = None;
             }
+        }
+    }
+
+    // Drain the audit journal (#698 review): dropping every sender closes
+    // the collector's channel, its finish() flushes held records and any
+    // proposal still pending (a quit mid-confirm keeps the recorded denial),
+    // and the writes complete before the process exits.
+    app.audit = None;
+    drop(audit_handle);
+    if let Some(task) = audit_task {
+        if tokio::time::timeout(Duration::from_secs(5), task).await.is_err() {
+            tracing::warn!("audit journal did not drain within 5s; some records may be lost");
         }
     }
 

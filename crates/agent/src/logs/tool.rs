@@ -359,6 +359,7 @@ impl LogSources {
                 };
                 if !approved {
                     emit(AgentEvent::CommandFinished {
+                        proposal_id: Some(proposal_id),
                         command: display,
                         output: String::new(),
                         denied: true,
@@ -420,6 +421,7 @@ impl LogSources {
             Err(error) => self.redact(&format!("Error: log query failed: {error}")),
         };
         emit(AgentEvent::CommandFinished {
+            proposal_id: Some(proposal_id),
             command: display,
             output: output.clone(),
             denied: false,

@@ -14039,3 +14039,27 @@ Denied/Policy). Флот: одна запись на хост из `FleetSummary
 цепочки `[secret_provider]` и env `FILAR_SECRET_*` (внешний TTL 0,
 кэш цепочки сохраняется), снапшот снимается внутри `spawn_blocking`,
 чтобы CLI пароль-менеджера не тормозил реактор. +1 tui-тест (11 audit).
+
+Ревью-раунд 1 (PR #746): 18 замечаний CodeRabbit, все приняты.
+Идентичность: `CommandFinished`/`Cancelled` несут `proposal_id` (все точки
+эмиссии agent/kube_agent/logs; `Cancelled` стал struct-вариантом, агенты
+помнят `last_proposal_id` со сбросом на ход) — исход потребляет только свой
+proposal, поздний finish не съедает более новый. Оценка: при настроенном
+scorer запись держится до `CommandScored`; конец хода (`Finished`/`Error` →
+`TurnEnded`) отпускает удержанные и журналирует proposal без исхода как
+Denied/Policy; новый proposal вытесняет старый так же. F2 во время confirm —
+`cancelled`/`user` (`Decision.mode_switch`), Esc/quit — `denied`/`user`;
+quit не синтезирует finish: `finish()` уважает записанное решение, раннер
+дренирует коллектор при выходе (очередь ограничена 1024, `try_send`,
+`JoinHandle` + таймаут 5 с). `confirm_mode` фиксируется в момент Proposed;
+распознавание отказа политики — только без exit_code/duration; неудачный
+`!cmd` журналируется с текстом ошибки. Маскирование — `MaskingUnion`
+вместо цепочки: значения всех линков маскируются даже при коллизии имён.
+Флот: `ViewGroup.exits` (per-host), запись несёт поля арбитра, dropped-хост
+получает state/reason в explanation; target pod-вкладки —
+`pod/<pod>/<container>`. Output ограничен 2048 символами, `FleetSummary`
+очищает sample группы. +11 tui-тестов (22 audit). ENGINE_API: секция и
+миграционная таблица обновлены. DoD: пути confirm/арбитр/Ctrl+C требуют
+живого LLM (недоступен в окружении агента) — покрыты юнит-тестами и
+помечены ручными в PR; shell escape и дренаж журнала проверены прогоном
+бинарника.

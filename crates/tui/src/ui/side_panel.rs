@@ -593,6 +593,7 @@ mod tests {
                 hosts: vec!["prod-eu/shop/web-a/main".into()],
                 sample: "RESTARTS 1".into(),
                 role: GroupRole::Baseline,
+                exits: vec![None],
             }],
             dropped: vec![
                 ViewDropped {

@@ -64,6 +64,10 @@ pub struct ViewGroup {
     pub sample: String,
     /// Against the rest of the fleet.
     pub role: GroupRole,
+    /// Per-host process exit codes, aligned with [`hosts`](Self::hosts)
+    /// (#698 review): `Some` for a host that ran a process, `None` for a
+    /// typed answer with no process behind it (e.g. a Kubernetes read).
+    pub exits: Vec<Option<i32>>,
 }
 
 /// A host with no value in the comparison.
@@ -119,6 +123,16 @@ impl FleetView {
                 })
                 .unwrap_or_default()
         };
+        let exit_of = |name: &str| -> Option<i32> {
+            op.handles()
+                .zip(op.members())
+                .find(|(_, m)| m.name() == name)
+                .and_then(|(h, _)| report.run_for(h))
+                .and_then(|run| match run {
+                    HostRun::Answered(result) => result.exit_code,
+                    _ => None,
+                })
+        };
         let baseline = table.baseline().map(|b| b.hosts().to_vec());
         let groups = table
             .groups()
@@ -146,6 +160,7 @@ impl FleetView {
                         .unwrap_or_default(),
                 };
                 ViewGroup {
+                    exits: group.hosts().iter().map(|h| exit_of(h)).collect(),
                     hosts: group.hosts().to_vec(),
                     sample,
                     role,

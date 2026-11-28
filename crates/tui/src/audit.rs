@@ -41,6 +41,10 @@ pub enum AuditInput {
         command: String,
         explanation: String,
         destructive: bool,
+        /// The tab's confirm mode when the proposal was made (#698 review):
+        /// the mode can change mid-turn (F2), but the gate that judged this
+        /// command is the one in force at proposal time.
+        confirm_mode: CommandConfirmMode,
     },
     /// `AgentEvent::CommandAudited`: the arbiter's advisory verdict on the
     /// pending proposal.
@@ -63,15 +67,22 @@ pub enum AuditInput {
         explanation: String,
     },
     /// The user answered the dialog (`respond_to_confirmation`), including
-    /// the auto-deny on Esc/F2/quit.
+    /// the auto-deny on Esc/quit.
     Decision {
         session_id: String,
         command: String,
         approved: bool,
+        /// The answer was a mode switch (F2), not a deliberate yes/no
+        /// (#698 review): the command is cancelled, not denied.
+        mode_switch: bool,
     },
     /// `AgentEvent::CommandFinished`: the outcome. Writes the record.
     Finished {
         session_id: String,
+        /// The originating proposal's id (#698 review): the outcome consumes
+        /// only its own proposal, never a newer one. `None` for the user's
+        /// own `!cmd` shell escape, which has no proposal.
+        proposal_id: Option<u64>,
         /// The tab's target right now — used when no proposal is pending
         /// (the user's own `!cmd` shell escape).
         target: AuditTarget,
@@ -85,9 +96,19 @@ pub enum AuditInput {
         /// host by [`AuditInput::Fleet`] instead of one aggregate record.
         fleet: bool,
     },
-    /// `AgentEvent::Cancelled`: Ctrl+C/Ctrl+Z fired the token. A proposal
-    /// still pending is journaled as `cancelled`.
-    Cancelled { session_id: String },
+    /// `AgentEvent::Cancelled`: Ctrl+C/Ctrl+Z fired the token. The proposal
+    /// it names (when any) is journaled as `cancelled`.
+    Cancelled {
+        session_id: String,
+        /// The proposal the turn was working on (#698 review), so a late
+        /// cancellation never consumes a newer proposal.
+        proposal_id: Option<u64>,
+    },
+    /// The turn ended (`AgentEvent::Finished`/`Error`): ratings still in
+    /// flight have settled, so held records are released and a proposal
+    /// left without an outcome (a gate refusal that emits no finish) is
+    /// journaled (#698 review).
+    TurnEnded { session_id: String },
     /// `AgentEvent::ClusterChanged`: one changed object, journaled with the
     /// dry-run window text as its explanation.
     ClusterChanged { session_id: String, trace: String },
@@ -105,13 +126,21 @@ pub enum AuditInput {
 /// Cheap cloneable sender into the collector task.
 #[derive(Clone)]
 pub struct AuditHandle {
-    tx: mpsc::UnboundedSender<AuditInput>,
+    tx: mpsc::Sender<AuditInput>,
 }
 
 impl AuditHandle {
-    /// Queue one observation. A closed channel (shutdown) drops it silently.
+    /// Queue one observation without ever blocking the event loop: a full
+    /// queue drops the observation with a warning (auditing must not stall
+    /// the TUI); a closed channel (shutdown) drops it silently.
     pub fn send(&self, input: AuditInput) {
-        let _ = self.tx.send(input);
+        match self.tx.try_send(input) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("audit queue full: observation dropped");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
     }
 }
 
@@ -120,38 +149,63 @@ impl AuditHandle {
 /// `spawn_blocking` in arrival order. Write failures only warn — auditing
 /// must never block or fail a command.
 ///
-/// `provider` is the masking set: the runner passes the union of the
-/// in-memory substitution provider, the `[secret_provider]` chain and the
-/// env `FILAR_SECRET_*` names, so a value resolved by any of them is masked.
-/// Resolution happens inside `spawn_blocking` — a password-manager CLI link
-/// must not stall the async reactor.
-pub fn spawn(dir: PathBuf, provider: Arc<dyn SecretProvider>) -> AuditHandle {
-    let (tx, mut rx) = mpsc::unbounded_channel::<AuditInput>();
+/// `provider` is the masking set: the runner passes a [`MaskingUnion`] of
+/// the in-memory substitution provider, the `[secret_provider]` chain and
+/// the env `FILAR_SECRET_*` names, so a value resolved by any of them is
+/// masked. Resolution happens inside `spawn_blocking` — a password-manager
+/// CLI link must not stall the async reactor.
+///
+/// `scoring` tells the collector a risk scorer is configured, so finished
+/// records are held for a rating that may still be in flight (#698 review).
+/// The returned [`tokio::task::JoinHandle`] lets the runner drain the queue
+/// on shutdown: drop every sender, then await it (with a timeout) so the
+/// last records of a session are not lost.
+pub fn spawn(
+    dir: PathBuf,
+    provider: Arc<dyn SecretProvider>,
+    scoring: bool,
+) -> (AuditHandle, tokio::task::JoinHandle<()>) {
+    // Bounded (#698 review): an unbounded queue could grow without end if
+    // the writer stalls; 1024 observations is far more than a turn produces.
+    let (tx, mut rx) = mpsc::channel::<AuditInput>(1024);
     let writer = Arc::new(tokio::sync::Mutex::new(AuditWriter::new(dir)));
-    tokio::spawn(async move {
-        let mut collector = AuditCollector::default();
+    let task = tokio::spawn(async move {
+        let mut collector = AuditCollector::with_scoring(scoring);
         while let Some(input) = rx.recv().await {
             for record in collector.handle(input) {
-                let writer = Arc::clone(&writer);
-                let provider = Arc::clone(&provider);
-                let result = tokio::task::spawn_blocking(move || {
-                    // A fresh snapshot per record: secrets added mid-session
-                    // (Ctrl+P) must mask later lines too. Fail-closed: no
-                    // snapshot, no line.
-                    let snapshot = secret_snapshot(provider.as_ref())?;
-                    let mut guard = writer.blocking_lock();
-                    guard.append(&record, Some(&snapshot))
-                })
-                .await;
-                match result {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => tracing::warn!(error = %e, "audit record not written"),
-                    Err(e) => tracing::warn!(error = %e, "audit journal write task failed"),
-                }
+                append_record(&writer, &provider, record).await;
             }
         }
+        // Every sender is gone (shutdown): flush what is still in flight so
+        // a quit never loses the last records (#698 review).
+        for record in collector.finish() {
+            append_record(&writer, &provider, record).await;
+        }
     });
-    AuditHandle { tx }
+    (AuditHandle { tx }, task)
+}
+
+/// Append one record with a fresh masking snapshot, off the async reactor.
+async fn append_record(
+    writer: &Arc<tokio::sync::Mutex<AuditWriter>>,
+    provider: &Arc<dyn SecretProvider>,
+    record: AuditRecord,
+) {
+    let writer = Arc::clone(writer);
+    let provider = Arc::clone(provider);
+    let result = tokio::task::spawn_blocking(move || {
+        // A fresh snapshot per record: secrets added mid-session (Ctrl+P)
+        // must mask later lines too. Fail-closed: no snapshot, no line.
+        let snapshot = secret_snapshot(provider.as_ref())?;
+        let mut guard = writer.blocking_lock();
+        guard.append(&record, Some(&snapshot))
+    })
+    .await;
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "audit record not written"),
+        Err(e) => tracing::warn!(error = %e, "audit journal write task failed"),
+    }
 }
 
 /// The target descriptor of a tab at this moment: fleet, cluster, SSH or
@@ -166,6 +220,24 @@ pub fn session_target(session: &Session, ssh_targets: &[filar_core::SshTarget]) 
         };
     }
     if let Some(kube) = &session.kube {
+        // A pod tab journals the pod's own address, not just the cluster
+        // (#698 review): the shell ran in a container of that pod.
+        if let Some(pod) = &kube.pod {
+            let container = pod
+                .container
+                .as_deref()
+                .or(pod.pod_ref.container.as_deref());
+            let host = match container {
+                Some(c) => format!("pod/{}/{}", pod.display_pod(), c),
+                None => format!("pod/{}", pod.display_pod()),
+            };
+            return AuditTarget {
+                kind: "kube".into(),
+                name: format!("{}/{}", pod.pod_ref.cluster, pod.pod_ref.namespace),
+                host: Some(host),
+                tags: kube.target.tags.clone(),
+            };
+        }
         return AuditTarget {
             kind: "kube".into(),
             name: kube.target.name.clone(),
@@ -244,8 +316,23 @@ pub fn input_from_event(app: &App, event: &TuiEvent) -> Option<AuditInput> {
     use filar_agent::AgentEvent;
     match event {
         TuiEvent::Agent { session_id, event } => {
-            let session = app.sessions.iter().find(|s| s.id == *session_id)?;
             let sid = session_id.0.to_string();
+            // Terminal events route without a live session (#698 review):
+            // the tab may already be closed when the agent's last event
+            // lands, and the collector still holds its pending proposal.
+            match event {
+                AgentEvent::Cancelled { proposal_id } => {
+                    return Some(AuditInput::Cancelled {
+                        session_id: sid,
+                        proposal_id: *proposal_id,
+                    });
+                }
+                AgentEvent::Finished(_) | AgentEvent::Error(_) => {
+                    return Some(AuditInput::TurnEnded { session_id: sid });
+                }
+                _ => {}
+            }
+            let session = app.sessions.iter().find(|s| s.id == *session_id)?;
             match event {
                 AgentEvent::CommandProposed {
                     proposal_id,
@@ -260,6 +347,7 @@ pub fn input_from_event(app: &App, event: &TuiEvent) -> Option<AuditInput> {
                     command: command.clone(),
                     explanation: explanation.clone(),
                     destructive: *destructive,
+                    confirm_mode: session.confirm_mode,
                 }),
                 AgentEvent::CommandAudited {
                     verdict,
@@ -282,6 +370,7 @@ pub fn input_from_event(app: &App, event: &TuiEvent) -> Option<AuditInput> {
                     safety_pct: *safety_pct,
                 }),
                 AgentEvent::CommandFinished {
+                    proposal_id,
                     command,
                     output,
                     denied,
@@ -289,16 +378,16 @@ pub fn input_from_event(app: &App, event: &TuiEvent) -> Option<AuditInput> {
                     duration_ms,
                 } => Some(AuditInput::Finished {
                     session_id: sid,
+                    proposal_id: *proposal_id,
                     target: session_target(session, &app.ssh_targets),
                     command: command.clone(),
-                    output: output.clone(),
+                    output: bound_output(output),
                     denied: *denied,
                     exit_code: *exit_code,
                     duration_ms: *duration_ms,
                     confirm_mode: session.confirm_mode,
                     fleet: session.fleet.is_some(),
                 }),
-                AgentEvent::Cancelled => Some(AuditInput::Cancelled { session_id: sid }),
                 AgentEvent::ClusterChanged { trace } => Some(AuditInput::ClusterChanged {
                     session_id: sid,
                     trace: trace.clone(),
@@ -321,14 +410,34 @@ pub fn input_from_event(app: &App, event: &TuiEvent) -> Option<AuditInput> {
                 .as_ref()
                 .map(|op| fleet_host_targets(op, &app.kube_clusters))
                 .unwrap_or_default();
+            // The collector never reads the samples; drop them so a fleet
+            // of megabyte answers does not sit in the queue (#698 review).
+            let mut view = view.clone();
+            for group in &mut view.groups {
+                group.sample.clear();
+            }
             Some(AuditInput::Fleet {
                 session_id: session_id.0.to_string(),
-                view: view.clone(),
+                view,
                 hosts,
                 confirm_mode: session.confirm_mode,
             })
         }
         _ => None,
+    }
+}
+
+/// Longest command output kept on an audit observation, in characters
+/// (#698 review): the collector only sniffs the leading policy-refusal
+/// text and journals a shell escape's error, never the whole output. This
+/// bounds the queue payload for a command that printed megabytes.
+const MAX_AUDIT_OUTPUT_CHARS: usize = 2048;
+
+/// Cut an output to [`MAX_AUDIT_OUTPUT_CHARS`] on a character boundary.
+pub(crate) fn bound_output(output: &str) -> String {
+    match output.char_indices().nth(MAX_AUDIT_OUTPUT_CHARS) {
+        Some((cut, _)) => format!("{}…", &output[..cut]),
+        None => output.to_string(),
     }
 }
 
@@ -339,6 +448,8 @@ struct Pending {
     explanation: String,
     destructive: bool,
     target: AuditTarget,
+    /// The confirm mode in force when the proposal was made (#698 review).
+    confirm_mode: CommandConfirmMode,
     decision: Option<(AuditDecision, AuditDecisionSource)>,
     arbiter_verdict: Option<String>,
     arbiter_reason: Option<String>,
@@ -353,8 +464,9 @@ struct Pending {
 ///
 /// One record per command, written when its outcome is known (finish,
 /// cancellation); a fleet operation writes one record per host instead.
-/// A risk rating that arrives after its record was written is dropped —
-/// the journal is append-only.
+/// When a risk scorer is configured, a finished record is held until its
+/// rating lands (or the turn ends) so a late score is not lost (#698
+/// review); both agents settle ratings before the turn's terminal event.
 #[derive(Default)]
 pub struct AuditCollector {
     pending: HashMap<String, Pending>,
@@ -362,9 +474,23 @@ pub struct AuditCollector {
     /// Last fleet operation journaled per session: the observer fires once
     /// per operation, this guards against a replayed summary.
     fleet_ops: HashMap<String, u64>,
+    /// Finished records waiting for their risk rating (#698 review).
+    held: Vec<AuditRecord>,
+    /// Whether a risk scorer is configured: only then are finished records
+    /// held for a rating that may still be in flight.
+    scoring: bool,
 }
 
 impl AuditCollector {
+    /// A collector that holds finished records for in-flight ratings when
+    /// `scoring` is set (the runner passes whether a scorer is configured).
+    pub fn with_scoring(scoring: bool) -> Self {
+        Self {
+            scoring,
+            ..Default::default()
+        }
+    }
+
     /// Fold one observation into the state, returning the records it
     /// completes (usually zero or one; a fleet view returns one per host).
     pub fn handle(&mut self, input: AuditInput) -> Vec<AuditRecord> {
@@ -376,7 +502,20 @@ impl AuditCollector {
                 command,
                 explanation,
                 destructive,
+                confirm_mode,
             } => {
+                let mut out = Vec::new();
+                // A proposal replaced without an outcome event: the gate
+                // refused it without a finish (the kube/log Blocked path).
+                // Journal it before the new one takes its slot (#698 review).
+                if let Some(old) = self.pending.remove(&session_id) {
+                    out.push(self.orphan_record(
+                        &session_id,
+                        old,
+                        AuditDecision::Denied,
+                        AuditDecisionSource::Policy,
+                    ));
+                }
                 self.pending.insert(
                     session_id,
                     Pending {
@@ -385,6 +524,7 @@ impl AuditCollector {
                         explanation,
                         destructive,
                         target,
+                        confirm_mode,
                         decision: None,
                         arbiter_verdict: None,
                         arbiter_reason: None,
@@ -392,7 +532,7 @@ impl AuditCollector {
                         confirm_explanation: None,
                     },
                 );
-                Vec::new()
+                out
             }
             AuditInput::Audited {
                 session_id,
@@ -424,7 +564,28 @@ impl AuditCollector {
                     }
                     self.scores.insert(proposal_id, pct);
                 }
-                Vec::new()
+                // Release a held record whose rating just arrived (or proved
+                // unavailable): the journal is append-only, so this is the
+                // last chance to attach it (#698 review).
+                let mut out = Vec::new();
+                let mut released = false;
+                let mut i = 0;
+                while i < self.held.len() {
+                    if self.held[i].proposal_id == Some(proposal_id) {
+                        let mut rec = self.held.remove(i);
+                        if rec.risk_score.is_none() {
+                            rec.risk_score = safety_pct;
+                        }
+                        out.push(rec);
+                        released = true;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if released {
+                    self.scores.remove(&proposal_id);
+                }
+                out
             }
             AuditInput::Confirmation {
                 session_id,
@@ -439,10 +600,15 @@ impl AuditCollector {
                 session_id,
                 command,
                 approved,
+                mode_switch,
             } => {
                 if let Some(p) = self.pending.get_mut(&session_id) {
                     if p.command == command {
-                        p.decision = Some(if approved {
+                        p.decision = Some(if mode_switch {
+                            // F2 switched the mode instead of answering: the
+                            // command is cancelled, not deliberately denied.
+                            (AuditDecision::Cancelled, AuditDecisionSource::User)
+                        } else if approved {
                             (AuditDecision::Approved, AuditDecisionSource::User)
                         } else {
                             (AuditDecision::Denied, AuditDecisionSource::User)
@@ -453,6 +619,7 @@ impl AuditCollector {
             }
             AuditInput::Finished {
                 session_id,
+                proposal_id,
                 target,
                 command,
                 output,
@@ -462,14 +629,23 @@ impl AuditCollector {
                 confirm_mode,
                 fleet,
             } => {
-                let pending = self.pending.remove(&session_id);
+                // Identity matching (#698 review): an outcome consumes only
+                // its own proposal. A late outcome of an older proposal (a
+                // newer one is pending) is dropped — its fate is already
+                // journaled; a shell escape (`None`) never touches a proposal.
+                let p = match proposal_id {
+                    Some(pid) => match self.pending.get(&session_id) {
+                        Some(p) if p.proposal_id == Some(pid) => self.pending.remove(&session_id),
+                        Some(_) => return Vec::new(),
+                        None => None,
+                    },
+                    None => None,
+                };
                 // A fleet's aggregate finish is journaled per host by the
                 // Fleet input; only a refusal (nothing ran) writes here.
                 if fleet && !denied {
                     return Vec::new();
                 }
-                let had_proposal = pending.is_some();
-                let p = pending.filter(|p| p.command == command);
                 let (decision, source) = if denied {
                     if output.is_empty() {
                         // The user said no — the Decision input recorded it.
@@ -483,18 +659,27 @@ impl AuditCollector {
                         // gate, a dry-run refusal, a policy stop.
                         (AuditDecision::Denied, AuditDecisionSource::Policy)
                     }
-                } else if output.contains("read-only policy")
-                    || output.contains("refused to run a ~")
+                } else if exit_code.is_none()
+                    && duration_ms.is_none()
+                    && (output.starts_with("Error: read-only policy")
+                        || output.starts_with("Error: refused to run a ~"))
                 {
                     // The read-only allowlist / long-wait policy stopped the
-                    // command without running it.
+                    // command without running it. Gated on the absence of
+                    // execution metadata and the leading refusal text, so a
+                    // command that merely prints those words is not misread
+                    // (#698 review).
                     (AuditDecision::Denied, AuditDecisionSource::Policy)
                 } else if let Some(p) = &p {
-                    p.decision.unwrap_or_else(|| auto_decision(confirm_mode))
-                } else if !had_proposal {
+                    p.decision.unwrap_or_else(|| auto_decision(p.confirm_mode))
+                } else if proposal_id.is_none() {
                     // No proposal at all: the user's own `!cmd` shell escape
                     // — their direct action, not a gate decision.
-                    (AuditDecision::Approved, AuditDecisionSource::User)
+                    if denied {
+                        (AuditDecision::Denied, AuditDecisionSource::User)
+                    } else {
+                        (AuditDecision::Approved, AuditDecisionSource::User)
+                    }
                 } else {
                     auto_decision(confirm_mode)
                 };
@@ -502,23 +687,71 @@ impl AuditCollector {
                     self.record_from(&session_id, p.as_ref(), &target, &command, decision, source);
                 rec.exit_code = exit_code;
                 rec.duration_ms = duration_ms;
+                // A shell escape that failed before producing a result has
+                // no exit code or duration: keep the error text as its
+                // explanation so the journal says what went wrong (#698).
+                if proposal_id.is_none()
+                    && exit_code.is_none()
+                    && duration_ms.is_none()
+                    && !output.is_empty()
+                {
+                    rec.explanation = output.clone();
+                }
+                // Hold a finished record for its in-flight rating (#698).
+                if self.scoring && rec.risk_score.is_none() && rec.proposal_id.is_some() {
+                    // Bound the hold: a scorer that never answers must not
+                    // grow it without end (it never fills in practice).
+                    if self.held.len() >= 1024 {
+                        let oldest = self.held.remove(0);
+                        self.held.push(rec);
+                        return vec![oldest];
+                    }
+                    self.held.push(rec);
+                    return Vec::new();
+                }
                 vec![rec]
             }
-            AuditInput::Cancelled { session_id } => {
-                match self.pending.remove(&session_id) {
-                    Some(p) => {
-                        let command = p.command.clone();
-                        vec![self.record_from(
+            AuditInput::Cancelled {
+                session_id,
+                proposal_id,
+            } => {
+                let mut out = self.release_held(&session_id);
+                // Journal the pending proposal only when it is the one
+                // cancelled (#698 review); a cancellation that names no
+                // proposal (the turn had not proposed) still clears a stray
+                // pending, as before.
+                let take = match proposal_id {
+                    Some(pid) => {
+                        self.pending.get(&session_id).and_then(|p| p.proposal_id) == Some(pid)
+                    }
+                    None => self.pending.contains_key(&session_id),
+                };
+                if take {
+                    if let Some(p) = self.pending.remove(&session_id) {
+                        out.push(self.orphan_record(
                             &session_id,
-                            Some(&p),
-                            &p.target.clone(),
-                            &command,
+                            p,
                             AuditDecision::Cancelled,
                             AuditDecisionSource::User,
-                        )]
+                        ));
                     }
-                    None => Vec::new(),
                 }
+                out
+            }
+            AuditInput::TurnEnded { session_id } => {
+                let mut out = self.release_held(&session_id);
+                // A proposal still pending at turn end never got an outcome
+                // event: the gate refused it without a finish (the kube/log
+                // Blocked path). Journal it as a policy denial (#698 review).
+                if let Some(p) = self.pending.remove(&session_id) {
+                    out.push(self.orphan_record(
+                        &session_id,
+                        p,
+                        AuditDecision::Denied,
+                        AuditDecisionSource::Policy,
+                    ));
+                }
+                out
             }
             AuditInput::ClusterChanged { session_id, trace } => {
                 let Some(p) = self.pending.get(&session_id) else {
@@ -564,29 +797,52 @@ impl AuditCollector {
                 let destructive = pending.map(|p| p.destructive).unwrap_or(false);
                 let proposal_id = pending.and_then(|p| p.proposal_id);
                 let risk_score = proposal_id.and_then(|pid| self.scores.get(&pid).copied());
+                let arbiter_verdict = pending.and_then(|p| p.arbiter_verdict.clone());
+                let arbiter_reason = pending.and_then(|p| p.arbiter_reason.clone());
+                let arbiter_model = pending.and_then(|p| p.arbiter_model.clone());
                 let mut out = Vec::new();
                 let mut record = |host: &str,
                                   dec: AuditDecision,
                                   src: AuditDecisionSource,
-                                  exit: Option<i32>| {
+                                  exit: Option<i32>,
+                                  note: Option<String>| {
                     let target = hosts.get(host).cloned().unwrap_or_else(|| fallback.clone());
                     let mut rec =
                         AuditRecord::new(session_id.clone(), target, view.command.clone(), dec, src);
-                    rec.explanation = explanation.clone();
+                    rec.explanation = match note {
+                        Some(note) if !explanation.is_empty() => format!("{explanation}\n{note}"),
+                        Some(note) => note,
+                        None => explanation.clone(),
+                    };
                     rec.destructive = destructive;
                     rec.proposal_id = proposal_id;
                     rec.risk_score = risk_score;
+                    rec.arbiter_verdict = arbiter_verdict.clone();
+                    rec.arbiter_reason = arbiter_reason.clone();
+                    rec.arbiter_model = arbiter_model.clone();
                     rec.exit_code = exit;
                     out.push(rec);
                 };
-                // Hosts in a group answered and exited 0 (that is what puts
-                // them in a group); a divergent answer still exited cleanly.
+                // Group members answered; each keeps its own process exit
+                // code (#698 review) — a typed answer (e.g. a Kubernetes
+                // read) has no process behind it and so no exit code.
                 for group in &view.groups {
-                    for host in &group.hosts {
-                        record(host, decision, source, Some(0));
+                    for (i, host) in group.hosts.iter().enumerate() {
+                        let exit = group.exits.get(i).copied().flatten();
+                        record(host, decision, source, exit, None);
                     }
                 }
                 for d in &view.dropped {
+                    // The host's state and reason go into the explanation:
+                    // the decision enum has no error variant, but a dropped
+                    // host's fate must still be readable (#698 review).
+                    let mut note = format!("host result: {}", d.state.label());
+                    if let Some(code) = d.exit_code {
+                        note.push_str(&format!(" (exit {code})"));
+                    }
+                    if let Some(reason) = &d.reason {
+                        note.push_str(&format!(": {reason}"));
+                    }
                     let (dec, src, exit) = match d.state {
                         HostState::ExecutionError => (decision, source, d.exit_code),
                         HostState::AccessDenied => {
@@ -596,7 +852,7 @@ impl AuditCollector {
                         // never asked: the host produced no result.
                         _ => (AuditDecision::Cancelled, AuditDecisionSource::Policy, None),
                     };
-                    record(&d.host, dec, src, exit);
+                    record(&d.host, dec, src, exit, Some(note));
                 }
                 out
             }
@@ -633,6 +889,53 @@ impl AuditCollector {
         }
         rec
     }
+
+    /// Journal a proposal that left the pending slot without an outcome
+    /// event of its own (a gate refusal, a cancellation, shutdown).
+    fn orphan_record(
+        &mut self,
+        session_id: &str,
+        p: Pending,
+        decision: AuditDecision,
+        source: AuditDecisionSource,
+    ) -> AuditRecord {
+        let command = p.command.clone();
+        let target = p.target.clone();
+        self.record_from(session_id, Some(&p), &target, &command, decision, source)
+    }
+
+    /// Release every held record of a session (its turn ended or was
+    /// cancelled): their ratings have settled or been aborted (#698 review).
+    fn release_held(&mut self, session_id: &str) -> Vec<AuditRecord> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.held.len() {
+            if self.held[i].session_id == session_id {
+                out.push(self.held.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Flush everything still in flight when the channel closes (shutdown):
+    /// held records keep their fate; a proposal without an outcome honors a
+    /// recorded user decision (the denial on quit, #698 review) and otherwise
+    /// is journaled as cancelled — its fate is unknown.
+    pub fn finish(&mut self) -> Vec<AuditRecord> {
+        let mut out = std::mem::take(&mut self.held);
+        let sessions: Vec<String> = self.pending.keys().cloned().collect();
+        for sid in sessions {
+            if let Some(p) = self.pending.remove(&sid) {
+                let (decision, source) = p
+                    .decision
+                    .unwrap_or((AuditDecision::Cancelled, AuditDecisionSource::User));
+                out.push(self.orphan_record(&sid, p, decision, source));
+            }
+        }
+        out
+    }
 }
 
 /// The decision of a command that ran without a user answer: the confirm
@@ -643,6 +946,81 @@ fn auto_decision(mode: CommandConfirmMode) -> (AuditDecision, AuditDecisionSourc
         CommandConfirmMode::Allowlist => (AuditDecision::Auto, AuditDecisionSource::Allowlist),
         CommandConfirmMode::Never => (AuditDecision::Auto, AuditDecisionSource::Never),
         _ => (AuditDecision::Auto, AuditDecisionSource::Policy),
+    }
+}
+
+/// The masking set of the journal (#698 review): every secret link, not
+/// just the first that resolves a name. [`filar_core::ChainSecretProvider`]
+/// keeps only the first value per name, so a later link's value for a
+/// colliding name would leak into the journal. This provider enumerates
+/// each link's names; a duplicate name gets a synthetic key (the name plus
+/// a `\u{2}` separator and the link index) so both values are masked.
+///
+/// A plain name resolves first-non-empty across the links, exactly as the
+/// substitution chain resolves it; a total failure stays fail-closed (the
+/// record is skipped). A synthetic duplicate key addresses one specific
+/// link, and a link that cannot resolve it yields an empty value rather
+/// than failing the whole snapshot — the first link's value for that name
+/// is still masked.
+pub struct MaskingUnion {
+    links: Vec<Arc<dyn SecretProvider>>,
+}
+
+impl MaskingUnion {
+    /// Build the union of `links`, in resolution order.
+    pub fn new(links: Vec<Arc<dyn SecretProvider>>) -> Self {
+        Self { links }
+    }
+}
+
+impl SecretProvider for MaskingUnion {
+    fn get(&self, name: &str) -> filar_core::Result<String> {
+        // A synthetic duplicate key addresses one specific link.
+        if let Some((base, idx)) = name.rsplit_once('\u{2}') {
+            return match idx
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| self.links.get(i))
+            {
+                Some(link) => link.get(base).or_else(|_| Ok(String::new())),
+                None => Ok(String::new()),
+            };
+        }
+        // Plain name: first non-empty value wins, as the chain resolves it.
+        let mut failures: Vec<String> = Vec::new();
+        for link in &self.links {
+            match link.get(name) {
+                Ok(value) if !value.is_empty() => return Ok(value),
+                Ok(_) => {}
+                Err(e) => failures.push(e.to_string()),
+            }
+        }
+        let detail = if failures.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", failures.join("; "))
+        };
+        Err(filar_core::CoreError::Secret(format!(
+            "{name} not resolved by any of the {} masking links{detail}",
+            self.links.len()
+        )))
+    }
+
+    fn secret_names(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (idx, link) in self.links.iter().enumerate() {
+            for name in link.secret_names() {
+                if seen.insert(name.clone()) {
+                    out.push(name);
+                } else {
+                    // A later link's value for the same name must be masked
+                    // too; a synthetic key keeps both in the snapshot.
+                    out.push(format!("{name}\u{2}{idx}"));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -667,6 +1045,15 @@ mod tests {
     }
 
     fn proposed(sid: &str, pid: u64, command: &str) -> AuditInput {
+        proposed_in_mode(sid, pid, command, CommandConfirmMode::Always)
+    }
+
+    fn proposed_in_mode(
+        sid: &str,
+        pid: u64,
+        command: &str,
+        confirm_mode: CommandConfirmMode,
+    ) -> AuditInput {
         AuditInput::Proposed {
             session_id: sid.into(),
             target: target(),
@@ -674,12 +1061,14 @@ mod tests {
             command: command.into(),
             explanation: "check the load".into(),
             destructive: false,
+            confirm_mode,
         }
     }
 
-    fn finished(sid: &str, command: &str, denied: bool, output: &str) -> AuditInput {
+    fn finished(sid: &str, pid: u64, command: &str, denied: bool, output: &str) -> AuditInput {
         AuditInput::Finished {
             session_id: sid.into(),
+            proposal_id: Some(pid),
             target: target(),
             command: command.into(),
             output: output.into(),
@@ -717,9 +1106,10 @@ mod tests {
                 session_id: "1".into(),
                 command: "uptime".into(),
                 approved: true,
+                mode_switch: false,
             })
             .is_empty());
-        let records = c.handle(finished("1", "uptime", false, "load average: 0.1"));
+        let records = c.handle(finished("1", 7, "uptime", false, "load average: 0.1"));
         assert_eq!(records.len(), 1);
         let r = &records[0];
         assert_eq!(r.session_id, "1");
@@ -746,8 +1136,9 @@ mod tests {
             session_id: "1".into(),
             command: "rm -rf /tmp/x".into(),
             approved: false,
+            mode_switch: false,
         });
-        let records = c.handle(finished("1", "rm -rf /tmp/x", true, ""));
+        let records = c.handle(finished("1", 1, "rm -rf /tmp/x", true, ""));
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].decision, AuditDecision::Denied);
         assert_eq!(records[0].decision_source, AuditDecisionSource::User);
@@ -758,7 +1149,7 @@ mod tests {
     fn a_confirmation_timeout_is_cancelled_by_policy() {
         let mut c = AuditCollector::default();
         c.handle(proposed("1", 1, "uptime"));
-        let records = c.handle(finished("1", "uptime", true, "Confirmation timed out"));
+        let records = c.handle(finished("1", 1, "uptime", true, "Confirmation timed out"));
         assert_eq!(records[0].decision, AuditDecision::Cancelled);
         assert_eq!(records[0].decision_source, AuditDecisionSource::Policy);
     }
@@ -769,6 +1160,7 @@ mod tests {
         c.handle(proposed("1", 1, "systemctl restart nginx"));
         let records = c.handle(finished(
             "1",
+            1,
             "systemctl restart nginx",
             true,
             filar_agent::fleet_gate::FLEET_WRITE_DENIED,
@@ -781,12 +1173,19 @@ mod tests {
     fn a_read_only_refusal_is_denied_by_policy() {
         let mut c = AuditCollector::default();
         c.handle(proposed("1", 1, "touch /tmp/x"));
-        let records = c.handle(finished(
-            "1",
-            "touch /tmp/x",
-            false,
-            "Error: read-only policy: \"touch\" is not in the read-only allowlist — command not sent to the host: touch /tmp/x",
-        ));
+        // A gate refusal never reached the host: no exit code, no duration.
+        let records = c.handle(AuditInput::Finished {
+            session_id: "1".into(),
+            proposal_id: Some(1),
+            target: target(),
+            command: "touch /tmp/x".into(),
+            output: "Error: read-only policy: \"touch\" is not in the read-only allowlist — command not sent to the host: touch /tmp/x".into(),
+            denied: false,
+            exit_code: None,
+            duration_ms: None,
+            confirm_mode: CommandConfirmMode::Always,
+            fleet: false,
+        });
         assert_eq!(records[0].decision, AuditDecision::Denied);
         assert_eq!(records[0].decision_source, AuditDecisionSource::Policy);
     }
@@ -797,6 +1196,7 @@ mod tests {
         c.handle(proposed("1", 1, "sleep 30"));
         let records = c.handle(AuditInput::Cancelled {
             session_id: "1".into(),
+            proposal_id: Some(1),
         });
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].decision, AuditDecision::Cancelled);
@@ -806,6 +1206,7 @@ mod tests {
         assert!(c
             .handle(AuditInput::Cancelled {
                 session_id: "1".into(),
+                proposal_id: Some(1),
             })
             .is_empty());
     }
@@ -813,9 +1214,10 @@ mod tests {
     #[test]
     fn an_auto_approved_command_records_the_allowlist() {
         let mut c = AuditCollector::default();
-        c.handle(proposed("1", 1, "ls"));
+        c.handle(proposed_in_mode("1", 1, "ls", CommandConfirmMode::Allowlist));
         let records = c.handle(AuditInput::Finished {
             session_id: "1".into(),
+            proposal_id: Some(1),
             target: target(),
             command: "ls".into(),
             output: "file1".into(),
@@ -836,6 +1238,7 @@ mod tests {
         let mut c = AuditCollector::default();
         let records = c.handle(AuditInput::Finished {
             session_id: "1".into(),
+            proposal_id: None,
             target: AuditTarget {
                 kind: "local".into(),
                 name: "local".into(),
@@ -867,6 +1270,7 @@ mod tests {
             session_id: "1".into(),
             command: "uname -r".into(),
             approved: true,
+            mode_switch: false,
         });
         let group = filar_core::HostGroup {
             name: "web".into(),
@@ -894,6 +1298,7 @@ mod tests {
                 hosts: vec!["web-1".into(), "web-2".into()],
                 sample: "5.15.0".into(),
                 role: GroupRole::Baseline,
+                exits: vec![Some(0), Some(0)],
             }],
             dropped: vec![
                 ViewDropped {
@@ -943,6 +1348,7 @@ mod tests {
         assert!(c
             .handle(AuditInput::Finished {
                 session_id: "1".into(),
+                proposal_id: Some(1),
                 target: target(),
                 command: "uname -r".into(),
                 output: "3 hosts answered".into(),
@@ -979,6 +1385,7 @@ mod tests {
             session_id: "1".into(),
             command: "k8s_apply manifest.yaml".into(),
             approved: true,
+            mode_switch: false,
         });
         let records = c.handle(AuditInput::ClusterChanged {
             session_id: "1".into(),
@@ -989,7 +1396,7 @@ mod tests {
         assert_eq!(records[0].decision, AuditDecision::Approved);
         assert_eq!(records[0].decision_source, AuditDecisionSource::User);
         // The command's own finish still writes its record afterwards.
-        let records = c.handle(finished("1", "k8s_apply manifest.yaml", false, "scaled"));
+        let records = c.handle(finished("1", 1, "k8s_apply manifest.yaml", false, "scaled"));
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].explanation, window);
     }
@@ -1003,7 +1410,7 @@ mod tests {
         let provider = Arc::new(StaticSecretProvider::with_secrets(
             [("$FILAR_SECRET_TOKEN".to_string(), "hunter2-tui-secret".to_string())].into(),
         ));
-        let handle = spawn(dir.clone(), provider);
+        let (handle, task) = spawn(dir.clone(), provider, false);
         handle.send(proposed("1", 1, "curl -H 'Bearer hunter2-tui-secret' https://x"));
         handle.send(AuditInput::Audited {
             session_id: "1".into(),
@@ -1016,22 +1423,22 @@ mod tests {
             session_id: "1".into(),
             command: "curl -H 'Bearer hunter2-tui-secret' https://x".into(),
             approved: true,
+            mode_switch: false,
         });
         handle.send(finished(
             "1",
+            1,
             "curl -H 'Bearer hunter2-tui-secret' https://x",
             false,
             "ok",
         ));
-        // Let the collector task drain the queue and finish its writes.
-        for _ in 0..200 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                if entries.count() > 0 {
-                    break;
-                }
-            }
-        }
+        // Drop the sender and let the collector drain the queue and finish
+        // its writes (the shutdown path, #698 review).
+        drop(handle);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("collector drained in time")
+            .expect("collector task");
         let mut found = false;
         for entry in std::fs::read_dir(&dir).expect("journal dir") {
             let path = entry.expect("entry").path();
@@ -1051,5 +1458,258 @@ mod tests {
         }
         assert!(found, "no journal record was written");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A late finish of an older proposal must not consume the newer one
+    /// pending in the same slot (#698 review): identity is the proposal id.
+    #[test]
+    fn a_late_finish_never_consumes_a_newer_proposal() {
+        let mut c = AuditCollector::default();
+        c.handle(proposed("1", 1, "uptime"));
+        assert_eq!(c.handle(finished("1", 1, "uptime", false, "ok")).len(), 1);
+        c.handle(proposed("1", 2, "date"));
+        assert!(
+            c.handle(finished("1", 1, "uptime", false, "ok")).is_empty(),
+            "the late outcome of proposal 1 is dropped"
+        );
+        let records = c.handle(finished("1", 2, "date", false, "today"));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].command, "date");
+    }
+
+    /// With a scorer configured, a finished record is held until its rating
+    /// lands, then written carrying it (#698 review).
+    #[test]
+    fn a_late_rating_is_held_then_attached() {
+        let mut c = AuditCollector::with_scoring(true);
+        c.handle(proposed("1", 7, "uptime"));
+        assert!(
+            c.handle(finished("1", 7, "uptime", false, "ok")).is_empty(),
+            "held for the in-flight rating"
+        );
+        let records = c.handle(AuditInput::Scored {
+            proposal_id: 7,
+            safety_pct: Some(90),
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].risk_score, Some(90));
+        assert!(c.scores.is_empty(), "the rating is consumed with the record");
+    }
+
+    /// A turn end releases a held record even when no rating ever came.
+    #[test]
+    fn a_turn_end_releases_a_held_record_without_a_rating() {
+        let mut c = AuditCollector::with_scoring(true);
+        c.handle(proposed("1", 7, "uptime"));
+        assert!(c.handle(finished("1", 7, "uptime", false, "ok")).is_empty());
+        let records = c.handle(AuditInput::TurnEnded {
+            session_id: "1".into(),
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].risk_score, None);
+    }
+
+    /// F2 switches the mode instead of answering: the command is cancelled,
+    /// not deliberately denied (#698 review).
+    #[test]
+    fn a_mode_switch_cancels_rather_than_denies() {
+        let mut c = AuditCollector::default();
+        c.handle(proposed("1", 1, "uptime"));
+        c.handle(AuditInput::Decision {
+            session_id: "1".into(),
+            command: "uptime".into(),
+            approved: false,
+            mode_switch: true,
+        });
+        let records = c.handle(finished("1", 1, "uptime", true, ""));
+        assert_eq!(records[0].decision, AuditDecision::Cancelled);
+        assert_eq!(records[0].decision_source, AuditDecisionSource::User);
+    }
+
+    /// A shell escape that failed before a result keeps the error text as
+    /// its explanation (#698 review).
+    #[test]
+    fn a_shell_escape_failure_keeps_the_error_text() {
+        let mut c = AuditCollector::default();
+        let records = c.handle(AuditInput::Finished {
+            session_id: "1".into(),
+            proposal_id: None,
+            target: AuditTarget {
+                kind: "local".into(),
+                name: "local".into(),
+                host: None,
+                tags: Vec::new(),
+            },
+            command: "badcmd".into(),
+            output: "Shell command failed: boom".into(),
+            denied: false,
+            exit_code: None,
+            duration_ms: None,
+            confirm_mode: CommandConfirmMode::Always,
+            fleet: false,
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].explanation, "Shell command failed: boom");
+        assert_eq!(records[0].decision, AuditDecision::Approved);
+        assert_eq!(records[0].decision_source, AuditDecisionSource::User);
+    }
+
+    /// A command that ran and merely printed the refusal words is not a
+    /// policy denial: the sniff is gated on execution metadata (#698 review).
+    #[test]
+    fn a_printed_refusal_string_is_not_a_policy_denial() {
+        let mut c = AuditCollector::default();
+        c.handle(proposed("1", 1, "echo"));
+        let records = c.handle(finished(
+            "1",
+            1,
+            "echo",
+            false,
+            "Error: read-only policy is just text I printed",
+        ));
+        assert_eq!(records[0].decision, AuditDecision::Auto);
+        assert_eq!(records[0].exit_code, Some(0));
+    }
+
+    /// A proposal left without an outcome event (a gate refusal that emits
+    /// no finish) is journaled as a policy denial at turn end (#698 review).
+    #[test]
+    fn a_proposal_without_an_outcome_is_journaled_at_turn_end() {
+        let mut c = AuditCollector::default();
+        c.handle(proposed("1", 1, "k8s_scale deployment/web"));
+        let records = c.handle(AuditInput::TurnEnded {
+            session_id: "1".into(),
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, AuditDecision::Denied);
+        assert_eq!(records[0].decision_source, AuditDecisionSource::Policy);
+    }
+
+    /// Fleet records carry the arbiter verdict, each host's own exit code,
+    /// and a dropped host's state and reason in the explanation (#698).
+    #[test]
+    fn a_fleet_record_carries_the_arbiter_and_per_host_exits() {
+        let mut c = AuditCollector::default();
+        c.handle(proposed("1", 1, "uname -r"));
+        c.handle(AuditInput::Audited {
+            session_id: "1".into(),
+            verdict: "AGREE".into(),
+            reason: "looks safe".into(),
+            model: Some("arbiter-x".into()),
+            unavailable: false,
+        });
+        c.handle(AuditInput::Decision {
+            session_id: "1".into(),
+            command: "uname -r".into(),
+            approved: true,
+            mode_switch: false,
+        });
+        let group = filar_core::HostGroup {
+            name: "web".into(),
+            match_tags: vec!["web".into()],
+            ..Default::default()
+        };
+        let targets: Vec<filar_core::SshTarget> = ["web-1", "web-2", "web-3"]
+            .iter()
+            .map(|name| filar_core::SshTarget {
+                name: (*name).into(),
+                host: (*name).into(),
+                port: 22,
+                user: "root".into(),
+                auth: Default::default(),
+                host_key_policy: Default::default(),
+                tags: vec!["web".into()],
+            })
+            .collect();
+        let op = filar_core::FleetOperation::open(&group, &targets);
+        let view = FleetView {
+            operation: op.id(),
+            command: "uname -r".into(),
+            headline: "2 hosts answered".into(),
+            groups: vec![ViewGroup {
+                hosts: vec!["web-1".into(), "web-2".into()],
+                sample: "5.15.0".into(),
+                role: GroupRole::Baseline,
+                exits: vec![Some(0), None],
+            }],
+            dropped: vec![ViewDropped {
+                host: "web-3".into(),
+                state: HostState::ExecutionError,
+                exit_code: Some(2),
+                reason: Some("boom".into()),
+            }],
+        };
+        let records = c.handle(AuditInput::Fleet {
+            session_id: "1".into(),
+            view,
+            hosts: HashMap::new(),
+            confirm_mode: CommandConfirmMode::Always,
+        });
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].exit_code, Some(0));
+        assert_eq!(records[1].exit_code, None, "a typed answer has no process exit code");
+        assert_eq!(records[0].arbiter_verdict.as_deref(), Some("AGREE"));
+        assert_eq!(records[0].arbiter_model.as_deref(), Some("arbiter-x"));
+        assert_eq!(records[2].exit_code, Some(2));
+        assert!(
+            records[2].explanation.contains("host result: error (exit 2): boom"),
+            "{}",
+            records[2].explanation
+        );
+    }
+
+    /// The masking union masks every link's value for a colliding name, not
+    /// just the first link's (#698 review).
+    #[test]
+    fn masking_union_masks_every_links_value_for_a_colliding_name() {
+        let a = Arc::new(StaticSecretProvider::with_secrets(
+            [("TOKEN".to_string(), "first-value".to_string())].into(),
+        ));
+        let b = Arc::new(StaticSecretProvider::with_secrets(
+            [("TOKEN".to_string(), "second-value".to_string())].into(),
+        ));
+        let union = MaskingUnion::new(vec![a, b]);
+        let names = union.secret_names();
+        assert_eq!(names.len(), 2, "the duplicate gets a synthetic key: {names:?}");
+        assert!(names.contains(&"TOKEN".to_string()));
+        let snapshot = secret_snapshot(&union).expect("snapshot");
+        let red = filar_core::secrets::redact_secrets("first-value and second-value", &snapshot);
+        assert!(!red.contains("first-value"), "{red}");
+        assert!(!red.contains("second-value"), "{red}");
+    }
+
+    /// Shutdown flushes held records and pending proposals alike (#698).
+    #[test]
+    fn finish_drains_held_records_and_pending_proposals() {
+        let mut c = AuditCollector::with_scoring(true);
+        c.handle(proposed("1", 7, "uptime"));
+        assert!(c.handle(finished("1", 7, "uptime", false, "ok")).is_empty());
+        c.handle(proposed("2", 8, "date"));
+        let records = c.finish();
+        assert_eq!(records.len(), 2);
+        let uptime = records.iter().find(|r| r.command == "uptime").expect("held");
+        assert_eq!(uptime.decision, AuditDecision::Auto);
+        let date = records.iter().find(|r| r.command == "date").expect("pending");
+        assert_eq!(date.decision, AuditDecision::Cancelled);
+        assert_eq!(date.decision_source, AuditDecisionSource::User);
+        assert!(c.finish().is_empty(), "a second drain writes nothing");
+    }
+
+    /// The denial recorded on quit is honored when the queue drains, even
+    /// though the agent's own denied finish never lands (#698 review).
+    #[test]
+    fn finish_honors_a_recorded_denial_on_quit() {
+        let mut c = AuditCollector::default();
+        c.handle(proposed("1", 1, "rm -rf /tmp/x"));
+        c.handle(AuditInput::Decision {
+            session_id: "1".into(),
+            command: "rm -rf /tmp/x".into(),
+            approved: false,
+            mode_switch: false,
+        });
+        let records = c.finish();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, AuditDecision::Denied);
+        assert_eq!(records[0].decision_source, AuditDecisionSource::User);
     }
 }

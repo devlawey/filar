@@ -126,6 +126,14 @@ pub enum AgentEvent {
 
     /// A command was executed (or did not run — see `denied`).
     CommandFinished {
+        /// The `proposal_id` of the originating [`CommandProposed`], when
+        /// the outcome belongs to a proposal (#698 review). `None` for a
+        /// frontend's own shell escape, which has no proposal. A terminal
+        /// event carries the identity so a late outcome of a cancelled
+        /// operation cannot be attributed to the next turn's proposal.
+        ///
+        /// [`CommandProposed`]: AgentEvent::CommandProposed
+        proposal_id: Option<u64>,
         /// The command that was processed.
         command: String,
         /// Command output. When `denied`: empty if the user said no, or a
@@ -169,7 +177,13 @@ pub enum AgentEvent {
     /// This is a terminal event — no further events will be emitted after it.
     /// The chat history remains consistent: any partial response or tool result
     /// produced before cancellation is preserved.
-    Cancelled,
+    Cancelled {
+        /// The `proposal_id` of the command the turn was working on, when
+        /// one was proposed (#698 review). `None` when the turn had not
+        /// proposed anything. Lets a consumer match the cancellation to its
+        /// proposal instead of guessing by session.
+        proposal_id: Option<u64>,
+    },
 }
 
 /// A callback for delivering [`AgentEvent`]s to a frontend.
