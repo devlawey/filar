@@ -235,10 +235,11 @@ pub enum ChainOutcome {
     Disabled,
     /// Every record links correctly and hashes match.
     Intact,
-    /// The first suspicious record: 1-based line number and what is
-    /// wrong with it. Verification stops there — later lines cannot be
-    /// trusted once the chain is broken.
-    Broken { line: usize, reason: String },
+    /// The first suspicious record: its 1-based record number (blank
+    /// lines are skipped by [`read_records`], so this is not necessarily
+    /// the physical line) and what is wrong with it. Verification stops
+    /// there — later records cannot be trusted once the chain is broken.
+    Broken { record: usize, reason: String },
 }
 
 /// Summary of a [`verify_chain`] run.
@@ -268,12 +269,12 @@ pub fn verify_chain(records: &[AuditRecord]) -> Result<ChainVerifyReport> {
     }
     let mut expected_prev = GENESIS_HASH.to_string();
     for (i, rec) in records.iter().enumerate() {
-        let line = i + 1;
+        let record = i + 1;
         let (Some(prev), Some(hash)) = (&rec.prev_hash, &rec.hash) else {
             return Ok(ChainVerifyReport {
                 records_checked,
                 outcome: ChainOutcome::Broken {
-                    line,
+                    record,
                     reason: "record has no hash-chain fields in a chained journal".into(),
                 },
             });
@@ -282,7 +283,7 @@ pub fn verify_chain(records: &[AuditRecord]) -> Result<ChainVerifyReport> {
             return Ok(ChainVerifyReport {
                 records_checked,
                 outcome: ChainOutcome::Broken {
-                    line,
+                    record,
                     reason: "prev_hash does not match the previous record (record deleted, reordered or inserted)".into(),
                 },
             });
@@ -292,7 +293,7 @@ pub fn verify_chain(records: &[AuditRecord]) -> Result<ChainVerifyReport> {
             return Ok(ChainVerifyReport {
                 records_checked,
                 outcome: ChainOutcome::Broken {
-                    line,
+                    record,
                     reason: "hash does not match the record content (fields were modified)".into(),
                 },
             });
@@ -345,6 +346,12 @@ impl AuditWriter {
     /// already holds unchained records is an error — the writer never
     /// rewrites existing lines; point it at a fresh directory or keep
     /// the chain off for that journal.
+    ///
+    /// Concurrent writers are not serialized (same limitation as the
+    /// plain writer, #696): interleaved appends from two writers can
+    /// fork the chain, which `verify_chain` then reports as broken.
+    /// One journal directory is meant to be served by one writer at a
+    /// time.
     pub fn with_hash_chain(mut self, enabled: bool) -> Self {
         self.hash_chain = enabled;
         self
@@ -449,8 +456,8 @@ impl AuditWriter {
     /// The hash a new record in `path` must link to: the cached tip when
     /// this writer just wrote to the file, otherwise the file's last
     /// record. A missing or empty file starts at [`GENESIS_HASH`]; a file
-    /// whose last record has no `hash` cannot be extended with the chain
-    /// enabled — existing lines are never rewritten.
+    /// that holds any record without a `hash` cannot be extended with the
+    /// chain enabled — existing lines are never rewritten.
     fn chain_tip(&self, path: &Path) -> Result<String> {
         if let Some((p, tip)) = &self.chain {
             if p == path {
@@ -461,6 +468,15 @@ impl AuditWriter {
             return Ok(GENESIS_HASH.to_string());
         }
         let records = read_records(path)?;
+        // Any unchained record makes the file unusable for the chain —
+        // not just an unchained tail: a legacy record before a hashed
+        // one would still fail verification.
+        if records.iter().any(|r| r.hash.is_none()) {
+            return Err(CoreError::Other(format!(
+                "hash chain is enabled but {} holds records without hashes; use a fresh journal directory or disable the chain",
+                path.display()
+            )));
+        }
         match records.last() {
             None => Ok(GENESIS_HASH.to_string()),
             Some(last) => last.hash.clone().ok_or_else(|| {
@@ -898,8 +914,8 @@ mod tests {
         rewrite_lines(&path, &lines);
         let report = verify_chain(&read_records(&path).unwrap()).unwrap();
         match report.outcome {
-            ChainOutcome::Broken { line, reason } => {
-                assert_eq!(line, 2);
+            ChainOutcome::Broken { record, reason } => {
+                assert_eq!(record, 2);
                 assert!(reason.contains("modified"), "{reason}");
             }
             other => panic!("expected Broken, got {other:?}"),
@@ -915,8 +931,8 @@ mod tests {
         rewrite_lines(&path, &lines);
         let report = verify_chain(&read_records(&path).unwrap()).unwrap();
         match report.outcome {
-            ChainOutcome::Broken { line, reason } => {
-                assert_eq!(line, 2, "the record after the hole is the first mismatch");
+            ChainOutcome::Broken { record, reason } => {
+                assert_eq!(record, 2, "the record after the hole is the first mismatch");
                 assert!(reason.contains("prev_hash"), "{reason}");
             }
             other => panic!("expected Broken, got {other:?}"),
@@ -932,7 +948,7 @@ mod tests {
         rewrite_lines(&path, &lines);
         let report = verify_chain(&read_records(&path).unwrap()).unwrap();
         match report.outcome {
-            ChainOutcome::Broken { line, .. } => assert_eq!(line, 1, "a missing genesis is caught at line 1"),
+            ChainOutcome::Broken { record, .. } => assert_eq!(record, 1, "a missing genesis is caught at record 1"),
             other => panic!("expected Broken, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -945,7 +961,7 @@ mod tests {
         lines.swap(1, 2);
         rewrite_lines(&path, &lines);
         let report = verify_chain(&read_records(&path).unwrap()).unwrap();
-        assert!(matches!(report.outcome, ChainOutcome::Broken { line: 2, .. }), "{:?}", report.outcome);
+        assert!(matches!(report.outcome, ChainOutcome::Broken { record: 2, .. }), "{:?}", report.outcome);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -957,7 +973,7 @@ mod tests {
         lines.insert(2, dup);
         rewrite_lines(&path, &lines);
         let report = verify_chain(&read_records(&path).unwrap()).unwrap();
-        assert!(matches!(report.outcome, ChainOutcome::Broken { line: 3, .. }), "{:?}", report.outcome);
+        assert!(matches!(report.outcome, ChainOutcome::Broken { record: 3, .. }), "{:?}", report.outcome);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -983,8 +999,8 @@ mod tests {
         rewrite_lines(&path, &lines);
         let report = verify_chain(&read_records(&path).unwrap()).unwrap();
         match report.outcome {
-            ChainOutcome::Broken { line, reason } => {
-                assert_eq!(line, 4);
+            ChainOutcome::Broken { record, reason } => {
+                assert_eq!(record, 4);
                 assert!(reason.contains("no hash-chain fields"), "{reason}");
             }
             other => panic!("expected Broken, got {other:?}"),
@@ -1011,6 +1027,21 @@ mod tests {
         plain.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap();
         let mut chained = AuditWriter::new(&dir).with_hash_chain(true);
         let err = chained.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap_err().to_string();
+        assert!(err.contains("without hashes"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_record_before_hashed_tail_is_rejected() {
+        let (dir, path) = chained_journal("chainlegacy");
+        // Prepend an unchained legacy record: the tail is hashed, but the
+        // file as a whole can never verify — the writer must refuse it.
+        let plain = serde_json::to_string(&record("2026-01-02T03:04:05Z", "legacy")).unwrap();
+        let mut lines = lines_of(&path);
+        lines.insert(0, plain);
+        rewrite_lines(&path, &lines);
+        let mut w = AuditWriter::new(&dir).with_hash_chain(true);
+        let err = w.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap_err().to_string();
         assert!(err.contains("without hashes"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -6,14 +6,16 @@
 //! 1 — corruption or unreadable journal, 2 — usage/OS error.
 
 use filar_core::audit::{self, ChainOutcome};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Handle `filar audit …` when argv starts with `audit`; returns the
 /// process exit code. `None` means "not an audit invocation" — the
-/// normal GUI/TUI startup proceeds.
+/// normal GUI/TUI startup proceeds. Uses `args_os` so a non-UTF-8
+/// `--path` value (valid on Unix) is preserved instead of panicking.
 pub fn maybe_run() -> Option<i32> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) != Some("audit") {
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if args.first().and_then(|a| a.to_str()) != Some("audit") {
         return None;
     }
     Some(run(&args))
@@ -22,8 +24,8 @@ pub fn maybe_run() -> Option<i32> {
 const USAGE: &str = "Usage: filar audit verify [--path <file>]";
 
 /// Run the `audit` subcommand over already-split args (`args[0] == "audit"`).
-fn run(args: &[String]) -> i32 {
-    if args.get(1).map(String::as_str) != Some("verify") {
+fn run(args: &[OsString]) -> i32 {
+    if args.get(1).and_then(|a| a.to_str()) != Some("verify") {
         eprintln!("unknown audit subcommand");
         eprintln!("{USAGE}");
         return 2;
@@ -31,18 +33,18 @@ fn run(args: &[String]) -> i32 {
     let mut path: Option<PathBuf> = None;
     let mut i = 2;
     while i < args.len() {
-        match args[i].as_str() {
-            "--path" => {
+        match args[i].to_str() {
+            Some("--path") => {
                 let Some(value) = args.get(i + 1) else {
                     eprintln!("--path requires a value");
                     eprintln!("{USAGE}");
                     return 2;
                 };
-                path = Some(PathBuf::from(value));
+                path = Some(PathBuf::from(value.as_os_str()));
                 i += 2;
             }
             other => {
-                eprintln!("unknown argument: {other}");
+                eprintln!("unknown argument: {}", other.unwrap_or("<non-UTF-8>"));
                 eprintln!("{USAGE}");
                 return 2;
             }
@@ -75,13 +77,17 @@ fn run(args: &[String]) -> i32 {
 }
 
 /// All `audit-*.jsonl` files of a directory, sorted by name. A missing
-/// directory is simply "no journals yet".
+/// directory (`NotFound`) is "no journals yet"; any other `read_dir`
+/// error propagates — an unreadable directory must not read as empty
+/// (`Path::exists` would swallow access errors).
 fn journal_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
+    for entry in entries {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with("audit-") && name.ends_with(".jsonl") {
@@ -120,8 +126,10 @@ fn verify_files(files: &[PathBuf]) -> i32 {
                     file.display(),
                     report.records_checked
                 ),
-                ChainOutcome::Broken { line, reason } => {
-                    println!("{}: BROKEN at line {line}: {reason}", file.display());
+                ChainOutcome::Broken { record, reason } => {
+                    // Record number, not physical line: blank lines are
+                    // skipped by read_records.
+                    println!("{}: BROKEN at record {record}: {reason}", file.display());
                     problems += 1;
                 }
             },
@@ -163,8 +171,8 @@ mod tests {
         r
     }
 
-    fn args(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
+    fn args(parts: &[&str]) -> Vec<OsString> {
+        parts.iter().map(OsString::from).collect()
     }
 
     #[test]

@@ -1312,10 +1312,13 @@ SHA-256 (hex) of the record's canonical JSON without the `hash` field
 on a file that already holds unchained records is an error — existing lines
 are never rewritten. `filar_core::verify_chain(&records)` returns a
 `ChainVerifyReport { records_checked, outcome }` with `ChainOutcome::Disabled`
-(no hash fields at all), `Intact`, or `Broken { line, reason }` — the first
-modified/deleted/reordered/inserted record. Tail truncation (dropping the
-last records) is not detectable without an external anchor. The config
-switch `[audit].hash_chain` arrives with #699.
+(no hash fields at all), `Intact`, or `Broken { record, reason }` — the first
+modified/deleted/reordered/inserted record (1-based record number; blank
+lines are skipped). Tail truncation (dropping the
+last records) is not detectable without an external anchor. Concurrent
+writers are not serialized (as with the plain writer, #696): interleaved
+appends can fork the chain, which verification then reports as broken.
+The config switch `[audit].hash_chain` arrives with #699.
 
 CLI: `filar audit verify [--path <file>]` — read-only check; without
 `--path` it verifies every `audit-*.jsonl` in `audit::default_dir()`.
@@ -1324,13 +1327,20 @@ unreadable journal, 2 — usage error.
 
 ```rust
 let mut writer = filar_core::AuditWriter::new("journal-dir").with_hash_chain(true);
-// ... writer.append(&record, None)?;
-let records = filar_core::audit::read_records(std::path::Path::new("journal-dir/audit-2026-01-02.jsonl"))?;
+let record = filar_core::AuditRecord::new(
+    "session-123",
+    filar_core::AuditTarget { kind: "ssh".into(), name: "web-1".into(), host: None, tags: vec![] },
+    "uptime",
+    filar_core::AuditDecision::Approved,
+    filar_core::AuditDecisionSource::User,
+);
+let path = writer.append(&record, None)?;
+let records = filar_core::audit::read_records(&path)?;
 let report = filar_core::verify_chain(&records)?;
 match report.outcome {
     filar_core::ChainOutcome::Intact => println!("{} records, chain OK", report.records_checked),
     filar_core::ChainOutcome::Disabled => println!("chain disabled"),
-    filar_core::ChainOutcome::Broken { line, reason } => println!("line {line}: {reason}"),
+    filar_core::ChainOutcome::Broken { record, reason } => println!("record {record}: {reason}"),
 }
 # Ok::<(), filar_core::CoreError>(())
 ```

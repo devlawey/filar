@@ -79,13 +79,13 @@ pub fn audit_chain() -> filar_core::Result<()> {
         filar_core::AuditDecision::Approved,
         filar_core::AuditDecisionSource::User,
     );
-    writer.append(&record, None)?;
-    let records = filar_core::audit::read_records(std::path::Path::new("journal-dir/audit-2026-01-02.jsonl"))?;
+    let path = writer.append(&record, None)?;
+    let records = filar_core::audit::read_records(&path)?;
     let report = filar_core::verify_chain(&records)?;
     match report.outcome {
         filar_core::ChainOutcome::Intact => println!("{} records, chain OK", report.records_checked),
         filar_core::ChainOutcome::Disabled => println!("chain disabled"),
-        filar_core::ChainOutcome::Broken { line, reason } => println!("line {line}: {reason}"),
+        filar_core::ChainOutcome::Broken { record, reason } => println!("record {record}: {reason}"),
     }
     Ok(())
 }
