@@ -13,11 +13,16 @@
 use crate::error::{CoreError, Result};
 use crate::secrets::{redact_secrets, SecretProvider, StaticSecretProvider};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Default size limit for one journal file before rollover (10 MiB).
 pub const DEFAULT_AUDIT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// `prev_hash` of the first (genesis) record of a chained journal file:
+/// 64 hex zeros — there is no record before it.
+pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// What happened to the command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,7 +71,8 @@ pub struct AuditTarget {
 ///
 /// Optional fields are `None` when the information was not available
 /// (no scorer configured, command never ran, …). The hash-chain fields
-/// arrive with #697; readers must tolerate their absence.
+/// (`prev_hash` / `hash`, #697) are absent unless the writer was built
+/// with [`AuditWriter::with_hash_chain`]; readers must tolerate that.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditRecord {
     /// UTC RFC 3339 timestamp of the decision.
@@ -108,6 +114,14 @@ pub struct AuditRecord {
     /// `proposal_id` of the originating `CommandProposed`, when known.
     #[serde(default)]
     pub proposal_id: Option<u64>,
+    /// `hash` of the previous record in this file ([`GENESIS_HASH`] for
+    /// the first one). Present only in chained journals (#697).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
+    /// SHA-256 of the canonical representation of this record without
+    /// the `hash` field (hex). Present only in chained journals (#697).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
 }
 
 impl AuditRecord {
@@ -135,6 +149,8 @@ impl AuditRecord {
             exit_code: None,
             duration_ms: None,
             proposal_id: None,
+            prev_hash: None,
+            hash: None,
         }
     }
 
@@ -143,6 +159,30 @@ impl AuditRecord {
         serde_json::from_str(line)
             .map_err(|e| CoreError::Other(format!("invalid audit record line: {e}")))
     }
+
+    /// SHA-256 (lowercase hex) of the canonical representation of this
+    /// record: its JSON serialization with the `hash` field omitted
+    /// (`prev_hash` included). Field order is fixed by the struct, so
+    /// re-serializing a parsed line reproduces the same bytes regardless
+    /// of the key order in the original JSON.
+    pub fn compute_hash(&self) -> Result<String> {
+        let mut canonical = self.clone();
+        canonical.hash = None;
+        let bytes = serde_json::to_vec(&canonical)
+            .map_err(|e| CoreError::Other(format!("failed to serialize audit record for hashing: {e}")))?;
+        Ok(hex(&Sha256::digest(&bytes)))
+    }
+}
+
+/// Lowercase hex encoding of a digest (no extra dependency for 32 bytes).
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        // Writing into a String is infallible.
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Current UTC time as RFC 3339 (second precision, `Z` suffix).
@@ -187,6 +227,82 @@ pub fn read_records(path: &Path) -> Result<Vec<AuditRecord>> {
     Ok(out)
 }
 
+/// Outcome of a hash-chain verification (#697).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainOutcome {
+    /// No record carries hash fields — the journal was written with the
+    /// chain disabled (the default). Nothing to verify.
+    Disabled,
+    /// Every record links correctly and hashes match.
+    Intact,
+    /// The first suspicious record: its 1-based record number (blank
+    /// lines are skipped by [`read_records`], so this is not necessarily
+    /// the physical line) and what is wrong with it. Verification stops
+    /// there — later records cannot be trusted once the chain is broken.
+    Broken { record: usize, reason: String },
+}
+
+/// Summary of a [`verify_chain`] run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainVerifyReport {
+    /// How many records were read.
+    pub records_checked: usize,
+    /// The verdict.
+    pub outcome: ChainOutcome,
+}
+
+/// Verify the hash chain of one journal file's records, in file order.
+/// Read-only: nothing is written or modified.
+///
+/// Detects modified fields (hash mismatch), deleted, reordered or
+/// inserted records (`prev_hash` mismatch, including a missing head).
+/// A journal where no record has hash fields reports
+/// [`ChainOutcome::Disabled`]; a mix of chained and unchained records is
+/// broken. Limitation: truncation at the very end (dropping the last
+/// record(s)) keeps the remaining chain valid — detecting it requires
+/// an external anchor (e.g. a periodically published tip hash), which
+/// is out of scope here.
+pub fn verify_chain(records: &[AuditRecord]) -> Result<ChainVerifyReport> {
+    let records_checked = records.len();
+    if !records.iter().any(|r| r.prev_hash.is_some() || r.hash.is_some()) {
+        return Ok(ChainVerifyReport { records_checked, outcome: ChainOutcome::Disabled });
+    }
+    let mut expected_prev = GENESIS_HASH.to_string();
+    for (i, rec) in records.iter().enumerate() {
+        let record = i + 1;
+        let (Some(prev), Some(hash)) = (&rec.prev_hash, &rec.hash) else {
+            return Ok(ChainVerifyReport {
+                records_checked,
+                outcome: ChainOutcome::Broken {
+                    record,
+                    reason: "record has no hash-chain fields in a chained journal".into(),
+                },
+            });
+        };
+        if prev != &expected_prev {
+            return Ok(ChainVerifyReport {
+                records_checked,
+                outcome: ChainOutcome::Broken {
+                    record,
+                    reason: "prev_hash does not match the previous record (record deleted, reordered or inserted)".into(),
+                },
+            });
+        }
+        let recomputed = rec.compute_hash()?;
+        if hash != &recomputed {
+            return Ok(ChainVerifyReport {
+                records_checked,
+                outcome: ChainOutcome::Broken {
+                    record,
+                    reason: "hash does not match the record content (fields were modified)".into(),
+                },
+            });
+        }
+        expected_prev = hash.clone();
+    }
+    Ok(ChainVerifyReport { records_checked, outcome: ChainOutcome::Intact })
+}
+
 /// Append-only JSONL writer with date/size rollover.
 ///
 /// The writer never truncates or rewrites an existing file: it opens with
@@ -196,8 +312,13 @@ pub fn read_records(path: &Path) -> Result<Vec<AuditRecord>> {
 pub struct AuditWriter {
     dir: PathBuf,
     max_bytes: u64,
+    /// Whether records are hash-chained (#697). Off by default so
+    /// existing journals keep their shape.
+    hash_chain: bool,
     /// Currently open file: path, handle, bytes written so far.
     current: Option<(PathBuf, std::fs::File, u64)>,
+    /// Chain tip of the file being extended: path and its last `hash`.
+    chain: Option<(PathBuf, String)>,
 }
 
 impl AuditWriter {
@@ -208,7 +329,32 @@ impl AuditWriter {
 
     /// Writer with an explicit rollover size (bytes).
     pub fn with_max_bytes(dir: impl Into<PathBuf>, max_bytes: u64) -> Self {
-        Self { dir: dir.into(), max_bytes: max_bytes.max(1), current: None }
+        Self {
+            dir: dir.into(),
+            max_bytes: max_bytes.max(1),
+            hash_chain: false,
+            current: None,
+            chain: None,
+        }
+    }
+
+    /// Enable or disable the hash chain (#697). Disabled by default.
+    ///
+    /// Each journal file carries its own chain: the first record of a
+    /// file has `prev_hash = `[`GENESIS_HASH`], every next one links to
+    /// the previous record's `hash`. Enabling the chain on a file that
+    /// already holds unchained records is an error — the writer never
+    /// rewrites existing lines; point it at a fresh directory or keep
+    /// the chain off for that journal.
+    ///
+    /// Concurrent writers are not serialized (same limitation as the
+    /// plain writer, #696): interleaved appends from two writers can
+    /// fork the chain, which `verify_chain` then reports as broken.
+    /// One journal directory is meant to be served by one writer at a
+    /// time.
+    pub fn with_hash_chain(mut self, enabled: bool) -> Self {
+        self.hash_chain = enabled;
+        self
     }
 
     /// Writer for [`default_dir`].
@@ -240,6 +386,10 @@ impl AuditWriter {
     /// runtime-agnostic. Callers on an async executor (agent loop, TUI)
     /// should offload it, e.g. via `tokio::task::spawn_blocking`, so the
     /// write cannot stall the runtime (#698 wires this up).
+    ///
+    /// With the hash chain enabled ([`Self::with_hash_chain`]) the record
+    /// is linked to the target file's chain tip and its `hash` is computed
+    /// over the masked content — masking always happens first.
     pub fn append(
         &mut self,
         record: &AuditRecord,
@@ -253,15 +403,92 @@ impl AuditWriter {
                 clean.arbiter_reason = Some(redact_secrets(reason, snapshot));
             }
         }
+        std::fs::create_dir_all(&self.dir)?;
+        let date = date_of_ts(&clean.ts);
+
+        if self.hash_chain {
+            return self.append_chained(&date, clean);
+        }
+
         let mut line = serde_json::to_string(&clean)
             .map_err(|e| CoreError::Other(format!("failed to serialize audit record: {e}")))?;
         line.push('\n');
-
-        std::fs::create_dir_all(&self.dir)?;
-        let date = date_of_ts(&clean.ts);
         let path = self.pick_file(&date, line.len() as u64)?;
         self.write_line(&path, line.as_bytes())?;
         Ok(path)
+    }
+
+    /// Append with the hash chain: link to the target file's tip, hash
+    /// the record, then write. The file is picked twice — first with an
+    /// estimate (the hash fields are not known yet), then with the exact
+    /// line length; a rollover between the two restarts at genesis.
+    fn append_chained(&mut self, date: &str, mut clean: AuditRecord) -> Result<PathBuf> {
+        clean.prev_hash = None;
+        clean.hash = None;
+        let base = serde_json::to_string(&clean)
+            .map_err(|e| CoreError::Other(format!("failed to serialize audit record: {e}")))?;
+        // Exact overhead of the chained line over `base` (which carries
+        // neither hash field nor newline): `,"prev_hash":"<64 hex>"` is
+        // 1 + 11 + 1 + 2 + 64 = 79 bytes, `,"hash":"<64 hex>"` is
+        // 1 + 6 + 1 + 2 + 64 = 74 bytes, plus the trailing newline.
+        const HASH_FIELDS_EXTRA: u64 = 79 + 74 + 1;
+        let mut path = self.pick_file(date, base.len() as u64 + HASH_FIELDS_EXTRA)?;
+        let mut prev = self.chain_tip(&path)?;
+        clean.prev_hash = Some(prev.clone());
+        clean.hash = Some(clean.compute_hash()?);
+        let mut line = serde_json::to_string(&clean)
+            .map_err(|e| CoreError::Other(format!("failed to serialize audit record: {e}")))?;
+        line.push('\n');
+        let actual = self.pick_file(date, line.len() as u64)?;
+        if actual != path {
+            path = actual;
+            prev = self.chain_tip(&path)?;
+            clean.prev_hash = Some(prev);
+            clean.hash = Some(clean.compute_hash()?);
+            line = serde_json::to_string(&clean)
+                .map_err(|e| CoreError::Other(format!("failed to serialize audit record: {e}")))?;
+            line.push('\n');
+        }
+        self.write_line(&path, line.as_bytes())?;
+        if let Some(hash) = clean.hash {
+            self.chain = Some((path.clone(), hash));
+        }
+        Ok(path)
+    }
+
+    /// The hash a new record in `path` must link to: the cached tip when
+    /// this writer just wrote to the file, otherwise the file's last
+    /// record. A missing or empty file starts at [`GENESIS_HASH`]; a file
+    /// that holds any record without a `hash` cannot be extended with the
+    /// chain enabled — existing lines are never rewritten.
+    fn chain_tip(&self, path: &Path) -> Result<String> {
+        if let Some((p, tip)) = &self.chain {
+            if p == path {
+                return Ok(tip.clone());
+            }
+        }
+        if !path.exists() {
+            return Ok(GENESIS_HASH.to_string());
+        }
+        let records = read_records(path)?;
+        // Any unchained record makes the file unusable for the chain —
+        // not just an unchained tail: a legacy record before a hashed
+        // one would still fail verification.
+        if records.iter().any(|r| r.hash.is_none()) {
+            return Err(CoreError::Other(format!(
+                "hash chain is enabled but {} holds records without hashes; use a fresh journal directory or disable the chain",
+                path.display()
+            )));
+        }
+        match records.last() {
+            None => Ok(GENESIS_HASH.to_string()),
+            Some(last) => last.hash.clone().ok_or_else(|| {
+                CoreError::Other(format!(
+                    "hash chain is enabled but {} holds records without hashes; use a fresh journal directory or disable the chain",
+                    path.display()
+                ))
+            }),
+        }
     }
 
     /// Choose the file for `date`: the cached one while it fits, otherwise
@@ -638,6 +865,240 @@ mod tests {
         std::fs::write(&file, format!("{good}\nnot json\n")).unwrap();
         let err = read_records(&file).unwrap_err().to_string();
         assert!(err.contains("line 2"), "error names the malformed line: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Hash chain (#697) ────────────────────────────────────────────
+
+    /// Write a chained journal of three records; returns (dir, path).
+    fn chained_journal(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = tmp_dir(tag);
+        let mut w = AuditWriter::new(&dir).with_hash_chain(true);
+        let mut path = None;
+        for i in 0..3 {
+            path = Some(w.append(&record("2026-01-02T03:04:05Z", &format!("echo step-{i}")), None).unwrap());
+        }
+        (dir, path.unwrap())
+    }
+
+    fn rewrite_lines(path: &Path, lines: &[String]) {
+        let mut data = lines.join("\n");
+        data.push('\n');
+        std::fs::write(path, data).unwrap();
+    }
+
+    fn lines_of(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path).unwrap().lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn chained_journal_verifies_intact() {
+        let (dir, path) = chained_journal("chainok");
+        let records = read_records(&path).unwrap();
+        assert_eq!(records[0].prev_hash.as_deref(), Some(GENESIS_HASH), "genesis links to zeros");
+        for r in &records {
+            let h = r.hash.as_ref().unwrap();
+            assert_eq!(h.len(), 64);
+            assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        let report = verify_chain(&records).unwrap();
+        assert_eq!(report.records_checked, 3);
+        assert_eq!(report.outcome, ChainOutcome::Intact);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn modified_field_is_detected() {
+        let (dir, path) = chained_journal("chainmod");
+        let mut lines = lines_of(&path);
+        let mut rec = AuditRecord::parse_line(&lines[1]).unwrap();
+        rec.command = "rm -rf /".into(); // hash field kept as it was
+        lines[1] = serde_json::to_string(&rec).unwrap();
+        rewrite_lines(&path, &lines);
+        let report = verify_chain(&read_records(&path).unwrap()).unwrap();
+        match report.outcome {
+            ChainOutcome::Broken { record, reason } => {
+                assert_eq!(record, 2);
+                assert!(reason.contains("modified"), "{reason}");
+            }
+            other => panic!("expected Broken, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleted_record_is_detected() {
+        let (dir, path) = chained_journal("chaindel");
+        let mut lines = lines_of(&path);
+        lines.remove(1);
+        rewrite_lines(&path, &lines);
+        let report = verify_chain(&read_records(&path).unwrap()).unwrap();
+        match report.outcome {
+            ChainOutcome::Broken { record, reason } => {
+                assert_eq!(record, 2, "the record after the hole is the first mismatch");
+                assert!(reason.contains("prev_hash"), "{reason}");
+            }
+            other => panic!("expected Broken, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleted_head_is_detected() {
+        let (dir, path) = chained_journal("chainhead");
+        let mut lines = lines_of(&path);
+        lines.remove(0);
+        rewrite_lines(&path, &lines);
+        let report = verify_chain(&read_records(&path).unwrap()).unwrap();
+        match report.outcome {
+            ChainOutcome::Broken { record, .. } => assert_eq!(record, 1, "a missing genesis is caught at record 1"),
+            other => panic!("expected Broken, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reordered_records_are_detected() {
+        let (dir, path) = chained_journal("chainswap");
+        let mut lines = lines_of(&path);
+        lines.swap(1, 2);
+        rewrite_lines(&path, &lines);
+        let report = verify_chain(&read_records(&path).unwrap()).unwrap();
+        assert!(matches!(report.outcome, ChainOutcome::Broken { record: 2, .. }), "{:?}", report.outcome);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inserted_record_is_detected() {
+        let (dir, path) = chained_journal("chainins");
+        let mut lines = lines_of(&path);
+        // A byte-for-byte duplicate of record 2 still carries
+        // prev_hash = hash(record 1), while its new predecessor (record 2)
+        // has a different hash — the chain breaks at the inserted line.
+        let dup = lines[1].clone();
+        lines.insert(2, dup);
+        rewrite_lines(&path, &lines);
+        let report = verify_chain(&read_records(&path).unwrap()).unwrap();
+        match report.outcome {
+            ChainOutcome::Broken { record, reason } => {
+                assert_eq!(record, 3);
+                assert!(reason.contains("prev_hash"), "{reason}");
+            }
+            other => panic!("expected Broken, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unchained_journal_reports_disabled() {
+        let dir = tmp_dir("chainoff");
+        let mut w = AuditWriter::new(&dir); // chain off by default
+        let path = w.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap();
+        let records = read_records(&path).unwrap();
+        assert!(records[0].hash.is_none() && records[0].prev_hash.is_none());
+        let report = verify_chain(&records).unwrap();
+        assert_eq!(report.outcome, ChainOutcome::Disabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mixed_journal_is_broken() {
+        let (dir, path) = chained_journal("chainmix");
+        // An unchained record appended by hand after the chained ones.
+        let plain = serde_json::to_string(&record("2026-01-02T03:04:05Z", "uptime")).unwrap();
+        let mut lines = lines_of(&path);
+        lines.push(plain);
+        rewrite_lines(&path, &lines);
+        let report = verify_chain(&read_records(&path).unwrap()).unwrap();
+        match report.outcome {
+            ChainOutcome::Broken { record, reason } => {
+                assert_eq!(record, 4);
+                assert!(reason.contains("no hash-chain fields"), "{reason}");
+            }
+            other => panic!("expected Broken, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writer_restart_continues_chain() {
+        let (dir, path) = chained_journal("chainrestart");
+        // A fresh writer (process restart) must pick up the file's tip.
+        let mut w = AuditWriter::new(&dir).with_hash_chain(true);
+        w.append(&record("2026-01-02T03:04:05Z", "echo after-restart"), None).unwrap();
+        let report = verify_chain(&read_records(&path).unwrap()).unwrap();
+        assert_eq!(report.records_checked, 4);
+        assert_eq!(report.outcome, ChainOutcome::Intact);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enabling_chain_on_unchained_file_is_error() {
+        let dir = tmp_dir("chainenable");
+        let mut plain = AuditWriter::new(&dir);
+        plain.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap();
+        let mut chained = AuditWriter::new(&dir).with_hash_chain(true);
+        let err = chained.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap_err().to_string();
+        assert!(err.contains("without hashes"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_record_before_hashed_tail_is_rejected() {
+        let (dir, path) = chained_journal("chainlegacy");
+        // Prepend an unchained legacy record: the tail is hashed, but the
+        // file as a whole can never verify — the writer must refuse it.
+        let plain = serde_json::to_string(&record("2026-01-02T03:04:05Z", "legacy")).unwrap();
+        let mut lines = lines_of(&path);
+        lines.insert(0, plain);
+        rewrite_lines(&path, &lines);
+        let mut w = AuditWriter::new(&dir).with_hash_chain(true);
+        let err = w.append(&record("2026-01-02T03:04:05Z", "uptime"), None).unwrap_err().to_string();
+        assert!(err.contains("without hashes"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rollover_starts_new_genesis_chain() {
+        let dir = tmp_dir("chainroll");
+        let mut w1 = AuditWriter::new(&dir).with_hash_chain(true);
+        let p1 = w1.append(&record("2026-01-02T03:04:05Z", "echo first"), None).unwrap();
+        let line_len = lines_of(&p1)[0].len() as u64 + 1;
+        // Room for two chained lines, not three.
+        let mut w2 = AuditWriter::with_max_bytes(&dir, line_len * 2 + line_len / 2).with_hash_chain(true);
+        let mut paths = vec![p1.clone()];
+        for i in 0..3 {
+            paths.push(w2.append(&record("2026-01-02T03:04:05Z", &format!("echo more-{i}")), None).unwrap());
+        }
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert!(unique.len() >= 2, "size limit must roll over");
+        for p in &unique {
+            let records = read_records(p).unwrap();
+            assert_eq!(records[0].prev_hash.as_deref(), Some(GENESIS_HASH), "each file starts its own chain");
+            assert_eq!(verify_chain(&records).unwrap().outcome, ChainOutcome::Intact, "{}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn masking_precedes_hashing() {
+        let dir = tmp_dir("chainmask");
+        let provider = StaticSecretProvider::with_secrets(
+            [("$FILAR_SECRET_TOKEN".to_string(), "hunter2-chain-secret".to_string())].into(),
+        );
+        let mut w = AuditWriter::new(&dir).with_hash_chain(true);
+        let mut r = record("2026-01-02T03:04:05Z", "curl -H 'Bearer hunter2-chain-secret' https://api.example.com");
+        r.arbiter_reason = Some("rejected: token hunter2-chain-secret is expired".into());
+        let path = w.append(&r, Some(&provider)).unwrap();
+        let data = std::fs::read_to_string(&path).unwrap();
+        assert!(!data.contains("hunter2-chain-secret"), "masked before hashing and writing");
+        // Every masked field carries the placeholder, not just `command`.
+        let records = read_records(&path).unwrap();
+        assert!(records[0].command.contains("$FILAR_SECRET_TOKEN"), "command is masked per-field");
+        let reason = records[0].arbiter_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("$FILAR_SECRET_TOKEN"), "arbiter_reason is masked per-field: {reason}");
+        // The hash covers the masked content, so verification passes.
+        assert_eq!(verify_chain(&records).unwrap().outcome, ChainOutcome::Intact);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1303,5 +1303,44 @@ writer.append(&record, secrets.as_ref())?;
 # Ok::<(), filar_core::CoreError>(())
 ```
 
-The hash chain (`prev_hash` / `hash`) and integrity verification arrive with
-#697; readers must tolerate records without those fields.
+The hash chain (#697) is opt-in: `AuditWriter::new(dir).with_hash_chain(true)`
+(default off, so existing journals keep their shape). Each journal file
+carries its own chain: `prev_hash` of the first record is `GENESIS_HASH`
+(64 hex zeros), every next record links to the previous record's `hash` —
+SHA-256 (hex) of the record's canonical JSON without the `hash` field
+(`prev_hash` included; masking happens before hashing). Enabling the chain
+on a file that already holds unchained records is an error — existing lines
+are never rewritten. `filar_core::verify_chain(&records)` returns a
+`ChainVerifyReport { records_checked, outcome }` with `ChainOutcome::Disabled`
+(no hash fields at all), `Intact`, or `Broken { record, reason }` — the first
+modified/deleted/reordered/inserted record (1-based record number; blank
+lines are skipped). Tail truncation (dropping the
+last records) is not detectable without an external anchor. Concurrent
+writers are not serialized (as with the plain writer, #696): interleaved
+appends can fork the chain, which verification then reports as broken.
+The config switch `[audit].hash_chain` arrives with #699.
+
+CLI: `filar audit verify [--path <file>]` — read-only check; without
+`--path` it verifies every `audit-*.jsonl` in `audit::default_dir()`.
+Exit codes: 0 — no errors (including "chain disabled"), 1 — corruption or
+unreadable journal, 2 — usage error.
+
+```rust
+let mut writer = filar_core::AuditWriter::new("journal-dir").with_hash_chain(true);
+let record = filar_core::AuditRecord::new(
+    "session-123",
+    filar_core::AuditTarget { kind: "ssh".into(), name: "web-1".into(), host: None, tags: vec![] },
+    "uptime",
+    filar_core::AuditDecision::Approved,
+    filar_core::AuditDecisionSource::User,
+);
+let path = writer.append(&record, None)?;
+let records = filar_core::audit::read_records(&path)?;
+let report = filar_core::verify_chain(&records)?;
+match report.outcome {
+    filar_core::ChainOutcome::Intact => println!("{} records, chain OK", report.records_checked),
+    filar_core::ChainOutcome::Disabled => println!("chain disabled"),
+    filar_core::ChainOutcome::Broken { record, reason } => println!("record {record}: {reason}"),
+}
+# Ok::<(), filar_core::CoreError>(())
+```
