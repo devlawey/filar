@@ -600,6 +600,13 @@ impl ChainSecretProvider {
     fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<String, CachedSecret>> {
         self.cache.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// The chain's inner links, in resolution order (#698): the audit
+    /// masking union flattens them so a colliding name's value in every
+    /// link is masked, not just the first the chain would return.
+    pub fn links(&self) -> &[Arc<dyn SecretProvider>] {
+        &self.providers
+    }
 }
 
 /// Where a KeePassXC database password comes from (#695): a typed one is

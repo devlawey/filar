@@ -399,10 +399,6 @@ pub struct Agent {
     log_sources: Option<Arc<crate::logs::LogSources>>,
     /// The pod of a pod tab (#564): `pod_logs_history` defaults to it (#583).
     kube_pod: Option<KubePodTarget>,
-    /// Last proposal this turn emitted (#698 review): a `Cancelled` carries
-    /// it so a consumer can match the cancellation to its proposal. `0` =
-    /// none yet; reset at the start of every [`run`](Self::run).
-    last_proposal_id: AtomicU64,
 }
 
 /// Process-wide source of [`AgentEvent::CommandProposed`] ids: unique across
@@ -783,7 +779,6 @@ impl AgentBuilder {
             risk_scorer: self.risk_scorer,
             log_sources,
             kube_pod: self.kube_pod,
-            last_proposal_id: AtomicU64::new(0),
         })
     }
 }
@@ -824,9 +819,6 @@ impl Agent {
 
     /// Emit an event to the sink (if set).
     fn emit(&self, event: AgentEvent) {
-        if let AgentEvent::CommandProposed { proposal_id, .. } = &event {
-            self.last_proposal_id.store(*proposal_id, Ordering::Relaxed);
-        }
         if let Some(ref sink) = self.event_sink {
             sink(event);
         }
@@ -938,10 +930,9 @@ impl Agent {
     /// [`AgentEvent::Finished`] (success) or [`AgentEvent::Error`] (failure).
     pub async fn run(&self, user_prompt: &str, history: &[ChatMessage]) -> Result<String> {
         self.emit(AgentEvent::Started);
-        self.last_proposal_id.store(0, Ordering::Relaxed);
-        // The ratings belong to this turn (#644): a dropped `run` future
-        // aborts them with it, and another turn of the same agent never
-        // touches them.
+        // The ratings and the last-proposal id belong to this turn (#644,
+        // #698): a dropped `run` future aborts them with it, and another
+        // turn of the same agent never touches them.
         let scores = PendingScores::default();
         let result = self.run_loop(user_prompt, history, &scores).await;
         // Ratings still in flight land before the terminal event; each is
@@ -956,9 +947,8 @@ impl Agent {
             }
             Err(e) => {
                 if self.is_cancelled() {
-                    let pid = self.last_proposal_id.load(Ordering::Relaxed);
                     self.emit(AgentEvent::Cancelled {
-                        proposal_id: (pid != 0).then_some(pid),
+                        proposal_id: scores.last_proposal(),
                     });
                 } else {
                     self.emit(AgentEvent::Error(e.to_string()));
@@ -1156,7 +1146,12 @@ impl Agent {
             let (Some(sources), Some(pod)) = (&self.log_sources, &self.kube_pod) else {
                 return Ok(ChatMessage::tool(&tc.id, "Error: pod_logs_history is available only in a pod tab with log sources."));
             };
-            let emit = |event: AgentEvent| self.emit(event);
+            let emit = |event: AgentEvent| {
+                if let AgentEvent::CommandProposed { proposal_id, .. } = &event {
+                    scores.note_proposal(*proposal_id);
+                }
+                self.emit(event);
+            };
             return sources
                 .process_pod_logs_history(
                     tc,
@@ -1180,7 +1175,12 @@ impl Agent {
                     "Error: no log sources are available in this tab.",
                 ));
             };
-            let emit = |event: AgentEvent| self.emit(event);
+            let emit = |event: AgentEvent| {
+                if let AgentEvent::CommandProposed { proposal_id, .. } = &event {
+                    scores.note_proposal(*proposal_id);
+                }
+                self.emit(event);
+            };
             return sources
                 .process(
                     tc,
@@ -1250,6 +1250,7 @@ impl Agent {
 
         // Emit CommandProposed before any confirmation logic.
         let proposal_id = NEXT_PROPOSAL_ID.fetch_add(1, Ordering::Relaxed);
+        scores.note_proposal(proposal_id);
         self.emit(AgentEvent::CommandProposed {
             proposal_id,
             command: display_command.clone(),
@@ -1259,6 +1260,7 @@ impl Agent {
                 name: tc.name.clone(),
                 arguments: tc.arguments.clone(),
             },
+            confirm_mode: self.confirm_mode,
         });
 
         // Safety rating (#549): every command the agent proposes, in every
@@ -1310,7 +1312,12 @@ impl Agent {
                 warn!(command = %parsed.command, reason = %reason, "command blocked by security");
                 // No CommandFinished event for blocked commands: blocked is not a
                 // user denial, and the TUI should not show a command block for it.
-                // The block reason is sent back to the LLM as tool context.
+                // The audit journal learns of the refusal from CommandRefused;
+                // the block reason is sent back to the LLM as tool context.
+                self.emit(AgentEvent::CommandRefused {
+                    proposal_id,
+                    reason: reason.clone(),
+                });
                 return Ok(ChatMessage::tool(
                     &tc.id,
                     format!("Error: command blocked by security policy: {reason}"),

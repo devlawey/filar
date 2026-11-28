@@ -6315,8 +6315,8 @@ impl App {
                 .map(|(_, _, tool)| tool.clone());
             let command = confirm.command.clone();
             // The user's answer is an audit decision (#698) — including the
-            // auto-deny on Esc/quit, which funnels through here too. F2 is a
-            // mode switch, not an answer, and journals separately.
+            // auto-deny on Ctrl+Z/quit, which funnels through here too. F2 is
+            // a mode switch, not an answer, and journals separately.
             if let Some(audit) = &self.audit {
                 audit.send(crate::audit::AuditInput::Decision {
                     session_id: self.sessions[self.active].id.0.to_string(),
@@ -6423,6 +6423,7 @@ impl App {
         let is_confirm_request = matches!(&event, TuiEvent::ConfirmationRequest { .. });
         let sid = match &event {
             TuiEvent::Agent { session_id, .. } => *session_id,
+            TuiEvent::Shell { session_id, .. } => *session_id,
             TuiEvent::Thinking => self.sessions[self.active].id,
             TuiEvent::ConfirmationRequest { session_id, .. } => *session_id,
             TuiEvent::TransportChanged { session_id, .. } => *session_id,
@@ -6746,6 +6747,40 @@ impl App {
                 }
                 _ => {}
             },
+            TuiEvent::Shell {
+                session_id,
+                event: shell_event,
+                ..
+            } => {
+                // The user's own `!cmd` escape (#698 review): the audit
+                // record is journaled from this event's captured context by
+                // the runner; here only the UI follows. A shell escape is
+                // not an agent turn — no replay verdict, no turn-end event.
+                match shell_event {
+                    filar_agent::AgentEvent::CommandFinished { .. } => {
+                        // Show the command block exactly as an agent finish
+                        // would, then reset the run state the old
+                        // `Finished("")` used to reset.
+                        self.handle_agent_event(TuiEvent::Agent {
+                            session_id,
+                            event: shell_event,
+                        });
+                        self.mode = AppMode::Normal;
+                        self.agent_running = false;
+                        self.cancellation = None;
+                        self.active_session_mut().background_activity = false;
+                        return;
+                    }
+                    filar_agent::AgentEvent::Error(text) => {
+                        self.push_message(ChatBlock::Error(text));
+                        self.mode = AppMode::Normal;
+                        self.agent_running = false;
+                        self.cancellation = None;
+                        self.active_session_mut().background_activity = false;
+                    }
+                    _ => {}
+                }
+            }
             TuiEvent::Thinking => {
                 self.mode = AppMode::Thinking;
             }
@@ -8880,6 +8915,7 @@ mod tests {
                     name: "run_command".into(),
                     arguments: serde_json::json!({ "command": command }),
                 },
+                confirm_mode: filar_core::CommandConfirmMode::Always,
             },
         });
         app.handle_agent_event(TuiEvent::ConfirmationRequest {
@@ -8923,6 +8959,7 @@ mod tests {
                     name: "read_file".into(),
                     arguments: serde_json::json!({ "path": "/etc/hosts" }),
                 },
+                confirm_mode: filar_core::CommandConfirmMode::Always,
             },
         });
         app.handle_agent_event(TuiEvent::Agent {
@@ -18222,6 +18259,7 @@ mod tests {
                     name: tool.into(),
                     arguments: serde_json::json!({ "command": command }),
                 },
+                confirm_mode: filar_core::CommandConfirmMode::Always,
             },
         });
     }

@@ -338,6 +338,7 @@ impl LogSources {
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
             },
+            confirm_mode: mode,
         });
         let cancelled = || CoreError::Other("cancelled".into());
         match self.decision(mode, parsed) {
@@ -374,6 +375,10 @@ impl LogSources {
             }
             ConfirmDecision::AutoApproved => {}
             ConfirmDecision::Blocked(reason) => {
+                emit(AgentEvent::CommandRefused {
+                    proposal_id,
+                    reason: reason.clone(),
+                });
                 return Ok(ChatMessage::tool(&call.id, format!("Error: {reason}")));
             }
         }

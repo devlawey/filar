@@ -583,6 +583,10 @@ pub struct TuiConfig {
     /// point; `None` (no section) keeps it. Synchronous chain calls happen
     /// only at start-up or in `spawn_blocking`, never in the event loop.
     pub secret_chain: Option<Arc<dyn SecretProvider>>,
+    /// The chain's inner links, flattened (#698 review): the audit masking
+    /// union masks every link's value for a colliding name, which a single
+    /// chain handle (first-wins) cannot do. Empty when no chain is set.
+    pub secret_chain_links: Vec<Arc<dyn SecretProvider>>,
     /// Shown once at start-up, one per profile whose key the chain could
     /// not resolve (#694). Never contains a secret.
     pub secret_provider_notes: Vec<String>,
@@ -1971,9 +1975,10 @@ async fn run_app(
             // answer the same name differently — a first-wins chain would
             // leave the other value in the journal.
             let mut links: Vec<Arc<dyn SecretProvider>> = vec![config.secret_provider.clone()];
-            if let Some(chain) = &config.secret_chain {
-                links.push(chain.clone());
-            }
+            // The chain's inner links, not the chain handle (#698 review):
+            // a first-wins chain would mask only one value of a colliding
+            // name and let the other links' values reach the journal.
+            links.extend(config.secret_chain_links.iter().cloned());
             links.push(Arc::new(filar_core::EnvSecretProvider::new()));
             let masking: Arc<dyn SecretProvider> =
                 Arc::new(crate::audit::MaskingUnion::new(links));
@@ -2715,10 +2720,12 @@ async fn run_app(
                             let provider = config.secret_provider.clone();
                             let sid = app.sessions[app.active].id;
                             let tx = agent_tx.clone();
-                            // The audit journal needs the tab's target even
-                            // when the escape fails before any event reaches
-                            // the forward loop (#698 review).
-                            let audit = app.audit.clone();
+                            // The audit journal needs the tab's context as it
+                            // was when the escape started (#698 review): the
+                            // tab may reconnect or close before the outcome
+                            // lands. The task holds no audit sender — the
+                            // outcome rides the event channel like everything
+                            // else, so shutdown drains it in order.
                             let audit_target = crate::audit::session_target(
                                 &app.sessions[app.active],
                                 &app.ssh_targets,
@@ -2730,7 +2737,7 @@ async fn run_app(
                                     exec,
                                     provider as Arc<dyn SecretProvider>,
                                 );
-                                let succeeded = match wrapped.run(&cmd).await {
+                                let event = match wrapped.run(&cmd).await {
                                     Ok(result) => {
                                         let mut output = result.stdout.clone();
                                         if !result.stderr.is_empty() {
@@ -2742,52 +2749,27 @@ async fn run_app(
                                                 output.push_str(&format!("\n[exit code: {code}]"));
                                             }
                                         }
-                                        let _ = tx.send(TuiEvent::Agent {
-                                            session_id: sid,
-                                            event: filar_agent::AgentEvent::CommandFinished {
-                                                proposal_id: None,
-                                                command: cmd.clone(),
-                                                output,
-                                                denied: false,
-                                                exit_code: result.exit_code,
-                                                duration_ms: u64::try_from(result.duration.as_millis()).ok(),
-                                            }
-                                        });
-                                        true
-                                    }
-                                    Err(e) => {
-                                        let text = format!("Shell command failed: {e}");
-                                        // A failed escape never produced a
-                                        // CommandFinished, so journal it here
-                                        // (#698 review): the error text is the
-                                        // record's explanation.
-                                        if let Some(audit) = &audit {
-                                            audit.send(crate::audit::AuditInput::Finished {
-                                                session_id: sid.0.to_string(),
-                                                proposal_id: None,
-                                                target: audit_target,
-                                                command: cmd,
-                                                output: crate::audit::bound_output(&text),
-                                                denied: false,
-                                                exit_code: None,
-                                                duration_ms: None,
-                                                confirm_mode,
-                                                fleet: fleet_tab,
-                                            });
+                                        filar_agent::AgentEvent::CommandFinished {
+                                            proposal_id: None,
+                                            command: cmd.clone(),
+                                            output,
+                                            denied: false,
+                                            exit_code: result.exit_code,
+                                            duration_ms: u64::try_from(result.duration.as_millis()).ok(),
                                         }
-                                        let _ = tx.send(TuiEvent::Agent {
-                                            session_id: sid,
-                                            event: filar_agent::AgentEvent::Error(text)
-                                        });
-                                        false
                                     }
+                                    Err(e) => filar_agent::AgentEvent::Error(format!(
+                                        "Shell command failed: {e}"
+                                    )),
                                 };
-                                if succeeded {
-                                    let _ = tx.send(TuiEvent::Agent {
-                                        session_id: sid,
-                                        event: filar_agent::AgentEvent::Finished(String::new())
-                                    });
-                                }
+                                let _ = tx.send(TuiEvent::Shell {
+                                    session_id: sid,
+                                    event,
+                                    command: cmd,
+                                    target: audit_target,
+                                    confirm_mode,
+                                    fleet: fleet_tab,
+                                });
                             });
                         } else {
                             // Empty command after ! — just return to normal.
@@ -3770,10 +3752,20 @@ async fn run_app(
         }
     }
 
-    // Drain the audit journal (#698 review): dropping every sender closes
-    // the collector's channel, its finish() flushes held records and any
-    // proposal still pending (a quit mid-confirm keeps the recorded denial),
-    // and the writes complete before the process exits.
+    // Drain the audit journal (#698 review). First the upstream tail: an
+    // outcome already queued in the agent channel (a finish that raced the
+    // quit) still reaches the collector instead of dying with the loop.
+    if let Some(audit) = &audit_handle {
+        while let Ok(event) = agent_rx.try_recv() {
+            if let Some(input) = crate::audit::input_from_event(&app, &event) {
+                audit.send(input);
+            }
+        }
+    }
+    // Then dropping every sender closes the collector's channel, its
+    // finish() flushes held records and any proposal still pending (a quit
+    // mid-confirm keeps the recorded denial), and the writes complete
+    // before the process exits.
     app.audit = None;
     drop(audit_handle);
     if let Some(task) = audit_task {
@@ -6722,6 +6714,7 @@ mod tests {
             is_local: true,
             secret_provider,
             secret_chain: None,
+            secret_chain_links: Vec::new(),
             secret_provider_notes: Vec::new(),
             profiles: vec![filar_core::LlmProfile {
                 name: "glm".into(),

@@ -45,6 +45,27 @@ pub enum AgentEvent {
         /// (#525). Frontends keep it on the chat block so the history can be
         /// replayed to the model as a real tool call.
         tool: filar_core::ToolInvocation,
+        /// The agent's effective confirmation mode for this proposal (#698):
+        /// the builder's mode, possibly tightened by a tag policy. A
+        /// frontend's own tab setting may be looser and must not stand in
+        /// for it in the audit record.
+        confirm_mode: filar_core::CommandConfirmMode,
+    },
+
+    /// A proposed command was refused by policy before anyone was asked
+    /// (#698): the confirm gate blocked it (read-only policy, destructive
+    /// command in a mode that never runs one, a fleet gate refusal of a
+    /// per-host approval). No confirmation window opens and no
+    /// [`CommandFinished`](AgentEvent::CommandFinished) follows; the reason
+    /// goes to the model as tool context. The audit journal records the
+    /// refusal from this event instead of guessing from output text.
+    CommandRefused {
+        /// The `proposal_id` of the refused [`CommandProposed`].
+        ///
+        /// [`CommandProposed`]: AgentEvent::CommandProposed
+        proposal_id: u64,
+        /// Why the gate refused the command.
+        reason: String,
     },
 
     /// Independent arbiter verdict on a command awaiting confirmation.

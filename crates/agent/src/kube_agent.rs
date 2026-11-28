@@ -5,7 +5,6 @@
 //! own gate: dry run, diff, confirmation in every mode. It never adapts
 //! Kubernetes operations to shell commands or `CommandExecutor`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -93,10 +92,6 @@ pub struct KubeAgent {
     writer: Option<Arc<dyn ClusterWriteApi>>,
     /// How long a scale, restart or undo waits for its rollout (#641).
     rollout_wait: Duration,
-    /// Last proposal this turn emitted (#698 review): a `Cancelled` carries
-    /// it so a consumer can match the cancellation to its proposal. `0` =
-    /// none yet; reset at the start of every [`run`](Self::run).
-    last_proposal_id: AtomicU64,
 }
 
 /// The arbiter of a [`KubeAgent`] (#620).
@@ -134,7 +129,6 @@ impl KubeAgent {
             risk_scorer: None,
             writer: None,
             rollout_wait: crate::kube_write::ROLLOUT_WAIT,
-            last_proposal_id: AtomicU64::new(0),
         }
     }
 
@@ -162,7 +156,6 @@ impl KubeAgent {
             risk_scorer: None,
             writer: None,
             rollout_wait: crate::kube_write::ROLLOUT_WAIT,
-            last_proposal_id: AtomicU64::new(0),
         }
     }
 
@@ -261,6 +254,9 @@ impl KubeAgent {
     /// `namespace` as in [`Self::spawn_risk_score`]. The log-source paths,
     /// which announce their own proposals, use it as their sink.
     fn emit_and_rate(&self, scores: &PendingScores, event: AgentEvent, namespace: Option<&str>) {
+        if let AgentEvent::CommandProposed { proposal_id, .. } = &event {
+            scores.note_proposal(*proposal_id);
+        }
         let rates =
             self.risk_scorer.is_some() && matches!(self.execution, KubeExecution::Cluster { .. });
         // Copy the proposal only when it is going to be rated.
@@ -389,9 +385,6 @@ impl KubeAgent {
     }
 
     fn emit(&self, event: AgentEvent) {
-        if let AgentEvent::CommandProposed { proposal_id, .. } = &event {
-            self.last_proposal_id.store(*proposal_id, Ordering::Relaxed);
-        }
         if let Some(sink) = &self.event_sink {
             sink(event);
         }
@@ -420,10 +413,9 @@ impl KubeAgent {
     /// Run one user turn, including any approved Kubernetes API calls.
     pub async fn run(&self, user_prompt: &str, history: &[ChatMessage]) -> Result<String> {
         self.emit(AgentEvent::Started);
-        self.last_proposal_id.store(0, Ordering::Relaxed);
-        // The ratings belong to this turn (#644): a dropped `run` future
-        // aborts them with it, and another turn of the same agent never
-        // touches them.
+        // The ratings and the last-proposal id belong to this turn (#644,
+        // #698): a dropped `run` future aborts them with it, and another
+        // turn of the same agent never touches them.
         let scores = PendingScores::default();
         let result = self.run_loop(user_prompt, history, &scores).await;
         // Ratings in flight land before the terminal event; a cancel drops
@@ -435,9 +427,8 @@ impl KubeAgent {
             // state of a request started since — while the caller still
             // gets the answer.
             Ok(text) if self.cancelled() => {
-                let pid = self.last_proposal_id.load(Ordering::Relaxed);
                 self.emit(AgentEvent::Cancelled {
-                    proposal_id: (pid != 0).then_some(pid),
+                    proposal_id: scores.last_proposal(),
                 });
                 Ok(text)
             }
@@ -447,9 +438,8 @@ impl KubeAgent {
             }
             Err(error) => {
                 if self.cancelled() || error.to_string() == "cancelled" {
-                    let pid = self.last_proposal_id.load(Ordering::Relaxed);
                     self.emit(AgentEvent::Cancelled {
-                        proposal_id: (pid != 0).then_some(pid),
+                        proposal_id: scores.last_proposal(),
                     });
                 } else {
                     self.emit(AgentEvent::Error(error.to_string()));
@@ -739,6 +729,7 @@ impl KubeAgent {
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                 },
+                confirm_mode: self.confirm_mode,
             },
             parsed.namespace(),
         );
@@ -767,6 +758,10 @@ impl KubeAgent {
             }
             ConfirmDecision::AutoApproved => {}
             ConfirmDecision::Blocked(reason) => {
+                self.emit(AgentEvent::CommandRefused {
+                    proposal_id,
+                    reason: reason.clone(),
+                });
                 return Ok(ChatMessage::tool(&call.id, format!("Error: {reason}")));
             }
         }
@@ -929,6 +924,7 @@ impl KubeAgent {
                 explanation: explanation.to_string(),
                 destructive,
                 tool,
+                confirm_mode: self.confirm_mode,
             },
             call_namespace,
         );
@@ -968,6 +964,10 @@ impl KubeAgent {
             &self.tag_policies,
         ) {
             ConfirmDecision::Blocked(reason) => {
+                self.emit(AgentEvent::CommandRefused {
+                    proposal_id,
+                    reason: reason.clone(),
+                });
                 return Ok(ChatMessage::tool(call_id, format!("Error: {reason}")));
             }
             ConfirmDecision::NeedsConfirmation | ConfirmDecision::AutoApproved => {

@@ -458,13 +458,28 @@ fn config_with_launch_secret_provider(
 /// never a crash.
 fn build_secret_chain(
     cfg: Option<&filar_core::SecretProviderConfig>,
-) -> anyhow::Result<Option<Arc<dyn SecretProvider>>> {
+) -> anyhow::Result<Option<Arc<filar_core::ChainSecretProvider>>> {
     match cfg {
         Some(cfg) => Ok(Some(Arc::new(
             filar_core::ChainSecretProvider::from_config(cfg)
                 .map_err(|e| anyhow::anyhow!("[secret_provider]: {e}"))?,
         ))),
         None => Ok(None),
+    }
+}
+
+/// The chain as a trait object for the resolution points, plus its inner
+/// links for the audit masking union (#698 review): a first-wins chain
+/// handle alone would mask only one value of a colliding name.
+fn chain_and_links(
+    chain: Option<Arc<filar_core::ChainSecretProvider>>,
+) -> (Option<Arc<dyn SecretProvider>>, Vec<Arc<dyn SecretProvider>>) {
+    match chain {
+        Some(c) => {
+            let links = c.links().to_vec();
+            (Some(c), links)
+        }
+        None => (None, Vec::new()),
     }
 }
 
@@ -803,10 +818,10 @@ async fn run() -> anyhow::Result<()> {
     // choice (#695) is applied: an invalid section in the file must not stop
     // the launcher that could repair it (#695 review). CLI mode reports it
     // here, before any session starts.
-    let mut secret_chain = if args.is_empty() {
-        None
+    let (mut secret_chain, mut secret_chain_links) = if args.is_empty() {
+        (None, Vec::new())
     } else {
-        build_secret_chain(config.secret_provider.as_ref())?
+        chain_and_links(build_secret_chain(config.secret_provider.as_ref())?)
     };
 
     // The launcher's command-safety choice (#552); `None` = not said (CLI
@@ -865,7 +880,8 @@ async fn run() -> anyhow::Result<()> {
                 // An older handoff without the field keeps the file's section;
                 // an invalid one is reported here, after the launcher had its
                 // chance to replace it (#695 review).
-                secret_chain = build_secret_chain(config.secret_provider.as_ref())?;
+                (secret_chain, secret_chain_links) =
+                    chain_and_links(build_secret_chain(config.secret_provider.as_ref())?);
                 let temperature = if launch.temperature.trim().is_empty() {
                     None
                 } else {
@@ -1255,6 +1271,7 @@ async fn run() -> anyhow::Result<()> {
         initial_ssh_info: loaded.ssh_info,
         secret_provider: secret_provider.clone(),
         secret_chain: secret_chain.clone(),
+        secret_chain_links: secret_chain_links.clone(),
         secret_provider_notes,
         log_rx,
         profiles: launch_profiles,
