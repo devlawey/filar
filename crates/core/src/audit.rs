@@ -427,8 +427,11 @@ impl AuditWriter {
         clean.hash = None;
         let base = serde_json::to_string(&clean)
             .map_err(|e| CoreError::Other(format!("failed to serialize audit record: {e}")))?;
-        // Two `"prev_hash":"<64 hex>"` fields plus separators and newline.
-        const HASH_FIELDS_EXTRA: u64 = 2 * (12 + 64 + 4) + 2;
+        // Exact overhead of the chained line over `base` (which carries
+        // neither hash field nor newline): `,"prev_hash":"<64 hex>"` is
+        // 1 + 11 + 1 + 2 + 64 = 79 bytes, `,"hash":"<64 hex>"` is
+        // 1 + 6 + 1 + 2 + 64 = 74 bytes, plus the trailing newline.
+        const HASH_FIELDS_EXTRA: u64 = 79 + 74 + 1;
         let mut path = self.pick_file(date, base.len() as u64 + HASH_FIELDS_EXTRA)?;
         let mut prev = self.chain_tip(&path)?;
         clean.prev_hash = Some(prev.clone());
@@ -969,11 +972,20 @@ mod tests {
     fn inserted_record_is_detected() {
         let (dir, path) = chained_journal("chainins");
         let mut lines = lines_of(&path);
+        // A byte-for-byte duplicate of record 2 still carries
+        // prev_hash = hash(record 1), while its new predecessor (record 2)
+        // has a different hash — the chain breaks at the inserted line.
         let dup = lines[1].clone();
         lines.insert(2, dup);
         rewrite_lines(&path, &lines);
         let report = verify_chain(&read_records(&path).unwrap()).unwrap();
-        assert!(matches!(report.outcome, ChainOutcome::Broken { record: 3, .. }), "{:?}", report.outcome);
+        match report.outcome {
+            ChainOutcome::Broken { record, reason } => {
+                assert_eq!(record, 3);
+                assert!(reason.contains("prev_hash"), "{reason}");
+            }
+            other => panic!("expected Broken, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1075,12 +1087,18 @@ mod tests {
             [("$FILAR_SECRET_TOKEN".to_string(), "hunter2-chain-secret".to_string())].into(),
         );
         let mut w = AuditWriter::new(&dir).with_hash_chain(true);
-        let r = record("2026-01-02T03:04:05Z", "curl -H 'Bearer hunter2-chain-secret' https://api.example.com");
+        let mut r = record("2026-01-02T03:04:05Z", "curl -H 'Bearer hunter2-chain-secret' https://api.example.com");
+        r.arbiter_reason = Some("rejected: token hunter2-chain-secret is expired".into());
         let path = w.append(&r, Some(&provider)).unwrap();
         let data = std::fs::read_to_string(&path).unwrap();
         assert!(!data.contains("hunter2-chain-secret"), "masked before hashing and writing");
+        // Every masked field carries the placeholder, not just `command`.
+        let records = read_records(&path).unwrap();
+        assert!(records[0].command.contains("$FILAR_SECRET_TOKEN"), "command is masked per-field");
+        let reason = records[0].arbiter_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("$FILAR_SECRET_TOKEN"), "arbiter_reason is masked per-field: {reason}");
         // The hash covers the masked content, so verification passes.
-        assert_eq!(verify_chain(&read_records(&path).unwrap()).unwrap().outcome, ChainOutcome::Intact);
+        assert_eq!(verify_chain(&records).unwrap().outcome, ChainOutcome::Intact);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
